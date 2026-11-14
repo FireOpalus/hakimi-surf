@@ -9,6 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import aiosqlite
+import anyio
 
 from .bot_guard import SCHEMA as BOT_SCHEMA
 from .bot_guard import BotInteractionGuard
@@ -287,12 +288,15 @@ class Store:
     @asynccontextmanager
     async def transaction(self):
         async with self.lock:
-            await self.db.execute("BEGIN IMMEDIATE")
             try:
+                # SQLite may execute BEGIN even if awaiting its result is cancelled.
+                await self.db.execute("BEGIN IMMEDIATE")
                 yield
                 await self.db.commit()
             except BaseException:
-                await self.db.rollback()
+                # Keep the lock until cleanup survives AnyIO's repeated cancellation.
+                with anyio.CancelScope(shield=True):
+                    await self.db.rollback()
                 raise
 
     async def one(self, sql: str, args: tuple = ()) -> aiosqlite.Row | None:
