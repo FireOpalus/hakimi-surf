@@ -1,0 +1,40 @@
+# Optional companion for a fresh, same-host NapCat deployment.
+# docker compose -f docker-compose.yml -f compose.napcat.yml up -d --build
+# Configure data/napcat/state/config before starting; never pass backend .env to NapCat.
+services:
+  napcat:
+    image: ghcr.io/napneko/nodenapcat@sha256:43e600211bc1ab273e9b2fc68776359d6cfbf03f99ba0f7cf52f3c99add51316
+    # The pinned image's loader can run directly without privileged host/mount setup.
+    entrypoint: [node, /app/load.cjs]
+    working_dir: /app
+    user: '10001:10001'
+    environment:
+      HOME: /app
+      NAPCAT_WORKDIR: /app/napcat-state
+      TZ: Asia/Shanghai
+    ports:
+      - '127.0.0.1:6099:6099'
+    volumes:
+      - ./data/napcat/qq:/app/.config/QQ
+      - ./data/napcat/state:/app/napcat-state
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 2g
+    pids_limit: 256
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:6099/webui/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'

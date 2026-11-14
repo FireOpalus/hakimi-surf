@@ -1,0 +1,278 @@
+"""Fetch only bounded public QQ CDN images; pin validated DNS results at connect time."""
+
+import asyncio
+import base64
+import io
+import ipaddress
+import logging
+import re
+import socket
+import ssl
+import warnings
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+import aiohttp
+from aiohttp.abc import AbstractResolver
+from PIL import Image, ImageOps
+
+from .config import Settings
+from .models import ImageRef
+from .security import Rejected
+
+MAX_IMAGE_BYTES = 3_500_000
+HTTP_FALLBACK_HOSTS = {"multimedia.nt.qq.com.cn", "gchat.qpic.cn"}
+BROWSER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+log = logging.getLogger("hakimi")
+
+
+def validate_image_url(url: str, *, allow_http: bool = False) -> str:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    http = allow_http and parsed.scheme == "http" and host in HTTP_FALLBACK_HOSTS
+    if (
+        (parsed.scheme != "https" and not http)
+        or parsed.port not in ({None, 80} if http else {None, 443})
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or len(url) > 4096
+        or not (
+            host.endswith(".qpic.cn") or host in {"multimedia.nt.qq.com", "multimedia.nt.qq.com.cn"}
+        )
+    ):
+        raise Rejected("image_origin_forbidden")
+    return url
+
+
+class PublicResolver(AbstractResolver):
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        entries = await asyncio.get_running_loop().getaddrinfo(
+            host, port, family=family, type=socket.SOCK_STREAM
+        )
+        results = []
+        for address_family, _, protocol, _, address in entries:
+            ip = ipaddress.ip_address(address[0])
+            if not ip.is_global or ip.is_multicast or (ip.version == 6 and ip.ipv4_mapped):
+                raise Rejected("image_address_forbidden")
+            results.append(
+                {
+                    "hostname": host,
+                    "host": str(ip),
+                    "port": port,
+                    "family": address_family,
+                    "proto": protocol,
+                    "flags": socket.AI_NUMERICHOST,
+                }
+            )
+        if not results:
+            raise Rejected("image_dns_failed")
+        return results
+
+    async def close(self):
+        pass
+
+
+@dataclass(frozen=True)
+class ModelImage:
+    data: str
+    mime_type: str = "image/jpeg"
+
+    def block(self) -> dict:
+        return {
+            "type": "image",
+            "data": self.data,
+            "mime_type": self.mime_type,
+            "resolution": "low",
+        }
+
+
+def normalize_image(raw: bytes, max_pixels: int) -> ModelImage:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as source:
+                if (
+                    source.format not in {"JPEG", "PNG", "WEBP", "GIF"}
+                    or source.width * source.height > max_pixels
+                    or source.width < 1
+                    or source.height < 1
+                ):
+                    raise Rejected("image_format_or_size")
+                source.seek(0)
+                source.load()
+                resized = ImageOps.exif_transpose(source).convert("RGB")
+                resized.thumbnail((768, 768))
+                resized.info.clear()
+                target = io.BytesIO()
+                # No EXIF, ICC, comments, animation or other embedded metadata is forwarded.
+                resized.save(target, format="JPEG", quality=80, optimize=True)
+        return ModelImage(base64.b64encode(target.getvalue()).decode("ascii"))
+    except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise Rejected("invalid_image") from None
+
+
+class ImageHTTPFailure(Rejected):
+    def __init__(self, status):
+        super().__init__("image_http_failed")
+        self.status = status
+
+
+class ImageLoader:
+    def __init__(self, settings: Settings, transport=None):
+        self.s, self.transport = settings, transport
+        # Shared by all sessions; only one image transfer can occupy the Shanghai uplink.
+        self.ws_images = asyncio.Semaphore(1)
+
+    @staticmethod
+    def failure_placeholder(ref):
+        return (
+            "[大图略过]" if ref.file_size and ref.file_size > MAX_IMAGE_BYTES else "[图片加载失败]"
+        )
+
+    async def load(self, refs: list[ImageRef]) -> list[ModelImage]:
+        if not refs:
+            return []
+        if not self.s.images_enabled or len(refs) > 2:
+            raise Rejected("images_disabled_or_excessive")
+        images = []
+        async with self._client() as client:
+            for ref in refs:
+                images.append(await self._one(client, ref))
+        return images
+
+    def _client(self):
+        # Keep the existing DNS pinning resolver: httpx's high-level API cannot pin a
+        # validated DNS result while preserving TLS SNI. Compatibility TLS is restricted
+        # to this QQ-CDN-only client; it never affects Gemini/Bilibili/Drive clients.
+        legacy_tls = ssl.create_default_context()
+        legacy_tls.check_hostname = False
+        legacy_tls.verify_mode = ssl.CERT_NONE
+        legacy_tls.set_ciphers("DEFAULT:@SECLEVEL=1")
+        connector = aiohttp.TCPConnector(
+            resolver=PublicResolver(), use_dns_cache=False, limit=2, ssl=legacy_tls
+        )
+        return aiohttp.ClientSession(
+            connector=connector,
+            trust_env=False,
+            cookie_jar=aiohttp.DummyCookieJar(),
+            auto_decompress=False,
+            timeout=aiohttp.ClientTimeout(total=5, connect=5),
+        )
+
+    @staticmethod
+    def _warn(stage, exc):
+        # Exception class and numeric status are sufficient diagnostics. Never log
+        # exception text, file IDs, signed URLs, QQ identities or raw image bytes.
+        status = getattr(exc, "status", None)
+        log.warning(
+            "event=image_download_failed stage=%s exception=%s status=%s",
+            stage,
+            type(exc).__name__,
+            status if isinstance(status, int) else "none",
+        )
+
+    async def _napcat(self, ref):
+        if self.transport is None or not re.fullmatch(r"[A-Za-z0-9_.=+\-]{1,1024}", ref.file):
+            return None, []
+        if ref.file in {".", ".."}:
+            return None, []
+        urls = []
+        maximum = min(self.s.image_max_bytes, MAX_IMAGE_BYTES)
+        async with self.ws_images:
+            for action in ("get_image", "get_file"):
+                try:
+                    async with asyncio.timeout(10):
+                        value = await self.transport.call(action, {"file": ref.file})
+                    if not isinstance(value, dict):
+                        raise Rejected("image_rpc_invalid")
+                    declared = value.get("file_size")
+                    if str(declared).isdecimal() and int(declared) > maximum:
+                        raise Rejected("image_too_large")
+                    raw = value.get("base64")
+                    if isinstance(raw, str) and raw:
+                        if raw.startswith("base64://"):
+                            raw = raw[9:]
+                        if len(raw) > 4 * ((maximum + 2) // 3):
+                            raise Rejected("image_too_large")
+                        decoded = base64.b64decode(raw, validate=True)
+                        if not decoded or len(decoded) > maximum:
+                            raise Rejected("image_too_large")
+                        return decoded, urls
+                    url = value.get("url")
+                    if isinstance(url, str) and url.startswith("https://"):
+                        validate_image_url(url)
+                        urls.append(url)
+                except (Rejected, TimeoutError, OSError, ValueError) as exc:
+                    self._warn("napcat", exc)
+                    if str(exc) == "image_too_large":
+                        raise
+        return None, urls
+
+    async def _http_one(self, client, url, *, allow_http=False):
+        maximum = min(self.s.image_max_bytes, MAX_IMAGE_BYTES)
+        async with asyncio.timeout(5):
+            async with client.get(
+                validate_image_url(url, allow_http=allow_http),
+                allow_redirects=False,
+                headers={
+                    "Accept": "image/jpeg,image/png,image/webp,image/gif",
+                    "User-Agent": BROWSER_AGENT,
+                },
+            ) as response:
+                if response.status != 200:
+                    raise ImageHTTPFailure(response.status)
+                if (
+                    response.headers.get("Content-Encoding", "identity") != "identity"
+                    or response.content_type
+                    not in {"image/jpeg", "image/png", "image/webp", "image/gif"}
+                    or (response.content_length or 0) > maximum
+                ):
+                    raise Rejected("image_download_failed")
+                raw = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    raw.extend(chunk)
+                    if len(raw) > maximum:
+                        raise Rejected("image_too_large")
+            return bytes(raw)
+
+    async def _one(self, client, ref):
+        if ref.file_size and ref.file_size > min(self.s.image_max_bytes, MAX_IMAGE_BYTES):
+            raise Rejected("image_too_large")
+        raw, refreshed = await self._napcat(ref)
+        if raw is not None:
+            return await asyncio.to_thread(normalize_image, raw, self.s.image_max_pixels)
+        # Prefer a freshly resolved CDN URL, otherwise use the authenticated event's URL.
+        url = next(iter(refreshed), ref.url)
+        if not url:
+            raise Rejected("image_url_unavailable")
+        try:
+            raw = await self._http_one(client, url)
+        except (Rejected, TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+            self._warn("https", exc)
+            # Never downgrade redirects, oversized/invalid bodies or rejected origins.
+            retryable = isinstance(exc, (TimeoutError, aiohttp.ClientError, OSError)) or (
+                isinstance(exc, ImageHTTPFailure) and (exc.status == 403 or exc.status >= 500)
+            )
+            if not retryable or urlsplit(url).hostname not in HTTP_FALLBACK_HOSTS:
+                raise
+            raw = await self._http_one(
+                client, "http://" + url.removeprefix("https://"), allow_http=True
+            )
+        return await asyncio.to_thread(normalize_image, raw, self.s.image_max_pixels)
+
+    async def load_results(self, refs: list[ImageRef]) -> list[ModelImage | None]:
+        """Keep positions for sender attribution; a failed image never aborts ordinary chat."""
+        if len(refs) > 2:
+            raise Rejected("images_disabled_or_excessive")
+        if not refs or not self.s.images_enabled:
+            return [None for _ in refs]
+        results = []
+        async with self._client() as client:
+            for ref in refs:
+                try:
+                    results.append(await self._one(client, ref))
+                except (Rejected, TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+                    self._warn("fallback", exc)
+                    results.append(None)
+        return results

@@ -1,0 +1,13 @@
+# With the existing NapCat deployment:
+# docker compose -f docker-compose.yml -f compose.napcat.yml -f compose.roaming.yaml up -d --no-deps hakimi-bot
+# Create ./secrets/roaming-service-account.json first (owner 10001:10001, mode 0400).
+# A missing key must fail instead of silently becoming a host directory.
+services:
+  hakimi-bot:
+    volumes:
+      - type: bind
+        source: ./secrets/roaming-service-account.json
+        target: /run/secrets/roaming-service-account.json
+        read_only: true
+        bind:
+          create_host_path: false

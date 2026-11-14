@@ -1,0 +1,25 @@
+{
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [],
+    "websocketClients": [
+      {
+        "name": "hakimi-seoul",
+        "enable": true,
+        "url": "wss://qq.example.com/ws/onebot/REPLACE_WITH_48_RANDOM_HEX_CHARS",
+        "messagePostFormat": "array",
+        "reportSelfMessage": false,
+        "reconnectInterval": 5000,
+        "token": "REPLACE_WITH_SEOUL_ONEBOT_ACCESS_TOKEN",
+        "debug": false,
+        "heartInterval": 25000
+      }
+    ],
+    "plugins": []
+  },
+  "musicSignUrl": "",
+  "enableLocalFile2Url": true,
+  "parseMultMsg": false
+}

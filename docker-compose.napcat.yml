@@ -1,0 +1,29 @@
+# Shanghai only. Do not combine this with the Seoul compose project.
+# docker compose --env-file .env.napcat -f docker-compose.napcat.yml up -d
+name: hakimi-napcat-shanghai
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MODE: reverse_ws
+      ONEBOT_URL: ${ONEBOT_URL:?Set the Seoul wss URL in .env.napcat}
+      WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:?Set a strong local WebUI token}
+      NAPCAT_UID: ${NAPCAT_UID:-1000}
+      NAPCAT_GID: ${NAPCAT_GID:-1000}
+    ports:
+      - '127.0.0.1:6099:6099'
+    volumes:
+      - ./data/napcat-shanghai/qq:/app/.config/QQ
+      - ./data/napcat-shanghai/config:/app/napcat/config
+      - ./data/napcat-shanghai/plugins:/app/napcat/plugins
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 2g
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'

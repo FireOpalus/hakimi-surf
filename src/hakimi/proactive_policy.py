@@ -1,0 +1,89 @@
+"""Local-only scheduling policy. No message or model output can change it."""
+
+import re
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def minute_of_day(value: str) -> int:
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+        raise ValueError("Use HH:MM")
+    hour, minute = map(int, value.split(":"))
+    return hour * 60 + minute
+
+
+class ProactiveConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    enabled: bool = True
+    daily_digest_enabled: bool = True
+    daily_digest_time: str = "22:30"
+    companion_ping_enabled: bool = True
+    max_per_day: int = Field(default=1, ge=1, le=2)
+    quiet_hours: str = "23:30-08:30"
+
+    @field_validator("daily_digest_time")
+    @classmethod
+    def valid_time(cls, value):
+        minute_of_day(value)
+        return value
+
+    @field_validator("quiet_hours")
+    @classmethod
+    def valid_quiet(cls, value):
+        parts = value.split("-")
+        if len(parts) != 2 or minute_of_day(parts[0]) == minute_of_day(parts[1]):
+            raise ValueError("Quiet hours must be two different HH:MM times")
+        return value
+
+    @classmethod
+    def from_settings(cls, s):
+        return cls(
+            enabled=s.proactive_dm_enabled,
+            daily_digest_enabled=s.daily_digest_enabled,
+            daily_digest_time=s.daily_digest_time,
+            companion_ping_enabled=s.companion_ping_enabled,
+            max_per_day=s.proactive_chat_max_per_day,
+            quiet_hours=s.quiet_hours,
+        )
+
+    def quiet(self, local: datetime) -> bool:
+        start, end = map(minute_of_day, self.quiet_hours.split("-"))
+        current = local.hour * 60 + local.minute
+        return start <= current < end if start < end else current >= start or current < end
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS operational_health (
+  provider TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, changed REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS owner_dm_state (
+  scope TEXT PRIMARY KEY, last_private_at REAL NOT NULL DEFAULT 0,
+  ever_online INTEGER NOT NULL DEFAULT 0, online INTEGER NOT NULL DEFAULT 0,
+  disconnected_at REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS proactive_days (
+  scope TEXT NOT NULL, day TEXT NOT NULL, PRIMARY KEY(scope,day)
+);
+CREATE TABLE IF NOT EXISTS proactive_schedule (
+  id TEXT PRIMARY KEY, scope TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL,
+  due_at REAL NOT NULL, expires_at REAL NOT NULL, status TEXT NOT NULL,
+  reason TEXT, UNIQUE(scope,day,kind,id)
+);
+CREATE INDEX IF NOT EXISTS proactive_due ON proactive_schedule(status,due_at);
+CREATE TABLE IF NOT EXISTS pending_owner_dms (
+  id TEXT PRIMARY KEY, scope TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL,
+  payload BLOB, created REAL NOT NULL, expires_at REAL NOT NULL, status TEXT NOT NULL,
+  session_epoch INTEGER, sent_at REAL, receipt BLOB, reason TEXT
+);
+CREATE INDEX IF NOT EXISTS owner_dm_delivery ON pending_owner_dms(status,created);
+CREATE TABLE IF NOT EXISTS alert_cooldown (
+  alert_key TEXT PRIMARY KEY, queued_at REAL NOT NULL, cooldown_until REAL NOT NULL,
+  dm_id TEXT NOT NULL, sent_at REAL
+);
+CREATE TABLE IF NOT EXISTS budget_totals (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1), amount INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ledger_times (id TEXT PRIMARY KEY, created REAL NOT NULL);
+"""

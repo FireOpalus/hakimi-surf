@@ -1,0 +1,843 @@
+"""Owner-only, durable proactive delivery. Schedules never poll a language model.
+
+The outbox is at-most-once after a OneBot request is submitted: an absent ACK is
+ambiguous, not permission to send again. Confirmed ACKs have a separate durable
+state so a crash between delivery and memory persistence can repair memory only.
+"""
+
+import asyncio
+import json
+import logging
+import random
+import re
+import time
+import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from .bot_server import is_persona_owner, untrusted_input
+from .generation_policy import Scenario
+from .models import Message
+from .proactive_policy import ProactiveConfig, minute_of_day
+from .roaming_logger import redact_public_summary
+from .security import Rejected
+
+log = logging.getLogger("hakimi")
+TEST_MESSAGE = "BOISER，这是哈基米的主动私信通路测试喵~这条固定消息没有调用模型。"
+ACTIVE_DELIVERIES = "('pending','sending','delivered','sent','uncertain')"
+
+
+class OwnerProactive:
+    def __init__(self, service, *, clock=time.time, rng=None):
+        self.service, self.s, self.store = service, service.s, service.store
+        self.clock, self.rng = clock, rng or random.SystemRandom()
+        self.zone = ZoneInfo(self.s.bot_timezone)
+        self.scope = self.store.vault.digest(
+            "owner-dm", self.s.namespace, self.s.onebot_self_id, self.s.owner_qq_id
+        )
+        self.policy_lock = asyncio.Lock()
+        self.plan_lock = asyncio.Lock()
+        self.delivery_lock = asyncio.Lock()
+        self.wakeup = asyncio.Event()
+
+    @property
+    def config(self):
+        return self.store.runtime.proactive
+
+    @property
+    def configured(self):
+        return bool(self.s.onebot_enabled and self.s.owner_qq_id and self.s.onebot_self_id)
+
+    def target(self):
+        if not self.configured:
+            raise Rejected("configure_owner_qq_id")
+        return Message(
+            platform="onebot",
+            bot_id=self.s.onebot_self_id,
+            event_id="owner-proactive",
+            user_id=self.s.owner_qq_id,
+            conversation_id=self.s.owner_qq_id,
+            kind="private",
+            text="",
+            addressed=True,
+            created_at=self.clock(),
+        )
+
+    def local(self, now=None):
+        return datetime.fromtimestamp(self.clock() if now is None else now, self.zone)
+
+    def day_bounds(self, now):
+        local = self.local(now)
+        start = datetime.combine(local.date(), datetime.min.time(), self.zone)
+        end = datetime.combine(local.date() + timedelta(days=1), datetime.min.time(), self.zone)
+        return start.timestamp(), end.timestamp()
+
+    def connected(self):
+        transport = getattr(self.service.sender, "onebot", None)
+        if self.s.onebot_mode == "http":
+            return transport is not None
+        ready = getattr(transport, "ready", None)
+        return bool(ready and ready.is_set())
+
+    async def initialize(self):
+        now = self.clock()
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "INSERT OR IGNORE INTO owner_dm_state(scope) VALUES (?)", (self.scope,)
+            )
+            # A server restart is also an offline interval; preserve an earlier disconnect.
+            await self.store.db.execute(
+                "UPDATE owner_dm_state SET online=0,disconnected_at=CASE "
+                "WHEN ever_online=1 AND disconnected_at=0 THEN ? ELSE disconnected_at END "
+                "WHERE scope=?",
+                (now, self.scope),
+            )
+            await self.store.db.execute(
+                "UPDATE pending_owner_dms SET status='cancelled',payload=NULL,receipt=NULL,"
+                "reason='owner_changed' WHERE scope!=? AND status IN "
+                "('pending','sending','delivered')",
+                (self.scope,),
+            )
+            await self.store.db.execute(
+                "UPDATE pending_owner_dms SET status='uncertain',payload=NULL,"
+                "reason='restart_after_submit' WHERE status='sending'"
+            )
+            await self.store.db.execute(
+                "UPDATE proactive_schedule SET status='failed',reason='generation_interrupted' "
+                "WHERE status='generating' AND id NOT IN (SELECT id FROM pending_owner_dms)"
+            )
+            if self.configured:
+                # Existing authenticated job timestamps cover the first upgrade's recent
+                # activity window without opening or disclosing any private message body.
+                await self.store.db.execute(
+                    "UPDATE owner_dm_state SET last_private_at=MAX(last_private_at,"
+                    "COALESCE((SELECT MAX(created) FROM jobs WHERE kind='message' AND scope=?),0)) "
+                    "WHERE scope=?",
+                    (self.store.session_scope(self.target()), self.scope),
+                )
+            # Move only old, never-submitted proactive outbox rows into the durable queue.
+            for row in await self.store.all("SELECT * FROM outbox WHERE status='pending'"):
+                legacy = self.store.vault.open(row["id"], row["payload"])
+                if not legacy.get("proactive"):
+                    continue
+                target = Message.model_validate(legacy["message"])
+                allowed = (
+                    self.config.enabled
+                    and target.kind == "private"
+                    and is_persona_owner(target, self.s)
+                    and row["expires"] > now
+                )
+                if allowed:
+                    await self._insert(
+                        row["id"],
+                        "patrol",
+                        self.service.output(legacy["text"]),
+                        row["expires"],
+                        now,
+                    )
+                await self.store.db.execute(
+                    "UPDATE outbox SET status=?,payload=NULL WHERE id=?",
+                    ("migrated" if allowed else "cancelled", row["id"]),
+                )
+        # Complete confirmed deliveries before workers can read Owner memory.
+        async with self.service.owner_dialogue_lock:
+            await self._repair_confirmed()
+
+    async def note_activity(self, message):
+        if message.kind != "private" or not is_persona_owner(message, self.s):
+            return
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "INSERT INTO owner_dm_state(scope,last_private_at) VALUES (?,?) "
+                "ON CONFLICT(scope) DO UPDATE SET last_private_at=excluded.last_private_at",
+                (self.scope, self.clock()),
+            )
+
+    async def on_connection(self, online):
+        now, lost = self.clock(), 0
+        async with self.store.transaction():
+            row = await self.store.one("SELECT * FROM owner_dm_state WHERE scope=?", (self.scope,))
+            if row and online and row["ever_online"] and row["disconnected_at"]:
+                lost = max(0, now - row["disconnected_at"])
+            await self.store.db.execute(
+                "INSERT INTO owner_dm_state(scope,ever_online,online,disconnected_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
+                "ever_online=MAX(ever_online,excluded.ever_online),online=excluded.online,"
+                "disconnected_at=CASE WHEN excluded.online=1 THEN 0 "
+                "WHEN disconnected_at=0 THEN excluded.disconnected_at ELSE disconnected_at END",
+                (self.scope, int(online), int(online), 0 if online else now),
+            )
+        if online:
+            if lost >= self.s.proactive_ws_alert_after_seconds:
+                await self.alert(
+                    "ws_recovered",
+                    f"BOISER，NapCat 连接已恢复喵。刚才中断约 {int(lost // 60)} 分钟，"
+                    "仅补发尚未过期的待发消息。",
+                )
+            self.wakeup.set()
+
+    async def set_config(self, value: ProactiveConfig | None):
+        async with self.plan_lock, self.policy_lock:
+            runtime = self.store.runtime
+            if value is None:
+                async with self.store.transaction():
+                    await self.store.db.execute("DELETE FROM admin_config WHERE key='proactive'")
+                runtime.proactive, runtime.proactive_overridden = runtime.env_proactive, False
+            else:
+                await runtime.save_config("proactive", value.model_dump())
+                runtime.proactive, runtime.proactive_overridden = value, True
+            # Replan only unattempted work. Paid or ambiguous attempts are never rerolled.
+            day = self.local().date().isoformat()
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "DELETE FROM proactive_schedule WHERE scope=? AND day=? AND status='planned'",
+                    (self.scope, day),
+                )
+                await self.store.db.execute(
+                    "DELETE FROM proactive_days WHERE scope=? AND day=?", (self.scope, day)
+                )
+            await self._expire_and_disable()
+            await self._plan_day(self.clock(), future_only=True)
+        self.wakeup.set()
+
+    async def ensure_plan(self):
+        async with self.plan_lock, self.policy_lock:
+            await self._plan_day(self.clock())
+
+    async def _plan_day(self, now, *, future_only=False):
+        day = self.local(now).date().isoformat()
+        start, end = self.day_bounds(now)
+        cfg = self.config
+        async with self.store.transaction():
+            inserted = await self.store.db.execute(
+                "INSERT OR IGNORE INTO proactive_days VALUES (?,?)", (self.scope, day)
+            )
+            if inserted.rowcount != 1 or not cfg.enabled or not self.configured:
+                return
+            if cfg.daily_digest_enabled:
+                minute = minute_of_day(cfg.daily_digest_time)
+                due = self.local(start).replace(hour=minute // 60, minute=minute % 60).timestamp()
+                key = self.store.vault.digest(self.scope, day, "digest")
+                await self.store.db.execute(
+                    "INSERT OR IGNORE INTO proactive_schedule VALUES (?,?,?,?,?,?,'planned',NULL)",
+                    (key, self.scope, day, "digest", due, min(due + 43200, end)),
+                )
+            if not cfg.companion_ping_enabled:
+                return
+            used = (
+                await self.store.one(
+                    "SELECT COUNT(*) FROM proactive_schedule WHERE scope=? AND day=? "
+                    "AND kind='companion'",
+                    (self.scope, day),
+                )
+            )[0]
+            # Real timestamps handle DST gaps and repeated local hours without phantom slots.
+            slots = [
+                stamp
+                for stamp in range(int(start), int(end), 60)
+                if not cfg.quiet(self.local(stamp)) and (not future_only or stamp > now)
+            ]
+            for due in sorted(
+                self.rng.sample(slots, min(max(0, cfg.max_per_day - used), len(slots)))
+            ):
+                key = self.store.vault.digest(self.scope, day, "companion", uuid.uuid4().hex)
+                await self.store.db.execute(
+                    "INSERT INTO proactive_schedule VALUES (?,?,?,?,?,?,'planned',NULL)",
+                    (key, self.scope, day, "companion", due, self._companion_expiry(due)),
+                )
+
+    def _companion_expiry(self, now):
+        _, end = self.day_bounds(now)
+        expiry = min(now + 7200, end)
+        # Cap at the first quiet boundary; a queued afternoon greeting cannot survive night.
+        for stamp in range(int(now // 60 + 1) * 60, int(expiry) + 1, 60):
+            if self.config.quiet(self.local(stamp)):
+                return stamp
+        return expiry
+
+    async def _eligible(self, kind, now, *, day=None, exclude_id=None):
+        cfg = self.config
+        if not self.configured or not cfg.enabled:
+            return "disabled"
+        if kind == "digest" and not cfg.daily_digest_enabled:
+            return "digest_disabled"
+        if kind == "companion":
+            if not cfg.companion_ping_enabled:
+                return "companion_disabled"
+            if cfg.quiet(self.local(now)):
+                return "quiet_hours"
+            if day and day != self.local(now).date().isoformat():
+                return "old_day"
+            async with self.store.lock:
+                activity = await self.store.one(
+                    "SELECT last_private_at FROM owner_dm_state WHERE scope=?", (self.scope,)
+                )
+                count = (
+                    await self.store.one(
+                        "SELECT COUNT(*) FROM pending_owner_dms WHERE scope=? AND day=? "
+                        f"AND kind='companion' AND status IN {ACTIVE_DELIVERIES} AND id!=?",
+                        (self.scope, day or self.local(now).date().isoformat(), exclude_id or ""),
+                    )
+                )[0]
+            if activity and activity[0] and now - activity[0] < 10800:
+                return "owner_recently_active"
+            if count >= cfg.max_per_day:
+                return "daily_limit"
+        if kind in {"digest", "companion"} and (await self.store.budget_status())["hard_stop"]:
+            return "budget_hard_stop"
+        return None
+
+    async def _insert(self, key, kind, text, expires, now):
+        # Caller holds store transaction. No queue row can choose a destination.
+        payload = {"owner": self.s.owner_qq_id, "bot": self.s.onebot_self_id, "text": text}
+        await self.store.db.execute(
+            "INSERT OR IGNORE INTO pending_owner_dms"
+            "(id,scope,day,kind,payload,created,expires_at,status) VALUES "
+            "(?,?,?,?,?,?,?,'pending')",
+            (
+                key,
+                self.scope,
+                self.local(now).date().isoformat(),
+                kind,
+                self.store.vault.seal(key, payload),
+                now,
+                expires,
+            ),
+        )
+
+    async def enqueue(self, kind, text, *, key=None, expires=None):
+        now = self.clock()
+        if kind not in {"test", "patrol", "digest", "companion"}:
+            raise Rejected("invalid_owner_dm_kind")
+        maximum = self._companion_expiry(now) if kind == "companion" else now + 43200
+        expires = min(expires, maximum) if expires is not None else maximum
+        key = key or uuid.uuid4().hex
+        async with self.policy_lock:
+            reason = await self._eligible(kind, now, exclude_id=key)
+            if expires is not None and expires <= now:
+                reason = "expired"
+            if reason:
+                raise Rejected(reason)
+            async with self.store.transaction():
+                await self._insert(
+                    key, kind, self.service.output(text), expires or now + 43200, now
+                )
+        self.wakeup.set()
+        return key
+
+    async def alert(self, code, text, *, daily=False):
+        now = self.clock()
+        key = self.scope + ":" + code
+        if daily:
+            key += ":" + self.local(now).date().isoformat()
+        async with self.policy_lock:
+            if not self.configured or not self.config.enabled:
+                return None
+            async with self.store.transaction():
+                row = await self.store.one(
+                    "SELECT cooldown_until FROM alert_cooldown WHERE alert_key=?", (key,)
+                )
+                if row and row[0] > now:
+                    return None
+                dm_id = uuid.uuid4().hex
+                await self._insert(dm_id, "alert", text, now + 43200, now)
+                cooldown = (
+                    self.day_bounds(now)[1]
+                    if daily
+                    else now + self.s.proactive_alert_cooldown_seconds
+                )
+                await self.store.db.execute(
+                    "INSERT INTO alert_cooldown VALUES (?,?,?,?,NULL) ON CONFLICT(alert_key) "
+                    "DO UPDATE SET "
+                    "queued_at=excluded.queued_at,cooldown_until=excluded.cooldown_until,"
+                    "dm_id=excluded.dm_id,sent_at=NULL",
+                    (key, now, cooldown, dm_id),
+                )
+        self.wakeup.set()
+        return dm_id
+
+    async def check_alerts(self):
+        if not self.configured or not self.config.enabled:
+            return
+        budget = await self.store.budget_status()
+        for kind, label in (
+            ("daily", f"{self.s.bot_timezone} 日预算"),
+            ("monthly", f"{self.s.bot_timezone} 自然月预算"),
+            ("total", "本地累计预算"),
+        ):
+            amount, limit = budget[kind], budget[kind + "_limit"]
+            if limit <= 0:
+                continue
+            for level in (100, 85):
+                if amount * 100 >= limit * level:
+                    await self.alert(
+                        f"budget_{kind}_{level}",
+                        f"BOISER，{label}已达 {level}% {'硬熔断线' if level == 100 else '预警线'}："
+                        f"账本约 ${amount / 1000000:.4f} / ${limit / 1000000:.2f}（含费用预留）。"
+                        + (
+                            "付费生成已暂停。这条告警不调用模型。"
+                            if level == 100
+                            else "请留意余量喵。"
+                        ),
+                        daily=True,
+                    )
+                    break  # Crossing both thresholds at once needs only the stronger alert.
+        if budget["circuit"]:
+            await self.alert(
+                "budget_circuit",
+                "BOISER，账本发现实际用量超出保守预留，付费调用已熔断；请在后台检查费用。这条通知没有调用模型。",
+                daily=True,
+            )
+        async with self.store.lock:
+            health = dict(await self.store.all("SELECT provider,failures FROM operational_health"))
+        if health.get("bilibili_412", 0) >= 3:
+            await self.alert(
+                "bilibili_412",
+                "BOISER，B 站巡逻已连续至少 3 次遇到 412 风控。"
+                "程序已退避，请稍后检查网络与巡逻状态喵。",
+            )
+        if max(health.get("gemini_chat", 0), health.get("gemini_decision", 0)) >= 5:
+            await self.alert(
+                "gemini_errors",
+                "BOISER，Gemini 同一接口已连续至少 5 次调用失败。"
+                "请检查 API 可用性、配置与账单；本条通知由本地模板生成。",
+            )
+
+    async def _public_digest(self, now):
+        day = self.local(now).date().isoformat()
+        start, end = self.day_bounds(now)
+        payload = {
+            "day": day,
+            "timezone": self.s.bot_timezone,
+            "public_summaries": [],
+            "group_activity": {},
+        }
+        # Read the same public diary data; never call render/generation or any Session here.
+        diary = self.service.diary
+        if diary and self.s.roaming_timezone == self.s.bot_timezone:
+            async with self.store.lock:
+                counts = dict(
+                    await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
+                )
+                rows = await self.store.all(
+                    "SELECT id,payload FROM roaming_events WHERE day=? ORDER BY rowid", (day,)
+                )
+            payload.update(diary._summary_input(day, counts, rows))
+        if not payload["public_summaries"]:
+            subject = self.store.subject(self.target())
+            async with self.store.lock:
+                rows = await self.store.all(
+                    "SELECT payload FROM reports WHERE subject=? AND created>=? AND created<? "
+                    "ORDER BY id DESC LIMIT 10",
+                    (subject, start, end),
+                )
+            payload["public_summaries"] = [
+                redact_public_summary(self.store.vault.open(subject, row[0]))[:500]
+                for row in reversed(rows)
+            ]
+        async with self.store.lock:
+            amount = (
+                await self.store.one(
+                    "SELECT COALESCE(SUM(l.amount),0) FROM ledger l "
+                    "LEFT JOIN ledger_times t ON t.id=l.id "
+                    "WHERE (t.created>=? AND t.created<?) OR (t.id IS NULL AND l.day=?)",
+                    (start, end, self.local(now).date().isoformat()),
+                )
+            )[0]
+        payload["approximate_api_usd_including_reservations"] = f"{amount / 1000000:.4f}"
+        while (
+            len(untrusted_input(payload).encode()) > self.s.max_context_bytes
+            and payload["public_summaries"]
+        ):
+            payload["public_summaries"].pop(0)
+            payload["omitted_public_summaries"] = payload.get("omitted_public_summaries", 0) + 1
+        return payload
+
+    async def generate_slot(self, slot_id, *, manual=False):
+        daily_longnick = None
+        now = self.clock()
+        async with self.policy_lock:
+            async with self.store.lock:
+                row = await self.store.one(
+                    "SELECT * FROM proactive_schedule WHERE id=? AND scope=?", (slot_id, self.scope)
+                )
+            if not row or row["status"] != "planned":
+                return {"status": row["status"] if row else "not_found", "id": slot_id}
+            reason = await self._eligible(row["kind"], now, day=row["day"], exclude_id=slot_id)
+            if row["expires_at"] <= now:
+                reason = "expired"
+            if not manual and row["kind"] == "companion" and now - row["due_at"] > 300:
+                reason = "missed_slot"  # No stale greeting after a stopped scheduler/restart.
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "UPDATE proactive_schedule SET status=?,reason=? WHERE id=?",
+                    ("skipped" if reason else "generating", reason, slot_id),
+                )
+            if reason:
+                return {"status": "skipped", "reason": reason, "id": slot_id}
+        try:
+            digest = row["kind"] == "digest"
+            payload = (
+                await self._public_digest(now)
+                if digest
+                else {
+                    "task": "one_short_companion_greeting",
+                    "local_time": self.local(now).strftime("%H:%M"),
+                    "topic": self.rng.choice(
+                        ["轻松打个招呼", "分享一个猫猫伸懒腰的小动作", "一句不催促的摸鱼问候"]
+                    ),
+                }
+            )
+            subject = self.store.subject(self.target())
+            await self.service.ai.screen(
+                payload, subject, purpose="source", budget_lane="proactive"
+            )
+            requested_longnick = digest and self.service.longnick.config.enabled
+            generated = await self.service.ai.generate(
+                payload,
+                subject,
+                scenario=Scenario.OWNER_DIGEST if digest else Scenario.OWNER_COMPANION,
+                message=self.target(),
+                budget_lane="proactive",
+                **({"with_longnick": True} if requested_longnick else {}),
+            )
+            if requested_longnick:
+                try:
+                    value = json.loads(generated)
+                    if isinstance(value, dict) and isinstance(value.get("digest"), str):
+                        generated = value["digest"]
+                        daily_longnick = value.get("daily_longnick")
+                except (ValueError, TypeError):
+                    pass  # A malformed optional signature must not suppress the digest.
+            generated = re.sub(r"https?://\S+", "[外部链接已省略]", self.service.output(generated))
+            text = generated[: 250 if digest else 80]
+            if digest:
+                cost = payload["approximate_api_usd_including_reservations"]
+                text = (
+                    f"{row['day']} 巡逻小报\n{text}\n今日 API 约 ${cost}"
+                    "（本地估算，含预留，不含本次汇报）。"
+                )
+            await self.enqueue(row["kind"], text, key=slot_id, expires=row["expires_at"])
+        except asyncio.CancelledError:
+            raise  # 'generating' is durable; restart never repeats an ambiguous paid call.
+        except Exception as exc:
+            reason = (
+                str(exc)
+                if isinstance(exc, Rejected)
+                and str(exc)
+                in {
+                    "budget_hard_stop",
+                    "budget_exhausted",
+                    "budget_circuit_open",
+                    "disabled",
+                    "quiet_hours",
+                    "owner_recently_active",
+                    "daily_limit",
+                    "companion_disabled",
+                    "digest_disabled",
+                    "prompt_injection",
+                    "content_blocked",
+                    "gemini_unavailable",
+                }
+                else "generation_failed"
+            )
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "UPDATE proactive_schedule SET status='failed',reason=? WHERE id=?",
+                    (reason, slot_id),
+                )
+            log.info("event=owner_dm_failed")
+            return {"status": "failed", "reason": reason, "id": slot_id}
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "UPDATE proactive_schedule SET status='queued' WHERE id=?", (slot_id,)
+            )
+        if daily_longnick is not None:
+            await self.service.longnick.apply_digest(daily_longnick)
+        return {"status": "queued", "id": slot_id}
+
+    async def manual_digest(self):
+        await self.ensure_plan()
+        now = self.clock()
+        day = self.local(now).date().isoformat()
+        key = self.store.vault.digest(self.scope, day, "digest")
+        async with self.store.transaction():
+            # The manual action and the scheduled digest share one daily paid attempt.
+            await self.store.db.execute(
+                "INSERT OR IGNORE INTO proactive_schedule VALUES (?,?,?,?,?,?,'planned',NULL)",
+                (key, self.scope, day, "digest", now, now + 43200),
+            )
+        result = await self.generate_slot(key, manual=True)
+        await self.deliver_once()
+        return {**result, "delivery": await self.delivery_status(key)}
+
+    async def test_dm(self):
+        # Fixed template, not even Decisions or a post-send compression call.
+        key = await self.enqueue("test", TEST_MESSAGE, expires=self.clock() + 7200)
+        await self.deliver_once()
+        return {"id": key, "status": await self.delivery_status(key)}
+
+    async def delivery_status(self, key):
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT status FROM pending_owner_dms WHERE id=? AND scope=?", (key, self.scope)
+            )
+        return row[0] if row else "not_queued"
+
+    async def _expire_and_disable(self):
+        now, cfg = self.clock(), self.config
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "UPDATE pending_owner_dms SET status='expired',payload=NULL,reason='expired' "
+                "WHERE status='pending' AND expires_at<=?",
+                (now,),
+            )
+            await self.store.db.execute(
+                "UPDATE pending_owner_dms SET status='cancelled',payload=NULL,reason='disabled' "
+                "WHERE scope=? AND status='pending' AND (?=0 OR (kind='digest' AND ?=0) "
+                "OR (kind='companion' AND ?=0))",
+                (
+                    self.scope,
+                    int(cfg.enabled),
+                    int(cfg.daily_digest_enabled),
+                    int(cfg.companion_ping_enabled),
+                ),
+            )
+
+    async def _finish_memory(self, row):
+        payload = self.store.vault.open(row["id"], row["payload"])
+        if payload["owner"] != self.s.owner_qq_id or payload["bot"] != self.s.onebot_self_id:
+            raise Rejected("owner_dm_target_forbidden")
+        remembered = await self.service.sessions.remember_assistant(
+            self.target(), payload["text"], row["id"], expected_epoch=row["session_epoch"]
+        )
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "UPDATE pending_owner_dms SET status='sent',payload=NULL,reason=? WHERE id=?",
+                (None if remembered else "memory_reset_or_disabled", row["id"]),
+            )
+            await self.store.db.execute(
+                "UPDATE proactive_schedule SET status='sent' WHERE id=?", (row["id"],)
+            )
+            await self.store.db.execute(
+                "UPDATE alert_cooldown SET sent_at=? WHERE dm_id=?", (row["sent_at"], row["id"])
+            )
+
+    async def _repair_confirmed(self):
+        async with self.store.lock:
+            rows = await self.store.all(
+                "SELECT * FROM pending_owner_dms WHERE scope=? AND status='delivered' ORDER "
+                "BY created",
+                (self.scope,),
+            )
+        for row in rows:
+            await self._finish_memory(row)
+
+    async def deliver_once(self):
+        async with self.delivery_lock, self.service.owner_dialogue_lock:
+            await self._repair_confirmed()
+            async with self.policy_lock:
+                await self._expire_and_disable()
+                if not self.connected():
+                    return False
+                async with self.store.lock:
+                    row = await self.store.one(
+                        "SELECT * FROM pending_owner_dms WHERE scope=? AND status='pending' "
+                        "ORDER BY created,rowid LIMIT 1",
+                        (self.scope,),
+                    )
+                if not row:
+                    return False
+                key = row["id"]
+                payload = self.store.vault.open(key, row["payload"])
+                if (
+                    payload["owner"] != self.s.owner_qq_id
+                    or payload["bot"] != self.s.onebot_self_id
+                ):
+                    raise Rejected("owner_dm_target_forbidden")
+                submitted = False
+
+                async def before_send():
+                    nonlocal submitted
+                    now = self.clock()
+                    reason = await self._eligible(row["kind"], now, day=row["day"], exclude_id=key)
+                    if row["expires_at"] <= now:
+                        reason = "expired"
+                    if reason:
+                        async with self.store.transaction():
+                            await self.store.db.execute(
+                                "UPDATE pending_owner_dms SET "
+                                "status='skipped',payload=NULL,reason=? WHERE id=?",
+                                (reason, key),
+                            )
+                        return False
+                    if not self.connected():
+                        return False  # No request submitted: keep durable pending state.
+                    epoch = (await self.service.sessions.snapshot(self.target()))["epoch"]
+                    async with self.store.transaction():
+                        await self.store.db.execute(
+                            "UPDATE pending_owner_dms SET status='sending',session_epoch=? "
+                            "WHERE id=?",
+                            (epoch, key),
+                        )
+                    submitted = True
+                    return True
+
+                try:
+                    receipt = await self.service.sender.send_owner_dm(
+                        int(self.s.owner_qq_id), payload["text"], before_send=before_send
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if isinstance(exc, Rejected) and str(exc) == "onebot_not_dispatched":
+                        # The transport proves nothing was submitted; retain the durable message.
+                        async with self.store.transaction():
+                            await self.store.db.execute(
+                                "UPDATE pending_owner_dms SET status='pending',session_epoch=NULL "
+                                "WHERE id=? AND status='sending' AND payload IS NOT NULL",
+                                (key,),
+                            )
+                        return False
+                    if submitted:
+                        async with self.store.transaction():
+                            await self.store.db.execute(
+                                "UPDATE pending_owner_dms SET "
+                                "status='uncertain',payload=NULL,reason='send_unconfirmed' "
+                                "WHERE id=?",
+                                (key,),
+                            )
+                        log.info("event=owner_dm_uncertain")
+                    return True
+                async with self.store.transaction():
+                    await self.store.db.execute(
+                        "UPDATE pending_owner_dms SET status='delivered',sent_at=?,receipt=? "
+                        "WHERE id=?",
+                        (self.clock(), self.store.vault.seal("receipt:" + key, receipt), key),
+                    )
+                    confirmed = await self.store.one(
+                        "SELECT * FROM pending_owner_dms WHERE id=?", (key,)
+                    )
+                await self._finish_memory(confirmed)
+                # No compression here: alert/test delivery must remain strictly zero-token.
+                return True
+
+    async def tick(self):
+        await self.ensure_plan()
+        await self.check_alerts()
+        await self._expire_and_disable()
+        async with self.store.lock:
+            rows = await self.store.all(
+                "SELECT id FROM proactive_schedule WHERE scope=? AND status='planned' AND "
+                "due_at<=? ORDER BY due_at LIMIT 5",
+                (self.scope, self.clock()),
+            )
+        for row in rows:
+            await self.generate_slot(row[0])
+
+    async def run(self):
+        while True:
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.info("event=owner_dm_worker_error")
+            await asyncio.sleep(10)
+
+    async def delivery(self):
+        while True:
+            try:
+                self.wakeup.clear()
+                sent = await self.deliver_once()
+                if sent:
+                    await asyncio.sleep(2)
+                else:
+                    try:
+                        await asyncio.wait_for(self.wakeup.wait(), 5)
+                    except TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.info("event=owner_dm_worker_error")
+                await asyncio.sleep(5)
+
+    async def status(self):
+        now = self.clock()
+        day = self.local(now).date().isoformat()
+        async with self.store.lock:
+            sent = (
+                await self.store.one(
+                    "SELECT COUNT(*) FROM pending_owner_dms WHERE scope=? AND day=? AND "
+                    "kind='companion' AND status IN ('sent','delivered')",
+                    (self.scope, day),
+                )
+            )[0]
+            planned = await self.store.all(
+                "SELECT kind,MIN(due_at) AS at FROM proactive_schedule WHERE scope=? AND "
+                "status='planned' AND expires_at>? GROUP BY kind",
+                (self.scope, now),
+            )
+            pending = await self.store.all(
+                "SELECT kind,status,COUNT(*) AS n FROM pending_owner_dms WHERE scope=? AND "
+                "status IN ('pending','uncertain','delivered') GROUP BY kind,status",
+                (self.scope,),
+            )
+            alerts = await self.store.all(
+                "SELECT a.alert_key,a.queued_at,a.cooldown_until,a.sent_at,p.status FROM "
+                "alert_cooldown a LEFT JOIN pending_owner_dms p ON p.id=a.dm_id WHERE "
+                "a.alert_key LIKE ? ORDER BY a.queued_at DESC LIMIT 20",
+                (self.scope + ":%",),
+            )
+        upcoming = {row["kind"]: row["at"] for row in planned}
+        if self.config.enabled and self.config.daily_digest_enabled and "digest" not in upcoming:
+            minute = minute_of_day(self.config.daily_digest_time)
+            candidate = self.local(now).replace(
+                hour=minute // 60, minute=minute % 60, second=0, microsecond=0
+            )
+            if candidate.timestamp() <= now or await self._digest_attempted(day):
+                candidate += timedelta(days=1)
+            upcoming["digest"] = candidate.timestamp()
+        return {
+            "config": self.config.model_dump(),
+            "source": "admin" if self.store.runtime.proactive_overridden else "env",
+            "environment": self.store.runtime.env_proactive.model_dump(),
+            "timezone": self.s.bot_timezone,
+            "configured": self.configured,
+            "connected": self.connected(),
+            "day": day,
+            "companion_sent_today": sent,
+            "next": upcoming,
+            "queue": [dict(row) for row in pending],
+            "alerts": [
+                {**dict(row), "alert_key": row["alert_key"][len(self.scope) + 1 :]}
+                for row in alerts
+            ],
+            "budget": await self.store.budget_status(),
+            "proactive_daily_limit_usd": str(self.s.proactive_daily_usd),
+        }
+
+    async def _digest_attempted(self, day):
+        async with self.store.lock:
+            return bool(
+                await self.store.one(
+                    "SELECT 1 FROM proactive_schedule WHERE scope=? AND day=? AND "
+                    "kind='digest' AND status!='planned'",
+                    (self.scope, day),
+                )
+            )
+
+    async def prune(self):
+        now = self.clock()
+        day = self.local(now - 9 * 86400).date().isoformat()
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "DELETE FROM pending_owner_dms WHERE created<? AND status!='delivered'",
+                (now - 8 * 86400,),
+            )
+            await self.store.db.execute(
+                "DELETE FROM alert_cooldown WHERE cooldown_until<?", (now - 8 * 86400,)
+            )
+            await self.store.db.execute("DELETE FROM proactive_schedule WHERE day<?", (day,))
+            await self.store.db.execute("DELETE FROM proactive_days WHERE day<?", (day,))

@@ -1,0 +1,12 @@
+# Personal My Drive, explicitly selected OAuth mode. Do not combine with compose.roaming.yaml.
+# Run scripts/authorize_drive.py first; protect roaming-oauth.json as UID 10001, mode 0400.
+# docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml up -d --no-deps hakimi-bot
+services:
+  hakimi-bot:
+    volumes:
+      - type: bind
+        source: ./secrets/roaming-oauth.json
+        target: /run/secrets/roaming-oauth.json
+        read_only: true
+        bind:
+          create_host_path: false

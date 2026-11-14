@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hakimi-surf"
+version = "0.8.1"
+description = "Security-first asynchronous QQ assistant and controlled Bilibili text/video patrol"
+requires-python = ">=3.12"
+dependencies = [
+  "google-genai>=3.2.0,<4",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.7,<3",
+  "aiosqlite>=0.20,<1",
+  "anyio>=4.6,<5",
+  "cryptography>=44,<50",
+  "websockets>=15,<18",
+  "aiohttp>=3.11,<4",
+  "pillow>=12,<13",
+  "google-auth>=2.40,<3",
+  "yt-dlp==2026.10.26",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hakimi"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

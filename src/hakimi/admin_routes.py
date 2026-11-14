@@ -1,0 +1,791 @@
+"""Small, authenticated control plane; simulation never calls Service.accept or Sender."""
+
+import re
+import time
+from datetime import date
+from pathlib import Path
+from typing import Literal
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from .admission_policy import AdmissionConfig
+from .attention import direct_attention
+from .bilibili import extract_bvid
+from .bot_server import prompt_context
+from .budget_policy import BudgetConfig
+from .compression_policy import CompressionConfig
+from .gateway import FilterConfig
+from .generation_policy import Scenario, generation_plan
+from .mentions import parse_reply
+from .models import Message
+from .proactive_policy import ProactiveConfig
+from .rich_message_parser import parse_message
+from .security import Rejected, authorize, configured_secrets
+from .thinking_policy import ThinkingConfig
+
+router = APIRouter(prefix="/admin")
+
+
+class Input(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class Sandbox(Input):
+    identity: Literal["OWNER", "MEMBER", "BOT"]
+    scene: Literal["group_at", "group_plain", "private"]
+    text: str = Field(min_length=1, max_length=2000)
+    group_id: str = Field(default="", pattern=r"^[0-9]{0,20}$")
+
+
+class GroupPolicy(Input):
+    platform: Literal["onebot", "qq"] = "onebot"
+    group_id: str = Field(min_length=1, max_length=128)
+    mode: Literal["at_only", "smart_reply", "muted"]
+
+
+class GroupActivity(Input):
+    platform: Literal["onebot", "qq"] = "onebot"
+    group_id: str = Field(min_length=1, max_length=128)
+    preset: Literal["quiet", "natural", "active"] | None = None
+
+
+class BotChange(Input):
+    user_id: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
+    action: Literal["add", "remove"]
+
+
+class AdmissionChange(Input):
+    list: Literal["allowed_groups", "allowed_users", "ignored_bot_ids"]
+    action: Literal["add", "remove"]
+    id: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
+
+
+class SummaryEdit(Input):
+    text: str = Field(max_length=800)
+    version: int = Field(ge=0)
+
+
+class TextInput(Input):
+    text: str = Field(max_length=4000)
+
+
+class Subscription(Input):
+    kind: Literal["up", "live"]
+    uid: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
+
+
+async def body(request, model):
+    from .app import json_object, read_body
+
+    try:
+        return model.model_validate(
+            json_object(await read_body(request, request.app.state.settings))
+        )
+    except ValidationError:
+        raise HTTPException(400, "invalid_admin_input") from None
+
+
+def service(request):
+    return request.app.state.service
+
+
+def owner_target(s):
+    if not s.onebot_enabled or not s.owner_qq_id:
+        raise Rejected("configure_owner_qq_id")
+    return Message(
+        platform="onebot",
+        bot_id=s.onebot_self_id,
+        user_id=s.owner_qq_id,
+        kind="private",
+        conversation_id=s.owner_qq_id,
+        event_id="admin-patrol",
+        text="",
+        addressed=True,
+        created_at=time.time(),
+    )
+
+
+@router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
+async def page():
+    return HTMLResponse(Path(__file__).with_name("admin_page.html").read_text())
+
+
+@router.get("/api/dashboard")
+async def dashboard(request: Request):
+    svc = service(request)
+    await svc.store.runtime.flush()
+    usage = await svc.store.usage()
+    async with svc.store.lock:
+        metrics = await svc.store.all(
+            "SELECT code,source,n FROM daily_metrics WHERE day=?", (usage["day_utc"],)
+        )
+        count = await svc.store.one(
+            "SELECT n FROM counters WHERE key=?", (f"global:{int(time.time() // 60)}",)
+        )
+        circuit = bool(await svc.store.one("SELECT 1 FROM meta WHERE key='budget_overrun'"))
+    transport = request.app.state.onebot
+    ws = (
+        "http_mode"
+        if svc.s.onebot_mode == "http"
+        else "online"
+        if transport.ready.is_set()
+        else "reconnecting"
+    )
+    notebook = svc.notebook.status() if svc.notebook else {"enabled": False}
+    notebook.pop("text", None)
+    return {
+        "uptime_seconds": int(time.monotonic() - svc.started_at),
+        "onebot": ws,
+        "onebot_detail": transport.status()
+        if hasattr(transport, "status")
+        else {"online": None, "last_heartbeat_at": None, "source_ip": None, "connected_at": None},
+        "usage": usage,
+        "budget_status": await svc.store.budget_status(),
+        "daily_limit_usd": str(svc.s.daily_usd),
+        "patrol_limit_usd": str(svc.s.patrol_daily_usd),
+        "memory_limit_usd": str(svc.s.memory_daily_usd),
+        "admin_limit_usd": str(svc.s.admin_daily_usd),
+        "minute_requests": count[0] if count else 0,
+        "minute_limit": svc.s.global_requests_per_minute,
+        "budget_circuit_open": circuit,
+        "metrics": [dict(row) for row in metrics],
+        "notebook": notebook,
+    }
+
+
+@router.get("/api/budget")
+async def budget_config(request: Request):
+    return await service(request).store.budget_config_status()
+
+
+@router.put("/api/budget")
+async def budget_save(request: Request):
+    value = await body(request, BudgetConfig)
+    return await service(request).store.set_budget_config(value)
+
+
+@router.delete("/api/budget")
+async def budget_reset(request: Request):
+    return await service(request).store.set_budget_config(None)
+
+
+@router.get("/api/filter")
+async def filter_status(request: Request):
+    return await service(request).store.runtime.filters.status()
+
+
+@router.get("/api/thinking")
+async def thinking_status(request: Request):
+    return service(request).store.runtime.thinking_status()
+
+
+@router.put("/api/thinking")
+async def thinking_save(request: Request):
+    value = await body(request, ThinkingConfig)
+    return await service(request).store.runtime.set_thinking(value)
+
+
+@router.delete("/api/thinking")
+async def thinking_reset(request: Request):
+    return await service(request).store.runtime.set_thinking(None)
+
+
+def allowed_activity_group(settings, platform, group_id):
+    allowed = settings.onebot_allowed_groups if platform == "onebot" else settings.qq_allowed_groups
+    if group_id not in allowed:
+        raise Rejected("group_not_allowlisted")
+
+
+@router.put("/api/filter")
+async def filter_save(request: Request):
+    value = await body(request, FilterConfig)
+    svc = service(request)
+    manager = svc.store.runtime.filters
+    async with request.app.state.admin_config_lock:
+        if "group_activity" not in value.model_fields_set:
+            value = value.model_copy(update={"group_activity": dict(manager.config.group_activity)})
+        else:
+            for key in value.group_activity:
+                platform, group_id = key.split(":", 1)
+                allowed_activity_group(svc.s, platform, group_id)
+        return await manager.set_config(value)
+
+
+@router.delete("/api/filter")
+async def filter_reset(request: Request):
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.filters.set_config(None)
+
+
+@router.post("/api/filter/group-activity")
+async def group_activity(request: Request):
+    value = await body(request, GroupActivity)
+    svc = service(request)
+    allowed_activity_group(svc.s, value.platform, value.group_id)
+    async with request.app.state.admin_config_lock:
+        return await svc.store.runtime.filters.set_group_activity(
+            value.platform, value.group_id, value.preset
+        )
+
+
+@router.get("/api/decision-audit")
+async def decision_audit(request: Request):
+    return await service(request).store.runtime.filters.recent_audit(limit=30)
+
+
+@router.get("/api/logs")
+async def logs(request: Request):
+    store = service(request).store
+    await store.runtime.flush()
+    async with store.lock:
+        return [
+            dict(row)
+            for row in await store.all(
+                "SELECT at,code,source FROM audit_events ORDER BY id DESC LIMIT 50"
+            )
+        ]
+
+
+@router.post("/api/actions/{action}")
+async def action(request: Request, action: str):
+    svc = service(request)
+    request.app.state.admin_auth.costly()
+    lock = request.app.state.admin_action_lock
+    if lock.locked():
+        raise HTTPException(409, "admin_action_busy")
+    async with lock:
+        if action == "patrol":
+            await svc.poll_once(force=True)
+            return {
+                "status": "polled_updates_queued",
+                "note": "模型摘要按原工作队列处理；首次巡逻只建立基线。",
+            }
+        if action == "diary":
+            if not svc.diary or not svc.s.roaming_enabled:
+                raise Rejected("diary_disabled")
+            await svc.diary.sync_due(force=True)
+            return {
+                "status": "sync_attempted",
+                "note": "相同日记不重复上传；每日模型总结仍最多尝试一次。",
+            }
+        if action == "notebook":
+            return await svc.notebook.refresh()
+        raise HTTPException(404)
+
+
+@router.get("/api/groups")
+async def groups(request: Request):
+    s = service(request).s
+    return [
+        {
+            "platform": platform,
+            "group_id": gid,
+            "mode": s.group_policies.get(f"{platform}:{gid}", "at_only"),
+        }
+        for platform, ids in [("onebot", s.onebot_allowed_groups), ("qq", s.qq_allowed_groups)]
+        for gid in sorted(ids)
+    ]
+
+
+@router.get("/api/admission")
+async def admission(request: Request):
+    svc = service(request)
+    state = svc.store.runtime
+    return {
+        "config": state.admission.model_dump(mode="json"),
+        "environment": state.env_admission.model_dump(mode="json"),
+        "source": "admin" if state.admission_overridden else "env",
+        "owner_qq_id": svc.s.owner_qq_id,
+        "onebot_self_id": svc.s.onebot_self_id,
+        # Effective policy; the legacy environment flag no longer restricts group members.
+        "allow_group_members": True,
+        "group_membership_policy": "all_non_blocked_members",
+        "all_groups_allowed": False,
+    }
+
+
+@router.put("/api/admission")
+async def save_admission(request: Request):
+    await service(request).store.runtime.set_admission(await body(request, AdmissionConfig))
+    return await admission(request)
+
+
+@router.post("/api/admission/change")
+async def change_admission(request: Request):
+    data = await body(request, AdmissionChange)
+    try:
+        await service(request).store.runtime.change_admission(data.list, data.action, data.id)
+    except ValidationError:
+        raise HTTPException(400, "invalid_admin_input") from None
+    return await admission(request)
+
+
+@router.delete("/api/admission")
+async def reset_admission(request: Request):
+    await service(request).store.runtime.set_admission(None)
+    return await admission(request)
+
+
+@router.put("/api/groups")
+async def policy(request: Request):
+    data = await body(request, GroupPolicy)
+    svc = service(request)
+    allowed = svc.s.onebot_allowed_groups if data.platform == "onebot" else svc.s.qq_allowed_groups
+    if data.group_id not in allowed:
+        raise Rejected("group_not_allowlisted")
+    key = f"{data.platform}:{data.group_id}"
+    await svc.store.runtime.save_config("policy:" + key, data.mode)
+    svc.s.group_policies[key] = data.mode
+    return {"status": "saved"}
+
+
+@router.get("/api/bots")
+async def bots(request: Request):
+    svc = service(request)
+    result = []
+    now = time.time()
+    async with svc.store.lock:
+        rows = await svc.store.all(
+            "SELECT scope,target,used,expires,permit_until FROM bot_dialogue_windows "
+            "WHERE expires>? AND authorized_by=?",
+            (now, svc.bot_guard.owner_key()),
+        )
+    for uid in sorted(svc.s.bot_qq_ids):
+        item = {"user_id": uid, "groups": []}
+        for group in svc.s.onebot_allowed_groups:
+            m = Message(
+                platform="onebot",
+                bot_id=svc.s.onebot_self_id,
+                user_id=uid,
+                kind="group",
+                conversation_id=group,
+                event_id="admin",
+                text="",
+                addressed=True,
+                created_at=time.time(),
+            )
+            for row in rows:
+                if row["scope"] == svc.store.session_scope(m):
+                    item["groups"].append(
+                        {
+                            "group_id": group,
+                            "cooldown_seconds": max(0, int(row["expires"] - now))
+                            if row["used"] >= 2
+                            else 0,
+                            "is_target": row["target"] == svc.store.subject(m),
+                            "consumed": row["used"] >= 2,
+                            "used": row["used"],
+                            "max_turns": 2,
+                            "expires_at": row["expires"],
+                            "window_seconds": max(0, int(row["expires"] - now)),
+                            "permit_seconds": max(0, int(row["permit_until"] - now)),
+                        }
+                    )
+        result.append(item)
+    return result
+
+
+@router.put("/api/bots")
+async def bot_change(request: Request):
+    data = await body(request, BotChange)
+    svc = service(request)
+    try:
+        await svc.store.runtime.change_admission("ignored_bot_ids", data.action, data.user_id)
+    except ValidationError:
+        raise HTTPException(400, "invalid_admin_input") from None
+    return {"status": "saved"}
+
+
+@router.get("/api/sessions")
+async def sessions(request: Request):
+    svc = service(request)
+    result = []
+    for key, msg in await svc.store.runtime.sessions():
+        snap = await svc.sessions.snapshot(msg)
+        result.append(
+            {
+                "id": key,
+                "platform": msg.platform,
+                "kind": msg.kind,
+                "conversation_id": msg.conversation_id,
+                "enabled": snap["enabled"],
+                "summary_chars": len(snap["rolling_summary"]),
+                "recent_count": len(snap["recent_messages"]),
+            }
+        )
+    return result
+
+
+@router.get("/api/compression")
+async def compression_config(request: Request):
+    runtime = service(request).store.runtime
+    return {
+        "config": runtime.compression.model_dump(),
+        "source": "admin" if runtime.compression_overridden else "env",
+        "environment": runtime.env_compression.model_dump(),
+    }
+
+
+@router.get("/api/proactive")
+async def proactive_status(request: Request):
+    svc = service(request)
+    await svc.proactive.ensure_plan()
+    return await svc.proactive.status()
+
+
+@router.put("/api/proactive")
+async def proactive_config(request: Request):
+    data = await body(request, ProactiveConfig)
+    await service(request).proactive.set_config(data)
+    return await proactive_status(request)
+
+
+@router.delete("/api/proactive")
+async def proactive_reset(request: Request):
+    await service(request).proactive.set_config(None)
+    return await proactive_status(request)
+
+
+@router.post("/api/proactive/{action}")
+async def proactive_action(request: Request, action: str):
+    request.app.state.admin_auth.costly()
+    lock = request.app.state.admin_action_lock
+    if lock.locked():
+        raise HTTPException(409, "admin_action_busy")
+    async with lock:
+        dm = service(request).proactive
+        if action == "test":
+            return await dm.test_dm()
+        if action == "digest":
+            return await dm.manual_digest()
+        raise HTTPException(404)
+
+
+@router.put("/api/compression")
+async def save_compression_config(request: Request):
+    data = await body(request, CompressionConfig)
+    async with request.app.state.admin_config_lock:
+        await service(request).store.runtime.set_compression(data)
+    return await compression_config(request)
+
+
+@router.delete("/api/compression")
+async def reset_compression_config(request: Request):
+    async with request.app.state.admin_config_lock:
+        await service(request).store.runtime.set_compression(None)
+    return await compression_config(request)
+
+
+async def session_message(request, key):
+    if not re.fullmatch(r"[a-f0-9]{64}", key):
+        raise HTTPException(404)
+    return await service(request).store.runtime.session(key)
+
+
+@router.get("/api/sessions/{key}")
+async def session_detail(request: Request, key: str):
+    snap = await service(request).sessions.snapshot(await session_message(request, key))
+    # Admin needs summary and hot-window count, not automatic disclosure of raw conversations.
+    snap["recent_count"] = len(snap.pop("recent_messages"))
+    return snap
+
+
+@router.put("/api/sessions/{key}/summary")
+async def edit_summary(request: Request, key: str):
+    data = await body(request, SummaryEdit)
+    svc = service(request)
+    msg = await session_message(request, key)
+    if (await svc.sessions.snapshot(msg))["version"] != data.version:
+        raise Rejected("session_changed")
+    request.app.state.admin_auth.costly()
+    subject = svc.store.vault.digest("admin-summary-validation")
+    await svc.compressor.validate_summary(data.text, subject)
+    await svc.sessions.edit_summary(msg, data.text, data.version)
+    return {"status": "saved"}
+
+
+@router.post("/api/sessions/{key}/reset")
+async def reset_session(request: Request, key: str):
+    svc = service(request)
+    await svc.sessions.clear(await session_message(request, key))
+    return {"status": "reset"}
+
+
+@router.post("/api/sessions/{key}/compress")
+async def compress_session(request: Request, key: str):
+    request.app.state.admin_auth.costly()
+    svc = service(request)
+    return await svc.compressor.compress(await session_message(request, key), force=True)
+
+
+@router.get("/api/notebook")
+async def notebook(request: Request):
+    return service(request).notebook.status()
+
+
+@router.put("/api/notebook")
+async def notebook_write(request: Request):
+    data = await body(request, TextInput)
+    request.app.state.admin_auth.costly()
+    return await service(request).notebook.update_local(data.text)
+
+
+@router.get("/api/subscriptions")
+async def subscriptions(request: Request):
+    store = service(request).store
+    result = [
+        {"id": row["id"], "kind": "up", "uid": row["mid"], "next_poll": row["next_poll"]}
+        for row in await store.subscriptions()
+    ]
+    async with store.lock:
+        rows = await store.all("SELECT room_id,last_status,next_poll FROM live_watches")
+    return result + [
+        {
+            "id": row["room_id"],
+            "kind": "live",
+            "uid": row["room_id"],
+            "last_status": row["last_status"],
+            "next_poll": row["next_poll"],
+        }
+        for row in rows
+    ]
+
+
+@router.post("/api/subscriptions")
+async def add_subscription(request: Request):
+    data = await body(request, Subscription)
+    svc = service(request)
+    target = owner_target(svc.s)
+    async with request.app.state.admin_config_lock:
+        current = await subscriptions(request)
+        if len(current) >= svc.s.max_subscriptions:
+            raise Rejected("subscription_limit")
+        if data.kind == "up":
+            await svc.store.add_subscription(target, data.uid)
+        else:
+            async with svc.store.transaction():
+                await svc.store.db.execute(
+                    "INSERT OR IGNORE INTO live_watches(room_id,target) VALUES (?,?)",
+                    (data.uid, svc.store.vault.seal("live:" + data.uid, target.model_dump())),
+                )
+    return {"status": "saved"}
+
+
+@router.delete("/api/subscriptions/{kind}/{key}")
+async def delete_subscription(request: Request, kind: str, key: str):
+    store = service(request).store
+    if kind == "up":
+        row = next((r for r in await store.subscriptions() if r["id"] == key), None)
+        if not row:
+            raise HTTPException(404)
+        await store.remove_subscription(row["subject"], row["mid"])
+    elif kind == "live":
+        async with store.transaction():
+            await store.db.execute("DELETE FROM live_watches WHERE room_id=?", (key,))
+    else:
+        raise HTTPException(404)
+    return {"status": "deleted"}
+
+
+@router.get("/api/diaries")
+async def diaries(request: Request):
+    svc = service(request)
+    if not svc.diary:
+        return []
+    async with svc.store.lock:
+        return [
+            dict(row)
+            for row in await svc.store.all(
+                "SELECT day,slot,next_attempt,failures,last_error,last_success "
+                "FROM roaming_sync ORDER BY day DESC LIMIT 8"
+            )
+        ]
+
+
+@router.get("/api/diaries/{day}")
+async def diary(request: Request, day: str):
+    try:
+        if date.fromisoformat(day).isoformat() != day:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, "invalid_day") from None
+    svc = service(request)
+    if not svc.diary:
+        raise Rejected("diary_disabled")
+    return {"name": day + ".md", "markdown": await svc.diary.render(day)}
+
+
+@router.post("/api/sandbox")
+async def sandbox(request: Request):
+    data = await body(request, Sandbox)
+    svc = service(request)
+    request.app.state.admin_auth.costly()
+    lock = request.app.state.sandbox_lock
+    if lock.locked():
+        raise HTTPException(409, "sandbox_busy")
+    async with lock:
+        # A private copied configuration: synthetic IDs cannot touch real scopes or grants.
+        s = svc.s.model_copy(deep=True)
+        if not s.onebot_enabled:
+            raise Rejected("sandbox_requires_onebot")
+        owner_id = s.owner_qq_id or "990000001"
+        member_id = next(
+            (
+                str(i)
+                for i in range(990000002, 990000020)
+                if str(i) not in {owner_id, s.onebot_self_id}
+            ),
+            None,
+        )
+        bot_id = next(
+            str(i)
+            for i in range(990000020, 990000040)
+            if str(i) not in {owner_id, s.onebot_self_id, member_id}
+        )
+        s.owner_qq_id = owner_id
+        s.onebot_owner_ids = {owner_id}
+        s.onebot_allowed_users = {member_id, bot_id}
+        s.bot_qq_ids = {bot_id}
+        group = data.group_id or next(iter(sorted(s.onebot_allowed_groups)), "990000100")
+        mode = svc.s.group_policies.get("onebot:" + group, "at_only")
+        s.onebot_allowed_groups = {group}
+        s.group_policies = {"onebot:" + group: mode}
+        uid = {"OWNER": owner_id, "MEMBER": member_id, "BOT": bot_id}[data.identity]
+        kind = "private" if data.scene == "private" else "group"
+        rich = parse_message([{"type": "text", "data": {"text": data.text}}], s.onebot_self_id)
+        attention = direct_attention(
+            kind,
+            mentioned=data.scene == "group_at",
+            text=rich.command_text,
+            has_video=bool(rich.video_ids or rich.short_urls),
+        )
+        msg = Message(
+            platform="onebot",
+            bot_id=s.onebot_self_id,
+            user_id=uid,
+            kind=kind,
+            conversation_id=uid if kind == "private" else group,
+            event_id="sandbox",
+            text=data.text,
+            command_text="",
+            addressed=bool(attention),
+            attention_reason=attention,
+            created_at=time.time(),
+        )
+        context = prompt_context(msg, s)
+        scenario = Scenario.OWNER_PRIVATE if context.private_owner else Scenario.FAST_CHAT
+        preview = {
+            "thinking_level": generation_plan(s, scenario).thinking_level,
+            "persona": "OWNER" if context.private_owner else "PUBLIC",
+            "text": "",
+        }
+        result = {
+            "decisions": {"result": "not_called", "answers": {}},
+            "preview": preview,
+            "sandbox": True,
+            "group_policy": mode,
+        }
+        if data.identity == "BOT" or not authorize(msg, s):
+            result["decisions"]["reason"] = (
+                "known_bot_ignored" if data.identity == "BOT" else "group_policy_ignored"
+            )
+            return result
+        if any(
+            secret and len(secret) >= 8 and secret in data.text
+            for secret in configured_secrets(svc.s)
+        ):
+            raise Rejected("credential_in_input")
+        # Production gateway recomputes identity. For OWNER simulation with no configured Owner,
+        # keep PUBLIC; never allow synthetic identity to unlock production private context.
+        actual_context = prompt_context(msg, svc.s)
+        preview["persona"] = "OWNER" if actual_context.private_owner else "PUBLIC"
+        direct = data.text.strip()
+        if direct == "/new-session" or direct.startswith(("/bot-interact", svc.s.command_prefix)):
+            result["decisions"]["reason"] = "sandbox_stateful_command_skipped"
+            preview["thinking_level"] = None
+            preview["text"] = "沙盒不执行会修改生产状态的斜杠指令。"
+            return result
+        deep_match = re.fullmatch(r"/deep(?:\s+(.*))?", direct, re.DOTALL)
+        deep = deep_match is not None
+        if deep and (not actual_context.private_owner or not deep_match[1]):
+            result["decisions"]["reason"] = "owner_private_deep_required"
+            preview["thinking_level"] = None
+            return result
+        preview["thinking_level"] = generation_plan(s, scenario, deep=deep).thinking_level
+        subject = svc.store.vault.digest("admin-sandbox-budget")
+        payload = {
+            "current_message": data.text,
+            "surface": kind,
+            "directly_addressed": msg.addressed,
+            "recent_messages": [],
+            "rolling_summary": "",
+        }
+        try:
+            intent = await svc.ai.screen(
+                payload,
+                subject,
+                purpose="message",
+                group=kind == "group",
+                message=msg,
+                trace=result["decisions"],
+                budget_lane="admin",
+                audit_source="sandbox",
+            )
+            if result["decisions"].get("result") == "not_called":
+                result["decisions"]["result"] = intent
+            if intent != "ignore":
+                bvid = extract_bvid(data.text)
+                if bvid:
+                    video = await svc.bili.video(bvid)
+                    payload = {
+                        "task": "summarize_public_metadata",
+                        "untrusted_sources": [video.model_dump(exclude={"mid"})],
+                    }
+                    result["decisions"]["source"] = {}
+                    await svc.ai.screen(
+                        payload,
+                        subject,
+                        purpose="source",
+                        budget_lane="admin",
+                        audit_source="sandbox",
+                        trace=result["decisions"]["source"],
+                    )
+                    scenario = Scenario.BILIBILI_SUMMARY
+                    preview["thinking_level"] = generation_plan(
+                        s, scenario, deep=deep
+                    ).thinking_level
+                elif intent == "bilibili_watch":
+                    preview["text"] = "请提供 BV 号或 B 站公开视频完整链接；沙盒不修改生产订阅。"
+                    preview["thinking_level"] = None
+                    return result
+                preview["text"] = svc.output(
+                    await svc.ai.generate(
+                        payload,
+                        subject,
+                        scenario=scenario,
+                        deep=deep,
+                        message=msg,
+                        budget_lane="admin",
+                        audit_source="sandbox",
+                    )
+                )
+                if bvid:
+                    preview["text"] = (
+                        "公开视频标题／简介摘要（未观看全片）：\n"
+                        + preview["text"]
+                        + "\n"
+                        + video.url
+                    )
+                parsed = parse_reply(preview["text"], msg, svc.s)
+                preview["text"] = parsed.text
+                if parsed.meme_tag in svc.memes.labels:
+                    preview["meme_tag"] = parsed.meme_tag
+        except Rejected as exc:
+            result["decisions"].setdefault("reason", str(exc))
+            result["decisions"]["final_result"] = "blocked_or_unavailable"
+            if not preview["text"]:
+                preview["status"] = "blocked_or_unavailable"
+        return result

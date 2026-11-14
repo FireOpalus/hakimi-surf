@@ -1,0 +1,377 @@
+"""A diary of public patrols and coarse group activity, never a chat-memory reader."""
+
+import asyncio
+import hashlib
+import json
+import logging
+import re
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from .config import Settings
+from .drive_client import FolderDrive
+from .gemini import GeminiGateway
+from .generation_policy import Scenario
+from .models import Message
+from .security import Rejected, clean_text, configured_secrets, safe_output
+from .store import Store
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS roaming_events (
+  id TEXT PRIMARY KEY, day TEXT NOT NULL, payload BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS roaming_events_day ON roaming_events(day);
+CREATE TABLE IF NOT EXISTS roaming_receipts (id TEXT PRIMARY KEY, day TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS roaming_counts (
+  day TEXT NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY(day,kind)
+);
+CREATE TABLE IF NOT EXISTS roaming_sync (
+  day TEXT PRIMARY KEY, digest TEXT, file_id TEXT, slot TEXT,
+  next_attempt REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS roaming_summaries (
+  day TEXT PRIMARY KEY, source_digest TEXT NOT NULL, payload BLOB,
+  status TEXT NOT NULL CHECK(status IN ('attempted','done','failed')), created REAL NOT NULL
+);
+"""
+GROUP_TEXT = {
+    "group_chat": "群友与哈基米聊了聊日常话题",
+    "group_image": "群友发来图片，一起进行图片交流",
+    "group_bilibili": "群友分享了 B 站公开内容",
+}
+
+
+def redact_public_summary(text: str) -> str:
+    # Defense in depth; callers may supply only already-screened public metadata summaries.
+    text = clean_text(text)[:3000]
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[联系方式已隐去]", text)
+    text = re.sub(r"(?<!\w)\d{5,}(?!\w)", "[号码已隐去]", text)
+    text = re.sub(r"@[\w\u4e00-\u9fff-]+", "[称呼已隐去]", text)
+    # Diaries are plain Markdown; disable HTML, images, links from external text and fences.
+    text = re.sub(r"https?://\S+", "[链接省略]", text)
+    return text.translate(
+        str.maketrans({"<": "＜", ">": "＞", "[": "［", "]": "］", "`": "｀", "!": "！"})
+    )
+
+
+class RoamingLogger:
+    def __init__(
+        self,
+        settings: Settings,
+        store: Store,
+        drive: FolderDrive | None = None,
+        *,
+        gateway: GeminiGateway | None = None,
+    ):
+        self.s, self.store, self.drive = settings, store, drive
+        self.gateway = gateway
+        self.zone = ZoneInfo(settings.roaming_timezone)
+        self.sync_lock = asyncio.Lock()
+
+    async def initialize(self):
+        async with self.store.lock:
+            await self.store.db.executescript(SCHEMA)
+            columns = {row[1] for row in await self.store.all("PRAGMA table_info(roaming_sync)")}
+            for name, kind in [("last_error", "TEXT"), ("last_success", "REAL")]:
+                if name not in columns:
+                    await self.store.db.execute(
+                        f"ALTER TABLE roaming_sync ADD COLUMN {name} {kind}"
+                    )
+
+    def local(self, now: float | None = None) -> datetime:
+        return datetime.fromtimestamp(time.time() if now is None else now, self.zone)
+
+    async def _record(self, event_id: str, kind: str, text: str | None = None, now=None):
+        if not self.s.roaming_enabled:
+            return
+        day = self.local(now).date().isoformat()
+        key = self.store.vault.digest("diary-event", event_id, kind)
+        async with self.store.transaction():
+            if await self.store.one("SELECT 1 FROM roaming_receipts WHERE id=?", (key,)):
+                return
+            await self.store.db.execute("INSERT INTO roaming_receipts VALUES (?,?)", (key, day))
+            if text is not None:
+                count = await self.store.one(
+                    "SELECT COUNT(*) FROM roaming_events WHERE day=?", (day,)
+                )
+                if count[0] < self.s.roaming_max_events_per_day:
+                    await self.store.db.execute(
+                        "INSERT INTO roaming_events VALUES (?,?,?)",
+                        (key, day, self.store.vault.seal(key, text)),
+                    )
+                else:
+                    kind = "patrol_omitted"
+            await self.store.db.execute(
+                "INSERT INTO roaming_counts VALUES (?,?,1) "
+                "ON CONFLICT(day,kind) DO UPDATE SET n=n+1",
+                (day, kind),
+            )
+            await self.store.db.execute(
+                "INSERT OR IGNORE INTO roaming_sync(day) VALUES (?)", (day,)
+            )
+
+    async def injection(self, event_id: str, *, now=None):
+        # No attempted prompt, user ID, group ID or private text enters the diary.
+        await self._record(event_id, "injection", now=now)
+
+    async def patrol(self, event_id: str, public_summary: str, *, now=None):
+        await self._record(event_id, "patrol", redact_public_summary(public_summary), now=now)
+
+    async def group(self, event_id: str, message: Message, *, now=None):
+        if (
+            message.kind != "group"
+            or f"{message.platform}:{message.conversation_id}" not in self.s.roaming_group_ids
+        ):
+            return
+        kind = (
+            "group_bilibili"
+            if message.video_ids or message.short_urls
+            else "group_image"
+            if message.images
+            else "group_chat"
+        )
+        # Deliberately aggregate templates, not quotations or LLM anonymization guesses.
+        await self._record(event_id, kind, now=now)
+
+    def _summary_input(self, day: str, counts: dict, rows: list) -> dict:
+        # Only diary tables feed this payload; no Session, private message, user or group IDs.
+        payload = {
+            "day": day,
+            "group_activity": {label: counts.get(kind, 0) for kind, label in GROUP_TEXT.items()},
+            "injection_attempts": counts.get("injection", 0),
+            "public_summaries": [],
+            "omitted_public_summaries": counts.get("patrol_omitted", 0) + len(rows),
+        }
+        for row in reversed(rows[-20:]):
+            excerpt = self.store.vault.open(row["id"], row["payload"])[:500]
+            payload["public_summaries"].append(excerpt)
+            payload["omitted_public_summaries"] -= 1
+            if len(json.dumps(payload, ensure_ascii=False).encode()) > self.s.max_context_bytes:
+                payload["public_summaries"].pop()
+                payload["omitted_public_summaries"] += 1
+                break
+        payload["public_summaries"].reverse()
+        return payload
+
+    async def _daily_summary(self, day: str, now: float):
+        if self.gateway is None:
+            return
+        key = self.store.vault.digest("daily-summary", self.s.namespace, day)
+        async with self.store.transaction():
+            if await self.store.one("SELECT 1 FROM roaming_summaries WHERE day=?", (day,)):
+                return
+            counts = dict(
+                await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
+            )
+            rows = await self.store.all(
+                "SELECT id,payload FROM roaming_events WHERE day=? ORDER BY rowid", (day,)
+            )
+            if not counts and not rows:
+                return
+            payload = self._summary_input(day, counts, rows)
+            # Persist BEFORE any paid call: crashes, ambiguous failures and Drive retries
+            # must never automatically pay for a second summary of the same day.
+            await self.store.db.execute(
+                "INSERT INTO roaming_summaries VALUES (?,?,NULL,'attempted',?)",
+                (day, self.store.vault.digest("diary-input", payload), now),
+            )
+        subject = self.store.vault.digest("diary-budget", self.s.namespace)
+        try:
+            await self.gateway.screen(payload, subject, purpose="source", budget_lane="patrol")
+            generated = await self.gateway.generate(
+                payload, subject, scenario=Scenario.DAILY_DIARY, budget_lane="patrol"
+            )
+            summary = redact_public_summary(safe_output(generated, configured_secrets(self.s)))
+        except asyncio.CancelledError:
+            # Keep attempted on cancellation/restart; do not repeat ambiguous paid work.
+            raise
+        except Exception as exc:
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "UPDATE roaming_summaries SET status='failed' WHERE day=?", (day,)
+                )
+            if isinstance(exc, Rejected) and str(exc) == "prompt_injection":
+                await self.injection("daily-summary:" + day, now=now)
+            logging.getLogger("hakimi").info("event=diary_summary_unavailable")
+        else:
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "UPDATE roaming_summaries SET status='done',payload=? WHERE day=?",
+                    (self.store.vault.seal(key, summary), day),
+                )
+
+    async def render(self, day: str) -> str:
+        async with self.store.lock:
+            counts = dict(
+                await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
+            )
+            rows = await self.store.all(
+                "SELECT id,payload FROM roaming_events WHERE day=? ORDER BY rowid", (day,)
+            )
+        lines = [
+            f"# 分身巡逻日记 · {day}",
+            "",
+            f"时区：{self.s.roaming_timezone}",
+            "",
+            "## B 站公开内容巡逻",
+            "",
+            "仅基于公开标题和简介，未观看全片。",
+            "",
+        ]
+        omitted = counts.get("patrol_omitted", 0)
+        used_bytes = 0
+        if rows:
+            for index, row in enumerate(rows):
+                summary = self.store.vault.open(row["id"], row["payload"])
+                quoted = ["> " + line for line in summary.splitlines()]
+                used_bytes += len("\n".join(quoted).encode()) + 2
+                if used_bytes > 196608:
+                    omitted += len(rows) - index
+                    break
+                lines += quoted
+                lines.append("")
+        else:
+            lines += ["今天暂无新的公开内容摘要。", ""]
+        if omitted:
+            lines += [f"另有 {omitted} 条摘要因日记长度限制省略。", ""]
+        lines += ["## 群聊趣事（脱敏活动摘要）", ""]
+        activities = [
+            f"- {text}：{counts[kind]} 次。"
+            for kind, text in GROUP_TEXT.items()
+            if counts.get(kind)
+        ]
+        lines += activities or ["今天暂无获准记录的群聊活动。"]
+        lines += [
+            "",
+            "仅记录活动类别和次数，不记录群号、成员身份、原话或图片。",
+            "",
+            "## 安全拦截",
+            "",
+            f"检测到的提示词注入试探：{counts.get('injection', 0)} 次。",
+            "",
+            "私聊内容和 Session 记忆不进入日记。",
+            "",
+        ]
+        async with self.store.lock:
+            summary = await self.store.one("SELECT * FROM roaming_summaries WHERE day=?", (day,))
+        if summary:
+            lines += ["## 每日总结", ""]
+            if summary["status"] == "done":
+                key = self.store.vault.digest("daily-summary", self.s.namespace, day)
+                text = self.store.vault.open(key, summary["payload"])
+                lines += ["> " + line for line in text.splitlines()]
+                snapshot = self.local(summary["created"]).strftime("%Y-%m-%d %H:%M")
+                lines += ["", f"基于 {snapshot} 的脱敏数据快照；后续记录见上方明细。", ""]
+            else:
+                lines += ["当日模型总结未完成；以上保留已记录的脱敏数据。", ""]
+        return "\n".join(lines)
+
+    async def sync_due(self, *, now: float | None = None, force=False):
+        if not self.s.roaming_enabled or self.drive is None:
+            return
+        now = time.time() if now is None else now
+        local = self.local(now)
+        day = local.date().isoformat()
+        # The 23:55 flush has its own persistent slot, independent of the two-hour cadence.
+        slot = (
+            "final"
+            if (local.hour, local.minute) >= (23, 55)
+            else str(
+                int(
+                    (
+                        local - local.replace(hour=0, minute=0, second=0, microsecond=0)
+                    ).total_seconds()
+                )
+                // self.s.roaming_interval_seconds
+            )
+        )
+        async with self.sync_lock:
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "INSERT OR IGNORE INTO roaming_sync(day) VALUES (?)", (day,)
+                )
+                rows = await self.store.all(
+                    "SELECT * FROM roaming_sync WHERE day=?"
+                    if force
+                    else "SELECT * FROM roaming_sync WHERE day>=? AND next_attempt<=? ORDER BY day",
+                    (day,) if force else ((local.date() - timedelta(days=7)).isoformat(), now),
+                )
+            for row in rows:
+                current_slot = slot if row["day"] == day else "closed"
+                # Finished days are rechecked: events can arrive after the final flush.
+                if not force and row["day"] == day and row["slot"] == current_slot:
+                    continue
+                if force or current_slot in {"final", "closed"}:
+                    await self._daily_summary(row["day"], now)
+                markdown = await self.render(row["day"])
+                digest = hashlib.sha256(markdown.encode()).hexdigest()
+                if digest == row["digest"]:
+                    async with self.store.transaction():
+                        await self.store.db.execute(
+                            "UPDATE roaming_sync SET slot=? WHERE day=?", (current_slot, row["day"])
+                        )
+                    continue
+                try:
+                    file_id = await self.drive.sync_day(row["day"], markdown)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    delay = min(7200, 60 * 2 ** min(row["failures"], 7))
+                    reason = (
+                        str(exc)
+                        if isinstance(exc, Rejected)
+                        and str(exc)
+                        in {
+                            "drive_credentials_invalid",
+                            "drive_shared_folder_required",
+                            "drive_request_failed",
+                            "drive_file_outside_scope",
+                            "drive_ambiguous_file",
+                            "drive_token_failed",
+                            "drive_folder_unavailable",
+                            "drive_oauth_credentials_invalid",
+                            "drive_oauth_folder_mismatch",
+                            "drive_oauth_scope_mismatch",
+                            "drive_oauth_reauthorization_required",
+                            "drive_oauth_client_invalid",
+                        }
+                        else "drive_sync_failed"
+                    )
+                    async with self.store.transaction():
+                        await self.store.db.execute(
+                            "UPDATE roaming_sync SET "
+                            "next_attempt=?,failures=failures+1,last_error=? "
+                            "WHERE day=?",
+                            (now + delay, reason, row["day"]),
+                        )
+                    logging.getLogger("hakimi").info("event=diary_sync_pending")
+                else:
+                    async with self.store.transaction():
+                        await self.store.db.execute(
+                            "UPDATE roaming_sync SET digest=?,file_id=?,slot=?,"
+                            "next_attempt=0,failures=0,last_error=NULL,last_success=? WHERE day=?",
+                            (digest, file_id, current_slot, now, row["day"]),
+                        )
+
+    async def run(self):
+        while True:
+            try:
+                await self.sync_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.getLogger("hakimi").info("event=diary_worker_error")
+            await asyncio.sleep(30)
+
+    async def prune(self):
+        cutoff = (self.local().date() - timedelta(days=8)).isoformat()
+        async with self.store.transaction():
+            for table in (
+                "roaming_events",
+                "roaming_receipts",
+                "roaming_counts",
+                "roaming_sync",
+                "roaming_summaries",
+            ):
+                await self.store.db.execute(f"DELETE FROM {table} WHERE day<?", (cutoff,))
