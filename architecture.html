@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="基于 hakimi-surf 0.8.1 源码绘制的项目架构图：上海 NapCat／首尔主脑、会话串行与接收日志、受控点名、公开记忆桥、Gemini 思考策略与本地时区预算。">
+  <meta name="description" content="基于 hakimi-surf 0.8.1 源码绘制的项目架构图：境内 NapCat／境外主脑、会话串行与接收日志、受控点名、公开记忆桥、Gemini 思考策略与本地时区预算。">
   <title>hakimi-surf · 项目架构图</title>
   <style>
     :root {
@@ -278,7 +278,7 @@
       <div class="hero">
         <div class="eyebrow">PROJECT ARCHITECTURE</div>
         <h1>哈基米跨平台冲浪助手 <span>/ 项目架构图</span></h1>
-        <p>上海协议接入 → 首尔会话串行处理 → 受控模型生成 → QQ 回复与隔离记忆。</p>
+        <p>境内协议接入 → 境外会话串行处理 → 受控模型生成 → QQ 回复与隔离记忆。</p>
         <div class="hero-bottom">
           <div class="tags" aria-label="项目技术栈">
             <span class="tag">Python 3.12+</span><span class="tag">FastAPI + asyncio</span>
@@ -301,8 +301,8 @@
       <figure aria-labelledby="overview-heading" aria-describedby="architecture-caption">
         <div class="entry-grid">
           <div class="entry">
-            <div class="external-node"><h3>上海 · QQ / NapCat</h3><p>OneBot v11 · 私聊、群聊与 @Bot</p></div>
-            <div class="vertical-edge"><i class="stem" aria-hidden="true"></i><span>反向 WSS → 首尔 Nginx → FastAPI</span></div>
+            <div class="external-node"><h3>境内 · QQ / NapCat</h3><p>OneBot v11 · 私聊、群聊与 @Bot</p></div>
+            <div class="vertical-edge"><i class="stem" aria-hidden="true"></i><span>反向 WSS → 境外 Nginx → FastAPI</span></div>
           </div>
           <div class="entry">
             <div class="external-node"><h3>官方 QQ Bot <span class="optional">可选接入</span></h3><p>C2C 私聊 · 群 @ 事件</p></div>
@@ -316,7 +316,7 @@
 
         <div class="application">
           <div class="boundary-title">
-            <strong>首尔 · hakimi-bot <span>／ 一个 FastAPI 应用进程</span></strong>
+            <strong>境外 · hakimi-bot <span>／ 一个 FastAPI 应用进程</span></strong>
             <span>入口 <code>hakimi.app:create_app</code> · 端口 <code>12141</code></span>
           </div>
           <div class="grid-3">
@@ -393,7 +393,7 @@
             </article>
             <article class="node capability">
               <h3><span class="node-key">C</span> 媒体与 B 站分析</h3>
-              <p>QQ 图片优先经跨机 WS 获取 Base64，再尝试受限 CDN；不读取上海本地路径。每轮最多两图，引用与转发保留来源身份。</p>
+              <p>QQ 图片优先经跨机 WS 获取 Base64，再尝试受限 CDN；不读取境内本地路径。每轮最多两图，引用与转发保留来源身份。</p>
               <div class="mini-flow"><span>字幕 / 文字优先</span><i aria-hidden="true">→</i><span>受限原片分析</span><b class="optional">可选</b></div>
               <p>原片分支经 yt-dlp / ffmpeg 子进程下载校验，再进入 Files API 与视频分析。</p>
               <div class="files"><a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/bilibili.py">bilibili.py</a> · <a href="src/hakimi/memes.py">memes.py</a><br><a href="src/hakimi/video_watch.py">video_watch.py</a> · <a href="src/hakimi/video_downloader.py">video_downloader.py</a></div>
@@ -433,7 +433,7 @@
             <small>Compose 将 data 挂载为持久卷，视频缓存使用独立 tmpfs。</small>
           </article>
         </div>
-        <figcaption id="architecture-caption">箭头表示消息流或标注的调用关系。图中以 0.8.1 上海 NapCat／首尔主脑拓扑组织；后端业务模块仍属于单进程，NapCat 是独立协议端。兼容接入和可选功能以配置为准；图中不包含实际密钥或随机入口路径。</figcaption>
+        <figcaption id="architecture-caption">箭头表示消息流或标注的调用关系。图中以 0.8.1 境内 NapCat／境外主脑拓扑组织；后端业务模块仍属于单进程，NapCat 是独立协议端。兼容接入和可选功能以配置为准；图中不包含实际密钥或随机入口路径。</figcaption>
       </figure>
     </section>
 
@@ -462,13 +462,13 @@
       <div class="section-heading"><h2 id="deployment-heading">03 / 部署结构</h2><p>以仓库 Dockerfile、Compose 与 Nginx 模板为依据</p></div>
       <div class="deployment">
         <article class="deploy-card">
-          <h3>上海协议端 → 首尔主脑</h3>
-          <div class="deploy-line"><span>上海 · NapCat</span><i aria-hidden="true">⇄ WSS ⇄</i><span>首尔 · Nginx TLS</span><i aria-hidden="true">⇄</i><span>127.0.0.1:12141</span></div>
-          <p>上海使用 <code>docker-compose.napcat.yml</code>，可采用官方 Node 镜像覆盖模板；主动向首尔建立反向 WSS。QQ 文件经 RPC／Base64 传递，两端不共享本地文件路径。</p>
+          <h3>境内协议端 → 境外主脑</h3>
+          <div class="deploy-line"><span>境内 · NapCat</span><i aria-hidden="true">⇄ WSS ⇄</i><span>境外 · Nginx TLS</span><i aria-hidden="true">⇄</i><span>127.0.0.1:12141</span></div>
+          <p>境内使用 <code>docker-compose.napcat.yml</code>，可采用官方 Node 镜像覆盖模板；主动向境外建立反向 WSS。QQ 文件经 RPC／Base64 传递，两端不共享本地文件路径。</p>
           <p><code>deploy/hakimi-ws.conf</code> 只精确代理一条带随机后缀的 WS 路径，其余公网路径返回 404。WebUI 与后台分别经 SSH 隧道访问回环 6099／12141。</p>
         </article>
         <article class="deploy-card">
-          <h3>首尔后端与数据边界</h3>
+          <h3>境外后端与数据边界</h3>
           <div class="deploy-line"><span>Uvicorn × 1</span><i aria-hidden="true">+</i><span>进程内 asyncio 任务</span><i aria-hidden="true">+</i><span>hakimi-data → /app/data</span></div>
           <p>容器 UID 10001、只读根文件系统、持久卷与视频 tmpfs。WS 帧上限 16 MiB，Ping 25 秒／超时 30 秒；<code>/healthz</code> 检查任务存活，进程锁限制共享数据库。</p>
           <p>两端 TZ 与后端 BOT_TIMEZONE 均使用 Asia/Shanghai。后端仍为单副本，NapCat 分离不等于业务横向扩容；旧同机／Webhook 模板仅用于另行选择的拓扑。</p>
