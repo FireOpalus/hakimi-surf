@@ -243,12 +243,19 @@ class Store:
         async with self.lock:
             row = await self.one("SELECT payload FROM admin_config WHERE key='budget'")
         if row:
-            self._apply_budget(BudgetConfig.model_validate(self.vault.open("admin:budget", row[0])))
+            saved = self.vault.open("admin:budget", row[0])
+            merged = (
+                {**self.env_budget.model_dump(mode="json"), **saved}
+                if isinstance(saved, dict)
+                else saved
+            )
+            self._apply_budget(BudgetConfig.model_validate(merged))
             self.budget_overridden = True
 
     def _apply_budget(self, value):
-        self.s.daily_usd = value.daily_usd
-        self.s.monthly_usd = value.monthly_usd
+        # Update all fields synchronously without await so readers never see a torn snapshot.
+        for name in BudgetConfig.model_fields:
+            setattr(self.s, name, getattr(value, name))
 
     async def budget_config_status(self):
         async with self.lock:
@@ -513,17 +520,21 @@ class Store:
                 "proactive": self.s.proactive_daily_usd,
                 "search": self.runtime.web_search.config.daily_usd,
             }.get(lane)
-            if (
-                self.s.daily_usd <= 0
-                or monthly_limit <= 0
-                or global_total + amount > microdollars(self.s.daily_usd)
-                or monthly_total + amount > monthly_limit
-                or personal + amount > microdollars(self.s.user_daily_usd)
-                or (lane == "patrol" and patrol + amount > microdollars(self.s.patrol_daily_usd))
-                or (extra_limit is not None and lane_total + amount > microdollars(extra_limit))
-                or (self.s.total_usd > 0 and total + amount > microdollars(self.s.total_usd))
-            ):
-                raise Rejected("budget_exhausted")
+            budget_detail = ""
+            if self.s.daily_usd <= 0 or global_total + amount > microdollars(self.s.daily_usd):
+                budget_detail = "daily"
+            elif monthly_limit <= 0 or monthly_total + amount > monthly_limit:
+                budget_detail = "monthly"
+            elif self.s.total_usd > 0 and total + amount > microdollars(self.s.total_usd):
+                budget_detail = "total"
+            elif personal + amount > microdollars(self.s.user_daily_usd):
+                budget_detail = "user_daily"
+            elif lane == "patrol" and patrol + amount > microdollars(self.s.patrol_daily_usd):
+                budget_detail = "patrol_daily"
+            elif extra_limit is not None and lane_total + amount > microdollars(extra_limit):
+                budget_detail = f"{lane}_daily"
+            if budget_detail:
+                raise Rejected("budget_exhausted", budget_detail)
             await self.db.execute(
                 "INSERT INTO ledger VALUES (?,?,?,?,?,?,'reserved')",
                 (reservation, day, subject, lane, amount, amount),
@@ -791,6 +802,19 @@ class Store:
             monthly_carry = await self._calendar_carry("month:" + day[:7])
             monthly = monthly_observed + monthly_carry
             circuit = bool(await self.one("SELECT 1 FROM meta WHERE key='budget_overrun'"))
+            user_top_row = await self.one(
+                "SELECT COALESCE(MAX(total),0) FROM ("
+                "SELECT SUM(amount) AS total FROM ledger WHERE day=? GROUP BY subject"
+                ")",
+                (day,),
+            )
+            lane_rows = await self.all(
+                "SELECT lane, COALESCE(SUM(amount),0) AS total "
+                "FROM ledger WHERE day=? AND lane IN ('patrol','memory','proactive','admin') "
+                "GROUP BY lane",
+                (day,),
+            )
+            lane_used = {row["lane"]: row["total"] for row in lane_rows}
             daily_limit, total_limit = (
                 microdollars(self.s.daily_usd),
                 microdollars(self.s.total_usd),
@@ -812,6 +836,26 @@ class Store:
             "monthly_limit": monthly_limit,
             "total": total,
             "total_limit": total_limit,
+            "user_top_daily": user_top_row[0] if user_top_row else 0,
+            "user_daily_limit": microdollars(self.s.user_daily_usd),
+            "sub_budgets": {
+                "patrol": {
+                    "used": lane_used.get("patrol", 0),
+                    "limit": microdollars(self.s.patrol_daily_usd),
+                },
+                "memory": {
+                    "used": lane_used.get("memory", 0),
+                    "limit": microdollars(self.s.memory_daily_usd),
+                },
+                "proactive": {
+                    "used": lane_used.get("proactive", 0),
+                    "limit": microdollars(self.s.proactive_daily_usd),
+                },
+                "admin": {
+                    "used": lane_used.get("admin", 0),
+                    "limit": microdollars(self.s.admin_daily_usd),
+                },
+            },
             "hard_stop": circuit
             or daily >= daily_limit
             or monthly >= monthly_limit

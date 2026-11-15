@@ -20,6 +20,7 @@ from .compression_policy import CompressionConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterConfig
 from .generation_policy import Scenario, generation_plan
+from .limits_policy import GenerationCapsConfig, PatrolLimitConfig, RateLimitConfig
 from .memory_compressor import check_memory_text
 from .mentions import parse_reply
 from .models import Message
@@ -157,8 +158,10 @@ async def dashboard(request: Request):
         "usage": usage,
         "budget_status": await svc.store.budget_status(),
         "daily_limit_usd": str(svc.s.daily_usd),
+        "user_limit_usd": str(svc.s.user_daily_usd),
         "patrol_limit_usd": str(svc.s.patrol_daily_usd),
         "memory_limit_usd": str(svc.s.memory_daily_usd),
+        "proactive_limit_usd": str(svc.s.proactive_daily_usd),
         "admin_limit_usd": str(svc.s.admin_daily_usd),
         "minute_requests": count[0] if count else 0,
         "minute_limit": svc.s.global_requests_per_minute,
@@ -175,13 +178,79 @@ async def budget_config(request: Request):
 
 @router.put("/api/budget")
 async def budget_save(request: Request):
-    value = await body(request, BudgetConfig)
-    return await service(request).store.set_budget_config(value)
+    from .app import json_object, read_body
+
+    raw = json_object(await read_body(request, request.app.state.settings))
+    if not raw:
+        raise HTTPException(400, "invalid_admin_input")
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        current = BudgetConfig.from_settings(svc.s).model_dump(mode="json")
+        try:
+            value = BudgetConfig.model_validate({**current, **raw})
+        except ValidationError:
+            raise HTTPException(400, "invalid_admin_input") from None
+        return await svc.store.set_budget_config(value)
 
 
 @router.delete("/api/budget")
 async def budget_reset(request: Request):
-    return await service(request).store.set_budget_config(None)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.set_budget_config(None)
+
+
+@router.get("/api/rate-limits")
+async def rate_limits_status(request: Request):
+    return service(request).store.runtime.rate_limits_status()
+
+
+@router.put("/api/rate-limits")
+async def rate_limits_save(request: Request):
+    value = await body(request, RateLimitConfig)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_rate_limits(value)
+
+
+@router.delete("/api/rate-limits")
+async def rate_limits_reset(request: Request):
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_rate_limits(None)
+
+
+@router.get("/api/generation-caps")
+async def generation_caps_status(request: Request):
+    return service(request).store.runtime.generation_caps_status()
+
+
+@router.put("/api/generation-caps")
+async def generation_caps_save(request: Request):
+    value = await body(request, GenerationCapsConfig)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_generation_caps(value)
+
+
+@router.delete("/api/generation-caps")
+async def generation_caps_reset(request: Request):
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_generation_caps(None)
+
+
+@router.get("/api/patrol-limits")
+async def patrol_limits_status(request: Request):
+    return service(request).store.runtime.patrol_limits_status()
+
+
+@router.put("/api/patrol-limits")
+async def patrol_limits_save(request: Request):
+    value = await body(request, PatrolLimitConfig)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_patrol_limits(value)
+
+
+@router.delete("/api/patrol-limits")
+async def patrol_limits_reset(request: Request):
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_patrol_limits(None)
 
 
 @router.get("/api/filter")
@@ -864,7 +933,7 @@ async def sandbox(request: Request):
                         audit_id, "cancelled", "empty_reply"
                     )
         except Rejected as exc:
-            await svc.store.runtime.filters.update_audit(audit_id, "rejected", str(exc))
+            await svc.store.runtime.filters.update_audit(audit_id, "rejected", exc.audit_detail)
             result["decisions"].setdefault("reason", str(exc))
             result["decisions"]["final_result"] = "blocked_or_unavailable"
             if not preview["text"]:

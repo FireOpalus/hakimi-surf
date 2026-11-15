@@ -1,4 +1,4 @@
-"""Mutable daily/monthly caps; zero pauses paid work rather than removing a limit."""
+"""Mutable daily/monthly and lane/user caps; zero pauses paid work cleanly."""
 
 from decimal import Decimal
 
@@ -12,8 +12,32 @@ class BudgetConfig(BaseModel):
     monthly_usd: Decimal = Field(
         default=Decimal("40"), ge=0, le=10000, max_digits=12, decimal_places=6
     )
+    user_daily_usd: Decimal = Field(
+        default=Decimal("1"), ge=0, le=1000, max_digits=12, decimal_places=6
+    )
+    patrol_daily_usd: Decimal = Field(
+        default=Decimal("0.50"), ge=0, le=1000, max_digits=12, decimal_places=6
+    )
+    memory_daily_usd: Decimal = Field(
+        default=Decimal("0.20"), ge=0, le=100, max_digits=12, decimal_places=6
+    )
+    proactive_daily_usd: Decimal = Field(
+        default=Decimal("0.10"), ge=0, le=100, max_digits=12, decimal_places=6
+    )
+    admin_daily_usd: Decimal = Field(
+        default=Decimal("0.20"), ge=0, le=100, max_digits=12, decimal_places=6
+    )
 
-    @field_validator("daily_usd", "monthly_usd", mode="before")
+    @field_validator(
+        "daily_usd",
+        "monthly_usd",
+        "user_daily_usd",
+        "patrol_daily_usd",
+        "memory_daily_usd",
+        "proactive_daily_usd",
+        "admin_daily_usd",
+        mode="before",
+    )
     @classmethod
     def amount(cls, value):
         if isinstance(value, bool) or not isinstance(value, (Decimal, str, int, float)):
@@ -22,4 +46,9 @@ class BudgetConfig(BaseModel):
 
     @classmethod
     def from_settings(cls, settings):
-        return cls(daily_usd=settings.daily_usd, monthly_usd=getattr(settings, "monthly_usd", "40"))
+        return cls(
+            **{
+                name: getattr(settings, name, field.default)
+                for name, field in cls.model_fields.items()
+            }
+        )

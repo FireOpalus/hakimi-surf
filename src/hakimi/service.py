@@ -1089,7 +1089,7 @@ class Service:
                 await self.store.finish(job["id"], "cancelled")
                 return
             self.record(str(exc))
-            await self.store.runtime.filters.update_audit(audit_id, "rejected", str(exc))
+            await self.store.runtime.filters.update_audit(audit_id, "rejected", exc.audit_detail)
             if self.diary and str(exc) == "prompt_injection":
                 await self.diary.injection(job["id"])
             if job["kind"] == "message":

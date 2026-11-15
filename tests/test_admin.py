@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 import httpx
 import pytest
@@ -120,7 +121,16 @@ async def test_embedded_page_has_csp_no_external_assets_or_token(admin_api):
     r = await client.get("/admin", headers={"Authorization": ""})
     assert r.status_code == 200
     assert TOKEN not in r.text
-    assert "localStorage" not in r.text and "sessionStorage" not in r.text
+    # Only a fixed theme key with literal dark/light values may be persisted.
+    # Any other storage use (including token persistence) remains forbidden.
+    without_theme_preferences = re.sub(
+        r"localStorage\.getItem\('hakimi-theme'\)"
+        r"|localStorage\.setItem\('hakimi-theme',dark\?'dark':'light'\)",
+        "",
+        r.text,
+    )
+    assert "localStorage" not in without_theme_preferences
+    assert "sessionStorage" not in r.text
     assert "innerHTML" not in r.text
     assert 'src="http' not in r.text and 'href="http' not in r.text
     assert "script-src 'sha256-" in r.headers["content-security-policy"]

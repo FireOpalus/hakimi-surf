@@ -37,6 +37,14 @@ def bot_event_authorized(message, settings):
 class Rejected(Exception):
     """Only constant reason codes belong in this exception, never input or credentials."""
 
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(code)
+        self.detail = detail
+
+    @property
+    def audit_detail(self) -> str:
+        return f"{self}_{self.detail}" if self.detail else str(self)
+
 
 def configured_secrets(settings: Settings) -> list[str]:
     return [

@@ -13,6 +13,7 @@ from .attention import AttentionRouter
 from .compression_policy import CompressionConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterManager
+from .limits_policy import GenerationCapsConfig, PatrolLimitConfig, RateLimitConfig
 from .models import Message
 from .proactive_policy import ProactiveConfig
 from .security import Rejected
@@ -110,6 +111,18 @@ class RuntimeState:
         self.env_debounce = DebounceConfig.from_settings(self.s)
         self.debounce_override = None
         self.debounce_lock = asyncio.Lock()
+        self.env_rate_limits = RateLimitConfig.from_settings(self.s)
+        self.rate_limits = self.env_rate_limits
+        self.rate_limits_overridden = False
+        self.rate_limits_lock = asyncio.Lock()
+        self.env_generation_caps = GenerationCapsConfig.from_settings(self.s)
+        self.generation_caps = self.env_generation_caps
+        self.generation_caps_overridden = False
+        self.generation_caps_lock = asyncio.Lock()
+        self.env_patrol_limits = PatrolLimitConfig.from_settings(self.s)
+        self.patrol_limits = self.env_patrol_limits
+        self.patrol_limits_overridden = False
+        self.patrol_limits_lock = asyncio.Lock()
         self.web_search = WebSearch(store)
 
     async def event(self, code, source="system"):
@@ -158,6 +171,15 @@ class RuntimeState:
         self.compression_overridden = False
         self.proactive = self.env_proactive
         self.proactive_overridden = False
+        self.rate_limits = self.env_rate_limits
+        self.rate_limits_overridden = False
+        self._apply_fields(self.env_rate_limits)
+        self.generation_caps = self.env_generation_caps
+        self.generation_caps_overridden = False
+        self._apply_fields(self.env_generation_caps)
+        self.patrol_limits = self.env_patrol_limits
+        self.patrol_limits_overridden = False
+        self._apply_fields(self.env_patrol_limits)
         admission = self.env_admission
         self.admission_overridden = False
         legacy_bots = None
@@ -179,6 +201,18 @@ class RuntimeState:
                 self.s._thinking_override = ThinkingConfig.model_validate(value)
             elif row["key"] == "debounce":
                 self.debounce_override = DebounceConfig.model_validate(value)
+            elif row["key"] == "rate_limits":
+                self.rate_limits = self._validate_loaded(self.env_rate_limits, value)
+                self.rate_limits_overridden = True
+                self._apply_fields(self.rate_limits)
+            elif row["key"] == "generation_caps":
+                self.generation_caps = self._validate_loaded(self.env_generation_caps, value)
+                self.generation_caps_overridden = True
+                self._apply_fields(self.generation_caps)
+            elif row["key"] == "patrol_limits":
+                self.patrol_limits = self._validate_loaded(self.env_patrol_limits, value)
+                self.patrol_limits_overridden = True
+                self._apply_fields(self.patrol_limits)
             elif row["key"].startswith("policy:"):
                 self.s.group_policies[row["key"][7:]] = value
         if not self.admission_overridden and legacy_bots is not None:
@@ -239,6 +273,97 @@ class RuntimeState:
             # One immutable snapshot assignment: concurrent requests see one whole policy.
             self.s._thinking_override = value
             return self.thinking_status()
+
+    @staticmethod
+    def _validate_loaded(env_model, saved):
+        data = {**env_model.model_dump(), **saved} if isinstance(saved, dict) else saved
+        return type(env_model).model_validate(data)
+
+    def _apply_fields(self, model):
+        # No await here so concurrent readers never observe partial limit updates.
+        for name in type(model).model_fields:
+            setattr(self.s, name, getattr(model, name))
+
+    def _limits_status(self, current, env_model, overridden: bool):
+        return {
+            "config": current.model_dump(),
+            "source": "admin" if overridden else "env",
+            "environment": env_model.model_dump(),
+        }
+
+    async def _save_limits(self, key: str, value, expected_cls, lock, env_model, attr: str):
+        if value is not None and not isinstance(value, expected_cls):
+            raise ValueError(f"Expected a validated {expected_cls.__name__}")
+        effective = env_model if value is None else value
+        async with lock:
+            async with self.store.transaction():
+                if value is None:
+                    await self.store.db.execute("DELETE FROM admin_config WHERE key=?", (key,))
+                else:
+                    await self.store.db.execute(
+                        "INSERT INTO admin_config VALUES (?,?) ON CONFLICT(key) "
+                        "DO UPDATE SET payload=excluded.payload",
+                        (key, self.store.vault.seal("admin:" + key, value.model_dump())),
+                    )
+                if key == "patrol_limits":
+                    deadline = time.time() + effective.patrol_interval_seconds
+                    await self.store.db.execute(
+                        "UPDATE subscriptions SET next_poll=? WHERE next_poll>?",
+                        (deadline, deadline),
+                    )
+                    await self.store.db.execute(
+                        "UPDATE live_watches SET next_poll=? WHERE next_poll>?",
+                        (deadline, deadline),
+                    )
+            self._apply_fields(effective)
+            setattr(self, attr, effective)
+            setattr(self, attr + "_overridden", value is not None)
+            return self._limits_status(effective, env_model, value is not None)
+
+    def rate_limits_status(self):
+        return self._limits_status(
+            self.rate_limits, self.env_rate_limits, self.rate_limits_overridden
+        )
+
+    async def set_rate_limits(self, value: RateLimitConfig | None):
+        return await self._save_limits(
+            "rate_limits",
+            value,
+            RateLimitConfig,
+            self.rate_limits_lock,
+            self.env_rate_limits,
+            "rate_limits",
+        )
+
+    def generation_caps_status(self):
+        return self._limits_status(
+            self.generation_caps, self.env_generation_caps, self.generation_caps_overridden
+        )
+
+    async def set_generation_caps(self, value: GenerationCapsConfig | None):
+        return await self._save_limits(
+            "generation_caps",
+            value,
+            GenerationCapsConfig,
+            self.generation_caps_lock,
+            self.env_generation_caps,
+            "generation_caps",
+        )
+
+    def patrol_limits_status(self):
+        return self._limits_status(
+            self.patrol_limits, self.env_patrol_limits, self.patrol_limits_overridden
+        )
+
+    async def set_patrol_limits(self, value: PatrolLimitConfig | None):
+        return await self._save_limits(
+            "patrol_limits",
+            value,
+            PatrolLimitConfig,
+            self.patrol_limits_lock,
+            self.env_patrol_limits,
+            "patrol_limits",
+        )
 
     def _validate_admission(self, value):
         protected = {self.s.owner_qq_id, self.s.onebot_self_id} - {""}
