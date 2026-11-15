@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="hakimi-surf 1.1.3 源码架构：境内 NapCat 与境外单进程后端、可取消消息管道、受控联网取证、A/B/C 上下文、双轨记忆与 ACK 确认投递。">
-  <title>hakimi-surf 1.1.3 · 项目架构图</title>
+  <meta name="description" content="hakimi-surf 1.1.4 源码架构：境内 NapCat 与境外单进程后端、可取消消息管道、群聊上下文、按模型差量续链、双轨记忆与 ACK 确认投递。">
+  <title>hakimi-surf 1.1.4 · 项目架构图</title>
   <style>
     :root {
       color-scheme: light;
@@ -137,6 +137,22 @@
     .context-card .files { margin-top: 13px; }
     .context-caption { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 14px 0 24px; padding: 10px 14px; border-radius: 7px; background: var(--subtle); font-size: 12px; color: var(--muted); }
     .context-caption strong { color: var(--blue); }
+    .context-updates { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px; }
+    .context-updates .resource { border-color: var(--blue); }
+    .chain-map { padding: 20px; border: 1px solid var(--line); border-top: 3px solid var(--violet); border-radius: 12px; background: var(--violet-soft); }
+    .chain-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+    .chain-heading h3 { color: var(--violet); }
+    .chain-heading p { color: var(--muted); font-size: 12px; }
+    .chain-requests { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .chain-requests .node p { font-size: 12px; }
+    .chain-requests .mode { display: block; color: var(--violet); font-size: 11px; margin-bottom: 6px; }
+    .chain-requests .formula { display: block; background: var(--subtle); border-radius: 5px; padding: 7px 9px; margin-top: 10px; color: var(--violet); font-size: 12px; }
+    .chain-requests small { font-size: 11px; }
+    .chain-flow-title { margin: 20px 0 12px; font-size: 13px; }
+    .chain-map .memory-flow h4 { color: var(--violet); }
+    .chain-loop { font-size: 12px; color: var(--violet); border-top: 1px solid var(--line); padding-top: 12px; margin-top: 14px; }
+    .chain-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+    .chain-controls p { font-size: 12px; color: var(--muted); margin-top: 5px; }
     .memory-map { border: 1px solid var(--line); border-radius: 12px; padding: 18px; background: var(--teal-soft); }
     .memory-title { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
     .memory-title p { font-size: 12px; color: var(--muted); }
@@ -191,7 +207,7 @@
       .topology > .edge b::before { font-size: 20px; }
       .gateway-flow { grid-template-columns: minmax(0, .8fr) 30px minmax(0, 1.2fr); gap: 0; }
       .gateway-flow > .edge b { transform: none; }
-      .resource-grid, .branch-grid, .storage-grid { grid-template-columns: 1fr; }
+      .resource-grid, .branch-grid, .storage-grid, .context-updates, .chain-requests, .chain-controls { grid-template-columns: 1fr; }
       .context-grid { grid-template-columns: 1fr; }
       .memory-flow { grid-template-columns: 1fr; }
       .memory-flow .edge { padding: 5px; }
@@ -218,7 +234,7 @@
       .step p { font-size: 13px; }
       .step-number { margin-bottom: 5px; }
       .card, .context-card { padding: 15px; }
-      .memory-map { padding: 13px; }
+      .memory-map, .chain-map { padding: 13px; }
       .control-line { gap: 5px 10px; }
       .detail-content { padding: 0 15px 15px; }
       summary { padding: 14px 15px; }
@@ -243,15 +259,15 @@
   <main class="page">
     <header class="masthead">
       <div class="brand"><span class="brand-mark" aria-hidden="true">H</span> hakimi-surf</div>
-      <div class="meta">SOURCE ARCHITECTURE · <a href="pyproject.toml">v1.1.3</a> · 2026-11-15</div>
+      <div class="meta">SOURCE ARCHITECTURE · <a href="pyproject.toml">v1.1.4</a> · 2026-11-15</div>
     </header>
     <section class="hero" aria-labelledby="page-title">
       <div class="eyebrow">QQ ASSISTANT / SYSTEM MAP</div>
       <h1 id="page-title">哈基米 <span>／ 项目架构图</span></h1>
-      <p>境内协议接入，境外会话编排。沿一条消息，查看联网取证、模型生成、确认投递与双轨记忆如何协作。</p>
+      <p>境内协议接入，境外会话编排。沿一条消息，查看群聊上下文、模型差量续链、确认投递与双轨记忆如何协作。</p>
       <div class="hero-bottom">
-        <div class="tags"><span class="tag">单进程 FastAPI</span><span class="tag">默认 2 个异步消费者</span><span class="tag">按会话隔离</span><span class="tag">ACK 后写入助手历史</span></div>
-        <nav aria-label="架构图导航"><a href="#overview">部署</a><a href="#pipeline">消息流</a><a href="#memory">上下文与记忆</a><a href="#operations">后台与控制</a><a href="#sources">源码</a></nav>
+        <div class="tags"><span class="tag">单进程 FastAPI</span><span class="tag">默认 2 个异步消费者</span><span class="tag">按会话隔离</span><span class="tag">按模型差量续链</span><span class="tag">ACK 后写入助手历史</span></div>
+        <nav aria-label="架构图导航"><a href="#overview">部署</a><a href="#pipeline">消息流</a><a href="#context">上下文与续链</a><a href="#memory">双轨记忆</a><a href="#operations">后台与控制</a><a href="#sources">源码</a></nav>
       </div>
     </section>
 
@@ -279,7 +295,7 @@
         <div class="fanout-label">后端访问下列资源；业务模块、调度器和后台任务都在上述同一进程内</div>
         <div class="resource-grid">
           <article class="resource storage"><strong>↔ 本地存储</strong><p>主库 + 每会话独立 SQLite；数据卷持久化，本地缓存按用途限额。</p></article>
-          <article class="resource model"><strong>↔ Gemini API</strong><p>Decisions 门卫、Interactions 生成；独立搜索请求与 Flex 记忆归档。</p></article>
+          <article class="resource model"><strong>↔ Gemini API</strong><p>Decisions 门卫、Interactions 生成；启用记忆的主对话可云端保存并续链，搜索与 Flex 归档独立请求。</p></article>
           <article class="resource"><strong>↔ Bilibili / Google Drive</strong><p>B 站公开资料与可选原片；Drive 日记、群记忆镜像与 Owner 快照分别配置。</p></article>
         </div>
         <figcaption id="overview-caption">两端通过协议传递消息和媒体字节，不共享本地路径。后端 Compose 使用只读根目录、UID 10001 与持久数据卷；进程文件锁禁止多个实例共用数据库。</figcaption>
@@ -292,39 +308,74 @@
       <figure aria-describedby="pipeline-caption">
         <ol class="pipeline">
           <li class="step"><span class="step-number">01</span><h3>接收与归一化</h3><p>认证、白名单、去重与 BotGuard。记录接收日志，核验同会话引用和转发；提前准备图片与网页预览。</p><div class="files"><a href="src/hakimi/adapters.py">adapters.py</a><br><a href="src/hakimi/message_context.py">message_context.py</a><br><a href="src/hakimi/hot_ring.py">hot_ring.py</a></div></li>
-          <li class="step"><span class="step-number">02</span><h3>合批与会话串行</h3><p>SQLite 保存 jobs 与防抖批次。最多合并 6 条，同会话持锁处理；下一次生成等前次出站结束后读取历史。</p><div class="files"><a href="src/hakimi/group_pipeline.py">group_pipeline.py</a><br><a href="src/hakimi/session_scheduler.py">session_scheduler.py</a><br><a href="src/hakimi/debounce_policy.py">debounce_policy.py</a></div></li>
+          <li class="step"><span class="step-number">02</span><h3>合批与会话串行</h3><p>SQLite 保存 jobs 与防抖批次。最多合并 16 条／24,000 字，同会话持锁处理；下一次生成等前次出站结束后读取历史。</p><div class="files"><a href="src/hakimi/group_pipeline.py">group_pipeline.py</a><br><a href="src/hakimi/session_scheduler.py">session_scheduler.py</a><br><a href="src/hakimi/debounce_policy.py">debounce_policy.py</a></div></li>
           <li class="step gate"><span class="step-number">03</span><h3>一次门卫，多项决策</h3><p>Decisions 同时判断安全、接话、意图、召回、查资料与 L1–L4 档位。原消息过审后才进入会话历史。</p><div class="files"><a href="src/hakimi/gemini.py">GeminiGateway.screen</a><br><a href="src/hakimi/routing.py">routing.py</a><br><a href="src/hakimi/service.py">Service</a></div></li>
-          <li class="step generate"><span class="step-number">04</span><h3>上下文与流式生成</h3><p>A/B/C 组织输入，按需添加本地记忆与联网证据。默认 auto：L1–L3 Hydrogen；L4 Carbon 专家通道。</p><div class="files"><a href="src/hakimi/bot_server.py">bot_server.py</a><br><a href="src/hakimi/generation_policy.py">generation_policy.py</a><br><a href="src/hakimi/streaming.py">streaming.py</a></div></li>
+          <li class="step generate"><span class="step-number">04</span><h3>上下文与流式生成</h3><p>A/B/C 组织输入，按会话与模型选择全量或差量请求。默认 auto：L1–L3 Hydrogen；L4 Carbon 专家通道。</p><div class="files"><a href="src/hakimi/bot_server.py">bot_server.py</a><br><a href="src/hakimi/generation_policy.py">generation_policy.py</a><br><a href="src/hakimi/streaming.py">streaming.py</a></div></li>
           <li class="step"><span class="step-number">05</span><h3>输出审核与入队</h3><p>完整流收集后进行输出筛查、五维 JSON 校验和链接过滤。引用、点名与贴纸受本地名单约束，再写加密 Outbox。</p><div class="files"><a href="src/hakimi/outbound_actions.py">outbound_actions.py</a><br><a href="src/hakimi/output_links.py">output_links.py</a><br><a href="src/hakimi/store.py">Store.enqueue_reply</a></div></li>
-          <li class="step confirm"><span class="step-number">06</span><h3>投递、ACK 与回写</h3><p>逐条复检权限、撤回、epoch 与时效，再经 Sender 返回 QQ。持久化 ACK，幂等追加已确认文本与视觉简述。</p><div class="files"><a href="src/hakimi/outgoing.py">outgoing.py</a><br><a href="src/hakimi/adapters.py">Sender</a><br><a href="src/hakimi/session_manager.py">SessionManager</a></div></li>
+          <li class="step confirm"><span class="step-number">06</span><h3>投递、ACK 与回写</h3><p>逐条复检权限、撤回、epoch 与时效，再经 Sender 返回 QQ。持久化 ACK，幂等追加已确认内容；送达成功后提交本地续链标识。</p><div class="files"><a href="src/hakimi/outgoing.py">outgoing.py</a><br><a href="src/hakimi/adapters.py">Sender</a><br><a href="src/hakimi/session_manager.py">SessionManager</a></div></li>
         </ol>
         <div class="flow-note"><strong>接收日志 ≠ 模型历史</strong>未审核接收数据保存在本会话；用户原文经门卫放行后入史，助手内容只有发送确认后才入史。重启先恢复未应用的 ACK，再启动消息消费者。</div>
         <figcaption id="pipeline-caption">受控的静默入史不等于必须回复。安全沙箱使用受限 low 档，不读取会话历史、双轨召回或 Owner 背景，也不自动联网。</figcaption>
       </figure>
       <div class="branch-grid">
-        <article class="card"><span class="card-kicker">本地旁路 · 02 → Outbox</span><h3>固定命令与实时打断</h3><div class="mini-flow"><span>固定语法</span><i aria-hidden="true">→</i><span>权限代码</span><i aria-hidden="true">→</i><span>Outbox</span></div><p>固定命令在主模型前执行。撤回通过独立通知队列处理，持久化撤回索引并取消关联待发项。</p><p>原触发者在生成中追发，可取消尚未出站的请求并重新合批；已提交的未知用量保留预算预留。</p><p>五类防抖可在后台调整为 <strong>0–30 秒</strong>，开放批次按新值重新计算；会话串行和 6 条上限仍生效。</p><div class="files"><a href="src/hakimi/service.py">service.py</a> · <a href="src/hakimi/group_pipeline.py">group_pipeline.py</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置</a></div></article>
+        <article class="card"><span class="card-kicker">本地旁路 · 02 → Outbox</span><h3>固定命令与实时打断</h3><div class="mini-flow"><span>固定语法</span><i aria-hidden="true">→</i><span>权限代码</span><i aria-hidden="true">→</i><span>Outbox</span></div><p>固定命令在主模型前执行。撤回通过独立通知队列处理，持久化撤回索引，取消关联待发项并使旧续链失效。</p><p>原触发者在生成中追发，可取消尚未出站的请求并重新合批；已提交的未知用量保留预算预留。</p><p>五类防抖可在后台调整为 <strong>0–30 秒</strong>，开放批次按新值重新计算；会话串行和 16 条／24,000 字上限仍生效。</p><div class="files"><a href="src/hakimi/service.py">service.py</a> · <a href="src/hakimi/group_pipeline.py">group_pipeline.py</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置</a></div></article>
         <article class="card"><span class="card-kicker">取证分支 · 03 → 04</span><h3>受控联网搜索 <span class="optional-tag">默认关闭</span></h3><div class="mini-flow"><span>当前查询</span><i aria-hidden="true">→</i><span>Google Search</span><i aria-hidden="true">→</i><span>来源筛查</span><i aria-hidden="true">→</i><span>C 区</span></div><p>显式 <code>/search</code>、<code>/搜索</code> 或门卫建议触发；群聊须明确叫到 Bot。独立 Hydrogen medium 请求只开放搜索工具，不携带会话历史或记忆。</p><p>干净事实与纯文本来源交给主对话组织表达。无资料时透传状态继续聊天；取得证据时将自动路由托底至 medium。</p><div class="status-list" aria-label="联网四态"><code>grounded</code><code>disabled</code><code>skipped_query</code><code>unavailable</code></div><div class="files"><a href="src/hakimi/web_search.py">web_search.py</a> · <a href="src/hakimi/gemini.py">GeminiGateway.search</a></div></article>
         <article class="card"><span class="card-kicker">视频分支 · 03 → 05</span><h3>B 站资料与原片分析</h3><div class="mini-flow"><span>有效 BV</span><i aria-hidden="true">→</i><span>公开资料</span><i aria-hidden="true">→</i><span>来源筛查</span><i aria-hidden="true">→</i><span>分析</span></div><p>优先元数据、字幕和公开材料；配置允许且需要视听信息时，走受限下载 → Files API → 视频分析。</p><p>原片不可用时可回退已审核的文字资料；预算与权限仍须有效。多视频取首个有效目标，无 BV 的观看意图回到聊天。</p><p>外部视频材料与分析摘要不写入聊天历史。</p><div class="files"><a href="src/hakimi/bilibili.py">bilibili.py</a> · <a href="src/hakimi/video_watch.py">video_watch.py</a> · <a href="src/hakimi/video_files.py">video_files.py</a></div></article>
       </div>
       <div class="protocol">
-        <div><h4>流式接收，完整校验后投递</h4><div class="schema"><code>abstain</code><code>bubbles</code><code>anchor</code><code>sticker</code><code>image_digest</code></div><p>固定五维协议供公开与 Owner 对话共用。主对话 <code>tools=[]</code>、<code>store=False</code>，不把未完成 JSON 或思考内容发到 QQ。</p></div>
+        <div><h4>流式接收，完整校验后投递</h4><div class="schema"><code>abstain</code><code>bubbles</code><code>anchor</code><code>sticker</code><code>image_digest</code></div><p>固定五维协议供公开与 Owner 对话共用。主对话保持 <code>tools=[]</code>；是否 <code>store=True</code> 由续链开关、会话记忆和沙箱状态决定。未完成 JSON 和思考内容不发送给 QQ。</p></div>
         <div><h4>可靠出站与长文展示</h4><p>群聊正文超过 180 字可折叠为合并转发；仅在明确“不支持”的回执后回退图片。逐条 ACK 保存已确认部分，结果不确定时不自动重发。</p><p>聊天 auto 可被后台场景档位覆盖。Carbon 受独立单并发、准入和预算约束；未启用、槽位繁忙或预留不足时回到 Hydrogen high。</p></div>
       </div>
     </section>
 
-    <section class="section" id="memory" aria-labelledby="memory-title">
-      <div class="section-heading"><h2 id="memory-title"><span>03</span>A / B / C 与双轨记忆</h2><p>上下文组装、长期归档与物理隔离</p></div>
+    <section class="section" id="context" aria-labelledby="context-title">
+      <div class="section-heading"><h2 id="context-title"><span>03</span>上下文与差量续链</h2><p>1.1.4 · 逻辑上下文与实际请求载荷分开组织</p></div>
       <div class="panel">
         <div class="context-grid">
           <article class="context-card a"><div class="context-head"><b class="letter">A</b><h3>稳定系统前缀</h3></div><p>共享指令、公开／Owner 人设、固定协议与静态规则；按可信身份选择。</p><p>不随当前群成员或检索结果变化；表情名单等静态规则变更时刷新。</p><div class="files"><a href="src/hakimi/persona.py">persona.py</a> · <a href="src/hakimi/prefix_runtime.py">prefix_runtime.py</a></div></article>
-          <article class="context-card b"><div class="context-head"><b class="letter">B</b><h3>追加式会话热史</h3></div><p>过审用户消息与 ACK 确认的助手回复，以稳定 seq 序号序列化。</p><p>只读当前会话数据库；视觉简述在送达后追加，不回写旧行。图片字节不进入 B。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/bot_server.py">history_lines</a></div></article>
-          <article class="context-card c"><div class="context-head"><b class="letter">C</b><h3>当轮动态尾窗</h3></div><p>时间、核验身份、当前批次、可引用与点名目标、媒体状态、网页预览、搜索事实／状态及本地记忆召回。</p><p>Owner 专属背景仅在对应私聊加载。可选记忆先让出预算；默认以本地估算的 1,800 Token 限长，为动态尾窗留出余量。</p><div class="files"><a href="src/hakimi/bot_server.py">assemble_chat_input</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a></div></article>
+          <article class="context-card b"><div class="context-head"><b class="letter">B</b><h3>追加式会话热史</h3></div><p>过审用户消息与 ACK 确认的助手回复，按稳定 seq 序列化；格式化时去掉重复的身份前缀。</p><p>相邻消息间隔达到 30 分钟时，按 BOT_TIMEZONE 标注时间断点。视觉简述追加为新行，图片字节不进入 B。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/bot_server.py">history_lines</a></div></article>
+          <article class="context-card c"><div class="context-head"><b class="letter">C</b><h3>当轮动态尾窗</h3></div><p>时间、核验身份、结构化当前批次、去重后的邻近群聊文本、可引用与点名目标、媒体状态、搜索证据及本地召回。</p><p>Owner 专属背景仅在对应私聊加载。可选记忆先让出预算；门卫输入与 C 尾窗默认分别以本地估算的 4,200 Token 限长。</p><div class="files"><a href="src/hakimi/bot_server.py">assemble_chat_input</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a></div></article>
         </div>
-        <div class="context-caption"><strong>A + B + C → 主对话 Interactions</strong><span>最多两张当轮图片放在输入末尾 · 本地 Token 估算用于限长，计费以供应商 usage 为准</span></div>
+        <div class="context-caption"><strong>A + B + C → 续链校验 → 全量或差量请求</strong><span>最多两张当轮图片放在输入末尾 · 本地 Token 估算用于限长，计费以供应商 usage 为准</span></div>
+        <div class="context-updates">
+          <article class="resource"><strong>结构化群聊批次</strong><p>最多 16 条／24,000 字；保留 event_id、发送者 ID、昵称与正文，引用回复可对应到被回应的那条消息。</p></article>
+          <article class="resource"><strong>多图仍补邻近文本</strong><p>取邻近 6 条群消息，每条最多 160 字；按 event_id 排除 B 和当前批次已有内容。当前两张图片占满时仍补文本。</p></article>
+          <article class="resource"><strong>有界引用与转发展开</strong><p>主展开路径最多 6 个引用 ID、4 个合并转发，每个转发最多 40 个节点；总展开限 24,000 字，图片仍最多两张。</p></article>
+        </div>
+        <figure class="chain-map" id="interaction-chain" aria-describedby="chain-caption">
+          <div class="chain-heading"><h3>按会话 × 模型通道续链</h3><p>Hydrogen 与 Carbon 分别保存标识 · 每轮继续传入 A 静态指令</p></div>
+          <div class="chain-requests">
+            <article class="node"><span class="mode">允许续链 · 有效旧链</span><h4>发送新增历史</h4><p>本地记忆开启、非沙箱且全局续链开关开启。校验旧链的有效期、epoch、裁剪版本与静态前缀摘要。</p><code class="formula">A + ΔB + C + 当轮图片</code><small><code>store=True</code> · 携带 <code>previous_interaction_id</code><br>ΔB 仅含 seq &gt; covered_seq 的历史条目</small></article>
+            <article class="node"><span class="mode">允许续链 · 无可用旧链</span><h4>从完整本地上下文起链</h4><p>首轮、过期、清空、历史裁剪或前缀变化后，不携带旧交互标识，发送当前完整逻辑上下文。</p><code class="formula">A + B + C + 当轮图片</code><small><code>store=True</code> · 返回新交互 ID<br>新标识仍须经过送达确认才能本地提交</small></article>
+            <article class="node"><span class="mode">不使用续链</span><h4>独立构建每次请求</h4><p>关闭续链开关或本地记忆时，主对话按可用本地上下文请求。搜索、沙箱、日记、巡逻和归档使用各自独立输入。</p><code class="formula">store=False</code><small>不携带 <code>previous_interaction_id</code><br>不提交可供下一轮使用的续链标识</small></article>
+          </div>
+          <p class="chain-flow-title"><strong>允许续链的主对话：生成结果 → 协议确认 → 本地提交</strong></p>
+          <div class="memory-flow">
+            <article class="node"><h4>Gemini 返回候选 ID</h4><p>流完成并通过输出筛查；记录通道、前缀摘要与已覆盖序号。</p></article>
+            <div class="edge"><b aria-hidden="true">→</b></div>
+            <article class="node"><h4>携带至加密 Outbox</h4><p>续链候选与五维动作共同入队。尚未获得发送确认时不提交会话链。</p></article>
+            <div class="edge"><b aria-hidden="true">→</b></div>
+            <article class="node"><h4>QQ 送达确认</h4><p>逐条记录 ACK，幂等应用已确认历史；检查本次投递成功及会话版本。</p></article>
+            <div class="edge"><b aria-hidden="true">→</b></div>
+            <article class="node"><h4>会话库提交新链</h4><p>Fernet 加密 interaction_chains，更新 covered_seq；下一轮按模型读取。</p></article>
+          </div>
+          <p class="chain-loop">↩ 下一轮读取已确认标识 → 校验 expires / epoch / trim_version / system_digest → 选择全量或差量请求。撤回、清空、历史裁剪、过期、前缀变化或投递失败会使旧链失效。</p>
+          <div class="chain-controls">
+            <div><h4>开关与本地有效期</h4><p><code>HAKIMI_INTERACTION_STORE_ENABLED=true</code> 默认允许主对话续链；设为 false 则回到独立请求。<code>HAKIMI_INTERACTION_CHAIN_TTL_SECONDS=21600</code>，再与会话记忆 TTL 取较小值。</p></div>
+            <div><h4>预算按完整上下文预留</h4><p>差量仅改变实际发送的历史，不减少本地保守预留依据。按返回 usage 结算；未知用量继续保留预留，不把少传字节等同于已确认节省费用。</p></div>
+          </div>
+          <figcaption id="chain-caption"><code>store=True</code> 在模型请求阶段启用云端保存；ACK 约束的是本地续链标识提交。本地默认 6 小时有效期不代表云端数据删除期限。<span class="files"><a href="src/hakimi/gemini.py">gemini.py</a> · <a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/outgoing.py">outgoing.py</a> · <a href="docs/GROUP_CONTEXT_114.md">1.1.4 升级说明</a></span></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section" id="memory" aria-labelledby="memory-title">
+      <div class="section-heading"><h2 id="memory-title"><span>04</span>双轨记忆与存储边界</h2><p>本地归档、按需召回与受控同步</p></div>
+      <div class="panel">
         <figure class="memory-map" aria-describedby="memory-caption">
           <div class="memory-title"><h3>双轨归档与本地召回</h3><p>在线写库与后台提炼分开执行</p></div>
           <div class="memory-flow">
-            <article class="node"><h4>会话热史 B</h4><p>达到 28k 估算 Token 或 96 KB 时约折半；定时快照与 TTL 清理也会入冷史。</p></article>
+            <article class="node"><h4>会话热史 B</h4><p>默认达到 28k 估算 Token 或 144,000 字节时约折半；定时快照与 TTL 清理也会入冷史。</p></article>
             <div class="edge"><b aria-hidden="true">→</b></div>
             <article class="node"><h4>不可变冷史</h4><p>源分片、序列范围、epoch 与归档任务同库保存。付费尝试持久化去重。</p></article>
             <div class="edge"><b aria-hidden="true">→</b></div>
@@ -332,7 +383,7 @@
             <div class="edge"><b aria-hidden="true">→</b></div>
             <article class="node"><h4>画像 + 编年史</h4><p>画像依据本人原话；事件按主题整理。管理员可修订、擦除或解锁，保留删除墓碑。</p></article>
           </div>
-          <p class="memory-return">↩ 当前账号画像 + 按需编年史检索 → C 区。检索使用本地关键词与 192 维特征哈希，仅访问当前会话，不需要外部向量库。</p>
+          <p class="memory-return">↩ 当前发言者画像 + 最多 3 名相关成员的别名／偏好 + 按需编年史 → C 区。相关成员与编年史都从当前会话库读取；检索使用本地关键词与 192 维特征哈希。</p>
           <figcaption id="memory-caption">默认按 BOT_TIMEZONE 在 03:10 之后的后台扫描中快照超过 24 小时的记录。旧摘要作为迁移兜底，首次成功提炼后停用旧摘要写入。显式重置才可清除冷史。</figcaption>
         </figure>
         <div class="memory-exits">
@@ -342,13 +393,13 @@
       </div>
       <div class="storage-grid">
         <article class="card"><h3>主库 · 调度与账本</h3><code class="path">data/hakimi.sqlite3</code><p>jobs、Outbox、逐条 ACK、防抖批次、撤回索引、公开互动、预算、热配置、审计、巡逻与主动私信状态。</p><p>SQLite WAL、事务锁与进程锁；敏感载荷 Fernet 加密，身份索引用 HMAC。</p><div class="files"><a href="src/hakimi/store.py">store.py</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a></div></article>
-        <article class="card"><h3>会话库 · 一群／一私聊一库</h3><code class="path">data/sessions/{group,private}/&lt;HMAC&gt;.sqlite3</code><p>隔离接收日志、热史、回执、画像、编年史、冷史与归档任务。文件名由 namespace、平台、Bot 与会话身份派生。</p><p>清空会递增 epoch/version，使旧任务失效；公开索引同步提交墓碑，阻止已删除背景再次出现。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/dual_memory.py">dual_memory.py</a></div></article>
+        <article class="card"><h3>会话库 · 一群／一私聊一库</h3><code class="path">data/sessions/{group,private}/&lt;HMAC&gt;.sqlite3</code><p>隔离接收日志、热史、回执、画像、编年史、冷史、归档任务及 interaction_chains。文件名由 namespace、平台、Bot 与会话身份派生。</p><p>续链标识按模型通道加密保存。清空递增 epoch/version 并清除旧链；公开索引同步提交墓碑。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/dual_memory.py">dual_memory.py</a></div></article>
         <article class="card"><h3>缓存、素材与临时文件</h3><p>HotRing、图片 LRU、静态前缀池与本地召回索引均有内存边界。图片经 WS 字节优先水合，CDN 为受限兜底。</p><code class="path">data/memes/ · 本地白名单表情<br>/tmp/bili_video_cache/ · 视频 tmpfs</code><p>媒体通过 RPC／Base64 跨机传递；当轮引用结束释放，缓存按容量逐出。</p><div class="files"><a href="src/hakimi/hot_ring.py">hot_ring.py</a> · <a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/memes.py">memes.py</a></div></article>
       </div>
     </section>
 
     <section class="section" id="operations" aria-labelledby="operations-title">
-      <div class="section-heading"><h2 id="operations-title"><span>04</span>后台任务与控制面</h2><p>Service.start() 创建进程内协程；各功能仍受配置和准入约束</p></div>
+      <div class="section-heading"><h2 id="operations-title"><span>05</span>后台任务与控制面</h2><p>Service.start() 创建进程内协程；各功能仍受配置和准入约束</p></div>
       <div class="tasks">
         <article class="card"><h3>消息、投递与清理</h3><p>默认 2 个消息消费者，共用会话锁；Delivery 负责出站。Janitor 清理过期数据与远端临时视频文件。</p><div class="files"><a href="src/hakimi/service.py">worker / delivery / janitor</a></div></article>
         <article class="card"><h3>记忆归档</h3><p>启动恢复未尝试任务，后台扫描冷史、执行 Flex 提炼并调度群记忆镜像。已付费但结果不明的任务不自动重试。</p><div class="files"><a href="src/hakimi/memory_compressor.py">memory_compressor.py</a> · <a href="src/hakimi/memory_mirror.py">memory_mirror.py</a></div></article>
@@ -362,26 +413,26 @@
       </div>
       <div class="control-panel">
         <article><h3>/admin · 可热更新的运行策略</h3><p>身份与群准入、防抖五项、九场景思考档位、联网开关与每日上限、预算、记忆治理、本地表情及功能开关。</p><p>覆盖配置加密保存到主库，重启后恢复。后台独立鉴权、同源检查；控制策略不会授予消息文本或模型新的权限。</p><div class="files"><a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a></div></article>
-        <article><h3>统一预算与运行观测</h3><p>每次模型请求先预留再结算；未知用量保留预留。搜索次数／工具费、memory_flex 与模型分账统一受本地日／月／总预算约束。</p><p>按 BOT_TIMEZONE 计日；观测 Token、缓存、思考与来源归属。历史未知账目保持“历史未归属（Gemini）”，不猜测为 Drive 费用。</p><div class="files"><a href="src/hakimi/budget_calendar.py">budget_calendar.py</a> · <a href="src/hakimi/usage_accounting.py">usage_accounting.py</a> · <a href="src/hakimi/model_accounting.py">model_accounting.py</a></div></article>
+        <article><h3>统一预算与运行观测</h3><p>每次模型请求先预留再结算；续链也按完整逻辑上下文保守预留，未知用量保留预留。搜索次数／工具费、memory_flex 与模型分账统一受本地日／月／总预算约束。</p><p>按 BOT_TIMEZONE 计日；观测 Token、缓存、思考与来源归属。历史未知账目保持“历史未归属（Gemini）”，不猜测为 Drive 费用。</p><div class="files"><a href="src/hakimi/budget_calendar.py">budget_calendar.py</a> · <a href="src/hakimi/usage_accounting.py">usage_accounting.py</a> · <a href="src/hakimi/model_accounting.py">model_accounting.py</a></div></article>
       </div>
     </section>
 
     <section class="section" id="sources" aria-labelledby="sources-title">
-      <div class="section-heading"><h2 id="sources-title"><span>05</span>源码与阅读入口</h2><p>相对链接指向本项目文件，克隆后可离线查看</p></div>
+      <div class="section-heading"><h2 id="sources-title"><span>06</span>源码与阅读入口</h2><p>相对链接指向本项目文件，克隆后可离线查看</p></div>
       <details><summary>按职责查看源码 <span>从图上的模块定位实际实现</span></summary><div class="detail-content"><dl class="source-list">
         <div><dt>装配、协议与身份</dt><dd><a href="src/hakimi/app.py">app.py</a> · <a href="src/hakimi/adapters.py">adapters.py</a> · <a href="src/hakimi/onebot_transport.py">onebot_transport.py</a> · <a href="src/hakimi/rich_message_parser.py">rich_message_parser.py</a> · <a href="src/hakimi/security.py">security.py</a> · <a href="src/hakimi/bot_guard.py">bot_guard.py</a></dd></div>
         <div><dt>编排、热消息与取消</dt><dd><a href="src/hakimi/service.py">service.py</a> · <a href="src/hakimi/group_pipeline.py">group_pipeline.py</a> · <a href="src/hakimi/session_scheduler.py">session_scheduler.py</a> · <a href="src/hakimi/debounce_policy.py">debounce_policy.py</a> · <a href="src/hakimi/hot_ring.py">hot_ring.py</a> · <a href="src/hakimi/attention.py">attention.py</a></dd></div>
         <div><dt>门卫、生成与联网</dt><dd><a href="src/hakimi/gemini.py">gemini.py</a> · <a href="src/hakimi/gateway.py">gateway.py</a> · <a href="src/hakimi/routing.py">routing.py</a> · <a href="src/hakimi/generation_policy.py">generation_policy.py</a> · <a href="src/hakimi/thinking_policy.py">thinking_policy.py</a> · <a href="src/hakimi/streaming.py">streaming.py</a> · <a href="src/hakimi/web_search.py">web_search.py</a></dd></div>
-        <div><dt>上下文与人设</dt><dd><a href="src/hakimi/bot_server.py">bot_server.py</a> · <a href="src/hakimi/persona.py">persona.py</a> · <a href="src/hakimi/prefix_runtime.py">prefix_runtime.py</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a> · <a href="src/hakimi/message_context.py">message_context.py</a> · <a href="src/hakimi/link_preview.py">link_preview.py</a></dd></div>
+        <div><dt>上下文、人设与续链</dt><dd><a href="src/hakimi/bot_server.py">bot_server.py</a> · <a href="src/hakimi/persona.py">persona.py</a> · <a href="src/hakimi/prefix_runtime.py">prefix_runtime.py</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a> · <a href="src/hakimi/message_context.py">message_context.py</a> · <a href="src/hakimi/link_preview.py">link_preview.py</a></dd></div>
         <div><dt>持久化、双轨记忆与镜像</dt><dd><a href="src/hakimi/store.py">store.py</a> · <a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/dual_memory.py">dual_memory.py</a> · <a href="src/hakimi/memory_compressor.py">memory_compressor.py</a> · <a href="src/hakimi/memory_mirror.py">memory_mirror.py</a> · <a href="src/hakimi/public_memory.py">public_memory.py</a></dd></div>
         <div><dt>五维动作与可靠投递</dt><dd><a href="src/hakimi/outbound_actions.py">outbound_actions.py</a> · <a href="src/hakimi/outgoing.py">outgoing.py</a> · <a href="src/hakimi/output_links.py">output_links.py</a> · <a href="src/hakimi/text_card.py">text_card.py</a> · <a href="src/hakimi/memes.py">memes.py</a> · <a href="src/hakimi/mentions.py">mentions.py</a></dd></div>
         <div><dt>媒体与 B 站</dt><dd><a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/bilibili.py">bilibili.py</a> · <a href="src/hakimi/bili_watcher.py">bili_watcher.py</a> · <a href="src/hakimi/video_watch.py">video_watch.py</a> · <a href="src/hakimi/video_downloader.py">video_downloader.py</a> · <a href="src/hakimi/video_files.py">video_files.py</a></dd></div>
         <div><dt>主动任务与 Drive</dt><dd><a href="src/hakimi/proactive_dm.py">proactive_dm.py</a> · <a href="src/hakimi/roaming_logger.py">roaming_logger.py</a> · <a href="src/hakimi/drive_client.py">drive_client.py</a> · <a href="src/hakimi/drive_oauth.py">drive_oauth.py</a> · <a href="src/hakimi/notebook_snapshot.py">notebook_snapshot.py</a></dd></div>
         <div><dt>控制面与账本</dt><dd><a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="src/hakimi/admin_auth.py">admin_auth.py</a> · <a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/community_admin.py">community_admin.py</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a> · <a href="src/hakimi/budget_policy.py">budget_policy.py</a> · <a href="src/hakimi/config.py">config.py</a></dd></div>
       </dl></div></details>
-      <details><summary>版本依据与部署文档 <span>当前行为优先参照 1.1.3 代码</span></summary><div class="detail-content"><p><a href="docs/NATURAL_PIPELINE_112.md">1.1.2 / 1.1.3 主对话与自然回复</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置与受控联网</a> · <a href="docs/MEMORY_100.md">双轨记忆与治理</a> · <a href="docs/STREAMING_010.md">流式管道与 ACK 投递</a> · <a href="docs/CONTEXT_ROUTING_09.md">A/B/C 与分档路由</a></p><p><a href="README.md">README</a> · <a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a> · <a href="docs/UPGRADE.md">升级交付</a> · <a href="Dockerfile">Dockerfile</a> · <a href="compose.roaming.yaml">Drive SA 覆盖</a> · <a href="compose.roaming-oauth.yaml">Drive OAuth 覆盖</a></p><p>图中展示源码支持的结构与默认值；实例启用状态由配置与管理台决定。当前版本来自 <code>pyproject.toml</code>，源码基线为 <code>8b08453</code>。部分早期文档保留旧行为说明，以当前实现为准。</p></div></details>
+      <details><summary>版本依据与部署文档 <span>当前行为优先参照 1.1.4 代码</span></summary><div class="detail-content"><p><a href="docs/GROUP_CONTEXT_114.md">1.1.4 群聊上下文与差量续链</a> · <a href="docs/NATURAL_PIPELINE_112.md">1.1.2 / 1.1.3 主对话与自然回复</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置与受控联网</a> · <a href="docs/MEMORY_100.md">双轨记忆与治理</a> · <a href="docs/STREAMING_010.md">流式管道与 ACK 投递</a> · <a href="docs/CONTEXT_ROUTING_09.md">A/B/C 与分档路由</a></p><p><a href="README.md">README</a> · <a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a> · <a href="docs/UPGRADE.md">升级交付</a> · <a href="Dockerfile">Dockerfile</a> · <a href="compose.roaming.yaml">Drive SA 覆盖</a> · <a href="compose.roaming-oauth.yaml">Drive OAuth 覆盖</a></p><p>图中展示源码支持的结构与默认值；实例启用状态由配置与管理台决定。当前版本来自 <code>pyproject.toml</code>，源码基线为 <code>010cc38</code>。部分早期文档保留旧行为说明，以当前实现为准。</p></div></details>
     </section>
-    <footer><span>hakimi-surf / v1.1.3 · 源码架构快照 · 2026-11-15</span><span>独立 HTML + CSS · 无外部资源 · <a href="#overview">返回总览 ↑</a></span></footer>
+    <footer><span>hakimi-surf / v1.1.4 · 源码架构快照 · 2026-11-15</span><span>独立 HTML + CSS · 无外部资源 · <a href="#overview">返回总览 ↑</a></span></footer>
   </main>
 </body>
 </html>

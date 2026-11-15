@@ -6,7 +6,7 @@
 
 沿用 [v0.10 流式防抖与五维出站](docs/STREAMING_010.md) 和 [v0.9 A/B/C 前缀路由](docs/CONTEXT_ROUTING_09.md)。群聊／Owner 私聊默认 `auto`，后台可选至 `xhigh`；双轨归档固定 `medium`。三段原文人设、跨机 WS 和账本安全边界不变；新增 `memory_flex` 费用列。有效缓存覆盖率 90% 是观察目标，不能保证每次命中。
 
-[项目架构图（HTML/CSS）](architecture.html)：按 **1.1.3 源码**绘制，包含境内／境外部署、可取消的消息管道、联网取证、A/B/C 上下文、双轨记忆及 ACK 确认投递；1.1.4 的差量续链补充见升级说明。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
+[项目架构图（HTML/CSS）](architecture.html)：按 **1.1.4 当前源码**重构，包含境内／境外部署、扩容后的群聊上下文、联网取证、A/B/C 全量与差量请求、ACK 确认续链、双轨记忆及存储边界。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
 
 0.8.0 新增 [会话串行管道、引用回溯与受控点名](docs/CORE_PIPELINE_08.md)，支持 [上海 NapCat／首尔主脑分离部署](docs/CROSS_BORDER_DEPLOYMENT.md)。群聊、私聊与 `@Bot` 统一先写隔离接收日志，再按 1.8 秒／最长 3.5 秒防抖；同会话模型请求串行，后台清空通过 epoch 作废旧任务。补齐引用／转发原图、公开群互动到 Owner 私聊的单向背景、受控 `[AT:...]` 与本地表情联合发送。预算日／月边界统一按 `BOT_TIMEZONE=Asia/Shanghai`，旧 UTC 账本保留审计并保守迁移。
 
@@ -154,7 +154,7 @@ flowchart TD
 
   subgraph Backend[境外 · 单进程 FastAPI]
     Ingress[鉴权、接收日志、同会话引用与媒体准备]
-    Ingress --> Queue[(SQLite 防抖批次与 jobs)]
+    Ingress --> Queue[(SQLite 防抖批次与 jobs / 最多 16 条)]
     Queue --> Serial[会话串行 / 追发与撤回取消]
     Serial -->|固定命令| Outbox
     Serial --> Gate[Decisions：安全、意图、召回、联网、L1–L4]
@@ -162,18 +162,24 @@ flowchart TD
     Gate -->|按需且显式启用| Search[独立 Google Search 请求 / 来源筛查]
     Search -->|事实与联网四态| Context
     Gate -->|有效 BV| Video[B站公开资料 / 来源筛查 / 可选原片分析]
-    Context --> Chat[Interactions 流式生成 / Hydrogen 或 Carbon]
+    Context --> Chain[按会话与模型校验续链 / 选择全量或差量]
+    Chain --> Chat[Interactions 流式生成 / Hydrogen 或 Carbon]
     Chat --> OutputGate[输出筛查 / 五维协议与链接校验]
     Video --> VideoOutput[视频输出筛查 / 受控文本]
     VideoOutput --> Outbox
     OutputGate --> Outbox[(加密 Outbox)]
     Outbox --> Delivery[逐条复检 / Sender 投递 / 持久化 ACK]
+    Delivery -->|主对话候选确认送达后| ChainStore[(加密 interaction_chains / 提交已覆盖序号)]
   end
 
   Delivery -->|经原 OneBot 连接返回| Reply[QQ 接收回复]
 ```
 
 所有模型请求共用预算预留与结算；搜索另受每日次数和独立额度约束。主对话不开放工具，联网使用独立请求，结果过审后才进入 C 区。用户原文在门卫放行后入史，助手正文在 ACK 后入史；视频材料与分析摘要不写入聊天记忆。Drive 群记忆镜像、巡逻日记和 Owner 只读快照分别配置。
+
+启用会话记忆、非沙箱且续链开关开启时，主对话使用 `store=True`；有效旧链携带 `previous_interaction_id`，按模型通道发送未覆盖的 B 历史及完整当轮 C，每轮仍传 A。首次或链失效时用完整本地上下文起链。新标识随 Outbox 传递，回复成功送达后才加密提交到会话库，供下一轮读取。关闭续链、关闭记忆及搜索／沙箱／后台任务保持 `store=False`。续链按完整逻辑上下文预留预算；本地默认 6 小时有效期不等于云端删除期限。详见 [续链流程图](architecture.html#interaction-chain)。
+
+群聊批次最多 16 条／24,000 字；当前两张图片占满时仍补充去重后的邻近群聊文本。历史序列化去除重复身份前缀，并在相邻消息间隔达到 30 分钟时插入按 Bot 时区格式化的时间断点。主引用展开路径最多 6 个引用 ID、4 个转发，每个转发最多 40 个节点；其他字数和权限限制继续生效。
 
 记忆从会话热史进入不可变冷史，经后台 Flex 提炼形成画像与编年史，再按需本地召回到 C 区。已确认的公开群互动可单向进入 Owner 私聊背景；显式启用的白名单群可与单目录 Drive Markdown 双向同步，私聊不导出。完整存储边界和调用关系见 [HTML 架构图](architecture.html#memory)。
 
@@ -185,18 +191,18 @@ flowchart TD
 | `src/hakimi/routing.py` / `generation_policy.py` / `thinking_policy.py` | 一次入站决策、聊天 auto 分档、Hydrogen／Carbon 策略与场景热配置 |
 | `src/hakimi/gemini.py` / `streaming.py` | Decisions、流式 Interactions、结构化输出、取消与费用预留 |
 | `src/hakimi/web_search.py` | 独立联网取证、查询净化、来源提炼、四态透传及次数／费用控制 |
-| `src/hakimi/bot_server.py` / `prefix_runtime.py` | A/B/C 组装、稳定前缀、当轮尾窗与模型历史选择 |
+| `src/hakimi/bot_server.py` / `prefix_runtime.py` | A/B/C 组装、历史身份去重与时间断点、模型历史选择与续链元数据 |
 | `src/hakimi/store.py` | SQLite 事务、任务／发送队列、预算、订阅、报告、群策略与旧记忆迁移源 |
 | `src/hakimi/onebot_transport.py` | HTTP／正向 WS／反向 WS、echo 回执、心跳、重连 |
 | `src/hakimi/rich_message_parser.py` | 消息段、卡片、转发及顶层 @ 识别 |
 | `src/hakimi/message_context.py` / `media.py` | 当前会话引用校验、转发展开、WS 串行取图、受限 CDN 兜底与压缩 |
-| `src/hakimi/group_pipeline.py` / `session_scheduler.py` / `debounce_policy.py` | 持久化防抖、0–30 秒热配置、会话串行与选择性取消 |
+| `src/hakimi/group_pipeline.py` / `session_scheduler.py` / `debounce_policy.py` | 最多 16 条的持久化批次、0–30 秒热配置、会话串行与选择性取消 |
 | `src/hakimi/hot_ring.py` / `link_preview.py` | 有界热消息、撤回索引与受限网页预览 |
 | `src/hakimi/public_memory.py` | 已确认群聊互动到 Owner 私聊的单向只读背景 |
-| `src/hakimi/outbound_actions.py` / `outgoing.py` / `output_links.py` | 五维动作校验、出站链接过滤、长文折叠、逐条 ACK 与启动恢复 |
+| `src/hakimi/outbound_actions.py` / `outgoing.py` / `output_links.py` | 五维动作校验、出站过滤、长文折叠、逐条 ACK、成功投递后提交续链与回执恢复 |
 | `src/hakimi/mentions.py` / `bot_guard.py` | 兼容 AT／MEME、真实事件授权、外部 Bot 两轮熔断 |
 | `src/hakimi/budget_calendar.py` | 本地日／月账本迁移、旧 UTC 聚合归档与保守占用 |
-| `src/hakimi/session_manager.py` / `dual_memory.py` | 每会话独立 SQLite、追加热史、画像、编年史、不可变冷史与本地召回 |
+| `src/hakimi/session_manager.py` / `dual_memory.py` | 每会话独立 SQLite、加密续链、热史、画像、编年史、冷史与相关成员背景召回 |
 | `src/hakimi/memory_compressor.py` / `memory_mirror.py` | 后台 Flex 提炼、版本与人工锁核验、可选群记忆 Drive 镜像 |
 | `src/hakimi/roaming_logger.py` / `drive_client.py` / `drive_oauth.py` | 独立日记数据、定时汇总、单目录 SA／OAuth 同步 |
 | `src/hakimi/bilibili.py` | 固定主机的匿名 GET、受限响应体、缓存、风控熔断 |
