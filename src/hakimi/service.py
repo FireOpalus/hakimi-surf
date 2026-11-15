@@ -3,9 +3,11 @@ import logging
 import random
 import re
 import time
+import uuid
 from collections import Counter
 
 from .adapters import Sender, identifier, onebot_message
+from .attention import can_watch_video
 from .bili_watcher import BiliWatcher
 from .bilibili import Bilibili, extract_bvid
 from .bot_server import is_persona_owner, untrusted_input
@@ -40,7 +42,7 @@ from .video_watch import VideoWatch
 from .web_search import explicit_search, search_query
 
 log = logging.getLogger("hakimi")
-HELP = """哈基米在这里。直接提问，或发送 B 站 BV 号、视频链接或分享卡片。
+HELP = """哈基米在这里。私聊可直接提问或发送 B 站视频；群聊看视频请明确 @ 我。
 /new-session：清空当前会话上下文，保留记忆开关
 外部 Bot 默认忽略；仅主人在群内明确邀请后临时互动，同群 10 分钟最多两轮。
 /哈基米 记忆 开：为当前私聊或本群启用短期记忆
@@ -671,6 +673,8 @@ class Service:
             if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
                 raise Rejected("reply_invalidated")
 
+        audit_id = uuid.uuid4().hex
+        job["_audit_id"] = audit_id
         try:
             relevance = frozen_relevance
             intent = await self.ai.screen(
@@ -680,6 +684,8 @@ class Service:
                 group=message.kind == "group",
                 message=message,
                 before_call=message_guard,
+                audit_id=audit_id,
+                audit_job_id=job["id"],
                 **({"relevance_context": relevance} if relevance else {}),
                 **({"images": [i.gate() for i in images]} if images else {}),
             )
@@ -694,6 +700,7 @@ class Service:
                 )
             raise
         if not authorize(message, self.s):
+            await self.store.runtime.filters.update_audit(audit_id, "cancelled", "unauthorized")
             return
         if self.diary:
             await self.diary.group(job["id"], message)
@@ -702,6 +709,9 @@ class Service:
             if not await self.sessions.admit_history(
                 message, members, expected_epoch=session["epoch"]
             ):
+                await self.store.runtime.filters.update_audit(
+                    audit_id, "cancelled", "epoch_changed"
+                )
                 return
             self.compressor.schedule(message)
             # Admission may atomically fold B. Reload before constructing the model history.
@@ -822,10 +832,13 @@ class Service:
         parsed = None
         meme_tag = None
         public = not (message.kind == "private" and is_persona_owner(message, self.s))
-        bvid = message.video_ids[0] if message.video_ids else extract_bvid(message.text)
-        if sandbox:
-            bvid = None
-        if not sandbox and not bvid and message.short_urls:
+        allow_video = not sandbox and can_watch_video(message, members)
+        bvid = (
+            (message.video_ids[0] if message.video_ids else extract_bvid(message.text))
+            if allow_video
+            else None
+        )
+        if allow_video and not bvid and message.short_urls:
             bvid = await self.bili.resolve_short(message.short_urls[0])
         if bvid:
             # Only a validated, admitted video request gets a longer processing deadline.
@@ -965,6 +978,9 @@ class Service:
                 if actions.abstain:
                     if gen_trace.get("chain_invalidate"):
                         await self.sessions.invalidate_chains(message)
+                    await self.store.runtime.filters.update_audit(
+                        audit_id, "abstained", "model_abstain"
+                    )
                     return
                 if not actions.image_digest:
                     actions.image_digest = next(
@@ -985,6 +1001,7 @@ class Service:
                     session_epoch=session["epoch"],
                     participants=members,
                     allowed_at_qqs=allowed_at,
+                    audit_id=audit_id,
                     actions={
                         **actions.model_dump(),
                         "folded": folded,
@@ -1003,6 +1020,7 @@ class Service:
                         ),
                     },
                 )
+                await self.store.runtime.filters.update_audit(audit_id, "queued")
                 return
             # Read compatibility for integrations returning the old single-text contract.
             # The production Gemini gateway validates the new schema before reaching here.
@@ -1010,11 +1028,13 @@ class Service:
             generated, meme_tag = parsed.text, parsed.meme_tag
             result = self.output(generated) if generated else ""
         if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
+            await self.store.runtime.filters.update_audit(audit_id, "cancelled", "epoch_changed")
             return
         if parsed is None:
             parsed = parse_reply(result, message, self.s, allowed_at_qqs=allowed_at)
             result, meme_tag = parsed.text, parsed.meme_tag
         if not result and not (meme_tag and meme_tag in self.memes.labels):
+            await self.store.runtime.filters.update_audit(audit_id, "cancelled", "empty_reply")
             return
         await self.store.enqueue_reply(
             job["id"],
@@ -1026,7 +1046,9 @@ class Service:
             participants=members if len(members) > 1 else None,
             segments=parsed.segments,
             allowed_at_qqs=allowed_at,
+            audit_id=audit_id,
         )
+        await self.store.runtime.filters.update_audit(audit_id, "queued")
 
     async def handle_patrol(self, job: dict):
         sub_id = job["payload"]["subscription"]
@@ -1055,13 +1077,19 @@ class Service:
             else:
                 await self.handle_patrol(job)
         except Rejected as exc:
+            audit_id = job.get("_audit_id")
             if str(exc) == "batch_interrupted":
+                await self.store.runtime.filters.update_audit(
+                    audit_id, "interrupted", "batch_interrupted"
+                )
                 await self.store.groups.requeue_interrupted(job)
                 return
             if str(exc) in {"batch_recalled", "reply_invalidated", "video_watch_invalidated"}:
+                await self.store.runtime.filters.update_audit(audit_id, "cancelled", str(exc))
                 await self.store.finish(job["id"], "cancelled")
                 return
             self.record(str(exc))
+            await self.store.runtime.filters.update_audit(audit_id, "rejected", str(exc))
             if self.diary and str(exc) == "prompt_injection":
                 await self.diary.injection(job["id"])
             if job["kind"] == "message":
@@ -1093,6 +1121,9 @@ class Service:
             await self.store.finish(job["id"], "rejected")
         except Exception:
             self.record("job_failed")
+            await self.store.runtime.filters.update_audit(
+                job.get("_audit_id"), "failed", "job_failed"
+            )
             await self.store.finish(job["id"], "failed")
         else:
             await self.store.finish(job["id"])
@@ -1150,6 +1181,11 @@ class Service:
         except Exception:
             self.record("quick_ack_unavailable")
 
+    async def _finish_delivery_audit(self, reply: dict, status: str, detail: str = ""):
+        audit_id = reply.get("audit_id")
+        if audit_id:
+            await self.store.runtime.filters.update_audit(audit_id, status, detail)
+
     async def deliver_once(self) -> bool:
         reply = await self.store.claim_reply()
         if not reply:
@@ -1168,9 +1204,11 @@ class Service:
         delivery_epoch = (await self.sessions.snapshot(message))["epoch"]
         if "session_epoch" in reply and delivery_epoch != reply["session_epoch"]:
             await self.store.finish_reply(reply["id"], "cancelled")
+            await self._finish_delivery_audit(reply, "cancelled", "epoch_changed")
             return True
         if not await self.bot_guard.may_process(message, reply["id"]):
             await self.store.finish_reply(reply["id"], "blocked")
+            await self._finish_delivery_audit(reply, "blocked", "bot_cooldown")
             return True
         try:
             await self.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
@@ -1270,6 +1308,7 @@ class Service:
                 )
                 if not retained:
                     await self.store.finish_reply(reply["id"], "cancelled")
+                    await self._finish_delivery_audit(reply, "cancelled", "epoch_changed")
                     return True
             if reply.get("meme_eligible") and not reply["proactive"] and await valid_after_delay():
                 allowed = await self.memes.reserve_reply(
@@ -1321,7 +1360,11 @@ class Service:
             self.record("delivery_uncertain")
         await self.bot_guard.extend_cooldown(message, reply["id"])
         if not await self.store.finish_reply(reply["id"], status):
+            await self._finish_delivery_audit(reply, "cancelled", "session_reset")
             return True  # A reset cancelled this delivery while the transport awaited its ACK.
+        await self._finish_delivery_audit(
+            reply, status, "delivery_uncertain" if status == "uncertain" else ""
+        )
         if (
             status == "sent"
             and text_confirmed

@@ -392,6 +392,20 @@ async def test_sandbox_bilibili_and_owner_deep_use_actual_scenarios(admin_api):
     assert response.status_code == 200, response.text
     assert response.json()["preview"]["thinking_level"] == "medium"
     assert gateway.calls[-1][3]["scenario"] == "bilibili_summary"
+    assert (
+        await client.put("/admin/api/groups", json={"group_id": "40000", "mode": "smart_reply"})
+    ).status_code == 200
+    response = await client.post(
+        "/admin/api/sandbox",
+        json={
+            "identity": "MEMBER",
+            "scene": "group_plain",
+            "group_id": "40000",
+            "text": "BV1xx411c7mD",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert gateway.calls[-1][3]["scenario"] == "fast_chat"
     response = await client.post(
         "/admin/api/sandbox",
         json={"identity": "OWNER", "scene": "private", "text": "/deep 解释一下并发问题"},

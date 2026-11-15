@@ -2,6 +2,7 @@
 
 import re
 import time
+import uuid
 from datetime import date
 from pathlib import Path
 from typing import Literal
@@ -11,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .admission_policy import AdmissionConfig
-from .attention import direct_attention
+from .attention import can_watch_video, direct_attention
 from .bilibili import extract_bvid
 from .bot_server import prompt_context
 from .budget_policy import BudgetConfig
@@ -769,6 +770,7 @@ async def sandbox(request: Request):
             "recent_messages": [],
             "rolling_summary": "",
         }
+        audit_id = uuid.uuid4().hex
         try:
             intent = await svc.ai.screen(
                 payload,
@@ -779,11 +781,16 @@ async def sandbox(request: Request):
                 trace=result["decisions"],
                 budget_lane="admin",
                 audit_source="sandbox",
+                audit_id=audit_id,
             )
             if result["decisions"].get("result") == "not_called":
                 result["decisions"]["result"] = intent
             if intent != "ignore":
-                bvid = None if getattr(intent, "sandbox_mode", False) else extract_bvid(data.text)
+                bvid = (
+                    extract_bvid(data.text)
+                    if not getattr(intent, "sandbox_mode", False) and can_watch_video(msg)
+                    else None
+                )
                 if bvid:
                     video = await svc.bili.video(bvid)
                     payload = {
@@ -816,6 +823,7 @@ async def sandbox(request: Request):
                     generation_trace=preview,
                 )
                 public = not actual_context.private_owner
+                sandbox_abstain = False
                 if bvid:
                     summary = filter_reply_links(generated, public=public)
                     preview["text"] = parse_reply(
@@ -835,16 +843,28 @@ async def sandbox(request: Request):
                         tier=getattr(intent, "tier", 2),
                     )
                     preview["actions"] = actions.model_dump()
+                    sandbox_abstain = actions.abstain
                     body_text = folded or "\n".join(actions.bubbles)
                     preview["text"] = (
-                        "" if actions.abstain or not body_text.strip() else svc.output(body_text)
+                        "" if sandbox_abstain or not body_text.strip() else svc.output(body_text)
                     )
                 else:
                     parsed = parse_reply(svc.output(generated), msg, svc.s)
                     preview["text"] = parsed.text
                     if parsed.meme_tag in svc.memes.labels:
                         preview["meme_tag"] = parsed.meme_tag
+                if sandbox_abstain:
+                    await svc.store.runtime.filters.update_audit(
+                        audit_id, "abstained", "model_abstain"
+                    )
+                elif preview["text"] or preview.get("meme_tag"):
+                    await svc.store.runtime.filters.update_audit(audit_id, "sent")
+                else:
+                    await svc.store.runtime.filters.update_audit(
+                        audit_id, "cancelled", "empty_reply"
+                    )
         except Rejected as exc:
+            await svc.store.runtime.filters.update_audit(audit_id, "rejected", str(exc))
             result["decisions"].setdefault("reason", str(exc))
             result["decisions"]["final_result"] = "blocked_or_unavailable"
             if not preview["text"]:

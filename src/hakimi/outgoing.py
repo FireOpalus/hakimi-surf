@@ -88,7 +88,7 @@ async def deliver_actions(service, reply):
     members = [Message.model_validate(m) for m in reply.get("participants", [])] or [message]
     actions = reply["actions"]
     epoch = reply.get("session_epoch", -1)
-    status, confirmed, position = "sent", [], 0
+    status, detail, confirmed, position = "sent", "", [], 0
     sticker_choice = None
 
     async def valid():
@@ -205,14 +205,17 @@ async def deliver_actions(service, reply):
             await asyncio.sleep(0.6)
             await sticker()
         if not confirmed:
-            status = "cancelled"
+            status, detail = "cancelled", "empty_reply"
     except asyncio.CancelledError:
         # ACKs already journalled; restart applies them once. Unknown sends stay uncertain.
         raise
     except Rejected as exc:
-        status = "cancelled" if str(exc) == "reply_invalidated" else "uncertain"
+        if str(exc) == "reply_invalidated":
+            status, detail = "cancelled", "reply_invalidated"
+        else:
+            status, detail = "uncertain", "delivery_uncertain"
     except Exception:
-        status = "uncertain"
+        status, detail = "uncertain", "delivery_uncertain"
         service.record("delivery_uncertain")
     finally:
         applied = await asyncio.shield(apply_receipts(service, reply["id"]))
@@ -239,5 +242,9 @@ async def deliver_actions(service, reply):
                 await asyncio.shield(service.sessions.invalidate_chains(message))
         elif commit:
             await asyncio.shield(service.sessions.invalidate_chains(message))
-    await store.finish_reply(reply["id"], status)
+    finished = await store.finish_reply(reply["id"], status)
+    if finished:
+        await service._finish_delivery_audit(reply, status, detail)
+    else:
+        await service._finish_delivery_audit(reply, "cancelled", "session_reset")
     return True

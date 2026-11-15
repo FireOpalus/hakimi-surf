@@ -12,6 +12,7 @@ import httpx
 from google import genai
 from google.genai._interactions import APITimeoutError
 
+from .attention import can_watch_video
 from .bilibili import extract_bvid
 from .bot_server import assemble_chat_input, escape_data, prompt_context, untrusted_input
 from .config import Settings
@@ -526,6 +527,8 @@ class GeminiGateway:
         before_call=None,
         explicit_reply: bool | None = None,
         relevance_context: list[str] | None = None,
+        audit_id: str | None = None,
+        audit_job_id: str | None = None,
     ) -> str:
         inbound = purpose == "message"
         context = prompt_context(message, self.s)
@@ -667,14 +670,20 @@ class GeminiGateway:
                 ("is_unsafe_or_spam", bounds["unsafe"]),
             ):
                 p, confidence = scores[name]
-                # Relaxed conversational thresholds never apply to webpages, summaries,
-                # video source content or generated output; those retain fail-closed confidence.
-                if not inbound and confidence < self.s.min_confidence:
-                    raise Rejected("invalid_decision")
                 if p >= threshold:
                     raise Rejected(
                         "prompt_injection" if name == "is_prompt_injection" else "content_blocked"
                     )
+                # In gemini-decision-1 noul answers, confidence == max(p, 1 - p), so safe scores
+                # with p < threshold (e.g. p=0.35, c=0.65 against unsafe=0.50) are valid binary
+                # distributions. Fail closed only on degenerate epistemic confidence where
+                # confidence < 0.5 or unassigned mass (1 - confidence) could cross threshold.
+                if (
+                    not inbound
+                    and confidence < self.s.min_confidence
+                    and (confidence < 0.5 or 1.0 - confidence >= threshold)
+                ):
+                    raise Rejected("invalid_decision")
             if not inbound:
                 read_noul(result.answers, "should_reply")
                 report.update(result="chat", reason="safe_source_or_output")
@@ -708,7 +717,9 @@ class GeminiGateway:
                 tier = 1
             chosen = (
                 "bilibili_watch"
-                if not sandbox and extract_bvid(str(data_payload["current_message"]))
+                if not sandbox
+                and can_watch_video(message)
+                and extract_bvid(str(data_payload["current_message"]))
                 else "chat"
             )
             report.update(tier=tier, sandbox_mode=sandbox)
@@ -743,7 +754,14 @@ class GeminiGateway:
             raise Rejected("invalid_decision") from None
         finally:
             if inbound:
-                await self.filters.record(message, data_payload, report, audit_source)
+                await self.filters.record(
+                    message,
+                    data_payload,
+                    report,
+                    audit_source,
+                    audit_id=audit_id,
+                    job_id=audit_job_id,
+                )
 
     async def generate(
         self,

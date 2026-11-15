@@ -339,3 +339,73 @@ async def test_deep_video_uses_summary_route_and_never_chat_memory(service, mess
     call = service.ai.calls[-1]
     assert call[3]["summary"] is True and call[3]["deep"] is True
     assert "private-secret" not in json.dumps(call[1])
+
+
+@pytest.mark.parametrize("reason", ["", "alias", "reply"])
+async def test_group_video_without_at_never_fetches_bili_and_falls_back_to_chat(
+    service, message, reason
+):
+    service.s.group_policies["onebot:40000"] = "smart_reply"
+    group_msg = message.model_copy(
+        update={
+            "event_id": f"no-at-{reason or 'plain'}",
+            "kind": "group",
+            "conversation_id": "40000",
+            "user_id": "30000",
+            "text": "分享个视频 BV1xx411c7mD",
+            "command_text": "",
+            "addressed": bool(reason),
+            "attention_reason": reason,
+            "video_ids": ["BV1xx411c7mD"],
+            "short_urls": ["https://b23.tv/abc123"],
+        }
+    )
+    await run_message(service, group_msg)
+    assert not service.bili.calls
+    assert any(c[0] == "generate" and c[3]["scenario"] == "fast_chat" for c in service.ai.calls)
+
+
+async def test_group_video_watches_only_with_at_including_quoted_video(service, message):
+    from hakimi.adapters import onebot_message
+
+    unmentioned = onebot_message(
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "self_id": "10000",
+            "user_id": "30000",
+            "group_id": "40000",
+            "message_id": 501,
+            "time": time.time(),
+            "message": [
+                {
+                    "type": "json",
+                    "data": {"data": '{"url":"https://bilibili.com/video/BV1xx411c7mD"}'},
+                }
+            ],
+        },
+        service.s,
+    )
+    assert await service.accept(unmentioned) == "ignored"
+    assert not service.bili.calls
+
+    quoted_with_at = onebot_message(
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "self_id": "10000",
+            "user_id": "30000",
+            "group_id": "40000",
+            "message_id": 502,
+            "time": time.time(),
+            "message": [
+                {"type": "reply", "data": {"id": "501"}},
+                {"type": "at", "data": {"qq": "10000"}},
+                {"type": "text", "data": {"text": "帮我看看这个视频"}},
+            ],
+        },
+        service.s,
+    )
+    await run_message(service, quoted_with_at)
+    assert service.bili.calls == ["BV1xx411c7mD"]
+    assert service.ai.calls[-1][3]["summary"] is True

@@ -21,7 +21,23 @@ def direct_attention(kind, *, mentioned=False, text="", has_video=False):
         return "mention"
     if any(alias in text for alias in WAKE_WORDS):
         return "alias"
-    return "bilibili" if has_video else ""
+    return ""
+
+
+def _explicit_at(message) -> bool:
+    return bool(
+        message.attention_reason == "mention"
+        or (message.bot_id and message.bot_id in message.mentioned_ids)
+    )
+
+
+def can_watch_video(message, members=()) -> bool:
+    """Return whether incoming message or batch is allowed to trigger video watching."""
+    if message is None:
+        return True
+    if message.kind == "private":
+        return True
+    return _explicit_at(message) or any(_explicit_at(m) for m in members)
 
 
 class AttentionRouter:

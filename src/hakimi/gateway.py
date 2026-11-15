@@ -72,6 +72,11 @@ def redact_excerpt(text, settings, *, limit=180):
     return text.replace("[CQ:", "［CQ:")[:limit]
 
 
+def _safe_detail(detail: str) -> str:
+    text = str(detail or "").strip()
+    return text if re.fullmatch(r"[a-z0-9_]{1,64}", text) else ""
+
+
 class FilterManager:
     def __init__(self, store):
         self.store, self.s = store, store.s
@@ -155,10 +160,20 @@ class FilterManager:
             },
         }
 
-    async def record(self, message, payload, trace, audit_source):
+    async def record(
+        self,
+        message,
+        payload,
+        trace,
+        audit_source,
+        *,
+        audit_id: str | None = None,
+        job_id: str | None = None,
+    ):
         await self.initialize()
-        key, now = uuid.uuid4().hex, time.time()
+        key, now = audit_id or uuid.uuid4().hex, time.time()
         user_id = message.user_id if message else ""
+        tracked = bool(audit_id or job_id) and trace.get("result") in {"chat", "bilibili_watch"}
         value = {
             "at": now,
             "source": audit_source
@@ -189,15 +204,38 @@ class FilterManager:
             "result": trace.get("result", "blocked"),
             "reason": trace.get("reason", "invalid_decision"),
             "reply_bypassed": bool(trace.get("reply_bypassed")),
+            "execution_status": "processing" if tracked else "",
+            "execution_detail": "",
         }
+        if job_id:
+            value["job_id"] = job_id
         async with self.store.transaction():
             await self.store.db.execute(
-                "INSERT INTO decision_audit VALUES (?,?,?)",
+                "INSERT OR REPLACE INTO decision_audit VALUES (?,?,?)",
                 (key, now, self.store.vault.seal("decision-audit:" + key, value)),
             )
             await self.store.db.execute(
                 "DELETE FROM decision_audit WHERE id NOT IN "
                 "(SELECT id FROM decision_audit ORDER BY at DESC,rowid DESC LIMIT 30)"
+            )
+        return key
+
+    async def update_audit(self, audit_id: str | None, status: str, detail: str = ""):
+        if not audit_id or not re.fullmatch(r"[a-z0-9_]{1,32}", status):
+            return
+        await self.initialize()
+        async with self.store.transaction():
+            row = await self.store.one("SELECT payload FROM decision_audit WHERE id=?", (audit_id,))
+            if not row:
+                return
+            value = self.store.vault.open("decision-audit:" + audit_id, row["payload"])
+            if value.get("result") in {"ignore", "blocked"}:
+                return
+            value["execution_status"] = status
+            value["execution_detail"] = _safe_detail(detail)
+            await self.store.db.execute(
+                "UPDATE decision_audit SET payload=? WHERE id=?",
+                (self.store.vault.seal("decision-audit:" + audit_id, value), audit_id),
             )
 
     async def recent_audit(self, limit=30):
@@ -208,9 +246,33 @@ class FilterManager:
                 "SELECT id,payload FROM decision_audit ORDER BY at DESC,rowid DESC LIMIT ?",
                 (limit,),
             )
-        return [
-            self.store.vault.open("decision-audit:" + row["id"], row["payload"]) for row in rows
-        ]
+            items = []
+            for row in rows:
+                item = self.store.vault.open("decision-audit:" + row["id"], row["payload"])
+                job_id = item.pop("job_id", None)
+                if job_id and item.get("execution_status") in {"processing", "queued", "sending"}:
+                    outbox = await self.store.one("SELECT status FROM outbox WHERE id=?", (job_id,))
+                    if outbox:
+                        status = outbox["status"]
+                        if status == "pending":
+                            item["execution_status"] = "queued"
+                        elif status in {
+                            "sending",
+                            "sent",
+                            "cancelled",
+                            "blocked",
+                            "uncertain",
+                            "expired",
+                        }:
+                            item["execution_status"] = status
+                    else:
+                        job = await self.store.one("SELECT status FROM jobs WHERE id=?", (job_id,))
+                        if job and job["status"] in {"rejected", "cancelled", "failed"}:
+                            item["execution_status"] = job["status"]
+                        elif job and job["status"] == "done":
+                            item["execution_status"] = "no_reply"
+                items.append(item)
+            return items
 
     def _group_scope(self, message):
         return self.store.vault.digest("gateway-group", *message.session_parts(self.s.namespace))

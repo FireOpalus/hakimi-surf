@@ -834,6 +834,7 @@ class Store:
         allowed_at_qqs=(),
         actions=None,
         external_search=False,
+        audit_id=None,
     ) -> None:
         batch = self.groups.active.get(self.session_scope(message))
         if batch and batch.job["id"] == job_id:
@@ -842,6 +843,8 @@ class Store:
             batch.sealed = True  # No follow-up may cancel/requeue a committed outbox.
         now = time.time()
         payload = {"message": message.model_dump(), "text": text, "proactive": proactive}
+        if audit_id:
+            payload["audit_id"] = audit_id
         if external_search:
             payload["external_search"] = True
         if actions is not None:

@@ -33,16 +33,20 @@ def test_alias_is_explicit_attention(settings, name):
     assert authorize(message, settings)
 
 
-def test_bili_card_is_explicit_but_cannot_override_muted_or_unknown_group(settings):
+def test_bili_card_is_not_explicit_without_mention(settings):
     segments = [
         {"type": "json", "data": {"data": '{"url":"https://bilibili.com/video/BV1xx411c7mD"}'}}
     ]
     message = onebot_message(event(segments), settings)
-    assert message.addressed and message.attention_reason == "bilibili"
-    assert authorize(message, settings)
-    settings.group_policies["onebot:40000"] = "muted"
+    assert not message.addressed and message.attention_reason == ""
     assert not authorize(message, settings)
-    assert not authorize(onebot_message(event(segments, group="88888"), settings), settings)
+    at_segments = [{"type": "at", "data": {"qq": "10000"}}, *segments]
+    mentioned = onebot_message(event(at_segments), settings)
+    assert mentioned.addressed and mentioned.attention_reason == "mention"
+    assert authorize(mentioned, settings)
+    settings.group_policies["onebot:40000"] = "muted"
+    assert not authorize(mentioned, settings)
+    assert not authorize(onebot_message(event(at_segments, group="88888"), settings), settings)
 
 
 def test_quoted_alias_and_bot_author_fields_do_not_create_attention(settings):
@@ -144,8 +148,7 @@ async def test_group_relevance_is_separate_from_private_and_cleared_with_session
     assert await store.runtime.filters.group_context(current) == []
 
 
-@pytest.mark.parametrize("text", ["哈基米，猫娘叫一声", "BV1xx411c7mD"])
-async def test_sandbox_direct_attention_matches_protocol_without_production_context(settings, text):
+async def test_sandbox_direct_attention_matches_protocol_without_production_context(settings):
     settings.admin_token = SecretStr("attention-test-admin-token")
     gateway = FakeGateway()
     gateway.block_purpose = "message"  # Stop before any video fetch or generation.
@@ -156,17 +159,34 @@ async def test_sandbox_direct_attention_matches_protocol_without_production_cont
             base_url="http://127.0.0.1:12141",
             headers={"Authorization": "Bearer attention-test-admin-token"},
         ) as client:
-            response = await client.post(
+            plain_video = await client.post(
                 "/admin/api/sandbox",
                 json={
                     "identity": "MEMBER",
                     "scene": "group_plain",
                     "group_id": "40000",
-                    "text": text,
+                    "text": "BV1xx411c7mD",
                 },
             )
-        assert response.status_code == 200
-        assert len(gateway.calls) == 1
-        assert gateway.calls[0][3]["message"]["addressed"] is True
-        assert "relevance_context" not in gateway.calls[0][3]
+            assert plain_video.status_code == 200
+            assert plain_video.json()["decisions"]["reason"] == "group_policy_ignored"
+            assert not gateway.calls
+            for scene, text in [
+                ("group_plain", "哈基米，猫娘叫一声"),
+                ("group_at", "BV1xx411c7mD"),
+            ]:
+                gateway.calls.clear()
+                response = await client.post(
+                    "/admin/api/sandbox",
+                    json={
+                        "identity": "MEMBER",
+                        "scene": scene,
+                        "group_id": "40000",
+                        "text": text,
+                    },
+                )
+                assert response.status_code == 200
+                assert len(gateway.calls) == 1
+                assert gateway.calls[0][3]["message"]["addressed"] is True
+                assert "relevance_context" not in gateway.calls[0][3]
         assert not await app.state.service.store.all("SELECT * FROM gateway_group_context")

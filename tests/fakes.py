@@ -9,7 +9,7 @@ def recorded_kwargs(kwargs):
     return {
         k: v.model_dump() if isinstance(v, Message) else copy.deepcopy(v)
         for k, v in kwargs.items()
-        if k not in {"before_call", "cancel_event"}
+        if k not in {"before_call", "cancel_event", "audit_id", "audit_job_id"}
     }
 
 

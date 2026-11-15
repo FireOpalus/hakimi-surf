@@ -437,3 +437,157 @@ async def test_hot_revocation_while_waiting_for_decision_slot_costs_zero(
         await task
     assert not calls
     assert (await store.one("SELECT COUNT(*) FROM ledger"))[0] == 0
+
+
+async def test_source_and_output_accept_binary_noul_confidence_near_threshold(
+    settings, store, sdk_pair, message
+):
+    case = [0.35, 0.65, "is_unsafe_or_spam"]
+
+    def handler(request):
+        resp = decision_response()
+        p, conf, field = case
+        resp["answers"][field].update(noul=p, confidence=conf)
+        return httpx.Response(200, json=resp)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    for purpose in ("source", "output"):
+        case[:] = [0.35, 0.65, "is_unsafe_or_spam"]
+        assert (
+            await gate.screen({"current_message": "normal video"}, "s", purpose=purpose) == "chat"
+        )
+
+        case[:] = [0.55, 0.55, "is_unsafe_or_spam"]
+        with pytest.raises(Rejected, match="^content_blocked$"):
+            await gate.screen({"current_message": "unsafe"}, "s", purpose=purpose)
+
+        case[:] = [0.35, 0.65, "is_prompt_injection"]
+        with pytest.raises(Rejected, match="^prompt_injection$"):
+            await gate.screen({"current_message": "inject"}, "s", purpose=purpose)
+
+    # Group non-@ message with a BVID must route to "chat", while @ or private routes to bilibili.
+    case[:] = [0.01, 0.99, "is_unsafe_or_spam"]
+    plain_group = group(message, addressed=True, attention_reason="alias")
+    assert (
+        await gate.screen(
+            {"current_message": "BV1xx411c7mD"},
+            "s",
+            purpose="message",
+            message=plain_group,
+        )
+        == "chat"
+    )
+    at_group = group(message, addressed=True, attention_reason="mention", mentioned_ids=["10000"])
+    assert (
+        await gate.screen(
+            {"current_message": "BV1xx411c7mD"},
+            "s",
+            purpose="message",
+            message=at_group,
+        )
+        == "bilibili_watch"
+    )
+
+
+async def test_decision_audit_tracks_downstream_sent_abstained_and_rejected(
+    settings, store, sdk_pair, message
+):
+    from hakimi.models import Video
+    from hakimi.service import Service
+    from tests.fakes import FakeBili, FakeSender
+
+    scenario = ["sent"]
+
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            body = json.loads(request.content)
+            resp = decision_response()
+            if (
+                scenario[0] == "source_blocked"
+                and "<current_batch_to_evaluate>" not in body["input"]
+            ):
+                resp["answers"]["is_unsafe_or_spam"].update(noul=0.60, confidence=0.60)
+            return httpx.Response(200, json=resp)
+        resp = interaction_response()
+        payload = {
+            "abstain": scenario[0] == "abstained",
+            "bubbles": [""] if scenario[0] == "abstained" else ["收到啦"],
+            "anchor": {"reply_id": None, "mentions": []},
+            "sticker": {"label": None, "timing": "after_text"},
+            "image_digest": None,
+        }
+        resp["steps"][0]["content"][0]["text"] = json.dumps(payload)
+        return httpx.Response(200, json=resp)
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    bili = FakeBili(
+        [
+            Video(
+                bvid="BV1xx411c7mD",
+                mid="12345",
+                title="t",
+                description="d",
+                author="UP",
+                published_at=1,
+            )
+        ]
+    )
+    sender = FakeSender()
+    svc = Service(settings, store, gateway, bili, sender)
+    svc.bili_watcher.public_material = bili.material
+    try:
+        # 1. Delivered reply -> execution_status == "sent"
+        msg1 = group(
+            message,
+            event_id="ev-sent",
+            addressed=True,
+            attention_reason="mention",
+            mentioned_ids=["10000"],
+            text="你好",
+        )
+        assert await svc.accept(msg1) == "accepted"
+        await svc.process(await store.claim())
+        assert await svc.deliver_once()
+        row1 = (await store.runtime.filters.recent_audit())[0]
+        assert row1["execution_status"] == "sent" and "job_id" not in row1
+
+        # 2. Main model abstains -> execution_status == "abstained"
+        scenario[0] = "abstained"
+        msg2 = group(
+            message,
+            event_id="ev-abstain",
+            addressed=True,
+            attention_reason="mention",
+            mentioned_ids=["10000"],
+            text="随便聊聊",
+        )
+        assert await svc.accept(msg2) == "accepted"
+        await svc.process(await store.claim())
+        row2 = (await store.runtime.filters.recent_audit())[0]
+        assert row2["execution_status"] == "abstained"
+        assert row2["execution_detail"] == "model_abstain"
+
+        # 3. Source screening rejects Bilibili material -> rejected + content_blocked
+        scenario[0] = "source_blocked"
+        msg3 = group(
+            message,
+            event_id="ev-source-block",
+            addressed=True,
+            attention_reason="mention",
+            mentioned_ids=["10000"],
+            text="看下 https://www.bilibili.com/video/BV1xx411c7mD",
+            video_ids=["BV1xx411c7mD"],
+        )
+        assert await svc.accept(msg3) == "accepted"
+        await svc.process(await store.claim())
+        row3 = (await store.runtime.filters.recent_audit())[0]
+        assert row3["result"] == "bilibili_watch"
+        assert row3["execution_status"] == "rejected"
+        assert row3["execution_detail"] == "content_blocked"
+
+        raw_rows = await store.all("SELECT payload FROM decision_audit")
+        assert all(
+            b"model_abstain" not in r[0] and b"content_blocked" not in r[0] for r in raw_rows
+        )
+    finally:
+        await svc.stop()

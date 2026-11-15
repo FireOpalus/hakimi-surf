@@ -374,7 +374,9 @@ class GroupPipeline:
         if len(messages) > 1:
             ordinary = [m for m in messages if not is_persona_owner(m, self.s)]
             anchor = (ordinary or messages)[-1]
-            addressed = next((m for m in messages if m.addressed), None)
+            addressed = next(
+                (m for m in messages if m.attention_reason == "mention"), None
+            ) or next((m for m in messages if m.addressed), None)
 
             def unique(field, limit):
                 items = []

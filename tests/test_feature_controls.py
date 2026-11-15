@@ -163,6 +163,8 @@ async def test_only_current_group_message_verdict_is_attributed_to_sender(
             "user_id": "30000",
             "kind": "group",
             "conversation_id": "40000",
+            "attention_reason": "mention",
+            "mentioned_ids": ["10000"],
             "text": "https://www.bilibili.com/video/BV1xx411c7mD",
         }
     )
