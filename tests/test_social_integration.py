@@ -165,7 +165,7 @@ async def test_prior_three_image_provenance_screening_and_owner_private_isolatio
         command_text="刚截的图",
     )
     assert await social.accept(nearby) == "ignored"
-    for n in range(2):
+    for n in range(5):
         assert (
             await social.accept(group(message, f"nearby-{n}", addressed=False, mentioned_ids=[]))
             == "ignored"

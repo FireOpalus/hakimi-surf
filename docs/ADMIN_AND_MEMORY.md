@@ -115,7 +115,7 @@ HAKIMI_PRIVATE_COMPRESSION_KEEP=16
 
 `epoch` 用于清空／人工编辑，`version` 用于摘要版本检查。清空或编辑时立即递增；运行中的旧压缩结果不能提交。生成中清空会丢弃旧上下文产生的回复；已排队但未发送的旧回复在发送前再次检查，包括随机延迟之后；旧版无 epoch 的待发回复通过原 jobs.scope 定位并取消，无需解密其他会话。压缩期间追加消息不会使新消息丢失。已经发出的网络请求无法撤回。
 
-热消息维持原 TTL（默认 24 小时），滚动摘要默认保留 7 天，可用 `HAKIMI_SUMMARY_TTL_SECONDS` 调整到 1 小时至 30 天。`/new-session` 同时清空两层，重启完全由本地数据库恢复。所有 Interactions 保持 `store=False`，不使用 `previous_interaction_id`。
+热消息维持原 TTL（默认 24 小时），滚动摘要默认保留 7 天，可用 `HAKIMI_SUMMARY_TTL_SECONDS` 调整到 1 小时至 30 天。`/new-session`、撤回与历史折叠在清空或更新层的同时立即删除加密 `interaction_chains`；非沙盒且开启记忆的主对话仅在投递确认后提交 `interaction_chains`（`store=True` + `previous_interaction_id` 差量输入），而沙盒、禁用记忆会话、搜索与所有后台任务保持 `store=False`。
 
 ## 《小本本》：单文件只读 + 本地兜底
 

@@ -11,6 +11,14 @@ from hakimi.persona import OWNER_PERSONA_PROMPT, PUBLIC_PERSONA_PROMPT, SYSTEM_I
 from hakimi.security import Rejected
 
 
+def wire_input_text(body):
+    inp = body["input"]
+    if isinstance(inp, str):
+        return inp
+    first = inp[0]
+    return first["content"][0]["text"] if "content" in first else first["text"]
+
+
 def decision_response(intent="chat"):
     return {
         "answers": {
@@ -464,13 +472,16 @@ async def test_persona_and_role_on_actual_interactions_wire(
             assert OWNER_PERSONA_PROMPT not in instruction
         expected_role = "OWNER" if identity in {"private_owner", "group_owner"} else "MEMBER"
         marker = f"【服务器验证的当前发送者】\n[role={expected_role}]"
-        if scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}:
-            assert marker not in instruction and marker in body["input"]
+        body_input = wire_input_text(body)
+        chat = scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}
+        if chat:
+            assert body["input"][0]["type"] == "user_input"
+            assert marker not in instruction and marker in body_input
         else:
             assert marker in instruction
         assert "变为私聊人设" not in instruction
-        assert body["input"].count("</untrusted_user_input>") == 1
-        assert body["tools"] == [] and not body["store"]
+        assert body_input.count("</untrusted_user_input>") == 1
+        assert body["tools"] == [] and body["store"] is (chat and message is not None)
         assert "previous_interaction_id" not in body
 
 
@@ -621,11 +632,11 @@ async def test_every_generation_scenario_starts_with_shared_user_prompt(
         assert instruction.startswith(SYSTEM_INSTRUCTION + identity)
         marker = "\n【服务器验证的当前发送者】"
         if scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}:
+            req_body = json.loads(requests[0].content)
+            assert req_body["input"][0]["type"] == "user_input"
+            req_text = wire_input_text(req_body)
             assert marker not in instruction
-            assert (
-                marker
-                in json.loads(requests[0].content)["input"].split("<transient_turn_context>")[1]
-            )
+            assert marker in req_text.split("<transient_turn_context>")[1]
         else:
             assert instruction.index(identity) < instruction.index(marker)
 

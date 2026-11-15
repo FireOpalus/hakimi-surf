@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS received_messages (
  event TEXT PRIMARY KEY, payload BLOB NOT NULL, received REAL NOT NULL,
  expires REAL NOT NULL, state TEXT NOT NULL DEFAULT 'received'
 );
+CREATE TABLE IF NOT EXISTS interaction_chains (
+ lane TEXT PRIMARY KEY, payload BLOB NOT NULL, expires REAL NOT NULL
+);
 """
 
 
@@ -163,6 +166,7 @@ class SessionManager:
                         )
                         if expired.rowcount:
                             await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+                            await db.execute("DELETE FROM interaction_chains")
                         await db.execute(
                             "UPDATE rolling_state SET "
                             "summary=NULL,version=version+1 WHERE summary IS NOT NULL AND "
@@ -171,6 +175,9 @@ class SessionManager:
                         )
                         await db.execute(
                             "DELETE FROM history_folds WHERE expires<=?", (time.time(),)
+                        )
+                        await db.execute(
+                            "DELETE FROM interaction_chains WHERE expires<=?", (time.time(),)
                         )
                     yield db, key
                     await db.commit()
@@ -227,6 +234,17 @@ class SessionManager:
                 rows = await cur.fetchall()
             async with db.execute("SELECT ready FROM memory_control") as cur:
                 dual_ready = bool((await cur.fetchone())[0])
+            chains = {}
+            if enabled:
+                async with db.execute(
+                    "SELECT lane,payload,expires FROM interaction_chains WHERE expires>?",
+                    (time.time(),),
+                ) as cur:
+                    for lane, blob, exp in await cur.fetchall():
+                        chains[lane] = {
+                            **self.vault.open(f"{key}:chain:{lane}", blob),
+                            "expires": exp,
+                        }
             return {
                 "dual_ready": dual_ready,
                 "rolling_summary": self.vault.open(key, state[0])
@@ -235,6 +253,7 @@ class SessionManager:
                 "recent_messages": [{**self.vault.open(key, row[1]), "seq": row[0]} for row in rows]
                 if enabled
                 else [],
+                "interaction_chains": chains,
                 "epoch": state[1],
                 "version": state[2],
                 "retry_after": state[3],
@@ -267,6 +286,7 @@ class SessionManager:
                                 "role": role,
                                 "text": text,
                                 "speaker": speaker if role == "user" else "哈基米",
+                                "created_at": time.time(),
                             },
                         ),
                         time.time() + self.s.memory_ttl_seconds,
@@ -389,8 +409,6 @@ class SessionManager:
                     text = member.text
                     if member.images:
                         text += " [附图]"
-                    if member.kind == "group":
-                        text = f"[{member.sender_nickname or '群友'}(QQ:{member.user_id})]: {text}"
                     await db.execute(
                         "INSERT INTO recent_messages(payload,expires) VALUES (?,?)",
                         (
@@ -402,6 +420,7 @@ class SessionManager:
                                     "speaker": member.sender_nickname or "群友",
                                     "user_id": member.user_id,
                                     "event_id": member.event_id,
+                                    "created_at": member.created_at or time.time(),
                                 },
                             ),
                             time.time() + self.s.memory_ttl_seconds,
@@ -413,11 +432,14 @@ class SessionManager:
             if self.s.prefix_history_enabled:
                 await self._fold_history(db, key, message)
             else:
-                await db.execute(
+                trimmed = await db.execute(
                     "DELETE FROM recent_messages WHERE id NOT IN (SELECT id FROM recent_messages "
                     "ORDER BY id DESC LIMIT ?)",
                     (self.store.runtime.compression.window(message.kind).hard_limit,),
                 )
+                if trimmed.rowcount:
+                    await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+                    await db.execute("DELETE FROM interaction_chains")
             return True
 
     async def reply(self, message, text, receipt_id, *, expected_epoch):
@@ -438,7 +460,13 @@ class SessionManager:
                 "INSERT INTO recent_messages(payload,expires) VALUES (?,?)",
                 (
                     self.vault.seal(
-                        key, {"role": "assistant", "text": text, "speaker": "吉米奈喵"}
+                        key,
+                        {
+                            "role": "assistant",
+                            "text": text,
+                            "speaker": "吉米奈喵",
+                            "created_at": time.time(),
+                        },
                     ),
                     time.time() + self.s.memory_ttl_seconds,
                 ),
@@ -470,7 +498,14 @@ class SessionManager:
                         "INSERT INTO recent_messages(payload,expires) VALUES (?,?)",
                         (
                             self.vault.seal(
-                                key, {"role": "assistant", "text": body, "speaker": "吉米奈喵"}
+                                key,
+                                {
+                                    "role": "assistant",
+                                    "text": body,
+                                    "speaker": "吉米奈喵",
+                                    "created_at": time.time(),
+                                    "reply_id": reply_id,
+                                },
                             ),
                             time.time() + self.s.memory_ttl_seconds,
                         ),
@@ -516,6 +551,7 @@ class SessionManager:
             await db.execute("DELETE FROM recent_messages")
             await db.execute("DELETE FROM received_messages")
             await db.execute("DELETE FROM history_folds")
+            await db.execute("DELETE FROM interaction_chains")
             await db.execute(
                 "UPDATE rolling_state SET "
                 "summary=NULL,expires=0,epoch=epoch+1,version=version+1,attempt=NULL,retry_after=0"
@@ -547,7 +583,15 @@ class SessionManager:
             await db.execute(
                 "INSERT INTO recent_messages(payload,expires) VALUES (?,?)",
                 (
-                    self.vault.seal(key, {"role": "assistant", "text": text, "speaker": "哈基米"}),
+                    self.vault.seal(
+                        key,
+                        {
+                            "role": "assistant",
+                            "text": text,
+                            "speaker": "哈基米",
+                            "created_at": time.time(),
+                        },
+                    ),
                     time.time() + self.s.memory_ttl_seconds,
                 ),
             )
@@ -558,7 +602,7 @@ class SessionManager:
             if self.s.prefix_history_enabled:
                 await self._fold_history(db, key, message)
             else:
-                await db.execute(
+                trimmed = await db.execute(
                     "DELETE FROM recent_messages WHERE id NOT IN "
                     "(SELECT id FROM recent_messages ORDER BY id DESC LIMIT ?)",
                     (
@@ -568,6 +612,9 @@ class SessionManager:
                         ),
                     ),
                 )
+                if trimmed.rowcount:
+                    await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+                    await db.execute("DELETE FROM interaction_chains")
             return True
 
     async def enable(self, message: Message):
@@ -594,6 +641,7 @@ class SessionManager:
             if cur.rowcount != 1:
                 raise Rejected("session_changed")
             await db.execute("DELETE FROM history_folds")
+            await db.execute("DELETE FROM interaction_chains")
         await self.store.cancel_session_replies(message)
 
     async def _fold_history(self, db, key, message):
@@ -631,6 +679,7 @@ class SessionManager:
         )
         await db.execute("DELETE FROM recent_messages WHERE id<=?", (rows[half - 1][0],))
         await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+        await db.execute("DELETE FROM interaction_chains")
         # Bounded offline backlog; uncompressed tails never become trusted instructions.
         await db.execute(
             "DELETE FROM history_folds WHERE id NOT IN "
@@ -722,6 +771,7 @@ class SessionManager:
                     (self.vault.seal(key, summary), time.time() + self.s.summary_ttl_seconds),
                 )
                 await db.execute("DELETE FROM history_folds WHERE id=?", (snapshot["fold_id"],))
+                await db.execute("DELETE FROM interaction_chains")
                 return True
             async with db.execute(
                 "SELECT id FROM recent_messages WHERE id<=? ORDER BY id", (snapshot["ids"][-1],)
@@ -741,7 +791,88 @@ class SessionManager:
             )
             await db.execute("DELETE FROM recent_messages WHERE id<=?", (snapshot["ids"][-1],))
             await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+            await db.execute("DELETE FROM interaction_chains")
             return True
+
+    async def commit_chain(
+        self,
+        message: Message,
+        *,
+        lane: str,
+        interaction_id: str,
+        expected_epoch: int,
+        trim_version: int,
+        system_digest: str,
+        covered_seq: int,
+        source_ids: list[str] | None = None,
+        reply_id: str | None = None,
+    ) -> bool:
+        if not interaction_id or not self.s.interaction_store_enabled:
+            return False
+        owned_events = set(source_ids or ())
+        async with self.database(message) as (db, key):
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                if not (await cur.fetchone())[0]:
+                    return False
+            async with db.execute("SELECT epoch,trim_version FROM rolling_state") as cur:
+                epoch, current_trim = await cur.fetchone()
+            if (epoch, current_trim) != (expected_epoch, trim_version):
+                return False
+            final_covered_seq = int(covered_seq)
+            async with db.execute(
+                "SELECT id,payload FROM recent_messages WHERE id>? ORDER BY id",
+                (final_covered_seq,),
+            ) as cur:
+                for row_id, blob in await cur.fetchall():
+                    item = self.vault.open(key, blob)
+                    if (item.get("event_id") and item.get("event_id") in owned_events) or (
+                        reply_id and item.get("reply_id") == reply_id
+                    ):
+                        final_covered_seq = row_id
+                    else:
+                        break
+            ttl = min(self.s.interaction_chain_ttl_seconds, self.s.memory_ttl_seconds)
+            expires = time.time() + ttl
+            await db.execute(
+                "INSERT OR REPLACE INTO interaction_chains(lane,payload,expires) VALUES (?,?,?)",
+                (
+                    lane,
+                    self.vault.seal(
+                        f"{key}:chain:{lane}",
+                        {
+                            "interaction_id": interaction_id,
+                            "epoch": expected_epoch,
+                            "trim_version": trim_version,
+                            "system_digest": system_digest,
+                            "covered_seq": final_covered_seq,
+                        },
+                    ),
+                    expires,
+                ),
+            )
+            return True
+
+    async def invalidate_chains(
+        self, message: Message, *, recalled_event_id: str | None = None
+    ) -> None:
+        if not self.path(message).exists():
+            return
+        async with self.database(message) as (db, key):
+            await db.execute("DELETE FROM interaction_chains")
+            if recalled_event_id:
+                async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id") as cur:
+                    rows = await cur.fetchall()
+                to_delete = []
+                for row_id, blob in rows:
+                    if self.vault.open(key, blob).get("event_id") == recalled_event_id:
+                        to_delete.append(row_id)
+                if to_delete:
+                    placeholders = ",".join("?" for _ in to_delete)
+                    await db.execute(
+                        f"DELETE FROM recent_messages WHERE id IN ({placeholders})",
+                        tuple(to_delete),
+                    )
+                    await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
 
     async def index_existing(self):
         for path in self.root.glob("*/*.sqlite3"):
@@ -788,13 +919,28 @@ class SessionManager:
                         "SELECT name FROM sqlite_master WHERE name='rolling_state'"
                     ) as cur:
                         if await cur.fetchone():
-                            await db.execute(
+                            deleted = await db.execute(
                                 "DELETE FROM recent_messages WHERE expires<=?", (time.time(),)
                             )
+                            if deleted.rowcount:
+                                await db.execute(
+                                    "UPDATE rolling_state SET trim_version=trim_version+1"
+                                )
                             await db.execute(
                                 "UPDATE rolling_state SET "
                                 "summary=NULL,version=version+1 "
                                 "WHERE summary IS NOT NULL AND expires<=?",
                                 (time.time(),),
                             )
+                            async with db.execute(
+                                "SELECT name FROM sqlite_master WHERE name='interaction_chains'"
+                            ) as chain_cur:
+                                if await chain_cur.fetchone():
+                                    if deleted.rowcount:
+                                        await db.execute("DELETE FROM interaction_chains")
+                                    else:
+                                        await db.execute(
+                                            "DELETE FROM interaction_chains WHERE expires<=?",
+                                            (time.time(),),
+                                        )
                     await db.commit()

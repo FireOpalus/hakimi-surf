@@ -239,12 +239,13 @@ def test_forward_first_fifteen_senders_self_anchor_images_and_no_command():
                 {"type": "at", "data": {"qq": "10000"}},
             ],
         }
-        for i in range(22)
+        for i in range(45)
     ]
     rich = parse_forward({"messages": nodes}, "10000", include_authors=True)
     assert "[转发记录 - 我自己(吉米奈喵)]" in rich.text
     assert "作者1(QQ:31001)" in rich.text
-    assert "第14条" in rich.text and "第15条" not in rich.text
+    assert "第39条" in rich.text and "第40条" not in rich.text
+    assert rich.truncated is True
     assert len(rich.images) == 2 and rich.images[0].sender_id == "10000"
     assert not rich.addressed and not rich.mentioned_ids and not rich.command_text
 
@@ -272,6 +273,6 @@ async def test_rpc_cancellation_propagates(settings, message):
 
 async def test_expanded_context_never_exceeds_message_limit(settings, message):
     wire = Wire({"get_msg": Rejected("onebot_rpc_timeout")})
-    incoming = message.model_copy(update={"text": "字" * 7998, "reply_ids": ["12"]})
+    incoming = message.model_copy(update={"text": "字" * 23998, "reply_ids": ["12"]})
     result = await MessageContextResolver(settings, wire).resolve(incoming)
-    assert len(result.text) <= 8000
+    assert len(result.text) <= 24000

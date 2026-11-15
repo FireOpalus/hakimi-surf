@@ -13,6 +13,8 @@ from .security import Rejected, clean_text
 BV = re.compile(r"(?<![A-Za-z0-9])BV[1-9A-HJ-NP-Za-km-z]{10}(?![A-Za-z0-9])")
 URL = re.compile(r"https?://[^\s\"'<>\\，。！？）]+")
 CQ = re.compile(r"\[CQ:([a-z_]+)((?:,[^\]]*)?)\]")
+MAX_FORWARD_NODES = 40
+MAX_FORWARD_CHARS = 20000
 
 
 @dataclass
@@ -61,7 +63,7 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
             if bvid:
                 candidates.append(bvid)
         for bvid in candidates:
-            if bvid not in result.video_ids and len(result.video_ids) < 3:
+            if bvid not in result.video_ids and len(result.video_ids) < 5:
                 result.video_ids.append(bvid)
         for raw in URL.findall(html.unescape(value)):
             parsed = urlsplit(raw.rstrip("。，）)"))
@@ -73,7 +75,7 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
                 and re.fullmatch(r"/[A-Za-z0-9]{1,32}", parsed.path)
             ):
                 url = "https://b23.tv" + parsed.path
-                if url not in result.short_urls and len(result.short_urls) < 3:
+                if url not in result.short_urls and len(result.short_urls) < 5:
                     result.short_urls.append(url)
 
     def add(value: str):
@@ -201,7 +203,7 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
                 card(content)
             elif kind == "forward":
                 ref = str(data.get("id", ""))
-                if re.fullmatch(r"[A-Za-z0-9_.=+\-]{1,256}", ref) and len(result.forward_ids) < 2:
+                if re.fullmatch(r"[A-Za-z0-9_.=+\-]{1,256}", ref) and len(result.forward_ids) < 4:
                     result.forward_ids.append(ref)
                 add("[合并转发]")
             elif kind == "node":
@@ -230,7 +232,7 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
     if include_authors:
         result = RichMessage()
         lines = []
-        for node in nodes[:15]:
+        for node in nodes[:MAX_FORWARD_NODES]:
             if not isinstance(node, dict):
                 raise Rejected("invalid_forward")
             sender = node.get("sender") or {}
@@ -263,15 +265,15 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
                 (result.short_urls, rich.short_urls),
             ):
                 for value in values:
-                    if len(dest) < 3 and value not in dest:
+                    if len(dest) < 5 and value not in dest:
                         dest.append(value)
-            if sum(map(len, lines)) > 7500:
+            if sum(map(len, lines)) > MAX_FORWARD_CHARS - 500:
                 result.truncated = True
                 break
         body = "\n".join(lines)
-        if len(nodes) > 15 or len(body) > 7900:
+        if len(nodes) > MAX_FORWARD_NODES or len(body) > MAX_FORWARD_CHARS:
             result.truncated = True
-        result.text = body[:7900]
+        result.text = body[:MAX_FORWARD_CHARS]
         return result
     segments = []
     for node in nodes[:15]:
@@ -281,4 +283,4 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
             {"type": "node", "data": {"content": node.get("content", node.get("message", []))}}
         )
     # All content remains nested: no quoted @ or slash command becomes an instruction.
-    return parse_message(segments, bot_id)
+    return parse_message(segments, bot_id, max_chars=24000)

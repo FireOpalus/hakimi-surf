@@ -253,7 +253,7 @@ class Sender:
     async def send_folded(self, message, text, *, before_send):
         if message.platform != "onebot" or message.kind != "group":
             raise Rejected("forward_group_only")
-        text = safe_output(text, configured_secrets(self.s), limit=6000)
+        text = safe_output(text, configured_secrets(self.s), limit=8000)
         async with self.send_lock:
             if not await before_send() or not authorize(message, self.s):
                 raise Rejected("reply_invalidated")

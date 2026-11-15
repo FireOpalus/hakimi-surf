@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS group_recent_messages (
 );
 CREATE INDEX IF NOT EXISTS group_recent_scope ON group_recent_messages(scope,at);
 """
-MAX_BATCH_MESSAGES = 6
-MAX_BATCH_CHARS = 8000
+MAX_BATCH_MESSAGES = 16
+MAX_BATCH_CHARS = 24000
 CONTEXT_TTL = 300
 
 
@@ -59,6 +59,7 @@ def record_line(message):
     # Both nickname and text remain JSON data; only actual protocol ids establish authorship.
     return json.dumps(
         {
+            "event_id": message.event_id,
             "sender_id": message.user_id,
             "sender_nickname": message.sender_nickname,
             "text": message.text,
@@ -392,10 +393,10 @@ class GroupPipeline:
                     "addressed": bool(addressed),
                     "attention_reason": addressed.attention_reason if addressed else "",
                     "images": unique("images", 2),
-                    "forward_ids": unique("forward_ids", 2),
-                    "video_ids": unique("video_ids", 3),
-                    "short_urls": unique("short_urls", 3),
-                    "context_status": unique("context_status", 3),
+                    "forward_ids": unique("forward_ids", 4),
+                    "video_ids": unique("video_ids", 5),
+                    "short_urls": unique("short_urls", 5),
+                    "context_status": unique("context_status", 5),
                 }
             )
             job["payload"] = merged.model_dump()
@@ -436,7 +437,7 @@ class GroupPipeline:
             await self.store.db.execute(
                 "DELETE FROM group_recent_messages WHERE scope=? AND event NOT IN "
                 "(SELECT event FROM group_recent_messages WHERE scope=? "
-                "ORDER BY at DESC,rowid DESC LIMIT 30)",
+                "ORDER BY at DESC,rowid DESC LIMIT 50)",
                 (scope, scope),
             )
             await self.store.db.execute(
@@ -444,7 +445,7 @@ class GroupPipeline:
                 "(SELECT rowid FROM group_recent_messages ORDER BY at DESC,rowid DESC LIMIT 1000)"
             )
 
-    async def previous_messages(self, message, batch_messages=None, *, limit=3):
+    async def previous_messages(self, message, batch_messages=None, *, limit=6):
         if message.kind != "group":
             return []
         originals = (
@@ -471,7 +472,7 @@ class GroupPipeline:
                     at,
                     at,
                     rowid,
-                    max(0, min(3, limit)),
+                    max(0, min(8, limit)),
                 ),
             )
         return [

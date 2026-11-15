@@ -10,6 +10,7 @@ from .rich_message_parser import RichMessage, parse_forward, parse_message
 from .security import Rejected, clean_text
 
 Lookup = Callable[[Message, str], Awaitable[Message | dict | None]]
+MAX_EXPANDED_CHARS = 24000
 log = logging.getLogger("hakimi")
 
 
@@ -102,7 +103,7 @@ class MessageContextResolver:
 
         def append_text(block):
             nonlocal text
-            available = 8000 - len(text) - 1
+            available = MAX_EXPANDED_CHARS - len(text) - 1
             if len(block) > max(0, available):
                 statuses.add("truncated")
             if available > 0:
@@ -111,8 +112,8 @@ class MessageContextResolver:
         def merge(rich):
             for target, values, cap, key in (
                 (images, rich.images, 2, lambda x: x.identity),
-                (videos, rich.video_ids, 3, lambda x: x),
-                (shorts, rich.short_urls, 3, lambda x: x),
+                (videos, rich.video_ids, 5, lambda x: x),
+                (shorts, rich.short_urls, 5, lambda x: x),
             ):
                 for value in values:
                     if len(target) < cap and key(value) not in [key(old) for old in target]:
@@ -121,12 +122,12 @@ class MessageContextResolver:
         pending = [(ref, 0) for ref in message.reply_ids[:2]]
         seen = set()
         for ref, depth in pending:
-            if ref in seen or len(seen) >= 4:
+            if ref in seen or len(seen) >= 6:
                 continue
             seen.add(ref)
             try:
                 original = await self._reply(message, ref)
-                if depth < 1:
+                if depth < 5:
                     pending.extend((nested, depth + 1) for nested in original.reply_ids[:2])
                 name = nickname(original.sender_nickname)
                 author = (
@@ -146,7 +147,7 @@ class MessageContextResolver:
             except (Rejected, TimeoutError, OSError, ValueError, TypeError):
                 log.warning("event=message_context_unavailable kind=reply")
                 statuses.add("reply_unavailable")
-        forwards = list(dict.fromkeys([*message.forward_ids, *forwards]))[:2]
+        forwards = list(dict.fromkeys([*message.forward_ids, *forwards]))[:4]
         for ref in forwards:
             try:
                 value = await self._rpc("get_forward_msg", {"id": ref})
@@ -162,8 +163,8 @@ class MessageContextResolver:
             update={
                 "text": text,
                 "images": images[:2],
-                "video_ids": videos[:3],
-                "short_urls": shorts[:3],
+                "video_ids": videos[:5],
+                "short_urls": shorts[:5],
                 "forward_ids": [],
                 "context_expanded": True,
                 "context_status": sorted(statuses),

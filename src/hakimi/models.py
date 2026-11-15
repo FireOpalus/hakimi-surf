@@ -26,7 +26,7 @@ class Message(BaseModel):
     user_id: str = Field(min_length=1, max_length=128)
     kind: Literal["private", "group"]
     conversation_id: str = Field(min_length=1, max_length=128)
-    text: str = Field(max_length=8000)
+    text: str = Field(max_length=24000)
     addressed: bool
     created_at: float
     sender_nickname: str = Field(default="", max_length=80)
@@ -37,16 +37,16 @@ class Message(BaseModel):
         default_factory=list, max_length=3
     )
     # Only direct text may invoke commands; quoted/card/forward text never can.
-    command_text: str | None = Field(default=None, max_length=8000)
+    command_text: str | None = Field(default=None, max_length=24000)
     # Only genuine top-level OneBot at segments; never inferred from text or forwards.
     mentioned_ids: list[str] = Field(default_factory=list, max_length=32)
     # Reply ids come only from top-level protocol segments; authors are verified locally.
     reply_ids: list[str] = Field(default_factory=list, max_length=2)
     attention_reason: Literal["", "private", "mention", "alias", "bilibili", "reply"] = ""
     images: list[ImageRef] = Field(default_factory=list, max_length=2)
-    forward_ids: list[str] = Field(default_factory=list, max_length=2)
-    video_ids: list[str] = Field(default_factory=list, max_length=3)
-    short_urls: list[str] = Field(default_factory=list, max_length=3)
+    forward_ids: list[str] = Field(default_factory=list, max_length=4)
+    video_ids: list[str] = Field(default_factory=list, max_length=5)
+    short_urls: list[str] = Field(default_factory=list, max_length=5)
 
     def session_parts(self, namespace: str) -> list[str]:
         return [namespace, self.platform, self.bot_id, self.kind, self.conversation_id]

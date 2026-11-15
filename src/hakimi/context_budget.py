@@ -9,10 +9,12 @@ import re
 
 
 def estimate_tokens(text: str) -> int:
-    # CJK/punctuation are usually individual tokens; Latin runs average ~4 bytes.
+    # Wide/CJK chars average ~0.68 tokens on Gemini tokenizers; Latin runs average ~4 bytes.
     wide = sum(ord(c) > 127 for c in text)
     ascii_text = "".join(c if ord(c) < 128 else " " for c in text)
-    return wide + sum(max(1, math.ceil(len(t) / 4)) for t in re.findall(r"\w+|[^\w\s]", ascii_text))
+    return math.ceil(wide * 0.68) + sum(
+        max(1, math.ceil(len(t) / 4)) for t in re.findall(r"\w+|[^\w\s]", ascii_text)
+    )
 
 
 def truncate_tokens(text: str, limit: int) -> str:

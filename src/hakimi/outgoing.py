@@ -216,9 +216,28 @@ async def deliver_actions(service, reply):
         service.record("delivery_uncertain")
     finally:
         applied = await asyncio.shield(apply_receipts(service, reply["id"]))
+        commit = actions.get("chain_commit")
         if applied:
             service.store.runtime.filters.spoke(message)
             service.compressor.schedule(message)
             await service.bot_guard.extend_cooldown(message, reply["id"])
+            if commit and status == "sent":
+                await asyncio.shield(
+                    service.sessions.commit_chain(
+                        message,
+                        lane=commit["lane"],
+                        interaction_id=commit["interaction_id"],
+                        expected_epoch=commit["epoch"],
+                        trim_version=commit["trim_version"],
+                        system_digest=commit["system_digest"],
+                        covered_seq=commit["covered_seq"],
+                        source_ids=commit.get("source_ids"),
+                        reply_id=reply["id"],
+                    )
+                )
+            elif commit:
+                await asyncio.shield(service.sessions.invalidate_chains(message))
+        elif commit:
+            await asyncio.shield(service.sessions.invalidate_chains(message))
     await store.finish_reply(reply["id"], status)
     return True

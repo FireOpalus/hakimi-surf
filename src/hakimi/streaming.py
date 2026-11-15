@@ -46,6 +46,7 @@ async def consume_stream(stream):
                 interaction = event.interaction
                 # Lifecycle events omit steps; assemble only final-text deltas locally.
                 return SimpleNamespace(
+                    id=getattr(interaction, "id", None),
                     status=interaction.status,
                     usage=interaction.usage,
                     steps=[

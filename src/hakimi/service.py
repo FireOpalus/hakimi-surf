@@ -183,6 +183,14 @@ class Service:
                 ref = identifier(payload.get("message_id"))
                 self.hot.recall(message, ref)
                 self.store.groups.recall(message, ref)
+                await self.sessions.invalidate_chains(message, recalled_event_id=ref)
+                prefix_runtime = getattr(self.ai, "prefix_runtime", None)
+                if prefix_runtime is not None:
+                    prefix_runtime.invalidate_chain(
+                        self.store.vault.digest(
+                            "generation-cache", "production", self.store.session_scope(message)
+                        )
+                    )
                 async with self.store.transaction():
                     event = self.store.event_key(message.model_copy(update={"event_id": ref}))
                     await self.store.db.execute(
@@ -469,7 +477,7 @@ class Service:
             shorts.extend(u for u in rich.short_urls if u not in shorts)
             # No recursive get_forward_msg calls: a quoted reference cannot fan out requests.
         text = "\n".join(texts)
-        if len(text) > 8000 or len(images) > 2:
+        if len(text) > 24000 or len(images) > 2:
             raise Rejected("forward_too_large")
         if any(secret and len(secret) >= 8 and secret in text for secret in self.secrets):
             raise Rejected("credential_in_input")
@@ -477,8 +485,8 @@ class Service:
             update={
                 "text": text,
                 "images": images,
-                "video_ids": videos[:3],
-                "short_urls": shorts[:3],
+                "video_ids": videos[:5],
+                "short_urls": shorts[:5],
                 "forward_ids": [],
             }
         )
@@ -567,7 +575,7 @@ class Service:
             message = await self.expand_forwards(message)
         frozen_relevance = (
             (await self.store.runtime.filters.group_context(message))
-            if message.kind == "group" and not message.addressed
+            if message.kind == "group"
             else []
         )
         images, image_sources = [], []
@@ -577,6 +585,15 @@ class Service:
         history = session["recent_messages"]
         payload = {
             "current_message": message.text,
+            "current_batch_items": [
+                {
+                    "event_id": m.event_id,
+                    "sender_id": m.user_id,
+                    "sender_nickname": m.sender_nickname or "群友",
+                    "text": message.text if len(members) == 1 else m.text,
+                }
+                for m in members
+            ],
             "current_sender": {
                 "nickname": message.sender_nickname or "群友",
                 "qq": message.user_id,
@@ -586,6 +603,8 @@ class Service:
             "recent_messages": history,
             "rolling_summary": session["rolling_summary"],
             "session_epoch": session["epoch"],
+            "session_enabled": session.get("enabled", False),
+            "interaction_chains": session.get("interaction_chains", {}),
             "allowed_reply_ids": [
                 m.event_id for m in members if re.fullmatch(r"-?[0-9]{1,30}", m.event_id)
             ],
@@ -697,17 +716,20 @@ class Service:
                 recent_messages=history,
                 rolling_summary=fresh["rolling_summary"],
                 history_revision=fresh.get("history_revision", 0),
+                session_enabled=fresh.get("enabled", False),
+                interaction_chains=fresh.get("interaction_chains", {}),
             )
         else:
-            payload.update(recent_messages=[], rolling_summary="")
+            payload.update(
+                recent_messages=[],
+                rolling_summary="",
+                session_enabled=False,
+                interaction_chains={},
+            )
             payload.pop("owner_notebook_snapshot", None)
             payload.pop("近期群聊巡逻记忆（只读背景）", None)
         if intent == "ignore":
             return
-        if not sandbox:
-            payload["dual_memory_data"] = await self.sessions.dual.prefetch(
-                message, message.text, recall=getattr(intent, "need_memory_recall", False)
-            )
         invited_bots = set()
         if not sandbox and len(members) == 1 and owner(message, self.s):
             invited_bots = await self.bot_guard.invite(message)
@@ -715,14 +737,27 @@ class Service:
             message, message.user_id
         ):
             invited_bots.add(message.user_id)
-        if message.kind == "group" and not sandbox and len(images) < 2:
-            nearby = await self.store.groups.previous_messages(message, members, limit=3)
+        filtered_nearby = []
+        if message.kind == "group" and not sandbox:
+            nearby = await self.store.groups.previous_messages(message, members, limit=6)
             neighbour_members[:] = nearby
-            neighbour_images, neighbour_sources = await self.message_images(
-                message, [], nearby, limit=2 - len(images), include_current=False
-            )
-            nearby_context = [{"sender": self.image_sender(m), "text": m.text[:80]} for m in nearby]
-            payload["nearby_group_context"] = nearby_context
+            history_events = {item.get("event_id") for item in history if item.get("event_id")}
+            current_events = {m.event_id for m in members}
+            filtered_nearby = [
+                m
+                for m in nearby
+                if m.event_id not in history_events and m.event_id not in current_events
+            ]
+            nearby_context = [
+                {"sender": self.image_sender(m), "text": m.text[:160]} for m in filtered_nearby
+            ]
+            if nearby_context:
+                payload["nearby_group_context"] = nearby_context
+            neighbour_images, neighbour_sources = [], []
+            if len(images) < 2 and nearby:
+                neighbour_images, neighbour_sources = await self.message_images(
+                    message, [], nearby, limit=2 - len(images), include_current=False
+                )
             await message_guard()
             if neighbour_images:
                 # Adjacent users' images remain an independent strict SOURCE gate.
@@ -733,17 +768,30 @@ class Service:
                     images=[i.gate() for i in neighbour_images],
                     before_call=message_guard,
                 )
-            for source in neighbour_sources:
-                if "image_number" in source:
-                    source = {**source, "image_number": source["image_number"] + len(images)}
-                image_sources.append(source)
-            images.extend(neighbour_images)
-            if neighbour_sources:
-                payload["image_sources"] = image_sources
+                for source in neighbour_sources:
+                    if "image_number" in source:
+                        source = {**source, "image_number": source["image_number"] + len(images)}
+                    image_sources.append(source)
+                images.extend(neighbour_images)
+                if neighbour_sources:
+                    payload["image_sources"] = image_sources
             payload["context_status"].extend(
                 {"event_id": m.event_id, "states": m.context_status}
-                for m in nearby
+                for m in filtered_nearby
                 if m.context_status
+            )
+        if not sandbox:
+            related_user_ids = [
+                *(m.user_id for m in members),
+                *(uid for m in members for uid in m.mentioned_ids if uid != self.s.onebot_self_id),
+                *(m.user_id for m in filtered_nearby),
+                *(str(item.get("user_id", "")) for item in history[-8:]),
+            ]
+            payload["dual_memory_data"] = await self.sessions.dual.prefetch(
+                message,
+                message.text,
+                recall=getattr(intent, "need_memory_recall", False),
+                related_user_ids=related_user_ids,
             )
         context_members = list(members)
         if message.kind == "group":
@@ -880,19 +928,26 @@ class Service:
                     )
             if tier >= 3 and hasattr(self.sender, "quick_ack"):
                 self.background(self.quick_ack(job, message, message_guard))
-            generated = await self.ai.generate(
-                payload,
-                job["subject"],
-                scenario=Scenario.OWNER_PRIVATE
-                if message.kind == "private" and is_persona_owner(message, self.s)
-                else Scenario.FAST_CHAT,
-                deep=deep,
-                route=chat_route,
-                message=message,
-                before_call=message_guard,
-                cancel_event=batch.cancel if batch else None,
-                **({"images": images} if images else {}),
-            )
+            gen_trace = {}
+            try:
+                generated = await self.ai.generate(
+                    payload,
+                    job["subject"],
+                    scenario=Scenario.OWNER_PRIVATE
+                    if message.kind == "private" and is_persona_owner(message, self.s)
+                    else Scenario.FAST_CHAT,
+                    deep=deep,
+                    route=chat_route,
+                    message=message,
+                    before_call=message_guard,
+                    cancel_event=batch.cancel if batch else None,
+                    generation_trace=gen_trace,
+                    **({"images": images} if images else {}),
+                )
+            except BaseException:
+                if gen_trace.get("chain_invalidate"):
+                    await self.sessions.invalidate_chains(message)
+                raise
             await message_guard()
             allowed_reply = payload["allowed_reply_ids"]
             payload.clear()
@@ -908,6 +963,8 @@ class Service:
                     tier=tier,
                 )
                 if actions.abstain:
+                    if gen_trace.get("chain_invalidate"):
+                        await self.sessions.invalidate_chains(message)
                     return
                 if not actions.image_digest:
                     actions.image_digest = next(
@@ -920,6 +977,7 @@ class Service:
                     )
                 if actions.image_digest:
                     check_memory_text(actions.image_digest, self.s)
+                chain_commit = gen_trace.get("chain_commit")
                 await self.store.enqueue_reply(
                     job["id"],
                     message,
@@ -933,6 +991,16 @@ class Service:
                         "watermark": watermark,
                         "source_ids": [m.event_id for m in members],
                         "public": public,
+                        **(
+                            {
+                                "chain_commit": {
+                                    **chain_commit,
+                                    "source_ids": [m.event_id for m in members],
+                                }
+                            }
+                            if chain_commit
+                            else {}
+                        ),
                     },
                 )
                 return

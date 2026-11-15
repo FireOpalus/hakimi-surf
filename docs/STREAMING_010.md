@@ -1,6 +1,6 @@
 # v0.10.0：流式防抖与五维出站
 
-本次基于 v0.9.0 增量升级。原三段人设正文、A/B/C 顺序、SQLite 账本、公私聊隔离、上海 NapCat 与首尔反向 WSS 拓扑继续保留。SDK 为 `google-genai >= 3.2.0`；Decisions 使用 v1beta，聊天 Interactions 使用 v1、`store=False`。v0.9 的 L4 Carbon 与后台思考配置不变。
+本次基于 v0.9.0 增量升级。原三段人设正文、A/B/C 顺序、SQLite 账本、公私聊隔离、上海 NapCat 与首尔反向 WSS 拓扑继续保留。SDK 为 `google-genai >= 3.2.0`；Decisions 使用 v1beta，聊天 Interactions 使用 v1（v1.1.4 起对非沙箱且启用记忆的主对话开启 `store=True` 与 `previous_interaction_id` 差量续链，其余任务与沙盒保持 `store=False`）。v0.9 的 L4 Carbon 与后台思考配置不变。
 
 ## 入站与四态机
 

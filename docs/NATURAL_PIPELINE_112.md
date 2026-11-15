@@ -1,6 +1,6 @@
 # v1.1.2 / v1.1.3：自然回复与主对话管道修复
 
-从 v1.1.1 增量升级至 v1.1.2 并在 **v1.1.3** 完成 18 项细节对齐，无新依赖、配置项或 SQL 迁移。原有 ADMIN_TOKEN、准入名单、Owner 身份校验、SSRF 防护、Fernet 加密和 SQLite 预算预留／结算继续生效。三个基础人设字符串逐字不变，新增完整 SHA256 回归测试；静态前缀保持 4,200–5,200 估算 Token。
+从 v1.1.1 增量升级至 v1.1.2 并在 **v1.1.3** 完成 18 项细节对齐；**v1.1.4** 进一步清理群聊历史重复前缀、增加 30 分钟时间断点、解耦多图时的邻近群聊上下文并扩容批处理与转发容量，同时对非沙箱且启用记忆的主对话开启 `store=True` + `previous_interaction_id` 差量续链（详见 [上下文路由](CONTEXT_ROUTING_09.md) 与 [流式出站说明](STREAMING_010.md)）。原有 ADMIN_TOKEN、准入名单、Owner 身份校验、SSRF 防护、Fernet 加密和 SQLite 预算预留／结算继续生效。三个基础人设字符串逐字不变，新增完整 SHA256 回归测试；静态前缀保持 4,200–5,200 估算 Token。
 
 ## 逐项实现
 
@@ -33,13 +33,13 @@
 
 ## 本地验证与部署
 
-本次全量测试 **1314 项通过**，Ruff 检查、前端 JavaScript 语法检查、依赖锁检查与容器断网冒烟均通过。测试全部使用 mock，禁止真实外部连接，不花费 Gemini 额度：
+v1.1.3 发布时全量测试 **1314 项通过**；v1.1.4 的新增改动与验证见 [升级说明](GROUP_CONTEXT_114.md)。发布检查包含 Ruff、前端 JavaScript 语法、依赖锁与容器断网冒烟。测试全部使用 mock，禁止真实外部连接，不花费 Gemini 额度：
 
 ```bash
 .venv/bin/ruff check src tests
 .venv/bin/pytest -q
 uv lock --check --offline
-docker build -t hakimi-surf:1.1.3 .
+docker build -t hakimi-surf:1.1.4 .
 ```
 
 部署前备份主 SQLite、各会话 SQLite 和 `.env`，保留旧镜像以便回滚。沿用现有 Compose 覆盖文件，尤其 Google Drive OAuth 凭证挂载；只重建后端，不重启上海 NapCat。原 `/admin`、0–30 秒防抖、联网开关和预算配置继续使用 SQLite 中的值。

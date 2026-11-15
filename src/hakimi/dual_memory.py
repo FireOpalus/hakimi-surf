@@ -566,24 +566,55 @@ class DualMemory:
         self.index.discard(key)
         return {"status": "saved", "version": version + 1}
 
-    async def prefetch(self, message, query, *, recall=False):
+    async def prefetch(self, message, query, *, recall=False, related_user_ids=()):
         # Caller has already checked admission, source gate and sandbox. Never accepts a
         # scope parameter.
+        peers = []
+        for uid in related_user_ids or ():
+            candidate = str(uid)
+            if (
+                candidate not in {message.user_id, message.bot_id}
+                and re.fullmatch(r"[1-9][0-9]{0,19}", candidate)
+                and candidate not in peers
+            ):
+                peers.append(candidate)
+            if len(peers) >= 24:
+                break
+        mentioned_profiles = {}
         async with self.sessions.database(message, preserve_history=True) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 if not (await cur.fetchone())[0]:
                     return {}
             async with db.execute("SELECT version FROM rolling_state") as cur:
                 version = (await cur.fetchone())[0]
+            now = time.time()
             async with db.execute(
                 "SELECT slot,payload FROM member_profiles WHERE member_id=? AND deleted=0 "
                 "AND (expires=0 OR expires>?)",
-                (message.user_id, time.time()),
+                (message.user_id, now),
             ) as cur:
                 profile = {
                     slot: self.vault.open(key + f":p:{message.user_id}:{slot}", blob)["text"]
                     for slot, blob in await cur.fetchall()
                 }
+            if peers:
+                placeholders = ",".join("?" for _ in peers)
+                raw_peers = {}
+                async with db.execute(
+                    f"SELECT member_id,slot,payload FROM member_profiles "
+                    f"WHERE member_id IN ({placeholders}) "
+                    "AND slot IN ('alias','preferences') "
+                    "AND deleted=0 AND (expires=0 OR expires>?)",
+                    (*peers, now),
+                ) as cur:
+                    for member_id, slot, blob in await cur.fetchall():
+                        text = self.vault.open(key + f":p:{member_id}:{slot}", blob)["text"]
+                        raw_peers.setdefault(member_id, {})[slot] = text
+                for uid in peers:
+                    if uid in raw_peers:
+                        mentioned_profiles[uid] = raw_peers[uid]
+                        if len(mentioned_profiles) >= 3:
+                            break
             cards = []
             if recall:
                 cards = self.index.get(key, version)
@@ -629,4 +660,7 @@ class DualMemory:
                 for c in selected
                 if words & terms(c[1] + " " + c[2]) or similarity(query_vector, c[3]) > 0.35
             ][:3]
-        return {"speaker_profile": profile, "chronicle_recall": found}
+        result = {"speaker_profile": profile, "chronicle_recall": found}
+        if mentioned_profiles:
+            result["mentioned_profiles"] = mentioned_profiles
+        return result

@@ -37,10 +37,10 @@ class ChatActions(BaseModel):
 CHAT_RESPONSE_FORMAT = ChatActions.model_json_schema()
 ACTION_INSTRUCTION = """\n【固定五维回复协议，优先于旧文本标签示例】
 始终输出符合 response_format 的 JSON，且只包含 abstain、bubbles、anchor、sticker、image_digest。
-abstain=true 表示读图后无需插话；bubbles 为一至三条口语气泡，
-公开闲聊简短自然，问答保留完整意思，不为凑字数截断句子。
-公开回复合计超过一百八十字会折叠，别切成刷屏短句；语气符号适量使用。
-anchor.reply_id 只能选本轮 allowed_reply_ids；
+abstain=true 表示读图或读上下文后无需插话；bubbles 为一至三条口语气泡，
+日常闲聊与接梗简短自然；遇到技术排错、代码细节或明确追问时给完整准确的步骤、条件与代码，不为凑短句截断有效信息。
+公开回复合计超过一百八十字会自动合并转发折叠，长技术解答请整理在单条清晰气泡里，别切成刷屏短句；语气符号适量使用。
+anchor.reply_id 只能选本轮 allowed_reply_ids（优先对应 current_batch 中被回应那条消息的 event_id）；
 mentions 只选 allowed_at_qqs，通常为空，默认最多一人，绝不上全体。
 sticker.label 仅选已加载本地白名单情绪，不要输出图片地址；
 timing 为 before_text 或 after_text，约四次回复一次即可。
@@ -57,7 +57,7 @@ def parse_actions(
         actions = ChatActions.model_validate(value)
     except (ValueError, TypeError, ValidationError):
         raise Rejected("invalid_action_output") from None
-    if sum(len(t) for t in actions.bubbles) > 6000:
+    if sum(len(t) for t in actions.bubbles) > 8000:
         raise Rejected("invalid_output")
     allowed = set(allowed_at)
     if settings:

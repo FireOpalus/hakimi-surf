@@ -97,23 +97,23 @@ async def test_duplicate_does_not_extend_window_or_rate_count(settings, store, m
 
 async def test_concurrent_admission_caps_batch_at_six(settings, store, message, clock):
     debounce(settings)
-    results = await asyncio.gather(*(store.admit(group(message, f"event-{n}")) for n in range(9)))
-    assert results == ["accepted"] * 9
+    results = await asyncio.gather(*(store.admit(group(message, f"event-{n}")) for n in range(20)))
+    assert results == ["accepted"] * 20
     # Hitting the cap releases the first batch, retaining all originals in the next batch.
     job = await store.claim()
-    assert len(job["batch_messages"]) == 6
+    assert len(job["batch_messages"]) == 16
     await store.finish(job["id"])
     assert await store.claim() is None
     clock[0] += 1.8
     remaining = await store.claim()
-    assert len(remaining["batch_messages"]) == 3
+    assert len(remaining["batch_messages"]) == 4
 
 
 async def test_utf8_bound_starts_new_batch_without_truncating_user_text(
     settings, store, message, clock
 ):
     debounce(settings)
-    text = "界" * 1800
+    text = "界" * 4500
     await store.admit(group(message, "large-1", text=text))
     await store.admit(group(message, "large-2", text=text))
     first = await store.claim()
@@ -176,7 +176,7 @@ async def test_followup_rejects_expired_full_and_nonaddressed_batches(
     )
     await store.groups.clear_recent(group(message, "reset"))
     await store.admit(group(message, "addressed"))
-    for n in range(5):
+    for n in range(15):
         assert (
             await store.admit(
                 group(message, f"follow-{n}", addressed=False), continuation_only=True
@@ -193,7 +193,7 @@ async def test_followup_rejects_expired_full_and_nonaddressed_batches(
         == "ignored"
     )
     job = await store.claim()
-    assert len(job["batch_messages"]) == 6
+    assert len(job["batch_messages"]) == 16
 
 
 async def test_followup_cannot_bypass_blacklists_scope_commands_or_byte_cap(
@@ -210,7 +210,7 @@ async def test_followup_cannot_bypass_blacklists_scope_commands_or_byte_cap(
         {"user_id": settings.onebot_self_id},
         {"conversation_id": "50000"},
         {"text": "/new-session", "command_text": "/new-session"},
-        {"text": "界" * 4000, "command_text": "界" * 4000},
+        {"text": "界" * 9000, "command_text": "界" * 9000},
         {"mentioned_ids": ["80000"]},
         {"kind": "private", "conversation_id": base.user_id},
     ]:
@@ -353,7 +353,7 @@ async def test_nearby_three_keeps_image_author_and_excludes_private_group_future
 ):
     store.groups.clock = lambda: clock[0]
     before = []
-    for n in range(4):
+    for n in range(8):
         clock[0] += 1
         item = group(message, f"past-{n}", text=f"群背景{n}").model_copy(
             update={
@@ -375,7 +375,7 @@ async def test_nearby_three_keeps_image_author_and_excludes_private_group_future
     nearby = await store.groups.previous_messages(
         current, [current.model_dump(), continuation.model_dump()]
     )
-    assert [m.event_id for m in nearby] == [m.event_id for m in before[-3:]]
+    assert [m.event_id for m in nearby] == [m.event_id for m in before[-6:]]
     assert all(m.user_id == "30000" and m.sender_nickname == "群友A" and m.images for m in nearby)
     encrypted = await store.all("SELECT payload FROM group_recent_messages")
     assert all(

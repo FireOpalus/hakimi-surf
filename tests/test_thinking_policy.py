@@ -192,9 +192,10 @@ async def test_real_sdk_transmits_default_medium_and_hot_xhigh_without_reserve_i
         )
     interactions = [request for request in requests if request.url.path == "/v1/interactions"]
     assert len(interactions) == 2
+    expected_store = scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}
     for request, level in zip(interactions, ("medium", "xhigh"), strict=True):
         data = json.loads(request.content)
-        assert data["model"] == "gemini-4-hydrogen" and data["store"] is False
+        assert data["model"] == "gemini-4-hydrogen" and data["store"] is expected_store
         assert data["generation_config"]["thinking_level"] == level
         assert (
             data["generation_config"]["max_output_tokens"]

@@ -49,4 +49,6 @@ CREATE TABLE IF NOT EXISTS roaming_summaries (
 0.3.0 曾新增压缩 low 场景与独立 memory／admin 预算；0.8.1 压缩默认已改为 medium，仍包含在原全局预算内。管理台与快照详见 [对应说明](ADMIN_AND_MEMORY.md)。
 
 
-v1.1 联网补充：普通对话仍不传工具。后台显式开启的独立公开检索请求使用 GA v1 Hydrogen、store=False、medium 和唯一 google_search 工具；原消息及搜索来源均经过 Decisions，不传任何历史／私密快照。见 [联网与预算边界](CONTROLS_SEARCH_110.md)。
+v1.1 联网补充：普通对话仍不传工具。后台显式开启的独立公开检索请求使用 GA v1 Hydrogen、`store=False`、medium 和唯一 `google_search` 工具；原消息及搜索来源均经过 Decisions，不传任何历史／私密快照。见 [联网与预算边界](CONTROLS_SEARCH_110.md)。
+
+v1.1.4 续链补充：仅非沙箱、启用记忆的 `fast_chat` / `owner_private` 会话开启 `store=True` 与经本地加密 `interaction_chains` 托管的 `previous_interaction_id`（发生撤回、清空、折叠、过期或送达失败立即失效重链）；非聊天后台任务、记忆压缩、日记、巡逻与沙盒仍严格保持 `store=False`。

@@ -29,7 +29,7 @@ Owner 身份来自已通过 HMAC／WS Token、机器人 Self-ID 与事件格式�
 
 旧 `HAKIMI_ONEBOT_OWNER_IDS`／`HAKIMI_QQ_OWNER_IDS` 为配置兼容保留，不授予聊天管理权限、`/deep` 或 Owner 身份。官方 QQ OpenID 不能证明数字 QQ 身份；普通好友私聊须列入 `HAKIMI_QQ_ALLOWED_USERS`。`OWNER_QQ_ID` 为空时不授予 Owner 权限。管理后台独立验证 `ADMIN_TOKEN`。
 
-来自消息、历史、网页及卡片的 JSON 仍放入 `<untrusted_user_input>`；尖括号与 `&` 转义，正文里的字面 `[role=...]` 改写成不可信角色声明。所有人设选择、会话访问和管理权限均由 Python 决定，模型不能切换身份。Interactions 每轮重传 `system_instruction`，使用 `tools=[]`、`store=False`，不通过服务器端 interaction ID 串联历史。
+来自消息、历史、网页及卡片的 JSON 仍放入 `<untrusted_user_input>`；尖括号与 `&` 转义（保留普通引号），正文里的字面 `[role=...]` 改写成不可信角色声明。所有人设选择、会话访问和管理权限均由 Python 决定，模型不能切换身份。Interactions 每轮重传 `system_instruction` 并使用 `tools=[]`；仅非沙箱且启用本地记忆的主对话按会话 `epoch`/`trim_version` 维护加密 `interaction_chains` 以使用 `store=True` + `previous_interaction_id`（沙盒、未开启记忆与后台任务始终保持 `store=False` 且不串联远端 ID）。
 
 ## 群成员与私聊准入
 

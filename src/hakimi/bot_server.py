@@ -8,7 +8,9 @@ import html
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Settings
 from .models import Message
@@ -80,10 +82,28 @@ def untrusted_input(payload: dict) -> str:
 
 
 def escape_data(value) -> str:
-    return html.escape(re.sub(r"\[role=", "[untrusted_role=", str(value), flags=re.I), quote=True)
+    return html.escape(re.sub(r"\[role=", "[untrusted_role=", str(value), flags=re.I), quote=False)
 
 
-def history_lines(messages: list[dict], self_id: str = "") -> str:
+def _format_gap(seconds: float) -> str:
+    minutes = max(1, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    if minutes < 1440:
+        hours, rem = divmod(minutes, 60)
+        return f"{hours} 小时" if rem == 0 else f"{hours} 小时 {rem} 分钟"
+    days, rem_m = divmod(minutes, 1440)
+    hours = rem_m // 60
+    return f"{days} 天" if hours == 0 else f"{days} 天 {hours} 小时"
+
+
+def history_lines(
+    messages: list[dict],
+    self_id: str = "",
+    timezone_name: str = "Asia/Shanghai",
+    *,
+    prev_created_at: float | None = None,
+) -> str:
     """Stable sequence numbers come from SQLite, not the position in a moving window."""
 
     def line_data(value):
@@ -91,7 +111,19 @@ def history_lines(messages: list[dict], self_id: str = "") -> str:
             escape_data(value).replace("\r", "&#13;").replace("\n", "&#10;").replace("|", "&#124;")
         )
 
+    try:
+        tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("UTC")
+
     lines = []
+    prev_ts = (
+        float(prev_created_at)
+        if isinstance(prev_created_at, (int, float))
+        and not isinstance(prev_created_at, bool)
+        and prev_created_at > 0
+        else None
+    )
     for position, item in enumerate(messages, 1):
         seq = item.get("seq", position)
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
@@ -99,33 +131,77 @@ def history_lines(messages: list[dict], self_id: str = "") -> str:
         role = "assistant" if item.get("role") == "assistant" else "user"
         qq = self_id if role == "assistant" else str(item.get("user_id", ""))
         qq = qq if re.fullmatch(r"[0-9]{1,20}", qq) else "unknown"
+        raw_ts = item.get("created_at")
+        ts = (
+            float(raw_ts)
+            if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool) and raw_ts > 0
+            else None
+        )
+        if prev_ts is not None and ts is not None and ts - prev_ts >= 1800:
+            dt_str = datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"# --- {dt_str} (距上条 {_format_gap(ts - prev_ts)}) ---\n")
+        prev_ts = ts
+        text = str(item.get("text", ""))
+        if role == "user" and qq != "unknown":
+            text = re.sub(rf"^\[[^\n]{{1,80}}?\(QQ:{re.escape(qq)}\)\]:\s*", "", text)
         lines.append(
-            f"{seq}|{role}|QQ:{qq}|{line_data(item.get('speaker', ''))}|"
-            f"{line_data(item.get('text', ''))}\n"
+            f"{seq}|{role}|QQ:{qq}|{line_data(item.get('speaker', ''))}|{line_data(text)}\n"
         )
     return "".join(lines)
 
 
 def assemble_chat_input(
-    payload: dict, message, settings, *, sandbox_mode=False, recall=True, history=None
+    payload: dict,
+    message,
+    settings,
+    *,
+    sandbox_mode=False,
+    recall=True,
+    history=None,
+    prev_created_at: float | None = None,
 ) -> str:
     """A lives in system_instruction; immutable B records precede the bounded C tail.
 
     Escaping applies only to data. The verified identity block is created here,
     never accepted from payload keys, nicknames or forwarded text.
     """
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
     from .context_budget import estimate_tokens, truncate_tokens
     from .security import Rejected
 
     context = prompt_context(message, settings)
     messages = payload.get("recent_messages", []) if history is None else history
-    b = "" if sandbox_mode else history_lines(messages, settings.onebot_self_id)
+    b = (
+        ""
+        if sandbox_mode
+        else history_lines(
+            messages,
+            settings.onebot_self_id,
+            settings.bot_timezone,
+            prev_created_at=prev_created_at,
+        )
+    )
     current = str(payload.get("current_message", ""))
     if len(current.encode()) > settings.max_context_bytes:
         raise Rejected("context_too_large")
+    batch_items = payload.get("current_batch_items")
+    if isinstance(batch_items, list) and batch_items:
+        current_batch = [
+            {
+                "event_id": str(item.get("event_id", "")),
+                "sender_id": str(item.get("sender_id", "")),
+                "sender_nickname": str(item.get("sender_nickname", "")),
+                "text": str(item.get("text", "")),
+            }
+            for item in batch_items
+            if isinstance(item, dict)
+        ]
+        if (
+            len(json.dumps(current_batch, ensure_ascii=False, separators=(",", ":")).encode())
+            > settings.max_context_bytes
+        ):
+            raise Rejected("context_too_large")
+    else:
+        current_batch = current
     metadata = {
         "current_time": datetime.now(ZoneInfo(settings.bot_timezone)).isoformat(timespec="minutes"),
         "timezone": settings.bot_timezone,
@@ -142,7 +218,7 @@ def assemble_chat_input(
         "nearby_group_context": payload.get("nearby_group_context", []),
         "allowed_reply_ids": payload.get("allowed_reply_ids", []),
         "web_preview_untrusted": payload.get("web_preview_untrusted", []),
-        "current_batch": current,
+        "current_batch": current_batch,
     }
     if not sandbox_mode:
         for key in ("web_search_findings", "web_search_status"):
@@ -189,6 +265,9 @@ def assemble_chat_input(
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         background = {}
         summary = truncate_tokens(summary, 180)
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata["nearby_group_context"]:
+        half = max(1, len(metadata["nearby_group_context"]) // 2)
+        metadata["nearby_group_context"] = metadata["nearby_group_context"][-half:]
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         summary = ""
         metadata["image_sources"] = metadata["image_sources"][:2]

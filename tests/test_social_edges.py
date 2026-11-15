@@ -208,7 +208,10 @@ async def test_actual_sdk_meme_static_prefix_tracks_admin_edits_and_excludes_pub
             message=msg,
         )
         body = calls[-1]
-        assert body["model"] == "gemini-4-hydrogen" and body["store"] is False
+        expected_store = (
+            scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE} and msg is not None
+        )
+        assert body["model"] == "gemini-4-hydrogen" and body["store"] is expected_store
         assert "动态消息内容只在末尾输入" not in body["system_instruction"]
         return body["system_instruction"]
 
@@ -225,7 +228,15 @@ async def test_actual_sdk_meme_static_prefix_tracks_admin_edits_and_excludes_pub
     assert active.startswith(SYSTEM_INSTRUCTION + PUBLIC_PERSONA_PROMPT)
     assert '表情标签白名单：["刚加入"]' in active
     assert "【服务器验证的当前发送者】" not in active
-    assert "【服务器验证的当前发送者】" in calls[-1]["input"]
+    last_raw_input = calls[-1]["input"]
+    if isinstance(last_raw_input, list):
+        first_item = last_raw_input[0]
+        last_input = (
+            first_item["content"][0]["text"] if "content" in first_item else first_item["text"]
+        )
+    else:
+        last_input = last_raw_input
+    assert "【服务器验证的当前发送者】" in last_input
     owner_group = await generate(msg=target.model_copy(update={"user_id": service.s.owner_qq_id}))
     assert (
         active.partition("【服务器验证的当前发送者】")[0]

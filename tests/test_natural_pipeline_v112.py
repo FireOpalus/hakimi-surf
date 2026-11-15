@@ -302,17 +302,17 @@ async def test_reference_failures_and_truncation_only_in_metadata(settings, mess
     assert set(resolved.context_status) == {"reply_unavailable", "forward_unavailable"}
 
     async def lookup(current, ref):
-        return current.model_copy(update={"event_id": ref, "text": "原文" * 3000, "reply_ids": []})
+        return current.model_copy(update={"event_id": ref, "text": "原文" * 10000, "reply_ids": []})
 
     resolved = await MessageContextResolver(settings, None, lookup).resolve(
-        message.model_copy(update={"text": "本轮" * 2000, "reply_ids": ["99"]})
+        message.model_copy(update={"text": "本轮" * 3000, "reply_ids": ["99"]})
     )
-    assert len(resolved.text) == 8000 and resolved.context_status == ["truncated"]
+    assert len(resolved.text) == 24000 and resolved.context_status == ["truncated"]
     assert "[上下文截断]" not in resolved.text
 
     nodes = [
         {"sender": {"user_id": str(100 + i), "nickname": "群友"}, "content": f"节点{i}"}
-        for i in range(20)
+        for i in range(45)
     ]
     parsed_fwd = parse_forward({"messages": nodes}, settings.onebot_self_id, include_authors=True)
     assert parsed_fwd.truncated is True

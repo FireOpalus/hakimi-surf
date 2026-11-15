@@ -43,7 +43,7 @@ B 默认跨过 **估算 28000 Token 或 96000 UTF-8 字节**才裁最旧一半�
 
 Carbon 群聊只接受直接找 Bot 或真实 Owner 触发。关闭、并发占满或本地预算预留不足时立即回退 Hydrogen high。Carbon 全局单路，不排队等待专家槽位；API 已发出后的超时、失败、取消或不完整结果**不换模型重做**。600 秒内沿用同一历史起点，冷池只取最近 12 条完整历史（估算 ≤3000 Token）；重置、TTL／折半截断会使锚点失效。管理沙盒使用独立的运行态命名空间。
 
-两种主模型均使用 v1 Interactions、`store=False`、空工具、无流式、无后台续写与思考摘要。没有 `previous_interaction_id` 远端历史链。
+两种主模型均使用 v1 Interactions、空工具与无后台续写；v1.1.4 起，非沙箱且开启本地记忆的主对话（`FAST_CHAT` / `OWNER_PRIVATE`）启用 `store=True` + 加密本地托管的 `previous_interaction_id` 差量续链，而 `search()`、沙盒与所有后台摘要／压缩任务继续保持 `store=False`、无 `previous_interaction_id`。
 
 ## 迁移与账本
 

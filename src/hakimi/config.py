@@ -49,10 +49,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("NOTEBOOK_SNAPSHOT_PATH", "HAKIMI_NOTEBOOK_SNAPSHOT_PATH"),
     )
     prefix_history_enabled: bool = True
+    interaction_store_enabled: bool = True
+    interaction_chain_ttl_seconds: int = Field(default=21600, ge=60, le=604800)
     history_high_tokens: int = Field(default=28000, ge=1000, le=28000)
-    history_max_bytes: int = Field(default=96000, ge=4000, le=96000)
-    chat_tail_tokens: int = Field(default=1800, ge=400, le=1800)
-    decision_input_tokens: int = Field(default=1200, ge=400, le=1200)
+    history_max_bytes: int = Field(default=144000, ge=4000, le=144000)
+    chat_tail_tokens: int = Field(default=4200, ge=400, le=4200)
+    decision_input_tokens: int = Field(default=4200, ge=400, le=4200)
     compression_enabled: bool = True
     memory_archive_time: str = Field(default="03:10", pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
     memory_flex_timeout: int = Field(default=900, ge=60, le=1800)
@@ -200,8 +202,8 @@ class Settings(BaseSettings):
     allow_group_members: bool = False
     command_prefix: Literal["/哈基米"] = "/哈基米"
 
-    max_body_bytes: int = Field(default=65536, ge=1024, le=262144)
-    max_message_chars: int = Field(default=2000, ge=100, le=8000)
+    max_body_bytes: int = Field(default=131072, ge=1024, le=262144)
+    max_message_chars: int = Field(default=4000, ge=100, le=8000)
     signature_max_age: int = Field(default=300, ge=30, le=600)
     queue_capacity: int = Field(default=200, ge=1, le=10000)
     group_debounce_seconds: float = Field(default=2.0, ge=0, le=30)
@@ -270,7 +272,7 @@ class Settings(BaseSettings):
     summary_output_tokens: int = Field(default=4096, ge=128, le=8192)
     diary_output_tokens: int = Field(default=4096, ge=128, le=8192)
     high_output_tokens: int = Field(default=8192, ge=128, le=16384)
-    max_context_bytes: int = Field(default=16000, ge=2048, le=64000)
+    max_context_bytes: int = Field(default=48000, ge=2048, le=64000)
     daily_usd: Decimal = Field(default=Decimal("2"), ge=0, le=1000)
     monthly_usd: Decimal = Field(default=Decimal("40"), ge=0, le=10000)
     user_daily_usd: Decimal = Field(default=Decimal("1"), ge=0, le=1000)

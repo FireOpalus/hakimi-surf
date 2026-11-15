@@ -879,35 +879,89 @@ class GeminiGateway:
             else:
                 await self.carbon_slots.acquire()
                 carbon_acquired = True
+        sandbox_mode = bool(getattr(route, "sandbox_mode", False)) or audit_source == "sandbox"
+        stateful_chat = (
+            chat
+            and self.s.interaction_store_enabled
+            and message is not None
+            and not sandbox_mode
+            and bool(payload.get("session_enabled", True))
+        )
+        system_digest = self.store.vault.digest("static-prefix", system)
+        epoch = payload.get("session_epoch", 0)
+        trim_version = payload.get("history_revision", 0)
+        allow_chain = True
+        used_lane = plan.model_lane
+        used_rows = payload.get("recent_messages", [])
 
         async def dispatch(active_plan):
+            nonlocal used_lane, used_rows
             rows = payload.get("recent_messages", [])
             if active_plan.model_lane == "carbon":
                 rows = self.prefix_runtime.carbon_history(scope, payload)
+            used_lane = active_plan.model_lane
+            used_rows = rows
+            prev_id = None
+            wire_rows = rows
+            prev_created_at = None
+            if stateful_chat and allow_chain:
+                chain = (payload.get("interaction_chains") or {}).get(active_plan.model_lane)
+                if (
+                    isinstance(chain, dict)
+                    and chain.get("expires", 0) > time.time()
+                    and chain.get("epoch") == epoch
+                    and chain.get("trim_version") == trim_version
+                    and chain.get("system_digest") == system_digest
+                    and chain.get("interaction_id")
+                ):
+                    prev_id = str(chain["interaction_id"])
+                    covered_seq = int(chain.get("covered_seq", 0))
+                    wire_rows = [r for r in rows if int(r.get("seq", 0)) > covered_seq]
+                    older = [r for r in rows if int(r.get("seq", 0)) <= covered_seq]
+                    if older:
+                        ts = older[-1].get("created_at")
+                        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0:
+                            prev_created_at = float(ts)
+                else:
+                    self.prefix_runtime.invalidate_chain(scope, active_plan.model_lane)
             if chat:
-                data = assemble_chat_input(
+                wire_data = assemble_chat_input(
                     payload,
                     message,
                     self.s,
                     sandbox_mode=getattr(route, "sandbox_mode", False),
                     recall=route is None or getattr(route, "need_memory_recall", False),
-                    history=rows,
+                    history=wire_rows,
+                    prev_created_at=prev_created_at,
+                )
+                reserve_data = (
+                    wire_data
+                    if not prev_id
+                    else assemble_chat_input(
+                        payload,
+                        message,
+                        self.s,
+                        sandbox_mode=getattr(route, "sandbox_mode", False),
+                        recall=route is None or getattr(route, "need_memory_recall", False),
+                        history=rows,
+                    )
                 )
             else:
-                data = untrusted_input(payload)
+                wire_data = untrusted_input(payload)
                 limit = (
                     self.s.history_max_bytes
                     if (scenario == Scenario.MEMORY_COMPRESSION and self.s.prefix_history_enabled)
                     else self.s.max_context_bytes
                 )
-                if len(data.encode()) > limit:
+                if len(wire_data.encode()) > limit:
                     raise Rejected("context_too_large")
+                reserve_data = wire_data
             model_input = (
-                [{"type": "text", "text": data}, video.block()]
+                [{"type": "text", "text": wire_data}, video.block()]
                 if video
-                else [{"type": "text", "text": data}, *(i.block() for i in images)]
-                if images
-                else data
+                else [{"type": "text", "text": wire_data}, *(i.block() for i in images)]
+                if chat or images
+                else wire_data
             )
             model = self.s.carbon_model if active_plan.model_lane == "carbon" else self.s.chat_model
             if generation_trace is not None:
@@ -925,7 +979,8 @@ class GeminiGateway:
                     system_instruction=system,
                     input=model_input,
                     tools=[],
-                    store=False,
+                    store=stateful_chat,
+                    **({"previous_interaction_id": prev_id} if prev_id else {}),
                     background=False,
                     stream=chat,
                     **(
@@ -972,7 +1027,7 @@ class GeminiGateway:
                 subject,
                 budget_lane,
                 active_plan.model_lane,
-                {"input": data, "system_instruction": system},
+                {"input": reserve_data, "system_instruction": system},
                 active_plan.output_tokens,
                 self.s.memory_flex_timeout
                 if memory_archive
@@ -1011,6 +1066,12 @@ class GeminiGateway:
                     await self.store.runtime.event("cache_prefix_busted", audit_source)
             return result
 
+        def mark_chain_invalid():
+            if stateful_chat:
+                self.prefix_runtime.invalidate_chain(scope)
+                if generation_trace is not None:
+                    generation_trace["chain_invalidate"] = True
+
         try:
             try:
                 result = await dispatch(plan)
@@ -1018,18 +1079,28 @@ class GeminiGateway:
                 if carbon_acquired:
                     self.carbon_slots.release()
                     carbon_acquired = False
+                allow_chain = False
+                mark_chain_invalid()
                 plan = GenerationPlan("high", 8192)
                 result = await dispatch(plan)
             except GenerationTimeout:
+                allow_chain = False
+                mark_chain_invalid()
                 result = None
+            except BaseException:
+                mark_chain_invalid()
+                raise
             if chat and (result is None or getattr(result, "status", None) == "incomplete"):
                 if cancel_event is not None and cancel_event.is_set():
+                    mark_chain_invalid()
                     raise asyncio.CancelledError
                 # One bounded lower-tier attempt, with a NEW reservation. Unknown first
                 # usage stays fully charged. Never retry safety errors or arbitrary failures.
                 if carbon_acquired:
                     self.carbon_slots.release()
                     carbon_acquired = False
+                allow_chain = False
+                mark_chain_invalid()
                 level = (
                     "high"
                     if plan.model_lane == "carbon"
@@ -1046,40 +1117,73 @@ class GeminiGateway:
                 try:
                     result = await dispatch(plan)
                 except GenerationTimeout:
+                    mark_chain_invalid()
                     self.blocked_until = time.monotonic() + 60
                     raise Rejected("generation_incomplete") from None
+                except BaseException:
+                    mark_chain_invalid()
+                    raise
         finally:
             if carbon_acquired:
                 self.carbon_slots.release()
-        if getattr(result, "status", None) != "completed":
-            raise Rejected("generation_incomplete")
-        # Explicitly exclude thoughts, signatures, function calls and other non-text output.
-        pieces = []
-        for step in getattr(result, "steps", []) or []:
-            if step.type == "thought":
-                continue
-            if step.type != "model_output":
-                raise Rejected("unexpected_model_action")
-            for part in step.content:
-                if part.type != "text":
-                    raise Rejected("unexpected_model_content")
-                pieces.append(part.text)
-        text = "\n".join(pieces).strip()
-        if not text or len(text) > (18000 if memory_archive else 6000):
-            raise Rejected("invalid_output")
-        if chat:
-            try:
-                ChatActions.model_validate_json(text)
-            except ValueError:
-                raise Rejected("invalid_action_output") from None
-        await self.screen(
-            {"generated_text": text},
-            subject,
-            purpose="output",
-            budget_lane=budget_lane,
-            audit_source=audit_source,
-            before_call=before_call,
-        )
+        try:
+            if getattr(result, "status", None) != "completed":
+                raise Rejected("generation_incomplete")
+            # Explicitly exclude thoughts, signatures, function calls and other non-text output.
+            pieces = []
+            for step in getattr(result, "steps", []) or []:
+                if step.type == "thought":
+                    continue
+                if step.type != "model_output":
+                    raise Rejected("unexpected_model_action")
+                for part in step.content:
+                    if part.type != "text":
+                        raise Rejected("unexpected_model_content")
+                    pieces.append(part.text)
+            text = "\n".join(pieces).strip()
+            if not text or len(text) > (18000 if memory_archive else 8000):
+                raise Rejected("invalid_output")
+            if chat:
+                try:
+                    ChatActions.model_validate_json(text)
+                except ValueError:
+                    raise Rejected("invalid_action_output") from None
+            await self.screen(
+                {"generated_text": text},
+                subject,
+                purpose="output",
+                budget_lane=budget_lane,
+                audit_source=audit_source,
+                before_call=before_call,
+            )
+        except BaseException:
+            mark_chain_invalid()
+            raise
+        if stateful_chat and getattr(result, "id", None):
+            covered_seq = max((int(r.get("seq", 0)) for r in used_rows), default=0)
+            expires = time.time() + min(
+                self.s.interaction_chain_ttl_seconds, self.s.memory_ttl_seconds
+            )
+            self.prefix_runtime.put_chain(
+                scope,
+                used_lane,
+                interaction_id=result.id,
+                epoch=epoch,
+                trim_version=trim_version,
+                system_digest=system_digest,
+                covered_seq=covered_seq,
+                expires=expires,
+            )
+            if generation_trace is not None:
+                generation_trace.pop("chain_invalidate", None)
+                generation_trace["chain_commit"] = {
+                    "lane": used_lane,
+                    "interaction_id": result.id,
+                    "epoch": epoch,
+                    "trim_version": trim_version,
+                    "system_digest": system_digest,
+                    "covered_seq": covered_seq,
+                }
         return text
 
     async def cleanup_video_files(self):
