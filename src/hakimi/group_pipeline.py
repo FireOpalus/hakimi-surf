@@ -92,11 +92,17 @@ class GroupPipeline:
     def delay(self, message, config=None):
         config = config or self.config
         explicit = message.attention_reason in {"mention", "reply"} or message.kind == "private"
-        incomplete = not message.images and bool(
-            re.search(
-                r"(?:你看这个(?:报错|图|问题)?|看下这个|等下|等等|还有|比如|例如|看这里)"
-                r"[：:，,。 ]*$",
-                message.command_text or message.text,
+        raw = message.command_text if message.command_text is not None else message.text
+        spoken = re.sub(r"\[(?:图片|商城贴纸|提及机器人|提及群友|附图)\]", "", raw).strip()
+        pure_image = bool(message.images) and not spoken
+        incomplete = pure_image or (
+            not message.images
+            and bool(
+                re.search(
+                    r"(?:你看这个(?:报错|图|问题)?|看下这个|等下|等等|还有|比如|例如|看这里)"
+                    r"[：:，,。 ]*$",
+                    raw,
+                )
             )
         )
         if incomplete:

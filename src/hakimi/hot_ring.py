@@ -85,3 +85,28 @@ class HotRing:
             if ring
             else 0
         )
+
+    def recent_with_images(self, message, *, exclude_events=(), max_age_seconds=1800, limit=20):
+        ring = self.rings.get(self.key(message))
+        if not ring:
+            return []
+        excluded = {str(event_id) for event_id in exclude_events}
+        results = []
+        for _, item, _ in reversed(list(ring.messages.values())):
+            if (
+                item.event_id in excluded
+                or self.recalled(message, item.event_id)
+                or item.user_id == item.bot_id
+                or not item.images
+            ):
+                continue
+            if (
+                message.created_at > 0
+                and item.created_at > 0
+                and message.created_at - item.created_at > max_age_seconds
+            ):
+                continue
+            results.append(item)
+            if len(results) >= limit:
+                break
+        return list(reversed(results))

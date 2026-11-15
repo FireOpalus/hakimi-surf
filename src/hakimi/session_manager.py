@@ -13,6 +13,7 @@ from .context_budget import estimate_tokens
 from .dual_memory import SCHEMA as DUAL_SCHEMA
 from .dual_memory import DualMemory
 from .models import Message
+from .outbound_actions import MAX_IMAGE_DIGEST_CHARS
 from .public_memory import PublicMemory
 from .security import Rejected
 from .store import Store
@@ -517,7 +518,11 @@ class SessionManager:
             if digest:
                 await append(
                     reply_id + ":image-digest",
-                    "[附图摘要，消息" + message.event_id + "：" + digest[:20] + "]",
+                    "[附图摘要，消息"
+                    + message.event_id
+                    + "："
+                    + digest[:MAX_IMAGE_DIGEST_CHARS]
+                    + "]",
                 )
             await self._fold_history(db, key, message)
             return True

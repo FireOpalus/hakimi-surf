@@ -110,16 +110,18 @@ def normalize_image(raw: bytes, max_pixels: int) -> ModelImage:
                 source.seek(0)
                 source.load()
                 resized = ImageOps.exif_transpose(source).convert("RGB")
-                resized.thumbnail((768, 768))
+                orig_w, orig_h = resized.size
+                aspect = max(orig_w, orig_h) / max(1, min(orig_w, orig_h))
                 if getattr(source, "is_animated", False):
                     if (
                         source.n_frames > 300
                         or source.n_frames * source.width * source.height > 32_000_000
                     ):
                         raise Rejected("image_animation_too_long")
+                    resized.thumbnail((768, 768), Image.Resampling.LANCZOS)
                     source.seek(source.n_frames - 1)
-                    last = source.convert("RGB")
-                    last.thumbnail((768, 768))
+                    last = ImageOps.exif_transpose(source).convert("RGB")
+                    last.thumbnail((768, 768), Image.Resampling.LANCZOS)
                     stitched = Image.new(
                         "RGB",
                         (resized.width + last.width, max(resized.height, last.height)),
@@ -128,19 +130,34 @@ def normalize_image(raw: bytes, max_pixels: int) -> ModelImage:
                     stitched.paste(resized, (0, 0))
                     stitched.paste(last, (resized.width, 0))
                     resized = stitched
-                    resized.thumbnail((768, 768))
+                    resized.thumbnail((1152, 768), Image.Resampling.LANCZOS)
+                    save_kwargs = {"quality": 82, "optimize": True}
+                    resolution = "medium"
+                elif aspect > 2.0:
+                    scale = min(1.0, 1536 / max(orig_w, orig_h), 768 / min(orig_w, orig_h))
+                    if scale < 1.0:
+                        resized = resized.resize(
+                            (max(1, round(orig_w * scale)), max(1, round(orig_h * scale))),
+                            Image.Resampling.LANCZOS,
+                        )
+                    save_kwargs = {"quality": 86, "subsampling": 0, "optimize": True}
+                    resolution = "high"
+                else:
+                    resized.thumbnail((768, 768), Image.Resampling.LANCZOS)
+                    save_kwargs = {"quality": 85, "subsampling": 0, "optimize": True}
+                    resolution = "medium"
                 resized.info.clear()
                 target = io.BytesIO()
-                resized.save(target, format="JPEG", quality=80, optimize=True)
+                resized.save(target, format="JPEG", **save_kwargs)
                 tiny = resized.copy()
-                tiny.thumbnail((192, 192))
+                tiny.thumbnail((512, 512) if aspect > 2.0 else (448, 448), Image.Resampling.LANCZOS)
                 thumb = io.BytesIO()
-                tiny.save(thumb, format="JPEG", quality=55)
+                tiny.save(thumb, format="JPEG", quality=72, optimize=True)
         return ModelImage(
             base64.b64encode(target.getvalue()).decode("ascii"),
             thumbnail=base64.b64encode(thumb.getvalue()).decode("ascii"),
             digest=hashlib.sha256(raw).hexdigest(),
-            resolution="medium",
+            resolution=resolution,
         )
     except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
         raise Rejected("invalid_image") from None

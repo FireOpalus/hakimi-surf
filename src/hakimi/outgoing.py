@@ -46,16 +46,34 @@ async def apply_receipts(service, reply_id):
     epoch = data[0]["epoch"]
     appended = await service.sessions.reply_batch(message, reply_id, data, expected_epoch=epoch)
     if appended:
+        remembered_group = False
+        combined_text = "\n".join(d["text"] for d in data)
         for item in data:
             receipt = {"message_id": item["message_id"]}
+
+            async def remember_sent(receipt=receipt):
+                nonlocal remembered_group
+                if await service.store.runtime.attention.record_sent(message, receipt):
+                    if not remembered_group and message.kind == "group":
+                        remembered_group = True
+                        await service.store.runtime.filters.remember_group(
+                            message.model_copy(
+                                update={
+                                    "event_id": "sent:" + str(reply_id),
+                                    "user_id": message.bot_id,
+                                    "images": [],
+                                    "text": "[哈基米已回复] " + service.output(combined_text),
+                                    "created_at": time.time(),
+                                }
+                            )
+                        )
+
             await service.sessions.receive_outgoing(
                 message,
                 item["message_id"],
                 item["text"],
                 expected_epoch=epoch,
-                on_confirmed=lambda receipt=receipt: service.store.runtime.attention.record_sent(
-                    message, receipt
-                ),
+                on_confirmed=remember_sent,
             )
         service.store.runtime.filters.spoke(message)
         if message.kind == "group":

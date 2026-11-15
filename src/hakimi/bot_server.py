@@ -159,6 +159,7 @@ def assemble_chat_input(
     recall=True,
     history=None,
     prev_created_at: float | None = None,
+    meme_labels: list[str] | None = None,
 ) -> str:
     """A lives in system_instruction; immutable B records precede the bounded C tail.
 
@@ -221,6 +222,8 @@ def assemble_chat_input(
         "current_batch": current_batch,
     }
     if not sandbox_mode:
+        if meme_labels is not None:
+            metadata["meme_labels"] = list(meme_labels)
         for key in ("web_search_findings", "web_search_status"):
             if payload.get(key):
                 metadata[key] = payload[key]

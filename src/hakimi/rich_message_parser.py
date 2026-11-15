@@ -154,13 +154,18 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
                     if not isinstance(size, bool) and re.fullmatch(r"[0-9]{1,15}", str(size))
                     else None
                 )
-                ref = ImageRef(url=url, file=file, file_size=size)
-                if (
-                    ref.identity
-                    and len(result.images) < 2
-                    and ref.identity not in [i.identity for i in result.images]
-                ):
-                    result.images.append(ref)
+                sub_raw = data.get("sub_type", data.get("subType"))
+                is_sticker = kind == "mface" or (
+                    not isinstance(sub_raw, bool)
+                    and re.fullmatch(r"[0-9]{1,4}", str(sub_raw or "")) is not None
+                    and int(str(sub_raw)) != 0
+                )
+                ref = ImageRef(url=url, file=file, file_size=size, is_sticker=is_sticker)
+                if ref.identity and ref.identity not in [i.identity for i in result.images]:
+                    if len(result.images) < 2:
+                        result.images.append(ref)
+                    else:
+                        result.truncated = True
                 add("[商城贴纸]" if kind == "mface" else "[图片]")
             elif kind == "face":
                 face = str(data.get("id", ""))
@@ -248,18 +253,21 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
             rich = parse_message(node.get("content", node.get("message", [])), bot_id)
             lines.append(f"[转发记录 - {author}]: {rich.text}")
             for ref in rich.images:
-                if len(result.images) < 2 and ref.identity not in [
-                    i.identity for i in result.images
-                ]:
-                    result.images.append(
-                        ref.model_copy(
-                            update={
-                                "sender_id": uid if uid != "未知" else "",
-                                "sender_nickname": name,
-                                "origin": "转发记录（作者声明）",
-                            }
+                if ref.identity not in [i.identity for i in result.images]:
+                    if len(result.images) < 2:
+                        result.images.append(
+                            ref.model_copy(
+                                update={
+                                    "sender_id": uid if uid != "未知" else "",
+                                    "sender_nickname": name,
+                                    "origin": "转发记录（作者声明）",
+                                }
+                            )
                         )
-                    )
+                    else:
+                        result.truncated = True
+            if rich.truncated:
+                result.truncated = True
             for dest, values in (
                 (result.video_ids, rich.video_ids),
                 (result.short_urls, rich.short_urls),

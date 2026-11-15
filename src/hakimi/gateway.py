@@ -291,7 +291,12 @@ class FilterManager:
         scope = self._group_scope(message)
         event = self.store.event_key(message)
         now = time.time()
-        text = redact_excerpt(message.text, self.s, limit=240)
+        raw = str(message.text or "")
+        if message.images and "[附图]" not in raw:
+            raw = f"{raw.strip()} [附图]" if raw.strip() else "[附图]"
+        text = redact_excerpt(raw, self.s, limit=240)
+        if not text:
+            return
         async with self.store.transaction():
             await self.store.db.execute(
                 "INSERT OR IGNORE INTO gateway_group_context VALUES (?,?,?,?,?)",

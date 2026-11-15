@@ -12,6 +12,7 @@ class ImageRef(BaseModel):
     sender_id: str = Field(default="", max_length=128)
     sender_nickname: str = Field(default="", max_length=80)
     origin: str = Field(default="", max_length=40)
+    is_sticker: bool = False
 
     @property
     def identity(self) -> str:

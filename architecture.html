@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="hakimi-surf 1.1.8 源码架构：跨机 OneBot、A/B/C 差量续链、Bot 阈值、双轨记忆、缓存折扣结算、流中断估算与历史账本迁移。">
-  <title>hakimi-surf 1.1.8 · 项目架构图</title>
+  <meta name="description" content="hakimi-surf 1.2.0 源码架构：跨机 OneBot、图片上下文闭环、短期找图、自适应长图、120 字视觉摘要、动态表情标签与稳定前缀、费用结算及双轨记忆。">
+  <title>hakimi-surf 1.2.0 · 项目架构图</title>
   <style>
     :root {
       color-scheme: light;
@@ -281,6 +281,11 @@
     .billing-outcomes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:22px 0}.billing-outcomes article{padding:18px;border:1px solid var(--line);border-radius:10px;background:var(--subtle)}.billing-outcomes h4{font-size:14px;margin-bottom:8px}.billing-outcomes p{font-size:12px;color:var(--muted)}.billing-outcomes code{display:block;margin-bottom:8px;color:var(--teal);font-size:11px}.billing-outcomes .uncertain{background:var(--amber-soft);border-color:transparent}.billing-outcomes .uncertain code{color:var(--amber)}
     .migration-line{padding:18px 20px;border-left:3px solid var(--violet);background:var(--violet-soft);border-radius:0 8px 8px 0}.migration-line h4{margin-bottom:6px}.migration-line p{font-size:12px;color:var(--muted)}
     @media(max-width:800px){.billing-map .policy-flow{grid-template-columns:1fr}.billing-map .policy-flow li:not(:last-child)::after{content:'↓';top:auto;bottom:-23px;right:50%}.billing-outcomes{grid-template-columns:1fr}}
+
+    .image-map{margin:26px 0;border-top:1px solid var(--line);padding-top:24px}.image-map .section-heading h3{font-size:18px}.image-sources{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.image-sources article{padding:17px;border:1px solid var(--line);border-radius:10px;min-width:0}.image-sources article:last-child{background:var(--teal-soft);border-color:transparent}.image-sources h4{margin:8px 0}.image-sources p,.image-sources small{font-size:12px;color:var(--muted)}
+    .image-gate{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 18px;background:var(--blue-soft);border-radius:9px;margin:18px 0}.image-gate strong{font-size:13px;flex-shrink:0}.image-gate span{font-size:12px;color:var(--muted)}
+    .image-types{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.image-types article{padding:18px;border-radius:10px;background:var(--subtle)}.image-types h4{font-size:14px;margin-bottom:9px}.image-types code{display:block;color:var(--teal);font-size:12px;margin:8px 0}.image-types p{font-size:12px;color:var(--muted)}.image-loop{padding:18px 0;color:var(--teal);font-size:13px;font-weight:600;border-bottom:1px solid var(--line);margin-bottom:18px}
+    @media(max-width:800px){.image-sources,.image-types{grid-template-columns:1fr}.image-gate{align-items:flex-start;flex-direction:column;gap:8px}}
   </style>
 </head>
 <body>
@@ -288,15 +293,15 @@
   <main class="page">
     <header class="masthead">
       <div class="brand"><span class="brand-mark" aria-hidden="true">H</span> hakimi-surf</div>
-      <div class="meta">SOURCE ARCHITECTURE · <a href="pyproject.toml">v1.1.8</a> · 2026-11-15</div>
+      <div class="meta">SOURCE ARCHITECTURE · <a href="pyproject.toml">v1.2.0</a> · 2026-11-15</div>
     </header>
     <section class="hero" aria-labelledby="page-title">
       <div class="eyebrow">QQ ASSISTANT / SYSTEM MAP</div>
       <h1 id="page-title">哈基米 <span>／ 项目架构图</span></h1>
-      <p>境内协议接入，境外会话编排。消息、热配置与冷历史各有边界；本版沿每次模型请求展开事务预留、缓存折扣结算、流中断估算及旧账本校正。</p>
+      <p>境内协议接入，境外会话编排。本版沿图片走完选择、清晰度处理、筛查、生成与确认入史；短期找图限定当前会话，表情标签随 C 区热更新，A 区协议保持稳定。</p>
       <div class="hero-bottom">
-        <div class="tags"><span class="tag">单进程 FastAPI</span><span class="tag">默认 2 个异步消费者</span><span class="tag">按会话隔离</span><span class="tag">Bot 阈值分流</span><span class="tag">冷历史合批预检</span><span class="tag">预留与结算分离</span><span class="tag">中断费用有限估算</span><span class="tag">决策关联投递结果</span><span class="tag">ACK 后写入助手历史</span></div>
-        <nav aria-label="架构图导航"><a href="#overview">部署</a><a href="#pipeline">消息流</a><a href="#audit">筛查与审计</a><a href="#bot-routing">Bot 接话</a><a href="#controls">热配置</a><a href="#billing">费用结算</a><a href="#context">上下文与续链</a><a href="#memory">双轨记忆</a><a href="#operations">后台与控制</a><a href="#sources">源码</a></nav>
+        <div class="tags"><span class="tag">单进程 FastAPI</span><span class="tag">默认 2 个异步消费者</span><span class="tag">按会话隔离</span><span class="tag">Bot 阈值分流</span><span class="tag">冷历史合批预检</span><span class="tag">会话内短期找图</span><span class="tag">自适应长截图</span><span class="tag">120 字视觉摘要</span><span class="tag">决策关联投递结果</span><span class="tag">ACK 后写入助手历史</span></div>
+        <nav aria-label="架构图导航"><a href="#overview">部署</a><a href="#pipeline">消息流</a><a href="#audit">筛查与审计</a><a href="#bot-routing">Bot 接话</a><a href="#controls">热配置</a><a href="#billing">费用结算</a><a href="#image-context">图片上下文</a><a href="#context">上下文与续链</a><a href="#memory">双轨记忆</a><a href="#operations">后台与控制</a><a href="#sources">源码</a></nav>
       </div>
     </section>
 
@@ -337,9 +342,9 @@
       <figure aria-describedby="pipeline-caption">
         <ol class="pipeline">
           <li class="step"><span class="step-number">01</span><h3>接收与归一化</h3><p>认证、白名单、去重与 BotGuard。已知 Bot 区分硬屏蔽、阈值接话和 Owner 邀请；入队仍检查用户／全局 RPM 与队列容量。</p><div class="files"><a href="src/hakimi/adapters.py">adapters.py</a><br><a href="src/hakimi/message_context.py">message_context.py</a><br><a href="src/hakimi/hot_ring.py">hot_ring.py</a></div></li>
-          <li class="step"><span class="step-number">02</span><h3>合批与会话串行</h3><p>SQLite 保存 jobs 与防抖批次。最多合并 16 条／24,000 字，同会话持锁处理；合批优先保留真实 @ 触发，下一次生成等前次出站结束后读取历史。</p><div class="files"><a href="src/hakimi/group_pipeline.py">group_pipeline.py</a><br><a href="src/hakimi/session_scheduler.py">session_scheduler.py</a><br><a href="src/hakimi/debounce_policy.py">debounce_policy.py</a></div></li>
+          <li class="step"><span class="step-number">02</span><h3>合批与会话串行</h3><p>SQLite 保存 jobs 与防抖批次。最多合并 16 条／24,000 字；纯图片走 incomplete 等待档，仍受最大窗口约束。同会话持锁，下一次生成等前次出站结束后读取历史。</p><div class="files"><a href="src/hakimi/group_pipeline.py">group_pipeline.py</a><br><a href="src/hakimi/session_scheduler.py">session_scheduler.py</a><br><a href="src/hakimi/debounce_policy.py">debounce_policy.py</a></div></li>
           <li class="step gate"><span class="step-number">03</span><h3>一次门卫，多项决策</h3><p>Decisions 同时判断安全、接话、意图、召回、查资料与 L1–L4 档位。原消息过审后才进入会话历史；记录关联任务的审计标识。</p><div class="files"><a href="src/hakimi/gemini.py">GeminiGateway.screen</a><br><a href="src/hakimi/routing.py">routing.py</a><br><a href="src/hakimi/service.py">Service</a></div></li>
-          <li class="step generate"><span class="step-number">04</span><h3>上下文与流式生成</h3><p>A/B/C 组织输入，按会话与模型选择全量或差量请求。默认 auto：L1–L3 Hydrogen；L4 Carbon 专家通道。</p><div class="files"><a href="src/hakimi/bot_server.py">bot_server.py</a><br><a href="src/hakimi/generation_policy.py">generation_policy.py</a><br><a href="src/hakimi/streaming.py">streaming.py</a></div></li>
+          <li class="step generate"><span class="step-number">04</span><h3>上下文与流式生成</h3><p>A/B/C 组织输入；本批、邻近或短期找回图片最多两张。带图自动路由最低 L2；L1–L3 Hydrogen，L4 Carbon；后台显式档位仍可覆盖。</p><div class="files"><a href="src/hakimi/bot_server.py">bot_server.py</a><br><a href="src/hakimi/generation_policy.py">generation_policy.py</a><br><a href="src/hakimi/streaming.py">streaming.py</a></div></li>
           <li class="step"><span class="step-number">05</span><h3>输出审核与入队</h3><p>完整流收集后进行输出筛查、五维 JSON 校验和链接过滤。引用、点名与贴纸受本地名单约束；携带审计标识写入加密 Outbox。</p><div class="files"><a href="src/hakimi/outbound_actions.py">outbound_actions.py</a><br><a href="src/hakimi/output_links.py">output_links.py</a><br><a href="src/hakimi/store.py">Store.enqueue_reply</a></div></li>
           <li class="step confirm"><span class="step-number">06</span><h3>投递、ACK 与回写</h3><p>逐条复检权限、撤回、epoch 与时效，再经 Sender 返回 QQ。持久化 ACK，幂等追加已确认内容；送达成功后提交本地续链标识，回写审计结果。</p><div class="files"><a href="src/hakimi/outgoing.py">outgoing.py</a><br><a href="src/hakimi/adapters.py">Sender</a><br><a href="src/hakimi/session_manager.py">SessionManager</a></div></li>
         </ol>
@@ -443,16 +448,35 @@
       <div class="section-heading"><h2 id="context-title"><span>05</span>上下文与差量续链</h2><p>沿用 1.1.4 续链机制 · 逻辑上下文与实际请求载荷分开组织</p></div>
       <div class="panel">
         <div class="context-grid">
-          <article class="context-card a"><div class="context-head"><b class="letter">A</b><h3>稳定系统前缀</h3></div><p>共享指令、公开／Owner 人设、固定协议与静态规则；按可信身份选择。</p><p>不随当前群成员或检索结果变化；表情名单等静态规则变更时刷新。</p><div class="files"><a href="src/hakimi/persona.py">persona.py</a> · <a href="src/hakimi/prefix_runtime.py">prefix_runtime.py</a></div></article>
-          <article class="context-card b"><div class="context-head"><b class="letter">B</b><h3>追加式会话热史</h3></div><p>过审用户消息与 ACK 确认的助手回复，按稳定 seq 序列化；格式化时去掉重复的身份前缀。</p><p>相邻消息间隔达到 30 分钟时，按 BOT_TIMEZONE 标注时间断点。视觉简述追加为新行，图片字节不进入 B。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/bot_server.py">history_lines</a></div></article>
-          <article class="context-card c"><div class="context-head"><b class="letter">C</b><h3>当轮动态尾窗</h3></div><p>时间、核验身份、结构化当前批次、去重后的邻近群聊文本、可引用与点名目标、媒体状态、搜索证据及本地召回。</p><p>Owner 专属背景仅在对应私聊加载。可选记忆先让出预算；门卫输入与 C 尾窗默认分别以本地估算的 4,200 Token 限长。</p><div class="files"><a href="src/hakimi/bot_server.py">assemble_chat_input</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a></div></article>
+          <article class="context-card a"><div class="context-head"><b class="letter">A</b><h3>稳定系统前缀</h3></div><p>共享指令、公开／Owner 人设、固定协议与静态规则；按可信身份选择。</p><p>人设与固定表情协议稳定；可用标签放到 C，增删表情不再改写 A 或仅因此打断续链。</p><div class="files"><a href="src/hakimi/persona.py">persona.py</a> · <a href="src/hakimi/prefix_runtime.py">prefix_runtime.py</a></div></article>
+          <article class="context-card b"><div class="context-head"><b class="letter">B</b><h3>追加式会话热史</h3></div><p>过审用户消息与 ACK 确认的助手回复，按稳定 seq 序列化；格式化时去掉重复的身份前缀。</p><p>相邻消息间隔达到 30 分钟时，按 BOT_TIMEZONE 标注时间断点。经过检查的最多 120 字附图摘要在 ACK 后追加为新行，图片字节不进入 B。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/bot_server.py">history_lines</a></div></article>
+          <article class="context-card c"><div class="context-head"><b class="letter">C</b><h3>当轮动态尾窗</h3></div><p>时间、核验身份、结构化当前批次、去重后的邻近群聊文本、可引用与点名目标、媒体状态、搜索证据、本地召回及公开聊天的 meme_labels。</p><p>Owner 专属背景仅在对应私聊加载。可选记忆先让出预算；门卫输入与 C 尾窗默认分别以本地估算的 4,200 Token 限长。</p><div class="files"><a href="src/hakimi/bot_server.py">assemble_chat_input</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a></div></article>
         </div>
-        <div class="context-caption"><strong>A + B + C → 续链校验 → 全量或差量请求</strong><span>最多两张当轮图片放在输入末尾 · 本地 Token 估算用于限长，计费以供应商 usage 为准</span></div>
+        <div class="context-caption"><strong>A + B + C → 续链校验 → 全量或差量请求</strong><span>最多两张本轮选中图片放在输入末尾 · 本地 Token 估算用于限长，计费以供应商 usage 为准</span></div>
         <div class="context-updates">
           <article class="resource"><strong>结构化群聊批次</strong><p>最多 16 条／24,000 字；保留 event_id、发送者 ID、昵称与正文，引用回复可对应到被回应的那条消息。</p></article>
           <article class="resource"><strong>多图仍补邻近文本</strong><p>取邻近 6 条群消息，每条最多 160 字；按 event_id 排除 B 和当前批次已有内容。当前两张图片占满时仍补文本。</p></article>
-          <article class="resource"><strong>有界引用与转发展开</strong><p>主展开路径最多 6 个引用 ID、4 个合并转发，每个转发最多 40 个节点；总展开限 24,000 字，图片仍最多两张。</p></article>
+          <article class="resource"><strong>有界引用与转发展开</strong><p>主展开路径最多 6 个引用 ID、4 个合并转发，每个转发最多 40 个节点；总展开限 24,000 字，图片仍最多两张；多余图片去重截断并记录状态。</p></article>
         </div>
+
+        <figure class="image-map" id="image-context" aria-labelledby="image-title" aria-describedby="image-caption">
+          <div class="section-heading"><h3 id="image-title">图片上下文：选择、筛查与确认入史</h3><p>v1.2.0 · 群聊与私聊各自隔离 · 每轮最多两张</p></div>
+          <div class="image-sources">
+            <article><span class="plane-label">01 / CURRENT</span><h4>当前批次与引用原图</h4><p>优先当前消息、reply／forward 展开图片，按标识去重。纯图沿用未说完等待档；超过两张则记录截断，文字检查仍生效。</p></article>
+            <article><span class="plane-label">02 / NEARBY</span><h4>邻近群消息补图</h4><p>还有空位时从邻近上下文补图，普通图排在贴纸前。即使两张图片已满，仍补去重后的邻近文本。</p></article>
+            <article><span class="plane-label">03 / RECALL</span><h4>“刚才那张图”</h4><p>消息门卫已放行、非沙箱且尚无可用图，才按文字指代从同会话 HotRing 找图。通常限 30 分钟／20 条候选；排除已考虑消息、本机和撤回。</p><small>匹配被点名者，低于 L4 时优先未摘要图，同等条件取较新图。</small></article>
+          </div>
+          <div class="image-gate"><strong>↓ 串行取图与来源复检</strong><span>NapCat WS 字节优先 → 受限 CDN 兜底 → 单图 ≤3,500,000 字节／像素限制 → Pillow 清晰度处理。仍检查群准入、来源撤回与会话 epoch。</span></div>
+          <div class="image-types">
+            <article><h4>普通静态图</h4><code>最长边 768 px · medium</code><p>JPEG quality 85，不放大，保留文字边缘。门卫使用最长边 448 px 的 low 缩略图。</p></article>
+            <article><h4>长截图 · 长宽比 &gt; 2</h4><code>长边 ≤1536 / 短边 ≤768 · high</code><p>JPEG quality 86，不放大；更适合报错、代码与长图文字。门卫缩略图最长边 512 px。</p></article>
+            <article><h4>动图</h4><code>首尾两帧 → 1152×768 范围 · medium</code><p>quality 82；保留帧数与总像素上限。缩略图按原始宽高比选 448／512 px，quality 72。</p></article>
+          </div>
+          <div class="image-gate"><strong>↓ Decisions → Interactions</strong><span>当前图随消息筛查；邻近／历史图独立过来源筛查。最多两张放在输入尾部并标注来源；带图自动路由最低 L2，不绕过预算。</span></div>
+          <p class="image-loop">↩ 输出检查 + ACK → 最多 120 字 image_digest 进入 B 热史；已确认的多气泡正文合成一条门卫背景，供下一轮接话判断。</p>
+          <div class="migration-line"><h4>表情更新只改变 C 区标签数据</h4><p>A 固定保留表情协议；公开群聊／非 Owner 私聊的 <code>meme_labels</code> 放在 C 动态尾窗。后台增删标签不改 A 的哈希，输出仍按本地白名单校验后通过 Base64 发送。此次升级的固定协议变化按原有前缀校验重建旧链。</p></div>
+          <figcaption id="image-caption">找图使用当前进程的有界内存，重启、清空或逐出后不保证保留原图；图片字节不写入 B，文字摘要遵守原有会话隔离。低／中分辨率与 high 的回退费用估算分开处理，有效 usage 优先。<span class="files"><a href="src/hakimi/service.py">图片选择与筛查</a> · <a href="src/hakimi/hot_ring.py">短期候选</a> · <a href="src/hakimi/media.py">自适应压缩</a> · <a href="src/hakimi/outgoing.py">ACK 上下文闭环</a> · <a href="docs/IMAGE_CONTEXT_120.md">实现与限制</a></span></figcaption>
+        </figure>
         <figure class="chain-map" id="interaction-chain" aria-describedby="chain-caption">
           <div class="chain-heading"><h3>按会话 × 模型通道续链</h3><p>Hydrogen 与 Carbon 分别保存标识 · 每轮继续传入 A 静态指令</p></div>
           <div class="chain-requests">
@@ -523,7 +547,7 @@
       <div class="storage-grid">
         <article class="card"><h3>主库 · 调度与账本</h3><code class="path">data/hakimi.sqlite3</code><p>jobs、Outbox、逐条 ACK、防抖批次、撤回索引、公开互动、预算、热配置、最近 30 条加密决策与执行审计、巡逻与主动私信状态。</p><p>SQLite WAL、事务锁与进程锁；敏感载荷 Fernet 加密，身份索引用 HMAC。</p><div class="files"><a href="src/hakimi/store.py">store.py</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a></div></article>
         <article class="card"><h3>会话库 · 一群／一私聊一库</h3><code class="path">data/sessions/{group,private}/&lt;HMAC&gt;.sqlite3</code><p>隔离接收日志、热史、回执、画像、编年史、冷史、归档任务（含批次、时间、错误信息）及 interaction_chains。文件名由 namespace、平台、Bot 与会话身份派生。</p><p>续链标识按模型通道加密保存。清空递增 epoch/version 并清除旧链；公开索引同步提交墓碑。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/dual_memory.py">dual_memory.py</a></div></article>
-        <article class="card"><h3>缓存、素材与临时文件</h3><p>HotRing、图片 LRU、静态前缀池与本地召回索引均有内存边界。图片经 WS 字节优先水合，CDN 为受限兜底。</p><code class="path">data/memes/ · 本地白名单表情<br>/tmp/bili_video_cache/ · 视频 tmpfs</code><p>媒体通过 RPC／Base64 跨机传递；当轮引用结束释放，缓存按容量逐出。</p><div class="files"><a href="src/hakimi/hot_ring.py">hot_ring.py</a> · <a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/memes.py">memes.py</a></div></article>
+        <article class="card"><h3>缓存、素材与临时文件</h3><p>HotRing 限定会话，默认 64 个会话／每会话 200 条／全局 8 MiB；历史找图通常限 30 分钟。图片 LRU 与前缀池有界，WS 字节优先，CDN 为受限兜底。</p><code class="path">data/memes/ · 本地白名单表情<br>/tmp/bili_video_cache/ · 视频 tmpfs</code><p>媒体通过 RPC／Base64 跨机传递。重启或容量逐出后不保证找回原图；ACK 后保存文字摘要，不持久化图片字节。</p><div class="files"><a href="src/hakimi/hot_ring.py">hot_ring.py</a> · <a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/memes.py">memes.py</a></div></article>
       </div>
     </section>
 
@@ -559,9 +583,9 @@
         <div><dt>主动任务与 Drive</dt><dd><a href="src/hakimi/proactive_dm.py">proactive_dm.py</a> · <a href="src/hakimi/roaming_logger.py">roaming_logger.py</a> · <a href="src/hakimi/drive_client.py">drive_client.py</a> · <a href="src/hakimi/drive_oauth.py">drive_oauth.py</a> · <a href="src/hakimi/notebook_snapshot.py">notebook_snapshot.py</a></dd></div>
         <div><dt>控制面与账本</dt><dd><a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="src/hakimi/admin_auth.py">admin_auth.py</a> · <a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/community_admin.py">community_admin.py</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a> · <a href="src/hakimi/budget_policy.py">budget_policy.py</a> · <a href="src/hakimi/limits_policy.py">limits_policy.py</a> · <a href="src/hakimi/config.py">config.py</a></dd></div>
       </dl></div></details>
-      <details><summary>版本依据与部署文档 <span>当前行为优先参照 1.1.8 代码</span></summary><div class="detail-content"><p><a href="docs/BILLING_118.md">1.1.8 结算与历史账本校正</a> · <a href="docs/BOT_MEMORY_117.md">1.1.7 Bot 阈值与合批归档</a> · <a href="docs/CONTROL_PLANE_116.md">1.1.6 热配置与管理台</a> · <a href="docs/DELIVERY_AUDIT_115.md">1.1.5 视频触发与执行审计</a> · <a href="docs/GROUP_CONTEXT_114.md">1.1.4 群聊上下文与差量续链</a> · <a href="docs/NATURAL_PIPELINE_112.md">1.1.2 / 1.1.3 主对话与自然回复</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置与受控联网</a> · <a href="docs/MEMORY_100.md">双轨记忆与治理</a> · <a href="docs/STREAMING_010.md">流式管道与 ACK 投递</a> · <a href="docs/CONTEXT_ROUTING_09.md">A/B/C 与分档路由</a></p><p><a href="README.md">README</a> · <a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a> · <a href="docs/UPGRADE.md">升级交付</a> · <a href="Dockerfile">Dockerfile</a> · <a href="compose.roaming.yaml">Drive SA 覆盖</a> · <a href="compose.roaming-oauth.yaml">Drive OAuth 覆盖</a></p><p>图中展示源码支持的结构与默认值；实例启用状态由配置与管理台决定。当前快照对应 v1.1.8 工作树，本版重点核对 <code>gemini.py</code>、<code>streaming.py</code>、<code>store.py</code> 与 <code>budget_calendar.py</code>；Bot 分流、合批记忆、热配置、差量续链和 ACK 投递沿用既有结构。部分早期文档保留旧行为说明，以当前实现为准。</p></div></details>
+      <details><summary>版本依据与部署文档 <span>当前行为优先参照 1.2.0 代码</span></summary><div class="detail-content"><p><a href="docs/IMAGE_CONTEXT_120.md">1.2.0 图片上下文与稳定表情协议</a> · <a href="docs/BILLING_118.md">1.1.8 结算与历史账本校正</a> · <a href="docs/BOT_MEMORY_117.md">1.1.7 Bot 阈值与合批归档</a> · <a href="docs/CONTROL_PLANE_116.md">1.1.6 热配置与管理台</a> · <a href="docs/DELIVERY_AUDIT_115.md">1.1.5 视频触发与执行审计</a> · <a href="docs/GROUP_CONTEXT_114.md">1.1.4 群聊上下文与差量续链</a> · <a href="docs/NATURAL_PIPELINE_112.md">1.1.2 / 1.1.3 主对话与自然回复</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置与受控联网</a> · <a href="docs/MEMORY_100.md">双轨记忆与治理</a> · <a href="docs/STREAMING_010.md">流式管道与 ACK 投递</a> · <a href="docs/CONTEXT_ROUTING_09.md">A/B/C 与分档路由</a></p><p><a href="README.md">README</a> · <a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a> · <a href="docs/UPGRADE.md">升级交付</a> · <a href="Dockerfile">Dockerfile</a> · <a href="compose.roaming.yaml">Drive SA 覆盖</a> · <a href="compose.roaming-oauth.yaml">Drive OAuth 覆盖</a></p><p>图中展示源码支持的结构与默认值；实例启用状态由配置与管理台决定。当前快照对应 v1.2.0 工作树，本版重点核对 <code>service.py</code>、<code>media.py</code>、<code>hot_ring.py</code>、<code>outgoing.py</code>、<code>memes.py</code> 与 <code>bot_server.py</code>；费用结算、Bot 分流、合批记忆与热配置沿用既有结构。部分早期文档保留旧行为说明，以当前实现为准。</p></div></details>
     </section>
-    <footer><span>hakimi-surf / v1.1.8 · 源码架构快照 · 2026-11-15</span><span>独立 HTML + CSS · 无外部资源 · <a href="#overview">返回总览 ↑</a></span></footer>
+    <footer><span>hakimi-surf / v1.2.0 · 源码架构快照 · 2026-11-15</span><span>独立 HTML + CSS · 无外部资源 · <a href="#overview">返回总览 ↑</a></span></footer>
   </main>
 </body>
 </html>

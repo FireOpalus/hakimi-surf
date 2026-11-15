@@ -42,6 +42,11 @@ from .video_watch import VideoWatch
 from .web_search import explicit_search, search_query
 
 log = logging.getLogger("hakimi")
+PRIOR_IMAGE_REF_RE = re.compile(
+    r"(?:这|那|上|刚|前|原).{0,6}(?:张|幅|个)?(?:图|截图|照片|画面|报错图)"
+    r"|(?:图|截图|照片)(?:里|中|上)"
+    r"|(?:看|瞅|瞧|分析|解释|推导)(?:下|一下|看)?.{0,6}(?:图|截图|照片)"
+)
 HELP = """哈基米在这里。私聊可直接提问或发送 B 站视频；群聊看视频请明确 @ 我。
 /new-session：清空当前会话上下文，保留记忆开关
 外部 Bot 默认忽略；仅主人在群内明确邀请后临时互动，同群 10 分钟最多两轮。
@@ -272,7 +277,9 @@ class Service:
                 result = await self.store.admit(message)
             if message.kind == "group" and result in {"accepted", "ignored"}:
                 await self.store.groups.observe(message)
-                if result == "accepted":
+                if result == "accepted" or (
+                    eligible_context and not self.bot_guard.known_bot(message)
+                ):
                     await self.store.runtime.filters.remember_group(message)
         if result in {"accepted", "ignored"}:
             self.hot.observe(message)
@@ -409,9 +416,32 @@ class Service:
         ]
         return f"{nickname}（成员标识 {token}）"
 
-    async def message_images(self, message, members, nearby, *, limit=2, include_current=True):
+    def _is_sticker_candidate(self, message, ref) -> bool:
+        if getattr(ref, "is_sticker", False):
+            return True
+        if isinstance(self.images, ImageLoader):
+            cached = self.images.cache_get(self.store.session_scope(message), ref)
+            if cached is not None and cached.digest and self.memes.semantic_label(cached.digest):
+                return True
+        return False
+
+    async def message_images(
+        self,
+        message,
+        members,
+        nearby,
+        *,
+        limit=2,
+        include_current=True,
+        nearby_origin="紧邻群消息",
+        selected_members=None,
+    ):
         selected, seen = [], set()
-        for origin, messages in (("本批消息", reversed(members)), ("紧邻群消息", reversed(nearby))):
+        for origin, messages in (
+            ("本批消息", reversed(members)),
+            (nearby_origin, reversed(nearby)),
+        ):
+            entries = []
             for item in messages:
                 candidate = (
                     item.model_copy(update={"addressed": True}) if item.kind == "group" else item
@@ -421,7 +451,12 @@ class Service:
                 for ref in item.images:
                     if ref.identity not in seen:
                         seen.add(ref.identity)
-                        selected.append((ref, item, origin))
+                        entries.append((ref, item, origin))
+            if origin == nearby_origin and entries:
+                regular = [e for e in entries if not self._is_sticker_candidate(message, e[0])]
+                stickers = [e for e in entries if self._is_sticker_candidate(message, e[0])]
+                entries = regular + stickers
+            selected.extend(entries)
         # Expanded forward images can lack an original-user mapping; never invent authorship.
         for ref in message.images if include_current else []:
             if ref.identity not in seen:
@@ -460,6 +495,8 @@ class Service:
             else:
                 images.append(loaded)
                 data.update(image_number=len(images), status="available")
+                if selected_members is not None:
+                    selected_members.append(member)
                 semantic = self.memes.semantic_label(loaded.digest)
                 if semantic:
                     data["local_sticker_label"] = semantic
@@ -470,17 +507,27 @@ class Service:
 
     async def expand_forwards(self, message: Message) -> Message:
         texts, images = [message.text], list(message.images)
+        seen_ids = {i.identity for i in images}
         videos, shorts = list(message.video_ids), list(message.short_urls)
+        statuses = set(message.context_status)
         for forward_id in message.forward_ids:
             rich = parse_forward(await self.sender.forward(forward_id), message.bot_id)
+            if rich.truncated:
+                statuses.add("truncated")
             texts.append(rich.text)
-            images.extend(i for i in rich.images if i not in images)
+            for img in rich.images:
+                if img.identity not in seen_ids:
+                    images.append(img)
+                    seen_ids.add(img.identity)
             videos.extend(v for v in rich.video_ids if v not in videos)
             shorts.extend(u for u in rich.short_urls if u not in shorts)
             # No recursive get_forward_msg calls: a quoted reference cannot fan out requests.
         text = "\n".join(texts)
-        if len(text) > 24000 or len(images) > 2:
+        if len(text) > 24000:
             raise Rejected("forward_too_large")
+        if len(images) > 2:
+            images = images[:2]
+            statuses.add("truncated")
         if any(secret and len(secret) >= 8 and secret in text for secret in self.secrets):
             raise Rejected("credential_in_input")
         return message.model_copy(
@@ -490,6 +537,8 @@ class Service:
                 "video_ids": videos[:5],
                 "short_urls": shorts[:5],
                 "forward_ids": [],
+                "context_expanded": True,
+                "context_status": sorted(statuses),
             }
         )
 
@@ -552,6 +601,7 @@ class Service:
             if self.bot_guard.known_bot(original):
                 await self.bot_guard.prepare(original)
         neighbour_members = []
+        recalled_members = []
         if await self.recalled(members):
             return
         watermark = self.hot.watermark(message)
@@ -656,7 +706,9 @@ class Service:
             return
 
         async def message_guard():
-            if await self.recalled(members):
+            if await self.recalled(members) or (
+                recalled_members and await self.recalled(recalled_members)
+            ):
                 raise Rejected("reply_invalidated")
             if (
                 not self.batch_authorized(message, members)
@@ -751,11 +803,11 @@ class Service:
         ):
             invited_bots.add(message.user_id)
         filtered_nearby = []
+        current_events = {m.event_id for m in members}
         if message.kind == "group" and not sandbox:
             nearby = await self.store.groups.previous_messages(message, members, limit=6)
             neighbour_members[:] = nearby
             history_events = {item.get("event_id") for item in history if item.get("event_id")}
-            current_events = {m.event_id for m in members}
             filtered_nearby = [
                 m
                 for m in nearby
@@ -793,6 +845,64 @@ class Service:
                 for m in filtered_nearby
                 if m.context_status
             )
+        if not sandbox and not images and PRIOR_IMAGE_REF_RE.search(message.text):
+            candidates = self.hot.recent_with_images(
+                message,
+                exclude_events={*current_events, *(m.event_id for m in neighbour_members)},
+            )
+            valid_candidates = []
+            for item in candidates:
+                if not await self.recalled([item]):
+                    valid_candidates.append(item)
+            if valid_candidates:
+                mentioned_peers = {
+                    uid for m in members for uid in m.mentioned_ids if uid != self.s.onebot_self_id
+                }
+                digested_events = set()
+                for entry in history:
+                    match = re.match(r"^\[附图摘要，消息([^：\]]+)：", str(entry.get("text", "")))
+                    if match:
+                        digested_events.add(match.group(1))
+                tier_hint = getattr(intent, "tier", 2)
+
+                def _recall_rank(idx_item):
+                    idx, item = idx_item
+                    speaker_match = (item.user_id in mentioned_peers) or bool(
+                        item.sender_nickname and item.sender_nickname in message.text
+                    )
+                    undigested = item.event_id not in digested_events
+                    return (
+                        1 if speaker_match else 0,
+                        1 if (tier_hint < 4 and undigested) else 0,
+                        idx,
+                    )
+
+                ordered_candidates = [
+                    item for _, item in sorted(enumerate(valid_candidates), key=_recall_rank)
+                ]
+                recalled_members.clear()
+                recalled_images, recalled_sources = await self.message_images(
+                    message,
+                    [],
+                    ordered_candidates,
+                    limit=2,
+                    include_current=False,
+                    nearby_origin="历史消息附图",
+                    selected_members=recalled_members,
+                )
+                await message_guard()
+                if recalled_images:
+                    neighbour_members.extend(recalled_members)
+                    await self.ai.screen(
+                        {"image_sources": recalled_sources, "historical_image_recall": True},
+                        job["subject"],
+                        purpose="source",
+                        images=[i.gate() for i in recalled_images],
+                        before_call=message_guard,
+                    )
+                    image_sources.extend(recalled_sources)
+                    images.extend(recalled_images)
+                    payload["image_sources"] = image_sources
         if not sandbox:
             related_user_ids = [
                 *(m.user_id for m in members),
@@ -936,7 +1046,7 @@ class Service:
             batch = self.store.groups.active.get(self.store.session_scope(message))
             chat_route = intent
             tier = getattr(intent, "tier", 2)
-            if payload.get("web_search_findings") and tier < 2:
+            if (payload.get("web_search_findings") or images) and tier < 2:
                 tier = 2
                 if isinstance(intent, RouteDecision):
                     chat_route = RouteDecision(

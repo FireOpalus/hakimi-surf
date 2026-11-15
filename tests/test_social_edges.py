@@ -200,6 +200,13 @@ async def test_actual_sdk_meme_static_prefix_tracks_admin_edits_and_excludes_pub
     gateway = GeminiGateway(service.s, service.store, *sdk_pair(handler))
     target = group(message)
 
+    def _extract_input(body):
+        raw = body["input"]
+        if isinstance(raw, list):
+            first = raw[0]
+            return first["content"][0]["text"] if "content" in first else first["text"]
+        return raw
+
     async def generate(scenario=Scenario.FAST_CHAT, msg=target):
         await gateway.generate(
             {"current_message": "动态消息内容只在末尾输入"},
@@ -213,10 +220,11 @@ async def test_actual_sdk_meme_static_prefix_tracks_admin_edits_and_excludes_pub
         )
         assert body["model"] == "gemini-4-hydrogen" and body["store"] is expected_store
         assert "动态消息内容只在末尾输入" not in body["system_instruction"]
-        return body["system_instruction"]
+        return body["system_instruction"], _extract_input(body)
 
-    empty = await generate()
-    assert "表情标签白名单：[]" in empty
+    empty_sys, empty_input = await generate()
+    assert "【公开聊天的本地表情协议】" in empty_sys
+    assert '"meme_labels":[]' in empty_input
     response = await client.post(
         "/admin/api/memes/upload/" + quote("刚加入.png"),
         content=picture(),
@@ -224,23 +232,19 @@ async def test_actual_sdk_meme_static_prefix_tracks_admin_edits_and_excludes_pub
     )
     assert response.status_code == 200, response.text
     key = response.json()["id"]
-    active = await generate()
-    assert active.startswith(SYSTEM_INSTRUCTION + PUBLIC_PERSONA_PROMPT)
-    assert '表情标签白名单：["刚加入"]' in active
-    assert "【服务器验证的当前发送者】" not in active
-    last_raw_input = calls[-1]["input"]
-    if isinstance(last_raw_input, list):
-        first_item = last_raw_input[0]
-        last_input = (
-            first_item["content"][0]["text"] if "content" in first_item else first_item["text"]
-        )
-    else:
-        last_input = last_raw_input
-    assert "【服务器验证的当前发送者】" in last_input
-    owner_group = await generate(msg=target.model_copy(update={"user_id": service.s.owner_qq_id}))
+    active_sys, active_input = await generate()
+    assert active_sys.startswith(SYSTEM_INSTRUCTION + PUBLIC_PERSONA_PROMPT)
+    assert active_sys == empty_sys
+    assert "刚加入" not in active_sys
+    assert '"meme_labels":["刚加入"]' in active_input
+    assert "【服务器验证的当前发送者】" not in active_sys
+    assert "【服务器验证的当前发送者】" in active_input
+    owner_group_sys, _ = await generate(
+        msg=target.model_copy(update={"user_id": service.s.owner_qq_id})
+    )
     assert (
-        active.partition("【服务器验证的当前发送者】")[0]
-        == owner_group.partition("【服务器验证的当前发送者】")[0]
+        active_sys.partition("【服务器验证的当前发送者】")[0]
+        == owner_group_sys.partition("【服务器验证的当前发送者】")[0]
     )
     for scenario, msg in (
         (Scenario.BILI_SELECTION, None),
@@ -250,9 +254,15 @@ async def test_actual_sdk_meme_static_prefix_tracks_admin_edits_and_excludes_pub
         (Scenario.FAST_CHAT, None),
         (Scenario.OWNER_PRIVATE, message),
     ):
-        instruction = await generate(scenario, msg)
-        assert "表情标签白名单" not in instruction and "[MEME:" not in instruction
+        instruction, _ = await generate(scenario, msg)
+        assert (
+            "本地表情协议" not in instruction
+            and "表情标签白名单" not in instruction
+            and "[MEME:" not in instruction
+        )
         if scenario == Scenario.OWNER_PRIVATE:
             assert instruction.startswith(SYSTEM_INSTRUCTION + OWNER_PERSONA_PROMPT)
     assert (await client.delete(f"/admin/api/memes/{key}")).status_code == 200
-    assert await generate() == empty
+    deleted_sys, deleted_input = await generate()
+    assert deleted_sys == empty_sys
+    assert '"meme_labels":[]' in deleted_input
