@@ -228,7 +228,7 @@ async def test_remote_get_msg_requires_matching_message_and_group(settings, mess
     assert "是这张吗" not in rejected.text and not rejected.images
 
 
-def test_forward_first_twenty_senders_self_anchor_images_and_no_command():
+def test_forward_first_fifteen_senders_self_anchor_images_and_no_command():
     nodes = [
         {
             "sender": {"user_id": 10000 if i == 0 else 31000 + i, "nickname": f"作者{i}"},
@@ -243,7 +243,7 @@ def test_forward_first_twenty_senders_self_anchor_images_and_no_command():
     rich = parse_forward({"messages": nodes}, "10000", include_authors=True)
     assert "[转发记录 - 我自己(吉米奈喵)]" in rich.text
     assert "作者1(QQ:31001)" in rich.text
-    assert "第19条" in rich.text and "第20条" not in rich.text
+    assert "第14条" in rich.text and "第15条" not in rich.text
     assert len(rich.images) == 2 and rich.images[0].sender_id == "10000"
     assert not rich.addressed and not rich.mentioned_ids and not rich.command_text
 

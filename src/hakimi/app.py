@@ -11,7 +11,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 
-from .adapters import Sender, onebot_message, qq_message
+from .adapters import Sender, qq_message
 from .admin_auth import AdminAuth
 from .admin_routes import router as admin_router
 from .bili_account_admin import router as bili_account_router
@@ -118,6 +118,9 @@ def create_app(
                     await service.bili_watcher.initialize()
                     await service.video_watch.initialize()
                     await service.memes.initialize()
+                    from .outgoing import recover_receipts
+
+                    await recover_receipts(service)
                     if hasattr(ai, "cleanup_video_files"):
                         await ai.cleanup_video_files()
                     if isinstance(onebot, WebSocketTransport):
@@ -134,7 +137,7 @@ def create_app(
 
                     async def ws_event(payload):
                         try:
-                            return await service.accept(onebot_message(payload, s))
+                            return await service.accept_event(payload)
                         except (Rejected, KeyError, TypeError, ValueError, AttributeError):
                             return "ignored"
 
@@ -233,10 +236,14 @@ def create_app(
                 payload.get("self_id")
             ):
                 raise Rejected("wrong_bot")
-            message = onebot_message(payload, s)
+            if str(payload.get("self_id")) != s.onebot_self_id:
+                raise Rejected("wrong_bot")
         except (Rejected, KeyError, TypeError, ValueError, AttributeError):
             raise HTTPException(400, "invalid event") from None
-        result = await request.app.state.service.accept(message)
+        try:
+            result = await request.app.state.service.accept_event(payload)
+        except (Rejected, KeyError, TypeError, ValueError, AttributeError):
+            raise HTTPException(400, "invalid event") from None
         if result == "full":
             raise HTTPException(503, "queue full", headers={"Retry-After": "5"})
         # Never use OneBot quick-action fields; only the authenticated outbox sends messages.

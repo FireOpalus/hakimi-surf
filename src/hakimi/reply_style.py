@@ -26,12 +26,12 @@ def clean_chinese_punctuation(text: str, *, public=False) -> str:
     return text
 
 
-def public_reply(text: str) -> str:
+def public_reply(text: str, *, limit=30) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"[~～∼〜﹏]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     sentences = re.findall(r"[^。！？!?]+[。！？!?]*", text)
     text = "".join(sentences[:2]).strip() if sentences else text
-    if len(text) > 30:
-        text = text[:29].rstrip("，、；：,;:") + "。"
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip("，、；：,;:") + "。"
     return clean_chinese_punctuation(text, public=True)

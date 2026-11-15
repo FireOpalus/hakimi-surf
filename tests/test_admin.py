@@ -172,6 +172,7 @@ async def test_admin_compression_changes_existing_session_without_restart(admin_
 
     app, client, gateway = admin_api
     svc = app.state.service
+    svc.s.prefix_history_enabled = False  # Explicit legacy-window compatibility.
     initial = (await client.get("/admin/api/compression")).json()
     assert initial["source"] == "env"
     assert initial["config"]["group"] == {
@@ -455,3 +456,65 @@ async def test_proactive_manual_digest_uses_shared_daily_attempt(admin_api):
     assert second.status_code == 200
     assert len(gateway.calls) == 2
     assert len(app.state.service.sender.onebot.calls) == 1
+
+
+async def test_dual_memory_governance_cas_lock_delete_unlock_and_no_raw_history(admin_api, message):
+    from tests.test_dual_memory_v100 import group, populate
+
+    app, client, ai = admin_api
+    svc = app.state.service
+    msg = group(message)
+    await populate(svc.sessions, msg)
+    key = next(k for k, _ in await svc.store.runtime.sessions())
+    url = "/admin/api/sessions/" + key + "/memory"
+    view = (await client.get(url)).json()
+    assert view["ready"] and len(view["entries"]) == 2
+    assert "recent_messages" not in view
+    entry = next(e for e in view["entries"] if e["kind"] == "profile")
+    update = {
+        "id": entry["id"],
+        "version": view["version"],
+        "action": "edit",
+        "text": "人工确认：喜欢数学",
+    }
+    assert (await client.put(url, json=update)).status_code == 200
+    assert ai.calls[-1][3]["budget_lane"] == "admin"
+    assert (await client.put(url, json=update)).status_code == 409
+    view = (await client.post(url + "/search", json={"query": "数学"})).json()
+    assert len(view["entries"]) == 1 and view["entries"][0]["locked"]
+    update.update(version=view["version"], action="delete", text="")
+    calls = len(ai.calls)
+    assert (await client.put(url, json=update)).status_code == 200
+    view = (await client.get(url)).json()
+    erased = next(e for e in view["entries"] if e["id"] == entry["id"])
+    assert erased["deleted"] and erased["locked"] and not erased["text"]
+    update.update(version=view["version"], action="unlock")
+    assert (await client.put(url, json=update)).status_code == 200
+    assert len(ai.calls) == calls
+    version = (await client.get(url)).json()["version"]
+    assert (
+        await client.put(url + "/mirror", json={"enabled": True, "version": version})
+    ).status_code == 200
+    assert (await client.post("/admin/api/sessions/" + key + "/reset")).status_code == 200
+    view = (await client.get(url)).json()
+    assert not view["entries"] and not view["mirror_enabled"]
+    assert (await client.get(url, headers={"Authorization": "Bearer wrong"})).status_code == 401
+
+
+async def test_dual_memory_admin_page_and_ledger_fields(admin_api):
+    _, client, _ = admin_api
+    page = await client.get("/admin")
+    assert "memory-mirror-save" in page.text and "双轨记忆治理" in page.text
+    assert "innerHTML" not in page.text and "unpkg.com" not in page.text
+    usage = (await client.get("/admin/api/dashboard")).json()["usage"]["token_usage"]["today"]
+    assert (
+        "effective_cache_hit_ratio" in usage and "cache_hit_ratio" in usage and "by_model" in usage
+    )
+
+
+async def test_cache_prefix_alert_is_visible_in_ledger(admin_api):
+    app, client, _ = admin_api
+    await app.state.service.store.runtime.event("cache_prefix_busted", "production")
+    health = (await client.get("/admin/api/dashboard")).json()["usage"]["cache_health"]
+    assert health == {"target": 0.9, "tail_tokens": 2050, "prefix_busts_today": 1}
+    assert "cache-alert" in (await client.get("/admin")).text

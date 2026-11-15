@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 ThinkingLevel = Literal["low", "medium", "high", "xhigh"]
+ChatThinkingLevel = Literal["auto", "low", "medium", "high", "xhigh"]
 THINKING_LEVELS = ("low", "medium", "high", "xhigh")
 SETTING_FIELDS = {
     "fast_chat": "fast_chat_thinking_level",
@@ -22,8 +23,8 @@ SETTING_FIELDS = {
 class ThinkingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    fast_chat: ThinkingLevel = "medium"
-    owner_private: ThinkingLevel = "medium"
+    fast_chat: ChatThinkingLevel = "auto"
+    owner_private: ChatThinkingLevel = "auto"
     bilibili_summary: ThinkingLevel = "medium"
     daily_diary: ThinkingLevel = "medium"
     memory_compression: ThinkingLevel = "medium"

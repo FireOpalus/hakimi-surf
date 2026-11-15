@@ -1,3 +1,4 @@
+import inspect
 import json
 
 import httpx
@@ -16,11 +17,22 @@ def decision_response(intent="chat"):
             "is_prompt_injection": {"type": "noul", "noul": 0.01, "confidence": 0.99},
             "is_unsafe_or_spam": {"type": "noul", "noul": 0.01, "confidence": 0.99},
             "should_reply": {"type": "noul", "noul": 0.99, "confidence": 0.99},
-            "intent": {
-                "type": "choice",
-                "choice": intent,
+            "need_memory_recall": {"type": "noul", "noul": 0.1, "confidence": 0.99},
+            "need_external_lookup": {
+                "type": "noul",
+                "noul": 0.99 if intent == "bilibili_watch" else 0.01,
                 "confidence": 0.99,
-                "probabilities": {intent: 0.99},
+            },
+            "reasoning_tier": {
+                "type": "choice",
+                "choice": "tier_2_medium",
+                "confidence": 0.99,
+                "probabilities": {
+                    "tier_1_low": 0.1,
+                    "tier_2_medium": 0.8,
+                    "tier_3_high": 0.05,
+                    "tier_4_carbon": 0.05,
+                },
             },
         },
         "usage": {"total_input_tokens": 100, "total_output_tokens": 0, "total_tokens": 100},
@@ -42,15 +54,72 @@ def interaction_response():
     }
 
 
+def stream_response(request, response):
+    if not (
+        request.method == "POST"
+        and request.url.path.endswith("interactions")
+        and json.loads(request.content).get("stream")
+        and response.status_code == 200
+    ):
+        return response
+    if response.headers.get("content-type", "").startswith("text/event-stream"):
+        return response
+    result = response.json()
+    events = []
+    for index, step in enumerate(result.get("steps", [])):
+        content = step.get("content", [])
+        if step.get("type") == "model_output" and all(p.get("type") == "text" for p in content):
+            text = "\n".join(p["text"] for p in content)
+            if not text.lstrip().startswith("{"):
+                text = json.dumps(
+                    {
+                        "abstain": False,
+                        "bubbles": [text],
+                        "anchor": {},
+                        "sticker": {},
+                        "image_digest": None,
+                    },
+                    ensure_ascii=False,
+                )
+            events += [
+                {"event_type": "step.start", "index": index, "step": {"type": "model_output"}},
+                {
+                    "event_type": "step.delta",
+                    "index": index,
+                    "delta": {"type": "text", "text": text},
+                },
+            ]
+        else:
+            events.append({"event_type": "step.start", "index": index, "step": step})
+        events.append({"event_type": "step.stop", "index": index})
+    events.append(
+        {
+            "event_type": "interaction.completed",
+            "interaction": {k: v for k, v in result.items() if k != "steps"},
+        }
+    )
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content="".join("data: " + json.dumps(e) + "\n\n" for e in events),
+    )
+
+
 @pytest.fixture
 async def sdk_pair():
     clients = []
     transports = []
 
     def create(handler):
+        async def adapted(request):
+            response = handler(request)
+            if inspect.isawaitable(response):
+                response = await response
+            return stream_response(request, response)
+
         result = []
         for v in ("v1beta", "v1"):
-            transport = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+            transport = httpx.AsyncClient(transport=httpx.MockTransport(adapted), trust_env=False)
             transports.append(transport)
             client = genai.Client(
                 api_key="test-only",
@@ -88,9 +157,8 @@ async def test_real_sdk_serialization_versions_usage_and_async_path(settings, st
     gateway = GeminiGateway(settings, store, *sdk_pair(handler))
     assert await gateway.screen({"current_message": "你好"}, "s", purpose="message") == "chat"
     for summary in (False, True):
-        assert (
-            await gateway.generate({"current_message": "你好"}, "s", summary=summary) == "你好喵。"
-        )
+        result = await gateway.generate({"current_message": "你好"}, "s", summary=summary)
+        assert (result if summary else json.loads(result)["bubbles"][0]) == "你好喵。"
     assert [r.url.path for r in calls] == [
         "/v1beta/decisions",
         "/v1/interactions",
@@ -193,7 +261,7 @@ async def test_fail_closed_decisions(settings, store, sdk_pair, mutation):
     elif mutation == "unsafe":
         response["answers"]["is_unsafe_or_spam"]["noul"] = 0.9
     else:
-        response["answers"]["intent"]["choice"] = "execute_shell"
+        response["answers"]["reasoning_tier"]["choice"] = "execute_shell"
     gateway = GeminiGateway(
         settings, store, *sdk_pair(lambda _: httpx.Response(200, json=response))
     )
@@ -201,7 +269,9 @@ async def test_fail_closed_decisions(settings, store, sdk_pair, mutation):
         await gateway.screen({"current_message": "x"}, "s", purpose="message")
 
 
-async def test_incomplete_response_is_not_continued(settings, store, sdk_pair):
+async def test_incomplete_response_downgrades_once_without_server_continuation(
+    settings, store, sdk_pair
+):
     response = interaction_response()
     response["status"] = "incomplete"
     calls = []
@@ -213,7 +283,9 @@ async def test_incomplete_response_is_not_continued(settings, store, sdk_pair):
     gateway = GeminiGateway(settings, store, *sdk_pair(handler))
     with pytest.raises(Rejected, match="generation_incomplete"):
         await gateway.generate({}, "s")
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert json.loads(calls[1].content)["generation_config"]["thinking_level"] == "low"
+    assert "previous_interaction_id" not in json.loads(calls[1].content)
 
 
 async def test_production_clients_pin_versions_and_disable_environment_vertex(
@@ -276,7 +348,7 @@ async def test_multimodal_wire_format_matches_both_new_apis(settings, store, sdk
 @pytest.mark.parametrize(
     "scenario,deep,level,cap",
     [
-        (Scenario.FAST_CHAT, False, "medium", 1536),
+        (Scenario.FAST_CHAT, False, "medium", 4096),
         (Scenario.OWNER_PRIVATE, False, "medium", 4096),
         (Scenario.BILIBILI_SUMMARY, False, "medium", 4096),
         (Scenario.DAILY_DIARY, False, "medium", 4096),
@@ -391,7 +463,11 @@ async def test_persona_and_role_on_actual_interactions_wire(
             assert instruction.startswith(SYSTEM_INSTRUCTION + PUBLIC_PERSONA_PROMPT)
             assert OWNER_PERSONA_PROMPT not in instruction
         expected_role = "OWNER" if identity in {"private_owner", "group_owner"} else "MEMBER"
-        assert f"【服务器验证的当前发送者】\n[role={expected_role}]" in instruction
+        marker = f"【服务器验证的当前发送者】\n[role={expected_role}]"
+        if scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}:
+            assert marker not in instruction and marker in body["input"]
+        else:
+            assert marker in instruction
         assert "变为私聊人设" not in instruction
         assert body["input"].count("</untrusted_user_input>") == 1
         assert body["tools"] == [] and not body["store"]
@@ -544,7 +620,14 @@ async def test_every_generation_scenario_starts_with_shared_user_prompt(
         )
         assert instruction.startswith(SYSTEM_INSTRUCTION + identity)
         marker = "\n【服务器验证的当前发送者】"
-        assert instruction.index(identity) < instruction.index(marker)
+        if scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}:
+            assert marker not in instruction
+            assert (
+                marker
+                in json.loads(requests[0].content)["input"].split("<transient_turn_context>")[1]
+            )
+        else:
+            assert instruction.index(identity) < instruction.index(marker)
 
 
 @pytest.mark.parametrize("lane", ["memory", "admin", "proactive"])

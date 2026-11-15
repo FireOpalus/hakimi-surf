@@ -26,10 +26,18 @@ def test_every_business_scenario_defaults_to_medium_without_changing_caps(settin
     for level in ("low", "medium", "high", "xhigh"):
         settings._thinking_override = ThinkingConfig(**{str(scene): level for scene in Scenario})
         assert generation_plan(settings, scenario).thinking_level == level
-        assert generation_plan(settings, scenario).output_tokens == baseline.output_tokens
+        if scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}:
+            expected = (
+                settings.chat_output_tokens
+                if scenario == Scenario.FAST_CHAT
+                else settings.owner_output_tokens
+            )
+            assert generation_plan(settings, scenario).output_tokens == expected
+        else:
+            assert generation_plan(settings, scenario).output_tokens == baseline.output_tokens
 
 
-@pytest.mark.parametrize("value", ["minimal", "auto", "ultra", "xHigh", "", 1, True, None, []])
+@pytest.mark.parametrize("value", ["minimal", "ultra", "xHigh", "", 1, True, None, []])
 def test_thinking_policy_rejects_unknown_or_coerced_levels(value):
     with pytest.raises(ValidationError):
         ThinkingConfig(fast_chat=value)
@@ -89,7 +97,7 @@ async def test_thinking_admin_disabled_with_empty_token(settings, method):
 async def test_admin_thinking_hot_save_and_reset_are_local_only(admin_api):
     app, client, gateway = admin_api
     initial = (await client.get("/admin/api/thinking")).json()
-    assert initial["config"] == {str(scene): "medium" for scene in Scenario}
+    assert initial["config"] == ThinkingConfig().model_dump()
     assert initial["source"] == "env" and initial["environment"] == initial["config"]
     assert initial["levels"] == ["low", "medium", "high", "xhigh"]
     changed = dict(initial["config"], fast_chat="xhigh", owner_companion="high")

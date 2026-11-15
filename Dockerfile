@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy PATH="/app/.venv/bin:$PATH" TZ=Asia/Shanghai
 WORKDIR /app
 # Latest stable yt-dlp is pinned in uv.lock; ffmpeg/ffprobe validate and merge bounded media.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates fonts-wqy-zenhei && \
     rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project

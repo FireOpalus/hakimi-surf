@@ -110,6 +110,8 @@ class FolderDrive(DriveAuth):
         async with self.http.stream(
             method, url, headers=headers, follow_redirects=False, **kwargs
         ) as response:
+            if response.status_code == 412:
+                raise Rejected("drive_etag_conflict")
             if response.status_code not in {200, 201}:
                 raise Rejected("drive_request_failed")
             body = bytearray()
@@ -135,10 +137,7 @@ class FolderDrive(DriveAuth):
             raise Rejected("drive_file_outside_scope")
         return file_id
 
-    async def sync_day(self, day: str, markdown: str) -> str:
-        if date.fromisoformat(day).isoformat() != day or len(markdown.encode()) > 262144:
-            raise Rejected("drive_invalid_diary")
-        filename = day + ".md"
+    async def validate_folder(self):
         # The only unconditionally fetched object is the configured folder itself.
         folder, _ = await self._json(
             "GET",
@@ -164,6 +163,12 @@ class FolderDrive(DriveAuth):
             != self.oauth.info["folder_marker"]
         ):
             raise Rejected("drive_oauth_folder_mismatch")
+
+    async def sync_day(self, day: str, markdown: str) -> str:
+        if date.fromisoformat(day).isoformat() != day or len(markdown.encode()) > 262144:
+            raise Rejected("drive_invalid_diary")
+        filename = day + ".md"
+        await self.validate_folder()
         listing, _ = await self._json(
             "GET",
             API,
@@ -232,3 +237,141 @@ class FolderDrive(DriveAuth):
                 content=body,
             )
         return self._validate_file(result, filename)
+
+    def _memory_identity(self, scope):
+        if not re.fullmatch(r"[a-f0-9]{64}", scope):
+            raise Rejected("drive_memory_scope_invalid")
+        return "group-memory-" + scope[:24] + ".md"
+
+    def _validate_memory_file(self, item, scope):
+        file_id = item.get("id", "")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id)
+            or item.get("parents") != [self.folder]
+            or item.get("trashed", False)
+            or item.get("name") != self._memory_identity(scope)
+            or item.get("mimeType") != "text/markdown"
+            or item.get("appProperties", {}).get("hakimi_group_memory") != self.marker
+            or item.get("appProperties", {}).get("hakimi_group_scope") != scope
+        ):
+            raise Rejected("drive_file_outside_scope")
+        return file_id
+
+    async def memory_head(self, scope):
+        filename = self._memory_identity(scope)
+        await self.validate_folder()
+        # All discovery is explicitly parent AND dedicated-property constrained.
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.marker):
+            raise Rejected("drive_memory_marker_invalid")
+        listing, _ = await self._json(
+            "GET",
+            API,
+            params={
+                "q": f"'{self.folder}' in parents and trashed = false and name = '{filename}' "
+                f"and appProperties has {{ key='hakimi_group_memory' and value='{self.marker}' }} "
+                f"and appProperties has {{ key='hakimi_group_scope' and value='{scope}' }}",
+                "fields": f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
+                "pageSize": "2",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "corpora": "user",
+            },
+        )
+        files = listing.get("files")
+        if (
+            not isinstance(files, list)
+            or len(files) > 1
+            or listing.get("nextPageToken")
+            or listing.get("incompleteSearch")
+        ):
+            raise Rejected("drive_ambiguous_file")
+        if not files:
+            return None
+        ident = self._validate_memory_file(files[0], scope)
+        meta, etag = await self._json(
+            "GET",
+            API + "/" + ident,
+            params={"fields": FILE_FIELDS + ",md5Checksum,size", "supportsAllDrives": "true"},
+        )
+        self._validate_memory_file(meta, scope)
+        if not etag:
+            raise Rejected("drive_etag_required")
+        return {"id": ident, "etag": etag, "md5": meta.get("md5Checksum"), "size": meta.get("size")}
+
+    async def read_memory(self, scope, head):
+        # Revalidate against a fresh constrained listing, never accept an arbitrary file ID.
+        fresh = await self.memory_head(scope)
+        if not fresh or fresh["id"] != head["id"] or fresh["etag"] != head["etag"]:
+            raise Rejected("drive_etag_conflict")
+        try:
+            if int(fresh.get("size") or 0) > 262144:
+                raise Rejected("drive_memory_too_large")
+        except (TypeError, ValueError):
+            raise Rejected("drive_invalid_response") from None
+        headers = {
+            "Authorization": "Bearer " + await self._access_token(),
+            "If-Match": head["etag"],
+        }
+        async with self.http.stream(
+            "GET",
+            API + "/" + head["id"],
+            headers=headers,
+            params={"alt": "media", "supportsAllDrives": "true"},
+            follow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                raise Rejected("drive_memory_download_failed")
+            data = bytearray()
+            async for chunk in response.aiter_bytes():
+                data.extend(chunk)
+                if len(data) > 262144:
+                    raise Rejected("drive_memory_too_large")
+            try:
+                return data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise Rejected("drive_memory_not_text") from None
+
+    async def write_memory(self, scope, markdown, head):
+        filename = self._memory_identity(scope)
+        if len(markdown.encode()) > 262144:
+            raise Rejected("drive_memory_too_large")
+        fresh = await self.memory_head(scope)
+        if (fresh is None) != (head is None) or (
+            fresh and (fresh["id"], fresh["etag"]) != (head["id"], head["etag"])
+        ):
+            raise Rejected("drive_etag_conflict")
+        if head:
+            result, _ = await self._json(
+                "PATCH",
+                UPLOAD + "/" + head["id"],
+                params={"uploadType": "media", "supportsAllDrives": "true", "fields": FILE_FIELDS},
+                headers={"If-Match": head["etag"], "Content-Type": "text/markdown; charset=UTF-8"},
+                content=markdown.encode(),
+            )
+        else:
+            meta = {
+                "name": filename,
+                "parents": [self.folder],
+                "mimeType": "text/markdown",
+                "appProperties": {"hakimi_group_memory": self.marker, "hakimi_group_scope": scope},
+            }
+            boundary = "hakimi_" + uuid.uuid4().hex
+            data = (
+                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+                + json.dumps(meta)
+                + f"\r\n--{boundary}\r\nContent-Type: text/markdown; charset=UTF-8\r\n\r\n"
+                + markdown
+                + f"\r\n--{boundary}--\r\n"
+            ).encode()
+            result, _ = await self._json(
+                "POST",
+                UPLOAD,
+                params={
+                    "uploadType": "multipart",
+                    "supportsAllDrives": "true",
+                    "fields": FILE_FIELDS,
+                },
+                headers={"Content-Type": "multipart/related; boundary=" + boundary},
+                content=data,
+            )
+        return self._validate_memory_file(result, scope)

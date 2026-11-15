@@ -11,11 +11,13 @@ from zoneinfo import ZoneInfo
 from .admission_policy import AdmissionConfig
 from .attention import AttentionRouter
 from .compression_policy import CompressionConfig
+from .debounce_policy import DebounceConfig
 from .gateway import FilterManager
 from .models import Message
 from .proactive_policy import ProactiveConfig
 from .security import Rejected
 from .thinking_policy import THINKING_LEVELS, ThinkingConfig
+from .web_search import WebSearch
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS admin_config (key TEXT PRIMARY KEY, payload BLOB NOT NULL);
@@ -55,7 +57,11 @@ CODES = frozenset(
         "patrol_worker_error",
         "budget_exhausted",
         "gemini_unavailable",
+        "web_search_failed",
         "compression_failed",
+        "memory_worker_failed",
+        "memory_mirror_failed",
+        "cache_prefix_busted",
         "compression_stale",
         "notebook_refresh_failed",
         "admin_action_failed",
@@ -101,6 +107,10 @@ class RuntimeState:
         self.filters = FilterManager(store)
         self.env_thinking = ThinkingConfig.from_settings(self.s)
         self.thinking_lock = asyncio.Lock()
+        self.env_debounce = DebounceConfig.from_settings(self.s)
+        self.debounce_override = None
+        self.debounce_lock = asyncio.Lock()
+        self.web_search = WebSearch(store)
 
     async def event(self, code, source="system"):
         if code not in CODES or source not in {"system", "production", "sandbox", "memory"}:
@@ -142,6 +152,7 @@ class RuntimeState:
             )
 
     async def load_config(self):
+        self.debounce_override = None
         self.s._thinking_override = None
         self.compression = self.env_compression
         self.compression_overridden = False
@@ -166,6 +177,8 @@ class RuntimeState:
                 self.proactive_overridden = True
             elif row["key"] == "thinking":
                 self.s._thinking_override = ThinkingConfig.model_validate(value)
+            elif row["key"] == "debounce":
+                self.debounce_override = DebounceConfig.model_validate(value)
             elif row["key"].startswith("policy:"):
                 self.s.group_policies[row["key"][7:]] = value
         if not self.admission_overridden and legacy_bots is not None:
@@ -179,6 +192,30 @@ class RuntimeState:
             raise Rejected("bot_identity_config_conflict")
         await self.attention.initialize()
         await self.filters.initialize()
+        await self.web_search.initialize()
+
+    def debounce_status(self):
+        return {
+            "config": self.store.groups.config.model_dump(),
+            "source": "sqlite" if self.debounce_override is not None else "env",
+            "environment": self.env_debounce.model_dump(),
+        }
+
+    async def set_debounce(self, value: DebounceConfig | None):
+        if value is not None and not isinstance(value, DebounceConfig):
+            raise ValueError("Expected a validated DebounceConfig")
+        async with self.debounce_lock:
+            async with self.store.transaction():
+                if value is None:
+                    await self.store.db.execute("DELETE FROM admin_config WHERE key='debounce'")
+                else:
+                    await self.store.db.execute(
+                        "INSERT OR REPLACE INTO admin_config VALUES ('debounce',?)",
+                        (self.store.vault.seal("admin:debounce", value.model_dump()),),
+                    )
+                await self.store.groups.retime_pending_in_transaction(value or self.env_debounce)
+            self.debounce_override = value
+        return self.debounce_status()
 
     def thinking_status(self):
         return {
@@ -186,6 +223,8 @@ class RuntimeState:
             "source": "sqlite" if self.s._thinking_override is not None else "env",
             "environment": self.env_thinking.model_dump(),
             "levels": list(THINKING_LEVELS),
+            "chat_levels": ["auto", *THINKING_LEVELS],
+            "carbon_enabled": self.s.carbon_enabled,
         }
 
     async def set_thinking(self, value: ThinkingConfig | None):

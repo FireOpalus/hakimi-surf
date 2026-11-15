@@ -7,8 +7,11 @@ from contextlib import asynccontextmanager
 
 import aiosqlite
 
-from .bot_server import is_persona_owner
+from .bot_server import history_lines, is_persona_owner
 from .config import Settings
+from .context_budget import estimate_tokens
+from .dual_memory import SCHEMA as DUAL_SCHEMA
+from .dual_memory import DualMemory
 from .models import Message
 from .public_memory import PublicMemory
 from .security import Rejected
@@ -31,6 +34,10 @@ CREATE TABLE IF NOT EXISTS rolling_state (
   epoch INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 0,
   attempt TEXT, retry_after REAL NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS history_folds (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL,
+ epoch INTEGER NOT NULL, expires REAL NOT NULL, attempted INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS outgoing_receipts (id TEXT PRIMARY KEY, expires REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS received_messages (
  event TEXT PRIMARY KEY, payload BLOB NOT NULL, received REAL NOT NULL,
@@ -45,6 +52,7 @@ class SessionManager:
         self.root = settings.data_dir / "sessions"
         self.locks = [asyncio.Lock() for _ in range(32)]
         self.create_lock = asyncio.Lock()
+        self.dual = DualMemory(self)
 
     def key(self, message: Message) -> str:
         if message.kind == "private" and message.conversation_id != message.user_id:
@@ -55,7 +63,7 @@ class SessionManager:
         return self.root / message.kind / (self.key(message) + ".sqlite3")
 
     @asynccontextmanager
-    async def database(self, message: Message):
+    async def database(self, message: Message, *, preserve_history=False):
         key, path = self.key(message), self.path(message)
         await self.store.runtime.register(message)
         async with self.locks[int(key[:8], 16) % len(self.locks)]:
@@ -74,11 +82,18 @@ class SessionManager:
                 os.close(fd)
                 path.chmod(0o600)
             async with aiosqlite.connect(path, isolation_level=None) as db:
-                await db.execute("PRAGMA journal_mode=DELETE")
+                await db.execute("PRAGMA journal_mode=WAL")
                 await db.execute("PRAGMA synchronous=FULL")
                 await db.execute("PRAGMA secure_delete=ON")
                 await db.execute("PRAGMA busy_timeout=5000")
-                await db.executescript(SCHEMA)
+                await db.executescript(SCHEMA + DUAL_SCHEMA)
+                async with db.execute("PRAGMA table_info(rolling_state)") as cur:
+                    columns = {row[1] for row in await cur.fetchall()}
+                if "trim_version" not in columns:
+                    await db.execute(
+                        "ALTER TABLE rolling_state ADD COLUMN trim_version INTEGER NOT NULL "
+                        "DEFAULT 0"
+                    )
                 await db.execute("BEGIN IMMEDIATE")
                 try:
                     async with db.execute(
@@ -128,12 +143,35 @@ class SessionManager:
                                 )
                         await db.execute("DELETE FROM turns")
                     await db.execute("DELETE FROM turns WHERE expires<=?", (time.time(),))
-                    await db.execute("DELETE FROM recent_messages WHERE expires<=?", (time.time(),))
-                    await db.execute(
-                        "UPDATE rolling_state SET "
-                        "summary=NULL,version=version+1 WHERE summary IS NOT NULL AND expires<=?",
-                        (time.time(),),
-                    )
+                    await self.dual.migrate(db, key)
+                    if not preserve_history:
+                        if self.s.prefix_history_enabled:
+                            async with db.execute(
+                                "SELECT id,payload FROM recent_messages WHERE expires<=? "
+                                "ORDER BY id",
+                                (time.time(),),
+                            ) as cur:
+                                expired_rows = [
+                                    {**self.vault.open(key, r[1]), "seq": r[0]}
+                                    for r in await cur.fetchall()
+                                ]
+                            async with db.execute("SELECT epoch FROM rolling_state") as cur:
+                                epoch = (await cur.fetchone())[0]
+                            await self.dual.append_slice(db, key, expired_rows, epoch, "expiry")
+                        expired = await db.execute(
+                            "DELETE FROM recent_messages WHERE expires<=?", (time.time(),)
+                        )
+                        if expired.rowcount:
+                            await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+                        await db.execute(
+                            "UPDATE rolling_state SET "
+                            "summary=NULL,version=version+1 WHERE summary IS NOT NULL AND "
+                            "expires<=?",
+                            (time.time(),),
+                        )
+                        await db.execute(
+                            "DELETE FROM history_folds WHERE expires<=?", (time.time(),)
+                        )
                     yield db, key
                     await db.commit()
                 except BaseException:
@@ -180,20 +218,27 @@ class SessionManager:
         async with self.database(message) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 enabled = bool((await cur.fetchone())[0])
+            await self._fold_history(db, key, message)
             async with db.execute(
-                "SELECT summary,epoch,version,retry_after FROM rolling_state"
+                "SELECT summary,epoch,version,retry_after,trim_version FROM rolling_state"
             ) as cur:
                 state = await cur.fetchone()
-            async with db.execute("SELECT payload FROM recent_messages ORDER BY id") as cur:
+            async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id") as cur:
                 rows = await cur.fetchall()
+            async with db.execute("SELECT ready FROM memory_control") as cur:
+                dual_ready = bool((await cur.fetchone())[0])
             return {
-                "rolling_summary": self.vault.open(key, state[0]) if enabled and state[0] else "",
-                "recent_messages": [self.vault.open(key, row[0]) for row in rows]
+                "dual_ready": dual_ready,
+                "rolling_summary": self.vault.open(key, state[0])
+                if enabled and state[0] and not dual_ready
+                else "",
+                "recent_messages": [{**self.vault.open(key, row[1]), "seq": row[0]} for row in rows]
                 if enabled
                 else [],
                 "epoch": state[1],
                 "version": state[2],
                 "retry_after": state[3],
+                "history_revision": state[4],
                 "enabled": enabled,
             }
 
@@ -227,16 +272,19 @@ class SessionManager:
                         time.time() + self.s.memory_ttl_seconds,
                     ),
                 )
-            await db.execute(
-                "DELETE FROM recent_messages WHERE id NOT IN (SELECT id "
-                "FROM recent_messages ORDER BY id DESC LIMIT ?)",
-                (
-                    max(
-                        self.s.session_turns * 2,
-                        self.store.runtime.compression.window(message.kind).hard_limit,
+            if self.s.prefix_history_enabled:
+                await self._fold_history(db, key, message)
+            else:
+                await db.execute(
+                    "DELETE FROM recent_messages WHERE id NOT IN (SELECT id "
+                    "FROM recent_messages ORDER BY id DESC LIMIT ?)",
+                    (
+                        max(
+                            self.s.session_turns * 2,
+                            self.store.runtime.compression.window(message.kind).hard_limit,
+                        ),
                     ),
-                ),
-            )
+                )
             return True
 
     async def receive(self, message, *, expected_epoch=None):
@@ -339,6 +387,8 @@ class SessionManager:
                     continue
                 if enabled:
                     text = member.text
+                    if member.images:
+                        text += " [附图]"
                     if member.kind == "group":
                         text = f"[{member.sender_nickname or '群友'}(QQ:{member.user_id})]: {text}"
                     await db.execute(
@@ -360,11 +410,14 @@ class SessionManager:
                 await db.execute(
                     "UPDATE received_messages SET state='screened' WHERE event=?", (event,)
                 )
-            await db.execute(
-                "DELETE FROM recent_messages WHERE id NOT IN (SELECT id FROM recent_messages "
-                "ORDER BY id DESC LIMIT ?)",
-                (self.store.runtime.compression.window(message.kind).hard_limit,),
-            )
+            if self.s.prefix_history_enabled:
+                await self._fold_history(db, key, message)
+            else:
+                await db.execute(
+                    "DELETE FROM recent_messages WHERE id NOT IN (SELECT id FROM recent_messages "
+                    "ORDER BY id DESC LIMIT ?)",
+                    (self.store.runtime.compression.window(message.kind).hard_limit,),
+                )
             return True
 
     async def reply(self, message, text, receipt_id, *, expected_epoch):
@@ -394,23 +447,79 @@ class SessionManager:
                 "INSERT INTO outgoing_receipts VALUES (?,?)", (receipt_id, time.time() + 9 * 86400)
             )
             await db.execute("DELETE FROM outgoing_receipts WHERE expires<?", (time.time(),))
+            await self._fold_history(db, key, message)
+            return True
+
+    async def reply_batch(self, message, reply_id, acknowledgements, *, expected_epoch):
+        """One SQLite commit for all verified bubbles and the append-only visual note."""
+        async with self.database(message) as (db, key):
+            async with db.execute("SELECT epoch FROM rolling_state") as cur:
+                if (await cur.fetchone())[0] != expected_epoch:
+                    return False
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                if not (await cur.fetchone())[0]:
+                    return True
+
+            async def append(receipt, body):
+                cursor = await db.execute(
+                    "INSERT OR IGNORE INTO outgoing_receipts VALUES (?,?)",
+                    (receipt, time.time() + 9 * 86400),
+                )
+                if cursor.rowcount:
+                    await db.execute(
+                        "INSERT INTO recent_messages(payload,expires) VALUES (?,?)",
+                        (
+                            self.vault.seal(
+                                key, {"role": "assistant", "text": body, "speaker": "吉米奈喵"}
+                            ),
+                            time.time() + self.s.memory_ttl_seconds,
+                        ),
+                    )
+
+            for item in acknowledgements:
+                await append(reply_id + ":ack:" + item["message_id"], item["text"])
+            digest = next((v["digest"] for v in acknowledgements if v.get("digest")), None)
+            if digest:
+                await append(
+                    reply_id + ":image-digest",
+                    "[附图摘要，消息" + message.event_id + "：" + digest[:20] + "]",
+                )
+            await self._fold_history(db, key, message)
             return True
 
     async def clear(self, message: Message, *, enabled: bool | None = None):
+        hot = getattr(self.store.runtime, "hot_ring", None)
+        if hot is not None:
+            hot.clear(message)
         async with self.database(message) as (db, _):
+            async with db.execute("SELECT epoch FROM rolling_state") as cur:
+                epoch = (await cur.fetchone())[0] + 1
+            # The main tombstone commits first, before ANY local deletion; failed
+            # resets fail closed.
+            await PublicMemory(self.store).clear_group(message, epoch=epoch)
+            await self.store.cancel_session_replies(message)
+            for table in (
+                "member_profiles",
+                "chronicle_events",
+                "memory_slice_jobs",
+                "cold_history_slices",
+                "memory_covered",
+                "outgoing_receipts",
+            ):
+                await db.execute("DELETE FROM " + table)
+            await db.execute(
+                "UPDATE memory_control SET "
+                "ready=0,mirror_enabled=0,mirror_payload=NULL,last_nightly=NULL"
+            )
+            self.dual.index.discard(self.key(message))
             await db.execute("DELETE FROM turns")
             await db.execute("DELETE FROM recent_messages")
             await db.execute("DELETE FROM received_messages")
+            await db.execute("DELETE FROM history_folds")
             await db.execute(
                 "UPDATE rolling_state SET "
                 "summary=NULL,expires=0,epoch=epoch+1,version=version+1,attempt=NULL,retry_after=0"
             )
-            async with db.execute("SELECT epoch FROM rolling_state") as cur:
-                epoch = (await cur.fetchone())[0]
-            # Commit the main-DB tombstone before the physical-session reset commits.
-            # A crash between commits can suppress a fresh public entry, never revive an
-            # erased entry. Retrying reset catches up the local epoch safely.
-            await PublicMemory(self.store).clear_group(message, epoch=epoch)
             if enabled is not None:
                 await db.execute("UPDATE session_meta SET enabled=?", (int(enabled),))
         # Remove old private data too; it must not survive an explicit erasure request.
@@ -446,11 +555,19 @@ class SessionManager:
                 "INSERT INTO outgoing_receipts VALUES (?,?)", (receipt_id, time.time() + 9 * 86400)
             )
             await db.execute("DELETE FROM outgoing_receipts WHERE expires<?", (time.time(),))
-            await db.execute(
-                "DELETE FROM recent_messages WHERE id NOT IN "
-                "(SELECT id FROM recent_messages ORDER BY id DESC LIMIT ?)",
-                (max(self.s.session_turns * 2, self.store.runtime.compression.private.hard_limit),),
-            )
+            if self.s.prefix_history_enabled:
+                await self._fold_history(db, key, message)
+            else:
+                await db.execute(
+                    "DELETE FROM recent_messages WHERE id NOT IN "
+                    "(SELECT id FROM recent_messages ORDER BY id DESC LIMIT ?)",
+                    (
+                        max(
+                            self.s.session_turns * 2,
+                            self.store.runtime.compression.private.hard_limit,
+                        ),
+                    ),
+                )
             return True
 
     async def enable(self, message: Message):
@@ -461,6 +578,9 @@ class SessionManager:
         if len(summary) > 800:
             raise Rejected("summary_too_long")
         async with self.database(message) as (db, key):
+            async with db.execute("SELECT ready FROM memory_control") as ready_cursor:
+                if (await ready_cursor.fetchone())[0]:
+                    raise Rejected("legacy_summary_retired")
             cur = await db.execute(
                 "UPDATE rolling_state SET "
                 "summary=?,expires=?,epoch=epoch+1,version=version+1,"
@@ -473,7 +593,49 @@ class SessionManager:
             )
             if cur.rowcount != 1:
                 raise Rejected("session_changed")
+            await db.execute("DELETE FROM history_folds")
         await self.store.cancel_session_replies(message)
+
+    async def _fold_history(self, db, key, message):
+        if not self.s.prefix_history_enabled:
+            return
+        async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id") as cur:
+            rows = await cur.fetchall()
+        texts = [{**self.vault.open(key, r[1]), "seq": r[0]} for r in rows]
+        rendered = history_lines(texts, self.s.onebot_self_id)
+        if len(rows) < 2 or (
+            estimate_tokens(rendered) < self.s.history_high_tokens
+            and len(rendered.encode()) <= self.s.history_max_bytes
+        ):
+            return
+        # One atomic step, never a one-message sliding window. Payload is durably
+        # encrypted before removal, so a restart cannot lose the compression hand-off.
+        target, running, half = estimate_tokens(rendered) / 2, 0, 0
+        for entry in texts[:-1]:
+            running += estimate_tokens(history_lines([entry], self.s.onebot_self_id))
+            half += 1
+            if running >= target:
+                break
+        async with db.execute("SELECT epoch FROM rolling_state") as cur:
+            epoch = (await cur.fetchone())[0]
+        fold_cursor = await db.execute(
+            "INSERT INTO history_folds(payload,epoch,expires) VALUES (?,?,?)",
+            (
+                self.vault.seal(key + ":fold", texts[:half]),
+                epoch,
+                time.time() + self.s.summary_ttl_seconds,
+            ),
+        )
+        await self.dual.append_slice(
+            db, key, texts[:half], epoch, "fold", ident="legacy-" + str(fold_cursor.lastrowid)
+        )
+        await db.execute("DELETE FROM recent_messages WHERE id<=?", (rows[half - 1][0],))
+        await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+        # Bounded offline backlog; uncompressed tails never become trusted instructions.
+        await db.execute(
+            "DELETE FROM history_folds WHERE id NOT IN "
+            "(SELECT id FROM history_folds ORDER BY id DESC LIMIT 16)"
+        )
 
     async def compression_snapshot(self, message, *, force=False):
         async with self.database(message) as (db, key):
@@ -484,6 +646,27 @@ class SessionManager:
                 "SELECT summary,epoch,version,attempt,retry_after FROM rolling_state"
             ) as cur:
                 state = await cur.fetchone()
+            if self.s.prefix_history_enabled:
+                async with db.execute(
+                    "SELECT id,payload FROM history_folds WHERE attempted=0 AND epoch=? "
+                    "ORDER BY id LIMIT 1",
+                    (state[1],),
+                ) as cur:
+                    fold = await cur.fetchone()
+                if fold and self.store.runtime.compression.enabled:
+                    await db.execute("UPDATE history_folds SET attempted=1 WHERE id=?", (fold[0],))
+                    texts = self.vault.open(key + ":fold", fold[1])
+                    return {
+                        "old_summary": self.vault.open(key, state[0]) if state[0] else "",
+                        "messages": texts,
+                        "ids": [t["seq"] for t in texts],
+                        "epoch": state[1],
+                        "version": state[2],
+                        "fold_id": fold[0],
+                        "force": force,
+                    }
+                if not force:
+                    return None
             async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id") as cur:
                 rows = await cur.fetchall()
             texts = [self.vault.open(key, row[1]) for row in rows]
@@ -522,6 +705,24 @@ class SessionManager:
         async with self.store.runtime.compression_lock, self.database(message) as (db, key):
             async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
                 state = await cur.fetchone()
+            if "fold_id" in snapshot:
+                async with db.execute(
+                    "SELECT 1 FROM history_folds WHERE id=? AND epoch=?",
+                    (snapshot["fold_id"], snapshot["epoch"]),
+                ) as cur:
+                    exists = await cur.fetchone()
+                if (
+                    state != (snapshot["epoch"], snapshot["version"])
+                    or not exists
+                    or not self.store.runtime.compression.enabled
+                ):
+                    return False
+                await db.execute(
+                    "UPDATE rolling_state SET summary=?,expires=?,version=version+1,retry_after=0",
+                    (self.vault.seal(key, summary), time.time() + self.s.summary_ttl_seconds),
+                )
+                await db.execute("DELETE FROM history_folds WHERE id=?", (snapshot["fold_id"],))
+                return True
             async with db.execute(
                 "SELECT id FROM recent_messages WHERE id<=? ORDER BY id", (snapshot["ids"][-1],)
             ) as cur:
@@ -539,6 +740,7 @@ class SessionManager:
                 (self.vault.seal(key, summary), time.time() + self.s.summary_ttl_seconds),
             )
             await db.execute("DELETE FROM recent_messages WHERE id<=?", (snapshot["ids"][-1],))
+            await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
             return True
 
     async def index_existing(self):
@@ -568,6 +770,12 @@ class SessionManager:
                 await self.store.runtime.register(msg)
 
     async def prune(self):
+        if self.s.prefix_history_enabled:
+            # The same transactional expiry path preserves a cold slice before pruning.
+            for _, message in await self.store.runtime.sessions():
+                async with self.database(message):
+                    pass
+            return
         # Expiry erasure also applies to sessions that receive no further messages.
         for path in self.root.glob("*/*.sqlite3"):
             if path.is_symlink() or len(path.stem) != 64:

@@ -32,7 +32,7 @@ METRICS = (
 
 def observations(row):
     known = row["input_tokens"] is not None and row["output_tokens"] is not None
-    interaction = known and row["model_lane"] == "interaction"
+    interaction = known and row["model_lane"] in {"interaction", "hydrogen", "carbon"}
     cache_known = interaction and row["cached_tokens"] is not None
     return {
         "charged_amount": row["amount"],

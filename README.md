@@ -1,12 +1,16 @@
 # 哈基米跨平台冲浪助手
 
-当前版本 **0.8.1**。新增 [按场景热调思考强度](docs/MODEL_POLICY.md)：管理台九个生成场景默认统一 `medium`，可分别或统一选择 `low / medium / high / xhigh`，保存持久化且无需重启；不支持 `minimal`。
+当前版本 **1.1.1**。防抖五项可调范围统一为 **0–30 秒**，现有配置值保持不变。新增 [/admin 防抖热配置与受控联网搜索](docs/CONTROLS_SEARCH_110.md)：后台可调整五类等待时间、开启 Google Search 并设置每日次数和预算；旧 `unknown` 账目明确标为“历史未归属（Gemini）”，不误标为 Drive。联网默认关闭。
 
-[项目架构图（HTML/CSS）](architecture.html)：下载或克隆仓库后在浏览器打开，可查看 0.8.1 的消息管道、会话记忆、外部依赖与上海／首尔部署结构，内含源码链接。下方「实现结构」提供可在 GitHub 直接查看的简图。
+保留 1.0 的 [双轨记忆与治理说明](docs/MEMORY_100.md)：每个会话的加密 SQLite 增建画像、编年史、不可变冷史，后台通过 Hydrogen Flex 半价提炼，在线按需本地召回；管理台可检索、修订、擦除及解锁，显式选择的白名单群可与单目录 Drive Markdown 双向同步。旧摘要保留至首次成功提炼。私聊档案不导出，Owner《小本本》仍默认关闭。
+
+沿用 [v0.10 流式防抖与五维出站](docs/STREAMING_010.md) 和 [v0.9 A/B/C 前缀路由](docs/CONTEXT_ROUTING_09.md)。群聊／Owner 私聊默认 `auto`，后台可选至 `xhigh`；双轨归档固定 `medium`。三段原文人设、跨机 WS 和账本安全边界不变；新增 `memory_flex` 费用列。有效缓存覆盖率 90% 是观察目标，不能保证每次命中。
+
+[项目架构图（HTML/CSS）](architecture.html)：下载或克隆仓库后在浏览器打开，可查看 1.0.0 的消息管道、会话记忆、外部依赖与上海／首尔部署结构，内含源码链接。下方「实现结构」提供可在 GitHub 直接查看的简图。
 
 0.8.0 新增 [会话串行管道、引用回溯与受控点名](docs/CORE_PIPELINE_08.md)，支持 [上海 NapCat／首尔主脑分离部署](docs/CROSS_BORDER_DEPLOYMENT.md)。群聊、私聊与 `@Bot` 统一先写隔离接收日志，再按 1.8 秒／最长 3.5 秒防抖；同会话模型请求串行，后台清空通过 epoch 作废旧任务。补齐引用／转发原图、公开群互动到 Owner 私聊的单向背景、受控 `[AT:...]` 与本地表情联合发送。预算日／月边界统一按 `BOT_TIMEZONE=Asia/Shanghai`，旧 UTC 账本保留审计并保守迁移。
 
-默认双端拓扑：上海只运行 NapCat，首尔只运行后端；公网只开放 `qq.example.com` 的随机后缀 WS 路径，原主域名 DSH 站点保留。管理台仅经 SSH 隧道访问回环 **12141**。下方旧版本段落是功能沿革，当前行为以 0.8 文档为准。
+默认双端拓扑：上海只运行 NapCat，首尔只运行后端；公网只开放 `qq.example.com` 的随机后缀 WS 路径，原主域名 DSH 站点保留。管理台仅经 SSH 隧道访问回环 **12141**。下方旧版本段落是功能沿革，当前行为以 1.0 记忆文档及 0.10 管道文档为准。
 
 0.7.0 新增 [群聊防抖、看图与本地表情包](docs/GROUP_SOCIAL_AND_MEMES.md)：明确 `@他人` 时先做 0 Token 抢话过滤，同群消息默认按 1.8 秒窗口合并、最长等待 3.5 秒；结合当前批次与紧邻三条群消息安全看图。公开人设改为平视群友的短句口语，Owner 私聊与共享指令保持原文。`/admin` 可管理本地表情白名单，通过 `base64://` 跨容器发送；B 站小号缺失 `buvid4` 时可按需补齐并加密持久化。
 
@@ -16,7 +20,7 @@
 
 面向 Linux 服务器的 Python 3.12+ 异步后端；后端仍是单实例，协议端可独立部署在上海。支持 OneBot v11 HTTP、NapCat 正向／反向 WebSocket，以及官方 QQ Bot 的私聊、群 @ Webhook。B 站功能支持公开视频链接摘要、UP 主巡逻，以及默认关闭的独立小号文本巡逻。
 
-默认策略：OneBot 私聊仅 Owner、白名单群内所有非黑名单成员可按群策略互动（默认仅明确叫到时回复）、每会话独立保存滚动摘要与热消息（可关闭）、每日总预算 2 美元、模型无工具权限。适合个人与小群；一个实例只绑定一个 OneBot 账号和一个 QQ AppID。
+默认策略：OneBot 私聊仅 Owner、白名单群内所有非黑名单成员可按群策略互动（默认仅明确叫到时回复）、每会话独立保存双轨记忆、加密冷史与热消息（可关闭）、每日总预算 2 美元、默认主对话无工具权限；显式开启的独立联网请求仅使用 Google Search。适合个人与小群；一个实例只绑定一个 OneBot 账号和一个 QQ AppID。
 
 0.5.0 新增 [字幕优先与受限原片分析](docs/VIDEO_WATCH.md)。群／私聊的视频卡片链接和小号自主巡逻共享原片额度；默认关闭，开启后无可用字幕或明确要求视听细节才用 yt-dlp 下载低清 MP4，经 Files API、视频 Decisions 和 Interactions 分析。默认最长 480 秒、每天 3 次尝试、每文件最多 80 MiB。
 
@@ -223,7 +227,7 @@ result = await chat_client.aio.interactions.create(
 )
 ```
 
-上例是接口说明；完整实现包含 `background=False`、禁用工具及思考摘要、返回类型检查、输出再筛查和所有错误路径。每轮重传 `system_instruction`／`tools`，不使用 `previous_interaction_id`。接口失败不会降级到旧 SDK 或跳过 Decisions。
+上例是接口说明；普通对话完整实现包含 `background=False`、禁用工具及思考摘要、返回类型检查、输出再筛查和所有错误路径。每轮重传 `system_instruction`／`tools`，不使用 `previous_interaction_id`。接口失败不会降级到旧 SDK 或跳过 Decisions。
 
 Decisions 的 `noul` 是概率，程序显式组合阈值；不是把它当布尔值。普通消息默认注入概率 ≥0.78、违规概率 ≥0.80 才拦截，真实 Owner 的两项安全阈值默认均为 0.90。明确请求跳过 `should_reply`；自由群聊插话默认要求 ≥0.42，真实 Owner 取当前群阈值与 0.28 中较小者，可在后台调整全局阈值或群活跃度。外部来源和模型输出仍单独使用注入 0.20／违规 0.50 的严格门槛，并检查置信度。缺字段、未知类型、NaN、超时或上游错误不会作为放行结果。`choice` 只分流，不能授权工具或更改订阅。
 
@@ -248,7 +252,7 @@ docker compose run --rm hakimi-bot python -m hakimi.admin clear-budget-circuit
 docker compose up -d
 ```
 
-[`max_output_tokens` 包含思考 Token](https://aistudio.google.com/docs/thinking#token-limits)。0.8.1 的九个生成场景默认 `medium`，可在「思考强度」后台选择至 `xhigh`；各档仍有独立 Token 上限与预算门禁，详情见 [模型策略](docs/MODEL_POLICY.md)。输出不完整时不续写、不发布部分文本。SDK 自动重试与自动续写均关闭，单次模型错误开启 60 秒熔断。
+[`max_output_tokens` 包含思考 Token](https://aistudio.google.com/docs/thinking#token-limits)。0.8.1 的九个生成场景默认 `medium`，可在「思考强度」后台选择至 `xhigh`；各档仍有独立 Token 上限与预算门禁，详情见 [模型策略](docs/MODEL_POLICY.md)。输出不完整时不续写、不发布部分文本。SDK 自动重试与自动续写均关闭；v0.10 聊天仅在超时或 incomplete 时重新预留并降一档重试一次，中断且无 usage 保留全部预留，其他接口错误不重试。
 
 预算门禁控制本服务按已配置价格计入的费用，不能替代供应商账户额度；Key 被其他程序使用、供应商调价或预估异常造成的账单偏差不在本地硬上限的保证内。保守预留可能使实际账单未到上限时提前停止，这属于设计行为。
 

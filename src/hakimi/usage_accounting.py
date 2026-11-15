@@ -10,7 +10,9 @@ class TokenUsage:
     output_tokens: int
     cached_tokens: int | None = None
     thought_tokens: int | None = None
-    model_lane: Literal["interaction", "decision"] = "interaction"
+    model_lane: Literal["interaction", "decision", "hydrogen", "carbon", "memory_flex"] = (
+        "interaction"
+    )
 
     def __post_init__(self):
         for name in ("input_tokens", "output_tokens", "cached_tokens", "thought_tokens"):
@@ -25,5 +27,5 @@ class TokenUsage:
                 raise ValueError("Invalid observed token count")
         if self.cached_tokens is not None and self.cached_tokens > self.input_tokens:
             raise ValueError("Cached tokens cannot exceed input tokens")
-        if self.model_lane not in {"interaction", "decision"}:
+        if self.model_lane not in {"interaction", "decision", "hydrogen", "carbon", "memory_flex"}:
             raise ValueError("Invalid model lane")

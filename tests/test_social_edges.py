@@ -224,7 +224,8 @@ async def test_actual_sdk_meme_static_prefix_tracks_admin_edits_and_excludes_pub
     active = await generate()
     assert active.startswith(SYSTEM_INSTRUCTION + PUBLIC_PERSONA_PROMPT)
     assert '表情标签白名单：["刚加入"]' in active
-    assert active.index("【公开聊天的本地表情协议】") < active.index("【服务器验证的当前发送者】")
+    assert "【服务器验证的当前发送者】" not in active
+    assert "【服务器验证的当前发送者】" in calls[-1]["input"]
     owner_group = await generate(msg=target.model_copy(update={"user_id": service.s.owner_qq_id}))
     assert (
         active.partition("【服务器验证的当前发送者】")[0]

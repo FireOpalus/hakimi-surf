@@ -44,6 +44,7 @@ async def test_restore_after_store_close_and_reopen(settings, message):
 
 
 async def test_bounded_fallback_window_and_clear_preserves_switch(settings, store, message):
+    settings.prefix_history_enabled = False
     sessions = SessionManager(settings, store)
     for n in range(44):
         await sessions.remember(message, str(n), "reply")

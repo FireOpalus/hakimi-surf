@@ -225,7 +225,7 @@ async def test_current_and_prior_image_authors_are_both_preserved(social, messag
     )
     assert await social.accept(prior) == "ignored"
     await process(social, group(message, images=[image_ref("current")]))
-    assert [ref.url for ref in social.images.calls[0]] == [
+    assert [ref.url for refs in social.images.calls for ref in refs] == [
         image_ref("current").url,
         image_ref("prior").url,
     ]

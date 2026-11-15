@@ -213,3 +213,68 @@ async def test_service_account_jwt_uses_only_drive_file_scope_and_fixed_token_ur
         path.write_text(json.dumps(info))
         with pytest.raises(Rejected, match="credentials_invalid"):
             drive._load_credentials()
+
+
+async def test_group_memory_scope_properties_etag_download_and_conditional_update(settings):
+    scope = "a" * 64
+    filename = "group-memory-" + scope[:24] + ".md"
+    item = file_info(
+        name=filename,
+        appProperties={"hakimi_group_memory": "test-marker", "hakimi_group_scope": scope},
+    )
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.url.path == "/drive/v3/files/" + FOLDER:
+            return httpx.Response(200, json=folder_info())
+        if request.url.path == "/drive/v3/files":
+            q = request.url.params["q"]
+            assert f"'{FOLDER}' in parents" in q
+            assert "key='hakimi_group_memory'" in q and "key='hakimi_group_scope'" in q
+            return httpx.Response(200, json={"files": [item]})
+        if request.url.params.get("alt") == "media":
+            assert request.headers["If-Match"] == '"v1"'
+            return httpx.Response(200, text="readable memory")
+        if request.method == "PATCH":
+            assert request.headers["If-Match"] == '"v1"'
+            return httpx.Response(200, json=item)
+        return httpx.Response(200, json={**item, "size": "15"}, headers={"ETag": '"v1"'})
+
+    drive, client = await drive_for(settings, handler)
+    async with client:
+        head = await drive.memory_head(scope)
+        assert await drive.read_memory(scope, head) == "readable memory"
+        assert await drive.write_memory(scope, "updated", head) == FILE
+    assert all(r.url.host == "www.googleapis.com" for r in seen)
+
+
+@pytest.mark.parametrize("mode", ["missing_etag", "changed_parent", "changed_etag", "too_big"])
+async def test_group_memory_no_unconditional_update_or_out_of_scope_download(settings, mode):
+    scope = "b" * 64
+    item = file_info(
+        name="group-memory-" + scope[:24] + ".md",
+        appProperties={"hakimi_group_memory": "test-marker", "hakimi_group_scope": scope},
+    )
+    touched = []
+
+    def handler(request):
+        if request.url.path == "/drive/v3/files/" + FOLDER:
+            return httpx.Response(200, json=folder_info())
+        if request.url.path == "/drive/v3/files":
+            return httpx.Response(200, json={"files": [item]})
+        assert request.method == "GET" and request.url.params.get("alt") != "media"
+        touched.append(1)
+        meta = {**item, "size": str(262145 if mode == "too_big" else 20)}
+        if mode == "changed_parent":
+            meta["parents"] = ["foreign-folder"]
+        return httpx.Response(
+            200, json=meta, headers={} if mode == "missing_etag" else {"ETag": '"v2"'}
+        )
+
+    drive, client = await drive_for(settings, handler)
+    async with client:
+        with pytest.raises(Rejected):
+            await drive.read_memory(
+                scope, {"id": FILE, "etag": '"v2"' if mode == "too_big" else '"v1"'}
+            )

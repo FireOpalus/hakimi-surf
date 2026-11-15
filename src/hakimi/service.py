@@ -5,7 +5,7 @@ import re
 import time
 from collections import Counter
 
-from .adapters import Sender
+from .adapters import Sender, identifier, onebot_message
 from .bili_watcher import BiliWatcher
 from .bilibili import Bilibili, extract_bvid
 from .bot_server import is_persona_owner, untrusted_input
@@ -13,14 +13,18 @@ from .config import Settings
 from .gemini import GeminiGateway
 from .generation_policy import Scenario
 from .group_pipeline import other_mentions
+from .hot_ring import HotRing
+from .link_preview import preview_links
 from .longnick import Longnick
 from .media import ImageLoader
 from .memes import MemeLibrary
 from .memory_compressor import MemoryCompressor, check_memory_text
+from .memory_mirror import MemoryMirror
 from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
+from .outbound_actions import parse_actions
 from .proactive_dm import OwnerProactive
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
@@ -29,7 +33,9 @@ from .security import Rejected, authorize, configured_secrets, owner, safe_outpu
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
 from .store import Store
+from .streaming import cancellable
 from .video_watch import VideoWatch
+from .web_search import explicit_search, search_query
 
 log = logging.getLogger("hakimi")
 HELP = """哈基米在这里。直接提问，或发送 B 站 BV 号、视频链接或分享卡片。
@@ -68,12 +74,17 @@ class Service:
     ):
         self.s, self.store, self.ai, self.bili, self.sender = settings, store, gateway, bili, sender
         self.sessions = SessionManager(settings, store)
+        self.hot = HotRing()
+        store.runtime.hot_ring = self.hot
+        self.enrichments = {}
+        self.preview_slots = asyncio.Semaphore(4)
+        self.background_tasks = set()
         self.bot_guard = store.bot_guard
         self.images = image_loader or ImageLoader(
             settings, transport=getattr(sender, "onebot", None)
         )
         self.context_resolver = MessageContextResolver(
-            settings, getattr(sender, "onebot", None), lookup=self.sessions.lookup_received
+            settings, getattr(sender, "onebot", None), lookup=self.lookup_received
         )
         self.ingress_scheduler = SessionScheduler()
         self.dialogue_scheduler = SessionScheduler()
@@ -81,6 +92,9 @@ class Service:
         self.diary = diary
         self.notebook = notebook
         self.compressor = MemoryCompressor(settings, self.sessions, gateway, store)
+        self.memory_mirror = MemoryMirror(self)
+        self.compressor.mirror = self.memory_mirror
+        self.recovery_task = None
         self.poll_lock = asyncio.Lock()
         self.owner_dialogue_lock = asyncio.Lock()
         self.proactive = OwnerProactive(self)
@@ -99,6 +113,95 @@ class Service:
         # Only internal constant labels. Never log exception repr, payloads, URLs or IDs.
         self.counters[event] += 1
         log.info("event=%s", event)
+
+    async def lookup_received(self, message, event_id):
+        if await self.recalled([message.model_copy(update={"event_id": event_id})]):
+            raise Rejected("recalled_message")
+        return self.hot.lookup(message, event_id) or await self.sessions.lookup_received(
+            message, event_id
+        )
+
+    async def recalled(self, members):
+        for member in members:
+            for ref in [member.event_id, *member.reply_ids]:
+                if self.hot.recalled(member, ref):
+                    return True
+                event = self.store.event_key(member.model_copy(update={"event_id": ref}))
+                async with self.store.lock:
+                    if await self.store.one(
+                        "SELECT 1 FROM message_recalls WHERE event=?", (event,)
+                    ):
+                        return True
+        return False
+
+    def background(self, awaitable):
+        task = asyncio.create_task(awaitable)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
+    async def enrich(self, message):
+        try:
+
+            async def hydrate():
+                if message.images and isinstance(self.images, ImageLoader):
+                    await self.images.load_results(
+                        message.images, scope=self.store.session_scope(message)
+                    )
+
+            _, links = await asyncio.gather(
+                hydrate(), preview_links(message.command_text or message.text, self.preview_slots)
+            )
+            return links
+        except Exception:
+            return []
+
+    async def accept_event(self, payload):
+        if str(payload.get("self_id")) != self.s.onebot_self_id:
+            raise Rejected("wrong_bot")
+        typ = payload.get("post_type")
+        if (
+            typ in {"message", "message_sent"}
+            and str(payload.get("user_id")) == self.s.onebot_self_id
+        ):
+            # Echoes only confirm an outgoing protocol ID; they cannot enter debounce or B.
+            echo = onebot_message({**payload, "post_type": "message"}, self.s)
+            if echo:
+                await self.store.runtime.attention.record_sent(echo, {"message_id": echo.event_id})
+            return "ignored"
+        if typ == "notice":
+            from .adapters import notice_message
+
+            message = notice_message(payload, self.s)
+            if message is None:
+                return "ignored"
+            if payload.get("notice_type") in {"group_recall", "friend_recall"}:
+                if not authorize(message.model_copy(update={"addressed": True}), self.s):
+                    return "ignored"
+                ref = identifier(payload.get("message_id"))
+                self.hot.recall(message, ref)
+                self.store.groups.recall(message, ref)
+                async with self.store.transaction():
+                    event = self.store.event_key(message.model_copy(update={"event_id": ref}))
+                    await self.store.db.execute(
+                        "INSERT OR REPLACE INTO message_recalls VALUES (?,?)", (event, time.time())
+                    )
+                    rows = await self.store.all(
+                        "SELECT o.id,o.payload FROM outbox o JOIN jobs j ON j.id=o.id "
+                        "WHERE j.scope=? AND o.status IN ('pending','sending')",
+                        (self.store.session_scope(message),),
+                    )
+                    for row in rows:
+                        data = self.store.vault.open(row["id"], row["payload"])
+                        originals = data.get("participants") or [data["message"]]
+                        if any(ref in {m["event_id"], *m.get("reply_ids", [])} for m in originals):
+                            await self.store.db.execute(
+                                "UPDATE outbox SET status='cancelled',payload=NULL WHERE id=?",
+                                (row["id"],),
+                            )
+                return "recalled"
+            return await self.accept(message)
+        return await self.accept(onebot_message(payload, self.s))
 
     async def accept(self, message: Message | None) -> str:
         if other_mentions(message):
@@ -140,6 +243,15 @@ class Service:
                 return "ignored"
             if await self.sessions.receive(message, expected_epoch=epoch) is None:
                 return "ignored"
+            # Start hydration before opening the debounce window. Context-only images
+            # in an admitted group can support the next addressed message; no LLM call.
+            if (message.images or "http" in message.text) and len(self.background_tasks) < 32:
+                if len(self.enrichments) >= 256:
+                    oldest = next(iter(self.enrichments))
+                    self.enrichments.pop(oldest).cancel()
+                self.enrichments[self.store.event_key(message)] = self.background(
+                    self.enrich(message)
+                )
             if not authorize(message, self.s):
                 # Context-only messages remain local; only an existing addressed batch can wake.
                 await self.store.groups.observe(message)
@@ -150,15 +262,23 @@ class Service:
                 await self.store.groups.observe(message)
                 if result == "accepted":
                     await self.store.runtime.filters.remember_group(message)
+        if result in {"accepted", "ignored"}:
+            self.hot.observe(message)
+        if result == "accepted":
+            self.store.groups.interrupt(message)
         self.counters["admission_" + result] += 1
         return result
 
     def start(self):
+        self.recovery_task = asyncio.create_task(
+            self.resume_compression(), name="compression-recovery"
+        )
         self.tasks = [
             asyncio.create_task(self.worker(), name=f"worker-{i}") for i in range(self.s.workers)
         ]
         self.tasks += [
             asyncio.create_task(self.delivery(), name="delivery"),
+            asyncio.create_task(self.compressor.run(), name="memory-archive"),
             asyncio.create_task(self.patrol(), name="patrol"),
             asyncio.create_task(self.janitor(), name="janitor"),
             asyncio.create_task(self.proactive.run(), name="owner-proactive"),
@@ -170,10 +290,20 @@ class Service:
         if self.notebook:
             self.tasks.append(asyncio.create_task(self.notebook.run(), name="notebook-refresh"))
 
+    async def resume_compression(self):
+        # Persisted, unattempted folds survive restarts. Paid ambiguous attempts never replay.
+        for _, message in await self.store.runtime.sessions():
+            self.compressor.schedule(message)
+            await asyncio.sleep(0)
+
     async def stop(self):
-        for task in self.tasks:
+        for task in list(self.background_tasks):
             task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.gather(*self.background_tasks, return_exceptions=True)
+        tasks = [*self.tasks, *([self.recovery_task] if self.recovery_task is not None else [])]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await self.compressor.close()
         await self.bili_watcher.close()
 
@@ -267,7 +397,7 @@ class Service:
         ]
         return f"{nickname}（成员标识 {token}）"
 
-    async def message_images(self, message, members, nearby):
+    async def message_images(self, message, members, nearby, *, limit=2, include_current=True):
         selected, seen = [], set()
         for origin, messages in (("本批消息", reversed(members)), ("紧邻群消息", reversed(nearby))):
             for item in messages:
@@ -281,17 +411,24 @@ class Service:
                         seen.add(ref.identity)
                         selected.append((ref, item, origin))
         # Expanded forward images can lack an original-user mapping; never invent authorship.
-        for ref in message.images:
+        for ref in message.images if include_current else []:
             if ref.identity not in seen:
                 selected.append((ref, message, "转发材料，原始作者未核实"))
                 seen.add(ref.identity)
-        omitted = max(0, len(selected) - 2)
-        selected = selected[:2]
+        omitted = max(0, len(selected) - limit)
+        selected = selected[:limit]
         if not selected:
             return [], []
         refs = [entry[0] for entry in selected]
         if hasattr(self.images, "load_results"):
-            results = await self.images.load_results(refs)
+            results = await self.images.load_results(
+                refs,
+                **(
+                    {"scope": self.store.session_scope(message)}
+                    if isinstance(self.images, ImageLoader)
+                    else {}
+                ),
+            )
         else:
             results = await self.images.load(refs)  # Compatible injected loaders in integrations.
         images, sources = [], []
@@ -310,7 +447,10 @@ class Service:
                 )
             else:
                 images.append(loaded)
-                data.update(image_number=len(images), status="已提供缩略图")
+                data.update(image_number=len(images), status="已提供图片")
+                semantic = self.memes.semantic_label(loaded.digest)
+                if semantic:
+                    data["local_sticker_label"] = semantic
             sources.append(data)
         if omitted:
             sources.append({"status": f"另有{omitted}张图片未加载；本轮最多读取2张"})
@@ -373,10 +513,24 @@ class Service:
     async def handle_message(self, job: dict):
         message = Message.model_validate(job["payload"])
         async with self.dialogue_scheduler.hold(self.store.session_scope(message)):
-            if message.kind == "private" and is_persona_owner(message, self.s):
-                async with self.owner_dialogue_lock:
+            batch = self.store.groups.begin(job)
+            try:
+
+                async def run():
+                    if message.kind == "private" and is_persona_owner(message, self.s):
+                        async with self.owner_dialogue_lock:
+                            return await self._handle_message(job)
                     return await self._handle_message(job)
-            return await self._handle_message(job)
+
+                return await cancellable(run, batch.cancel)
+            except asyncio.CancelledError:
+                if batch.cancel.is_set():
+                    raise Rejected(
+                        "batch_interrupted" if batch.reason == "followup" else "batch_recalled"
+                    ) from None
+                raise
+            finally:
+                self.store.groups.active.pop(job["scope"], None)
 
     async def _handle_message(self, job: dict):
         message = Message.model_validate(job["payload"])
@@ -385,6 +539,9 @@ class Service:
             if self.bot_guard.known_bot(original):
                 await self.bot_guard.prepare(original)
         neighbour_members = []
+        if await self.recalled(members):
+            return
+        watermark = self.hot.watermark(message)
         if not self.batch_authorized(message, members) or time.time() > job["expires"]:
             return
         # Recheck persisted permits before image downloads, forward RPCs, memory or paid calls.
@@ -405,9 +562,13 @@ class Service:
                 return
         if not message.context_expanded:
             message = await self.expand_forwards(message)
+        frozen_relevance = (
+            (await self.store.runtime.filters.group_context(message))
+            if message.kind == "group" and not message.addressed
+            else []
+        )
         images, image_sources = [], []
-        if message.kind == "private":
-            images, image_sources = await self.message_images(message, [message], [])
+        images, image_sources = await self.message_images(message, members or [message], [])
         # Open exactly one physical database; never search other conversations.
         session = await self.sessions.snapshot(message)
         history = session["recent_messages"]
@@ -421,7 +582,19 @@ class Service:
             "directly_addressed": message.addressed,
             "recent_messages": history,
             "rolling_summary": session["rolling_summary"],
+            "session_epoch": session["epoch"],
+            "allowed_reply_ids": [
+                m.event_id for m in members if re.fullmatch(r"-?[0-9]{1,30}", m.event_id)
+            ],
+            "history_revision": session.get("history_revision", 0),
         }
+        previews = []
+        for m in members:
+            task = self.enrichments.pop(self.store.event_key(m), None)
+            if task:
+                previews.extend(await task)
+        if previews:
+            payload["web_preview_untrusted"] = previews[:2]
         if image_sources:
             payload["image_sources"] = image_sources
         if self.notebook:
@@ -437,20 +610,22 @@ class Service:
             public_history.pop()
         if public_history:
             payload["近期群聊巡逻记忆（只读背景）"] = public_history
-        while history and len(untrusted_input(payload).encode()) > self.s.max_context_bytes:
-            history.pop(0)
         # Attribute strikes to this incoming content, never to another member's history.
         # Stored history, summaries and model outputs were screened on entry/creation.
         current = {
             key: payload[key]
             for key in ("current_message", "current_sender", "surface", "directly_addressed")
         }
+        if previews:
+            current["web_preview_untrusted"] = previews[:2]
         # Forward/image/session preparation yields to admin updates. A revocation
         # during those waits must take effect before the first paid gateway call.
         if not authorize(message, self.s):
             return
 
         async def message_guard():
+            if await self.recalled(members):
+                raise Rejected("reply_invalidated")
             if (
                 not self.batch_authorized(message, members)
                 or any(
@@ -460,17 +635,17 @@ class Service:
                 )
                 or not authorize(message, self.s)
                 or time.time() > job["expires"]
+                or any(
+                    self.hot.recalled(m) or any(self.hot.recalled(m, r) for r in m.reply_ids)
+                    for m in members
+                )
             ):
                 raise Rejected("reply_invalidated")
             if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
                 raise Rejected("reply_invalidated")
 
         try:
-            relevance = (
-                await self.store.runtime.filters.group_context(message)
-                if message.kind == "group" and not message.addressed
-                else []
-            )
+            relevance = frozen_relevance
             intent = await self.ai.screen(
                 current,
                 job["subject"],
@@ -479,10 +654,14 @@ class Service:
                 message=message,
                 before_call=message_guard,
                 **({"relevance_context": relevance} if relevance else {}),
-                **({"images": images} if images else {}),
+                **({"images": [i.gate() for i in images]} if images else {}),
             )
         except Rejected as exc:
-            if len(members) == 1 and str(exc) in {"prompt_injection", "content_blocked"}:
+            if (
+                len(members) == 1
+                and not previews
+                and str(exc) in {"prompt_injection", "content_blocked"}
+            ):
                 await self.moderation.record_strike(
                     message, str(exc), nickname=message.sender_nickname
                 )
@@ -491,40 +670,67 @@ class Service:
             return
         if self.diary:
             await self.diary.group(job["id"], message)
+        sandbox = getattr(intent, "sandbox_mode", False)
+        if not sandbox:
+            if not await self.sessions.admit_history(
+                message, members, expected_epoch=session["epoch"]
+            ):
+                return
+            self.compressor.schedule(message)
+            # Admission may atomically fold B. Reload before constructing the model history.
+            fresh = await self.sessions.snapshot(message)
+            current_events = {m.event_id for m in members}
+            history = [
+                item
+                for item in fresh["recent_messages"]
+                if item.get("event_id") not in current_events
+            ]
+            payload.update(
+                recent_messages=history,
+                rolling_summary=fresh["rolling_summary"],
+                history_revision=fresh.get("history_revision", 0),
+            )
+        else:
+            payload.update(recent_messages=[], rolling_summary="")
+            payload.pop("owner_notebook_snapshot", None)
+            payload.pop("近期群聊巡逻记忆（只读背景）", None)
         if intent == "ignore":
             return
-        if not await self.sessions.admit_history(message, members, expected_epoch=session["epoch"]):
-            return
+        if not sandbox:
+            payload["dual_memory_data"] = await self.sessions.dual.prefetch(
+                message, message.text, recall=getattr(intent, "need_memory_recall", False)
+            )
         invited_bots = set()
-        if len(members) == 1 and owner(message, self.s):
+        if not sandbox and len(members) == 1 and owner(message, self.s):
             invited_bots = await self.bot_guard.invite(message)
         if self.bot_guard.known_bot(message) and await self.bot_guard.allowed_reply_target(
             message, message.user_id
         ):
             invited_bots.add(message.user_id)
-        if message.kind == "group":
+        if message.kind == "group" and not sandbox and len(images) < 2:
             nearby = await self.store.groups.previous_messages(message, members, limit=3)
             neighbour_members[:] = nearby
-            image_members = members if len(members) > 1 else [message]
-            images, image_sources = await self.message_images(message, image_members, nearby)
+            neighbour_images, neighbour_sources = await self.message_images(
+                message, [], nearby, limit=2 - len(images), include_current=False
+            )
+            nearby_context = [{"sender": self.image_sender(m), "text": m.text[:80]} for m in nearby]
+            payload["nearby_group_context"] = nearby_context
             await message_guard()
-            if image_sources:
-                payload["image_sources"] = image_sources
-            if images:
-                payload["nearby_group_context"] = [
-                    {"sender": self.image_sender(m), "text": m.text[:240]} for m in nearby
-                ]
-                # Images from neighbouring users are source data, never strikes on the trigger user.
+            if neighbour_images:
+                # Adjacent users' images remain an independent strict SOURCE gate.
                 await self.ai.screen(
-                    {
-                        "image_sources": image_sources,
-                        "nearby_group_context": payload["nearby_group_context"],
-                    },
+                    {"image_sources": neighbour_sources, "nearby_group_context": nearby_context},
                     job["subject"],
                     purpose="source",
-                    images=images,
+                    images=[i.gate() for i in neighbour_images],
                     before_call=message_guard,
                 )
+                for source in neighbour_sources:
+                    if "image_number" in source:
+                        source = {**source, "image_number": source["image_number"] + len(images)}
+                    image_sources.append(source)
+                images.extend(neighbour_images)
+                payload["image_sources"] = image_sources
         context_members = list(members)
         if message.kind == "group":
             context_members.extend(neighbour_members if images else [])
@@ -547,6 +753,8 @@ class Service:
                         )
                     )
         allowed_at = valid_at_targets(message, context_members, self.s, invited_bots=invited_bots)
+        if sandbox:
+            allowed_at = set()
         if allowed_at:
             payload["allowed_at_qqs"] = sorted(allowed_at)
         parsed = None
@@ -555,7 +763,9 @@ class Service:
         if len(message.video_ids) > 1 or len(message.short_urls) > 1:
             raise Rejected("one_video_per_request")
         bvid = message.video_ids[0] if message.video_ids else extract_bvid(message.text)
-        if not bvid and message.short_urls:
+        if sandbox:
+            bvid = None
+        if not sandbox and not bvid and message.short_urls:
             bvid = await self.bili.resolve_short(message.short_urls[0])
         if bvid:
             # Only a validated, admitted video request gets a longer processing deadline.
@@ -591,34 +801,128 @@ class Service:
             text = re.sub(r"https?://\S+", "[外部链接已省略]", analysis.text)
             result = self.output(f"{analysis.evidence}\n{text}\n来源：\n{video.url}")
             # Sources and generated summaries are deliberately excluded from conversation memory.
+        elif (
+            not sandbox
+            and not self.bot_guard.known_bot(message)
+            and (
+                explicit_search(members[-1].command_text or members[-1].text)
+                or (
+                    getattr(intent, "need_external_lookup", False)
+                    and (message.kind == "private" or message.addressed)
+                )
+            )
+        ):
+            controller = self.store.runtime.web_search
+            if not controller.config.enabled:
+                result = "联网搜索还没开启，这次没法替你上网核实。"
+            else:
+                self.store.groups.phase(message, "generating")
+                batch = self.store.groups.active.get(self.store.session_scope(message))
+                grounded = False
+                try:
+                    result = await self.ai.search(
+                        search_query(members[-1], self.s),
+                        job["subject"],
+                        before_call=message_guard,
+                        cancel_event=batch.cancel if batch else None,
+                    )
+                    grounded = True
+                except Rejected as exc:
+                    if str(exc) in {"reply_invalidated", "batch_interrupted", "batch_recalled"}:
+                        raise
+                    self.record("web_search_failed")
+                    result = (
+                        "请把要查的公开问题单独发我，别带账号、链接或凭证。"
+                        if str(exc)
+                        in {
+                            "search_query_length",
+                            "search_query_private_data",
+                            "credential_in_memory",
+                        }
+                        else "这次联网没拿到可核实的结果，或已到搜索额度上限，先不乱猜。"
+                    )
+                await message_guard()
+                await self.store.enqueue_reply(
+                    job["id"],
+                    message,
+                    self.output(result),
+                    session_epoch=session["epoch"],
+                    participants=members,
+                    external_search=grounded,
+                )
+                return
         elif intent == "bilibili_watch":
             result = (
                 "请发送 BV 号或 https://www.bilibili.com/video/BV… 完整链接；"
                 "订阅请用 /哈基米 帮助。"
             )
         else:
-            generated = re.sub(
-                r"https?://\S+",
-                "[外部链接已省略]",
-                await self.ai.generate(
-                    payload,
-                    job["subject"],
-                    scenario=Scenario.OWNER_PRIVATE
-                    if message.kind == "private" and is_persona_owner(message, self.s)
-                    else Scenario.FAST_CHAT,
-                    deep=deep,
-                    message=message,
-                    before_call=message_guard,
-                    **({"images": images} if images else {}),
-                ),
+            self.store.groups.phase(message, "generating")
+            batch = self.store.groups.active.get(self.store.session_scope(message))
+            tier = getattr(intent, "tier", 2)
+            if tier >= 3 and hasattr(self.sender, "quick_ack"):
+                self.background(self.quick_ack(job, message, message_guard))
+            generated = await self.ai.generate(
+                payload,
+                job["subject"],
+                scenario=Scenario.OWNER_PRIVATE
+                if message.kind == "private" and is_persona_owner(message, self.s)
+                else Scenario.FAST_CHAT,
+                deep=deep,
+                route=intent,
+                message=message,
+                before_call=message_guard,
+                cancel_event=batch.cancel if batch else None,
+                **({"images": images} if images else {}),
             )
+            await message_guard()
+            allowed_reply = payload["allowed_reply_ids"]
+            payload.clear()
+            images.clear()
+            if generated.lstrip().startswith("{"):
+                actions, folded = parse_actions(
+                    generated,
+                    public=public,
+                    allowed_at=allowed_at,
+                    allowed_reply=allowed_reply,
+                    labels=self.memes.labels,
+                    settings=self.s,
+                    tier=tier,
+                )
+                if actions.abstain:
+                    return
+                if not actions.image_digest:
+                    actions.image_digest = next(
+                        (
+                            v["local_sticker_label"]
+                            for v in image_sources
+                            if v.get("local_sticker_label")
+                        ),
+                        None,
+                    )
+                if actions.image_digest:
+                    check_memory_text(actions.image_digest, self.s)
+                await self.store.enqueue_reply(
+                    job["id"],
+                    message,
+                    "\n".join(actions.bubbles),
+                    session_epoch=session["epoch"],
+                    participants=members,
+                    allowed_at_qqs=allowed_at,
+                    actions={
+                        **actions.model_dump(),
+                        "folded": folded,
+                        "watermark": watermark,
+                        "source_ids": [m.event_id for m in members],
+                        "public": public,
+                    },
+                )
+                return
+            # Read compatibility for integrations returning the old single-text contract.
+            # The production Gemini gateway validates the new schema before reaching here.
             parsed = parse_reply(generated, message, self.s, allowed_at_qqs=allowed_at)
             generated, meme_tag = parsed.text, parsed.meme_tag
             result = self.output(generated) if generated else ""
-            if result and not await self.sessions.reply(
-                message, result, job["id"], expected_epoch=session["epoch"]
-            ):
-                return
         if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
             return
         if parsed is None:
@@ -665,6 +969,12 @@ class Service:
             else:
                 await self.handle_patrol(job)
         except Rejected as exc:
+            if str(exc) == "batch_interrupted":
+                await self.store.groups.requeue_interrupted(job)
+                return
+            if str(exc) in {"batch_recalled", "reply_invalidated", "video_watch_invalidated"}:
+                await self.store.finish(job["id"], "cancelled")
+                return
             self.record(str(exc))
             if self.diary and str(exc) == "prompt_injection":
                 await self.diary.injection(job["id"])
@@ -674,6 +984,13 @@ class Service:
                     notice = (
                         "该管理功能仅供主人在私聊中使用。"
                         if str(exc) == "owner_private_only"
+                        else "这段有点长，分成短一点的问题再发给我吧。"
+                        if str(exc)
+                        in {
+                            "decision_context_too_large",
+                            "transient_context_too_large",
+                            "context_too_large",
+                        }
                         else "本次请求未处理：安全检查、可用额度或上游服务未满足要求。稍后可重试。"
                     )
                     await self.store.enqueue_reply(job["id"], message, notice)
@@ -699,10 +1016,41 @@ class Service:
                 self.record("worker_error")
                 await asyncio.sleep(1)
 
+    async def quick_ack(self, job, message, guard):
+        try:
+            async with self.store.transaction():
+                row = await self.store.one(
+                    "SELECT at FROM local_quick_acks WHERE scope=?", (job["scope"],)
+                )
+                if row and time.time() - row[0] < 60:
+                    return
+                await self.store.db.execute(
+                    "INSERT OR REPLACE INTO local_quick_acks VALUES (?,?)",
+                    (job["scope"], time.time()),
+                )
+
+            async def valid():
+                try:
+                    await guard()
+                    active = self.store.groups.active.get(job["scope"])
+                    return active is not None and not active.cancel.is_set()
+                except Rejected:
+                    return False
+
+            receipt = await self.sender.quick_ack(message, "稍等，我仔细看看", before_send=valid)
+            if receipt:
+                await self.store.runtime.attention.record_sent(message, receipt)
+        except Exception:
+            self.record("quick_ack_unavailable")
+
     async def deliver_once(self) -> bool:
         reply = await self.store.claim_reply()
         if not reply:
             return False
+        if reply.get("actions"):
+            from .outgoing import deliver_actions
+
+            return await deliver_actions(self, reply)
         status = "sent"
         text_confirmed = False
         message = Message.model_validate(reply["message"])
@@ -721,11 +1069,26 @@ class Service:
             await self.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
 
             async def valid_after_delay():
+                if (
+                    reply.get("external_search")
+                    and not self.store.runtime.web_search.config.enabled
+                ):
+                    return False
                 async with self.store.lock:
                     row = await self.store.one(
                         "SELECT status FROM outbox WHERE id=?", (reply["id"],)
                     )
                 if not row or row[0] != "sending":
+                    return False
+                if (
+                    not reply["proactive"]
+                    and time.time() - message.created_at > self.s.event_ttl_seconds
+                ):
+                    return False
+                if any(
+                    self.hot.recalled(m) or any(self.hot.recalled(m, ref) for ref in m.reply_ids)
+                    for m in participants or [message]
+                ):
                     return False
                 if not await self.bot_guard.may_process(message, reply["id"]):
                     return False
@@ -766,6 +1129,11 @@ class Service:
                     reply["proactive"],
                     before_send=valid_after_delay,
                 )
+            if message.platform == "onebot" and reply["text"]:
+                from .outbound_actions import valid_receipt
+
+                if not valid_receipt(receipt):
+                    raise Rejected("onebot_send_unconfirmed")
             text_confirmed = (
                 message.platform == "onebot"
                 and isinstance(receipt, dict)
@@ -773,6 +1141,15 @@ class Service:
                 and bool(re.fullmatch(r"-?[0-9]{1,30}", str(receipt.get("message_id", ""))))
             )
             if text_confirmed:
+                # Grounded answers are transient transport data, never profile/chronicle input.
+                retained_text = (
+                    "[已联网回答本轮问题；检索资料不进入记忆]"
+                    if reply.get("external_search")
+                    else reply["text"]
+                )
+                await self.sessions.reply(
+                    message, retained_text, reply["id"], expected_epoch=delivery_epoch
+                )
 
                 async def remember_sent():
                     if await self.store.runtime.attention.record_sent(message, receipt):
@@ -781,7 +1158,7 @@ class Service:
                                 update={
                                     "event_id": "sent:" + str(receipt["message_id"]),
                                     "user_id": message.bot_id,
-                                    "text": "[哈基米已回复] " + self.output(reply["text"]),
+                                    "text": "[哈基米已回复] " + self.output(retained_text),
                                     "created_at": time.time(),
                                 }
                             )
@@ -790,7 +1167,7 @@ class Service:
                 retained = await self.sessions.receive_outgoing(
                     message,
                     receipt["message_id"],
-                    reply["text"],
+                    retained_text,
                     expected_epoch=delivery_epoch,
                     on_confirmed=remember_sent,
                 )
@@ -853,6 +1230,7 @@ class Service:
             and text_confirmed
             and not reply["proactive"]
             and message.kind == "group"
+            and not reply.get("external_search")
         ):
             await self.public_memory.record(
                 reply["id"],
@@ -863,6 +1241,7 @@ class Service:
             )
         if status == "sent" and not reply["proactive"] and "session_epoch" in reply:
             await self.proactive.note_activity(message)
+            self.store.runtime.filters.spoke(message)
             self.compressor.schedule(message)
         return True
 

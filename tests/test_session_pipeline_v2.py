@@ -25,31 +25,27 @@ async def test_private_receipt_precedes_debounce_and_llm(pipeline, message, monk
     assert (await pipeline.sessions.lookup_received(first, "1")).text == first.text
     assert not pipeline.ai.calls
     assert await pipeline.store.claim() is None
-    clock[0] += 1
+    clock[0] += 0.3
     second = first.model_copy(
         update={"event_id": "2", "text": "再补充一句", "created_at": clock[0]}
     )
     assert await pipeline.accept(second) == "accepted"
-    clock[0] += 1
+    clock[0] += 0.5
     assert await pipeline.store.claim() is None
-    clock[0] += 1
+    clock[0] += 0.2
     job = await pipeline.store.claim()
     assert len(job["batch_messages"]) == 2
     await pipeline.process(job)
+    await pipeline.deliver_once()
     assert sum(c[0] == "generate" for c in pipeline.ai.calls) == 1
     history = (await pipeline.sessions.snapshot(first))["recent_messages"]
     assert [r["role"] for r in history] == ["user", "user", "assistant"]
     assert [r["text"] for r in history[:2]] == [first.text, second.text]
 
 
-async def test_arrivals_while_busy_merge_and_reread_latest_reply(pipeline, message, monkeypatch):
-    now = [time.time()]
-    monkeypatch.setattr("hakimi.store.time.time", lambda: now[0])
-    pipeline.s.group_debounce_seconds = 1.8
-    pipeline.s.group_debounce_max_seconds = 3.5
-    first = message.model_copy(update={"event_id": "first", "created_at": now[0]})
+async def test_same_sender_busy_followup_merges_before_any_reply(pipeline, message, monkeypatch):
+    first = message.model_copy(update={"event_id": "first"})
     await pipeline.accept(first)
-    now[0] += 2
     job = await pipeline.store.claim()
     entered, resume = asyncio.Event(), asyncio.Event()
     original = pipeline.ai.generate
@@ -63,24 +59,20 @@ async def test_arrivals_while_busy_merge_and_reread_latest_reply(pipeline, messa
     task = asyncio.create_task(pipeline.process(job))
     try:
         await asyncio.wait_for(entered.wait(), 3)
-        for i in range(2):
-            now[0] += 5  # Different debounce windows, still one pending batch while busy.
-            next_message = first.model_copy(
-                update={"event_id": f"later-{i}", "text": f"补充{i}", "created_at": now[0]}
-            )
-            assert await pipeline.accept(next_message) == "accepted"
-        assert await pipeline.store.claim() is None
-        resume.set()
-        await task
+        await pipeline.accept(
+            first.model_copy(update={"event_id": "later", "text": "补充截图说明"})
+        )
+        await asyncio.wait_for(task, 3)
+        assert not await pipeline.store.claim_reply()
         pending = await pipeline.store.claim()
         assert len(pending["batch_messages"]) == 2
+        resume.set()
         await pipeline.process(pending)
         calls = [c for c in pipeline.ai.calls if c[0] == "generate"]
-        assert len(calls) == 2
-        assert any(r["role"] == "assistant" for r in calls[1][1]["recent_messages"])
-        assert (
-            "补充0" in calls[1][1]["current_message"] and "补充1" in calls[1][1]["current_message"]
-        )
+        assert len(calls) == 1
+        assert "补充截图说明" in calls[0][1]["current_message"]
+        await pipeline.deliver_once()
+        assert len(pipeline.sender.sent) == 1
     finally:
         resume.set()
         await asyncio.gather(task, return_exceptions=True)

@@ -2,7 +2,6 @@ import asyncio
 
 import pytest
 
-from hakimi.security import Rejected
 from hakimi.service import Service
 from tests.fakes import FakeBili, FakeGateway, FakeSender
 
@@ -55,17 +54,10 @@ async def test_revocation_during_preparation_prevents_further_model_calls(
             await svc.moderation.set_muted("30000")
         resume.set()
         async with asyncio.timeout(3):
-            if phase == "images" and revocation == "group":
-                with pytest.raises(Rejected, match="reply_invalidated"):
-                    await processing
-            else:
-                await processing
-        if phase == "images" and revocation == "group":
-            # Group image fetching follows the text-only reply decision; revocation must
-            # prevent the image safety call and main generation after that initial decision.
-            assert len(gateway.calls) == 1 and gateway.calls[0][3]["purpose"] == "message"
-        else:
-            assert gateway.calls == []
+            await processing
+        # Current attachments now enter the same inbound gate; preparation revocation
+        # is caught before any paid call in both public and private conversations.
+        assert gateway.calls == []
         assert not await store.all("SELECT * FROM ledger")
         assert not await store.all("SELECT * FROM outbox")
     finally:

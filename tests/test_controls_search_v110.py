@@ -1,0 +1,429 @@
+import asyncio
+import json
+from decimal import Decimal
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from hakimi.debounce_policy import DebounceConfig
+from hakimi.gemini import GeminiGateway
+from hakimi.security import Rejected
+from hakimi.web_search import WebSearchConfig, parse_result, public_url, query_count, search_query
+from tests.fakes import FakeBili, FakeGateway, FakeSender
+from tests.test_admin import admin_api as admin_api
+from tests.test_group_pipeline import clock as clock
+from tests.test_sdk_contract import decision_response, interaction_response
+from tests.test_sdk_contract import sdk_pair as sdk_pair
+
+
+async def enable_search(store, **updates):
+    await store.runtime.web_search.save(WebSearchConfig(enabled=True, **updates))
+
+
+def grounded_response():
+    data = interaction_response()
+    data["steps"] = [
+        {"type": "google_search_call", "id": "s1", "arguments": {"queries": ["公开资料"]}},
+        {
+            "type": "google_search_result",
+            "call_id": "s1",
+            "result": [
+                {
+                    "search_suggestions": '<style>.x{}</style><a href="https://www.google.com/search?q=public">公开资料</a>'
+                }
+            ],
+        },
+        {
+            "type": "model_output",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "已核实的公开事实。",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url": "https://example.org/source",
+                            "title": "原始来源",
+                            "start_index": 0,
+                            "end_index": 9,
+                        }
+                    ],
+                }
+            ],
+        },
+    ]
+    data["usage"].update(
+        total_cached_tokens=40, grounding_tool_count=[{"type": "google_search", "count": 2}]
+    )
+    return data
+
+
+@pytest.mark.parametrize("path", ["debounce", "web-search"])
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+async def test_controls_authentication_precedes_changes(admin_api, path, method):
+    app, client, gateway = admin_api
+    response = await client.request(
+        method, "/admin/api/" + path, headers={"Authorization": "Bearer bad"}, json={}
+    )
+    assert response.status_code == 401
+    assert not await app.state.service.store.all("SELECT * FROM admin_config")
+    assert not gateway.calls
+
+
+async def test_controls_save_restart_reset_and_validate(admin_api):
+    app, client, gateway = admin_api
+    store = app.state.service.store
+    original = (await client.get("/admin/api/debounce")).json()
+    debounce = DebounceConfig(**dict.fromkeys(DebounceConfig.model_fields, 30.0)).model_dump()
+    response = await client.put("/admin/api/debounce", json=debounce)
+    assert response.status_code == 200 and response.json()["config"] == debounce
+    response = await client.put(
+        "/admin/api/web-search", json={"enabled": True, "daily_limit": 3, "daily_usd": "0.75"}
+    )
+    assert response.status_code == 200 and response.json()["source"] == "sqlite"
+    await store.runtime.load_config()
+    assert store.groups.config.mention_debounce_seconds == 30.0
+    assert store.runtime.web_search.config.enabled
+    for path, invalid in [
+        ("debounce", {"group_debounce_seconds": 30.1}),
+        ("debounce", {"group_debounce_max_seconds": -1}),
+        ("web-search", {"enabled": True, "daily_limit": -1}),
+        ("web-search", {"enabled": True, "daily_usd": "NaN"}),
+    ]:
+        assert (await client.put("/admin/api/" + path, json=invalid)).status_code == 400
+    assert store.groups.config.mention_debounce_seconds == 30.0
+    assert (await client.delete("/admin/api/debounce")).json()["config"] == original["environment"]
+    assert not (await client.delete("/admin/api/web-search")).json()["config"]["enabled"]
+    assert not gateway.calls
+
+
+async def test_debounce_retimes_pending_not_working(store, message, clock):
+    state = store.runtime
+    await state.set_debounce(DebounceConfig())
+    assert await store.admit(message) == "accepted"
+    assert await store.claim() is None
+    start = clock[0]
+    clock[0] += 0.3
+    await state.set_debounce(DebounceConfig(mention_debounce_seconds=1.2))
+    row = await store.one("SELECT ready_at FROM group_debounce_batches")
+    assert row[0] == pytest.approx(start + 1.2)
+    clock[0] += 0.4
+    assert await store.claim() is None
+    await state.set_debounce(DebounceConfig(mention_debounce_seconds=0.1))
+    job = await store.claim()
+    assert job is not None
+    before = dict(await store.one("SELECT * FROM group_debounce_batches"))
+    await state.set_debounce(DebounceConfig(mention_debounce_seconds=4.5))
+    assert dict(await store.one("SELECT * FROM group_debounce_batches")) == before
+    assert (await store.one("SELECT status FROM jobs"))[0] == "working"
+    assert not await store.all("SELECT * FROM ledger")
+
+
+async def test_debounce_pending_capped_and_zero_release(store, message, clock):
+    await store.runtime.set_debounce(
+        DebounceConfig(mention_debounce_seconds=30, group_debounce_max_seconds=20)
+    )
+    start = clock[0]
+    await store.admit(message)
+    clock[0] += 1
+    await store.admit(message.model_copy(update={"event_id": "follow", "created_at": clock[0]}))
+    assert (await store.one("SELECT ready_at FROM group_debounce_batches"))[0] == start + 20
+    await store.runtime.set_debounce(DebounceConfig(group_debounce_max_seconds=0))
+    job = await store.claim()
+    assert len(job["batch_messages"]) == 2
+
+
+async def test_attribution_survives_unknown_usage_and_crash(settings, store):
+    pending = await store.reserve("subject", "chat", Decimal("0.01"), model_lane="hydrogen")
+    known_model = await store.reserve("subject", "chat", Decimal("0.02"), model_lane="decision")
+    await store.settle(known_model, None)
+    assert (await store.one("SELECT model_lane FROM ledger_usage WHERE id=?", (known_model,)))[
+        0
+    ] == "decision"
+    before = (await store.one("SELECT amount FROM budget_totals"))[0]
+    await store.close()
+    await store.open()
+    after = await store.one("SELECT amount,status FROM ledger WHERE id=?", (pending,))
+    assert after[0] == 10000 and after[1] == "unknown"
+    assert (await store.one("SELECT model_lane FROM ledger_usage WHERE id=?", (pending,)))[
+        0
+    ] == "hydrogen"
+    assert (await store.one("SELECT amount FROM budget_totals"))[0] == before
+    models = (await store.usage())["token_usage"]["today"]["by_model"]
+    assert {m["model_lane"] for m in models} == {"hydrogen", "decision"}
+    assert sum(m["charged_amount"] for m in models) == before
+    await store.close()
+    await store.open()
+    assert (await store.one("SELECT amount FROM budget_totals"))[0] == before
+
+
+async def test_legacy_unknown_not_relabelled_as_drive(store):
+    key = await store.reserve("legacy", "admin", Decimal("0.01"))
+    await store.settle(key, Decimal("0.01"))
+    before = dict(await store.one("SELECT * FROM ledger"))
+    await store.close()
+    await store.open()
+    assert dict(await store.one("SELECT * FROM ledger")) == before
+    models = (await store.usage())["token_usage"]["today"]["by_model"]
+    assert models[0]["model_lane"] == "unknown"
+    assert models[0]["charged_amount"] == 10000
+
+
+async def test_sdk_search_v1_isolated_tool_usage_and_source_gate(settings, store, sdk_pair):
+    await enable_search(store)
+    requests = []
+
+    def handler(request):
+        data = json.loads(request.content)
+        requests.append((request.url.path, data))
+        return httpx.Response(
+            200,
+            json=decision_response()
+            if request.url.path.endswith("decisions")
+            else grounded_response(),
+        )
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    output = await gateway.search("请查一下公开事实", "subject")
+    assert "https://example.org/source" in output and "Google 搜索建议" in output
+    assert "<style>" not in output and "<a" not in output
+    path, data = requests[0]
+    assert path == "/v1/interactions"
+    assert data["store"] is False and data["stream"] is False
+    assert data["model"] == "gemini-4-hydrogen"
+    assert data["tools"] == [{"type": "google_search", "search_types": ["web_search"]}]
+    assert data["generation_config"]["thinking_level"] == "medium"
+    assert "previous_interaction_id" not in data and "history" not in data["input"]
+    assert requests[1][0] == "/v1beta/decisions"
+    row = await store.one("SELECT * FROM ledger WHERE lane='search' ORDER BY rowid LIMIT 1")
+    assert row["amount"] == 28525  # two paid queries + 100 input + 50 output/thought tokens
+    usage = await store.one("SELECT * FROM ledger_usage WHERE id=?", (row["id"],))
+    assert usage["estimated_amount"] == 28468
+    assert usage["model_lane"] == "hydrogen" and usage["cached_tokens"] == 40
+    assert (await store.runtime.web_search.status())["today"]["queries"] == 2
+
+
+async def test_lookup_is_not_bili_without_bvid(settings, store, message, sdk_pair):
+    gateway = GeminiGateway(
+        settings,
+        store,
+        *sdk_pair(lambda r: httpx.Response(200, json=decision_response("bilibili_watch"))),
+    )
+    route = await gateway.screen(
+        {"current_message": "请查今天的科技新闻"}, "s", purpose="message", message=message
+    )
+    assert route == "chat" and route.need_external_lookup
+
+
+@pytest.mark.parametrize("reason", ["disabled", "limit", "budget"])
+async def test_search_blocked_locally_has_zero_provider_calls(settings, store, sdk_pair, reason):
+    if reason != "disabled":
+        await enable_search(
+            store, **({"daily_limit": 0} if reason == "limit" else {"daily_usd": Decimal(0)})
+        )
+    calls = []
+    gateway = GeminiGateway(settings, store, *sdk_pair(lambda r: calls.append(r)))
+    with pytest.raises(Rejected):
+        await gateway.search("测试", "s")
+    assert not calls and not await store.all("SELECT * FROM ledger")
+
+
+async def test_search_unknown_fee_keeps_reserve_and_attribution(settings, store, sdk_pair):
+    await enable_search(store)
+    response = grounded_response()
+    del response["usage"]["grounding_tool_count"]
+    gateway = GeminiGateway(
+        settings,
+        store,
+        *sdk_pair(
+            lambda r: httpx.Response(
+                200, json=decision_response() if r.url.path.endswith("decisions") else response
+            )
+        ),
+    )
+    await gateway.search("测试公开信息", "s")
+    row = await store.one("SELECT * FROM ledger WHERE lane='search' ORDER BY rowid LIMIT 1")
+    assert row["amount"] == row["reserved"] and row["status"] == "unknown"
+    assert (await store.one("SELECT model_lane FROM ledger_usage WHERE id=?", (row["id"],)))[
+        0
+    ] == "hydrogen"
+    assert (await store.runtime.web_search.status())["today"]["known_calls"] == 0
+
+
+async def test_search_overrun_opens_global_circuit(settings, store, sdk_pair):
+    await enable_search(store)
+    response = grounded_response()
+    response["usage"]["grounding_tool_count"][0]["count"] = 100
+    gateway = GeminiGateway(
+        settings, store, *sdk_pair(lambda r: httpx.Response(200, json=response))
+    )
+    with pytest.raises(Rejected, match="budget_reservation_exceeded"):
+        await gateway.search("测试公开信息", "s")
+    assert await store.one("SELECT 1 FROM meta WHERE key='budget_overrun'")
+
+
+async def test_search_source_rejected_or_hot_disabled(settings, store, sdk_pair):
+    await enable_search(store)
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        await store.runtime.web_search.save(WebSearchConfig(enabled=False))
+        return httpx.Response(200, json=grounded_response())
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    with pytest.raises(Rejected, match="web_search_disabled"):
+        await gateway.search("公开事实", "s")
+    assert len(calls) == 1  # no subsequent Decisions/generation after hot disable
+    assert (await store.one("SELECT model_lane FROM ledger_usage"))[0] == "hydrogen"
+
+
+async def test_search_result_injection_is_not_delivered(settings, store, sdk_pair):
+    await enable_search(store)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("decisions"):
+            decision = decision_response()
+            decision["answers"]["is_prompt_injection"]["noul"] = 0.99
+            return httpx.Response(200, json=decision)
+        return httpx.Response(200, json=grounded_response())
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    with pytest.raises(Rejected, match="prompt_injection"):
+        await gateway.search("测试公开资料", "s")
+    assert len(requests) == 2
+    assert not await store.all("SELECT * FROM outbox")
+
+
+async def test_search_cancellation_keeps_budget_and_never_retries(settings, store, sdk_pair):
+    await enable_search(store)
+    arrived, cancel = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        arrived.set()
+        await asyncio.Event().wait()
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    task = asyncio.create_task(gateway.search("公开资料", "s", cancel_event=cancel))
+    await asyncio.wait_for(arrived.wait(), 3)
+    cancel.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    row = await store.one("SELECT amount,reserved,status FROM ledger")
+    assert row[0] == row[1] > 0 and row[2] == "unknown"
+    assert len(calls) == 1
+    assert (await store.one("SELECT model_lane FROM ledger_usage"))[0] == "hydrogen"
+
+
+async def test_search_daily_limit_atomic_and_survives_restart(store):
+    await enable_search(store, daily_limit=1)
+    results = await asyncio.gather(
+        store.runtime.web_search.claim(), store.runtime.web_search.claim(), return_exceptions=True
+    )
+    assert sum(isinstance(r, str) for r in results) == 1
+    assert sum(isinstance(r, Rejected) for r in results) == 1
+    await store.close()
+    await store.open()
+    with pytest.raises(Rejected, match="search_daily_limit"):
+        await store.runtime.web_search.claim()
+    assert not await store.all("SELECT * FROM ledger")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1/",
+        "https://169.254.169.254/",
+        "file:///tmp/x",
+        "javascript:alert(1)",
+        "https://localhost/",
+        "https://a.example:8080/",
+        "https://x:y@a.example/",
+        "https://a.example/\nx",
+    ],
+)
+def test_no_local_or_unsafe_search_citations(url):
+    assert public_url(url) is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "我的QQ是20000帮我查",
+        "查一下password=privatevalue",
+        "搜索 sk-abcdefghijklmnopqrst",
+        "搜索 https://private.example/secret",
+        "搜索 user@example.org",
+    ],
+)
+def test_queries_do_not_export_private_identifiers(settings, message, question):
+    with pytest.raises(Rejected):
+        search_query(message.model_copy(update={"text": question}), settings)
+
+
+def test_query_original_only_and_no_non_google_tools(settings, message):
+    m = message.model_copy(
+        update={"command_text": "/搜索 公开问题", "text": "PRIVATE_FORWARD_SECRET"}
+    )
+    assert search_query(m, settings) == "公开问题"
+    response = grounded_response()
+    response["steps"].insert(0, {"type": "function_call", "name": "delete_file"})
+    with pytest.raises(Rejected, match="search_unexpected_tool"):
+        parse_result(response)
+    assert query_count(SimpleNamespace(usage=None)) is None
+
+
+async def test_service_search_never_exports_or_learns_private_memory(settings, store, message):
+    from hakimi.service import Service
+
+    class SearchGateway(FakeGateway):
+        async def search(self, query, subject, **kwargs):
+            self.calls.append(("search", query, subject))
+            return "检索专用事实不应进入记忆\n来源：https://example.org/source"
+
+    ai, sender = SearchGateway(), FakeSender()
+    svc = Service(settings, store, ai, FakeBili(), sender)
+    try:
+        await enable_search(store)
+        await svc.sessions.reply(
+            message,
+            "OWNER_PRIVATE_MEMORY",
+            "seed",
+            expected_epoch=(await svc.sessions.snapshot(message))["epoch"],
+        )
+        m = message.model_copy(
+            update={"text": "搜索今天的科技新闻", "command_text": "搜索今天的科技新闻"}
+        )
+        assert await svc.accept(m) == "accepted"
+        job = await store.claim()
+        await svc.process(job)
+        assert [c[1] for c in ai.calls if c[0] == "search"] == ["搜索今天的科技新闻"]
+        assert not any(c[0] == "generate" for c in ai.calls)
+        assert await svc.deliver_once()
+        assert "检索专用事实" in sender.sent[0][1]
+        snapshot = json.dumps(await svc.sessions.snapshot(m), ensure_ascii=False)
+        assert "OWNER_PRIVATE_MEMORY" in snapshot and "检索专用事实" not in snapshot
+        assert "检索资料不进入记忆" in snapshot
+    finally:
+        await svc.stop()
+
+
+async def test_search_off_uses_local_reply_not_model(settings, store, message):
+    from hakimi.service import Service
+
+    ai, sender = FakeGateway(), FakeSender()
+    svc = Service(settings, store, ai, FakeBili(), sender)
+    try:
+        m = message.model_copy(update={"text": "搜索今天的新闻"})
+        assert await svc.accept(m) == "accepted"
+        await svc.process(await store.claim())
+        assert await svc.deliver_once()
+        assert "联网搜索还没开启" in sender.sent[0][1]
+        assert not any(c[0] == "generate" for c in ai.calls)
+    finally:
+        await svc.stop()

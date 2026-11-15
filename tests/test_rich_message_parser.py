@@ -95,7 +95,7 @@ def test_full_segments_forward_image_face_and_reply():
     assert not result.addressed
     assert result.images[0].url == "https://gchat.qpic.cn/a"
     assert result.forward_ids == ["safe-forward-id"]
-    assert "[表情14]" in result.text
+    assert "[表情:微笑]" in result.text
 
 
 def test_forward_content_has_no_author_ids_and_cannot_address_bot():

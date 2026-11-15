@@ -16,14 +16,18 @@ from .bilibili import extract_bvid
 from .bot_server import prompt_context
 from .budget_policy import BudgetConfig
 from .compression_policy import CompressionConfig
+from .debounce_policy import DebounceConfig
 from .gateway import FilterConfig
 from .generation_policy import Scenario, generation_plan
+from .memory_compressor import check_memory_text
 from .mentions import parse_reply
 from .models import Message
+from .outbound_actions import parse_actions
 from .proactive_policy import ProactiveConfig
 from .rich_message_parser import parse_message
 from .security import Rejected, authorize, configured_secrets
 from .thinking_policy import ThinkingConfig
+from .web_search import WebSearchConfig
 
 router = APIRouter(prefix="/admin")
 
@@ -138,6 +142,12 @@ async def dashboard(request: Request):
     notebook.pop("text", None)
     return {
         "uptime_seconds": int(time.monotonic() - svc.started_at),
+        "pipeline": {
+            "gate": sum(b.phase == "gate" for b in svc.store.groups.active.values()),
+            "generating": sum(b.phase == "generating" for b in svc.store.groups.active.values()),
+            "hot_sessions": len(svc.hot.rings),
+            "image_cache_bytes": getattr(svc.images, "cache_bytes", 0),
+        },
         "onebot": ws,
         "onebot_detail": transport.status()
         if hasattr(transport, "status")
@@ -180,6 +190,38 @@ async def filter_status(request: Request):
 @router.get("/api/thinking")
 async def thinking_status(request: Request):
     return service(request).store.runtime.thinking_status()
+
+
+@router.get("/api/debounce")
+async def debounce_status(request: Request):
+    return service(request).store.runtime.debounce_status()
+
+
+@router.get("/api/web-search")
+async def web_search_status(request: Request):
+    return await service(request).store.runtime.web_search.status()
+
+
+@router.put("/api/web-search")
+async def web_search_save(request: Request):
+    return await service(request).store.runtime.web_search.save(
+        await body(request, WebSearchConfig)
+    )
+
+
+@router.delete("/api/web-search")
+async def web_search_reset(request: Request):
+    return await service(request).store.runtime.web_search.save(None)
+
+
+@router.put("/api/debounce")
+async def debounce_save(request: Request):
+    return await service(request).store.runtime.set_debounce(await body(request, DebounceConfig))
+
+
+@router.delete("/api/debounce")
+async def debounce_reset(request: Request):
+    return await service(request).store.runtime.set_debounce(None)
 
 
 @router.put("/api/thinking")
@@ -424,6 +466,9 @@ async def compression_config(request: Request):
     runtime = service(request).store.runtime
     return {
         "config": runtime.compression.model_dump(),
+        "history_strategy": "prefix_half" if runtime.s.prefix_history_enabled else "legacy_window",
+        "history_high_tokens_estimate": runtime.s.history_high_tokens,
+        "history_max_bytes": runtime.s.history_max_bytes,
         "source": "admin" if runtime.compression_overridden else "env",
         "environment": runtime.env_compression.model_dump(),
     }
@@ -737,7 +782,7 @@ async def sandbox(request: Request):
             if result["decisions"].get("result") == "not_called":
                 result["decisions"]["result"] = intent
             if intent != "ignore":
-                bvid = extract_bvid(data.text)
+                bvid = None if getattr(intent, "sandbox_mode", False) else extract_bvid(data.text)
                 if bvid:
                     video = await svc.bili.video(bvid)
                     payload = {
@@ -770,6 +815,8 @@ async def sandbox(request: Request):
                         message=msg,
                         budget_lane="admin",
                         audit_source="sandbox",
+                        route=intent,
+                        generation_trace=preview,
                     )
                 )
                 if bvid:
@@ -779,13 +826,98 @@ async def sandbox(request: Request):
                         + "\n"
                         + video.url
                     )
-                parsed = parse_reply(preview["text"], msg, svc.s)
-                preview["text"] = parsed.text
-                if parsed.meme_tag in svc.memes.labels:
-                    preview["meme_tag"] = parsed.meme_tag
+                if not bvid and preview["text"].lstrip().startswith("{"):
+                    actions, folded = parse_actions(
+                        preview["text"],
+                        public=not (msg.kind == "private" and msg.user_id == svc.s.owner_qq_id),
+                        settings=svc.s,
+                        labels=svc.memes.labels,
+                        tier=getattr(intent, "tier", 2),
+                    )
+                    preview["actions"] = actions.model_dump()
+                    preview["text"] = (
+                        "" if actions.abstain else folded or "\n".join(actions.bubbles)
+                    )
+                else:
+                    parsed = parse_reply(preview["text"], msg, svc.s)
+                    preview["text"] = parsed.text
+                    if parsed.meme_tag in svc.memes.labels:
+                        preview["meme_tag"] = parsed.meme_tag
         except Rejected as exc:
             result["decisions"].setdefault("reason", str(exc))
             result["decisions"]["final_result"] = "blocked_or_unavailable"
             if not preview["text"]:
                 preview["status"] = "blocked_or_unavailable"
         return result
+
+
+class MemoryEdit(Input):
+    id: str = Field(
+        pattern=r"^(?:p:[1-9][0-9]{0,19}:(?:alias|preferences|boundaries|state)|e:[a-f0-9]{24})$"
+    )
+    version: int = Field(ge=0)
+    action: Literal["edit", "delete", "unlock"]
+    text: str = Field(default="", max_length=500)
+    expires: float = Field(default=0, ge=0)
+
+
+class MemoryMirrorConfig(Input):
+    enabled: bool
+    version: int = Field(ge=0)
+
+
+@router.get("/api/sessions/{key}/memory")
+async def dual_memory_detail(request: Request, key: str):
+    svc = service(request)
+    msg = await session_message(request, key)
+    return await svc.sessions.dual.view(msg)
+
+
+class MemoryQuery(Input):
+    query: str = Field(default="", max_length=200)
+
+
+@router.post("/api/sessions/{key}/memory/search")
+async def dual_memory_search(request: Request, key: str):
+    data = await body(request, MemoryQuery)
+    svc = service(request)
+    return await svc.sessions.dual.view(await session_message(request, key), data.query)
+
+
+@router.put("/api/sessions/{key}/memory")
+async def dual_memory_edit(request: Request, key: str):
+    data = await body(request, MemoryEdit)
+    svc, msg = service(request), await session_message(request, key)
+    if (await svc.sessions.dual.view(msg))["version"] != data.version:
+        raise Rejected("session_changed")
+    if data.action == "edit":
+        check_memory_text(data.text, svc.s)
+        request.app.state.admin_auth.costly()
+        await svc.ai.screen(
+            {"proposed_memory": data.text},
+            svc.store.vault.digest("admin-memory", key),
+            purpose="source",
+            budget_lane="admin",
+            audit_source="memory",
+        )
+    return await svc.sessions.dual.edit(
+        msg, data.id, version=data.version, action=data.action, text=data.text, expires=data.expires
+    )
+
+
+@router.put("/api/sessions/{key}/memory/mirror")
+async def dual_memory_mirror_config(request: Request, key: str):
+    data = await body(request, MemoryMirrorConfig)
+    svc = service(request)
+    return await svc.memory_mirror.configure(
+        await session_message(request, key), data.enabled, data.version
+    )
+
+
+@router.post("/api/sessions/{key}/memory/{direction}")
+async def dual_memory_sync(request: Request, key: str, direction: Literal["push", "pull"]):
+    request.app.state.admin_auth.costly()
+    svc = service(request)
+    return await svc.memory_mirror.sync(
+        await session_message(request, key), push=direction == "push"
+    )

@@ -133,7 +133,7 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
                 if depth == 0 and str(data.get("qq")) == bot_id:
                     result.addressed = True
                 add("[提及机器人]" if str(data.get("qq")) == bot_id else "[提及群友]")
-            elif kind == "image":
+            elif kind in {"image", "mface"}:
                 url = data.get("url", "")
                 file = data.get("file", "")
                 # A native opaque file id is useful over WS; paths/URLs in this field are not.
@@ -158,10 +158,35 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
                     and ref.identity not in [i.identity for i in result.images]
                 ):
                     result.images.append(ref)
-                add("[图片]")
+                add("[商城贴纸]" if kind == "mface" else "[图片]")
             elif kind == "face":
                 face = str(data.get("id", ""))
-                add("[表情" + (face if face.isdigit() and len(face) <= 6 else "") + "]")
+                label = {
+                    "0": "惊讶",
+                    "1": "撇嘴",
+                    "2": "色",
+                    "3": "发呆",
+                    "4": "得意",
+                    "5": "流泪",
+                    "6": "害羞",
+                    "9": "大哭",
+                    "14": "微笑",
+                    "21": "可爱",
+                    "24": "饥饿",
+                    "28": "憨笑",
+                    "30": "奋斗",
+                    "32": "疑问",
+                    "38": "敲打",
+                    "66": "爱心",
+                    "76": "赞",
+                    "97": "擦汗",
+                    "178": "笑哭",
+                }.get(face)
+                add(
+                    "[表情：" + label + "]"
+                    if label
+                    else "[表情" + (face if face.isdigit() and len(face) <= 6 else "") + "]"
+                )
             elif kind == "json":
                 content = data.get("data", {})
                 if isinstance(content, str):
@@ -204,7 +229,7 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
     if include_authors:
         result = RichMessage()
         lines = []
-        for node in nodes[:20]:
+        for node in nodes[:15]:
             if not isinstance(node, dict):
                 raise Rejected("invalid_forward")
             sender = node.get("sender") or {}
@@ -242,11 +267,11 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
             if sum(map(len, lines)) > 7500:
                 break
         result.text = "\n".join(lines)[:7900]
-        if len(nodes) > 20:
-            result.text += "\n[转发仅展示前20条]"
+        if len(nodes) > 15:
+            result.text += f"\n[转发共{len(nodes)}条，仅展示前15条]"
         return result
     segments = []
-    for node in nodes[:20]:
+    for node in nodes[:15]:
         if not isinstance(node, dict):
             raise Rejected("invalid_forward")
         segments.append(

@@ -28,6 +28,8 @@ ACTIONS |= {
     "get_image",
     "get_file",
     "get_msg",
+    "set_input_status",
+    "send_group_forward_msg",
 }
 EventHandler = Callable[[dict], Awaitable[str]]
 
@@ -38,6 +40,8 @@ class OneBotTransport(Protocol):
 
 def response_data(value: dict, action: str = "") -> dict | list:
     if value.get("status") != "ok" or value.get("retcode") != 0:
+        if action == "send_group_forward_msg" and value.get("retcode") in {404, 1404}:
+            raise Rejected("onebot_action_unsupported")
         raise Rejected("onebot_rpc_failed")
     data = value.get("data")
     if action == "get_friend_list" and isinstance(data, list):
@@ -52,6 +56,32 @@ def response_data(value: dict, action: str = "") -> dict | list:
 def validate_action(settings, action, params):
     if action not in ACTIONS:
         raise Rejected("onebot_action_forbidden")
+    if action == "send_group_forward_msg":
+        target = str(params.get("group_id", ""))
+        nodes = params.get("messages", [])
+        if (
+            target not in settings.onebot_allowed_groups
+            or settings.group_policies.get("onebot:" + target, "at_only") == "muted"
+            or not isinstance(nodes, list)
+            or len(nodes) != 1
+        ):
+            raise Rejected("onebot_action_forbidden")
+        node = nodes[0]
+        data = node.get("data", {}) if isinstance(node, dict) else {}
+        content = data.get("content", [])
+        if (
+            node.get("type") != "node"
+            or str(data.get("user_id")) != settings.onebot_self_id
+            or not isinstance(content, list)
+            or len(content) != 1
+            or content[0].get("type") != "text"
+            or len(content[0].get("data", {}).get("text", "")) > 6000
+        ):
+            raise Rejected("onebot_action_forbidden")
+    if action == "set_input_status":
+        target = str(params.get("user_id", ""))
+        if target != settings.owner_qq_id and target not in settings.onebot_allowed_users:
+            raise Rejected("onebot_action_forbidden")
     if action == "delete_friend":
         value = params.get("user_id")
         if (
@@ -187,7 +217,13 @@ class WebSocketTransport:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if dispatched and action in {"send_private_msg", "send_group_msg"}:
+            if dispatched and action in {
+                "send_private_msg",
+                "send_group_msg",
+                "send_group_forward_msg",
+            }:
+                if isinstance(exc, Rejected) and str(exc) == "onebot_action_unsupported":
+                    raise
                 raise Rejected("onebot_delivery_uncertain") from None
             if isinstance(exc, TimeoutError):
                 raise Rejected("onebot_rpc_timeout") from None
@@ -261,6 +297,7 @@ class WebSocketTransport:
                 self._retired.add(retire)
                 retire.add_done_callback(self._retired.discard)
         events: asyncio.Queue = asyncio.Queue(maxsize=32)
+        notices: asyncio.Queue = asyncio.Queue(maxsize=32)
 
         async def reader():
             while True:
@@ -277,23 +314,25 @@ class WebSocketTransport:
                         raise Rejected("onebot_event_too_large")
                     if str(value.get("self_id")) != self.s.onebot_self_id:
                         raise Rejected("wrong_bot")
-                    if value.get("post_type") == "message":
+                    if value.get("post_type") in {"message", "message_sent", "notice"}:
                         try:
-                            events.put_nowait(value)
+                            (notices if value.get("post_type") == "notice" else events).put_nowait(
+                                value
+                            )
                         except asyncio.QueueFull:
                             raise Rejected("onebot_backpressure") from None
 
-        async def consumer():
+        async def consumer(queue):
             await peer.ready.wait()
             while True:
-                value = await events.get()
+                value = await queue.get()
                 try:
                     if peer is not self._peer:
                         return
                     if await on_event(value) == "full":
                         raise Rejected("onebot_backpressure")
                 finally:
-                    events.task_done()
+                    queue.task_done()
 
         async def heartbeat():
             while True:
@@ -304,7 +343,11 @@ class WebSocketTransport:
                 if peer is self._peer:
                     self.last_heartbeat_at = time.time()
 
-        tasks = [asyncio.create_task(reader()), asyncio.create_task(consumer())]
+        tasks = [
+            asyncio.create_task(reader()),
+            asyncio.create_task(consumer(events)),
+            asyncio.create_task(consumer(notices)),
+        ]
         try:
             info = await self._rpc("get_login_info", {}, peer)
             if str(info.get("user_id")) != self.s.onebot_self_id:

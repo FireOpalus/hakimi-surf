@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import io
 import ipaddress
 import logging
@@ -9,6 +10,7 @@ import re
 import socket
 import ssl
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -77,13 +79,19 @@ class PublicResolver(AbstractResolver):
 class ModelImage:
     data: str
     mime_type: str = "image/jpeg"
+    thumbnail: str = ""
+    digest: str = ""
+    resolution: str = "low"
+
+    def gate(self):
+        return ModelImage(self.thumbnail or self.data, self.mime_type, digest=self.digest)
 
     def block(self) -> dict:
         return {
             "type": "image",
             "data": self.data,
             "mime_type": self.mime_type,
-            "resolution": "low",
+            "resolution": self.resolution,
         }
 
 
@@ -103,11 +111,37 @@ def normalize_image(raw: bytes, max_pixels: int) -> ModelImage:
                 source.load()
                 resized = ImageOps.exif_transpose(source).convert("RGB")
                 resized.thumbnail((768, 768))
+                if getattr(source, "is_animated", False):
+                    if (
+                        source.n_frames > 300
+                        or source.n_frames * source.width * source.height > 32_000_000
+                    ):
+                        raise Rejected("image_animation_too_long")
+                    source.seek(source.n_frames - 1)
+                    last = source.convert("RGB")
+                    last.thumbnail((768, 768))
+                    stitched = Image.new(
+                        "RGB",
+                        (resized.width + last.width, max(resized.height, last.height)),
+                        "white",
+                    )
+                    stitched.paste(resized, (0, 0))
+                    stitched.paste(last, (resized.width, 0))
+                    resized = stitched
+                    resized.thumbnail((768, 768))
                 resized.info.clear()
                 target = io.BytesIO()
-                # No EXIF, ICC, comments, animation or other embedded metadata is forwarded.
                 resized.save(target, format="JPEG", quality=80, optimize=True)
-        return ModelImage(base64.b64encode(target.getvalue()).decode("ascii"))
+                tiny = resized.copy()
+                tiny.thumbnail((192, 192))
+                thumb = io.BytesIO()
+                tiny.save(thumb, format="JPEG", quality=55)
+        return ModelImage(
+            base64.b64encode(target.getvalue()).decode("ascii"),
+            thumbnail=base64.b64encode(thumb.getvalue()).decode("ascii"),
+            digest=hashlib.sha256(raw).hexdigest(),
+            resolution="medium",
+        )
     except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
         raise Rejected("invalid_image") from None
 
@@ -123,6 +157,13 @@ class ImageLoader:
         self.s, self.transport = settings, transport
         # Shared by all sessions; only one image transfer can occupy the Shanghai uplink.
         self.ws_images = asyncio.Semaphore(1)
+        self.decode_slots = asyncio.Semaphore(1)
+        self.download_slots = asyncio.Semaphore(2)
+        self.cache = OrderedDict()
+        self.aliases = OrderedDict()
+        self.cache_bytes = 0
+        self.cache_limit = 48 * 1024 * 1024
+        self.fetch_locks = [asyncio.Lock() for _ in range(64)]
 
     @staticmethod
     def failure_placeholder(ref):
@@ -136,9 +177,9 @@ class ImageLoader:
         if not self.s.images_enabled or len(refs) > 2:
             raise Rejected("images_disabled_or_excessive")
         images = []
-        async with self._client() as client:
+        async with self.download_slots, self._client() as client:
             for ref in refs:
-                images.append(await self._one(client, ref))
+                images.append(await self.cached_one(client, ref, "legacy"))
         return images
 
     def _client(self):
@@ -241,7 +282,7 @@ class ImageLoader:
             raise Rejected("image_too_large")
         raw, refreshed = await self._napcat(ref)
         if raw is not None:
-            return await asyncio.to_thread(normalize_image, raw, self.s.image_max_pixels)
+            return await self.normalize(raw)
         # Prefer a freshly resolved CDN URL, otherwise use the authenticated event's URL.
         url = next(iter(refreshed), ref.url)
         if not url:
@@ -259,19 +300,59 @@ class ImageLoader:
             raw = await self._http_one(
                 client, "http://" + url.removeprefix("https://"), allow_http=True
             )
-        return await asyncio.to_thread(normalize_image, raw, self.s.image_max_pixels)
+        return await self.normalize(raw)
 
-    async def load_results(self, refs: list[ImageRef]) -> list[ModelImage | None]:
+    async def normalize(self, raw):
+        async with self.decode_slots:
+            return await asyncio.to_thread(normalize_image, raw, self.s.image_max_pixels)
+
+    def cache_get(self, scope, ref):
+        key = self.aliases.get((scope, ref.identity))
+        if key not in self.cache:
+            return None
+        self.cache.move_to_end(key)
+        return self.cache[key]
+
+    async def cached_one(self, client, ref, scope):
+        async with self.fetch_locks[hash((scope, ref.identity)) % len(self.fetch_locks)]:
+            found = self.cache_get(scope, ref)
+            if found:
+                return found
+            image = await self._one(client, ref)
+            key = (scope, image.digest or hashlib.sha256(image.data.encode()).hexdigest())
+            if key not in self.cache:
+                self.cache[key] = image
+                self.cache_bytes += len(image.data) + len(image.thumbnail)
+            self.aliases[(scope, ref.identity)] = key
+
+            def evict(victim):
+                old = self.cache.pop(victim)
+                self.cache_bytes -= len(old.data) + len(old.thumbnail)
+
+            own = [k for k in self.cache if k[0] == scope]
+            for victim in own[:-30]:
+                evict(victim)
+            while self.cache_bytes > self.cache_limit or len(self.cache) > 1024:
+                evict(next(iter(self.cache)))
+            # Remove aliases to evicted data; cap aliases independently of repeated identities.
+            self.aliases = OrderedDict((k, v) for k, v in self.aliases.items() if v in self.cache)
+            while len(self.aliases) > 4096:
+                self.aliases.popitem(last=False)
+            return image
+
+    async def load_results(
+        self, refs: list[ImageRef], *, scope="legacy"
+    ) -> list[ModelImage | None]:
         """Keep positions for sender attribution; a failed image never aborts ordinary chat."""
         if len(refs) > 2:
             raise Rejected("images_disabled_or_excessive")
         if not refs or not self.s.images_enabled:
             return [None for _ in refs]
         results = []
-        async with self._client() as client:
+        async with self.download_slots, self._client() as client:
             for ref in refs:
                 try:
-                    results.append(await self._one(client, ref))
+                    results.append(await self.cached_one(client, ref, scope))
                 except (Rejected, TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
                     self._warn("fallback", exc)
                     results.append(None)

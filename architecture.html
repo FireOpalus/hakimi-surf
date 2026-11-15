@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="基于 hakimi-surf 0.8.1 源码绘制的项目架构图：境内 NapCat／境外主脑、会话串行与接收日志、受控点名、公开记忆桥、Gemini 思考策略与本地时区预算。">
+  <meta name="description" content="基于 hakimi-surf 1.0.0 源码绘制的项目架构图：境内 NapCat／境外主脑、会话串行与接收日志、受控点名、公开记忆桥、Gemini 思考策略与本地时区预算。">
   <title>hakimi-surf · 项目架构图</title>
   <style>
     :root {
@@ -273,7 +273,7 @@
     <header>
       <div class="masthead">
         <div class="brand"><span class="brand-mark" aria-hidden="true">H</span> hakimi-surf</div>
-        <div class="meta">源码架构 · v0.8.1 · 2026-11-14</div>
+        <div class="meta">源码架构 · v1.0.0 · 2026-11-14</div>
       </div>
       <div class="hero">
         <div class="eyebrow">PROJECT ARCHITECTURE</div>
@@ -372,7 +372,7 @@
           <div class="state-lane">
             <strong>接收日志与模型历史分开保存</strong>
             <div class="mini-flow"><span>received_messages · 未审核</span><i aria-hidden="true">→ 门卫放行 →</i><span>admit_history → recent_messages</span><i aria-hidden="true">→</i><span>生成与输出审核</span><i aria-hidden="true">→</i><span>reply() → outbox</span></div>
-            <p>普通聊天的 assistant 历史在投递前幂等写入，QQ 是否送达由 outbox 单独记录；纯表情与主动私信仍在确认发送后写入。清空或编辑摘要通过 epoch 使在途结果失效。</p>
+            <p>所有已发送正文与视觉简述都在 OneBot ACK 后通过回执幂等写入。五维 JSON 流式收集后校验；同人追发可取消未出站请求。清空先提交公开墓碑，再递增 epoch、取消待发任务。</p>
           </div>
 
           <div class="divider"><span>↓ 业务处理按需调用；这些模块运行在同一进程中 ↓</span></div>
@@ -386,7 +386,7 @@
             </article>
             <article class="node capability">
               <h3><span class="node-key">B</span> 会话隔离与公开背景</h3>
-              <p>每个私聊／群聊独立 SQLite 文件，接收日志、审核历史和滚动摘要各有边界；压缩按 epoch／version 提交。</p>
+              <p>每个私聊／群聊独立 WAL SQLite，Fernet 加密正文。画像、编年史和不可变冷史分轨；归档按 epoch／version 与人工锁提交，旧摘要无损过渡。</p>
               <div class="mini-flow"><span>SessionManager</span><i aria-hidden="true">↔</i><span>MemoryCompressor</span></div>
               <p>已确认的公开群互动 → 主库只读索引 → Owner 私聊背景；没有私聊到群聊的反向路径。小本本快照仍独立启用。</p>
               <div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/memory_compressor.py">memory_compressor.py</a><br><a href="src/hakimi/public_memory.py">public_memory.py</a> · <a href="src/hakimi/bot_server.py">bot_server.py</a></div>
@@ -401,7 +401,7 @@
           </div>
 
           <div class="divider"><span>后台任务 · Service.start() 创建 asyncio 协程</span></div>
-          <div class="workers">
+          <div class="workers"><article class="worker"><h4>异步双轨归档</h4><p>28k 估算词元折半入冷史；03:10 上海时间做超过24小时的只读快照，B 字节不改。Hydrogen Flex、medium、store=False；$0.75 输入／$3.75 输出每百万词元，memory 日预算 $0.20。</p><p><code>dual_memory.py / memory_compressor.py</code></p></article>
             <article class="worker"><h4>UP 订阅巡逻</h4><p>定时读取 UP 更新 → 写入 jobs → 摘要与报告；同时轮询已配置直播间状态。</p><p><code>service.py / patrol()</code></p></article>
             <article class="worker"><h4>Owner 主动私信 <span class="optional">可选</span></h4><p>告警、日报、陪伴计划使用独立持久化队列；接收人固定为真实 OneBot Owner。</p><p><code>proactive_dm.py</code></p></article>
             <article class="worker"><h4>B 站小号巡逻 <span class="optional">可选</span></h4><p>独立账号发现候选内容、选择和分析；受额度、冷却与写操作开关控制。</p><p><code>bili_watcher.py</code></p></article>
@@ -424,7 +424,7 @@
           </article>
           <article class="node storage">
             <h3>按会话隔离的记忆库</h3><code class="path">data/sessions/{private,group}/*.sqlite3</code>
-            <p>received_messages、recent_messages、滚动摘要、发送回执、版本／epoch 与 TTL；以会话身份派生文件名。</p>
+            <p>A 静态前缀 + B 追加热史 + C ≤2050 词元尾窗；member_profiles、chronicle_events、cold_history_slices 与接收日志、回执并存，以会话身份派生文件名。</p>
             <small>未审核接收日志不直接进入热历史或压缩；主库仅另存受控公开背景与会话索引。</small>
           </article>
           <article class="node storage">
@@ -433,7 +433,7 @@
             <small>Compose 将 data 挂载为持久卷，视频缓存使用独立 tmpfs。</small>
           </article>
         </div>
-        <figcaption id="architecture-caption">箭头表示消息流或标注的调用关系。图中以 0.8.1 境内 NapCat／境外主脑拓扑组织；后端业务模块仍属于单进程，NapCat 是独立协议端。兼容接入和可选功能以配置为准；图中不包含实际密钥或随机入口路径。</figcaption>
+        <figcaption id="architecture-caption">箭头表示消息流或标注的调用关系。图中以 1.0.0 境内 NapCat／境外主脑拓扑组织；后端业务模块仍属于单进程，NapCat 是独立协议端。兼容接入和可选功能以配置为准；图中不包含实际密钥或随机入口路径。</figcaption>
       </figure>
     </section>
 
@@ -453,7 +453,7 @@
         <article class="dependency">
           <div class="origin">RoamingLogger / NotebookSnapshot</div>
           <div class="target"><b aria-hidden="true">↔</b><h3>Google Drive</h3><span class="optional">可选</span></div>
-          <p>日记 → 固定文件夹（Service Account 或 OAuth）；指定只读文件 → Owner 快照。两条数据路径独立，日记不读取私聊记忆。</p>
+          <p>日记 → 固定文件夹（Service Account 或 OAuth）；指定只读文件 → Owner 快照。路径独立，日记不读取私聊记忆。显式启用的白名单群可导出双轨 Markdown，ETag 条件更新；云端人工删改经 source 筛查后 CAS 回写并加锁，私聊永不导出。</p>
         </article>
       </div>
     </section>
@@ -487,7 +487,7 @@
                 <li>协议认证与 Layer 0 准入后，在接收锁内 <strong>receive → 同会话引用／转发展开 → receive 更新</strong>，再由 Store.admit 写 jobs 与持久化防抖批次。</li>
                 <li>Worker 领取任务并复检权限。<strong>固定命令由本地代码执行，直接写入 Outbox</strong>，无需模型生成。</li>
                 <li>对话锁覆盖读取最新会话历史、<strong>Decisions 输入筛查 → admit_history → Interactions 生成 → Decisions 输出筛查</strong>；按阶段检查 epoch。</li>
-                <li>解析 AT／MEME，普通文本回复先由 reply() 幂等入历史再入 Outbox；Delivery 复检后发送，确认的群文本更新公开索引，并可调度记忆压缩。</li>
+                <li>解析 AT／MEME，先入 Outbox；Delivery 复检后发送，ACK 后幂等写入历史，确认的群文本更新公开索引，并可调度记忆压缩。</li>
               </ol>
             </article>
             <article class="path-card">
@@ -522,7 +522,7 @@
       </details>
     </section>
 
-    <footer><span>hakimi-surf / v0.8.1 源码架构快照 · 2026-11-14</span><span>独立 HTML + CSS · 离线可打开 · <a href="#overview">返回架构图 ↑</a></span></footer>
+    <footer><span>hakimi-surf / v1.0.0 源码架构快照 · 2026-11-14</span><span>独立 HTML + CSS · 离线可打开 · <a href="#overview">返回架构图 ↑</a></span></footer>
   </main>
 </body>
 </html>

@@ -195,6 +195,93 @@ class Sender:
                 {"group_id": int(message.conversation_id), "auto_escape": True, "message": parts},
             )
 
+    async def quick_ack(self, message, text, *, before_send):
+        # Best effort: never wait behind the global sender or connectivity for > 900 ms.
+        async with asyncio.timeout(0.9):
+            async with self.send_lock:
+                if not await before_send():
+                    return
+                return await self._send_once(message, text, False, before_send=before_send)
+
+    async def typing(self, message):
+        if message.platform != "onebot" or message.kind != "private":
+            return  # NapCat's input-status API is a private-peer action.
+        try:
+            async with asyncio.timeout(0.3):
+                await self.onebot.call(
+                    "set_input_status", {"user_id": int(message.user_id), "event_type": 1}
+                )
+        except Exception:
+            pass
+
+    async def send_action_bubble(self, message, segments, *, targets, before_send):
+        async with self.send_lock:
+            if not await before_send() or not authorize(message, self.s):
+                raise Rejected("reply_invalidated")
+            allowed = await targets()
+            parts = revalidate_segments(segments, message, self.s, allowed_at_qqs=allowed)
+            if message.kind == "group":
+                reply = next(
+                    (
+                        p
+                        for p in segments
+                        if p.get("type") == "reply"
+                        and re.fullmatch(r"-?[0-9]{1,30}", str(p.get("data", {}).get("id", "")))
+                    ),
+                    None,
+                )
+                if reply:
+                    parts.insert(0, reply)
+            for part in parts:
+                if part["type"] == "text" and part["data"]["text"].strip():
+                    part["data"]["text"] = safe_output(
+                        part["data"]["text"], configured_secrets(self.s), limit=6000
+                    )
+            if not await before_send():
+                raise Rejected("reply_invalidated")
+            return await self.onebot.call(
+                "send_group_msg" if message.kind == "group" else "send_private_msg",
+                {
+                    "group_id" if message.kind == "group" else "user_id": int(
+                        message.conversation_id
+                    ),
+                    "auto_escape": True,
+                    "message": parts,
+                },
+            )
+
+    async def send_folded(self, message, text, *, before_send):
+        if message.platform != "onebot" or message.kind != "group":
+            raise Rejected("forward_group_only")
+        text = safe_output(text, configured_secrets(self.s), limit=6000)
+        async with self.send_lock:
+            if not await before_send() or not authorize(message, self.s):
+                raise Rejected("reply_invalidated")
+            try:
+                return await self.onebot.call(
+                    "send_group_forward_msg",
+                    {
+                        "group_id": int(message.conversation_id),
+                        "messages": [
+                            {
+                                "type": "node",
+                                "data": {
+                                    "user_id": int(self.s.onebot_self_id),
+                                    "nickname": "吉米奈喵",
+                                    "content": [{"type": "text", "data": {"text": text}}],
+                                },
+                            }
+                        ],
+                    },
+                )
+            except Rejected as exc:
+                if str(exc) != "onebot_action_unsupported":
+                    raise  # Unknown delivery can NEVER become an extra image send.
+        from .text_card import render_card
+
+        image = await asyncio.to_thread(render_card, text)
+        return await self.send_meme(message, image, before_send=before_send)
+
     async def send_owner_dm(self, target_user_id: int, text: str, *, before_send=None):
         if (
             isinstance(target_user_id, bool)
@@ -328,3 +415,50 @@ class Sender:
             )
             if data.get("code", 0) != 0 or data.get("err_code", 0) != 0 or not data.get("id"):
                 raise Rejected("qq_send_failed")
+
+
+def notice_message(payload, settings):
+    """Authenticated protocol notices become untrusted action descriptions, never commands."""
+    if str(payload.get("self_id")) != settings.onebot_self_id:
+        raise Rejected("wrong_bot")
+    notice = payload.get("notice_type")
+    subtype = payload.get("sub_type")
+    recall = notice in {"group_recall", "friend_recall"}
+    poke = notice == "notify" and subtype == "poke"
+    reaction = notice in {"group_msg_emoji_like", "group_msg_emoji_like_update", "msg_emoji_like"}
+    if not (recall or poke or reaction):
+        return None
+    user = identifier(payload.get("user_id", payload.get("operator_id")), numeric=True)
+    if user == settings.onebot_self_id:
+        return None
+    kind = "group" if payload.get("group_id") else "private"
+    target = str(payload.get("target_id", ""))
+    direct = target == settings.onebot_self_id
+    ref = identifier(payload.get("message_id", "0"))
+    text = (
+        "[协议事件：撤回消息]"
+        if recall
+        else "[协议事件：戳了戳你]"
+        if poke and direct
+        else "[协议事件：戳了戳另一位群友]"
+        if poke
+        else "[协议事件：对消息贴了表情]"
+    )
+    created = float(payload.get("time", time.time()))
+    check_fresh(created, settings.signature_max_age)
+    return Message(
+        platform="onebot",
+        bot_id=settings.onebot_self_id,
+        event_id=f"notice:{notice}:{user}:{ref}:{created}:{target}",
+        user_id=user,
+        kind=kind,
+        conversation_id=identifier(payload.get("group_id"), numeric=True)
+        if kind == "group"
+        else user,
+        text=text,
+        command_text="",
+        addressed=direct or kind == "private",
+        attention_reason="mention" if direct else "private" if kind == "private" else "",
+        reply_ids=[ref] if reaction and ref != "0" else [],
+        created_at=created,
+    )

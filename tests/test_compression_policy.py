@@ -11,6 +11,12 @@ from hakimi.session_manager import SessionManager
 from tests.fakes import FakeGateway
 
 
+@pytest.fixture(autouse=True)
+def legacy_compression_compatibility(settings):
+    # Retain coverage of the opt-in v0.8 window; v0.9 prefix folding has its own contracts.
+    settings.prefix_history_enabled = False
+
+
 async def fill_exact(sessions, message, count, chars):
     width, remainder = divmod(chars, count)
     texts = ["字" * (width + int(n < remainder)) for n in range(count)]

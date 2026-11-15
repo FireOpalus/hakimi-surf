@@ -72,7 +72,7 @@ class MessageContextResolver:
                 "sender_nickname": name,
                 "text": rich.text,
                 "command_text": "",
-                "reply_ids": [],
+                "reply_ids": rich.reply_ids,
                 "images": rich.images,
                 "video_ids": rich.video_ids,
                 "short_urls": rich.short_urls,
@@ -122,9 +122,16 @@ class MessageContextResolver:
                     if len(target) < cap and key(value) not in [key(old) for old in target]:
                         target.append(value)
 
-        for ref in message.reply_ids[:2]:
+        pending = [(ref, 0) for ref in message.reply_ids[:2]]
+        seen = set()
+        for ref, depth in pending:
+            if ref in seen or len(seen) >= 4:
+                continue
+            seen.add(ref)
             try:
                 original = await self._reply(message, ref)
+                if depth < 1:
+                    pending.extend((nested, depth + 1) for nested in original.reply_ids[:2])
                 name = nickname(original.sender_nickname)
                 author = (
                     "我自己(吉米奈喵)"

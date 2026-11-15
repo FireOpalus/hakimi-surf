@@ -77,3 +77,118 @@ def untrusted_input(payload: dict) -> str:
         + html.escape(data, quote=False)
         + "\n</untrusted_user_input>"
     )
+
+
+def escape_data(value) -> str:
+    return html.escape(re.sub(r"\[role=", "[untrusted_role=", str(value), flags=re.I), quote=True)
+
+
+def history_lines(messages: list[dict], self_id: str = "") -> str:
+    """Stable sequence numbers come from SQLite, not the position in a moving window."""
+
+    def line_data(value):
+        return (
+            escape_data(value).replace("\r", "&#13;").replace("\n", "&#10;").replace("|", "&#124;")
+        )
+
+    lines = []
+    for position, item in enumerate(messages, 1):
+        seq = item.get("seq", position)
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            seq = position
+        role = "assistant" if item.get("role") == "assistant" else "user"
+        qq = self_id if role == "assistant" else str(item.get("user_id", ""))
+        qq = qq if re.fullmatch(r"[0-9]{1,20}", qq) else "unknown"
+        lines.append(
+            f"{seq}|{role}|QQ:{qq}|{line_data(item.get('speaker', ''))}|"
+            f"{line_data(item.get('text', ''))}\n"
+        )
+    return "".join(lines)
+
+
+def assemble_chat_input(
+    payload: dict, message, settings, *, sandbox_mode=False, recall=True, history=None
+) -> str:
+    """A lives in system_instruction; immutable B records precede the bounded C tail.
+
+    Escaping applies only to data. The verified identity block is created here,
+    never accepted from payload keys, nicknames or forwarded text.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from .context_budget import estimate_tokens, truncate_tokens
+    from .security import Rejected
+
+    context = prompt_context(message, settings)
+    messages = payload.get("recent_messages", []) if history is None else history
+    b = "" if sandbox_mode else history_lines(messages, settings.onebot_self_id)
+    current = str(payload.get("current_message", ""))
+    if len(current.encode()) > settings.max_context_bytes:
+        raise Rejected("context_too_large")
+    metadata = {
+        "current_time": datetime.now(ZoneInfo(settings.bot_timezone)).isoformat(timespec="minutes"),
+        "timezone": settings.bot_timezone,
+        "verified_sender": {
+            "role": context.role,
+            "surface": context.surface,
+            "qq": message.user_id if message else "",
+        },
+        "sandbox_mode": sandbox_mode,
+        "allowed_at_qqs": payload.get("allowed_at_qqs", []) if not sandbox_mode else [],
+        "current_sender": payload.get("current_sender", {}),
+        "image_sources": payload.get("image_sources", []),
+        "nearby_group_context": payload.get("nearby_group_context", []),
+        "allowed_reply_ids": payload.get("allowed_reply_ids", []),
+        "web_preview_untrusted": payload.get("web_preview_untrusted", []),
+        "current_batch": current,
+    }
+    summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
+    dual = payload.get("dual_memory_data", {}) if not sandbox_mode else {}
+    background = {}
+    if context.private_owner and recall and not sandbox_mode:
+        for key in ("owner_notebook_snapshot", "近期群聊巡逻记忆（只读背景）"):
+            if payload.get(key):
+                background[key] = payload[key]
+
+    def tail():
+        return (
+            "<transient_turn_context>\n"
+            + context.instruction
+            + "<untrusted_user_input>"
+            + escape_data(json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
+            + "</untrusted_user_input>\n"
+            + "<memory_summary_data>"
+            + escape_data(summary)
+            + "</memory_summary_data>\n"
+            + "<readonly_owner_background>"
+            + escape_data(json.dumps(background, ensure_ascii=False, separators=(",", ":")))
+            + "</readonly_owner_background>\n"
+            + "<untrusted_memory_data>"
+            + escape_data(json.dumps(dual, ensure_ascii=False, separators=(",", ":")))
+            + "</untrusted_memory_data>\n"
+            + "</transient_turn_context>"
+        )
+
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and dual:
+        dual = {"speaker_profile": dual.get("speaker_profile", {})}
+    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        dual = {}
+    # Trim optional background first; never move a dynamic fragment ahead of B.
+    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        background = (
+            {"excerpt": truncate_tokens(json.dumps(background, ensure_ascii=False), 180)}
+            if background
+            else {}
+        )
+    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        background = {}
+        summary = truncate_tokens(summary, 180)
+    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        summary = ""
+        metadata["image_sources"] = metadata["image_sources"][:2]
+        metadata["nearby_group_context"] = []
+        metadata["allowed_at_qqs"] = metadata["allowed_at_qqs"][:20]
+    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        raise Rejected("transient_context_too_large")
+    return "<conversation_history_log>\n" + b + "</conversation_history_log>\n" + tail()

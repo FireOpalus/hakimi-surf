@@ -70,7 +70,8 @@ def test_image_is_bounded_and_metadata_removed():
     assert b"secret-camera-comment" not in decoded
     with Image.open(io.BytesIO(decoded)) as output:
         assert max(output.size) <= 768 and not output.getexif()
-    assert result.block()["resolution"] == "low"
+    assert result.block()["resolution"] == "medium"
+    assert result.gate().block()["resolution"] == "low"
     with pytest.raises(Rejected):
         normalize_image(raw.getvalue(), 1_000_000)
     with pytest.raises(Rejected):

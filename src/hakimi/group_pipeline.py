@@ -1,15 +1,24 @@
 """Durable per-session debounce and a bounded, encrypted nearby-group window."""
 
+import asyncio
 import html
 import json
+import re
 import time
+from dataclasses import dataclass, field
 
 from .attention import WAKE_WORDS
 from .bot_server import is_persona_owner
+from .debounce_policy import DebounceConfig
 from .models import Message
 from .security import authorize
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS message_recalls (event TEXT PRIMARY KEY, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS local_quick_acks (scope TEXT PRIMARY KEY, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS outbox_bubble_receipts (
+ reply_id TEXT NOT NULL, position INTEGER NOT NULL, payload BLOB NOT NULL,
+ created REAL NOT NULL, applied INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(reply_id,position));
 CREATE TABLE IF NOT EXISTS group_debounce_batches (
  id TEXT PRIMARY KEY, scope TEXT NOT NULL, first_at REAL NOT NULL,
  ready_at REAL NOT NULL, closed INTEGER NOT NULL DEFAULT 0,
@@ -26,7 +35,7 @@ CREATE TABLE IF NOT EXISTS group_recent_messages (
 );
 CREATE INDEX IF NOT EXISTS group_recent_scope ON group_recent_messages(scope,at);
 """
-MAX_BATCH_MESSAGES = 8
+MAX_BATCH_MESSAGES = 6
 MAX_BATCH_CHARS = 8000
 CONTEXT_TTL = 300
 
@@ -59,10 +68,158 @@ def record_line(message):
     )
 
 
+@dataclass
+class ActiveBatch:
+    job: dict
+    members: list
+    phase: str = "gate"
+    cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    reason: str = ""
+    sealed: bool = False
+
+
 class GroupPipeline:
     def __init__(self, store, *, clock=None):
         self.store, self.s = store, store.s
         self.clock = clock or time.time
+        self.active = {}
+
+    @property
+    def config(self):
+        return self.store.runtime.debounce_override or DebounceConfig.from_settings(self.s)
+
+    def delay(self, message, config=None):
+        config = config or self.config
+        explicit = message.attention_reason in {"mention", "reply"} or message.kind == "private"
+        incomplete = not message.images and bool(
+            re.search(
+                r"(?:你看这个(?:报错|图|问题)?|看下这个|等下|等等|还有|比如|例如|看这里)"
+                r"[：:，,。 ]*$",
+                message.command_text or message.text,
+            )
+        )
+        if incomplete:
+            return (
+                config.mention_incomplete_seconds
+                if explicit
+                else config.ordinary_incomplete_seconds
+            )
+        return config.mention_debounce_seconds if explicit else config.group_debounce_seconds
+
+    async def retime_pending_in_transaction(self, config):
+        """Re-time only open, unclaimed work; never interrupt an in-flight reply."""
+        now = self.clock()
+        batches = await self.store.all(
+            "SELECT * FROM group_debounce_batches WHERE closed=0 AND ready_at>?", (now,)
+        )
+        for batch in batches:
+            rows = await self.store.all(
+                "SELECT j.* FROM jobs j JOIN group_debounce_items i ON i.job_id=j.id "
+                "WHERE i.batch_id=? ORDER BY j.created DESC,j.rowid DESC",
+                (batch["id"],),
+            )
+            if not rows or any(row["status"] != "pending" for row in rows):
+                continue
+            latest = rows[0]
+            message = Message.model_validate(self.store.vault.open(latest["id"], latest["payload"]))
+            ready = min(
+                latest["created"] + self.delay(message, config),
+                batch["first_at"] + config.group_debounce_max_seconds,
+            )
+            if config.group_debounce_seconds <= 0:
+                ready = now
+            await self.store.db.execute(
+                "UPDATE group_debounce_batches SET ready_at=? WHERE id=?", (ready, batch["id"])
+            )
+
+    def begin(self, job):
+        members = [Message.model_validate(m) for m in job.get("batch_messages", [])]
+        members = members or [Message.model_validate(job["payload"])]
+        batch = ActiveBatch(job, members)
+        self.active[job["scope"]] = batch
+        return batch
+
+    def phase(self, message, value):
+        batch = self.active.get(self.store.session_scope(message))
+        if batch:
+            batch.phase = value
+
+    def interrupt(self, message):
+        batch = self.active.get(self.store.session_scope(message))
+        if (
+            batch
+            and batch.phase == "generating"
+            and not batch.sealed
+            and not direct_command(message)
+            and not self.store.bot_guard.known_bot(message)
+            and message.user_id
+            == next((m.user_id for m in batch.members if m.addressed), batch.members[0].user_id)
+            and not any(
+                direct_command(m) or self.store.bot_guard.known_bot(m) for m in batch.members
+            )
+        ):
+            batch.reason = "followup"
+            batch.cancel.set()
+
+    def recall(self, message, event_id):
+        batch = self.active.get(self.store.session_scope(message))
+        if batch and any(event_id in {m.event_id, *m.reply_ids} for m in batch.members):
+            batch.reason = "recall"
+            batch.cancel.set()
+
+    async def state(self, message):
+        scope = self.store.session_scope(message)
+        if scope in self.active:
+            return self.active[scope].phase
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT 1 FROM jobs WHERE scope=? AND status='pending' LIMIT 1", (scope,)
+            )
+        return "debouncing" if row else "idle"
+
+    async def requeue_interrupted(self, job):
+        # Old originals already passed the gate and are in append-only B. Keep at most
+        # six current originals; superseded older ones remain visible as history.
+        async with self.store.transaction():
+            rows = await self.store.all(
+                "SELECT * FROM jobs WHERE scope=? AND status IN ('working','pending') "
+                "ORDER BY created,rowid",
+                (job["scope"],),
+            )
+            eligible = []
+            for row in rows:
+                msg = Message.model_validate(self.store.vault.open(row["id"], row["payload"]))
+                if direct_command(msg) or self.store.bot_guard.known_bot(msg):
+                    break
+                eligible.append((row, msg))
+            if not eligible:
+                return
+            selected = eligible[-MAX_BATCH_MESSAGES:]
+            batch_id = selected[0][0]["id"]
+            now = self.clock()
+            for row, _ in eligible[:-MAX_BATCH_MESSAGES]:
+                await self.store.db.execute(
+                    "UPDATE jobs SET status='superseded',payload=NULL WHERE id=?", (row["id"],)
+                )
+            await self.store.db.execute(
+                "INSERT OR REPLACE INTO group_debounce_batches VALUES (?,?,?,?,0,?,?)",
+                (
+                    batch_id,
+                    job["scope"],
+                    now,
+                    now + min(self.delay(selected[-1][1]), self.config.group_debounce_max_seconds),
+                    len(selected),
+                    sum(self.message_size(m) for _, m in selected),
+                ),
+            )
+            for row, _ in selected:
+                await self.store.db.execute(
+                    "UPDATE jobs SET status='pending' WHERE id=?", (row["id"],)
+                )
+                await self.store.db.execute(
+                    "INSERT OR REPLACE INTO group_debounce_items VALUES (?,?)",
+                    (row["id"], batch_id),
+                )
 
     async def initialize(self):
         await self.store.db.executescript(SCHEMA)
@@ -84,8 +241,8 @@ class GroupPipeline:
             or other_mentions(message)
             or direct_command(message)
             or not authorize(message.model_copy(update={"addressed": True}), self.s)
-            or self.s.group_debounce_seconds <= 0
-            or self.s.group_debounce_max_seconds <= 0
+            or self.config.group_debounce_seconds <= 0
+            or self.config.group_debounce_max_seconds <= 0
         ):
             return False
         batch = await self.store.one(
@@ -116,8 +273,8 @@ class GroupPipeline:
 
     async def register_in_transaction(self, message, job_id, now):
         scope = self.store.session_scope(message)
-        delay = self.s.group_debounce_seconds
-        maximum = self.s.group_debounce_max_seconds
+        delay = self.delay(message)
+        maximum = self.config.group_debounce_max_seconds
         standalone = direct_command(message) or self.store.bot_guard.known_bot(message)
         if standalone:
             # Older group work must become eligible before a subsequent reset/command.
@@ -126,7 +283,7 @@ class GroupPipeline:
                 "WHERE scope=? AND closed=0",
                 (now, scope),
             )
-        if delay <= 0 or maximum <= 0:
+        if self.config.group_debounce_seconds <= 0 or delay <= 0 or maximum <= 0:
             return
         # Count the escaped UTF-8 representation as it will enter current_message,
         # reserving half the main context limit for provenance/history and framing.
@@ -174,9 +331,15 @@ class GroupPipeline:
         await self.store.db.execute(
             "INSERT INTO group_debounce_items VALUES (?,?)", (job_id, batch_id)
         )
-        if standalone:
+        count = (batch["count"] + 1) if batch else 1
+        if (
+            standalone
+            or count >= MAX_BATCH_MESSAGES
+            or now >= (batch["first_at"] + maximum if batch else now + maximum)
+        ):
             await self.store.db.execute(
-                "UPDATE group_debounce_batches SET closed=1 WHERE id=?", (batch_id,)
+                "UPDATE group_debounce_batches SET closed=1,ready_at=MIN(ready_at,?) WHERE id=?",
+                (now, batch_id),
             )
 
     async def claim_in_transaction(self, row):

@@ -61,3 +61,24 @@ def message():
         addressed=True,
         created_at=time.time(),
     )
+
+
+@pytest.fixture(autouse=True)
+def forbid_external_test_connections(monkeypatch):
+    """All provider tests are mocks. Real sockets are limited to loopback test servers."""
+    import ipaddress
+    import socket
+
+    original = socket.socket.connect
+
+    def connect(sock, address):
+        if isinstance(address, tuple):
+            try:
+                permitted = ipaddress.ip_address(address[0]).is_loopback
+            except ValueError:
+                permitted = address[0] == "localhost"
+            if not permitted:
+                raise AssertionError("External network forbidden in offline tests")
+        return original(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)

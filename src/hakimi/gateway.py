@@ -174,8 +174,17 @@ class FilterManager:
             "purpose": "message",
             "scores": {
                 key: trace.get("answers", {}).get(key)
-                for key in ("is_prompt_injection", "is_unsafe_or_spam", "should_reply")
+                for key in (
+                    "is_prompt_injection",
+                    "is_unsafe_or_spam",
+                    "should_reply",
+                    "need_memory_recall",
+                    "need_external_lookup",
+                    "reasoning_tier",
+                )
             },
+            "tier": trace.get("tier"),
+            "sandbox_mode": trace.get("sandbox_mode", False),
             "thresholds": trace.get("thresholds", {}),
             "result": trace.get("result", "blocked"),
             "reason": trace.get("reason", "invalid_decision"),
@@ -268,6 +277,34 @@ class FilterManager:
             self.store.vault.open("group-context:" + scope + r["event"], r["payload"])
             for r in reversed(rows)
         ]
+
+    async def speaking_state(self, message):
+        """Locally bucket timing/density; the zero-thought classifier receives no arithmetic."""
+        await self.initialize()
+        scope, now = self._group_scope(message), time.time()
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT COUNT(*) FROM gateway_group_context WHERE scope=? AND at>?",
+                (scope, now - 60),
+            )
+        last = getattr(self, "last_spoke", {}).get(scope, 0)
+        elapsed = now - last
+        return (
+            "cooling_heavy"
+            if elapsed < 15 or row[0] >= 8
+            else "cooling_light"
+            if elapsed < 60
+            else "ready"
+        )
+
+    def spoke(self, message):
+        if message.kind != "group":
+            return
+        if not hasattr(self, "last_spoke"):
+            self.last_spoke = {}
+        self.last_spoke[self._group_scope(message)] = time.time()
+        if len(self.last_spoke) > 2048:
+            self.last_spoke.pop(next(iter(self.last_spoke)))
 
     async def clear_group(self, message):
         if message.kind != "group":

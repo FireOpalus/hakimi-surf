@@ -12,7 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .compression_policy import CompressionConfig
 from .proactive_policy import ProactiveConfig
-from .thinking_policy import ThinkingConfig, ThinkingLevel
+from .thinking_policy import ChatThinkingLevel, ThinkingConfig, ThinkingLevel
 
 
 class Settings(BaseSettings):
@@ -48,7 +48,14 @@ class Settings(BaseSettings):
         default=Path("data/owner_notebook_snapshot.md"),
         validation_alias=AliasChoices("NOTEBOOK_SNAPSHOT_PATH", "HAKIMI_NOTEBOOK_SNAPSHOT_PATH"),
     )
+    prefix_history_enabled: bool = True
+    history_high_tokens: int = Field(default=28000, ge=1000, le=28000)
+    history_max_bytes: int = Field(default=96000, ge=4000, le=96000)
+    chat_tail_tokens: int = Field(default=1800, ge=400, le=1800)
+    decision_input_tokens: int = Field(default=1200, ge=400, le=1200)
     compression_enabled: bool = True
+    memory_archive_time: str = Field(default="03:10", pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+    memory_flex_timeout: int = Field(default=900, ge=60, le=1800)
     group_compression_messages: int = 60
     group_compression_chars: int = 6000
     group_compression_keep: int = 25
@@ -60,6 +67,9 @@ class Settings(BaseSettings):
     summary_ttl_seconds: int = Field(default=604800, ge=3600, le=2592000)
     memory_daily_usd: Decimal = Field(default=Decimal("0.20"), ge=0, le=100)
     admin_daily_usd: Decimal = Field(default=Decimal("0.20"), ge=0, le=100)
+    web_search_enabled: bool = False
+    web_search_daily_limit: int = Field(default=10, ge=0, le=100)
+    web_search_daily_usd: Decimal = Field(default=Decimal("0.50"), ge=0, le=20)
     onebot_enabled: bool = False
     onebot_self_id: str = Field(default="", pattern=r"^[0-9]{0,20}$")
     onebot_secret: SecretStr = SecretStr("")
@@ -194,8 +204,11 @@ class Settings(BaseSettings):
     max_message_chars: int = Field(default=2000, ge=100, le=8000)
     signature_max_age: int = Field(default=300, ge=30, le=600)
     queue_capacity: int = Field(default=200, ge=1, le=10000)
-    group_debounce_seconds: float = Field(default=1.8, ge=0, le=3.5)
-    group_debounce_max_seconds: float = Field(default=3.5, ge=0, le=3.5)
+    group_debounce_seconds: float = Field(default=2.0, ge=0, le=30)
+    mention_debounce_seconds: float = Field(default=0.6, ge=0, le=30)
+    mention_incomplete_seconds: float = Field(default=2.2, ge=0, le=30)
+    ordinary_incomplete_seconds: float = Field(default=3.0, ge=0, le=30)
+    group_debounce_max_seconds: float = Field(default=5.0, ge=0, le=30)
     workers: int = Field(default=2, ge=1, le=8)
     user_requests_per_minute: int = Field(default=6, ge=1, le=100)
     global_requests_per_minute: int = Field(default=30, ge=1, le=1000)
@@ -203,13 +216,21 @@ class Settings(BaseSettings):
 
     decision_model: Literal["gemini-decision-1"] = "gemini-decision-1"
     chat_model: Literal["gemini-4-hydrogen"] = "gemini-4-hydrogen"
+    carbon_enabled: bool = True
+    carbon_model: Literal["gemini-4-carbon"] = "gemini-4-carbon"
+    carbon_input_usd_per_m: Decimal = Field(default=Decimal("2.00"), gt=0)
+    carbon_cached_input_usd_per_m: Decimal = Field(default=Decimal("0.10"), ge=0)
+    carbon_output_usd_per_m: Decimal = Field(default=Decimal("10.00"), gt=0)
+    carbon_regular_input_usd_per_m: Decimal = Field(default=Decimal("4.00"), gt=0)
+    carbon_regular_cached_input_usd_per_m: Decimal = Field(default=Decimal("0.20"), ge=0)
+    carbon_regular_output_usd_per_m: Decimal = Field(default=Decimal("20.00"), gt=0)
     # Retain validation of the old env key, but allow only the unified generation model.
     summary_model: Literal["gemini-4-hydrogen"] = "gemini-4-hydrogen"
     # Only the authenticated control plane may replace this immutable policy snapshot.
     _thinking_override: ThinkingConfig | None = PrivateAttr(default=None)
-    fast_chat_thinking_level: ThinkingLevel = "medium"
-    owner_thinking_level: ThinkingLevel = Field(
-        default="medium",
+    fast_chat_thinking_level: ChatThinkingLevel = "auto"
+    owner_thinking_level: ChatThinkingLevel = Field(
+        default="auto",
         validation_alias=AliasChoices(
             "HAKIMI_OWNER_PRIVATE_THINKING_LEVEL", "HAKIMI_OWNER_THINKING_LEVEL"
         ),

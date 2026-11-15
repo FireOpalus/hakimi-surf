@@ -7,9 +7,9 @@ from hakimi.security import Rejected
 
 def recorded_kwargs(kwargs):
     return {
-        k: v.model_dump() if isinstance(v, Message) else v
+        k: v.model_dump() if isinstance(v, Message) else copy.deepcopy(v)
         for k, v in kwargs.items()
-        if k != "before_call"
+        if k not in {"before_call", "cancel_event"}
     }
 
 
@@ -56,6 +56,7 @@ class FakeSender:
         self.sent.append((message, text, proactive))
         if self.fail:
             raise TimeoutError
+        return {"message_id": len(self.sent)}
 
 
 class FakeBili:

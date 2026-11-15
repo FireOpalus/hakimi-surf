@@ -13,6 +13,12 @@ from hakimi.session_manager import SessionManager
 from tests.fakes import FakeBili, FakeGateway, FakeSender
 
 
+@pytest.fixture(autouse=True)
+def legacy_compression_compatibility(settings):
+    # Retain coverage of the opt-in v0.8 window; v0.9 prefix folding has its own contracts.
+    settings.prefix_history_enabled = False
+
+
 async def fill(sessions, message, rounds=20, text="历史话题"):
     for n in range(rounds):
         await sessions.remember(message, f"{text}-{n}", f"答复-{n}")

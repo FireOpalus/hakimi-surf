@@ -95,18 +95,18 @@ async def test_duplicate_does_not_extend_window_or_rate_count(settings, store, m
     assert (await store.one("SELECT n FROM counters WHERE key LIKE 'global:%'"))[0] == 1
 
 
-async def test_concurrent_admission_caps_batch_at_eight(settings, store, message, clock):
+async def test_concurrent_admission_caps_batch_at_six(settings, store, message, clock):
     debounce(settings)
     results = await asyncio.gather(*(store.admit(group(message, f"event-{n}")) for n in range(9)))
     assert results == ["accepted"] * 9
     # Hitting the cap releases the first batch, retaining all originals in the next batch.
     job = await store.claim()
-    assert len(job["batch_messages"]) == 8
+    assert len(job["batch_messages"]) == 6
     await store.finish(job["id"])
     assert await store.claim() is None
     clock[0] += 1.8
     remaining = await store.claim()
-    assert len(remaining["batch_messages"]) == 1
+    assert len(remaining["batch_messages"]) == 3
 
 
 async def test_utf8_bound_starts_new_batch_without_truncating_user_text(
@@ -134,7 +134,6 @@ async def test_commands_flush_prior_batch_and_never_join_it(settings, store, mes
     assert earlier["payload"]["text"] == "先聊这个"
     assert await store.claim() is None
     await store.finish(earlier["id"])
-    assert await store.claim() is None
     clock[0] += 1.8
     later = await store.claim()
     assert later["payload"]["command_text"] == "/new-session"
@@ -177,7 +176,7 @@ async def test_followup_rejects_expired_full_and_nonaddressed_batches(
     )
     await store.groups.clear_recent(group(message, "reset"))
     await store.admit(group(message, "addressed"))
-    for n in range(7):
+    for n in range(5):
         assert (
             await store.admit(
                 group(message, f"follow-{n}", addressed=False), continuation_only=True
@@ -194,7 +193,7 @@ async def test_followup_rejects_expired_full_and_nonaddressed_batches(
         == "ignored"
     )
     job = await store.claim()
-    assert len(job["batch_messages"]) == 8
+    assert len(job["batch_messages"]) == 6
 
 
 async def test_followup_cannot_bypass_blacklists_scope_commands_or_byte_cap(

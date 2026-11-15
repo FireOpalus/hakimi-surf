@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 import anyio
 
+from . import model_accounting
 from .bot_guard import SCHEMA as BOT_SCHEMA
 from .bot_guard import BotInteractionGuard
 from .budget_calendar import SCHEMA as CALENDAR_SCHEMA
@@ -187,9 +188,18 @@ class Store:
                     )
                     if row:
                         self.s.group_policies[name] = row[0]
+        await model_accounting.initialize(self)
         await self.runtime.load_config()
         await self._load_budget_config()
         await self.groups.initialize()
+        # Only new, explicitly attributed reservations can be recovered by model.
+        # Historical unattributed ledger rows and their amounts remain untouched.
+        pending = await self.all(
+            "SELECT l.id FROM ledger l JOIN ledger_attribution a ON a.id=l.id "
+            "WHERE l.status='reserved'"
+        )
+        for row in pending:
+            await self.settle(row[0], None)
 
     @staticmethod
     def _periods(day):
@@ -396,11 +406,13 @@ class Store:
                 "SELECT * FROM jobs j WHERE status='pending' AND NOT EXISTS "
                 "(SELECT 1 FROM jobs active WHERE active.scope=j.scope "
                 "AND active.status='working') "
+                "AND NOT EXISTS (SELECT 1 FROM outbox o JOIN jobs prev ON prev.id=o.id "
+                "WHERE prev.scope=j.scope AND o.status IN ('pending','sending') AND o.expires>=?) "
                 "AND NOT EXISTS (SELECT 1 FROM group_debounce_items i "
                 "JOIN group_debounce_batches b ON b.id=i.batch_id "
                 "WHERE i.job_id=j.id AND b.ready_at>?) "
                 "ORDER BY created, rowid LIMIT 1",
-                (now,),
+                (now, now),
             )
             if not row:
                 return None
@@ -455,7 +467,7 @@ class Store:
                 (scope, scope, self.s.memory_turns),
             )
 
-    async def reserve(self, subject: str, lane: str, usd: Decimal) -> str:
+    async def reserve(self, subject: str, lane: str, usd: Decimal, *, model_lane=None) -> str:
         if not isinstance(usd, Decimal) or not usd.is_finite() or usd < 0:
             raise Rejected("invalid_budget_amount")
         now = self.local_now()
@@ -499,6 +511,7 @@ class Store:
                 "memory": self.s.memory_daily_usd,
                 "admin": self.s.admin_daily_usd,
                 "proactive": self.s.proactive_daily_usd,
+                "search": self.runtime.web_search.config.daily_usd,
             }.get(lane)
             if (
                 self.s.daily_usd <= 0
@@ -518,6 +531,11 @@ class Store:
             await self.db.execute(
                 "INSERT INTO ledger_times VALUES (?,?)", (reservation, now.timestamp())
             )
+            if model_lane is not None:
+                await self.db.execute(
+                    "INSERT INTO ledger_attribution VALUES (?,?)",
+                    (reservation, model_accounting.lane_name(model_lane)),
+                )
             await self.db.execute("UPDATE budget_totals SET amount=amount+?", (amount,))
             await self._charge_aggregates(day, amount, 1)
         return reservation
@@ -529,6 +547,7 @@ class Store:
         *,
         usage: TokenUsage | None = None,
         discounted_actual: Decimal | None = None,
+        model_lane: str | None = None,
     ) -> None:
         # No usage or an ambiguous failure: keep the entire reservation, including on restart.
         if actual is not None and (
@@ -551,6 +570,14 @@ class Store:
             row = await self.one("SELECT * FROM ledger WHERE id=?", (reservation,))
             if row is None or row["status"] != "reserved":
                 return
+            attribution = await self.one(
+                "SELECT model_lane FROM ledger_attribution WHERE id=?", (reservation,)
+            )
+            model_lane = (
+                model_lane
+                or (usage.model_lane if usage else None)
+                or (attribution[0] if attribution else None)
+            )
             amount = row["amount"] if actual is None else microdollars(actual)
             await self.db.execute(
                 "UPDATE budget_totals SET amount=amount+?", (amount - row["amount"],)
@@ -574,11 +601,13 @@ class Store:
                     usage.output_tokens if usage else None,
                     usage.cached_tokens if usage else None,
                     usage.thought_tokens if usage else None,
-                    usage.model_lane if usage else None,
+                    model_lane,
                     estimated,
                 ),
             )
-            interaction = bool(usage and usage.model_lane == "interaction")
+            interaction = bool(
+                usage and usage.model_lane in {"interaction", "hydrogen", "carbon", "memory_flex"}
+            )
             cache_known = bool(interaction and usage.cached_tokens is not None)
             for period in self._periods(row["day"]):
                 await self.db.execute(
@@ -605,10 +634,33 @@ class Store:
                         period,
                     ),
                 )
+            await model_accounting.accumulate(
+                self,
+                row["day"],
+                model_lane or (usage.model_lane if usage else None),
+                amount,
+                estimated,
+                {
+                    name: getattr(usage, name, None)
+                    for name in ("input_tokens", "output_tokens", "cached_tokens", "thought_tokens")
+                },
+            )
             if overrun:
                 await self.db.execute("INSERT OR REPLACE INTO meta VALUES ('budget_overrun','1')")
         if overrun:
             raise Rejected("budget_reservation_exceeded")
+
+    async def record_cache_usage(self, lane, usage):
+        day = self.local_now().date().isoformat()
+        async with self.transaction():
+            for period in self._periods(day):
+                await self.db.execute(
+                    "INSERT INTO cache_aggregates VALUES (?,?,1,?,?) "
+                    "ON CONFLICT(period,model_lane) DO UPDATE SET calls=calls+1, "
+                    "cached_tokens=cached_tokens+excluded.cached_tokens, "
+                    "eligible_input_tokens=eligible_input_tokens+excluded.eligible_input_tokens",
+                    (period, lane, usage.cached_tokens, max(1, usage.input_tokens - 2050)),
+                )
 
     async def usage(self) -> dict:
         day = self.local_now().date().isoformat()
@@ -663,6 +715,29 @@ class Store:
                 )
                 for key in ("input_tokens", "output_tokens", "cached_tokens", "thought_tokens"):
                     tokens["total_" + key] = tokens[key]
+                cache_rows = await self.all(
+                    "SELECT * FROM cache_aggregates WHERE period=?", (period,)
+                )
+                eligible = sum(r["eligible_input_tokens"] for r in cache_rows)
+                tokens["effective_cache_hit_ratio"] = (
+                    sum(r["cached_tokens"] for r in cache_rows) / eligible if eligible else None
+                )
+                tokens["effective_cache_calls"] = sum(r["calls"] for r in cache_rows)
+                tokens["by_model"] = [
+                    dict(r)
+                    for r in await self.all(
+                        "SELECT * FROM model_usage_aggregates WHERE period=? ORDER BY model_lane",
+                        (period,),
+                    )
+                ]
+                tokens["effective_cache_by_model"] = [
+                    {
+                        **dict(r),
+                        "effective_cache_hit_ratio": r["cached_tokens"]
+                        / max(1, r["eligible_input_tokens"]),
+                    }
+                    for r in cache_rows
+                ]
                 token_usage[label] = tokens
                 estimates = stats.get("estimated_calls", 0)
                 cost_estimates[label] = {
@@ -676,7 +751,17 @@ class Store:
                     "complete": estimates == tokens["calls"]
                     and (label != "lifetime" or history["lifetime_call_count_complete"]),
                 }
+            busts = await self.one(
+                "SELECT COALESCE(SUM(n),0) FROM daily_metrics "
+                "WHERE day=? AND code='cache_prefix_busted' AND source='production'",
+                (day,),
+            )
             return {
+                "cache_health": {
+                    "target": 0.9,
+                    "tail_tokens": 2050,
+                    "prefix_busts_today": busts[0],
+                },
                 "day_local": day,
                 "month_local": day[:7],
                 "timezone": self.budget_zone.key,
@@ -747,9 +832,20 @@ class Store:
         participants=None,
         segments=None,
         allowed_at_qqs=(),
+        actions=None,
+        external_search=False,
     ) -> None:
+        batch = self.groups.active.get(self.session_scope(message))
+        if batch and batch.job["id"] == job_id:
+            if batch.cancel.is_set():
+                raise asyncio.CancelledError
+            batch.sealed = True  # No follow-up may cancel/requeue a committed outbox.
         now = time.time()
         payload = {"message": message.model_dump(), "text": text, "proactive": proactive}
+        if external_search:
+            payload["external_search"] = True
+        if actions is not None:
+            payload.update(actions=actions, allowed_at_qqs=sorted(set(allowed_at_qqs)))
         if meme_eligible:
             payload.update(meme_tag=meme_tag, meme_eligible=True)
         if session_epoch is not None:
@@ -908,6 +1004,13 @@ class Store:
             return [self.vault.open(subject, row[0]) for row in rows]
 
     async def prune(self) -> None:
+        async with self.transaction():
+            await self.db.execute("DELETE FROM message_recalls WHERE at<?", (time.time() - 86400,))
+            await self.db.execute(
+                "DELETE FROM outbox_bubble_receipts WHERE applied=1 AND created<?",
+                (time.time() - 9 * 86400,),
+            )
+            await self.db.execute("DELETE FROM local_quick_acks WHERE at<?", (time.time() - 86400,))
         now = time.time()
         async with self.transaction():
             await self.groups.prune_in_transaction(now)
@@ -935,6 +1038,9 @@ class Store:
                 )
             cutoff = datetime.fromtimestamp(now - 32 * 86400, UTC).date().isoformat()
             await self.db.execute("DELETE FROM ledger WHERE day<?", (cutoff,))
+            await self.db.execute(
+                "DELETE FROM ledger_attribution WHERE id NOT IN (SELECT id FROM ledger)"
+            )
             await self.db.execute(
                 "DELETE FROM ledger_usage WHERE id NOT IN (SELECT id FROM ledger)"
             )

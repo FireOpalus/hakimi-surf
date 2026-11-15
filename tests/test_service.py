@@ -38,6 +38,8 @@ def service(settings, store, videos):
 
 
 async def run_message(service, message):
+    while await service.deliver_once():
+        pass
     assert await service.accept(message) == "accepted"
     job = await service.store.claim()
     assert job is not None

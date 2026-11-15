@@ -391,7 +391,7 @@ async def test_real_gateway_slot_wait_rechecks_admission_before_dispatch(
 
     async def blocked_call(*args, **kwargs):
         model_lane = args[2]
-        target = "decision" if phase == "source" else "chat"
+        target = "decision" if phase == "source" else "hydrogen"
         if model_lane == target and not held[0]:
             # Simulate the only provider slot being occupied by an unrelated request.
             await gateway.slots.acquire()

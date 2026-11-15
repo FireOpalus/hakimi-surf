@@ -24,10 +24,11 @@ class Scenario(StrEnum):
 class GenerationPlan:
     thinking_level: ThinkingLevel
     output_tokens: int
+    model_lane: str = "hydrogen"
 
 
 def generation_plan(
-    settings: Settings, scenario: Scenario, *, deep: bool = False
+    settings: Settings, scenario: Scenario, *, deep: bool = False, route=None
 ) -> GenerationPlan:
     caps = {
         Scenario.FAST_CHAT: settings.chat_output_tokens,
@@ -44,6 +45,20 @@ def generation_plan(
         raise Rejected("invalid_generation_scenario")
     policy = settings._thinking_override or ThinkingConfig.from_settings(settings)
     level, cap = getattr(policy, str(scenario)), caps[scenario]
+    if scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}:
+        # Security sandbox has precedence over both manual controls and /deep.
+        if route is not None and getattr(route, "sandbox_mode", False):
+            return GenerationPlan("low", 1536)
+        if level == "auto":
+            tier = getattr(route, "tier", 2)
+            if not deep:
+                return {
+                    1: GenerationPlan("low", 1536),
+                    2: GenerationPlan("medium", 4096),
+                    3: GenerationPlan("high", 8192),
+                    4: GenerationPlan("medium", 12288, "carbon"),
+                }[tier]
+            level = "high"
     if deep:
         if scenario not in {
             Scenario.OWNER_PRIVATE,
