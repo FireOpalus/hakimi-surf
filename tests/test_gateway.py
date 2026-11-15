@@ -489,6 +489,83 @@ async def test_source_and_output_accept_binary_noul_confidence_near_threshold(
     )
 
 
+async def test_gateway_bot_threshold_blocks_bypass_and_skips_bili_and_search(
+    settings, store, sdk_pair, message
+):
+    settings.owner_qq_id = "20000"
+    settings.bot_qq_ids = {"60000"}
+    settings.onebot_allowed_users.add("60000")
+    score = [0.72]
+
+    def handler(request):
+        resp = decision_response()
+        resp["answers"]["should_reply"].update(noul=score[0], confidence=0.99)
+        if "need_external_lookup" in resp["answers"]:
+            resp["answers"]["need_external_lookup"].update(noul=0.98, confidence=0.99)
+        return httpx.Response(200, json=resp)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    bot_at = group(
+        message,
+        user_id="60000",
+        addressed=True,
+        attention_reason="mention",
+        mentioned_ids=["10000"],
+    )
+
+    low = await gate.screen(
+        {"current_message": "BV1xx411c7mD"}, "s", purpose="message", message=bot_at
+    )
+    assert low == "ignore"
+    assert low.need_external_lookup is False
+    audit_low = (await store.runtime.filters.recent_audit(limit=1))[0]
+    assert audit_low["result"] == "ignore"
+    assert audit_low["reason"] == "bot_reply_threshold"
+    assert audit_low["reply_bypassed"] is False
+
+    score[0] = 0.90
+    res = await gate.screen(
+        {"current_message": "BV1xx411c7mD"}, "s", purpose="message", message=bot_at
+    )
+    assert res == "chat"
+    assert res.need_external_lookup is False
+    audit_hi = (await store.runtime.filters.recent_audit(limit=1))[0]
+    assert audit_hi["result"] == "chat"
+    assert audit_hi["reason"] == "bot_threshold_passed"
+    assert audit_hi["reply_bypassed"] is False
+
+    invite = group(
+        message,
+        event_id="owner-bot-interact",
+        user_id="20000",
+        addressed=True,
+        text="/bot-interact @60000",
+        command_text="/bot-interact @60000",
+        mentioned_ids=["10000", "60000"],
+        created_at=time.time(),
+    )
+    assert await store.bot_guard.invite(invite) == {"60000"}
+    invited_bot = group(
+        message,
+        event_id="bot-invited-1",
+        user_id="60000",
+        addressed=True,
+        attention_reason="mention",
+        mentioned_ids=["10000"],
+        created_at=time.time(),
+    )
+    assert await store.bot_guard.prepare(invited_bot)
+    assert await store.admit(invited_bot) == "accepted"
+    assert store.bot_guard.is_owner_invited(invited_bot)
+    score[0] = 0.20
+    inv_res = await gate.screen(
+        {"current_message": "你好"}, "s", purpose="message", message=invited_bot
+    )
+    assert inv_res == "chat"
+    audit_inv = (await store.runtime.filters.recent_audit(limit=1))[0]
+    assert audit_inv["reply_bypassed"] is True
+
+
 async def test_decision_audit_tracks_downstream_sent_abstained_and_rejected(
     settings, store, sdk_pair, message
 ):

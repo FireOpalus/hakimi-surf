@@ -189,7 +189,21 @@ class RuntimeState:
             if row["key"] == "bot_ids":
                 legacy_bots = value
             elif row["key"] == "admission":
-                admission = AdmissionConfig.model_validate(value)
+                merged = (
+                    {**self.env_admission.model_dump(mode="json"), **value}
+                    if isinstance(value, dict)
+                    else value
+                )
+                if (
+                    isinstance(merged, dict)
+                    and isinstance(merged.get("ignored_bot_ids"), (list, tuple))
+                    and isinstance(merged.get("bot_reply_thresholds"), dict)
+                ):
+                    listed = set(merged["ignored_bot_ids"])
+                    merged["bot_reply_thresholds"] = {
+                        k: v for k, v in merged["bot_reply_thresholds"].items() if k in listed
+                    }
+                admission = AdmissionConfig.model_validate(merged)
                 self.admission_overridden = True
             elif row["key"] == "compression":
                 self.compression = CompressionConfig.model_validate(value)
@@ -216,9 +230,13 @@ class RuntimeState:
             elif row["key"].startswith("policy:"):
                 self.s.group_policies[row["key"][7:]] = value
         if not self.admission_overridden and legacy_bots is not None:
-            admission = AdmissionConfig.model_validate(
-                {**admission.model_dump(mode="json"), "ignored_bot_ids": legacy_bots}
-            )
+            data = {**admission.model_dump(mode="json"), "ignored_bot_ids": legacy_bots}
+            if isinstance(legacy_bots, (list, tuple)):
+                listed = set(legacy_bots)
+                data["bot_reply_thresholds"] = {
+                    k: v for k, v in data.get("bot_reply_thresholds", {}).items() if k in listed
+                }
+            admission = AdmissionConfig.model_validate(data)
             self.admission_overridden = True
         self._validate_admission(admission)
         self._apply_admission(admission)
@@ -369,6 +387,8 @@ class RuntimeState:
         protected = {self.s.owner_qq_id, self.s.onebot_self_id} - {""}
         if protected.intersection(value.ignored_bot_ids):
             raise Rejected("reserved_identity")
+        if protected.intersection(value.bot_reply_thresholds):
+            raise Rejected("reserved_identity")
         if protected.intersection(value.allowed_users):
             raise Rejected("reserved_identity")
 
@@ -377,6 +397,8 @@ class RuntimeState:
         self.s.onebot_allowed_groups = set(value.allowed_groups)
         self.s.onebot_allowed_users = set(value.allowed_users)
         self.s.bot_qq_ids = set(value.ignored_bot_ids)
+        self.s.bot_reply_threshold = value.bot_reply_threshold
+        self.s.bot_reply_thresholds = dict(value.bot_reply_thresholds)
         self.s.onebot_private_mode = value.private_mode
         self.admission = value
 
@@ -428,10 +450,42 @@ class RuntimeState:
             values.add(identifier) if action == "add" else values.discard(identifier)
             data = self.admission.model_dump(mode="json")
             data[field] = sorted(values)
+            if field == "ignored_bot_ids" and action == "remove":
+                overrides = dict(data.get("bot_reply_thresholds", {}))
+                overrides.pop(identifier, None)
+                data["bot_reply_thresholds"] = overrides
+            await self._save_admission(AdmissionConfig.model_validate(data))
+
+    async def set_bot_thresholds(
+        self,
+        *,
+        default_threshold: float | None = None,
+        user_id: str | None = None,
+        threshold: float | None = None,
+        clear_user_override: bool = False,
+    ):
+        """Atomically update default or per-bot reply thresholds under admission_lock."""
+        async with self.admission_lock:
+            protected = {self.s.owner_qq_id, self.s.onebot_self_id} - {""}
+            if user_id is not None:
+                if user_id in protected:
+                    raise Rejected("reserved_identity")
+                if user_id not in self.admission.ignored_bot_ids:
+                    raise Rejected("not_listed")
+            data = self.admission.model_dump(mode="json")
+            if default_threshold is not None:
+                data["bot_reply_threshold"] = default_threshold
+            if user_id is not None:
+                overrides = dict(data.get("bot_reply_thresholds", {}))
+                if clear_user_override or threshold is None:
+                    overrides.pop(user_id, None)
+                else:
+                    overrides[user_id] = threshold
+                data["bot_reply_thresholds"] = overrides
             await self._save_admission(AdmissionConfig.model_validate(data))
 
     async def provider_result(self, provider: str, failed: bool):
-        if provider not in {"bilibili_412", "gemini_decision", "gemini_chat"}:
+        if provider not in {"bilibili_412", "gemini_decision", "gemini_chat", "gemini_memory"}:
             return
         async with self.store.transaction():
             await self.store.db.execute(

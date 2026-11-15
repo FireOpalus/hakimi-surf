@@ -303,19 +303,22 @@ async def test_admin_summary_edit_validation_cas_and_reset(admin_api, message):
 
 
 @pytest.mark.parametrize(
-    "identity,scene,called",
+    "identity,scene,bot_threshold,called",
     [
-        ("BOT", "group_at", False),
-        ("MEMBER", "group_plain", False),
-        ("OWNER", "private", True),
-        ("MEMBER", "group_at", True),
+        ("BOT", "private", 0.85, False),
+        ("BOT", "group_at", 0.85, True),
+        ("BOT", "group_at", 1.0, False),
+        ("MEMBER", "group_plain", 0.85, False),
+        ("OWNER", "private", 0.85, True),
+        ("MEMBER", "group_at", 0.85, True),
     ],
 )
 async def test_sandbox_isolated_and_known_bot_zero_calls(
-    admin_api, message, identity, scene, called
+    admin_api, message, identity, scene, bot_threshold, called
 ):
     app, client, gateway = admin_api
     svc = app.state.service
+    svc.s.bot_reply_threshold = bot_threshold
     await svc.sessions.remember(message, "production-private-sentinel", "private-response")
     before = list(svc.s.data_dir.glob("sessions/*/*.sqlite3"))
     response = await client.post(
@@ -324,6 +327,8 @@ async def test_sandbox_isolated_and_known_bot_zero_calls(
     )
     assert response.status_code == 200, response.text
     assert bool(gateway.calls) is called
+    if identity == "BOT" and not called:
+        assert response.json()["decisions"]["reason"] == "known_bot_ignored"
     assert "production-private-sentinel" not in json.dumps(gateway.calls, default=str)
     assert list(svc.s.data_dir.glob("sessions/*/*.sqlite3")) == before
     assert len(await svc.sessions.history(message)) == 1

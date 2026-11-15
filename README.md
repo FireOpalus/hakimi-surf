@@ -1,12 +1,12 @@
 # 哈基米跨平台冲浪助手
 
-当前版本 **1.1.6**。新增限流与发送节奏、Carbon 路由及输出上限、订阅巡逻配额、用户与分项预算的持久化热配置；`/admin` 采用分组侧栏、状态卡片、深浅主题和移动端导航，详见 [1.1.6 升级说明](docs/CONTROL_PLANE_116.md)。沿用 [1.1.5 视频触发与执行审计](docs/DELIVERY_AUDIT_115.md)、[1.1.4 群聊上下文与差量续链](docs/GROUP_CONTEXT_114.md) 和 [18 项管道修复](docs/NATURAL_PIPELINE_112.md)。防抖五项仍支持 **0–30 秒**；后台配置优先从 SQLite 恢复。[/admin 受控联网搜索](docs/CONTROLS_SEARCH_110.md) 默认关闭，可设置每日次数和预算；旧 `unknown` 账目明确标为“历史未归属（Gemini）”，不误标为 Drive。
+当前版本 **1.1.7**。已知外部 Bot 新增默认／逐账号接话阈值，`1.00` 完全屏蔽，较低阈值须经 Decisions；冷历史支持同会话合批、提炼前双重预算预检与逐条事实校验，详见 [1.1.7 升级说明](docs/BOT_MEMORY_117.md)。沿用 [1.1.6 热配置与星夜控制台](docs/CONTROL_PLANE_116.md)、[1.1.5 执行审计](docs/DELIVERY_AUDIT_115.md) 与 [1.1.4 差量续链](docs/GROUP_CONTEXT_114.md)。防抖仍支持 **0–30 秒**；后台设置加密保存并热生效；联网默认关闭。
 
 保留 1.0 的 [双轨记忆与治理说明](docs/MEMORY_100.md)：每个会话的加密 SQLite 增建画像、编年史、不可变冷史，后台通过 Hydrogen Flex 半价提炼，在线按需本地召回；管理台可检索、修订、擦除及解锁，显式选择的白名单群可与单目录 Drive Markdown 双向同步。旧摘要保留至首次成功提炼。私聊档案不导出，Owner《小本本》仍默认关闭。
 
 沿用 [v0.10 流式防抖与五维出站](docs/STREAMING_010.md) 和 [v0.9 A/B/C 前缀路由](docs/CONTEXT_ROUTING_09.md)。群聊／Owner 私聊默认 `auto`，后台可选至 `xhigh`；双轨归档固定 `medium`。三段原文人设、跨机 WS 和账本安全边界不变；新增 `memory_flex` 费用列。有效缓存覆盖率 90% 是观察目标，不能保证每次命中。
 
-[项目架构图（HTML/CSS）](architecture.html)：按 **1.1.6 当前源码**重构，区分消息数据流与热配置控制流，包含境内／境外部署、分层筛查与审计、配置验证与加密持久化、分项预算、A/B/C 差量续链及双轨记忆。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
+[项目架构图（HTML/CSS）](architecture.html)：按 **1.1.7 当前源码**重构，区分消息数据流、热配置控制流与后台归档流程，增加 Bot 三路分流、冷历史合批与预算预检图；保留跨机部署、审计、差量续链与隔离存储。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
 
 0.8.0 新增 [会话串行管道、引用回溯与受控点名](docs/CORE_PIPELINE_08.md)，支持 [上海 NapCat／首尔主脑分离部署](docs/CROSS_BORDER_DEPLOYMENT.md)。群聊、私聊与 `@Bot` 统一先写隔离接收日志，再按 1.8 秒／最长 3.5 秒防抖；同会话模型请求串行，后台清空通过 epoch 作废旧任务。补齐引用／转发原图、公开群互动到 Owner 私聊的单向背景、受控 `[AT:...]` 与本地表情联合发送。预算日／月边界统一按 `BOT_TIMEZONE=Asia/Shanghai`，旧 UTC 账本保留审计并保守迁移。
 
@@ -86,7 +86,7 @@ OneBot 设置上报地址、`secret`、消息格式及 HTTP API Access Token，�
 
 唯一的 `OWNER_QQ_ID` 同时限定聊天管理身份与专属人设：认证后的 OneBot 事件须匹配本机器人和该 `user_id`；只有对应私聊使用 `OWNER_PERSONA_PROMPT`。所有群聊均使用 `PUBLIC_PERSONA_PROMPT`，公开聊天把 Owner 当熟人损友，不表忠心、不读取私聊历史；真实身份仍供权限和插话门槛判断。昵称和消息内角色标记无效。旧 `HAKIMI_ONEBOT_OWNER_IDS`／`HAKIMI_QQ_OWNER_IDS` 不授予管理或 Owner 权限；官方 QQ OpenID 不映射为数字 QQ 身份，使用公开人设。管理后台继续独立验证 `ADMIN_TOKEN`。
 
-`BOT_QQ_IDS=["目标机器人QQ号"]` 配置已知 Bot，默认在任何群聊／私聊中提前忽略，不下载素材、不调用模型。0.8 仅允许真实 Owner 在获准群中明确邀请一个真实顶层 `@` 的外部 Bot：自然语言邀请需先通过门卫，或使用固定 `/bot-interact` 命令。许可只绑定该群、目标和实际消息事件，120 秒内可接话，整群 10 分钟窗口最多接纳两轮；重复邀请和切换目标不重置计数。第三轮继续 0 Token 忽略，私聊永不因该许可放行。详见 [受控点名与 Bot 熔断](docs/CORE_PIPELINE_08.md#受控点名与表情联合发送)。
+`BOT_QQ_IDS` 标识已知外部机器人。默认 `BOT_REPLY_THRESHOLD=0.85`；在获准群与群策略允许的前提下，未获邀请的 Bot 须通过自身 `should_reply` 门槛，即使 @ 本机也不跳过。设为 `1.00` 可恢复 0 Token 完全屏蔽；逐账号设置优先，私聊 Bot 继续在门口忽略。真实 Owner 的显式邀请使用独立的两轮／10 分钟许可，保留受控 @／引用；阈值接话清除这些锚点，Bot 消息不会自动联网或解析 B 站视频。两轮限制仅作用于邀请路径；阈值路径仍受全局 RPM、队列与预算控制。详见 [Bot 接话路径](architecture.html#bot-routing)。
 
 巡逻订阅、报告和状态等管理命令仅由真实 Owner 在 OneBot 私聊中执行；主动汇报底层固定发往 `OWNER_QQ_ID`。官方 QQ OpenID 不具有这些管理和主动私信权限，旧主动开关也不能绕过接收人校验。发送失败不会自动改发到其他人或群。
 
@@ -163,10 +163,15 @@ flowchart TD
     Budget -.请求前事务预留 / 返回后结算.-> Gate
     Budget -.请求前事务预留 / 返回后结算.-> Chat
     Ingress[鉴权、接收日志、同会话引用与媒体准备]
-    Ingress --> Queue[(SQLite 防抖批次与 jobs / 最多 16 条)]
+    Ingress --> BotPolicy{已知 Bot 与授权检查}
+    Runtime -.默认和逐 Bot 阈值.-> BotPolicy
+    BotPolicy -->|普通用户| Queue[(SQLite 防抖批次与 jobs / 最多 16 条)]
+    BotPolicy -->|有效 Owner 邀请 / 两轮每十分钟| Queue
+    BotPolicy -->|非邀请且阈值低于 1.00 / 仅获准群| Queue
+    BotPolicy -->|其余已知 Bot| Ignore[本地静默忽略 / 0 Token]
     Queue --> Serial[会话串行 / 追发与撤回取消]
     Serial -->|固定命令| Outbox
-    Serial --> Gate[Decisions：安全、意图、召回、联网、L1–L4]
+    Serial --> Gate[Decisions：安全、用户或 Bot 接话阈值、意图与 L1–L4]
     Gate -->|聊天| Context[A 静态前缀 + B 热史 + C 当轮上下文]
     Gate -->|按需且显式启用| Search[独立 Google Search 请求 / 来源筛查]
     Search -->|事实与联网四态| Context
@@ -188,7 +193,9 @@ flowchart TD
   Delivery -->|经原 OneBot 连接返回| Reply[QQ 接收回复]
 ```
 
-群聊视频解析仅由当前消息或同批成员的真实 @ 触发；昵称点名、引用回复与单发视频链接不能开启视频分支。私聊按既有准入规则处理，安全沙箱禁用视频解析。Decisions 保留原判定，另以审计标识关联 jobs、生成与 Outbox 的执行状态；后台展示已发送、主模型弃权、下游拦截、取消或发送待确认等结果。沙盒成功状态仅代表预览完成。详见 [筛查与审计图](architecture.html#audit)。
+已知 Bot 不触发自动联网或视频解析。群聊视频解析仅由当前消息或同批成员的真实 @ 触发；昵称点名、引用回复与单发视频链接不能开启视频分支。私聊按既有准入规则处理，安全沙箱禁用视频解析。Decisions 保留原判定，另以审计标识关联 jobs、生成与 Outbox 的执行状态；后台展示已发送、主模型弃权、下游拦截、取消或发送待确认等结果。沙盒成功状态仅代表预览完成。详见 [筛查与审计图](architecture.html#audit)。
+
+冷历史提炼先进行最小费用检查，再只读合批并按完整载荷预检；随后核对候选领取、执行来源筛查与 Flex 提炼、逐条强校验后提交。后台纯 expiry 小批次有 24 条／4096 字节／30 分钟等待规则，详见 [合批提炼流程](architecture.html#memory-batching)。
 
 所有模型请求共用预算预留与结算；搜索另受每日次数和独立额度约束。主对话不开放工具，联网使用独立请求，结果过审后才进入 C 区。用户原文在门卫放行后入史，助手正文在 ACK 后入史；视频材料与分析摘要不写入聊天记忆。Drive 群记忆镜像、巡逻日记和 Owner 只读快照分别配置。
 
@@ -215,7 +222,7 @@ flowchart TD
 | `src/hakimi/hot_ring.py` / `link_preview.py` | 有界热消息、撤回索引与受限网页预览 |
 | `src/hakimi/public_memory.py` | 已确认群聊互动到 Owner 私聊的单向只读背景 |
 | `src/hakimi/outbound_actions.py` / `outgoing.py` / `output_links.py` | 五维动作校验、出站过滤、长文折叠、逐条 ACK、成功投递后提交续链与回执恢复 |
-| `src/hakimi/mentions.py` / `bot_guard.py` | 兼容 AT／MEME、真实事件授权、外部 Bot 两轮熔断 |
+| `src/hakimi/mentions.py` / `bot_guard.py` | 兼容 AT／MEME、阈值接话、真实事件授权、Owner 邀请两轮熔断 |
 | `src/hakimi/budget_calendar.py` | 本地日／月账本迁移、旧 UTC 聚合归档与保守占用 |
 | `src/hakimi/session_manager.py` / `dual_memory.py` | 每会话独立 SQLite、加密续链、热史、画像、编年史、冷史与相关成员背景召回 |
 | `src/hakimi/memory_compressor.py` / `memory_mirror.py` | 后台 Flex 提炼、版本与人工锁核验、可选群记忆 Drive 镜像 |

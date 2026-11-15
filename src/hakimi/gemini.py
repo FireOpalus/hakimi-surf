@@ -17,7 +17,7 @@ from .bilibili import extract_bvid
 from .bot_server import assemble_chat_input, escape_data, prompt_context, untrusted_input
 from .config import Settings
 from .context_budget import estimate_tokens
-from .dual_memory import EXTRACTION_INSTRUCTION, Extraction
+from .dual_memory import EXTRACTION_INSTRUCTION, EXTRACTION_RESPONSE_FORMAT
 from .gateway import FilterManager, redact_excerpt
 from .generation_policy import GenerationPlan, Scenario, generation_plan
 from .media import ModelImage
@@ -529,6 +529,7 @@ class GeminiGateway:
         relevance_context: list[str] | None = None,
         audit_id: str | None = None,
         audit_job_id: str | None = None,
+        known_bot: bool | None = None,
     ) -> str:
         inbound = purpose == "message"
         context = prompt_context(message, self.s)
@@ -540,6 +541,15 @@ class GeminiGateway:
             if message is not None
             else not is_group
         )
+        is_bot = (
+            bool(known_bot)
+            if known_bot is not None
+            else bool(message is not None and self.store.bot_guard.known_bot(message))
+        )
+        bot_invited = bool(
+            is_bot and message is not None and self.store.bot_guard.is_owner_invited(message)
+        )
+        bot_gated = inbound and is_bot and not bot_invited
         query = questions(purpose)
         data_payload = (
             {
@@ -606,14 +616,19 @@ class GeminiGateway:
             answers={"should_reply": {"noul": None, "confidence": None, "skipped": True}},
             result="blocked",
             reason="invalid_decision",
-            reply_bypassed=inbound and direct,
+            reply_bypassed=inbound and direct and not bot_gated,
         )
         if inbound:
             await self.filters.initialize()
 
         def thresholds():
             return (
-                self.filters.thresholds(message, owner=context.role == "OWNER")
+                self.filters.thresholds(
+                    message,
+                    owner=context.role == "OWNER",
+                    known_bot=is_bot,
+                    bot_invited=bot_invited,
+                )
                 if inbound
                 else {
                     "injection": self.s.injection_threshold,
@@ -718,20 +733,26 @@ class GeminiGateway:
             chosen = (
                 "bilibili_watch"
                 if not sandbox
+                and not is_bot
                 and can_watch_video(message)
                 and extract_bvid(str(data_payload["current_message"]))
                 else "chat"
             )
             report.update(tier=tier, sandbox_mode=sandbox)
-            if not direct and is_group and reply < bounds["reply"]:
+            if (bot_gated or (not direct and is_group)) and reply < bounds["reply"]:
                 chosen = "ignore"
-                report.update(result=chosen, reason="should_reply")
+                report.update(
+                    result=chosen,
+                    reason="bot_reply_threshold" if bot_gated else "should_reply",
+                )
                 await self.store.runtime.event("noise_ignored", audit_source)
             else:
                 report.update(
                     result=chosen,
                     reason="soft_injection_sandbox"
                     if sandbox
+                    else "bot_threshold_passed"
+                    if bot_gated
                     else "explicit_request"
                     if direct
                     else "relevant_group_conversation",
@@ -741,7 +762,8 @@ class GeminiGateway:
                 tier=tier,
                 sandbox_mode=sandbox,
                 need_memory_recall=recall >= 0.5,
-                need_external_lookup=lookup >= 0.65
+                need_external_lookup=not is_bot
+                and lookup >= 0.65
                 and (not is_group or bool(message and message.addressed)),
             )
         except Rejected as exc:
@@ -1014,7 +1036,7 @@ class GeminiGateway:
                             "response_format": {
                                 "type": "text",
                                 "mime_type": "application/json",
-                                "schema": Extraction.model_json_schema(),
+                                "schema": EXTRACTION_RESPONSE_FORMAT,
                             }
                         }
                         if memory_archive

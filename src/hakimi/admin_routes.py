@@ -9,9 +9,14 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from .admission_policy import AdmissionConfig
+from .admission_policy import (
+    AdmissionConfig,
+    _validate_threshold_number,
+    effective_bot_reply_threshold,
+    is_bot_hard_blocked,
+)
 from .attention import can_watch_video, direct_attention
 from .bilibili import extract_bvid
 from .bot_server import prompt_context
@@ -60,7 +65,25 @@ class GroupActivity(Input):
 
 class BotChange(Input):
     user_id: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
-    action: Literal["add", "remove"]
+    action: Literal["add", "remove", "threshold"]
+    threshold: float | None = Field(default=None, ge=0.01, le=1.00)
+
+    @field_validator("threshold", mode="before")
+    @classmethod
+    def valid_threshold(cls, value):
+        if value is None:
+            return None
+        return _validate_threshold_number(value)
+
+
+class BotThresholdConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    bot_reply_threshold: float = Field(ge=0.01, le=1.00)
+
+    @field_validator("bot_reply_threshold", mode="before")
+    @classmethod
+    def valid_threshold(cls, value):
+        return _validate_threshold_number(value)
 
 
 class AdmissionChange(Input):
@@ -455,6 +478,16 @@ async def policy(request: Request):
     return {"status": "saved"}
 
 
+def _bot_thresholds_status(svc):
+    state = svc.store.runtime
+    return {
+        "bot_reply_threshold": state.admission.bot_reply_threshold,
+        "environment_bot_reply_threshold": state.env_admission.bot_reply_threshold,
+        "bot_reply_thresholds": dict(state.admission.bot_reply_thresholds),
+        "source": "admin" if state.admission_overridden else "env",
+    }
+
+
 @router.get("/api/bots")
 async def bots(request: Request):
     svc = service(request)
@@ -467,7 +500,13 @@ async def bots(request: Request):
             (now, svc.bot_guard.owner_key()),
         )
     for uid in sorted(svc.s.bot_qq_ids):
-        item = {"user_id": uid, "groups": []}
+        item = {
+            "user_id": uid,
+            "custom_threshold": svc.s.bot_reply_thresholds.get(uid),
+            "effective_threshold": effective_bot_reply_threshold(uid, svc.s),
+            "hard_blocked": is_bot_hard_blocked(uid, svc.s),
+            "groups": [],
+        }
         for group in svc.s.onebot_allowed_groups:
             m = Message(
                 platform="onebot",
@@ -506,10 +545,37 @@ async def bot_change(request: Request):
     data = await body(request, BotChange)
     svc = service(request)
     try:
-        await svc.store.runtime.change_admission("ignored_bot_ids", data.action, data.user_id)
+        if data.action in {"add", "remove"}:
+            await svc.store.runtime.change_admission("ignored_bot_ids", data.action, data.user_id)
+            if data.action == "add" and data.threshold is not None:
+                await svc.store.runtime.set_bot_thresholds(
+                    user_id=data.user_id, threshold=data.threshold
+                )
+        else:
+            await svc.store.runtime.set_bot_thresholds(
+                user_id=data.user_id,
+                threshold=data.threshold,
+                clear_user_override=data.threshold is None,
+            )
     except ValidationError:
         raise HTTPException(400, "invalid_admin_input") from None
     return {"status": "saved"}
+
+
+@router.get("/api/bots/thresholds")
+async def bot_thresholds(request: Request):
+    return _bot_thresholds_status(service(request))
+
+
+@router.put("/api/bots/thresholds")
+async def save_bot_thresholds(request: Request):
+    data = await body(request, BotThresholdConfig)
+    svc = service(request)
+    try:
+        await svc.store.runtime.set_bot_thresholds(default_threshold=data.bot_reply_threshold)
+    except ValidationError:
+        raise HTTPException(400, "invalid_admin_input") from None
+    return _bot_thresholds_status(svc)
 
 
 @router.get("/api/sessions")
@@ -804,10 +870,15 @@ async def sandbox(request: Request):
             "sandbox": True,
             "group_policy": mode,
         }
-        if data.identity == "BOT" or not authorize(msg, s):
-            result["decisions"]["reason"] = (
-                "known_bot_ignored" if data.identity == "BOT" else "group_policy_ignored"
-            )
+        if data.identity == "BOT":
+            if kind != "group" or is_bot_hard_blocked(bot_id, svc.s):
+                result["decisions"]["reason"] = "known_bot_ignored"
+                return result
+            if not authorize(msg, s, _bot_exempt=True):
+                result["decisions"]["reason"] = "group_policy_ignored"
+                return result
+        elif not authorize(msg, s):
+            result["decisions"]["reason"] = "group_policy_ignored"
             return result
         if any(
             secret and len(secret) >= 8 and secret in data.text
@@ -851,13 +922,16 @@ async def sandbox(request: Request):
                 budget_lane="admin",
                 audit_source="sandbox",
                 audit_id=audit_id,
+                known_bot=data.identity == "BOT",
             )
             if result["decisions"].get("result") == "not_called":
                 result["decisions"]["result"] = intent
             if intent != "ignore":
                 bvid = (
                     extract_bvid(data.text)
-                    if not getattr(intent, "sandbox_mode", False) and can_watch_video(msg)
+                    if data.identity != "BOT"
+                    and not getattr(intent, "sandbox_mode", False)
+                    and can_watch_video(msg)
                     else None
                 )
                 if bvid:

@@ -142,6 +142,7 @@ async def test_owner_invite_admits_two_turns_atomically_and_cannot_reset_window(
     store, settings, message
 ):
     settings.bot_qq_ids = {"60000", "60001"}
+    settings.bot_reply_threshold = 1.0
     g = store.bot_guard
     assert await g.invite(invitation(message)) == {"60000"}
     before = dict(await store.one("SELECT * FROM bot_dialogue_windows"))
@@ -180,16 +181,41 @@ async def test_ambiguous_or_untrusted_invites_never_unlock_bot(
     store, settings, message, text, owner, mentions
 ):
     settings.bot_qq_ids = {"60000"}
+    settings.bot_reply_threshold = 1.0
     m = group(message, user_id=owner, command_text=text, mentioned_ids=mentions)
     assert not await store.bot_guard.invite(m)
     assert not await store.bot_guard.prepare(incoming_bot(message))
     assert not await store.all("SELECT * FROM bot_authorized_events")
 
 
+async def test_threshold_admitted_bot_cannot_receive_at_while_invited_bot_can(
+    store, settings, message
+):
+    settings.owner_qq_id = "20000"
+    settings.bot_qq_ids = {"60000"}
+    settings.group_policies["onebot:40000"] = "smart_reply"
+
+    bot_thresh = incoming_bot(message, event="bot-thresh-at")
+    assert await store.bot_guard.prepare(bot_thresh)
+    assert await store.admit(bot_thresh) == "accepted"
+    assert not await store.bot_guard.allowed_reply_target(bot_thresh, "60000")
+    assert "60000" not in valid_at_targets(bot_thresh, [bot_thresh], settings)
+
+    assert await store.bot_guard.invite(invitation(message, event_id="invite-allow-at")) == {
+        "60000"
+    }
+    bot_invited = incoming_bot(message, event="bot-invited-at")
+    assert await store.bot_guard.prepare(bot_invited)
+    assert await store.admit(bot_invited) == "accepted"
+    assert await store.bot_guard.allowed_reply_target(bot_invited, "60000")
+    assert "60000" in valid_at_targets(bot_invited, [bot_invited], settings, invited_bots={"60000"})
+
+
 async def test_grant_is_persistent_but_old_legacy_tickets_do_not_authorize(
     store, settings, message
 ):
     settings.bot_qq_ids = {"60000"}
+    settings.bot_reply_threshold = 1.0
     owner = invitation(message)
     bot = incoming_bot(message)
     assert await store.bot_guard.invite(owner)

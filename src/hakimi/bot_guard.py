@@ -4,6 +4,7 @@ import re
 import time
 from typing import TYPE_CHECKING
 
+from .admission_policy import effective_bot_reply_threshold, is_bot_hard_blocked
 from .bot_server import is_persona_owner
 from .config import Settings
 from .models import Message
@@ -49,6 +50,12 @@ class BotInteractionGuard:
     def known_bot(self, message: Message) -> bool:
         return message.platform == "onebot" and message.user_id in self.s.bot_qq_ids
 
+    def reply_threshold(self, message: Message) -> float:
+        return effective_bot_reply_threshold(message.user_id, self.s)
+
+    def hard_blocked(self, message: Message) -> bool:
+        return is_bot_hard_blocked(message.user_id, self.s)
+
     def owner_key(self) -> str:
         return self.store.vault.digest(
             "bot-authorizer", self.s.namespace, self.s.onebot_self_id, self.s.owner_qq_id
@@ -66,25 +73,40 @@ class BotInteractionGuard:
         )
 
     def authorize_cached(self, message):
+        entry = self._events.get(self.event_identity(message))
         return bool(
             message.kind == "group"
-            and self._events.get(self.event_identity(message), 0) > time.time()
+            and entry is not None
+            and entry[0] > time.time()
+            and (entry[1] == "owner" or not self.hard_blocked(message))
         )
 
-    def _cache(self, message, expires):
+    def is_owner_invited(self, message: Message) -> bool:
+        entry = self._events.get(self.event_identity(message))
+        return bool(
+            self.known_bot(message)
+            and message.kind == "group"
+            and entry is not None
+            and entry[0] > time.time()
+            and entry[1] == "owner"
+        )
+
+    def _cache(self, message, expires, *, mode="owner"):
         now = time.time()
-        self._events = {k: v for k, v in self._events.items() if v > now}
+        self._events = {k: v for k, v in self._events.items() if v[0] > now}
         if len(self._events) >= 512:
             self._events.pop(next(iter(self._events)))
-        self._events[self.event_identity(message)] = expires
+        self._events[self.event_identity(message)] = (expires, mode)
 
-    def _base_allowed(self, message):
+    def _group_allowed(self, message):
         return (
             self.known_bot(message)
-            and bool(self.s.owner_qq_id)
             and message.kind == "group"
             and authorize(message, self.s, _bot_exempt=True)
         )
+
+    def _base_allowed(self, message):
+        return self._group_allowed(message) and bool(self.s.owner_qq_id)
 
     def invitation_target(self, message):
         """Only a real Owner's direct imperative and one genuine top-level @ qualifies."""
@@ -161,15 +183,22 @@ class BotInteractionGuard:
             return "已授权这位机器人本群互动；10分钟内最多2轮，仍需通过安全检查。"
         return "请真实 @ 一个目标并明确说要互动；本群达到2轮后需等待10分钟窗口结束。"
 
-    async def _receipt(self, message, now):
+    async def _receipt(self, message, now, *, owner_only: bool = False):
         row = await self.store.one(
             "SELECT * FROM bot_authorized_events WHERE job_id=?", (self.store.event_key(message),)
         )
-        if row and (
-            row["expires"] > now
-            and row["scope"] == self.store.session_scope(message)
-            and row["target"] == self.store.subject(message)
-            and row["authorized_by"] == self.owner_key()
+        if not row or (
+            row["expires"] <= now
+            or row["scope"] != self.store.session_scope(message)
+            or row["target"] != self.store.subject(message)
+        ):
+            return None
+        if self.s.owner_qq_id and row["authorized_by"] == self.owner_key():
+            return row
+        if (
+            not owner_only
+            and row["authorized_by"] == "threshold"
+            and not self.hard_blocked(message)
         ):
             return row
         return None
@@ -178,21 +207,26 @@ class BotInteractionGuard:
         """Called at ingress (and restored job processing), before ordinary authorize()."""
         if not self.known_bot(message):
             return True
-        if not self._base_allowed(message):
+        if not self._group_allowed(message):
             return False
         now = time.time()
+        if message.created_at + self.s.event_ttl_seconds <= now:
+            return False
         async with self.store.lock:
             receipt = await self._receipt(message, now)
-            row = receipt or await self.available_in_transaction(message, now)
-            if row is None:
-                return False
-            expires = (
-                receipt["expires"]
-                if receipt
-                else min(row["expires"], message.created_at + self.s.event_ttl_seconds)
-            )
-            self._cache(message, expires)
-            return True
+            if receipt:
+                mode = "threshold" if receipt["authorized_by"] == "threshold" else "owner"
+                self._cache(message, receipt["expires"], mode=mode)
+                return True
+            row = await self.available_in_transaction(message, now) if self.s.owner_qq_id else None
+            if row is not None:
+                expires = min(row["expires"], message.created_at + self.s.event_ttl_seconds)
+                self._cache(message, expires, mode="owner")
+                return True
+        if self.hard_blocked(message):
+            return False
+        self._cache(message, message.created_at + self.s.event_ttl_seconds, mode="threshold")
+        return True
 
     async def available_in_transaction(self, message: Message, now: float):
         if not self._base_allowed(message) or message.created_at + self.s.event_ttl_seconds <= now:
@@ -215,29 +249,54 @@ class BotInteractionGuard:
     async def consume_in_transaction(self, message: Message, job_id: str, now: float) -> bool:
         if not self.known_bot(message):
             return True
-        row = await self.available_in_transaction(message, now)
-        if row is None:
+        if not self._group_allowed(message) or message.created_at + self.s.event_ttl_seconds <= now:
             return False
-        expires = min(row["expires"], message.created_at + self.s.event_ttl_seconds)
-        await self.store.db.execute(
-            "UPDATE bot_dialogue_windows SET used=used+1 WHERE scope=?", (row["scope"],)
-        )
+        row = await self.available_in_transaction(message, now) if self.s.owner_qq_id else None
+        if row is not None:
+            expires = min(row["expires"], message.created_at + self.s.event_ttl_seconds)
+            await self.store.db.execute(
+                "UPDATE bot_dialogue_windows SET used=used+1 WHERE scope=?", (row["scope"],)
+            )
+            await self.store.db.execute(
+                "INSERT INTO bot_authorized_events VALUES (?,?,?,?,?,?)",
+                (
+                    job_id,
+                    row["scope"],
+                    row["target"],
+                    row["authorized_by"],
+                    expires,
+                    row["started"],
+                ),
+            )
+            self._cache(message, expires, mode="owner")
+            return True
+        if self.hard_blocked(message):
+            return False
+        expires = message.created_at + self.s.event_ttl_seconds
         await self.store.db.execute(
             "INSERT INTO bot_authorized_events VALUES (?,?,?,?,?,?)",
-            (job_id, row["scope"], row["target"], row["authorized_by"], expires, row["started"]),
+            (
+                job_id,
+                self.store.session_scope(message),
+                self.store.subject(message),
+                "threshold",
+                expires,
+                now,
+            ),
         )
-        self._cache(message, expires)
+        self._cache(message, expires, mode="threshold")
         return True
 
     async def may_process(self, message: Message, job_id: str) -> bool:
         if not self.known_bot(message):
             return True
-        if not self._base_allowed(message) or self.store.event_key(message) != job_id:
+        if not self._group_allowed(message) or self.store.event_key(message) != job_id:
             return False
         async with self.store.lock:
             row = await self._receipt(message, time.time())
         if row:
-            self._cache(message, row["expires"])
+            mode = "threshold" if row["authorized_by"] == "threshold" else "owner"
+            self._cache(message, row["expires"], mode=mode)
         return bool(row)
 
     async def allowed_reply_target(self, message, target, *, invitation_event=None):
@@ -250,7 +309,7 @@ class BotInteractionGuard:
         now = time.time()
         async with self.store.lock:
             if self.known_bot(message) and target == message.user_id:
-                return bool(await self._receipt(message, now))
+                return bool(await self._receipt(message, now, owner_only=True))
             row = await self.store.one(
                 "SELECT * FROM bot_dialogue_windows WHERE scope=?",
                 (self.store.session_scope(message),),

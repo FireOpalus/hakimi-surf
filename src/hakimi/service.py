@@ -608,7 +608,10 @@ class Service:
             "session_enabled": session.get("enabled", False),
             "interaction_chains": session.get("interaction_chains", {}),
             "allowed_reply_ids": [
-                m.event_id for m in members if re.fullmatch(r"-?[0-9]{1,30}", m.event_id)
+                m.event_id
+                for m in members
+                if re.fullmatch(r"-?[0-9]{1,30}", m.event_id)
+                and (not self.bot_guard.known_bot(m) or self.bot_guard.is_owner_invited(m))
             ],
             "history_revision": session.get("history_revision", 0),
             "context_status": [
@@ -832,7 +835,11 @@ class Service:
         parsed = None
         meme_tag = None
         public = not (message.kind == "private" and is_persona_owner(message, self.s))
-        allow_video = not sandbox and can_watch_video(message, members)
+        allow_video = (
+            not sandbox
+            and not self.bot_guard.known_bot(message)
+            and can_watch_video(message, members)
+        )
         bvid = (
             (message.video_ids[0] if message.video_ids else extract_bvid(message.text))
             if allow_video

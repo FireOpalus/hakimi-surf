@@ -73,6 +73,55 @@ async def test_group_member_replies_without_private_admission_or_owner_context(
             await service.stop()
 
 
+async def test_group_bot_uses_public_persona_and_stays_isolated_in_private_under_threshold(
+    settings, store, message
+):
+    settings.onebot_allowed_users = set()
+    settings.allow_group_members = False
+    settings.onebot_owner_ids.add("70000")
+    settings.group_policies["onebot:40000"] = "smart_reply"
+    settings.bot_qq_ids.add("70000")
+    gateway, sender = FakeGateway(), FakeSender()
+    service = Service(settings, store, gateway, FakeBili(), sender)
+    try:
+        await service.sessions.remember(message, "owner-private-sentinel", "secret-reply")
+        group_bot = message.model_copy(
+            update={
+                "kind": "group",
+                "conversation_id": "40000",
+                "user_id": "70000",
+                "event_id": "group-bot-public",
+                "text": "今天群里真热闹",
+                "addressed": True,
+                "attention_reason": "mention",
+            }
+        )
+        assert not owner(group_bot, settings)
+        assert await service.accept(group_bot) == "accepted"
+        await service.process(await store.claim())
+        assert await service.deliver_once()
+        generated = [c for c in gateway.calls if c[0] == "generate"]
+        assert len(generated) == 1
+        trusted = prompt_context(Message.model_validate(generated[0][3]["message"]), settings)
+        assert trusted.role == "MEMBER"
+        assert trusted.persona == PUBLIC_PERSONA_PROMPT
+        assert "owner-private-sentinel" not in json.dumps(gateway.calls, default=str)
+
+        calls_before = len(gateway.calls)
+        priv_bot = group_bot.model_copy(
+            update={
+                "kind": "private",
+                "conversation_id": "70000",
+                "event_id": "priv-bot-block",
+            }
+        )
+        assert not authorize(priv_bot, settings)
+        assert await service.accept(priv_bot) == "ignored"
+        assert len(gateway.calls) == calls_before
+    finally:
+        await service.stop()
+
+
 @pytest.mark.parametrize("reason", ["bot", "muted", "self", "unknown_group", "muted_group"])
 async def test_group_exclusions_still_stop_before_jobs_models_and_send(
     settings, store, message, reason
@@ -87,6 +136,7 @@ async def test_group_exclusions_still_stop_before_jobs_models_and_send(
     )
     if reason == "bot":
         settings.bot_qq_ids.add("70000")
+        settings.bot_reply_threshold = 1.0
     elif reason == "muted":
         settings.muted_user_ids.add("70000")
     elif reason == "self":

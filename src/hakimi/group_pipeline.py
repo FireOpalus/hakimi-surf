@@ -417,6 +417,7 @@ class GroupPipeline:
         if (
             message.kind != "group"
             or other_mentions(message)
+            or self.store.bot_guard.known_bot(message)
             or not authorize(message.model_copy(update={"addressed": True}), self.s)
         ):
             return

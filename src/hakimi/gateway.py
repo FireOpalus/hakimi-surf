@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .admission_policy import effective_bot_reply_threshold
 from .security import Rejected, clean_text, configured_secrets
 
 PRESETS = {"quiet": 0.65, "natural": 0.42, "active": 0.28}
@@ -132,7 +133,7 @@ class FilterManager:
             self.config, self.overridden = config, True
         return await self.status()
 
-    def thresholds(self, message=None, *, owner=False):
+    def thresholds(self, message=None, *, owner=False, known_bot=False, bot_invited=False):
         config = self.config
         preset = (
             config.group_activity.get(f"{message.platform}:{message.conversation_id}")
@@ -140,10 +141,14 @@ class FilterManager:
             else None
         )
         reply = PRESETS[preset] if preset else config.reply_threshold
+        if owner:
+            reply = min(reply, OWNER_REPLY_CEILING)
+        elif known_bot and not bot_invited:
+            reply = effective_bot_reply_threshold(message.user_id if message else "", self.s)
         return {
             "injection": config.owner_injection_threshold if owner else config.injection_threshold,
             "unsafe": config.owner_unsafe_threshold if owner else config.unsafe_threshold,
-            "reply": min(reply, OWNER_REPLY_CEILING) if owner else reply,
+            "reply": reply,
         }
 
     async def status(self):
@@ -154,6 +159,8 @@ class FilterManager:
             "source": "sqlite" if self.overridden else "env",
             "presets": PRESETS,
             "owner_reply_ceiling": OWNER_REPLY_CEILING,
+            "bot_reply_threshold": self.s.bot_reply_threshold,
+            "environment_bot_reply_threshold": self.store.runtime.env_admission.bot_reply_threshold,
             "source_thresholds": {
                 "injection": self.s.injection_threshold,
                 "unsafe": self.s.unsafe_threshold,

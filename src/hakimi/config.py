@@ -1,4 +1,5 @@
 import ipaddress
+import math
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -116,6 +117,15 @@ class Settings(BaseSettings):
         max_length=1000,
         validation_alias=AliasChoices("BOT_QQ_IDS", "HAKIMI_BOT_QQ_IDS", "IGNORED_BOT_QQ_IDS"),
     )
+    bot_reply_threshold: float = Field(
+        default=0.85,
+        ge=0.01,
+        le=1.00,
+        validation_alias=AliasChoices(
+            "BOT_REPLY_THRESHOLD", "HAKIMI_BOT_REPLY_THRESHOLD", "MESSAGE_BOT_REPLY_THRESHOLD"
+        ),
+    )
+    bot_reply_thresholds: dict[str, float] = Field(default_factory=dict)
     onebot_mode: Literal["http", "ws_forward", "ws_reverse"] = "http"
     onebot_webhook_enabled: bool = True
     onebot_ws_url: str = "ws://127.0.0.1:3001/"
@@ -322,6 +332,22 @@ class Settings(BaseSettings):
             raise ValueError("BOT_QQ_IDS must contain numeric IDs as strings")
         if self.bot_qq_ids & {self.owner_qq_id, self.onebot_self_id}:
             raise ValueError("BOT_QQ_IDS must exclude OWNER_QQ_ID and the assistant itself")
+        if (
+            isinstance(self.bot_reply_threshold, bool)
+            or not math.isfinite(self.bot_reply_threshold)
+            or not (0.01 <= self.bot_reply_threshold <= 1.00)
+        ):
+            raise ValueError("bot_reply_threshold must be between 0.01 and 1.00")
+        if len(self.bot_reply_thresholds) > 1000 or any(
+            not re.fullmatch(r"[1-9][0-9]{0,19}", key)
+            or isinstance(val, bool)
+            or not math.isfinite(val)
+            or not (0.01 <= val <= 1.00)
+            for key, val in self.bot_reply_thresholds.items()
+        ):
+            raise ValueError("bot_reply_thresholds must map valid QQ IDs to 0.01..1.00")
+        if set(self.bot_reply_thresholds) & {self.owner_qq_id, self.onebot_self_id}:
+            raise ValueError("bot_reply_thresholds must exclude OWNER_QQ_ID and assistant itself")
         if self.owner_reply_threshold > self.reply_threshold:
             raise ValueError("owner_reply_threshold must be <= reply_threshold")
         if self.chat_cached_input_usd_per_m > self.chat_input_usd_per_m:

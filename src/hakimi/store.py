@@ -360,7 +360,7 @@ class Store:
                 message, now
             ):
                 return "ignored"
-            if self.bot_guard.known_bot(message):
+            if self.bot_guard.known_bot(message) and self.bot_guard.hard_blocked(message):
                 if await self.bot_guard.available_in_transaction(message, now) is None:
                     return "ignored"
             n = await self.one("SELECT COUNT(*) FROM jobs WHERE status IN ('pending','working')")
@@ -474,6 +474,64 @@ class Store:
                 (scope, scope, self.s.memory_turns),
             )
 
+    async def _budget_refusal(self, day: str, subject: str, lane: str, amount: int) -> str:
+        if await self.one("SELECT 1 FROM meta WHERE key='budget_overrun'"):
+            return "circuit"
+        total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
+        month = await self.one(
+            "SELECT charged_amount FROM usage_aggregates WHERE period=?", ("month:" + day[:7],)
+        )
+        monthly_total = (month[0] if month else 0) + await self._calendar_carry("month:" + day[:7])
+        monthly_limit = microdollars(getattr(self.s, "monthly_usd", Decimal("40")))
+        daily_row = await self.one(
+            "SELECT charged_amount FROM usage_aggregates WHERE period=?", ("day:" + day,)
+        )
+        global_total = (daily_row[0] if daily_row else 0) + await self._calendar_carry("day:" + day)
+        personal = (
+            await self.one(
+                "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND subject=?",
+                (day, subject),
+            )
+        )[0]
+        patrol = (
+            await self.one(
+                "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND lane='patrol'",
+                (day,),
+            )
+        )[0]
+        lane_total = (
+            await self.one(
+                "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND lane=?", (day, lane)
+            )
+        )[0]
+        extra_limit = {
+            "memory": self.s.memory_daily_usd,
+            "admin": self.s.admin_daily_usd,
+            "proactive": self.s.proactive_daily_usd,
+            "search": self.runtime.web_search.config.daily_usd,
+        }.get(lane)
+        if self.s.daily_usd <= 0 or global_total + amount > microdollars(self.s.daily_usd):
+            return "daily"
+        if monthly_limit <= 0 or monthly_total + amount > monthly_limit:
+            return "monthly"
+        if self.s.total_usd > 0 and total + amount > microdollars(self.s.total_usd):
+            return "total"
+        if personal + amount > microdollars(self.s.user_daily_usd):
+            return "user_daily"
+        if lane == "patrol" and patrol + amount > microdollars(self.s.patrol_daily_usd):
+            return "patrol_daily"
+        if extra_limit is not None and lane_total + amount > microdollars(extra_limit):
+            return f"{lane}_daily"
+        return ""
+
+    async def can_reserve(self, subject: str, lane: str, usd: Decimal) -> bool:
+        if not isinstance(usd, Decimal) or not usd.is_finite() or usd < 0:
+            return False
+        day = self.local_now().date().isoformat()
+        amount = microdollars(usd)
+        async with self.lock:
+            return not await self._budget_refusal(day, subject, lane, amount)
+
     async def reserve(self, subject: str, lane: str, usd: Decimal, *, model_lane=None) -> str:
         if not isinstance(usd, Decimal) or not usd.is_finite() or usd < 0:
             raise Rejected("invalid_budget_amount")
@@ -481,58 +539,9 @@ class Store:
         day = now.date().isoformat()
         amount, reservation = microdollars(usd), uuid.uuid4().hex
         async with self.transaction():
-            if await self.one("SELECT 1 FROM meta WHERE key='budget_overrun'"):
+            budget_detail = await self._budget_refusal(day, subject, lane, amount)
+            if budget_detail == "circuit":
                 raise Rejected("budget_circuit_open")
-            total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
-            month = await self.one(
-                "SELECT charged_amount FROM usage_aggregates WHERE period=?", ("month:" + day[:7],)
-            )
-            monthly_total = (month[0] if month else 0) + await self._calendar_carry(
-                "month:" + day[:7]
-            )
-            monthly_limit = microdollars(getattr(self.s, "monthly_usd", Decimal("40")))
-            daily_row = await self.one(
-                "SELECT charged_amount FROM usage_aggregates WHERE period=?", ("day:" + day,)
-            )
-            global_total = (daily_row[0] if daily_row else 0) + await self._calendar_carry(
-                "day:" + day
-            )
-            personal = (
-                await self.one(
-                    "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND subject=?",
-                    (day, subject),
-                )
-            )[0]
-            patrol = (
-                await self.one(
-                    "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND lane='patrol'",
-                    (day,),
-                )
-            )[0]
-            lane_total = (
-                await self.one(
-                    "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND lane=?", (day, lane)
-                )
-            )[0]
-            extra_limit = {
-                "memory": self.s.memory_daily_usd,
-                "admin": self.s.admin_daily_usd,
-                "proactive": self.s.proactive_daily_usd,
-                "search": self.runtime.web_search.config.daily_usd,
-            }.get(lane)
-            budget_detail = ""
-            if self.s.daily_usd <= 0 or global_total + amount > microdollars(self.s.daily_usd):
-                budget_detail = "daily"
-            elif monthly_limit <= 0 or monthly_total + amount > monthly_limit:
-                budget_detail = "monthly"
-            elif self.s.total_usd > 0 and total + amount > microdollars(self.s.total_usd):
-                budget_detail = "total"
-            elif personal + amount > microdollars(self.s.user_daily_usd):
-                budget_detail = "user_daily"
-            elif lane == "patrol" and patrol + amount > microdollars(self.s.patrol_daily_usd):
-                budget_detail = "patrol_daily"
-            elif extra_limit is not None and lane_total + amount > microdollars(extra_limit):
-                budget_detail = f"{lane}_daily"
             if budget_detail:
                 raise Rejected("budget_exhausted", budget_detail)
             await self.db.execute(

@@ -36,6 +36,8 @@ ROUTES = [
     ("DELETE", "/admin/api/filter"),
     ("POST", "/admin/api/filter/group-activity"),
     ("GET", "/admin/api/decision-audit"),
+    ("GET", "/admin/api/bots/thresholds"),
+    ("PUT", "/admin/api/bots/thresholds"),
 ]
 
 
@@ -140,6 +142,16 @@ async def test_filter_hot_persistence_preserves_group_preset_when_saving_global_
         ("patrol-limits", {"patrol_interval_seconds": 899}),
         ("patrol-limits", {"patrol_interval_seconds": "1800"}),
         ("patrol-limits", {"unexpected": "sensitive-input"}),
+        ("bots/thresholds", {"bot_reply_threshold": "0.85"}),
+        ("bots/thresholds", {"bot_reply_threshold": True}),
+        ("bots/thresholds", {"bot_reply_threshold": 0}),
+        ("bots/thresholds", {"bot_reply_threshold": 1.01}),
+        ("bots/thresholds", {"bot_reply_threshold": "NaN"}),
+        ("bots/thresholds", {"bot_reply_threshold": 0.85, "unexpected": "sensitive-input"}),
+        ("bots", {"user_id": "60000", "action": "threshold", "threshold": "0.5"}),
+        ("bots", {"user_id": "60000", "action": "threshold", "threshold": True}),
+        ("bots", {"user_id": "60000", "action": "threshold", "threshold": 0.0}),
+        ("bots", {"user_id": "60000", "action": "threshold", "threshold": 1.5}),
     ],
 )
 async def test_policy_inputs_are_bounded_and_do_not_echo_values(admin_api, path, payload):
@@ -446,3 +458,108 @@ def test_message_thresholds_are_independent_of_strict_sources_and_prices(setting
     data["chat_cached_input_usd_per_m"] = Decimal("2.00")
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **data)
+
+
+async def test_bot_thresholds_409_guards_encrypted_persistence_and_reset(settings):
+    settings.admin_token = SecretStr(TOKEN)
+    gateway = FakeGateway()
+    app = create_app(settings, gateway_factory=lambda *_: gateway, start_workers=False)
+    async with app.router.lifespan_context(app):
+        store = app.state.service.store
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": "Bearer " + TOKEN},
+        ) as client:
+            unlisted = await client.put(
+                "/admin/api/bots",
+                json={"user_id": "69999", "action": "threshold", "threshold": 0.6},
+            )
+            assert unlisted.status_code == 409
+            assert unlisted.json()["detail"] == "not_listed"
+
+            for protected_id in (settings.owner_qq_id, settings.onebot_self_id):
+                assert protected_id
+                reserved = await client.put(
+                    "/admin/api/bots",
+                    json={"user_id": protected_id, "action": "threshold", "threshold": 0.6},
+                )
+                assert reserved.status_code == 409
+                assert reserved.json()["detail"] == "reserved_identity"
+
+            add_60000 = await client.put(
+                "/admin/api/bots",
+                json={"user_id": "60000", "action": "add", "threshold": 0.65},
+            )
+            add_60001 = await client.put(
+                "/admin/api/bots",
+                json={"user_id": "60001", "action": "add"},
+            )
+            assert add_60000.status_code == 200 and add_60001.status_code == 200
+
+            save_default = await client.put(
+                "/admin/api/bots/thresholds",
+                json={"bot_reply_threshold": 0.92},
+            )
+            assert save_default.status_code == 200
+
+            th_res = await client.get("/admin/api/bots/thresholds")
+            assert th_res.status_code == 200
+            th = th_res.json()
+            assert th["bot_reply_threshold"] == pytest.approx(0.92)
+            assert th["bot_reply_thresholds"] == {"60000": pytest.approx(0.65)}
+            assert th["source"] == "admin"
+
+            bots_res = await client.get("/admin/api/bots")
+            assert bots_res.status_code == 200
+            by_id = {row["user_id"]: row for row in bots_res.json()}
+            assert by_id["60000"]["custom_threshold"] == pytest.approx(0.65)
+            assert by_id["60000"]["effective_threshold"] == pytest.approx(0.65)
+            assert by_id["60000"]["hard_blocked"] is False
+            assert by_id["60001"]["custom_threshold"] is None
+            assert by_id["60001"]["effective_threshold"] == pytest.approx(0.92)
+            assert by_id["60001"]["hard_blocked"] is False
+
+            blob = (await store.one("SELECT payload FROM admin_config WHERE key='admission'"))[0]
+            assert b"bot_reply_threshold" not in blob and b"60000" not in blob
+
+    changed_env = settings.model_copy(update={"bot_reply_threshold": 0.75})
+    restarted = create_app(changed_env, gateway_factory=lambda *_: gateway, start_workers=False)
+    async with restarted.router.lifespan_context(restarted):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": "Bearer " + TOKEN},
+        ) as client:
+            assert changed_env.bot_reply_threshold == pytest.approx(0.92)
+            assert changed_env.bot_reply_thresholds == {"60000": pytest.approx(0.65)}
+
+            clear_60000 = await client.put(
+                "/admin/api/bots",
+                json={"user_id": "60000", "action": "threshold", "threshold": None},
+            )
+            assert clear_60000.status_code == 200
+            by_id = {row["user_id"]: row for row in (await client.get("/admin/api/bots")).json()}
+            assert by_id["60000"]["custom_threshold"] is None
+            assert by_id["60000"]["effective_threshold"] == pytest.approx(0.92)
+
+            block_60001 = await client.put(
+                "/admin/api/bots",
+                json={"user_id": "60001", "action": "threshold", "threshold": 1.0},
+            )
+            assert block_60001.status_code == 200
+            by_id = {row["user_id"]: row for row in (await client.get("/admin/api/bots")).json()}
+            assert by_id["60001"]["hard_blocked"] is True
+
+            rm_60001 = await client.put(
+                "/admin/api/bots",
+                json={"user_id": "60001", "action": "remove"},
+            )
+            assert rm_60001.status_code == 200
+            assert "60001" not in changed_env.bot_reply_thresholds
+
+            reset = await client.delete("/admin/api/admission")
+            assert reset.status_code == 200
+            assert reset.json()["source"] == "env"
+            assert changed_env.bot_reply_threshold == pytest.approx(0.75)
+    assert not gateway.calls

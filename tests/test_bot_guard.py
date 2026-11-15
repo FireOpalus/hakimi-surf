@@ -66,6 +66,7 @@ async def process(service, message):
 async def test_known_bots_ignored_before_queue_images_or_any_api(
     bot_service, message, kind, policy, addressed
 ):
+    bot_service.s.bot_reply_threshold = 1.0
     bot_service.s.group_policies["onebot:40000"] = policy
     bot = bot_message(message).model_copy(
         update={
@@ -85,6 +86,7 @@ async def test_known_bots_ignored_before_queue_images_or_any_api(
 
 
 async def test_explicit_owner_invitation_is_the_only_bounded_exception(bot_service, message):
+    bot_service.s.bot_reply_threshold = 1.0
     invite = invitation(message)
     assert await bot_service.bot_guard.invite(invite) == {"60000"}
     first, second, third = [bot_message(message, event=f"bounded-{n}") for n in range(3)]
@@ -102,9 +104,13 @@ async def test_known_bot_cannot_invoke_commands_even_as_legacy_admin(bot_service
         update={"text": "/new-session", "command_text": "/new-session"}
     )
     await bot_service.sessions.remember(bot, "keep-group-memory", "reply")
+    bot_service.s.bot_reply_threshold = 1.0
     assert await bot_service.accept(bot) == "ignored"
     assert (await bot_service.sessions.history(bot))[0]["user"] == "keep-group-memory"
     assert not bot_service.ai.calls
+    bot_service.s.bot_reply_threshold = 0.85
+    assert await bot_service.command(bot) is None
+    assert (await bot_service.sessions.history(bot))[0]["user"] == "keep-group-memory"
 
 
 async def test_legacy_queued_bot_jobs_and_outbox_are_blocked(bot_service, message):
@@ -123,6 +129,7 @@ async def test_legacy_queued_bot_jobs_and_outbox_are_blocked(bot_service, messag
 
 async def test_legacy_sql_tickets_never_reactivate_blacklist(bot_service, message):
     svc = bot_service
+    svc.s.bot_reply_threshold = 1.0
     bot = bot_message(message)
     now = time.time()
     scope = svc.store.session_scope(bot)
@@ -152,6 +159,7 @@ async def test_fixed_window_expires_without_rearming_and_binds_group(
     bot_service, message, monkeypatch
 ):
     svc = bot_service
+    svc.s.bot_reply_threshold = 1.0
     assert await svc.bot_guard.invite(invitation(message))
     assert not await svc.bot_guard.prepare(bot_message(message, group="50000"))
     assert not await svc.bot_guard.prepare(bot_message(message, user="60001"))
@@ -163,3 +171,59 @@ async def test_fixed_window_expires_without_rearming_and_binds_group(
     assert not await svc.bot_guard.prepare(bot_message(message, event="after-window"))
     assert not await svc.bot_guard.may_process(first, svc.store.event_key(first))
     assert not svc.ai.calls
+
+
+async def test_group_bot_admitted_under_default_threshold_while_private_ignored(
+    bot_service, message
+):
+    assert bot_service.s.bot_reply_threshold == pytest.approx(0.85)
+    group_bot = bot_message(message, event="group-default")
+    assert await bot_service.accept(group_bot) == "accepted"
+
+    private_bot = group_bot.model_copy(
+        update={"kind": "private", "conversation_id": "60000", "event_id": "priv-default"}
+    )
+    assert await bot_service.accept(private_bot) == "ignored"
+    assert not bot_service.ai.calls
+
+
+async def test_per_bot_threshold_overrides_and_hot_raise_invalidates_pending_job(
+    bot_service, message
+):
+    svc = bot_service
+    svc.s.bot_reply_thresholds = {"60000": 1.0, "60001": 0.6}
+    bot_60000 = bot_message(message, event="override-block")
+    bot_60001 = bot_message(message, event="override-allow").model_copy(update={"user_id": "60001"})
+    assert svc.bot_guard.hard_blocked(bot_60000)
+    assert not svc.bot_guard.hard_blocked(bot_60001)
+    assert svc.bot_guard.reply_threshold(bot_60001) == pytest.approx(0.6)
+    assert await svc.accept(bot_60000) == "ignored"
+    assert await svc.accept(bot_60001) == "accepted"
+
+    pending = bot_message(message, event="hot-raise").model_copy(update={"user_id": "60001"})
+    key = svc.store.event_key(pending)
+    assert await svc.bot_guard.prepare(pending)
+    assert await svc.store.admit(pending) == "accepted"
+    assert await svc.bot_guard.may_process(pending, key)
+    svc.s.bot_reply_thresholds["60001"] = 1.0
+    assert not await svc.bot_guard.may_process(pending, key)
+
+
+async def test_owner_invite_reverts_to_threshold_gating_on_third_turn(bot_service, message):
+    svc = bot_service
+    assert await svc.bot_guard.invite(invitation(message)) == {"60000"}
+    t1, t2, t3 = [bot_message(message, event=f"revert-{n}") for n in range(3)]
+    for item in (t1, t2):
+        assert await svc.bot_guard.prepare(item)
+        key = svc.store.event_key(item)
+        assert await svc.store.admit(item) == "accepted"
+        assert svc.bot_guard.is_owner_invited(item)
+        assert await svc.bot_guard.allowed_reply_target(item, "60000")
+        assert await svc.bot_guard.may_process(item, key)
+
+    assert await svc.bot_guard.prepare(t3)
+    k3 = svc.store.event_key(t3)
+    assert await svc.store.admit(t3) == "accepted"
+    assert not svc.bot_guard.is_owner_invited(t3)
+    assert not await svc.bot_guard.allowed_reply_target(t3, "60000")
+    assert await svc.bot_guard.may_process(t3, k3)

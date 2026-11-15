@@ -9,10 +9,17 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from hakimi.bot_server import assemble_chat_input
 from hakimi.context_budget import estimate_tokens
-from hakimi.dual_memory import Extraction, RecallIndex, vector
+from hakimi.dual_memory import (
+    EXTRACTION_RESPONSE_FORMAT,
+    Extraction,
+    RecallIndex,
+    parse_extraction,
+    vector,
+)
 from hakimi.gemini import GeminiGateway
 from hakimi.generation_policy import Scenario
 from hakimi.memory_compressor import MemoryCompressor
@@ -503,3 +510,245 @@ async def test_mirror_scheduler_remains_available_when_extraction_disabled(setti
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def _schema_keys(node):
+    keys = set()
+    if isinstance(node, dict):
+        for k, v in node.items():
+            keys.add(k)
+            keys.update(_schema_keys(v))
+    elif isinstance(node, list):
+        for item in node:
+            keys.update(_schema_keys(item))
+    return keys
+
+
+async def test_extraction_wire_schema_is_serving_safe_and_parses_per_item(
+    settings, store, sdk_pair
+):
+    forbidden = {
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+    }
+    assert not (_schema_keys(EXTRACTION_RESPONSE_FORMAT) & forbidden)
+    assert EXTRACTION_RESPONSE_FORMAT["additionalProperties"] is False
+    seen = []
+
+    def handler(request):
+        data = json.loads(request.content)
+        seen.append(data)
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(
+            200,
+            json={
+                **interaction_response(),
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": '{"profiles":[],"chronicles":[]}'}],
+                    }
+                ],
+            },
+        )
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    await gateway.generate(
+        {"recent_messages": []},
+        "s",
+        scenario=Scenario.MEMORY_COMPRESSION,
+        budget_lane="memory",
+        memory_archive=True,
+    )
+    sent_schema = seen[0]["response_format"]["schema"]
+    assert sent_schema == EXTRACTION_RESPONSE_FORMAT
+    assert not (_schema_keys(sent_schema) & forbidden)
+
+    with pytest.raises(ValidationError):
+        parse_extraction("{invalid")
+    with pytest.raises(ValidationError):
+        parse_extraction('{"profiles":[],"chronicles":[],"extra":1}')
+
+    mixed = json.dumps(
+        {
+            "profiles": [
+                {
+                    "member_id": "30000",
+                    "slot": "preferences",
+                    "text": "喜欢天文",
+                    "evidence_seq": 1,
+                    "quote": "我喜欢天文",
+                    "basis": "self_report",
+                },
+                {
+                    "member_id": "0",
+                    "slot": "preferences",
+                    "text": "坏ID",
+                    "evidence_seq": 1,
+                    "quote": "我喜欢天文",
+                    "basis": "self_report",
+                },
+                {
+                    "member_id": "30000",
+                    "slot": "state",
+                    "text": "太久",
+                    "evidence_seq": 1,
+                    "quote": "太久了",
+                    "basis": "self_report",
+                    "valid_days": 99,
+                },
+            ],
+            "chronicles": [
+                {
+                    "topic": "星星梗",
+                    "category": "slang",
+                    "text": "群友把看星星称为星星梗",
+                    "tags": ["天文"],
+                    "evidence_seqs": [1],
+                },
+                {
+                    "topic": "空证据",
+                    "category": "event",
+                    "text": "缺证据",
+                    "tags": [],
+                    "evidence_seqs": [],
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+    parsed = parse_extraction(mixed)
+    assert len(parsed.profiles) == 1 and parsed.profiles[0].text == "喜欢天文"
+    assert len(parsed.chronicles) == 1 and parsed.chronicles[0].topic == "星星梗"
+
+
+async def test_near_exhausted_memory_budget_preserves_pending_slices(
+    settings, store, message, sdk_pair
+):
+    res = await store.reserve("prior", "memory", Decimal("0.188"))
+    await store.settle(res, Decimal("0.188"))
+    sessions, msg = SessionManager(settings, store), group(message)
+    await seed(sessions, msg)
+    ai = FakeGateway()
+    compressor = MemoryCompressor(settings, sessions, ai, store)
+    assert (await compressor.compress(msg, force=True))["status"] == "budget_hard_stop"
+    assert ai.calls == []
+
+    await sessions.dual.snapshot_cold(msg, force=True)
+    assert (await compressor.extract(msg))["status"] == "budget_hard_stop"
+    assert ai.calls == []
+    assert (await sessions.dual.view(msg))["jobs"] == {"pending": 1}
+    assert (await store.one("SELECT COUNT(*) FROM audit_events WHERE code='compression_failed'"))[
+        0
+    ] == 0
+
+    settings.memory_daily_usd = Decimal("0.22")
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        raise AssertionError("memory_flex must not dispatch when reserve fails")
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    orig_claim = sessions.dual.claim
+
+    async def claim_then_spend(*args, **kwargs):
+        snap = await orig_claim(*args, **kwargs)
+        spent = await store.reserve("race", "memory", Decimal("0.025"))
+        await store.settle(spent, Decimal("0.025"))
+        return snap
+
+    sessions.dual.claim = claim_then_spend
+    race_compressor = MemoryCompressor(settings, sessions, gateway, store)
+    assert (await race_compressor.extract(msg))["status"] == "budget_hard_stop"
+    assert len(requests) == 1 and requests[0].endswith("decisions")
+    assert (await sessions.dual.view(msg))["jobs"] == {"pending": 1}
+    assert (await store.one("SELECT COUNT(*) FROM audit_events WHERE code='compression_failed'"))[
+        0
+    ] == 0
+
+
+async def test_expiry_coalescing_background_debounce_and_memory_health(
+    settings, store, message, sdk_pair, monkeypatch
+):
+    sessions, msg = SessionManager(settings, store), group(message)
+    await seed(sessions, msg, count=2)
+    async with sessions.database(msg, preserve_history=True) as (db, _):
+        await db.execute("UPDATE recent_messages SET expires=1")
+    async with sessions.database(msg):
+        pass
+    await seed(sessions, msg, text="第二批天文话题", count=2)
+    async with sessions.database(msg, preserve_history=True) as (db, _):
+        await db.execute("UPDATE recent_messages SET expires=1")
+    async with sessions.database(msg):
+        pass
+    assert (await sessions.dual.view(msg))["jobs"] == {"pending": 2}
+
+    ai = FakeGateway()
+
+    async def extract_ok(*args, **kwargs):
+        ai.calls.append(("generate", args[0], args[1], kwargs))
+        return facts(seq=1).model_dump_json()
+
+    ai.generate = extract_ok
+    compressor = MemoryCompressor(settings, sessions, ai, store)
+    assert (await compressor.extract(msg, background=True))["status"] == "not_due_or_cooling_down"
+    assert ai.calls == []
+
+    future = time.time() + 2000
+    monkeypatch.setattr("hakimi.dual_memory.time.time", lambda: future)
+    res = await compressor.extract(msg, background=True)
+    assert res["status"] == "compressed" and res["compressed_messages"] == 4
+    assert len([c for c in ai.calls if c[0] == "generate"]) == 1
+    async with sessions.database(msg, preserve_history=True) as (db, _):
+        async with db.execute("SELECT status,batch_id FROM memory_slice_jobs") as cur:
+            rows = await cur.fetchall()
+    assert len(rows) == 2 and all(r[0] == "done" and r[1] == res["batch_id"] for r in rows)
+
+    failing = True
+
+    def handler(request):
+        if failing:
+            return httpx.Response(503, json={"error": {"code": 503, "message": "mock"}})
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(
+            200,
+            json={
+                **interaction_response(),
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": '{"profiles":[],"chronicles":[]}'}],
+                    }
+                ],
+            },
+        )
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    with pytest.raises(Rejected):
+        await gateway.generate(
+            {}, "s", scenario=Scenario.MEMORY_COMPRESSION, budget_lane="memory", memory_archive=True
+        )
+    assert gateway.blocked_until == 0
+    assert (
+        await store.one("SELECT failures FROM operational_health WHERE provider='gemini_memory'")
+    )[0] == 1
+    assert (
+        await store.one("SELECT failures FROM operational_health WHERE provider='gemini_chat'")
+    ) is None
+    failing = False
+    await gateway.generate(
+        {}, "s", scenario=Scenario.MEMORY_COMPRESSION, budget_lane="memory", memory_archive=True
+    )
+    assert (
+        await store.one("SELECT failures FROM operational_health WHERE provider='gemini_memory'")
+    )[0] == 0

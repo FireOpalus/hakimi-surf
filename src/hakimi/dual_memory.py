@@ -6,6 +6,7 @@ not remote embeddings. No cross-session search, plaintext disk index or embeddin
 
 import base64
 import hashlib
+import json
 import math
 import re
 import struct
@@ -15,7 +16,7 @@ import uuid
 from collections import OrderedDict
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .security import Rejected
 
@@ -84,6 +85,54 @@ class ChronicleFact(Strict):
 class Extraction(Strict):
     profiles: list[ProfileFact] = Field(default_factory=list, max_length=24)
     chronicles: list[ChronicleFact] = Field(default_factory=list, max_length=16)
+
+
+# Keep serving constraints lightweight (strict types + enums only); full bounds run in Python.
+class WireProfileFact(Strict):
+    member_id: str
+    slot: Literal["alias", "preferences", "boundaries", "state"]
+    text: str
+    evidence_seq: int
+    quote: str
+    basis: Literal["self_report", "self_correction"]
+    valid_days: int = 0
+
+
+class WireChronicleFact(Strict):
+    topic: str
+    category: Literal["event", "slang", "consensus", "open_question"]
+    text: str
+    tags: list[str] = Field(default_factory=list)
+    evidence_seqs: list[int] = Field(default_factory=list)
+
+
+class WireExtraction(Strict):
+    profiles: list[WireProfileFact] = Field(default_factory=list)
+    chronicles: list[WireChronicleFact] = Field(default_factory=list)
+
+
+EXTRACTION_RESPONSE_FORMAT = WireExtraction.model_json_schema()
+
+
+def parse_extraction(raw: str) -> Extraction:
+    wire = WireExtraction.model_validate_json(raw)
+    profiles: list[ProfileFact] = []
+    for item in wire.profiles:
+        if len(profiles) >= 24:
+            break
+        try:
+            profiles.append(ProfileFact.model_validate(item.model_dump()))
+        except ValidationError:
+            continue
+    chronicles: list[ChronicleFact] = []
+    for item in wire.chronicles:
+        if len(chronicles) >= 16:
+            break
+        try:
+            chronicles.append(ChronicleFact.model_validate(item.model_dump()))
+        except ValidationError:
+            continue
+    return Extraction(profiles=profiles, chronicles=chronicles)
 
 
 EXTRACTION_INSTRUCTION = """你是隔离会话的双轨事实提炼器。
@@ -251,7 +300,59 @@ class DualMemory:
                 rows = [{**self.vault.open(key, r[1]), "seq": r[0]} for r in await cur.fetchall()]
             return await self.append_slice(db, key, rows, epoch, "manual" if force else "nightly")
 
-    async def claim(self, message):
+    async def _select_pending(self, db, key, epoch, *, background=False, expected_ids=None):
+        async with db.execute(
+            "SELECT c.id,c.payload,c.created,c.kind FROM cold_history_slices c JOIN "
+            "memory_slice_jobs j ON j.id=c.id WHERE j.status='pending' AND c.epoch=? "
+            "ORDER BY c.created,c.id",
+            (epoch,),
+        ) as cur:
+            pending = await cur.fetchall()
+        if not pending:
+            return None
+        if expected_ids is not None:
+            wanted = list(expected_ids)
+            if len(pending) < len(wanted) or [r[0] for r in pending[: len(wanted)]] != wanted:
+                return None
+            unpacked = [
+                (
+                    row[0],
+                    [
+                        r
+                        for r in self.vault.open(key + ":cold:" + row[0], row[1])
+                        if r.get("archive_eligible", True)
+                    ],
+                    row[2],
+                    row[3],
+                )
+                for row in pending[: len(wanted)]
+            ]
+        else:
+            unpacked = []
+            running_bytes = 0
+            for row in pending[:64]:
+                rows = [
+                    r
+                    for r in self.vault.open(key + ":cold:" + row[0], row[1])
+                    if r.get("archive_eligible", True)
+                ]
+                item_bytes = len(json.dumps(rows, ensure_ascii=False).encode("utf-8"))
+                if unpacked and running_bytes + item_bytes > self.s.history_max_bytes:
+                    break
+                unpacked.append((row[0], rows, row[2], row[3]))
+                running_bytes += item_bytes
+        ids = [item[0] for item in unpacked]
+        messages = [msg for item in unpacked for msg in item[1]]
+        kinds = [item[3] for item in unpacked]
+        min_created = min(item[2] for item in unpacked)
+        max_created = max(item[2] for item in unpacked)
+        if background and expected_ids is None and all(k == "expiry" for k in kinds):
+            combined_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+            if len(messages) < 24 and combined_bytes < 4096 and time.time() - min_created < 1800:
+                return None
+        return ids, messages, max_created
+
+    async def peek(self, message, *, background=False):
         async with self.sessions.database(message, preserve_history=True) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 if not (await cur.fetchone())[0]:
@@ -260,45 +361,74 @@ class DualMemory:
                 "SELECT epoch,version,summary,(SELECT ready FROM memory_control) FROM rolling_state"
             ) as cur:
                 epoch, version, summary, ready = await cur.fetchone()
-            async with db.execute(
-                "SELECT c.id,c.payload,c.created FROM cold_history_slices c JOIN "
-                "memory_slice_jobs j "
-                "ON j.id=c.id WHERE j.status='pending' AND c.epoch=? ORDER BY "
-                "c.created,c.id LIMIT 1",
-                (epoch,),
-            ) as cur:
-                row = await cur.fetchone()
-            if not row:
+            selected = await self._select_pending(db, key, epoch, background=background)
+            if not selected:
                 return None
-            ident, blob, created = row
-            rows = [
-                r
-                for r in self.vault.open(key + ":cold:" + ident, blob)
-                if r.get("archive_eligible", True)
-            ]
-            attempt = self.vault.digest("memory-attempt", key, epoch, ident)
-            batch = "flex-" + uuid.uuid4().hex
-            await db.execute(
-                "UPDATE memory_slice_jobs SET "
-                "status='attempted',attempt=?,batch_id=?,attempted_at=? "
-                "WHERE id=?",
-                (attempt, batch, time.time(), ident),
-            )
+            ids, messages, created = selected
             return {
-                "id": ident,
+                "id": ids[0],
+                "ids": ids,
                 "epoch": epoch,
                 "version": version,
-                "messages": rows,
+                "messages": messages,
+                "old_summary": self.vault.open(key, summary) if summary and not ready else "",
+                "created": created,
+            }
+
+    async def claim(self, message, *, background=False, expected_ids=None):
+        async with self.sessions.database(message, preserve_history=True) as (db, key):
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                if not (await cur.fetchone())[0]:
+                    return None
+            async with db.execute(
+                "SELECT epoch,version,summary,(SELECT ready FROM memory_control) FROM rolling_state"
+            ) as cur:
+                epoch, version, summary, ready = await cur.fetchone()
+            selected = await self._select_pending(
+                db, key, epoch, background=background, expected_ids=expected_ids
+            )
+            if not selected:
+                return None
+            ids, messages, created = selected
+            batch = "flex-" + uuid.uuid4().hex
+            now = time.time()
+            await db.executemany(
+                "UPDATE memory_slice_jobs SET "
+                "status='attempted',attempt=?,batch_id=?,attempted_at=?,error=NULL "
+                "WHERE id=?",
+                [
+                    (self.vault.digest("memory-attempt", key, epoch, ident), batch, now, ident)
+                    for ident in ids
+                ],
+            )
+            return {
+                "id": ids[0],
+                "ids": ids,
+                "epoch": epoch,
+                "version": version,
+                "messages": messages,
                 "old_summary": self.vault.open(key, summary) if summary and not ready else "",
                 "created": created,
                 "batch_id": batch,
             }
 
-    async def finish(self, message, snapshot, status):
+    async def requeue(self, message, snapshot):
+        ids = snapshot.get("ids") or [snapshot["id"]]
         async with self.sessions.database(message, preserve_history=True) as (db, _):
-            await db.execute(
+            await db.executemany(
+                "UPDATE memory_slice_jobs SET "
+                "status='pending',attempt=NULL,batch_id=NULL,attempted_at=NULL,error=NULL "
+                "WHERE id=? AND status='attempted'",
+                [(ident,) for ident in ids],
+            )
+
+    async def finish(self, message, snapshot, status, *, error=None):
+        ids = snapshot.get("ids") or [snapshot["id"]]
+        detail = None if status == "done" else str(error or status)[:64]
+        async with self.sessions.database(message, preserve_history=True) as (db, _):
+            await db.executemany(
                 "UPDATE memory_slice_jobs SET status=?,error=? WHERE id=?",
-                (status, status if status != "done" else None, snapshot["id"]),
+                [(status, detail, ident) for ident in ids],
             )
 
     async def view(self, message, query=""):
@@ -373,11 +503,14 @@ class DualMemory:
             async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
                 if await cur.fetchone() != (snapshot["epoch"], snapshot["version"]):
                     return False
+            ids = snapshot.get("ids") or [snapshot["id"]]
+            placeholders = ",".join("?" for _ in ids)
             async with db.execute(
-                "SELECT status FROM memory_slice_jobs WHERE id=?", (snapshot["id"],)
+                f"SELECT status FROM memory_slice_jobs WHERE id IN ({placeholders})",
+                tuple(ids),
             ) as cur:
-                job = await cur.fetchone()
-            if not job or job[0] != "attempted":
+                jobs = await cur.fetchall()
+            if len(jobs) != len(ids) or any(row[0] != "attempted" for row in jobs):
                 return False
             rows = {r["seq"]: r for r in snapshot["messages"]}
             for fact in sorted(
@@ -485,8 +618,9 @@ class DualMemory:
                 )
             await db.execute("UPDATE memory_control SET ready=1")
             await db.execute("UPDATE rolling_state SET version=version+1")
-            await db.execute(
-                "UPDATE memory_slice_jobs SET status='done' WHERE id=?", (snapshot["id"],)
+            await db.executemany(
+                "UPDATE memory_slice_jobs SET status='done',error=NULL WHERE id=?",
+                [(ident,) for ident in ids],
             )
         self.index.discard(key)
         return True

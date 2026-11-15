@@ -1,5 +1,7 @@
 """Real receive->gateway->outbox->OneBot arrays, with no external network or model calls."""
 
+import json
+
 import pytest
 
 from tests.test_admin import admin_api as admin_api
@@ -32,6 +34,7 @@ async def test_owner_invitation_reaches_array_send_and_two_bot_turns_then_zero_t
     social, message
 ):
     social.s.bot_qq_ids = {"60000"}
+    social.s.bot_reply_threshold = 1.0
     social.ai.answer = "[AT:60000] 你说的对，但是猫不同意"
     await process(social, invite(message))
     assert social.ai.calls[0][0] == "screen"
@@ -61,9 +64,48 @@ async def test_owner_invitation_reaches_array_send_and_two_bot_turns_then_zero_t
     assert len(sent_mentions(wire)) == 3
 
 
+async def test_threshold_bot_reply_strips_outgoing_at_and_quote_anchor(social, message):
+    social.s.bot_qq_ids = {"60000"}
+    assert social.s.bot_reply_threshold == pytest.approx(0.85)
+    social.ai.answer = json.dumps(
+        {
+            "abstain": False,
+            "bubbles": ["收到啦"],
+            "anchor": {"reply_id": "88888", "mentions": ["60000"]},
+            "sticker": {"label": None, "timing": "after_text"},
+            "image_digest": None,
+        }
+    )
+    incoming = group(
+        message,
+        "88888",
+        user_id="60000",
+        sender_nickname="外部Bot",
+        text="哈基米看看",
+        command_text="哈基米看看",
+        mentioned_ids=["10000"],
+    )
+    await process(social, incoming)
+    assert await social.deliver_once()
+    gen_payload = social.ai.calls[-1][1]
+    assert "60000" not in gen_payload.get("allowed_at_qqs", [])
+    assert "88888" not in gen_payload.get("allowed_reply_ids", [])
+    wire = social.sender.onebot
+    assert not sent_mentions(wire)
+    assert all(p["type"] not in {"at", "reply"} for _, args in wire.calls for p in args["message"])
+    text = "".join(
+        p["data"].get("text", "")
+        for _, args in wire.calls
+        for p in args["message"]
+        if p["type"] == "text"
+    )
+    assert "收到啦" in text
+
+
 @pytest.mark.parametrize("blocked", [False, True])
 async def test_member_spoof_or_blocked_owner_invite_cannot_authorize_bot(social, message, blocked):
     social.s.bot_qq_ids = {"60000"}
+    social.s.bot_reply_threshold = 1.0
     social.ai.answer = "[AT:60000] 一起来聊两句"
     if blocked:
         social.ai.block_purpose = "message"

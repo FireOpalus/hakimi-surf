@@ -1,12 +1,14 @@
 """Background, bounded compression with persisted attempts and optimistic commits."""
 
 import asyncio
+import json
 import re
 from datetime import datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from .bot_server import is_persona_owner, untrusted_input
-from .dual_memory import Extraction
+from .dual_memory import EXTRACTION_INSTRUCTION, parse_extraction
 from .generation_policy import Scenario
 from .security import Rejected, configured_secrets
 
@@ -141,30 +143,36 @@ class MemoryCompressor:
                 await self.store.runtime.event("compression_failed", "memory")
                 return {"status": "failed"}
 
-    async def extract(self, message, *, force=False):
+    def _estimate_extract_reserve(self, payload_bytes: int) -> Decimal:
+        decision_in = self.s.decision_input_usd_per_m
+        flex_in = self.s.chat_input_usd_per_m / 2
+        flex_out = self.s.chat_output_usd_per_m / 2
+        system_bytes = len(EXTRACTION_INSTRUCTION.encode("utf-8"))
+        source_reserve = ((payload_bytes + 4096) * decision_in) / 1_000_000
+        flex_reserve = (
+            (payload_bytes + system_bytes + 4096) * flex_in + 4096 * flex_out
+        ) / 1_000_000
+        output_reserve = (20098 * decision_in) / 1_000_000
+        return source_reserve + flex_reserve + output_reserve
+
+    async def extract(self, message, *, force=False, background=False):
         lock = self.locks[int(self.sessions.key(message)[:8], 16) % len(self.locks)]
         if lock.locked():
             return {"status": "busy"}
         async with lock, self.slots:
             if not force and not self.store.runtime.compression.enabled:
                 return {"status": "disabled"}
-            # Do not claim/consume a slice while the global budget is already closed.
-            day = self.store.local_now().date().isoformat()
-            async with self.store.lock:
-                lane = await self.store.one(
-                    "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND lane='memory'",
-                    (day,),
-                )
-            if lane[0] >= int(self.s.memory_daily_usd * 1000000):
-                return {"status": "budget_hard_stop"}
-            if (await self.store.budget_status())["hard_stop"]:
+            subject = self.store.vault.digest("compression-budget", self.sessions.key(message))
+            # Do not snapshot/claim a slice or spend decision calls unless memory lane can pay.
+            if (await self.store.budget_status())["hard_stop"] or not await self.store.can_reserve(
+                subject, "memory", self._estimate_extract_reserve(0)
+            ):
                 return {"status": "budget_hard_stop"}
             if force:
                 await self.sessions.dual.snapshot_cold(message, force=True)
-            snapshot = await self.sessions.dual.claim(message)
-            if snapshot is None:
+            candidate = await self.sessions.dual.peek(message, background=background and not force)
+            if candidate is None:
                 return {"status": "not_due_or_cooling_down"}
-            subject = self.store.vault.digest("compression-budget", self.sessions.key(message))
             known = await self.sessions.dual.view(message)
             payload = {
                 "known_chronicles": [
@@ -174,11 +182,23 @@ class MemoryCompressor:
                 ][-24:],
                 "task": "dual_memory",
                 "surface": message.kind,
-                "recent_messages": snapshot["messages"],
-                "rolling_summary": snapshot["old_summary"],
+                "recent_messages": candidate["messages"],
+                "rolling_summary": candidate["old_summary"],
             }
+            payload_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            if not await self.store.can_reserve(
+                subject, "memory", self._estimate_extract_reserve(payload_bytes)
+            ):
+                return {"status": "budget_hard_stop"}
+            snapshot = await self.sessions.dual.claim(
+                message, background=background and not force, expected_ids=candidate["ids"]
+            )
+            if snapshot is None:
+                return {"status": "not_due_or_cooling_down"}
+            call_stage = 0
 
             async def guard():
+                nonlocal call_stage
                 async with self.sessions.database(message, preserve_history=True) as (db, _):
                     async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
                         if await cur.fetchone() != (snapshot["epoch"], snapshot["version"]):
@@ -188,6 +208,7 @@ class MemoryCompressor:
                             raise Rejected("compression_stale")
                 if not force and not self.store.runtime.compression.enabled:
                     raise Rejected("compression_stale")
+                call_stage += 1
 
             try:
                 check_memory_text(str(payload), self.s)
@@ -204,7 +225,7 @@ class MemoryCompressor:
                     before_call=guard,
                 )
                 check_memory_text(result, self.s)
-                extraction = Extraction.model_validate_json(result)
+                extraction = parse_extraction(result)
                 committed = await self.sessions.dual.commit(message, snapshot, extraction)
                 if not committed:
                     await self.sessions.dual.finish(message, snapshot, "compression_stale")
@@ -222,7 +243,25 @@ class MemoryCompressor:
                     await self.sessions.dual.finish(message, snapshot, "compression_stale")
                     await self.store.runtime.event("compression_stale", "memory")
                     return {"status": "stale"}
-                await self.sessions.dual.finish(message, snapshot, "failed")
+                if (
+                    call_stage < 2
+                    and isinstance(exc, Rejected)
+                    and exc.args
+                    and exc.args[0]
+                    in {"budget_exhausted", "budget_circuit_open", "gemini_circuit_open"}
+                ):
+                    await self.sessions.dual.requeue(message, snapshot)
+                    return {
+                        "status": "provider_backoff"
+                        if exc.args[0] == "gemini_circuit_open"
+                        else "budget_hard_stop"
+                    }
+                err_code = (
+                    str(exc.args[0])
+                    if isinstance(exc, Rejected) and exc.args
+                    else type(exc).__name__
+                )
+                await self.sessions.dual.finish(message, snapshot, "failed", error=err_code)
                 await self.store.runtime.event("compression_failed", "memory")
                 return {"status": "failed"}
 
@@ -253,7 +292,7 @@ class MemoryCompressor:
                         await self.nightly()
                         last_scan = time.monotonic()
                     for _, message in await self.store.runtime.sessions():
-                        await self.extract(message)
+                        await self.extract(message, background=True)
                 if self.mirror:
                     await self.mirror.scheduled()
             except asyncio.CancelledError:

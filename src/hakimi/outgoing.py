@@ -162,7 +162,9 @@ async def deliver_actions(service, reply):
             if sticker_choice:
                 await asyncio.sleep(0.6)
         anchor = dict(actions.get("anchor", {}))
-        if message.kind != "group":
+        if message.kind != "group" or (
+            service.bot_guard.known_bot(message) and not service.bot_guard.is_owner_invited(message)
+        ):
             anchor = {}
         else:
             drift = service.hot.intervening(
@@ -172,7 +174,15 @@ async def deliver_actions(service, reply):
                 anchor["reply_id"] = None
             elif drift >= 3:
                 anchor["reply_id"] = next(
-                    (m.event_id for m in reversed(members) if m.event_id.lstrip("-").isdigit()),
+                    (
+                        m.event_id
+                        for m in reversed(members)
+                        if m.event_id.lstrip("-").isdigit()
+                        and (
+                            not service.bot_guard.known_bot(m)
+                            or service.bot_guard.is_owner_invited(m)
+                        )
+                    ),
                     None,
                 )
         folded = actions.get("folded") if message.kind == "group" else None

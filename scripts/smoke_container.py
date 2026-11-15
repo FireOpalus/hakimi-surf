@@ -272,6 +272,7 @@ def main():
                     "OWNER_QQ_ID=20000",
                     "PROACTIVE_DM_ENABLED=false",
                     'BOT_QQ_IDS=["60000"]',
+                    "BOT_REPLY_THRESHOLD=1.00",
                     'HAKIMI_ONEBOT_ALLOWED_USERS=["60000"]',
                     'HAKIMI_ONEBOT_ALLOWED_GROUPS=["40000"]',
                     "HAKIMI_ALLOW_GROUP_MEMBERS=false",
