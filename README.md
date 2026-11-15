@@ -1,12 +1,12 @@
 # 哈基米跨平台冲浪助手
 
-当前版本 **1.1.7**。已知外部 Bot 新增默认／逐账号接话阈值，`1.00` 完全屏蔽，较低阈值须经 Decisions；冷历史支持同会话合批、提炼前双重预算预检与逐条事实校验，详见 [1.1.7 升级说明](docs/BOT_MEMORY_117.md)。沿用 [1.1.6 热配置与星夜控制台](docs/CONTROL_PLANE_116.md)、[1.1.5 执行审计](docs/DELIVERY_AUDIT_115.md) 与 [1.1.4 差量续链](docs/GROUP_CONTEXT_114.md)。防抖仍支持 **0–30 秒**；后台设置加密保存并热生效；联网默认关闭。
+当前版本 **1.1.8**。缓存折扣直接进入预算结算，流中断与未知用量采用有限回退估算；启动时一次性校正保留的历史账目，详见 [1.1.8 费用与迁移说明](docs/BILLING_118.md)。沿用 [Bot 阈值与冷历史合批](docs/BOT_MEMORY_117.md)、[热配置与星夜控制台](docs/CONTROL_PLANE_116.md) 及 [差量续链](docs/GROUP_CONTEXT_114.md)。防抖仍支持 **0–30 秒**；后台设置加密保存并热生效；联网默认关闭。
 
 保留 1.0 的 [双轨记忆与治理说明](docs/MEMORY_100.md)：每个会话的加密 SQLite 增建画像、编年史、不可变冷史，后台通过 Hydrogen Flex 半价提炼，在线按需本地召回；管理台可检索、修订、擦除及解锁，显式选择的白名单群可与单目录 Drive Markdown 双向同步。旧摘要保留至首次成功提炼。私聊档案不导出，Owner《小本本》仍默认关闭。
 
 沿用 [v0.10 流式防抖与五维出站](docs/STREAMING_010.md) 和 [v0.9 A/B/C 前缀路由](docs/CONTEXT_ROUTING_09.md)。群聊／Owner 私聊默认 `auto`，后台可选至 `xhigh`；双轨归档固定 `medium`。三段原文人设、跨机 WS 和账本安全边界不变；新增 `memory_flex` 费用列。有效缓存覆盖率 90% 是观察目标，不能保证每次命中。
 
-[项目架构图（HTML/CSS）](architecture.html)：按 **1.1.7 当前源码**重构，区分消息数据流、热配置控制流与后台归档流程，增加 Bot 三路分流、冷历史合批与预算预检图；保留跨机部署、审计、差量续链与隔离存储。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
+[项目架构图（HTML/CSS）](architecture.html)：按 **1.1.8 当前源码**同步，新增事务预留、流进度、缓存折扣结算、未知费用回退与一次性历史校正流程；保留消息流、热配置、Bot 三路分流、冷历史合批、跨机部署和隔离存储。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
 
 0.8.0 新增 [会话串行管道、引用回溯与受控点名](docs/CORE_PIPELINE_08.md)，支持 [上海 NapCat／首尔主脑分离部署](docs/CROSS_BORDER_DEPLOYMENT.md)。群聊、私聊与 `@Bot` 统一先写隔离接收日志，再按 1.8 秒／最长 3.5 秒防抖；同会话模型请求串行，后台清空通过 epoch 作废旧任务。补齐引用／转发原图、公开群互动到 Owner 私聊的单向背景、受控 `[AT:...]` 与本地表情联合发送。预算日／月边界统一按 `BOT_TIMEZONE=Asia/Shanghai`，旧 UTC 账本保留审计并保守迁移。
 
@@ -160,8 +160,14 @@ flowchart TD
     Runtime -.模型路由与输出上限.-> Chat
     Runtime -.发送延迟.-> Delivery
     Runtime --> Budget[全局日月 / 用户 / 分项预算]
-    Budget -.请求前事务预留 / 返回后结算.-> Gate
-    Budget -.请求前事务预留 / 返回后结算.-> Chat
+    Budget -.请求前事务预留.-> Gate
+    Budget -.请求前事务预留.-> Chat
+    Budget -.请求前事务预留.-> Search
+    Gate --> Settlement[用量结算 / 缓存折扣 / 未计费释放 / 未知费用估算]
+    Chat --> Settlement
+    Search --> Settlement
+    Settlement --> Ledger[(账目 / 日月累计 / 按模型聚合)]
+    Ledger -.结算差额更新预算占用.-> Budget
     Ingress[鉴权、接收日志、同会话引用与媒体准备]
     Ingress --> BotPolicy{已知 Bot 与授权检查}
     Runtime -.默认和逐 Bot 阈值.-> BotPolicy
@@ -197,7 +203,7 @@ flowchart TD
 
 冷历史提炼先进行最小费用检查，再只读合批并按完整载荷预检；随后核对候选领取、执行来源筛查与 Flex 提炼、逐条强校验后提交。后台纯 expiry 小批次有 24 条／4096 字节／30 分钟等待规则，详见 [合批提炼流程](architecture.html#memory-batching)。
 
-所有模型请求共用预算预留与结算；搜索另受每日次数和独立额度约束。主对话不开放工具，联网使用独立请求，结果过审后才进入 C 区。用户原文在门卫放行后入史，助手正文在 ACK 后入史；视频材料与分析摘要不写入聊天记忆。Drive 群记忆镜像、巡逻日记和 Owner 只读快照分别配置。
+所有模型请求共用事务预留与结算，缓存折扣释放多余占用；失败按是否发出、HTTP 状态与流进度区分未计费和有限回退估算，未知仍标为未知。首次启动校正保留账目，详情见 [费用结算图](architecture.html#billing)。搜索另受每日次数和独立额度约束。主对话不开放工具，联网使用独立请求，结果过审后才进入 C 区。用户原文在门卫放行后入史，助手正文在 ACK 后入史；视频材料与分析摘要不写入聊天记忆。Drive 群记忆镜像、巡逻日记和 Owner 只读快照分别配置。
 
 启用会话记忆、非沙箱且续链开关开启时，主对话使用 `store=True`；有效旧链携带 `previous_interaction_id`，按模型通道发送未覆盖的 B 历史及完整当轮 C，每轮仍传 A。首次或链失效时用完整本地上下文起链。新标识随 Outbox 传递，回复成功送达后才加密提交到会话库，供下一轮读取。关闭续链、关闭记忆及搜索／沙箱／后台任务保持 `store=False`。续链按完整逻辑上下文预留预算；本地默认 6 小时有效期不等于云端删除期限。详见 [续链流程图](architecture.html#interaction-chain)。
 
@@ -211,7 +217,7 @@ flowchart TD
 | `src/hakimi/adapters.py` | QQ／OneBot 事件规范化、固定收件人发送 |
 | `src/hakimi/security.py` | 签名、身份策略、加密、内容控制码处理 |
 | `src/hakimi/routing.py` / `generation_policy.py` / `thinking_policy.py` | 一次入站决策、聊天 auto 分档、Hydrogen／Carbon 策略与场景热配置 |
-| `src/hakimi/gemini.py` / `streaming.py` | Decisions、流式 Interactions、结构化输出、取消与费用预留 |
+| `src/hakimi/gemini.py` / `streaming.py` | Decisions、流式 Interactions、结构化输出、流进度与分支费用结算 |
 | `src/hakimi/web_search.py` | 独立联网取证、查询净化、来源提炼、四态透传及次数／费用控制 |
 | `src/hakimi/bot_server.py` / `prefix_runtime.py` | A/B/C 组装、历史身份去重与时间断点、模型历史选择与续链元数据 |
 | `src/hakimi/store.py` | SQLite 事务、任务／发送队列、预算、订阅、报告、群策略与旧记忆迁移源 |
@@ -223,7 +229,7 @@ flowchart TD
 | `src/hakimi/public_memory.py` | 已确认群聊互动到 Owner 私聊的单向只读背景 |
 | `src/hakimi/outbound_actions.py` / `outgoing.py` / `output_links.py` | 五维动作校验、出站过滤、长文折叠、逐条 ACK、成功投递后提交续链与回执恢复 |
 | `src/hakimi/mentions.py` / `bot_guard.py` | 兼容 AT／MEME、阈值接话、真实事件授权、Owner 邀请两轮熔断 |
-| `src/hakimi/budget_calendar.py` | 本地日／月账本迁移、旧 UTC 聚合归档与保守占用 |
+| `src/hakimi/budget_calendar.py` | 本地日／月账本迁移、旧 UTC 聚合归档及 memory_flex 缓存观测 |
 | `src/hakimi/session_manager.py` / `dual_memory.py` | 每会话独立 SQLite、加密续链、热史、画像、编年史、冷史与相关成员背景召回 |
 | `src/hakimi/memory_compressor.py` / `memory_mirror.py` | 后台 Flex 提炼、版本与人工锁核验、可选群记忆 Drive 镜像 |
 | `src/hakimi/roaming_logger.py` / `drive_client.py` / `drive_oauth.py` | 独立日记数据、定时汇总、单目录 SA／OAuth 同步 |
@@ -277,7 +283,7 @@ Decisions 的 `noul` 是概率，程序显式组合阈值；不是把它当布�
 
 每次调用前，在一个 SQLite 事务中按 UTF-8 字节保守估计文字输入，图片另按每张 8192 Token 预留、加上问题／系统指令／封装余量，以及完整输出上限，预留费用；同时检查全局、平台用户、巡逻／记忆／管理／主动生成子预算及本地累计上限。单用户预算跨群聊与私聊计数，防止切换群聊绕过。日额度、自然月额度、主动私信计划与免打扰统一按 `BOT_TIMEZONE`（默认 Asia/Shanghai）划分，使用整数微美元记账。旧 UTC 账本按保留的真实时间戳迁移，累计花销不清零；无法精确归日的旧记录在迁移当日／当月保守占用预算，后台单独标示，详见 [时区迁移](docs/CORE_PIPELINE_08.md#预算时区与旧账本迁移)。
 
-成功收到 usage 后结算 `total_input_tokens` 与输出／思考 Token；缺少 usage、超时、取消和崩溃保留预留费用。实际费用超过预留时设置持久化停用标记，后续模型调用全部停止。修正定价／接口配置并核对账单后，用下面的本机维护命令解除标记，已有费用不会被清零。
+成功收到 usage 后，按配置价格结算输入、输出／思考及已报告的缓存折扣与联网查询费，释放多余预留。发送前取消和指定的未收到流事件 HTTP 错误释放预留；缺少完整 usage、超时或发出后取消使用有限回退估算，仍标记 `unknown`。崩溃后缺少回退信息的预留保持占用。结算金额超过预留时设置持久化停用标记，后续模型调用全部停止。修正定价／接口配置并核对账单后，用下面的本机维护命令解除标记，已有费用不会被清零。
 
 ```bash
 docker compose stop hakimi-bot
@@ -285,9 +291,9 @@ docker compose run --rm hakimi-bot python -m hakimi.admin clear-budget-circuit
 docker compose up -d
 ```
 
-[`max_output_tokens` 包含思考 Token](https://aistudio.google.com/docs/thinking#token-limits)。0.8.1 的九个生成场景默认 `medium`，可在「思考强度」后台选择至 `xhigh`；各档仍有独立 Token 上限与预算门禁，详情见 [模型策略](docs/MODEL_POLICY.md)。输出不完整时不续写、不发布部分文本。SDK 自动重试与自动续写均关闭；v0.10 聊天仅在超时或 incomplete 时重新预留并降一档重试一次，中断且无 usage 保留全部预留，其他接口错误不重试。
+[`max_output_tokens` 包含思考 Token](https://aistudio.google.com/docs/thinking#token-limits)。0.8.1 的九个生成场景默认 `medium`，可在「思考强度」后台选择至 `xhigh`；各档仍有独立 Token 上限与预算门禁，详情见 [模型策略](docs/MODEL_POLICY.md)。输出不完整时不续写、不发布部分文本。SDK 自动重试与自动续写均关闭；v0.10 聊天仅在超时或 incomplete 时重新预留并降一档重试一次，中断且无完整 usage 保留有限估算费用，其他接口错误不重试。历史保留明细在首次启动时按新口径一次性校正，不重建账本；需要恢复旧口径时必须配套恢复数据库备份，详见 [v1.1.8 迁移说明](docs/BILLING_118.md)。
 
-预算门禁控制本服务按已配置价格计入的费用，不能替代供应商账户额度；Key 被其他程序使用、供应商调价或预估异常造成的账单偏差不在本地硬上限的保证内。保守预留可能使实际账单未到上限时提前停止，这属于设计行为。
+预算门禁控制本地按已配置价格计入的估算费用，不能替代供应商账户额度；尤其回退估算不代表实际 Token 或最终账单，可能高估或低估。Key 被其他程序使用、供应商调价或预估异常造成的账单偏差不在本地硬上限的保证内。调用前的保守预留也可能使实际账单未到上限时提前停止。
 
 ## 安全、隔离与保留周期
 

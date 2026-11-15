@@ -344,7 +344,7 @@ async def test_stable_persona_and_scenario_prefix_precedes_dynamic_identity(
 
 
 @pytest.mark.parametrize("cached", [None, 0, 80])
-async def test_actual_sdk_usage_preserves_unknown_cache_and_conservative_cost(
+async def test_actual_sdk_usage_preserves_unknown_cache_and_bill_aligned_cost(
     settings, store, sdk_pair, cached
 ):
     def handler(request):
@@ -363,11 +363,8 @@ async def test_actual_sdk_usage_preserves_unknown_cache_and_conservative_cost(
     assert observed["input_tokens"] == 100 and observed["output_tokens"] == 20
     assert observed["thought_tokens"] == 30 and observed["cached_tokens"] == cached
     charged = (await store.usage())["lanes"][0]["amount"]
-    assert charged == 535
-    if cached is None:
-        assert observed["estimated_amount"] is None
-    else:
-        assert observed["estimated_amount"] == (525 if cached == 0 else 411)
+    assert charged == (535 if cached in (None, 0) else 421)
+    assert observed["estimated_amount"] == (525 if cached in (None, 0) else 411)
 
 
 def test_malformed_usage_does_not_invent_cache_or_thought_metadata():
@@ -401,15 +398,17 @@ async def test_unknown_thoughts_need_total_for_actual_cost(settings, store, sdk_
     gate = GeminiGateway(settings, store, *sdk_pair(handler))
     await gate.generate({"current_message": "你好"}, "s")
     row = await store.one(
-        "SELECT l.status,u.* FROM ledger l JOIN ledger_usage u ON l.id=u.id "
-        "WHERE u.model_lane='hydrogen'"
+        "SELECT l.status,l.amount,l.reserved,u.* FROM ledger l "
+        "JOIN ledger_usage u ON l.id=u.id WHERE u.model_lane='hydrogen'"
     )
     assert row["thought_tokens"] is None
     assert row["cached_tokens"] == 80
     if total is None:
         assert row["status"] == "unknown" and row["estimated_amount"] is None
+        assert 0 < row["amount"] < row["reserved"]
     else:
         assert row["status"] == "settled" and row["estimated_amount"] == 411
+        assert row["amount"] == 411
 
 
 async def test_hot_revocation_while_waiting_for_decision_slot_costs_zero(

@@ -29,7 +29,7 @@ from .prefix_runtime import PrefixRuntime, StaticPrefixes
 from .routing import RouteDecision, select_tier
 from .security import Rejected
 from .store import Store
-from .streaming import cancellable, consume_stream
+from .streaming import StreamProgress, cancellable, consume_stream
 from .usage_accounting import TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
 from .web_search import QUERY_RESERVE, QUERY_USD, SEARCH_INSTRUCTION, parse_result, query_count
@@ -309,29 +309,41 @@ class GeminiGateway:
         except ValueError:
             return None
 
-    def _discounted(self, actual, usage, rates, *, priced_at=None):
-        if actual is None or usage is None:
+    def _cached_input_rate(self, model_lane: str, *, priced_at=None) -> Decimal | None:
+        if model_lane == "decision":
             return None
-        if usage.model_lane == "decision":
-            return actual
-        if usage.cached_tokens is None:
-            return None
-        # Only the explicitly reported cached portion receives the separate estimate.
-        # Hard budgets always settle against the full conservative amount above.
-        if usage.model_lane == "carbon":
-            prefix = (
-                "carbon_regular_"
-                if (priced_at or datetime.now(UTC)).date().isoformat() >= "2026-12-01"
-                else "carbon_"
-            )
+        if model_lane == "carbon":
+            regular = (priced_at or datetime.now(UTC)).date().isoformat() >= "2026-12-01"
+            prefix = "carbon_regular_" if regular else "carbon_"
             cached_rate = getattr(self.s, prefix + "cached_input_usd_per_m")
         else:
             cached_rate = self.s.chat_cached_input_usd_per_m
-        if usage.model_lane == "memory_flex":
+        if model_lane == "memory_flex":
             cached_rate /= 2
-        if not Decimal(0) <= cached_rate <= rates[0]:
+        return cached_rate
+
+    def _discounted(self, actual, usage, rates, *, priced_at=None):
+        if actual is None:
             return None
+        if usage is None or usage.model_lane == "decision" or not usage.cached_tokens:
+            return actual
+        cached_rate = self._cached_input_rate(usage.model_lane, priced_at=priced_at)
+        if cached_rate is None or not Decimal(0) <= cached_rate <= rates[0]:
+            return actual
         return actual - usage.cached_tokens * (rates[0] - cached_rate) / 1_000_000
+
+    @staticmethod
+    def _non_billable_http_error(exc: BaseException, stream_started: bool) -> bool:
+        if stream_started:
+            return False
+        for candidate in (
+            getattr(exc, "status_code", None),
+            getattr(exc, "code", None),
+            getattr(getattr(exc, "response", None), "status_code", None),
+        ):
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                return candidate in {400, 401, 403, 404, 409, 413, 422, 429}
+        return False
 
     async def _call(
         self,
@@ -350,11 +362,17 @@ class GeminiGateway:
         stream_retryable=False,
         additional_reserve=Decimal(0),
         additional_actual=None,
+        fallback_media_tokens: int | None = None,
+        fallback_additional: Decimal | None = None,
+        cached_prefix_tokens: int = 0,
+        stream_progress: StreamProgress | None = None,
+        call_state: dict[str, bool] | None = None,
     ) -> Any:
         if self.blocked_until > time.monotonic():
             raise Rejected("gemini_circuit_open")
         # Count text bytes and separately reserve bounded image tokens, never base64 as text.
-        byte_count = len(json.dumps(input_payload, ensure_ascii=False).encode("utf-8"))
+        serialized = json.dumps(input_payload, ensure_ascii=False)
+        byte_count = len(serialized.encode("utf-8"))
         if byte_count > (context_limit or self.s.max_context_bytes + 12000):
             raise Rejected("context_too_large")
         async with self.memory_slots if model_lane == "memory_flex" else self.slots:
@@ -364,6 +382,49 @@ class GeminiGateway:
             reserve_usd = (
                 (byte_count + 2048 + image_tokens) * rates[0] + output_cap * rates[1]
             ) / 1_000_000 + additional_reserve
+
+            def fallback_cost(
+                elapsed: float,
+                *,
+                result: Any = None,
+                usage: TokenUsage | None = None,
+                token_actual: Decimal | None = None,
+            ) -> Decimal:
+                extra = additional_reserve if fallback_additional is None else fallback_additional
+                if result is not None and token_actual is not None:
+                    disc = self._discounted(token_actual, usage, rates, priced_at=priced_at)
+                    est = (disc if disc is not None else token_actual) + extra
+                elif result is not None and usage is not None:
+                    est_out = usage.output_tokens + min(output_cap, 256)
+                    gross = (usage.input_tokens * rates[0] + est_out * rates[1]) / 1_000_000
+                    disc = self._discounted(gross, usage, rates, priced_at=priced_at)
+                    est = (disc if disc is not None else gross) + extra
+                else:
+                    media = image_tokens if fallback_media_tokens is None else fallback_media_tokens
+                    in_tokens = estimate_tokens(serialized) + 256 + media
+                    cached_rate = self._cached_input_rate(model_lane, priced_at=priced_at)
+                    cached_in = (
+                        min(in_tokens, max(0, cached_prefix_tokens))
+                        if (cached_rate is not None and Decimal(0) <= cached_rate <= rates[0])
+                        else 0
+                    )
+                    in_cost = (in_tokens - cached_in) * rates[0] + cached_in * (
+                        cached_rate or Decimal(0)
+                    )
+                    if output_cap <= 0:
+                        out_tokens = 0
+                    elif stream_progress is not None:
+                        streamed = estimate_tokens(stream_progress.output_text)
+                        out_tokens = min(
+                            output_cap,
+                            streamed + min(512, max(64, math.ceil(elapsed * 90))),
+                        )
+                    else:
+                        out_tokens = min(output_cap, min(768, max(128, math.ceil(elapsed * 90))))
+                    est = (in_cost + out_tokens * rates[1]) / 1_000_000 + extra
+                floor = Decimal("0.000001") if reserve_usd > 0 else Decimal(0)
+                return min(reserve_usd, max(floor, est))
+
             try:
                 reservation = await self.store.reserve(
                     subject, budget_lane, reserve_usd, model_lane=model_lane
@@ -386,17 +447,52 @@ class GeminiGateway:
             except BaseException:
                 # A local hot revocation before dispatch is not a paid/provider failure.
                 await asyncio.shield(
-                    self.store.settle(reservation, Decimal(0), model_lane=model_lane)
+                    self.store.settle(
+                        reservation,
+                        Decimal(0),
+                        discounted_actual=Decimal(0),
+                        model_lane=model_lane,
+                    )
                 )
                 raise
+            started_at = time.monotonic()
             try:
                 async with asyncio.timeout(deadline_seconds):
                     result = await operation()
             except asyncio.CancelledError:
-                await asyncio.shield(self.store.settle(reservation, None, model_lane=model_lane))
+                not_dispatched = (
+                    stream_progress is not None and not stream_progress.dispatched
+                ) or (call_state is not None and not call_state.get("dispatched", True))
+                if not_dispatched:
+                    await asyncio.shield(
+                        self.store.settle(
+                            reservation,
+                            Decimal(0),
+                            discounted_actual=Decimal(0),
+                            model_lane=model_lane,
+                        )
+                    )
+                else:
+                    elapsed = max(0.0, time.monotonic() - started_at)
+                    await asyncio.shield(
+                        self.store.settle(
+                            reservation,
+                            None,
+                            fallback_actual=fallback_cost(elapsed),
+                            model_lane=model_lane,
+                        )
+                    )
                 raise
             except (TimeoutError, httpx.TimeoutException, APITimeoutError):
-                await asyncio.shield(self.store.settle(reservation, None, model_lane=model_lane))
+                elapsed = max(0.0, time.monotonic() - started_at)
+                await asyncio.shield(
+                    self.store.settle(
+                        reservation,
+                        None,
+                        fallback_actual=fallback_cost(elapsed),
+                        model_lane=model_lane,
+                    )
+                )
                 await self.store.runtime.provider_result(
                     "gemini_memory"
                     if model_lane == "memory_flex"
@@ -411,10 +507,37 @@ class GeminiGateway:
                     self.blocked_until = time.monotonic() + 60
                 raise Rejected("gemini_unavailable") from None
             except Rejected:
-                await asyncio.shield(self.store.settle(reservation, None, model_lane=model_lane))
+                elapsed = max(0.0, time.monotonic() - started_at)
+                await asyncio.shield(
+                    self.store.settle(
+                        reservation,
+                        None,
+                        fallback_actual=fallback_cost(elapsed),
+                        model_lane=model_lane,
+                    )
+                )
                 raise
-            except Exception:
-                await asyncio.shield(self.store.settle(reservation, None, model_lane=model_lane))
+            except Exception as exc:
+                stream_started = bool(stream_progress and stream_progress.started)
+                if self._non_billable_http_error(exc, stream_started):
+                    await asyncio.shield(
+                        self.store.settle(
+                            reservation,
+                            Decimal(0),
+                            discounted_actual=Decimal(0),
+                            model_lane=model_lane,
+                        )
+                    )
+                else:
+                    elapsed = max(0.0, time.monotonic() - started_at)
+                    await asyncio.shield(
+                        self.store.settle(
+                            reservation,
+                            None,
+                            fallback_actual=fallback_cost(elapsed),
+                            model_lane=model_lane,
+                        )
+                    )
                 await self.store.runtime.provider_result(
                     "gemini_memory"
                     if model_lane == "memory_flex"
@@ -426,6 +549,7 @@ class GeminiGateway:
                 if model_lane != "memory_flex" and budget_lane != "search":
                     self.blocked_until = time.monotonic() + 60
                 raise Rejected("gemini_unavailable") from None
+            elapsed = max(0.0, time.monotonic() - started_at)
             await self.store.runtime.provider_result(
                 "gemini_memory"
                 if model_lane == "memory_flex"
@@ -434,15 +558,26 @@ class GeminiGateway:
                 else "gemini_chat",
                 False,
             )
-            actual, usage = self._actual(result, rates), self._usage(result, model_lane)
+            token_actual = self._actual(result, rates)
+            usage = self._usage(result, model_lane)
+            actual = token_actual
             if additional_actual is not None:
                 extra = additional_actual(result)
-                actual = actual + extra if actual is not None and extra is not None else None
+                actual = (
+                    token_actual + extra if token_actual is not None and extra is not None else None
+                )
+            discounted = self._discounted(actual, usage, rates, priced_at=priced_at)
+            fallback = (
+                fallback_cost(elapsed, result=result, usage=usage, token_actual=token_actual)
+                if actual is None
+                else None
+            )
             await self.store.settle(
                 reservation,
                 actual,
                 usage=usage,
-                discounted_actual=self._discounted(actual, usage, rates, priced_at=priced_at),
+                discounted_actual=discounted,
+                fallback_actual=fallback,
                 model_lane=model_lane,
             )
             await run_guard(before_call)
@@ -459,28 +594,30 @@ class GeminiGateway:
         await guard()
         attempt = await controller.claim()
         result = None
+        call_state = {"dispatched": False}
         try:
 
-            async def operation():
-                return await cancellable(
-                    lambda: self.chat_client.aio.interactions.create(
-                        model="gemini-4-hydrogen",
-                        store=False,
-                        stream=False,
-                        background=False,
-                        automatic_continuation=False,
-                        system_instruction=SEARCH_INSTRUCTION,
-                        input=untrusted_input({"public_search_question": query}),
-                        tools=[{"type": "google_search", "search_types": ["web_search"]}],
-                        generation_config={
-                            "thinking_level": "medium",
-                            "max_output_tokens": 4096,
-                            "tool_choice": "auto",
-                            "thinking_summaries": "none",
-                        },
-                    ),
-                    cancel_event,
+            async def send_search():
+                call_state["dispatched"] = True
+                return await self.chat_client.aio.interactions.create(
+                    model="gemini-4-hydrogen",
+                    store=False,
+                    stream=False,
+                    background=False,
+                    automatic_continuation=False,
+                    system_instruction=SEARCH_INSTRUCTION,
+                    input=untrusted_input({"public_search_question": query}),
+                    tools=[{"type": "google_search", "search_types": ["web_search"]}],
+                    generation_config={
+                        "thinking_level": "medium",
+                        "max_output_tokens": 4096,
+                        "tool_choice": "auto",
+                        "thinking_summaries": "none",
+                    },
                 )
+
+            async def operation():
+                return await cancellable(send_search, cancel_event)
 
             result = await self._call(
                 subject,
@@ -496,6 +633,9 @@ class GeminiGateway:
                 additional_actual=lambda r: (
                     query_count(r) * QUERY_USD if query_count(r) is not None else None
                 ),
+                fallback_media_tokens=2048,
+                fallback_additional=QUERY_USD,
+                call_state=call_state,
             )
             parsed = parse_result(result)
             rendered = parsed.render(self.s)
@@ -663,6 +803,7 @@ class GeminiGateway:
                 + (video.tokens if video else 0),
                 before_call=before_call,
                 context_limit=source_limit + 12000,
+                fallback_media_tokens=len(images) * 560 + (video.tokens if video else 0),
             )
             bounds = thresholds()
             report.update(thresholds=bounds, reply_threshold=bounds["reply"])
@@ -1011,9 +1152,18 @@ class GeminiGateway:
                     sandbox_mode=getattr(route, "sandbox_mode", False),
                 )
 
+            progress = StreamProgress() if chat else None
+            call_state = {"dispatched": False}
+            cached_prefix = (
+                max(0, estimate_tokens(reserve_data) - estimate_tokens(wire_data)) if prev_id else 0
+            )
+
             async def operation():
                 if active_plan.model_lane == "carbon":
                     self.prefix_runtime.carbon_dispatched(scope, payload, rows)
+                call_state["dispatched"] = True
+                if progress is not None:
+                    progress.dispatched = True
                 response = await self.chat_client.aio.interactions.create(
                     model=model,
                     system_instruction=system,
@@ -1058,7 +1208,7 @@ class GeminiGateway:
                     },
                 )
 
-                return await consume_stream(response) if chat else response
+                return await consume_stream(response, progress) if chat else response
 
             async def controlled_operation():
                 return await cancellable(operation, cancel_event) if chat else await operation()
@@ -1087,6 +1237,10 @@ class GeminiGateway:
                     else None
                 ),
                 carbon_reserve_fallback=active_plan.model_lane == "carbon",
+                fallback_media_tokens=len(images) * 560 + (video.tokens if video else 0),
+                cached_prefix_tokens=cached_prefix,
+                stream_progress=progress,
+                call_state=call_state,
             )
             usage = self._usage(result, active_plan.model_lane)
             if chat and usage is None:
@@ -1135,7 +1289,7 @@ class GeminiGateway:
                     mark_chain_invalid()
                     raise asyncio.CancelledError
                 # One bounded lower-tier attempt, with a NEW reservation. Unknown first
-                # usage stays fully charged. Never retry safety errors or arbitrary failures.
+                # usage keeps its fallback charge. Never retry safety errors or arbitrary failures.
                 if carbon_acquired:
                     self.carbon_slots.release()
                     carbon_acquired = False

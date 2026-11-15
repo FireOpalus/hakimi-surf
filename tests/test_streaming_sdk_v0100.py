@@ -49,7 +49,7 @@ async def test_real_sdk_stream_cancel_closes_http_and_keeps_full_reserve(setting
         await task
     assert closed.is_set()
     row = await store.one("SELECT reserved,amount,status FROM ledger")
-    assert row[0] == row[1] > 0 and row[2] == "unknown"
+    assert 0 < row[1] < row[0] and row[2] == "unknown"
     assert len(await store.all("SELECT * FROM ledger")) == 1
 
 
@@ -78,7 +78,7 @@ async def test_real_sdk_timeout_downgrades_once_new_reservation_and_fixed_schema
     rows = await store.all(
         "SELECT amount,reserved,status FROM ledger WHERE lane='chat' ORDER BY rowid"
     )
-    assert rows[0]["status"] == "unknown" and rows[0]["amount"] == rows[0]["reserved"]
+    assert rows[0]["status"] == "unknown" and 0 < rows[0]["amount"] < rows[0]["reserved"]
     assert rows[1]["status"] == "settled"
 
 
@@ -93,3 +93,54 @@ async def test_sdk_arbitrary_error_is_never_retried(settings, store, sdk_pair):
     with pytest.raises(Rejected):
         await gateway.generate({"current_message": "你好"}, "s")
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "status,refunded", [(400, True), (429, True), (500, False), (502, False), (503, False)]
+)
+async def test_http_error_billing_policy_distinguishes_unbilled_vs_ambiguous(
+    settings, store, sdk_pair, status, refunded
+):
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(status, json={"error": {"code": status, "message": "mock"}})
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    try:
+        with pytest.raises(Rejected, match="gemini_unavailable"):
+            await gateway.generate({"current_message": "测试长一点的中文提示词用于对比预算"}, "s")
+        row = await store.one(
+            "SELECT l.status,l.amount,l.reserved,u.estimated_amount "
+            "FROM ledger l JOIN ledger_usage u ON u.id=l.id WHERE u.model_lane='hydrogen'"
+        )
+        if refunded:
+            assert row["status"] == "settled"
+            assert row["amount"] == 0 and row["estimated_amount"] == 0
+        else:
+            assert row["status"] == "unknown"
+            assert 0 < row["amount"] < row["reserved"]
+            assert row["estimated_amount"] is None
+    finally:
+        await gateway.close()
+
+
+async def test_pre_dispatch_cancel_refunds_zero_vs_mid_stream_fallback(settings, store, sdk_pair):
+    cancel = asyncio.Event()
+    cancel.set()
+    gateway = GeminiGateway(
+        settings,
+        store,
+        *sdk_pair(lambda r: httpx.Response(200, json=decision_response())),
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await gateway.generate(
+                {"current_message": "不会被发出去的一段中文消息"},
+                "s",
+                cancel_event=cancel,
+            )
+        row = await store.one("SELECT reserved,amount,status FROM ledger")
+        assert row["status"] == "settled" and row["amount"] == 0 and row["reserved"] > 0
+    finally:
+        await gateway.close()

@@ -7,16 +7,34 @@ from types import SimpleNamespace
 from .security import Rejected
 
 
-async def consume_stream(stream):
+class StreamProgress:
+    """Tracks stream execution state and assembled output for interrupted billing fallback."""
+
+    def __init__(self) -> None:
+        self.dispatched = False
+        self.started = False
+        self.text_parts: list[str] = []
+        self.thought_steps = 0
+
+    @property
+    def output_text(self) -> str:
+        return "".join(self.text_parts)
+
+
+async def consume_stream(stream, progress: StreamProgress | None = None):
     steps = {}
     length = 0
     try:
         async for event in stream:
+            if progress is not None:
+                progress.started = True
             kind = event.event_type
             if kind == "step.start":
                 step = event.step
                 if step.type not in {"thought", "model_output"}:
                     raise Rejected("unexpected_model_action")
+                if step.type == "thought" and progress is not None:
+                    progress.thought_steps += 1
                 if len(steps) >= 32 or event.index in steps:
                     raise Rejected("invalid_stream")
                 pieces = []
@@ -25,6 +43,8 @@ async def consume_stream(stream):
                         if part.type != "text":
                             raise Rejected("unexpected_model_content")
                         pieces.append(part.text or "")
+                    if progress is not None and pieces:
+                        progress.text_parts.extend(pieces)
                 steps[event.index] = (step.type, pieces)
             elif kind == "step.delta":
                 if event.index not in steps:
@@ -38,6 +58,8 @@ async def consume_stream(stream):
                     if length > 16000:
                         raise Rejected("invalid_output")
                     pieces.append(text)
+                    if progress is not None and text:
+                        progress.text_parts.append(text)
             elif kind == "error":
                 if getattr(event.error, "code", "") in {"gateway_timeout", "deadline_exceeded"}:
                     raise TimeoutError

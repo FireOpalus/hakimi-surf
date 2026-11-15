@@ -489,7 +489,8 @@ async def test_flex_capacity_failure_never_opens_live_chat_circuit(settings, sto
             {}, "s", scenario=Scenario.MEMORY_COMPRESSION, budget_lane="memory", memory_archive=True
         )
     assert len(requests) == 1 and gateway.blocked_until == 0
-    assert (await store.one("SELECT status FROM ledger"))[0] == "unknown"
+    row = await store.one("SELECT status,amount,reserved FROM ledger")
+    assert row["status"] == "unknown" and 0 < row["amount"] < row["reserved"]
 
 
 async def test_mirror_scheduler_remains_available_when_extraction_disabled(settings, store):

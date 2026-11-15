@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -24,7 +25,7 @@ async def observed(store, *, subject="s"):
     return reservation
 
 
-async def test_cache_discount_is_reported_but_never_releases_conservative_charge(store):
+async def test_cache_discount_settles_at_bill_aligned_charge(store):
     reservation = await observed(store)
     data = await store.usage()
     for period in ("today", "month", "lifetime"):
@@ -35,13 +36,13 @@ async def test_cache_discount_is_reported_but_never_releases_conservative_charge
         assert tokens["thought_tokens"] == 30
         assert tokens["cached_tokens"] == 600
         assert tokens["cache_hit_ratio"] == 0.6
-        assert costs["charged_microdollars"] == 1875
+        assert costs["charged_microdollars"] == 1020
         assert costs["estimated_microdollars"] == 1020
         assert costs["complete"] is True
-    assert data["lanes"][0]["amount"] == 1875
+    assert data["lanes"][0]["amount"] == 1020
     row = await store.one("SELECT * FROM ledger_usage WHERE id=?", (reservation,))
     assert row["cached_tokens"] == 600 and row["estimated_amount"] == 1020
-    assert (await store.budget_status())["monthly"] == 1875
+    assert (await store.budget_status())["monthly"] == 1020
 
 
 async def test_cache_ratio_uses_all_reported_interaction_inputs_and_marks_partial_coverage(store):
@@ -67,8 +68,9 @@ async def test_cache_ratio_uses_all_reported_interaction_inputs_and_marks_partia
     assert tokens["cache_coverage_complete"] is False
     assert tokens["thought_known_calls"] == 2
     costs = usage["cost_estimates"]["lifetime"]
-    assert costs["estimated_calls"] == 2 and costs["unknown_estimate_calls"] == 1
-    assert costs["complete"] is False
+    assert costs["estimated_calls"] == 3 and costs["unknown_estimate_calls"] == 0
+    assert costs["complete"] is True
+    assert costs["charged_microdollars"] == costs["estimated_microdollars"] == 1420
     assert (
         await store.one(
             "SELECT cached_tokens,thought_tokens FROM ledger_usage WHERE id=?", (missing,)
@@ -92,7 +94,7 @@ async def test_settlement_is_idempotent_under_concurrency(store):
     data = await store.usage()
     assert data["token_usage"]["lifetime"]["input_tokens"] == 1000
     assert data["cost_estimates"]["lifetime"]["estimated_calls"] == 1
-    assert data["cost_estimates"]["lifetime"]["charged_microdollars"] == 1875
+    assert data["cost_estimates"]["lifetime"]["charged_microdollars"] == 1020
     assert (await store.one("SELECT COUNT(*) FROM ledger_usage"))[0] == 1
 
 
@@ -134,8 +136,8 @@ async def test_aggregates_survive_pruning_and_restart(settings, monkeypatch):
         assert usage["token_usage"]["today"]["cached_tokens"] == 600
         assert usage["token_usage"]["lifetime"]["input_tokens"] == 1000
         assert usage["cost_estimates"]["lifetime"]["estimated_microdollars"] == 1020
-        assert (await restored.budget_status())["monthly"] == 1875
-        assert (await restored.budget_status())["total"] == 1875
+        assert (await restored.budget_status())["monthly"] == 1020
+        assert (await restored.budget_status())["total"] == 1020
     finally:
         await restored.close()
 
@@ -214,13 +216,13 @@ async def test_lowering_budget_below_spent_blocks_immediately_without_refunding(
     await observed(store)
     await store.set_budget_config(BudgetConfig(daily_usd="1", monthly_usd=".001"))
     status = await store.budget_status()
-    assert status["monthly"] == 1875 and status["monthly_limit"] == 1000
+    assert status["monthly"] == 1020 and status["monthly_limit"] == 1000
     assert status["hard_stop"]
     with pytest.raises(Rejected, match="budget_exhausted"):
         await store.reserve("s", "chat", Decimal(".000001"))
     await store.set_budget_config(BudgetConfig(daily_usd="1", monthly_usd="1"))
     assert not (await store.budget_status())["hard_stop"]
-    assert (await store.budget_status())["total"] == 1875
+    assert (await store.budget_status())["total"] == 1020
 
 
 @pytest.mark.parametrize("value", [BudgetConfig(daily_usd="0"), BudgetConfig(monthly_usd="0")])
@@ -252,7 +254,7 @@ async def test_hot_budget_override_restart_and_environment_reset(settings):
         reset = await restored.set_budget_config(None)
         assert reset["source"] == "env"
         assert Decimal(reset["config"]["daily_usd"]) == 9
-        assert (await restored.budget_status())["total"] == 1875
+        assert (await restored.budget_status())["total"] == 1020
     finally:
         await restored.close()
 
@@ -294,3 +296,75 @@ def test_observed_usage_rejects_invalid_provider_counts(kwargs):
 def test_budget_configuration_validates_amounts(amount):
     with pytest.raises(ValidationError):
         BudgetConfig(monthly_usd=amount)
+
+
+async def test_bill_aligned_reconciliation_upgrades_retained_rows_idempotently(settings):
+    day = datetime.now(UTC).astimezone(ZoneInfo(settings.bot_timezone)).date().isoformat()
+    store = Store(settings)
+    await store.open()
+    await store.close()
+    with sqlite3.connect(settings.data_dir / "hakimi.sqlite3") as db:
+        db.execute("DELETE FROM meta WHERE key='bill_aligned_v1'")
+        rows = [
+            ("cached-hit", day, "u1", "chat", 10000, 50000, "settled"),
+            ("legacy-settled", day, "u1", "chat", 1500, 5000, "settled"),
+            ("chat-unknown", day, "u1", "chat", 80000, 80000, "unknown"),
+            ("flex-unknown", day, "u1", "memory", 21000, 21000, "unknown"),
+        ]
+        db.executemany("INSERT INTO ledger VALUES (?,?,?,?,?,?,?)", rows)
+        db.execute("INSERT INTO ledger_usage VALUES ('cached-hit',1000,20,800,30,'hydrogen',3000)")
+        db.execute("INSERT INTO ledger_attribution VALUES ('cached-hit','hydrogen')")
+        db.execute("INSERT INTO ledger_attribution VALUES ('chat-unknown','hydrogen')")
+        db.execute("INSERT INTO ledger_attribution VALUES ('flex-unknown','memory_flex')")
+        # Include 50000 pruned unattributed historical microdollars in budget_totals / lifetime.
+        charged_total = 10000 + 1500 + 80000 + 21000
+        db.execute("UPDATE budget_totals SET amount=?", (charged_total + 50000,))
+        for period in ("day:" + day, "month:" + day[:7], "lifetime"):
+            total = charged_total + (50000 if period == "lifetime" else 0)
+            db.execute(
+                "INSERT OR REPLACE INTO usage_aggregates(period,charged_amount,calls,"
+                "known_usage_calls,input_tokens,output_tokens,cached_tokens,thought_tokens,"
+                "interaction_calls,interaction_input_tokens,cache_known_calls,"
+                "cache_known_input_tokens,thought_known_calls,estimated_amount,estimated_calls) "
+                "VALUES (?,?,4,1,1000,20,800,30,1,1000,1,1000,1,3000,1)",
+                (period, total),
+            )
+            for lane, n, chg, est, est_n in (
+                ("hydrogen", 2, 90000, 3000, 1),
+                ("unknown", 1, 1500, 0, 0),
+                ("memory_flex", 1, 21000, 0, 0),
+            ):
+                db.execute(
+                    "INSERT INTO model_usage_aggregates VALUES (?,?,?,?,?,?,1000,800,20,30)",
+                    (period, lane, n, chg, est, est_n),
+                )
+    expected_snapshot = None
+    for _ in range(2):
+        restored = Store(settings)
+        await restored.open()
+        try:
+            chat_u = (await restored.one("SELECT amount FROM ledger WHERE id='chat-unknown'"))[0]
+            flex_u = (await restored.one("SELECT amount FROM ledger WHERE id='flex-unknown'"))[0]
+            assert 0 < chat_u < 80000 and 0 < flex_u < 21000
+            cached_row = await restored.one("SELECT amount FROM ledger WHERE id='cached-hit'")
+            assert cached_row[0] == 3000
+            legacy_est = await restored.one(
+                "SELECT estimated_amount FROM ledger_usage WHERE id='legacy-settled'"
+            )
+            assert legacy_est[0] == 1500
+            expected_charged = 3000 + 1500 + chat_u + flex_u
+            usage = await restored.usage()
+            costs_today = usage["cost_estimates"]["today"]
+            costs_life = usage["cost_estimates"]["lifetime"]
+            assert costs_today["charged_microdollars"] == expected_charged
+            assert costs_today["estimated_microdollars"] == 4500
+            assert costs_today["estimated_calls"] == 2
+            assert costs_today["unknown_estimate_calls"] == 2
+            assert costs_life["charged_microdollars"] == expected_charged + 50000
+            assert costs_life["estimated_microdollars"] == 4500
+            if expected_snapshot is None:
+                expected_snapshot = usage
+            else:
+                assert usage["cost_estimates"] == expected_snapshot["cost_estimates"]
+        finally:
+            await restored.close()

@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="hakimi-surf 1.1.5 源码架构：境内 NapCat 与境外单进程后端、群聊视频显式触发、分层筛查、投递结果审计、差量续链与双轨记忆。">
-  <title>hakimi-surf 1.1.5 · 项目架构图</title>
+  <meta name="description" content="hakimi-surf 1.1.8 源码架构：跨机 OneBot、A/B/C 差量续链、Bot 阈值、双轨记忆、缓存折扣结算、流中断估算与历史账本迁移。">
+  <title>hakimi-surf 1.1.8 · 项目架构图</title>
   <style>
     :root {
       color-scheme: light;
@@ -276,6 +276,11 @@
     .bot-paths{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.bot-path{padding:20px;border:1px solid var(--line);border-radius:11px;min-width:0;display:flex;flex-direction:column}.bot-path h4{font-size:15px;margin:0 0 10px}.bot-path p{font-size:13px;color:var(--muted);margin:0 0 16px}.bot-path .plane-label{margin-bottom:12px}.bot-path.adaptive{background:var(--violet-soft);border-color:transparent}.bot-path.invited{background:var(--teal-soft);border-color:transparent}.path-result{margin-top:auto;font-size:11px;font-weight:600;padding-top:12px;border-top:1px solid var(--line)}
     .archive-map{border-top:1px solid var(--line);padding-top:26px;margin-top:26px}.archive-map .memory-title{margin-bottom:18px}.batch-outcomes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:22px}.batch-outcomes article{padding:15px;border-left:2px solid var(--teal);background:var(--subtle)}.batch-outcomes h4{font-size:13px;margin-bottom:6px}.batch-outcomes p{font-size:12px;color:var(--muted)}
     @media(max-width:800px){.bot-paths,.batch-outcomes{grid-template-columns:1fr}.bot-path{padding:17px}.archive-map .policy-flow{grid-template-columns:1fr}.archive-map .policy-flow li:not(:last-child)::after{content:'↓';top:auto;bottom:-23px;right:50%}}
+
+    .billing-map{margin-top:22px;border-top:3px solid var(--teal)}.billing-map .policy-flow{grid-template-columns:repeat(4,minmax(0,1fr))}.billing-map .policy-flow li:nth-child(3)::after{content:'→'}.billing-map .policy-index{color:var(--teal)}
+    .billing-outcomes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:22px 0}.billing-outcomes article{padding:18px;border:1px solid var(--line);border-radius:10px;background:var(--subtle)}.billing-outcomes h4{font-size:14px;margin-bottom:8px}.billing-outcomes p{font-size:12px;color:var(--muted)}.billing-outcomes code{display:block;margin-bottom:8px;color:var(--teal);font-size:11px}.billing-outcomes .uncertain{background:var(--amber-soft);border-color:transparent}.billing-outcomes .uncertain code{color:var(--amber)}
+    .migration-line{padding:18px 20px;border-left:3px solid var(--violet);background:var(--violet-soft);border-radius:0 8px 8px 0}.migration-line h4{margin-bottom:6px}.migration-line p{font-size:12px;color:var(--muted)}
+    @media(max-width:800px){.billing-map .policy-flow{grid-template-columns:1fr}.billing-map .policy-flow li:not(:last-child)::after{content:'↓';top:auto;bottom:-23px;right:50%}.billing-outcomes{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -283,15 +288,15 @@
   <main class="page">
     <header class="masthead">
       <div class="brand"><span class="brand-mark" aria-hidden="true">H</span> hakimi-surf</div>
-      <div class="meta">SOURCE ARCHITECTURE · <a href="pyproject.toml">v1.1.7</a> · 2026-11-15</div>
+      <div class="meta">SOURCE ARCHITECTURE · <a href="pyproject.toml">v1.1.8</a> · 2026-11-15</div>
     </header>
     <section class="hero" aria-labelledby="page-title">
       <div class="eyebrow">QQ ASSISTANT / SYSTEM MAP</div>
       <h1 id="page-title">哈基米 <span>／ 项目架构图</span></h1>
-      <p>境内协议接入，境外会话编排。沿消息查看准入、Bot 接话阈值、模型生成与确认投递；沿冷历史查看合批、预算预检与 Flex 提炼。配置控制流与付费数据流分开标明。</p>
+      <p>境内协议接入，境外会话编排。消息、热配置与冷历史各有边界；本版沿每次模型请求展开事务预留、缓存折扣结算、流中断估算及旧账本校正。</p>
       <div class="hero-bottom">
-        <div class="tags"><span class="tag">单进程 FastAPI</span><span class="tag">默认 2 个异步消费者</span><span class="tag">按会话隔离</span><span class="tag">Bot 阈值分流</span><span class="tag">冷历史合批预检</span><span class="tag">分项预算独立限制</span><span class="tag">决策关联投递结果</span><span class="tag">ACK 后写入助手历史</span></div>
-        <nav aria-label="架构图导航"><a href="#overview">部署</a><a href="#pipeline">消息流</a><a href="#audit">筛查与审计</a><a href="#bot-routing">Bot 接话</a><a href="#controls">热配置与预算</a><a href="#context">上下文与续链</a><a href="#memory">双轨记忆</a><a href="#operations">后台与控制</a><a href="#sources">源码</a></nav>
+        <div class="tags"><span class="tag">单进程 FastAPI</span><span class="tag">默认 2 个异步消费者</span><span class="tag">按会话隔离</span><span class="tag">Bot 阈值分流</span><span class="tag">冷历史合批预检</span><span class="tag">预留与结算分离</span><span class="tag">中断费用有限估算</span><span class="tag">决策关联投递结果</span><span class="tag">ACK 后写入助手历史</span></div>
+        <nav aria-label="架构图导航"><a href="#overview">部署</a><a href="#pipeline">消息流</a><a href="#audit">筛查与审计</a><a href="#bot-routing">Bot 接话</a><a href="#controls">热配置</a><a href="#billing">费用结算</a><a href="#context">上下文与续链</a><a href="#memory">双轨记忆</a><a href="#operations">后台与控制</a><a href="#sources">源码</a></nav>
       </div>
     </section>
 
@@ -392,7 +397,7 @@
 
 
     <section class="section" id="controls" aria-labelledby="controls-title">
-      <div class="section-heading"><h2 id="controls-title"><span>04</span>热配置控制流与预算门禁</h2><p>v1.1.7 · 管理员显式修改，SQLite 持久化，当前进程立即应用</p></div>
+      <div class="section-heading"><h2 id="controls-title"><span>04</span>热配置控制流与预算门禁</h2><p>v1.1.8 · 管理员显式修改，SQLite 持久化，当前进程立即应用</p></div>
       <figure class="panel policy-panel" aria-describedby="controls-caption">
         <div class="plane-label">CONTROL PLANE / 配置写入路径</div>
         <ol class="policy-flow">
@@ -409,10 +414,28 @@
           <article><h3>订阅巡逻</h3><p>最多 1–50 个订阅 · 轮询 900–86400 秒<br>缩短间隔时推进过远的 next_poll</p><div class="files"><a href="src/hakimi/runtime_state.py">RuntimeState._save_limits()</a></div><code>/admin/api/patrol-limits</code></article>
         </div>
         <div class="budget-map">
-          <div><span class="plane-label">BEFORE EVERY PAID CALL</span><h3>一次请求，逐层校验</h3><p>完整上下文 + 输出上限估算 → SQLite 事务预留 → API 调用 → usage 结算；失败或未知用量保留保守扣账。</p></div>
+          <div><span class="plane-label">BEFORE EVERY PAID CALL</span><h3>一次请求，逐层校验</h3><p>完整上下文 + 输出上限估算 → SQLite 事务预留 → API 调用 → 按 usage 结算。缓存折扣释放多余预留，含糊失败保留未知标记并回退估算。</p></div>
           <div class="budget-levels"><div><b>全局</b><span>自然日 / 自然月 / 累计总额</span></div><div><b>用户</b><span>跨群与私聊共用用户日预算</span></div><div><b>分项</b><span>巡逻 / 记忆 / 主动私信 / 管理测试</span></div><div><b>专用</b><span>联网次数与费用等功能独立上限</span></div></div>
         </div>
         <figcaption id="controls-caption">后台可调日／月、单用户及四类分项日预算；累计总上限仍由 .env 管理。上限为 0 暂停相关付费调用，0 Token 指令和模板告警继续可用。旧预算行合并缺失字段后加载；审计分别标明日、月、用户或分项额度不足。<span class="files"><a href="src/hakimi/budget_policy.py">budget_policy.py</a> · <a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="tests/test_policy_admin.py">持久化／热更新测试</a></span></figcaption>
+      </figure>
+
+      <figure class="panel billing-map" id="billing" aria-labelledby="billing-title" aria-describedby="billing-caption">
+        <div class="section-heading"><h3 id="billing-title">每次模型调用：预留、结算与未知费用</h3><p>v1.1.8 · 当前费率来自配置，本地估算不代表供应商最终账单</p></div>
+        <ol class="policy-flow">
+          <li><span class="policy-index">01 / RESERVE</span><h3>事务预留完整上界</h3><p>完整上下文、媒体与输出上限；检查全局、用户和分项预算，先占额度再发请求。</p><code>Store.reserve()</code></li>
+          <li><span class="policy-index">02 / DISPATCH</span><h3>追踪请求与流进度</h3><p>记录是否发出、是否收到事件及输出片段。部分文本仅作估算依据，不直接发给 QQ。</p><code>StreamProgress / _call()</code></li>
+          <li><span class="policy-index">03 / SETTLE</span><h3>按结果选择结算</h3><p>有效 usage 应用缓存费率与工具费；未计费分支退回，含糊结果保持未知并估算。</p><code>Store.settle()</code></li>
+          <li><span class="policy-index">04 / AGGREGATE</span><h3>同步预算与管理台</h3><p>更新账目、总额、日／月／累计及按模型聚合；memory_flex 同样纳入缓存观测。</p><code>ledger → usage_aggregates</code></li>
+        </ol>
+        <div class="billing-outcomes">
+          <article><code>SETTLED / 有效用量</code><h4>缓存折扣进入预算扣账</h4><p>按 usage 和配置价格计算，释放多余预留；缺失缓存字段不补造命中，不应用未知折扣。联网另加已报告的查询费。</p></article>
+          <article><code>SETTLED = 0 / 未计费错误策略</code><h4>发出前取消或指定 HTTP 拒绝</h4><p>撤销发生在发送前，或尚未收到流事件且返回 400／401／403／404／409／413／422／429 时，释放预留；不泛化到所有错误。</p></article>
+          <article class="uncertain"><code>UNKNOWN / 有限回退估算</code><h4>超时、流中断或用量不完整</h4><p>利用可用 usage，或文本估算、媒体、输出片段与耗时余量；不超过预留，正预留至少计 1 微美元。状态与缺失明细仍为未知。</p></article>
+          <article class="uncertain"><code>UNKNOWN / 无回退信息</code><h4>进程崩溃与待恢复预留</h4><p>保留在途预留金额，不自动重发。已有超支熔断继续生效；有限重试使用新预留，前一轮费用不清零。</p></article>
+        </div>
+        <div class="migration-line"><h4>首次启动：校正保留明细，同步聚合，一次完成</h4><p>非 reserved 的保留账目 → 合法旧折后金额或已归属未知项启发式估算 → 事务更新账目及聚合 → 写入 <code>meta.bill_aligned_v1</code>。已清理历史保留原聚合；不补造 Token。再次启动不重复校正，旧口径回滚需要配套数据库备份。</p></div>
+        <figcaption id="billing-caption">调用前仍用保守上界防并发超支；调用后用量结算和回退估算分开标识。回退费用可能高于或低于最终账单，未知费用不会显示为免费。<span class="files"><a href="src/hakimi/gemini.py">请求与费用分支</a> · <a href="src/hakimi/streaming.py">流进度</a> · <a href="src/hakimi/store.py">事务结算与迁移</a> · <a href="src/hakimi/budget_calendar.py">日历聚合</a> · <a href="docs/BILLING_118.md">迁移说明</a></span></figcaption>
       </figure>
     </section>
 
@@ -450,7 +473,7 @@
           <p class="chain-loop">↩ 下一轮读取已确认标识 → 校验 expires / epoch / trim_version / system_digest → 选择全量或差量请求。撤回、清空、历史裁剪、过期、前缀变化或投递失败会使旧链失效。</p>
           <div class="chain-controls">
             <div><h4>开关与本地有效期</h4><p><code>HAKIMI_INTERACTION_STORE_ENABLED=true</code> 默认允许主对话续链；设为 false 则回到独立请求。<code>HAKIMI_INTERACTION_CHAIN_TTL_SECONDS=21600</code>，再与会话记忆 TTL 取较小值。</p></div>
-            <div><h4>预算按完整上下文预留</h4><p>差量仅改变实际发送的历史，不减少本地保守预留依据。按返回 usage 结算；未知用量继续保留预留，不把少传字节等同于已确认节省费用。</p></div>
+            <div><h4>预算按完整上下文预留</h4><p>差量仅改变实际发送的历史，不减少调用前预留依据。结算优先使用 usage 中的缓存量；缺失 usage 时才估算续链复用前缀，且保持 unknown，不把少传字节当作已确认账单折扣。</p></div>
           </div>
           <figcaption id="chain-caption"><code>store=True</code> 在模型请求阶段启用云端保存；ACK 约束的是本地续链标识提交。本地默认 6 小时有效期不代表云端数据删除期限。<span class="files"><a href="src/hakimi/gemini.py">gemini.py</a> · <a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/outgoing.py">outgoing.py</a> · <a href="docs/GROUP_CONTEXT_114.md">1.1.4 升级说明</a></span></figcaption>
         </figure>
@@ -519,7 +542,7 @@
       </div>
       <div class="control-panel">
         <article><h3>/admin · 可热更新的运行策略</h3><p>15 个模块按运行、对话、记忆与巡逻分组；热调 Bot 默认／逐账号阈值、RPM、队列、发送间隔、模型输出与订阅配额。会话面板新增归档健康统计。</p><p>覆盖配置加密保存到主库，重启后恢复。后台独立鉴权、同源检查；运行策略由管理员显式设置，模型不能自行修改。</p><div class="files"><a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a></div></article>
-        <article><h3>统一预算与运行观测</h3><p>每次模型请求先预留再结算；续链也按完整逻辑上下文保守预留，未知用量保留预留。搜索次数／工具费、memory_flex 与模型分账统一受全局日／月／总预算、用户及分项日预算约束；任一相关额度不足都会阻止调用。</p><p>按 BOT_TIMEZONE 计日；观测 Token、缓存、思考与来源归属。历史未知账目保持“历史未归属（Gemini）”，不猜测为 Drive 费用。</p><div class="files"><a href="src/hakimi/budget_calendar.py">budget_calendar.py</a> · <a href="src/hakimi/usage_accounting.py">usage_accounting.py</a> · <a href="src/hakimi/model_accounting.py">model_accounting.py</a></div></article>
+        <article><h3>统一预算与运行观测</h3><p>每次模型请求先预留再结算；续链按完整逻辑上下文预留，返回后缓存折扣直接进入预算扣账。含糊失败用有限估算，崩溃后缺少回退信息则保留预留。搜索次数／工具费、memory_flex 与模型分账统一受全局、用户及分项预算约束。</p><p>按 BOT_TIMEZONE 计日；观测 Token、缓存、思考与来源归属；本地费用估算不等于 Google 最终账单。历史未知账目保持“历史未归属（Gemini）”，不猜测为 Drive 费用。</p><div class="files"><a href="src/hakimi/budget_calendar.py">budget_calendar.py</a> · <a href="src/hakimi/usage_accounting.py">usage_accounting.py</a> · <a href="src/hakimi/model_accounting.py">model_accounting.py</a></div></article>
       </div>
     </section>
 
@@ -536,9 +559,9 @@
         <div><dt>主动任务与 Drive</dt><dd><a href="src/hakimi/proactive_dm.py">proactive_dm.py</a> · <a href="src/hakimi/roaming_logger.py">roaming_logger.py</a> · <a href="src/hakimi/drive_client.py">drive_client.py</a> · <a href="src/hakimi/drive_oauth.py">drive_oauth.py</a> · <a href="src/hakimi/notebook_snapshot.py">notebook_snapshot.py</a></dd></div>
         <div><dt>控制面与账本</dt><dd><a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="src/hakimi/admin_auth.py">admin_auth.py</a> · <a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/community_admin.py">community_admin.py</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a> · <a href="src/hakimi/budget_policy.py">budget_policy.py</a> · <a href="src/hakimi/limits_policy.py">limits_policy.py</a> · <a href="src/hakimi/config.py">config.py</a></dd></div>
       </dl></div></details>
-      <details><summary>版本依据与部署文档 <span>当前行为优先参照 1.1.7 代码</span></summary><div class="detail-content"><p><a href="docs/BOT_MEMORY_117.md">1.1.7 Bot 阈值与合批归档</a> · <a href="docs/CONTROL_PLANE_116.md">1.1.6 热配置与管理台</a> · <a href="docs/DELIVERY_AUDIT_115.md">1.1.5 视频触发与执行审计</a> · <a href="docs/GROUP_CONTEXT_114.md">1.1.4 群聊上下文与差量续链</a> · <a href="docs/NATURAL_PIPELINE_112.md">1.1.2 / 1.1.3 主对话与自然回复</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置与受控联网</a> · <a href="docs/MEMORY_100.md">双轨记忆与治理</a> · <a href="docs/STREAMING_010.md">流式管道与 ACK 投递</a> · <a href="docs/CONTEXT_ROUTING_09.md">A/B/C 与分档路由</a></p><p><a href="README.md">README</a> · <a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a> · <a href="docs/UPGRADE.md">升级交付</a> · <a href="Dockerfile">Dockerfile</a> · <a href="compose.roaming.yaml">Drive SA 覆盖</a> · <a href="compose.roaming-oauth.yaml">Drive OAuth 覆盖</a></p><p>图中展示源码支持的结构与默认值；实例启用状态由配置与管理台决定。当前快照对应 v1.1.7 工作树，本版重点核对 <code>bot_guard.py</code>、<code>gateway.py</code>、<code>dual_memory.py</code> 与 <code>memory_compressor.py</code>；热配置、差量续链和 ACK 投递沿用既有结构。部分早期文档保留旧行为说明，以当前实现为准。</p></div></details>
+      <details><summary>版本依据与部署文档 <span>当前行为优先参照 1.1.8 代码</span></summary><div class="detail-content"><p><a href="docs/BILLING_118.md">1.1.8 结算与历史账本校正</a> · <a href="docs/BOT_MEMORY_117.md">1.1.7 Bot 阈值与合批归档</a> · <a href="docs/CONTROL_PLANE_116.md">1.1.6 热配置与管理台</a> · <a href="docs/DELIVERY_AUDIT_115.md">1.1.5 视频触发与执行审计</a> · <a href="docs/GROUP_CONTEXT_114.md">1.1.4 群聊上下文与差量续链</a> · <a href="docs/NATURAL_PIPELINE_112.md">1.1.2 / 1.1.3 主对话与自然回复</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置与受控联网</a> · <a href="docs/MEMORY_100.md">双轨记忆与治理</a> · <a href="docs/STREAMING_010.md">流式管道与 ACK 投递</a> · <a href="docs/CONTEXT_ROUTING_09.md">A/B/C 与分档路由</a></p><p><a href="README.md">README</a> · <a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a> · <a href="docs/UPGRADE.md">升级交付</a> · <a href="Dockerfile">Dockerfile</a> · <a href="compose.roaming.yaml">Drive SA 覆盖</a> · <a href="compose.roaming-oauth.yaml">Drive OAuth 覆盖</a></p><p>图中展示源码支持的结构与默认值；实例启用状态由配置与管理台决定。当前快照对应 v1.1.8 工作树，本版重点核对 <code>gemini.py</code>、<code>streaming.py</code>、<code>store.py</code> 与 <code>budget_calendar.py</code>；Bot 分流、合批记忆、热配置、差量续链和 ACK 投递沿用既有结构。部分早期文档保留旧行为说明，以当前实现为准。</p></div></details>
     </section>
-    <footer><span>hakimi-surf / v1.1.7 · 源码架构快照 · 2026-11-15</span><span>独立 HTML + CSS · 无外部资源 · <a href="#overview">返回总览 ↑</a></span></footer>
+    <footer><span>hakimi-surf / v1.1.8 · 源码架构快照 · 2026-11-15</span><span>独立 HTML + CSS · 无外部资源 · <a href="#overview">返回总览 ↑</a></span></footer>
   </main>
 </body>
 </html>

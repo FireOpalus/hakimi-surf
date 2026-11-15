@@ -189,6 +189,7 @@ class Store:
                     if row:
                         self.s.group_policies[name] = row[0]
         await model_accounting.initialize(self)
+        await self._reconcile_bill_aligned_v1()
         await self.runtime.load_config()
         await self._load_budget_config()
         await self.groups.initialize()
@@ -238,6 +239,112 @@ class Store:
             "INSERT INTO meta VALUES ('usage_history_v1',?)",
             (self.vault.seal("usage-history", history),),
         )
+
+    def _reconciled_unknown_microdollars(
+        self, lane: str, model_lane: str | None, reserved: int
+    ) -> int:
+        if reserved <= 0:
+            return 0
+        if model_lane in {"hydrogen", "interaction", "chat"}:
+            in_rate, out_rate = self.s.chat_input_usd_per_m, self.s.chat_output_usd_per_m
+            if lane == "search":
+                fixed_ceiling = microdollars(
+                    (Decimal(16000) * in_rate + Decimal(4096) * out_rate) / 1_000_000
+                    + Decimal("0.14")
+                )
+                text_part = max(0, reserved - fixed_ceiling) // 3
+                est = text_part + microdollars(
+                    (Decimal(2048) * in_rate + Decimal(256) * out_rate) / 1_000_000
+                    + Decimal("0.014")
+                )
+                return max(1, min(reserved, est))
+        elif model_lane == "memory_flex":
+            out_rate = self.s.chat_output_usd_per_m / 2
+        elif model_lane == "carbon":
+            out_rate = self.s.carbon_output_usd_per_m
+        else:
+            return reserved
+        cap_micro = 0
+        for cap in (16384, 8192, 4096):
+            candidate = microdollars(Decimal(cap) * out_rate / 1_000_000)
+            if reserved > candidate + 1000:
+                cap_micro = candidate
+                break
+        input_part = max(0, reserved - cap_micro) // 3
+        out_part = microdollars(Decimal(256) * out_rate / 1_000_000)
+        return max(1, min(reserved, input_part + out_part))
+
+    async def _reconcile_bill_aligned_v1(self) -> None:
+        async with self.transaction():
+            if await self.one("SELECT 1 FROM meta WHERE key='bill_aligned_v1'"):
+                return
+            rows = await self.all(
+                "SELECT l.id,l.day,l.lane,l.reserved,l.amount,l.status,"
+                "u.id AS uid,u.input_tokens,u.estimated_amount,"
+                "COALESCE(u.model_lane,a.model_lane) AS model_lane "
+                "FROM ledger l "
+                "LEFT JOIN ledger_usage u ON u.id=l.id "
+                "LEFT JOIN ledger_attribution a ON a.id=l.id "
+                "WHERE l.status<>'reserved'"
+            )
+            for row in rows:
+                status = row["status"]
+                amount = row["amount"]
+                reserved = row["reserved"]
+                est = row["estimated_amount"]
+                if status == "settled":
+                    if est is not None and 0 <= est <= amount:
+                        new_amount, new_est = est, est
+                    elif est is None and (amount < reserved or row["input_tokens"] is not None):
+                        new_amount, new_est = amount, amount
+                    else:
+                        new_amount, new_est = amount, est
+                elif status == "unknown" and amount == reserved > 0:
+                    new_amount = self._reconciled_unknown_microdollars(
+                        row["lane"], row["model_lane"], reserved
+                    )
+                    new_est = est
+                else:
+                    new_amount, new_est = amount, est
+                d_amount = new_amount - amount
+                d_est = (new_est or 0) - (est or 0)
+                d_est_calls = int(new_est is not None) - int(est is not None)
+                if not (d_amount or d_est or d_est_calls):
+                    continue
+                if d_amount:
+                    await self.db.execute(
+                        "UPDATE ledger SET amount=? WHERE id=?", (new_amount, row["id"])
+                    )
+                    await self.db.execute(
+                        "UPDATE budget_totals SET amount=MAX(0,amount+?)", (d_amount,)
+                    )
+                if d_est or d_est_calls:
+                    if row["uid"] is not None:
+                        await self.db.execute(
+                            "UPDATE ledger_usage SET estimated_amount=? WHERE id=?",
+                            (new_est, row["id"]),
+                        )
+                    elif new_est is not None:
+                        await self.db.execute(
+                            "INSERT INTO ledger_usage VALUES (?,NULL,NULL,NULL,NULL,?,?)",
+                            (row["id"], row["model_lane"], new_est),
+                        )
+                lane_key = model_accounting.lane_name(row["model_lane"])
+                for period in self._periods(row["day"]):
+                    await self.db.execute(
+                        "UPDATE usage_aggregates SET charged_amount=MAX(0,charged_amount+?),"
+                        "estimated_amount=MAX(0,estimated_amount+?),"
+                        "estimated_calls=MAX(0,estimated_calls+?) WHERE period=?",
+                        (d_amount, d_est, d_est_calls, period),
+                    )
+                    await self.db.execute(
+                        "UPDATE model_usage_aggregates SET charged_amount=MAX(0,charged_amount+?),"
+                        "estimated_amount=MAX(0,estimated_amount+?),"
+                        "estimated_calls=MAX(0,estimated_calls+?) "
+                        "WHERE period=? AND model_lane=?",
+                        (d_amount, d_est, d_est_calls, period, lane_key),
+                    )
+            await self.db.execute("INSERT INTO meta VALUES ('bill_aligned_v1','1')")
 
     async def _load_budget_config(self):
         async with self.lock:
@@ -567,16 +674,16 @@ class Store:
         *,
         usage: TokenUsage | None = None,
         discounted_actual: Decimal | None = None,
+        fallback_actual: Decimal | None = None,
         model_lane: str | None = None,
     ) -> None:
-        # No usage or an ambiguous failure: keep the entire reservation, including on restart.
+        # Unknown/ambiguous failures settle via bounded fallback (or keep reserve on crash).
         if actual is not None and (
             not isinstance(actual, Decimal) or not actual.is_finite() or actual < 0
         ):
             raise Rejected("invalid_budget_amount")
         if not isinstance(usage, TokenUsage):
             usage = None
-        # Unknown/malformed discount metadata must not interfere with conservative settlement.
         if (
             not isinstance(discounted_actual, Decimal)
             or not discounted_actual.is_finite()
@@ -585,6 +692,12 @@ class Store:
             or discounted_actual > actual
         ):
             discounted_actual = None
+        if (
+            not isinstance(fallback_actual, Decimal)
+            or not fallback_actual.is_finite()
+            or fallback_actual < 0
+        ):
+            fallback_actual = None
         overrun = False
         async with self.transaction():
             row = await self.one("SELECT * FROM ledger WHERE id=?", (reservation,))
@@ -598,7 +711,19 @@ class Store:
                 or (usage.model_lane if usage else None)
                 or (attribution[0] if attribution else None)
             )
-            amount = row["amount"] if actual is None else microdollars(actual)
+            if actual is not None:
+                billable = discounted_actual if discounted_actual is not None else actual
+                amount = microdollars(billable)
+                estimated = amount
+                status = "settled"
+            else:
+                amount = (
+                    row["amount"]
+                    if fallback_actual is None
+                    else min(row["reserved"], microdollars(fallback_actual))
+                )
+                estimated = None
+                status = "unknown"
             await self.db.execute(
                 "UPDATE budget_totals SET amount=amount+?", (amount - row["amount"],)
             )
@@ -606,13 +731,8 @@ class Store:
             overrun = amount > row["reserved"]
             await self.db.execute(
                 "UPDATE ledger SET amount=?,status=? WHERE id=?",
-                (
-                    amount,
-                    "unknown" if actual is None else "settled",
-                    reservation,
-                ),
+                (amount, status, reservation),
             )
-            estimated = microdollars(discounted_actual) if discounted_actual is not None else None
             await self.db.execute(
                 "INSERT INTO ledger_usage VALUES (?,?,?,?,?,?,?)",
                 (

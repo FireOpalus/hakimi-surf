@@ -189,7 +189,7 @@ async def test_search_provider_failure_does_not_open_chat_circuit(settings, stor
             await gateway.search("公开问题", "s")
         assert gateway.blocked_until == 0
         row = await store.one("SELECT status,amount,reserved FROM ledger WHERE lane='search'")
-        assert row["status"] == "unknown" and row["amount"] == row["reserved"] > 0
+        assert row["status"] == "unknown" and 0 < row["amount"] < row["reserved"]
     finally:
         await gateway.close()
 

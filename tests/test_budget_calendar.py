@@ -41,12 +41,12 @@ async def test_midnight_and_month_rollover_are_shanghai_not_host_utc(store, monk
     set_clock(monkeypatch, "2026-11-30T15:59:59+00:00")
     await charge(store)
     before = await store.budget_status()
-    assert before["day_local"] == "2026-11-30" and before["monthly"] == 20000
+    assert before["day_local"] == "2026-11-30" and before["monthly"] == 10000
     set_clock(monkeypatch, "2026-11-30T16:00:00+00:00")
     after = await store.budget_status()
     assert after["day_local"] == "2026-12-01" and after["month_local"] == "2026-12"
     assert after["daily"] == after["monthly"] == 0
-    assert after["total"] == 20000 and after["timezone"] == "Asia/Shanghai"
+    assert after["total"] == 10000 and after["timezone"] == "Asia/Shanghai"
     await charge(store)
     usage = await store.usage()
     assert usage["day_local"] == "2026-12-01"
@@ -118,8 +118,8 @@ async def test_utc_migration_rebuckets_retained_rows_preserves_all_lifetime_metr
                 == lifetime
             )
             status = await store.budget_status()
-            assert status["daily"] == status["monthly"] == status["total"] == 40000
-            assert status["monthly_calendar_carry"] == (20000 if prune else 0)
+            assert status["daily"] == status["monthly"] == status["total"] == 20000
+            assert status["monthly_calendar_carry"] == (10000 if prune else 0)
             usage = await store.usage()
             assert usage["token_usage"]["lifetime"]["cached_tokens"] == 1000
             assert usage["token_usage"]["lifetime"]["thought_tokens"] == 24
@@ -151,18 +151,18 @@ async def test_unknown_legacy_timestamps_add_conservative_carry_without_inventin
     await store.open()
     try:
         status = await store.budget_status()
-        assert status["monthly"] == status["daily"] == 40000
+        assert status["monthly"] == status["daily"] == 20000
         assert status["monthly_observed"] == 0
-        assert status["monthly_calendar_carry"] == 40000
+        assert status["monthly_calendar_carry"] == 20000
         assert (await store.usage())["token_usage"]["today"]["cached_tokens"] == 0
         assert (await store.usage())["history"]["calendar"]["missing_timestamp_calls"] == 2
-        store.s.daily_usd = Decimal(".04")
+        store.s.daily_usd = Decimal(".02")
         with pytest.raises(Rejected, match="budget_exhausted"):
             await store.reserve("u", "chat", Decimal(".000001"))
         # Day carry expires at the Shanghai boundary, month carry remains until next month.
         set_clock(monkeypatch, "2026-12-01T16:00:00+00:00")
         assert (await store.budget_status())["daily"] == 0
-        assert (await store.budget_status())["monthly"] == 40000
+        assert (await store.budget_status())["monthly"] == 20000
     finally:
         await store.close()
 
@@ -179,7 +179,7 @@ async def test_preaggregate_unassigned_lifetime_cost_is_not_lost(settings, monke
     await store.open()
     try:
         status = await store.budget_status()
-        assert status["total"] == status["monthly"] == status["daily"] == 50000
+        assert status["total"] == status["monthly"] == status["daily"] == 30000
         assert (await store.usage())["history"]["calendar"]["unassigned_microdollars"] == 10000
     finally:
         await store.close()
