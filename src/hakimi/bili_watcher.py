@@ -580,7 +580,7 @@ class BiliWatcher:
             await self.svc.proactive.alert(
                 "bili_account_" + reason,
                 "BOISER，小号巡逻遇到凭证过期或平台风控，已暂停 12 小时喵。"
-                "请先登录 B 站检查状态，再在后台更新凭证。",
+                "请先登录 B 站检查状态，再在后台更新凭证喵。",
             )
         except Exception:
             logging.getLogger("hakimi").info("event=bili_account_alert_failed")

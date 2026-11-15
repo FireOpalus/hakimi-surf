@@ -69,6 +69,16 @@ def forbid_external_test_connections(monkeypatch):
     import ipaddress
     import socket
 
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     original = socket.socket.connect
 
     def connect(sock, address):

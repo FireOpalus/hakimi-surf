@@ -187,8 +187,8 @@ async def test_sdk_search_v1_isolated_tool_usage_and_source_gate(settings, store
 
     gateway = GeminiGateway(settings, store, *sdk_pair(handler))
     output = await gateway.search("请查一下公开事实", "subject")
-    assert output == "已核实的公开事实。"
-    assert "<style>" not in output and "<a" not in output
+    assert output == "已核实的公开事实。\n参考来源：原始来源"
+    assert "<style>" not in output and "<a" not in output and "http" not in output
     path, data = requests[0]
     assert path == "/v1/interactions"
     assert data["store"] is False and data["stream"] is False
@@ -386,6 +386,7 @@ async def test_service_search_never_exports_or_learns_private_memory(settings, s
 
         async def generate(self, payload, subject, **kwargs):
             await super().generate(payload, subject, **kwargs)
+            assert payload["web_search_status"] == "grounded"
             assert payload["web_search_findings"] == "今天的公开新闻事实"
             return action(bubbles=["今天的公开新闻是这个，你之前提的问题也能接上啦~"])
 

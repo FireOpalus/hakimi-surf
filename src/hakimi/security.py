@@ -191,7 +191,7 @@ def safe_output(text: str, secrets: list[str], limit: int = 1800) -> str:
     if len(text) <= limit:
         return text
     excerpt = text[: max(0, limit - 1)]
-    boundary = max(excerpt.rfind("\n"), excerpt.rfind("。"))
+    boundary = max(excerpt.rfind(mark) for mark in ("\n", "。", "！", "？", "!", "?"))
     if boundary >= 0:
         excerpt = excerpt[: boundary + 1]
     return excerpt.rstrip() + "…"

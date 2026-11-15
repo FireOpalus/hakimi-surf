@@ -23,6 +23,7 @@ from .memory_compressor import check_memory_text
 from .mentions import parse_reply
 from .models import Message
 from .outbound_actions import parse_actions
+from .output_links import filter_reply_links
 from .proactive_policy import ProactiveConfig
 from .rich_message_parser import parse_message
 from .security import Rejected, authorize, configured_secrets
@@ -803,35 +804,43 @@ async def sandbox(request: Request):
                     preview["thinking_level"] = generation_plan(
                         s, scenario, deep=deep
                     ).thinking_level
-                preview["text"] = svc.output(
-                    await svc.ai.generate(
-                        payload,
-                        subject,
-                        scenario=scenario,
-                        deep=deep,
-                        message=msg,
-                        budget_lane="admin",
-                        audit_source="sandbox",
-                        route=intent,
-                        generation_trace=preview,
-                    )
+                generated = await svc.ai.generate(
+                    payload,
+                    subject,
+                    scenario=scenario,
+                    deep=deep,
+                    message=msg,
+                    budget_lane="admin",
+                    audit_source="sandbox",
+                    route=intent,
+                    generation_trace=preview,
                 )
+                public = not actual_context.private_owner
                 if bvid:
-                    preview["text"] = preview["text"] + "\n" + video.url
-                if not bvid and preview["text"].lstrip().startswith("{"):
+                    summary = filter_reply_links(generated, public=public)
+                    preview["text"] = parse_reply(
+                        svc.output(f"{summary}\n{video.url}"), msg, svc.s
+                    ).text
+                elif generated.lstrip().startswith("{"):
+                    if any(
+                        secret and len(secret) >= 8 and secret in generated
+                        for secret in configured_secrets(svc.s)
+                    ):
+                        raise Rejected("invalid_output")
                     actions, folded = parse_actions(
-                        preview["text"],
-                        public=not (msg.kind == "private" and msg.user_id == svc.s.owner_qq_id),
+                        generated,
+                        public=public,
                         settings=svc.s,
                         labels=svc.memes.labels,
                         tier=getattr(intent, "tier", 2),
                     )
                     preview["actions"] = actions.model_dump()
+                    body_text = folded or "\n".join(actions.bubbles)
                     preview["text"] = (
-                        "" if actions.abstain else folded or "\n".join(actions.bubbles)
+                        "" if actions.abstain or not body_text.strip() else svc.output(body_text)
                     )
                 else:
-                    parsed = parse_reply(preview["text"], msg, svc.s)
+                    parsed = parse_reply(svc.output(generated), msg, svc.s)
                     preview["text"] = parsed.text
                     if parsed.meme_tag in svc.memes.labels:
                         preview["meme_tag"] = parsed.meme_tag

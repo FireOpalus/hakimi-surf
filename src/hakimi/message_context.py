@@ -151,6 +151,8 @@ class MessageContextResolver:
             try:
                 value = await self._rpc("get_forward_msg", {"id": ref})
                 rich = parse_forward(value, message.bot_id, include_authors=True)
+                if rich.truncated:
+                    statuses.add("truncated")
                 append_text(rich.text)
                 merge(rich)
             except (Rejected, TimeoutError, OSError, ValueError, TypeError):

@@ -36,8 +36,8 @@ def extract_bvid(text: str) -> str | None:
                 candidates.append(match[1])
         except ValueError:
             continue
-    if not urls:
-        candidates = BV_RE.findall(text)
+    if not candidates:
+        candidates = BV_RE.findall(URL_RE.sub(" ", text))
     return candidates[0] if candidates else None
 
 

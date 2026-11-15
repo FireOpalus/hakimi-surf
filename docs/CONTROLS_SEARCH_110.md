@@ -30,11 +30,11 @@ HAKIMI_GROUP_DEBOUNCE_MAX_SECONDS=5.0
 
 ## API 与隔离
 
-普通聊天仍使用 A/B/C 前缀及无工具五维流式协议。需要联网时使用一个独立、非流式的 `gemini-4-hydrogen` Interactions 请求：显式 GA `v1`、`store=False`、`thinking_level=medium`、只允许 `google_search`。只传当前触发原消息的检索问题（最长 500 字）；不传会话历史、画像、编年史、小本本、图片或展开的转发。已配置的 QQ／群号在查询中静默剥除，密钥与凭证仍由 `check_memory_text()` 拦截；普通版本号及公开链接可以用于查询。
+普通聊天仍使用 A/B/C 前缀及无工具五维流式协议。需要联网时使用一个独立、非流式的 `gemini-4-hydrogen` Interactions 请求：显式 GA `v1`、`store=False`、`thinking_level=medium`、只允许 `google_search`。只传当前触发原消息的检索问题（最长 500 字）；不传会话历史、画像、编年史、小本本、图片或展开的转发。密钥与凭证先由 `check_memory_text()` 拦截，随后静默剥除已配置数字账号与普通 URL 再校验长度，普通版本号（如 `Python 3.14`）保留用于查询。
 
-门卫仍为 `v1beta` / `gemini-decision-1`。原消息先筛查；搜索回复再按不可信来源筛查。只接受 Google Search 和文本输出步骤，不执行任何任意函数；后台提取 200 字以内事实，去除 URL，不解析搜索建议 HTML，也不输出 Grounding 重定向链接。完成 `google_search_call` 且正文非空即可成为候选资料，不强制要求引用角标；资料仍须通过来源门卫。没有结果、超限或检索不可用时只向主脑传状态，不假装搜索成功。
+门卫仍为 `v1beta` / `gemini-decision-1`。原消息先筛查；搜索回复再按不可信来源筛查。只接受 Google Search 和文本输出步骤，不执行任何任意函数；后台提取 200 字以内事实，去除原始 URL，不解析搜索建议 HTML，也不输出 Grounding 重定向长链，有合格来源时仅以纯文本附注媒体标题或主域名（`参考来源：…`）。完成 `google_search_call` 且正文非空即可成为候选资料，不强制要求引用角标；资料仍须通过来源门卫。没有结果、超限、跳过查询或检索不可用时只向主脑传状态，不假装搜索成功。
 
-检索事实进入当轮 C 区的 `web_search_findings`，关闭或失败时写入 `web_search_status`。主对话结合人设和本会话历史生成五维回复，送达后正常入史；后续追问可以引用已说过的内容。画像仍只从用户自述提取，助手转述不作为用户履历。群聊公开互动可沿既有规则进入群到 Owner 单向桥与归档；Owner 私密背景不出现在检索请求或群聊中。
+检索事实进入当轮 C 区的 `web_search_findings`（`web_search_status="grounded"`，并将主对话路由档位托底至至少 `medium`），未开启、跳过查询或失败时写入 `web_search_status`（`disabled` / `skipped_query` / `unavailable`），不再由外层硬编码拒答短路。主对话结合人设和本会话历史生成五维回复，送达后正常入史；后续追问可以引用已说过的内容。画像仍只从用户自述提取，助手转述不作为用户履历。群聊公开互动可沿既有规则进入群到 Owner 单向桥与归档；Owner 私密背景不出现在检索请求或群聊中。
 
 `store=False` 禁止本应用依赖供应商会话续链，并不代表搜索服务没有自己的保留期；Google 对 Grounding 另有数据处理规则。
 

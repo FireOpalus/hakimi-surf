@@ -1,6 +1,18 @@
 """Chinese punctuation and short public replies, without exposing transport tags."""
 
 import re
+import unicodedata
+
+_FULLWIDTH_CJK_PUNCT = frozenset("，。！？；：（）、")
+
+
+def _normalize_prose(segment: str) -> str:
+    segment = re.sub(r"[~～∼〜﹏]{3,}", "~", segment)
+    segment = "".join(
+        ch if ch in _FULLWIDTH_CJK_PUNCT else unicodedata.normalize("NFKC", ch) for ch in segment
+    )
+    segment = re.sub(r"[ \t\u3000]+", " ", segment)
+    return re.sub(r"\n{3,}", "\n\n", segment)
 
 
 def clean_chinese_punctuation(text: str, *, public=False) -> str:
@@ -29,5 +41,5 @@ def public_reply(text: str) -> str:
     # Keep natural sentences, code and links intact. Only tame repeated prose tildes.
     pieces = re.split(r"(```[\s\S]*?```|`[^`\n]*`|https?://\S+)", text)
     for index in range(0, len(pieces), 2):
-        pieces[index] = re.sub(r"~{3,}", "~", pieces[index])
+        pieces[index] = _normalize_prose(pieces[index])
     return clean_chinese_punctuation("".join(pieces).strip(), public=True)

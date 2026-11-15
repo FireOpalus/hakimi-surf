@@ -4,7 +4,17 @@ import re
 from urllib.parse import urlsplit
 
 # Exact domains or their real subdomains, never a substring of an arbitrary host.
-PUBLIC_DOMAINS = frozenset({"github.com", "bilibili.com", "b23.tv", "arxiv.org", "python.org"})
+PUBLIC_DOMAINS = frozenset(
+    {
+        "bilibili.com",
+        "b23.tv",
+        "github.com",
+        "arxiv.org",
+        "python.org",
+        "pypi.org",
+        "mozilla.org",
+    }
+)
 URL = re.compile(r"https?://[^\s<>\[\]`\"'，。！？；、（）]+", re.I)
 MARKDOWN_LINK = re.compile(r"\[([^\]\n]*)\]\((https?://[^\s<>]+)\)", re.I)
 
@@ -18,9 +28,10 @@ def allowed_url(value: str, *, public: bool) -> bool:
         # Grounding destinations are tracking redirects, never user-facing evidence.
         if host == "vertexaisearch.cloud.google.com" or "/grounding-api-redirect/" in url.path:
             return False
-        return not public or (
-            url.port in (None, 80, 443)
-            and any(host == domain or host.endswith("." + domain) for domain in PUBLIC_DOMAINS)
+        if not public:
+            return url.scheme == "https" or host in {"localhost", "127.0.0.1", "::1"}
+        return url.port in (None, 80, 443) and any(
+            host == domain or host.endswith("." + domain) for domain in PUBLIC_DOMAINS
         )
     except ValueError:
         return False

@@ -242,7 +242,11 @@ async def test_quick_ack_local_under_one_second(settings, store, message):
     class Fast(ActionSender):
         async def quick_ack(self, message, text, *, before_send):
             assert await before_send()
-            assert text in {"等我一下下，我仔细看看~", "稍等哦，我帮你理一下"}
+            assert text in {
+                "等我一下下，我仔细看看~",
+                "稍等哦，我帮你理一下~",
+                "唔，这个问题我想仔细点，等我几秒~",
+            }
             assert time.monotonic() - started < 1
             signal.set()
 

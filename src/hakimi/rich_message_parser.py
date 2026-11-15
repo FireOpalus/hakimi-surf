@@ -26,6 +26,7 @@ class RichMessage:
     video_ids: list[str] = field(default_factory=list)
     short_urls: list[str] = field(default_factory=list)
     forward_ids: list[str] = field(default_factory=list)
+    truncated: bool = False
 
 
 def cq_segments(raw: str) -> list[dict]:
@@ -265,10 +266,12 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
                     if len(dest) < 3 and value not in dest:
                         dest.append(value)
             if sum(map(len, lines)) > 7500:
+                result.truncated = True
                 break
-        result.text = "\n".join(lines)[:7900]
-        if len(nodes) > 15:
-            result.text += f"\n[转发共{len(nodes)}条，仅展示前15条]"
+        body = "\n".join(lines)
+        if len(nodes) > 15 or len(body) > 7900:
+            result.truncated = True
+        result.text = body[:7900]
         return result
     segments = []
     for node in nodes[:15]:

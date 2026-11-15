@@ -30,6 +30,7 @@ from .proactive_dm import OwnerProactive
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
 from .roaming_logger import RoamingLogger
+from .routing import RouteDecision
 from .security import Rejected, authorize, configured_secrets, owner, safe_output
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
@@ -823,29 +824,60 @@ class Service:
                 )
             ):
                 controller = self.store.runtime.web_search
-                payload["web_search_status"] = "disabled"
-                if controller.config.enabled:
-                    self.store.groups.phase(message, "generating")
-                    batch = self.store.groups.active.get(self.store.session_scope(message))
-                    payload["web_search_status"] = "unavailable"
+                if not controller.config.enabled:
+                    payload["web_search_status"] = "disabled"
+                    self.record("web_search_disabled")
+                else:
                     try:
-                        findings = await self.ai.search(
-                            search_query(members[-1], self.s),
-                            job["subject"],
-                            before_call=message_guard,
-                            cancel_event=batch.cancel if batch else None,
-                        )
-                        if findings and findings.strip() and controller.config.enabled:
-                            payload["web_search_findings"] = findings
-                            payload.pop("web_search_status", None)
-                    except Rejected as exc:
-                        if str(exc) in {"reply_invalidated", "batch_interrupted", "batch_recalled"}:
-                            raise
-                        self.record("web_search_failed")
-                    await message_guard()
+                        query = search_query(members[-1], self.s)
+                    except Rejected:
+                        query = None
+                        payload["web_search_status"] = "skipped_query"
+                        self.record("web_search_skipped_query")
+                    if query is not None:
+                        self.store.groups.phase(message, "generating")
+                        batch = self.store.groups.active.get(self.store.session_scope(message))
+                        payload["web_search_status"] = "unavailable"
+                        try:
+                            findings = await self.ai.search(
+                                query,
+                                job["subject"],
+                                before_call=message_guard,
+                                cancel_event=batch.cancel if batch else None,
+                            )
+                            if findings and findings.strip() and controller.config.enabled:
+                                payload["web_search_findings"] = findings
+                                payload["web_search_status"] = "grounded"
+                            else:
+                                if not controller.config.enabled:
+                                    payload["web_search_status"] = "disabled"
+                                self.record("web_search_empty")
+                        except Rejected as exc:
+                            if str(exc) in {
+                                "reply_invalidated",
+                                "batch_interrupted",
+                                "batch_recalled",
+                                "budget_reservation_exceeded",
+                            }:
+                                raise
+                            if str(exc) == "web_search_disabled":
+                                payload["web_search_status"] = "disabled"
+                            self.record("web_search_failed")
+                        await message_guard()
             self.store.groups.phase(message, "generating")
             batch = self.store.groups.active.get(self.store.session_scope(message))
+            chat_route = intent
             tier = getattr(intent, "tier", 2)
+            if payload.get("web_search_findings") and tier < 2:
+                tier = 2
+                if isinstance(intent, RouteDecision):
+                    chat_route = RouteDecision(
+                        str(intent),
+                        tier=2,
+                        sandbox_mode=intent.sandbox_mode,
+                        need_memory_recall=intent.need_memory_recall,
+                        need_external_lookup=intent.need_external_lookup,
+                    )
             if tier >= 3 and hasattr(self.sender, "quick_ack"):
                 self.background(self.quick_ack(job, message, message_guard))
             generated = await self.ai.generate(
@@ -855,7 +887,7 @@ class Service:
                 if message.kind == "private" and is_persona_owner(message, self.s)
                 else Scenario.FAST_CHAT,
                 deep=deep,
-                route=intent,
+                route=chat_route,
                 message=message,
                 before_call=message_guard,
                 cancel_event=batch.cancel if batch else None,
@@ -972,6 +1004,7 @@ class Service:
                         "gemini_unavailable",
                         "gemini_circuit_open",
                         "generation_incomplete",
+                        "invalid_action_output",
                     }:
                         notice = "唔，我这边刚刚卡了一下，等会儿再喊我试试~"
                     elif str(exc) in {
@@ -985,7 +1018,7 @@ class Service:
                         "user_budget",
                         "lane_budget",
                     }:
-                        notice = "今天的额度用完啦，明天再接着聊吧~"
+                        notice = "唔，今天的额度刚好用完啦，明天再接着聊吧~"
                     # Safety, permission and context rejections stay silent.
                     if notice:
                         await self.store.enqueue_reply(job["id"], message, notice)
@@ -1033,9 +1066,13 @@ class Service:
                     return False
 
             phrases = (
-                ("等我一下下，我仔细看看~", "稍等哦，我帮你理一下")
+                (
+                    "等我一下下，我仔细看看~",
+                    "稍等哦，我帮你理一下~",
+                    "唔，这个问题我想仔细点，等我几秒~",
+                )
                 if message.kind == "private" and is_persona_owner(message, self.s)
-                else ("稍等我捋一下", "等下，我看眼细节", "让我想想怎么讲")
+                else ("稍等我捋一下", "等下，我看眼细节", "让我想想怎么讲", "稍等，我看下上下文")
             )
             receipt = await self.sender.quick_ack(
                 message, random.choice(phrases), before_send=valid
