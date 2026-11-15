@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from .bot_server import is_persona_owner
 from .memes import extract_meme
+from .output_links import filter_reply_links
 from .reply_style import clean_chinese_punctuation, public_reply
 
 AT_MARKER = re.compile(r"\[AT:[^\]\r\n]*(?:\]|(?=\r?\n)|\Z)", re.IGNORECASE)
@@ -77,6 +78,7 @@ def parse_reply(raw, message, settings, *, allowed_at_qqs=(), max_targets=1):
         return PLACEHOLDERS[len(targets) - 1]
 
     text = AT_MARKER.sub(replace, text)
+    text = filter_reply_links(text, public=public)
     text = public_reply(text) if public else clean_chinese_punctuation(text.strip())
     segments, actual = [], []
     for part in re.split("([" + "".join(PLACEHOLDERS) + "])", text):

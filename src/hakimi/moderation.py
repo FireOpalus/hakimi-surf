@@ -154,7 +154,7 @@ class Moderation:
                 )
         if proposal:
             text = (
-                f"BOISER，哈基米想请你评评理喵。QQ {uid}（昵称：{nickname}，仅供辨认）"
+                f"BOISER，哈基米想请你评评理喵。{nickname}，QQ {uid}，"
                 f"在 24 小时内至少 3 次触发安全拦截，最近类别：{REASONS[reason]}。"
                 "目前还没有屏蔽，也没有删除好友。\n"
                 f"申请编号：{proposal}\n/mute-approve {proposal} 批准应用层屏蔽\n"

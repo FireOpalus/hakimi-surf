@@ -204,12 +204,12 @@ async def test_context_byte_clipping_removes_complete_claim(watcher):
         "subtitle_excerpt": "字" * 12000,
         "subtitle_complete": True,
         "subtitle_status": "complete",
-        "evidence": "complete",
+        "material_scope": "full_subtitle",
     }
     watcher.s.max_context_bytes = 2048
     clipped = watcher._bounded(payload)
     assert clipped["subtitle_complete"] is False and clipped["subtitle_status"] == "truncated"
-    assert "字幕节选" in clipped["evidence"]
+    assert clipped["material_scope"] == "partial_subtitle"
 
 
 async def test_patrol_uses_shared_video_analyzer_and_records_evidence(watcher):
@@ -220,7 +220,7 @@ async def test_patrol_uses_shared_video_analyzer_and_records_evidence(watcher):
         kwargs["guard"]()
         return SimpleNamespace(
             text="已分析提供的视频画面和声音。",
-            evidence="已提供短视频文件",
+            material_scope="metadata_only",
             mode="video",
             reason=None,
         )
@@ -233,7 +233,7 @@ async def test_patrol_uses_shared_video_analyzer_and_records_evidence(watcher):
     assert [c[0] for c in watcher.svc.ai.calls] == ["screen", "generate"]
     row = await watcher.store.one("SELECT summary FROM bili_watched_history WHERE bvid=?", (BV,))
     saved = watcher.store.vault.open("bili-learn:" + BV, row[0])
-    assert "已提供短视频文件" in saved and "公开视频学习" in saved
+    assert saved == f"公开视频学习 · {BV}\n已分析提供的视频画面和声音。"
 
 
 async def test_download_risk_records_metadata_then_stops_writes_and_next_video(watcher):
@@ -256,7 +256,7 @@ async def test_download_risk_records_metadata_then_stops_writes_and_next_video(w
         except Rejected:
             pass
         return SimpleNamespace(
-            text="已有简介摘录。", evidence="没有完成原片分析", mode="metadata", reason="risk"
+            text="已有简介摘录。", material_scope="metadata_only", mode="text", reason="risk"
         )
 
     watcher.svc.video_watch = SimpleNamespace(analyze=analyze)
@@ -269,6 +269,35 @@ async def test_download_risk_records_metadata_then_stops_writes_and_next_video(w
     saved = watcher.store.vault.open("bili-learn:" + BV, row[0])
     assert "已有简介摘录" in saved
     assert not await watcher.store.one("SELECT 1 FROM bili_watched_history WHERE bvid=?", (OTHER,))
+
+
+async def test_real_video_analyzer_can_finish_text_during_patrol_cooldown(watcher, tmp_path):
+    from hakimi.generation_policy import Scenario
+    from hakimi.video_policy import VideoWatchConfig
+    from hakimi.video_watch import VideoWatch
+    from tests.test_video_watch import Downloader
+
+    watcher.responses["/x/player/wbi/v2"] = {"subtitle": {"subtitles": []}}
+    downloader = Downloader(tmp_path / "unused.mp4")
+    downloader.error = "video_download_risk"
+    watcher.svc.bili_watcher = watcher
+    watch = VideoWatch(watcher.svc, downloader=downloader)
+    watcher.svc.video_watch = watch
+    await watch.set_config(VideoWatchConfig(enabled=True))
+    generate = watcher.svc.ai.generate
+
+    async def normal_generate(*args, **kwargs):
+        kwargs.setdefault("scenario", Scenario.BILIBILI_SUMMARY)
+        return await generate(*args, **kwargs)
+
+    watcher.svc.ai.generate = normal_generate
+    await watcher.set_policy(BiliPolicy(enabled=True, allow_like=True))
+    result = await watcher.run_once()
+    assert result == {"status": "failed", "learned": 1, "reason": "bili_account_risk"}
+    assert [c[0] for c in watcher.svc.ai.calls] == ["screen", "generate", "screen", "generate"]
+    assert not any(r.method == "POST" for r in watcher.calls)
+    assert watcher.blocked_until > watcher.clock() + 43000
+    assert downloader.cleaned == 1
 
 
 async def test_anonymous_nav_can_use_public_keys_without_retry_or_identity_switch(watcher, video):

@@ -220,12 +220,13 @@ def test_five_fields_unauthorized_targets(settings):
         settings=settings,
     )
     assert not actions.anchor.mentions and actions.sticker.label is None
-    assert len(actions.bubbles[0]) <= 40 and "~" not in actions.bubbles[0]
+    assert actions.bubbles == ["~" + "很长" * 40]
 
 
-async def test_folded_depth(settings, store, message):
+@pytest.mark.parametrize("tier", [1, 2, 3])
+async def test_folded_depth(settings, store, message, tier):
     ai = ActionGateway(action(bubbles=["细节" * 100]))
-    ai.intent = RouteDecision(tier=3)
+    ai.intent = RouteDecision(tier=tier)
     service = Service(settings, store, ai, FakeBili(), ActionSender())
     m = group(message, "10")
     await service.accept(m)
@@ -241,6 +242,7 @@ async def test_quick_ack_local_under_one_second(settings, store, message):
     class Fast(ActionSender):
         async def quick_ack(self, message, text, *, before_send):
             assert await before_send()
+            assert text in {"等我一下下，我仔细看看~", "稍等哦，我帮你理一下"}
             assert time.monotonic() - started < 1
             signal.set()
 

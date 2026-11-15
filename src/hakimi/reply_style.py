@@ -1,7 +1,6 @@
 """Chinese punctuation and short public replies, without exposing transport tags."""
 
 import re
-import unicodedata
 
 
 def clean_chinese_punctuation(text: str, *, public=False) -> str:
@@ -26,12 +25,9 @@ def clean_chinese_punctuation(text: str, *, public=False) -> str:
     return text
 
 
-def public_reply(text: str, *, limit=30) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"[~～∼〜﹏]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    sentences = re.findall(r"[^。！？!?]+[。！？!?]*", text)
-    text = "".join(sentences[:2]).strip() if sentences else text
-    if len(text) > limit:
-        text = text[: limit - 1].rstrip("，、；：,;:") + "。"
-    return clean_chinese_punctuation(text, public=True)
+def public_reply(text: str) -> str:
+    # Keep natural sentences, code and links intact. Only tame repeated prose tildes.
+    pieces = re.split(r"(```[\s\S]*?```|`[^`\n]*`|https?://\S+)", text)
+    for index in range(0, len(pieces), 2):
+        pieces[index] = re.sub(r"~{3,}", "~", pieces[index])
+    return clean_chinese_punctuation("".join(pieces).strip(), public=True)

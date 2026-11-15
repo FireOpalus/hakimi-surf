@@ -103,7 +103,7 @@ async def test_known_large_image_skips_before_ws_or_http(settings, monkeypatch):
     monkeypatch.setattr(loader, "_client", lambda: client)
     ref = ImageRef(file="big", url="https://gchat.qpic.cn/big", file_size=MAX_IMAGE_BYTES + 1)
     assert await loader.load_results([ref]) == [None]
-    assert loader.failure_placeholder(ref) == "[大图略过]"
+    assert loader.failure_status(ref) == "oversized"
     assert not wire.calls and not client.requests
 
 
@@ -202,7 +202,8 @@ async def test_group_reply_cannot_read_private_or_another_group(settings, messag
 
         expanded = await MessageContextResolver(settings, Wire({}), lookup).resolve(incoming)
         assert original.text not in expanded.text
-        assert "引用消息暂不可读取" in expanded.text
+        assert expanded.context_status == ["reply_unavailable"]
+        assert expanded.text == incoming.text
 
 
 async def test_remote_get_msg_requires_matching_message_and_group(settings, message):
@@ -254,7 +255,8 @@ async def test_forward_failures_are_placeholder_and_never_escape_scope(settings,
         update={"forward_ids": ["forward-ref"], "command_text": "解释一下"}
     )
     result = await MessageContextResolver(settings, wire).resolve(incoming)
-    assert result.forward_ids == [] and "合并转发暂不可读取" in result.text
+    assert result.forward_ids == [] and result.context_status == ["forward_unavailable"]
+    assert result.text == message.text
     assert result.command_text == "解释一下"
 
 

@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .memes import extract_meme
+from .output_links import filter_reply_links
 from .reply_style import clean_chinese_punctuation, public_reply
 from .security import Rejected
 
@@ -37,8 +38,8 @@ CHAT_RESPONSE_FORMAT = ChatActions.model_json_schema()
 ACTION_INSTRUCTION = """\n【固定五维回复协议，优先于旧文本标签示例】
 始终输出符合 response_format 的 JSON，且只包含 abstain、bubbles、anchor、sticker、image_digest。
 abstain=true 表示读图后无需插话；bubbles 为一至三条口语气泡，
-公开闲聊每条四十字以内，禁止列表和波浪号。
-深度技术说明允许原始 bubbles 长于四十字，服务器会把超过一百八十字的内容折叠，别切成刷屏短句。
+公开闲聊简短自然，问答保留完整意思，不为凑字数截断句子。
+公开回复合计超过一百八十字会折叠，别切成刷屏短句；语气符号适量使用。
 anchor.reply_id 只能选本轮 allowed_reply_ids；
 mentions 只选 allowed_at_qqs，通常为空，默认最多一人，绝不上全体。
 sticker.label 仅选已加载本地白名单情绪，不要输出图片地址；
@@ -77,13 +78,11 @@ def parse_actions(
     for text in actions.bubbles:
         text, _ = extract_meme(text)
         text = re.sub(r"\[AT:[^\]\n]*(?:\]|$)", "", text, flags=re.I)
-        text = re.sub(r"https?://\S+", "[外部链接已省略]", text)
-        if public:
-            text = re.sub(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", "", text)
+        text = filter_reply_links(text, public=public)
         clean.append(clean_chinese_punctuation(text.strip()))
-    folded = public and tier >= 3 and len("\n".join(clean)) > 180
-    actions.bubbles = [public_reply(t, limit=40) if public and not folded else t for t in clean]
-    return actions, "\n".join(clean) if folded else None
+    actions.bubbles = [public_reply(t) if public else t for t in clean]
+    combined = "\n".join(actions.bubbles)
+    return actions, combined if public and len(combined) > 180 else None
 
 
 def valid_receipt(receipt):

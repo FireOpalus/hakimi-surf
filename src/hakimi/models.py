@@ -32,6 +32,10 @@ class Message(BaseModel):
     sender_nickname: str = Field(default="", max_length=80)
     group_name: str = Field(default="", max_length=100)
     context_expanded: bool = False
+    # Resolver diagnostics are data in C, never bracketed prose in the chat/history body.
+    context_status: list[Literal["reply_unavailable", "forward_unavailable", "truncated"]] = Field(
+        default_factory=list, max_length=3
+    )
     # Only direct text may invoke commands; quoted/card/forward text never can.
     command_text: str | None = Field(default=None, max_length=8000)
     # Only genuine top-level OneBot at segments; never inferred from text or forwards.

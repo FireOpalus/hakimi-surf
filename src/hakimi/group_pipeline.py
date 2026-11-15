@@ -395,6 +395,7 @@ class GroupPipeline:
                     "forward_ids": unique("forward_ids", 2),
                     "video_ids": unique("video_ids", 3),
                     "short_urls": unique("short_urls", 3),
+                    "context_status": unique("context_status", 3),
                 }
             )
             job["payload"] = merged.model_dump()

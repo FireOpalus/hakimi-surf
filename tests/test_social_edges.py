@@ -168,8 +168,8 @@ async def test_sandbox_public_matches_tag_and_style_filter_without_delivery_or_f
     assert response.status_code == 200, response.text
     preview = response.json()["preview"]
     assert preview["persona"] == "PUBLIC" and preview["meme_tag"] == "无语盯"
-    assert 0 < len(preview["text"]) <= 30
-    assert "[MEME:" not in preview["text"] and "~" not in preview["text"]
+    assert preview["text"] == answer.removesuffix("[MEME:无语盯]")
+    assert "[MEME:" not in preview["text"] and "~" in preview["text"]
     owner = await client.post(
         "/admin/api/sandbox", json={"identity": "OWNER", "scene": "private", "text": "随便聊聊"}
     )

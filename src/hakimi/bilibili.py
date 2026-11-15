@@ -38,10 +38,7 @@ def extract_bvid(text: str) -> str | None:
             continue
     if not urls:
         candidates = BV_RE.findall(text)
-    ids = set(candidates)
-    if len(ids) > 1:
-        raise Rejected("one_video_per_request")
-    return next(iter(ids), None)
+    return candidates[0] if candidates else None
 
 
 async def bounded_json(

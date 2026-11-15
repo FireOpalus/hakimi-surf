@@ -76,8 +76,8 @@ async def test_reading_link_checks_external_data_and_excludes_memory(service, me
     assert "private-secret-in-history" not in json.dumps(calls[1:])
     assert len(await service.store.history(scope)) == 1
     reply = await service.store.claim_reply()
-    assert videos[0].url in reply["text"]
-    assert "未观看全片" in reply["text"]
+    assert videos[0].url not in reply["text"]
+    assert reply["text"] == "这是基于已有信息的简短回复。"
 
 
 async def test_external_injection_cannot_reach_generator(service, message, videos):

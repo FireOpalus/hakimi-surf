@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import random
-import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -18,12 +17,13 @@ from zoneinfo import ZoneInfo
 from .bot_server import is_persona_owner, untrusted_input
 from .generation_policy import Scenario
 from .models import Message
+from .output_links import filter_reply_links
 from .proactive_policy import ProactiveConfig, minute_of_day
 from .roaming_logger import redact_public_summary
 from .security import Rejected
 
 log = logging.getLogger("hakimi")
-TEST_MESSAGE = "BOISER，这是哈基米的主动私信通路测试喵~这条固定消息没有调用模型。"
+TEST_MESSAGE = "BOISER，这是哈基米的主动私信通路测试喵~"
 ACTIVE_DELIVERIES = "('pending','sending','delivered','sent','uncertain')"
 
 
@@ -374,18 +374,14 @@ class OwnerProactive:
                         f"budget_{kind}_{level}",
                         f"BOISER，{label}已达 {level}% {'硬熔断线' if level == 100 else '预警线'}："
                         f"账本约 ${amount / 1000000:.4f} / ${limit / 1000000:.2f}（含费用预留）。"
-                        + (
-                            "付费生成已暂停。这条告警不调用模型。"
-                            if level == 100
-                            else "请留意余量喵。"
-                        ),
+                        + ("付费生成已暂停。" if level == 100 else "请留意余量喵。"),
                         daily=True,
                     )
                     break  # Crossing both thresholds at once needs only the stronger alert.
         if budget["circuit"]:
             await self.alert(
                 "budget_circuit",
-                "BOISER，账本发现实际用量超出保守预留，付费调用已熔断；请在后台检查费用。这条通知没有调用模型。",
+                "BOISER，账本发现实际用量超出保守预留，付费调用已熔断；请在后台检查费用。",
                 daily=True,
             )
         async with self.store.lock:
@@ -399,8 +395,7 @@ class OwnerProactive:
         if max(health.get("gemini_chat", 0), health.get("gemini_decision", 0)) >= 5:
             await self.alert(
                 "gemini_errors",
-                "BOISER，Gemini 同一接口已连续至少 5 次调用失败。"
-                "请检查 API 可用性、配置与账单；本条通知由本地模板生成。",
+                "BOISER，Gemini 同一接口已连续至少 5 次调用失败。请检查 API 可用性、配置与账单。",
             )
 
     async def _public_digest(self, now):
@@ -509,7 +504,7 @@ class OwnerProactive:
                         daily_longnick = value.get("daily_longnick")
                 except (ValueError, TypeError):
                     pass  # A malformed optional signature must not suppress the digest.
-            generated = re.sub(r"https?://\S+", "[外部链接已省略]", self.service.output(generated))
+            generated = filter_reply_links(self.service.output(generated), public=False)
             text = generated[: 250 if digest else 80]
             if digest:
                 cost = payload["approximate_api_usd_including_reservations"]

@@ -12,7 +12,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .bot_server import untrusted_input
-from .security import Rejected, authorize, safe_output
+from .security import Rejected, authorize
 from .video_downloader import VideoDownloader
 from .video_policy import VideoWatchConfig
 
@@ -41,7 +41,7 @@ REASONS = {
 @dataclass(frozen=True)
 class VideoAnalysis:
     text: str
-    evidence: str
+    material_scope: str
     mode: str
     reason: str | None = None
 
@@ -152,6 +152,7 @@ class VideoWatch:
             "attempts_today": used,
             "remaining_today": max(0, self.config.daily_limit - used),
             "recent_attempts": [dict(r) for r in recent],
+            "reasons": REASONS,
             "remote_cleanup_pending": pending,
         }
 
@@ -169,7 +170,7 @@ class VideoWatch:
             if key == "subtitle_excerpt":
                 payload["subtitle_complete"] = False
                 payload["subtitle_status"] = "truncated"
-                payload["evidence"] = "仅阅读简介、字幕节选和评论；字幕已裁剪，没有播放视频流"
+                payload["material_scope"] = "partial_subtitle" if payload[key] else "metadata_only"
         return payload
 
     async def _identity_guard(self, message, guard, *, check_budget=True):
@@ -236,9 +237,14 @@ class VideoWatch:
             elif (await self.status())["remote_cleanup_pending"] >= 3:
                 reason = "cleanup_pending"
             else:
-                result, reason = await self._video(
-                    bvid, payload, subject, lane, message, deep, guard
-                )
+                try:
+                    result, reason = await self._video(
+                        bvid, payload, subject, lane, message, deep, guard
+                    )
+                except Rejected as exc:
+                    if str(exc) != "bili_account_cooling_down":
+                        raise
+                    result, reason = None, "risk"
                 if result is not None:
                     return result
         await self._identity_guard(message, guard)
@@ -252,10 +258,7 @@ class VideoWatch:
             before_call=valid_text,
         )
         await self._identity_guard(message, guard, check_budget=False)
-        evidence = payload.get("evidence", "仅依据公开文字资料，未观看视频画面或收听音轨")
-        if needs_video and reason:
-            evidence += "；" + REASONS.get(reason, "原片不可用") + "，已退回文字资料"
-        return VideoAnalysis(text, evidence, "text", reason)
+        return VideoAnalysis(text, payload.get("material_scope", "metadata_only"), "text", reason)
 
     async def _video(self, bvid, payload, subject, lane, message, deep, guard):
         async with self.video_lock:
@@ -310,7 +313,6 @@ class VideoWatch:
                             video.path,
                             {
                                 **payload,
-                                "evidence": "已提供低清原片及可用音轨，画面以1fps采样",
                                 "analysis_mode": "video_file",
                             },
                             subject,
@@ -324,7 +326,7 @@ class VideoWatch:
                         state, reason = "done", None
                         return VideoAnalysis(
                             result,
-                            "已分析低清原片画面与可用音轨；视频按低帧率采样，细小快速动作可能遗漏",
+                            payload.get("material_scope", "metadata_only"),
                             "video",
                         ), None
             except asyncio.CancelledError:
@@ -361,17 +363,6 @@ class VideoWatch:
                         )
 
                 await asyncio.shield(finish())
-            # Already-screened metadata provides a deterministic graceful fallback. No
-            # second model charge or Bili request after risk/upload/download failures.
-            text = "标题：" + payload.get("title", bvid)[:150]
-            if payload.get("description"):
-                text += "\n公开简介摘录：" + payload["description"][:300]
-            comments = payload.get("hot_comments_unverified") or []
-            if comments and isinstance(comments[0], str):
-                text += "\n热评摘录（仅代表评论者观点）：" + comments[0][:120]
-            text = re.sub(r"https?://\S+", "[链接已省略]", text)
-            text = safe_output(text, self.svc.secrets, limit=800)
-            evidence = (
-                REASONS.get(reason, "原片处理不可用") + "；未完成视频分析，仅提供已取得的公开文字"
-            )
-            return VideoAnalysis(text, evidence, "metadata", reason), reason
+            # Reuse only already-screened material. Bili remains in cooldown; the outer
+            # text generation still checks identity, revocation and the Gemini ledger.
+            return None, reason

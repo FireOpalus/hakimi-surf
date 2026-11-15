@@ -138,11 +138,16 @@ def assemble_chat_input(
         "allowed_at_qqs": payload.get("allowed_at_qqs", []) if not sandbox_mode else [],
         "current_sender": payload.get("current_sender", {}),
         "image_sources": payload.get("image_sources", []),
+        "context_status": payload.get("context_status", []),
         "nearby_group_context": payload.get("nearby_group_context", []),
         "allowed_reply_ids": payload.get("allowed_reply_ids", []),
         "web_preview_untrusted": payload.get("web_preview_untrusted", []),
         "current_batch": current,
     }
+    if not sandbox_mode:
+        for key in ("web_search_findings", "web_search_status"):
+            if payload.get(key):
+                metadata[key] = payload[key]
     summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
     dual = payload.get("dual_memory_data", {}) if not sandbox_mode else {}
     background = {}

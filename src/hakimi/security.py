@@ -183,10 +183,15 @@ def safe_output(text: str, secrets: list[str], limit: int = 1800) -> str:
     # Text-only transport plus neutralization: model text cannot become CQ/QQ tags.
     text = (
         text.replace("[CQ:", "［CQ:")
-        .replace("<", "＜")
-        .replace(">", "＞")
         .replace("@everyone", "＠everyone")
+        .replace("@all", "＠all")
         .replace("@全体成员", "＠全体成员")
     )
     text = clean_chinese_punctuation(text)
-    return text if len(text) <= limit else text[: limit - 12] + "\n[长回复已截断]"
+    if len(text) <= limit:
+        return text
+    excerpt = text[: max(0, limit - 1)]
+    boundary = max(excerpt.rfind("\n"), excerpt.rfind("。"))
+    if boundary >= 0:
+        excerpt = excerpt[: boundary + 1]
+    return excerpt.rstrip() + "…"

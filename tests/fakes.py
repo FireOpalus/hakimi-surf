@@ -84,5 +84,5 @@ class FakeBili:
             "subtitle_complete": False,
             "subtitle_status": "missing",
             "hot_comments_unverified": [],
-            "evidence": "仅依据公开标题与简介，未观看全片",
+            "material_scope": "metadata_only",
         }

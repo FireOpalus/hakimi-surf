@@ -580,7 +580,7 @@ class BiliWatcher:
             await self.svc.proactive.alert(
                 "bili_account_" + reason,
                 "BOISER，小号巡逻遇到凭证过期或平台风控，已暂停 12 小时喵。"
-                "请先登录 B 站检查状态，再在后台更新凭证；我不会尝试验证码。",
+                "请先登录 B 站检查状态，再在后台更新凭证。",
             )
         except Exception:
             logging.getLogger("hakimi").info("event=bili_account_alert_failed")
@@ -698,7 +698,7 @@ class BiliWatcher:
             "subtitle_complete": False,
             "subtitle_status": "unavailable",
             "hot_comments_unverified": [],
-            "evidence": "未取得字幕；仅公开标题和简介，不能声称看过完整视频",
+            "material_scope": "metadata_only",
         }
         token = self.public_read_context.set((self.credentials_epoch, guard))
         try:
@@ -861,11 +861,11 @@ class BiliWatcher:
             "subtitle_complete": complete,
             "subtitle_status": subtitle_status,
             "hot_comments_unverified": comments,
-            "evidence": "已读取完整字幕文本、简介和评论；没有播放视频流"
+            "material_scope": "full_subtitle"
             if complete
-            else "仅阅读简介、字幕节选和评论；没有播放视频流"
+            else "partial_subtitle"
             if transcript
-            else "未取得字幕；仅简介和评论，不能声称看过完整视频",
+            else "metadata_only",
         }
 
     async def _interaction(self, bvid, aid, pick, epoch):
@@ -952,7 +952,7 @@ class BiliWatcher:
                     if key == "subtitle_excerpt" and len(payload[key]) > 500:
                         payload["subtitle_complete"] = False
                         payload["subtitle_status"] = "truncated"
-                        payload["evidence"] = "仅阅读简介、字幕节选和评论；没有播放视频流"
+                        payload["material_scope"] = "partial_subtitle"
                     payload[key] = payload[key][:500]
             if "hot_comments_unverified" in payload:
                 payload["hot_comments_unverified"] = payload["hot_comments_unverified"][:1]
@@ -1036,10 +1036,10 @@ class BiliWatcher:
                             material,
                             subject,
                             "patrol",
-                            guard=self._ensure_current,
+                            guard=lambda: self._ensure_current(allow_cooldown=True),
                         )
-                        summary, evidence = result.text, result.evidence
-                        stop_for_risk = result.reason == "risk"
+                        summary = result.text
+                        stop_for_risk = result.reason == "risk" or self.blocked_until > self.clock()
                         label = (
                             "公开视频学习"
                             if result.mode == "video"
@@ -1058,14 +1058,14 @@ class BiliWatcher:
                             scenario=Scenario.BILI_LEARNING,
                             budget_lane="patrol",
                         )
-                        evidence, label = material["evidence"], "公开文本学习"
-                    # A downloader risk returns an already-screened metadata fallback.
-                    # Persist just that result, then stop without more HTTP/model/writes.
+                        label = "公开文本学习"
+                    # Persist the fallback summary, then stop Bili requests on risk.
+                    # The fallback model used only material screened before download.
                     self._ensure_current(epoch=epoch, allow_cooldown=stop_for_risk)
                     summary = redact_public_summary(
                         safe_output(summary, self.svc.secrets, limit=1000)
                     )
-                    text = f"{label} · {pick.bvid}\n{evidence}。\n{summary}"
+                    text = f"{label} · {pick.bvid}\n{summary}"
                     async with self.store.transaction():
                         await self.store.db.execute(
                             "UPDATE bili_watched_history SET status='done',summary=? WHERE bvid=?",

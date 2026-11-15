@@ -339,7 +339,7 @@ async def test_stable_persona_and_scenario_prefix_precedes_dynamic_identity(
     marker = "\n【服务器验证的当前发送者】"
     assert a.split(marker)[0] == b.split(marker)[0]
     assert a.startswith(SYSTEM_INSTRUCTION + PUBLIC_PERSONA_PROMPT)
-    assert a.index("任务是文本资料阅读心得") < a.index(marker)
+    assert a.index("依据 material_scope") < a.index(marker)
     assert "[role=OWNER]" in a.split(marker)[1] and "[role=MEMBER]" in b.split(marker)[1]
 
 

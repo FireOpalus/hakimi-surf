@@ -72,8 +72,13 @@ def test_no_untrusted_url_is_fetchable(url):
 def test_video_reference_canonicalization():
     assert extract_bvid(BV) == BV
     assert extract_bvid(f"帮我看看 https://www.bilibili.com/video/{BV}?share=123") == BV
-    with pytest.raises(Rejected):
-        extract_bvid(BV + " BV1Q541167Qg")
+    assert extract_bvid(BV + " BV1Q541167Qg") == BV
+    assert (
+        extract_bvid(
+            f"https://www.bilibili.com/video/{BV} https://www.bilibili.com/video/BV1Q541167Qg"
+        )
+        == BV
+    )
 
 
 def test_owner_and_group_policy_do_not_depend_on_display_names(settings, message):

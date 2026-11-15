@@ -208,7 +208,7 @@ async def test_failed_image_download_becomes_placeholder_without_blocking_reply(
     await process(social, group(message, images=[image_ref()]))
     assert [c[0] for c in social.ai.calls] == ["screen", "generate"]
     generated = social.ai.calls[-1]
-    assert generated[1]["image_sources"][0]["status"] == "[图片加载失败]"
+    assert generated[1]["image_sources"][0]["status"] == "unavailable"
     assert "images" not in generated[3]
     assert len(await social.store.all("SELECT * FROM outbox")) == 1
 
@@ -266,8 +266,8 @@ async def test_public_reply_strips_tag_bounds_text_then_sends_local_base64(
     assert wire.events == ["text", "delay:0.6", "image"]
     assert [action for action, _ in wire.calls] == ["send_group_msg", "send_group_msg"]
     sent_text = wire.calls[0][1]["message"][0]["data"]["text"]
-    assert 0 < len(sent_text) <= 30
-    assert "~" not in sent_text and "MEME:" not in sent_text
+    assert sent_text == social.ai.answer.removesuffix("[MEME:无语盯]")
+    assert "~" in sent_text and "MEME:" not in sent_text
     data = wire.calls[1][1]["message"][0]["data"]["file"]
     assert data.startswith("base64://")
     decoded = base64.b64decode(data[9:], validate=True)
@@ -362,7 +362,7 @@ async def test_allowlisted_friend_uses_public_style_without_owner_snapshot_or_hi
     assert await social.deliver_once()
     assert wire.events == ["text"]
     assert wire.calls[0][1]["user_id"] == 30000
-    assert "~" not in wire.calls[0][1]["message"][0]["data"]["text"]
+    assert wire.calls[0][1]["message"][0]["data"]["text"] == "来了~这事倒挺有趣"
 
 
 @pytest.mark.parametrize("revoke_first_member", [False, True])

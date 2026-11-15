@@ -95,7 +95,7 @@ async def test_outgoing_random_delay_is_serial_and_truncation_is_visible(
     def handler(request):
         events.append("send")
         text = json.loads(request.content)["message"][0]["data"]["text"]
-        assert len(text) <= 1800 and "长回复已截断" in text
+        assert len(text) <= 1800 and text.endswith("…")
         return httpx.Response(200, json={"status": "ok", "retcode": 0, "data": {"message_id": 42}})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:

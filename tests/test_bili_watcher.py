@@ -210,7 +210,7 @@ async def test_text_round_dedups_no_media_or_cookies_to_subtitle_and_defaults_re
     subtitle = next(r for r in watcher.calls if r.url.host == "aisubtitle.hdslb.com")
     assert not subtitle.headers["cookie"]
     assert all(0 <= n <= 6 for n in watcher.naps) and len(watcher.naps) == len(watcher.calls) - 1
-    assert "没有播放视频流" in watcher.svc.ai.calls[-1][1]["evidence"]
+    assert watcher.svc.ai.calls[-1][1]["material_scope"] == "partial_subtitle"
     before = len(watcher.svc.ai.calls)
     assert (await watcher.run_once(slot="20:30"))["status"] == "empty"
     assert len(watcher.svc.ai.calls) == before
@@ -221,7 +221,7 @@ async def test_reading_absent_subtitle_is_honest(watcher):
     watcher.responses["/x/player/wbi/v2"] = {"subtitle": {"subtitles": []}}
     await watcher.nav()
     _, data = await watcher.material(BV)
-    assert not data["subtitle_excerpt"] and "未取得字幕" in data["evidence"]
+    assert not data["subtitle_excerpt"] and data["material_scope"] == "metadata_only"
     assert not any("/bfs/" in r.url.path for r in watcher.calls)
 
 

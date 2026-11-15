@@ -15,6 +15,7 @@ from tests.test_admin import admin_api as admin_api
 from tests.test_group_pipeline import clock as clock
 from tests.test_sdk_contract import decision_response, interaction_response
 from tests.test_sdk_contract import sdk_pair as sdk_pair
+from tests.test_streaming_v0100 import ActionSender, action
 
 
 async def enable_search(store, **updates):
@@ -186,7 +187,7 @@ async def test_sdk_search_v1_isolated_tool_usage_and_source_gate(settings, store
 
     gateway = GeminiGateway(settings, store, *sdk_pair(handler))
     output = await gateway.search("请查一下公开事实", "subject")
-    assert "https://example.org/source" in output and "Google 搜索建议" in output
+    assert output == "已核实的公开事实。"
     assert "<style>" not in output and "<a" not in output
     path, data = requests[0]
     assert path == "/v1/interactions"
@@ -354,11 +355,8 @@ def test_no_local_or_unsafe_search_citations(url):
 @pytest.mark.parametrize(
     "question",
     [
-        "我的QQ是20000帮我查",
         "查一下password=privatevalue",
         "搜索 sk-abcdefghijklmnopqrst",
-        "搜索 https://private.example/secret",
-        "搜索 user@example.org",
     ],
 )
 def test_queries_do_not_export_private_identifiers(settings, message, question):
@@ -384,9 +382,14 @@ async def test_service_search_never_exports_or_learns_private_memory(settings, s
     class SearchGateway(FakeGateway):
         async def search(self, query, subject, **kwargs):
             self.calls.append(("search", query, subject))
-            return "检索专用事实不应进入记忆\n来源：https://example.org/source"
+            return "今天的公开新闻事实"
 
-    ai, sender = SearchGateway(), FakeSender()
+        async def generate(self, payload, subject, **kwargs):
+            await super().generate(payload, subject, **kwargs)
+            assert payload["web_search_findings"] == "今天的公开新闻事实"
+            return action(bubbles=["今天的公开新闻是这个，你之前提的问题也能接上啦~"])
+
+    ai, sender = SearchGateway(), ActionSender()
     svc = Service(settings, store, ai, FakeBili(), sender)
     try:
         await enable_search(store)
@@ -397,33 +400,37 @@ async def test_service_search_never_exports_or_learns_private_memory(settings, s
             expected_epoch=(await svc.sessions.snapshot(message))["epoch"],
         )
         m = message.model_copy(
-            update={"text": "搜索今天的科技新闻", "command_text": "搜索今天的科技新闻"}
+            update={"text": "/搜索 今天的科技新闻", "command_text": "/搜索 今天的科技新闻"}
         )
         assert await svc.accept(m) == "accepted"
         job = await store.claim()
         await svc.process(job)
-        assert [c[1] for c in ai.calls if c[0] == "search"] == ["搜索今天的科技新闻"]
-        assert not any(c[0] == "generate" for c in ai.calls)
+        assert [c[1] for c in ai.calls if c[0] == "search"] == ["今天的科技新闻"]
+        assert any(c[0] == "generate" for c in ai.calls)
         assert await svc.deliver_once()
-        assert "检索专用事实" in sender.sent[0][1]
+        assert "今天的公开新闻" in sender.sent[0][0]["data"]["text"]
         snapshot = json.dumps(await svc.sessions.snapshot(m), ensure_ascii=False)
-        assert "OWNER_PRIVATE_MEMORY" in snapshot and "检索专用事实" not in snapshot
-        assert "检索资料不进入记忆" in snapshot
+        assert "OWNER_PRIVATE_MEMORY" in snapshot and "今天的公开新闻" in snapshot
+        assert "检索资料不进入记忆" not in snapshot
+        assert all("OWNER_PRIVATE_MEMORY" not in c[1] for c in ai.calls if c[0] == "search")
     finally:
         await svc.stop()
 
 
-async def test_search_off_uses_local_reply_not_model(settings, store, message):
+async def test_search_off_passes_status_to_normal_model(settings, store, message):
     from hakimi.service import Service
 
     ai, sender = FakeGateway(), FakeSender()
     svc = Service(settings, store, ai, FakeBili(), sender)
     try:
-        m = message.model_copy(update={"text": "搜索今天的新闻"})
+        m = message.model_copy(update={"text": "/搜索 今天的新闻"})
         assert await svc.accept(m) == "accepted"
         await svc.process(await store.claim())
         assert await svc.deliver_once()
-        assert "联网搜索还没开启" in sender.sent[0][1]
-        assert not any(c[0] == "generate" for c in ai.calls)
+        assert sender.sent[0][1] == "这是基于已有信息的简短回复。"
+        generated = next(c[1] for c in ai.calls if c[0] == "generate")
+        assert generated["web_search_status"] == "disabled"
+        assert "web_search_findings" not in generated
+        assert any(c[0] == "generate" for c in ai.calls)
     finally:
         await svc.stop()

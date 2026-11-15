@@ -166,10 +166,8 @@ class ImageLoader:
         self.fetch_locks = [asyncio.Lock() for _ in range(64)]
 
     @staticmethod
-    def failure_placeholder(ref):
-        return (
-            "[大图略过]" if ref.file_size and ref.file_size > MAX_IMAGE_BYTES else "[图片加载失败]"
-        )
+    def failure_status(ref):
+        return "oversized" if ref.file_size and ref.file_size > MAX_IMAGE_BYTES else "unavailable"
 
     async def load(self, refs: list[ImageRef]) -> list[ModelImage]:
         if not refs:

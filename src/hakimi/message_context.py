@@ -94,6 +94,7 @@ class MessageContextResolver:
         if message.platform != "onebot" or message.context_expanded:
             return message
         text = message.text
+        statuses = set(message.context_status)
         images = annotate_images(
             message.images, message.user_id, message.sender_nickname, "当前消息"
         )
@@ -102,15 +103,10 @@ class MessageContextResolver:
         def append_text(block):
             nonlocal text
             available = 8000 - len(text) - 1
+            if len(block) > max(0, available):
+                statuses.add("truncated")
             if available > 0:
-                text += (
-                    "\n"
-                    + (
-                        block
-                        if len(block) <= available
-                        else block[: max(0, available - 8)] + "[上下文截断]"
-                    )[:available]
-                )
+                text += "\n" + block[:available]
 
         def merge(rich):
             for target, values, cap, key in (
@@ -149,7 +145,7 @@ class MessageContextResolver:
                 forwards.extend(original.forward_ids)
             except (Rejected, TimeoutError, OSError, ValueError, TypeError):
                 log.warning("event=message_context_unavailable kind=reply")
-                append_text("[引用消息暂不可读取]")
+                statuses.add("reply_unavailable")
         forwards = list(dict.fromkeys([*message.forward_ids, *forwards]))[:2]
         for ref in forwards:
             try:
@@ -159,7 +155,7 @@ class MessageContextResolver:
                 merge(rich)
             except (Rejected, TimeoutError, OSError, ValueError, TypeError):
                 log.warning("event=message_context_unavailable kind=forward")
-                append_text("[合并转发暂不可读取]")
+                statuses.add("forward_unavailable")
         return message.model_copy(
             update={
                 "text": text,
@@ -168,5 +164,6 @@ class MessageContextResolver:
                 "short_urls": shorts[:3],
                 "forward_ids": [],
                 "context_expanded": True,
+                "context_status": sorted(statuses),
             }
         )

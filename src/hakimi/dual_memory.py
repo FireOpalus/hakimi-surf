@@ -390,7 +390,7 @@ class DualMemory:
                     source.get("role") != "user"
                     or uid != fact.member_id
                     or fact.quote not in source.get("text", "")
-                    or re.search(r"哈哈|开玩笑|玩梗|他们说|据说|反讽", source.get("text", ""))
+                    or re.search(r"开玩笑|玩梗|他们说|据说|反讽|假的", source.get("text", ""))
                     or (fact.slot == "state") != (fact.valid_days > 0)
                     or (message.kind == "private" and uid != message.user_id)
                 ):

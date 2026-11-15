@@ -787,6 +787,7 @@ async def sandbox(request: Request):
                     video = await svc.bili.video(bvid)
                     payload = {
                         "task": "summarize_public_metadata",
+                        "material_scope": "metadata_only",
                         "untrusted_sources": [video.model_dump(exclude={"mid"})],
                     }
                     result["decisions"]["source"] = {}
@@ -802,10 +803,6 @@ async def sandbox(request: Request):
                     preview["thinking_level"] = generation_plan(
                         s, scenario, deep=deep
                     ).thinking_level
-                elif intent == "bilibili_watch":
-                    preview["text"] = "请提供 BV 号或 B 站公开视频完整链接；沙盒不修改生产订阅。"
-                    preview["thinking_level"] = None
-                    return result
                 preview["text"] = svc.output(
                     await svc.ai.generate(
                         payload,
@@ -820,12 +817,7 @@ async def sandbox(request: Request):
                     )
                 )
                 if bvid:
-                    preview["text"] = (
-                        "公开视频标题／简介摘要（未观看全片）：\n"
-                        + preview["text"]
-                        + "\n"
-                        + video.url
-                    )
+                    preview["text"] = preview["text"] + "\n" + video.url
                 if not bvid and preview["text"].lstrip().startswith("{"):
                     actions, folded = parse_actions(
                         preview["text"],

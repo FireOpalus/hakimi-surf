@@ -25,6 +25,7 @@ from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
 from .outbound_actions import parse_actions
+from .output_links import filter_reply_links
 from .proactive_dm import OwnerProactive
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
@@ -441,19 +442,19 @@ class Service:
             }
             if loaded is None:
                 data["status"] = (
-                    self.images.failure_placeholder(ref)
-                    if hasattr(self.images, "failure_placeholder")
-                    else "[图片加载失败]"
+                    self.images.failure_status(ref)
+                    if hasattr(self.images, "failure_status")
+                    else "unavailable"
                 )
             else:
                 images.append(loaded)
-                data.update(image_number=len(images), status="已提供图片")
+                data.update(image_number=len(images), status="available")
                 semantic = self.memes.semantic_label(loaded.digest)
                 if semantic:
                     data["local_sticker_label"] = semantic
             sources.append(data)
         if omitted:
-            sources.append({"status": f"另有{omitted}张图片未加载；本轮最多读取2张"})
+            sources.append({"status": "omitted", "count": omitted})
         return images, sources
 
     async def expand_forwards(self, message: Message) -> Message:
@@ -493,6 +494,7 @@ class Service:
         # No chat memory is ever included in public-content summarization.
         payload = {
             "task": "summarize_public_metadata",
+            "material_scope": "metadata_only",
             "untrusted_sources": [v.model_dump(exclude={"mid"}) for v in videos],
         }
         # Truncate before screening; the generator receives precisely the same screened excerpts.
@@ -506,9 +508,9 @@ class Service:
             payload, subject, summary=True, deep=deep, budget_lane=lane, message=message
         )
         # Links come only from validated BVIDs, never model output or fetched text.
-        text = re.sub(r"https?://\S+", "[外部链接已省略]", text)
+        text = filter_reply_links(text, public=False)
         sources = "\n".join(v.url for v in videos)
-        return self.output(f"公开标题／简介摘要（未观看全片）：\n{text}\n来源：\n{sources}")
+        return self.output(f"{text}\n{sources}")
 
     async def handle_message(self, job: dict):
         message = Message.model_validate(job["payload"])
@@ -587,6 +589,11 @@ class Service:
                 m.event_id for m in members if re.fullmatch(r"-?[0-9]{1,30}", m.event_id)
             ],
             "history_revision": session.get("history_revision", 0),
+            "context_status": [
+                {"event_id": m.event_id, "states": m.context_status}
+                for m in members or [message]
+                if m.context_status
+            ],
         }
         previews = []
         for m in members:
@@ -725,12 +732,18 @@ class Service:
                     images=[i.gate() for i in neighbour_images],
                     before_call=message_guard,
                 )
-                for source in neighbour_sources:
-                    if "image_number" in source:
-                        source = {**source, "image_number": source["image_number"] + len(images)}
-                    image_sources.append(source)
-                images.extend(neighbour_images)
+            for source in neighbour_sources:
+                if "image_number" in source:
+                    source = {**source, "image_number": source["image_number"] + len(images)}
+                image_sources.append(source)
+            images.extend(neighbour_images)
+            if neighbour_sources:
                 payload["image_sources"] = image_sources
+            payload["context_status"].extend(
+                {"event_id": m.event_id, "states": m.context_status}
+                for m in nearby
+                if m.context_status
+            )
         context_members = list(members)
         if message.kind == "group":
             context_members.extend(neighbour_members if images else [])
@@ -760,8 +773,6 @@ class Service:
         parsed = None
         meme_tag = None
         public = not (message.kind == "private" and is_persona_owner(message, self.s))
-        if len(message.video_ids) > 1 or len(message.short_urls) > 1:
-            raise Rejected("one_video_per_request")
         bvid = message.video_ids[0] if message.video_ids else extract_bvid(message.text)
         if sandbox:
             bvid = None
@@ -798,65 +809,40 @@ class Service:
                 message=message,
                 guard=video_guard,
             )
-            text = re.sub(r"https?://\S+", "[外部链接已省略]", analysis.text)
-            result = self.output(f"{analysis.evidence}\n{text}\n来源：\n{video.url}")
+            text = filter_reply_links(analysis.text, public=public)
+            result = self.output(text)
             # Sources and generated summaries are deliberately excluded from conversation memory.
-        elif (
-            not sandbox
-            and not self.bot_guard.known_bot(message)
-            and (
-                explicit_search(members[-1].command_text or members[-1].text)
-                or (
-                    getattr(intent, "need_external_lookup", False)
-                    and (message.kind == "private" or message.addressed)
-                )
-            )
-        ):
-            controller = self.store.runtime.web_search
-            if not controller.config.enabled:
-                result = "联网搜索还没开启，这次没法替你上网核实。"
-            else:
-                self.store.groups.phase(message, "generating")
-                batch = self.store.groups.active.get(self.store.session_scope(message))
-                grounded = False
-                try:
-                    result = await self.ai.search(
-                        search_query(members[-1], self.s),
-                        job["subject"],
-                        before_call=message_guard,
-                        cancel_event=batch.cancel if batch else None,
-                    )
-                    grounded = True
-                except Rejected as exc:
-                    if str(exc) in {"reply_invalidated", "batch_interrupted", "batch_recalled"}:
-                        raise
-                    self.record("web_search_failed")
-                    result = (
-                        "请把要查的公开问题单独发我，别带账号、链接或凭证。"
-                        if str(exc)
-                        in {
-                            "search_query_length",
-                            "search_query_private_data",
-                            "credential_in_memory",
-                        }
-                        else "这次联网没拿到可核实的结果，或已到搜索额度上限，先不乱猜。"
-                    )
-                await message_guard()
-                await self.store.enqueue_reply(
-                    job["id"],
-                    message,
-                    self.output(result),
-                    session_epoch=session["epoch"],
-                    participants=members,
-                    external_search=grounded,
-                )
-                return
-        elif intent == "bilibili_watch":
-            result = (
-                "请发送 BV 号或 https://www.bilibili.com/video/BV… 完整链接；"
-                "订阅请用 /哈基米 帮助。"
-            )
         else:
+            if (
+                not sandbox
+                and not self.bot_guard.known_bot(message)
+                and (message.kind == "private" or message.addressed)
+                and (
+                    explicit_search(members[-1].command_text or members[-1].text)
+                    or getattr(intent, "need_external_lookup", False)
+                )
+            ):
+                controller = self.store.runtime.web_search
+                payload["web_search_status"] = "disabled"
+                if controller.config.enabled:
+                    self.store.groups.phase(message, "generating")
+                    batch = self.store.groups.active.get(self.store.session_scope(message))
+                    payload["web_search_status"] = "unavailable"
+                    try:
+                        findings = await self.ai.search(
+                            search_query(members[-1], self.s),
+                            job["subject"],
+                            before_call=message_guard,
+                            cancel_event=batch.cancel if batch else None,
+                        )
+                        if findings and findings.strip() and controller.config.enabled:
+                            payload["web_search_findings"] = findings
+                            payload.pop("web_search_status", None)
+                    except Rejected as exc:
+                        if str(exc) in {"reply_invalidated", "batch_interrupted", "batch_recalled"}:
+                            raise
+                        self.record("web_search_failed")
+                    await message_guard()
             self.store.groups.phase(message, "generating")
             batch = self.store.groups.active.get(self.store.session_scope(message))
             tier = getattr(intent, "tier", 2)
@@ -981,19 +967,28 @@ class Service:
             if job["kind"] == "message":
                 message = Message.model_validate(job["payload"])
                 if message.kind == "private" and authorize(message, self.s):
-                    notice = (
-                        "该管理功能仅供主人在私聊中使用。"
-                        if str(exc) == "owner_private_only"
-                        else "这段有点长，分成短一点的问题再发给我吧。"
-                        if str(exc)
-                        in {
-                            "decision_context_too_large",
-                            "transient_context_too_large",
-                            "context_too_large",
-                        }
-                        else "本次请求未处理：安全检查、可用额度或上游服务未满足要求。稍后可重试。"
-                    )
-                    await self.store.enqueue_reply(job["id"], message, notice)
+                    notice = None
+                    if str(exc) in {
+                        "gemini_unavailable",
+                        "gemini_circuit_open",
+                        "generation_incomplete",
+                    }:
+                        notice = "唔，我这边刚刚卡了一下，等会儿再喊我试试~"
+                    elif str(exc) in {
+                        "budget_exhausted",
+                        "budget_hard_stop",
+                        "budget_circuit_open",
+                        "budget_reservation_exceeded",
+                        "daily_budget",
+                        "monthly_budget",
+                        "total_budget",
+                        "user_budget",
+                        "lane_budget",
+                    }:
+                        notice = "今天的额度用完啦，明天再接着聊吧~"
+                    # Safety, permission and context rejections stay silent.
+                    if notice:
+                        await self.store.enqueue_reply(job["id"], message, notice)
             await self.store.finish(job["id"], "rejected")
         except Exception:
             self.record("job_failed")
@@ -1037,7 +1032,14 @@ class Service:
                 except Rejected:
                     return False
 
-            receipt = await self.sender.quick_ack(message, "稍等，我仔细看看", before_send=valid)
+            phrases = (
+                ("等我一下下，我仔细看看~", "稍等哦，我帮你理一下")
+                if message.kind == "private" and is_persona_owner(message, self.s)
+                else ("稍等我捋一下", "等下，我看眼细节", "让我想想怎么讲")
+            )
+            receipt = await self.sender.quick_ack(
+                message, random.choice(phrases), before_send=valid
+            )
             if receipt:
                 await self.store.runtime.attention.record_sent(message, receipt)
         except Exception:
@@ -1069,11 +1071,6 @@ class Service:
             await self.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
 
             async def valid_after_delay():
-                if (
-                    reply.get("external_search")
-                    and not self.store.runtime.web_search.config.enabled
-                ):
-                    return False
                 async with self.store.lock:
                     row = await self.store.one(
                         "SELECT status FROM outbox WHERE id=?", (reply["id"],)
@@ -1141,12 +1138,7 @@ class Service:
                 and bool(re.fullmatch(r"-?[0-9]{1,30}", str(receipt.get("message_id", ""))))
             )
             if text_confirmed:
-                # Grounded answers are transient transport data, never profile/chronicle input.
-                retained_text = (
-                    "[已联网回答本轮问题；检索资料不进入记忆]"
-                    if reply.get("external_search")
-                    else reply["text"]
-                )
+                retained_text = reply["text"]
                 await self.sessions.reply(
                     message, retained_text, reply["id"], expected_epoch=delivery_epoch
                 )
@@ -1230,7 +1222,6 @@ class Service:
             and text_confirmed
             and not reply["proactive"]
             and message.kind == "group"
-            and not reply.get("external_search")
         ):
             await self.public_memory.record(
                 reply["id"],

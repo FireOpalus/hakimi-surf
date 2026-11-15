@@ -107,7 +107,9 @@ def material(subtitle="", duration=60, complete=True):
         "subtitle_complete": complete,
         "subtitle_status": "complete" if complete else "truncated",
         "hot_comments_unverified": ["可爱"],
-        "evidence": "仅阅读字幕文字，未观看画面" if subtitle else "没有可用字幕",
+        "material_scope": ("full_subtitle" if complete else "partial_subtitle")
+        if subtitle
+        else "metadata_only",
     }
 
 
@@ -161,7 +163,7 @@ async def test_configuration_gates_download_but_allows_honest_text_fallback(
     await rig.watch.set_config(VideoWatchConfig(enabled=enabled, daily_limit=limit))
     result = await rig.watch.analyze(BV, material(duration=duration), "subject", "chat")
     assert result.mode == "text" and result.reason == reason
-    assert "退回文字资料" in result.evidence
+    assert result.material_scope == "metadata_only"
     assert not rig.downloader.calls and not rig.gateway.video_calls
     assert [c[0] for c in rig.gateway.calls] == ["screen", "generate"]
 
@@ -243,19 +245,48 @@ async def test_hard_preconditions_fail_before_any_model_or_download(rig, message
 
 
 @pytest.mark.parametrize("code", ["video_download_risk", "video_download_cookie_expired"])
-async def test_download_risk_cools_account_and_returns_metadata_without_second_llm(rig, code):
+async def test_download_risk_cools_account_and_summarizes_screened_text(rig, code):
     rig.downloader.error = code
     result = await rig.watch.analyze(BV, material(), "subject", "chat")
-    assert result.mode == "metadata" and result.reason == "risk"
-    assert "未完成视频分析" in result.evidence
+    assert result.mode == "text" and result.reason == "risk"
+    assert result.material_scope == "metadata_only"
     assert rig.svc.bili_watcher.blocked_until == rig.clock[0] + 43200
     assert len(rig.svc.bili_watcher.risks) == 1
-    assert [c[0] for c in rig.gateway.calls] == ["screen"]
+    assert [c[0] for c in rig.gateway.calls] == ["screen", "generate"]
     assert not rig.gateway.video_calls
     assert rig.downloader.cleaned == 1
     status = await rig.watch.status()
     assert status["recent_attempts"][0]["reason"] == "risk"
     assert status["attempts_today"] == 1
+
+
+@pytest.mark.parametrize(
+    "code,reason",
+    [
+        ("video_download_failed", "download_failed"),
+        ("video_file_upload_failed", "files_unavailable"),
+        ("video_processing_failed", "files_unavailable"),
+    ],
+)
+async def test_failed_video_summarizes_same_screened_material_and_cleans(rig, code, reason):
+    if code.startswith("video_download"):
+        rig.downloader.error = code
+    else:
+        rig.gateway.video_error = code
+    result = await rig.watch.analyze(BV, material(), "subject", "chat")
+    assert result.mode == "text" and result.reason == reason
+    assert [c[0] for c in rig.gateway.calls] == ["screen", "generate"]
+    assert rig.gateway.calls[0][1] == rig.gateway.calls[1][1]
+    assert rig.downloader.cleaned == 1
+    assert (await rig.watch.status())["recent_attempts"][0]["reason"] == reason
+
+
+async def test_existing_cooldown_uses_existing_metadata_without_download(rig):
+    rig.svc.bili_watcher.blocked_until = rig.clock[0] + 43200
+    result = await rig.watch.analyze(BV, material(), "subject", "chat")
+    assert result.mode == "text" and result.reason == "risk"
+    assert not rig.downloader.calls
+    assert [c[0] for c in rig.gateway.calls] == ["screen", "generate"]
 
 
 @pytest.mark.parametrize("code", ["prompt_injection", "content_blocked", "budget_exhausted"])
