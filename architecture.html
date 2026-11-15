@@ -4,525 +4,384 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="基于 hakimi-surf 1.0.0 源码绘制的项目架构图：境内 NapCat／境外主脑、会话串行与接收日志、受控点名、公开记忆桥、Gemini 思考策略与本地时区预算。">
-  <title>hakimi-surf · 项目架构图</title>
+  <meta name="description" content="hakimi-surf 1.1.3 源码架构：境内 NapCat 与境外单进程后端、可取消消息管道、受控联网取证、A/B/C 上下文、双轨记忆与 ACK 确认投递。">
+  <title>hakimi-surf 1.1.3 · 项目架构图</title>
   <style>
     :root {
       color-scheme: light;
-      --page: #f5f7fb;
-      --surface: #ffffff;
-      --subtle: #f8fafc;
-      --ink: #182539;
-      --muted: #52647b;
-      --line: #dbe3ed;
-      --connector: #96a8be;
-      --blue: #315de2;
-      --blue-soft: #eef3ff;
-      --teal: #08796e;
-      --teal-soft: #ebf8f5;
-      --purple: #7451ba;
-      --purple-soft: #f4effb;
-      --amber: #936018;
-      --amber-soft: #fcf5e8;
-      --shadow: 0 8px 28px rgb(26 44 77 / 4%);
+      --page: #f3f5f8; --surface: #fff; --subtle: #f8fafc;
+      --ink: #17263d; --muted: #53657d; --line: #dce3ed; --edge: #91a3ba;
+      --blue: #244fc5; --blue-soft: #edf2ff;
+      --teal: #087568; --teal-soft: #eaf7f3;
+      --violet: #7146ad; --violet-soft: #f4effc;
+      --amber: #8a5811; --amber-soft: #fcf3e4;
+      --shadow: 0 8px 30px rgb(24 42 70 / 4%);
     }
     @media (prefers-color-scheme: dark) {
       :root {
         color-scheme: dark;
-        --page: #111822;
-        --surface: #192330;
-        --subtle: #1e2a39;
-        --ink: #e5edf8;
-        --muted: #afbed2;
-        --line: #354458;
-        --connector: #768ba6;
-        --blue: #9ab7ff;
-        --blue-soft: #243454;
-        --teal: #83d4c6;
-        --teal-soft: #1c393a;
-        --purple: #c6aff2;
-        --purple-soft: #332d49;
-        --amber: #e5bf7e;
-        --amber-soft: #393326;
-        --shadow: none;
+        --page: #101720; --surface: #182331; --subtle: #1d2a3a;
+        --ink: #e5edf7; --muted: #b1c1d5; --line: #35475e; --edge: #8a9db8;
+        --blue: #a9c0ff; --blue-soft: #223452;
+        --teal: #8ad9c8; --teal-soft: #1b3938;
+        --violet: #d1b5ff; --violet-soft: #342c48;
+        --amber: #f1cc8b; --amber-soft: #3a3123; --shadow: none;
       }
     }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; scroll-padding-top: 24px; }
-    body {
-      margin: 0;
-      background: var(--page);
-      color: var(--ink);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-      font-size: 14px;
-      line-height: 1.65;
-      -webkit-font-smoothing: antialiased;
-    }
-    a { color: var(--blue); text-underline-offset: 3px; }
+    body { margin: 0; color: var(--ink); background: var(--page); font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; -webkit-font-smoothing: antialiased; }
+    a { color: var(--blue); text-underline-offset: 4px; }
     a:hover { text-decoration-thickness: 2px; }
-    a:focus-visible, summary:focus-visible { outline: 3px solid var(--blue); outline-offset: 5px; }
-    h1, h2, h3, h4, p, figure { margin: 0; }
-    h1, h2, h3, h4, strong { font-weight: 600; }
-    code {
-      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-      font-size: .86em;
-      overflow-wrap: anywhere;
-    }
-    .page { max-width: 1440px; margin: auto; padding: 36px 36px 24px; }
-    .masthead { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: .04em; }
-    .brand-mark {
-      display: grid; place-items: center; width: 30px; height: 30px;
-      border-radius: 9px; color: var(--surface); background: var(--ink);
-    }
-    .meta, .eyebrow { color: var(--muted); font-size: 12px; letter-spacing: .08em; }
-    .hero { padding: 34px 0 28px; }
-    .hero h1 { margin: 6px 0 9px; font-size: clamp(26px, 3.2vw, 42px); line-height: 1.3; letter-spacing: -.035em; }
-    .hero h1 span { display: inline-block; color: var(--muted); font-weight: 400; }
-    .hero p { color: var(--muted); font-size: 15px; }
-    .hero-bottom { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-top: 21px; }
-    .tags, nav, .legend { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-    .tag { padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; background: var(--surface); }
+    a:focus-visible, summary:focus-visible { outline: 3px solid var(--blue); outline-offset: 4px; }
+    h1, h2, h3, h4, p, figure, dl, dd { margin: 0; }
+    h1, h2, h3, h4, strong { font-weight: 650; }
+    h3 { font-size: 16px; line-height: 1.5; }
+    h4 { font-size: 14px; }
+    code { font: .87em/1.6 "SFMono-Regular", Consolas, "Liberation Mono", monospace; overflow-wrap: anywhere; }
+    small { font-size: 12px; }
+    .page { max-width: 1480px; margin: auto; padding: 30px 40px; }
+    .masthead { display: flex; justify-content: space-between; gap: 18px; align-items: center; flex-wrap: wrap; }
+    .brand { display: flex; gap: 10px; align-items: center; letter-spacing: .04em; font-weight: 650; }
+    .brand-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 9px; color: var(--surface); background: var(--ink); }
+    .meta, .eyebrow { font-size: 11px; letter-spacing: .09em; color: var(--muted); }
+    .meta a { color: inherit; }
+    .hero { padding: 36px 0 26px; }
+    .hero h1 { margin: 8px 0 12px; font-size: clamp(28px, 4vw, 46px); line-height: 1.25; letter-spacing: -.04em; }
+    .hero h1 span { color: var(--muted); font-weight: 400; }
+    .hero > p { max-width: 820px; color: var(--muted); font-size: 16px; }
+    .hero-bottom { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px; margin-top: 25px; }
+    .tags, .legend, nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .tag { font-size: 12px; padding: 4px 10px; border: 1px solid var(--line); background: var(--surface); border-radius: 6px; }
     nav { gap: 18px; }
     nav a { font-size: 13px; text-decoration: none; }
-    .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
-    .section-heading h2 { font-size: 19px; }
-    .section-heading p { color: var(--muted); font-size: 12px; }
-    .legend { gap: 16px; color: var(--muted); font-size: 12px; }
-    .legend span { display: inline-flex; align-items: center; gap: 6px; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); }
-    .dot.teal { background: var(--teal); }
-    .optional { color: var(--amber); background: var(--amber-soft); font-size: 11px; border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
-    .entry-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; padding: 0 24px; }
-    .entry { text-align: center; }
-    .external-node {
-      padding: 15px 12px; border: 1px solid var(--line); border-radius: 12px;
-      background: var(--surface); box-shadow: var(--shadow);
-    }
-    .external-node h3 { font-size: 16px; }
-    .external-node p { color: var(--muted); font-size: 12px; margin-top: 3px; }
-    .vertical-edge { display: flex; justify-content: center; align-items: center; gap: 9px; min-height: 52px; color: var(--muted); font-size: 12px; }
-    .stem { position: relative; width: 1px; height: 29px; flex: 0 0 1px; background: var(--connector); }
-    .stem::after {
-      content: ""; position: absolute; left: -3px; bottom: 0; width: 7px; height: 7px;
-      border-right: 1px solid var(--connector); border-bottom: 1px solid var(--connector); transform: rotate(45deg);
-    }
-    .application {
-      padding: 22px 24px 24px; border: 1px solid var(--line); border-top: 3px solid var(--blue);
-      border-radius: 14px; background: var(--surface); box-shadow: var(--shadow);
-    }
-    .boundary-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-    .boundary-title strong { font-size: 16px; }
-    .boundary-title span { color: var(--muted); font-size: 12px; }
-    .boundary-title code { color: var(--blue); }
-    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
-    .node { min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 16px; background: var(--surface); }
-    .node h3 { font-size: 16px; line-height: 1.5; margin-bottom: 7px; }
-    .node p { color: var(--muted); font-size: 13px; }
-    .node .files { margin-top: 10px; font-size: 12px; color: var(--muted); line-height: 1.7; }
-    .node .files a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--connector); }
-    .node .files a:hover { color: var(--blue); }
-    .endpoint { background: var(--subtle); }
-    .endpoint code.route { display: block; color: var(--ink); font-size: 12px; margin-bottom: 8px; }
-    .control { border-style: dashed; }
-    .merge-note {
-      display: grid; grid-template-columns: 2fr 1fr; gap: 20px; padding: 1px 0;
-      color: var(--muted); font-size: 12px;
-    }
-    .control-note { display: flex; align-items: center; justify-content: center; text-align: center; }
-    .lane-heading { display: flex; align-items: center; gap: 10px; margin: 4px 0 12px; }
-    .lane-heading .index { color: var(--blue); font-size: 11px; font-weight: 600; letter-spacing: .1em; }
-    .lane-heading h3 { font-size: 14px; }
-    .lane-heading small { margin-left: auto; color: var(--muted); font-size: 12px; }
-    .flow-row { display: grid; grid-template-columns: 1fr 28px 1.1fr 28px 1fr; align-items: stretch; }
-    .flow-row .node { background: var(--blue-soft); border-color: transparent; }
-    .flow-row .node h3 { color: var(--blue); }
-    .step-num { display: block; font-size: 11px; color: var(--blue); letter-spacing: .1em; margin-bottom: 6px; }
-    .horizontal-edge { position: relative; align-self: center; height: 1px; background: var(--connector); margin: 0 4px; }
-    .horizontal-edge::after {
-      content: ""; position: absolute; right: 0; top: -3px; width: 7px; height: 7px;
-      border-right: 1px solid var(--connector); border-top: 1px solid var(--connector); transform: rotate(45deg);
-    }
-    .return-note { display: flex; justify-content: flex-end; gap: 8px; color: var(--muted); font-size: 12px; padding: 10px 0 2px; }
-    .return-note b { color: var(--blue); font-weight: 400; }
-    .state-lane { margin-top: 16px; padding: 14px 16px; border-left: 2px solid var(--purple); background: var(--subtle); }
-    .state-lane strong { font-size: 13px; }
-    .state-lane p { font-size: 12px; color: var(--muted); }
-    .state-lane .mini-flow { margin: 8px 0; }
-    .state-lane .mini-flow span { color: var(--purple); background: var(--purple-soft); }
-    .divider { display: flex; align-items: center; gap: 12px; margin: 22px 0 14px; color: var(--muted); font-size: 12px; }
-    .divider::before, .divider::after { content: ""; height: 1px; background: var(--line); flex: 1; }
-    .capability h3 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .node-key { font-family: Consolas, monospace; color: var(--teal); font-size: 12px; font-weight: 400; }
-    .capability { border-top: 2px solid var(--teal); }
-    .mini-flow { margin: 10px 0; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; font-size: 12px; }
-    .mini-flow span { padding: 3px 6px; border-radius: 4px; background: var(--teal-soft); color: var(--teal); }
-    .mini-flow i { font-style: normal; color: var(--muted); }
-    .workers { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; }
-    .worker { min-width: 0; padding-left: 12px; border-left: 2px solid var(--line); }
-    .worker h4 { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 13px; margin-bottom: 5px; }
-    .worker p { font-size: 12px; color: var(--muted); }
-    .worker code { font-size: 11px; }
-    .shared-strip { display: flex; align-items: baseline; gap: 12px 22px; flex-wrap: wrap; margin-top: 22px; padding: 12px 14px; border-radius: 7px; background: var(--subtle); font-size: 12px; }
-    .shared-strip strong { white-space: nowrap; }
-    .shared-strip span { color: var(--muted); }
-    .storage-grid { display: grid; grid-template-columns: 1.2fr 1.1fr 1fr; gap: 20px; }
-    .storage { background: var(--teal-soft); border-color: transparent; }
-    .storage h3 { color: var(--teal); }
-    .storage .path { display: block; color: var(--ink); margin-bottom: 8px; }
-    .storage small { display: block; color: var(--muted); font-size: 12px; margin-top: 6px; }
-    figcaption { color: var(--muted); font-size: 12px; margin: 14px 0 0; }
-    .block { margin-top: 34px; }
-    .dependencies { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
-    .dependency { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); padding: 17px 18px; }
-    .dependency .origin { color: var(--muted); font-size: 12px; }
-    .dependency .target { display: flex; align-items: center; gap: 10px; margin: 10px 0 6px; }
-    .dependency .target b { font-weight: 400; color: var(--purple); }
-    .dependency h3 { font-size: 16px; }
-    .dependency p { color: var(--muted); font-size: 12px; }
-    .dependency .node-key { color: var(--purple); }
-    .request-path { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 16px; }
-    .path-card { border-left: 2px solid var(--blue); padding: 0 0 0 16px; }
-    .path-card h3 { font-size: 14px; margin-bottom: 8px; }
-    .path-card ol { padding-left: 20px; margin: 0; color: var(--muted); font-size: 13px; }
-    .path-card li + li { margin-top: 6px; }
-    .path-card strong { color: var(--ink); }
-    .deployment { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    .deploy-card { min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
-    .deploy-card h3 { font-size: 15px; margin-bottom: 10px; }
-    .deploy-card p { color: var(--muted); font-size: 13px; }
-    .deploy-card p + p { margin-top: 8px; }
-    .deploy-line { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 12px; }
-    .deploy-line span { padding: 4px 7px; background: var(--subtle); border-radius: 4px; font-size: 12px; }
-    .deploy-line i { color: var(--connector); font-style: normal; }
-    details { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 0 20px; }
-    details + details { margin-top: 12px; }
-    summary { padding: 17px 0; font-weight: 600; cursor: pointer; }
+    .section { margin-top: 36px; }
+    .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .section-heading h2 { font-size: 21px; letter-spacing: -.02em; }
+    .section-heading h2 span { color: var(--blue); font-size: 13px; margin-right: 12px; }
+    .section-heading > p { color: var(--muted); font-size: 12px; }
+    .panel { border: 1px solid var(--line); border-radius: 16px; background: var(--surface); padding: 24px; box-shadow: var(--shadow); }
+    .legend { gap: 16px; margin-bottom: 18px; color: var(--muted); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { height: 8px; width: 8px; border-radius: 50%; background: var(--blue); }
+    .swatch.teal { background: var(--teal); }
+    .swatch.violet { background: var(--violet); }
+    .swatch.optional { background: transparent; border: 1px dashed var(--amber); }
+    .optional-tag { display: inline-block; padding: 1px 6px; border-radius: 4px; color: var(--amber); background: var(--amber-soft); font-size: 11px; font-weight: 500; vertical-align: middle; }
+    .topology { display: grid; grid-template-columns: minmax(190px, .8fr) 112px minmax(0, 2.3fr); align-items: stretch; }
+    .region { border: 1px solid var(--line); border-radius: 12px; padding: 18px; min-width: 0; }
+    .region-title { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 5px; margin-bottom: 14px; }
+    .region-title b { font-size: 15px; }
+    .region-title span { color: var(--muted); font-size: 10px; letter-spacing: .06em; }
+    .region.domestic { background: var(--subtle); }
+    .region.overseas { background: var(--blue-soft); border-color: transparent; }
+    .node { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 9px; padding: 15px; }
+    .node p, .card p { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .node small { display: block; color: var(--muted); margin-top: 6px; }
+    .node strong { color: var(--blue); }
+    .node .endpoint { display: block; margin-top: 8px; color: var(--blue); }
+    .edge { display: flex; align-items: center; justify-content: center; text-align: center; color: var(--muted); font-size: 11px; padding: 8px; }
+    .edge b { display: block; font-size: 25px; line-height: 1.1; color: var(--edge); }
+    .gateway-flow { display: grid; grid-template-columns: minmax(0, .8fr) 40px minmax(0, 1.2fr); align-items: stretch; }
+    .app-node { border-color: var(--blue); }
+    .app-modules { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 10px; }
+    .app-modules code { padding: 2px 6px; border-radius: 4px; background: var(--blue-soft); color: var(--blue); font-size: 10px; }
+    .local-port { margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .control-line { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 13px 16px; border: 1px dashed var(--edge); border-radius: 9px; margin-top: 16px; font-size: 13px; }
+    .control-line > span { color: var(--muted); }
+    .fanout-label { text-align: center; color: var(--muted); font-size: 12px; margin: 19px 0 12px; }
+    .resource-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .resource { border-top: 2px solid var(--edge); background: var(--subtle); border-radius: 0 0 8px 8px; padding: 12px 15px; min-width: 0; }
+    .resource strong { font-size: 14px; }
+    .resource p { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .resource.storage { border-color: var(--teal); }
+    .resource.model { border-color: var(--violet); }
+    figcaption, .note { font-size: 12px; color: var(--muted); margin-top: 16px; }
+    .pipeline { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 22px; margin: 0; padding: 0; list-style: none; }
+    .step { position: relative; min-width: 0; padding: 16px 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .step:not(:last-child)::after { content: "→"; position: absolute; top: 39px; right: -19px; color: var(--edge); font-size: 18px; }
+    .step-number { display: block; color: var(--blue); font-size: 11px; letter-spacing: .08em; margin-bottom: 8px; }
+    .step h3 { font-size: 15px; }
+    .step p { color: var(--muted); font-size: 12px; margin-top: 9px; }
+    .step .files { margin-top: 12px; }
+    .step.gate { background: var(--violet-soft); border-color: transparent; }
+    .step.generate { background: var(--blue-soft); border-color: transparent; }
+    .step.confirm { background: var(--teal-soft); border-color: transparent; }
+    .files { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; line-height: 1.8; }
+    .files a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--edge); }
+    .files a:hover { color: var(--blue); }
+    .flow-note { padding: 14px 16px; margin-top: 16px; border-radius: 9px; background: var(--teal-soft); font-size: 13px; color: var(--teal); }
+    .flow-note strong { margin-right: 10px; }
+    .branch-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 20px; }
+    .card { border: 1px solid var(--line); border-radius: 10px; padding: 18px; background: var(--surface); min-width: 0; }
+    .card h3 { margin-bottom: 8px; }
+    .card .files { margin-top: 13px; }
+    .card-kicker { display: block; font-size: 11px; color: var(--blue); letter-spacing: .05em; margin-bottom: 7px; }
+    .mini-flow { display: flex; flex-wrap: wrap; gap: 5px 7px; align-items: center; margin: 12px 0; font-size: 12px; }
+    .mini-flow span { background: var(--subtle); padding: 3px 7px; border-radius: 5px; }
+    .mini-flow i { font-style: normal; color: var(--edge); }
+    .status-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+    .status-list code { background: var(--subtle); color: var(--muted); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+    .protocol { margin-top: 18px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+    .protocol > div { background: var(--subtle); border-radius: 9px; padding: 14px 16px; min-width: 0; }
+    .protocol p { color: var(--muted); font-size: 12px; margin-top: 6px; }
+    .schema { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+    .schema code { padding: 3px 7px; border: 1px solid var(--line); border-radius: 4px; color: var(--blue); font-size: 11px; }
+    .context-grid { display: grid; grid-template-columns: .9fr 1.1fr 1.4fr; gap: 16px; }
+    .context-card { min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+    .context-head { display: flex; align-items: center; gap: 11px; margin-bottom: 12px; }
+    .letter { display: grid; place-items: center; width: 35px; height: 35px; flex: 0 0 35px; font-size: 20px; border-radius: 8px; background: var(--blue-soft); color: var(--blue); }
+    .context-card.b .letter { color: var(--teal); background: var(--teal-soft); }
+    .context-card.c .letter { color: var(--violet); background: var(--violet-soft); }
+    .context-card p { color: var(--muted); font-size: 13px; margin-top: 7px; }
+    .context-card .files { margin-top: 13px; }
+    .context-caption { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 14px 0 24px; padding: 10px 14px; border-radius: 7px; background: var(--subtle); font-size: 12px; color: var(--muted); }
+    .context-caption strong { color: var(--blue); }
+    .memory-map { border: 1px solid var(--line); border-radius: 12px; padding: 18px; background: var(--teal-soft); }
+    .memory-title { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+    .memory-title p { font-size: 12px; color: var(--muted); }
+    .memory-flow { display: grid; grid-template-columns: 1fr 30px 1fr 30px 1.15fr 30px 1.15fr; align-items: stretch; }
+    .memory-flow .node { padding: 13px; }
+    .memory-flow h4 { color: var(--teal); }
+    .memory-flow p { font-size: 12px; }
+    .memory-return { color: var(--teal); font-size: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+    .memory-exits { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    .memory-exits .card { background: var(--subtle); border-style: dashed; }
+    .storage-grid { display: grid; grid-template-columns: 1fr 1.2fr 1fr; gap: 16px; margin-top: 20px; }
+    .storage-grid .card { border-top: 3px solid var(--teal); }
+    .path { display: block; color: var(--teal); margin: 9px 0; font-size: 11px; }
+    .tasks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+    .tasks .card { padding: 16px; }
+    .control-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 20px; padding: 20px; background: var(--blue-soft); border-radius: 10px; }
+    .control-panel h3 { color: var(--blue); margin-bottom: 9px; }
+    .control-panel p { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .control-panel .files { margin-top: 10px; }
+    details { border: 1px solid var(--line); border-radius: 11px; background: var(--surface); margin-top: 12px; }
+    summary { cursor: pointer; padding: 16px 20px; font-weight: 650; }
     summary span { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 10px; }
-    .detail-content { padding: 0 0 22px; }
-    .source-list { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 32px; margin: 4px 0 0; }
-    .source-list div { min-width: 0; }
-    .source-list dt { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
-    .source-list dd { margin: 0; color: var(--muted); font-size: 12px; }
-    .source-list dd a { overflow-wrap: anywhere; }
-    .note { margin-top: 18px; color: var(--muted); font-size: 12px; }
-    footer { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; border-top: 1px solid var(--line); margin-top: 30px; padding-top: 16px; color: var(--muted); font-size: 12px; }
-    @media (max-width: 1050px) {
-      .page { padding: 28px 24px 20px; }
-      .workers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .entry-grid, .grid-3, .dependencies, .storage-grid { gap: 12px; }
-      .application { padding: 20px 18px; }
-      .entry-grid { padding: 0 18px; }
-      .node { padding: 13px; }
+    .detail-content { padding: 2px 20px 20px; }
+    .detail-content > p { color: var(--muted); font-size: 13px; margin-top: 8px; }
+    .source-list > div { display: grid; grid-template-columns: 205px minmax(0, 1fr); gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .source-list > div:last-child { border: 0; }
+    .source-list dt { font-size: 13px; font-weight: 650; }
+    .source-list dd { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+    footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-top: 26px; color: var(--muted); font-size: 11px; }
+    .skip { position: absolute; left: 16px; top: -100px; background: var(--surface); padding: 10px; z-index: 5; }
+    .skip:focus { top: 10px; }
+    @media (max-width: 1150px) {
+      .page { padding: 26px; }
+      .topology { grid-template-columns: minmax(180px, .85fr) 86px minmax(0, 2fr); }
+      .region { padding: 14px; }
+      .gateway-flow { grid-template-columns: 1fr; gap: 8px; }
+      .gateway-flow > .edge { padding: 0; }
+      .gateway-flow > .edge b { transform: rotate(90deg); }
+      .pipeline { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .step:nth-child(3)::after { content: none; }
+      .step-number::after { content: " / 06"; color: var(--muted); }
+      .tasks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
-    @media (max-width: 760px) {
-      .entry-grid, .grid-3, .storage-grid, .dependencies, .deployment, .request-path, .source-list { grid-template-columns: 1fr; }
-      .entry-grid { padding: 0; gap: 10px; margin-bottom: 14px; }
-      .entry { display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 12px; }
-      .entry .vertical-edge { flex-direction: row; justify-content: flex-start; min-height: 0; }
-      .entry .stem { display: none; }
-      .entry .vertical-edge::before { content: "→"; color: var(--connector); }
-      .external-node { padding: 12px; box-shadow: none; }
-      .flow-row { grid-template-columns: 1fr; }
-      .horizontal-edge { width: 1px; height: 24px; margin: 4px auto; }
-      .horizontal-edge::after { top: auto; right: -3px; bottom: 0; transform: rotate(135deg); }
-      .merge-note { grid-template-columns: 1fr; gap: 0; }
-      .control-note { margin-bottom: 15px; }
-      .lane-heading { flex-wrap: wrap; }
-      .lane-heading small { flex-basis: 100%; margin-left: 0; }
-      .storage-grid { gap: 12px; }
-      .divider { text-align: center; }
-      .divider span { max-width: 80%; }
+    @media (max-width: 800px) {
+      .page { padding: 22px; }
+      .panel { padding: 18px; }
+      .topology { grid-template-columns: 1fr; }
+      .topology > .edge { padding: 12px; }
+      .topology > .edge b { display: inline; font-size: 18px; }
+      .topology > .edge b::before { content: "↕ "; }
+      .topology > .edge b { font-size: 0; }
+      .topology > .edge b::before { font-size: 20px; }
+      .gateway-flow { grid-template-columns: minmax(0, .8fr) 30px minmax(0, 1.2fr); gap: 0; }
+      .gateway-flow > .edge b { transform: none; }
+      .resource-grid, .branch-grid, .storage-grid { grid-template-columns: 1fr; }
+      .context-grid { grid-template-columns: 1fr; }
+      .memory-flow { grid-template-columns: 1fr; }
+      .memory-flow .edge { padding: 5px; }
+      .memory-flow .edge b { transform: rotate(90deg); font-size: 20px; }
+      .memory-exits, .protocol, .control-panel { grid-template-columns: 1fr; }
+      .section-heading > p { max-width: 100%; }
+      .source-list > div { grid-template-columns: 1fr; gap: 5px; }
     }
-    @media (max-width: 440px) {
-      .page { padding: 20px 14px; }
-      .hero { padding: 26px 0 24px; }
-      .hero h1 span { display: block; margin-top: 4px; }
-      .application { padding: 18px 12px; }
-      .workers { grid-template-columns: 1fr; gap: 16px; }
-      .entry { grid-template-columns: 1fr; gap: 4px; }
-      .entry .vertical-edge { justify-content: center; }
-      .entry .vertical-edge::before { content: "接入："; color: var(--muted); }
-      .shared-strip { display: grid; gap: 7px; }
-      .masthead { gap: 10px; }
-      .section-heading { gap: 8px; }
-      .legend { gap: 10px; }
-      details { padding: 0 14px; }
+    @media (max-width: 540px) {
+      .page { padding: 18px 14px; }
+      .hero { padding-top: 27px; }
+      .hero > p { font-size: 14px; }
+      .hero h1 span { display: block; margin-top: 6px; }
+      .hero-bottom { gap: 16px; }
+      nav { gap: 12px; }
+      .section { margin-top: 28px; }
+      .section-heading h2 { font-size: 19px; }
+      .panel { padding: 14px; border-radius: 12px; }
+      .gateway-flow { grid-template-columns: 1fr; gap: 7px; }
+      .gateway-flow > .edge b { transform: rotate(90deg); }
+      .pipeline, .tasks { grid-template-columns: 1fr; }
+      .step { padding: 15px; }
+      .step:not(:last-child)::after { content: "↓"; top: auto; right: calc(50% - 8px); bottom: -25px; }
+      .step p { font-size: 13px; }
+      .step-number { margin-bottom: 5px; }
+      .card, .context-card { padding: 15px; }
+      .memory-map { padding: 13px; }
+      .control-line { gap: 5px 10px; }
+      .detail-content { padding: 0 15px 15px; }
+      summary { padding: 14px 15px; }
       summary span { display: block; margin-left: 0; }
     }
     @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
     @media print {
-      :root {
-        color-scheme: light;
-        --page: #fff; --surface: #fff; --subtle: #f6f7f9; --ink: #182539; --muted: #52647b;
-        --line: #cbd5e1; --connector: #788da6; --blue: #315de2; --blue-soft: #eef3ff;
-        --teal: #08796e; --teal-soft: #ebf8f5; --purple: #7451ba; --purple-soft: #f4effb;
-        --amber: #936018; --amber-soft: #fcf5e8; --shadow: none;
-      }
-      body { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
-      .page { max-width: none; padding: 0; }
-      nav, footer a { display: none; }
+      :root { --page: #fff; --surface: #fff; --subtle: #f5f6f8; --ink: #17263d; --muted: #41536a; --line: #c6ced9; --edge: #677c98; --blue: #244fc5; --blue-soft: #edf2ff; --teal: #087568; --teal-soft: #eaf7f3; --violet: #7146ad; --violet-soft: #f4effc; --amber: #8a5811; --amber-soft: #fcf3e4; --shadow: none; color-scheme: light; }
+      .page { padding: 0; max-width: none; }
+      nav, .skip { display: none; }
       .hero { padding: 20px 0; }
-      .node, .worker, .dependency, .deploy-card { break-inside: avoid; }
-      a { color: inherit; text-decoration: none; }
+      .section { margin-top: 24px; }
+      .panel { padding: 16px; }
+      .card, .step, .context-card, .node { break-inside: avoid; }
+      a { color: inherit; }
+      body { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
     }
   </style>
 </head>
 <body>
+  <a class="skip" href="#overview">跳到架构总览</a>
   <main class="page">
-    <header>
-      <div class="masthead">
-        <div class="brand"><span class="brand-mark" aria-hidden="true">H</span> hakimi-surf</div>
-        <div class="meta">源码架构 · v1.0.0 · 2026-11-14</div>
-      </div>
-      <div class="hero">
-        <div class="eyebrow">PROJECT ARCHITECTURE</div>
-        <h1>哈基米跨平台冲浪助手 <span>/ 项目架构图</span></h1>
-        <p>境内协议接入 → 境外会话串行处理 → 受控模型生成 → QQ 回复与隔离记忆。</p>
-        <div class="hero-bottom">
-          <div class="tags" aria-label="项目技术栈">
-            <span class="tag">Python 3.12+</span><span class="tag">FastAPI + asyncio</span>
-            <span class="tag">SQLite / aiosqlite</span><span class="tag">双端部署 · 后端单副本</span>
-          </div>
-          <nav aria-label="页面导航"><a href="#overview">架构总览</a><a href="#dependencies">外部依赖</a><a href="#deployment">部署结构</a><a href="#sources">源码索引</a></nav>
-        </div>
-      </div>
+    <header class="masthead">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">H</span> hakimi-surf</div>
+      <div class="meta">SOURCE ARCHITECTURE · <a href="pyproject.toml">v1.1.3</a> · 2026-11-15</div>
     </header>
-
-    <section id="overview" aria-labelledby="overview-heading">
-      <div class="section-heading">
-        <h2 id="overview-heading">01 / 应用架构</h2>
-        <div class="legend" aria-label="图例">
-          <span><i class="dot" aria-hidden="true"></i>消息主链路</span>
-          <span><i class="dot teal" aria-hidden="true"></i>共享能力与存储</span>
-          <span><b class="optional">可选</b>按配置启用</span>
-        </div>
+    <section class="hero" aria-labelledby="page-title">
+      <div class="eyebrow">QQ ASSISTANT / SYSTEM MAP</div>
+      <h1 id="page-title">哈基米 <span>／ 项目架构图</span></h1>
+      <p>境内协议接入，境外会话编排。沿一条消息，查看联网取证、模型生成、确认投递与双轨记忆如何协作。</p>
+      <div class="hero-bottom">
+        <div class="tags"><span class="tag">单进程 FastAPI</span><span class="tag">默认 2 个异步消费者</span><span class="tag">按会话隔离</span><span class="tag">ACK 后写入助手历史</span></div>
+        <nav aria-label="架构图导航"><a href="#overview">部署</a><a href="#pipeline">消息流</a><a href="#memory">上下文与记忆</a><a href="#operations">后台与控制</a><a href="#sources">源码</a></nav>
       </div>
-      <figure aria-labelledby="overview-heading" aria-describedby="architecture-caption">
-        <div class="entry-grid">
-          <div class="entry">
-            <div class="external-node"><h3>境内 · QQ / NapCat</h3><p>OneBot v11 · 私聊、群聊与 @Bot</p></div>
-            <div class="vertical-edge"><i class="stem" aria-hidden="true"></i><span>反向 WSS → 境外 Nginx → FastAPI</span></div>
+    </section>
+
+    <section class="section" id="overview" aria-labelledby="overview-title">
+      <div class="section-heading"><h2 id="overview-title"><span>01</span>部署与进程边界</h2><p>当前默认拓扑 · OneBot v11 反向 WebSocket</p></div>
+      <figure class="panel" aria-describedby="overview-caption">
+        <div class="legend"><span><i class="swatch" aria-hidden="true"></i>在线消息</span><span><i class="swatch teal" aria-hidden="true"></i>持久化与记忆</span><span><i class="swatch violet" aria-hidden="true"></i>模型请求</span><span><i class="swatch optional" aria-hidden="true"></i>按配置启用</span></div>
+        <div class="topology">
+          <div class="region domestic">
+            <div class="region-title"><b>境内 · 协议端</b><span>PROTOCOL HOST</span></div>
+            <article class="node"><h3>QQ ⇄ NapCat</h3><p>私聊、群聊、提及、通知与发送回执。</p><small>OneBot v11 Universal</small></article>
+            <p class="local-port">独立部署与登录态<br>WebUI：<code>127.0.0.1:6099</code></p>
           </div>
-          <div class="entry">
-            <div class="external-node"><h3>官方 QQ Bot <span class="optional">可选接入</span></h3><p>C2C 私聊 · 群 @ 事件</p></div>
-            <div class="vertical-edge"><i class="stem" aria-hidden="true"></i><span>已签名的 Webhook 事件</span></div>
-          </div>
-          <div class="entry">
-            <div class="external-node"><h3>管理员浏览器</h3><p>本机访问 / SSH 隧道</p></div>
-            <div class="vertical-edge"><i class="stem" aria-hidden="true"></i><span>/admin · API 使用 Bearer Token</span></div>
+          <div class="edge"><div>主动建立 WSS<b aria-hidden="true">⇄</b>TLS · 443<br>事件 / RPC / Base64</div></div>
+          <div class="region overseas">
+            <div class="region-title"><b>境外 · 应用端</b><span>APPLICATION HOST</span></div>
+            <div class="gateway-flow">
+              <article class="node"><h3>Nginx</h3><p>TLS 终止，仅代理随机后缀 WS 路径。</p><small>其余公网路径返回 404</small><code class="endpoint">/ws/onebot/&lt;随机后缀&gt;</code></article>
+              <div class="edge"><b aria-hidden="true">⇄</b></div>
+              <article class="node app-node"><h3>FastAPI · hakimi-bot</h3><p><strong>一个 Uvicorn 进程</strong>，内部以 asyncio 任务运行。</p><code class="endpoint">127.0.0.1:12141</code><div class="app-modules"><code>Service</code><code>GeminiGateway</code><code>Store / SessionManager</code></div></article>
+            </div>
           </div>
         </div>
-
-        <div class="application">
-          <div class="boundary-title">
-            <strong>境外 · hakimi-bot <span>／ 一个 FastAPI 应用进程</span></strong>
-            <span>入口 <code>hakimi.app:create_app</code> · 端口 <code>12141</code></span>
-          </div>
-          <div class="grid-3">
-            <article class="node endpoint">
-              <h3>OneBot 接入与适配</h3>
-              <code class="route">WS ONEBOT_WS_PATH<br>兼容 POST /webhooks/onebot</code>
-              <p>跨机拓扑使用带随机后缀的 WS 路径，验证 Token、Self-ID 与登录身份；支持心跳、重连与旧连接接管。HTTP／正向 WS 仍可配置。</p>
-              <div class="files"><a href="src/hakimi/app.py">app.py</a> · <a href="src/hakimi/onebot_transport.py">onebot_transport.py</a><br><a href="src/hakimi/adapters.py">adapters.py</a> · <a href="src/hakimi/rich_message_parser.py">rich_message_parser.py</a></div>
-            </article>
-            <article class="node endpoint">
-              <h3>官方 QQ 事件适配</h3>
-              <code class="route">POST /webhooks/qq</code>
-              <p>Ed25519 签名、AppID 与时间校验；将支持的事件规范化为 Message。代码保留此入口，默认跨机 Nginx 模板不公开它。</p>
-              <div class="files"><a href="src/hakimi/app.py">app.py</a> · <a href="src/hakimi/adapters.py">adapters.py</a><br><a href="src/hakimi/security.py">security.py</a> · <a href="src/hakimi/models.py">models.py</a></div>
-            </article>
-            <article class="node endpoint control">
-              <h3>内嵌管理台</h3>
-              <code class="route">GET /admin · /admin/*</code>
-              <p>同源 HTML 页面与管理 API；热调准入、九场景思考强度、预算、记忆、巡逻和表情配置，查看连接与审计状态。</p>
-              <div class="files"><a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/admin_routes.py">admin_routes.py</a><br><a href="src/hakimi/admin_auth.py">admin_auth.py</a> · 专项管理路由</div>
-            </article>
-          </div>
-
-          <div class="merge-note">
-            <div class="vertical-edge"><i class="stem" aria-hidden="true"></i><span>规范化 Message → Service.accept()</span></div>
-            <div class="control-note">管理 API → RuntimeState / 各功能模块<br>配置持久化到主库</div>
-          </div>
-
-          <div class="lane-heading"><span class="index">CORE</span><h3>Service 会话管道</h3><small>默认 2 个消费者；接收锁与对话锁按会话分别串行</small></div>
-          <div class="flow-row">
-            <article class="node">
-              <span class="step-num">01 / RECEIVE</span><h3>准入、接收日志与防抖</h3>
-              <p>先做身份与抢话过滤；获准消息在接收锁内写隔离日志、展开同会话引用／转发，再入队。群／私聊统一防抖 1.8 秒，最长 3.5 秒。</p>
-              <div class="mini-flow"><span>receive</span><i aria-hidden="true">→</i><span>resolve</span><i aria-hidden="true">→</i><span>jobs / 批次</span></div>
-              <div class="files"><a href="src/hakimi/session_manager.py">SessionManager.receive()</a> · <a href="src/hakimi/message_context.py">MessageContextResolver</a><br><a href="src/hakimi/store.py">Store.admit()</a> · <a href="src/hakimi/group_pipeline.py">GroupPipeline</a></div>
-            </article>
-            <div class="horizontal-edge" aria-hidden="true"></div>
-            <article class="node">
-              <span class="step-num">02 / PROCESS</span><h3>会话锁内审核与生成</h3>
-              <p>认领批次后读取最新历史；门卫放行才将原消息加入热历史。固定命令直接处理，对话／视频按场景调用模型；epoch 复核阻止旧结果回写。</p>
-              <div class="mini-flow"><span>claim</span><i aria-hidden="true">→</i><span>SessionScheduler.hold</span></div>
-              <div class="files"><a href="src/hakimi/service.py">service.py</a> · <a href="src/hakimi/session_scheduler.py">session_scheduler.py</a><br>command · handle_message · handle_patrol</div>
-            </article>
-            <div class="horizontal-edge" aria-hidden="true"></div>
-            <article class="node">
-              <span class="step-num">03 / DELIVER</span><h3>受控点名与协议投递</h3>
-              <p>解析 AT／MEME 后进入 Outbox；发送前复核权限、epoch 和点名名单。正文先发，本地表情延后发送；确认的群聊文本可进入公开互动索引。</p>
-              <div class="mini-flow"><span>outbox</span><i aria-hidden="true">→</i><span>delivery → Sender</span></div>
-              <div class="files"><a href="src/hakimi/mentions.py">mentions.py</a> · <a href="src/hakimi/bot_guard.py">bot_guard.py</a><br><a href="src/hakimi/adapters.py">Sender</a> · <a href="src/hakimi/public_memory.py">PublicMemory</a></div>
-            </article>
-          </div>
-          <div class="return-note"><b aria-hidden="true">↗</b><span>出站返回 QQ；发送结果不确定时记录 uncertain，不盲目重发。</span></div>
-          <div class="state-lane">
-            <strong>接收日志与模型历史分开保存</strong>
-            <div class="mini-flow"><span>received_messages · 未审核</span><i aria-hidden="true">→ 门卫放行 →</i><span>admit_history → recent_messages</span><i aria-hidden="true">→</i><span>生成与输出审核</span><i aria-hidden="true">→</i><span>reply() → outbox</span></div>
-            <p>所有已发送正文与视觉简述都在 OneBot ACK 后通过回执幂等写入。五维 JSON 流式收集后校验；同人追发可取消未出站请求。清空先提交公开墓碑，再递增 epoch、取消待发任务。</p>
-          </div>
-
-          <div class="divider"><span>↓ 业务处理按需调用；这些模块运行在同一进程中 ↓</span></div>
-          <div class="grid-3">
-            <article class="node capability">
-              <h3><span class="node-key">A</span> 模型网关与生成策略</h3>
-              <p>GeminiGateway 统一输入／来源筛查、生成与输出筛查。九个生成场景默认 medium，可热调 low / medium / high / xhigh。</p>
-              <div class="mini-flow"><span>Decisions</span><i aria-hidden="true">→</i><span>Interactions</span><i aria-hidden="true">→</i><span>Decisions</span></div>
-              <p>每次模型请求预留与结算预算；日／月边界按 BOT_TIMEZONE 计算。生成禁用工具，不使用云端历史续接。</p>
-              <div class="files"><a href="src/hakimi/gemini.py">gemini.py</a> · <a href="src/hakimi/thinking_policy.py">thinking_policy.py</a><br><a href="src/hakimi/generation_policy.py">generation_policy.py</a> · <a href="src/hakimi/budget_calendar.py">budget_calendar.py</a></div>
-            </article>
-            <article class="node capability">
-              <h3><span class="node-key">B</span> 会话隔离与公开背景</h3>
-              <p>每个私聊／群聊独立 WAL SQLite，Fernet 加密正文。画像、编年史和不可变冷史分轨；归档按 epoch／version 与人工锁提交，旧摘要无损过渡。</p>
-              <div class="mini-flow"><span>SessionManager</span><i aria-hidden="true">↔</i><span>MemoryCompressor</span></div>
-              <p>已确认的公开群互动 → 主库只读索引 → Owner 私聊背景；没有私聊到群聊的反向路径。小本本快照仍独立启用。</p>
-              <div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/memory_compressor.py">memory_compressor.py</a><br><a href="src/hakimi/public_memory.py">public_memory.py</a> · <a href="src/hakimi/bot_server.py">bot_server.py</a></div>
-            </article>
-            <article class="node capability">
-              <h3><span class="node-key">C</span> 媒体与 B 站分析</h3>
-              <p>QQ 图片优先经跨机 WS 获取 Base64，再尝试受限 CDN；不读取境内本地路径。每轮最多两图，引用与转发保留来源身份。</p>
-              <div class="mini-flow"><span>字幕 / 文字优先</span><i aria-hidden="true">→</i><span>受限原片分析</span><b class="optional">可选</b></div>
-              <p>原片分支经 yt-dlp / ffmpeg 子进程下载校验，再进入 Files API 与视频分析。</p>
-              <div class="files"><a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/bilibili.py">bilibili.py</a> · <a href="src/hakimi/memes.py">memes.py</a><br><a href="src/hakimi/video_watch.py">video_watch.py</a> · <a href="src/hakimi/video_downloader.py">video_downloader.py</a></div>
-            </article>
-          </div>
-
-          <div class="divider"><span>后台任务 · Service.start() 创建 asyncio 协程</span></div>
-          <div class="workers"><article class="worker"><h4>异步双轨归档</h4><p>28k 估算词元折半入冷史；03:10 上海时间做超过24小时的只读快照，B 字节不改。Hydrogen Flex、medium、store=False；$0.75 输入／$3.75 输出每百万词元，memory 日预算 $0.20。</p><p><code>dual_memory.py / memory_compressor.py</code></p></article>
-            <article class="worker"><h4>UP 订阅巡逻</h4><p>定时读取 UP 更新 → 写入 jobs → 摘要与报告；同时轮询已配置直播间状态。</p><p><code>service.py / patrol()</code></p></article>
-            <article class="worker"><h4>Owner 主动私信 <span class="optional">可选</span></h4><p>告警、日报、陪伴计划使用独立持久化队列；接收人固定为真实 OneBot Owner。</p><p><code>proactive_dm.py</code></p></article>
-            <article class="worker"><h4>B 站小号巡逻 <span class="optional">可选</span></h4><p>独立账号发现候选内容、选择和分析；受额度、冷却与写操作开关控制。</p><p><code>bili_watcher.py</code></p></article>
-            <article class="worker"><h4>日记与小本本 <span class="optional">可选</span></h4><p>脱敏巡逻日记定时同步 Drive；独立任务刷新 Owner 只读快照。</p><p><code>roaming_logger.py / notebook_snapshot.py</code></p></article>
-          </div>
-          <div class="shared-strip">
-            <strong>横向支撑</strong><span>RuntimeState：热配置、过滤审计与运行指标</span>
-            <span>BotGuard：群内 Owner 邀请、事件授权与两轮额度</span>
-            <span>Moderation / Longnick：审批屏蔽与受控个签</span>
-            <span>janitor：过期数据与远端视频文件清理</span>
-          </div>
+        <div class="control-line"><strong>管理员 → SSH 隧道 → /admin</strong><span>ADMIN_TOKEN 独立鉴权 · 管理面仅在回环端口提供</span></div>
+        <div class="fanout-label">后端访问下列资源；业务模块、调度器和后台任务都在上述同一进程内</div>
+        <div class="resource-grid">
+          <article class="resource storage"><strong>↔ 本地存储</strong><p>主库 + 每会话独立 SQLite；数据卷持久化，本地缓存按用途限额。</p></article>
+          <article class="resource model"><strong>↔ Gemini API</strong><p>Decisions 门卫、Interactions 生成；独立搜索请求与 Flex 记忆归档。</p></article>
+          <article class="resource"><strong>↔ Bilibili / Google Drive</strong><p>B 站公开资料与可选原片；Drive 日记、群记忆镜像与 Owner 快照分别配置。</p></article>
         </div>
-
-        <div class="vertical-edge"><i class="stem" aria-hidden="true"></i><span>各模块通过 Store / SessionManager 持久化；队列与预算共用主库</span></div>
-        <div class="storage-grid">
-          <article class="node storage">
-            <h3>主库 · SQLite WAL</h3><code class="path">data/hakimi.sqlite3</code>
-            <p>jobs / outbox、防抖批次、公开互动索引、Bot 授权、预算、管理配置、审计、主动私信、巡逻日记与视频额度。</p>
-            <small>事务锁 + 进程文件锁；敏感载荷 Fernet 加密。旧 UTC 账本保留审计并保守迁移。</small>
-          </article>
-          <article class="node storage">
-            <h3>按会话隔离的记忆库</h3><code class="path">data/sessions/{private,group}/*.sqlite3</code>
-            <p>A 静态前缀 + B 追加热史 + C ≤2050 词元尾窗；member_profiles、chronicle_events、cold_history_slices 与接收日志、回执并存，以会话身份派生文件名。</p>
-            <small>未审核接收日志不直接进入热历史或压缩；主库仅另存受控公开背景与会话索引。</small>
-          </article>
-          <article class="node storage">
-            <h3>本地文件与临时资源</h3>
-            <p><code>data/memes/</code> · 管理员维护的本地表情<br><code>data/owner_notebook_snapshot.md</code> · 可选本地快照<br><code>/tmp/bili_video_cache/</code> · 临时原片</p>
-            <small>Compose 将 data 挂载为持久卷，视频缓存使用独立 tmpfs。</small>
-          </article>
-        </div>
-        <figcaption id="architecture-caption">箭头表示消息流或标注的调用关系。图中以 1.0.0 境内 NapCat／境外主脑拓扑组织；后端业务模块仍属于单进程，NapCat 是独立协议端。兼容接入和可选功能以配置为准；图中不包含实际密钥或随机入口路径。</figcaption>
+        <figcaption id="overview-caption">两端通过协议传递消息和媒体字节，不共享本地路径。后端 Compose 使用只读根目录、UID 10001 与持久数据卷；进程文件锁禁止多个实例共用数据库。</figcaption>
       </figure>
+      <details><summary>兼容接入与部署依据 <span>代码支持的其他入口，不代表默认公网开放</span></summary><div class="detail-content"><p>兼容 OneBot HTTP、正向 WS 和官方 QQ Webhook。HTTP 回调走 <code>/webhooks/onebot</code> 或 <code>/webhooks/qq</code>，分别验证 HMAC 或 Ed25519；默认 Nginx 模板只暴露反向 WS 路径。</p><p>反向 WS 验证 Bearer Token、Self-ID、Universal 角色，并经 <code>get_login_info</code> 再核对身份。连接可接管旧会话，带心跳和受控 RPC。</p><p class="files"><a href="src/hakimi/app.py">app.py</a> · <a href="src/hakimi/onebot_transport.py">onebot_transport.py</a> · <a href="docker-compose.yml">后端 Compose</a> · <a href="docker-compose.napcat.yml">NapCat Compose</a> · <a href="docker-compose.napcat.official-node.yml.example">Node 镜像示例</a> · <a href="deploy/hakimi-ws.conf">Nginx WS 模板</a></p></div></details>
     </section>
 
-    <section class="block" id="dependencies" aria-labelledby="dependencies-heading">
-      <div class="section-heading"><h2 id="dependencies-heading">02 / 外部依赖</h2><p>由对应 Python 模块发起受控请求</p></div>
-      <div class="dependencies">
-        <article class="dependency">
-          <div class="origin"><span class="node-key">A</span> GeminiGateway / VideoFiles</div>
-          <div class="target"><b aria-hidden="true">↔</b><h3>Google Gemini API</h3></div>
-          <p>google-genai 异步 SDK；Decisions 使用 v1beta，Interactions 使用 v1。原片分支使用 Files API 上传、引用与清理。</p>
-        </article>
-        <article class="dependency">
-          <div class="origin"><span class="node-key">C</span> Bilibili / BiliWatcher / VideoDownloader</div>
-          <div class="target"><b aria-hidden="true">↔</b><h3>Bilibili</h3></div>
-          <p>公开元数据、UP 更新、字幕与受限视频素材。小号巡逻独立启用；点赞／收藏／关注等写操作由专门策略控制。</p>
-        </article>
-        <article class="dependency">
-          <div class="origin">RoamingLogger / NotebookSnapshot</div>
-          <div class="target"><b aria-hidden="true">↔</b><h3>Google Drive</h3><span class="optional">可选</span></div>
-          <p>日记 → 固定文件夹（Service Account 或 OAuth）；指定只读文件 → Owner 快照。路径独立，日记不读取私聊记忆。显式启用的白名单群可导出双轨 Markdown，ETag 条件更新；云端人工删改经 source 筛查后 CAS 回写并加锁，私聊永不导出。</p>
-        </article>
+    <section class="section" id="pipeline" aria-labelledby="pipeline-title">
+      <div class="section-heading"><h2 id="pipeline-title"><span>02</span>从消息到确认回复</h2><p>按 01 → 06 阅读 · 主链为普通聊天，旁路按意图进入</p></div>
+      <figure aria-describedby="pipeline-caption">
+        <ol class="pipeline">
+          <li class="step"><span class="step-number">01</span><h3>接收与归一化</h3><p>认证、白名单、去重与 BotGuard。记录接收日志，核验同会话引用和转发；提前准备图片与网页预览。</p><div class="files"><a href="src/hakimi/adapters.py">adapters.py</a><br><a href="src/hakimi/message_context.py">message_context.py</a><br><a href="src/hakimi/hot_ring.py">hot_ring.py</a></div></li>
+          <li class="step"><span class="step-number">02</span><h3>合批与会话串行</h3><p>SQLite 保存 jobs 与防抖批次。最多合并 6 条，同会话持锁处理；下一次生成等前次出站结束后读取历史。</p><div class="files"><a href="src/hakimi/group_pipeline.py">group_pipeline.py</a><br><a href="src/hakimi/session_scheduler.py">session_scheduler.py</a><br><a href="src/hakimi/debounce_policy.py">debounce_policy.py</a></div></li>
+          <li class="step gate"><span class="step-number">03</span><h3>一次门卫，多项决策</h3><p>Decisions 同时判断安全、接话、意图、召回、查资料与 L1–L4 档位。原消息过审后才进入会话历史。</p><div class="files"><a href="src/hakimi/gemini.py">GeminiGateway.screen</a><br><a href="src/hakimi/routing.py">routing.py</a><br><a href="src/hakimi/service.py">Service</a></div></li>
+          <li class="step generate"><span class="step-number">04</span><h3>上下文与流式生成</h3><p>A/B/C 组织输入，按需添加本地记忆与联网证据。默认 auto：L1–L3 Hydrogen；L4 Carbon 专家通道。</p><div class="files"><a href="src/hakimi/bot_server.py">bot_server.py</a><br><a href="src/hakimi/generation_policy.py">generation_policy.py</a><br><a href="src/hakimi/streaming.py">streaming.py</a></div></li>
+          <li class="step"><span class="step-number">05</span><h3>输出审核与入队</h3><p>完整流收集后进行输出筛查、五维 JSON 校验和链接过滤。引用、点名与贴纸受本地名单约束，再写加密 Outbox。</p><div class="files"><a href="src/hakimi/outbound_actions.py">outbound_actions.py</a><br><a href="src/hakimi/output_links.py">output_links.py</a><br><a href="src/hakimi/store.py">Store.enqueue_reply</a></div></li>
+          <li class="step confirm"><span class="step-number">06</span><h3>投递、ACK 与回写</h3><p>逐条复检权限、撤回、epoch 与时效，再经 Sender 返回 QQ。持久化 ACK，幂等追加已确认文本与视觉简述。</p><div class="files"><a href="src/hakimi/outgoing.py">outgoing.py</a><br><a href="src/hakimi/adapters.py">Sender</a><br><a href="src/hakimi/session_manager.py">SessionManager</a></div></li>
+        </ol>
+        <div class="flow-note"><strong>接收日志 ≠ 模型历史</strong>未审核接收数据保存在本会话；用户原文经门卫放行后入史，助手内容只有发送确认后才入史。重启先恢复未应用的 ACK，再启动消息消费者。</div>
+        <figcaption id="pipeline-caption">受控的静默入史不等于必须回复。安全沙箱使用受限 low 档，不读取会话历史、双轨召回或 Owner 背景，也不自动联网。</figcaption>
+      </figure>
+      <div class="branch-grid">
+        <article class="card"><span class="card-kicker">本地旁路 · 02 → Outbox</span><h3>固定命令与实时打断</h3><div class="mini-flow"><span>固定语法</span><i aria-hidden="true">→</i><span>权限代码</span><i aria-hidden="true">→</i><span>Outbox</span></div><p>固定命令在主模型前执行。撤回通过独立通知队列处理，持久化撤回索引并取消关联待发项。</p><p>原触发者在生成中追发，可取消尚未出站的请求并重新合批；已提交的未知用量保留预算预留。</p><p>五类防抖可在后台调整为 <strong>0–30 秒</strong>，开放批次按新值重新计算；会话串行和 6 条上限仍生效。</p><div class="files"><a href="src/hakimi/service.py">service.py</a> · <a href="src/hakimi/group_pipeline.py">group_pipeline.py</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置</a></div></article>
+        <article class="card"><span class="card-kicker">取证分支 · 03 → 04</span><h3>受控联网搜索 <span class="optional-tag">默认关闭</span></h3><div class="mini-flow"><span>当前查询</span><i aria-hidden="true">→</i><span>Google Search</span><i aria-hidden="true">→</i><span>来源筛查</span><i aria-hidden="true">→</i><span>C 区</span></div><p>显式 <code>/search</code>、<code>/搜索</code> 或门卫建议触发；群聊须明确叫到 Bot。独立 Hydrogen medium 请求只开放搜索工具，不携带会话历史或记忆。</p><p>干净事实与纯文本来源交给主对话组织表达。无资料时透传状态继续聊天；取得证据时将自动路由托底至 medium。</p><div class="status-list" aria-label="联网四态"><code>grounded</code><code>disabled</code><code>skipped_query</code><code>unavailable</code></div><div class="files"><a href="src/hakimi/web_search.py">web_search.py</a> · <a href="src/hakimi/gemini.py">GeminiGateway.search</a></div></article>
+        <article class="card"><span class="card-kicker">视频分支 · 03 → 05</span><h3>B 站资料与原片分析</h3><div class="mini-flow"><span>有效 BV</span><i aria-hidden="true">→</i><span>公开资料</span><i aria-hidden="true">→</i><span>来源筛查</span><i aria-hidden="true">→</i><span>分析</span></div><p>优先元数据、字幕和公开材料；配置允许且需要视听信息时，走受限下载 → Files API → 视频分析。</p><p>原片不可用时可回退已审核的文字资料；预算与权限仍须有效。多视频取首个有效目标，无 BV 的观看意图回到聊天。</p><p>外部视频材料与分析摘要不写入聊天历史。</p><div class="files"><a href="src/hakimi/bilibili.py">bilibili.py</a> · <a href="src/hakimi/video_watch.py">video_watch.py</a> · <a href="src/hakimi/video_files.py">video_files.py</a></div></article>
+      </div>
+      <div class="protocol">
+        <div><h4>流式接收，完整校验后投递</h4><div class="schema"><code>abstain</code><code>bubbles</code><code>anchor</code><code>sticker</code><code>image_digest</code></div><p>固定五维协议供公开与 Owner 对话共用。主对话 <code>tools=[]</code>、<code>store=False</code>，不把未完成 JSON 或思考内容发到 QQ。</p></div>
+        <div><h4>可靠出站与长文展示</h4><p>群聊正文超过 180 字可折叠为合并转发；仅在明确“不支持”的回执后回退图片。逐条 ACK 保存已确认部分，结果不确定时不自动重发。</p><p>聊天 auto 可被后台场景档位覆盖。Carbon 受独立单并发、准入和预算约束；未启用、槽位繁忙或预留不足时回到 Hydrogen high。</p></div>
       </div>
     </section>
 
-    <section class="block" id="deployment" aria-labelledby="deployment-heading">
-      <div class="section-heading"><h2 id="deployment-heading">03 / 部署结构</h2><p>以仓库 Dockerfile、Compose 与 Nginx 模板为依据</p></div>
-      <div class="deployment">
-        <article class="deploy-card">
-          <h3>境内协议端 → 境外主脑</h3>
-          <div class="deploy-line"><span>境内 · NapCat</span><i aria-hidden="true">⇄ WSS ⇄</i><span>境外 · Nginx TLS</span><i aria-hidden="true">⇄</i><span>127.0.0.1:12141</span></div>
-          <p>境内使用 <code>docker-compose.napcat.yml</code>，可采用官方 Node 镜像覆盖模板；主动向境外建立反向 WSS。QQ 文件经 RPC／Base64 传递，两端不共享本地文件路径。</p>
-          <p><code>deploy/hakimi-ws.conf</code> 只精确代理一条带随机后缀的 WS 路径，其余公网路径返回 404。WebUI 与后台分别经 SSH 隧道访问回环 6099／12141。</p>
-        </article>
-        <article class="deploy-card">
-          <h3>境外后端与数据边界</h3>
-          <div class="deploy-line"><span>Uvicorn × 1</span><i aria-hidden="true">+</i><span>进程内 asyncio 任务</span><i aria-hidden="true">+</i><span>hakimi-data → /app/data</span></div>
-          <p>容器 UID 10001、只读根文件系统、持久卷与视频 tmpfs。WS 帧上限 16 MiB，Ping 25 秒／超时 30 秒；<code>/healthz</code> 检查任务存活，进程锁限制共享数据库。</p>
-          <p>两端 TZ 与后端 BOT_TIMEZONE 均使用 Asia/Shanghai。后端仍为单副本，NapCat 分离不等于业务横向扩容；旧同机／Webhook 模板仅用于另行选择的拓扑。</p>
-        </article>
-      </div>
-    </section>
-
-    <section class="block" id="sources" aria-label="消息路径与源码索引">
-      <details>
-        <summary>展开：消息处理路径 <span>固定命令、模型回复与视频分支</span></summary>
-        <div class="detail-content">
-          <div class="request-path">
-            <article class="path-card">
-              <h3>普通消息 / 固定命令</h3>
-              <ol>
-                <li>协议认证与 Layer 0 准入后，在接收锁内 <strong>receive → 同会话引用／转发展开 → receive 更新</strong>，再由 Store.admit 写 jobs 与持久化防抖批次。</li>
-                <li>Worker 领取任务并复检权限。<strong>固定命令由本地代码执行，直接写入 Outbox</strong>，无需模型生成。</li>
-                <li>对话锁覆盖读取最新会话历史、<strong>Decisions 输入筛查 → admit_history → Interactions 生成 → Decisions 输出筛查</strong>；按阶段检查 epoch。</li>
-                <li>解析 AT／MEME，先入 Outbox；Delivery 复检后发送，ACK 后幂等写入历史，确认的群文本更新公开索引，并可调度记忆压缩。</li>
-              </ol>
-            </article>
-            <article class="path-card">
-              <h3>B 站链接 / 视频分析</h3>
-              <ol>
-                <li>消息筛查通过后解析 BV，读取公开视频元数据，并尝试取得公开字幕等资料。</li>
-                <li><strong>VideoWatch</strong> 对外部文字资料单独筛查；默认优先使用字幕与文字生成摘要。</li>
-                <li>原片功能开启且需要视听信息时，经额度与时长检查，进入 <strong>受限下载 → Files API → 视频筛查与生成</strong>；不可用时按实现回退文字资料。</li>
-                <li>来源链接由已验证 BV 生成，结果进入 Outbox；原始用户请求经门卫后可进入历史，但外部视频材料与生成摘要不写入聊天记忆。</li>
-              </ol>
-            </article>
+    <section class="section" id="memory" aria-labelledby="memory-title">
+      <div class="section-heading"><h2 id="memory-title"><span>03</span>A / B / C 与双轨记忆</h2><p>上下文组装、长期归档与物理隔离</p></div>
+      <div class="panel">
+        <div class="context-grid">
+          <article class="context-card a"><div class="context-head"><b class="letter">A</b><h3>稳定系统前缀</h3></div><p>共享指令、公开／Owner 人设、固定协议与静态规则；按可信身份选择。</p><p>不随当前群成员或检索结果变化；表情名单等静态规则变更时刷新。</p><div class="files"><a href="src/hakimi/persona.py">persona.py</a> · <a href="src/hakimi/prefix_runtime.py">prefix_runtime.py</a></div></article>
+          <article class="context-card b"><div class="context-head"><b class="letter">B</b><h3>追加式会话热史</h3></div><p>过审用户消息与 ACK 确认的助手回复，以稳定 seq 序号序列化。</p><p>只读当前会话数据库；视觉简述在送达后追加，不回写旧行。图片字节不进入 B。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/bot_server.py">history_lines</a></div></article>
+          <article class="context-card c"><div class="context-head"><b class="letter">C</b><h3>当轮动态尾窗</h3></div><p>时间、核验身份、当前批次、可引用与点名目标、媒体状态、网页预览、搜索事实／状态及本地记忆召回。</p><p>Owner 专属背景仅在对应私聊加载。可选记忆先让出预算；默认以本地估算的 1,800 Token 限长，为动态尾窗留出余量。</p><div class="files"><a href="src/hakimi/bot_server.py">assemble_chat_input</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a></div></article>
+        </div>
+        <div class="context-caption"><strong>A + B + C → 主对话 Interactions</strong><span>最多两张当轮图片放在输入末尾 · 本地 Token 估算用于限长，计费以供应商 usage 为准</span></div>
+        <figure class="memory-map" aria-describedby="memory-caption">
+          <div class="memory-title"><h3>双轨归档与本地召回</h3><p>在线写库与后台提炼分开执行</p></div>
+          <div class="memory-flow">
+            <article class="node"><h4>会话热史 B</h4><p>达到 28k 估算 Token 或 96 KB 时约折半；定时快照与 TTL 清理也会入冷史。</p></article>
+            <div class="edge"><b aria-hidden="true">→</b></div>
+            <article class="node"><h4>不可变冷史</h4><p>源分片、序列范围、epoch 与归档任务同库保存。付费尝试持久化去重。</p></article>
+            <div class="edge"><b aria-hidden="true">→</b></div>
+            <article class="node"><h4>后台 Flex 提炼</h4><p>来源筛查 → Hydrogen Flex medium → 输出筛查。提交前校验版本、epoch 与人工锁。</p></article>
+            <div class="edge"><b aria-hidden="true">→</b></div>
+            <article class="node"><h4>画像 + 编年史</h4><p>画像依据本人原话；事件按主题整理。管理员可修订、擦除或解锁，保留删除墓碑。</p></article>
           </div>
+          <p class="memory-return">↩ 当前账号画像 + 按需编年史检索 → C 区。检索使用本地关键词与 192 维特征哈希，仅访问当前会话，不需要外部向量库。</p>
+          <figcaption id="memory-caption">默认按 BOT_TIMEZONE 在 03:10 之后的后台扫描中快照超过 24 小时的记录。旧摘要作为迁移兜底，首次成功提炼后停用旧摘要写入。显式重置才可清除冷史。</figcaption>
+        </figure>
+        <div class="memory-exits">
+          <article class="card"><h3>公开群互动 → Owner 私聊</h3><div class="mini-flow"><span>已确认的群聊互动</span><i aria-hidden="true">→</i><span>PublicMemory</span><i aria-hidden="true">→</i><span>Owner 的 C 区</span></div><p>主库保存受控的公开互动索引。仅真实 OneBot Owner 私聊可读取，群聊不会反向获得私聊历史。</p><div class="files"><a href="src/hakimi/public_memory.py">public_memory.py</a></div></article>
+          <article class="card"><h3>白名单群 ↔ Drive 镜像 <span class="optional-tag">逐群启用</span></h3><div class="mini-flow"><span>群画像／编年史</span><i aria-hidden="true">↔</i><span>单目录 Markdown</span></div><p>ETag 条件更新；云端人工修改经来源筛查、版本核对后回写并加锁。私聊档案不导出，重置会关闭该群镜像。</p><div class="files"><a href="src/hakimi/memory_mirror.py">memory_mirror.py</a> · <a href="src/hakimi/dual_memory.py">dual_memory.py</a></div></article>
         </div>
-      </details>
-      <details>
-        <summary>展开：源码模块索引 <span>链接相对于本项目根目录，可直接定位实现</span></summary>
-        <div class="detail-content">
-          <dl class="source-list">
-            <div><dt>应用装配与协议接入</dt><dd><a href="src/hakimi/app.py">app.py</a>、<a href="src/hakimi/adapters.py">adapters.py</a>、<a href="src/hakimi/onebot_transport.py">onebot_transport.py</a>、<a href="src/hakimi/rich_message_parser.py">rich_message_parser.py</a>、<a href="src/hakimi/models.py">models.py</a></dd></div>
-            <div><dt>编排、统一防抖与会话串行</dt><dd><a href="src/hakimi/service.py">service.py</a>、<a href="src/hakimi/store.py">store.py</a>、<a href="src/hakimi/group_pipeline.py">group_pipeline.py</a>、<a href="src/hakimi/session_scheduler.py">session_scheduler.py</a>、<a href="src/hakimi/attention.py">attention.py</a></dd></div>
-            <div><dt>模型网关、思考档位与本地预算日界</dt><dd><a href="src/hakimi/gemini.py">gemini.py</a>、<a href="src/hakimi/gateway.py">gateway.py</a>、<a href="src/hakimi/generation_policy.py">generation_policy.py</a>、<a href="src/hakimi/thinking_policy.py">thinking_policy.py</a>、<a href="src/hakimi/budget_policy.py">budget_policy.py</a>、<a href="src/hakimi/budget_calendar.py">budget_calendar.py</a>、<a href="src/hakimi/usage_accounting.py">usage_accounting.py</a></dd></div>
-            <div><dt>记忆、单向公开背景与人设</dt><dd><a href="src/hakimi/session_manager.py">session_manager.py</a>、<a href="src/hakimi/memory_compressor.py">memory_compressor.py</a>、<a href="src/hakimi/public_memory.py">public_memory.py</a>、<a href="src/hakimi/compression_policy.py">compression_policy.py</a>、<a href="src/hakimi/persona.py">persona.py</a>、<a href="src/hakimi/bot_server.py">bot_server.py</a>、<a href="src/hakimi/reply_style.py">reply_style.py</a></dd></div>
-            <div><dt>B 站、图片与受限原片</dt><dd><a href="src/hakimi/bilibili.py">bilibili.py</a>、<a href="src/hakimi/bili_watcher.py">bili_watcher.py</a>、<a href="src/hakimi/media.py">media.py</a>、<a href="src/hakimi/video_watch.py">video_watch.py</a>、<a href="src/hakimi/video_policy.py">video_policy.py</a>、<a href="src/hakimi/video_downloader.py">video_downloader.py</a>、<a href="src/hakimi/video_download_worker.py">video_download_worker.py</a>、<a href="src/hakimi/video_files.py">video_files.py</a></dd></div>
-            <div><dt>引用回溯、受控点名与社群能力</dt><dd><a href="src/hakimi/message_context.py">message_context.py</a>、<a href="src/hakimi/mentions.py">mentions.py</a>、<a href="src/hakimi/proactive_dm.py">proactive_dm.py</a>、<a href="src/hakimi/proactive_policy.py">proactive_policy.py</a>、<a href="src/hakimi/moderation.py">moderation.py</a>、<a href="src/hakimi/longnick.py">longnick.py</a>、<a href="src/hakimi/memes.py">memes.py</a></dd></div>
-            <div><dt>日记同步与 Owner 快照</dt><dd><a href="src/hakimi/roaming_logger.py">roaming_logger.py</a>、<a href="src/hakimi/drive_client.py">drive_client.py</a>、<a href="src/hakimi/drive_oauth.py">drive_oauth.py</a>、<a href="src/hakimi/notebook_snapshot.py">notebook_snapshot.py</a></dd></div>
-            <div><dt>配置、身份边界与运行状态</dt><dd><a href="src/hakimi/config.py">config.py</a>、<a href="src/hakimi/security.py">security.py</a>、<a href="src/hakimi/admission_policy.py">admission_policy.py</a>、<a href="src/hakimi/bot_guard.py">bot_guard.py</a>、<a href="src/hakimi/runtime_state.py">runtime_state.py</a></dd></div>
-            <div><dt>管理界面与管理 API</dt><dd><a href="src/hakimi/admin_page.html">admin_page.html</a>、<a href="src/hakimi/admin_routes.py">admin_routes.py</a>、<a href="src/hakimi/admin_auth.py">admin_auth.py</a>、<a href="src/hakimi/community_admin.py">community_admin.py</a>、<a href="src/hakimi/bili_account_admin.py">bili_account_admin.py</a>、<a href="src/hakimi/meme_admin.py">meme_admin.py</a>；<a href="src/hakimi/admin.py">admin.py</a> 为本地维护 CLI。</dd></div>
-            <div><dt>依赖、部署与项目文档</dt><dd><a href="pyproject.toml">pyproject.toml</a>、<a href="Dockerfile">Dockerfile</a>、<a href="compose.yaml">compose.yaml</a>、<a href="docker-compose.napcat.yml">docker-compose.napcat.yml</a>、<a href="docker-compose.napcat.official-node.yml.example">官方 Node 覆盖示例</a>、<a href="deploy/hakimi-ws.conf">hakimi-ws.conf</a>、<a href="compose.roaming.yaml">compose.roaming.yaml</a>、<a href="compose.roaming-oauth.yaml">compose.roaming-oauth.yaml</a>、<a href="docs/CORE_PIPELINE_08.md">核心管道</a>、<a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a>、<a href="README.md">README.md</a></dd></div>
-          </dl>
-          <p class="note">依据项目源码与部署模板整理，未读取实例密钥或实际运行配置。版本取自 pyproject.toml；页面展示代码支持的结构，功能启用状态以实例配置和管理台为准。</p>
-        </div>
-      </details>
+      </div>
+      <div class="storage-grid">
+        <article class="card"><h3>主库 · 调度与账本</h3><code class="path">data/hakimi.sqlite3</code><p>jobs、Outbox、逐条 ACK、防抖批次、撤回索引、公开互动、预算、热配置、审计、巡逻与主动私信状态。</p><p>SQLite WAL、事务锁与进程锁；敏感载荷 Fernet 加密，身份索引用 HMAC。</p><div class="files"><a href="src/hakimi/store.py">store.py</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a></div></article>
+        <article class="card"><h3>会话库 · 一群／一私聊一库</h3><code class="path">data/sessions/{group,private}/&lt;HMAC&gt;.sqlite3</code><p>隔离接收日志、热史、回执、画像、编年史、冷史与归档任务。文件名由 namespace、平台、Bot 与会话身份派生。</p><p>清空会递增 epoch/version，使旧任务失效；公开索引同步提交墓碑，阻止已删除背景再次出现。</p><div class="files"><a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/dual_memory.py">dual_memory.py</a></div></article>
+        <article class="card"><h3>缓存、素材与临时文件</h3><p>HotRing、图片 LRU、静态前缀池与本地召回索引均有内存边界。图片经 WS 字节优先水合，CDN 为受限兜底。</p><code class="path">data/memes/ · 本地白名单表情<br>/tmp/bili_video_cache/ · 视频 tmpfs</code><p>媒体通过 RPC／Base64 跨机传递；当轮引用结束释放，缓存按容量逐出。</p><div class="files"><a href="src/hakimi/hot_ring.py">hot_ring.py</a> · <a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/memes.py">memes.py</a></div></article>
+      </div>
     </section>
 
-    <footer><span>hakimi-surf / v1.0.0 源码架构快照 · 2026-11-14</span><span>独立 HTML + CSS · 离线可打开 · <a href="#overview">返回架构图 ↑</a></span></footer>
+    <section class="section" id="operations" aria-labelledby="operations-title">
+      <div class="section-heading"><h2 id="operations-title"><span>04</span>后台任务与控制面</h2><p>Service.start() 创建进程内协程；各功能仍受配置和准入约束</p></div>
+      <div class="tasks">
+        <article class="card"><h3>消息、投递与清理</h3><p>默认 2 个消息消费者，共用会话锁；Delivery 负责出站。Janitor 清理过期数据与远端临时视频文件。</p><div class="files"><a href="src/hakimi/service.py">worker / delivery / janitor</a></div></article>
+        <article class="card"><h3>记忆归档</h3><p>启动恢复未尝试任务，后台扫描冷史、执行 Flex 提炼并调度群记忆镜像。已付费但结果不明的任务不自动重试。</p><div class="files"><a href="src/hakimi/memory_compressor.py">memory_compressor.py</a> · <a href="src/hakimi/memory_mirror.py">memory_mirror.py</a></div></article>
+        <article class="card"><h3>订阅与小号巡逻</h3><p>UP 订阅、直播状态按已配置目标轮询；小号候选发现与学习单独启用，B 站写操作另受开关与额度控制。</p><div class="files"><a href="src/hakimi/service.py">patrol</a> · <a href="src/hakimi/bili_watcher.py">bili_watcher.py</a></div></article>
+        <article class="card"><h3>Owner 主动私信 <span class="optional-tag">可选</span></h3><p>运维告警、日报、陪伴计划与离线队列；接收人由代码固定为真实 Owner，发送前再次核验。</p><div class="files"><a href="src/hakimi/proactive_dm.py">proactive_dm.py</a> · <a href="src/hakimi/proactive_policy.py">proactive_policy.py</a></div></article>
+      </div>
+      <div class="branch-grid">
+        <article class="card"><h3>Drive · 巡逻日记 <span class="optional-tag">可选</span></h3><div class="mini-flow"><span>脱敏活动／公开摘要</span><i aria-hidden="true">→</i><span>每日 Markdown</span></div><p>RoamingLogger 定时写固定文件夹；日记不复制私聊历史。复用显式选择的 Service Account 或 OAuth 身份。</p><div class="files"><a href="src/hakimi/roaming_logger.py">roaming_logger.py</a> · <a href="src/hakimi/drive_client.py">drive_client.py</a></div></article>
+        <article class="card"><h3>Drive · 群记忆镜像 <span class="optional-tag">可选</span></h3><div class="mini-flow"><span>显式启用的白名单群</span><i aria-hidden="true">↔</i><span>群记忆 Markdown</span></div><p>双轨记忆的受控人工编辑通道。逐群配置，验证目录、应用标记、稳定条目锚点与同步版本。</p><div class="files"><a href="src/hakimi/memory_mirror.py">memory_mirror.py</a> · <a href="docs/MEMORY_100.md">双轨记忆说明</a></div></article>
+        <article class="card"><h3>Drive · Owner 小本本 <span class="optional-tag">默认关闭</span></h3><div class="mini-flow"><span>指定只读文件</span><i aria-hidden="true">→</i><span>本地审核快照</span><i aria-hidden="true">→</i><span>Owner 私聊</span></div><p>NotebookSnapshot 独立刷新指定文件；与日记、群镜像分别启用，不扩展到其他 Drive 文件。</p><div class="files"><a href="src/hakimi/notebook_snapshot.py">notebook_snapshot.py</a></div></article>
+      </div>
+      <div class="control-panel">
+        <article><h3>/admin · 可热更新的运行策略</h3><p>身份与群准入、防抖五项、九场景思考档位、联网开关与每日上限、预算、记忆治理、本地表情及功能开关。</p><p>覆盖配置加密保存到主库，重启后恢复。后台独立鉴权、同源检查；控制策略不会授予消息文本或模型新的权限。</p><div class="files"><a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a></div></article>
+        <article><h3>统一预算与运行观测</h3><p>每次模型请求先预留再结算；未知用量保留预留。搜索次数／工具费、memory_flex 与模型分账统一受本地日／月／总预算约束。</p><p>按 BOT_TIMEZONE 计日；观测 Token、缓存、思考与来源归属。历史未知账目保持“历史未归属（Gemini）”，不猜测为 Drive 费用。</p><div class="files"><a href="src/hakimi/budget_calendar.py">budget_calendar.py</a> · <a href="src/hakimi/usage_accounting.py">usage_accounting.py</a> · <a href="src/hakimi/model_accounting.py">model_accounting.py</a></div></article>
+      </div>
+    </section>
+
+    <section class="section" id="sources" aria-labelledby="sources-title">
+      <div class="section-heading"><h2 id="sources-title"><span>05</span>源码与阅读入口</h2><p>相对链接指向本项目文件，克隆后可离线查看</p></div>
+      <details><summary>按职责查看源码 <span>从图上的模块定位实际实现</span></summary><div class="detail-content"><dl class="source-list">
+        <div><dt>装配、协议与身份</dt><dd><a href="src/hakimi/app.py">app.py</a> · <a href="src/hakimi/adapters.py">adapters.py</a> · <a href="src/hakimi/onebot_transport.py">onebot_transport.py</a> · <a href="src/hakimi/rich_message_parser.py">rich_message_parser.py</a> · <a href="src/hakimi/security.py">security.py</a> · <a href="src/hakimi/bot_guard.py">bot_guard.py</a></dd></div>
+        <div><dt>编排、热消息与取消</dt><dd><a href="src/hakimi/service.py">service.py</a> · <a href="src/hakimi/group_pipeline.py">group_pipeline.py</a> · <a href="src/hakimi/session_scheduler.py">session_scheduler.py</a> · <a href="src/hakimi/debounce_policy.py">debounce_policy.py</a> · <a href="src/hakimi/hot_ring.py">hot_ring.py</a> · <a href="src/hakimi/attention.py">attention.py</a></dd></div>
+        <div><dt>门卫、生成与联网</dt><dd><a href="src/hakimi/gemini.py">gemini.py</a> · <a href="src/hakimi/gateway.py">gateway.py</a> · <a href="src/hakimi/routing.py">routing.py</a> · <a href="src/hakimi/generation_policy.py">generation_policy.py</a> · <a href="src/hakimi/thinking_policy.py">thinking_policy.py</a> · <a href="src/hakimi/streaming.py">streaming.py</a> · <a href="src/hakimi/web_search.py">web_search.py</a></dd></div>
+        <div><dt>上下文与人设</dt><dd><a href="src/hakimi/bot_server.py">bot_server.py</a> · <a href="src/hakimi/persona.py">persona.py</a> · <a href="src/hakimi/prefix_runtime.py">prefix_runtime.py</a> · <a href="src/hakimi/context_budget.py">context_budget.py</a> · <a href="src/hakimi/message_context.py">message_context.py</a> · <a href="src/hakimi/link_preview.py">link_preview.py</a></dd></div>
+        <div><dt>持久化、双轨记忆与镜像</dt><dd><a href="src/hakimi/store.py">store.py</a> · <a href="src/hakimi/session_manager.py">session_manager.py</a> · <a href="src/hakimi/dual_memory.py">dual_memory.py</a> · <a href="src/hakimi/memory_compressor.py">memory_compressor.py</a> · <a href="src/hakimi/memory_mirror.py">memory_mirror.py</a> · <a href="src/hakimi/public_memory.py">public_memory.py</a></dd></div>
+        <div><dt>五维动作与可靠投递</dt><dd><a href="src/hakimi/outbound_actions.py">outbound_actions.py</a> · <a href="src/hakimi/outgoing.py">outgoing.py</a> · <a href="src/hakimi/output_links.py">output_links.py</a> · <a href="src/hakimi/text_card.py">text_card.py</a> · <a href="src/hakimi/memes.py">memes.py</a> · <a href="src/hakimi/mentions.py">mentions.py</a></dd></div>
+        <div><dt>媒体与 B 站</dt><dd><a href="src/hakimi/media.py">media.py</a> · <a href="src/hakimi/bilibili.py">bilibili.py</a> · <a href="src/hakimi/bili_watcher.py">bili_watcher.py</a> · <a href="src/hakimi/video_watch.py">video_watch.py</a> · <a href="src/hakimi/video_downloader.py">video_downloader.py</a> · <a href="src/hakimi/video_files.py">video_files.py</a></dd></div>
+        <div><dt>主动任务与 Drive</dt><dd><a href="src/hakimi/proactive_dm.py">proactive_dm.py</a> · <a href="src/hakimi/roaming_logger.py">roaming_logger.py</a> · <a href="src/hakimi/drive_client.py">drive_client.py</a> · <a href="src/hakimi/drive_oauth.py">drive_oauth.py</a> · <a href="src/hakimi/notebook_snapshot.py">notebook_snapshot.py</a></dd></div>
+        <div><dt>控制面与账本</dt><dd><a href="src/hakimi/admin_routes.py">admin_routes.py</a> · <a href="src/hakimi/admin_auth.py">admin_auth.py</a> · <a href="src/hakimi/admin_page.html">admin_page.html</a> · <a href="src/hakimi/community_admin.py">community_admin.py</a> · <a href="src/hakimi/runtime_state.py">runtime_state.py</a> · <a href="src/hakimi/budget_policy.py">budget_policy.py</a> · <a href="src/hakimi/config.py">config.py</a></dd></div>
+      </dl></div></details>
+      <details><summary>版本依据与部署文档 <span>当前行为优先参照 1.1.3 代码</span></summary><div class="detail-content"><p><a href="docs/NATURAL_PIPELINE_112.md">1.1.2 / 1.1.3 主对话与自然回复</a> · <a href="docs/CONTROLS_SEARCH_110.md">防抖热配置与受控联网</a> · <a href="docs/MEMORY_100.md">双轨记忆与治理</a> · <a href="docs/STREAMING_010.md">流式管道与 ACK 投递</a> · <a href="docs/CONTEXT_ROUTING_09.md">A/B/C 与分档路由</a></p><p><a href="README.md">README</a> · <a href="docs/CROSS_BORDER_DEPLOYMENT.md">跨机部署</a> · <a href="docs/UPGRADE.md">升级交付</a> · <a href="Dockerfile">Dockerfile</a> · <a href="compose.roaming.yaml">Drive SA 覆盖</a> · <a href="compose.roaming-oauth.yaml">Drive OAuth 覆盖</a></p><p>图中展示源码支持的结构与默认值；实例启用状态由配置与管理台决定。当前版本来自 <code>pyproject.toml</code>，源码基线为 <code>8b08453</code>。部分早期文档保留旧行为说明，以当前实现为准。</p></div></details>
+    </section>
+    <footer><span>hakimi-surf / v1.1.3 · 源码架构快照 · 2026-11-15</span><span>独立 HTML + CSS · 无外部资源 · <a href="#overview">返回总览 ↑</a></span></footer>
   </main>
 </body>
 </html>
