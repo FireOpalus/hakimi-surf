@@ -1103,7 +1103,7 @@ class BiliWatcher:
         return {"status": status, "learned": completed, "reason": reason}
 
     async def tick(self):
-        if not self.policy.enabled:
+        if not self.policy.enabled or self.store.runtime.is_resting(self.clock()):
             return
         local = self.local()
         for value in self.policy.times:

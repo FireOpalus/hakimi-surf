@@ -19,6 +19,7 @@ async def persist_ack(service, reply, position, text, receipt, epoch, digest=Non
         "message_id": str(receipt["message_id"]),
         "digest": digest,
         "participants": reply.get("participants") or [reply["message"]],
+        "consumed_image_events": reply.get("consumed_image_events") or [],
     }
     async with service.store.transaction():
         await service.store.db.execute(
@@ -83,6 +84,9 @@ async def apply_receipts(service, reply_id):
             await service.public_memory.record(
                 reply_id, message, members, "\n".join(d["text"] for d in data), expected_epoch=epoch
             )
+            consumed = data[0].get("consumed_image_events") or []
+            if consumed:
+                await service.store.groups.mark_images_consumed(message, consumed)
     # Idempotent B receipts/public index make crashes before this marker safe to recover.
     async with service.store.transaction():
         await service.store.db.execute(
@@ -264,6 +268,9 @@ async def deliver_actions(service, reply):
                         covered_seq=commit["covered_seq"],
                         source_ids=commit.get("source_ids"),
                         reply_id=reply["id"],
+                        turns=commit.get("turns", 1),
+                        context_digests=commit.get("context_digests"),
+                        seen_nearby=commit.get("seen_nearby"),
                     )
                 )
             elif commit:

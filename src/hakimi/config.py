@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .compression_policy import CompressionConfig
 from .proactive_policy import ProactiveConfig
+from .rest_policy import RestHoursConfig
 from .thinking_policy import ChatThinkingLevel, ThinkingConfig, ThinkingLevel
 
 
@@ -51,7 +52,7 @@ class Settings(BaseSettings):
     )
     prefix_history_enabled: bool = True
     interaction_store_enabled: bool = True
-    interaction_chain_ttl_seconds: int = Field(default=21600, ge=60, le=604800)
+    interaction_chain_ttl_seconds: int = Field(default=300, ge=60, le=604800)
     history_high_tokens: int = Field(default=28000, ge=1000, le=28000)
     history_max_bytes: int = Field(default=144000, ge=4000, le=144000)
     chat_tail_tokens: int = Field(default=4200, ge=400, le=4200)
@@ -157,6 +158,20 @@ class Settings(BaseSettings):
     session_default_enabled: bool = True
     session_max_files: int = Field(default=1000, ge=10, le=10000)
     bot_timezone: str = Field(default="Asia/Shanghai", validation_alias="BOT_TIMEZONE")
+    rest_hours_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("REST_HOURS_ENABLED", "HAKIMI_REST_HOURS_ENABLED"),
+    )
+    rest_hours: str = Field(
+        default="23:00-08:00",
+        validation_alias=AliasChoices("REST_HOURS", "HAKIMI_REST_HOURS"),
+    )
+    rest_allow_owner_private: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "REST_ALLOW_OWNER_PRIVATE", "HAKIMI_REST_ALLOW_OWNER_PRIVATE"
+        ),
+    )
     proactive_dm_enabled: bool = Field(default=True, validation_alias="PROACTIVE_DM_ENABLED")
     daily_digest_enabled: bool = Field(default=True, validation_alias="DAILY_DIGEST_ENABLED")
     daily_digest_time: str = Field(default="22:30", validation_alias="DAILY_DIGEST_TIME")
@@ -314,6 +329,7 @@ class Settings(BaseSettings):
     def check_secrets_and_destinations(self) -> Self:
         CompressionConfig.from_settings(self)
         ProactiveConfig.from_settings(self)
+        RestHoursConfig.from_settings(self)
         ZoneInfo(self.bot_timezone)
         for proxy_ip in self.onebot_trusted_proxy_ips:
             ipaddress.ip_address(proxy_ip)

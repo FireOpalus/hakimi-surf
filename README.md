@@ -1,12 +1,12 @@
 # 哈基米跨平台冲浪助手
 
-当前版本 **1.2.0**。新增图片上下文闭环、自适应长截图、会话内短期找图与 120 字视觉摘要；表情协议留在 A 静态前缀，可用标签移到 C 动态尾窗，增删表情不再打断续链。详见 [1.2.0 图片上下文说明](docs/IMAGE_CONTEXT_120.md)。沿用 [缓存折扣与费用结算](docs/BILLING_118.md)、[Bot 阈值与冷历史合批](docs/BOT_MEMORY_117.md) 及 [热配置控制台](docs/CONTROL_PLANE_116.md)。防抖支持 **0–30 秒**；配置加密保存并热生效；联网默认关闭。
+当前版本 **1.3.0**。新增每日休息热配置、续链 C 尾窗去重、邻近图消费记录、按模型／思考档位统计及 Flex 429 有限退避，详见 [1.3.0 升级说明](docs/CONTEXT_REST_130.md)。默认北京时间 **23:00–08:00** 暂停新聊天、定时 B 站巡逻及陪伴，Owner 私聊默认同步休息；后台可调整。沿用 [图片上下文](docs/IMAGE_CONTEXT_120.md)、[费用结算](docs/BILLING_118.md) 与 [Bot 阈值／冷历史合批](docs/BOT_MEMORY_117.md)。防抖支持 **0–30 秒**，联网默认关闭。
 
 保留 1.0 的 [双轨记忆与治理说明](docs/MEMORY_100.md)：每个会话的加密 SQLite 增建画像、编年史、不可变冷史，后台通过 Hydrogen Flex 半价提炼，在线按需本地召回；管理台可检索、修订、擦除及解锁，显式选择的白名单群可与单目录 Drive Markdown 双向同步。旧摘要保留至首次成功提炼。私聊档案不导出，Owner《小本本》仍默认关闭。
 
 沿用 [v0.10 流式防抖与五维出站](docs/STREAMING_010.md) 和 [v0.9 A/B/C 前缀路由](docs/CONTEXT_ROUTING_09.md)。群聊／Owner 私聊默认 `auto`，后台可选至 `xhigh`；双轨归档固定 `medium`。三段原文人设、跨机 WS 和账本安全边界不变；新增 `memory_flex` 费用列。有效缓存覆盖率 90% 是观察目标，不能保证每次命中。
 
-[项目架构图（HTML/CSS）](architecture.html)：按 **1.2.0 当前源码**同步，新增当前／邻近／历史图片选择、自适应压缩、来源筛查、ACK 后摘要入史，以及 A 协议与 C 表情标签分离；保留费用结算、Bot 分流、冷历史合批和跨机部署。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
+[项目架构图（HTML/CSS）](architecture.html)：按 **1.3.0 当前源码**同步，新增休息门禁、短续链与 C 尾窗去重、图片消费、思考档位归账及 Flex 退避；保留图片处理、费用结算、Bot 分流、冷历史合批和跨机部署。下载或克隆后可离线打开，支持窄屏、深浅主题及源码跳转。下方「实现结构」提供可在 GitHub 直接查看的简图。
 
 0.8.0 新增 [会话串行管道、引用回溯与受控点名](docs/CORE_PIPELINE_08.md)，支持 [上海 NapCat／首尔主脑分离部署](docs/CROSS_BORDER_DEPLOYMENT.md)。群聊、私聊与 `@Bot` 统一先写隔离接收日志，再按 1.8 秒／最长 3.5 秒防抖；同会话模型请求串行，后台清空通过 epoch 作废旧任务。补齐引用／转发原图、公开群互动到 Owner 私聊的单向背景、受控 `[AT:...]` 与本地表情联合发送。预算日／月边界统一按 `BOT_TIMEZONE=Asia/Shanghai`，旧 UTC 账本保留审计并保守迁移。
 
@@ -160,20 +160,23 @@ flowchart TD
     Runtime -.模型路由与输出上限.-> Chat
     Runtime -.发送延迟.-> Delivery
     Runtime --> Budget[全局日月 / 用户 / 分项预算]
+    Runtime -.作息与 Owner 私聊例外.-> Rest
     Budget -.请求前事务预留.-> Gate
     Budget -.请求前事务预留.-> Chat
     Budget -.请求前事务预留.-> Search
     Gate --> Settlement[用量结算 / 缓存折扣 / 未计费释放 / 未知费用估算]
     Chat --> Settlement
     Search --> Settlement
-    Settlement --> Ledger[(账目 / 日月累计 / 按模型聚合)]
+    Settlement --> Ledger[(账目 / 日月累计 / 模型与思考档位聚合)]
     Ledger -.结算差额更新预算占用.-> Budget
     Ingress[鉴权、接收日志、同会话引用与媒体准备]
     Ingress --> BotPolicy{已知 Bot 与授权检查}
     Runtime -.默认和逐 Bot 阈值.-> BotPolicy
-    BotPolicy -->|普通用户| Queue[(SQLite 防抖批次与 jobs / 最多 16 条)]
-    BotPolicy -->|有效 Owner 邀请 / 两轮每十分钟| Queue
-    BotPolicy -->|非邀请且阈值低于 1.00 / 仅获准群| Queue
+    BotPolicy -->|普通用户| Rest{本地休息门禁}
+    Rest -->|休息中且非 Owner 私聊例外| Resting[保留允许的本地背景 / 不入模型队列]
+    Rest -->|正常工作| Queue[(SQLite 防抖批次与 jobs / 最多 16 条)]
+    BotPolicy -->|有效 Owner 邀请 / 两轮每十分钟| Rest
+    BotPolicy -->|非邀请且阈值低于 1.00 / 仅获准群| Rest
     BotPolicy -->|其余已知 Bot| Ignore[本地静默忽略 / 0 Token]
     Queue --> Serial[会话串行 / 追发与撤回取消]
     Serial -->|固定命令| Outbox
@@ -188,9 +191,10 @@ flowchart TD
     Gate -->|按需且显式启用| Search[独立 Google Search 请求 / 来源筛查]
     Search -->|事实与联网四态| Context
     Gate -->|私聊或群真实 @ 且有效 BV| Video[B站公开资料 / 来源筛查 / 可选原片分析]
-    Context --> Chain[按会话与模型校验续链 / 选择全量或差量]
+    Context --> Chain[会话与模型续链 / 默认 300 秒且最多 12 轮 / ΔB 与精简 C]
     Chain --> Chat[Interactions 流式生成 / Hydrogen 或 Carbon]
-    Chat --> OutputGate[输出筛查 / 五维协议与链接校验]
+    Chat -->|非弃权| OutputGate[输出筛查 / 五维协议与链接校验]
+    Chat -->|合法 abstain| Abstain[规范化空动作 / 无输出门卫或新链提交]
     Video --> VideoOutput[视频输出筛查 / 受控文本]
     VideoOutput --> Outbox
     OutputGate --> Outbox[(加密 Outbox)]
@@ -202,6 +206,8 @@ flowchart TD
     Delivery -->|主对话候选确认送达后| ChainStore[(加密 interaction_chains / 提交已覆盖序号)]
     Delivery -.ACK 后合并回复写入门卫背景.-> GateContext[(有限群聊上下文 / 附图占位)]
     GateContext -.下一轮接话依据.-> Gate
+    Delivery -.ACK 后记录邻近图事件.-> Consumed[(group_consumed_images / 300 秒)]
+    Consumed -.自动补图去重 / 显式重看仍可召回.-> ImageContext
   end
 
   Delivery -->|经原 OneBot 连接返回| Reply[QQ 接收回复]
@@ -211,15 +217,17 @@ flowchart TD
 
 冷历史提炼先进行最小费用检查，再只读合批并按完整载荷预检；随后核对候选领取、执行来源筛查与 Flex 提炼、逐条强校验后提交。后台纯 expiry 小批次有 24 条／4096 字节／30 分钟等待规则，详见 [合批提炼流程](architecture.html#memory-batching)。
 
+作息热配置控制新入站聊天、定时 B 站任务和陪伴计划；它不暂停所有后台工作，手动管理、日报、模板告警、Drive 和记忆归档按各自规则继续运行。详见 [休息门禁](architecture.html#rest-hours)。
+
 所有模型请求共用事务预留与结算，缓存折扣释放多余占用；失败按是否发出、HTTP 状态与流进度区分未计费和有限回退估算，未知仍标为未知。首次启动校正保留账目，详情见 [费用结算图](architecture.html#billing)。搜索另受每日次数和独立额度约束。主对话不开放工具，联网使用独立请求，结果过审后才进入 C 区。用户原文在门卫放行后入史，助手正文在 ACK 后入史；视频材料与分析摘要不写入聊天记忆。Drive 群记忆镜像、巡逻日记和 Owner 只读快照分别配置。
 
-启用会话记忆、非沙箱且续链开关开启时，主对话使用 `store=True`；有效旧链携带 `previous_interaction_id`，按模型通道发送未覆盖的 B 历史及完整当轮 C，每轮仍传 A。首次或链失效时用完整本地上下文起链。新标识随 Outbox 传递，回复成功送达后才加密提交到会话库，供下一轮读取。关闭续链、关闭记忆及搜索／沙箱／后台任务保持 `store=False`。续链按完整逻辑上下文预留预算；本地默认 6 小时有效期不等于云端删除期限。详见 [续链流程图](architecture.html#interaction-chain)。
+启用会话记忆、非沙箱且续链开关开启时，主对话使用 `store=True`；有效旧链携带 `previous_interaction_id`，按模型通道发送未覆盖的 ΔB 及去重后的精简 C，每轮仍传 A。摘要／背景／表情名单按摘要比较，邻近内容去重最多记住 16 项。首次或链失效时用完整本地上下文起链。新标识随 Outbox 传递，回复成功送达后才加密提交到会话库，供下一轮读取。关闭续链、关闭记忆及搜索／沙箱／后台任务保持 `store=False`。续链按完整逻辑上下文预留预算；新链默认有效 300 秒，每链最多 12 轮，满额后重新起链。本地期限不等于云端删除期限。详见 [续链流程图](architecture.html#interaction-chain)。
 
 群聊批次最多 16 条／24,000 字；纯图采用现有 incomplete 防抖档，仍受最大等待上限约束。当前两张图片占满时仍补充去重后的邻近群聊文本。历史序列化去除重复身份前缀，并在相邻消息间隔达到 30 分钟时插入按 Bot 时区格式化的时间断点。主引用展开路径最多 6 个引用 ID、4 个转发，每个转发最多 40 个节点；多余图片截断并标注状态，其他字数和权限限制继续生效。
 
-图片来源依次为当前批次、邻近上下文，以及无图且明确指代旧图时的同会话 HotRing；历史候选通常限 30 分钟、最多 20 条，最终每轮仍最多两张，新增来源图片需单独过门卫。普通图最长边 768 px；长宽比大于 2 的静态图保留到长边 1536／短边 768 px；动图取首尾两帧。最多 120 字视觉摘要在安全检查和 ACK 后追加热史，原图不持久化。详见 [图片上下文图](architecture.html#image-context)。
+图片来源依次为当前批次、邻近上下文，以及无图且明确指代旧图时的同会话 HotRing；历史候选通常限 30 分钟、最多 20 条，最终每轮仍最多两张，新增来源图片需单独过门卫。自动补邻近图排除已入史、已摘要或 ACK 后标记为已消费的事件，消费记录按群保留 300 秒；明确重看仍可走历史找图。普通图最长边 768 px；长宽比大于 2 的静态图保留到长边 1536／短边 768 px；动图取首尾两帧。最多 120 字视觉摘要在安全检查和 ACK 后追加热史，原图不持久化。详见 [图片上下文图](architecture.html#image-context)。
 
-公开聊天的表情协议属于 A 静态指令，可用名单由 C 区 `meme_labels` 提供；后台增删表情不改 A 的哈希，仍由后端白名单控制发送。Owner 私聊、沙箱及非聊天任务不加载这份动态标签。此次升级固定协议本身改变，旧链会按已有前缀校验正常失效，之后重新起链。
+公开聊天的表情协议属于 A 静态指令，可用名单由 C 区 `meme_labels` 提供；后台增删表情不改 A 的哈希，仍由后端白名单控制发送。Owner 私聊、沙箱及非聊天任务不加载这份动态标签。续链仅在名单变化时重传标签，空名单会显式发送；首次或重新起链恢复完整名单。
 
 记忆从会话热史进入不可变冷史，经后台 Flex 提炼形成画像与编年史，再按需本地召回到 C 区。已确认的公开群互动可单向进入 Owner 私聊背景；显式启用的白名单群可与单目录 Drive Markdown 双向同步，私聊不导出。完整存储边界和调用关系见 [HTML 架构图](architecture.html#memory)。
 
@@ -304,6 +312,8 @@ docker compose up -d
 ```
 
 [`max_output_tokens` 包含思考 Token](https://aistudio.google.com/docs/thinking#token-limits)。0.8.1 的九个生成场景默认 `medium`，可在「思考强度」后台选择至 `xhigh`；各档仍有独立 Token 上限与预算门禁，详情见 [模型策略](docs/MODEL_POLICY.md)。输出不完整时不续写、不发布部分文本。SDK 自动重试与自动续写均关闭；v0.10 聊天仅在超时或 incomplete 时重新预留并降一档重试一次，中断且无完整 usage 保留有限估算费用，其他接口错误不重试。历史保留明细在首次启动时按新口径一次性校正，不重建账本；需要恢复旧口径时必须配套恢复数据库备份，详见 [v1.1.8 迁移说明](docs/BILLING_118.md)。
+
+v1.3.0 预留时同时记录实际下发的模型通道与思考档位，后台可按档位查看 Token／费用分布，未知历史保留 unknown；不根据档位猜测实际思考 Token。有效缓存观测在空闲超过 180 秒或切换档位后重新建立样本。记忆 Flex 的未计费 429 可将批次退回 pending，后台等待 60／120 秒、最多两次额外尝试，退避状态不跨进程持久化。
 
 预算门禁控制本地按已配置价格计入的估算费用，不能替代供应商账户额度；尤其回退估算不代表实际 Token 或最终账单，可能高估或低估。Key 被其他程序使用、供应商调价或预估异常造成的账单偏差不在本地硬上限的保证内。调用前的保守预留也可能使实际账单未到上限时提前停止。
 

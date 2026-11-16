@@ -32,6 +32,7 @@ from .models import Message
 from .outbound_actions import parse_actions
 from .output_links import filter_reply_links
 from .proactive_policy import ProactiveConfig
+from .rest_policy import RestHoursConfig
 from .rich_message_parser import parse_message
 from .security import Rejected, authorize, configured_secrets
 from .thinking_policy import ThinkingConfig
@@ -191,6 +192,7 @@ async def dashboard(request: Request):
         "budget_circuit_open": circuit,
         "metrics": [dict(row) for row in metrics],
         "notebook": notebook,
+        "rest_hours": svc.store.runtime.rest_hours_status(),
     }
 
 
@@ -274,6 +276,32 @@ async def patrol_limits_save(request: Request):
 async def patrol_limits_reset(request: Request):
     async with request.app.state.admin_config_lock:
         return await service(request).store.runtime.set_patrol_limits(None)
+
+
+@router.get("/api/rest-hours")
+async def rest_hours_status(request: Request):
+    return service(request).store.runtime.rest_hours_status()
+
+
+@router.put("/api/rest-hours")
+async def rest_hours_save(request: Request):
+    value = await body(request, RestHoursConfig)
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        status = await svc.store.runtime.set_rest_hours(value)
+        if svc.proactive:
+            await svc.proactive.replan_unattempted()
+        return status
+
+
+@router.delete("/api/rest-hours")
+async def rest_hours_reset(request: Request):
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        status = await svc.store.runtime.set_rest_hours(None)
+        if svc.proactive:
+            await svc.proactive.replan_unattempted()
+        return status
 
 
 @router.get("/api/filter")

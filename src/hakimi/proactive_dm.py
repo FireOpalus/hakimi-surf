@@ -176,6 +176,28 @@ class OwnerProactive:
                 )
             self.wakeup.set()
 
+    def _resting(self, stamp: float) -> bool:
+        return self.store.runtime.rest_hours.active(self.local(stamp))
+
+    async def _replan_locked(self):
+        # Replan only unattempted work. Paid or ambiguous attempts are never rerolled.
+        day = self.local().date().isoformat()
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "DELETE FROM proactive_schedule WHERE scope=? AND day=? AND status='planned'",
+                (self.scope, day),
+            )
+            await self.store.db.execute(
+                "DELETE FROM proactive_days WHERE scope=? AND day=?", (self.scope, day)
+            )
+        await self._expire_and_disable()
+        await self._plan_day(self.clock(), future_only=True)
+
+    async def replan_unattempted(self):
+        async with self.plan_lock, self.policy_lock:
+            await self._replan_locked()
+        self.wakeup.set()
+
     async def set_config(self, value: ProactiveConfig | None):
         async with self.plan_lock, self.policy_lock:
             runtime = self.store.runtime
@@ -186,18 +208,7 @@ class OwnerProactive:
             else:
                 await runtime.save_config("proactive", value.model_dump())
                 runtime.proactive, runtime.proactive_overridden = value, True
-            # Replan only unattempted work. Paid or ambiguous attempts are never rerolled.
-            day = self.local().date().isoformat()
-            async with self.store.transaction():
-                await self.store.db.execute(
-                    "DELETE FROM proactive_schedule WHERE scope=? AND day=? AND status='planned'",
-                    (self.scope, day),
-                )
-                await self.store.db.execute(
-                    "DELETE FROM proactive_days WHERE scope=? AND day=?", (self.scope, day)
-                )
-            await self._expire_and_disable()
-            await self._plan_day(self.clock(), future_only=True)
+            await self._replan_locked()
         self.wakeup.set()
 
     async def ensure_plan(self):
@@ -235,7 +246,9 @@ class OwnerProactive:
             slots = [
                 stamp
                 for stamp in range(int(start), int(end), 60)
-                if not cfg.quiet(self.local(stamp)) and (not future_only or stamp > now)
+                if not cfg.quiet(self.local(stamp))
+                and not self._resting(stamp)
+                and (not future_only or stamp > now)
             ]
             for due in sorted(
                 self.rng.sample(slots, min(max(0, cfg.max_per_day - used), len(slots)))
@@ -251,7 +264,7 @@ class OwnerProactive:
         expiry = min(now + 7200, end)
         # Cap at the first quiet boundary; a queued afternoon greeting cannot survive night.
         for stamp in range(int(now // 60 + 1) * 60, int(expiry) + 1, 60):
-            if self.config.quiet(self.local(stamp)):
+            if self.config.quiet(self.local(stamp)) or self._resting(stamp):
                 return stamp
         return expiry
 
@@ -264,7 +277,7 @@ class OwnerProactive:
         if kind == "companion":
             if not cfg.companion_ping_enabled:
                 return "companion_disabled"
-            if cfg.quiet(self.local(now)):
+            if cfg.quiet(self.local(now)) or self._resting(now):
                 return "quiet_hours"
             if day and day != self.local(now).date().isoformat():
                 return "old_day"

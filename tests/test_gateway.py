@@ -667,3 +667,88 @@ async def test_decision_audit_tracks_downstream_sent_abstained_and_rejected(
         )
     finally:
         await svc.stop()
+
+
+async def test_abstain_skips_output_screen_and_screen_rejection_avoids_duplicate_system_audit(
+    settings, store, sdk_pair, message
+):
+    from hakimi.bilibili import Video
+    from hakimi.service import Service
+    from tests.fakes import FakeBili, FakeSender
+
+    decision_calls = []
+    block_mode = [False]
+
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            decision_calls.append(json.loads(request.content))
+            resp = decision_response()
+            if block_mode[0]:
+                resp["answers"]["is_unsafe_or_spam"].update(noul=0.95, confidence=0.95)
+            return httpx.Response(200, json=resp)
+        resp = interaction_response()
+        resp["steps"][0]["content"][0]["text"] = json.dumps(
+            {
+                "abstain": True,
+                "bubbles": ["不应该输出的草稿"],
+                "anchor": {"reply_id": "bad", "mentions": ["999"]},
+                "sticker": {"label": "快乐", "timing": "after_text"},
+                "image_digest": "ignored",
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json=resp)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    svc = Service(
+        settings,
+        store,
+        gate,
+        FakeBili(
+            [
+                Video(
+                    bvid="BV1xx411c7mD",
+                    mid="1",
+                    title="t",
+                    description="d",
+                    author="u",
+                    published_at=1,
+                )
+            ]
+        ),
+        FakeSender(),
+    )
+    try:
+        m1 = group(
+            message,
+            event_id="ev-abstain-1",
+            addressed=True,
+            attention_reason="mention",
+            mentioned_ids=["10000"],
+            text="随便聊聊",
+        )
+        assert await svc.accept(m1) == "accepted"
+        await svc.process(await store.claim())
+        # Only 1 decision call (inbound message screen); output screen skipped on abstain=True.
+        assert len(decision_calls) == 1
+        snap = await svc.sessions.snapshot(m1)
+        assert snap["interaction_chains"] == {}
+
+        # Inbound content_blocked must emit only one production audit_events row, not a system dup.
+        block_mode[0] = True
+        m2 = group(
+            message,
+            event_id="ev-block-1",
+            addressed=True,
+            attention_reason="mention",
+            mentioned_ids=["10000"],
+            text="拦截测试消息",
+        )
+        assert await svc.accept(m2) == "accepted"
+        await svc.process(await store.claim())
+        await store.runtime.flush()
+        rows = await store.all("SELECT code,source FROM audit_events WHERE code='content_blocked'")
+        assert [tuple(r) for r in rows] == [("content_blocked", "production")]
+        assert svc.counters["content_blocked"] == 1
+    finally:
+        await svc.stop()

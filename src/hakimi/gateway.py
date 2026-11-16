@@ -245,6 +245,40 @@ class FilterManager:
                 (self.store.vault.seal("decision-audit:" + audit_id, value), audit_id),
             )
 
+    async def record_generation(
+        self,
+        audit_id: str | None,
+        *,
+        thinking_level: str | None = None,
+        model_lane: str | None = None,
+    ):
+        if not audit_id:
+            return
+        valid_level = (
+            thinking_level
+            if thinking_level in {"none", "minimal", "low", "medium", "high", "xhigh"}
+            else None
+        )
+        valid_lane = (
+            model_lane if model_lane in {"hydrogen", "carbon", "memory_flex", "decision"} else None
+        )
+        if not valid_level and not valid_lane:
+            return
+        await self.initialize()
+        async with self.store.transaction():
+            row = await self.store.one("SELECT payload FROM decision_audit WHERE id=?", (audit_id,))
+            if not row:
+                return
+            value = self.store.vault.open("decision-audit:" + audit_id, row["payload"])
+            if valid_level:
+                value["thinking_level"] = valid_level
+            if valid_lane:
+                value["model_lane"] = valid_lane
+            await self.store.db.execute(
+                "UPDATE decision_audit SET payload=? WHERE id=?",
+                (self.store.vault.seal("decision-audit:" + audit_id, value), audit_id),
+            )
+
     async def recent_audit(self, limit=30):
         await self.initialize()
         limit = max(1, min(30, int(limit)))

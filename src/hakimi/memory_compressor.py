@@ -3,6 +3,8 @@
 import asyncio
 import json
 import re
+import time
+from collections import OrderedDict
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -11,6 +13,9 @@ from .bot_server import is_persona_owner, untrusted_input
 from .dual_memory import EXTRACTION_INSTRUCTION, parse_extraction
 from .generation_policy import Scenario
 from .security import Rejected, configured_secrets
+
+MAX_RATE_LIMIT_RETRIES = 2
+RATE_LIMIT_BACKOFF_SECONDS = 60.0
 
 
 def check_memory_text(text, settings):
@@ -28,13 +33,15 @@ def check_memory_text(text, settings):
 
 
 class MemoryCompressor:
-    def __init__(self, settings, sessions, gateway, store):
+    def __init__(self, settings, sessions, gateway, store, *, clock=time.monotonic):
         self.s, self.sessions, self.ai, self.store = settings, sessions, gateway, store
         self.tasks = {}
         self.locks = [asyncio.Lock() for _ in range(32)]
         self.slots = asyncio.Semaphore(1)
         self.wakeup = asyncio.Event()
         self.mirror = None
+        self.clock = clock
+        self.slice_backoff: OrderedDict[str, tuple[int, float]] = OrderedDict()
 
     def schedule(self, message):
         if self.s.prefix_history_enabled:
@@ -173,6 +180,9 @@ class MemoryCompressor:
             candidate = await self.sessions.dual.peek(message, background=background and not force)
             if candidate is None:
                 return {"status": "not_due_or_cooling_down"}
+            backoff_entry = self.slice_backoff.get(candidate["id"])
+            if background and not force and backoff_entry and self.clock() < backoff_entry[1]:
+                return {"status": "provider_backoff"}
             known = await self.sessions.dual.view(message)
             payload = {
                 "known_chronicles": [
@@ -227,7 +237,9 @@ class MemoryCompressor:
                 check_memory_text(result, self.s)
                 extraction = parse_extraction(result)
                 committed = await self.sessions.dual.commit(message, snapshot, extraction)
-                if not committed:
+                if committed:
+                    self.slice_backoff.pop(snapshot["id"], None)
+                else:
                     await self.sessions.dual.finish(message, snapshot, "compression_stale")
                     await self.store.runtime.event("compression_stale", "memory")
                 return {
@@ -256,6 +268,24 @@ class MemoryCompressor:
                         if exc.args[0] == "gemini_circuit_open"
                         else "budget_hard_stop"
                     }
+                if (
+                    isinstance(exc, Rejected)
+                    and str(exc) == "gemini_unavailable"
+                    and exc.detail == "rate_limited"
+                ):
+                    prior = self.slice_backoff.get(snapshot["id"], (0, 0.0))[0]
+                    if prior < MAX_RATE_LIMIT_RETRIES:
+                        attempts = prior + 1
+                        self.slice_backoff[snapshot["id"]] = (
+                            attempts,
+                            self.clock() + RATE_LIMIT_BACKOFF_SECONDS * attempts,
+                        )
+                        self.slice_backoff.move_to_end(snapshot["id"])
+                        while len(self.slice_backoff) > 256:
+                            self.slice_backoff.popitem(last=False)
+                        await self.sessions.dual.requeue(message, snapshot)
+                        return {"status": "provider_backoff"}
+                self.slice_backoff.pop(snapshot["id"], None)
                 err_code = (
                     str(exc.args[0])
                     if isinstance(exc, Rejected) and exc.args

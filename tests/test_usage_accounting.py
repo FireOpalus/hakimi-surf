@@ -368,3 +368,82 @@ async def test_bill_aligned_reconciliation_upgrades_retained_rows_idempotently(s
                 assert usage["cost_estimates"] == expected_snapshot["cost_estimates"]
         finally:
             await restored.close()
+
+
+async def test_thinking_level_accounting_recovery_backfill_and_audit(settings, message):
+    from hakimi import model_accounting
+
+    store = Store(settings)
+    await store.open()
+    try:
+        samples = [
+            ("decision", "none", "decision"),
+            ("hydrogen", "low", "chat"),
+            ("hydrogen", "medium", "chat"),
+            ("carbon", "high", "chat"),
+            ("memory_flex", "medium", "memory"),
+        ]
+        for model_lane, level, budget_lane in samples:
+            rid = await store.reserve(
+                "u1",
+                budget_lane,
+                Decimal(".05"),
+                model_lane=model_lane,
+                thinking_level=level,
+            )
+            await store.settle(
+                rid,
+                Decimal(".001"),
+                usage=TokenUsage(500, 40, 200, 15, model_lane, level),
+                discounted_actual=Decimal(".0008"),
+                model_lane=model_lane,
+                thinking_level=level,
+            )
+
+        # Open reservation before simulated crash retains thinking_level across Store.open().
+        crashed_rid = await store.reserve(
+            "u1", "chat", Decimal(".05"), model_lane="carbon", thinking_level="high"
+        )
+        assert crashed_rid
+    finally:
+        await store.close()
+
+    recovered = Store(settings)
+    await recovered.open()
+    try:
+        usage = await recovered.usage()
+        for period in ("today", "month", "lifetime"):
+            tokens = usage["token_usage"][period]
+            assert sum(r["calls"] for r in tokens["by_thinking"]) == tokens["calls"]
+            assert tokens["calls"] == 6
+            summary = {r["thinking_level"]: r["calls"] for r in tokens["thinking_summary"]}
+            assert summary == {"none": 1, "low": 1, "medium": 2, "high": 2}
+
+        # Verify historical backfill maps pre-upgrade decision -> 'none' and chat -> 'unknown'.
+        async with recovered.transaction():
+            await recovered.db.execute("DELETE FROM meta WHERE key='thinking_usage_v1'")
+            await recovered.db.execute("DELETE FROM ledger_thinking")
+            await recovered.db.execute("DELETE FROM thinking_usage_aggregates")
+        await model_accounting.initialize_thinking(recovered)
+        after_backfill = (await recovered.usage())["token_usage"]["today"]
+        backfill_summary = {
+            r["thinking_level"]: r["calls"] for r in after_backfill["thinking_summary"]
+        }
+        assert backfill_summary == {"none": 1, "unknown": 5}
+
+        audit_id = await recovered.runtime.filters.record(
+            message,
+            {"current_message": "hi"},
+            {"result": "chat", "tier": 3, "answers": {}},
+            "production",
+            job_id="job-think-1",
+        )
+        await recovered.runtime.filters.record_generation(
+            audit_id, thinking_level="high", model_lane="carbon"
+        )
+        recent = await recovered.runtime.filters.recent_audit(limit=5)
+        item = next(r for r in recent if r["excerpt"] == "hi")
+        assert item["thinking_level"] == "high"
+        assert item["model_lane"] == "carbon"
+    finally:
+        await recovered.close()

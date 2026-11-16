@@ -23,14 +23,14 @@ from .generation_policy import GenerationPlan, Scenario, generation_plan
 from .media import ModelImage
 from .mentions import AT_INSTRUCTION
 from .models import Message
-from .outbound_actions import CHAT_RESPONSE_FORMAT, ChatActions
+from .outbound_actions import CHAT_RESPONSE_FORMAT, Anchor, ChatActions, Sticker
 from .persona import SYSTEM_INSTRUCTION, identity_anchor
-from .prefix_runtime import PrefixRuntime, StaticPrefixes
+from .prefix_runtime import MAX_CHAIN_TURNS, PrefixRuntime, StaticPrefixes
 from .routing import RouteDecision, select_tier
 from .security import Rejected
 from .store import Store
 from .streaming import StreamProgress, cancellable, consume_stream
-from .usage_accounting import TokenUsage
+from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
 from .web_search import QUERY_RESERVE, QUERY_USD, SEARCH_INSTRUCTION, parse_result, query_count
 
@@ -193,6 +193,8 @@ class GeminiGateway:
         self.blocked_until = 0.0
         self.files_client = files_client
         self._owned_files = files_client is None
+        self.flex_client = chat_client
+        self._owned_flex = False
         self.video_files = VideoFiles(store, self._files)
         self.filters = getattr(store.runtime, "filters", None) or FilterManager(store)
 
@@ -201,6 +203,12 @@ class GeminiGateway:
             # Uploads must not inherit the 8-second Decisions transport deadline.
             self.files_client = self._client("v1beta", 120)
         return self.files_client.aio.files
+
+    def _flex_chat_client(self):
+        if self.flex_client is None:
+            self.flex_client = self._client("v1", self.s.memory_flex_timeout)
+            self._owned_flex = True
+        return self.flex_client
 
     def _client(self, api_version: str, timeout: float):
         transport = httpx.AsyncClient(
@@ -232,6 +240,9 @@ class GeminiGateway:
         if self._owned_files and self.files_client is not None:
             await self.files_client.aio.aclose()
             self.files_client.close()
+        if self._owned_flex and self.flex_client is not None:
+            await self.flex_client.aio.aclose()
+            self.flex_client.close()
         for transport in self._transports:
             await transport.aclose()
 
@@ -275,7 +286,9 @@ class GeminiGateway:
         return (incoming * price[0] + outgoing * price[1]) / 1_000_000
 
     @staticmethod
-    def _usage(result: Any, model_lane: str) -> TokenUsage | None:
+    def _usage(
+        result: Any, model_lane: str, thinking_level: str | None = None
+    ) -> TokenUsage | None:
         """Only provider-reported observations; missing optional fields remain unknown."""
         usage = getattr(result, "usage", None)
         if usage is None:
@@ -296,6 +309,7 @@ class GeminiGateway:
         cached = optional_count("total_cached_tokens")
         if cached is not None and (not isinstance(incoming, int) or cached > incoming):
             cached = None
+        level = thinking_level if thinking_level in VALID_THINKING_LEVELS else None
         try:
             return TokenUsage(
                 input_tokens=incoming,
@@ -305,6 +319,7 @@ class GeminiGateway:
                 model_lane=model_lane
                 if model_lane in {"decision", "hydrogen", "carbon", "memory_flex"}
                 else "interaction",
+                thinking_level=level,
             )
         except ValueError:
             return None
@@ -333,17 +348,22 @@ class GeminiGateway:
         return actual - usage.cached_tokens * (rates[0] - cached_rate) / 1_000_000
 
     @staticmethod
-    def _non_billable_http_error(exc: BaseException, stream_started: bool) -> bool:
-        if stream_started:
-            return False
+    def _http_status(exc: BaseException) -> int | None:
         for candidate in (
             getattr(exc, "status_code", None),
             getattr(exc, "code", None),
             getattr(getattr(exc, "response", None), "status_code", None),
         ):
             if isinstance(candidate, int) and not isinstance(candidate, bool):
-                return candidate in {400, 401, 403, 404, 409, 413, 422, 429}
-        return False
+                return candidate
+        return None
+
+    @classmethod
+    def _non_billable_http_error(cls, exc: BaseException, stream_started: bool) -> bool:
+        if stream_started:
+            return False
+        status = cls._http_status(exc)
+        return status in {400, 401, 403, 404, 409, 413, 422, 429}
 
     async def _call(
         self,
@@ -367,6 +387,7 @@ class GeminiGateway:
         cached_prefix_tokens: int = 0,
         stream_progress: StreamProgress | None = None,
         call_state: dict[str, bool] | None = None,
+        thinking_level: str | None = None,
     ) -> Any:
         if self.blocked_until > time.monotonic():
             raise Rejected("gemini_circuit_open")
@@ -427,7 +448,11 @@ class GeminiGateway:
 
             try:
                 reservation = await self.store.reserve(
-                    subject, budget_lane, reserve_usd, model_lane=model_lane
+                    subject,
+                    budget_lane,
+                    reserve_usd,
+                    model_lane=model_lane,
+                    thinking_level=thinking_level,
                 )
             except Rejected as exc:
                 # Only a failure before dispatch permits a second model attempt.
@@ -452,6 +477,7 @@ class GeminiGateway:
                         Decimal(0),
                         discounted_actual=Decimal(0),
                         model_lane=model_lane,
+                        thinking_level=thinking_level,
                     )
                 )
                 raise
@@ -470,6 +496,7 @@ class GeminiGateway:
                             Decimal(0),
                             discounted_actual=Decimal(0),
                             model_lane=model_lane,
+                            thinking_level=thinking_level,
                         )
                     )
                 else:
@@ -480,6 +507,7 @@ class GeminiGateway:
                             None,
                             fallback_actual=fallback_cost(elapsed),
                             model_lane=model_lane,
+                            thinking_level=thinking_level,
                         )
                     )
                 raise
@@ -491,6 +519,7 @@ class GeminiGateway:
                         None,
                         fallback_actual=fallback_cost(elapsed),
                         model_lane=model_lane,
+                        thinking_level=thinking_level,
                     )
                 )
                 await self.store.runtime.provider_result(
@@ -514,18 +543,21 @@ class GeminiGateway:
                         None,
                         fallback_actual=fallback_cost(elapsed),
                         model_lane=model_lane,
+                        thinking_level=thinking_level,
                     )
                 )
                 raise
             except Exception as exc:
                 stream_started = bool(stream_progress and stream_progress.started)
-                if self._non_billable_http_error(exc, stream_started):
+                non_billable = self._non_billable_http_error(exc, stream_started)
+                if non_billable:
                     await asyncio.shield(
                         self.store.settle(
                             reservation,
                             Decimal(0),
                             discounted_actual=Decimal(0),
                             model_lane=model_lane,
+                            thinking_level=thinking_level,
                         )
                     )
                 else:
@@ -536,6 +568,7 @@ class GeminiGateway:
                             None,
                             fallback_actual=fallback_cost(elapsed),
                             model_lane=model_lane,
+                            thinking_level=thinking_level,
                         )
                     )
                 await self.store.runtime.provider_result(
@@ -548,6 +581,8 @@ class GeminiGateway:
                 )
                 if model_lane != "memory_flex" and budget_lane != "search":
                     self.blocked_until = time.monotonic() + 60
+                if non_billable and self._http_status(exc) == 429:
+                    raise Rejected("gemini_unavailable", detail="rate_limited") from None
                 raise Rejected("gemini_unavailable") from None
             elapsed = max(0.0, time.monotonic() - started_at)
             await self.store.runtime.provider_result(
@@ -559,7 +594,7 @@ class GeminiGateway:
                 False,
             )
             token_actual = self._actual(result, rates)
-            usage = self._usage(result, model_lane)
+            usage = self._usage(result, model_lane, thinking_level=thinking_level)
             actual = token_actual
             if additional_actual is not None:
                 extra = additional_actual(result)
@@ -579,6 +614,7 @@ class GeminiGateway:
                 discounted_actual=discounted,
                 fallback_actual=fallback,
                 model_lane=model_lane,
+                thinking_level=thinking_level,
             )
             await run_guard(before_call)
             return result
@@ -636,6 +672,7 @@ class GeminiGateway:
                 fallback_media_tokens=2048,
                 fallback_additional=QUERY_USD,
                 call_state=call_state,
+                thinking_level="medium",
             )
             parsed = parse_result(result)
             rendered = parsed.render(self.s)
@@ -807,6 +844,7 @@ class GeminiGateway:
                     sum(1120 if i.resolution == "high" else 560 for i in images)
                     + (video.tokens if video else 0)
                 ),
+                thinking_level="none",
             )
             bounds = thresholds()
             report.update(thresholds=bounds, reply_threshold=bounds["reply"])
@@ -912,12 +950,14 @@ class GeminiGateway:
             )
         except Rejected as exc:
             report.update(result="blocked", reason=str(exc))
-            await self.store.runtime.event(str(exc), audit_source)
+            if not exc.audited:
+                await self.store.runtime.event(str(exc), audit_source)
+                exc.audited = True
             raise
         except (KeyError, AttributeError, TypeError, ValueError):
             report.update(result="blocked", reason="invalid_decision")
             await self.store.runtime.event("invalid_decision", audit_source)
-            raise Rejected("invalid_decision") from None
+            raise Rejected("invalid_decision", audited=True) from None
         finally:
             if inbound:
                 await self.filters.record(
@@ -1080,9 +1120,11 @@ class GeminiGateway:
         allow_chain = True
         used_lane = plan.model_lane
         used_rows = payload.get("recent_messages", [])
+        used_turns = 1
+        used_wire_state: dict[str, Any] = {}
 
         async def dispatch(active_plan):
-            nonlocal used_lane, used_rows
+            nonlocal used_lane, used_rows, used_turns, used_wire_state
             rows = payload.get("recent_messages", [])
             if active_plan.model_lane == "carbon":
                 rows = self.prefix_runtime.carbon_history(scope, payload)
@@ -1091,6 +1133,7 @@ class GeminiGateway:
             prev_id = None
             wire_rows = rows
             prev_created_at = None
+            chain = None
             if stateful_chat and allow_chain:
                 chain = (payload.get("interaction_chains") or {}).get(active_plan.model_lane)
                 if (
@@ -1100,6 +1143,7 @@ class GeminiGateway:
                     and chain.get("trim_version") == trim_version
                     and chain.get("system_digest") == system_digest
                     and chain.get("interaction_id")
+                    and int(chain.get("turns", 1)) < MAX_CHAIN_TURNS
                 ):
                     prev_id = str(chain["interaction_id"])
                     covered_seq = int(chain.get("covered_seq", 0))
@@ -1111,10 +1155,12 @@ class GeminiGateway:
                             prev_created_at = float(ts)
                 else:
                     self.prefix_runtime.invalidate_chain(scope, active_plan.model_lane)
+            used_turns = int(chain.get("turns", 1)) + 1 if prev_id and chain else 1
             if chat:
                 active_meme_labels = (
                     list(memes.labels) if (public_memes and memes is not None) else None
                 )
+                wire_state: dict[str, Any] = {}
                 wire_data = assemble_chat_input(
                     payload,
                     message,
@@ -1124,7 +1170,12 @@ class GeminiGateway:
                     history=wire_rows,
                     prev_created_at=prev_created_at,
                     meme_labels=active_meme_labels,
+                    continuation=bool(prev_id),
+                    prev_digests=chain.get("context_digests") if prev_id and chain else None,
+                    seen_nearby=chain.get("seen_nearby") if prev_id and chain else None,
+                    out_state=wire_state,
                 )
+                used_wire_state = wire_state
                 reserve_data = (
                     wire_data
                     if not prev_id
@@ -1159,6 +1210,7 @@ class GeminiGateway:
             if generation_trace is not None:
                 generation_trace.update(
                     model=model,
+                    model_lane=active_plan.model_lane,
                     thinking_level=active_plan.thinking_level,
                     sandbox_mode=getattr(route, "sandbox_mode", False),
                 )
@@ -1175,7 +1227,8 @@ class GeminiGateway:
                 call_state["dispatched"] = True
                 if progress is not None:
                     progress.dispatched = True
-                response = await self.chat_client.aio.interactions.create(
+                client = self._flex_chat_client() if memory_archive else self.chat_client
+                response = await client.aio.interactions.create(
                     model=model,
                     system_instruction=system,
                     input=model_input,
@@ -1255,8 +1308,11 @@ class GeminiGateway:
                 cached_prefix_tokens=cached_prefix,
                 stream_progress=progress,
                 call_state=call_state,
+                thinking_level=active_plan.thinking_level,
             )
-            usage = self._usage(result, active_plan.model_lane)
+            usage = self._usage(
+                result, active_plan.model_lane, thinking_level=active_plan.thinking_level
+            )
             if chat and usage is None:
                 self.prefix_runtime.cache.pop((scope, active_plan.model_lane), None)
             if chat and usage:
@@ -1264,6 +1320,7 @@ class GeminiGateway:
                     *self.prefix_runtime.marker(payload),
                     rows[0].get("seq", 0) if rows and active_plan.model_lane == "carbon" else 0,
                     self.store.vault.digest("static-prefix", system),
+                    active_plan.thinking_level,
                 )
                 eligible, busted = self.prefix_runtime.observe(
                     scope, active_plan.model_lane, marker, usage
@@ -1334,6 +1391,7 @@ class GeminiGateway:
         finally:
             if carbon_acquired:
                 self.carbon_slots.release()
+        abstained_chat = False
         try:
             if getattr(result, "status", None) != "completed":
                 raise Rejected("generation_incomplete")
@@ -1353,21 +1411,31 @@ class GeminiGateway:
                 raise Rejected("invalid_output")
             if chat:
                 try:
-                    ChatActions.model_validate_json(text)
+                    parsed_actions = ChatActions.model_validate_json(text)
                 except ValueError:
                     raise Rejected("invalid_action_output") from None
-            await self.screen(
-                {"generated_text": text},
-                subject,
-                purpose="output",
-                budget_lane=budget_lane,
-                audit_source=audit_source,
-                before_call=before_call,
-            )
+                if parsed_actions.abstain:
+                    abstained_chat = True
+                    text = ChatActions(
+                        abstain=True,
+                        bubbles=[""],
+                        anchor=Anchor(),
+                        sticker=Sticker(),
+                        image_digest=None,
+                    ).model_dump_json()
+            if not abstained_chat:
+                await self.screen(
+                    {"generated_text": text},
+                    subject,
+                    purpose="output",
+                    budget_lane=budget_lane,
+                    audit_source=audit_source,
+                    before_call=before_call,
+                )
         except BaseException:
             mark_chain_invalid()
             raise
-        if stateful_chat and getattr(result, "id", None):
+        if stateful_chat and not abstained_chat and getattr(result, "id", None):
             covered_seq = max((int(r.get("seq", 0)) for r in used_rows), default=0)
             expires = time.time() + min(
                 self.s.interaction_chain_ttl_seconds, self.s.memory_ttl_seconds
@@ -1381,6 +1449,9 @@ class GeminiGateway:
                 system_digest=system_digest,
                 covered_seq=covered_seq,
                 expires=expires,
+                turns=used_turns,
+                context_digests=used_wire_state.get("context_digests"),
+                seen_nearby=used_wire_state.get("seen_nearby"),
             )
             if generation_trace is not None:
                 generation_trace.pop("chain_invalidate", None)
@@ -1391,6 +1462,9 @@ class GeminiGateway:
                     "trim_version": trim_version,
                     "system_digest": system_digest,
                     "covered_seq": covered_seq,
+                    "turns": used_turns,
+                    "context_digests": used_wire_state.get("context_digests"),
+                    "seen_nearby": used_wire_state.get("seen_nearby"),
                 }
         return text
 

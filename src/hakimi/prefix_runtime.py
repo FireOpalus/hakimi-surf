@@ -58,16 +58,22 @@ class StaticPrefixes:
         return self.pool[key]
 
 
+IDLE_CACHE_TTL_SECONDS = 180.0
+MAX_CHAIN_TURNS = 12
+
+
 @dataclass
 class CacheState:
     marker: tuple
     high_water: int = 0
     drops: int = 0
+    last_at: float = 0.0
 
 
 class PrefixRuntime:
-    def __init__(self, limit=2048):
+    def __init__(self, limit=2048, *, clock=time.monotonic):
         self.limit = limit
+        self.clock = clock
         self.cache = OrderedDict()
         self.carbon = OrderedDict()
         self.chains = OrderedDict()
@@ -103,6 +109,9 @@ class PrefixRuntime:
         system_digest,
         covered_seq,
         expires,
+        turns=1,
+        context_digests=None,
+        seen_nearby=None,
     ):
         if not interaction_id:
             return
@@ -116,6 +125,9 @@ class PrefixRuntime:
                 "system_digest": system_digest,
                 "covered_seq": int(covered_seq),
                 "expires": expires,
+                "turns": int(turns),
+                "context_digests": dict(context_digests or {}),
+                "seen_nearby": list(seen_nearby or [])[:16],
             },
         )
 
@@ -148,9 +160,13 @@ class PrefixRuntime:
     def observe(self, scope, lane, marker, usage):
         """Return (eligible, busted); no QQ IDs or message bodies are stored here."""
         key = (scope, lane)
+        now = self.clock()
         old = self.cache.get(key)
-        continuous = old is not None and old.marker == marker
+        continuous = (
+            old is not None and old.marker == marker and now - old.last_at <= IDLE_CACHE_TTL_SECONDS
+        )
         state = old if continuous else CacheState(marker)
+        state.last_at = now
         eligible = continuous and usage.input_tokens >= 6144 and usage.cached_tokens is not None
         busted = False
         if usage.cached_tokens is None:

@@ -190,6 +190,7 @@ class Store:
                         self.s.group_policies[name] = row[0]
         await model_accounting.initialize(self)
         await self._reconcile_bill_aligned_v1()
+        await model_accounting.initialize_thinking(self)
         await self.runtime.load_config()
         await self._load_budget_config()
         await self.groups.initialize()
@@ -281,10 +282,12 @@ class Store:
             rows = await self.all(
                 "SELECT l.id,l.day,l.lane,l.reserved,l.amount,l.status,"
                 "u.id AS uid,u.input_tokens,u.estimated_amount,"
-                "COALESCE(u.model_lane,a.model_lane) AS model_lane "
+                "COALESCE(t.model_lane,u.model_lane,a.model_lane) AS model_lane,"
+                "t.thinking_level AS thinking_level "
                 "FROM ledger l "
                 "LEFT JOIN ledger_usage u ON u.id=l.id "
                 "LEFT JOIN ledger_attribution a ON a.id=l.id "
+                "LEFT JOIN ledger_thinking t ON t.id=l.id "
                 "WHERE l.status<>'reserved'"
             )
             for row in rows:
@@ -330,6 +333,7 @@ class Store:
                             (row["id"], row["model_lane"], new_est),
                         )
                 lane_key = model_accounting.lane_name(row["model_lane"])
+                thinking_key = model_accounting.thinking_name(row["thinking_level"], lane_key)
                 for period in self._periods(row["day"]):
                     await self.db.execute(
                         "UPDATE usage_aggregates SET charged_amount=MAX(0,charged_amount+?),"
@@ -343,6 +347,14 @@ class Store:
                         "estimated_calls=MAX(0,estimated_calls+?) "
                         "WHERE period=? AND model_lane=?",
                         (d_amount, d_est, d_est_calls, period, lane_key),
+                    )
+                    await self.db.execute(
+                        "UPDATE thinking_usage_aggregates "
+                        "SET charged_amount=MAX(0,charged_amount+?),"
+                        "estimated_amount=MAX(0,estimated_amount+?),"
+                        "estimated_calls=MAX(0,estimated_calls+?) "
+                        "WHERE period=? AND model_lane=? AND thinking_level=?",
+                        (d_amount, d_est, d_est_calls, period, lane_key, thinking_key),
                     )
             await self.db.execute("INSERT INTO meta VALUES ('bill_aligned_v1','1')")
 
@@ -639,7 +651,15 @@ class Store:
         async with self.lock:
             return not await self._budget_refusal(day, subject, lane, amount)
 
-    async def reserve(self, subject: str, lane: str, usd: Decimal, *, model_lane=None) -> str:
+    async def reserve(
+        self,
+        subject: str,
+        lane: str,
+        usd: Decimal,
+        *,
+        model_lane: str | None = None,
+        thinking_level: str | None = None,
+    ) -> str:
         if not isinstance(usd, Decimal) or not usd.is_finite() or usd < 0:
             raise Rejected("invalid_budget_amount")
         now = self.local_now()
@@ -663,6 +683,16 @@ class Store:
                     "INSERT INTO ledger_attribution VALUES (?,?)",
                     (reservation, model_accounting.lane_name(model_lane)),
                 )
+            if model_lane is not None or thinking_level is not None:
+                lane_key = model_accounting.lane_name(model_lane)
+                await self.db.execute(
+                    "INSERT OR REPLACE INTO ledger_thinking VALUES (?,?,?)",
+                    (
+                        reservation,
+                        lane_key,
+                        model_accounting.thinking_name(thinking_level, lane_key),
+                    ),
+                )
             await self.db.execute("UPDATE budget_totals SET amount=amount+?", (amount,))
             await self._charge_aggregates(day, amount, 1)
         return reservation
@@ -676,6 +706,7 @@ class Store:
         discounted_actual: Decimal | None = None,
         fallback_actual: Decimal | None = None,
         model_lane: str | None = None,
+        thinking_level: str | None = None,
     ) -> None:
         # Unknown/ambiguous failures settle via bounded fallback (or keep reserve on crash).
         if actual is not None and (
@@ -706,10 +737,21 @@ class Store:
             attribution = await self.one(
                 "SELECT model_lane FROM ledger_attribution WHERE id=?", (reservation,)
             )
+            thinking_row = await self.one(
+                "SELECT model_lane,thinking_level FROM ledger_thinking WHERE id=?",
+                (reservation,),
+            )
             model_lane = (
                 model_lane
                 or (usage.model_lane if usage else None)
                 or (attribution[0] if attribution else None)
+                or (thinking_row[0] if thinking_row else None)
+            )
+            resolved_thinking = model_accounting.thinking_name(
+                thinking_level
+                or (usage.thinking_level if usage else None)
+                or (thinking_row[1] if thinking_row else None),
+                model_lane,
             )
             if actual is not None:
                 billable = discounted_actual if discounted_actual is not None else actual
@@ -774,6 +816,10 @@ class Store:
                         period,
                     ),
                 )
+            await self.db.execute(
+                "INSERT OR REPLACE INTO ledger_thinking VALUES (?,?,?)",
+                (reservation, model_accounting.lane_name(model_lane), resolved_thinking),
+            )
             await model_accounting.accumulate(
                 self,
                 row["day"],
@@ -784,6 +830,7 @@ class Store:
                     name: getattr(usage, name, None)
                     for name in ("input_tokens", "output_tokens", "cached_tokens", "thought_tokens")
                 },
+                thinking_level=resolved_thinking,
             )
             if overrun:
                 await self.db.execute("INSERT OR REPLACE INTO meta VALUES ('budget_overrun','1')")
@@ -870,6 +917,12 @@ class Store:
                         (period,),
                     )
                 ]
+                thinking_rows = await self.all(
+                    "SELECT * FROM thinking_usage_aggregates WHERE period=?", (period,)
+                )
+                tokens["by_thinking"], tokens["thinking_summary"] = (
+                    model_accounting.summarize_thinking(thinking_rows)
+                )
                 tokens["effective_cache_by_model"] = [
                     {
                         **dict(r),
@@ -1008,6 +1061,7 @@ class Store:
         actions=None,
         external_search=False,
         audit_id=None,
+        consumed_image_events=(),
     ) -> None:
         batch = self.groups.active.get(self.session_scope(message))
         if batch and batch.job["id"] == job_id:
@@ -1031,6 +1085,8 @@ class Store:
         if segments:
             payload["segments"] = segments
             payload["allowed_at_qqs"] = sorted(set(allowed_at_qqs))
+        if consumed_image_events:
+            payload["consumed_image_events"] = list(dict.fromkeys(consumed_image_events))
         expires = now + 3600 if proactive else message.created_at + self.s.event_ttl_seconds
         async with self.transaction():
             if not proactive:
@@ -1219,6 +1275,9 @@ class Store:
             )
             await self.db.execute(
                 "DELETE FROM ledger_usage WHERE id NOT IN (SELECT id FROM ledger)"
+            )
+            await self.db.execute(
+                "DELETE FROM ledger_thinking WHERE id NOT IN (SELECT id FROM ledger)"
             )
             await self.db.execute(
                 "DELETE FROM ledger_times WHERE id NOT IN (SELECT id FROM ledger)"

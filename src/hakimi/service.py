@@ -118,10 +118,11 @@ class Service:
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
 
-    def record(self, event: str):
+    def record(self, event: str, *, emit_audit: bool = True):
         # Only internal constant labels. Never log exception repr, payloads, URLs or IDs.
         self.counters[event] += 1
-        log.info("event=%s", event)
+        if emit_audit:
+            log.info("event=%s", event)
 
     async def lookup_received(self, message, event_id):
         if await self.recalled([message.model_copy(update={"event_id": event_id})]):
@@ -260,6 +261,14 @@ class Service:
                 return "ignored"
             if await self.sessions.receive(message, expected_epoch=epoch) is None:
                 return "ignored"
+            if self.store.runtime.is_resting_for(message):
+                if message.kind == "group":
+                    await self.store.groups.observe(message)
+                    if eligible_context and not self.bot_guard.known_bot(message):
+                        await self.store.runtime.filters.remember_group(message)
+                self.hot.observe(message)
+                self.counters["admission_resting"] += 1
+                return "resting"
             # Start hydration before opening the debounce window. Context-only images
             # in an admitted group can support the next addressed message; no LLM call.
             if (message.images or "http" in message.text) and len(self.background_tasks) < 32:
@@ -605,7 +614,11 @@ class Service:
         if await self.recalled(members):
             return
         watermark = self.hot.watermark(message)
-        if not self.batch_authorized(message, members) or time.time() > job["expires"]:
+        if (
+            not self.batch_authorized(message, members)
+            or time.time() > job["expires"]
+            or self.store.runtime.is_resting_for(message)
+        ):
             return
         # Recheck persisted permits before image downloads, forward RPCs, memory or paid calls.
         if not await self.bot_guard.may_process(message, job["id"]):
@@ -702,7 +715,7 @@ class Service:
             current["web_preview_untrusted"] = previews[:2]
         # Forward/image/session preparation yields to admin updates. A revocation
         # during those waits must take effect before the first paid gateway call.
-        if not authorize(message, self.s):
+        if not authorize(message, self.s) or self.store.runtime.is_resting_for(message):
             return
 
         async def message_guard():
@@ -803,25 +816,44 @@ class Service:
         ):
             invited_bots.add(message.user_id)
         filtered_nearby = []
+        image_nearby = []
+        selected_neighbour_members = []
+        neighbour_image_events = []
+        digested_events = {
+            match.group(1)
+            for entry in history
+            if (match := re.match(r"^\[附图摘要，消息([^：\]]+)：", str(entry.get("text", ""))))
+        }
         current_events = {m.event_id for m in members}
         if message.kind == "group" and not sandbox:
             nearby = await self.store.groups.previous_messages(message, members, limit=6)
-            neighbour_members[:] = nearby
+            consumed_events = await self.store.groups.consumed_image_events(message)
             history_events = {item.get("event_id") for item in history if item.get("event_id")}
             filtered_nearby = [
                 m
                 for m in nearby
                 if m.event_id not in history_events and m.event_id not in current_events
             ]
+            image_nearby = [
+                m
+                for m in filtered_nearby
+                if m.event_id not in digested_events and m.event_id not in consumed_events
+            ]
+            neighbour_members[:] = filtered_nearby
             nearby_context = [
                 {"sender": self.image_sender(m), "text": m.text[:160]} for m in filtered_nearby
             ]
             if nearby_context:
                 payload["nearby_group_context"] = nearby_context
             neighbour_images, neighbour_sources = [], []
-            if len(images) < 2 and nearby:
+            if len(images) < 2 and image_nearby:
                 neighbour_images, neighbour_sources = await self.message_images(
-                    message, [], nearby, limit=2 - len(images), include_current=False
+                    message,
+                    [],
+                    image_nearby,
+                    limit=2 - len(images),
+                    include_current=False,
+                    selected_members=selected_neighbour_members,
                 )
             await message_guard()
             if neighbour_images:
@@ -833,6 +865,9 @@ class Service:
                     images=[i.gate() for i in neighbour_images],
                     before_call=message_guard,
                 )
+                neighbour_image_events = [
+                    m.event_id for m in selected_neighbour_members if m.event_id
+                ]
                 for source in neighbour_sources:
                     if "image_number" in source:
                         source = {**source, "image_number": source["image_number"] + len(images)}
@@ -848,7 +883,7 @@ class Service:
         if not sandbox and not images and PRIOR_IMAGE_REF_RE.search(message.text):
             candidates = self.hot.recent_with_images(
                 message,
-                exclude_events={*current_events, *(m.event_id for m in neighbour_members)},
+                exclude_events={*current_events, *(m.event_id for m in image_nearby)},
             )
             valid_candidates = []
             for item in candidates:
@@ -858,11 +893,6 @@ class Service:
                 mentioned_peers = {
                     uid for m in members for uid in m.mentioned_ids if uid != self.s.onebot_self_id
                 }
-                digested_events = set()
-                for entry in history:
-                    match = re.match(r"^\[附图摘要，消息([^：\]]+)：", str(entry.get("text", "")))
-                    if match:
-                        digested_events.add(match.group(1))
                 tier_hint = getattr(intent, "tier", 2)
 
                 def _recall_rank(idx_item):
@@ -1078,6 +1108,13 @@ class Service:
                 if gen_trace.get("chain_invalidate"):
                     await self.sessions.invalidate_chains(message)
                 raise
+            finally:
+                if gen_trace.get("thinking_level"):
+                    await self.store.runtime.filters.record_generation(
+                        audit_id,
+                        thinking_level=gen_trace.get("thinking_level"),
+                        model_lane=gen_trace.get("model_lane"),
+                    )
             await message_guard()
             allowed_reply = payload["allowed_reply_ids"]
             payload.clear()
@@ -1136,6 +1173,7 @@ class Service:
                             else {}
                         ),
                     },
+                    consumed_image_events=neighbour_image_events,
                 )
                 await self.store.runtime.filters.update_audit(audit_id, "queued")
                 return
@@ -1164,6 +1202,7 @@ class Service:
             segments=parsed.segments,
             allowed_at_qqs=allowed_at,
             audit_id=audit_id,
+            consumed_image_events=neighbour_image_events,
         )
         await self.store.runtime.filters.update_audit(audit_id, "queued")
 
@@ -1205,7 +1244,7 @@ class Service:
                 await self.store.runtime.filters.update_audit(audit_id, "cancelled", str(exc))
                 await self.store.finish(job["id"], "cancelled")
                 return
-            self.record(str(exc))
+            self.record(str(exc), emit_audit=not exc.audited)
             await self.store.runtime.filters.update_audit(audit_id, "rejected", exc.audit_detail)
             if self.diary and str(exc) == "prompt_injection":
                 await self.diary.injection(job["id"])
@@ -1496,6 +1535,10 @@ class Service:
                 expected_epoch=delivery_epoch,
             )
         if status == "sent" and not reply["proactive"] and "session_epoch" in reply:
+            if reply.get("consumed_image_events"):
+                await self.store.groups.mark_images_consumed(
+                    message, reply["consumed_image_events"]
+                )
             await self.proactive.note_activity(message)
             self.store.runtime.filters.spoke(message)
             self.compressor.schedule(message)
@@ -1519,7 +1562,7 @@ class Service:
             await self._poll_once(force=force)
 
     async def _poll_once(self, *, force=False):
-        if not self.s.bilibili_enabled:
+        if not self.s.bilibili_enabled or (not force and self.store.runtime.is_resting()):
             return
         for sub in await self.store.subscriptions():
             if not force and sub["next_poll"] > time.time():

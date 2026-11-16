@@ -4,6 +4,7 @@ Call only with Message objects built by authenticated protocol adapters / encryp
 Never construct identity from model input, nicknames, cards, forwards or conversation history.
 """
 
+import hashlib
 import html
 import json
 import re
@@ -15,6 +16,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .config import Settings
 from .models import Message
 from .persona import OWNER_PERSONA_PROMPT, PUBLIC_PERSONA_PROMPT
+
+
+def _state_digest(value) -> str:
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.blake2s(raw, digest_size=8).hexdigest()
 
 
 def is_persona_owner(message: Message | None, settings: Settings) -> bool:
@@ -51,6 +57,10 @@ class PromptContext:
             "身份不改变事实、安全规则或授权范围；公开社交平等接话，不以身份讨好或骚扰他人。\n"
             "公开人设用于所有群聊和普通用户私聊；公开回复不得称对方为‘主人’。\n"
         )
+
+    @property
+    def compact_instruction(self) -> str:
+        return f"\n【服务器验证的当前发送者】\n[role={self.role}]\n[surface={self.surface}]\n"
 
 
 def prompt_context(message: Message | None, settings: Settings) -> PromptContext:
@@ -160,6 +170,10 @@ def assemble_chat_input(
     history=None,
     prev_created_at: float | None = None,
     meme_labels: list[str] | None = None,
+    continuation: bool = False,
+    prev_digests: dict[str, str] | None = None,
+    seen_nearby: list[str] | None = None,
+    out_state: dict | None = None,
 ) -> str:
     """A lives in system_instruction; immutable B records precede the bounded C tail.
 
@@ -203,30 +217,86 @@ def assemble_chat_input(
             raise Rejected("context_too_large")
     else:
         current_batch = current
-    metadata = {
-        "current_time": datetime.now(ZoneInfo(settings.bot_timezone)).isoformat(timespec="minutes"),
-        "timezone": settings.bot_timezone,
-        "verified_sender": {
-            "role": context.role,
-            "surface": context.surface,
-            "qq": message.user_id if message else "",
-        },
-        "sandbox_mode": sandbox_mode,
-        "allowed_at_qqs": payload.get("allowed_at_qqs", []) if not sandbox_mode else [],
-        "current_sender": payload.get("current_sender", {}),
-        "image_sources": payload.get("image_sources", []),
-        "context_status": payload.get("context_status", []),
-        "nearby_group_context": payload.get("nearby_group_context", []),
-        "allowed_reply_ids": payload.get("allowed_reply_ids", []),
-        "web_preview_untrusted": payload.get("web_preview_untrusted", []),
-        "current_batch": current_batch,
-    }
-    if not sandbox_mode:
-        if meme_labels is not None:
-            metadata["meme_labels"] = list(meme_labels)
-        for key in ("web_search_findings", "web_search_status"):
+    prev = prev_digests or {}
+    raw_nearby = list(payload.get("nearby_group_context", []))
+    nearby_digests = [_state_digest(item) for item in raw_nearby]
+    seen_set = set(seen_nearby or ())
+    nearby_wire = (
+        [
+            item
+            for item, digest in zip(raw_nearby, nearby_digests, strict=True)
+            if digest not in seen_set
+        ]
+        if continuation and seen_set
+        else raw_nearby
+    )
+    next_seen_nearby = list(dict.fromkeys([*(seen_nearby or ()), *nearby_digests]))[-16:]
+    next_meme_dig = prev.get("memes", "") if continuation else ""
+    if continuation:
+        metadata = {
+            "current_time": datetime.now(ZoneInfo(settings.bot_timezone)).isoformat(
+                timespec="minutes"
+            ),
+            "verified_sender": {
+                "role": context.role,
+                "surface": context.surface,
+                "qq": message.user_id if message else "",
+            },
+            "sandbox_mode": sandbox_mode,
+            "current_sender": payload.get("current_sender", {}),
+            "current_batch": current_batch,
+        }
+        if not sandbox_mode and payload.get("allowed_at_qqs"):
+            metadata["allowed_at_qqs"] = payload["allowed_at_qqs"]
+        for key in (
+            "image_sources",
+            "context_status",
+            "allowed_reply_ids",
+            "web_preview_untrusted",
+        ):
             if payload.get(key):
                 metadata[key] = payload[key]
+        if nearby_wire:
+            metadata["nearby_group_context"] = nearby_wire
+        if not sandbox_mode and meme_labels is not None:
+            meme_list = list(meme_labels)
+            meme_dig = _state_digest(meme_list)
+            next_meme_dig = meme_dig
+            if "memes" not in prev or prev.get("memes") != meme_dig:
+                metadata["meme_labels"] = meme_list
+        if not sandbox_mode:
+            for key in ("web_search_findings", "web_search_status"):
+                if payload.get(key):
+                    metadata[key] = payload[key]
+    else:
+        metadata = {
+            "current_time": datetime.now(ZoneInfo(settings.bot_timezone)).isoformat(
+                timespec="minutes"
+            ),
+            "timezone": settings.bot_timezone,
+            "verified_sender": {
+                "role": context.role,
+                "surface": context.surface,
+                "qq": message.user_id if message else "",
+            },
+            "sandbox_mode": sandbox_mode,
+            "allowed_at_qqs": payload.get("allowed_at_qqs", []) if not sandbox_mode else [],
+            "current_sender": payload.get("current_sender", {}),
+            "image_sources": payload.get("image_sources", []),
+            "context_status": payload.get("context_status", []),
+            "nearby_group_context": raw_nearby,
+            "allowed_reply_ids": payload.get("allowed_reply_ids", []),
+            "web_preview_untrusted": payload.get("web_preview_untrusted", []),
+            "current_batch": current_batch,
+        }
+        if not sandbox_mode:
+            if meme_labels is not None:
+                meme_list = list(meme_labels)
+                metadata["meme_labels"] = meme_list
+                next_meme_dig = _state_digest(meme_list)
+            for key in ("web_search_findings", "web_search_status"):
+                if payload.get(key):
+                    metadata[key] = payload[key]
     summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
     dual = payload.get("dual_memory_data", {}) if not sandbox_mode else {}
     background = {}
@@ -234,25 +304,72 @@ def assemble_chat_input(
         for key in ("owner_notebook_snapshot", "近期群聊巡逻记忆（只读背景）"):
             if payload.get(key):
                 background[key] = payload[key]
+    sum_dig = _state_digest(summary) if summary else ""
+    bg_dig = _state_digest(background) if background else ""
+    dual_dig = _state_digest(dual) if dual else ""
+    if continuation:
+        if sum_dig and sum_dig == prev.get("summary"):
+            summary = ""
+        if bg_dig and bg_dig == prev.get("bg"):
+            background = {}
+        if dual_dig and dual_dig == prev.get("dual"):
+            dual = {}
+    if out_state is not None:
+        digests = {
+            "summary": sum_dig or (prev.get("summary", "") if continuation else ""),
+            "bg": bg_dig or (prev.get("bg", "") if continuation else ""),
+            "dual": dual_dig or (prev.get("dual", "") if continuation else ""),
+        }
+        if next_meme_dig:
+            digests["memes"] = next_meme_dig
+        out_state["context_digests"] = digests
+        out_state["seen_nearby"] = next_seen_nearby
 
     def tail():
-        return (
-            "<transient_turn_context>\n"
-            + context.instruction
-            + "<untrusted_user_input>"
+        input_block = (
+            "<untrusted_user_input>"
             + escape_data(json.dumps(metadata, ensure_ascii=False, separators=(",", ":")))
             + "</untrusted_user_input>\n"
-            + "<memory_summary_data>"
-            + escape_data(summary)
-            + "</memory_summary_data>\n"
-            + "<readonly_owner_background>"
-            + escape_data(json.dumps(background, ensure_ascii=False, separators=(",", ":")))
-            + "</readonly_owner_background>\n"
-            + "<untrusted_memory_data>"
-            + escape_data(json.dumps(dual, ensure_ascii=False, separators=(",", ":")))
-            + "</untrusted_memory_data>\n"
-            + "</transient_turn_context>"
         )
+        if not continuation:
+            return (
+                "<transient_turn_context>\n"
+                + context.instruction
+                + input_block
+                + "<memory_summary_data>"
+                + escape_data(summary)
+                + "</memory_summary_data>\n"
+                + "<readonly_owner_background>"
+                + escape_data(json.dumps(background, ensure_ascii=False, separators=(",", ":")))
+                + "</readonly_owner_background>\n"
+                + "<untrusted_memory_data>"
+                + escape_data(json.dumps(dual, ensure_ascii=False, separators=(",", ":")))
+                + "</untrusted_memory_data>\n"
+                + "</transient_turn_context>"
+            )
+        parts = ["<transient_turn_context>\n", context.compact_instruction, input_block]
+        if summary:
+            parts.extend(
+                ["<memory_summary_data>", escape_data(summary), "</memory_summary_data>\n"]
+            )
+        if background:
+            parts.extend(
+                [
+                    "<readonly_owner_background>",
+                    escape_data(json.dumps(background, ensure_ascii=False, separators=(",", ":"))),
+                    "</readonly_owner_background>\n",
+                ]
+            )
+        if dual:
+            parts.extend(
+                [
+                    "<untrusted_memory_data>",
+                    escape_data(json.dumps(dual, ensure_ascii=False, separators=(",", ":"))),
+                    "</untrusted_memory_data>\n",
+                ]
+            )
+        parts.append("</transient_turn_context>")
+        return "".join(parts)
 
     if estimate_tokens(tail()) > settings.chat_tail_tokens and dual:
         dual = {"speaker_profile": dual.get("speaker_profile", {})}
@@ -268,14 +385,17 @@ def assemble_chat_input(
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         background = {}
         summary = truncate_tokens(summary, 180)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata["nearby_group_context"]:
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("nearby_group_context"):
         half = max(1, len(metadata["nearby_group_context"]) // 2)
         metadata["nearby_group_context"] = metadata["nearby_group_context"][-half:]
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         summary = ""
-        metadata["image_sources"] = metadata["image_sources"][:2]
-        metadata["nearby_group_context"] = []
-        metadata["allowed_at_qqs"] = metadata["allowed_at_qqs"][:20]
+        if "image_sources" in metadata:
+            metadata["image_sources"] = metadata["image_sources"][:2]
+        if "nearby_group_context" in metadata:
+            metadata["nearby_group_context"] = []
+        if "allowed_at_qqs" in metadata:
+            metadata["allowed_at_qqs"] = metadata["allowed_at_qqs"][:20]
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         raise Rejected("transient_context_too_large")
     return "<conversation_history_log>\n" + b + "</conversation_history_log>\n" + tail()

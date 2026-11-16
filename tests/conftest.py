@@ -35,6 +35,7 @@ def settings(tmp_path):
         group_debounce_max_seconds=0,
         send_delay_min=0,
         send_delay_max=0,
+        rest_hours_enabled=False,
     )
 
 

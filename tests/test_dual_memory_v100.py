@@ -753,3 +753,80 @@ async def test_expiry_coalescing_background_debounce_and_memory_health(
     assert (
         await store.one("SELECT failures FROM operational_health WHERE provider='gemini_memory'")
     )[0] == 0
+
+
+async def test_flex_dedicated_timeout_and_rate_limit_zero_cost_backoff_requeue(
+    settings, store, message, sdk_pair
+):
+    bare = GeminiGateway(settings, store)
+    try:
+        flex = bare._flex_chat_client()
+        assert flex is not bare.chat_client
+        assert bare._transports[-1].timeout.read == float(settings.memory_flex_timeout)
+        assert bare._transports[1].timeout.read == float(settings.generation_timeout)
+    finally:
+        await bare.close()
+
+    sessions, msg = SessionManager(settings, store), group(message)
+    await seed(sessions, msg, count=2)
+    await sessions.dual.snapshot_cold(msg, force=True)
+
+    calls = []
+    mode = ["rate_limit"]
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        if mode[0] == "rate_limit":
+            return httpx.Response(429, json={"error": {"code": 429, "message": "rate"}})
+        if mode[0] == "outage":
+            return httpx.Response(503, json={"error": {"code": 503, "message": "err"}})
+        return httpx.Response(
+            200,
+            json={
+                **interaction_response(),
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": '{"profiles":[],"chronicles":[]}'}],
+                    }
+                ],
+            },
+        )
+
+    now = [100.0]
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    comp = MemoryCompressor(settings, sessions, gate, store, clock=lambda: now[0])
+
+    # 1st 429 -> $0 settlement + requeued to pending + provider_backoff, no compression_failed.
+    r1 = await comp.extract(msg, background=True)
+    assert r1["status"] == "provider_backoff"
+    assert (await sessions.dual.view(msg))["jobs"] == {"pending": 1}
+    assert (await store.one("SELECT COUNT(*) FROM audit_events WHERE code='compression_failed'"))[
+        0
+    ] == 0
+    row = await store.one(
+        "SELECT status,amount FROM ledger l JOIN ledger_attribution a ON a.id=l.id "
+        "WHERE a.model_lane='memory_flex'"
+    )
+    assert row["status"] == "settled" and row["amount"] == 0
+
+    # Within 60s backoff window -> skipped locally with zero extra HTTP calls.
+    before_calls = len(calls)
+    r_wait = await comp.extract(msg, background=True)
+    assert r_wait["status"] == "provider_backoff" and len(calls) == before_calls
+
+    # After backoff expires and 429 clears -> slice compresses cleanly to done.
+    now[0] += 70.0
+    mode[0] = "ok"
+    r2 = await comp.extract(msg, background=True)
+    assert r2["status"] == "compressed"
+
+    # Ambiguous 503 never requeues and still settles unknown + marks slice failed.
+    await seed(sessions, msg, text="第三批", count=2)
+    await sessions.dual.snapshot_cold(msg, force=True)
+    mode[0] = "outage"
+    r3 = await comp.extract(msg, background=True)
+    assert r3["status"] == "failed"
+    assert (await sessions.dual.view(msg))["jobs"]["failed"] == 1

@@ -472,3 +472,68 @@ async def test_meme_hot_update_preserves_interaction_chain_and_prefix_hash(
     text_wire = raw_input["content"][0]["text"] if "content" in raw_input else raw_input["text"]
     assert '"meme_labels":["无语盯"]' in text_wire
     await svc.stop()
+
+
+async def test_neighbour_image_deduplicated_after_reply_while_explicit_recall_works(
+    settings, store, message, monkeypatch
+):
+    settings.group_policies["onebot:40000"] = "at_only"
+    ai = ActionGateway(action(bubbles=["看到了，这是配置报错"]))
+    sender = ActionSender()
+    svc = Service(settings, store, ai, FakeBili(), sender)
+
+    async def fake_load(refs, *, scope="legacy"):
+        return [normalize_image(_png_bytes(), settings.image_max_pixels) for _ in refs]
+
+    monkeypatch.setattr(svc.images, "load_results", fake_load)
+
+    now = time.time()
+    bystander = group(
+        message,
+        "2001",
+        uid="30001",
+        text="",
+        command_text="",
+        addressed=False,
+        images=[ImageRef(file="bystander-pic")],
+        created_at=now,
+    )
+    assert await svc.accept(bystander) == "ignored"
+
+    q1 = group(message, "2002", text="帮我看下这张报错图", addressed=True, created_at=now + 1)
+    assert await svc.accept(q1) == "accepted"
+    await svc.process(await store.claim())
+    assert await svc.deliver_once()
+    assert len(ai.calls) >= 2
+    assert any(c[0] == "screen" and c[3].get("purpose") == "source" for c in ai.calls)
+    gen1 = next(c for c in ai.calls if c[0] == "generate")
+    assert len(gen1[3].get("images", [])) == 1
+
+    # Next plain-text turn within 6 messages must NOT re-screen or re-upload already answered image.
+    ai.calls.clear()
+    q2 = group(
+        message, "2003", text="原来如此，那应该怎么改配置", addressed=True, created_at=now + 2
+    )
+    assert await svc.accept(q2) == "accepted"
+    await svc.process(await store.claim())
+    assert await svc.deliver_once()
+    assert not any(c[0] == "screen" and c[3].get("purpose") == "source" for c in ai.calls)
+    gen2 = next(c for c in ai.calls if c[0] == "generate")
+    assert not gen2[3].get("images")
+
+    # Explicit recall phrase ("刚才那张图") within 6 messages still recalls via HotRing.
+    ai.calls.clear()
+    q3 = group(
+        message,
+        "2004",
+        text="再仔细看下刚才那张图右上角写的啥",
+        addressed=True,
+        created_at=now + 3,
+    )
+    assert await svc.accept(q3) == "accepted"
+    await svc.process(await store.claim())
+    assert await svc.deliver_once()
+    assert any(c[0] == "screen" and c[3].get("purpose") == "source" for c in ai.calls)
+    gen3 = next(c for c in ai.calls if c[0] == "generate")
+    assert len(gen3[3].get("images", [])) == 1
+    await svc.stop()

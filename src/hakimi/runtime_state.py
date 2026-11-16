@@ -10,12 +10,14 @@ from zoneinfo import ZoneInfo
 
 from .admission_policy import AdmissionConfig
 from .attention import AttentionRouter
+from .bot_server import is_persona_owner
 from .compression_policy import CompressionConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterManager
 from .limits_policy import GenerationCapsConfig, PatrolLimitConfig, RateLimitConfig
 from .models import Message
 from .proactive_policy import ProactiveConfig
+from .rest_policy import RestHoursConfig
 from .security import Rejected
 from .thinking_policy import THINKING_LEVELS, ThinkingConfig
 from .web_search import WebSearch
@@ -123,6 +125,11 @@ class RuntimeState:
         self.patrol_limits = self.env_patrol_limits
         self.patrol_limits_overridden = False
         self.patrol_limits_lock = asyncio.Lock()
+        self.clock = time.time
+        self.env_rest_hours = RestHoursConfig.from_settings(self.s)
+        self.rest_hours = self.env_rest_hours
+        self.rest_hours_overridden = False
+        self.rest_hours_lock = asyncio.Lock()
         self.web_search = WebSearch(store)
 
     async def event(self, code, source="system"):
@@ -180,6 +187,8 @@ class RuntimeState:
         self.patrol_limits = self.env_patrol_limits
         self.patrol_limits_overridden = False
         self._apply_fields(self.env_patrol_limits)
+        self._apply_rest_hours(self.env_rest_hours)
+        self.rest_hours_overridden = False
         admission = self.env_admission
         self.admission_overridden = False
         legacy_bots = None
@@ -227,6 +236,9 @@ class RuntimeState:
                 self.patrol_limits = self._validate_loaded(self.env_patrol_limits, value)
                 self.patrol_limits_overridden = True
                 self._apply_fields(self.patrol_limits)
+            elif row["key"] == "rest_hours":
+                self._apply_rest_hours(self._validate_loaded(self.env_rest_hours, value))
+                self.rest_hours_overridden = True
             elif row["key"].startswith("policy:"):
                 self.s.group_policies[row["key"][7:]] = value
         if not self.admission_overridden and legacy_bots is not None:
@@ -382,6 +394,61 @@ class RuntimeState:
             self.env_patrol_limits,
             "patrol_limits",
         )
+
+    def _apply_rest_hours(self, value: RestHoursConfig):
+        # Synchronous update: readers never observe partial rest-hour settings.
+        self.s.rest_hours_enabled = value.enabled
+        self.s.rest_hours = value.rest_hours
+        self.s.rest_allow_owner_private = value.allow_owner_private
+        self.rest_hours = value
+
+    def _local_time(self, now: float | None = None) -> datetime:
+        stamp = self.clock() if now is None else now
+        return datetime.fromtimestamp(stamp, ZoneInfo(self.s.bot_timezone))
+
+    def is_resting(self, now: float | None = None) -> bool:
+        return self.rest_hours.active(self._local_time(now))
+
+    def is_resting_for(self, message: Message | None, now: float | None = None) -> bool:
+        if not self.is_resting(now):
+            return False
+        if (
+            message is not None
+            and self.rest_hours.allow_owner_private
+            and message.kind == "private"
+            and is_persona_owner(message, self.s)
+        ):
+            return False
+        return True
+
+    def rest_hours_status(self, now: float | None = None):
+        local = self._local_time(now)
+        return {
+            "config": self.rest_hours.model_dump(),
+            "source": "admin" if self.rest_hours_overridden else "env",
+            "environment": self.env_rest_hours.model_dump(),
+            "timezone": self.s.bot_timezone,
+            "resting_now": self.rest_hours.active(local),
+            "local_time": local.strftime("%H:%M"),
+        }
+
+    async def set_rest_hours(self, value: RestHoursConfig | None):
+        if value is not None and not isinstance(value, RestHoursConfig):
+            raise ValueError("Expected a validated RestHoursConfig")
+        effective = self.env_rest_hours if value is None else value
+        async with self.rest_hours_lock:
+            async with self.store.transaction():
+                if value is None:
+                    await self.store.db.execute("DELETE FROM admin_config WHERE key='rest_hours'")
+                else:
+                    await self.store.db.execute(
+                        "INSERT INTO admin_config VALUES ('rest_hours',?) ON CONFLICT(key) "
+                        "DO UPDATE SET payload=excluded.payload",
+                        (self.store.vault.seal("admin:rest_hours", value.model_dump()),),
+                    )
+            self._apply_rest_hours(effective)
+            self.rest_hours_overridden = value is not None
+            return self.rest_hours_status()
 
     def _validate_admission(self, value):
         protected = {self.s.owner_qq_id, self.s.onebot_self_id} - {""}

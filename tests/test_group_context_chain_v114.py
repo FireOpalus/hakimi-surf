@@ -442,3 +442,84 @@ async def test_chain_safety_and_invalidation_paths(settings, store, message, sdk
     await svc.sessions.clear(m4)
     assert (await svc.sessions.snapshot(m4))["interaction_chains"] == {}
     await svc.stop()
+
+
+async def test_continuation_turn_deduplicates_unchanged_transient_context_and_caps_turns(
+    settings, store, message, sdk_pair, monkeypatch
+):
+    from hakimi.prefix_runtime import MAX_CHAIN_TURNS
+
+    assert MAX_CHAIN_TURNS == 12 and settings.interaction_chain_ttl_seconds == 300
+    monkeypatch.setattr("hakimi.gemini.MAX_CHAIN_TURNS", 2)
+    recorded = []
+
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            dec = decision_response()
+            dec["answers"]["need_memory_recall"]["noul"] = 0.9
+            return httpx.Response(200, json=dec)
+        body = json.loads(request.content)
+        recorded.append(body)
+        resp = interaction_response()
+        resp["id"] = f"inter_slim_{len(recorded)}"
+        resp["steps"][0]["content"][0]["text"] = action(bubbles=[f"第{len(recorded)}轮"])
+        return httpx.Response(200, json=resp)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    sender = ActionSender()
+    svc = Service(settings, store, gate, FakeBili(), sender)
+    settings.group_policies = {"onebot:40000": "at_only"}
+    await svc.memes.upload("测试表情.png", _png_bytes())
+
+    now = time.time()
+    m1 = group(message, event_id="3001", addressed=True, text="第一轮", created_at=now + 1)
+    async with svc.sessions.database(m1) as (db, key):
+        await db.execute(
+            "UPDATE rolling_state SET summary=?,expires=?",
+            (svc.sessions.vault.seal(key, "固定群聊摘要"), now + 3600),
+        )
+    bystander = group(
+        message,
+        event_id="3000",
+        uid="30001",
+        addressed=False,
+        text="旁观背景一句",
+        created_at=now,
+    )
+    assert await svc.accept(bystander) == "ignored"
+    assert await svc.accept(m1) == "accepted"
+    await svc.process(await store.claim())
+    assert await svc.deliver_once()
+
+    def wire(idx):
+        item = recorded[idx]["input"][0]
+        return item["content"][0]["text"] if "content" in item else item["text"]
+
+    w1 = wire(0)
+    assert "固定群聊摘要" in w1
+    assert '"meme_labels":["测试表情"]' in w1
+    assert "旁观背景一句" in w1
+    assert "公开回复不得称对方为" in w1
+
+    # Turn 2 continues inter_slim_1 and drops unchanged summary, memes, nearby, static text.
+    m2 = group(message, event_id="3002", addressed=True, text="第二轮", created_at=now + 2)
+    assert await svc.accept(m2) == "accepted"
+    await svc.process(await store.claim())
+    assert await svc.deliver_once()
+    assert recorded[1]["previous_interaction_id"] == "inter_slim_1"
+    w2 = wire(1)
+    assert "固定群聊摘要" not in w2
+    assert "meme_labels" not in w2
+    assert "旁观背景一句" not in w2
+    assert "公开回复不得称对方为" not in w2
+    assert "<memory_summary_data>" not in w2
+    assert "<untrusted_memory_data>" not in w2
+
+    # Turn 3 hits MAX_CHAIN_TURNS=2 and starts a fresh chain with full context again.
+    m3 = group(message, event_id="3003", addressed=True, text="第三轮", created_at=now + 3)
+    assert await svc.accept(m3) == "accepted"
+    await svc.process(await store.claim())
+    assert "previous_interaction_id" not in recorded[2]
+    w3 = wire(2)
+    assert "固定群聊摘要" in w3 and '"meme_labels":["测试表情"]' in w3
+    await svc.stop()

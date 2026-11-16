@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS group_recent_messages (
  event_at REAL NOT NULL, payload BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS group_recent_scope ON group_recent_messages(scope,at);
+CREATE TABLE IF NOT EXISTS group_consumed_images (
+ scope TEXT NOT NULL, event_id TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(scope,event_id)
+);
+CREATE INDEX IF NOT EXISTS group_consumed_scope ON group_consumed_images(scope,at);
 """
 MAX_BATCH_MESSAGES = 16
 MAX_BATCH_CHARS = 24000
@@ -491,11 +496,42 @@ class GroupPipeline:
             for r in reversed(rows)
         ]
 
+    async def consumed_image_events(self, message) -> set[str]:
+        if message.kind != "group":
+            return set()
+        scope = self.store.session_scope(message)
+        async with self.store.lock:
+            rows = await self.store.all(
+                "SELECT event_id FROM group_consumed_images WHERE scope=? AND at>=?",
+                (scope, self.clock() - CONTEXT_TTL),
+            )
+        return {r[0] for r in rows}
+
+    async def mark_images_consumed(self, message, event_ids) -> None:
+        clean = [str(eid) for eid in (event_ids or ()) if eid]
+        if message.kind != "group" or not clean:
+            return
+        scope = self.store.session_scope(message)
+        now = self.clock()
+        async with self.store.transaction():
+            for eid in dict.fromkeys(clean):
+                await self.store.db.execute(
+                    "INSERT OR REPLACE INTO group_consumed_images VALUES (?,?,?)",
+                    (scope, eid, now),
+                )
+            await self.store.db.execute(
+                "DELETE FROM group_consumed_images WHERE at<?", (now - CONTEXT_TTL,)
+            )
+
     async def clear_recent(self, message):
         scope = self.store.session_scope(message)
         async with self.store.transaction():
             await self.store.db.execute(
                 "DELETE FROM group_recent_messages WHERE scope=?",
+                (scope,),
+            )
+            await self.store.db.execute(
+                "DELETE FROM group_consumed_images WHERE scope=?",
                 (scope,),
             )
             # A reset also discards accepted inputs that have not started processing.
@@ -513,6 +549,9 @@ class GroupPipeline:
     async def prune_in_transaction(self, now):
         await self.store.db.execute(
             "DELETE FROM group_recent_messages WHERE at<?", (now - CONTEXT_TTL,)
+        )
+        await self.store.db.execute(
+            "DELETE FROM group_consumed_images WHERE at<?", (now - CONTEXT_TTL,)
         )
         await self.store.db.execute(
             "DELETE FROM group_debounce_batches WHERE first_at<? AND NOT EXISTS "

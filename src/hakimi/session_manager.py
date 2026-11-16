@@ -811,6 +811,9 @@ class SessionManager:
         covered_seq: int,
         source_ids: list[str] | None = None,
         reply_id: str | None = None,
+        turns: int = 1,
+        context_digests: dict[str, str] | None = None,
+        seen_nearby: list[str] | None = None,
     ) -> bool:
         if not interaction_id or not self.s.interaction_store_enabled:
             return False
@@ -850,6 +853,9 @@ class SessionManager:
                             "trim_version": trim_version,
                             "system_digest": system_digest,
                             "covered_seq": final_covered_seq,
+                            "turns": int(turns),
+                            "context_digests": dict(context_digests or {}),
+                            "seen_nearby": list(seen_nearby or [])[:16],
                         },
                     ),
                     expires,

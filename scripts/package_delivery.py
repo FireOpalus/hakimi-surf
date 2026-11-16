@@ -37,6 +37,7 @@ for directory, pattern in (
     ("src", "*.html"),
     ("tests", "*.py"),
     ("scripts", "*.py"),
+    ("scripts", "*.sh"),
     ("deploy", "*.conf"),
     ("deploy", "*.json.example"),
     ("docs", "*.md"),

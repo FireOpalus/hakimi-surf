@@ -673,3 +673,86 @@ async def test_completed_one_time_recovery_is_not_a_dead_worker(settings):
             response = await client.get("/healthz")
             assert response.status_code == 200
         assert app.state.service.recovery_task not in app.state.service.tasks
+
+
+def test_prefix_runtime_idle_window_resets_without_false_bust_and_thinking_marker():
+    t = [1000.0]
+    runtime = PrefixRuntime(clock=lambda: t[0])
+
+    # Active drops within <= 180s fire cache_prefix_busted on second drop.
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "low"), TokenUsage(12000, 20, 9000, 0, "hydrogen", "low")
+    )[1]
+    t[0] += 10.0
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "low"), TokenUsage(12000, 20, 500, 0, "hydrogen", "low")
+    )[1]
+    t[0] += 10.0
+    assert runtime.observe(
+        "s", "hydrogen", (0, 0, "low"), TokenUsage(12000, 20, 500, 0, "hydrogen", "low")
+    )[1]
+
+    # Switching thinking_level starts a fresh CacheState even within <= 180s.
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "low"), TokenUsage(12000, 20, 9000, 0, "hydrogen", "low")
+    )[1]
+    t[0] += 5.0
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "low"), TokenUsage(12000, 20, 500, 0, "hydrogen", "low")
+    )[1]
+    t[0] += 5.0
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "medium"), TokenUsage(12000, 20, 500, 0, "hydrogen", "medium")
+    )[1]
+
+    # Idle gap > 180s resets state as a cold window rather than busting; subsequent active drops
+    # after re-warming still trigger cache_prefix_busted.
+    t[0] += 185.0
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "medium"), TokenUsage(12000, 20, 500, 0, "hydrogen", "medium")
+    )[1]
+    t[0] += 10.0
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "medium"), TokenUsage(12000, 20, 500, 0, "hydrogen", "medium")
+    )[1]
+    t[0] += 10.0
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "medium"), TokenUsage(12000, 20, 9000, 0, "hydrogen", "medium")
+    )[1]
+    t[0] += 10.0
+    assert not runtime.observe(
+        "s", "hydrogen", (0, 0, "medium"), TokenUsage(12000, 20, 500, 0, "hydrogen", "medium")
+    )[1]
+    t[0] += 10.0
+    assert runtime.observe(
+        "s", "hydrogen", (0, 0, "medium"), TokenUsage(12000, 20, 500, 0, "hydrogen", "medium")
+    )[1]
+
+
+async def test_thinking_tier_switch_tracks_thinking_usage_without_prefix_bust(
+    settings, store, message, sdk_pair
+):
+    cached = iter([9000, 500, 500])
+
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            return responder(request)
+        result = interaction_response()
+        result["usage"].update(
+            total_input_tokens=12000, total_cached_tokens=next(cached), total_tokens=12050
+        )
+        return httpx.Response(200, json=result)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    await gate.generate(payload(), "think-test", message=message, route=RouteDecision(tier=1))
+    await gate.generate(payload(), "think-test", message=message, route=RouteDecision(tier=1))
+    await gate.generate(payload(), "think-test", message=message, route=RouteDecision(tier=2))
+    audit = await store.all("SELECT * FROM audit_events WHERE code='cache_prefix_busted'")
+    assert not audit
+    today = (await store.usage())["token_usage"]["today"]
+    by_thinking = {(r["model_lane"], r["thinking_level"]): r["calls"] for r in today["by_thinking"]}
+    assert by_thinking[("hydrogen", "low")] == 2
+    assert by_thinking[("hydrogen", "medium")] == 1
+    summary = {r["thinking_level"]: r["calls"] for r in today["thinking_summary"]}
+    assert summary["low"] == 2
+    assert summary["medium"] == 1

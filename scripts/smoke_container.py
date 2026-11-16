@@ -133,8 +133,11 @@ with urllib.request.urlopen(admin, timeout=3) as response:
     assert dashboard["usage"]["token_usage"]["today"]["cached_tokens"] == 0
     assert "effective_cache_hit_ratio" in dashboard["usage"]["token_usage"]["today"]
     assert "by_model" in dashboard["usage"]["token_usage"]["today"]
+    assert "by_thinking" in dashboard["usage"]["token_usage"]["today"]
+    assert "thinking_summary" in dashboard["usage"]["token_usage"]["today"]
 for path in ("admission", "moderation", "longnick", "bili-account", "bili-account/video-watch",
-             "thinking", "filter", "decision-audit", "budget", "debounce", "web-search"):
+             "thinking", "filter", "decision-audit", "budget", "debounce", "web-search",
+             "rest-hours"):
     probe = urllib.request.Request(origin + "/admin/api/" + path,
         headers={"Authorization":"Bearer " + os.environ["ADMIN_TOKEN"]})
     with urllib.request.urlopen(probe, timeout=3) as response:
@@ -146,6 +149,10 @@ for path in ("admission", "moderation", "longnick", "bili-account", "bili-accoun
         elif path == "debounce":
             assert data["source"] == "env"
             assert 0 <= data["config"]["group_debounce_max_seconds"] <= 30
+        elif path == "rest-hours":
+            assert data["source"] == "env"
+            assert data["config"]["enabled"] is False
+            assert data["config"]["rest_hours"] == "23:00-08:00"
         elif path == "admission":
             assert data["config"]["private_mode"] == "owner_only"
             assert data["allow_group_members"] is True
@@ -178,6 +185,28 @@ for path in ("admission", "moderation", "longnick", "bili-account", "bili-accoun
                 with urllib.request.urlopen(save, timeout=3) as saved:
                     result = json.load(saved)
                     assert result["config"] == updated and result["source"] == "sqlite"
+auth_headers = {"Authorization": "Bearer " + os.environ["ADMIN_TOKEN"]}
+put_rest = urllib.request.Request(
+    origin + "/admin/api/rest-hours",
+    data=json.dumps(
+        {"enabled": True, "rest_hours": "00:00-23:59", "allow_owner_private": True}
+    ).encode(),
+    headers={**auth_headers, "Content-Type": "application/json"},
+    method="PUT",
+)
+with urllib.request.urlopen(put_rest, timeout=3) as response:
+    assert response.status == 200
+    assert json.load(response)["config"]["enabled"] is True
+del_rest = urllib.request.Request(
+    origin + "/admin/api/rest-hours",
+    headers=auth_headers,
+    method="DELETE",
+)
+with urllib.request.urlopen(del_rest, timeout=3) as response:
+    assert response.status == 200
+    reset = json.load(response)
+    assert reset["source"] == "env"
+    assert reset["config"]["enabled"] is False
 # A local fixture simulates one extracted card; delete/unlock use zero-token admin paths.
 from pathlib import Path
 from hakimi.config import Settings
@@ -271,6 +300,7 @@ def main():
                     'HAKIMI_ONEBOT_OWNER_IDS=["20000"]',
                     "OWNER_QQ_ID=20000",
                     "PROACTIVE_DM_ENABLED=false",
+                    "REST_HOURS_ENABLED=false",
                     'BOT_QQ_IDS=["60000"]',
                     "BOT_REPLY_THRESHOLD=1.00",
                     'HAKIMI_ONEBOT_ALLOWED_USERS=["60000"]',

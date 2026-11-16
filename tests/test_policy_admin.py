@@ -31,6 +31,9 @@ ROUTES = [
     ("GET", "/admin/api/patrol-limits"),
     ("PUT", "/admin/api/patrol-limits"),
     ("DELETE", "/admin/api/patrol-limits"),
+    ("GET", "/admin/api/rest-hours"),
+    ("PUT", "/admin/api/rest-hours"),
+    ("DELETE", "/admin/api/rest-hours"),
     ("GET", "/admin/api/filter"),
     ("PUT", "/admin/api/filter"),
     ("DELETE", "/admin/api/filter"),
@@ -102,6 +105,12 @@ async def test_filter_hot_persistence_preserves_group_preset_when_saving_global_
 @pytest.mark.parametrize(
     "path,payload",
     [
+        ("rest-hours", {"enabled": "yes"}),
+        ("rest-hours", {"enabled": 1}),
+        ("rest-hours", {"rest_hours": "23:00-23:00"}),
+        ("rest-hours", {"rest_hours": "25:00-08:00"}),
+        ("rest-hours", {"allow_owner_private": "no"}),
+        ("rest-hours", {"unexpected": "sensitive-input"}),
         ("filter", {"injection_threshold": "0.78"}),
         ("filter", {"unsafe_threshold": 1}),
         ("filter", {"reply_threshold": 0}),
