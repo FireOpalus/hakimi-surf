@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import random
 import time
 
 import httpx
@@ -167,23 +168,28 @@ async def test_image_digest_allows_120_chars_and_blocks_secrets(settings, store,
 
 
 def test_adaptive_image_normalization_and_clearer_gate_thumbnails():
-    tall = normalize_image(_png_bytes((1080, 2400)), 12_000_000)
-    assert tall.resolution == "high"
+    tall = normalize_image(_png_bytes((1080, 3600)), 50_000_000)
+    assert tall.resolution == "high" and not tall.tiles
     with Image.open(io.BytesIO(base64.b64decode(tall.data))) as im:
-        assert im.size == (691, 1536)
+        assert im.size == (768, 2560)
     with Image.open(io.BytesIO(base64.b64decode(tall.gate().data))) as g_im:
-        assert g_im.size == (230, 512)
+        assert g_im.size == (154, 512)
         assert tall.gate().block()["resolution"] == "low"
 
-    normal = normalize_image(_png_bytes((1600, 1200)), 12_000_000)
-    assert normal.resolution == "medium"
-    with Image.open(io.BytesIO(base64.b64decode(normal.data))) as im:
-        assert im.size == (768, 576)
-    with Image.open(io.BytesIO(base64.b64decode(normal.gate().data))) as g_im:
-        assert g_im.size == (448, 336)
-        assert normal.gate().block()["resolution"] == "low"
+    desktop = normalize_image(_png_bytes((2560, 1440)), 50_000_000)
+    assert desktop.resolution == "high"
+    with Image.open(io.BytesIO(base64.b64decode(desktop.data))) as im:
+        assert im.size == (1600, 900)
+    with Image.open(io.BytesIO(base64.b64decode(desktop.gate().data))) as g_im:
+        assert g_im.size == (448, 252)
+        assert desktop.gate().block()["resolution"] == "low"
 
-    gif = normalize_image(_gif_bytes((800, 600)), 12_000_000)
+    small = normalize_image(_png_bytes((800, 600)), 50_000_000)
+    assert small.resolution == "medium"
+    with Image.open(io.BytesIO(base64.b64decode(small.data))) as im:
+        assert im.size == (800, 600)
+
+    gif = normalize_image(_gif_bytes((800, 600)), 50_000_000)
     assert gif.resolution == "medium"
     with Image.open(io.BytesIO(base64.b64decode(gif.data))) as im:
         assert im.size == (1152, 432)
@@ -536,4 +542,55 @@ async def test_neighbour_image_deduplicated_after_reply_while_explicit_recall_wo
     assert any(c[0] == "screen" and c[3].get("purpose") == "source" for c in ai.calls)
     gen3 = next(c for c in ai.calls if c[0] == "generate")
     assert len(gen3[3].get("images", [])) == 1
+    await svc.stop()
+
+
+async def test_high_megapixel_draft_jpeg_byte_cap_and_ultra_tall_auto_split(
+    settings, store, message, monkeypatch
+):
+    from hakimi.media import MAX_ENCODED_JPEG_BYTES
+
+    big_jpeg = io.BytesIO()
+    Image.new("RGB", (6000, 5000), "teal").save(big_jpeg, format="JPEG", quality=75)
+    norm_30mp = normalize_image(big_jpeg.getvalue(), settings.image_max_pixels)
+    assert norm_30mp.resolution == "high"
+    with Image.open(io.BytesIO(base64.b64decode(norm_30mp.data))) as im:
+        assert im.size == (1440, 1200)
+
+    # Dense 2x2-blocky RGB texture exceeds 800 KiB at q=85 subsampling=0 and steps down below cap.
+    rng = random.Random(42)
+    dense = Image.frombytes("RGB", (800, 600), rng.randbytes(800 * 600 * 3)).resize(
+        (1600, 1200), Image.Resampling.NEAREST
+    )
+    half_clean = Image.new("RGB", (1600, 1200), "white")
+    half_clean.paste(dense.crop((0, 0, 1600, 520)), (0, 0))
+    dense_png = io.BytesIO()
+    half_clean.save(dense_png, format="PNG")
+    norm_dense = normalize_image(dense_png.getvalue(), settings.image_max_pixels)
+    assert len(base64.b64decode(norm_dense.data)) <= MAX_ENCODED_JPEG_BYTES
+
+    # Ultra-tall screenshot (aspect > 4.5) expands to 2 overlapping tiles when limit=2.
+    ultra_model = normalize_image(_png_bytes((1080, 7200)), settings.image_max_pixels)
+    assert len(ultra_model.tiles) == 2
+
+    svc = Service(settings, store, ActionGateway(), FakeBili(), ActionSender())
+
+    async def fake_load(refs, *, scope="legacy"):
+        return [ultra_model for _ in refs]
+
+    monkeypatch.setattr(svc.images, "load_results", fake_load)
+    msg = group(
+        message, "7001", text="看长图", images=[ImageRef(file="ultra-long")], addressed=True
+    )
+
+    selected_2: list = []
+    imgs_2, srcs_2 = await svc.message_images(msg, [msg], [], limit=2, selected_members=selected_2)
+    assert len(imgs_2) == 2 and len(selected_2) == 1
+    assert srcs_2[0]["slice"] == "1/2" and srcs_2[1]["slice"] == "2/2"
+    for tile in imgs_2:
+        with Image.open(io.BytesIO(base64.b64decode(tile.data))) as tim:
+            assert tim.width >= 700 and tim.height == 2560
+
+    imgs_1, srcs_1 = await svc.message_images(msg, [msg], [], limit=1)
+    assert len(imgs_1) == 1 and "slice" not in srcs_1[0]
     await svc.stop()

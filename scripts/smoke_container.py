@@ -137,7 +137,7 @@ with urllib.request.urlopen(admin, timeout=3) as response:
     assert "thinking_summary" in dashboard["usage"]["token_usage"]["today"]
 for path in ("admission", "moderation", "longnick", "bili-account", "bili-account/video-watch",
              "thinking", "filter", "decision-audit", "budget", "debounce", "web-search",
-             "rest-hours"):
+             "rest-hours", "image-limits"):
     probe = urllib.request.Request(origin + "/admin/api/" + path,
         headers={"Authorization":"Bearer " + os.environ["ADMIN_TOKEN"]})
     with urllib.request.urlopen(probe, timeout=3) as response:
@@ -153,6 +153,12 @@ for path in ("admission", "moderation", "longnick", "bili-account", "bili-accoun
             assert data["source"] == "env"
             assert data["config"]["enabled"] is False
             assert data["config"]["rest_hours"] == "23:00-08:00"
+        elif path == "image-limits":
+            assert data["source"] == "env"
+            assert data["config"]["image_max_bytes"] == 16777216
+            assert data["config"]["image_max_pixels"] == 50000000
+            assert data["config"]["image_standard_max_edge"] == 1600
+            assert data["config"]["image_tall_max_edge"] == 2560
         elif path == "admission":
             assert data["config"]["private_mode"] == "owner_only"
             assert data["allow_group_members"] is True

@@ -72,7 +72,8 @@ async def test_napcat_image_base64_avoids_http_and_normalizes(settings, monkeypa
     assert [action for action, _ in wire.calls] == ["get_image"]
     assert not client.requests
     with Image.open(io.BytesIO(base64.b64decode(results[0].data))) as im:
-        assert im.format == "JPEG" and im.size == (768, 384)
+        assert im.format == "JPEG" and im.size == (900, 450)
+    assert results[0].resolution == "medium"
 
 
 async def test_get_file_fallback_uses_same_file_identifier(settings, monkeypatch):
@@ -109,7 +110,11 @@ async def test_known_large_image_skips_before_ws_or_http(settings, monkeypatch):
 
 @pytest.mark.parametrize(
     "value",
-    [{"base64": "!!!"}, {"base64": "YQ==", "file_size": "99999999"}, {"base64": "A" * (5_000_000)}],
+    [
+        {"base64": "!!!"},
+        {"base64": "YQ==", "file_size": "99999999"},
+        {"base64": "A" * (4 * (MAX_IMAGE_BYTES // 3) + 100)},
+    ],
 )
 async def test_invalid_or_oversized_rpc_payload_never_loads_remote_path(
     settings, monkeypatch, value

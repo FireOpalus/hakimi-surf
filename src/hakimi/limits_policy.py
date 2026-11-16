@@ -60,3 +60,18 @@ class PatrolLimitConfig(_LimitsBase):
 
     max_subscriptions: StrictInt = Field(default=10, ge=1, le=50)
     patrol_interval_seconds: StrictInt = Field(default=1800, ge=900, le=86400)
+
+
+class ImageLimitsConfig(_LimitsBase):
+    """Hot-configurable inbound image byte cap, pixel ceiling, and resize edges."""
+
+    image_max_bytes: StrictInt = Field(default=16_777_216, ge=1_048_576, le=20_971_520)
+    image_max_pixels: StrictInt = Field(default=50_000_000, ge=65536, le=80_000_000)
+    image_standard_max_edge: StrictInt = Field(default=1600, ge=512, le=2560)
+    image_tall_max_edge: StrictInt = Field(default=2560, ge=1024, le=4096)
+
+    @model_validator(mode="after")
+    def edge_order(self) -> Self:
+        if self.image_tall_max_edge < self.image_standard_max_edge:
+            raise ValueError("image_tall_max_edge must be >= image_standard_max_edge")
+        return self

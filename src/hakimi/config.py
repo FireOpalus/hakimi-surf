@@ -185,8 +185,10 @@ class Settings(BaseSettings):
     proactive_alert_cooldown_seconds: int = Field(default=21600, ge=3600, le=86400)
     proactive_ws_alert_after_seconds: int = Field(default=300, ge=60, le=86400)
     images_enabled: bool = True
-    image_max_bytes: int = Field(default=4_194_304, ge=1024, le=8_388_608)
-    image_max_pixels: int = Field(default=12_000_000, ge=65536, le=20_000_000)
+    image_max_bytes: int = Field(default=16_777_216, ge=1024, le=20_971_520)
+    image_max_pixels: int = Field(default=50_000_000, ge=65536, le=80_000_000)
+    image_standard_max_edge: int = Field(default=1600, ge=512, le=2560)
+    image_tall_max_edge: int = Field(default=2560, ge=1024, le=4096)
     image_token_reserve: int = Field(default=8192, ge=4096, le=32768)
 
     roaming_enabled: bool = False
@@ -330,6 +332,8 @@ class Settings(BaseSettings):
         CompressionConfig.from_settings(self)
         ProactiveConfig.from_settings(self)
         RestHoursConfig.from_settings(self)
+        if self.image_tall_max_edge < self.image_standard_max_edge:
+            raise ValueError("image_tall_max_edge must be >= image_standard_max_edge")
         ZoneInfo(self.bot_timezone)
         for proxy_ip in self.onebot_trusted_proxy_ips:
             ipaddress.ip_address(proxy_ip)

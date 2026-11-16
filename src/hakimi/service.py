@@ -488,6 +488,7 @@ class Service:
         else:
             results = await self.images.load(refs)  # Compatible injected loaders in integrations.
         images, sources = [], []
+        valid_loaded = sum(1 for item in results if item is not None)
         for (ref, member, origin), loaded in zip(selected, results, strict=True):
             data = {
                 "sender": f"{ref.sender_nickname or '群友'}(QQ:{ref.sender_id})"
@@ -501,6 +502,23 @@ class Service:
                     if hasattr(self.images, "failure_status")
                     else "unavailable"
                 )
+            elif valid_loaded == 1 and len(loaded.tiles) == 2 and len(images) + 2 <= limit:
+                split_imgs = loaded.tile_images()
+                if selected_members is not None:
+                    selected_members.append(member)
+                semantic = self.memes.semantic_label(loaded.digest)
+                for part_idx, part_img in enumerate(split_imgs, 1):
+                    images.append(part_img)
+                    part_data = {
+                        **data,
+                        "image_number": len(images),
+                        "status": "available",
+                        "slice": f"{part_idx}/2",
+                    }
+                    if semantic and part_idx == 1:
+                        part_data["local_sticker_label"] = semantic
+                    sources.append(part_data)
+                continue
             else:
                 images.append(loaded)
                 data.update(image_number=len(images), status="available")

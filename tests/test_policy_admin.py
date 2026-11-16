@@ -25,6 +25,9 @@ ROUTES = [
     ("GET", "/admin/api/rate-limits"),
     ("PUT", "/admin/api/rate-limits"),
     ("DELETE", "/admin/api/rate-limits"),
+    ("GET", "/admin/api/image-limits"),
+    ("PUT", "/admin/api/image-limits"),
+    ("DELETE", "/admin/api/image-limits"),
     ("GET", "/admin/api/generation-caps"),
     ("PUT", "/admin/api/generation-caps"),
     ("DELETE", "/admin/api/generation-caps"),
@@ -138,6 +141,11 @@ async def test_filter_hot_persistence_preserves_group_preset_when_saving_global_
         ("rate-limits", {"send_delay_min": "0.8"}),
         ("rate-limits", {"send_delay_max": True}),
         ("rate-limits", {"unexpected": "sensitive-input"}),
+        ("image-limits", {"image_max_bytes": 100}),
+        ("image-limits", {"image_max_bytes": True}),
+        ("image-limits", {"image_max_pixels": 80_000_001}),
+        ("image-limits", {"image_standard_max_edge": 2000, "image_tall_max_edge": 1500}),
+        ("image-limits", {"unexpected": "sensitive-input"}),
         ("generation-caps", {"carbon_enabled": "yes"}),
         ("generation-caps", {"carbon_enabled": 1}),
         ("generation-caps", {"chat_output_tokens": 127}),
@@ -572,3 +580,67 @@ async def test_bot_thresholds_409_guards_encrypted_persistence_and_reset(setting
             assert reset.json()["source"] == "env"
             assert changed_env.bot_reply_threshold == pytest.approx(0.75)
     assert not gateway.calls
+
+
+async def test_image_limits_admin_persistence_reset_and_legacy_upgrade(settings):
+    settings.admin_token = SecretStr(TOKEN)
+    gateway = FakeGateway()
+    # Seed legacy (4 MiB / 12 MP) production ledger store without image_limits override.
+    legacy_settings = settings.model_copy(
+        update={"image_max_bytes": 4_194_304, "image_max_pixels": 12_000_000}
+    )
+    seed_store = Store(legacy_settings)
+    await seed_store.open()
+    rid = await seed_store.reserve("u1", "chat", Decimal("0.01"))
+    await seed_store.settle(rid, Decimal("0.001"))
+    await seed_store.close()
+
+    upgraded_app = create_app(
+        legacy_settings, gateway_factory=lambda *_: gateway, start_workers=False
+    )
+    async with upgraded_app.router.lifespan_context(upgraded_app):
+        assert legacy_settings.image_max_bytes == 16_777_216
+        assert legacy_settings.image_max_pixels == 50_000_000
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=upgraded_app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": "Bearer " + TOKEN},
+        ) as client:
+            initial = (await client.get("/admin/api/image-limits")).json()
+            assert initial["source"] == "admin"
+            assert initial["config"]["image_max_bytes"] == 16_777_216
+
+            saved = await client.put(
+                "/admin/api/image-limits",
+                json={
+                    "image_max_bytes": 10_485_760,
+                    "image_max_pixels": 40_000_000,
+                    "image_standard_max_edge": 1920,
+                    "image_tall_max_edge": 3072,
+                },
+            )
+            assert saved.status_code == 200
+            assert legacy_settings.image_standard_max_edge == 1920
+            assert legacy_settings.image_tall_max_edge == 3072
+
+    restarted = settings.model_copy(
+        update={
+            "image_max_bytes": 16_777_216,
+            "image_max_pixels": 50_000_000,
+            "image_standard_max_edge": 1600,
+            "image_tall_max_edge": 2560,
+        }
+    )
+    app2 = create_app(restarted, gateway_factory=lambda *_: gateway, start_workers=False)
+    async with app2.router.lifespan_context(app2):
+        assert restarted.image_max_bytes == 10_485_760
+        assert restarted.image_standard_max_edge == 1920
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app2),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": "Bearer " + TOKEN},
+        ) as client:
+            reset = await client.delete("/admin/api/image-limits")
+            assert reset.status_code == 200 and reset.json()["source"] == "env"
+            assert restarted.image_max_bytes == 16_777_216
+            assert restarted.image_standard_max_edge == 1600

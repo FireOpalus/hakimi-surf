@@ -22,7 +22,9 @@ from .config import Settings
 from .models import ImageRef
 from .security import Rejected
 
-MAX_IMAGE_BYTES = 3_500_000
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+HTTP_IMAGE_TIMEOUT = 12
+MAX_ENCODED_JPEG_BYTES = 800 * 1024
 HTTP_FALLBACK_HOSTS = {"multimedia.nt.qq.com.cn", "gchat.qpic.cn"}
 BROWSER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
 log = logging.getLogger("hakimi")
@@ -82,6 +84,8 @@ class ModelImage:
     thumbnail: str = ""
     digest: str = ""
     resolution: str = "low"
+    tiles: tuple[str, ...] = ()
+    tile_thumbnails: tuple[str, ...] = ()
 
     def gate(self):
         return ModelImage(self.thumbnail or self.data, self.mime_type, digest=self.digest)
@@ -94,8 +98,83 @@ class ModelImage:
             "resolution": self.resolution,
         }
 
+    def tile_images(self) -> list["ModelImage"]:
+        if len(self.tiles) != 2:
+            return [self]
+        return [
+            ModelImage(
+                self.tiles[idx],
+                self.mime_type,
+                thumbnail=(
+                    self.tile_thumbnails[idx] if idx < len(self.tile_thumbnails) else self.thumbnail
+                ),
+                digest=self.digest if idx == 0 else "",
+                resolution=self.resolution,
+            )
+            for idx in range(2)
+        ]
 
-def normalize_image(raw: bytes, max_pixels: int) -> ModelImage:
+    def memory_bytes(self) -> int:
+        return (
+            len(self.data)
+            + len(self.thumbnail)
+            + sum(len(t) for t in self.tiles)
+            + sum(len(t) for t in self.tile_thumbnails)
+        )
+
+
+def _scale_box(img: Image.Image, max_long: int, max_short: int) -> Image.Image:
+    w, h = img.size
+    scale = min(1.0, max_long / max(1, max(w, h)), max_short / max(1, min(w, h)))
+    if scale < 1.0:
+        return img.resize(
+            (max(1, round(w * scale)), max(1, round(h * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    return img
+
+
+def _encode_jpeg(
+    img: Image.Image,
+    quality: int,
+    *,
+    subsampling: int = 0,
+    max_bytes: int = MAX_ENCODED_JPEG_BYTES,
+) -> bytes:
+    img.info.clear()
+    attempts = [(quality, subsampling), (78, 0), (72, 2), (65, 2)]
+    best = b""
+    seen = set()
+    for q, sub in attempts:
+        if (q, sub) in seen:
+            continue
+        seen.add((q, sub))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=q, subsampling=sub, optimize=True)
+        raw = buf.getvalue()
+        if not best or len(raw) < len(best):
+            best = raw
+        if len(raw) <= max_bytes:
+            return raw
+    return best
+
+
+def _make_thumb(img: Image.Image, edge: int) -> str:
+    tiny = img.copy()
+    tiny.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+    tiny.info.clear()
+    buf = io.BytesIO()
+    tiny.save(buf, format="JPEG", quality=72, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def normalize_image(
+    raw: bytes,
+    max_pixels: int,
+    *,
+    standard_max_edge: int = 1600,
+    tall_max_edge: int = 2560,
+) -> ModelImage:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -107,57 +186,86 @@ def normalize_image(raw: bytes, max_pixels: int) -> ModelImage:
                     or source.height < 1
                 ):
                     raise Rejected("image_format_or_size")
+                orig_raw_w, orig_raw_h = source.width, source.height
+                raw_long = max(orig_raw_w, orig_raw_h)
+                raw_aspect = raw_long / max(1, min(orig_raw_w, orig_raw_h))
+                animated = bool(getattr(source, "is_animated", False))
+                if (
+                    not animated
+                    and source.format == "JPEG"
+                    and raw_aspect <= 4.5
+                    and raw_long > tall_max_edge * 2
+                ):
+                    source.draft("RGB", (tall_max_edge, tall_max_edge))
                 source.seek(0)
                 source.load()
-                resized = ImageOps.exif_transpose(source).convert("RGB")
-                orig_w, orig_h = resized.size
+                full = ImageOps.exif_transpose(source).convert("RGB")
+                orig_w, orig_h = full.size
                 aspect = max(orig_w, orig_h) / max(1, min(orig_w, orig_h))
-                if getattr(source, "is_animated", False):
+                tiles: tuple[str, ...] = ()
+                tile_thumbnails: tuple[str, ...] = ()
+                if animated:
                     if (
                         source.n_frames > 300
-                        or source.n_frames * source.width * source.height > 32_000_000
+                        or source.n_frames * orig_raw_w * orig_raw_h > 64_000_000
                     ):
                         raise Rejected("image_animation_too_long")
-                    resized.thumbnail((768, 768), Image.Resampling.LANCZOS)
+                    full.thumbnail((768, 768), Image.Resampling.LANCZOS)
                     source.seek(source.n_frames - 1)
                     last = ImageOps.exif_transpose(source).convert("RGB")
                     last.thumbnail((768, 768), Image.Resampling.LANCZOS)
                     stitched = Image.new(
                         "RGB",
-                        (resized.width + last.width, max(resized.height, last.height)),
+                        (full.width + last.width, max(full.height, last.height)),
                         "white",
                     )
-                    stitched.paste(resized, (0, 0))
-                    stitched.paste(last, (resized.width, 0))
+                    stitched.paste(full, (0, 0))
+                    stitched.paste(last, (full.width, 0))
                     resized = stitched
                     resized.thumbnail((1152, 768), Image.Resampling.LANCZOS)
-                    save_kwargs = {"quality": 82, "optimize": True}
+                    encoded = _encode_jpeg(resized, 82, subsampling=2)
                     resolution = "medium"
-                elif aspect > 2.0:
-                    scale = min(1.0, 1536 / max(orig_w, orig_h), 768 / min(orig_w, orig_h))
-                    if scale < 1.0:
-                        resized = resized.resize(
-                            (max(1, round(orig_w * scale)), max(1, round(orig_h * scale))),
-                            Image.Resampling.LANCZOS,
-                        )
-                    save_kwargs = {"quality": 86, "subsampling": 0, "optimize": True}
-                    resolution = "high"
+                elif aspect <= 2.2:
+                    short_cap = max(384, round(standard_max_edge * 0.75))
+                    resized = _scale_box(full, standard_max_edge, short_cap)
+                    encoded = _encode_jpeg(resized, 85, subsampling=0)
+                    resolution = "high" if raw_long >= 1200 else "medium"
                 else:
-                    resized.thumbnail((768, 768), Image.Resampling.LANCZOS)
-                    save_kwargs = {"quality": 85, "subsampling": 0, "optimize": True}
-                    resolution = "medium"
-                resized.info.clear()
-                target = io.BytesIO()
-                resized.save(target, format="JPEG", **save_kwargs)
-                tiny = resized.copy()
-                tiny.thumbnail((512, 512) if aspect > 2.0 else (448, 448), Image.Resampling.LANCZOS)
-                thumb = io.BytesIO()
-                tiny.save(thumb, format="JPEG", quality=72, optimize=True)
+                    tall_short_cap = min(1080, tall_max_edge)
+                    resized = _scale_box(full, tall_max_edge, tall_short_cap)
+                    encoded = _encode_jpeg(resized, 86, subsampling=0)
+                    resolution = "high"
+                    if aspect > 4.5 and max(orig_w, orig_h) > tall_max_edge:
+                        overlap = min(96, max(32, max(orig_w, orig_h) // 40))
+                        if orig_h >= orig_w:
+                            mid = orig_h // 2
+                            crops = (
+                                full.crop((0, 0, orig_w, min(orig_h, mid + overlap // 2))),
+                                full.crop((0, max(0, mid - overlap // 2), orig_w, orig_h)),
+                            )
+                        else:
+                            mid = orig_w // 2
+                            crops = (
+                                full.crop((0, 0, min(orig_w, mid + overlap // 2), orig_h)),
+                                full.crop((max(0, mid - overlap // 2), 0, orig_w, orig_h)),
+                            )
+                        tile_list = []
+                        tile_thumb_list = []
+                        for crop in crops:
+                            scaled_tile = _scale_box(crop, tall_max_edge, tall_short_cap)
+                            tile_bytes = _encode_jpeg(scaled_tile, 86, subsampling=0)
+                            tile_list.append(base64.b64encode(tile_bytes).decode("ascii"))
+                            tile_thumb_list.append(_make_thumb(scaled_tile, 512))
+                        tiles = tuple(tile_list)
+                        tile_thumbnails = tuple(tile_thumb_list)
+                thumb_b64 = _make_thumb(resized, 512 if aspect > 2.2 else 448)
         return ModelImage(
-            base64.b64encode(target.getvalue()).decode("ascii"),
-            thumbnail=base64.b64encode(thumb.getvalue()).decode("ascii"),
+            base64.b64encode(encoded).decode("ascii"),
+            thumbnail=thumb_b64,
             digest=hashlib.sha256(raw).hexdigest(),
             resolution=resolution,
+            tiles=tiles,
+            tile_thumbnails=tile_thumbnails,
         )
     except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
         raise Rejected("invalid_image") from None
@@ -182,9 +290,9 @@ class ImageLoader:
         self.cache_limit = 48 * 1024 * 1024
         self.fetch_locks = [asyncio.Lock() for _ in range(64)]
 
-    @staticmethod
-    def failure_status(ref):
-        return "oversized" if ref.file_size and ref.file_size > MAX_IMAGE_BYTES else "unavailable"
+    def failure_status(self, ref):
+        limit = min(self.s.image_max_bytes, MAX_IMAGE_BYTES)
+        return "oversized" if ref.file_size and ref.file_size > limit else "unavailable"
 
     async def load(self, refs: list[ImageRef]) -> list[ModelImage]:
         if not refs:
@@ -213,7 +321,7 @@ class ImageLoader:
             trust_env=False,
             cookie_jar=aiohttp.DummyCookieJar(),
             auto_decompress=False,
-            timeout=aiohttp.ClientTimeout(total=5, connect=5),
+            timeout=aiohttp.ClientTimeout(total=HTTP_IMAGE_TIMEOUT, connect=5),
         )
 
     @staticmethod
@@ -238,7 +346,7 @@ class ImageLoader:
         async with self.ws_images:
             for action in ("get_image", "get_file"):
                 try:
-                    async with asyncio.timeout(10):
+                    async with asyncio.timeout(15):
                         value = await self.transport.call(action, {"file": ref.file})
                     if not isinstance(value, dict):
                         raise Rejected("image_rpc_invalid")
@@ -267,7 +375,7 @@ class ImageLoader:
 
     async def _http_one(self, client, url, *, allow_http=False):
         maximum = min(self.s.image_max_bytes, MAX_IMAGE_BYTES)
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(HTTP_IMAGE_TIMEOUT):
             async with client.get(
                 validate_image_url(url, allow_http=allow_http),
                 allow_redirects=False,
@@ -319,7 +427,16 @@ class ImageLoader:
 
     async def normalize(self, raw):
         async with self.decode_slots:
-            return await asyncio.to_thread(normalize_image, raw, self.s.image_max_pixels)
+            return await asyncio.to_thread(
+                normalize_image,
+                raw,
+                self.s.image_max_pixels,
+                standard_max_edge=self.s.image_standard_max_edge,
+                tall_max_edge=self.s.image_tall_max_edge,
+            )
+
+    def _current_edges(self):
+        return (self.s.image_standard_max_edge, self.s.image_tall_max_edge)
 
     def cache_get(self, scope, ref):
         key = self.aliases.get((scope, ref.identity))
@@ -329,20 +446,22 @@ class ImageLoader:
         return self.cache[key]
 
     async def cached_one(self, client, ref, scope):
+        edges = self._current_edges()
         async with self.fetch_locks[hash((scope, ref.identity)) % len(self.fetch_locks)]:
-            found = self.cache_get(scope, ref)
-            if found:
-                return found
+            alias = self.aliases.get((scope, ref.identity))
+            if alias in self.cache and alias[2:] == edges:
+                self.cache.move_to_end(alias)
+                return self.cache[alias]
             image = await self._one(client, ref)
-            key = (scope, image.digest or hashlib.sha256(image.data.encode()).hexdigest())
+            key = (scope, image.digest or hashlib.sha256(image.data.encode()).hexdigest(), *edges)
             if key not in self.cache:
                 self.cache[key] = image
-                self.cache_bytes += len(image.data) + len(image.thumbnail)
+                self.cache_bytes += image.memory_bytes()
             self.aliases[(scope, ref.identity)] = key
 
             def evict(victim):
                 old = self.cache.pop(victim)
-                self.cache_bytes -= len(old.data) + len(old.thumbnail)
+                self.cache_bytes -= old.memory_bytes()
 
             own = [k for k in self.cache if k[0] == scope]
             for victim in own[:-30]:

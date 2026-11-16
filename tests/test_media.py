@@ -60,17 +60,17 @@ async def test_resolver_returns_pinned_public_addresses(monkeypatch):
 
 
 def test_image_is_bounded_and_metadata_removed():
-    source = Image.new("RGB", (1600, 1200), "red")
+    source = Image.new("RGB", (2400, 1800), "red")
     exif = Image.Exif()
     exif[270] = "secret-camera-comment"
     raw = io.BytesIO()
     source.save(raw, format="JPEG", exif=exif)
-    result = normalize_image(raw.getvalue(), 2_000_000)
+    result = normalize_image(raw.getvalue(), 5_000_000)
     decoded = base64.b64decode(result.data)
     assert b"secret-camera-comment" not in decoded
     with Image.open(io.BytesIO(decoded)) as output:
-        assert max(output.size) <= 768 and not output.getexif()
-    assert result.block()["resolution"] == "medium"
+        assert output.size == (1600, 1200) and not output.getexif()
+    assert result.block()["resolution"] == "high"
     assert result.gate().block()["resolution"] == "low"
     with pytest.raises(Rejected):
         normalize_image(raw.getvalue(), 1_000_000)
@@ -131,7 +131,7 @@ class Client:
 
 async def test_failed_download_keeps_position_and_success_is_resized(settings, monkeypatch):
     data = io.BytesIO()
-    Image.new("RGB", (1600, 1200), "white").save(data, format="PNG")
+    Image.new("RGB", (2400, 1800), "white").save(data, format="PNG")
     loader = ImageLoader(settings)
     client = Client([Response(b"", status=302), Response(data.getvalue())])
     monkeypatch.setattr(loader, "_client", lambda: client)
@@ -142,14 +142,16 @@ async def test_failed_download_keeps_position_and_success_is_resized(settings, m
     result = await loader.load_results(refs)
     assert result[0] is None and result[1] is not None
     with Image.open(io.BytesIO(base64.b64decode(result[1].data))) as output:
-        assert output.format == "JPEG" and output.size == (768, 576)
+        assert output.format == "JPEG" and output.size == (1600, 1200)
     assert all(not kwargs["allow_redirects"] for _, kwargs in client.requests)
 
 
-async def test_image_download_never_exceeds_five_mib_even_if_env_larger(settings, monkeypatch):
-    settings.image_max_bytes = 8 * 1024 * 1024
+async def test_image_download_never_exceeds_max_image_bytes_even_if_env_larger(
+    settings, monkeypatch
+):
+    settings.image_max_bytes = 25 * 1024 * 1024
     loader = ImageLoader(settings)
-    client = Client([Response(b"x" * (5 * 1024 * 1024 + 1))])
+    client = Client([Response(b"x" * (20 * 1024 * 1024 + 1))])
     monkeypatch.setattr(loader, "_client", lambda: client)
     assert await loader.load_results([ImageRef(url="https://gchat.qpic.cn/huge")]) == [None]
 
@@ -161,7 +163,7 @@ async def test_timeout_falls_back_without_cancelling_following_image(settings, m
     original = asyncio.timeout
 
     def short_timeout(seconds):
-        assert seconds == 5
+        assert seconds == 12
         return original(0.01)
 
     monkeypatch.setattr(asyncio, "timeout", short_timeout)

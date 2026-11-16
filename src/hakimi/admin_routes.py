@@ -25,7 +25,12 @@ from .compression_policy import CompressionConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterConfig
 from .generation_policy import Scenario, generation_plan
-from .limits_policy import GenerationCapsConfig, PatrolLimitConfig, RateLimitConfig
+from .limits_policy import (
+    GenerationCapsConfig,
+    ImageLimitsConfig,
+    PatrolLimitConfig,
+    RateLimitConfig,
+)
 from .memory_compressor import check_memory_text
 from .mentions import parse_reply
 from .models import Message
@@ -240,6 +245,24 @@ async def rate_limits_save(request: Request):
 async def rate_limits_reset(request: Request):
     async with request.app.state.admin_config_lock:
         return await service(request).store.runtime.set_rate_limits(None)
+
+
+@router.get("/api/image-limits")
+async def image_limits_status(request: Request):
+    return service(request).store.runtime.image_limits_status()
+
+
+@router.put("/api/image-limits")
+async def image_limits_save(request: Request):
+    value = await body(request, ImageLimitsConfig)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_image_limits(value)
+
+
+@router.delete("/api/image-limits")
+async def image_limits_reset(request: Request):
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_image_limits(None)
 
 
 @router.get("/api/generation-caps")

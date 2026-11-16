@@ -14,7 +14,12 @@ from .bot_server import is_persona_owner
 from .compression_policy import CompressionConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterManager
-from .limits_policy import GenerationCapsConfig, PatrolLimitConfig, RateLimitConfig
+from .limits_policy import (
+    GenerationCapsConfig,
+    ImageLimitsConfig,
+    PatrolLimitConfig,
+    RateLimitConfig,
+)
 from .models import Message
 from .proactive_policy import ProactiveConfig
 from .rest_policy import RestHoursConfig
@@ -125,6 +130,15 @@ class RuntimeState:
         self.patrol_limits = self.env_patrol_limits
         self.patrol_limits_overridden = False
         self.patrol_limits_lock = asyncio.Lock()
+        self.env_image_limits = ImageLimitsConfig(
+            image_max_bytes=max(1_048_576, self.s.image_max_bytes),
+            image_max_pixels=self.s.image_max_pixels,
+            image_standard_max_edge=self.s.image_standard_max_edge,
+            image_tall_max_edge=self.s.image_tall_max_edge,
+        )
+        self.image_limits = self.env_image_limits
+        self.image_limits_overridden = False
+        self.image_limits_lock = asyncio.Lock()
         self.clock = time.time
         self.env_rest_hours = RestHoursConfig.from_settings(self.s)
         self.rest_hours = self.env_rest_hours
@@ -187,6 +201,9 @@ class RuntimeState:
         self.patrol_limits = self.env_patrol_limits
         self.patrol_limits_overridden = False
         self._apply_fields(self.env_patrol_limits)
+        self.image_limits = self.env_image_limits
+        self.image_limits_overridden = False
+        self._apply_fields(self.env_image_limits)
         self._apply_rest_hours(self.env_rest_hours)
         self.rest_hours_overridden = False
         admission = self.env_admission
@@ -236,11 +253,32 @@ class RuntimeState:
                 self.patrol_limits = self._validate_loaded(self.env_patrol_limits, value)
                 self.patrol_limits_overridden = True
                 self._apply_fields(self.patrol_limits)
+            elif row["key"] == "image_limits":
+                self.image_limits = self._validate_loaded(self.env_image_limits, value)
+                self.image_limits_overridden = True
+                self._apply_fields(self.image_limits)
             elif row["key"] == "rest_hours":
                 self._apply_rest_hours(self._validate_loaded(self.env_rest_hours, value))
                 self.rest_hours_overridden = True
             elif row["key"].startswith("policy:"):
                 self.s.group_policies[row["key"][7:]] = value
+        if (
+            not self.image_limits_overridden
+            and (self.env_image_limits.image_max_bytes, self.env_image_limits.image_max_pixels)
+            == (4_194_304, 12_000_000)
+            and not await self.store.one("SELECT 1 FROM meta WHERE key='image_limits_v140'")
+            and await self.store.one("SELECT 1 FROM ledger LIMIT 1")
+        ):
+            upgraded = ImageLimitsConfig()
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "INSERT OR REPLACE INTO admin_config VALUES ('image_limits',?)",
+                    (self.store.vault.seal("admin:image_limits", upgraded.model_dump()),),
+                )
+                await self.store.db.execute("INSERT INTO meta VALUES ('image_limits_v140','1')")
+            self.image_limits = upgraded
+            self.image_limits_overridden = True
+            self._apply_fields(upgraded)
         if not self.admission_overridden and legacy_bots is not None:
             data = {**admission.model_dump(mode="json"), "ignored_bot_ids": legacy_bots}
             if isinstance(legacy_bots, (list, tuple)):
@@ -393,6 +431,21 @@ class RuntimeState:
             self.patrol_limits_lock,
             self.env_patrol_limits,
             "patrol_limits",
+        )
+
+    def image_limits_status(self):
+        return self._limits_status(
+            self.image_limits, self.env_image_limits, self.image_limits_overridden
+        )
+
+    async def set_image_limits(self, value: ImageLimitsConfig | None):
+        return await self._save_limits(
+            "image_limits",
+            value,
+            ImageLimitsConfig,
+            self.image_limits_lock,
+            self.env_image_limits,
+            "image_limits",
         )
 
     def _apply_rest_hours(self, value: RestHoursConfig):
