@@ -19,7 +19,7 @@ from .generation_policy import Scenario
 from .models import Message
 from .output_links import filter_reply_links
 from .proactive_policy import ProactiveConfig, minute_of_day
-from .reply_style import casual_reply
+from .reply_style import casual_reply, trim_complete_text
 from .roaming_logger import redact_public_summary
 from .security import Rejected, configured_secrets, safe_output
 
@@ -529,28 +529,37 @@ class OwnerProactive:
                 pass
         bili_finds: list[dict] = []
         try:
-            async with self.store.lock:
-                has_bili = await self.store.one(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bili_watched_history'"
-                )
-                rows = (
-                    await self.store.all(
-                        "SELECT bvid,summary FROM bili_watched_history "
-                        "WHERE status='done' AND summary IS NOT NULL AND created>=? "
-                        "ORDER BY created DESC LIMIT 2",
-                        (now - 172800,),
+            watcher = getattr(self.service, "bili_watcher", None)
+            if watcher is not None and hasattr(watcher, "recent_surfed"):
+                for item in await watcher.recent_surfed(limit=2, now=now):
+                    bvid = item.get("bvid", "")
+                    gist = str(item.get("notes", ""))[:150]
+                    if bvid and gist:
+                        bili_finds.append({"bvid": bvid, "gist": gist})
+            else:
+                async with self.store.lock:
+                    has_bili = await self.store.one(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='bili_watched_history'"
                     )
-                    if has_bili
-                    else []
-                )
-            for bvid, sealed in rows:
-                gist = redact_public_summary(
-                    safe_output(
-                        self.store.vault.open("bili-learn:" + bvid, sealed), secrets, limit=150
+                    rows = (
+                        await self.store.all(
+                            "SELECT bvid,summary FROM bili_watched_history "
+                            "WHERE status='done' AND summary IS NOT NULL AND created>=? "
+                            "ORDER BY created DESC LIMIT 2",
+                            (now - 172800,),
+                        )
+                        if has_bili
+                        else []
                     )
-                )
-                if gist:
-                    bili_finds.append({"bvid": bvid, "gist": gist})
+                for bvid, sealed in rows:
+                    gist = redact_public_summary(
+                        safe_output(
+                            self.store.vault.open("bili-learn:" + bvid, sealed), secrets, limit=150
+                        )
+                    )
+                    if gist:
+                        bili_finds.append({"bvid": bvid, "gist": gist})
         except Exception:
             pass
         topics = ["结合星期与时段自然打个招呼", "一句不催促的摸鱼问候"]
@@ -626,7 +635,11 @@ class OwnerProactive:
                 except (ValueError, TypeError):
                     pass  # A malformed optional signature must not suppress the digest.
             generated = filter_reply_links(self.service.output(generated), public=False)
-            text = generated[:250] if digest else casual_reply(generated)[:120]
+            text = (
+                trim_complete_text(generated, 450)
+                if digest
+                else trim_complete_text(casual_reply(generated), 200)
+            )
             if digest:
                 cost = payload["approximate_api_usd_including_reservations"]
                 text = (

@@ -32,7 +32,7 @@ from .output_links import filter_reply_links
 from .proactive_dm import OwnerProactive
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
-from .roaming_logger import RoamingLogger
+from .roaming_logger import RoamingLogger, redact_public_summary
 from .routing import RouteDecision
 from .security import Rejected, authorize, configured_secrets, owner, safe_output
 from .session_manager import SessionManager
@@ -53,26 +53,26 @@ PRIOR_FILE_REF_RE = re.compile(
     r"|\.(?:log|txt|py|json|ya?ml|toml|md|js|ts|sh|sql)\b",
     re.I,
 )
-HELP = """哈基米在这里。私聊可直接提问或发送 B 站视频；群聊看视频请明确 @ 我。
+HELP = """哈基米在这里。私聊可直接提问或发 B 站视频；群聊也支持按语境看图、联网和聊视频。
+/哈基米 或 /哈基米 帮助：查看本指令说明
 /new-session：清空当前会话上下文，保留记忆开关
-外部 Bot 默认忽略；仅主人在群内明确邀请后临时互动，同群 10 分钟最多两轮。
-/哈基米 记忆 开：为当前私聊或本群启用短期记忆
+/search <内容> 或 /搜索 <内容>：显式联网检索公开信息（日常对话也会按需自动检索）
+/watch-video（随 B 站链接或引用视频发送）：请求原片画面/音频分析（默认优先读字幕与热评摘要）
+/哈基米 记忆 开：为当前私聊或本群启用短期与双轨记忆
 /哈基米 记忆 关 或 /哈基米 清空：关闭并删除当前会话记忆
-群聊记忆由配置中的主人管理；主人私聊可复盘近期公开群聊，私人记忆绝不进入群聊。
+外部 Bot 默认按阈值限流；群内记忆与策略由配置中的主人管理，私聊记忆绝不进入群聊。
+以下指令需真实主人权限（群内可用）：
+/存表情 <标签>（或 /偷表情、/save-meme）：引用或附带图片（静图/透明PNG/GIF）存进本地表情包库
+/bot-interact：群内 @ 外部 Bot 授权其本群临时互动（10 分钟最多 2 轮）
 以下功能仅限配置中的主人私聊使用：
-/mute <QQ> 或 /unmute <QQ>：应用层屏蔽或解除；不自动删好友
+/deep <问题或视频链接>：本次启用 high 档深度分析
+/set-sign <签名>：手动设置 50 字以内纯文本 QQ 个签
+/mute <QQ> 或 /unmute <QQ>：应用层屏蔽或解除（默认不删好友）
 /mute-approve <编号> 或 /mute-reject <编号>：批准或驳回屏蔽申请
-如同时移除好友，须在 /mute 或 /mute-approve 末尾明确加 --delete-friend
-/set-sign <签名>：手动设置 50 字以内纯文本签名
-/deep <问题或视频链接>：本次使用 high 档深度分析
-/存表情 <标签>：私聊或群内（需真实主人，可引用附图消息）保存图片到本地表情包库
-/哈基米 订阅 <UP主UID>
-/哈基米 退订 <UP主UID>
-/哈基米 订阅列表
-/哈基米 报告
-/哈基米 状态
-链接与小号巡逻优先阅读公开字幕资料；原片分析需后台开启，受时长、体积和次数限制。
-UP订阅巡逻摘要公开标题和简介；首次巡逻建立基线，不推送历史内容。"""
+（如需同时删除好友，须在 /mute 或 /mute-approve 末尾加 --delete-friend）
+/哈基米 订阅 <UP主UID> / /哈基米 退订 <UP主UID>：UP 更新私聊提醒（直播开播监控可在 /admin 添加）
+/哈基米 订阅列表 / /哈基米 报告 / /哈基米 状态：查看订阅、近 7 天巡逻报告与今日额度
+链接与小号巡逻优先阅读公开字幕与热评资料；原片分析受后台开关、时长、体积和每日次数限制。"""
 
 
 class Service:
@@ -757,10 +757,15 @@ class Service:
         *,
         deep: bool = False,
         message: Message | None = None,
+        patrol_notify: bool = False,
     ) -> str:
         # No chat memory is ever included in public-content summarization.
         payload = {
-            "task": "summarize_public_metadata",
+            "task": (
+                "notify_owner_subscribed_up_new_video"
+                if patrol_notify
+                else "summarize_public_metadata"
+            ),
             "material_scope": "metadata_only",
             "untrusted_sources": [v.model_dump(exclude={"mid"}) for v in videos],
         }
@@ -1081,6 +1086,7 @@ class Service:
         history_events: set[str] = set()
         selected_neighbour_members = []
         neighbour_image_events = []
+        late_images = False
         digested_events = {
             match.group(1)
             for entry in history
@@ -1119,6 +1125,7 @@ class Service:
                 )
             await message_guard()
             if neighbour_images:
+                late_images = True
                 # Adjacent users' images remain an independent strict SOURCE gate.
                 await self.ai.screen(
                     {"image_sources": neighbour_sources, "nearby_group_context": nearby_context},
@@ -1184,6 +1191,7 @@ class Service:
                 )
                 await message_guard()
                 if recalled_images:
+                    late_images = True
                     neighbour_members.extend(recalled_members)
                     await self.ai.screen(
                         {"image_sources": recalled_sources, "historical_image_recall": True},
@@ -1224,6 +1232,12 @@ class Service:
                 recall=getattr(intent, "need_memory_recall", False),
                 related_user_ids=related_user_ids,
             )
+            if not self.bot_guard.known_bot(message) and hasattr(
+                self.bili_watcher, "recent_surfed"
+            ):
+                surfed = await self.bili_watcher.recent_surfed(limit=4)
+                if surfed:
+                    payload["recent_bili_surfed"] = surfed
         context_members = list(members)
         if message.kind == "group":
             context_members.extend(neighbour_members if images else [])
@@ -1288,6 +1302,14 @@ class Service:
             await video_guard()
             video = await self.bili.video(bvid)
             material = await self.bili_watcher.public_material(video, guard=video_guard)
+            if (
+                not sandbox
+                and not self.bot_guard.known_bot(message)
+                and hasattr(self.bili_watcher, "lookup_watched")
+            ):
+                prior = await self.bili_watcher.lookup_watched(bvid)
+                if prior:
+                    material = {**material, "patrol_deja_vu": prior}
             analysis = await self.video_watch.analyze(
                 bvid,
                 material,
@@ -1363,7 +1385,12 @@ class Service:
             batch = self.store.groups.active.get(self.store.session_scope(message))
             chat_route = intent
             tier = getattr(intent, "tier", 2)
-            if (payload.get("web_search_findings") or images or file_attachments) and tier < 2:
+            if (
+                payload.get("web_search_findings")
+                or file_attachments
+                or late_images
+                or any(i.resolution == "high" for i in images)
+            ) and tier < 2:
                 tier = 2
                 if isinstance(intent, RouteDecision):
                     chat_route = RouteDecision(
@@ -1559,7 +1586,13 @@ class Service:
         if not authorize(target, self.s) or not owner(target, self.s) or target.kind != "private":
             return
         videos = [Video.model_validate(v) for v in job["payload"]["videos"]]
-        result = await self.summarize(videos, job["subject"], "patrol")
+        result = await self.summarize(
+            videos,
+            job["subject"],
+            "patrol",
+            message=target if is_persona_owner(target, self.s) else None,
+            patrol_notify=True,
+        )
         # Recheck unsubscribe requests that arrived while the model was running.
         if not any(s["id"] == sub_id for s in await self.store.subscriptions(job["subject"])):
             return
@@ -1927,7 +1960,9 @@ class Service:
             except Exception:
                 self.record("patrol_source_unavailable")
         async with self.store.lock:
-            rooms = await self.store.all("SELECT room_id,target,next_poll FROM live_watches")
+            rooms = await self.store.all(
+                "SELECT room_id,target,last_status,next_poll FROM live_watches"
+            )
         for room in rooms:
             if not force and room["next_poll"] > time.time():
                 continue
@@ -1942,14 +1977,72 @@ class Service:
                     (time.time() + self.s.patrol_interval_seconds, room["room_id"]),
                 )
             try:
-                status = await self.bili.live_status(room["room_id"])
+                info = (
+                    await self.bili.live_info(room["room_id"])
+                    if hasattr(self.bili, "live_info")
+                    else {
+                        "room_id": room["room_id"],
+                        "live_status": await self.bili.live_status(room["room_id"]),
+                        "title": "",
+                        "area": "",
+                    }
+                )
+                status = info["live_status"]
+                prev_status = room["last_status"]
                 async with self.store.transaction():
                     await self.store.db.execute(
                         "UPDATE live_watches SET last_status=? WHERE room_id=?",
                         (status, room["room_id"]),
                     )
+                if prev_status is not None and prev_status != 1 and status == 1:
+                    await self._notify_live_open(room["room_id"], target, info)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 self.record("patrol_source_unavailable")
+
+    async def _notify_live_open(self, room_id: str, target: Message, info: dict) -> None:
+        raw_title = str(info.get("title", "") or "").strip()
+        raw_area = str(info.get("area", "") or "").strip()
+        safe_title, safe_area = "", ""
+        if raw_title or raw_area:
+            try:
+                await self.ai.screen(
+                    {"room_id": room_id, "title": raw_title, "area": raw_area},
+                    self.store.subject(target),
+                    purpose="source",
+                    budget_lane="patrol",
+                )
+                safe_title = redact_public_summary(safe_output(raw_title, self.secrets, limit=80))
+                safe_area = redact_public_summary(safe_output(raw_area, self.secrets, limit=30))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                safe_title, safe_area = "", ""
+        detail = (
+            f"今天播的是《{safe_title}》" + (f"（{safe_area}）" if safe_area else "") + "，"
+            if safe_title
+            else ""
+        )
+        live_text = self.output(
+            f"诶！你蹲的直播间 {room_id} 刚开播啦~ {detail}快去瞄一眼喵！\n"
+            f"https://live.bilibili.com/{room_id}"
+        )
+        await self.store.save_report(self.store.subject(target), live_text)
+        if (
+            target.kind == "private"
+            and is_persona_owner(target, self.s)
+            and self.proactive.config.enabled
+        ):
+            live_key = self.store.vault.digest("live-open", room_id, int(time.time() // 1800))
+            try:
+                await self.proactive.enqueue(
+                    "patrol", live_text, key=live_key, expires=time.time() + 7200
+                )
+            except asyncio.CancelledError:
+                raise
+            except Rejected:
+                pass
 
     async def patrol(self):
         while True:

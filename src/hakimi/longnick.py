@@ -93,7 +93,7 @@ class Longnick:
             raise Rejected("invalid_longnick")
         return safe_output(text, secrets, limit=50)
 
-    async def update(self, raw, *, automatic=False):
+    async def update(self, raw, *, automatic=False, cooldown_seconds=None):
         await self.initialize()
         text = self.normalize(raw)
         async with self.lock:
@@ -106,12 +106,12 @@ class Longnick:
                 row = await self.store.one(
                     "SELECT * FROM longnick_state WHERE scope=?", (self.scope,)
                 )
-            if (
-                automatic
-                and max(row["last_success"], row["last_attempt"])
-                + self.config.cooldown_hours * 3600
-                > now
-            ):
+            auto_cooldown = (
+                self.config.cooldown_hours * 3600
+                if cooldown_seconds is None
+                else float(cooldown_seconds)
+            )
+            if automatic and max(row["last_success"], row["last_attempt"]) + auto_cooldown > now:
                 return {"status": "cooldown"}
             # Explicit human changes may override the daily cadence, but not double clicks.
             if row["last_attempt"] and row["last_attempt"] + 60 > now:
@@ -162,17 +162,28 @@ class Longnick:
                 log.info("event=longnick_update_failed")
             return {"status": status, "error": error}
 
-    async def apply_digest(self, value):
-        # Safe hook after the sole daily digest call. Signature errors never abort the DM.
+    async def _apply_auto(self, value, *, cooldown_seconds=None, error_code):
         try:
+            await self.initialize()
             if not self.config.enabled or not value:
                 return {"status": "disabled_or_absent"}
-            return await self.update(value, automatic=True)
+            return await self.update(value, automatic=True, cooldown_seconds=cooldown_seconds)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.info("event=longnick_update_failed")
-            return {"status": "failed", "error": "invalid_daily_longnick"}
+            return {"status": "failed", "error": error_code}
+
+    async def apply_digest(self, value):
+        # Safe hook after the sole daily digest call. Signature errors never abort the DM.
+        return await self._apply_auto(value, error_code="invalid_daily_longnick")
+
+    async def apply_patrol(self, value):
+        # Safe hook after Bilibili patrol. 6h cooldown avoids clashing with nightly digest.
+        cooldown = min(self.config.cooldown_hours * 3600, 6 * 3600)
+        return await self._apply_auto(
+            value, cooldown_seconds=cooldown, error_code="invalid_patrol_longnick"
+        )
 
     async def command(self, message):
         direct = message.command_text if message.command_text is not None else message.text

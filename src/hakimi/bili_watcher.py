@@ -28,6 +28,7 @@ from .bot_server import is_persona_owner, untrusted_input
 from .generation_policy import Scenario
 from .models import Video
 from .proactive_policy import minute_of_day
+from .reply_style import trim_complete_text
 from .roaming_logger import redact_public_summary
 from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
 
@@ -166,6 +167,7 @@ class BiliPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     enabled: bool = False
     times: list[str] = Field(default_factory=lambda: ["13:00", "20:30"], min_length=1, max_length=2)
+    jitter_minutes: int = Field(default=25, ge=0, le=60)
     allow_like: bool = False
     allow_favorite: bool = False
     favorite_folder_id: str = Field(default="", pattern=r"^[1-9][0-9]{0,19}$|^$")
@@ -206,11 +208,13 @@ class Pick(BaseModel):
     bvid: str = Field(pattern="^" + BVID + "$")
     like: bool = False
     favorite: bool = False
+    share_owner: bool = False
 
 
 class Selection(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     selected: list[Pick] = Field(max_length=2)
+    mood_longnick: str = Field(default="", max_length=80)
 
 
 def wbi_sign(params, keys, now):
@@ -387,8 +391,8 @@ class BiliWatcher:
         if self.owns_client:
             await self.http.aclose()
 
-    def local(self):
-        return datetime.fromtimestamp(self.clock(), self.zone)
+    def local(self, now=None):
+        return datetime.fromtimestamp(self.clock() if now is None else now, self.zone)
 
     def _ensure_current(self, *, epoch=None, allow_cooldown=False):
         if not allow_cooldown and self.blocked_until > self.clock():
@@ -845,10 +849,21 @@ class BiliWatcher:
             replies = await self._request(
                 "/x/v2/reply", {"type": 1, "oid": aid, "sort": 1, "ps": 5, "pn": 1}
             )
-            comments = [
-                clean_text(str((r.get("content") or {}).get("message", "")))[:250]
-                for r in (replies.get("hots") or replies.get("replies") or [])[:3]
-            ]
+            raw_replies = []
+            top_reply = (replies.get("upper") or {}).get("top")
+            if isinstance(top_reply, dict):
+                raw_replies.append(top_reply)
+            raw_replies.extend((replies.get("hots") or replies.get("replies") or [])[:5])
+            seen_comments = set()
+            for r in raw_replies:
+                if not isinstance(r, dict):
+                    continue
+                msg = clean_text(str((r.get("content") or {}).get("message", "")))[:250].strip()
+                if msg and msg not in seen_comments:
+                    seen_comments.add(msg)
+                    comments.append(msg)
+                if len(comments) >= 5:
+                    break
         except Rejected as exc:
             if str(exc) not in {"bili_account_unavailable", "bili_account_upstream_error"}:
                 raise
@@ -1055,6 +1070,148 @@ class BiliWatcher:
             result["recent_chat_topics"] = recent_topics[:5]
         return result
 
+    async def _actions_by_bvid(self, bvids: list[str]) -> dict[str, list[str]]:
+        if not bvids:
+            return {}
+        has_actions = await self.store.one(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bili_actions'"
+        )
+        if not has_actions:
+            return {}
+        placeholders = ",".join("?" for _ in bvids)
+        rows = await self.store.all(
+            f"SELECT bvid,kind FROM bili_actions WHERE status='done' AND bvid IN ({placeholders})",
+            tuple(bvids),
+        )
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            grouped.setdefault(row[0], []).append(str(row[1]))
+        return {k: sorted(set(v)) for k, v in grouped.items()}
+
+    def _open_watched_notes(self, bvid: str, sealed, *, limit: int) -> str:
+        secrets = getattr(self.svc, "secrets", None) or configured_secrets(self.s)
+        raw = self.store.vault.open("bili-learn:" + bvid, sealed)
+        return redact_public_summary(safe_output(str(raw), secrets, limit=limit))
+
+    async def recent_surfed(
+        self, *, limit: int = 4, max_age: float = 172800.0, now: float | None = None
+    ) -> list[dict]:
+        current = self.clock() if now is None else now
+        async with self.store.lock:
+            has_bili = await self.store.one(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bili_watched_history'"
+            )
+            if not has_bili:
+                return []
+            rows = await self.store.all(
+                "SELECT bvid,created,summary FROM bili_watched_history "
+                "WHERE status='done' AND summary IS NOT NULL AND created>=? "
+                "ORDER BY created DESC LIMIT ?",
+                (current - max_age, max(1, int(limit))),
+            )
+            actions = await self._actions_by_bvid([r[0] for r in rows])
+        items: list[dict] = []
+        for bvid, created, sealed in rows:
+            try:
+                notes = self._open_watched_notes(bvid, sealed, limit=220)
+            except Exception:
+                continue
+            if not notes:
+                continue
+            entry = {
+                "bvid": bvid,
+                "watched_at": datetime.fromtimestamp(created, self.zone).strftime("%m-%d %H:%M"),
+                "notes": notes,
+            }
+            if actions.get(bvid):
+                entry["actions"] = actions[bvid]
+            items.append(entry)
+        return items
+
+    async def lookup_watched(self, bvid: str) -> dict | None:
+        if not isinstance(bvid, str) or not re.fullmatch(BVID, bvid):
+            return None
+        async with self.store.lock:
+            has_bili = await self.store.one(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bili_watched_history'"
+            )
+            if not has_bili:
+                return None
+            row = await self.store.one(
+                "SELECT created,summary FROM bili_watched_history "
+                "WHERE bvid=? AND status='done' AND summary IS NOT NULL",
+                (bvid,),
+            )
+            if not row:
+                return None
+            actions = await self._actions_by_bvid([bvid])
+        try:
+            notes = self._open_watched_notes(bvid, row[1], limit=360)
+        except Exception:
+            return None
+        return {
+            "already_watched_in_patrol": True,
+            "watched_at": datetime.fromtimestamp(row[0], self.zone).strftime("%Y-%m-%d %H:%M"),
+            "actions_taken": actions.get(bvid, []),
+            "prior_patrol_notes": notes,
+        }
+
+    async def _maybe_share_owner(self, day: str, bvid: str, title: str, summary: str) -> bool:
+        proactive = getattr(self.svc, "proactive", None)
+        now = self.clock()
+        if (
+            not self.s.owner_qq_id
+            or proactive is None
+            or not hasattr(proactive, "config")
+            or not hasattr(proactive, "enqueue")
+            or not getattr(proactive, "configured", True)
+            or not proactive.config.enabled
+            or self.store.runtime.is_resting(now)
+            or proactive.config.quiet(self.local(now))
+        ):
+            return False
+        share_key = self.store.vault.digest("bili-instant-share", self.s.namespace, day)
+        async with self.store.lock:
+            has_dms = await self.store.one(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_owner_dms'"
+            )
+            if has_dms and await self.store.one(
+                "SELECT 1 FROM pending_owner_dms WHERE id=?", (share_key,)
+            ):
+                return False
+        secrets = getattr(self.svc, "secrets", None) or configured_secrets(self.s)
+        clean_title = redact_public_summary(safe_output(title, secrets, limit=80)) if title else ""
+        title_part = f"《{clean_title}》" if clean_title else bvid
+        header = f"诶我刚摸鱼刷B站刷到个超对胃口的视频{title_part}，感觉你会感兴趣！\n"
+        footer = f"\nhttps://www.bilibili.com/video/{bvid}"
+        body_budget = max(120, self.s.send_max_chars - len(header) - len(footer) - 8)
+        body = trim_complete_text(summary.strip(), body_budget)
+        share_text = f"{header}{body}{footer}"
+        expires = (
+            proactive._companion_expiry(now)
+            if hasattr(proactive, "_companion_expiry")
+            else now + 7200
+        )
+        try:
+            await proactive.enqueue("patrol", share_text, key=share_key, expires=expires)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+
+    def slot_due_minute(self, day: str, slot: str) -> int:
+        base = minute_of_day(slot)
+        jitter = self.policy.jitter_minutes
+        if jitter <= 0:
+            return base
+        digest = hashlib.blake2b(
+            f"{self.s.namespace}:{day}:{slot}".encode(), digest_size=4
+        ).digest()
+        span = 2 * jitter + 1
+        offset = (int.from_bytes(digest, "big") % span) - jitter
+        return max(0, min(1439, base + offset))
+
     async def run_once(self, *, slot="manual"):
         if self.run_lock.locked():
             return {"status": "busy"}
@@ -1086,6 +1243,7 @@ class BiliWatcher:
                     return {"status": "already_attempted"}
             reason = None
             completed = 0
+            shared_today = False
             token = self.patrol_context.set((self.policy_epoch, self.credentials_epoch))
             try:
                 epoch = self.credentials_epoch
@@ -1182,6 +1340,14 @@ class BiliWatcher:
                         reason = "bili_account_risk"
                         break
                     await self._interaction(pick.bvid, aid, pick, epoch)
+                    if pick.share_owner and not shared_today:
+                        shared_today = await self._maybe_share_owner(
+                            day, pick.bvid, str(material.get("title", "")), summary
+                        )
+                if completed > 0 and not reason and selection.mood_longnick.strip():
+                    longnick = getattr(self.svc, "longnick", None)
+                    if longnick is not None and hasattr(longnick, "apply_patrol"):
+                        await longnick.apply_patrol(selection.mood_longnick)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1213,8 +1379,9 @@ class BiliWatcher:
         if not self.policy.enabled or self.store.runtime.is_resting(self.clock()):
             return
         local = self.local()
+        day = local.date().isoformat()
         for value in self.policy.times:
-            minute = minute_of_day(value)
+            minute = self.slot_due_minute(day, value)
             due = local.replace(hour=minute // 60, minute=minute % 60, second=0, microsecond=0)
             if 0 <= self.clock() - due.timestamp() < 300:
                 await self.run_once(slot=value)
@@ -1230,6 +1397,7 @@ class BiliWatcher:
             await self.sleep(30)
 
     async def status(self):
+        day = self.local().date().isoformat()
         async with self.store.lock:
             state = await self.store.one("SELECT * FROM bili_account_state WHERE id=1")
             device = await self.store.one(
@@ -1243,12 +1411,14 @@ class BiliWatcher:
                 )
             ]
             actions = (
-                await self.store.one(
-                    "SELECT COUNT(*) FROM bili_actions WHERE day=?",
-                    (self.local().date().isoformat(),),
-                )
+                await self.store.one("SELECT COUNT(*) FROM bili_actions WHERE day=?", (day,))
             )[0]
             watched = (await self.store.one("SELECT COUNT(*) FROM bili_watched_history"))[0]
+        today_schedule = [
+            f"{m // 60:02d}:{m % 60:02d}"
+            for v in self.policy.times
+            for m in (self.slot_due_minute(day, v),)
+        ]
         return {
             "config": self.policy.model_dump(),
             "source": "sqlite" if self.overridden else "env",
@@ -1270,6 +1440,7 @@ class BiliWatcher:
             "recent_runs": runs,
             "actions_today": actions,
             "watched_count": watched,
+            "today_schedule": today_schedule,
             "timezone": self.s.bot_timezone,
             "heartbeat_supported": False,
         }

@@ -123,7 +123,7 @@ class Bilibili:
             self.cache[cache_key] = (time.monotonic() + ttl, result["data"])
             return result["data"]
 
-    async def live_status(self, room_id: str) -> int:
+    async def live_info(self, room_id: str) -> dict:
         if not re.fullmatch(r"[1-9][0-9]{0,19}", room_id):
             raise Rejected("invalid_room_id")
         data = await self._get(
@@ -132,7 +132,15 @@ class Bilibili:
         status = data.get("live_status")
         if isinstance(status, bool) or status not in {0, 1, 2}:
             raise Rejected("invalid_live_status")
-        return status
+        return {
+            "room_id": room_id,
+            "live_status": status,
+            "title": clean_text(str(data.get("title", "")))[:120],
+            "area": clean_text(str(data.get("area_name", "")))[:40],
+        }
+
+    async def live_status(self, room_id: str) -> int:
+        return (await self.live_info(room_id))["live_status"]
 
     async def video(self, bvid: str) -> Video:
         if not re.fullmatch(BVID, bvid):

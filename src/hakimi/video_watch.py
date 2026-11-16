@@ -178,15 +178,25 @@ class VideoWatch:
             "remote_cleanup_pending": pending,
         }
 
-    def bounded(self, material, query=""):
+    def bounded(self, material, query="", *, patrol=False):
         payload = copy.deepcopy(material)
-        payload["current_message"] = query[:2000] or "概括这个视频中能够确认的内容。"
+        default_prompt = (
+            "用哈基米逛B站的冲浪笔记口吻记下：①正片核心亮点；"
+            "②若 hot_comments_unverified 有神评或烂梗顺手记一笔（注明评论区玩梗）；"
+            "③一句猫猫自己的主观吐槽或锐评。"
+            if patrol
+            else "概括这个视频中能够确认的内容。"
+        )
+        payload["current_message"] = query[:2000] or default_prompt
         while len(untrusted_input(payload).encode()) > self.s.max_context_bytes:
             key = max(
                 ("subtitle_excerpt", "description", "current_message"),
                 key=lambda k: len(payload.get(k, "")),
             )
             if not payload.get(key):
+                if "patrol_deja_vu" in payload:
+                    payload.pop("patrol_deja_vu", None)
+                    continue
                 raise Rejected("context_too_large")
             payload[key] = payload[key][: len(payload[key]) // 2]
             if key == "subtitle_excerpt":
@@ -223,7 +233,7 @@ class VideoWatch:
             if message is not None
             else ""
         )
-        payload = self.bounded(material, direct)
+        payload = self.bounded(material, direct, patrol=(lane == "patrol"))
 
         async def valid_text():
             # Gemini reserves the budget atomically; a request's own reservation is

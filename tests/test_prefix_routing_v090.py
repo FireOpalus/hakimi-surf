@@ -74,9 +74,11 @@ def test_upper_tail_not_argmax(ps, expected):
     assert select_tier(dict(zip(TIERS, ps, strict=True))) == expected
 
 
-@pytest.mark.parametrize("floor", [{"has_images": True}, {"recall": True}, {"text_length": 281}])
-def test_hard_l2_floors(floor):
-    assert select_tier(dict(zip(TIERS, [1.0, 0.0, 0.0, 0.0], strict=True)), **floor) == 2
+@pytest.mark.parametrize(
+    "params,expected", [({"has_images": True}, 1), ({"recall": True}, 1), ({"text_length": 281}, 2)]
+)
+def test_hard_l2_floors(params, expected):
+    assert select_tier(dict(zip(TIERS, [1.0, 0.0, 0.0, 0.0], strict=True)), **params) == expected
 
 
 @pytest.mark.parametrize(

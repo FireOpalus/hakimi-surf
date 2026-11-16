@@ -36,4 +36,4 @@ def select_tier(probabilities, *, has_images=False, recall=False, text_length=0)
     if not 0.98 <= sum(ps) <= 1.02:
         raise Rejected("invalid_decision")
     tier = 4 if ps[3] >= 0.42 else 3 if sum(ps[2:]) >= 0.48 else 2 if sum(ps[1:]) >= 0.45 else 1
-    return max(tier, 2) if has_images or recall or text_length > 280 else tier
+    return max(tier, 2) if text_length > 280 else tier

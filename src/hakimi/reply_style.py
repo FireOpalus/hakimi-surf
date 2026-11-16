@@ -48,3 +48,24 @@ def public_reply(text: str) -> str:
 def casual_reply(text: str) -> str:
     """Format short casual private replies without stiff trailing single-sentence period."""
     return public_reply(text)
+
+
+def trim_complete_text(text: str, limit: int) -> str:
+    """Trim overlong text cleanly at a sentence or clause boundary when over `limit`."""
+    cleaned = str(text or "").strip()
+    if limit <= 0:
+        return ""
+    if len(cleaned) <= limit:
+        return cleaned
+    window = cleaned[:limit]
+    min_sentence = max(1, int(limit * 0.4))
+    best_sentence = max(
+        (window.rfind(sep) for sep in ("。", "！", "？", "!", "?", "~", "\n")), default=-1
+    )
+    if best_sentence >= min_sentence:
+        return window[: best_sentence + 1].rstrip()
+    min_clause = max(1, int(limit * 0.45))
+    best_clause = max((window.rfind(sep) for sep in ("；", ";", "，", ",", "、", " ")), default=-1)
+    if best_clause >= min_clause:
+        return window[:best_clause].rstrip() + "…"
+    return window[: max(1, limit - 1)].rstrip() + "…"

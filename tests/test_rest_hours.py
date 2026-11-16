@@ -313,7 +313,7 @@ async def test_scheduled_patrols_and_companion_pause_during_rest_while_manual_ru
             watcher = BiliWatcher(svc, http, clock=lambda: clock[0])
             await watcher.initialize()
             await watcher.update_credentials(CredentialUpdate(sessdata="cookie-val"))
-            await watcher.set_policy(BiliPolicy(enabled=True, times=["23:30"]))
+            await watcher.set_policy(BiliPolicy(enabled=True, times=["23:30"], jitter_minutes=0))
             await watcher.tick()
             assert http_calls == []
             await store.runtime.set_rest_hours(
