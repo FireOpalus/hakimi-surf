@@ -41,11 +41,47 @@ def test_upload_decodes_real_images_and_removes_metadata(fmt):
         assert "exif" not in image.info and "icc_profile" not in image.info
 
 
-def test_animation_first_frame_is_explicit():
-    result = normalize_meme(picture("GIF", animated=True))
-    assert result.was_animated
+@pytest.mark.parametrize("fmt", ["GIF", "WEBP"])
+def test_animated_gif_and_webp_preserve_animation_with_transparent_alpha(fmt):
+    raw_buf = io.BytesIO()
+    f1 = Image.new("RGBA", (600, 400), (120, 40, 200, 0))
+    f2 = Image.new("RGBA", (600, 400), (240, 180, 20, 255))
+    f1.save(
+        raw_buf,
+        format=fmt,
+        save_all=True,
+        append_images=[f2],
+        duration=[90, 140],
+        loop=0,
+    )
+    result = normalize_meme(raw_buf.getvalue())
+    assert result.was_animated is True
+    assert result.first_frame_only is False
+    assert result.mime_type == "image/gif"
+    assert result.extension == ".gif"
     with Image.open(io.BytesIO(result.data)) as image:
-        assert not getattr(image, "is_animated", False)
+        assert image.format == "GIF"
+        assert getattr(image, "is_animated", False) is True
+        assert image.n_frames == 2
+        assert image.size[0] <= 512 and image.size[1] <= 512
+
+
+def test_transparent_png_is_preserved_while_opaque_png_stays_jpeg():
+    rgba_buf = io.BytesIO()
+    rgba = Image.new("RGBA", (80, 80), (0, 0, 0, 0))
+    rgba.paste((255, 80, 120, 255), (20, 20, 60, 60))
+    rgba.save(rgba_buf, format="PNG")
+    res_alpha = normalize_meme(rgba_buf.getvalue())
+    assert res_alpha.mime_type == "image/png"
+    assert res_alpha.extension == ".png"
+    assert res_alpha.first_frame_only is False
+    with Image.open(io.BytesIO(res_alpha.data)) as img:
+        assert img.format == "PNG"
+        assert img.convert("RGBA").getchannel("A").getextrema()[0] == 0
+
+    res_opaque = normalize_meme(picture("PNG"))
+    assert res_opaque.mime_type == "image/jpeg"
+    assert res_opaque.extension == ".jpg"
 
 
 @pytest.mark.parametrize(
@@ -253,3 +289,139 @@ async def test_admin_guards_stream_uploads_before_processing(meme_api):
 
     app.state.admin_auth = AdminAuth(app.state.settings)
     assert (await client.get("/admin/api/memes")).status_code == 403
+
+
+async def test_owner_save_meme_command_from_quoted_message_only_allows_owner(
+    settings, store, message, monkeypatch
+):
+    from hakimi.adapters import onebot_message
+    from hakimi.security import Rejected
+    from hakimi.service import Service
+    from tests.fakes import FakeBili, FakeGateway, FakeSender
+
+    settings.onebot_allowed_groups = {"40000"}
+    settings.owner_qq_id = "20000"
+    svc = Service(settings, store, FakeGateway(), FakeBili(), FakeSender())
+    try:
+
+        async def fake_fetch_raw(ref, *, max_bytes=None):
+            return picture()
+
+        monkeypatch.setattr(svc.images, "fetch_raw", fake_fetch_raw)
+        non_owner_msg = onebot_message(
+            {
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": settings.onebot_self_id,
+                "user_id": 30000,
+                "group_id": 40000,
+                "message_id": 9001,
+                "time": int(__import__("time").time()),
+                "message": [
+                    {"type": "image", "data": {"url": "https://gchat.qpic.cn/test.jpg"}},
+                    {"type": "text", "data": {"text": "/存表情 偷图"}},
+                ],
+            },
+            settings,
+        )
+        assert non_owner_msg.attention_reason == "command"
+        with pytest.raises(Rejected, match="group_owner_only"):
+            await svc.command(non_owner_msg)
+        assert not svc.memes.labels
+
+        owner_msg = onebot_message(
+            {
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": settings.onebot_self_id,
+                "user_id": 20000,
+                "group_id": 40000,
+                "message_id": 9002,
+                "time": int(__import__("time").time()),
+                "message": [
+                    {"type": "image", "data": {"url": "https://gchat.qpic.cn/good.jpg"}},
+                    {"type": "text", "data": {"text": "/存表情 疑惑"}},
+                ],
+            },
+            settings,
+        )
+        reply = await svc.command(owner_msg)
+        assert "疑惑" in reply
+        assert "疑惑" in svc.memes.labels
+        dup_reply = await svc.command(owner_msg)
+        assert "已经有这张图" in dup_reply
+    finally:
+        await svc.stop()
+
+
+async def test_single_image_anti_deadlock_native_sticker_subtype_and_owner_unthrottled(
+    settings, store, message
+):
+    from hakimi.adapters import Sender
+    from hakimi.service import Service
+    from tests.fakes import FakeBili, FakeGateway
+    from tests.test_social_integration import Wire, group, process
+    from tests.test_streaming_v0100 import action
+
+    # 1) Single-image label never deadlocks after repeated confirm_choice
+    lib = MemeLibrary(store)
+    await lib.upload_bytes("独苗喵", picture("PNG"))
+    for _ in range(12):
+        picked = await lib.choose("独苗喵", "scope-single")
+        assert picked is not None
+        await lib.confirm_choice("scope-single", picked["digest"])
+
+    # 2) Native sub_type=1 + summary="[动画表情]" on sticker vs omitted on send_card
+    settings.owner_qq_id = "20000"
+    gif_buf = io.BytesIO()
+    Image.new("RGBA", (60, 60), (10, 200, 120, 0)).save(
+        gif_buf,
+        format="GIF",
+        save_all=True,
+        append_images=[Image.new("RGBA", (60, 60), (220, 50, 90, 255))],
+        duration=100,
+        loop=0,
+    )
+
+    class StickerGw(FakeGateway):
+        async def generate(self, payload, subject, **kwargs):
+            await super().generate(payload, subject, **kwargs)
+            return action(
+                abstain=False,
+                bubbles=[""],
+                sticker={"label": "动图喵", "timing": "after_text"},
+            )
+
+    wire = Wire()
+    async with httpx.AsyncClient() as http:
+        sender = Sender(settings, http, wire)
+        svc = Service(settings, store, StickerGw(), FakeBili(), sender)
+        try:
+            await svc.memes.initialize()
+            await svc.moderation.initialize()
+            await svc.memes.upload_bytes("动图喵", gif_buf.getvalue())
+
+            # Back-to-back pure-sticker Owner DMs are never throttled
+            for n in range(2):
+                m = message.model_copy(update={"event_id": f"dm-s-{n}", "text": "发个表情包"})
+                await process(svc, m)
+                assert await svc.deliver_once()
+
+            dm_calls = [p for act, p in wire.calls if act == "send_private_msg"]
+            assert len(dm_calls) == 2
+            for params in dm_calls:
+                seg = params["message"][0]
+                assert seg["type"] == "image"
+                assert seg["data"]["file"].startswith("base64://")
+                assert seg["data"]["summary"] == "[动画表情]"
+                assert seg["data"]["sub_type"] == 1
+
+            # send_card keeps full-size normal image (no sub_type=1)
+            wire.calls.clear()
+            grp = group(message, "card-1")
+            await sender.send_card(grp, "| A | B |\n| --- | --- |\n| 1 | 2 |")
+            card_seg = wire.calls[-1][1]["message"][0]
+            assert card_seg["type"] == "image"
+            assert "sub_type" not in card_seg["data"]
+        finally:
+            await svc.stop()

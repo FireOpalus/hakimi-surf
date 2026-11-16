@@ -342,9 +342,7 @@ async def test_deep_video_uses_summary_route_and_never_chat_memory(service, mess
 
 
 @pytest.mark.parametrize("reason", ["", "alias", "reply"])
-async def test_group_video_without_at_never_fetches_bili_and_falls_back_to_chat(
-    service, message, reason
-):
+async def test_group_video_without_at_fetches_bili_in_admitted_turns(service, message, reason):
     service.s.group_policies["onebot:40000"] = "smart_reply"
     group_msg = message.model_copy(
         update={
@@ -361,8 +359,8 @@ async def test_group_video_without_at_never_fetches_bili_and_falls_back_to_chat(
         }
     )
     await run_message(service, group_msg)
-    assert not service.bili.calls
-    assert any(c[0] == "generate" and c[3]["scenario"] == "fast_chat" for c in service.ai.calls)
+    assert service.bili.calls == ["BV1xx411c7mD"]
+    assert any(c[0] == "generate" and c[3]["summary"] is True for c in service.ai.calls)
 
 
 async def test_group_video_watches_only_with_at_including_quoted_video(service, message):

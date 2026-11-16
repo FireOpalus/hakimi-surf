@@ -503,3 +503,66 @@ async def test_preview_800ms_hard_timeout(monkeypatch):
     start = time.monotonic()
     assert await preview_links("https://example.com/a") == []
     assert time.monotonic() - start < 0.95
+
+
+async def test_preview_links_follows_safe_redirects_gzip_and_opengraph(monkeypatch):
+    import gzip
+
+    from hakimi.link_preview import preview_links
+
+    html = (
+        '<html><head><meta property="og:title" content="OpenGraph 标题">'
+        '<meta name="og:description" content="OpenGraph 摘要内容"></head></html>'
+    )
+    gz = gzip.compress(html.encode("utf-8"))
+    seen_urls = []
+
+    class FakeContent:
+        def __init__(self, data):
+            self.data = data
+
+        async def read(self, limit):
+            return self.data[:limit]
+
+    class FakeResp:
+        def __init__(self, status, headers=None, body=b""):
+            self.status = status
+            self.headers = headers or {}
+            self.content = FakeContent(body)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.connector = kwargs["connector"]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            await self.connector.close()
+
+        def get(self, url, **kwargs):
+            seen_urls.append(url)
+            if url == "https://short.example/go":
+                return FakeResp(301, {"Location": "https://dest.example/article"})
+            if url == "https://dest.example/article":
+                return FakeResp(
+                    200,
+                    {"Content-Type": "text/html; charset=utf-8", "Content-Encoding": "gzip"},
+                    gz,
+                )
+            if url == "https://evil.example/bounce":
+                return FakeResp(302, {"Location": "http://127.0.0.1/admin"})
+            return FakeResp(404)
+
+    monkeypatch.setattr("hakimi.link_preview.aiohttp.ClientSession", Client)
+    res = await preview_links(
+        "看看这个 https://short.example/go，和这个 https://evil.example/bounce"
+    )
+    assert res == [{"title": "OpenGraph 标题", "description": "OpenGraph 摘要内容"}]
+    assert "http://127.0.0.1/admin" not in seen_urls

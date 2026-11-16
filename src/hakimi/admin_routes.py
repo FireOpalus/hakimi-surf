@@ -4,6 +4,7 @@ import re
 import time
 import uuid
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
@@ -26,6 +27,7 @@ from .debounce_policy import DebounceConfig
 from .gateway import FilterConfig
 from .generation_policy import Scenario, generation_plan
 from .limits_policy import (
+    ContentToolsConfig,
     GenerationCapsConfig,
     ImageLimitsConfig,
     PatrolLimitConfig,
@@ -110,6 +112,26 @@ class TextInput(Input):
 class Subscription(Input):
     kind: Literal["up", "live"]
     uid: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
+
+
+class AccountBalanceBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    balance_usd: Decimal = Field(ge=0, le=Decimal("100000"))
+
+    @field_validator("balance_usd", mode="before")
+    @classmethod
+    def reject_bool(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("bool is not a valid balance")
+        return value
+
+
+class DeepSeekCredentialsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    api_key: str = Field(default="", max_length=512)
+    base_url: str = Field(default="", max_length=256)
+    model: str = Field(default="", max_length=80)
+    clear: bool = False
 
 
 async def body(request, model):
@@ -229,6 +251,24 @@ async def budget_reset(request: Request):
         return await service(request).store.set_budget_config(None)
 
 
+@router.get("/api/account-balance")
+async def account_balance_status(request: Request):
+    return await service(request).store.account_balance_status()
+
+
+@router.put("/api/account-balance")
+async def account_balance_save(request: Request):
+    value = await body(request, AccountBalanceBody)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.set_account_balance(value.balance_usd)
+
+
+@router.delete("/api/account-balance")
+async def account_balance_clear(request: Request):
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.clear_account_balance()
+
+
 @router.get("/api/rate-limits")
 async def rate_limits_status(request: Request):
     return service(request).store.runtime.rate_limits_status()
@@ -263,6 +303,24 @@ async def image_limits_save(request: Request):
 async def image_limits_reset(request: Request):
     async with request.app.state.admin_config_lock:
         return await service(request).store.runtime.set_image_limits(None)
+
+
+@router.get("/api/content-tools")
+async def content_tools_status(request: Request):
+    return service(request).store.runtime.content_tools_status()
+
+
+@router.put("/api/content-tools")
+async def content_tools_save(request: Request):
+    value = await body(request, ContentToolsConfig)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_content_tools(value)
+
+
+@router.delete("/api/content-tools")
+async def content_tools_reset(request: Request):
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.set_content_tools(None)
 
 
 @router.get("/api/generation-caps")
@@ -357,6 +415,18 @@ async def web_search_save(request: Request):
 @router.delete("/api/web-search")
 async def web_search_reset(request: Request):
     return await service(request).store.runtime.web_search.save(None)
+
+
+@router.post("/api/web-search/deepseek")
+async def web_search_deepseek_save(request: Request):
+    value = await body(request, DeepSeekCredentialsBody)
+    async with request.app.state.admin_config_lock:
+        return await service(request).store.runtime.web_search.save_deepseek(
+            api_key=value.api_key,
+            base_url=value.base_url,
+            model=value.model,
+            clear=value.clear,
+        )
 
 
 @router.put("/api/debounce")

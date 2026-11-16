@@ -118,6 +118,13 @@ def checked_number(value):
     return value if value > 0 else None
 
 
+def valid_video_dimensions(width, height) -> bool:
+    w, h = checked_number(width), checked_number(height)
+    if not w or not h:
+        return False
+    return 180 <= min(w, h) <= 540 and max(w, h) <= 1280
+
+
 def validate_info(info, bvid, limit):
     if (
         not isinstance(info, dict)
@@ -166,8 +173,7 @@ def select_format(info):
         elif (
             fmt.get("ext") == "mp4"
             and fmt.get("vcodec") not in {None, "none"}
-            and fmt.get("height") in {360, 480}
-            and 0 < (checked_number(fmt.get("width")) or 0) <= 1280
+            and valid_video_dimensions(fmt.get("width"), fmt.get("height"))
         ):
             videos.append(fmt)
     options = []
@@ -194,10 +200,12 @@ def select_format(info):
                 continue
             candidate, cost = dict(video), format_size(video, duration)
         if math.isinf(cost) or cost <= MAX_BYTES:
-            options.append((cost, video["height"], candidate))
+            short_side = min(video["width"], video["height"])
+            long_side = max(video["width"], video["height"])
+            options.append((cost, short_side, long_side, candidate))
     if not options:
         raise WorkerError("video_download_format")
-    return min(options, key=lambda value: (value[0], value[1]))[2]
+    return min(options, key=lambda value: (value[0], value[1], value[2]))[3]
 
 
 def check_disk(*_):
@@ -244,8 +252,7 @@ def inspect_media(path, limit):
             or "mp4" not in raw.get("format_name", "").split(",")
             or len(video) != 1
             or len(audio) > 1
-            or video[0].get("height") not in {360, 480}
-            or not 0 < video[0].get("width", 0) <= 1280
+            or not valid_video_dimensions(video[0].get("width"), video[0].get("height"))
             or not 0 < path.stat().st_size <= MAX_BYTES
         ):
             raise ValueError

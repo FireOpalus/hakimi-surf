@@ -15,6 +15,7 @@ from .compression_policy import CompressionConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterManager
 from .limits_policy import (
+    ContentToolsConfig,
     GenerationCapsConfig,
     ImageLimitsConfig,
     PatrolLimitConfig,
@@ -103,6 +104,7 @@ class RuntimeState:
         self.env_compression = CompressionConfig.from_settings(self.s)
         self.compression = self.env_compression
         self.compression_overridden = False
+        self.s.history_high_tokens = self.env_compression.history_high_tokens
         self.compression_lock = asyncio.Lock()
         self.env_proactive = ProactiveConfig.from_settings(self.s)
         self.proactive = self.env_proactive
@@ -139,6 +141,10 @@ class RuntimeState:
         self.image_limits = self.env_image_limits
         self.image_limits_overridden = False
         self.image_limits_lock = asyncio.Lock()
+        self.env_content_tools = ContentToolsConfig.from_settings(self.s)
+        self.content_tools = self.env_content_tools
+        self.content_tools_overridden = False
+        self.content_tools_lock = asyncio.Lock()
         self.clock = time.time
         self.env_rest_hours = RestHoursConfig.from_settings(self.s)
         self.rest_hours = self.env_rest_hours
@@ -190,6 +196,7 @@ class RuntimeState:
         self.s._thinking_override = None
         self.compression = self.env_compression
         self.compression_overridden = False
+        self.s.history_high_tokens = self.env_compression.history_high_tokens
         self.proactive = self.env_proactive
         self.proactive_overridden = False
         self.rate_limits = self.env_rate_limits
@@ -204,6 +211,9 @@ class RuntimeState:
         self.image_limits = self.env_image_limits
         self.image_limits_overridden = False
         self._apply_fields(self.env_image_limits)
+        self.content_tools = self.env_content_tools
+        self.content_tools_overridden = False
+        self._apply_fields(self.env_content_tools)
         self._apply_rest_hours(self.env_rest_hours)
         self.rest_hours_overridden = False
         admission = self.env_admission
@@ -232,8 +242,14 @@ class RuntimeState:
                 admission = AdmissionConfig.model_validate(merged)
                 self.admission_overridden = True
             elif row["key"] == "compression":
-                self.compression = CompressionConfig.model_validate(value)
+                merged = (
+                    {**self.env_compression.model_dump(), **value}
+                    if isinstance(value, dict)
+                    else value
+                )
+                self.compression = CompressionConfig.model_validate(merged)
                 self.compression_overridden = True
+                self.s.history_high_tokens = self.compression.history_high_tokens
             elif row["key"] == "proactive":
                 self.proactive = ProactiveConfig.model_validate(value)
                 self.proactive_overridden = True
@@ -257,6 +273,10 @@ class RuntimeState:
                 self.image_limits = self._validate_loaded(self.env_image_limits, value)
                 self.image_limits_overridden = True
                 self._apply_fields(self.image_limits)
+            elif row["key"] == "content_tools":
+                self.content_tools = self._validate_loaded(self.env_content_tools, value)
+                self.content_tools_overridden = True
+                self._apply_fields(self.content_tools)
             elif row["key"] == "rest_hours":
                 self._apply_rest_hours(self._validate_loaded(self.env_rest_hours, value))
                 self.rest_hours_overridden = True
@@ -448,6 +468,21 @@ class RuntimeState:
             "image_limits",
         )
 
+    def content_tools_status(self):
+        return self._limits_status(
+            self.content_tools, self.env_content_tools, self.content_tools_overridden
+        )
+
+    async def set_content_tools(self, value: ContentToolsConfig | None):
+        return await self._save_limits(
+            "content_tools",
+            value,
+            ContentToolsConfig,
+            self.content_tools_lock,
+            self.env_content_tools,
+            "content_tools",
+        )
+
     def _apply_rest_hours(self, value: RestHoursConfig):
         # Synchronous update: readers never observe partial rest-hour settings.
         self.s.rest_hours_enabled = value.enabled
@@ -623,11 +658,13 @@ class RuntimeState:
                     await self.store.db.execute("DELETE FROM admin_config WHERE key='compression'")
                 self.compression = self.env_compression
                 self.compression_overridden = False
+                self.s.history_high_tokens = self.env_compression.history_high_tokens
             else:
                 await self.save_config("compression", value.model_dump())
                 # Swap one immutable object: consumers never see half-updated thresholds.
                 self.compression = value
                 self.compression_overridden = True
+                self.s.history_high_tokens = value.history_high_tokens
 
     async def register(self, message):
         key = self.store.session_scope(message)
@@ -638,6 +675,7 @@ class RuntimeState:
                 "text": "",
                 "command_text": "",
                 "images": [],
+                "files": [],
                 "forward_ids": [],
                 "video_ids": [],
                 "short_urls": [],

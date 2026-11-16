@@ -189,7 +189,7 @@ async def test_search_provider_failure_does_not_open_chat_circuit(settings, stor
             await gateway.search("公开问题", "s")
         assert gateway.blocked_until == 0
         row = await store.one("SELECT status,amount,reserved FROM ledger WHERE lane='search'")
-        assert row["status"] == "unknown" and 0 < row["amount"] < row["reserved"]
+        assert row["status"] == "unknown" and row["amount"] == 0 and row["reserved"] == 0
     finally:
         await gateway.close()
 
@@ -503,3 +503,49 @@ async def test_video_chat_reply_has_no_disclaimer_header_or_duplicate_link_and_f
         assert summary_calls[0][1]["material_scope"] == "metadata_only"
     finally:
         await svc.stop()
+
+
+def test_search_query_uses_same_sender_batch_and_link_title_without_leak(settings, message):
+    from hakimi.web_search import SearchResult
+
+    m1 = message.model_copy(
+        update={"user_id": "30000", "text": "Python 3.14 发布了", "command_text": None}
+    )
+    m2 = message.model_copy(
+        update={
+            "user_id": "30000",
+            "text": "PRIVATE_FORWARD_TEXT\n查下它有哪些新特性",
+            "command_text": "查下它有哪些新特性",
+        }
+    )
+    bystander = message.model_copy(
+        update={"user_id": "99999", "text": "无关路人话", "command_text": None}
+    )
+    q1 = search_query(m2, settings, batch_messages=[bystander, m1, m2])
+    assert q1 == "Python 3.14 发布了 查下它有哪些新特性"
+    assert "PRIVATE_FORWARD_TEXT" not in q1 and "无关路人话" not in q1
+
+    m_url = message.model_copy(
+        update={
+            "text": "https://github.com/python/cpython 这个仓库最近发布了什么",
+            "command_text": None,
+        }
+    )
+    q2 = search_query(
+        m_url,
+        settings,
+        link_titles=["python/cpython: The Python programming language"],
+    )
+    assert "这个仓库最近发布了什么" in q2 and "cpython" in q2 and "http" not in q2
+
+    explicit_msg = message.model_copy(update={"command_text": "/搜索 明确问题", "text": "SECRET"})
+    assert (
+        search_query(
+            explicit_msg, settings, batch_messages=[m1, explicit_msg], link_titles=["Ignored"]
+        )
+        == "明确问题"
+    )
+
+    long_fact = "核心结论：" + "甲" * 400
+    rendered = SearchResult(long_fact, (("官方公告", "https://docs.python.org/"),)).render(settings)
+    assert len(rendered) > 350 and "参考来源：官方公告" in rendered

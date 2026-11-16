@@ -464,17 +464,40 @@ async def test_source_and_output_accept_binary_noul_confidence_near_threshold(
         with pytest.raises(Rejected, match="^prompt_injection$"):
             await gate.screen({"current_message": "inject"}, "s", purpose=purpose)
 
-    # Group non-@ message with a BVID must route to "chat", while @ or private routes to bilibili.
+    # Admitted group turns (smart_reply, alias, @) with BVID route to bilibili_watch;
+    # low-relevance unaddressed group turns route to ignore; non-BVID routes to chat.
     case[:] = [0.01, 0.99, "is_unsafe_or_spam"]
+    unaddressed_group = group(message, addressed=False, attention_reason="")
+    assert (
+        await gate.screen(
+            {"current_message": "BV1xx411c7mD"},
+            "s",
+            purpose="message",
+            group=True,
+            message=unaddressed_group,
+        )
+        == "bilibili_watch"
+    )
+    assert (
+        await gate.screen(
+            {"current_message": "普通群聊文本"},
+            "s",
+            purpose="message",
+            group=True,
+            message=unaddressed_group,
+        )
+        == "chat"
+    )
     plain_group = group(message, addressed=True, attention_reason="alias")
     assert (
         await gate.screen(
             {"current_message": "BV1xx411c7mD"},
             "s",
             purpose="message",
+            group=True,
             message=plain_group,
         )
-        == "chat"
+        == "bilibili_watch"
     )
     at_group = group(message, addressed=True, attention_reason="mention", mentioned_ids=["10000"])
     assert (
@@ -482,9 +505,21 @@ async def test_source_and_output_accept_binary_noul_confidence_near_threshold(
             {"current_message": "BV1xx411c7mD"},
             "s",
             purpose="message",
+            group=True,
             message=at_group,
         )
         == "bilibili_watch"
+    )
+    case[:] = [0.10, 0.99, "should_reply"]
+    assert (
+        await gate.screen(
+            {"current_message": "BV1xx411c7mD"},
+            "s",
+            purpose="message",
+            group=True,
+            message=unaddressed_group,
+        )
+        == "ignore"
     )
 
 

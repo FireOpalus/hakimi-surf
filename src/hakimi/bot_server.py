@@ -250,11 +250,13 @@ def assemble_chat_input(
             metadata["allowed_at_qqs"] = payload["allowed_at_qqs"]
         for key in (
             "image_sources",
+            "file_sources",
+            "file_attachments",
             "context_status",
             "allowed_reply_ids",
             "web_preview_untrusted",
         ):
-            if payload.get(key):
+            if payload.get(key) and (key != "file_attachments" or not sandbox_mode):
                 metadata[key] = payload[key]
         if nearby_wire:
             metadata["nearby_group_context"] = nearby_wire
@@ -265,7 +267,7 @@ def assemble_chat_input(
             if "memes" not in prev or prev.get("memes") != meme_dig:
                 metadata["meme_labels"] = meme_list
         if not sandbox_mode:
-            for key in ("web_search_findings", "web_search_status"):
+            for key in ("file_attachments", "web_search_findings", "web_search_status"):
                 if payload.get(key):
                     metadata[key] = payload[key]
     else:
@@ -283,6 +285,7 @@ def assemble_chat_input(
             "allowed_at_qqs": payload.get("allowed_at_qqs", []) if not sandbox_mode else [],
             "current_sender": payload.get("current_sender", {}),
             "image_sources": payload.get("image_sources", []),
+            "file_sources": payload.get("file_sources", []),
             "context_status": payload.get("context_status", []),
             "nearby_group_context": raw_nearby,
             "allowed_reply_ids": payload.get("allowed_reply_ids", []),
@@ -294,7 +297,7 @@ def assemble_chat_input(
                 meme_list = list(meme_labels)
                 metadata["meme_labels"] = meme_list
                 next_meme_dig = _state_digest(meme_list)
-            for key in ("web_search_findings", "web_search_status"):
+            for key in ("file_attachments", "web_search_findings", "web_search_status"):
                 if payload.get(key):
                     metadata[key] = payload[key]
     summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
@@ -388,8 +391,21 @@ def assemble_chat_input(
     if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("nearby_group_context"):
         half = max(1, len(metadata["nearby_group_context"]) // 2)
         metadata["nearby_group_context"] = metadata["nearby_group_context"][-half:]
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("file_attachments"):
+        metadata["file_attachments"] = [
+            {**item, "content": truncate_tokens(str(item.get("content", "")), 900)}
+            for item in metadata["file_attachments"][:1]
+            if isinstance(item, dict)
+        ]
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("file_attachments"):
+        metadata["file_attachments"] = [
+            {**item, "content": truncate_tokens(str(item.get("content", "")), 350)}
+            for item in metadata["file_attachments"][:1]
+            if isinstance(item, dict)
+        ]
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         summary = ""
+        metadata.pop("file_attachments", None)
         if "image_sources" in metadata:
             metadata["image_sources"] = metadata["image_sources"][:2]
         if "nearby_group_context" in metadata:

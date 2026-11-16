@@ -450,3 +450,27 @@ async def test_real_gateway_slot_wait_rechecks_admission_before_dispatch(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await gateway.close()
+
+
+async def test_local_download_failures_keep_daily_quota_and_preserve_reasons(rig):
+    rig.downloader.error = "video_download_format"
+    first = await rig.watch.analyze(BV, material(), "subject-1", "chat")
+    assert first.mode == "text" and first.reason == "download_format"
+
+    rig.clock[0] += 1
+    rig.downloader.error = "video_download_size"
+    second = await rig.watch.analyze(BV, material(), "subject-2", "chat")
+    assert second.mode == "text" and second.reason == "download_size"
+
+    status = await rig.watch.status()
+    assert status["attempts_today"] == 0 and status["remaining_today"] == 3
+    assert [a["reason"] for a in status["recent_attempts"][:2]] == [
+        "download_size",
+        "download_format",
+    ]
+
+    rig.downloader.error = None
+    rig.gateway.video_error = "video_file_upload_failed"
+    third = await rig.watch.analyze(BV, material(), "subject-3", "chat")
+    assert third.mode == "text" and third.reason == "files_unavailable"
+    assert (await rig.watch.status())["attempts_today"] == 1

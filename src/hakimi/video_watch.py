@@ -25,13 +25,33 @@ CREATE TABLE IF NOT EXISTS video_watch_attempts (
 CREATE INDEX IF NOT EXISTS video_watch_day ON video_watch_attempts(day);
 """
 
+LOCAL_DOWNLOAD_REASONS = (
+    "download_failed",
+    "download_format",
+    "download_size",
+    "download_restricted",
+    "download_network",
+)
+DOWNLOAD_CODE_MAP = {
+    "video_download_format": "download_format",
+    "video_download_size": "download_size",
+    "video_download_restricted": "download_restricted",
+    "video_download_network_forbidden": "download_network",
+}
+LOCAL_FAILURE_SQL = (
+    "NOT (status='failed' AND reason IN ('" + "','".join(LOCAL_DOWNLOAD_REASONS) + "'))"
+)
 REASONS = {
     "disabled": "原片看片未开启",
     "daily_limit": "今日原片次数已用完",
     "too_long": "视频超过本地时长上限",
     "busy": "另一个原片任务正在处理",
     "cleanup_pending": "先前上传的文件正在等待清理",
-    "download_failed": "原片下载不可用或不符合大小／格式限制",
+    "download_failed": "原片下载暂不可用",
+    "download_format": "视频格式或分辨率不支持",
+    "download_size": "原片体积超过 80 MiB 上限",
+    "download_restricted": "视频受限或需付费解锁",
+    "download_network": "视频 CDN 地址未通过安全校验",
     "risk": "平台风控或凭证过期，已停止访问并冷却",
     "files_unavailable": "视频上传或处理暂不可用",
     "deadline": "原片处理超时",
@@ -130,7 +150,9 @@ class VideoWatch:
         async with self.store.lock:
             used = (
                 await self.store.one(
-                    "SELECT COUNT(*) FROM video_watch_attempts WHERE day=?", (self.day(),)
+                    "SELECT COUNT(*) FROM video_watch_attempts "
+                    f"WHERE day=? AND {LOCAL_FAILURE_SQL}",
+                    (self.day(),),
                 )
             )[0]
             recent = await self.store.all(
@@ -279,10 +301,18 @@ class VideoWatch:
             async with self.store.transaction():
                 count = (
                     await self.store.one(
-                        "SELECT COUNT(*) FROM video_watch_attempts WHERE day=?", (self.day(),)
+                        "SELECT COUNT(*) FROM video_watch_attempts "
+                        f"WHERE day=? AND {LOCAL_FAILURE_SQL}",
+                        (self.day(),),
                     )
                 )[0]
-                if count >= config.daily_limit:
+                total_attempts = (
+                    await self.store.one(
+                        "SELECT COUNT(*) FROM video_watch_attempts WHERE day=?",
+                        (self.day(),),
+                    )
+                )[0]
+                if count >= config.daily_limit or total_attempts >= max(config.daily_limit * 4, 12):
                     return None, "daily_limit"
                 await self.store.db.execute(
                     "INSERT INTO video_watch_attempts VALUES (?,?,?,?,'working',NULL,?,NULL,NULL)",
@@ -347,7 +377,7 @@ class VideoWatch:
                     except Rejected:
                         pass
                 elif code.startswith("video_download_"):
-                    reason = "download_failed"
+                    reason = DOWNLOAD_CODE_MAP.get(code, "download_failed")
                 elif code.startswith(("video_file_", "video_processing_")):
                     reason = "files_unavailable"
                 else:

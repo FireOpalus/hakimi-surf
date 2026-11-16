@@ -19,8 +19,9 @@ from .generation_policy import Scenario
 from .models import Message
 from .output_links import filter_reply_links
 from .proactive_policy import ProactiveConfig, minute_of_day
+from .reply_style import casual_reply
 from .roaming_logger import redact_public_summary
-from .security import Rejected
+from .security import Rejected, configured_secrets, safe_output
 
 log = logging.getLogger("hakimi")
 TEST_MESSAGE = "BOISER，这是哈基米的主动私信通路测试喵~"
@@ -461,6 +462,121 @@ class OwnerProactive:
             payload["omitted_public_summaries"] = payload.get("omitted_public_summaries", 0) + 1
         return payload
 
+    async def _companion_payload(self, now: float) -> dict:
+        local_dt = self.local(now)
+        weekday = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[local_dt.weekday()]
+        hour = local_dt.hour
+        day_phase = (
+            "早晨"
+            if hour < 10
+            else "上午"
+            if hour < 12
+            else "午休午后"
+            if hour < 14
+            else "下午摸鱼时段"
+            if hour < 18
+            else "傍晚"
+            if hour < 20
+            else "夜晚"
+        )
+        secrets = getattr(self.service, "secrets", None) or configured_secrets(self.s)
+        target_msg = self.target()
+        memory_hints: list[str] = []
+        recent_topics: list[str] = []
+        sessions = getattr(self.service, "sessions", None)
+        if sessions is not None:
+            try:
+                view = await sessions.dual.view(target_msg)
+                for entry in view.get("entries", []):
+                    if entry.get("deleted") or (entry.get("expires") and entry["expires"] <= now):
+                        continue
+                    is_hint = (
+                        entry.get("kind") == "profile"
+                        and entry.get("slot") in {"state", "preferences"}
+                    ) or entry.get("kind") == "chronicle"
+                    if not is_hint:
+                        continue
+                    topic = f"{entry.get('topic')}: " if entry.get("topic") else ""
+                    text = safe_output(f"{topic}{entry.get('text', '')}", secrets, limit=120)
+                    if text and text not in memory_hints:
+                        memory_hints.append(text)
+                    if len(memory_hints) >= 4:
+                        break
+            except Exception:
+                pass
+            try:
+                snap = await sessions.snapshot(target_msg)
+                for item in reversed(snap.get("recent_messages", [])[-8:]):
+                    if item.get("role") != "user":
+                        continue
+                    created = item.get("created_at")
+                    if (
+                        isinstance(created, (int, float))
+                        and not isinstance(created, bool)
+                        and created > 0
+                        and created < now - 172800
+                    ):
+                        continue
+                    raw_text = str(item.get("text", "")).strip()
+                    if not raw_text or raw_text.startswith(("[协议事件", "/")):
+                        continue
+                    cleaned = safe_output(raw_text, secrets, limit=100)
+                    if cleaned and cleaned not in recent_topics:
+                        recent_topics.append(cleaned)
+                    if len(recent_topics) >= 2:
+                        break
+            except Exception:
+                pass
+        bili_finds: list[dict] = []
+        try:
+            async with self.store.lock:
+                has_bili = await self.store.one(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bili_watched_history'"
+                )
+                rows = (
+                    await self.store.all(
+                        "SELECT bvid,summary FROM bili_watched_history "
+                        "WHERE status='done' AND summary IS NOT NULL AND created>=? "
+                        "ORDER BY created DESC LIMIT 2",
+                        (now - 172800,),
+                    )
+                    if has_bili
+                    else []
+                )
+            for bvid, sealed in rows:
+                gist = redact_public_summary(
+                    safe_output(
+                        self.store.vault.open("bili-learn:" + bvid, sealed), secrets, limit=150
+                    )
+                )
+                if gist:
+                    bili_finds.append({"bvid": bvid, "gist": gist})
+        except Exception:
+            pass
+        topics = ["结合星期与时段自然打个招呼", "一句不催促的摸鱼问候"]
+        if memory_hints or recent_topics:
+            topics.append("顺口挂念一下近期聊到的话题或状态")
+        if bili_finds:
+            topics.append("顺手分享刚在 B 站刷到的有趣内容")
+        payload: dict = {
+            "task": "one_short_companion_greeting",
+            "local_time": local_dt.strftime("%H:%M"),
+            "weekday": weekday,
+            "day_phase": day_phase,
+            "topic": self.rng.choice(topics),
+        }
+        if memory_hints:
+            payload["owner_memory_hints"] = memory_hints
+        if recent_topics:
+            payload["recent_private_topics"] = recent_topics
+        if bili_finds:
+            payload["recent_bili_finds"] = bili_finds
+        for key in ("recent_private_topics", "owner_memory_hints", "recent_bili_finds"):
+            if len(untrusted_input(payload).encode()) <= self.s.max_context_bytes:
+                break
+            payload.pop(key, None)
+        return payload
+
     async def generate_slot(self, slot_id, *, manual=False):
         daily_longnick = None
         now = self.clock()
@@ -486,15 +602,7 @@ class OwnerProactive:
         try:
             digest = row["kind"] == "digest"
             payload = (
-                await self._public_digest(now)
-                if digest
-                else {
-                    "task": "one_short_companion_greeting",
-                    "local_time": self.local(now).strftime("%H:%M"),
-                    "topic": self.rng.choice(
-                        ["轻松打个招呼", "分享一个猫猫伸懒腰的小动作", "一句不催促的摸鱼问候"]
-                    ),
-                }
+                await self._public_digest(now) if digest else await self._companion_payload(now)
             )
             subject = self.store.subject(self.target())
             await self.service.ai.screen(
@@ -518,7 +626,7 @@ class OwnerProactive:
                 except (ValueError, TypeError):
                     pass  # A malformed optional signature must not suppress the digest.
             generated = filter_reply_links(self.service.output(generated), public=False)
-            text = generated[: 250 if digest else 80]
+            text = generated[:250] if digest else casual_reply(generated)[:120]
             if digest:
                 cost = payload["approximate_api_usd_including_reservations"]
                 text = (

@@ -1,6 +1,6 @@
 """Hot-configurable runtime rate limits, send delays, output caps, and patrol limits."""
 
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -75,3 +75,12 @@ class ImageLimitsConfig(_LimitsBase):
         if self.image_tall_max_edge < self.image_standard_max_edge:
             raise ValueError("image_tall_max_edge must be >= image_standard_max_edge")
         return self
+
+
+class ContentToolsConfig(_LimitsBase):
+    """Hot-configurable text/code file reader limits and rich Markdown card mode."""
+
+    file_read_enabled: StrictBool = True
+    file_max_bytes: StrictInt = Field(default=131_072, ge=16_384, le=262_144)
+    file_daily_limit_per_user: StrictInt = Field(default=15, ge=0, le=100)
+    text_card_mode: Literal["rich_auto", "fallback_only"] = "rich_auto"

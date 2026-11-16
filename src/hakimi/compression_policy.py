@@ -53,6 +53,7 @@ class CompressionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     enabled: bool = True
+    history_high_tokens: int = Field(default=14000, ge=1000, le=40000)
     group: GroupWindowPolicy = Field(default_factory=GroupWindowPolicy)
     private: WindowPolicy = Field(default_factory=WindowPolicy)
 
@@ -63,6 +64,7 @@ class CompressionConfig(BaseModel):
     def from_settings(cls, settings):
         return cls(
             enabled=settings.compression_enabled,
+            history_high_tokens=settings.history_high_tokens,
             group=GroupWindowPolicy(
                 messages=settings.group_compression_messages,
                 chars=settings.group_compression_chars,

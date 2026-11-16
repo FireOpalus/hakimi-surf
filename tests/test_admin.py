@@ -420,7 +420,7 @@ async def test_sandbox_bilibili_and_owner_deep_use_actual_scenarios(admin_api):
         },
     )
     assert response.status_code == 200, response.text
-    assert gateway.calls[-1][3]["scenario"] == "fast_chat"
+    assert gateway.calls[-1][3]["scenario"] == "bilibili_summary"
     response = await client.post(
         "/admin/api/sandbox",
         json={"identity": "OWNER", "scene": "private", "text": "/deep 解释一下并发问题"},

@@ -19,6 +19,8 @@ def direct_attention(kind, *, mentioned=False, text="", has_video=False):
         return "private"
     if mentioned:
         return "mention"
+    if re.match(r"^/(?:存表情|偷表情|save-meme|哈基米\s+(?:存表情|偷表情))(?:\s|$)", text.strip()):
+        return "command"
     if any(alias in text for alias in WAKE_WORDS):
         return "alias"
     return ""
@@ -35,9 +37,7 @@ def can_watch_video(message, members=()) -> bool:
     """Return whether incoming message or batch is allowed to trigger video watching."""
     if message is None:
         return True
-    if message.kind == "private":
-        return True
-    return _explicit_at(message) or any(_explicit_at(m) for m in members)
+    return message.kind in {"private", "group"}
 
 
 class AttentionRouter:

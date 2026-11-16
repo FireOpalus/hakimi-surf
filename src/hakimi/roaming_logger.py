@@ -1,4 +1,4 @@
-"""A diary of public patrols and coarse group activity, never a chat-memory reader."""
+"""A diary of public patrols and allowlisted group/private chats."""
 
 import asyncio
 import hashlib
@@ -9,17 +9,19 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from .bot_server import is_persona_owner
 from .config import Settings
 from .drive_client import FolderDrive
 from .gemini import GeminiGateway
 from .generation_policy import Scenario
 from .models import Message
-from .security import Rejected, clean_text, configured_secrets, safe_output
+from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
 from .store import Store
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS roaming_events (
-  id TEXT PRIMARY KEY, day TEXT NOT NULL, payload BLOB NOT NULL
+  id TEXT PRIMARY KEY, day TEXT NOT NULL, payload BLOB NOT NULL,
+  event_kind TEXT NOT NULL DEFAULT 'patrol'
 );
 CREATE INDEX IF NOT EXISTS roaming_events_day ON roaming_events(day);
 CREATE TABLE IF NOT EXISTS roaming_receipts (id TEXT PRIMARY KEY, day TEXT NOT NULL);
@@ -39,7 +41,9 @@ GROUP_TEXT = {
     "group_chat": "群友与哈基米聊了聊日常话题",
     "group_image": "群友发来图片，一起进行图片交流",
     "group_bilibili": "群友分享了 B 站公开内容",
+    "private_chat": "私聊日常交流",
 }
+_MARKDOWN_SAFE = str.maketrans({"<": "＜", ">": "＞", "[": "［", "]": "］", "`": "｀", "!": "！"})
 
 
 def redact_public_summary(text: str) -> str:
@@ -50,9 +54,23 @@ def redact_public_summary(text: str) -> str:
     text = re.sub(r"@[\w\u4e00-\u9fff-]+", "[称呼已隐去]", text)
     # Diaries are plain Markdown; disable HTML, images, links from external text and fences.
     text = re.sub(r"https?://\S+", "[链接省略]", text)
-    return text.translate(
-        str.maketrans({"<": "＜", ">": "＞", "[": "［", "]": "］", "`": "｀", "!": "！"})
-    )
+    return text.translate(_MARKDOWN_SAFE)
+
+
+def format_chat_entry(
+    text: str, secrets: list[str], *, limit: int = 1200, scrub_secrets: bool = False
+) -> str:
+    """Sanitize chat/summary text for Drive Markdown without stripping speakers."""
+    cleaned = clean_text(text)
+    if scrub_secrets:
+        candidates = {
+            val for s in secrets if s and len(s) >= 8 for val in (s, clean_text(s)) if len(val) >= 8
+        }
+        for secret in sorted(candidates, key=len, reverse=True):
+            if secret in cleaned:
+                cleaned = cleaned.replace(secret, "[密钥已隐去]")
+    cleaned = safe_output(cleaned, secrets, limit=limit)
+    return cleaned.translate(_MARKDOWN_SAFE)
 
 
 class RoamingLogger:
@@ -78,11 +96,27 @@ class RoamingLogger:
                     await self.store.db.execute(
                         f"ALTER TABLE roaming_sync ADD COLUMN {name} {kind}"
                     )
+            event_cols = {
+                row[1] for row in await self.store.all("PRAGMA table_info(roaming_events)")
+            }
+            if "event_kind" not in event_cols:
+                await self.store.db.execute(
+                    "ALTER TABLE roaming_events "
+                    "ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'patrol'"
+                )
 
     def local(self, now: float | None = None) -> datetime:
         return datetime.fromtimestamp(time.time() if now is None else now, self.zone)
 
-    async def _record(self, event_id: str, kind: str, text: str | None = None, now=None):
+    async def _record(
+        self,
+        event_id: str,
+        kind: str,
+        text: str | None = None,
+        *,
+        event_kind: str = "patrol",
+        now=None,
+    ):
         if not self.s.roaming_enabled:
             return
         day = self.local(now).date().isoformat()
@@ -97,8 +131,8 @@ class RoamingLogger:
                 )
                 if count[0] < self.s.roaming_max_events_per_day:
                     await self.store.db.execute(
-                        "INSERT INTO roaming_events VALUES (?,?,?)",
-                        (key, day, self.store.vault.seal(key, text)),
+                        "INSERT INTO roaming_events(id,day,payload,event_kind) VALUES (?,?,?,?)",
+                        (key, day, self.store.vault.seal(key, text), event_kind),
                     )
                 else:
                     kind = "patrol_omitted"
@@ -116,34 +150,94 @@ class RoamingLogger:
         await self._record(event_id, "injection", now=now)
 
     async def patrol(self, event_id: str, public_summary: str, *, now=None):
-        await self._record(event_id, "patrol", redact_public_summary(public_summary), now=now)
-
-    async def group(self, event_id: str, message: Message, *, now=None):
-        if (
-            message.kind != "group"
-            or f"{message.platform}:{message.conversation_id}" not in self.s.roaming_group_ids
-        ):
-            return
-        kind = (
-            "group_bilibili"
-            if message.video_ids or message.short_urls
-            else "group_image"
-            if message.images
-            else "group_chat"
+        await self._record(
+            event_id, "patrol", redact_public_summary(public_summary), event_kind="patrol", now=now
         )
-        # Deliberately aggregate templates, not quotations or LLM anonymization guesses.
-        await self._record(event_id, kind, now=now)
+
+    def _chat_scope_label(self, message: Message) -> tuple[str, str]:
+        if message.kind == "group":
+            name = getattr(message, "group_name", "") or message.conversation_id
+            return "chat_group", f"群聊 {name}"
+        if is_persona_owner(message, self.s):
+            return "chat_private", "私聊 · BOISER"
+        label = message.sender_nickname or message.user_id
+        return "chat_private", f"私聊 · {label}"
+
+    async def group(
+        self, event_id: str, message: Message, *, members: list[Message] | None = None, now=None
+    ):
+        if not authorize(message.model_copy(update={"addressed": True}), self.s):
+            return
+        if message.kind == "group":
+            kind = (
+                "group_bilibili"
+                if message.video_ids or message.short_urls
+                else "group_image"
+                if message.images
+                else "group_chat"
+            )
+        else:
+            kind = "private_chat"
+        event_kind, scope_label = self._chat_scope_label(message)
+        ts = self.local(now if now is not None else message.created_at).strftime("%H:%M")
+        lines = []
+        for item in (members or [message])[:8]:
+            speaker = (
+                "BOISER"
+                if is_persona_owner(item, self.s)
+                else (item.sender_nickname or item.user_id)
+            )
+            body = str(item.text or "").strip()
+            if item.images and "[附图]" not in body:
+                body = f"{body} [附图]".strip()
+            if body:
+                lines.append(f"[{ts} · {scope_label}] {speaker}：{body}")
+        text = None
+        if lines:
+            try:
+                text = format_chat_entry(
+                    "\n".join(lines), configured_secrets(self.s), scrub_secrets=True
+                )
+            except Rejected:
+                text = None
+        await self._record(event_id, kind, text, event_kind=event_kind, now=now)
+
+    async def bot_reply(self, reply_id: str, message: Message, text: str, *, now=None):
+        if not text or not text.strip():
+            return
+        if not authorize(message.model_copy(update={"addressed": True}), self.s):
+            return
+        event_kind, scope_label = self._chat_scope_label(message)
+        ts = self.local(now).strftime("%H:%M")
+        raw = f"[{ts} · {scope_label}] 哈基米：{text.strip()}"
+        try:
+            formatted = format_chat_entry(raw, configured_secrets(self.s))
+        except Rejected:
+            return
+        await self._record(
+            "reply:" + reply_id, "bot_reply", formatted, event_kind=event_kind, now=now
+        )
 
     def _summary_input(self, day: str, counts: dict, rows: list) -> dict:
-        # Only diary tables feed this payload; no Session, private message, user or group IDs.
+        patrol_rows = [
+            r
+            for r in rows
+            if ("event_kind" not in r.keys() or (r["event_kind"] or "patrol") == "patrol")
+        ]
+        chat_rows = [
+            r
+            for r in rows
+            if "event_kind" in r.keys() and (r["event_kind"] or "patrol") != "patrol"
+        ]
         payload = {
             "day": day,
             "group_activity": {label: counts.get(kind, 0) for kind, label in GROUP_TEXT.items()},
             "injection_attempts": counts.get("injection", 0),
             "public_summaries": [],
-            "omitted_public_summaries": counts.get("patrol_omitted", 0) + len(rows),
+            "chat_excerpts": [],
+            "omitted_public_summaries": counts.get("patrol_omitted", 0) + len(patrol_rows),
         }
-        for row in reversed(rows[-20:]):
+        for row in reversed(patrol_rows[-20:]):
             excerpt = self.store.vault.open(row["id"], row["payload"])[:500]
             payload["public_summaries"].append(excerpt)
             payload["omitted_public_summaries"] -= 1
@@ -151,7 +245,14 @@ class RoamingLogger:
                 payload["public_summaries"].pop()
                 payload["omitted_public_summaries"] += 1
                 break
+        for row in reversed(chat_rows[-25:]):
+            excerpt = self.store.vault.open(row["id"], row["payload"])[:400]
+            payload["chat_excerpts"].append(excerpt)
+            if len(json.dumps(payload, ensure_ascii=False).encode()) > self.s.max_context_bytes:
+                payload["chat_excerpts"].pop()
+                break
         payload["public_summaries"].reverse()
+        payload["chat_excerpts"].reverse()
         return payload
 
     async def _daily_summary(self, day: str, now: float):
@@ -165,7 +266,8 @@ class RoamingLogger:
                 await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
             )
             rows = await self.store.all(
-                "SELECT id,payload FROM roaming_events WHERE day=? ORDER BY rowid", (day,)
+                "SELECT id,payload,event_kind FROM roaming_events WHERE day=? ORDER BY rowid",
+                (day,),
             )
             if not counts and not rows:
                 return
@@ -182,7 +284,7 @@ class RoamingLogger:
             generated = await self.gateway.generate(
                 payload, subject, scenario=Scenario.DAILY_DIARY, budget_lane="patrol"
             )
-            summary = redact_public_summary(safe_output(generated, configured_secrets(self.s)))
+            summary = format_chat_entry(generated, configured_secrets(self.s), limit=3000)
         except asyncio.CancelledError:
             # Keep attempted on cancellation/restart; do not repeat ambiguous paid work.
             raise
@@ -207,8 +309,11 @@ class RoamingLogger:
                 await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
             )
             rows = await self.store.all(
-                "SELECT id,payload FROM roaming_events WHERE day=? ORDER BY rowid", (day,)
+                "SELECT id,payload,event_kind FROM roaming_events WHERE day=? ORDER BY rowid",
+                (day,),
             )
+        patrol_rows = [r for r in rows if (r["event_kind"] or "patrol") == "patrol"]
+        chat_rows = [r for r in rows if (r["event_kind"] or "patrol") != "patrol"]
         lines = [
             f"# 分身巡逻日记 · {day}",
             "",
@@ -221,36 +326,45 @@ class RoamingLogger:
         ]
         omitted = counts.get("patrol_omitted", 0)
         used_bytes = 0
-        if rows:
-            for index, row in enumerate(rows):
+        if patrol_rows:
+            for index, row in enumerate(patrol_rows):
                 summary = self.store.vault.open(row["id"], row["payload"])
                 quoted = ["> " + line for line in summary.splitlines()]
                 used_bytes += len("\n".join(quoted).encode()) + 2
                 if used_bytes > 196608:
-                    omitted += len(rows) - index
+                    omitted += len(patrol_rows) - index
                     break
                 lines += quoted
                 lines.append("")
         else:
             lines += ["今天暂无新的公开内容摘要。", ""]
-        if omitted:
-            lines += [f"另有 {omitted} 条摘要因日记长度限制省略。", ""]
-        lines += ["## 群聊趣事（脱敏活动摘要）", ""]
+        lines += ["## 白名单聊天记录（群聊与私聊）", ""]
         activities = [
             f"- {text}：{counts[kind]} 次。"
             for kind, text in GROUP_TEXT.items()
             if counts.get(kind)
         ]
-        lines += activities or ["今天暂无获准记录的群聊活动。"]
+        if activities:
+            lines += activities
+            lines.append("")
+        if chat_rows:
+            for index, row in enumerate(chat_rows):
+                entry = self.store.vault.open(row["id"], row["payload"])
+                quoted = ["> " + line for line in entry.splitlines()]
+                used_bytes += len("\n".join(quoted).encode()) + 2
+                if used_bytes > 196608:
+                    omitted += len(chat_rows) - index
+                    break
+                lines += quoted
+                lines.append("")
+        elif not activities:
+            lines += ["今天暂无白名单聊天记录。", ""]
+        if omitted:
+            lines += [f"另有 {omitted} 条记录因日记长度限制省略。", ""]
         lines += [
-            "",
-            "仅记录活动类别和次数，不记录群号、成员身份、原话或图片。",
-            "",
             "## 安全拦截",
             "",
             f"检测到的提示词注入试探：{counts.get('injection', 0)} 次。",
-            "",
-            "私聊内容和 Session 记忆不进入日记。",
             "",
         ]
         async with self.store.lock:
@@ -262,9 +376,9 @@ class RoamingLogger:
                 text = self.store.vault.open(key, summary["payload"])
                 lines += ["> " + line for line in text.splitlines()]
                 snapshot = self.local(summary["created"]).strftime("%Y-%m-%d %H:%M")
-                lines += ["", f"基于 {snapshot} 的脱敏数据快照；后续记录见上方明细。", ""]
+                lines += ["", f"基于 {snapshot} 的日志快照；后续记录见上方明细。", ""]
             else:
-                lines += ["当日模型总结未完成；以上保留已记录的脱敏数据。", ""]
+                lines += ["当日模型总结未完成；以上保留已记录的日志明细。", ""]
         return "\n".join(lines)
 
     async def sync_due(self, *, now: float | None = None, force=False):

@@ -400,12 +400,14 @@ class ImageLoader:
                         raise Rejected("image_too_large")
             return bytes(raw)
 
-    async def _one(self, client, ref):
-        if ref.file_size and ref.file_size > min(self.s.image_max_bytes, MAX_IMAGE_BYTES):
+    async def _fetch_raw_with_client(self, client, ref, *, maximum: int) -> bytes:
+        if ref.file_size and ref.file_size > maximum:
             raise Rejected("image_too_large")
         raw, refreshed = await self._napcat(ref)
         if raw is not None:
-            return await self.normalize(raw)
+            if len(raw) > maximum:
+                raise Rejected("image_too_large")
+            return raw
         # Prefer a freshly resolved CDN URL, otherwise use the authenticated event's URL.
         url = next(iter(refreshed), ref.url)
         if not url:
@@ -423,6 +425,18 @@ class ImageLoader:
             raw = await self._http_one(
                 client, "http://" + url.removeprefix("https://"), allow_http=True
             )
+        if len(raw) > maximum:
+            raise Rejected("image_too_large")
+        return raw
+
+    async def fetch_raw(self, ref: ImageRef, *, max_bytes: int | None = None) -> bytes:
+        limit = min(max_bytes or MAX_IMAGE_BYTES, self.s.image_max_bytes, MAX_IMAGE_BYTES)
+        async with self.download_slots, self._client() as client:
+            return await self._fetch_raw_with_client(client, ref, maximum=limit)
+
+    async def _one(self, client, ref):
+        maximum = min(self.s.image_max_bytes, MAX_IMAGE_BYTES)
+        raw = await self._fetch_raw_with_client(client, ref, maximum=maximum)
         return await self.normalize(raw)
 
     async def normalize(self, raw):

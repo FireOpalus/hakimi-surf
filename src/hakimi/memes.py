@@ -25,6 +25,7 @@ MAX_PIXELS = 16_000_000
 LABEL = re.compile(r"[A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff]{1,24}\Z")
 IDENTIFIER = re.compile(r"[a-f0-9]{32}\Z")
 EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
+ALLOWED_MEME_MIMES = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meme_variants (
  id TEXT PRIMARY KEY, label TEXT NOT NULL, filename TEXT UNIQUE NOT NULL,
@@ -49,6 +50,12 @@ CREATE TABLE IF NOT EXISTS meme_reply_reservations (
  reply_id TEXT PRIMARY KEY, created REAL NOT NULL
 );
 """
+
+
+def validate_meme_label(label: str) -> str:
+    if not isinstance(label, str) or not LABEL.fullmatch(label.strip()):
+        raise Rejected("invalid_meme_label")
+    return label.strip()
 
 
 def label_from_filename(filename: str) -> str:
@@ -77,6 +84,9 @@ class NormalizedMeme:
     width: int
     height: int
     was_animated: bool
+    mime_type: str = "image/jpeg"
+    extension: str = ".jpg"
+    first_frame_only: bool = False
 
 
 def normalize_meme(raw: bytes) -> NormalizedMeme:
@@ -91,9 +101,68 @@ def normalize_meme(raw: bytes) -> NormalizedMeme:
                 if not 0 < source.width * source.height <= MAX_PIXELS:
                     raise Rejected("meme_image_dimensions")
                 animated = bool(getattr(source, "is_animated", False))
+                n_frames = int(getattr(source, "n_frames", 1))
+                if animated and n_frames > 1:
+                    frames, durations = [], []
+                    for idx in range(min(n_frames, 60)):
+                        source.seek(idx)
+                        rgba = source.convert("RGBA")
+                        rgba.thumbnail((512, 512))
+                        alpha = rgba.getchannel("A")
+                        if alpha.getextrema()[0] < 255:
+                            rgb = Image.new("RGB", rgba.size, "white")
+                            rgb.paste(rgba, mask=alpha)
+                            pal = rgb.quantize(colors=255)
+                            mask = Image.eval(alpha, lambda a: 255 if a <= 128 else 0)
+                            pal.paste(255, mask)
+                            pal.info["transparency"] = 255
+                        else:
+                            pal = rgba.convert("RGB").quantize(colors=256)
+                        frames.append(pal)
+                        durations.append(
+                            max(20, min(int(source.info.get("duration", 80) or 80), 5000))
+                        )
+                    gif_buf = io.BytesIO()
+                    frames[0].save(
+                        gif_buf,
+                        format="GIF",
+                        save_all=True,
+                        append_images=frames[1:],
+                        duration=durations,
+                        loop=0,
+                        disposal=2,
+                    )
+                    gif_data = gif_buf.getvalue()
+                    if len(gif_data) <= MAX_UPLOAD_BYTES:
+                        return NormalizedMeme(
+                            gif_data,
+                            frames[0].width,
+                            frames[0].height,
+                            True,
+                            "image/gif",
+                            ".gif",
+                            False,
+                        )
                 source.seek(0)
                 source.load()
                 oriented = ImageOps.exif_transpose(source).convert("RGBA")
+                has_alpha = not animated and oriented.getchannel("A").getextrema()[0] < 255
+                if has_alpha:
+                    oriented.thumbnail((512, 512))
+                    clean_rgba = Image.frombytes("RGBA", oriented.size, oriented.tobytes())
+                    png_buf = io.BytesIO()
+                    clean_rgba.save(png_buf, format="PNG", optimize=True)
+                    png_data = png_buf.getvalue()
+                    if len(png_data) <= MAX_UPLOAD_BYTES:
+                        return NormalizedMeme(
+                            png_data,
+                            clean_rgba.width,
+                            clean_rgba.height,
+                            False,
+                            "image/png",
+                            ".png",
+                            False,
+                        )
                 oriented.thumbnail((1024, 1024))
                 image = Image.new("RGB", oriented.size, "white")
                 image.paste(oriented, mask=oriented.getchannel("A"))
@@ -102,7 +171,9 @@ def normalize_meme(raw: bytes) -> NormalizedMeme:
                 data = target.getvalue()
                 if len(data) > MAX_UPLOAD_BYTES:
                     raise Rejected("meme_upload_too_large")
-                return NormalizedMeme(data, image.width, image.height, animated)
+                return NormalizedMeme(
+                    data, image.width, image.height, animated, "image/jpeg", ".jpg", animated
+                )
     except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
         raise Rejected("invalid_meme_image") from None
 
@@ -135,13 +206,14 @@ class MemeLibrary:
 
     @staticmethod
     def _valid_entry(row):
+        ext = ALLOWED_MEME_MIMES.get(row["mime_type"])
         return (
             isinstance(row["id"], str)
             and IDENTIFIER.fullmatch(row["id"])
             and isinstance(row["label"], str)
             and LABEL.fullmatch(row["label"])
-            and row["filename"] == row["id"] + ".jpg"
-            and row["mime_type"] == "image/jpeg"
+            and ext is not None
+            and row["filename"] == row["id"] + ext
             and re.fullmatch(r"[a-f0-9]{64}", row["digest"])
             and 0 < row["byte_size"] <= MAX_UPLOAD_BYTES
         )
@@ -239,8 +311,8 @@ class MemeLibrary:
             except FileNotFoundError:
                 pass
 
-    async def upload(self, filename: str, raw: bytes):
-        label = label_from_filename(filename)
+    async def upload(self, filename: str, raw: bytes, *, label: str | None = None):
+        label = validate_meme_label(label) if label is not None else label_from_filename(filename)
         async with self.decode_slots:
             normalized = await asyncio.to_thread(normalize_meme, raw)
         await self.initialize()
@@ -258,8 +330,8 @@ class MemeLibrary:
             entry = {
                 "id": key,
                 "label": label,
-                "filename": key + ".jpg",
-                "mime_type": "image/jpeg",
+                "filename": key + normalized.extension,
+                "mime_type": normalized.mime_type,
                 "digest": hashlib.sha256(normalized.data).hexdigest(),
                 "byte_size": len(normalized.data),
                 "width": normalized.width,
@@ -292,7 +364,11 @@ class MemeLibrary:
                 )
             self.source_hashes[source_digest] = label
             self._refresh_prompt()
-            return {**self._public(entry), "first_frame_only": normalized.was_animated}
+            return {**self._public(entry), "first_frame_only": normalized.first_frame_only}
+
+    async def upload_bytes(self, label: str, raw: bytes) -> dict:
+        clean = validate_meme_label(label)
+        return await self.upload(f"{clean}.jpg", raw, label=clean)
 
     def _read(self, entry):
         with self._directory() as directory:
@@ -325,7 +401,7 @@ class MemeLibrary:
             if entry is None:
                 raise Rejected("meme_not_found")
             try:
-                return await asyncio.to_thread(self._read, entry), "image/jpeg"
+                return await asyncio.to_thread(self._read, entry), entry["mime_type"]
             except (OSError, Rejected):
                 raise Rejected("meme_file_unavailable") from None
 
@@ -343,8 +419,10 @@ class MemeLibrary:
                 return None
             return "base64://" + base64.b64encode(raw).decode("ascii")
 
-    async def reserve_reply(self, scope: str, reply_id: str, tag: str | None) -> bool:
-        """Count public replies once; at most one meme attempt per four replies in a scope."""
+    async def reserve_reply(
+        self, scope: str, reply_id: str, tag: str | None, *, public: bool = True
+    ) -> bool:
+        """Count public replies once; throttle memes in public chats, allow freely in owner DM."""
         await self.initialize()
         scope_key = self.store.vault.digest("meme-frequency", scope)
         reply_key = self.store.vault.digest("meme-reply", scope, reply_id)
@@ -368,7 +446,7 @@ class MemeLibrary:
                 allowed = (
                     isinstance(tag, str)
                     and tag in self._entries
-                    and (count - row["last_meme_reply"] >= 4)
+                    and (not public or count - row["last_meme_reply"] >= 4)
                 )
                 await self.store.db.execute(
                     "UPDATE meme_reply_frequency SET replies=?,last_meme_reply=? WHERE scope=?",
@@ -421,11 +499,14 @@ class MemeLibrary:
                     (scope_key,),
                 )
             used = {r[0] for r in recent}
-            entries = [
+            pool = [
                 e
                 for e in [*self._entries.values(), *self._variants.values()]
-                if e["label"] == label and e["digest"] not in used
+                if e["label"] == label
             ]
+            fresh = [e for e in pool if e["digest"] not in used]
+            last_digest = recent[0][0] if recent else None
+            entries = fresh or [e for e in pool if e["digest"] != last_digest] or pool
             for entry in entries:
                 try:
                     raw = await asyncio.to_thread(self._read, entry)

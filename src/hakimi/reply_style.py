@@ -43,3 +43,8 @@ def public_reply(text: str) -> str:
     for index in range(0, len(pieces), 2):
         pieces[index] = _normalize_prose(pieces[index])
     return clean_chinese_punctuation("".join(pieces).strip(), public=True)
+
+
+def casual_reply(text: str) -> str:
+    """Format short casual private replies without stiff trailing single-sentence period."""
+    return public_reply(text)

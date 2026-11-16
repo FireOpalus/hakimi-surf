@@ -30,6 +30,13 @@ def annotate_images(images, uid, name, origin):
     ]
 
 
+def annotate_files(files, uid, name, origin):
+    return [
+        ref.model_copy(update={"sender_id": uid, "sender_nickname": name, "origin": origin})
+        for ref in files
+    ]
+
+
 class MessageContextResolver:
     def __init__(self, settings, transport, lookup: Lookup | None = None):
         self.s, self.transport, self.lookup = settings, transport, lookup
@@ -75,6 +82,7 @@ class MessageContextResolver:
                 "command_text": "",
                 "reply_ids": rich.reply_ids,
                 "images": rich.images,
+                "files": rich.files,
                 "video_ids": rich.video_ids,
                 "short_urls": rich.short_urls,
                 "forward_ids": rich.forward_ids,
@@ -99,6 +107,7 @@ class MessageContextResolver:
         images = annotate_images(
             message.images, message.user_id, message.sender_nickname, "当前消息"
         )
+        files = annotate_files(message.files, message.user_id, message.sender_nickname, "当前消息")
         videos, shorts, forwards = list(message.video_ids), list(message.short_urls), []
 
         def append_text(block):
@@ -112,6 +121,7 @@ class MessageContextResolver:
         def merge(rich):
             for target, values, cap, key in (
                 (images, rich.images, 2, lambda x: x.identity),
+                (files, rich.files, 2, lambda x: x.identity),
                 (videos, rich.video_ids, 5, lambda x: x),
                 (shorts, rich.short_urls, 5, lambda x: x),
             ):
@@ -139,6 +149,7 @@ class MessageContextResolver:
                 merge(
                     RichMessage(
                         images=annotate_images(original.images, original.user_id, name, "引用消息"),
+                        files=annotate_files(original.files, original.user_id, name, "引用消息"),
                         video_ids=original.video_ids,
                         short_urls=original.short_urls,
                     )
@@ -163,6 +174,7 @@ class MessageContextResolver:
             update={
                 "text": text,
                 "images": images[:2],
+                "files": files[:2],
                 "video_ids": videos[:5],
                 "short_urls": shorts[:5],
                 "forward_ids": [],

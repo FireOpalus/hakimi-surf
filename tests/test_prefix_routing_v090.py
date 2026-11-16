@@ -247,6 +247,7 @@ async def insert_messages(sessions, msg, n, width):
 
 
 async def test_28k_history_half_fold_atomic_persisted_and_compressed(settings, store, message):
+    settings.history_high_tokens = 28000
     sessions = SessionManager(settings, store)
     await insert_messages(sessions, message, 14, 2800)
     before = await sessions.snapshot(message)
@@ -529,7 +530,7 @@ async def test_admin_auto_is_restricted_to_chat_and_persisted(admin_api):
     assert good.status_code == 200 and good.json()["source"] == "sqlite"
     compression = (await client.get("/admin/api/compression")).json()
     assert compression["history_strategy"] == "prefix_half"
-    assert compression["history_high_tokens_estimate"] == 28000
+    assert compression["history_high_tokens_estimate"] == 14000
 
 
 async def test_model_accounting_double_open_does_not_duplicate_legacy_amounts(settings, message):
@@ -756,3 +757,26 @@ async def test_thinking_tier_switch_tracks_thinking_usage_without_prefix_bust(
     summary = {r["thinking_level"]: r["calls"] for r in today["thinking_summary"]}
     assert summary["low"] == 2
     assert summary["medium"] == 1
+
+
+async def test_default_14k_history_half_fold_and_admin_hot_override(admin_api, message):
+    app, client, _ = admin_api
+    initial = (await client.get("/admin/api/compression")).json()
+    assert initial["config"]["history_high_tokens"] == 14000
+    assert initial["history_high_tokens_estimate"] == 14000
+
+    config = dict(initial["config"], history_high_tokens=3000)
+    updated = await client.put("/admin/api/compression", json=config)
+    assert updated.status_code == 200
+    assert updated.json()["source"] == "admin"
+    assert updated.json()["history_high_tokens_estimate"] == 3000
+
+    svc = app.state.service
+    await insert_messages(svc.sessions, message, 4, 2200)
+    snap = await svc.sessions.snapshot(message)
+    assert snap["history_revision"] == 1 and len(snap["recent_messages"]) == 2
+
+    reset = await client.delete("/admin/api/compression")
+    assert reset.status_code == 200
+    assert reset.json()["source"] == "env"
+    assert reset.json()["history_high_tokens_estimate"] == 14000

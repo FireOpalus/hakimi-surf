@@ -198,11 +198,13 @@ async def test_sdk_search_v1_isolated_tool_usage_and_source_gate(settings, store
     assert "previous_interaction_id" not in data and "history" not in data["input"]
     assert requests[1][0] == "/v1beta/decisions"
     row = await store.one("SELECT * FROM ledger WHERE lane='search' ORDER BY rowid LIMIT 1")
-    assert row["amount"] == 28468  # two paid queries + 40 cached / 60 uncached + 50 output/thought
+    assert row["amount"] == 0 and row["reserved"] == 0
     usage = await store.one("SELECT * FROM ledger_usage WHERE id=?", (row["id"],))
-    assert usage["estimated_amount"] == 28468
+    assert usage["estimated_amount"] == 0
     assert usage["model_lane"] == "hydrogen" and usage["cached_tokens"] == 40
-    assert (await store.runtime.web_search.status())["today"]["queries"] == 2
+    status = await store.runtime.web_search.status()
+    assert status["today"]["queries"] == 2 and status["today"]["tool_amount"] == 0
+    assert (await store.one("SELECT amount FROM budget_totals"))[0] == 0
 
 
 async def test_lookup_is_not_bili_without_bvid(settings, store, message, sdk_pair):
@@ -217,12 +219,12 @@ async def test_lookup_is_not_bili_without_bvid(settings, store, message, sdk_pai
     assert route == "chat" and route.need_external_lookup
 
 
-@pytest.mark.parametrize("reason", ["disabled", "limit", "budget"])
+@pytest.mark.parametrize("reason", ["disabled", "limit", "monthly_unconfigured"])
 async def test_search_blocked_locally_has_zero_provider_calls(settings, store, sdk_pair, reason):
-    if reason != "disabled":
-        await enable_search(
-            store, **({"daily_limit": 0} if reason == "limit" else {"daily_usd": Decimal(0)})
-        )
+    if reason == "limit":
+        await enable_search(store, daily_limit=0)
+    elif reason == "monthly_unconfigured":
+        await enable_search(store, monthly_google_limit=0)
     calls = []
     gateway = GeminiGateway(settings, store, *sdk_pair(lambda r: calls.append(r)))
     with pytest.raises(Rejected):
@@ -230,7 +232,7 @@ async def test_search_blocked_locally_has_zero_provider_calls(settings, store, s
     assert not calls and not await store.all("SELECT * FROM ledger")
 
 
-async def test_search_unknown_fee_keeps_reserve_and_attribution(settings, store, sdk_pair):
+async def test_search_unknown_fee_keeps_unbilled_and_attribution(settings, store, sdk_pair):
     await enable_search(store)
     response = grounded_response()
     del response["usage"]["grounding_tool_count"]
@@ -245,23 +247,32 @@ async def test_search_unknown_fee_keeps_reserve_and_attribution(settings, store,
     )
     await gateway.search("测试公开信息", "s")
     row = await store.one("SELECT * FROM ledger WHERE lane='search' ORDER BY rowid LIMIT 1")
-    assert 0 < row["amount"] < row["reserved"] and row["status"] == "unknown"
+    assert row["amount"] == 0 and row["reserved"] == 0 and row["status"] == "settled"
     assert (await store.one("SELECT model_lane FROM ledger_usage WHERE id=?", (row["id"],)))[
         0
     ] == "hydrogen"
     assert (await store.runtime.web_search.status())["today"]["known_calls"] == 0
 
 
-async def test_search_overrun_opens_global_circuit(settings, store, sdk_pair):
+async def test_search_is_excluded_from_billing_and_never_opens_circuit(settings, store, sdk_pair):
     await enable_search(store)
     response = grounded_response()
     response["usage"]["grounding_tool_count"][0]["count"] = 100
     gateway = GeminiGateway(
-        settings, store, *sdk_pair(lambda r: httpx.Response(200, json=response))
+        settings,
+        store,
+        *sdk_pair(
+            lambda r: httpx.Response(
+                200, json=decision_response() if r.url.path.endswith("decisions") else response
+            )
+        ),
     )
-    with pytest.raises(Rejected, match="budget_reservation_exceeded"):
-        await gateway.search("测试公开信息", "s")
-    assert await store.one("SELECT 1 FROM meta WHERE key='budget_overrun'")
+    output = await gateway.search("测试公开信息", "s")
+    assert "已核实的公开事实" in output
+    assert not await store.one("SELECT 1 FROM meta WHERE key='budget_overrun'")
+    row = await store.one("SELECT amount,reserved,status FROM ledger WHERE lane='search'")
+    assert row["amount"] == 0 and row["reserved"] == 0 and row["status"] == "settled"
+    assert (await store.one("SELECT amount FROM budget_totals"))[0] == 0
 
 
 async def test_search_source_rejected_or_hot_disabled(settings, store, sdk_pair):
@@ -316,7 +327,7 @@ async def test_search_cancellation_keeps_budget_and_never_retries(settings, stor
     with pytest.raises(asyncio.CancelledError):
         await task
     row = await store.one("SELECT amount,reserved,status FROM ledger")
-    assert 0 < row[0] < row[1] and row[2] == "unknown"
+    assert row[0] == 0 and row[1] == 0 and row[2] == "unknown"
     assert len(calls) == 1
     assert (await store.one("SELECT model_lane FROM ledger_usage"))[0] == "hydrogen"
 

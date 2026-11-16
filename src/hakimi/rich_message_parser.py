@@ -4,10 +4,11 @@ import html
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 from .bilibili import extract_bvid
-from .models import ImageRef
+from .models import FileRef, ImageRef
 from .security import Rejected, clean_text
 
 BV = re.compile(r"(?<![A-Za-z0-9])BV[1-9A-HJ-NP-Za-km-z]{10}(?![A-Za-z0-9])")
@@ -15,6 +16,73 @@ URL = re.compile(r"https?://[^\s\"'<>\\，。！？）]+")
 CQ = re.compile(r"\[CQ:([a-z_]+)((?:,[^\]]*)?)\]")
 MAX_FORWARD_NODES = 40
 MAX_FORWARD_CHARS = 20000
+_LOCAL_FS_PREFIXES = (
+    "/etc/",
+    "/proc/",
+    "/sys/",
+    "/root/",
+    "/home/",
+    "/var/",
+    "/tmp/",
+    "/app/",
+    "/run/",
+    "/usr/",
+    "/dev/",
+)
+
+
+def sanitize_filename(raw) -> str:
+    cleaned = clean_text(str(raw or "")).replace("\\", "/")
+    name = PurePosixPath(cleaned).name.strip()
+    if name in {"", ".", ".."}:
+        return ""
+    return name[:120]
+
+
+def valid_file_id(raw) -> str:
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_./=+\-]{1,1024}", value)
+        or value in {".", "..", "/"}
+        or ".." in value.split("/")
+        or value.startswith(_LOCAL_FS_PREFIXES)
+    ):
+        return ""
+    return value
+
+
+def parse_file_ref(data: dict) -> FileRef | None:
+    if not isinstance(data, dict):
+        return None
+    name = sanitize_filename(data.get("file_name") or data.get("name") or data.get("file"))
+    file_id = valid_file_id(data.get("file_id") or data.get("id") or data.get("file"))
+    raw_url = data.get("url", "")
+    url = ""
+    if isinstance(raw_url, str) and len(raw_url) <= 4096:
+        parsed = urlsplit(raw_url)
+        if (
+            parsed.scheme in {"https", "http"}
+            and parsed.hostname
+            and not parsed.username
+            and not parsed.password
+        ):
+            url = raw_url
+    raw_size = data.get("file_size", data.get("size"))
+    size = (
+        int(raw_size)
+        if not isinstance(raw_size, bool) and re.fullmatch(r"[0-9]{1,15}", str(raw_size or ""))
+        else None
+    )
+    raw_busid = data.get("busid")
+    busid = (
+        int(raw_busid)
+        if not isinstance(raw_busid, bool) and re.fullmatch(r"[0-9]{1,10}", str(raw_busid or ""))
+        else None
+    )
+    ref = FileRef(name=name, file_id=file_id, url=url, file_size=size, busid=busid)
+    return ref if ref.identity else None
 
 
 @dataclass
@@ -25,6 +93,7 @@ class RichMessage:
     mentioned_ids: list[str] = field(default_factory=list)
     reply_ids: list[str] = field(default_factory=list)
     images: list[ImageRef] = field(default_factory=list)
+    files: list[FileRef] = field(default_factory=list)
     video_ids: list[str] = field(default_factory=list)
     short_urls: list[str] = field(default_factory=list)
     forward_ids: list[str] = field(default_factory=list)
@@ -220,6 +289,15 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
                     if ref not in result.reply_ids and len(result.reply_ids) < 2:
                         result.reply_ids.append(ref)
                 add("[引用消息]")
+            elif kind == "file":
+                ref = parse_file_ref(data)
+                if ref and ref.identity not in [f.identity for f in result.files]:
+                    if len(result.files) < 2:
+                        result.files.append(ref)
+                    else:
+                        result.truncated = True
+                label = ref.name if ref and ref.name else ""
+                add(f"[文件：{label}]" if label else "[文件]")
             else:
                 # Never execute unknown segments (music, record, video, xml, location, poke, etc.).
                 add("[其他消息段]")
@@ -256,6 +334,20 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
                 if ref.identity not in [i.identity for i in result.images]:
                     if len(result.images) < 2:
                         result.images.append(
+                            ref.model_copy(
+                                update={
+                                    "sender_id": uid if uid != "未知" else "",
+                                    "sender_nickname": name,
+                                    "origin": "转发记录（作者声明）",
+                                }
+                            )
+                        )
+                    else:
+                        result.truncated = True
+            for ref in rich.files:
+                if ref.identity not in [f.identity for f in result.files]:
+                    if len(result.files) < 2:
+                        result.files.append(
                             ref.model_copy(
                                 update={
                                     "sender_id": uid if uid != "未知" else "",

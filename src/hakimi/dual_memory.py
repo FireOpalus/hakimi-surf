@@ -142,7 +142,9 @@ EXTRACTION_INSTRUCTION = """你是隔离会话的双轨事实提炼器。
 不能把他人称呼、戏谑、反讽、猜测、群友贴标签当成事实画像；这些只能进入 chronicles 的 slang 类。
 本人纠错 basis=self_correction 优先于旧说法；普通自述为 self_report。短期情绪、行程只可用
 state 槽位，valid_days 为1至14天；长期 alias/preferences/boundaries 槽位 valid_days=0。
-没有可靠证据就留空。chronicles 保留少量名场面、黑话、共识或未完问题，给出稳定简短 topic、
+没有可靠证据就留空。chronicles 优先提炼立下的 Flag／赌约、踩坑翻车名场面（event）、
+群聊或私聊高频黑话口癖与老梗（slang，尽量保留原汁原味梗词方便日后翻旧账接梗）、
+共识（consensus）或未完待续的坑点与约定（open_question），给出稳定简短 topic、
 客观 text、最多8个短主题 tags 和真实 evidence_seqs；同一话题沿用已有 topic，不新造重复事件。
 助手发言不能证明用户的个人事实。只保留本会话的资料，不补全未知身份或私密信息。
 """

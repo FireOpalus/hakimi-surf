@@ -19,6 +19,22 @@ class ImageRef(BaseModel):
         return self.file or self.url
 
 
+class FileRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    name: str = Field(default="", max_length=255)
+    file_id: str = Field(default="", max_length=1024)
+    url: str = Field(default="", max_length=4096)
+    file_size: int | None = Field(default=None, ge=0)
+    busid: int | None = Field(default=None, ge=0)
+    sender_id: str = Field(default="", max_length=128)
+    sender_nickname: str = Field(default="", max_length=80)
+    origin: str = Field(default="", max_length=40)
+
+    @property
+    def identity(self) -> str:
+        return self.file_id or self.url or self.name
+
+
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     platform: Literal["onebot", "qq"]
@@ -43,8 +59,11 @@ class Message(BaseModel):
     mentioned_ids: list[str] = Field(default_factory=list, max_length=32)
     # Reply ids come only from top-level protocol segments; authors are verified locally.
     reply_ids: list[str] = Field(default_factory=list, max_length=2)
-    attention_reason: Literal["", "private", "mention", "alias", "bilibili", "reply"] = ""
+    attention_reason: Literal["", "private", "mention", "alias", "bilibili", "reply", "command"] = (
+        ""
+    )
     images: list[ImageRef] = Field(default_factory=list, max_length=2)
+    files: list[FileRef] = Field(default_factory=list, max_length=2)
     forward_ids: list[str] = Field(default_factory=list, max_length=4)
     video_ids: list[str] = Field(default_factory=list, max_length=5)
     short_urls: list[str] = Field(default_factory=list, max_length=5)

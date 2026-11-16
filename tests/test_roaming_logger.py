@@ -39,30 +39,35 @@ async def test_diary_generation_dedup_redaction_and_private_exclusion(diary, mes
     )
     await diary.injection("blocked-1", now=now)
     await diary.injection("blocked-1", now=now)
-    await diary.group("private-1", message.model_copy(update={"text": "主人私聊秘密"}), now=now)
+    await diary.group("private-1", message.model_copy(update={"text": "主人私聊内容"}), now=now)
     group = message.model_copy(
-        update={"kind": "group", "conversation_id": "40000", "text": "群友私密原话"}
+        update={"kind": "group", "conversation_id": "40000", "text": "群友闲聊日常"}
     )
     await diary.group("group-1", group, now=now)
+    await diary.bot_reply("r1", group, "哈基米也觉得有趣", now=now)
     text = await diary.render("2026-11-14")
     assert "公开简介介绍了科学实验" in text
     assert "提示词注入试探：1 次" in text
     assert "日常话题：1 次" in text
+    assert "私聊 · BOISER" in text and "主人私聊内容" in text
+    assert "群聊 40000" in text and "群友闲聊日常" in text
+    assert "哈基米:哈基米也觉得有趣" in text
     for secret in (
-        "主人私聊秘密",
-        "群友私密原话",
-        "20000",
-        "40000",
         "name@example.com",
         "13800138000",
+        diary.s.gemini_api_key.get_secret_value(),
     ):
         assert secret not in text
 
 
 async def test_groups_must_opt_in(diary, message):
-    group = message.model_copy(update={"kind": "group", "conversation_id": "50000"})
-    await diary.group("group-1", group, now=timestamp("2026-11-14T10:00:00"))
-    assert "暂无获准" in await diary.render("2026-11-14")
+    unlisted_group = message.model_copy(update={"kind": "group", "conversation_id": "60000"})
+    stranger_dm = message.model_copy(
+        update={"user_id": "99999", "conversation_id": "99999", "text": "陌生人私聊"}
+    )
+    await diary.group("group-1", unlisted_group, now=timestamp("2026-11-14T10:00:00"))
+    await diary.group("private-stranger", stranger_dm, now=timestamp("2026-11-14T10:00:00"))
+    assert "今天暂无白名单聊天记录" in await diary.render("2026-11-14")
 
 
 async def test_two_hour_slots_2355_flush_and_restart(diary):
@@ -122,10 +127,16 @@ async def test_nightly_summary_is_screened_private_free_and_cached_across_drive_
     morning = timestamp("2026-11-14T10:00:00")
     await diary.patrol("public", "公开视频介绍科学实验", now=morning)
     await diary.group(
-        "private", message.model_copy(update={"text": "never-send-private"}), now=morning
+        "private",
+        message.model_copy(
+            update={"user_id": "99999", "conversation_id": "99999", "text": "never-send-unlisted"}
+        ),
+        now=morning,
     )
     await diary.store.set_memory(diary.store.scope(message), True)
-    await diary.store.remember(diary.store.scope(message), "never-send-private", "owner history")
+    await diary.store.remember(
+        diary.store.scope(message), "never-send-legacy-memory", "owner history"
+    )
     await diary.sync_due(now=morning)
     assert diary.gateway.calls == []
     diary.drive.fail = True
@@ -136,8 +147,9 @@ async def test_nightly_summary_is_screened_private_free_and_cached_across_drive_
     assert calls[0][3]["purpose"] == "source"
     assert calls[0][1] == calls[1][1]
     assert calls[1][3] == {"scenario": "daily_diary", "budget_lane": "patrol"}
-    assert "never-send-private" not in json.dumps(calls, ensure_ascii=False)
-    assert "20000" not in json.dumps(calls, ensure_ascii=False)
+    assert "never-send-unlisted" not in json.dumps(calls, ensure_ascii=False)
+    assert "never-send-legacy-memory" not in json.dumps(calls, ensure_ascii=False)
+    assert diary.s.gemini_api_key.get_secret_value() not in json.dumps(calls, ensure_ascii=False)
     row = await diary.store.one("SELECT * FROM roaming_summaries WHERE day='2026-11-14'")
     assert row["status"] == "done" and "简短回复".encode() not in row["payload"]
     recovered = RoamingLogger(diary.s, diary.store, diary.drive, gateway=FakeGateway())

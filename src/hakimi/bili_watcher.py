@@ -24,12 +24,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .bilibili import BVID, bounded_json
-from .bot_server import untrusted_input
+from .bot_server import is_persona_owner, untrusted_input
 from .generation_policy import Scenario
 from .models import Video
 from .proactive_policy import minute_of_day
 from .roaming_logger import redact_public_summary
-from .security import Rejected, clean_text, safe_output
+from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bili_credentials (
@@ -956,9 +956,104 @@ class BiliWatcher:
                     payload[key] = payload[key][:500]
             if "hot_comments_unverified" in payload:
                 payload["hot_comments_unverified"] = payload["hot_comments_unverified"][:1]
+        if (
+            len(untrusted_input(payload).encode()) > self.s.max_context_bytes
+            and "memory_preferences" in payload
+        ):
+            payload.pop("memory_preferences", None)
         if len(untrusted_input(payload).encode()) > self.s.max_context_bytes:
             raise Rejected("context_too_large")
         return payload
+
+    async def _memory_preferences(self) -> dict:
+        sessions = getattr(self.svc, "sessions", None)
+        runtime = getattr(self.store, "runtime", None)
+        if sessions is None or runtime is None or not hasattr(runtime, "sessions"):
+            return {}
+        secrets = getattr(self.svc, "secrets", None) or configured_secrets(self.s)
+        owner_interests: list[str] = []
+        community_topics: list[str] = []
+        recent_topics: list[str] = []
+        now = self.clock()
+        try:
+            session_list = await runtime.sessions()
+        except Exception:
+            return {}
+        for _, msg in session_list[:20]:
+            try:
+                if not authorize(msg.model_copy(update={"addressed": True}), self.s):
+                    continue
+                view = await sessions.dual.view(msg)
+            except Exception:
+                continue
+            entries = [
+                e
+                for e in view.get("entries", [])
+                if not e.get("deleted") and (not e.get("expires") or e["expires"] > now)
+            ]
+            owner_private = msg.kind == "private" and is_persona_owner(msg, self.s)
+            if owner_private:
+                for entry in entries:
+                    if (
+                        entry.get("kind") == "profile"
+                        and entry.get("slot") in {"preferences", "state"}
+                    ) or entry.get("kind") == "chronicle":
+                        topic = f"{entry.get('topic')}: " if entry.get("topic") else ""
+                        text = redact_public_summary(
+                            safe_output(f"{topic}{entry.get('text', '')}", secrets, limit=140)
+                        )
+                        if text and text not in owner_interests:
+                            owner_interests.append(text)
+                        if len(owner_interests) >= 8:
+                            break
+            else:
+                profiles = [
+                    e
+                    for e in entries
+                    if e.get("kind") == "profile" and e.get("slot") == "preferences"
+                ]
+                chronicles = sorted(
+                    (e for e in entries if e.get("kind") == "chronicle"),
+                    key=lambda item: int(item.get("heat", 1)),
+                    reverse=True,
+                )
+                for entry in [*profiles[:4], *chronicles[:6]]:
+                    topic = f"{entry.get('topic')}: " if entry.get("topic") else ""
+                    text = redact_public_summary(
+                        safe_output(f"{topic}{entry.get('text', '')}", secrets, limit=120)
+                    )
+                    if text and text not in community_topics and len(community_topics) < 10:
+                        community_topics.append(text)
+            if len(owner_interests) >= 8 and len(community_topics) >= 10:
+                break
+        if not owner_interests and not community_topics:
+            for _, msg in session_list[:10]:
+                try:
+                    if not authorize(msg.model_copy(update={"addressed": True}), self.s):
+                        continue
+                    snap = await sessions.snapshot(msg)
+                except Exception:
+                    continue
+                for item in reversed(snap.get("recent_messages", [])[-6:]):
+                    if item.get("role") != "user":
+                        continue
+                    text = redact_public_summary(
+                        safe_output(str(item.get("text", "")), secrets, limit=80)
+                    )
+                    if text and text not in recent_topics:
+                        recent_topics.append(text)
+                    if len(recent_topics) >= 5:
+                        break
+                if len(recent_topics) >= 5:
+                    break
+        result = {}
+        if owner_interests:
+            result["owner_interests"] = owner_interests[:8]
+        if community_topics:
+            result["community_topics"] = community_topics[:10]
+        elif recent_topics:
+            result["recent_chat_topics"] = recent_topics[:5]
+        return result
 
     async def run_once(self, *, slot="manual"):
         if self.run_lock.locked():
@@ -999,7 +1094,12 @@ class BiliWatcher:
                 self._ensure_current()
                 if not candidates:
                     return await self._finish(key, "empty", 0)
-                payload = self._bounded({"candidates": candidates})
+                prefs = await self._memory_preferences()
+                raw_payload = {
+                    "candidates": candidates,
+                    **({"memory_preferences": prefs} if prefs else {}),
+                }
+                payload = self._bounded(raw_payload)
                 subject = self.store.vault.digest("bili-account-budget", self.s.namespace)
                 self._ensure_current()
                 await self.svc.ai.screen(payload, subject, purpose="source", budget_lane="patrol")
@@ -1090,7 +1190,14 @@ class BiliWatcher:
                     if isinstance(exc, Rejected) and re.fullmatch(r"[a-z_]{1,80}", str(exc))
                     else "bili_patrol_failed"
                 )
-                logging.getLogger("hakimi").info("event=bili_account_failed")
+                if reason not in {
+                    "gemini_unavailable",
+                    "gemini_circuit_open",
+                    "budget_hard_stop",
+                    "budget_exhausted",
+                    "budget_circuit_open",
+                }:
+                    logging.getLogger("hakimi").info("event=bili_account_failed")
             finally:
                 self.patrol_context.reset(token)
             return await self._finish(key, "failed" if reason else "done", completed, reason)

@@ -10,12 +10,12 @@ import httpx
 
 from .attention import direct_attention
 from .bilibili import bounded_json
-from .bot_server import is_persona_owner
 from .config import Settings
 from .mentions import revalidate_segments
 from .models import Message
 from .onebot_transport import HTTPTransport, OneBotTransport
-from .rich_message_parser import parse_message
+from .outbound_actions import ALLOWED_EMOJI_IDS
+from .rich_message_parser import parse_file_ref, parse_message
 from .security import Rejected, authorize, check_fresh, clean_text, configured_secrets, safe_output
 
 
@@ -68,6 +68,7 @@ def onebot_message(payload: dict, settings: Settings) -> Message | None:
         attention_reason=reason,
         addressed=bool(reason),
         images=rich.images,
+        files=rich.files,
         video_ids=rich.video_ids,
         short_urls=rich.short_urls,
         forward_ids=rich.forward_ids,
@@ -206,6 +207,13 @@ class Sender:
     async def typing(self, message):
         if message.platform != "onebot" or message.kind != "private":
             return  # NapCat's input-status API is a private-peer action.
+        from .onebot_transport import HTTPTransport, WebSocketTransport
+
+        if not (
+            isinstance(self.onebot, (HTTPTransport, WebSocketTransport))
+            or getattr(self.onebot, "supports_typing", False)
+        ):
+            return
         try:
             async with asyncio.timeout(0.3):
                 await self.onebot.call(
@@ -280,7 +288,20 @@ class Sender:
         from .text_card import render_card
 
         image = await asyncio.to_thread(render_card, text)
-        return await self.send_meme(message, image, before_send=before_send)
+        return await self.send_meme(message, image, before_send=before_send, as_sticker=False)
+
+    async def send_card(self, message, text, *, before_send=None):
+        if message.platform != "onebot" or message.kind != "group":
+            raise Rejected("card_group_only")
+        text = safe_output(text, configured_secrets(self.s), limit=8000)
+        if before_send is not None and not await before_send():
+            raise Rejected("reply_invalidated")
+        if not authorize(message, self.s):
+            raise Rejected("reply_invalidated")
+        from .text_card import render_card
+
+        image = await asyncio.to_thread(render_card, text)
+        return await self.send_meme(message, image, before_send=before_send, as_sticker=False)
 
     async def send_owner_dm(self, target_user_id: int, text: str, *, before_send=None):
         if (
@@ -303,11 +324,12 @@ class Sender:
         )
         return await self.send(message, text, proactive=True, before_send=before_send)
 
-    async def send_meme(self, message: Message, data: str, *, before_send=None):
+    async def send_meme(
+        self, message: Message, data: str, *, before_send=None, as_sticker: bool = True
+    ):
         """Only a local allowlist blob reaches this path; never accept an image URL or file path."""
         if (
             message.platform != "onebot"
-            or (message.kind == "private" and is_persona_owner(message, self.s))
             or not isinstance(data, str)
             or not data.startswith("base64://")
             or len(data) > 7 * 1024 * 1024
@@ -317,7 +339,12 @@ class Sender:
             raw = base64.b64decode(data[9:], validate=True)
         except (ValueError, binascii.Error):
             raise Rejected("invalid_meme_image") from None
-        if not raw or len(raw) > 5 * 1024 * 1024 or not raw.startswith(b"\xff\xd8\xff"):
+        valid_magic = (
+            raw.startswith(b"\xff\xd8\xff")
+            or raw.startswith(b"\x89PNG\r\n\x1a\n")
+            or raw.startswith((b"GIF87a", b"GIF89a"))
+        )
+        if not raw or len(raw) > 5 * 1024 * 1024 or not valid_magic:
             raise Rejected("invalid_meme_image")
         async with self.send_lock:
             if before_send is not None and not await before_send():
@@ -329,11 +356,15 @@ class Sender:
                 raise Rejected("reply_invalidated")
             action = "send_group_msg" if message.kind == "group" else "send_private_msg"
             field = "group_id" if message.kind == "group" else "user_id"
+            seg_data: dict[str, str | int] = {"file": data}
+            if as_sticker:
+                seg_data["summary"] = "[动画表情]"
+                seg_data["sub_type"] = 1
             receipt = await self.onebot.call(
                 action,
                 {
                     field: int(message.conversation_id),
-                    "message": [{"type": "image", "data": {"file": data}}],
+                    "message": [{"type": "image", "data": seg_data}],
                 },
             )
             if (
@@ -343,6 +374,67 @@ class Sender:
             ):
                 raise Rejected("onebot_send_unconfirmed")
             return receipt
+
+    async def send_emoji_like(
+        self, message: Message, target_message_id: str, emoji_id: str, *, before_send=None
+    ) -> bool:
+        if (
+            message.platform != "onebot"
+            or not re.fullmatch(r"-?[0-9]{1,30}", str(target_message_id))
+            or emoji_id not in ALLOWED_EMOJI_IDS
+        ):
+            return False
+        async with self.send_lock:
+            if before_send is not None and not await before_send():
+                raise Rejected("reply_invalidated")
+            if (
+                not authorize(message, self.s)
+                or time.time() - message.created_at > self.s.event_ttl_seconds
+            ):
+                raise Rejected("reply_invalidated")
+            await self.onebot.call(
+                "set_msg_emoji_like",
+                {"message_id": int(target_message_id), "emoji_id": str(emoji_id), "set": True},
+            )
+            return True
+
+    async def send_poke(self, message: Message, target_qq: str, *, before_send=None) -> bool:
+        target = str(target_qq or "").strip()
+        if (
+            message.platform != "onebot"
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", target)
+            or target == self.s.onebot_self_id
+        ):
+            return False
+        async with self.send_lock:
+            if before_send is not None and not await before_send():
+                raise Rejected("reply_invalidated")
+            if (
+                not authorize(message, self.s)
+                or time.time() - message.created_at > self.s.event_ttl_seconds
+            ):
+                raise Rejected("reply_invalidated")
+            if message.kind == "group":
+                try:
+                    await self.onebot.call(
+                        "group_poke",
+                        {"group_id": int(message.conversation_id), "user_id": int(target)},
+                    )
+                except Rejected as exc:
+                    if str(exc) != "onebot_action_unsupported":
+                        raise
+                    await self.onebot.call(
+                        "send_poke",
+                        {"group_id": int(message.conversation_id), "user_id": int(target)},
+                    )
+            else:
+                try:
+                    await self.onebot.call("friend_poke", {"user_id": int(target)})
+                except Rejected as exc:
+                    if str(exc) != "onebot_action_unsupported":
+                        raise
+                    await self.onebot.call("send_poke", {"user_id": int(target)})
+            return True
 
     async def forward(self, forward_id: str) -> dict:
         return await self.onebot.call("get_forward_msg", {"id": identifier(forward_id)})
@@ -426,14 +518,47 @@ def notice_message(payload, settings):
     recall = notice in {"group_recall", "friend_recall"}
     poke = notice == "notify" and subtype == "poke"
     reaction = notice in {"group_msg_emoji_like", "group_msg_emoji_like_update", "msg_emoji_like"}
-    if not (recall or poke or reaction):
+    upload = notice in {"group_upload", "offline_file"}
+    if not (recall or poke or reaction or upload):
         return None
-    user = identifier(payload.get("user_id", payload.get("operator_id")), numeric=True)
+    raw_actor = (
+        payload.get("sender_id")
+        if poke and payload.get("sender_id") is not None
+        else payload.get("user_id", payload.get("operator_id"))
+    )
+    user = identifier(raw_actor, numeric=True)
     if user == settings.onebot_self_id:
         return None
     kind = "group" if payload.get("group_id") else "private"
+    created = float(payload.get("time", time.time()))
+    check_fresh(created, settings.signature_max_age)
+    if upload:
+        file_info = payload.get("file") if isinstance(payload.get("file"), dict) else None
+        ref = parse_file_ref(file_info) if file_info else None
+        if ref is None:
+            return None
+        conv = identifier(payload.get("group_id"), numeric=True) if kind == "group" else user
+        event_id = f"notice:{notice}:{user}:{ref.identity[:48]}:{int(created)}"
+        return Message(
+            platform="onebot",
+            bot_id=settings.onebot_self_id,
+            event_id=event_id,
+            user_id=user,
+            kind=kind,
+            conversation_id=conv,
+            text=f"[文件：{ref.name or '未命名'}]",
+            command_text="",
+            addressed=(kind == "private"),
+            attention_reason="private" if kind == "private" else "",
+            files=[ref],
+            created_at=created,
+        )
     target = str(payload.get("target_id", ""))
     direct = target == settings.onebot_self_id
+    if poke and kind == "private" and not direct:
+        return None
+    if reaction and kind == "private":
+        return None
     ref = identifier(payload.get("message_id", "0"))
     text = (
         "[协议事件：撤回消息]"
@@ -444,8 +569,16 @@ def notice_message(payload, settings):
         if poke
         else "[协议事件：对消息贴了表情]"
     )
-    created = float(payload.get("time", time.time()))
-    check_fresh(created, settings.signature_max_age)
+    is_addressed = direct if poke else (kind == "private" if recall else False)
+    reason = (
+        "private" if (is_addressed and kind == "private") else ("mention" if is_addressed else "")
+    )
+    sender_info = payload.get("sender")
+    nickname = (
+        clean_text(str(sender_info.get("nickname", "")))[:80]
+        if isinstance(sender_info, dict)
+        else ""
+    )
     return Message(
         platform="onebot",
         bot_id=settings.onebot_self_id,
@@ -457,8 +590,9 @@ def notice_message(payload, settings):
         else user,
         text=text,
         command_text="",
-        addressed=direct or kind == "private",
-        attention_reason="mention" if direct else "private" if kind == "private" else "",
+        addressed=is_addressed,
+        attention_reason=reason,
         reply_ids=[ref] if reaction and ref != "0" else [],
+        sender_nickname=nickname,
         created_at=created,
     )

@@ -358,3 +358,43 @@ async def test_invalid_bvid_never_spawns(runner):
             async with downloader.download(bvid):
                 pytest.fail("must not yield")
     assert not downloader.root.exists()
+
+
+@pytest.mark.parametrize(
+    "width,height,accepted",
+    [
+        (360, 640, True),
+        (480, 852, True),
+        (540, 960, True),
+        (480, 480, True),
+        (1280, 540, True),
+        (720, 1280, False),
+        (640, 720, False),
+    ],
+)
+def test_vertical_square_and_ultrawide_540p_videos_accepted(
+    tmp_path, monkeypatch, width, height, accepted
+):
+    fmt = video(format_id=f"{width}x{height}", width=width, height=height, filesize=1024)
+    if accepted:
+        assert select_format({"duration": 60, "formats": [fmt]})["format_id"] == f"{width}x{height}"
+    else:
+        with pytest.raises(WorkerError, match="video_download_format"):
+            select_format({"duration": 60, "formats": [fmt]})
+
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"mock-video")
+    payload = {
+        "format": {"duration": "3.0", "format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+        "streams": [{"codec_type": "video", "width": width, "height": height}],
+    }
+    monkeypatch.setattr(
+        worker.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(stdout=json.dumps(payload).encode()),
+    )
+    if accepted:
+        assert inspect_media(path, 480) == 3.0
+    else:
+        with pytest.raises(WorkerError, match="video_download_invalid_media"):
+            inspect_media(path, 480)

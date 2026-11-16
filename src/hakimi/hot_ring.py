@@ -87,6 +87,26 @@ class HotRing:
         )
 
     def recent_with_images(self, message, *, exclude_events=(), max_age_seconds=1800, limit=20):
+        return self._recent_with_attr(
+            message,
+            attr="images",
+            exclude_events=exclude_events,
+            max_age_seconds=max_age_seconds,
+            limit=limit,
+        )
+
+    def recent_with_files(self, message, *, exclude_events=(), max_age_seconds=600, limit=10):
+        return self._recent_with_attr(
+            message,
+            attr="files",
+            exclude_events=exclude_events,
+            max_age_seconds=max_age_seconds,
+            limit=limit,
+        )
+
+    def _recent_with_attr(
+        self, message, *, attr: str, exclude_events=(), max_age_seconds=1800, limit=20
+    ):
         ring = self.rings.get(self.key(message))
         if not ring:
             return []
@@ -97,7 +117,7 @@ class HotRing:
                 item.event_id in excluded
                 or self.recalled(message, item.event_id)
                 or item.user_id == item.bot_id
-                or not item.images
+                or not getattr(item, attr, None)
             ):
                 continue
             if (

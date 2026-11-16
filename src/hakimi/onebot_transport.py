@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import random
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -18,6 +19,7 @@ from websockets.asyncio.client import connect
 
 from .bilibili import bounded_json
 from .config import Settings
+from .outbound_actions import ALLOWED_EMOJI_IDS
 from .security import Rejected
 
 ACTIONS = {"send_private_msg", "send_group_msg", "get_forward_msg", "get_login_info", "get_status"}
@@ -30,6 +32,10 @@ ACTIONS |= {
     "get_msg",
     "set_input_status",
     "send_group_forward_msg",
+    "set_msg_emoji_like",
+    "group_poke",
+    "friend_poke",
+    "send_poke",
 }
 EventHandler = Callable[[dict], Awaitable[str]]
 
@@ -46,7 +52,19 @@ def response_data(value: dict, action: str = "") -> dict | list:
     data = value.get("data")
     if action == "get_friend_list" and isinstance(data, list):
         return data
-    if action in {"delete_friend", "set_self_longnick"} and data is None:
+    if (
+        action
+        in {
+            "delete_friend",
+            "set_self_longnick",
+            "set_input_status",
+            "set_msg_emoji_like",
+            "group_poke",
+            "friend_poke",
+            "send_poke",
+        }
+        and data is None
+    ):
         return {}
     if not isinstance(data, dict):
         raise Rejected("onebot_invalid_response")
@@ -92,6 +110,40 @@ def validate_action(settings, action, params):
             or int(value) in {int(settings.owner_qq_id), int(settings.onebot_self_id)}
         ):
             raise Rejected("reserved_identity")
+    if action == "set_msg_emoji_like":
+        msg_id = params.get("message_id")
+        emoji_id = str(params.get("emoji_id", ""))
+        if (
+            isinstance(msg_id, bool)
+            or not re.fullmatch(r"-?[0-9]{1,30}", str(msg_id or ""))
+            or emoji_id not in ALLOWED_EMOJI_IDS
+        ):
+            raise Rejected("onebot_action_forbidden")
+    if action in {"group_poke", "friend_poke", "send_poke"}:
+        uid = params.get("user_id")
+        uid_str = str(uid)
+        if (
+            isinstance(uid, bool)
+            or not uid_str.isdecimal()
+            or int(uid_str) <= 0
+            or uid_str == settings.onebot_self_id
+            or uid_str in settings.muted_user_ids
+        ):
+            raise Rejected("onebot_action_forbidden")
+        if action == "group_poke" or (action == "send_poke" and "group_id" in params):
+            gid = str(params.get("group_id", ""))
+            if (
+                gid not in settings.onebot_allowed_groups
+                or settings.group_policies.get("onebot:" + gid, "at_only") == "muted"
+            ):
+                raise Rejected("onebot_action_forbidden")
+        else:
+            allowed_private = uid_str == settings.owner_qq_id or (
+                settings.onebot_private_mode == "owner_and_allowlist"
+                and uid_str in settings.onebot_allowed_users
+            )
+            if not allowed_private:
+                raise Rejected("onebot_action_forbidden")
 
 
 class HTTPTransport:

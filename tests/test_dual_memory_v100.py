@@ -490,7 +490,7 @@ async def test_flex_capacity_failure_never_opens_live_chat_circuit(settings, sto
         )
     assert len(requests) == 1 and gateway.blocked_until == 0
     row = await store.one("SELECT status,amount,reserved FROM ledger")
-    assert row["status"] == "unknown" and 0 < row["amount"] < row["reserved"]
+    assert row["status"] == "settled" and row["amount"] == 0
 
 
 async def test_mirror_scheduler_remains_available_when_extraction_disabled(settings, store):
@@ -781,7 +781,7 @@ async def test_flex_dedicated_timeout_and_rate_limit_zero_cost_backoff_requeue(
         if mode[0] == "rate_limit":
             return httpx.Response(429, json={"error": {"code": 429, "message": "rate"}})
         if mode[0] == "outage":
-            return httpx.Response(503, json={"error": {"code": 503, "message": "err"}})
+            return httpx.Response(500, json={"error": {"code": 500, "message": "err"}})
         return httpx.Response(
             200,
             json={
@@ -823,7 +823,7 @@ async def test_flex_dedicated_timeout_and_rate_limit_zero_cost_backoff_requeue(
     r2 = await comp.extract(msg, background=True)
     assert r2["status"] == "compressed"
 
-    # Ambiguous 503 never requeues and still settles unknown + marks slice failed.
+    # Ambiguous 500 never requeues and still settles unknown + marks slice failed.
     await seed(sessions, msg, text="第三批", count=2)
     await sessions.dual.snapshot_cold(msg, force=True)
     mode[0] = "outage"

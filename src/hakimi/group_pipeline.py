@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS group_consumed_images (
  PRIMARY KEY(scope,event_id)
 );
 CREATE INDEX IF NOT EXISTS group_consumed_scope ON group_consumed_images(scope,at);
+CREATE TABLE IF NOT EXISTS group_consumed_files (
+ scope TEXT NOT NULL, event_id TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(scope,event_id)
+);
+CREATE INDEX IF NOT EXISTS group_consumed_files_scope ON group_consumed_files(scope,at);
 """
 MAX_BATCH_MESSAGES = 16
 MAX_BATCH_CHARS = 24000
@@ -98,10 +103,12 @@ class GroupPipeline:
         config = config or self.config
         explicit = message.attention_reason in {"mention", "reply"} or message.kind == "private"
         raw = message.command_text if message.command_text is not None else message.text
-        spoken = re.sub(r"\[(?:图片|商城贴纸|提及机器人|提及群友|附图)\]", "", raw).strip()
-        pure_image = bool(message.images) and not spoken
+        spoken = re.sub(
+            r"\[(?:图片|商城贴纸|提及机器人|提及群友|附图|文件(?:[:：][^\]]*)?)\]", "", raw
+        ).strip()
+        pure_image = bool(message.images or message.files) and not spoken
         incomplete = pure_image or (
-            not message.images
+            not (message.images or message.files)
             and bool(
                 re.search(
                     r"(?:你看这个(?:报错|图|问题)?|看下这个|等下|等等|还有|比如|例如|看这里)"
@@ -496,18 +503,18 @@ class GroupPipeline:
             for r in reversed(rows)
         ]
 
-    async def consumed_image_events(self, message) -> set[str]:
+    async def _consumed_events(self, table: str, message) -> set[str]:
         if message.kind != "group":
             return set()
         scope = self.store.session_scope(message)
         async with self.store.lock:
             rows = await self.store.all(
-                "SELECT event_id FROM group_consumed_images WHERE scope=? AND at>=?",
+                f"SELECT event_id FROM {table} WHERE scope=? AND at>=?",
                 (scope, self.clock() - CONTEXT_TTL),
             )
         return {r[0] for r in rows}
 
-    async def mark_images_consumed(self, message, event_ids) -> None:
+    async def _mark_consumed(self, table: str, message, event_ids) -> None:
         clean = [str(eid) for eid in (event_ids or ()) if eid]
         if message.kind != "group" or not clean:
             return
@@ -516,12 +523,22 @@ class GroupPipeline:
         async with self.store.transaction():
             for eid in dict.fromkeys(clean):
                 await self.store.db.execute(
-                    "INSERT OR REPLACE INTO group_consumed_images VALUES (?,?,?)",
+                    f"INSERT OR REPLACE INTO {table} VALUES (?,?,?)",
                     (scope, eid, now),
                 )
-            await self.store.db.execute(
-                "DELETE FROM group_consumed_images WHERE at<?", (now - CONTEXT_TTL,)
-            )
+            await self.store.db.execute(f"DELETE FROM {table} WHERE at<?", (now - CONTEXT_TTL,))
+
+    async def consumed_image_events(self, message) -> set[str]:
+        return await self._consumed_events("group_consumed_images", message)
+
+    async def mark_images_consumed(self, message, event_ids) -> None:
+        await self._mark_consumed("group_consumed_images", message, event_ids)
+
+    async def consumed_file_events(self, message) -> set[str]:
+        return await self._consumed_events("group_consumed_files", message)
+
+    async def mark_files_consumed(self, message, event_ids) -> None:
+        await self._mark_consumed("group_consumed_files", message, event_ids)
 
     async def clear_recent(self, message):
         scope = self.store.session_scope(message)
@@ -532,6 +549,10 @@ class GroupPipeline:
             )
             await self.store.db.execute(
                 "DELETE FROM group_consumed_images WHERE scope=?",
+                (scope,),
+            )
+            await self.store.db.execute(
+                "DELETE FROM group_consumed_files WHERE scope=?",
                 (scope,),
             )
             # A reset also discards accepted inputs that have not started processing.
@@ -552,6 +573,9 @@ class GroupPipeline:
         )
         await self.store.db.execute(
             "DELETE FROM group_consumed_images WHERE at<?", (now - CONTEXT_TTL,)
+        )
+        await self.store.db.execute(
+            "DELETE FROM group_consumed_files WHERE at<?", (now - CONTEXT_TTL,)
         )
         await self.store.db.execute(
             "DELETE FROM group_debounce_batches WHERE first_at<? AND NOT EXISTS "

@@ -656,8 +656,13 @@ class SessionManager:
             rows = await cur.fetchall()
         texts = [{**self.vault.open(key, r[1]), "seq": r[0]} for r in rows]
         rendered = history_lines(texts, self.s.onebot_self_id)
+        high_tokens = (
+            self.store.runtime.compression.history_high_tokens
+            if self.store.runtime.compression_overridden
+            else self.s.history_high_tokens
+        )
         if len(rows) < 2 or (
-            estimate_tokens(rendered) < self.s.history_high_tokens
+            estimate_tokens(rendered) < high_tokens
             and len(rendered.encode()) <= self.s.history_max_bytes
         ):
             return

@@ -12,6 +12,7 @@ from .bili_watcher import BiliWatcher
 from .bilibili import Bilibili, extract_bvid
 from .bot_server import is_persona_owner, untrusted_input
 from .config import Settings
+from .file_reader import FileReader
 from .gemini import GeminiGateway
 from .generation_policy import Scenario
 from .group_pipeline import other_mentions
@@ -19,14 +20,14 @@ from .hot_ring import HotRing
 from .link_preview import preview_links
 from .longnick import Longnick
 from .media import ImageLoader
-from .memes import MemeLibrary
+from .memes import MAX_UPLOAD_BYTES, MemeLibrary, validate_meme_label
 from .memory_compressor import MemoryCompressor, check_memory_text
 from .memory_mirror import MemoryMirror
 from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
-from .outbound_actions import parse_actions
+from .outbound_actions import normalize_emoji_like, parse_actions
 from .output_links import filter_reply_links
 from .proactive_dm import OwnerProactive
 from .public_memory import PublicMemory
@@ -47,6 +48,11 @@ PRIOR_IMAGE_REF_RE = re.compile(
     r"|(?:图|截图|照片)(?:里|中|上)"
     r"|(?:看|瞅|瞧|分析|解释|推导)(?:下|一下|看)?.{0,6}(?:图|截图|照片)"
 )
+PRIOR_FILE_REF_RE = re.compile(
+    r"(?:文件|日志|代码|脚本|配置|报错)"
+    r"|\.(?:log|txt|py|json|ya?ml|toml|md|js|ts|sh|sql)\b",
+    re.I,
+)
 HELP = """哈基米在这里。私聊可直接提问或发送 B 站视频；群聊看视频请明确 @ 我。
 /new-session：清空当前会话上下文，保留记忆开关
 外部 Bot 默认忽略；仅主人在群内明确邀请后临时互动，同群 10 分钟最多两轮。
@@ -59,6 +65,7 @@ HELP = """哈基米在这里。私聊可直接提问或发送 B 站视频；群�
 如同时移除好友，须在 /mute 或 /mute-approve 末尾明确加 --delete-friend
 /set-sign <签名>：手动设置 50 字以内纯文本签名
 /deep <问题或视频链接>：本次使用 high 档深度分析
+/存表情 <标签>：私聊或群内（需真实主人，可引用附图消息）保存图片到本地表情包库
 /哈基米 订阅 <UP主UID>
 /哈基米 退订 <UP主UID>
 /哈基米 订阅列表
@@ -92,6 +99,7 @@ class Service:
         self.images = image_loader or ImageLoader(
             settings, transport=getattr(sender, "onebot", None)
         )
+        self.files = FileReader(settings, store, transport=getattr(sender, "onebot", None))
         self.context_resolver = MessageContextResolver(
             settings, getattr(sender, "onebot", None), lookup=self.lookup_received
         )
@@ -117,6 +125,7 @@ class Service:
         self.video_watch = VideoWatch(self)
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
+        self._lurk_react_at: dict[str, float] = {}
 
     def record(self, event: str, *, emit_audit: bool = True):
         # Only internal constant labels. Never log exception repr, payloads, URLs or IDs.
@@ -160,7 +169,10 @@ class Service:
                     )
 
             _, links = await asyncio.gather(
-                hydrate(), preview_links(message.command_text or message.text, self.preview_slots)
+                hydrate(),
+                preview_links(
+                    message.command_text or message.text, self.preview_slots, budget_seconds=1.8
+                ),
             )
             return links
         except Exception:
@@ -351,6 +363,14 @@ class Service:
                 raise Rejected("group_owner_only")
             await self.sessions.clear(message)
             return "已清空当前会话上下文，记忆开关保持原设置。"
+        meme_match = re.match(
+            r"^(?:/(?:存表情|偷表情|save-meme)|" + re.escape(prefix) + r"\s*(?:存表情|偷表情))"
+            r"(?:\s+(.*))?$",
+            direct.strip(),
+            re.DOTALL,
+        )
+        if meme_match:
+            return await self._save_meme_command(message, meme_match[1] or "")
         if not direct.startswith(prefix):
             return None
         command = direct[len(prefix) :].strip()
@@ -403,8 +423,92 @@ class Service:
         )
         return "已订阅；首次巡逻仅建立基线。" + tip
 
+    async def _save_meme_command(self, message: Message, raw_label: str) -> str:
+        if not owner(message, self.s):
+            raise Rejected("group_owner_only" if message.kind == "group" else "owner_private_only")
+        raw_label = raw_label.strip()
+        if not raw_label:
+            return "用法：引用带图消息（或附图同发）并发送 /存表情 <1~24字标签>"
+        try:
+            label = validate_meme_label(raw_label)
+        except Rejected:
+            return "标签格式不对，请用 1～24 个汉字、字母、数字、下划线或短横线。"
+        if not message.images and message.forward_ids and not message.context_expanded:
+            try:
+                message = await self.expand_forwards(message)
+            except Rejected:
+                return "转发内容展开失败，无法获取其中的图片。"
+        if not message.images:
+            return "未找到图片，请引用包含表情包的消息或随指令附带图片。"
+        if not hasattr(self.images, "fetch_raw"):
+            return "当前图片加载器不支持原始下载，请在管理后台上传。"
+        try:
+            raw = await self.images.fetch_raw(message.images[0], max_bytes=MAX_UPLOAD_BYTES)
+            saved = await self.memes.upload_bytes(label, raw)
+        except Rejected as exc:
+            code = str(exc)
+            messages = {
+                "image_too_large": "图片太大啦，单张表情不能超过 5 MiB。",
+                "meme_upload_too_large": "图片太大啦，单张表情不能超过 5 MiB。",
+                "meme_label_exists": f"标签「{label}」里已经有这张图啦，换个标签或直接用就行~",
+                "meme_library_full": (
+                    "表情包库已经满啦（最多 100 张 / 50 MiB），去后台删几张再来吧。"
+                ),
+                "invalid_meme_label": (
+                    "标签格式不对，请用 1～24 个汉字、字母、数字、下划线或短横线。"
+                ),
+            }
+            if code in messages:
+                return messages[code]
+            if code.startswith(("meme_image_", "invalid_meme_")):
+                return "这张图格式或尺寸不支持呢（支持 jpg / png / gif / webp）。"
+            return f"保存表情失败（{code}）。"
+        extra = "（动画已取第一帧）" if saved.get("first_frame_only") else ""
+        return f"表情已存好啦：标签「{saved['label']}」，随时可以用~{extra}"
+
+    async def _auto_save_meme(
+        self, message: Message, candidates: list[Message], label: str
+    ) -> bool:
+        if not hasattr(self.images, "fetch_raw"):
+            return False
+        ref = next(
+            (img for item in reversed(candidates) for img in reversed(item.images)),
+            None,
+        )
+        if ref is None and message.reply_ids:
+            for reply_id in reversed(message.reply_ids):
+                replied = await self.lookup_received(message, reply_id)
+                if replied and replied.images:
+                    ref = replied.images[-1]
+                    break
+        if ref is None:
+            return False
+        try:
+            raw = await self.images.fetch_raw(ref, max_bytes=MAX_UPLOAD_BYTES)
+            await self.memes.upload_bytes(label, raw)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+
     def output(self, text: str) -> str:
         return safe_output(text, self.secrets, limit=self.s.send_max_chars)
+
+    @staticmethod
+    def _pick_lurk_emoji(members: list[Message]) -> str | None:
+        combined = " ".join(str(m.text or "") for m in members)
+        for pattern, label in (
+            (r"(?:哈哈哈|笑死|绷不住|笑疯|草|2333|乐死)", "笑哭"),
+            (r"(?:好耶|太强了|牛逼|牛哇|出货了|不歪|搞定了|跑通了)", "庆祝"),
+            (r"(?:晚安|先睡了|困死|熬不住了)", "晚安"),
+            (r"(?:猫猫|喵喵|修猫|小猫)", "猫猫"),
+        ):
+            if re.search(pattern, combined, re.I):
+                return normalize_emoji_like(label)
+        if any(m.images for m in members):
+            return normalize_emoji_like("围观")
+        return None
 
     def batch_authorized(self, message, members):
         # An accepted @Bot batch may include subsequent unaddressed follow-up text.
@@ -532,9 +636,77 @@ class Service:
             sources.append({"status": "omitted", "count": omitted})
         return images, sources
 
+    async def _load_turn_files(
+        self,
+        message: Message,
+        members: list[Message],
+        filtered_nearby: list[Message],
+        history_events: set[str],
+        current_events: set[str],
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        candidates: list[tuple] = []
+        seen_ids: set[str] = set()
+        for item in reversed(members):
+            check = item.model_copy(update={"addressed": True}) if item.kind == "group" else item
+            if not authorize(check, self.s) or other_mentions(item):
+                continue
+            for ref in item.files:
+                if ref.identity not in seen_ids:
+                    seen_ids.add(ref.identity)
+                    candidates.append((ref, item, "本批消息"))
+        for ref in message.files:
+            if ref.identity not in seen_ids:
+                seen_ids.add(ref.identity)
+                candidates.append((ref, message, "引用或转发材料"))
+        if not candidates and (message.kind == "group" or PRIOR_FILE_REF_RE.search(message.text)):
+            consumed = (
+                await self.store.groups.consumed_file_events(message)
+                if message.kind == "group"
+                else set()
+            )
+            mention_any = bool(PRIOR_FILE_REF_RE.search(message.text))
+            nearby_pool = [m for m in filtered_nearby if m.files and m.event_id not in consumed]
+            hot_pool = [
+                m
+                for m in self.hot.recent_with_files(
+                    message, exclude_events={*current_events, *consumed}
+                )
+                if m.event_id not in history_events
+            ]
+            seen_events: set[str] = set()
+            for item in reversed([*hot_pool, *nearby_pool]):
+                if item.event_id in seen_events:
+                    continue
+                seen_events.add(item.event_id)
+                if item.user_id != message.user_id and (message.kind != "group" or not mention_any):
+                    continue
+                if await self.recalled([item]):
+                    continue
+                check = (
+                    item.model_copy(update={"addressed": True}) if item.kind == "group" else item
+                )
+                if not authorize(check, self.s) or other_mentions(item):
+                    continue
+                for ref in item.files:
+                    if ref.identity not in seen_ids:
+                        seen_ids.add(ref.identity)
+                        candidates.append((ref, item, "近期群聊文件"))
+        if not candidates:
+            return [], [], []
+        selected: list[Message] = []
+        attachments, sources = await self.files.load_for_turn(
+            message, candidates, limit=1, selected_members=selected
+        )
+        consumed_events = [
+            m.event_id for m in selected if m.event_id and m.event_id not in current_events
+        ]
+        return attachments, sources, consumed_events
+
     async def expand_forwards(self, message: Message) -> Message:
         texts, images = [message.text], list(message.images)
         seen_ids = {i.identity for i in images}
+        files = list(message.files)
+        seen_file_ids = {f.identity for f in files}
         videos, shorts = list(message.video_ids), list(message.short_urls)
         statuses = set(message.context_status)
         for forward_id in message.forward_ids:
@@ -546,6 +718,10 @@ class Service:
                 if img.identity not in seen_ids:
                     images.append(img)
                     seen_ids.add(img.identity)
+            for fref in rich.files:
+                if fref.identity not in seen_file_ids:
+                    files.append(fref)
+                    seen_file_ids.add(fref.identity)
             videos.extend(v for v in rich.video_ids if v not in videos)
             shorts.extend(u for u in rich.short_urls if u not in shorts)
             # No recursive get_forward_msg calls: a quoted reference cannot fan out requests.
@@ -555,12 +731,16 @@ class Service:
         if len(images) > 2:
             images = images[:2]
             statuses.add("truncated")
+        if len(files) > 2:
+            files = files[:2]
+            statuses.add("truncated")
         if any(secret and len(secret) >= 8 and secret in text for secret in self.secrets):
             raise Rejected("credential_in_input")
         return message.model_copy(
             update={
                 "text": text,
                 "images": images,
+                "files": files,
                 "video_ids": videos[:5],
                 "short_urls": shorts[:5],
                 "forward_ids": [],
@@ -654,6 +834,12 @@ class Service:
             if not deep_match[1] or not deep_match[1].strip():
                 await self.store.enqueue_reply(job["id"], message, "用法：/deep <问题或视频链接>")
                 return
+        if (
+            message.platform == "onebot"
+            and message.kind == "private"
+            and hasattr(self.sender, "typing")
+        ):
+            await self.sender.typing(message)
         if not message.context_expanded:
             message = await self.expand_forwards(message)
         frozen_relevance = (
@@ -788,9 +974,9 @@ class Service:
         if not authorize(message, self.s):
             await self.store.runtime.filters.update_audit(audit_id, "cancelled", "unauthorized")
             return
-        if self.diary:
-            await self.diary.group(job["id"], message)
         sandbox = getattr(intent, "sandbox_mode", False)
+        if self.diary and not sandbox:
+            await self.diary.group(job["id"], message, members=members)
         if not sandbox:
             if not await self.sessions.admit_history(
                 message, members, expected_epoch=session["epoch"]
@@ -825,6 +1011,63 @@ class Service:
             payload.pop("owner_notebook_snapshot", None)
             payload.pop("近期群聊巡逻记忆（只读背景）", None)
         if intent == "ignore":
+            if (
+                not sandbox
+                and message.platform == "onebot"
+                and message.kind == "group"
+                and not message.addressed
+                and not self.bot_guard.known_bot(message)
+            ):
+                r_score = getattr(intent, "reply_score", None)
+                r_thresh = getattr(intent, "reply_threshold", None)
+                if (
+                    isinstance(r_score, (int, float))
+                    and isinstance(r_thresh, (int, float))
+                    and max(0.20, r_thresh * 0.55) <= r_score < r_thresh
+                ):
+                    scope_key = self.store.session_scope(message)
+                    now_ts = time.time()
+                    if now_ts - self._lurk_react_at.get(scope_key, 0.0) >= 180:
+                        emoji_id = self._pick_lurk_emoji(members)
+                        target_id = next(
+                            (
+                                m.event_id
+                                for m in reversed(members)
+                                if re.fullmatch(r"-?[0-9]{1,30}", m.event_id)
+                            ),
+                            None,
+                        )
+                        if emoji_id and target_id:
+                            self._lurk_react_at[scope_key] = now_ts
+                            if len(self._lurk_react_at) > 1024:
+                                self._lurk_react_at.pop(next(iter(self._lurk_react_at)))
+                            await self.store.enqueue_reply(
+                                job["id"],
+                                message,
+                                "",
+                                session_epoch=session["epoch"],
+                                participants=members,
+                                allowed_at_qqs=set(),
+                                audit_id=audit_id,
+                                actions={
+                                    "abstain": True,
+                                    "bubbles": [],
+                                    "anchor": {"reply_id": target_id, "mentions": []},
+                                    "sticker": {"label": None, "timing": "after_text"},
+                                    "image_digest": None,
+                                    "emoji_like": emoji_id,
+                                    "poke_qq": None,
+                                    "save_meme_label": None,
+                                    "set_longnick": None,
+                                    "folded": None,
+                                    "watermark": watermark,
+                                    "source_ids": [m.event_id for m in members],
+                                    "public": True,
+                                },
+                                consumed_image_events=[],
+                                consumed_file_events=[],
+                            )
+                            await self.store.runtime.filters.update_audit(audit_id, "queued")
             return
         invited_bots = set()
         if not sandbox and len(members) == 1 and owner(message, self.s):
@@ -835,6 +1078,7 @@ class Service:
             invited_bots.add(message.user_id)
         filtered_nearby = []
         image_nearby = []
+        history_events: set[str] = set()
         selected_neighbour_members = []
         neighbour_image_events = []
         digested_events = {
@@ -951,6 +1195,22 @@ class Service:
                     image_sources.extend(recalled_sources)
                     images.extend(recalled_images)
                     payload["image_sources"] = image_sources
+        file_attachments, file_sources, consumed_file_events = [], [], []
+        if not sandbox and not self.bot_guard.known_bot(message):
+            file_attachments, file_sources, consumed_file_events = await self._load_turn_files(
+                message, members, filtered_nearby, history_events, current_events
+            )
+            await message_guard()
+            if file_sources:
+                payload["file_sources"] = file_sources
+            if file_attachments:
+                await self.ai.screen(
+                    {"file_sources": file_sources, "file_attachments": file_attachments},
+                    job["subject"],
+                    purpose="source",
+                    before_call=message_guard,
+                )
+                payload["file_attachments"] = file_attachments
         if not sandbox:
             related_user_ids = [
                 *(m.user_id for m in members),
@@ -982,6 +1242,7 @@ class Service:
                                 "command_text": "",
                                 "forward_ids": [],
                                 "images": [],
+                                "files": [],
                             }
                         )
                     )
@@ -1043,7 +1304,6 @@ class Service:
             if (
                 not sandbox
                 and not self.bot_guard.known_bot(message)
-                and (message.kind == "private" or message.addressed)
                 and (
                     explicit_search(members[-1].command_text or members[-1].text)
                     or getattr(intent, "need_external_lookup", False)
@@ -1055,7 +1315,16 @@ class Service:
                     self.record("web_search_disabled")
                 else:
                     try:
-                        query = search_query(members[-1], self.s)
+                        query = search_query(
+                            members[-1],
+                            self.s,
+                            batch_messages=members,
+                            link_titles=[
+                                p["title"]
+                                for p in previews
+                                if isinstance(p, dict) and p.get("title")
+                            ],
+                        )
                     except Rejected:
                         query = None
                         payload["web_search_status"] = "skipped_query"
@@ -1094,7 +1363,7 @@ class Service:
             batch = self.store.groups.active.get(self.store.session_scope(message))
             chat_route = intent
             tier = getattr(intent, "tier", 2)
-            if (payload.get("web_search_findings") or images) and tier < 2:
+            if (payload.get("web_search_findings") or images or file_attachments) and tier < 2:
                 tier = 2
                 if isinstance(intent, RouteDecision):
                     chat_route = RouteDecision(
@@ -1106,6 +1375,13 @@ class Service:
                     )
             if tier >= 3 and hasattr(self.sender, "quick_ack"):
                 self.background(self.quick_ack(job, message, message_guard))
+            if (
+                not sandbox
+                and message.platform == "onebot"
+                and message.kind == "private"
+                and hasattr(self.sender, "typing")
+            ):
+                await self.sender.typing(message)
             gen_trace = {}
             try:
                 generated = await self.ai.generate(
@@ -1138,6 +1414,13 @@ class Service:
             payload.clear()
             images.clear()
             if generated.lstrip().startswith("{"):
+                allowed_poke = (
+                    set()
+                    if sandbox
+                    else set(allowed_at)
+                    if message.kind == "group"
+                    else {message.user_id}
+                )
                 actions, folded = parse_actions(
                     generated,
                     public=public,
@@ -1146,8 +1429,48 @@ class Service:
                     labels=self.memes.labels,
                     settings=self.s,
                     tier=tier,
+                    allowed_poke=allowed_poke,
+                    allow_longnick=(not sandbox and is_persona_owner(message, self.s)),
                 )
+                if not sandbox and not actions.abstain:
+                    if actions.save_meme_label and not self.bot_guard.known_bot(message):
+                        await self._auto_save_meme(
+                            message, [*neighbour_members, *members], actions.save_meme_label
+                        )
+                    if actions.set_longnick and is_persona_owner(message, self.s):
+                        try:
+                            await self.longnick.update(actions.set_longnick, automatic=False)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            pass
                 if actions.abstain:
+                    if (
+                        not sandbox
+                        and message.platform == "onebot"
+                        and (actions.emoji_like or actions.poke_qq)
+                    ):
+                        await self.store.enqueue_reply(
+                            job["id"],
+                            message,
+                            "",
+                            session_epoch=session["epoch"],
+                            participants=members,
+                            allowed_at_qqs=allowed_at,
+                            audit_id=audit_id,
+                            actions={
+                                **actions.model_dump(),
+                                "bubbles": [],
+                                "folded": None,
+                                "watermark": watermark,
+                                "source_ids": [m.event_id for m in members],
+                                "public": public,
+                            },
+                            consumed_image_events=neighbour_image_events,
+                            consumed_file_events=consumed_file_events,
+                        )
+                        await self.store.runtime.filters.update_audit(audit_id, "queued")
+                        return
                     if gen_trace.get("chain_invalidate"):
                         await self.sessions.invalidate_chains(message)
                     await self.store.runtime.filters.update_audit(
@@ -1192,6 +1515,7 @@ class Service:
                         ),
                     },
                     consumed_image_events=neighbour_image_events,
+                    consumed_file_events=consumed_file_events,
                 )
                 await self.store.runtime.filters.update_audit(audit_id, "queued")
                 return
@@ -1221,6 +1545,7 @@ class Service:
             allowed_at_qqs=allowed_at,
             audit_id=audit_id,
             consumed_image_events=neighbour_image_events,
+            consumed_file_events=consumed_file_events,
         )
         await self.store.runtime.filters.update_audit(audit_id, "queued")
 
@@ -1552,11 +1877,15 @@ class Service:
                 reply["text"],
                 expected_epoch=delivery_epoch,
             )
+        if status == "sent" and text_confirmed and not reply["proactive"] and self.diary:
+            await self.diary.bot_reply(reply["id"], message, reply["text"])
         if status == "sent" and not reply["proactive"] and "session_epoch" in reply:
             if reply.get("consumed_image_events"):
                 await self.store.groups.mark_images_consumed(
                     message, reply["consumed_image_events"]
                 )
+            if reply.get("consumed_file_events"):
+                await self.store.groups.mark_files_consumed(message, reply["consumed_file_events"])
             await self.proactive.note_activity(message)
             self.store.runtime.filters.spoke(message)
             self.compressor.schedule(message)

@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     prefix_history_enabled: bool = True
     interaction_store_enabled: bool = True
     interaction_chain_ttl_seconds: int = Field(default=300, ge=60, le=604800)
-    history_high_tokens: int = Field(default=28000, ge=1000, le=28000)
+    history_high_tokens: int = Field(default=14000, ge=1000, le=40000)
     history_max_bytes: int = Field(default=144000, ge=4000, le=144000)
     chat_tail_tokens: int = Field(default=4200, ge=400, le=4200)
     decision_input_tokens: int = Field(default=4200, ge=400, le=4200)
@@ -72,8 +72,12 @@ class Settings(BaseSettings):
     memory_daily_usd: Decimal = Field(default=Decimal("0.20"), ge=0, le=100)
     admin_daily_usd: Decimal = Field(default=Decimal("0.20"), ge=0, le=100)
     web_search_enabled: bool = False
-    web_search_daily_limit: int = Field(default=10, ge=0, le=100)
+    web_search_daily_limit: int = Field(default=10, ge=0, le=500)
+    web_search_monthly_google_limit: int = Field(default=5000, ge=0, le=100000)
     web_search_daily_usd: Decimal = Field(default=Decimal("0.50"), ge=0, le=20)
+    deepseek_api_key: SecretStr = SecretStr("")
+    deepseek_base_url: str = Field(default="https://api.deepseek.com", max_length=256)
+    deepseek_model: str = Field(default="deepseek-flash", max_length=80)
     onebot_enabled: bool = False
     onebot_self_id: str = Field(default="", pattern=r"^[0-9]{0,20}$")
     onebot_secret: SecretStr = SecretStr("")
@@ -190,6 +194,10 @@ class Settings(BaseSettings):
     image_standard_max_edge: int = Field(default=1600, ge=512, le=2560)
     image_tall_max_edge: int = Field(default=2560, ge=1024, le=4096)
     image_token_reserve: int = Field(default=8192, ge=4096, le=32768)
+    file_read_enabled: bool = True
+    file_max_bytes: int = Field(default=131_072, ge=16_384, le=262_144)
+    file_daily_limit_per_user: int = Field(default=15, ge=0, le=100)
+    text_card_mode: Literal["rich_auto", "fallback_only"] = "rich_auto"
 
     roaming_enabled: bool = False
     gdrive_auth_mode: Literal["service_account", "oauth"] = Field(

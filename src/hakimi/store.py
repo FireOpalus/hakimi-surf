@@ -202,6 +202,7 @@ class Store:
         )
         for row in pending:
             await self.settle(row[0], None)
+        await self._reconcile_search_unbilled_v1()
 
     @staticmethod
     def _periods(day):
@@ -358,6 +359,61 @@ class Store:
                     )
             await self.db.execute("INSERT INTO meta VALUES ('bill_aligned_v1','1')")
 
+    async def _reconcile_search_unbilled_v1(self) -> None:
+        async with self.transaction():
+            if await self.one("SELECT 1 FROM meta WHERE key='search_unbilled_v1'"):
+                return
+            rows = await self.all(
+                "SELECT l.id,l.day,l.reserved,l.amount,u.estimated_amount,"
+                "COALESCE(t.model_lane,u.model_lane,a.model_lane) AS model_lane,"
+                "t.thinking_level AS thinking_level "
+                "FROM ledger l "
+                "LEFT JOIN ledger_usage u ON u.id=l.id "
+                "LEFT JOIN ledger_attribution a ON a.id=l.id "
+                "LEFT JOIN ledger_thinking t ON t.id=l.id "
+                "WHERE l.lane='search'"
+            )
+            for row in rows:
+                d_amount = -int(row["amount"] or 0)
+                est = row["estimated_amount"]
+                d_est = -int(est) if est is not None else 0
+                if d_amount:
+                    await self.db.execute(
+                        "UPDATE budget_totals SET amount=MAX(0,amount+?)", (d_amount,)
+                    )
+                if row["reserved"] or row["amount"]:
+                    await self.db.execute(
+                        "UPDATE ledger SET amount=0,reserved=0 WHERE id=?", (row["id"],)
+                    )
+                if est:
+                    await self.db.execute(
+                        "UPDATE ledger_usage SET estimated_amount=0 WHERE id=?", (row["id"],)
+                    )
+                if d_amount or d_est:
+                    lane_key = model_accounting.lane_name(row["model_lane"])
+                    thinking_key = model_accounting.thinking_name(row["thinking_level"], lane_key)
+                    for period in self._periods(row["day"]):
+                        await self.db.execute(
+                            "UPDATE usage_aggregates SET charged_amount=MAX(0,charged_amount+?),"
+                            "estimated_amount=MAX(0,estimated_amount+?) WHERE period=?",
+                            (d_amount, d_est, period),
+                        )
+                        await self.db.execute(
+                            "UPDATE model_usage_aggregates "
+                            "SET charged_amount=MAX(0,charged_amount+?),"
+                            "estimated_amount=MAX(0,estimated_amount+?) "
+                            "WHERE period=? AND model_lane=?",
+                            (d_amount, d_est, period, lane_key),
+                        )
+                        await self.db.execute(
+                            "UPDATE thinking_usage_aggregates "
+                            "SET charged_amount=MAX(0,charged_amount+?),"
+                            "estimated_amount=MAX(0,estimated_amount+?) "
+                            "WHERE period=? AND model_lane=? AND thinking_level=?",
+                            (d_amount, d_est, period, lane_key, thinking_key),
+                        )
+            await self.db.execute("INSERT INTO meta VALUES ('search_unbilled_v1','1')")
+
     async def _load_budget_config(self):
         async with self.lock:
             row = await self.one("SELECT payload FROM admin_config WHERE key='budget'")
@@ -399,6 +455,64 @@ class Store:
         self._apply_budget(value or self.env_budget)
         self.budget_overridden = value is not None
         return await self.budget_config_status()
+
+    async def _account_balance_unlocked(self) -> dict:
+        total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
+        row = await self.one("SELECT payload FROM admin_config WHERE key='account_balance'")
+        if not row:
+            return {
+                "configured": False,
+                "remaining_microdollars": None,
+                "remaining_usd": None,
+                "set_microdollars": None,
+                "set_usd": None,
+                "spent_since_set_microdollars": 0,
+                "updated_at": None,
+            }
+        data = self.vault.open("admin:account_balance", row[0])
+        set_micro = int(data["set_microdollars"])
+        base_total = int(data["baseline_total_microdollars"])
+        spent_since = max(0, total - base_total)
+        remaining_micro = max(0, set_micro - spent_since)
+        return {
+            "configured": True,
+            "remaining_microdollars": remaining_micro,
+            "remaining_usd": f"{Decimal(remaining_micro) / Decimal(1_000_000):.4f}",
+            "set_microdollars": set_micro,
+            "set_usd": f"{Decimal(set_micro) / Decimal(1_000_000):.2f}",
+            "spent_since_set_microdollars": spent_since,
+            "updated_at": data.get("updated_at"),
+        }
+
+    async def account_balance_status(self) -> dict:
+        async with self.lock:
+            return await self._account_balance_unlocked()
+
+    async def set_account_balance(self, balance_usd: Decimal) -> dict:
+        if (
+            not isinstance(balance_usd, Decimal)
+            or not balance_usd.is_finite()
+            or not Decimal(0) <= balance_usd <= Decimal("100000")
+        ):
+            raise Rejected("invalid_budget_amount")
+        async with self.transaction():
+            total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
+            payload = {
+                "set_microdollars": microdollars(balance_usd),
+                "baseline_total_microdollars": int(total),
+                "updated_at": time.time(),
+            }
+            await self.db.execute(
+                "INSERT INTO admin_config VALUES ('account_balance',?) ON CONFLICT(key) "
+                "DO UPDATE SET payload=excluded.payload",
+                (self.vault.seal("admin:account_balance", payload),),
+            )
+            return await self._account_balance_unlocked()
+
+    async def clear_account_balance(self) -> dict:
+        async with self.transaction():
+            await self.db.execute("DELETE FROM admin_config WHERE key='account_balance'")
+            return await self._account_balance_unlocked()
 
     async def _charge_aggregates(self, day, delta, calls=0):
         for period in self._periods(day):
@@ -596,6 +710,8 @@ class Store:
     async def _budget_refusal(self, day: str, subject: str, lane: str, amount: int) -> str:
         if await self.one("SELECT 1 FROM meta WHERE key='budget_overrun'"):
             return "circuit"
+        if lane == "search":
+            return ""
         total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
         month = await self.one(
             "SELECT charged_amount FROM usage_aggregates WHERE period=?", ("month:" + day[:7],)
@@ -627,7 +743,6 @@ class Store:
             "memory": self.s.memory_daily_usd,
             "admin": self.s.admin_daily_usd,
             "proactive": self.s.proactive_daily_usd,
-            "search": self.runtime.web_search.config.daily_usd,
         }.get(lane)
         if self.s.daily_usd <= 0 or global_total + amount > microdollars(self.s.daily_usd):
             return "daily"
@@ -664,7 +779,8 @@ class Store:
             raise Rejected("invalid_budget_amount")
         now = self.local_now()
         day = now.date().isoformat()
-        amount, reservation = microdollars(usd), uuid.uuid4().hex
+        amount = 0 if lane == "search" else microdollars(usd)
+        reservation = uuid.uuid4().hex
         async with self.transaction():
             budget_detail = await self._budget_refusal(day, subject, lane, amount)
             if budget_detail == "circuit":
@@ -753,11 +869,17 @@ class Store:
                 or (thinking_row[1] if thinking_row else None),
                 model_lane,
             )
-            if actual is not None:
+            if row["lane"] == "search":
+                amount = 0
+                estimated = 0 if actual is not None else None
+                status = "settled" if actual is not None else "unknown"
+                delta_amount = -int(row["amount"] or 0)
+            elif actual is not None:
                 billable = discounted_actual if discounted_actual is not None else actual
                 amount = microdollars(billable)
                 estimated = amount
                 status = "settled"
+                delta_amount = amount - row["amount"]
             else:
                 amount = (
                     row["amount"]
@@ -766,11 +888,12 @@ class Store:
                 )
                 estimated = None
                 status = "unknown"
+                delta_amount = amount - row["amount"]
             await self.db.execute(
-                "UPDATE budget_totals SET amount=amount+?", (amount - row["amount"],)
+                "UPDATE budget_totals SET amount=MAX(0,amount+?)", (delta_amount,)
             )
-            await self._charge_aggregates(row["day"], amount - row["amount"])
-            overrun = amount > row["reserved"]
+            await self._charge_aggregates(row["day"], delta_amount)
+            overrun = False if row["lane"] == "search" else amount > row["reserved"]
             await self.db.execute(
                 "UPDATE ledger SET amount=?,status=? WHERE id=?",
                 (amount, status, reservation),
@@ -854,7 +977,7 @@ class Store:
         async with self.lock:
             rows = await self.all(
                 "SELECT lane,SUM(amount) AS amount,COUNT(*) AS calls "
-                "FROM ledger WHERE day=? GROUP BY lane",
+                "FROM ledger WHERE day=? AND lane<>'search' GROUP BY lane",
                 (day,),
             )
             statuses = await self.all("SELECT status,COUNT(*) AS n FROM jobs GROUP BY status")
@@ -1002,6 +1125,7 @@ class Store:
                 microdollars(self.s.total_usd),
             )
             monthly_limit = microdollars(getattr(self.s, "monthly_usd", Decimal("40")))
+            account_balance = await self._account_balance_unlocked()
         return {
             "day_local": day,
             "month_local": day[:7],
@@ -1018,6 +1142,7 @@ class Store:
             "monthly_limit": monthly_limit,
             "total": total,
             "total_limit": total_limit,
+            "account_balance": account_balance,
             "user_top_daily": user_top_row[0] if user_top_row else 0,
             "user_daily_limit": microdollars(self.s.user_daily_usd),
             "sub_budgets": {
@@ -1062,6 +1187,7 @@ class Store:
         external_search=False,
         audit_id=None,
         consumed_image_events=(),
+        consumed_file_events=(),
     ) -> None:
         batch = self.groups.active.get(self.session_scope(message))
         if batch and batch.job["id"] == job_id:
@@ -1087,6 +1213,8 @@ class Store:
             payload["allowed_at_qqs"] = sorted(set(allowed_at_qqs))
         if consumed_image_events:
             payload["consumed_image_events"] = list(dict.fromkeys(consumed_image_events))
+        if consumed_file_events:
+            payload["consumed_file_events"] = list(dict.fromkeys(consumed_file_events))
         expires = now + 3600 if proactive else message.created_at + self.s.event_ttl_seconds
         async with self.transaction():
             if not proactive:
