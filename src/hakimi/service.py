@@ -23,6 +23,7 @@ from .gemini import GeminiGateway
 from .generation_policy import Scenario
 from .group_pipeline import other_mentions
 from .hot_ring import HotRing
+from .life_engine import LifeEngine
 from .link_preview import preview_links
 from .longnick import Longnick
 from .media import ImageLoader
@@ -104,6 +105,7 @@ class Service:
         self.sessions = SessionManager(settings, store)
         self.hot = HotRing()
         store.runtime.hot_ring = self.hot
+        store.runtime.filters.hot_ring = self.hot
         self.enrichments = {}
         self.preview_slots = asyncio.Semaphore(4)
         self.background_tasks = set()
@@ -158,6 +160,7 @@ class Service:
         active_drive = resolved_drive if settings.roaming_enabled else None
         self.db_backup = DatabaseBackup(settings, store, active_drive)
         self.surf_mirror = SurfMirror(self, active_drive)
+        self.life_engine = LifeEngine(self)
 
     def refresh_secrets(self):
         self.secrets = configured_secrets(self.s)
@@ -369,6 +372,7 @@ class Service:
             asyncio.create_task(self.proactive.delivery(), name="owner-dm-delivery"),
             asyncio.create_task(self.bili_watcher.run(), name="bili-account-patrol"),
             asyncio.create_task(self.gcp_billing_worker(), name="gcp-billing-sync"),
+            asyncio.create_task(self.life_engine.run(), name="life-engine"),
         ]
         if self.diary and self.s.roaming_enabled:
             self.tasks.append(asyncio.create_task(self.diary.run(), name="roaming-diary"))

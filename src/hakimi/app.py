@@ -22,6 +22,7 @@ from .config import Settings
 from .drive_client import FolderDrive
 from .gcp_admin import router as gcp_billing_router
 from .gemini import GeminiGateway
+from .life_admin import router as life_router
 from .meme_admin import router as meme_router
 from .notebook_snapshot import NotebookSnapshot
 from .onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
@@ -124,6 +125,7 @@ def create_app(
                     await service.video_watch.initialize()
                     await service.memes.initialize()
                     await service.world_state.initialize()
+                    await service.life_engine.initialize()
                     from .outgoing import recover_receipts
 
                     await recover_receipts(service)
@@ -180,6 +182,7 @@ def create_app(
     app.include_router(provider_router)
     app.include_router(gcp_billing_router)
     app.include_router(affection_router)
+    app.include_router(life_router)
     html = Path(__file__).with_name("admin_page.html").read_text()
     import base64
 

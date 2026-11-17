@@ -287,6 +287,7 @@ class LifeBlockPlanner:
         self.last_plan_at: float = 0.0
         self.last_plan_source: str = "none"
         self._impulse_cooldowns: dict[str, float] = {}
+        self._recorded_milestone_diary_ids: dict[str, float] = {}
 
     @property
     def config(self) -> LifeEngineConfig:
@@ -623,11 +624,42 @@ class LifeBlockPlanner:
             "next_plan_at": self.next_plan_at,
         }
 
+    async def _record_milestone_diary(self, event: MilestoneEvent, *, now: float) -> None:
+        diary = getattr(self.service, "diary", None)
+        if diary is None or not hasattr(diary, "world_event"):
+            return
+        if event.id in self._recorded_milestone_diary_ids:
+            return
+        self._recorded_milestone_diary_ids[event.id] = now
+        while len(self._recorded_milestone_diary_ids) > 512:
+            self._recorded_milestone_diary_ids.pop(
+                next(iter(self._recorded_milestone_diary_ids))
+            )
+        if event.payload:
+            summary_raw = json.dumps(event.payload, ensure_ascii=False, separators=(",", ":"))
+            raw_summary = f"重要动态 {event.event_type}: {summary_raw}"
+        else:
+            raw_summary = f"重要动态 {event.event_type}"
+        summary = trim_complete_text(raw_summary, 120)
+        try:
+            await diary.world_event(
+                f"milestone:{event.id}",
+                event.source_module,
+                event.event_type,
+                summary,
+                now=now,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("event=milestone_diary_failed")
+
     async def on_milestone_event(self, event: MilestoneEvent) -> str | None:
         """Derive a zero-Token fuzzy intent ticket on high-importance milestone events."""
         if not self.config.enabled or event.importance != "high":
             return None
         now = max(self.clock(), float(event.created_at or 0.0))
+        await self._record_milestone_diary(event, now=now)
         last_at = self._impulse_cooldowns.get(event.source_module, 0.0)
         if now - last_at < 600.0:
             return None
@@ -1015,7 +1047,7 @@ class JITExecutor:
             target_scope,
             self.s,
             event_id=f"jit:{intent_id}",
-            created_at=time.time(),
+            created_at=ts,
         )
         if target_msg is None or not authorize(target_msg, self.s):
             await ws.mark_intent(intent_id, "gated_skip", now=self.clock())
@@ -1240,6 +1272,13 @@ class LifeEngine:
                 self.overridden = False
             world_state = getattr(self.service, "world_state", None)
             if world_state is not None:
+                async with self.store.lock:
+                    has_intents_table = await self.store.one(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='scheduled_intents'"
+                    )
+                if not has_intents_table and hasattr(world_state, "initialize"):
+                    await world_state.initialize()
                 world_state.subscribe(self.planner.on_milestone_event)
             if self.planner.next_plan_at <= 0.0:
                 self.planner.next_plan_at = self.clock() + 120.0
