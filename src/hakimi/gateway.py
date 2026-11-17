@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .admission_policy import effective_bot_reply_threshold
+from .affection import level_for_score
 from .security import Rejected, clean_text, configured_secrets
 
 PRESETS = {"quiet": 0.65, "natural": 0.42, "active": 0.28}
@@ -86,6 +87,9 @@ class FilterManager:
         self.overridden = False
         self.initialized = False
         self.init_lock, self.lock = asyncio.Lock(), asyncio.Lock()
+        self.hot_ring = None
+        self.proactive_cooldown_seconds = 1500
+        self.last_proactive_spoke: dict[str, float] = {}
 
     async def initialize(self):
         async with self.init_lock:
@@ -133,7 +137,40 @@ class FilterManager:
             self.config, self.overridden = config, True
         return await self.status()
 
-    def thresholds(self, message=None, *, owner=False, known_bot=False, bot_invited=False):
+    @staticmethod
+    def _speaker_affection_level(aff, message) -> int | None:
+        if aff is None or message is None:
+            return None
+        cfg = getattr(aff, "config", None)
+        if cfg is not None and not getattr(cfg, "enabled", True):
+            return None
+        is_bot_fn = getattr(aff, "_is_known_bot", None)
+        if callable(is_bot_fn) and is_bot_fn(message.platform, message.user_id):
+            return None
+        is_owner_fn = getattr(aff, "is_owner_id", None)
+        user_key_fn = getattr(aff, "_user_key", None)
+        user_scores = getattr(aff, "_user_scores", None)
+        if callable(is_owner_fn) and callable(user_key_fn) and isinstance(user_scores, dict):
+            if is_owner_fn(message.platform, message.user_id):
+                return 6
+            cached = user_scores.get(user_key_fn(message.platform, message.user_id))
+            score = (
+                cached[0]
+                if cached is not None
+                else (int(getattr(cfg, "initial_score", 50)) if cfg is not None else 50)
+            )
+            return level_for_score(score, is_owner=False)
+        return None
+
+    def thresholds(
+        self,
+        message=None,
+        *,
+        owner=False,
+        known_bot=False,
+        bot_invited=False,
+        now: float | None = None,
+    ):
         config = self.config
         preset = (
             config.group_activity.get(f"{message.platform}:{message.conversation_id}")
@@ -141,15 +178,39 @@ class FilterManager:
             else None
         )
         reply = PRESETS[preset] if preset else config.reply_threshold
-        if (
-            not (known_bot and not bot_invited)
-            and (aff := getattr(self.store.runtime, "affection", None)) is not None
-        ):
+        aff = getattr(self.store.runtime, "affection", None)
+        if not (known_bot and not bot_invited) and aff is not None:
             reply = aff.adjust_reply_threshold(message, reply)
         if owner:
             reply = min(reply, OWNER_REPLY_CEILING)
         elif known_bot and not bot_invited:
             reply = effective_bot_reply_threshold(message.user_id if message else "", self.s)
+        if (
+            self.hot_ring is not None
+            and message is not None
+            and message.kind == "group"
+            and not message.addressed
+            and not (known_bot and not bot_invited)
+        ):
+            aff_level = self._speaker_affection_level(aff, message)
+            if aff_level is None or aff_level > 1:
+                ref_now = time.time() if now is None else float(now)
+                scope = self._group_scope(message)
+                last_at = getattr(self, "last_proactive_spoke", {}).get(scope, 0.0)
+                if last_at > 0 and (ref_now - last_at) < self.proactive_cooldown_seconds:
+                    reply = round(min(0.95, reply + 0.12), 4)
+                else:
+                    act = self.hot_ring.recent_group_activity(
+                        message,
+                        window_seconds=300,
+                        now=ref_now,
+                        bot_ids=self.s.bot_qq_ids,
+                    )
+                    if act["count"] >= 15:
+                        bonus = 0.08 + (
+                            0.04 if (owner or (aff_level is not None and aff_level >= 4)) else 0.0
+                        )
+                        reply = round(min(reply, max(0.18, reply - bonus)), 4)
         return {
             "injection": config.owner_injection_threshold if owner else config.injection_threshold,
             "unsafe": config.owner_unsafe_threshold if owner else config.unsafe_threshold,
@@ -414,6 +475,17 @@ class FilterManager:
             else "ready"
         )
 
+    def note_proactive_spoke(self, message, *, now: float | None = None):
+        if message is None or getattr(message, "kind", None) != "group":
+            return
+        if not hasattr(self, "last_proactive_spoke"):
+            self.last_proactive_spoke = {}
+        scope = self._group_scope(message)
+        self.last_proactive_spoke.pop(scope, None)
+        self.last_proactive_spoke[scope] = time.time() if now is None else float(now)
+        while len(self.last_proactive_spoke) > 2048:
+            self.last_proactive_spoke.pop(next(iter(self.last_proactive_spoke)))
+
     def spoke(self, message):
         if message.kind != "group":
             return
@@ -422,6 +494,8 @@ class FilterManager:
         self.last_spoke[self._group_scope(message)] = time.time()
         if len(self.last_spoke) > 2048:
             self.last_spoke.pop(next(iter(self.last_spoke)))
+        if not getattr(message, "addressed", True):
+            self.note_proactive_spoke(message)
 
     async def clear_group(self, message):
         if message.kind != "group":

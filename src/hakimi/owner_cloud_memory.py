@@ -7,8 +7,10 @@ import os
 import re
 import stat
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .bot_server import is_persona_owner
 from .reply_style import trim_complete_text
@@ -165,6 +167,9 @@ class OwnerCloudMemory:
         self._recent_core: list[dict[str, str]] = []
         self._chunks: list[dict[str, Any]] = []
         self._index_chunks: list[dict[str, Any]] = []
+        self._latest_ts: float = 0.0
+        self._latest_iso: str = ""
+        self._latest_tag: str = ""
 
     def _collect_files(self) -> list[tuple[str, Path]]:
         root = Path(self.s.antigravity_memory_dir)
@@ -210,6 +215,13 @@ class OwnerCloudMemory:
         recent_core: list[dict[str, str]] = []
         chunks: list[dict[str, Any]] = []
         index_chunks: list[dict[str, Any]] = []
+        latest_ts = 0.0
+        latest_iso = ""
+        latest_tag = ""
+        try:
+            bot_tz = ZoneInfo(self.s.bot_timezone)
+        except ZoneInfoNotFoundError:
+            bot_tz = ZoneInfo("UTC")
 
         for rel, path in files:
             raw = _read_regular_file(path)
@@ -260,6 +272,28 @@ class OwnerCloudMemory:
                                 "tags": set(),
                             }
                         )
+                        raw_ts = str(item.get("timestamp", "")).strip()
+                        if len(raw_ts) >= 16:
+                            parsed = None
+                            try:
+                                parsed = datetime.strptime(
+                                    raw_ts, "%Y-%m-%d %H:%M:%S"
+                                ).replace(tzinfo=bot_tz)
+                            except ValueError:
+                                try:
+                                    parsed = datetime.fromisoformat(raw_ts)
+                                    if parsed.tzinfo is None:
+                                        parsed = parsed.replace(tzinfo=bot_tz)
+                                except ValueError:
+                                    parsed = None
+                            if parsed is not None:
+                                ts_val = parsed.timestamp()
+                                if ts_val >= latest_ts:
+                                    latest_ts = ts_val
+                                    latest_iso = parsed.astimezone(bot_tz).isoformat(
+                                        timespec="seconds"
+                                    )
+                                    latest_tag = _sanitize(str(item.get("tag", "")), self.s)[:24]
                 continue
 
             text = _sanitize(raw, self.s)
@@ -281,6 +315,9 @@ class OwnerCloudMemory:
         self._recent_core = recent_core
         self._chunks = chunks
         self._index_chunks = index_chunks
+        self._latest_ts = latest_ts
+        self._latest_iso = latest_iso
+        self._latest_tag = latest_tag
 
     def _search_chunks(self, query_text: str, *, recall: bool) -> list[dict[str, str]]:
         if not self._chunks:
@@ -370,6 +407,18 @@ class OwnerCloudMemory:
             if recalled:
                 result["owner_recalled_memories"] = recalled
             return result
+
+    def latest_activity_info(self) -> dict[str, Any]:
+        enabled = bool(self.s.enable_antigravity_memory)
+        with self._lock:
+            if enabled:
+                self._rebuild_if_needed()
+            return {
+                "enabled": enabled,
+                "latest_timestamp": self._latest_ts if enabled else 0.0,
+                "latest_iso": self._latest_iso if enabled else "",
+                "latest_tag": self._latest_tag if enabled else "",
+            }
 
     def status(self) -> dict[str, Any]:
         with self._lock:
