@@ -1,0 +1,21 @@
+{
+  "name": "hakimi-mc-agent",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone pure-JS Mineflayer WebSocket sidecar for hakimi-surf CN node",
+  "main": "src/index.mjs",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/bridge.test.mjs"
+  },
+  "dependencies": {
+    "mineflayer": "^4.39.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.2.0",
+    "ws": "^8.23.0"
+  }
+}
