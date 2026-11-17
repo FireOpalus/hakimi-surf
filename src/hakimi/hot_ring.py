@@ -130,3 +130,38 @@ class HotRing:
             if len(results) >= limit:
                 break
         return list(reversed(results))
+
+    def recent_group_activity(
+        self,
+        message,
+        *,
+        window_seconds: float = 1800,
+        now: float | None = None,
+        bot_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> dict:
+        if message is None:
+            return {"count": 0, "unique_users": 0, "user_ids": [], "messages": []}
+        ring = self.rings.get(self.key(message))
+        if not ring:
+            return {"count": 0, "unique_users": 0, "user_ids": [], "messages": []}
+        ref_now = time.time() if now is None else float(now)
+        excluded_bots = bot_ids or frozenset()
+        items = []
+        for _, item, _ in reversed(list(ring.messages.values())):
+            if (
+                self.recalled(message, item.event_id)
+                or item.user_id == item.bot_id
+                or item.user_id in excluded_bots
+                or item.created_at <= 0
+                or (ref_now - item.created_at) > window_seconds
+            ):
+                continue
+            items.append(item)
+        chronological = list(reversed(items))
+        uids = list(dict.fromkeys(item.user_id for item in chronological))
+        return {
+            "count": len(chronological),
+            "unique_users": len(uids),
+            "user_ids": uids,
+            "messages": chronological,
+        }

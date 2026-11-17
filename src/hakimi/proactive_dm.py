@@ -462,6 +462,29 @@ class OwnerProactive:
             payload["omitted_public_summaries"] = payload.get("omitted_public_summaries", 0) + 1
         return payload
 
+    def _desktop_recent_activity(self, now: float) -> dict | None:
+        cloud_mem = getattr(self.service, "cloud_memory", None)
+        if cloud_mem is None or not getattr(self.s, "enable_antigravity_memory", False):
+            return None
+        info_fn = getattr(cloud_mem, "latest_activity_info", None)
+        if not callable(info_fn):
+            return None
+        try:
+            info = info_fn()
+        except Exception:
+            return None
+        if not isinstance(info, dict) or not info.get("enabled"):
+            return None
+        latest_ts = info.get("latest_timestamp")
+        if (
+            isinstance(latest_ts, (int, float))
+            and not isinstance(latest_ts, bool)
+            and latest_ts > 0
+            and 0 < (now - latest_ts) < 5400
+        ):
+            return info
+        return None
+
     async def _companion_payload(self, now: float) -> dict:
         local_dt = self.local(now)
         weekday = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[local_dt.weekday()]
@@ -562,25 +585,37 @@ class OwnerProactive:
                         bili_finds.append({"bvid": bvid, "gist": gist})
         except Exception:
             pass
+        desktop_activity = await asyncio.to_thread(self._desktop_recent_activity, now)
         topics = ["结合星期与时段自然打个招呼", "一句不催促的摸鱼问候"]
         if memory_hints or recent_topics:
             topics.append("顺口挂念一下近期聊到的话题或状态")
         if bili_finds:
             topics.append("顺手分享刚在 B 站刷到的有趣内容")
+        care_topic = "知冷知热地递杯水轻声问候刚刚还在电脑前忙正事的 BOISER"
         payload: dict = {
             "task": "one_short_companion_greeting",
             "local_time": local_dt.strftime("%H:%M"),
             "weekday": weekday,
             "day_phase": day_phase,
-            "topic": self.rng.choice(topics),
+            "topic": care_topic if desktop_activity else self.rng.choice(topics),
         }
+        if desktop_activity:
+            payload["desktop_recent_activity"] = (
+                "BOISER 近期刚在电脑端与本体交流忙正事，"
+                "请用知冷知热、不打扰的口吻顺手递杯水或轻声问候，切勿问怎么半天没出现"
+            )
         if memory_hints:
             payload["owner_memory_hints"] = memory_hints
         if recent_topics:
             payload["recent_private_topics"] = recent_topics
         if bili_finds:
             payload["recent_bili_finds"] = bili_finds
-        for key in ("recent_private_topics", "owner_memory_hints", "recent_bili_finds"):
+        for key in (
+            "recent_private_topics",
+            "owner_memory_hints",
+            "recent_bili_finds",
+            "desktop_recent_activity",
+        ):
             if len(untrusted_input(payload).encode()) <= self.s.max_context_bytes:
                 break
             payload.pop(key, None)

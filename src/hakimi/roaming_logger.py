@@ -154,6 +154,25 @@ class RoamingLogger:
             event_id, "patrol", redact_public_summary(public_summary), event_kind="patrol", now=now
         )
 
+    async def world_event(
+        self, event_id: str, source_module: str, event_type: str, summary: str, *, now=None
+    ):
+        ts = self.local(now).strftime("%H:%M")
+        raw = f"[{ts} · 模块 {source_module}/{event_type}] {summary}"
+        for secret in sorted(
+            (s for s in configured_secrets(self.s) if s and len(s) >= 6),
+            key=len,
+            reverse=True,
+        ):
+            raw = raw.replace(secret, "[密钥已隐去]")
+        await self._record(
+            event_id,
+            "world_event",
+            redact_public_summary(raw),
+            event_kind="world_life",
+            now=now,
+        )
+
     def _chat_scope_label(self, message: Message) -> tuple[str, str]:
         if message.kind == "group":
             name = getattr(message, "group_name", "") or message.conversation_id
@@ -224,10 +243,16 @@ class RoamingLogger:
             for r in rows
             if ("event_kind" not in r.keys() or (r["event_kind"] or "patrol") == "patrol")
         ]
+        world_rows = [
+            r
+            for r in rows
+            if "event_kind" in r.keys() and r["event_kind"] == "world_life"
+        ]
         chat_rows = [
             r
             for r in rows
-            if "event_kind" in r.keys() and (r["event_kind"] or "patrol") != "patrol"
+            if "event_kind" in r.keys()
+            and (r["event_kind"] or "patrol") not in {"patrol", "world_life"}
         ]
         payload = {
             "day": day,
@@ -245,6 +270,19 @@ class RoamingLogger:
                 payload["public_summaries"].pop()
                 payload["omitted_public_summaries"] += 1
                 break
+        if world_rows:
+            world_events: list[str] = []
+            payload["world_events"] = world_events
+            for row in reversed(world_rows[-20:]):
+                excerpt = self.store.vault.open(row["id"], row["payload"])[:400]
+                world_events.append(excerpt)
+                if len(json.dumps(payload, ensure_ascii=False).encode()) > self.s.max_context_bytes:
+                    world_events.pop()
+                    break
+            if world_events:
+                world_events.reverse()
+            else:
+                payload.pop("world_events", None)
         for row in reversed(chat_rows[-25:]):
             excerpt = self.store.vault.open(row["id"], row["payload"])[:400]
             payload["chat_excerpts"].append(excerpt)
@@ -313,7 +351,10 @@ class RoamingLogger:
                 (day,),
             )
         patrol_rows = [r for r in rows if (r["event_kind"] or "patrol") == "patrol"]
-        chat_rows = [r for r in rows if (r["event_kind"] or "patrol") != "patrol"]
+        world_rows = [r for r in rows if (r["event_kind"] or "patrol") == "world_life"]
+        chat_rows = [
+            r for r in rows if (r["event_kind"] or "patrol") not in {"patrol", "world_life"}
+        ]
         lines = [
             f"# 分身巡逻日记 · {day}",
             "",
@@ -359,6 +400,17 @@ class RoamingLogger:
                 lines.append("")
         elif not activities:
             lines += ["今天暂无白名单聊天记录。", ""]
+        if world_rows:
+            lines += ["## 🌍 今日生活与跨模块轨迹", ""]
+            for index, row in enumerate(world_rows):
+                entry = self.store.vault.open(row["id"], row["payload"])
+                quoted = ["> " + line for line in entry.splitlines()]
+                used_bytes += len("\n".join(quoted).encode()) + 2
+                if used_bytes > 196608:
+                    omitted += len(world_rows) - index
+                    break
+                lines += quoted
+                lines.append("")
         if omitted:
             lines += [f"另有 {omitted} 条记录因日记长度限制省略。", ""]
         lines += [

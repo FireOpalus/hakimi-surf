@@ -185,6 +185,22 @@ class Longnick:
             value, cooldown_seconds=cooldown, error_code="invalid_patrol_longnick"
         )
 
+    async def apply_life_block(self, value: str | None):
+        # Safe hook after LifeBlockPlanner wakes up; enforces full >=20h cooldown.
+        if not self.initialized:
+            try:
+                await self.initialize()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.info("event=longnick_update_failed")
+                return {"status": "failed", "error": "invalid_life_block_longnick"}
+        return await self._apply_auto(
+            value,
+            cooldown_seconds=self.config.cooldown_hours * 3600,
+            error_code="invalid_life_block_longnick",
+        )
+
     async def command(self, message):
         direct = message.command_text if message.command_text is not None else message.text
         if not re.match(r"^/set-sign(?:\s|$)", direct):
