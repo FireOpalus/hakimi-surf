@@ -10,6 +10,41 @@ from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _LOCAL_WS_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_LOCAL_MC_WS_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "hakimi-mc-agent"})
+
+
+def _validate_secret_token(token: str, *, env_name: str) -> None:
+    if (
+        len(token) < 32
+        or token.startswith(("GENERATE_", "REPLACE_"))
+        or any(ord(ch) < 33 or ord(ch) > 126 for ch in token)
+    ):
+        raise ValueError(
+            f"{env_name} must be at least 32 printable ASCII non-placeholder characters"
+        )
+
+
+def _validate_ws_url(
+    raw_url: str,
+    *,
+    env_name: str,
+    allowed_ws_hosts: frozenset[str],
+) -> None:
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in raw_url):
+        raise ValueError(f"{env_name} must not contain whitespace or control characters")
+    parsed = urlsplit(raw_url)
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme not in {"ws", "wss"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"{env_name} must be a ws/wss URL without query credentials")
+    if parsed.scheme == "ws" and host not in allowed_ws_hosts:
+        raise ValueError(f"Remote {env_name} must use wss://")
 
 
 class NodeAgentSettings(BaseSettings):
@@ -77,30 +112,41 @@ class NodeAgentSettings(BaseSettings):
             "temp_dir",
         ),
     )
+    mc_bridge_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("MC_BRIDGE_ENABLED", "mc_bridge_enabled"),
+    )
+    mc_bridge_url: str = Field(
+        default="ws://hakimi-mc-agent:8791/ws",
+        validation_alias=AliasChoices("MC_BRIDGE_URL", "mc_bridge_url"),
+    )
+    mc_bridge_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("MC_BRIDGE_TOKEN", "mc_bridge_token"),
+    )
+    mc_rpc_timeout: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=60.0,
+        validation_alias=AliasChoices("MC_RPC_TIMEOUT", "mc_rpc_timeout"),
+    )
 
     @model_validator(mode="after")
     def validate_transport_and_token(self) -> Self:
-        token = self.node_ws_token.get_secret_value()
-        if (
-            len(token) < 32
-            or token.startswith(("GENERATE_", "REPLACE_"))
-            or any(ord(ch) < 33 or ord(ch) > 126 for ch in token)
-        ):
-            raise ValueError(
-                "NODE_WS_TOKEN must be at least 32 printable ASCII non-placeholder characters"
+        _validate_secret_token(self.node_ws_token.get_secret_value(), env_name="NODE_WS_TOKEN")
+        _validate_ws_url(
+            self.node_ws_url,
+            env_name="NODE_WS_URL",
+            allowed_ws_hosts=_LOCAL_WS_HOSTS,
+        )
+        if self.mc_bridge_enabled:
+            _validate_secret_token(
+                self.mc_bridge_token.get_secret_value(),
+                env_name="MC_BRIDGE_TOKEN",
             )
-
-        parsed = urlsplit(self.node_ws_url)
-        host = (parsed.hostname or "").lower()
-        if (
-            parsed.scheme not in {"ws", "wss"}
-            or not host
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("NODE_WS_URL must be a ws/wss URL without query credentials")
-        if parsed.scheme == "ws" and host not in _LOCAL_WS_HOSTS:
-            raise ValueError("Remote NODE_WS_URL must use wss://")
+            _validate_ws_url(
+                self.mc_bridge_url,
+                env_name="MC_BRIDGE_URL",
+                allowed_ws_hosts=_LOCAL_MC_WS_HOSTS,
+            )
         return self

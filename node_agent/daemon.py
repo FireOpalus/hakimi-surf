@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
-import random
 import signal
 import time
 from typing import Any
@@ -16,7 +16,7 @@ from websockets.asyncio.client import connect
 from . import __version__
 from .bili_collector import BiliCollector, CollectorError
 from .config import NodeAgentSettings
-from .mc_bridge_slot import McBridgeSlot
+from .mc_bridge_slot import McBridgeSlot, compute_backoff_step, decode_node_frame
 
 log = logging.getLogger("node_agent.daemon")
 
@@ -29,62 +29,13 @@ CAPABILITIES = [
     "mc.slot",
 ]
 
-
-def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    obj: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in obj:
-            raise ValueError("duplicate_key")
-        obj[key] = value
-    return obj
-
-
-def _reject_constant(token: str) -> Any:
-    raise ValueError(f"invalid_json_constant:{token}")
-
-
-def decode_node_frame(raw: str | bytes, max_bytes: int) -> dict[str, Any]:
-    """Decode one bounded JSON object frame while rejecting duplicate keys or NaN/Infinity."""
-    if isinstance(raw, bytes):
-        if len(raw) > max_bytes:
-            raise CollectorError("node_frame_too_large")
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            raise CollectorError("node_invalid_json") from None
-    elif isinstance(raw, str):
-        encoded = raw.encode("utf-8")
-        if len(encoded) > max_bytes:
-            raise CollectorError("node_frame_too_large")
-        text = raw
-    else:
-        raise CollectorError("node_invalid_json")
-
-    try:
-        parsed = json.loads(
-            text,
-            object_pairs_hook=_no_duplicate_keys,
-            parse_constant=_reject_constant,
-        )
-    except ValueError:
-        raise CollectorError("node_invalid_json") from None
-    if not isinstance(parsed, dict):
-        raise CollectorError("node_invalid_json")
-    return parsed
-
-
-def compute_backoff_step(
-    delay: float,
-    *,
-    max_delay: float,
-    rng: random.Random | None = None,
-) -> tuple[float, float]:
-    """Return `(sleep_seconds, next_delay)` for exponential backoff with half-full jitter."""
-    bounded = min(max(delay, 0.01), max_delay)
-    sampler = rng if rng is not None else random
-    sleep_for = sampler.uniform(bounded / 2.0, bounded)
-    next_delay = min(bounded * 2.0, max_delay)
-    return sleep_for, next_delay
+__all__ = [
+    "CAPABILITIES",
+    "NodeDaemon",
+    "compute_backoff_step",
+    "decode_node_frame",
+    "main",
+]
 
 
 class NodeDaemon:
@@ -103,7 +54,18 @@ class NodeDaemon:
             min_interval=settings.bili_min_interval,
             temp_dir=settings.temp_dir,
         )
-        self.mc_slot = mc_slot or McBridgeSlot()
+        if mc_slot is None:
+            self.mc_slot = McBridgeSlot(
+                enabled=settings.mc_bridge_enabled,
+                bridge_url=settings.mc_bridge_url,
+                token=settings.mc_bridge_token.get_secret_value(),
+                rpc_timeout=settings.mc_rpc_timeout,
+                on_event=self._forward_mc_event,
+            )
+        else:
+            self.mc_slot = mc_slot
+            if getattr(self.mc_slot, "on_event", None) is None:
+                self.mc_slot.on_event = self._forward_mc_event
         self.reconnect_base = max(0.01, float(reconnect_base))
         self._rpc_semaphore = asyncio.Semaphore(4)
         self._send_lock = asyncio.Lock()
@@ -113,6 +75,9 @@ class NodeDaemon:
         self.backoff_history: list[float] = []
 
     def hello_event(self) -> dict[str, Any]:
+        capabilities = list(CAPABILITIES)
+        if self.settings.mc_bridge_enabled and "mc.bridge" not in capabilities:
+            capabilities.append("mc.bridge")
         return {
             "type": "event",
             "event": "node.hello",
@@ -121,7 +86,7 @@ class NodeDaemon:
             "ts": time.time(),
             "payload": {
                 "version": __version__,
-                "capabilities": list(CAPABILITIES),
+                "capabilities": capabilities,
             },
         }
 
@@ -145,6 +110,52 @@ class NodeDaemon:
                 raise CollectorError("node_frame_too_large")
         async with self._send_lock:
             await ws.send(raw)
+
+    async def _forward_mc_event(self, event_name: str, payload: dict[str, Any]) -> None:
+        if event_name not in {"mc.snapshot", "mc.milestone"}:
+            return
+        ws = self._active_ws
+        if ws is None:
+            return
+        frame = {
+            "type": "event",
+            "event": event_name,
+            "node_id": self.settings.node_id,
+            "region": self.settings.node_region,
+            "ts": time.time(),
+            "payload": dict(payload) if isinstance(payload, dict) else {},
+        }
+        try:
+            await self.send_json(ws, frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.info(
+                "event=mc_event_forward_failed event=%s err=%s",
+                event_name,
+                type(exc).__name__,
+            )
+
+    async def _start_mc_slot(self) -> None:
+        start_fn = getattr(self.mc_slot, "start", None)
+        if start_fn is None:
+            return
+        res = start_fn()
+        if inspect.isawaitable(res):
+            await res
+
+    async def _close_mc_slot(self) -> None:
+        close_fn = getattr(self.mc_slot, "close", None)
+        if close_fn is None:
+            return
+        try:
+            res = close_fn()
+            if inspect.isawaitable(res):
+                await res
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.info("event=mc_slot_close_error err=%s", type(exc).__name__)
 
     async def _execute_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         if action == "bili.public_get":
@@ -238,6 +249,8 @@ class NodeDaemon:
         self._active_ws = ws
         try:
             await self.send_json(ws, self.hello_event())
+            if self.settings.mc_bridge_enabled:
+                await self._forward_mc_event("mc.snapshot", self.mc_slot.current_snapshot())
             async for raw in ws:
                 if self._stop.is_set():
                     break
@@ -281,6 +294,7 @@ class NodeDaemon:
     async def run(self) -> None:
         """Maintain persistent outbound WSS connection with exponential backoff."""
         await self.collector.cleanup_stale()
+        await self._start_mc_slot()
         delay = min(self.reconnect_base, self.settings.reconnect_max)
         try:
             while not self._stop.is_set():
@@ -321,6 +335,7 @@ class NodeDaemon:
                     pass
                 delay = next_delay
         finally:
+            await self._close_mc_slot()
             await self.collector.close()
 
     async def stop(self) -> None:
@@ -332,6 +347,7 @@ class NodeDaemon:
                 await ws.close()
         for task in list(self._tasks):
             task.cancel()
+        await self._close_mc_slot()
 
 
 async def _run_cli() -> None:
