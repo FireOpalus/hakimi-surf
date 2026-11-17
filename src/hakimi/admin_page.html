@@ -1542,6 +1542,7 @@ body.authenticated footer { margin-left: 238px; }
     <div id="life-node-pills" class="pill-row"></div>
     <p id="life-world-status" class="muted"></p>
     <p id="life-node-status" class="muted"></p>
+    <p id="life-mc-status" class="muted"></p>
     <p id="life-desktop-status" class="muted"></p>
     <form id="life-world-form" class="quick-bar">
       <label for="life-world-module">当前模块（current_module）
@@ -1564,6 +1565,16 @@ body.authenticated footer { margin-left: 238px; }
       <label for="life-world-energy">精力（0–100）<input id="life-world-energy" type="number" min="0" max="100" step="1" required></label>
       <label for="life-world-boredom">无聊度（0–100）<input id="life-world-boredom" type="number" min="0" max="100" step="1" required></label>
       <button id="life-world-save" type="submit" disabled>更新世界状态</button>
+    </form>
+    <form id="life-mc-form" class="quick-bar">
+      <label for="life-mc-topic">Mineflayer 建造 / 活动目标
+        <input id="life-mc-topic" type="text" maxlength="80" placeholder="例如：红石自动门、探索雪原">
+      </label>
+      <button id="life-mc-build" type="submit" disabled>筹备建造 (build_plan)</button>
+      <button id="life-mc-status-btn" type="button" class="secondary" disabled>刷新 MC 状态</button>
+      <button id="life-mc-idle" type="button" class="secondary" disabled>MC 待命 (idle)</button>
+      <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
+      <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
     </form>
     <h3>能力模块传感器摘要</h3>
     <div id="life-modules-table" class="table"></div>
@@ -1750,6 +1761,7 @@ function logout(){
   affectionState=null;
   lifeState=null;
   text('life-node-status','');
+  text('life-mc-status','');
   text('rest-overview-badge','作息读取中');
   $('toggle-rest-quick').hidden=true;
   $('toggle-rest-quick').disabled=true;
@@ -1758,7 +1770,7 @@ function logout(){
   $('overview-gcp-strip').replaceChildren();
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
-  for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
+  for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
   ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-grants-list','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-modules-table','life-intents-table','life-events-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
@@ -1771,7 +1783,7 @@ function logout(){
   $('login').hidden=false;$('app').hidden=true;$('logout').hidden=true;
   if(timer)clearInterval(timer);
   $('session-dialog').close();
-  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search'].forEach(id=>{$(id).value='';});
+  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search','life-mc-topic'].forEach(id=>{$(id).value='';});
   $('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
   ['memory-entries','decision-audit','token-ledger','provider-ledger','cost-ledger','budget-periods','model-ledger','thinking-ledger','effective-cache','prov-sessions-table','gcp-credits-table','gcp-mon-compare-table','gcp-mon-models-table'].forEach(id=>$(id).replaceChildren());
@@ -2441,10 +2453,11 @@ function renderLife(d){
     ['今日主动触发',(eng.proactive_sent_today??0)+' / '+(c.max_proactive_per_day??6)]
   ];
   $('life-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
-  const nap=nodes.onebot_cn_napcat||{},sh=nodes.shanghai_node_agent||{};
+  const nap=nodes.onebot_cn_napcat||{},sh=nodes.shanghai_node_agent||{},mc=nodes.shanghai_mc_agent||{};
   const nodePills=[
     nap.connected?pill('NapCat CN 在线 ('+(nap.mode||'http')+')','ok'):pill('NapCat CN 未连接 ('+(nap.mode||'http')+')','warn'),
-    sh.connected?pill('上海躯干节点在线 ('+(sh.node_id||'CN')+')','ok'):sh.configured?pill('上海躯干节点等待接入 ('+(sh.node_id||'CN')+')','warn'):pill('上海躯干节点未启用 (Phase 3)','muted')
+    sh.connected?pill('上海躯干节点在线 ('+(sh.node_id||'CN')+')','ok'):sh.configured?pill('上海躯干节点等待接入 ('+(sh.node_id||'CN')+')','warn'):pill('上海躯干节点未启用 (Phase 3)','muted'),
+    mc.connected?pill('MC躯干在线'+(mc.paused?' (已暂停)':'')+(mc.dimension?' · '+mc.dimension:''),mc.paused?'warn':'ok'):mc.bridge_ready?pill('MC躯干就绪(待机)'+(mc.paused?' (已暂停)':''),mc.paused?'warn':'ok'):mc.mc_enabled?pill('MC躯干等待接入','warn'):pill('MC躯干未就绪','muted')
   ];
   if(sh.bili_delegate_active)nodePills.push(pill('B站 CN 专线托管中','ok'));
   nodePills.push(
@@ -2455,6 +2468,9 @@ function renderLife(d){
   text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 上海节点说明：'+(sh.phase_note||'CN 反向 WSS 躯干专线'));
   const caps=Array.isArray(sh.capabilities)&&sh.capabilities.length?sh.capabilities.join(', '):'—';
   text('life-node-status','上海节点 '+(sh.node_id||'shanghai-cn-1')+' ('+(sh.region||'CN')+')：'+(sh.connected?'在线':sh.configured?'等待连接':'未配置')+' · 来源 IP '+(sh.source_ip||'—')+' · 建连 '+lifeFmt(sh.connected_at,tz)+' · 心跳 '+lifeFmt(sh.last_heartbeat_at,tz)+' · RPC 成功/失败 '+(sh.rpc_calls??0)+'/'+(sh.rpc_errors??0)+' · B站托管 '+(sh.bili_delegate_active?'开启':'未激活')+' · 能力 '+caps);
+  const mcPos=Array.isArray(mc.pos)?'('+mc.pos.join(', ')+')':(mc.pos||'—');
+  const mcMode=mc.connected?'游戏在线':mc.bridge_ready?'躯干就绪(待机)':'未就绪';
+  text('life-mc-status','Mineflayer 躯干：'+mcMode+' · '+(mc.paused?'已暂停':'未暂停')+' · MC开关/配置 '+(mc.mc_enabled?'开':'关')+'/'+(mc.mc_configured?'已配':'未配')+' · 维度 '+(mc.dimension||'—')+' · 坐标 '+mcPos+' · 生命/饱食 '+(mc.health??'—')+'/'+(mc.food??'—')+' · 活动 '+(mc.activity||'—')+' · 更新 '+lifeFmt(mc.updated_at,tz));
   text('life-desktop-status',dm.enabled?('桌面端 Antigravity_Memory 最近活跃：'+(dm.latest_iso||lifeFmt(dm.latest_timestamp,tz))+(dm.latest_tag?' · 标签 '+dm.latest_tag:'')):'桌面端 Antigravity_Memory 协同当前未启用。');
   $('life-world-module').value=ws.current_module||'idle';
   $('life-world-focus').value=ws.focus_level||'LOW';
@@ -2481,7 +2497,7 @@ function renderLife(d){
   $('life-desktop-suppress').value=c.desktop_active_suppress_seconds??7200;
   const srcLabel=(d.source==='admin'||d.source==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
   text('life-source','配置来源：'+srcLabel+' · 时区 '+tz+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz):'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
-  for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
+  for(const id of ['life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
   table('life-intents-table',['ID','模块 / 目标','动作 / 情绪','执行窗口','门控与模糊动机','状态','操作'],(d.intents||[]).map(it=>[
     el('span',String(it.id||'').slice(0,10),'code-mono'),
     (it.target_module||'—')+(it.target_scope?' · '+it.target_scope:''),
@@ -2558,6 +2574,27 @@ $('life-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
   renderLife(next);
   notice('已恢复默认双层主动引擎配置');
 }));
+async function sendMcGoal(actionType,topic=''){
+  const body={action_type:actionType};
+  if(topic)body.topic=topic;
+  const res=await api('life/mc/goal','POST',body);
+  if(res&&res.life)renderLife(res.life);
+  const summary=res?.result?.summary||res?.result?.reason||res?.status||'ok';
+  notice('MC 指令 ['+actionType+']：'+(res?.status==='ok'?'成功':'不可用')+' · '+summary,res?.status!=='ok');
+}
+$('life-mc-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('life-mc-build'),async()=>{
+    const topic=$('life-mc-topic').value.trim();
+    if(!topic)throw Error('请输入建造或活动目标');
+    await sendMcGoal('build_plan',topic);
+    $('life-mc-topic').value='';
+  });
+});
+$('life-mc-status-btn').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('status')));
+$('life-mc-idle').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('idle')));
+$('life-mc-pause').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('pause')));
+$('life-mc-resume').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('resume')));
 $('life-plan-now').addEventListener('click',e=>busy(e.target,async()=>{
   notice('正在规划生活切片，请稍候…');
   const r=await api('life/plan','POST');
