@@ -15,6 +15,8 @@ from .bili_watcher import BiliWatcher
 from .bilibili import Bilibili, extract_bvid
 from .bot_server import is_persona_owner, untrusted_input
 from .config import Settings
+from .db_backup import DatabaseBackup
+from .drive_client import FolderDrive
 from .file_reader import FileReader
 from .gateway import redact_excerpt
 from .gemini import GeminiGateway
@@ -31,6 +33,7 @@ from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
+from .modules import BilibiliSurfModule, MinecraftSlotModule, ModuleRegistry, QQSocialModule
 from .outbound_actions import normalize_emoji_like, parse_actions
 from .output_links import filter_reply_links
 from .owner_cloud_memory import OwnerCloudMemory
@@ -44,8 +47,10 @@ from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
 from .store import Store
 from .streaming import cancellable
+from .surf_mirror import SurfMirror
 from .video_watch import VideoWatch
 from .web_search import explicit_search, search_query
+from .world_state import WorldStateManager
 
 log = logging.getLogger("hakimi")
 PRIOR_IMAGE_REF_RE = re.compile(
@@ -93,6 +98,7 @@ class Service:
         image_loader: ImageLoader | None = None,
         diary: RoamingLogger | None = None,
         notebook=None,
+        drive: FolderDrive | None = None,
     ):
         self.s, self.store, self.ai, self.bili, self.sender = settings, store, gateway, bili, sender
         self.sessions = SessionManager(settings, store)
@@ -134,6 +140,24 @@ class Service:
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
         self._lurk_react_at: dict[str, float] = {}
+        self.modules = ModuleRegistry()
+        self.modules.register(
+            QQSocialModule(
+                settings,
+                hot_ring=self.hot,
+                transport=getattr(sender, "onebot", None),
+                service=self,
+            )
+        )
+        self.modules.register(
+            BilibiliSurfModule(settings, watcher=self.bili_watcher, bili=bili)
+        )
+        self.world_state = WorldStateManager(settings, store, self.modules)
+        self.modules.register(MinecraftSlotModule(settings, world_state=self.world_state))
+        resolved_drive = drive if drive is not None else getattr(diary, "drive", None)
+        active_drive = resolved_drive if settings.roaming_enabled else None
+        self.db_backup = DatabaseBackup(settings, store, active_drive)
+        self.surf_mirror = SurfMirror(self, active_drive)
 
     def refresh_secrets(self):
         self.secrets = configured_secrets(self.s)
@@ -348,6 +372,9 @@ class Service:
         ]
         if self.diary and self.s.roaming_enabled:
             self.tasks.append(asyncio.create_task(self.diary.run(), name="roaming-diary"))
+        if self.s.roaming_enabled:
+            self.tasks.append(asyncio.create_task(self.db_backup.run(), name="db-backup"))
+            self.tasks.append(asyncio.create_task(self.surf_mirror.run(), name="surf-mirror"))
         if self.notebook:
             self.tasks.append(asyncio.create_task(self.notebook.run(), name="notebook-refresh"))
 
@@ -1556,6 +1583,10 @@ class Service:
                 surfed = await self.bili_watcher.recent_surfed(limit=4)
                 if surfed:
                     payload["recent_bili_surfed"] = surfed
+            if not self.bot_guard.known_bot(message) and hasattr(self, "world_state"):
+                ws_summary = await self.world_state.chat_sensor_payload()
+                if ws_summary:
+                    payload["world_state_summary"] = ws_summary
         context_members = list(members)
         if message.kind == "group":
             context_members.extend(neighbour_members if images else [])
@@ -2469,7 +2500,8 @@ class Service:
     async def patrol(self):
         while True:
             try:
-                await self.poll_once()
+                if not self.world_state.proactive_suspended():
+                    await self.poll_once()
             except asyncio.CancelledError:
                 raise
             except Exception:

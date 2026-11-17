@@ -1376,6 +1376,13 @@ class BiliWatcher:
         return {"status": status, "learned": completed, "reason": reason}
 
     async def tick(self):
+        world_state = getattr(self.svc, "world_state", None)
+        modules = getattr(self.svc, "modules", None)
+        bili_mod = modules.get("bilibili_surf") if modules is not None else None
+        if (world_state is not None and world_state.proactive_suspended()) or (
+            bili_mod is not None and getattr(bili_mod, "proactive_paused", False)
+        ):
+            return
         if not self.policy.enabled or self.store.runtime.is_resting(self.clock()):
             return
         local = self.local()

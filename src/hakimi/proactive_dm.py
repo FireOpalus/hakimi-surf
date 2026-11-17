@@ -855,6 +855,9 @@ class OwnerProactive:
         await self.ensure_plan()
         await self.check_alerts()
         await self._expire_and_disable()
+        world_state = getattr(self.service, "world_state", None)
+        if world_state is not None and world_state.proactive_suspended():
+            return
         async with self.store.lock:
             rows = await self.store.all(
                 "SELECT id FROM proactive_schedule WHERE scope=? AND status='planned' AND "

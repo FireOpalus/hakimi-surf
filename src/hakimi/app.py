@@ -99,6 +99,7 @@ def create_app(
                 )
                 try:
                     diary = None
+                    drive = None
                     if s.roaming_enabled:
                         drive = FolderDrive(
                             s, http, store.vault.digest("diary-writer", s.namespace)
@@ -113,6 +114,7 @@ def create_app(
                         Sender(s, http, onebot),
                         diary=diary,
                         notebook=NotebookSnapshot(s, http, ai, store),
+                        drive=drive,
                     )
                     await service.sessions.index_existing()
                     await service.proactive.initialize()
@@ -121,6 +123,7 @@ def create_app(
                     await service.bili_watcher.initialize()
                     await service.video_watch.initialize()
                     await service.memes.initialize()
+                    await service.world_state.initialize()
                     from .outgoing import recover_receipts
 
                     await recover_receipts(service)
