@@ -247,6 +247,7 @@ def assemble_chat_input(
     next_seen_nearby = list(dict.fromkeys([*(seen_nearby or ()), *nearby_digests]))[-16:]
     next_meme_dig = prev.get("memes", "") if continuation else ""
     next_bili_dig = prev.get("bili", "") if continuation else ""
+    next_world_dig = prev.get("world", "") if continuation else ""
     if continuation:
         metadata = {
             "current_time": datetime.now(ZoneInfo(settings.bot_timezone)).isoformat(
@@ -287,6 +288,13 @@ def assemble_chat_input(
             next_bili_dig = bili_dig
             if "bili" not in prev or prev.get("bili") != bili_dig:
                 metadata["recent_bili_surfed"] = bili_list
+        if not sandbox_mode and payload.get("world_state_summary"):
+            raw_world = payload["world_state_summary"]
+            world_obj = dict(raw_world) if isinstance(raw_world, dict) else raw_world
+            world_dig = _state_digest(world_obj)
+            next_world_dig = world_dig
+            if "world" not in prev or prev.get("world") != world_dig:
+                metadata["world_state_summary"] = world_obj
         if not sandbox_mode:
             for key in ("file_attachments", "web_search_findings", "web_search_status"):
                 if payload.get(key):
@@ -322,6 +330,11 @@ def assemble_chat_input(
                 bili_list = list(payload["recent_bili_surfed"])
                 metadata["recent_bili_surfed"] = bili_list
                 next_bili_dig = _state_digest(bili_list)
+            if payload.get("world_state_summary"):
+                raw_world = payload["world_state_summary"]
+                world_obj = dict(raw_world) if isinstance(raw_world, dict) else raw_world
+                metadata["world_state_summary"] = world_obj
+                next_world_dig = _state_digest(world_obj)
             for key in ("file_attachments", "web_search_findings", "web_search_status"):
                 if payload.get(key):
                     metadata[key] = payload[key]
@@ -356,6 +369,8 @@ def assemble_chat_input(
             digests["memes"] = next_meme_dig
         if next_bili_dig:
             digests["bili"] = next_bili_dig
+        if next_world_dig:
+            digests["world"] = next_world_dig
         out_state["context_digests"] = digests
         out_state["seen_nearby"] = next_seen_nearby
 
@@ -423,6 +438,8 @@ def assemble_chat_input(
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         background = {}
         summary = truncate_tokens(summary, 180)
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("world_state_summary"):
+        metadata.pop("world_state_summary", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("recent_bili_surfed"):
         metadata.pop("recent_bili_surfed", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("nearby_group_context"):
