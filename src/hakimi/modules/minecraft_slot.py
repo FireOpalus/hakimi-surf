@@ -42,6 +42,36 @@ def _normalize_pos(
     return sanitize_sensor_text(str(pos), settings, max_tokens=16) or None
 
 
+_BRIDGE_FLAG_KEYS = ("bridge_ready", "mc_enabled", "mc_configured", "paused")
+_NON_SNAPSHOT_KEYS = frozenset(
+    {
+        "bridge_ready",
+        "mc_enabled",
+        "mc_configured",
+        "paused",
+        "phase",
+        "snapshot",
+        "milestone",
+        "reason",
+        "accepted",
+        "ok",
+    }
+)
+_SNAPSHOT_FIELD_KEYS = frozenset(
+    {
+        "connected",
+        "dimension",
+        "pos",
+        "health",
+        "food",
+        "activity",
+        "nearby_entities",
+        "recent_chat_or_sign",
+        "updated_at",
+    }
+)
+
+
 class MinecraftSnapshot(BaseModel):
     """Sanitized snapshot of the remote CN Mineflayer agent."""
 
@@ -77,15 +107,38 @@ class MinecraftSlotModule(BaseModule):
         self.remote_dispatcher = remote_dispatcher
         self.snapshot = MinecraftSnapshot()
         self._has_snapshot = False
+        self.bridge_ready: bool = False
+        self.mc_enabled: bool = False
+        self.mc_configured: bool = False
+        self.paused: bool = False
 
     def bind_world_state(self, world_state: WorldStateManager) -> None:
         """Attach a WorldStateManager for publishing MilestoneEvents."""
         self.world_state = world_state
 
+    def _update_bridge_flags(self, raw: dict[str, Any] | MinecraftSnapshot) -> None:
+        if not isinstance(raw, dict):
+            return
+        nested = raw.get("snapshot")
+        if isinstance(nested, dict):
+            for key in _BRIDGE_FLAG_KEYS:
+                if key in nested:
+                    setattr(self, key, bool(nested[key]))
+        for key in _BRIDGE_FLAG_KEYS:
+            if key in raw:
+                setattr(self, key, bool(raw[key]))
+
     def _sanitize_snapshot(
         self, raw: dict[str, Any] | MinecraftSnapshot
     ) -> MinecraftSnapshot:
-        data = raw.model_dump() if isinstance(raw, MinecraftSnapshot) else dict(raw)
+        raw_dict = raw.model_dump() if isinstance(raw, MinecraftSnapshot) else dict(raw)
+        if isinstance(raw_dict.get("snapshot"), dict) and not any(
+            k in raw_dict for k in _SNAPSHOT_FIELD_KEYS
+        ):
+            source = dict(raw_dict["snapshot"])
+        else:
+            source = raw_dict
+        data = {k: v for k, v in source.items() if k not in _NON_SNAPSHOT_KEYS}
         connected = bool(data.get("connected", False))
         dimension = sanitize_sensor_text(
             str(data.get("dimension") or ""), self.settings, max_tokens=12
@@ -149,10 +202,32 @@ class MinecraftSlotModule(BaseModule):
         self, raw: dict[str, Any] | MinecraftSnapshot
     ) -> MinecraftSnapshot:
         """Sanitize and store a remote Mineflayer snapshot synchronously."""
+        self._update_bridge_flags(raw)
         sanitized = self._sanitize_snapshot(raw)
         self.snapshot = sanitized
         self._has_snapshot = True
         return sanitized
+
+    def apply_status(self, raw: dict[str, Any]) -> MinecraftSnapshot:
+        """Apply bridge status flags and optional snapshot without altering _has_snapshot."""
+        if not isinstance(raw, dict):
+            return self.snapshot
+        self._update_bridge_flags(raw)
+        nested = raw.get("snapshot")
+        if isinstance(nested, dict):
+            sanitized = self._sanitize_snapshot(nested)
+            self.snapshot = sanitized
+            self._has_snapshot = True
+            return sanitized
+        stripped = {k: v for k, v in raw.items() if k not in _NON_SNAPSHOT_KEYS}
+        snapshot_fields = {k: v for k, v in stripped.items() if k in _SNAPSHOT_FIELD_KEYS}
+        if snapshot_fields:
+            merged = {**self.snapshot.model_dump(), **snapshot_fields}
+            sanitized = self._sanitize_snapshot(merged)
+            self.snapshot = sanitized
+            if sanitized.connected:
+                self._has_snapshot = True
+        return self.snapshot
 
     async def publish_milestone(
         self,
@@ -236,6 +311,8 @@ class MinecraftSlotModule(BaseModule):
     async def _raw_sensor_summary(self) -> str:
         snap = self.snapshot
         if not snap.connected:
+            if self.bridge_ready:
+                return f"MC待机 {snap.activity}".strip() if snap.activity else "MC躯干就绪(待机)"
             if snap.activity:
                 return f"MC离线 {snap.activity}"
             return "MC离线" if self._has_snapshot else ""
@@ -261,16 +338,47 @@ class MinecraftSlotModule(BaseModule):
             parts.append(f"见闻:{snap.recent_chat_or_sign}")
         return " ".join(parts)
 
+    def status_dict(self) -> dict[str, Any]:
+        """Return a strictly sanitized status dictionary for /admin and telemetry."""
+        snap = self.snapshot
+        if isinstance(snap.pos, tuple):
+            pos_val: list[float] | str | None = [float(v) for v in snap.pos]
+        elif isinstance(snap.pos, str):
+            pos_val = sanitize_sensor_text(snap.pos, self.settings, max_tokens=16) or None
+        else:
+            pos_val = None
+        return {
+            "bridge_ready": bool(self.bridge_ready),
+            "mc_enabled": bool(self.mc_enabled),
+            "mc_configured": bool(self.mc_configured),
+            "connected": bool(snap.connected),
+            "paused": bool(self.paused),
+            "dimension": sanitize_sensor_text(snap.dimension, self.settings, max_tokens=12),
+            "pos": pos_val,
+            "health": snap.health,
+            "food": snap.food,
+            "activity": sanitize_sensor_text(snap.activity, self.settings, max_tokens=20),
+            "nearby_entities": [
+                clean
+                for item in snap.nearby_entities[:5]
+                if (clean := sanitize_sensor_text(item, self.settings, max_tokens=10))
+            ],
+            "recent_chat_or_sign": sanitize_sensor_text(
+                snap.recent_chat_or_sign, self.settings, max_tokens=20
+            ),
+            "updated_at": float(snap.updated_at),
+        }
+
     async def dispatch_goal(self, ticket: dict[str, Any]) -> GoalResult:
         action_type = str(ticket.get("action_type", "")).strip()
-        if action_type == "status":
-            return GoalResult(
-                ok=True,
-                module_id=self.module_id,
-                summary=await self.get_sensor_summary(),
-                artifacts={"connected": self.snapshot.connected},
-            )
         if self.remote_dispatcher is None:
+            if action_type == "status":
+                return GoalResult(
+                    ok=True,
+                    module_id=self.module_id,
+                    summary=await self.get_sensor_summary(),
+                    artifacts={"connected": self.snapshot.connected},
+                )
             return GoalResult(
                 ok=False,
                 module_id=self.module_id,

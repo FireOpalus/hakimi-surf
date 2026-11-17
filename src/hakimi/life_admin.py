@@ -98,6 +98,35 @@ class WorldStateAdminUpdate(BaseModel):
         return self
 
 
+class MinecraftAdminGoalRequest(BaseModel):
+    """Strict admin control request for Mineflayer goals and pause/resume."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    action_type: Literal[
+        "status",
+        "explore",
+        "mine",
+        "goto",
+        "build_plan",
+        "look_signs",
+        "stop",
+        "idle",
+        "pause",
+        "resume",
+    ]
+    topic: str = Field(default="", max_length=80)
+    block_type: str = Field(default="", max_length=48)
+    x: float | None = None
+    y: float | None = None
+    z: float | None = None
+
+    @field_validator("topic", "block_type")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        return value.strip()
+
+
 def _life_config_model() -> type[BaseModel]:
     try:
         from .life_engine import LifeEngineConfig
@@ -130,6 +159,31 @@ async def _table_exists(store: Any, name: str) -> bool:
         (name,),
     )
     return row is not None
+
+
+def _collect_mc_agent_status(svc: Any) -> dict[str, Any]:
+    registry = getattr(svc, "modules", None)
+    mc_mod = registry.get("minecraft") if registry is not None else None
+    raw: dict[str, Any] = {}
+    if mc_mod is not None and hasattr(mc_mod, "status_dict"):
+        candidate = mc_mod.status_dict()
+        if isinstance(candidate, dict):
+            raw = candidate
+    return {
+        "bridge_ready": bool(raw.get("bridge_ready", False)),
+        "mc_enabled": bool(raw.get("mc_enabled", False)),
+        "mc_configured": bool(raw.get("mc_configured", False)),
+        "connected": bool(raw.get("connected", False)),
+        "paused": bool(raw.get("paused", False)),
+        "dimension": str(raw.get("dimension") or ""),
+        "pos": raw.get("pos"),
+        "health": raw.get("health"),
+        "food": raw.get("food"),
+        "activity": str(raw.get("activity") or ""),
+        "nearby_entities": list(raw.get("nearby_entities") or []),
+        "recent_chat_or_sign": str(raw.get("recent_chat_or_sign") or ""),
+        "updated_at": float(raw.get("updated_at", 0.0) or 0.0),
+    }
 
 
 async def _collect_modules_status(svc: Any) -> list[dict[str, Any]]:
@@ -285,6 +339,7 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
             "bili_delegate_active": bili_delegate_active,
             "phase_note": "CN 反向 WSS 躯干专线",
         },
+        "shanghai_mc_agent": _collect_mc_agent_status(svc),
     }
 
     cloud_memory = getattr(svc, "cloud_memory", None)
@@ -431,3 +486,39 @@ async def life_cancel_intent(request: Request, intent_id: str):
         if not changed:
             raise HTTPException(404, "intent_not_found")
         return await _build_life_status(svc)
+
+
+@router.post("/mc/goal")
+async def life_mc_goal(request: Request):
+    value = await body(request, MinecraftAdminGoalRequest)
+    svc = service(request)
+    registry = getattr(svc, "modules", None)
+    mc_mod = registry.get("minecraft") if registry is not None else None
+    if mc_mod is None or not hasattr(mc_mod, "dispatch_goal"):
+        raise HTTPException(503, "minecraft_module_unavailable")
+    request.app.state.admin_auth.costly()
+    lock = request.app.state.admin_action_lock
+    if lock.locked():
+        raise HTTPException(409, "admin_action_busy")
+    async with lock:
+        ticket: dict[str, Any] = {"action_type": value.action_type}
+        if value.topic:
+            ticket["topic"] = value.topic
+        if value.block_type:
+            ticket["block_type"] = value.block_type
+        for axis in ("x", "y", "z"):
+            coord = getattr(value, axis)
+            if coord is not None:
+                ticket[axis] = coord
+        res = await _maybe_await(mc_mod.dispatch_goal(ticket))
+        if isinstance(res, dict):
+            res_dict = res
+            ok = bool(res.get("ok", False))
+        else:
+            res_dict = res.model_dump(mode="json")
+            ok = bool(res.ok)
+        return {
+            "status": "ok" if ok else "unavailable",
+            "result": res_dict,
+            "life": await _build_life_status(svc),
+        }

@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import inspect
 import logging
+import math
 import random
 import re
 import time
@@ -58,6 +59,18 @@ from .web_search import explicit_search, search_query
 from .world_state import WorldStateManager
 
 log = logging.getLogger("hakimi")
+_MC_ALLOWED_DISPATCH_FIELDS = (
+    "action_type",
+    "topic",
+    "block_type",
+    "x",
+    "y",
+    "z",
+    "target_player",
+    "intent_note",
+    "mood",
+    "gate_condition",
+)
 PRIOR_IMAGE_REF_RE = re.compile(
     r"(?:这|那|上|刚|前|原).{0,6}(?:张|幅|个)?(?:图|截图|照片|画面|报错图)"
     r"|(?:图|截图|照片)(?:里|中|上)"
@@ -170,9 +183,17 @@ class Service:
             )
         )
         self.world_state = WorldStateManager(settings, store, self.modules)
-        self.modules.register(MinecraftSlotModule(settings, world_state=self.world_state))
+        self.modules.register(
+            MinecraftSlotModule(
+                settings,
+                world_state=self.world_state,
+                remote_dispatcher=self._dispatch_mc_goal,
+            )
+        )
         if getattr(self.node_transport, "on_event", None) is None:
             self.node_transport.on_event = self._handle_node_event
+        if getattr(self.node_transport, "on_state", None) is None:
+            self.node_transport.on_state = self._handle_node_state
         resolved_drive = drive if drive is not None else getattr(diary, "drive", None)
         active_drive = resolved_drive if settings.roaming_enabled else None
         self.db_backup = DatabaseBackup(settings, store, active_drive)
@@ -345,7 +366,12 @@ class Service:
                 self.enrichments[self.store.event_key(message)] = self.background(
                     self.enrich(message)
                 )
-            if not authorize(message, self.s):
+            if not authorize(message, self.s) or (
+                message.kind == "group"
+                and not message.addressed
+                and hasattr(self, "world_state")
+                and self.world_state.proactive_suspended()
+            ):
                 # Context-only messages remain local; only an existing addressed batch can wake.
                 await self.store.groups.observe(message)
                 result = await self.store.admit(message, continuation_only=True)
@@ -421,13 +447,251 @@ class Service:
             if inspect.isawaitable(res):
                 await res
 
+    async def _ensure_world_state_ready(self) -> WorldStateManager | None:
+        ws_mgr = getattr(self, "world_state", None)
+        if ws_mgr is None:
+            return None
+        if hasattr(ws_mgr, "store") and hasattr(ws_mgr, "initialize"):
+            async with self.store.lock:
+                has_table = await self.store.one(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_state'"
+                )
+            if not has_table:
+                await ws_mgr.initialize()
+        return ws_mgr
+
+    async def _sync_mc_world_focus(
+        self,
+        mc_mod: MinecraftSlotModule,
+        *,
+        prev_connected: bool,
+        prev_paused: bool,
+    ) -> None:
+        ws_mgr = await self._ensure_world_state_ready()
+        if ws_mgr is None:
+            return
+        curr_connected = mc_mod.snapshot.connected
+        curr_paused = mc_mod.paused
+        cur = ws_mgr.current
+        if not prev_connected and curr_connected and not curr_paused:
+            await ws_mgr.update_state(
+                current_module="minecraft",
+                focus_level="HIGH",
+                mood="focused",
+            )
+        elif prev_connected and not curr_connected and cur.current_module == "minecraft":
+            await ws_mgr.update_state(
+                current_module="idle",
+                focus_level="LOW",
+                mood="calm",
+            )
+        elif (
+            curr_paused
+            and cur.current_module == "minecraft"
+            and cur.focus_level == "HIGH"
+        ):
+            await ws_mgr.update_state(
+                current_module="idle",
+                focus_level="LOW",
+                mood="calm",
+            )
+        elif (
+            prev_paused
+            and not curr_paused
+            and curr_connected
+            and cur.current_module != "minecraft"
+        ):
+            await ws_mgr.update_state(
+                current_module="minecraft",
+                focus_level="HIGH",
+                mood="focused",
+            )
+
+    async def _apply_mc_status_data(
+        self, mc_mod: MinecraftSlotModule, data: dict[str, Any]
+    ) -> None:
+        prev_connected = mc_mod.snapshot.connected
+        prev_paused = mc_mod.paused
+        if isinstance(data.get("snapshot"), dict):
+            snap_payload = dict(data["snapshot"])
+            for flag in ("bridge_ready", "mc_enabled", "mc_configured", "paused"):
+                if flag in data:
+                    snap_payload[flag] = data[flag]
+            await mc_mod.update_snapshot(snap_payload)
+        mc_mod.apply_status(data)
+        await self._sync_mc_world_focus(
+            mc_mod, prev_connected=prev_connected, prev_paused=prev_paused
+        )
+
+    async def _sync_mc_node_status(self) -> None:
+        nt = getattr(self, "node_transport", None)
+        if nt is None or not nt.connected():
+            return
+        try:
+            data = await nt.call("mc.status", {})
+        except (Rejected, Exception):
+            return
+        mc_mod = self.modules.get("minecraft")
+        if isinstance(mc_mod, MinecraftSlotModule) and isinstance(data, dict):
+            await self._apply_mc_status_data(mc_mod, data)
+
+    async def _handle_node_state(self, connected: bool) -> None:
+        if connected:
+            self.background(self._sync_mc_node_status())
+            return
+        mc_mod = self.modules.get("minecraft")
+        if isinstance(mc_mod, MinecraftSlotModule):
+            mc_mod.bridge_ready = False
+            if mc_mod.snapshot.connected:
+                await mc_mod.update_snapshot(
+                    {
+                        "connected": False,
+                        "bridge_ready": False,
+                        "activity": "节点连接断开",
+                    }
+                )
+        ws_mgr = await self._ensure_world_state_ready()
+        if ws_mgr is not None:
+            cur = ws_mgr.current
+            if cur.current_module == "minecraft" and cur.focus_level == "HIGH":
+                await ws_mgr.update_state(
+                    current_module="idle",
+                    focus_level="LOW",
+                    mood="calm",
+                )
+
+    async def _dispatch_mc_goal(self, ticket: dict[str, Any]) -> dict[str, Any]:
+        mc_mod = self.modules.get("minecraft")
+        nt = getattr(self, "node_transport", None)
+        if nt is None or not nt.connected():
+            summary = (
+                await mc_mod.get_sensor_summary()
+                if isinstance(mc_mod, MinecraftSlotModule)
+                else ""
+            )
+            return {
+                "ok": False,
+                "accepted": False,
+                "reason": "node_disconnected",
+                "summary": summary,
+            }
+        action_type = str(ticket.get("action_type", "")).strip()
+        try:
+            if action_type == "pause":
+                data = await nt.call("mc.pause", {})
+            elif action_type == "resume":
+                data = await nt.call("mc.resume", {})
+            elif action_type == "status":
+                data = await nt.call("mc.status", {})
+            else:
+                params: dict[str, Any] = {}
+                for field in _MC_ALLOWED_DISPATCH_FIELDS:
+                    if field not in ticket or ticket[field] is None:
+                        continue
+                    val = ticket[field]
+                    if field in ("x", "y", "z"):
+                        if (
+                            isinstance(val, (int, float))
+                            and not isinstance(val, bool)
+                            and math.isfinite(float(val))
+                        ):
+                            params[field] = float(val)
+                        continue
+                    params[field] = val
+                if not params.get("action_type"):
+                    params["action_type"] = action_type or "status"
+                data = await nt.call("mc.dispatch_goal", params)
+        except Rejected as exc:
+            summary = (
+                await mc_mod.get_sensor_summary()
+                if isinstance(mc_mod, MinecraftSlotModule)
+                else ""
+            )
+            return {
+                "ok": False,
+                "accepted": False,
+                "reason": str(exc),
+                "summary": summary,
+            }
+
+        if isinstance(data, dict) and isinstance(mc_mod, MinecraftSlotModule):
+            if any(
+                k in data
+                for k in (
+                    "snapshot",
+                    "bridge_ready",
+                    "mc_enabled",
+                    "mc_configured",
+                    "paused",
+                    "connected",
+                    "activity",
+                    "phase",
+                )
+            ):
+                await self._apply_mc_status_data(mc_mod, data)
+
+        if isinstance(data, dict):
+            if "ok" in data:
+                ok = bool(data["ok"])
+            elif action_type == "status":
+                ok = bool(
+                    data.get(
+                        "bridge_ready",
+                        mc_mod.bridge_ready if isinstance(mc_mod, MinecraftSlotModule) else False,
+                    )
+                )
+            else:
+                ok = True
+            reason_val = data.get("reason")
+            reason = (
+                str(reason_val)
+                if reason_val is not None
+                else (None if ok else "mc_bridge_disconnected")
+            )
+            summary = str(data.get("summary") or "")
+            if not summary and isinstance(mc_mod, MinecraftSlotModule):
+                summary = await mc_mod.get_sensor_summary()
+            artifacts: dict[str, Any] = {}
+            if isinstance(mc_mod, MinecraftSlotModule):
+                artifacts.update(
+                    {
+                        "connected": mc_mod.snapshot.connected,
+                        "bridge_ready": mc_mod.bridge_ready,
+                        "mc_enabled": mc_mod.mc_enabled,
+                        "mc_configured": mc_mod.mc_configured,
+                        "paused": mc_mod.paused,
+                    }
+                )
+            if "accepted" in data:
+                artifacts["accepted"] = bool(data["accepted"])
+            if "phase" in data:
+                artifacts["phase"] = str(data["phase"])[:32]
+            return {
+                "ok": ok,
+                "summary": summary,
+                "reason": reason,
+                "artifacts": artifacts,
+            }
+
+        summary = (
+            await mc_mod.get_sensor_summary()
+            if isinstance(mc_mod, MinecraftSlotModule)
+            else ""
+        )
+        return {"ok": True, "summary": summary, "reason": None, "artifacts": {}}
+
     async def _handle_node_event(self, frame: dict[str, Any]) -> str:
         event_name = frame.get("event")
         payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
         if event_name == "mc.snapshot":
             mc_mod = self.modules.get("minecraft")
             if isinstance(mc_mod, MinecraftSlotModule):
+                prev_connected = mc_mod.snapshot.connected
+                prev_paused = mc_mod.paused
                 await mc_mod.update_snapshot(payload)
+                await self._sync_mc_world_focus(
+                    mc_mod, prev_connected=prev_connected, prev_paused=prev_paused
+                )
         elif event_name == "mc.milestone":
             raw_type = payload.get("event_type") or payload.get("type") or "mc_milestone"
             clean_type = (
@@ -446,12 +710,14 @@ class Service:
                     if k not in {"event_type", "type", "importance"}
                 }
             )
-            await self.world_state.publish_event(
-                "minecraft",
-                clean_type,
-                event_data,
-                importance=importance,
-            )
+            ws_mgr = await self._ensure_world_state_ready()
+            if ws_mgr is not None:
+                await ws_mgr.publish_event(
+                    "minecraft",
+                    clean_type,
+                    event_data,
+                    importance=importance,
+                )
         return "accepted"
 
     async def command(self, message: Message) -> str | None:

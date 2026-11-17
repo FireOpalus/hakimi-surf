@@ -52,6 +52,20 @@ _GENERIC_OWNER_SILENCE_ACTIONS = frozenset(
         "check_in",
     }
 )
+_INTERNAL_MC_ACTIONS = frozenset(
+    {
+        "build_plan",
+        "explore",
+        "mine",
+        "gather",
+        "goto",
+        "follow",
+        "look_signs",
+        "observe",
+        "stop",
+        "idle",
+    }
+)
 
 
 class LifeEngineConfig(BaseModel):
@@ -577,10 +591,15 @@ class LifeBlockPlanner:
             )
             raw_scope = str(item.target_scope or "").strip()
             if (
-                target_module == "bilibili_surf"
-                and action_type in {"patrol", "run_once"}
-                and not raw_scope
-            ):
+                (
+                    target_module == "bilibili_surf"
+                    and action_type in {"patrol", "run_once"}
+                )
+                or (
+                    target_module == "minecraft"
+                    and action_type in _INTERNAL_MC_ACTIONS
+                )
+            ) and not raw_scope:
                 resolved_scope = ""
             else:
                 resolved_scope = _normalize_target_scope(raw_scope, self.s) or ""
@@ -655,10 +674,39 @@ class LifeBlockPlanner:
             log.warning("event=milestone_diary_failed")
 
     async def on_milestone_event(self, event: MilestoneEvent) -> str | None:
-        """Derive a zero-Token fuzzy intent ticket on high-importance milestone events."""
-        if not self.config.enabled or event.importance != "high":
+        """Derive a zero-Token fuzzy intent ticket on milestone events."""
+        if not self.config.enabled:
             return None
         now = max(self.clock(), float(event.created_at or 0.0))
+        if event.source_module == "bilibili_surf" and event.event_type == "bili_mc_inspiration":
+            await self._record_milestone_diary(event, now=now)
+            cooldown_key = "bilibili_surf:mc_goal"
+            last_at = self._impulse_cooldowns.get(cooldown_key, 0.0)
+            if now - last_at < 600.0:
+                return None
+            self._impulse_cooldowns[cooldown_key] = now
+            if len(self._impulse_cooldowns) > 256:
+                self._impulse_cooldowns.pop(next(iter(self._impulse_cooldowns)))
+            note = trim_complete_text(
+                "刚在B站刷到MC相关建筑或红石视频灵感，同步给MC躯干筹备建造目标",
+                120,
+            )
+            ticket = IntentTicketCreate(
+                target_module="minecraft",
+                target_scope="",
+                action_type="build_plan",
+                execute_after=now + 60.0,
+                expire_at=now + 7200.0,
+                mood=self.service.world_state.current.mood,
+                gate_condition={
+                    "milestone_event_id": event.id,
+                    "bvid": str(event.payload.get("bvid", ""))[:20],
+                },
+                intent_note=note,
+            )
+            return await self.service.world_state.enqueue_intent(ticket, now=now)
+        if event.importance != "high":
+            return None
         await self._record_milestone_diary(event, now=now)
         last_at = self._impulse_cooldowns.get(event.source_module, 0.0)
         if now - last_at < 600.0:
@@ -737,7 +785,8 @@ class GatekeeperWorker:
         async with self.store.lock:
             row = await self.store.one(
                 "SELECT COUNT(*) FROM scheduled_intents "
-                "WHERE status IN ('done','uncertain') AND updated_at>=? AND updated_at<?",
+                "WHERE target_scope != '' AND status IN ('done','uncertain') "
+                "AND updated_at>=? AND updated_at<?",
                 (day_start, day_end),
             )
         return int(row[0] or 0) if row else 0
@@ -864,6 +913,22 @@ class GatekeeperWorker:
             await self._defer_intent(intent_id, now + defer_by, now=now)
             return "deferred"
 
+        # Internal non-chat MC goal (zero LLM tokens; gated by node_transport instead of QQ)
+        if (
+            ticket["target_module"] == "minecraft"
+            and ticket["action_type"] in _INTERNAL_MC_ACTIONS
+            and not ticket.get("target_scope")
+        ):
+            nt = getattr(self.service, "node_transport", None)
+            if nt is None or not nt.connected():
+                if now + 120.0 < ticket["expire_at"]:
+                    await self._defer_intent(intent_id, now + 120.0, now=now)
+                    return "deferred"
+                await ws.mark_intent(intent_id, "gated_skip", now=now)
+                return "gated_skip"
+            res = await self.engine.jit.execute(ticket, now=now)
+            return str(res.get("status", "done"))
+
         # Gate 4: Daily budget circuit breaker & daily proactive cap
         pro_sub = budget.get("sub_budgets", {}).get("proactive") or {}
         if budget.get("hard_stop") or (
@@ -976,7 +1041,8 @@ class GatekeeperWorker:
             results[outcome] = results.get(outcome, 0) + 1
             if outcome in {"done", "uncertain"}:
                 executed += 1
-                today_count += 1
+                if ticket.get("target_scope"):
+                    today_count += 1
                 budget = await self.store.budget_status()
         return {
             "status": "ok",
@@ -1003,6 +1069,32 @@ class JITExecutor:
         self.engine = engine
         self.clock = clock
 
+    async def _lookup_milestone_event(
+        self, gate_condition: Any
+    ) -> tuple[str, dict[str, Any]] | None:
+        if not isinstance(gate_condition, dict):
+            return None
+        event_id = str(gate_condition.get("milestone_event_id") or "").strip()
+        if not event_id:
+            return None
+        async with self.store.lock:
+            has_table = await self.store.one(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='global_events'"
+            )
+            if not has_table:
+                return None
+            row = await self.store.one(
+                "SELECT event_type, payload_json FROM global_events WHERE id=?",
+                (event_id,),
+            )
+        if row is None:
+            return None
+        try:
+            parsed = json.loads(row["payload_json"] or "{}")
+        except ValueError:
+            parsed = {}
+        return str(row["event_type"] or ""), parsed if isinstance(parsed, dict) else {}
+
     async def execute(
         self,
         ticket: dict[str, Any],
@@ -1021,7 +1113,52 @@ class JITExecutor:
 
         material_summary = ""
         modules_reg = getattr(self.service, "modules", None)
-        if modules_reg is not None and (
+        if (
+            target_module == "minecraft"
+            and action_type in _INTERNAL_MC_ACTIONS
+            and not target_scope
+        ):
+            mc_mod = modules_reg.get("minecraft") if modules_reg is not None else None
+            if mc_mod is None:
+                await ws.mark_intent(intent_id, "gated_skip", now=self.clock())
+                return {"status": "gated_skip", "reason": "module_unavailable"}
+            topic = str(ticket.get("topic") or "").strip()
+            if not topic:
+                ev_info = await self._lookup_milestone_event(ticket.get("gate_condition"))
+                if ev_info is not None:
+                    _, ev_payload = ev_info
+                    raw_topic = str(
+                        ev_payload.get("title")
+                        or ev_payload.get("topic")
+                        or ev_payload.get("summary")
+                        or ""
+                    )
+                    topic = sanitize_sensor_text(raw_topic, self.s, max_tokens=20)
+            goal_res = await mc_mod.dispatch_goal({**ticket, "topic": topic})
+            final_mc_status: Literal["done", "gated_skip"] = (
+                "done" if goal_res.ok else "gated_skip"
+            )
+            await ws.mark_intent(intent_id, final_mc_status, now=self.clock())
+            return {"status": final_mc_status, "reason": goal_res.reason}
+
+        if modules_reg is not None and target_module == "minecraft" and target_scope:
+            mc_mod = modules_reg.get("minecraft")
+            sensor_part = await mc_mod.get_sensor_summary() if mc_mod is not None else ""
+            ev_info = await self._lookup_milestone_event(ticket.get("gate_condition"))
+            if ev_info is not None:
+                ev_type, ev_payload = ev_info
+                ev_detail = (
+                    json.dumps(ev_payload, ensure_ascii=False, separators=(",", ":"))
+                    if ev_payload
+                    else ""
+                )
+                ev_part = f"事件:{ev_type}" + (f" {ev_detail}" if ev_detail else "")
+                raw_material = " | ".join(p for p in (sensor_part, ev_part) if p)
+            else:
+                raw_material = sensor_part
+            if raw_material:
+                material_summary = sanitize_sensor_text(raw_material, self.s, max_tokens=90)
+        elif modules_reg is not None and (
             target_module == "bilibili_surf"
             or action_type in {"patrol", "run_once", "bili_patrol", "fetch_material"}
         ):

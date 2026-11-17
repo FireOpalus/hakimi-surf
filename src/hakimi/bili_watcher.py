@@ -33,6 +33,10 @@ from .reply_style import trim_complete_text
 from .roaming_logger import redact_public_summary
 from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
 
+_MC_INSPIRATION_RE = re.compile(
+    r"(?i)(?:我的世界|minecraft|(?:^|[^a-z0-9])mc(?:$|[^a-z0-9])|红石|生电|建筑教程|生存建筑|刷铁机|下界|末地|苦力怕)"
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bili_credentials (
  id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
@@ -1448,6 +1452,32 @@ class BiliWatcher:
                         await self.store.db.execute(
                             "UPDATE bili_watched_history SET status='done',summary=? WHERE bvid=?",
                             (self.store.vault.seal("bili-learn:" + pick.bvid, text), pick.bvid),
+                        )
+                    ws_mgr = getattr(self.svc, "world_state", None)
+                    if ws_mgr is not None:
+                        if hasattr(ws_mgr, "store") and hasattr(ws_mgr, "initialize"):
+                            async with self.store.lock:
+                                has_events_table = await self.store.one(
+                                    "SELECT 1 FROM sqlite_master "
+                                    "WHERE type='table' AND name='global_events'"
+                                )
+                            if not has_events_table:
+                                await ws_mgr.initialize()
+                        title_str = str(material.get("title", ""))
+                        is_mc = bool(_MC_INSPIRATION_RE.search(f"{title_str}\n{summary}"))
+                        event_type = "bili_mc_inspiration" if is_mc else "bili_video_watched"
+                        importance = (
+                            "normal" if is_mc else ("high" if pick.share_owner else "normal")
+                        )
+                        await ws_mgr.publish_event(
+                            "bilibili_surf",
+                            event_type,
+                            {
+                                "bvid": pick.bvid,
+                                "title": title_str[:80],
+                                "summary": summary[:140],
+                            },
+                            importance=importance,
                         )
                     if self.svc.diary:
                         await self.svc.diary.patrol("bili-account:" + pick.bvid, text)
