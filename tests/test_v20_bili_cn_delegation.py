@@ -599,8 +599,11 @@ async def test_video_watch_lane2_cn_storyboard_fallback_succeeds(
 
     res = await watch.analyze(BV, material(), "subject", "chat", message=message)
     assert res.mode == "cn_storyboard" and res.reason is None
-    assert [c[0] for c in gateway.calls] == ["screen", "generate"]
-    gen_call = gateway.calls[1]
+    assert [c[0] for c in gateway.calls] == ["screen", "screen", "generate"]
+    assert gateway.calls[1][1] == {"storyboard_bvid": BV}
+    assert gateway.calls[1][3]["purpose"] == "source"
+    assert len(gateway.calls[1][3]["images"]) == 1
+    gen_call = gateway.calls[2]
     assert gen_call[1]["analysis_mode"] == "cn_keyframe_storyboard"
     assert "3x3 关键帧拼图" in gen_call[1]["storyboard_note"]
     assert gen_call[3]["summary"] is True

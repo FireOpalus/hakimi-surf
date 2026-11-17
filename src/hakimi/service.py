@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import inspect
 import logging
 import random
 import re
@@ -7,6 +8,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import nullcontext
+from typing import Any, Literal
 
 from .adapters import Sender, farewell_send_bypass, identifier, onebot_message
 from .affection import _validate_platform_user
@@ -35,6 +37,8 @@ from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
 from .modules import BilibiliSurfModule, MinecraftSlotModule, ModuleRegistry, QQSocialModule
+from .modules.base import sanitize_sensor_text
+from .node_transport import NodeTransport
 from .outbound_actions import normalize_emoji_like, parse_actions
 from .output_links import filter_reply_links
 from .owner_cloud_memory import OwnerCloudMemory
@@ -100,8 +104,14 @@ class Service:
         diary: RoamingLogger | None = None,
         notebook=None,
         drive: FolderDrive | None = None,
+        node_transport: NodeTransport | None = None,
     ):
         self.s, self.store, self.ai, self.bili, self.sender = settings, store, gateway, bili, sender
+        self.node_transport = (
+            node_transport if node_transport is not None else NodeTransport(settings)
+        )
+        if node_transport is not None or getattr(self.bili, "node_transport", None) is None:
+            self.bili.node_transport = self.node_transport
         self.sessions = SessionManager(settings, store)
         self.hot = HotRing()
         store.runtime.hot_ring = self.hot
@@ -152,10 +162,17 @@ class Service:
             )
         )
         self.modules.register(
-            BilibiliSurfModule(settings, watcher=self.bili_watcher, bili=bili)
+            BilibiliSurfModule(
+                settings,
+                watcher=self.bili_watcher,
+                bili=bili,
+                node_transport=self.node_transport,
+            )
         )
         self.world_state = WorldStateManager(settings, store, self.modules)
         self.modules.register(MinecraftSlotModule(settings, world_state=self.world_state))
+        if getattr(self.node_transport, "on_event", None) is None:
+            self.node_transport.on_event = self._handle_node_event
         resolved_drive = drive if drive is not None else getattr(diary, "drive", None)
         active_drive = resolved_drive if settings.roaming_enabled else None
         self.db_backup = DatabaseBackup(settings, store, active_drive)
@@ -398,6 +415,44 @@ class Service:
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.compressor.close()
         await self.bili_watcher.close()
+        close_nt = getattr(self.node_transport, "close", None)
+        if close_nt is not None:
+            res = close_nt()
+            if inspect.isawaitable(res):
+                await res
+
+    async def _handle_node_event(self, frame: dict[str, Any]) -> str:
+        event_name = frame.get("event")
+        payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
+        if event_name == "mc.snapshot":
+            mc_mod = self.modules.get("minecraft")
+            if isinstance(mc_mod, MinecraftSlotModule):
+                await mc_mod.update_snapshot(payload)
+        elif event_name == "mc.milestone":
+            raw_type = payload.get("event_type") or payload.get("type") or "mc_milestone"
+            clean_type = (
+                sanitize_sensor_text(str(raw_type), self.s, max_tokens=16) or "mc_milestone"
+            )
+            raw_imp = payload.get("importance", "normal")
+            importance: Literal["low", "normal", "high"] = (
+                raw_imp if raw_imp in ("low", "normal", "high") else "normal"
+            )
+            event_data = (
+                dict(payload["payload"])
+                if isinstance(payload.get("payload"), dict)
+                else {
+                    k: v
+                    for k, v in payload.items()
+                    if k not in {"event_type", "type", "importance"}
+                }
+            )
+            await self.world_state.publish_event(
+                "minecraft",
+                clean_type,
+                event_data,
+                importance=importance,
+            )
+        return "accepted"
 
     async def command(self, message: Message) -> str | None:
         if self.bot_guard.known_bot(message):

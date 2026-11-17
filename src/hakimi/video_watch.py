@@ -357,6 +357,14 @@ class VideoWatch:
                 "UPDATE video_watch_attempts SET duration=?,bytes=? WHERE id=?",
                 (sb_duration, len(raw_bytes), key),
             )
+        await self.svc.ai.screen(
+            {"storyboard_bvid": bvid},
+            subject,
+            purpose="source",
+            budget_lane=lane,
+            images=[storyboard_img.gate()],
+            before_call=valid,
+        )
         result = await self.svc.ai.generate(
             {
                 **payload,

@@ -24,6 +24,7 @@ from .gcp_admin import router as gcp_billing_router
 from .gemini import GeminiGateway
 from .life_admin import router as life_router
 from .meme_admin import router as meme_router
+from .node_transport import NodeTransport
 from .notebook_snapshot import NotebookSnapshot
 from .onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
 from .provider_admin import router as provider_router
@@ -82,6 +83,8 @@ def create_app(
             raise RuntimeError("Enable and configure at least one QQ adapter")
         if s.onebot_mode != "http" and len(s.onebot_ws_token.get_secret_value()) < 32:
             raise RuntimeError("OneBot WebSocket requires a >=32-character access token")
+        if s.node_ws_enabled and len(s.node_ws_token.get_secret_value()) < 32:
+            raise RuntimeError("Node WebSocket requires a >=32-character access token")
         # HTTP debug logs may contain tokens, IDs and request metadata.
         for name in ("httpx", "httpcore", "google.genai", "websockets", "aiohttp"):
             logging.getLogger(name).setLevel(logging.CRITICAL)
@@ -98,6 +101,7 @@ def create_app(
                 onebot = (
                     HTTPTransport(s, http) if s.onebot_mode == "http" else WebSocketTransport(s)
                 )
+                node_transport = NodeTransport(s)
                 try:
                     diary = None
                     drive = None
@@ -111,11 +115,12 @@ def create_app(
                         s,
                         store,
                         ai,
-                        Bilibili(s, http, runtime=store.runtime),
+                        Bilibili(s, http, runtime=store.runtime, node_transport=node_transport),
                         Sender(s, http, onebot),
                         diary=diary,
                         notebook=NotebookSnapshot(s, http, ai, store),
                         drive=drive,
+                        node_transport=node_transport,
                     )
                     await service.sessions.index_existing()
                     await service.proactive.initialize()
@@ -164,6 +169,7 @@ def create_app(
                 finally:
                     if isinstance(onebot, WebSocketTransport):
                         await onebot.close()
+                    await node_transport.close()
                     await ai.close()
         finally:
             await store.close()
@@ -289,6 +295,38 @@ def create_app(
             websocket.close,
             websocket.app.state.ws_event,
             source_ip=source_ip,
+        )
+
+    @app.websocket("/ws/node{suffix:path}")
+    async def node_reverse(websocket: WebSocket, suffix: str = ""):
+        s = websocket.app.state.settings
+        expected = "Bearer " + s.node_ws_token.get_secret_value()
+        source_ip = websocket_source_ip(websocket, s)
+        node_id = websocket.headers.get("x-node-id", "")
+        region = websocket.headers.get("x-node-region", "")
+        if (
+            not s.node_ws_enabled
+            or websocket.url.path != s.node_ws_path
+            or not hmac.compare_digest(
+                websocket.headers.get("authorization", "").encode(), expected.encode()
+            )
+            or not hmac.compare_digest(node_id.encode(), s.node_id.encode())
+            or region != "CN"
+            or websocket.query_params
+        ):
+            logging.getLogger("hakimi").warning(
+                "event=node_auth_rejected source_ip=%s", source_ip
+            )
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        await websocket.app.state.service.node_transport.serve(
+            websocket.receive_text,
+            websocket.send_text,
+            websocket.close,
+            source_ip=source_ip,
+            node_id=node_id,
+            region=region,
         )
 
     @app.post("/webhooks/qq")

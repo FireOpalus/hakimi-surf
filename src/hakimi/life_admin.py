@@ -252,18 +252,38 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
     proactive_mgr = getattr(svc, "proactive", None)
     onebot_connected = bool(proactive_mgr.connected()) if proactive_mgr is not None else False
     node_transport = getattr(svc, "node_transport", None)
+    status_fn = getattr(node_transport, "status", None)
+    raw_node_status = status_fn() if callable(status_fn) else {}
+    if not isinstance(raw_node_status, dict):
+        raw_node_status = {}
     raw_node_conn = getattr(node_transport, "connected", False)
-    node_connected = bool(raw_node_conn() if callable(raw_node_conn) else raw_node_conn)
+    node_connected = bool(
+        raw_node_conn() if callable(raw_node_conn) else raw_node_status.get("online", raw_node_conn)
+    )
+    node_configured = bool(
+        raw_node_status.get("configured", getattr(svc.s, "node_ws_enabled", False))
+    )
+    bili_delegate_active = bool(
+        node_connected and getattr(svc.s, "node_bili_delegate_enabled", True)
+    )
     nodes = {
         "onebot_cn_napcat": {
             "connected": onebot_connected,
             "mode": svc.s.onebot_mode,
         },
         "shanghai_node_agent": {
-            "configured": bool(getattr(svc.s, "node_ws_enabled", False)),
+            "configured": node_configured,
             "connected": node_connected,
-            "region": "CN",
-            "phase_note": "Phase 3 /ws/node 躯干通道预留",
+            "node_id": raw_node_status.get("node_id") or getattr(svc.s, "node_id", "shanghai-cn-1"),
+            "region": raw_node_status.get("region", "CN"),
+            "source_ip": raw_node_status.get("source_ip"),
+            "connected_at": raw_node_status.get("connected_at"),
+            "last_heartbeat_at": raw_node_status.get("last_heartbeat_at"),
+            "capabilities": list(raw_node_status.get("capabilities") or []),
+            "rpc_calls": int(raw_node_status.get("rpc_calls", 0) or 0),
+            "rpc_errors": int(raw_node_status.get("rpc_errors", 0) or 0),
+            "bili_delegate_active": bili_delegate_active,
+            "phase_note": "CN 反向 WSS 躯干专线",
         },
     }
 

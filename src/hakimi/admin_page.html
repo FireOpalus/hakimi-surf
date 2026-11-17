@@ -1541,6 +1541,7 @@ body.authenticated footer { margin-left: 238px; }
     <div id="life-stats" class="stats"></div>
     <div id="life-node-pills" class="pill-row"></div>
     <p id="life-world-status" class="muted"></p>
+    <p id="life-node-status" class="muted"></p>
     <p id="life-desktop-status" class="muted"></p>
     <form id="life-world-form" class="quick-bar">
       <label for="life-world-module">当前模块（current_module）
@@ -1748,6 +1749,7 @@ function logout(){
   accountBalanceState=null;
   affectionState=null;
   lifeState=null;
+  text('life-node-status','');
   text('rest-overview-badge','作息读取中');
   $('toggle-rest-quick').hidden=true;
   $('toggle-rest-quick').disabled=true;
@@ -2440,13 +2442,19 @@ function renderLife(d){
   ];
   $('life-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
   const nap=nodes.onebot_cn_napcat||{},sh=nodes.shanghai_node_agent||{};
-  $('life-node-pills').replaceChildren(
+  const nodePills=[
     nap.connected?pill('NapCat CN 在线 ('+(nap.mode||'http')+')','ok'):pill('NapCat CN 未连接 ('+(nap.mode||'http')+')','warn'),
-    sh.connected?pill('上海躯干节点在线 (CN)','ok'):sh.configured?pill('上海躯干节点等待接入 (CN)','warn'):pill('上海躯干节点预留 (Phase 3)','muted'),
+    sh.connected?pill('上海躯干节点在线 ('+(sh.node_id||'CN')+')','ok'):sh.configured?pill('上海躯干节点等待接入 ('+(sh.node_id||'CN')+')','warn'):pill('上海躯干节点未启用 (Phase 3)','muted')
+  ];
+  if(sh.bili_delegate_active)nodePills.push(pill('B站 CN 专线托管中','ok'));
+  nodePills.push(
     dm.enabled?(dm.latest_timestamp?pill('桌面记忆活跃 '+lifeFmt(dm.latest_timestamp,tz),'ok'):pill('桌面记忆已启用（暂无活跃时间）','muted')):pill('桌面记忆未启用','muted'),
     ws.proactive_suspended?pill('Attention Lock 已触发：非核心主动已暂停','warn'):pill('Attention Lock 未锁定','ok')
   );
-  text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 上海节点说明：'+(sh.phase_note||'Phase 3 /ws/node 躯干通道预留'));
+  $('life-node-pills').replaceChildren(...nodePills);
+  text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 上海节点说明：'+(sh.phase_note||'CN 反向 WSS 躯干专线'));
+  const caps=Array.isArray(sh.capabilities)&&sh.capabilities.length?sh.capabilities.join(', '):'—';
+  text('life-node-status','上海节点 '+(sh.node_id||'shanghai-cn-1')+' ('+(sh.region||'CN')+')：'+(sh.connected?'在线':sh.configured?'等待连接':'未配置')+' · 来源 IP '+(sh.source_ip||'—')+' · 建连 '+lifeFmt(sh.connected_at,tz)+' · 心跳 '+lifeFmt(sh.last_heartbeat_at,tz)+' · RPC 成功/失败 '+(sh.rpc_calls??0)+'/'+(sh.rpc_errors??0)+' · B站托管 '+(sh.bili_delegate_active?'开启':'未激活')+' · 能力 '+caps);
   text('life-desktop-status',dm.enabled?('桌面端 Antigravity_Memory 最近活跃：'+(dm.latest_iso||lifeFmt(dm.latest_timestamp,tz))+(dm.latest_tag?' · 标签 '+dm.latest_tag:'')):'桌面端 Antigravity_Memory 协同当前未启用。');
   $('life-world-module').value=ws.current_module||'idle';
   $('life-world-focus').value=ws.focus_level||'LOW';
