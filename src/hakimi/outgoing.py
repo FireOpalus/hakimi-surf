@@ -2,13 +2,16 @@
 
 import asyncio
 import random
+import re
 import time
 from contextlib import nullcontext
 
 from .adapters import farewell_send_bypass
+from .bot_server import is_persona_owner
 from .models import Message
-from .outbound_actions import bubble_segments, valid_receipt
-from .security import Rejected
+from .outbound_actions import bubble_segments, parse_actions, valid_receipt
+from .output_links import filter_reply_links
+from .security import Rejected, authorize, configured_secrets, safe_output
 from .text_card import should_render_rich_card
 
 
@@ -381,3 +384,207 @@ async def deliver_actions(service, reply):
     else:
         await service._finish_delivery_audit(reply, "cancelled", "session_reset")
     return True
+
+
+async def _record_proactive_side_effects(service, message: Message) -> None:
+    if hasattr(service.store.runtime.filters, "note_proactive_spoke"):
+        service.store.runtime.filters.note_proactive_spoke(message)
+    world_state = getattr(service, "world_state", None)
+    if world_state is not None:
+        now_ts = world_state.clock() if hasattr(world_state, "clock") else time.time()
+        if message.kind == "group":
+            await world_state.record_group_proactive(
+                service.store.session_scope(message), now=now_ts
+            )
+        await world_state.update_state(last_proactive_at=now_ts)
+
+
+async def deliver_proactive_jit(
+    service, message: Message, raw_action_or_text: str, *, reply_id: str
+) -> dict:
+    """Deliver JIT proactive bubbles sequentially with at-most-once ambiguity safety."""
+    is_group = message.kind == "group"
+    public_chat = is_group or not is_persona_owner(message, service.s)
+    secrets = getattr(service, "secrets", None) or configured_secrets(service.s)
+    raw = str(raw_action_or_text or "")
+
+    abstain = False
+    emoji_like: str | None = None
+    poke_qq: str | None = None
+    anchor_dict: dict = {"reply_id": None, "mentions": []}
+    bubbles: list[str] = []
+
+    if raw.lstrip().startswith("{"):
+        labels = getattr(getattr(service, "memes", None), "labels", ())
+        allowed_poke = {message.user_id} if message.kind == "private" else ()
+        actions, _ = parse_actions(
+            raw,
+            public=public_chat,
+            allowed_at=(),
+            allowed_reply=(),
+            labels=labels,
+            settings=service.s,
+            allowed_poke=allowed_poke,
+            allow_longnick=False,
+            allow_sticker=False,
+        )
+        abstain = bool(actions.abstain)
+        emoji_like = actions.emoji_like
+        poke_qq = actions.poke_qq
+        anchor_dict = {"reply_id": None, "mentions": list(actions.anchor.mentions)}
+        if not abstain:
+            for item in actions.bubbles[:3]:
+                if not item.strip():
+                    continue
+                filtered = filter_reply_links(item, public=is_group).strip()
+                if not filtered:
+                    continue
+                bubbles.append(
+                    safe_output(safe_output(filtered, secrets, limit=218), secrets, limit=220)
+                )
+    else:
+        filtered = filter_reply_links(raw, public=is_group).strip()
+        if filtered:
+            bubbles = [safe_output(safe_output(filtered, secrets, limit=218), secrets, limit=220)]
+
+    reaction_target_id = (
+        str(message.event_id) if re.fullmatch(r"-?[0-9]{1,30}", str(message.event_id)) else None
+    )
+    can_emoji = bool(
+        emoji_like
+        and reaction_target_id
+        and message.platform == "onebot"
+        and hasattr(service.sender, "send_emoji_like")
+    )
+    can_poke = bool(
+        poke_qq
+        and message.platform == "onebot"
+        and message.kind == "private"
+        and poke_qq == message.user_id
+        and hasattr(service.sender, "send_poke")
+    )
+
+    if (abstain or not bubbles) and not can_emoji and not can_poke:
+        return {"status": "abstained", "bubbles_sent": 0}
+    if not authorize(message, service.s):
+        return {"status": "cancelled", "bubbles_sent": 0}
+
+    epoch = (await service.sessions.snapshot(message))["epoch"]
+    synthetic_reply = {
+        "id": reply_id,
+        "message": message.model_dump(),
+        "participants": [message.model_dump()],
+    }
+
+    confirmed: list[dict] = []
+    position = 0
+    dispatched = False
+    did_reaction = False
+    applied_done = False
+
+    async def valid() -> bool:
+        if not authorize(message, service.s):
+            return False
+        return (await service.sessions.snapshot(message))["epoch"] == epoch
+
+    async def targets() -> set[str]:
+        return set()
+
+    async def apply_confirmed() -> None:
+        nonlocal applied_done
+        if confirmed and not applied_done:
+            applied_done = True
+            await asyncio.shield(apply_receipts(service, reply_id))
+            await asyncio.shield(_record_proactive_side_effects(service, message))
+
+    try:
+        for index, text in enumerate(bubbles[:3]):
+            if index:
+                if hasattr(service.sender, "typing"):
+                    await service.sender.typing(message)
+                await asyncio.sleep(min(2.2, 0.8 + len(text) * 0.025 + random.uniform(0, 0.2)))
+            if not await valid():
+                if not confirmed:
+                    return {"status": "cancelled", "bubbles_sent": 0}
+                await apply_confirmed()
+                return {"status": "uncertain", "bubbles_sent": len(confirmed)}
+
+            async def before_bubble_send() -> bool:
+                nonlocal dispatched
+                if not await valid():
+                    return False
+                dispatched = True
+                return True
+
+            if message.platform == "onebot" and hasattr(service.sender, "send_action_bubble"):
+                receipt = await service.sender.send_action_bubble(
+                    message,
+                    bubble_segments(text, anchor_dict, include_anchor=index == 0),
+                    targets=targets,
+                    before_send=before_bubble_send,
+                )
+            else:
+                receipt = await service.sender.send(
+                    message,
+                    text,
+                    before_send=before_bubble_send,
+                )
+            dispatched = True
+            if not valid_receipt(receipt):
+                raise Rejected("onebot_send_unconfirmed")
+            data = await persist_ack(service, synthetic_reply, position, text, receipt, epoch)
+            confirmed.append(data)
+            position += 1
+
+        if can_emoji:
+            try:
+                if await service.sender.send_emoji_like(
+                    message, reaction_target_id, emoji_like, before_send=valid
+                ):
+                    did_reaction = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        if can_poke:
+            try:
+                if await service.sender.send_poke(message, poke_qq, before_send=valid):
+                    did_reaction = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        if confirmed:
+            await apply_confirmed()
+            return {
+                "status": "sent",
+                "bubbles_sent": len(confirmed),
+                "reply_id": reply_id,
+                "message_ids": [d["message_id"] for d in confirmed],
+            }
+        if did_reaction:
+            await _record_proactive_side_effects(service, message)
+            return {
+                "status": "sent",
+                "bubbles_sent": 0,
+                "reaction_only": True,
+                "reply_id": reply_id,
+            }
+        return {"status": "abstained", "bubbles_sent": 0}
+    except asyncio.CancelledError:
+        if confirmed:
+            await apply_confirmed()
+        raise
+    except Rejected as exc:
+        if str(exc) == "onebot_not_dispatched" and not confirmed:
+            return {"status": "not_dispatched", "bubbles_sent": 0}
+        if str(exc) == "reply_invalidated" and not confirmed and not dispatched:
+            return {"status": "cancelled", "bubbles_sent": 0}
+        if confirmed:
+            await apply_confirmed()
+        return {"status": "uncertain", "bubbles_sent": len(confirmed)}
+    except Exception:
+        if confirmed:
+            await apply_confirmed()
+        return {"status": "uncertain", "bubbles_sent": len(confirmed)}

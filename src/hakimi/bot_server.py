@@ -299,6 +299,11 @@ def assemble_chat_input(
             for key in ("file_attachments", "web_search_findings", "web_search_status"):
                 if payload.get(key):
                     metadata[key] = payload[key]
+            if payload.get("jit_proactive_intent"):
+                raw_jit = payload["jit_proactive_intent"]
+                metadata["jit_proactive_intent"] = (
+                    dict(raw_jit) if isinstance(raw_jit, dict) else raw_jit
+                )
     else:
         metadata = {
             "current_time": datetime.now(ZoneInfo(settings.bot_timezone)).isoformat(
@@ -338,6 +343,11 @@ def assemble_chat_input(
             for key in ("file_attachments", "web_search_findings", "web_search_status"):
                 if payload.get(key):
                     metadata[key] = payload[key]
+            if payload.get("jit_proactive_intent"):
+                raw_jit = payload["jit_proactive_intent"]
+                metadata["jit_proactive_intent"] = (
+                    dict(raw_jit) if isinstance(raw_jit, dict) else raw_jit
+                )
     summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
     dual = payload.get("dual_memory_data", {}) if not sandbox_mode else {}
     background = {}
@@ -466,6 +476,8 @@ def assemble_chat_input(
             metadata["nearby_group_context"] = []
         if "allowed_at_qqs" in metadata:
             metadata["allowed_at_qqs"] = metadata["allowed_at_qqs"][:20]
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and "jit_proactive_intent" in metadata:
+        metadata.pop("jit_proactive_intent", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         raise Rejected("transient_context_too_large")
     return "<conversation_history_log>\n" + b + "</conversation_history_log>\n" + tail()
