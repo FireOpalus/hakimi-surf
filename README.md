@@ -1,6 +1,6 @@
 # 哈基米跨平台冲浪助手（Hakimi Surf）
 
-**当前版本：v1.7.0** · 基于 Python 3.12+ 与 FastAPI 的 QQ AI 冲浪后端，支持 OneBot v11（NapCat HTTP / 正向 WS / 反向 WS）与官方 QQ Bot Webhook，后端默认对接 Gemini `Interactions` 与 `Decisions`。
+**当前版本：v2.0.0** · 基于 Python 3.12+ 与 FastAPI 的 QQ AI 冲浪后端，支持 OneBot v11（NapCat HTTP / 正向 WS / 反向 WS）与官方 QQ Bot Webhook，后端默认对接 Gemini `Interactions` 与 `Decisions`。
 
 设计目标很直接：**在群里像个懂分寸的活人损友，在私聊只偏心真正的主人；记性好、会贴表情回戳、能结合记忆逛 B 站，同时把注入和越权操作关在服务端裁决边界内。**
 

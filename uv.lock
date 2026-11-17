@@ -678,7 +678,7 @@ wheels = [
 
 [[package]]
 name = "hakimi-surf"
-version = "1.7.0"
+version = "2.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
