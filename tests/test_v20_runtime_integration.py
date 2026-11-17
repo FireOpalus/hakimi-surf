@@ -155,6 +155,10 @@ async def test_attention_lock_suppresses_non_urgent_ticks_and_keeps_alerts(
         slot_id = "slot-high-focus"
         async with store.transaction():
             await store.db.execute(
+                "UPDATE proactive_schedule SET status='skipped' WHERE scope=?",
+                (svc.proactive.scope,),
+            )
+            await store.db.execute(
                 "INSERT INTO proactive_schedule VALUES (?,?,?,?,?,?,'planned',NULL)",
                 (slot_id, svc.proactive.scope, day, "companion", now - 10, now + 1800),
             )
