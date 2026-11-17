@@ -1,7 +1,9 @@
 """Subtitle-first analysis with a durable, global quota for bounded video uploads."""
 
 import asyncio
+import base64
 import copy
+import hashlib
 import inspect
 import math
 import re
@@ -12,6 +14,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .bot_server import untrusted_input
+from .media import ModelImage
 from .security import Rejected, authorize
 from .video_downloader import VideoDownloader
 from .video_policy import VideoWatchConfig
@@ -38,6 +41,16 @@ DOWNLOAD_CODE_MAP = {
     "video_download_restricted": "download_restricted",
     "video_download_network_forbidden": "download_network",
 }
+LANE2_FALLBACK_CODES = frozenset(
+    {
+        "video_download_restricted",
+        "video_download_unavailable",
+        "video_download_timeout",
+        "video_download_network_forbidden",
+    }
+)
+MAX_STORYBOARD_BYTES = 262_144
+STORYBOARD_NOTE = "原片由上海节点本地提取 3x3 关键帧拼图回传（未传输大体积原片）"
 LOCAL_FAILURE_SQL = (
     "NOT (status='failed' AND reason IN ('" + "','".join(LOCAL_DOWNLOAD_REASONS) + "'))"
 )
@@ -292,6 +305,79 @@ class VideoWatch:
         await self._identity_guard(message, guard, check_budget=False)
         return VideoAnalysis(text, payload.get("material_scope", "metadata_only"), "text", reason)
 
+    async def _try_cn_storyboard(
+        self, bvid, payload, subject, lane, message, deep, config, cookies, key, valid
+    ) -> VideoAnalysis | None:
+        nt = getattr(self.svc, "node_transport", None)
+        if not (
+            nt is not None
+            and nt.connected()
+            and getattr(self.s, "node_bili_delegate_enabled", True)
+        ):
+            return None
+        await valid()
+        req_cookies = {k: v for k, v in cookies.items() if v} if isinstance(cookies, dict) else {}
+        try:
+            sb = await nt.call(
+                "bili.video_storyboard",
+                {"bvid": bvid, "max_seconds": config.max_seconds, "cookies": req_cookies},
+                timeout=120.0,
+            )
+        except (Rejected, TimeoutError, ValueError):
+            return None
+        await valid()
+        if not isinstance(sb, dict) or sb.get("mime_type") != "image/jpeg":
+            return None
+        data_b64 = sb.get("data_b64")
+        if not isinstance(data_b64, str) or not data_b64:
+            return None
+        try:
+            raw_bytes = base64.b64decode(data_b64, validate=True)
+        except ValueError:
+            return None
+        if not (1 <= len(raw_bytes) <= MAX_STORYBOARD_BYTES):
+            return None
+        raw_dur = sb.get("duration", payload.get("duration"))
+        sb_duration = (
+            float(raw_dur)
+            if isinstance(raw_dur, (int, float))
+            and not isinstance(raw_dur, bool)
+            and math.isfinite(raw_dur)
+            and raw_dur > 0
+            else None
+        )
+        storyboard_img = ModelImage(
+            data=base64.b64encode(raw_bytes).decode("ascii"),
+            mime_type="image/jpeg",
+            digest=hashlib.sha256(raw_bytes).hexdigest(),
+            resolution="high",
+        )
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "UPDATE video_watch_attempts SET duration=?,bytes=? WHERE id=?",
+                (sb_duration, len(raw_bytes), key),
+            )
+        result = await self.svc.ai.generate(
+            {
+                **payload,
+                "analysis_mode": "cn_keyframe_storyboard",
+                "storyboard_note": STORYBOARD_NOTE,
+            },
+            subject,
+            summary=True,
+            deep=deep,
+            budget_lane=lane,
+            message=message,
+            images=[storyboard_img],
+            before_call=valid,
+        )
+        await valid(check_budget=False)
+        return VideoAnalysis(
+            result,
+            payload.get("material_scope", "metadata_only"),
+            "cn_storyboard",
+        )
+
     async def _video(self, bvid, payload, subject, lane, message, deep, guard):
         async with self.video_lock:
             epoch, config = self.epoch, self.config
@@ -336,39 +422,59 @@ class VideoWatch:
                         if hasattr(watcher, "download_credentials")
                         else dict(watcher.creds)
                     )
-                    async with self.downloader.download(
-                        bvid,
-                        max_seconds=config.max_seconds,
-                        cookies=cookies,
-                        proxy=self.s.bili_proxy.get_secret_value(),
-                        guard=valid,
-                    ) as video:
-                        await valid()
-                        async with self.store.transaction():
-                            await self.store.db.execute(
-                                "UPDATE video_watch_attempts SET duration=?,bytes=? WHERE id=?",
-                                (video.duration, video.bytes, key),
+                    try:
+                        async with self.downloader.download(
+                            bvid,
+                            max_seconds=config.max_seconds,
+                            cookies=cookies,
+                            proxy=self.s.bili_proxy.get_secret_value(),
+                            guard=valid,
+                        ) as video:
+                            await valid()
+                            async with self.store.transaction():
+                                await self.store.db.execute(
+                                    "UPDATE video_watch_attempts SET duration=?,bytes=? WHERE id=?",
+                                    (video.duration, video.bytes, key),
+                                )
+                            result = await self.svc.ai.watch_video(
+                                video.path,
+                                {
+                                    **payload,
+                                    "analysis_mode": "video_file",
+                                },
+                                subject,
+                                duration=video.duration,
+                                budget_lane=lane,
+                                message=message,
+                                deep=deep,
+                                before_call=valid,
                             )
-                        result = await self.svc.ai.watch_video(
-                            video.path,
-                            {
-                                **payload,
-                                "analysis_mode": "video_file",
-                            },
+                            await valid(check_budget=False)
+                            state, reason = "done", None
+                            return VideoAnalysis(
+                                result,
+                                payload.get("material_scope", "metadata_only"),
+                                "video",
+                            ), None
+                    except Rejected as lane1_exc:
+                        if str(lane1_exc) not in LANE2_FALLBACK_CODES:
+                            raise
+                        analysis = await self._try_cn_storyboard(
+                            bvid,
+                            payload,
                             subject,
-                            duration=video.duration,
-                            budget_lane=lane,
-                            message=message,
-                            deep=deep,
-                            before_call=valid,
+                            lane,
+                            message,
+                            deep,
+                            config,
+                            cookies,
+                            key,
+                            valid,
                         )
-                        await valid(check_budget=False)
+                        if analysis is None:
+                            raise lane1_exc from None
                         state, reason = "done", None
-                        return VideoAnalysis(
-                            result,
-                            payload.get("material_scope", "metadata_only"),
-                            "video",
-                        ), None
+                        return analysis, None
             except asyncio.CancelledError:
                 state, reason = "uncertain", "interrupted"
                 raise

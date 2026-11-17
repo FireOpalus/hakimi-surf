@@ -33,6 +33,7 @@ class BilibiliSurfModule(BaseModule):
         bili: Bilibili | None = None,
         backend_mode: BackendMode = "local",
         remote_fetcher: Callable[..., Any] | None = None,
+        node_transport: Any | None = None,
     ) -> None:
         super().__init__(settings)
         if backend_mode not in ("local", "remote_node"):
@@ -41,6 +42,7 @@ class BilibiliSurfModule(BaseModule):
         self.bili = bili
         self.backend_mode: BackendMode = backend_mode
         self.remote_fetcher = remote_fetcher
+        self.node_transport = node_transport
 
     async def _call_remote(self, request: dict[str, Any]) -> Any:
         if self.remote_fetcher is None:
@@ -105,7 +107,24 @@ class BilibiliSurfModule(BaseModule):
             else:
                 state = "未启用"
 
-        parts = [f"B站冲浪:{state}", f"近期:{recent_count}", f"已看:{watched_count}"]
+        nt = (
+            self.node_transport
+            if self.node_transport is not None
+            else getattr(self.bili, "node_transport", None)
+        )
+        if nt is None and self.watcher is not None:
+            nt = getattr(getattr(self.watcher, "svc", None), "node_transport", None)
+        delegate_enabled = (
+            True
+            if self.settings is None
+            else bool(getattr(self.settings, "node_bili_delegate_enabled", True))
+        )
+        prefix = (
+            "B站冲浪(CN专线)"
+            if (nt is not None and nt.connected() and delegate_enabled)
+            else "B站冲浪"
+        )
+        parts = [f"{prefix}:{state}", f"近期:{recent_count}", f"已看:{watched_count}"]
         if last_run_status:
             parts.append(f"上次:{last_run_status}")
         if self.proactive_paused:

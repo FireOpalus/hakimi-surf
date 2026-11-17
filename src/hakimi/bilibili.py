@@ -15,6 +15,9 @@ BVID = r"BV[1-9A-HJ-NP-Za-km-z]{10}"
 BV_RE = re.compile(rf"(?<![A-Za-z0-9])({BVID})(?![A-Za-z0-9])")
 URL_RE = re.compile(r"https?://[^\s<>\"'，。！？）]+", re.IGNORECASE)
 API_ORIGIN = "https://api.bilibili.com"
+NODE_TRANSPORT_ERRORS = frozenset(
+    {"node_disconnected", "node_not_dispatched", "node_rpc_timeout", "node_unavailable"}
+)
 
 
 def extract_bvid(text: str) -> str | None:
@@ -62,13 +65,27 @@ async def bounded_json(
 class Bilibili:
     """Anonymous, read-only public metadata. No cookies, login, media or comment fetching."""
 
-    def __init__(self, settings: Settings, client: httpx.AsyncClient, runtime=None):
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient,
+        runtime=None,
+        node_transport=None,
+    ):
         self.s, self.http = settings, client
         self.runtime = runtime
+        self.node_transport = node_transport
         self.lock = asyncio.Lock()
         self.last_request = 0.0
         self.blocked_until = 0.0
         self.cache: dict[str, tuple[float, dict]] = {}
+
+    def _can_delegate(self) -> bool:
+        return bool(
+            self.node_transport is not None
+            and self.node_transport.connected()
+            and getattr(self.s, "node_bili_delegate_enabled", True)
+        )
 
     async def _get(
         self, path: str, params: dict[str, str], cache_key: str, ttl: int, *, live=False
@@ -88,21 +105,51 @@ class Bilibili:
             self.last_request = time.monotonic()
             risk_412 = False
             try:
-                result = await bounded_json(
-                    self.http,
-                    "GET",
-                    ("https://api.live.bilibili.com" if live else API_ORIGIN) + path,
-                    params=params,
-                    headers={
-                        "User-Agent": "HakimiSurf/0.1 (public metadata reader)",
-                        "Referer": "https://www.bilibili.com/",
-                    },
-                )
-                if result.get("code") != 0 or not isinstance(result.get("data"), dict):
-                    if result.get("code") in {-412, -352}:
+                result = None
+                if self._can_delegate():
+                    try:
+                        result = await self.node_transport.call(
+                            "bili.public_get",
+                            {"path": path, "params": params, "live": live},
+                        )
+                    except Rejected as exc:
+                        if str(exc) in NODE_TRANSPORT_ERRORS and getattr(
+                            self.s, "node_bili_fallback_local", True
+                        ):
+                            result = None
+                        else:
+                            raise
+                if result is None:
+                    result = await bounded_json(
+                        self.http,
+                        "GET",
+                        ("https://api.live.bilibili.com" if live else API_ORIGIN) + path,
+                        params=params,
+                        headers={
+                            "User-Agent": "HakimiSurf/0.1 (public metadata reader)",
+                            "Referer": "https://www.bilibili.com/",
+                        },
+                    )
+                code = result.get("code") if isinstance(result, dict) else None
+                if (
+                    isinstance(code, bool)
+                    or code != 0
+                    or not isinstance(result.get("data"), dict)
+                ):
+                    if not isinstance(code, bool) and code in {-412, -352}:
                         risk_412 = True
                         logging.getLogger("hakimi").warning("event=bilibili_http_412")
                     raise Rejected("bilibili_unavailable")
+            except Rejected as exc:
+                if str(exc) == "bili_http_status":
+                    status_detail = getattr(exc, "detail", "")
+                    risk_412 = status_detail == "412"
+                    if status_detail in {"403", "412", "429"}:
+                        logging.getLogger("hakimi").warning(
+                            "event=bilibili_http_%s", status_detail
+                        )
+                self.blocked_until = time.monotonic() + 900
+                raise Rejected("bilibili_unavailable") from None
             except httpx.HTTPStatusError as exc:
                 risk_412 = exc.response.status_code == 412
                 if exc.response.status_code in {403, 412, 429}:
@@ -173,6 +220,31 @@ class Bilibili:
             if delay > 0:
                 await asyncio.sleep(delay)
             self.last_request = time.monotonic()
+            if self._can_delegate():
+                resp = None
+                try:
+                    resp = await self.node_transport.call(
+                        "bili.resolve_short", {"url": url}
+                    )
+                except Rejected as exc:
+                    if str(exc) in NODE_TRANSPORT_ERRORS and getattr(
+                        self.s, "node_bili_fallback_local", True
+                    ):
+                        resp = None
+                    else:
+                        self.blocked_until = time.monotonic() + 900
+                        raise Rejected("bilibili_short_link_unavailable") from None
+                except Exception:
+                    self.blocked_until = time.monotonic() + 900
+                    raise Rejected("bilibili_short_link_unavailable") from None
+                if resp is not None:
+                    if not isinstance(resp, dict):
+                        self.blocked_until = time.monotonic() + 900
+                        raise Rejected("bilibili_short_link_unavailable")
+                    bvid = extract_bvid(str(resp.get("location") or ""))
+                    if not bvid:
+                        raise Rejected("bilibili_short_link_target_forbidden")
+                    return bvid
             async with self.http.stream("GET", url, follow_redirects=False) as response:
                 if response.status_code not in {301, 302, 303, 307, 308}:
                     self.blocked_until = time.monotonic() + 900
