@@ -49,22 +49,27 @@ class Rejected(Exception):
 
 def configured_secrets(settings: Settings) -> list[str]:
     return [
-        token.get_secret_value()
-        for token in (
-            settings.gemini_api_key,
-            settings.encryption_key,
-            settings.onebot_secret,
-            settings.onebot_access_token,
-            settings.onebot_ws_token,
-            settings.qq_app_secret,
-            settings.admin_token,
-            settings.bili_sessdata,
-            settings.bili_bili_jct,
-            settings.bili_buvid3,
-            settings.bili_buvid4,
-            settings.bili_proxy,
-            settings.deepseek_api_key,
-        )
+        *(
+            token.get_secret_value()
+            for token in (
+                settings.gemini_api_key,
+                settings.gemini_free_api_key,
+                settings.vertex_api_key,
+                settings.encryption_key,
+                settings.onebot_secret,
+                settings.onebot_access_token,
+                settings.onebot_ws_token,
+                settings.qq_app_secret,
+                settings.admin_token,
+                settings.bili_sessdata,
+                settings.bili_bili_jct,
+                settings.bili_buvid3,
+                settings.bili_buvid4,
+                settings.bili_proxy,
+                settings.deepseek_api_key,
+            )
+        ),
+        *(getattr(settings, "_runtime_extra_secrets", ()) or ()),
     ]
 
 

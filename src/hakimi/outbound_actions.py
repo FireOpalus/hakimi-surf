@@ -113,6 +113,7 @@ class ChatActions(BaseModel):
     poke_qq: str | None = None
     save_meme_label: str | None = None
     set_longnick: str | None = None
+    affection_delta: int | None = 0
 
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
@@ -135,7 +136,11 @@ ACTION_INSTRUCTION = """\n【固定回复协议，优先于旧文本标签示例
 - poke_qq（可选）：回戳或戳一戳时从 allowed_at_qqs/私聊对象选 1 个 QQ 号，否则 null；
   收到「[协议事件：戳了戳你]」可俏皮回戳、发表情包或短句吐槽，连戳多次可撒娇抱怨；
 - save_meme_label（可选）：遇到好图或让你收下/偷图时填 1~24 字标签，否则 null；
-- set_longnick（可选）：仅限 verified_sender.role=="OWNER" 时填 ≤50 字纯文本签名，否则 null。
+- set_longnick（可选）：仅限 verified_sender.role=="OWNER" 时填 ≤50 字纯文本签名，否则 null；
+- affection_delta（整数 -35~2，默认 0）：按当前互动态度打分：
+  友好有趣 +1~+2；普通/无恶意玩梗 0；烦人冒犯你 -1~-5；
+  阴阳贬损或挑衅 BOISER 扣 -10~-15；恶意辱骂、造谣中伤或围攻 BOISER 狠扣 -25~-35。
+  多人合批时用 anchor.reply_id 对准攻击者发言，绝不凭转述截图栽赃，也不透露分值或等级。
 不再在 bubbles 中写 AT/MEME 标签或解释后台动作。abstain=true 时 bubbles=[""]、sticker 留空。
 """
 
@@ -151,6 +156,9 @@ def parse_actions(
     tier=2,
     allowed_poke=None,
     allow_longnick=False,
+    allow_sticker: bool = True,
+    allow_emoji_like: bool = True,
+    allow_poke_action: bool = True,
 ):
     try:
         value = json.loads(raw)
@@ -174,20 +182,26 @@ def parse_actions(
     )[:1]
     if actions.anchor.reply_id not in set(allowed_reply):
         actions.anchor.reply_id = None
-    if actions.sticker.label not in set(labels):
+    if not allow_sticker or actions.sticker.label not in set(labels):
         actions.sticker.label = None
     actions.image_digest = (actions.image_digest or "").replace("\n", " ").strip()[
         :MAX_IMAGE_DIGEST_CHARS
     ] or None
-    actions.emoji_like = normalize_emoji_like(actions.emoji_like)
+    actions.emoji_like = normalize_emoji_like(actions.emoji_like) if allow_emoji_like else None
     poke_pool = (set(allowed_poke) - blocked_ids) if allowed_poke is not None else allowed
     actions.poke_qq = (
         actions.poke_qq.strip()
-        if isinstance(actions.poke_qq, str)
+        if allow_poke_action
+        and isinstance(actions.poke_qq, str)
         and re.fullmatch(r"[1-9][0-9]{0,19}", actions.poke_qq.strip())
         and actions.poke_qq.strip() in poke_pool
         else None
     )
+    raw_delta = actions.affection_delta
+    if isinstance(raw_delta, bool) or not isinstance(raw_delta, int):
+        actions.affection_delta = 0
+    else:
+        actions.affection_delta = max(-35, min(2, raw_delta))
     if actions.save_meme_label:
         try:
             actions.save_meme_label = validate_meme_label(actions.save_meme_label.strip())

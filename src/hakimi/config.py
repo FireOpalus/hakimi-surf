@@ -28,6 +28,10 @@ class Settings(BaseSettings):
 
     namespace: str = Field(default="home", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     gemini_api_key: SecretStr
+    gemini_free_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("GEMINI_FREE_API_KEY", "HAKIMI_GEMINI_FREE_API_KEY"),
+    )
     encryption_key: SecretStr
     data_dir: Path = Path("data")
     admin_token: SecretStr = Field(
@@ -50,6 +54,16 @@ class Settings(BaseSettings):
         default=Path("data/owner_notebook_snapshot.md"),
         validation_alias=AliasChoices("NOTEBOOK_SNAPSHOT_PATH", "HAKIMI_NOTEBOOK_SNAPSHOT_PATH"),
     )
+    enable_antigravity_memory: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ENABLE_ANTIGRAVITY_MEMORY", "HAKIMI_ENABLE_ANTIGRAVITY_MEMORY"
+        ),
+    )
+    antigravity_memory_dir: Path = Field(
+        default=Path("/run/antigravity-memory"),
+        validation_alias=AliasChoices("ANTIGRAVITY_MEMORY_DIR", "HAKIMI_ANTIGRAVITY_MEMORY_DIR"),
+    )
     prefix_history_enabled: bool = True
     interaction_store_enabled: bool = True
     interaction_chain_ttl_seconds: int = Field(default=300, ge=60, le=604800)
@@ -57,6 +71,12 @@ class Settings(BaseSettings):
     history_max_bytes: int = Field(default=144000, ge=4000, le=144000)
     chat_tail_tokens: int = Field(default=4200, ge=400, le=4200)
     decision_input_tokens: int = Field(default=4200, ge=400, le=4200)
+    decision_context_tokens: int = Field(
+        default=2500,
+        ge=600,
+        le=4200,
+        validation_alias=AliasChoices("DECISION_CONTEXT_TOKENS", "HAKIMI_DECISION_CONTEXT_TOKENS"),
+    )
     compression_enabled: bool = True
     memory_archive_time: str = Field(default="03:10", pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
     memory_flex_timeout: int = Field(default=900, ge=60, le=1800)
@@ -176,6 +196,10 @@ class Settings(BaseSettings):
             "REST_ALLOW_OWNER_PRIVATE", "HAKIMI_REST_ALLOW_OWNER_PRIVATE"
         ),
     )
+    affection_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AFFECTION_ENABLED", "HAKIMI_AFFECTION_ENABLED"),
+    )
     proactive_dm_enabled: bool = Field(default=True, validation_alias="PROACTIVE_DM_ENABLED")
     daily_digest_enabled: bool = Field(default=True, validation_alias="DAILY_DIGEST_ENABLED")
     daily_digest_time: str = Field(default="22:30", validation_alias="DAILY_DIGEST_TIME")
@@ -253,6 +277,39 @@ class Settings(BaseSettings):
 
     decision_model: Literal["gemini-decision-1"] = "gemini-decision-1"
     chat_model: Literal["gemini-4-hydrogen"] = "gemini-4-hydrogen"
+    vertex_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("VERTEX_ENABLED", "HAKIMI_VERTEX_ENABLED"),
+    )
+    vertex_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("VERTEX_API_KEY", "HAKIMI_VERTEX_API_KEY"),
+    )
+    vertex_project: str = Field(
+        default="",
+        max_length=128,
+        validation_alias=AliasChoices("VERTEX_PROJECT", "HAKIMI_VERTEX_PROJECT"),
+    )
+    vertex_location: str = Field(
+        default="global",
+        max_length=64,
+        validation_alias=AliasChoices("VERTEX_LOCATION", "HAKIMI_VERTEX_LOCATION"),
+    )
+    vertex_hydrogen_model: str = Field(
+        default="gemini-4-hydrogen",
+        max_length=128,
+        validation_alias=AliasChoices("VERTEX_HYDROGEN_MODEL", "HAKIMI_VERTEX_HYDROGEN_MODEL"),
+    )
+    gcp_billing_project: str = Field(
+        default="",
+        max_length=128,
+        validation_alias=AliasChoices("GCP_BILLING_PROJECT", "HAKIMI_GCP_BILLING_PROJECT"),
+    )
+    gcp_billing_table: str = Field(
+        default="",
+        max_length=512,
+        validation_alias=AliasChoices("GCP_BILLING_TABLE", "HAKIMI_GCP_BILLING_TABLE"),
+    )
     carbon_enabled: bool = True
     carbon_model: Literal["gemini-4-carbon"] = "gemini-4-carbon"
     carbon_input_usd_per_m: Decimal = Field(default=Decimal("2.00"), gt=0)
@@ -265,6 +322,7 @@ class Settings(BaseSettings):
     summary_model: Literal["gemini-4-hydrogen"] = "gemini-4-hydrogen"
     # Only the authenticated control plane may replace this immutable policy snapshot.
     _thinking_override: ThinkingConfig | None = PrivateAttr(default=None)
+    _runtime_extra_secrets: tuple[str, ...] = PrivateAttr(default=())
     fast_chat_thinking_level: ChatThinkingLevel = "auto"
     owner_thinking_level: ChatThinkingLevel = Field(
         default="auto",

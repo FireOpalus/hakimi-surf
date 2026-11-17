@@ -4,6 +4,8 @@ import binascii
 import random
 import re
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 
 import httpx
@@ -120,6 +122,19 @@ def qq_message(payload: dict, settings: Settings) -> Message | None:
     )
 
 
+_FAREWELL_BYPASS: ContextVar[tuple[str, str] | None] = ContextVar("farewell_bypass", default=None)
+
+
+@contextmanager
+def farewell_send_bypass(message: Message):
+    """Permit one plain-text farewell delivery to a just-blacklisted user in this task."""
+    token = _FAREWELL_BYPASS.set((message.platform, message.user_id))
+    try:
+        yield
+    finally:
+        _FAREWELL_BYPASS.reset(token)
+
+
 class Sender:
     def __init__(
         self, settings: Settings, client: httpx.AsyncClient, onebot: OneBotTransport | None = None
@@ -130,6 +145,21 @@ class Sender:
         self.token = ""
         self.token_expires = 0.0
         self.token_lock = asyncio.Lock()
+
+    def _authorized(self, message: Message, *, proactive: bool = False) -> bool:
+        if authorize(message, self.s):
+            return True
+        if (
+            not proactive
+            and _FAREWELL_BYPASS.get() == (message.platform, message.user_id)
+            and message.user_id not in getattr(self.s, "bot_qq_ids", set())
+            and message.user_id in getattr(self.s, "muted_user_ids", set())
+        ):
+            cfg = self.s.model_copy(
+                update={"muted_user_ids": set(self.s.muted_user_ids) - {message.user_id}}
+            )
+            return authorize(message, cfg)
+        return False
 
     @property
     def qq_origin(self) -> str:
@@ -175,7 +205,7 @@ class Sender:
                 raise Rejected("reply_invalidated")
             allowed = await targets()
             if (
-                not authorize(message, self.s)
+                not self._authorized(message)
                 or time.time() - message.created_at > self.s.event_ttl_seconds
             ):
                 raise Rejected("reply_invalidated")
@@ -224,7 +254,7 @@ class Sender:
 
     async def send_action_bubble(self, message, segments, *, targets, before_send):
         async with self.send_lock:
-            if not await before_send() or not authorize(message, self.s):
+            if not await before_send() or not self._authorized(message):
                 raise Rejected("reply_invalidated")
             allowed = await targets()
             parts = revalidate_segments(segments, message, self.s, allowed_at_qqs=allowed)
@@ -263,7 +293,7 @@ class Sender:
             raise Rejected("forward_group_only")
         text = safe_output(text, configured_secrets(self.s), limit=8000)
         async with self.send_lock:
-            if not await before_send() or not authorize(message, self.s):
+            if not await before_send() or not self._authorized(message):
                 raise Rejected("reply_invalidated")
             try:
                 return await self.onebot.call(
@@ -443,7 +473,7 @@ class Sender:
         self, message: Message, text: str, proactive: bool, *, before_send=None
     ) -> dict | None:
         # Recheck current configuration before every delivery, including restored outbox jobs.
-        if not authorize(message, self.s):
+        if not self._authorized(message, proactive=proactive):
             raise Rejected("delivery_not_authorized")
         if proactive:
             if (

@@ -176,6 +176,49 @@ class Moderation:
             (key, self.scope, self.store.vault.seal(key, {"user_id": uid}), self.clock(), source),
         )
 
+    async def mute_by_affection(self, uid: str, nickname: str = "") -> bool:
+        await self.initialize()
+        if isinstance(uid, bool) or not isinstance(uid, (str, int)):
+            return False
+        uid_str = str(uid)
+        if uid_str in (set(self.s.onebot_owner_ids) - {""}):
+            return False
+        try:
+            uid = self.target_id(uid_str)
+        except Rejected:
+            return False
+        key = self.key(uid)
+        clean_nick = self.nickname(nickname) if nickname else ""
+        identity = {"user_id": uid, **({"nickname": clean_nick} if clean_nick else {})}
+        async with self.lock:
+            async with self.store.transaction():
+                cur = await self.store.db.execute(
+                    "INSERT OR IGNORE INTO muted_users(user_key,scope,identity,created,source) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        key,
+                        self.scope,
+                        self.store.vault.seal(key, identity),
+                        self.clock(),
+                        "ai_affection_zero",
+                    ),
+                )
+            self.s.muted_user_ids = set(self.s.muted_user_ids) | {uid}
+        return cur.rowcount == 1
+
+    async def is_affection_muted(self, uid: str) -> bool:
+        await self.initialize()
+        try:
+            uid = self.target_id(uid)
+        except Rejected:
+            return False
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT source FROM muted_users WHERE user_key=? AND scope=?",
+                (self.key(uid), self.scope),
+            )
+        return bool(row and row["source"] == "ai_affection_zero")
+
     async def set_muted(self, uid, muted=True, *, delete_friend=False):
         await self.initialize()
         uid = self.target_id(uid)
@@ -193,6 +236,10 @@ class Moderation:
             ids.add(uid) if muted else ids.discard(uid)
             self.s.muted_user_ids = ids
             deletion = await self._delete_friend(uid) if delete_friend else "not_requested"
+        if not muted:
+            aff = getattr(self.store.runtime, "affection", None)
+            if aff is not None:
+                await aff.on_unmute(uid)
         return {"user_id": uid, "muted": muted, "delete_status": deletion}
 
     async def review(self, proposal, approve, *, delete_friend=False):

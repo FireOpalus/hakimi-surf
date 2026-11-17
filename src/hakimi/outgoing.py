@@ -3,7 +3,9 @@
 import asyncio
 import random
 import time
+from contextlib import nullcontext
 
+from .adapters import farewell_send_bypass
 from .models import Message
 from .outbound_actions import bubble_segments, valid_receipt
 from .security import Rejected
@@ -117,6 +119,9 @@ async def deliver_actions(service, reply):
     members = [Message.model_validate(m) for m in reply.get("participants", [])] or [message]
     actions = reply["actions"]
     epoch = reply.get("session_epoch", -1)
+    farewell_bypass_mute = bool(actions.get("farewell_bypass_mute")) and (
+        message.platform != "onebot" or await service.moderation.is_affection_muted(message.user_id)
+    )
     status, detail, confirmed, position = "sent", "", [], 0
     sticker_choice = None
 
@@ -130,7 +135,13 @@ async def deliver_actions(service, reply):
             for m in members
         ):
             return False
-        if not service.batch_authorized(message, members):
+        bypass_uid = None
+        if farewell_bypass_mute and (
+            message.platform != "onebot"
+            or await service.moderation.is_affection_muted(message.user_id)
+        ):
+            bypass_uid = message.user_id
+        if not service.batch_authorized(message, members, bypass_mute_user_id=bypass_uid):
             return False
         if not await service.bot_guard.may_process(message, reply["id"]):
             return False
@@ -179,141 +190,152 @@ async def deliver_actions(service, reply):
         await service.memes.confirm_choice(store.session_scope(message), sticker_choice["digest"])
 
     try:
-        if not await valid():
-            raise Rejected("reply_invalidated")
-        await service.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
-        label = actions.get("sticker", {}).get("label")
-        emoji_like = actions.get("emoji_like")
-        poke_qq = actions.get("poke_qq")
-        anchor = dict(actions.get("anchor", {}))
-        reaction_target_id = anchor.get("reply_id") or next(
-            (m.event_id for m in reversed(members) if m.event_id.lstrip("-").isdigit()),
-            None,
-        )
+        with farewell_send_bypass(message) if farewell_bypass_mute else nullcontext():
+            if not await valid():
+                raise Rejected("reply_invalidated")
+            await service.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
+            label = actions.get("sticker", {}).get("label")
+            emoji_like = actions.get("emoji_like")
+            poke_qq = actions.get("poke_qq")
+            anchor = dict(actions.get("anchor", {}))
+            reaction_target_id = anchor.get("reply_id") or next(
+                (m.event_id for m in reversed(members) if m.event_id.lstrip("-").isdigit()),
+                None,
+            )
 
-        async def _try_react_and_poke() -> bool:
-            did_any = False
-            if (
-                emoji_like
-                and reaction_target_id
-                and message.platform == "onebot"
-                and hasattr(service.sender, "send_emoji_like")
-            ):
-                try:
-                    if await service.sender.send_emoji_like(
-                        message, reaction_target_id, emoji_like, before_send=valid
-                    ):
-                        did_any = True
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-            if poke_qq and message.platform == "onebot" and hasattr(service.sender, "send_poke"):
-                try:
-                    allowed_poke_pool = (
-                        {message.user_id} - {service.s.onebot_self_id, *service.s.muted_user_ids}
-                        if message.kind == "private"
-                        else await targets()
-                    )
-                    if poke_qq in allowed_poke_pool and await service.sender.send_poke(
-                        message, poke_qq, before_send=valid
-                    ):
-                        did_any = True
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-            return did_any
-
-        if actions.get("abstain"):
-            if await _try_react_and_poke():
-                status, detail = "sent", "reaction_only"
-            else:
-                status, detail = "cancelled", "empty_reply"
-        else:
-            is_public = bool(actions.get("public", message.kind == "group"))
-            has_text_bubbles = any(b.strip() for b in actions.get("bubbles", [])[:3])
-            if message.platform == "onebot":
-                if await service.memes.reserve_reply(
-                    store.session_scope(message), reply["id"], label, public=is_public
+            async def _try_react_and_poke() -> bool:
+                did_any = False
+                if (
+                    emoji_like
+                    and reaction_target_id
+                    and message.platform == "onebot"
+                    and hasattr(service.sender, "send_emoji_like")
                 ):
-                    sticker_choice = await service.memes.choose(label, store.session_scope(message))
-            if actions["sticker"].get("timing") == "before_text":
-                await sticker()
-                if sticker_choice and has_text_bubbles:
-                    await asyncio.sleep(0.6)
-            if message.kind != "group" or (
-                service.bot_guard.known_bot(message)
-                and not service.bot_guard.is_owner_invited(message)
-            ):
-                anchor = {}
-            else:
-                drift = service.hot.intervening(
-                    message, actions.get("watermark", 0), {m.user_id for m in members}
-                )
-                if drift == 0:
-                    anchor["reply_id"] = None
-                elif drift >= 3:
-                    anchor["reply_id"] = next(
-                        (
-                            m.event_id
-                            for m in reversed(members)
-                            if m.event_id.lstrip("-").isdigit()
-                            and (
-                                not service.bot_guard.known_bot(m)
-                                or service.bot_guard.is_owner_invited(m)
-                            )
-                        ),
-                        None,
-                    )
-            folded = actions.get("folded") if message.kind == "group" else None
-            combined_bubbles = "\n".join(b for b in actions.get("bubbles", [])[:3] if b.strip())
-            card_source = folded or combined_bubbles
-            if (
-                message.kind == "group"
-                and message.platform == "onebot"
-                and card_source
-                and hasattr(service.sender, "send_card")
-                and should_render_rich_card(card_source, service.s.text_card_mode)
-            ):
-                receipt = await service.sender.send_card(message, card_source, before_send=valid)
-                await acknowledge(card_source, receipt)
-            elif folded:
-                receipt = await service.sender.send_folded(message, folded, before_send=valid)
-                await acknowledge(folded, receipt)
-            else:
-                for index, text in enumerate(actions.get("bubbles", [])[:3]):
-                    if not text.strip():
-                        continue
-                    if index:
-                        if hasattr(service.sender, "typing"):
-                            await service.sender.typing(message)
-                        await asyncio.sleep(
-                            min(2.2, 0.8 + len(text) * 0.025 + random.uniform(0, 0.2))
+                    try:
+                        if await service.sender.send_emoji_like(
+                            message, reaction_target_id, emoji_like, before_send=valid
+                        ):
+                            did_any = True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+                if (
+                    poke_qq
+                    and message.platform == "onebot"
+                    and hasattr(service.sender, "send_poke")
+                ):
+                    try:
+                        allowed_poke_pool = (
+                            {message.user_id}
+                            - {service.s.onebot_self_id, *service.s.muted_user_ids}
+                            if message.kind == "private"
+                            else await targets()
                         )
-                    if not await valid():
-                        raise Rejected("reply_invalidated")
-                    if message.platform == "onebot" and hasattr(
-                        service.sender, "send_action_bubble"
+                        if poke_qq in allowed_poke_pool and await service.sender.send_poke(
+                            message, poke_qq, before_send=valid
+                        ):
+                            did_any = True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+                return did_any
+
+            if actions.get("abstain"):
+                if await _try_react_and_poke():
+                    status, detail = "sent", "reaction_only"
+                else:
+                    status, detail = "cancelled", "empty_reply"
+            else:
+                is_public = bool(actions.get("public", message.kind == "group"))
+                has_text_bubbles = any(b.strip() for b in actions.get("bubbles", [])[:3])
+                if message.platform == "onebot":
+                    if await service.memes.reserve_reply(
+                        store.session_scope(message), reply["id"], label, public=is_public
                     ):
-                        receipt = await service.sender.send_action_bubble(
-                            message,
-                            bubble_segments(text, anchor, include_anchor=index == 0),
-                            targets=targets,
-                            before_send=valid,
+                        sticker_choice = await service.memes.choose(
+                            label, store.session_scope(message)
                         )
-                    else:
-                        receipt = await service.sender.send(
-                            message, service.output(text), before_send=valid
+                if actions["sticker"].get("timing") == "before_text":
+                    await sticker()
+                    if sticker_choice and has_text_bubbles:
+                        await asyncio.sleep(0.6)
+                if message.kind != "group" or (
+                    service.bot_guard.known_bot(message)
+                    and not service.bot_guard.is_owner_invited(message)
+                ):
+                    anchor = {}
+                else:
+                    drift = service.hot.intervening(
+                        message, actions.get("watermark", 0), {m.user_id for m in members}
+                    )
+                    if drift == 0:
+                        anchor["reply_id"] = None
+                    elif drift >= 3:
+                        anchor["reply_id"] = next(
+                            (
+                                m.event_id
+                                for m in reversed(members)
+                                if m.event_id.lstrip("-").isdigit()
+                                and (
+                                    not service.bot_guard.known_bot(m)
+                                    or service.bot_guard.is_owner_invited(m)
+                                )
+                            ),
+                            None,
                         )
-                    await acknowledge(text, receipt)
-            if actions["sticker"].get("timing") != "before_text" and sticker_choice:
-                if has_text_bubbles:
-                    await asyncio.sleep(0.6)
-                await sticker()
-            did_reaction = await _try_react_and_poke()
-            if not confirmed and not did_reaction:
-                status, detail = "cancelled", "empty_reply"
+                folded = actions.get("folded") if message.kind == "group" else None
+                combined_bubbles = "\n".join(b for b in actions.get("bubbles", [])[:3] if b.strip())
+                card_source = folded or combined_bubbles
+                if (
+                    actions.get("allow_text_card", True)
+                    and message.kind == "group"
+                    and message.platform == "onebot"
+                    and card_source
+                    and hasattr(service.sender, "send_card")
+                    and should_render_rich_card(card_source, service.s.text_card_mode)
+                ):
+                    receipt = await service.sender.send_card(
+                        message, card_source, before_send=valid
+                    )
+                    await acknowledge(card_source, receipt)
+                elif folded:
+                    receipt = await service.sender.send_folded(message, folded, before_send=valid)
+                    await acknowledge(folded, receipt)
+                else:
+                    for index, text in enumerate(actions.get("bubbles", [])[:3]):
+                        if not text.strip():
+                            continue
+                        if index:
+                            if hasattr(service.sender, "typing"):
+                                await service.sender.typing(message)
+                            await asyncio.sleep(
+                                min(2.2, 0.8 + len(text) * 0.025 + random.uniform(0, 0.2))
+                            )
+                        if not await valid():
+                            raise Rejected("reply_invalidated")
+                        if message.platform == "onebot" and hasattr(
+                            service.sender, "send_action_bubble"
+                        ):
+                            receipt = await service.sender.send_action_bubble(
+                                message,
+                                bubble_segments(text, anchor, include_anchor=index == 0),
+                                targets=targets,
+                                before_send=valid,
+                            )
+                        else:
+                            receipt = await service.sender.send(
+                                message, service.output(text), before_send=valid
+                            )
+                        await acknowledge(text, receipt)
+                if actions["sticker"].get("timing") != "before_text" and sticker_choice:
+                    if has_text_bubbles:
+                        await asyncio.sleep(0.6)
+                    await sticker()
+                did_reaction = await _try_react_and_poke()
+                if not confirmed and not did_reaction:
+                    status, detail = "cancelled", "empty_reply"
     except asyncio.CancelledError:
         # ACKs already journalled; restart applies them once. Unknown sends stay uncertain.
         raise

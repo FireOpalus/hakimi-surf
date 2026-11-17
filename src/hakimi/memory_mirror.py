@@ -205,7 +205,11 @@ class MemoryMirror:
             markdown = render(scope, entries)
             # Compare rendered entries too: harmless human whitespace changes aren't overwritten.
             if head and entries == state.get("entries"):
-                state["export_day"] = datetime.now(ZoneInfo(self.s.bot_timezone)).date().isoformat()
+                state.update(
+                    export_day=datetime.now(ZoneInfo(self.s.bot_timezone)).date().isoformat(),
+                    last_success=time.time(),
+                    last_error=None,
+                )
                 await self.save_state(message, state, fresh["epoch"])
                 return {"status": "unchanged"}
             check_memory_text(markdown, self.s)
@@ -222,7 +226,14 @@ class MemoryMirror:
             )
             await self.save_state(message, state, fresh["epoch"])
             return {"status": "pushed"}
-        return {"status": "pulled" if head else "not_exported"}
+        if head:
+            state.update(last_success=time.time(), last_error=None)
+            await self.save_state(message, state, view["epoch"])
+            return {"status": "pulled"}
+        if state.get("last_error") is not None:
+            state["last_error"] = None
+            await self.save_state(message, state, view["epoch"])
+        return {"status": "not_exported"}
 
     async def scheduled(self):
         if time.monotonic() - self.last_scan < 3600:

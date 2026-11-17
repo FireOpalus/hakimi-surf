@@ -1,6 +1,7 @@
 """Single-folder Drive writer: explicit SA or minimal-scope personal OAuth, never ADC."""
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -291,12 +292,35 @@ class FolderDrive(DriveAuth):
         meta, etag = await self._json(
             "GET",
             API + "/" + ident,
-            params={"fields": FILE_FIELDS + ",md5Checksum,size", "supportsAllDrives": "true"},
+            params={
+                "fields": FILE_FIELDS + ",md5Checksum,size,version,headRevisionId",
+                "supportsAllDrives": "true",
+            },
         )
         self._validate_memory_file(meta, scope)
+        etag = etag.strip() if isinstance(etag, str) else ""
         if not etag:
-            raise Rejected("drive_etag_required")
-        return {"id": ident, "etag": etag, "md5": meta.get("md5Checksum"), "size": meta.get("size")}
+            md5 = (
+                ("" if meta.get("md5Checksum") is None else str(meta.get("md5Checksum")))
+                .strip()
+                .lower()
+            )
+            ver = ("" if meta.get("version") is None else str(meta.get("version"))).strip()
+            rev = (
+                "" if meta.get("headRevisionId") is None else str(meta.get("headRevisionId"))
+            ).strip()
+            md5_ok = bool(re.fullmatch(r"[a-f0-9]{32}", md5))
+            ver_ok = bool(re.fullmatch(r"[0-9]{1,20}", ver))
+            rev_ok = bool(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", rev))
+            if not md5_ok or (ver and not ver_ok) or (rev and not rev_ok) or not (ver_ok or rev_ok):
+                raise Rejected("drive_etag_required")
+            etag = f"v3:{ver}:{rev}:{md5}"
+        return {
+            "id": ident,
+            "etag": etag,
+            "md5": meta.get("md5Checksum"),
+            "size": meta.get("size"),
+        }
 
     async def read_memory(self, scope, head):
         # Revalidate against a fresh constrained listing, never accept an arbitrary file ID.
@@ -308,10 +332,10 @@ class FolderDrive(DriveAuth):
                 raise Rejected("drive_memory_too_large")
         except (TypeError, ValueError):
             raise Rejected("drive_invalid_response") from None
-        headers = {
-            "Authorization": "Bearer " + await self._access_token(),
-            "If-Match": head["etag"],
-        }
+        is_v3_etag = str(head["etag"]).startswith("v3:")
+        headers = {"Authorization": "Bearer " + await self._access_token()}
+        if not is_v3_etag:
+            headers["If-Match"] = head["etag"]
         async with self.http.stream(
             "GET",
             API + "/" + head["id"],
@@ -326,6 +350,10 @@ class FolderDrive(DriveAuth):
                 data.extend(chunk)
                 if len(data) > 262144:
                     raise Rejected("drive_memory_too_large")
+            if is_v3_etag and fresh.get("md5"):
+                actual_md5 = hashlib.md5(data, usedforsecurity=False).hexdigest().lower()
+                if actual_md5 != str(fresh["md5"]).strip().lower():
+                    raise Rejected("drive_etag_conflict")
             try:
                 return data.decode("utf-8")
             except UnicodeDecodeError:
@@ -341,11 +369,14 @@ class FolderDrive(DriveAuth):
         ):
             raise Rejected("drive_etag_conflict")
         if head:
+            headers = {"Content-Type": "text/markdown; charset=UTF-8"}
+            if not str(head["etag"]).startswith("v3:"):
+                headers["If-Match"] = head["etag"]
             result, _ = await self._json(
                 "PATCH",
                 UPLOAD + "/" + head["id"],
                 params={"uploadType": "media", "supportsAllDrives": "true", "fields": FILE_FIELDS},
-                headers={"If-Match": head["etag"], "Content-Type": "text/markdown; charset=UTF-8"},
+                headers=headers,
                 content=markdown.encode(),
             )
         else:

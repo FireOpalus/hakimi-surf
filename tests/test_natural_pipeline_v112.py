@@ -31,7 +31,7 @@ from tests.test_streaming_v0100 import action
     "value,digest",
     [
         (SYSTEM_INSTRUCTION, "6f1ef928e5fac56fb64c4dcb191a1b4fb2d2820933f3f15e9954e21053b352db"),
-        (PUBLIC_PERSONA_PROMPT, "bdd7e30a9429a31012105dc31991cba98ec20a2d3ee813b3f83d9f5e94ae0230"),
+        (PUBLIC_PERSONA_PROMPT, "bd0516cf2b0b9d20f35b6e411ee0be528be5df6549bfb808f8fbe3af6b16e3b5"),
         (OWNER_PERSONA_PROMPT, "6bd4015e6a5914be4c4ab421b390ff924a1bd16a177a11270f2c2ef9f1ded77d"),
     ],
 )

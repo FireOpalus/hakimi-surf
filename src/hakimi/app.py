@@ -14,15 +14,18 @@ from fastapi.responses import JSONResponse
 from .adapters import Sender, qq_message
 from .admin_auth import AdminAuth
 from .admin_routes import router as admin_router
+from .affection_admin import router as affection_router
 from .bili_account_admin import router as bili_account_router
 from .bilibili import Bilibili
 from .community_admin import router as community_router
 from .config import Settings
 from .drive_client import FolderDrive
+from .gcp_admin import router as gcp_billing_router
 from .gemini import GeminiGateway
 from .meme_admin import router as meme_router
 from .notebook_snapshot import NotebookSnapshot
 from .onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
+from .provider_admin import router as provider_router
 from .roaming_logger import RoamingLogger
 from .security import Rejected, check_fresh, qq_signing_key, verify_onebot, verify_qq
 from .service import Service
@@ -171,6 +174,9 @@ def create_app(
     app.include_router(community_router)
     app.include_router(bili_account_router)
     app.include_router(meme_router)
+    app.include_router(provider_router)
+    app.include_router(gcp_billing_router)
+    app.include_router(affection_router)
     html = Path(__file__).with_name("admin_page.html").read_text()
     import base64
 

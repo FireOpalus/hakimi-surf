@@ -141,6 +141,11 @@ class FilterManager:
             else None
         )
         reply = PRESETS[preset] if preset else config.reply_threshold
+        if (
+            not (known_bot and not bot_invited)
+            and (aff := getattr(self.store.runtime, "affection", None)) is not None
+        ):
+            reply = aff.adjust_reply_threshold(message, reply)
         if owner:
             reply = min(reply, OWNER_REPLY_CEILING)
         elif known_bot and not bot_invited:
@@ -206,6 +211,8 @@ class FilterManager:
                 )
             },
             "tier": trace.get("tier"),
+            "privacy_level": trace.get("privacy_level"),
+            "decision_tier": trace.get("decision_tier"),
             "sandbox_mode": trace.get("sandbox_mode", False),
             "thresholds": trace.get("thresholds", {}),
             "result": trace.get("result", "blocked"),
@@ -328,7 +335,7 @@ class FilterManager:
         raw = str(message.text or "")
         if message.images and "[附图]" not in raw:
             raw = f"{raw.strip()} [附图]" if raw.strip() else "[附图]"
-        text = redact_excerpt(raw, self.s, limit=240)
+        text = redact_excerpt(raw, self.s, limit=320)
         if not text:
             return
         async with self.store.transaction():
@@ -348,7 +355,7 @@ class FilterManager:
             await self.store.db.execute(
                 "DELETE FROM gateway_group_context WHERE scope=? AND event NOT IN "
                 "(SELECT event FROM gateway_group_context WHERE scope=? "
-                "ORDER BY at DESC,rowid DESC LIMIT 10)",
+                "ORDER BY at DESC,rowid DESC LIMIT 24)",
                 (scope, scope),
             )
             await self.store.db.execute(
@@ -356,9 +363,10 @@ class FilterManager:
                 "(SELECT rowid FROM gateway_group_context ORDER BY at DESC,rowid DESC LIMIT 10000)"
             )
 
-    async def group_context(self, message):
+    async def group_context(self, message, *, limit: int = 10):
         if message.kind != "group":
             return []
+        limit = max(1, min(24, int(limit)))
         await self.initialize()
         scope, event = self._group_scope(message), self.store.event_key(message)
         async with self.store.lock:
@@ -370,7 +378,7 @@ class FilterManager:
                 "SELECT event,payload FROM gateway_group_context "
                 "WHERE scope=? AND event<>? AND at>=? AND event_at<=? "
                 "AND (at<? OR (at=? AND rowid<?)) "
-                "ORDER BY at DESC,rowid DESC LIMIT 10",
+                "ORDER BY at DESC,rowid DESC LIMIT ?",
                 (
                     scope,
                     event,
@@ -379,6 +387,7 @@ class FilterManager:
                     current[0] if current else time.time(),
                     current[0] if current else time.time(),
                     current[1] if current else 9223372036854775807,
+                    limit,
                 ),
             )
         return [

@@ -10,3 +10,9 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ./secrets/antigravity-memory
+        target: /run/antigravity-memory
+        read_only: true
+        bind:
+          create_host_path: false

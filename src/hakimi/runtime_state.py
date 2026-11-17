@@ -9,11 +9,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .admission_policy import AdmissionConfig
+from .affection import AffectionManager
 from .attention import AttentionRouter
 from .bot_server import is_persona_owner
 from .compression_policy import CompressionConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterManager
+from .gcp_billing import GcpBillingManager
 from .limits_policy import (
     ContentToolsConfig,
     GenerationCapsConfig,
@@ -23,6 +25,7 @@ from .limits_policy import (
 )
 from .models import Message
 from .proactive_policy import ProactiveConfig
+from .provider_routing import ProviderRoutingManager
 from .rest_policy import RestHoursConfig
 from .security import Rejected
 from .thinking_policy import THINKING_LEVELS, ThinkingConfig
@@ -81,6 +84,9 @@ CODES = frozenset(
         "friend_delete_unavailable",
         "longnick_update_failed",
         "meme_send_failed",
+        "gcp_bigquery_sync_failed",
+        "gcp_monitoring_sync_failed",
+        "affection_blacklisted",
     }
 )
 
@@ -151,6 +157,9 @@ class RuntimeState:
         self.rest_hours_overridden = False
         self.rest_hours_lock = asyncio.Lock()
         self.web_search = WebSearch(store)
+        self.provider_routing = ProviderRoutingManager(store)
+        self.gcp_billing = GcpBillingManager(store)
+        self.affection = AffectionManager(store)
 
     async def event(self, code, source="system"):
         if code not in CODES or source not in {"system", "production", "sandbox", "memory"}:
@@ -192,6 +201,8 @@ class RuntimeState:
             )
 
     async def load_config(self):
+        self.provider_routing.initialized = False
+        self.affection.initialized = False
         self.debounce_override = None
         self.s._thinking_override = None
         self.compression = self.env_compression
@@ -315,6 +326,9 @@ class RuntimeState:
         await self.attention.initialize()
         await self.filters.initialize()
         await self.web_search.initialize()
+        await self.provider_routing.initialize()
+        await self.gcp_billing.initialize()
+        await self.affection.initialize()
 
     def debounce_status(self):
         return {

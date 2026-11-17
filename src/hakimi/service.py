@@ -1,18 +1,22 @@
 import asyncio
+import dataclasses
 import logging
 import random
 import re
 import time
 import uuid
 from collections import Counter
+from contextlib import nullcontext
 
-from .adapters import Sender, identifier, onebot_message
+from .adapters import Sender, farewell_send_bypass, identifier, onebot_message
+from .affection import _validate_platform_user
 from .attention import can_watch_video
 from .bili_watcher import BiliWatcher
 from .bilibili import Bilibili, extract_bvid
 from .bot_server import is_persona_owner, untrusted_input
 from .config import Settings
 from .file_reader import FileReader
+from .gateway import redact_excerpt
 from .gemini import GeminiGateway
 from .generation_policy import Scenario
 from .group_pipeline import other_mentions
@@ -29,6 +33,7 @@ from .models import Message, Video
 from .moderation import Moderation
 from .outbound_actions import normalize_emoji_like, parse_actions
 from .output_links import filter_reply_links
+from .owner_cloud_memory import OwnerCloudMemory
 from .proactive_dm import OwnerProactive
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
@@ -70,6 +75,7 @@ HELP = """哈基米在这里。私聊可直接提问或发 B 站视频；群聊�
 /mute <QQ> 或 /unmute <QQ>：应用层屏蔽或解除（默认不删好友）
 /mute-approve <编号> 或 /mute-reject <编号>：批准或驳回屏蔽申请
 （如需同时删除好友，须在 /mute 或 /mute-approve 末尾加 --delete-friend）
+/affection [QQ] [分数]（或 /好感度）：查看或调整指定用户好感度档案（仅主人私聊）
 /哈基米 订阅 <UP主UID> / /哈基米 退订 <UP主UID>：UP 更新私聊提醒（直播开播监控可在 /admin 添加）
 /哈基米 订阅列表 / /哈基米 报告 / /哈基米 状态：查看订阅、近 7 天巡逻报告与今日额度
 链接与小号巡逻优先阅读公开字幕与热评资料；原片分析受后台开关、时长、体积和每日次数限制。"""
@@ -108,6 +114,7 @@ class Service:
         self.public_memory = PublicMemory(store)
         self.diary = diary
         self.notebook = notebook
+        self.cloud_memory = OwnerCloudMemory(settings)
         self.compressor = MemoryCompressor(settings, self.sessions, gateway, store)
         self.memory_mirror = MemoryMirror(self)
         self.compressor.mirror = self.memory_mirror
@@ -120,12 +127,16 @@ class Service:
         self.tasks: list[asyncio.Task] = []
         self.secrets = configured_secrets(settings)
         self.moderation = Moderation(self)
+        store.runtime.moderation = self.moderation
         self.longnick = Longnick(self)
         self.bili_watcher = BiliWatcher(self)
         self.video_watch = VideoWatch(self)
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
         self._lurk_react_at: dict[str, float] = {}
+
+    def refresh_secrets(self):
+        self.secrets = configured_secrets(self.s)
 
     def record(self, event: str, *, emit_audit: bool = True):
         # Only internal constant labels. Never log exception repr, payloads, URLs or IDs.
@@ -306,6 +317,15 @@ class Service:
             self.hot.observe(message)
         if result == "accepted":
             self.store.groups.interrupt(message)
+        if (
+            result == "limited"
+            and self.store.runtime.affection.config.enabled
+            and not self.bot_guard.known_bot(message)
+            and not owner(message, self.s)
+        ):
+            update = await self.store.runtime.affection.record_annoyance(message, "rate_limit")
+            if update.blacklisted_now:
+                await self._alert_affection_blacklisted(message, update)
         self.counters["admission_" + result] += 1
         return result
 
@@ -324,6 +344,7 @@ class Service:
             asyncio.create_task(self.proactive.run(), name="owner-proactive"),
             asyncio.create_task(self.proactive.delivery(), name="owner-dm-delivery"),
             asyncio.create_task(self.bili_watcher.run(), name="bili-account-patrol"),
+            asyncio.create_task(self.gcp_billing_worker(), name="gcp-billing-sync"),
         ]
         if self.diary and self.s.roaming_enabled:
             self.tasks.append(asyncio.create_task(self.diary.run(), name="roaming-diary"))
@@ -371,6 +392,14 @@ class Service:
         )
         if meme_match:
             return await self._save_meme_command(message, meme_match[1] or "")
+        aff_match = re.match(
+            r"^(?:/(?:affection|好感度)|(?:"
+            + re.escape(prefix)
+            + r"|/哈基米)\s+好感度)(?:\s+(.*))?$",
+            direct.strip(),
+        )
+        if aff_match:
+            return await self._affection_command(message, aff_match[1] or "")
         if not direct.startswith(prefix):
             return None
         command = direct[len(prefix) :].strip()
@@ -422,6 +451,73 @@ class Service:
             else "新摘要会保存在 /哈基米 报告 中。"
         )
         return "已订阅；首次巡逻仅建立基线。" + tip
+
+    async def _affection_command(self, message: Message, raw_args: str) -> str:
+        if message.kind != "private" or not owner(message, self.s):
+            raise Rejected("owner_private_only")
+        aff = self.store.runtime.affection
+        args = raw_args.strip().split()
+        if not args:
+            st = await aff.status()
+            owner_prof = await aff.profile(
+                message.platform, message.user_id, message.sender_nickname
+            )
+            users = st["users"]
+            blacklisted = [u for u in users if u["score"] == 0 and not u["is_owner"]]
+            bl_text = (
+                "、".join(f"{u['nickname']}({u['user_id']})" for u in blacklisted[:10]) or "暂无"
+            )
+            cap = st["config"]["daily_positive_cap"]
+            init_score = st["config"]["initial_score"]
+            return (
+                f"好感度系统：{'已启用' if st['config']['enabled'] else '已停用'}"
+                f"（初始 {init_score}，日正增长上限 +{cap}）。\n"
+                f"BOISER 当前羁绊：{owner_prof['score']} 分"
+                f"（{owner_prof['lv']} {owner_prof['tier_label']}）。\n"
+                f"已建档用户：{len(users)} 人；拉黑(0分)：{len(blacklisted)} 人（{bl_text}）。\n"
+                "用法：/affection <QQ> 查看档案，或 /affection <QQ> <0..120> 调整分数。"
+            )
+        if len(args) > 2:
+            return "用法：/affection [QQ] [0..120]"
+        raw_target = args[0].strip()
+        if raw_target.startswith("qq:"):
+            target_platform, target_uid = "qq", raw_target[3:]
+        elif raw_target.startswith("onebot:"):
+            target_platform, target_uid = "onebot", raw_target[7:]
+        else:
+            target_platform, target_uid = "onebot", raw_target
+        try:
+            target_uid = _validate_platform_user(target_platform, target_uid)
+        except Rejected:
+            return "用法：/affection [QQ] [0..120]，目标账号格式不正确。"
+        if len(args) == 1:
+            prof = await aff.profile(target_platform, target_uid)
+            return (
+                f"{prof['nickname']}（{prof['platform']}:{prof['user_id']}）：{prof['score']} 分｜"
+                f"{prof['lv']} {prof['tier_label']}｜"
+                f"今日正向 +{prof['today_positive_gain']}/{prof['daily_positive_cap']}"
+                f"{'｜已拉黑静音' if prof['muted'] else ''}"
+            )
+        if not re.fullmatch(r"-?[0-9]{1,4}", args[1]):
+            return "分数需为 0～120 之间的整数（Owner 下限 100，普通成员上限 100）。"
+        target_score = int(args[1])
+        if not 0 <= target_score <= 120:
+            return "分数需为 0～120 之间的整数（Owner 下限 100，普通成员上限 100）。"
+        try:
+            updated = await aff.set_user_score(
+                target_uid,
+                target_score,
+                platform=target_platform,
+                reason="owner_cmd",
+                moderation=self.moderation,
+            )
+        except Rejected as exc:
+            return f"设置失败：{exc}"
+        return (
+            f"已将 {updated['nickname']}（{updated['user_id']}）好感度设为 {updated['score']} 分"
+            f"（{updated['lv']} {updated['tier_label']}）"
+            + ("，并已同步应用层静音。" if updated["muted"] else "。")
+        )
 
     async def _save_meme_command(self, message: Message, raw_label: str) -> str:
         if not owner(message, self.s):
@@ -510,14 +606,32 @@ class Service:
             return normalize_emoji_like("围观")
         return None
 
-    def batch_authorized(self, message, members):
+    def _authorize_for_batch(
+        self, candidate: Message, *, bypass_mute_user_id: str | None = None
+    ) -> bool:
+        if (
+            bypass_mute_user_id
+            and candidate.user_id == bypass_mute_user_id
+            and candidate.user_id in self.s.muted_user_ids
+            and not self.bot_guard.known_bot(candidate)
+        ):
+            cfg = self.s.model_copy(
+                update={"muted_user_ids": self.s.muted_user_ids - {bypass_mute_user_id}}
+            )
+            return authorize(candidate, cfg)
+        return authorize(candidate, self.s)
+
+    def batch_authorized(self, message, members, *, bypass_mute_user_id: str | None = None):
         # An accepted @Bot batch may include subsequent unaddressed follow-up text.
         # This relaxes attention only, never group admission, identity or blacklists.
         addressed_batch = (
             message.kind == "group" and len(members) > 1 and any(m.addressed for m in members)
         )
-        return authorize(message, self.s) and all(
-            authorize(m.model_copy(update={"addressed": True}) if addressed_batch else m, self.s)
+        return self._authorize_for_batch(message, bypass_mute_user_id=bypass_mute_user_id) and all(
+            self._authorize_for_batch(
+                m.model_copy(update={"addressed": True}) if addressed_batch else m,
+                bypass_mute_user_id=bypass_mute_user_id,
+            )
             and not other_mentions(m)
             for m in members
         )
@@ -806,6 +920,98 @@ class Service:
             finally:
                 self.store.groups.active.pop(job["scope"], None)
 
+    def _select_affection_target(
+        self, message: Message, members: list[Message], actions
+    ) -> tuple[Message, int, str]:
+        target = message
+        delta = int(actions.affection_delta or 0)
+        if len(members) > 1:
+            if actions.anchor.reply_id:
+                matched = next((m for m in members if m.event_id == actions.anchor.reply_id), None)
+                if matched is not None:
+                    target = matched
+            elif actions.anchor.mentions:
+                matched = next(
+                    (m for m in members if m.user_id == actions.anchor.mentions[0]), None
+                )
+                if matched is not None:
+                    target = matched
+        if is_persona_owner(target, self.s) and (
+            delta <= -10 or (delta < 0 and any(not is_persona_owner(m, self.s) for m in members))
+        ):
+            non_owners = [m for m in members if not is_persona_owner(m, self.s)]
+            unique_non_owners = {m.user_id for m in non_owners}
+            if len(unique_non_owners) == 1:
+                target = non_owners[-1]
+            else:
+                delta = 0
+        reason = "attack_owner" if delta <= -10 else "chat"
+        return target, delta, reason
+
+    async def _alert_affection_blacklisted(self, message: Message, update) -> None:
+        self.record("affection_blacklisted")
+        nick = self.moderation.nickname(message.sender_nickname or getattr(update, "nickname", ""))
+        code = f"affection_zero_{message.platform}_{message.user_id}"
+        recovery = self.store.runtime.affection.config.unmute_recovery_score
+        hint = (
+            f"如需恢复互动，可私聊发送 /unmute {message.user_id}"
+            f"（恢复至 {recovery} 分）或前往后台调整。"
+            if message.platform == "onebot"
+            else "如需恢复互动，请前往后台好感度面板调整分值。"
+        )
+        text = (
+            f"BOISER，{nick}（{message.platform}:{message.user_id}）因「{update.reason}」"
+            f"好感度已降至 0 分，哈基米已发告别语并在应用层静音（绝不删好友）。\n{hint}"
+        )
+        try:
+            await self.proactive.alert(code, text)
+        except Exception:
+            pass
+
+    async def _enqueue_affection_farewell(
+        self, job, message: Message, members: list[Message], session, watermark, audit_id, update
+    ) -> None:
+        if session is None:
+            session = await self.sessions.snapshot(message)
+        aff = self.store.runtime.affection
+        farewell = self.output(update.farewell_message or aff.config.farewell_message)
+        public = not (message.kind == "private" and is_persona_owner(message, self.s))
+        target_id = next(
+            (m.event_id for m in reversed(members) if re.fullmatch(r"-?[0-9]{1,30}", m.event_id)),
+            None,
+        )
+        await self.store.enqueue_reply(
+            job["id"],
+            message,
+            farewell,
+            session_epoch=session["epoch"],
+            participants=members,
+            allowed_at_qqs=set(),
+            audit_id=audit_id,
+            actions={
+                "abstain": False,
+                "bubbles": [farewell],
+                "anchor": {"reply_id": target_id, "mentions": []},
+                "sticker": {"label": None, "timing": "after_text"},
+                "image_digest": None,
+                "emoji_like": None,
+                "poke_qq": None,
+                "save_meme_label": None,
+                "set_longnick": None,
+                "affection_delta": update.delta,
+                "folded": None,
+                "watermark": watermark,
+                "source_ids": [m.event_id for m in members],
+                "public": public,
+                "allow_text_card": False,
+                "farewell_bypass_mute": True,
+            },
+            consumed_image_events=[],
+            consumed_file_events=[],
+        )
+        if audit_id:
+            await self.store.runtime.filters.update_audit(audit_id, "queued")
+
     async def _handle_message(self, job: dict):
         message = Message.model_validate(job["payload"])
         members = [Message.model_validate(m) for m in job.get("batch_messages", [])] or [message]
@@ -826,6 +1032,11 @@ class Service:
         # Recheck persisted permits before image downloads, forward RPCs, memory or paid calls.
         if not await self.bot_guard.may_process(message, job["id"]):
             return
+        aff = self.store.runtime.affection
+        caps = await aff.capabilities_for(message)
+        aff_active = aff.config.enabled and not self.bot_guard.known_bot(message)
+        if aff_active and caps.level == 0:
+            return
         fixed = await self.command(message)
         if fixed is not None:
             await self.store.enqueue_reply(job["id"], message, self.output(fixed))
@@ -840,6 +1051,26 @@ class Service:
                 await self.store.enqueue_reply(job["id"], message, "用法：/deep <问题或视频链接>")
                 return
         if (
+            aff_active
+            and not caps.allow_poke_inbound
+            and message.text.strip().startswith("[协议事件：戳了戳你]")
+        ):
+            update = await aff.record_annoyance(message, "poke_ignored")
+            if update.blacklisted_now:
+                await self._enqueue_affection_farewell(
+                    job, message, members, None, watermark, None, update
+                )
+                await self._alert_affection_blacklisted(message, update)
+            return
+        if (
+            aff_active
+            and not aff.is_owner_id(message.platform, message.user_id)
+            and caps.direct_reply_prob < 1.0
+        ):
+            if random.random() > caps.direct_reply_prob:
+                self.counters["affection_prob_ignored"] += 1
+                return
+        if (
             message.platform == "onebot"
             and message.kind == "private"
             and hasattr(self.sender, "typing")
@@ -847,16 +1078,35 @@ class Service:
             await self.sender.typing(message)
         if not message.context_expanded:
             message = await self.expand_forwards(message)
-        frozen_relevance = (
-            (await self.store.runtime.filters.group_context(message))
-            if message.kind == "group"
-            else []
+        img_limit = (
+            0
+            if (aff_active and caps.max_images <= 0)
+            else (min(2, caps.max_images) if aff_active else 2)
         )
         images, image_sources = [], []
-        images, image_sources = await self.message_images(message, members or [message], [])
+        if img_limit > 0:
+            images, image_sources = await self.message_images(
+                message, members or [message], [], limit=img_limit
+            )
+            if aff_active and caps.low_res_images_only and images:
+                images = [dataclasses.replace(i, resolution="low") for i in images]
         # Open exactly one physical database; never search other conversations.
         session = await self.sessions.snapshot(message)
         history = session["recent_messages"]
+        if message.kind == "group":
+            frozen_relevance = await self.store.runtime.filters.group_context(message, limit=24)
+        elif message.kind == "private" and session.get("enabled") and history:
+            frozen_relevance = [
+                redact_excerpt(
+                    f"{item.get('role', 'user')}: {item.get('text', '')}",
+                    self.s,
+                    limit=240,
+                )
+                for item in history[-16:]
+                if isinstance(item, dict) and str(item.get("text", "")).strip()
+            ]
+        else:
+            frozen_relevance = []
         payload = {
             "current_message": message.text,
             "current_batch_items": [
@@ -975,6 +1225,13 @@ class Service:
                 await self.moderation.record_strike(
                     message, str(exc), nickname=message.sender_nickname
                 )
+                if aff_active:
+                    update = await aff.record_violation(message, str(exc))
+                    if update.blacklisted_now:
+                        await self._enqueue_affection_farewell(
+                            job, message, members, session, watermark, audit_id, update
+                        )
+                        await self._alert_affection_blacklisted(message, update)
             raise
         if not authorize(message, self.s):
             await self.store.runtime.filters.update_audit(audit_id, "cancelled", "unauthorized")
@@ -1006,6 +1263,15 @@ class Service:
                 session_enabled=fresh.get("enabled", False),
                 interaction_chains=fresh.get("interaction_chains", {}),
             )
+            if self.cloud_memory:
+                cloud_mem = await asyncio.to_thread(
+                    self.cloud_memory.for_message,
+                    message,
+                    message.text,
+                    recall=getattr(intent, "need_memory_recall", False),
+                )
+                if cloud_mem:
+                    payload.update(cloud_mem)
         else:
             payload.update(
                 recent_messages=[],
@@ -1014,6 +1280,8 @@ class Service:
                 interaction_chains={},
             )
             payload.pop("owner_notebook_snapshot", None)
+            payload.pop("owner_core_memory", None)
+            payload.pop("owner_recalled_memories", None)
             payload.pop("近期群聊巡逻记忆（只读背景）", None)
         if intent == "ignore":
             if (
@@ -1022,6 +1290,7 @@ class Service:
                 and message.kind == "group"
                 and not message.addressed
                 and not self.bot_guard.known_bot(message)
+                and (not aff_active or caps.allow_emoji_like)
             ):
                 r_score = getattr(intent, "reply_score", None)
                 r_thresh = getattr(intent, "reply_threshold", None)
@@ -1114,15 +1383,19 @@ class Service:
             if nearby_context:
                 payload["nearby_group_context"] = nearby_context
             neighbour_images, neighbour_sources = [], []
-            if len(images) < 2 and image_nearby:
+            if img_limit > 0 and len(images) < img_limit and image_nearby:
                 neighbour_images, neighbour_sources = await self.message_images(
                     message,
                     [],
                     image_nearby,
-                    limit=2 - len(images),
+                    limit=img_limit - len(images),
                     include_current=False,
                     selected_members=selected_neighbour_members,
                 )
+                if aff_active and caps.low_res_images_only and neighbour_images:
+                    neighbour_images = [
+                        dataclasses.replace(i, resolution="low") for i in neighbour_images
+                    ]
             await message_guard()
             if neighbour_images:
                 late_images = True
@@ -1131,6 +1404,7 @@ class Service:
                     {"image_sources": neighbour_sources, "nearby_group_context": nearby_context},
                     job["subject"],
                     purpose="source",
+                    message=message,
                     images=[i.gate() for i in neighbour_images],
                     before_call=message_guard,
                 )
@@ -1149,7 +1423,7 @@ class Service:
                 for m in filtered_nearby
                 if m.context_status
             )
-        if not sandbox and not images and PRIOR_IMAGE_REF_RE.search(message.text):
+        if img_limit > 0 and not sandbox and not images and PRIOR_IMAGE_REF_RE.search(message.text):
             candidates = self.hot.recent_with_images(
                 message,
                 exclude_events={*current_events, *(m.event_id for m in image_nearby)},
@@ -1184,11 +1458,15 @@ class Service:
                     message,
                     [],
                     ordered_candidates,
-                    limit=2,
+                    limit=img_limit,
                     include_current=False,
                     nearby_origin="历史消息附图",
                     selected_members=recalled_members,
                 )
+                if aff_active and caps.low_res_images_only and recalled_images:
+                    recalled_images = [
+                        dataclasses.replace(i, resolution="low") for i in recalled_images
+                    ]
                 await message_guard()
                 if recalled_images:
                     late_images = True
@@ -1197,6 +1475,7 @@ class Service:
                         {"image_sources": recalled_sources, "historical_image_recall": True},
                         job["subject"],
                         purpose="source",
+                        message=message,
                         images=[i.gate() for i in recalled_images],
                         before_call=message_guard,
                     )
@@ -1204,7 +1483,11 @@ class Service:
                     images.extend(recalled_images)
                     payload["image_sources"] = image_sources
         file_attachments, file_sources, consumed_file_events = [], [], []
-        if not sandbox and not self.bot_guard.known_bot(message):
+        if (
+            not sandbox
+            and not self.bot_guard.known_bot(message)
+            and (not aff_active or caps.allow_file_read)
+        ):
             file_attachments, file_sources, consumed_file_events = await self._load_turn_files(
                 message, members, filtered_nearby, history_events, current_events
             )
@@ -1216,6 +1499,7 @@ class Service:
                     {"file_sources": file_sources, "file_attachments": file_attachments},
                     job["subject"],
                     purpose="source",
+                    message=message,
                     before_call=message_guard,
                 )
                 payload["file_attachments"] = file_attachments
@@ -1226,12 +1510,46 @@ class Service:
                 *(m.user_id for m in filtered_nearby),
                 *(str(item.get("user_id", "")) for item in history[-8:]),
             ]
-            payload["dual_memory_data"] = await self.sessions.dual.prefetch(
+            dual_data = await self.sessions.dual.prefetch(
                 message,
                 message.text,
                 recall=getattr(intent, "need_memory_recall", False),
                 related_user_ids=related_user_ids,
             )
+            if aff_active and not caps.allow_dual_profile and isinstance(dual_data, dict):
+                dual_data = {
+                    k: v
+                    for k, v in dual_data.items()
+                    if k not in {"speaker_profile", "member_profiles"}
+                }
+            payload["dual_memory_data"] = dual_data
+            if aff_active:
+                sender_prof = await aff.profile(
+                    message.platform, message.user_id, message.sender_nickname
+                )
+                payload["sender_affection"] = {
+                    "score": sender_prof["score"],
+                    "lv": sender_prof["lv"],
+                    "tier": sender_prof["tier"],
+                    "attitude": sender_prof["attitude"],
+                }
+                batch_aff: dict[str, dict] = {}
+                for m in members:
+                    if m.user_id in batch_aff or self.bot_guard.known_bot(m):
+                        continue
+                    m_prof = (
+                        sender_prof
+                        if (m.user_id == message.user_id and m.platform == message.platform)
+                        else await aff.profile(m.platform, m.user_id, m.sender_nickname)
+                    )
+                    batch_aff[m.user_id] = {
+                        "score": m_prof["score"],
+                        "lv": m_prof["lv"],
+                        "tier": m_prof["tier"],
+                        "attitude": m_prof["attitude"],
+                    }
+                if batch_aff:
+                    payload["batch_affection"] = batch_aff
             if not self.bot_guard.known_bot(message) and hasattr(
                 self.bili_watcher, "recent_surfed"
             ):
@@ -1268,10 +1586,15 @@ class Service:
         parsed = None
         meme_tag = None
         public = not (message.kind == "private" and is_persona_owner(message, self.s))
+        is_watch_cmd = bool(re.search(r"(?:^|\s)/watch-video(?:\s|$)", direct))
         allow_video = (
             not sandbox
             and not self.bot_guard.known_bot(message)
             and can_watch_video(message, members)
+            and (
+                not aff_active
+                or (caps.allow_video_watch if is_watch_cmd else caps.allow_bili_summary)
+            )
         )
         bvid = (
             (message.video_ids[0] if message.video_ids else extract_bvid(message.text))
@@ -1310,22 +1633,45 @@ class Service:
                 prior = await self.bili_watcher.lookup_watched(bvid)
                 if prior:
                     material = {**material, "patrol_deja_vu": prior}
-            analysis = await self.video_watch.analyze(
-                bvid,
-                material,
-                job["subject"],
-                "chat",
-                deep=deep,
-                message=message,
-                guard=video_guard,
-            )
-            text = filter_reply_links(analysis.text, public=public)
+            if not aff_active or caps.allow_video_watch:
+                analysis = await self.video_watch.analyze(
+                    bvid,
+                    material,
+                    job["subject"],
+                    "chat",
+                    deep=deep,
+                    message=message,
+                    guard=video_guard,
+                )
+                text = filter_reply_links(analysis.text, public=public)
+            else:
+                mat_payload = self.video_watch.bounded(material, direct, patrol=False)
+                await self.ai.screen(
+                    mat_payload,
+                    job["subject"],
+                    purpose="source",
+                    budget_lane="chat",
+                    message=message,
+                    before_call=video_guard,
+                )
+                await video_guard()
+                summary_text = await self.ai.generate(
+                    mat_payload,
+                    job["subject"],
+                    summary=True,
+                    deep=deep,
+                    budget_lane="chat",
+                    message=message,
+                    before_call=video_guard,
+                )
+                text = filter_reply_links(summary_text, public=public)
             result = self.output(text)
             # Sources and generated summaries are deliberately excluded from conversation memory.
         else:
             if (
                 not sandbox
                 and not self.bot_guard.known_bot(message)
+                and (not aff_active or caps.allow_search)
                 and (
                     explicit_search(members[-1].command_text or members[-1].text)
                     or getattr(intent, "need_external_lookup", False)
@@ -1392,14 +1738,20 @@ class Service:
                 or any(i.resolution == "high" for i in images)
             ) and tier < 2:
                 tier = 2
-                if isinstance(intent, RouteDecision):
-                    chat_route = RouteDecision(
-                        str(intent),
-                        tier=2,
-                        sandbox_mode=intent.sandbox_mode,
-                        need_memory_recall=intent.need_memory_recall,
-                        need_external_lookup=intent.need_external_lookup,
-                    )
+            if aff_active:
+                tier = min(tier, caps.max_tier)
+                if not caps.allow_carbon and tier >= 4:
+                    tier = 3
+            if isinstance(intent, RouteDecision) and tier != getattr(intent, "tier", 2):
+                chat_route = RouteDecision(
+                    str(intent),
+                    tier=tier,
+                    sandbox_mode=intent.sandbox_mode,
+                    need_memory_recall=intent.need_memory_recall,
+                    need_external_lookup=intent.need_external_lookup,
+                    reply_score=getattr(intent, "reply_score", None),
+                    reply_threshold=getattr(intent, "reply_threshold", None),
+                )
             if tier >= 3 and hasattr(self.sender, "quick_ack"):
                 self.background(self.quick_ack(job, message, message_guard))
             if (
@@ -1458,8 +1810,35 @@ class Service:
                     tier=tier,
                     allowed_poke=allowed_poke,
                     allow_longnick=(not sandbox and is_persona_owner(message, self.s)),
+                    allow_sticker=(not aff_active or caps.allow_sticker),
+                    allow_emoji_like=(not aff_active or caps.allow_emoji_like),
+                    allow_poke_action=(
+                        not aff_active or (caps.allow_poke and caps.allow_poke_inbound)
+                    ),
                 )
-                if not sandbox and not actions.abstain:
+                aff_target, aff_delta, aff_reason = self._select_affection_target(
+                    message, members, actions
+                )
+                update = (
+                    await aff.apply_turn_delta(
+                        aff_target, aff_delta, sandbox_mode=sandbox, reason=aff_reason
+                    )
+                    if aff_active
+                    else None
+                )
+                farewell_bypass = bool(update and update.blacklisted_now)
+                if farewell_bypass:
+                    await self._alert_affection_blacklisted(aff_target, update)
+                    if not actions.anchor.reply_id and aff_target.event_id in allowed_reply:
+                        actions.anchor.reply_id = aff_target.event_id
+                    if actions.abstain or not any(b.strip() for b in actions.bubbles):
+                        actions.abstain = False
+                        actions.bubbles = [update.farewell_message or aff.config.farewell_message]
+                        actions.sticker.label = None
+                        actions.emoji_like = None
+                        actions.poke_qq = None
+                        folded = None
+                if not sandbox and not actions.abstain and not farewell_bypass:
                     if actions.save_meme_label and not self.bot_guard.known_bot(message):
                         await self._auto_save_meme(
                             message, [*neighbour_members, *members], actions.save_meme_label
@@ -1471,6 +1850,7 @@ class Service:
                             raise
                         except Exception:
                             pass
+                allow_text_card = not aff_active or caps.allow_text_card
                 if actions.abstain:
                     if (
                         not sandbox
@@ -1492,6 +1872,8 @@ class Service:
                                 "watermark": watermark,
                                 "source_ids": [m.event_id for m in members],
                                 "public": public,
+                                "allow_text_card": allow_text_card,
+                                **({"farewell_bypass_mute": True} if farewell_bypass else {}),
                             },
                             consumed_image_events=neighbour_image_events,
                             consumed_file_events=consumed_file_events,
@@ -1530,6 +1912,8 @@ class Service:
                         "watermark": watermark,
                         "source_ids": [m.event_id for m in members],
                         "public": public,
+                        "allow_text_card": allow_text_card,
+                        **({"farewell_bypass_mute": True} if farewell_bypass else {}),
                         **(
                             {
                                 "chain_commit": {
@@ -1559,6 +1943,15 @@ class Service:
             result, meme_tag = parsed.text, parsed.meme_tag
         if not result and not (meme_tag and meme_tag in self.memes.labels):
             await self.store.runtime.filters.update_audit(audit_id, "cancelled", "empty_reply")
+            return
+        update = (
+            await aff.apply_turn_delta(message, 0, sandbox_mode=sandbox) if aff_active else None
+        )
+        if update is not None and update.blacklisted_now:
+            await self._enqueue_affection_farewell(
+                job, message, members, session, watermark, audit_id, update
+            )
+            await self._alert_affection_blacklisted(message, update)
             return
         await self.store.enqueue_reply(
             job["id"],
@@ -1722,13 +2115,22 @@ class Service:
         reply = await self.store.claim_reply()
         if not reply:
             return False
-        if reply.get("actions"):
+        reply_actions = reply.get("actions") or {}
+        message = Message.model_validate(reply["message"])
+        farewell_bypass = bool(reply_actions.get("farewell_bypass_mute")) and (
+            message.platform != "onebot"
+            or await self.moderation.is_affection_muted(message.user_id)
+        )
+        if reply_actions and not (
+            bool(reply_actions.get("farewell_bypass_mute"))
+            and "bubbles" not in reply_actions
+            and reply.get("text")
+        ):
             from .outgoing import deliver_actions
 
             return await deliver_actions(self, reply)
         status = "sent"
         text_confirmed = False
-        message = Message.model_validate(reply["message"])
         participants = [Message.model_validate(m) for m in reply.get("participants", [])]
         for original in participants or [message]:
             if self.bot_guard.known_bot(original):
@@ -1743,64 +2145,74 @@ class Service:
             await self._finish_delivery_audit(reply, "blocked", "bot_cooldown")
             return True
         try:
-            await self.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
+            with farewell_send_bypass(message) if farewell_bypass else nullcontext():
+                await self.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
 
-            async def valid_after_delay():
-                async with self.store.lock:
-                    row = await self.store.one(
-                        "SELECT status FROM outbox WHERE id=?", (reply["id"],)
+                async def valid_after_delay():
+                    async with self.store.lock:
+                        row = await self.store.one(
+                            "SELECT status FROM outbox WHERE id=?", (reply["id"],)
+                        )
+                    if not row or row[0] != "sending":
+                        return False
+                    if (
+                        not reply["proactive"]
+                        and time.time() - message.created_at > self.s.event_ttl_seconds
+                    ):
+                        return False
+                    if any(
+                        self.hot.recalled(m)
+                        or any(self.hot.recalled(m, ref) for ref in m.reply_ids)
+                        for m in participants or [message]
+                    ):
+                        return False
+                    if not await self.bot_guard.may_process(message, reply["id"]):
+                        return False
+                    bypass_uid = None
+                    if farewell_bypass and (
+                        message.platform != "onebot"
+                        or await self.moderation.is_affection_muted(message.user_id)
+                    ):
+                        bypass_uid = message.user_id
+                    return (
+                        (await self.sessions.snapshot(message))["epoch"] == delivery_epoch
+                    ) and self.batch_authorized(
+                        message, participants or [message], bypass_mute_user_id=bypass_uid
                     )
-                if not row or row[0] != "sending":
-                    return False
+
+                receipt = None
+                image_confirmed = False
+
+                async def current_at_targets():
+                    targets = set(reply.get("allowed_at_qqs", []))
+                    for target in list(targets & self.s.bot_qq_ids):
+                        if not await self.bot_guard.allowed_reply_target(message, target):
+                            targets.discard(target)
+                    return targets - {
+                        self.s.onebot_self_id,
+                        "all",
+                        "0",
+                        *getattr(self.s, "muted_user_ids", set()),
+                    }
+
                 if (
-                    not reply["proactive"]
-                    and time.time() - message.created_at > self.s.event_ttl_seconds
+                    reply.get("segments")
+                    and any(s["type"] == "at" for s in reply["segments"])
+                    and hasattr(self.sender, "send_segments")
                 ):
-                    return False
-                if any(
-                    self.hot.recalled(m) or any(self.hot.recalled(m, ref) for ref in m.reply_ids)
-                    for m in participants or [message]
-                ):
-                    return False
-                if not await self.bot_guard.may_process(message, reply["id"]):
-                    return False
-                return (
-                    (await self.sessions.snapshot(message))["epoch"] == delivery_epoch
-                ) and self.batch_authorized(message, participants or [message])
-
-            receipt = None
-            image_confirmed = False
-
-            async def current_at_targets():
-                targets = set(reply.get("allowed_at_qqs", []))
-                for target in list(targets & self.s.bot_qq_ids):
-                    if not await self.bot_guard.allowed_reply_target(message, target):
-                        targets.discard(target)
-                return targets - {
-                    self.s.onebot_self_id,
-                    "all",
-                    "0",
-                    *getattr(self.s, "muted_user_ids", set()),
-                }
-
-            if (
-                reply.get("segments")
-                and any(s["type"] == "at" for s in reply["segments"])
-                and hasattr(self.sender, "send_segments")
-            ):
-                receipt = await self.sender.send_segments(
-                    message,
-                    reply["segments"],
-                    targets=current_at_targets,
-                    before_send=valid_after_delay,
-                )
-            elif reply["text"]:
-                receipt = await self.sender.send(
-                    message,
-                    self.output(reply["text"]),
-                    reply["proactive"],
-                    before_send=valid_after_delay,
-                )
+                    receipt = await self.sender.send_segments(
+                        message,
+                        reply["segments"],
+                        targets=current_at_targets,
+                        before_send=valid_after_delay,
+                    )
+                elif reply["text"]:
+                    receipt = await self.sender.send(
+                        message,
+                        self.output(reply["text"]),
+                        reply["proactive"],
+                        before_send=valid_after_delay,
+                    )
             if message.platform == "onebot" and reply["text"]:
                 from .outbound_actions import valid_receipt
 
@@ -2043,6 +2455,16 @@ class Service:
                 raise
             except Rejected:
                 pass
+
+    async def gcp_billing_worker(self):
+        while True:
+            try:
+                await self.store.runtime.gcp_billing.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(30)
 
     async def patrol(self):
         while True:

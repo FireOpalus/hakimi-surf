@@ -204,17 +204,22 @@ def assemble_chat_input(
     if len(current.encode()) > settings.max_context_bytes:
         raise Rejected("context_too_large")
     batch_items = payload.get("current_batch_items")
+    batch_affection = payload.get("batch_affection") if not sandbox_mode else None
     if isinstance(batch_items, list) and batch_items:
-        current_batch = [
-            {
+        current_batch = []
+        for item in batch_items:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("sender_id", ""))
+            entry = {
                 "event_id": str(item.get("event_id", "")),
-                "sender_id": str(item.get("sender_id", "")),
+                "sender_id": sid,
                 "sender_nickname": str(item.get("sender_nickname", "")),
                 "text": str(item.get("text", "")),
             }
-            for item in batch_items
-            if isinstance(item, dict)
-        ]
+            if isinstance(batch_affection, dict) and isinstance(batch_affection.get(sid), dict):
+                entry["affection"] = dict(batch_affection[sid])
+            current_batch.append(entry)
         if (
             len(json.dumps(current_batch, ensure_ascii=False, separators=(",", ":")).encode())
             > settings.max_context_bytes
@@ -222,6 +227,10 @@ def assemble_chat_input(
             raise Rejected("context_too_large")
     else:
         current_batch = current
+    raw_sender = payload.get("current_sender")
+    current_sender = dict(raw_sender) if isinstance(raw_sender, dict) else {}
+    if not sandbox_mode and isinstance(payload.get("sender_affection"), dict):
+        current_sender["affection"] = dict(payload["sender_affection"])
     prev = prev_digests or {}
     raw_nearby = list(payload.get("nearby_group_context", []))
     nearby_digests = [_state_digest(item) for item in raw_nearby]
@@ -249,7 +258,7 @@ def assemble_chat_input(
                 "qq": message.user_id if message else "",
             },
             "sandbox_mode": sandbox_mode,
-            "current_sender": payload.get("current_sender", {}),
+            "current_sender": current_sender,
             "current_batch": current_batch,
         }
         if not sandbox_mode and payload.get("allowed_at_qqs"):
@@ -295,7 +304,7 @@ def assemble_chat_input(
             },
             "sandbox_mode": sandbox_mode,
             "allowed_at_qqs": payload.get("allowed_at_qqs", []) if not sandbox_mode else [],
-            "current_sender": payload.get("current_sender", {}),
+            "current_sender": current_sender,
             "image_sources": payload.get("image_sources", []),
             "file_sources": payload.get("file_sources", []),
             "context_status": payload.get("context_status", []),
@@ -319,10 +328,14 @@ def assemble_chat_input(
     summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
     dual = payload.get("dual_memory_data", {}) if not sandbox_mode else {}
     background = {}
-    if context.private_owner and recall and not sandbox_mode:
-        for key in ("owner_notebook_snapshot", "近期群聊巡逻记忆（只读背景）"):
+    if context.private_owner and not sandbox_mode:
+        for key in ("owner_core_memory", "owner_recalled_memories"):
             if payload.get(key):
                 background[key] = payload[key]
+        if recall:
+            for key in ("owner_notebook_snapshot", "近期群聊巡逻记忆（只读背景）"):
+                if payload.get(key):
+                    background[key] = payload[key]
     sum_dig = _state_digest(summary) if summary else ""
     bg_dig = _state_digest(background) if background else ""
     dual_dig = _state_digest(dual) if dual else ""
@@ -397,6 +410,10 @@ def assemble_chat_input(
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         dual = {}
     # Trim optional background first; never move a dynamic fragment ahead of B.
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and background:
+        for drop_key in ("近期群聊巡逻记忆（只读背景）", "owner_recalled_memories"):
+            if drop_key in background and estimate_tokens(tail()) > settings.chat_tail_tokens:
+                background.pop(drop_key, None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         background = (
             {"excerpt": truncate_tokens(json.dumps(background, ensure_ascii=False), 180)}

@@ -36,6 +36,7 @@ def settings(tmp_path):
         send_delay_min=0,
         send_delay_max=0,
         rest_hours_enabled=False,
+        affection_enabled=False,
     )
 
 

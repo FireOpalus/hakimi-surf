@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS ledger_usage (
   cached_tokens INTEGER, thought_tokens INTEGER, model_lane TEXT,
   estimated_amount INTEGER
 );
+CREATE TABLE IF NOT EXISTS ledger_provider (
+  id TEXT PRIMARY KEY, provider TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS provider_usage_aggregates (
+  period TEXT NOT NULL, provider TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0,
+  charged_amount INTEGER NOT NULL DEFAULT 0, estimated_amount INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0, thought_tokens INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(period, provider)
+);
 CREATE TABLE IF NOT EXISTS usage_aggregates (
   period TEXT PRIMARY KEY, charged_amount INTEGER NOT NULL DEFAULT 0,
   calls INTEGER NOT NULL DEFAULT 0, known_usage_calls INTEGER NOT NULL DEFAULT 0,
@@ -82,6 +92,17 @@ CREATE TABLE IF NOT EXISTS group_policies (
   scope TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK(mode IN ('at_only','smart_reply','muted'))
 );
 """
+
+
+VALID_PROVIDERS = frozenset({"gemini_paid", "gemini_free", "vertex_paid"})
+
+
+def _resolve_provider(provider: str | None) -> str:
+    if provider is None:
+        return "gemini_paid"
+    if provider not in VALID_PROVIDERS:
+        raise Rejected("invalid_provider")
+    return provider
 
 
 def microdollars(value: Decimal) -> int:
@@ -456,32 +477,108 @@ class Store:
         self.budget_overridden = value is not None
         return await self.budget_config_status()
 
-    async def _account_balance_unlocked(self) -> dict:
-        total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
+    async def _read_manual_balance_unlocked(self) -> dict | None:
         row = await self.one("SELECT payload FROM admin_config WHERE key='account_balance'")
         if not row:
-            return {
-                "configured": False,
-                "remaining_microdollars": None,
-                "remaining_usd": None,
-                "set_microdollars": None,
-                "set_usd": None,
-                "spent_since_set_microdollars": 0,
-                "updated_at": None,
-            }
-        data = self.vault.open("admin:account_balance", row[0])
-        set_micro = int(data["set_microdollars"])
-        base_total = int(data["baseline_total_microdollars"])
-        spent_since = max(0, total - base_total)
-        remaining_micro = max(0, set_micro - spent_since)
+            return None
+        return self.vault.open("admin:account_balance", row[0])
+
+    @staticmethod
+    def _gcp_hard_stop_exhausted(gcp: Any, manual_set_micro: int | None) -> bool:
+        if gcp is None or not callable(getattr(gcp, "hard_stop_exhausted", None)):
+            return False
+        try:
+            return bool(gcp.hard_stop_exhausted(manual_set_micro=manual_set_micro))
+        except TypeError:
+            return bool(gcp.hard_stop_exhausted())
+
+    async def _account_balance_unlocked(self) -> dict:
+        total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
+        data = await self._read_manual_balance_unlocked()
+        manual_configured = data is not None
+        set_micro: int | None = None
+        spent_since = 0
+        manual_remaining_micro: int | None = None
+        updated_at = None
+        if data is not None:
+            set_micro = int(data["set_microdollars"])
+            base_total = int(data["baseline_total_microdollars"])
+            spent_since = max(0, total - base_total)
+            manual_remaining_micro = max(0, set_micro - spent_since)
+            updated_at = data.get("updated_at")
+
+        gcp = getattr(self.runtime, "gcp_billing", None)
+        if gcp is not None:
+            sync_local = getattr(gcp, "sync_local_spend_unlocked", None)
+            if callable(sync_local):
+                await sync_local(self._paid_spend_since_unlocked)
+            if hasattr(gcp, "set_manual_balance_microdollars"):
+                gcp.set_manual_balance_microdollars(set_micro)
+
+        gcp_details = (
+            gcp.bigquery_balance_details()
+            if gcp is not None and hasattr(gcp, "bigquery_balance_details")
+            else {"synced": False}
+        )
+        gcp_synced = bool(gcp_details.get("synced"))
+        gcp_signed_micro = (
+            int(gcp_details["signed_microdollars"])
+            if gcp_synced and gcp_details.get("signed_microdollars") is not None
+            else None
+        )
+
+        if (
+            manual_configured
+            and gcp_synced
+            and set_micro is not None
+            and gcp_signed_micro is not None
+        ):
+            mode = "merged"
+            remaining_micro: int | None = max(0, gcp_signed_micro + set_micro)
+        elif gcp_synced and gcp_signed_micro is not None:
+            mode = "gcp"
+            remaining_micro = max(0, gcp_signed_micro)
+        elif manual_configured:
+            mode = "manual"
+            remaining_micro = manual_remaining_micro
+        else:
+            mode = "none"
+            remaining_micro = None
+
+        exhausted = self._gcp_hard_stop_exhausted(gcp, set_micro) if gcp_synced else False
+
         return {
-            "configured": True,
+            "configured": mode != "none",
+            "mode": mode,
             "remaining_microdollars": remaining_micro,
-            "remaining_usd": f"{Decimal(remaining_micro) / Decimal(1_000_000):.4f}",
+            "remaining_usd": (
+                f"{Decimal(remaining_micro) / Decimal(1_000_000):.4f}"
+                if remaining_micro is not None
+                else None
+            ),
             "set_microdollars": set_micro,
-            "set_usd": f"{Decimal(set_micro) / Decimal(1_000_000):.2f}",
+            "set_usd": (
+                f"{Decimal(set_micro) / Decimal(1_000_000):.2f}" if set_micro is not None else None
+            ),
             "spent_since_set_microdollars": spent_since,
-            "updated_at": data.get("updated_at"),
+            "updated_at": updated_at,
+            "manual_configured": manual_configured,
+            "manual_remaining_usd": (
+                f"{Decimal(manual_remaining_micro) / Decimal(1_000_000):.4f}"
+                if manual_remaining_micro is not None
+                else None
+            ),
+            "gcp_synced": gcp_synced,
+            "gcp_settled_remaining_usd": (
+                gcp_details.get("settled_remaining_usd") if gcp_synced else None
+            ),
+            "gcp_unsettled_local_usd": (
+                gcp_details.get("unsettled_local_usd") if gcp_synced else None
+            ),
+            "gcp_realtime_remaining_usd": (
+                gcp_details.get("realtime_remaining_usd") if gcp_synced else None
+            ),
+            "exhausted": exhausted,
         }
 
     async def account_balance_status(self) -> dict:
@@ -707,11 +804,37 @@ class Store:
                 (scope, scope, self.s.memory_turns),
             )
 
+    async def _paid_spend_since_unlocked(self, since_ts: float) -> int:
+        row = await self.one(
+            "SELECT COALESCE(SUM(l.amount),0) FROM ledger l "
+            "JOIN ledger_times t ON t.id=l.id "
+            "WHERE l.lane<>'search' AND l.status<>'reserved' AND t.created>?",
+            (float(since_ts or 0),),
+        )
+        return int(row[0] or 0) if row else 0
+
+    async def paid_spend_since(self, since_ts: float) -> int:
+        async with self.lock:
+            return await self._paid_spend_since_unlocked(since_ts)
+
     async def _budget_refusal(self, day: str, subject: str, lane: str, amount: int) -> str:
         if await self.one("SELECT 1 FROM meta WHERE key='budget_overrun'"):
             return "circuit"
         if lane == "search":
             return ""
+        gcp = getattr(self.runtime, "gcp_billing", None)
+        if amount > 0 and gcp is not None:
+            sync_local = getattr(gcp, "sync_local_spend_unlocked", None)
+            if callable(sync_local):
+                await sync_local(self._paid_spend_since_unlocked)
+            manual_data = await self._read_manual_balance_unlocked()
+            manual_set_micro = (
+                int(manual_data["set_microdollars"]) if manual_data is not None else None
+            )
+            if hasattr(gcp, "set_manual_balance_microdollars"):
+                gcp.set_manual_balance_microdollars(manual_set_micro)
+            if self._gcp_hard_stop_exhausted(gcp, manual_set_micro):
+                return "gcp_credit_exhausted"
         total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
         month = await self.one(
             "SELECT charged_amount FROM usage_aggregates WHERE period=?", ("month:" + day[:7],)
@@ -750,7 +873,16 @@ class Store:
             return "monthly"
         if self.s.total_usd > 0 and total + amount > microdollars(self.s.total_usd):
             return "total"
-        if personal + amount > microdollars(self.s.user_daily_usd):
+        aff = getattr(self.runtime, "affection", None)
+        if aff is not None and hasattr(aff, "budget_multiplier_for_subject"):
+            raw_mult = aff.budget_multiplier_for_subject(subject)
+            user_mult = max(
+                Decimal("0"),
+                raw_mult if isinstance(raw_mult, Decimal) else Decimal(str(raw_mult)),
+            )
+        else:
+            user_mult = Decimal("1")
+        if personal + amount > microdollars(self.s.user_daily_usd * user_mult):
             return "user_daily"
         if lane == "patrol" and patrol + amount > microdollars(self.s.patrol_daily_usd):
             return "patrol_daily"
@@ -774,9 +906,11 @@ class Store:
         *,
         model_lane: str | None = None,
         thinking_level: str | None = None,
+        provider: str | None = None,
     ) -> str:
         if not isinstance(usd, Decimal) or not usd.is_finite() or usd < 0:
             raise Rejected("invalid_budget_amount")
+        resolved_provider = _resolve_provider(provider)
         now = self.local_now()
         day = now.date().isoformat()
         amount = 0 if lane == "search" else microdollars(usd)
@@ -793,6 +927,10 @@ class Store:
             )
             await self.db.execute(
                 "INSERT INTO ledger_times VALUES (?,?)", (reservation, now.timestamp())
+            )
+            await self.db.execute(
+                "INSERT OR REPLACE INTO ledger_provider VALUES (?,?)",
+                (reservation, resolved_provider),
             )
             if model_lane is not None:
                 await self.db.execute(
@@ -813,6 +951,32 @@ class Store:
             await self._charge_aggregates(day, amount, 1)
         return reservation
 
+    async def _accumulate_provider_usage(
+        self,
+        day: str,
+        provider: str,
+        amount: int,
+        estimated: int | None,
+        usage: TokenUsage | None,
+    ) -> None:
+        in_tok = usage.input_tokens if usage else 0
+        out_tok = usage.output_tokens if usage else 0
+        cached_tok = (usage.cached_tokens or 0) if usage else 0
+        thought_tok = (usage.thought_tokens or 0) if usage else 0
+        est_amt = estimated or 0
+        for period in self._periods(day):
+            await self.db.execute(
+                "INSERT INTO provider_usage_aggregates VALUES (?,?,1,?,?,?,?,?,?) "
+                "ON CONFLICT(period,provider) DO UPDATE SET calls=calls+1,"
+                "charged_amount=charged_amount+excluded.charged_amount,"
+                "estimated_amount=estimated_amount+excluded.estimated_amount,"
+                "input_tokens=input_tokens+excluded.input_tokens,"
+                "output_tokens=output_tokens+excluded.output_tokens,"
+                "cached_tokens=cached_tokens+excluded.cached_tokens,"
+                "thought_tokens=thought_tokens+excluded.thought_tokens",
+                (period, provider, amount, est_amt, in_tok, out_tok, cached_tok, thought_tok),
+            )
+
     async def settle(
         self,
         reservation: str,
@@ -823,12 +987,15 @@ class Store:
         fallback_actual: Decimal | None = None,
         model_lane: str | None = None,
         thinking_level: str | None = None,
+        provider: str | None = None,
     ) -> None:
         # Unknown/ambiguous failures settle via bounded fallback (or keep reserve on crash).
         if actual is not None and (
             not isinstance(actual, Decimal) or not actual.is_finite() or actual < 0
         ):
             raise Rejected("invalid_budget_amount")
+        if provider is not None and provider not in VALID_PROVIDERS:
+            raise Rejected("invalid_provider")
         if not isinstance(usage, TokenUsage):
             usage = None
         if (
@@ -856,6 +1023,16 @@ class Store:
             thinking_row = await self.one(
                 "SELECT model_lane,thinking_level FROM ledger_thinking WHERE id=?",
                 (reservation,),
+            )
+            provider_row = await self.one(
+                "SELECT provider FROM ledger_provider WHERE id=?", (reservation,)
+            )
+            resolved_provider = (
+                provider
+                or (
+                    provider_row[0] if provider_row and provider_row[0] in VALID_PROVIDERS else None
+                )
+                or "gemini_paid"
             )
             model_lane = (
                 model_lane
@@ -943,6 +1120,10 @@ class Store:
                 "INSERT OR REPLACE INTO ledger_thinking VALUES (?,?,?)",
                 (reservation, model_accounting.lane_name(model_lane), resolved_thinking),
             )
+            await self.db.execute(
+                "INSERT OR REPLACE INTO ledger_provider VALUES (?,?)",
+                (reservation, resolved_provider),
+            )
             await model_accounting.accumulate(
                 self,
                 row["day"],
@@ -954,6 +1135,9 @@ class Store:
                     for name in ("input_tokens", "output_tokens", "cached_tokens", "thought_tokens")
                 },
                 thinking_level=resolved_thinking,
+            )
+            await self._accumulate_provider_usage(
+                row["day"], resolved_provider, amount, estimated, usage
             )
             if overrun:
                 await self.db.execute("INSERT OR REPLACE INTO meta VALUES ('budget_overrun','1')")
@@ -1037,6 +1221,13 @@ class Store:
                     dict(r)
                     for r in await self.all(
                         "SELECT * FROM model_usage_aggregates WHERE period=? ORDER BY model_lane",
+                        (period,),
+                    )
+                ]
+                tokens["by_provider"] = [
+                    dict(r)
+                    for r in await self.all(
+                        "SELECT * FROM provider_usage_aggregates WHERE period=? ORDER BY provider",
                         (period,),
                     )
                 ]
@@ -1126,6 +1317,17 @@ class Store:
             )
             monthly_limit = microdollars(getattr(self.s, "monthly_usd", Decimal("40")))
             account_balance = await self._account_balance_unlocked()
+            gcp = getattr(self.runtime, "gcp_billing", None)
+            manual_set_micro = account_balance["set_microdollars"]
+            if gcp is not None:
+                try:
+                    gcp_summary = gcp.summary_for_budget(manual_set_micro=manual_set_micro)
+                except TypeError:
+                    gcp_summary = gcp.summary_for_budget()
+                gcp_exhausted = self._gcp_hard_stop_exhausted(gcp, manual_set_micro)
+            else:
+                gcp_summary = None
+                gcp_exhausted = False
         return {
             "day_local": day,
             "month_local": day[:7],
@@ -1143,6 +1345,7 @@ class Store:
             "total": total,
             "total_limit": total_limit,
             "account_balance": account_balance,
+            "gcp_billing": gcp_summary,
             "user_top_daily": user_top_row[0] if user_top_row else 0,
             "user_daily_limit": microdollars(self.s.user_daily_usd),
             "sub_budgets": {
@@ -1166,7 +1369,8 @@ class Store:
             "hard_stop": circuit
             or daily >= daily_limit
             or monthly >= monthly_limit
-            or (total_limit > 0 and total >= total_limit),
+            or (total_limit > 0 and total >= total_limit)
+            or gcp_exhausted,
             "circuit": circuit,
         }
 
@@ -1409,4 +1613,7 @@ class Store:
             )
             await self.db.execute(
                 "DELETE FROM ledger_times WHERE id NOT IN (SELECT id FROM ledger)"
+            )
+            await self.db.execute(
+                "DELETE FROM ledger_provider WHERE id NOT IN (SELECT id FROM ledger)"
             )

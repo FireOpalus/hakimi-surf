@@ -220,6 +220,7 @@ async def dashboard(request: Request):
         "metrics": [dict(row) for row in metrics],
         "notebook": notebook,
         "rest_hours": svc.store.runtime.rest_hours_status(),
+        "provider_routing": (await svc.store.runtime.provider_routing.status())["config"],
     }
 
 
