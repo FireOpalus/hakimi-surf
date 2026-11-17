@@ -68,6 +68,7 @@ REASONS = {
     "risk": "平台风控或凭证过期，已停止访问并冷却",
     "files_unavailable": "视频上传或处理暂不可用",
     "deadline": "原片处理超时",
+    "interrupted": "服务重启中断，不自动重放",
 }
 
 

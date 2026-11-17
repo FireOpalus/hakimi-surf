@@ -21,9 +21,7 @@ def _fmt_num(val: int | float) -> str:
     return str(int(fval)) if fval.is_integer() else str(round(fval, 1))
 
 
-def _normalize_pos(
-    pos: Any, settings: Settings | None
-) -> tuple[float, float, float] | str | None:
+def _normalize_pos(pos: Any, settings: Settings | None) -> tuple[float, float, float] | str | None:
     if pos is None:
         return None
     if isinstance(pos, dict) and all(k in pos for k in ("x", "y", "z")):
@@ -128,9 +126,7 @@ class MinecraftSlotModule(BaseModule):
             if key in raw:
                 setattr(self, key, bool(raw[key]))
 
-    def _sanitize_snapshot(
-        self, raw: dict[str, Any] | MinecraftSnapshot
-    ) -> MinecraftSnapshot:
+    def _sanitize_snapshot(self, raw: dict[str, Any] | MinecraftSnapshot) -> MinecraftSnapshot:
         raw_dict = raw.model_dump() if isinstance(raw, MinecraftSnapshot) else dict(raw)
         if isinstance(raw_dict.get("snapshot"), dict) and not any(
             k in raw_dict for k in _SNAPSHOT_FIELD_KEYS
@@ -198,9 +194,7 @@ class MinecraftSlotModule(BaseModule):
             updated_at=updated_at,
         )
 
-    def apply_snapshot(
-        self, raw: dict[str, Any] | MinecraftSnapshot
-    ) -> MinecraftSnapshot:
+    def apply_snapshot(self, raw: dict[str, Any] | MinecraftSnapshot) -> MinecraftSnapshot:
         """Sanitize and store a remote Mineflayer snapshot synchronously."""
         self._update_bridge_flags(raw)
         sanitized = self._sanitize_snapshot(raw)
@@ -297,8 +291,7 @@ class MinecraftSlotModule(BaseModule):
                 and curr.health is not None
                 and prev.health is not None
                 and (
-                    (prev.health > 0 and curr.health <= 0)
-                    or (prev.health > 4 and curr.health <= 4)
+                    (prev.health > 0 and curr.health <= 0) or (prev.health > 4 and curr.health <= 4)
                 )
             ):
                 await self.publish_milestone(
@@ -312,9 +305,11 @@ class MinecraftSlotModule(BaseModule):
         snap = self.snapshot
         if not snap.connected:
             if self.bridge_ready:
-                return f"MC待机 {snap.activity}".strip() if snap.activity else "MC躯干就绪(待机)"
+                if not snap.activity or snap.activity == "待机":
+                    return "MC躯干就绪(待机)"
+                return f"MC待机 {snap.activity}".strip()
             if snap.activity:
-                return f"MC离线 {snap.activity}"
+                return "MC离线" if snap.activity == "离线" else f"MC离线 {snap.activity}".strip()
             return "MC离线" if self._has_snapshot else ""
 
         parts = ["MC在线"]

@@ -204,9 +204,7 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
                 importance="high",
                 now=cur_now,
             )
-            pending2 = await svc.store.all(
-                "SELECT * FROM scheduled_intents WHERE status='pending'"
-            )
+            pending2 = await svc.store.all("SELECT * FROM scheduled_intents WHERE status='pending'")
             assert len(pending2) == 1
             warm_intent_id = pending2[0]["id"]
 
@@ -316,9 +314,7 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
             del_res = await client.delete(f"/admin/api/life/intents/{cancel_id}")
             assert del_res.status_code == 200
             assert (
-                await svc.store.one(
-                    "SELECT status FROM scheduled_intents WHERE id=?", (cancel_id,)
-                )
+                await svc.store.one("SELECT status FROM scheduled_intents WHERE id=?", (cancel_id,))
             )["status"] == "gated_skip"
 
             # Let event loop yield briefly before lifespan teardown

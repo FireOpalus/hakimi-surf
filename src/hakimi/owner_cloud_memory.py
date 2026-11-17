@@ -276,9 +276,9 @@ class OwnerCloudMemory:
                         if len(raw_ts) >= 16:
                             parsed = None
                             try:
-                                parsed = datetime.strptime(
-                                    raw_ts, "%Y-%m-%d %H:%M:%S"
-                                ).replace(tzinfo=bot_tz)
+                                parsed = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").replace(
+                                    tzinfo=bot_tz
+                                )
                             except ValueError:
                                 try:
                                     parsed = datetime.fromisoformat(raw_ts)
@@ -430,4 +430,24 @@ class OwnerCloudMemory:
                 "pinned_chars": len(self._pinned),
                 "recent_turns": len(self._recent_core),
                 "indexed_chunks": len(self._chunks),
+            }
+
+    def admin_preview(self) -> dict[str, Any]:
+        """Return sanitized read-only Owner Antigravity_Memory bridge status for /admin."""
+        enabled = bool(self.s.enable_antigravity_memory)
+        with self._lock:
+            if enabled:
+                self._rebuild_if_needed()
+            return {
+                "enabled": enabled,
+                "loaded": bool(self._pinned or self._recent_core or self._chunks)
+                if enabled
+                else False,
+                "pinned_text": self._pinned if enabled else "",
+                "pinned_chars": len(self._pinned) if enabled else 0,
+                "recent_turns": len(self._recent_core) if enabled else 0,
+                "indexed_chunks": len(self._chunks) if enabled else 0,
+                "latest_timestamp": self._latest_ts if enabled else 0.0,
+                "latest_iso": self._latest_iso if enabled else "",
+                "latest_tag": self._latest_tag if enabled else "",
             }

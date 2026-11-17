@@ -40,9 +40,7 @@ JIT_TRIGGER_MESSAGE = (
     "[系统主动意图触发：请结合 jit_proactive_intent 与最新上下文自然临场发言，"
     "若当前语境不适合插话请将 abstain 设为 true]"
 )
-DESKTOP_CONTEXT_HINT = (
-    "BOISER 近期刚在电脑端忙正事，默契关心一句注意休息喝水，绝不问怎么没回消息"
-)
+DESKTOP_CONTEXT_HINT = "BOISER 近期刚在电脑端忙正事，默契关心一句注意休息喝水，绝不问怎么没回消息"
 _GENERIC_OWNER_SILENCE_ACTIONS = frozenset(
     {
         "owner_silence_care",
@@ -465,9 +463,7 @@ class LifeBlockPlanner:
 
         planner_payload: dict[str, Any] = {
             "local_time": local_dt.strftime("%Y-%m-%d %H:%M"),
-            "weekday": ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[
-                local_dt.weekday()
-            ],
+            "weekday": ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[local_dt.weekday()],
             "current_world_state": {
                 "current_module": current.current_module,
                 "focus_level": current.focus_level,
@@ -530,9 +526,7 @@ class LifeBlockPlanner:
             )
             plan_source = "local_fallback"
 
-        resolved_module = (
-            sanitize_sensor_text(plan.current_module, self.s, max_tokens=16) or "idle"
-        )
+        resolved_module = sanitize_sensor_text(plan.current_module, self.s, max_tokens=16) or "idle"
         if resolved_module not in known_modules:
             resolved_module = "idle"
         resolved_focus: Literal["LOW", "MEDIUM", "HIGH"] = plan.focus_level
@@ -591,14 +585,8 @@ class LifeBlockPlanner:
             )
             raw_scope = str(item.target_scope or "").strip()
             if (
-                (
-                    target_module == "bilibili_surf"
-                    and action_type in {"patrol", "run_once"}
-                )
-                or (
-                    target_module == "minecraft"
-                    and action_type in _INTERNAL_MC_ACTIONS
-                )
+                (target_module == "bilibili_surf" and action_type in {"patrol", "run_once"})
+                or (target_module == "minecraft" and action_type in _INTERNAL_MC_ACTIONS)
             ) and not raw_scope:
                 resolved_scope = ""
             else:
@@ -651,9 +639,7 @@ class LifeBlockPlanner:
             return
         self._recorded_milestone_diary_ids[event.id] = now
         while len(self._recorded_milestone_diary_ids) > 512:
-            self._recorded_milestone_diary_ids.pop(
-                next(iter(self._recorded_milestone_diary_ids))
-            )
+            self._recorded_milestone_diary_ids.pop(next(iter(self._recorded_milestone_diary_ids)))
         if event.payload:
             summary_raw = json.dumps(event.payload, ensure_ascii=False, separators=(",", ":"))
             raw_summary = f"重要动态 {event.event_type}: {summary_raw}"
@@ -770,9 +756,7 @@ class GatekeeperWorker:
             )
             return int(cur.rowcount or 0)
 
-    async def _defer_intent(
-        self, intent_id: str, next_execute_after: float, *, now: float
-    ) -> None:
+    async def _defer_intent(self, intent_id: str, next_execute_after: float, *, now: float) -> None:
         async with self.store.transaction():
             await self.store.db.execute(
                 "UPDATE scheduled_intents SET execute_after=?, updated_at=? "
@@ -862,9 +846,8 @@ class GatekeeperWorker:
             )
         last_private_at = float(row["last_private_at"]) if row and row["last_private_at"] else 0.0
         action_type = str(ticket.get("action_type", ""))
-        is_generic = (
-            action_type in _GENERIC_OWNER_SILENCE_ACTIONS
-            or not action_type.endswith("_milestone_share")
+        is_generic = action_type in _GENERIC_OWNER_SILENCE_ACTIONS or not action_type.endswith(
+            "_milestone_share"
         )
         if last_private_at > 0 and 0.0 <= (now - last_private_at) < 3600.0 and is_generic:
             return False, None
@@ -1135,9 +1118,7 @@ class JITExecutor:
                     )
                     topic = sanitize_sensor_text(raw_topic, self.s, max_tokens=20)
             goal_res = await mc_mod.dispatch_goal({**ticket, "topic": topic})
-            final_mc_status: Literal["done", "gated_skip"] = (
-                "done" if goal_res.ok else "gated_skip"
-            )
+            final_mc_status: Literal["done", "gated_skip"] = "done" if goal_res.ok else "gated_skip"
             await ws.mark_intent(intent_id, final_mc_status, now=self.clock())
             return {"status": final_mc_status, "reason": goal_res.reason}
 
@@ -1176,9 +1157,7 @@ class JITExecutor:
                     await ws.mark_intent(intent_id, final_status, now=self.clock())
                     return {"status": final_status, "reason": goal_res.reason}
                 if goal_res.summary:
-                    material_summary = sanitize_sensor_text(
-                        goal_res.summary, self.s, max_tokens=90
-                    )
+                    material_summary = sanitize_sensor_text(goal_res.summary, self.s, max_tokens=90)
 
         target_msg = _scope_to_message(
             target_scope,
@@ -1398,9 +1377,7 @@ class LifeEngine:
             if row:
                 saved = self.store.vault.open("admin:life_engine", row[0])
                 merged = (
-                    {**self.env_config.model_dump(), **saved}
-                    if isinstance(saved, dict)
-                    else saved
+                    {**self.env_config.model_dump(), **saved} if isinstance(saved, dict) else saved
                 )
                 self.config = LifeEngineConfig.model_validate(merged)
                 self.overridden = True
@@ -1423,6 +1400,7 @@ class LifeEngine:
 
     async def status(self) -> dict[str, Any]:
         await self.initialize()
+        proactive_sent_today = await self.gatekeeper._count_today_proactive(self.clock())
         return {
             "config": self.config.model_dump(),
             "source": "admin" if self.overridden else "env",
@@ -1431,6 +1409,7 @@ class LifeEngine:
             "next_plan_at": self.planner.next_plan_at,
             "last_plan_at": self.planner.last_plan_at,
             "last_plan_source": self.planner.last_plan_source,
+            "proactive_sent_today": proactive_sent_today,
             "running": self._running,
         }
 
@@ -1439,9 +1418,7 @@ class LifeEngine:
         async with self._config_lock:
             if value is None:
                 async with self.store.transaction():
-                    await self.store.db.execute(
-                        "DELETE FROM admin_config WHERE key='life_engine'"
-                    )
+                    await self.store.db.execute("DELETE FROM admin_config WHERE key='life_engine'")
                 self.config = self.env_config
                 self.overridden = False
             else:

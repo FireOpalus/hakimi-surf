@@ -46,16 +46,9 @@ class _FixedDateTime(datetime):
 
 
 def _extract_untrusted_metadata(prompt_text: str) -> dict:
-    match = re.search(
-        r"<untrusted_user_input>(.*?)</untrusted_user_input>", prompt_text, re.DOTALL
-    )
+    match = re.search(r"<untrusted_user_input>(.*?)</untrusted_user_input>", prompt_text, re.DOTALL)
     assert match is not None
-    raw = (
-        match.group(1)
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-    )
+    raw = match.group(1).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
     return json.loads(raw)
 
 
@@ -100,9 +93,9 @@ def test_static_prefixes_unchanged_and_within_budget(settings):
         text = pool.get(prompt_context(msg, settings), settings.onebot_self_id)
         tokens = estimate_tokens(text)
         assert 4500 <= tokens <= 5200
-        assert hashlib.sha256(text.encode("utf-8")).hexdigest() == V181_STATIC_PREFIX_DIGESTS[
-            bucket
-        ]
+        assert (
+            hashlib.sha256(text.encode("utf-8")).hexdigest() == V181_STATIC_PREFIX_DIGESTS[bucket]
+        )
 
 
 async def test_sensor_firewall_neutralizes_injections_secrets_and_length(settings, store):
@@ -120,8 +113,7 @@ async def test_sensor_firewall_neutralizes_injections_secrets_and_length(setting
         "api_key=abc12345 password=hunter2 token: tok99999 secret=sec88888 "
         "sessdata=raw_sess bili_jct=raw_jct Bearer bearer_tok_123456 "
         "sk-proj-secret1234567890 AIzaSyFakeGoogleKey1234567890 "
-        "test-gemini-key-never-live custom_sessdata_secret_998877 "
-        + ("长文本注入干扰" * 200)
+        "test-gemini-key-never-live custom_sessdata_secret_998877 " + ("长文本注入干扰" * 200)
     )
     sanitized = sanitize_sensor_text(attack, configured, max_tokens=90)
     assert estimate_tokens(sanitized) <= 90
@@ -330,9 +322,7 @@ async def test_sqlite_plaintext_json_and_world_state_operations(settings, store)
     row_intent = await store.one("SELECT * FROM scheduled_intents WHERE id=?", (intent_id,))
     assert row_intent is not None
     assert json.loads(row_intent["gate_condition_json"]) == {"min_energy": 30}
-    assert json.loads(row_intent["intent_note_json"]) == {
-        "note": "想看看最近有没有有趣的新视频"
-    }
+    assert json.loads(row_intent["intent_note_json"]) == {"note": "想看看最近有没有有趣的新视频"}
 
     due = await ws.list_due_intents(now=now)
     assert len(due) == 1 and due[0]["id"] == intent_id

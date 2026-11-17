@@ -547,3 +547,57 @@ async def test_cache_prefix_alert_is_visible_in_ledger(admin_api):
     health = (await client.get("/admin/api/dashboard")).json()["usage"]["cache_health"]
     assert health == {"target": 0.9, "tail_tokens": 2050, "prefix_busts_today": 1}
     assert "cache-alert" in (await client.get("/admin")).text
+
+
+async def test_sessions_and_notebook_admin_accuracy_fixes(admin_api, message, tmp_path):
+    from types import SimpleNamespace
+
+    from hakimi.modules.bilibili_surf import BilibiliSurfModule
+    from tests.test_dual_memory_v100 import group, populate
+
+    app, client, _ = admin_api
+    svc = app.state.service
+    msg = group(message)
+    await populate(svc.sessions, msg)
+    entries = (await client.get("/admin/api/sessions")).json()
+    assert len(entries) == 1
+    row = entries[0]
+    assert row["summary_chars"] == 0
+    assert row["dual_ready"] is True
+    assert row["dual_entries_count"] == 2
+    assert row["dual_chars"] > 0
+
+    detail = (await client.get("/admin/api/sessions/" + row["id"])).json()
+    assert detail["dual_ready"] is True
+    assert detail["dual_entries_count"] == 2
+    assert detail["dual_chars"] == row["dual_chars"]
+
+    # Notebook disabled keeps enabled=False while surfacing sanitized antigravity_memory preview.
+    mem_dir = tmp_path / "ag_mem"
+    mem_dir.mkdir()
+    (mem_dir / "notebook.md").write_text(
+        "# 小本本\n\n## 🌟 长期核心备忘\n- 最喜欢草莓蛋糕\n- token: " + TOKEN + "\n",
+        encoding="utf-8",
+    )
+    app.state.settings.enable_notebook_snapshot = False
+    app.state.settings.enable_antigravity_memory = True
+    app.state.settings.antigravity_memory_dir = mem_dir
+    nb = (await client.get("/admin/api/notebook")).json()
+    assert nb["enabled"] is False
+    assert nb["antigravity_memory"]["enabled"] is True
+    assert nb["antigravity_memory"]["pinned_chars"] > 0
+    assert "最喜欢草莓蛋糕" in nb["antigravity_memory"]["pinned_text"]
+    assert TOKEN not in nb["antigravity_memory"]["pinned_text"]
+
+    # BilibiliSurfModule reflects SQLite watcher.policy.enabled even if env flag is False.
+    app.state.settings.bili_autonomous_enabled = False
+    watcher_stub = SimpleNamespace(policy=SimpleNamespace(enabled=True))
+    bili_mod = BilibiliSurfModule(app.state.settings, watcher=watcher_stub)
+    summary = await bili_mod.get_sensor_summary()
+    assert "巡逻开启" in summary and "手动可看" not in summary
+
+    # Admin HTML contains updated labels & passes strict CSP invariants.
+    page = await client.get("/admin", headers={"Authorization": ""})
+    assert "热窗口 / 长期记忆" in page.text
+    assert "(Phase 3)" not in page.text
+    assert "innerHTML" not in page.text

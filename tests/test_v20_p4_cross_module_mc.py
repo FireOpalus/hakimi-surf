@@ -105,7 +105,11 @@ class FakeNodeTransport:
         }
 
     async def call(
-        self, action: str, params: dict, *, timeout: float | None = None  # noqa: ASYNC109
+        self,
+        action: str,
+        params: dict,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
     ) -> dict:
         if not self._connected:
             raise Rejected("node_disconnected")
@@ -145,6 +149,10 @@ async def test_minecraft_slot_standby_live_apply_status_and_sanitization(setting
     )
     assert mc._has_snapshot is False
     assert mc.bridge_ready is True
+    assert await mc.get_sensor_summary() == "MC躯干就绪(待机)"
+
+    # Explicit "待机" activity string when bridge_ready must NOT duplicate "MC待机 待机".
+    mc.apply_status({"bridge_ready": True, "connected": False, "paused": False, "activity": "待机"})
     assert await mc.get_sensor_summary() == "MC躯干就绪(待机)"
 
     # Standby with activity renders MC待机 <activity>.
@@ -394,9 +402,7 @@ async def test_auto_high_focus_water_chat_suspension_instant_at_and_disconnect_u
         await svc.stop()
 
 
-async def test_mc_milestone_to_qq_with_receipts_and_reply_resolution(
-    settings, store, message
-):
+async def test_mc_milestone_to_qq_with_receipts_and_reply_resolution(settings, store, message):
     now = _stamp("2026-11-17T15:00:00")
     settings.owner_qq_id = "20000"
     settings.onebot_enabled = True
@@ -415,9 +421,7 @@ async def test_mc_milestone_to_qq_with_receipts_and_reply_resolution(
         svc.world_state.clock = lambda: now
         await svc.world_state.initialize()
         await svc.proactive.initialize()
-        await svc.proactive.set_config(
-            ProactiveConfig(enabled=True, quiet_hours="23:55-00:05")
-        )
+        await svc.proactive.set_config(ProactiveConfig(enabled=True, quiet_hours="23:55-00:05"))
         await svc.proactive.on_connection(True)
 
         engine = LifeEngine(svc, clock=lambda: now)
@@ -603,9 +607,7 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         svc.world_state.clock = lambda: now
         await svc.world_state.initialize()
         await svc.proactive.initialize()
-        await svc.proactive.set_config(
-            ProactiveConfig(enabled=True, quiet_hours="23:55-00:05")
-        )
+        await svc.proactive.set_config(ProactiveConfig(enabled=True, quiet_hours="23:55-00:05"))
         await svc.bili_watcher.initialize()
         await svc.bili_watcher.set_policy(BiliPolicy(enabled=True))
         await svc.bili_watcher.update_credentials(
@@ -714,8 +716,7 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         plan_res = await engine.trigger_plan_once(now=exec_now2)
         assert plan_res["intents_enqueued"] == 1
         planned_rows = await store.all(
-            "SELECT target_module, target_scope, action_type "
-            "FROM scheduled_intents WHERE id=?",
+            "SELECT target_module, target_scope, action_type FROM scheduled_intents WHERE id=?",
             (plan_res["intent_ids"][0],),
         )
         assert len(planned_rows) == 1
@@ -737,9 +738,7 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
             now=exec_now2 - 5,
         )
         await engine.tick_gatekeeper_once(now=exec_now2)
-        exp_row = await store.one(
-            "SELECT status FROM scheduled_intents WHERE id=?", (expiring_id,)
-        )
+        exp_row = await store.one("SELECT status FROM scheduled_intents WHERE id=?", (expiring_id,))
         assert exp_row["status"] == "gated_skip"
         await svc.stop()
 
@@ -859,15 +858,11 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(settings)
 
             # Lock held -> 409
             async with app.state.admin_action_lock:
-                busy = await client.post(
-                    "/admin/api/life/mc/goal", json={"action_type": "status"}
-                )
+                busy = await client.post("/admin/api/life/mc/goal", json={"action_type": "status"})
                 assert busy.status_code == 409
 
             # 3. Valid admin actions: status, build_plan, pause, resume, disconnected.
-            st_res = await client.post(
-                "/admin/api/life/mc/goal", json={"action_type": "status"}
-            )
+            st_res = await client.post("/admin/api/life/mc/goal", json={"action_type": "status"})
             assert st_res.status_code == 200
             assert st_res.json()["status"] == "ok"
             assert st_res.json()["life"]["nodes"]["shanghai_mc_agent"]["bridge_ready"] is True
@@ -880,9 +875,7 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(settings)
             assert bp_res.json()["status"] == "ok"
             assert "红石雪傀儡刷雪机" in bp_res.json()["result"]["summary"]
 
-            pause_res = await client.post(
-                "/admin/api/life/mc/goal", json={"action_type": "pause"}
-            )
+            pause_res = await client.post("/admin/api/life/mc/goal", json={"action_type": "pause"})
             assert pause_res.status_code == 200
             assert pause_res.json()["life"]["nodes"]["shanghai_mc_agent"]["paused"] is True
 
@@ -910,16 +903,12 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(settings)
                 "summary": "待机",
                 "snapshot": {"connected": False, "bridge_ready": True, "activity": "待机"},
             }
-            idle_res = await client.post(
-                "/admin/api/life/mc/goal", json={"action_type": "idle"}
-            )
+            idle_res = await client.post("/admin/api/life/mc/goal", json={"action_type": "idle"})
             assert idle_res.status_code == 200
             assert idle_res.json()["status"] == "ok"
 
             nt._connected = False
-            disc_res = await client.post(
-                "/admin/api/life/mc/goal", json={"action_type": "status"}
-            )
+            disc_res = await client.post("/admin/api/life/mc/goal", json={"action_type": "status"})
             assert disc_res.status_code == 200
             assert disc_res.json()["status"] == "unavailable"
             assert disc_res.json()["result"]["reason"] == "node_disconnected"

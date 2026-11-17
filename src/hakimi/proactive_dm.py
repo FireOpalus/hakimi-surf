@@ -883,6 +883,14 @@ class OwnerProactive:
                         "SELECT * FROM pending_owner_dms WHERE id=?", (key,)
                     )
                 await self._finish_memory(confirmed)
+                ws = getattr(self.service, "world_state", None)
+                if ws is not None and hasattr(ws, "update_state"):
+                    async with self.store.lock:
+                        has_ws = await self.store.one(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_state'"
+                        )
+                    if has_ws:
+                        await ws.update_state(last_proactive_at=self.clock())
                 # No compression here: alert/test delivery must remain strictly zero-token.
                 return True
 

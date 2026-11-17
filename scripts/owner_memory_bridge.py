@@ -33,9 +33,7 @@ from hakimi.security import Rejected  # noqa: E402
 BRIDGE_FILENAME = "owner-memory-bridge.json"
 BRIDGE_APP_KEY = "hakimi_owner_bridge"
 BRIDGE_APP_VALUE = "v1"
-BRIDGE_FIELDS = (
-    "id,name,parents,mimeType,trashed,appProperties,md5Checksum,modifiedTime,size"
-)
+BRIDGE_FIELDS = "id,name,parents,mimeType,trashed,appProperties,md5Checksum,modifiedTime,size"
 MAX_BRIDGE_BYTES = 16 * 1024 * 1024
 MAX_TAR_BYTES = 32 * 1024 * 1024
 MD_FILENAME_RE = re.compile(r"^[A-Za-z0-9._\u4e00-\u9fff-]+\.md$")
@@ -270,17 +268,13 @@ def write_memory_dir_atomic(memory_dir: Path, payload: dict[str, Any]) -> int:
     for name, content in payload["long_term_md"].items():
         if not is_valid_md_filename(name):
             raise Rejected("bridge_invalid_filename")
-        _atomic_write_bytes(
-            long_term_dir / name, content.encode("utf-8"), mode=0o640, set_gid=True
-        )
+        _atomic_write_bytes(long_term_dir / name, content.encode("utf-8"), mode=0o640, set_gid=True)
         written += 1
 
     for name, content in payload["notes_md"].items():
         if not is_valid_md_filename(name):
             raise Rejected("bridge_invalid_filename")
-        _atomic_write_bytes(
-            notes_dir / name, content.encode("utf-8"), mode=0o640, set_gid=True
-        )
+        _atomic_write_bytes(notes_dir / name, content.encode("utf-8"), mode=0o640, set_gid=True)
         written += 1
 
     return written
@@ -318,8 +312,10 @@ def extract_safe_tar_stream(raw_bytes: bytes, staging_dir: Path) -> int:
                 raise Rejected("bridge_tar_special_file")
             if parts == ["notebook.md"] or parts == ["short_term_memory.json"]:
                 rel_parts = parts
-            elif len(parts) == 2 and parts[0] in {"long_term", "notes"} and is_valid_md_filename(
-                parts[1]
+            elif (
+                len(parts) == 2
+                and parts[0] in {"long_term", "notes"}
+                and is_valid_md_filename(parts[1])
             ):
                 rel_parts = parts
             else:

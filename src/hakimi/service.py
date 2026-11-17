@@ -485,21 +485,14 @@ class Service:
                 focus_level="LOW",
                 mood="calm",
             )
-        elif (
-            curr_paused
-            and cur.current_module == "minecraft"
-            and cur.focus_level == "HIGH"
-        ):
+        elif curr_paused and cur.current_module == "minecraft" and cur.focus_level == "HIGH":
             await ws_mgr.update_state(
                 current_module="idle",
                 focus_level="LOW",
                 mood="calm",
             )
         elif (
-            prev_paused
-            and not curr_paused
-            and curr_connected
-            and cur.current_module != "minecraft"
+            prev_paused and not curr_paused and curr_connected and cur.current_module != "minecraft"
         ):
             await ws_mgr.update_state(
                 current_module="minecraft",
@@ -565,9 +558,7 @@ class Service:
         nt = getattr(self, "node_transport", None)
         if nt is None or not nt.connected():
             summary = (
-                await mc_mod.get_sensor_summary()
-                if isinstance(mc_mod, MinecraftSlotModule)
-                else ""
+                await mc_mod.get_sensor_summary() if isinstance(mc_mod, MinecraftSlotModule) else ""
             )
             return {
                 "ok": False,
@@ -603,9 +594,7 @@ class Service:
                 data = await nt.call("mc.dispatch_goal", params)
         except Rejected as exc:
             summary = (
-                await mc_mod.get_sensor_summary()
-                if isinstance(mc_mod, MinecraftSlotModule)
-                else ""
+                await mc_mod.get_sensor_summary() if isinstance(mc_mod, MinecraftSlotModule) else ""
             )
             return {
                 "ok": False,
@@ -674,9 +663,7 @@ class Service:
             }
 
         summary = (
-            await mc_mod.get_sensor_summary()
-            if isinstance(mc_mod, MinecraftSlotModule)
-            else ""
+            await mc_mod.get_sensor_summary() if isinstance(mc_mod, MinecraftSlotModule) else ""
         )
         return {"ok": True, "summary": summary, "reason": None, "artifacts": {}}
 

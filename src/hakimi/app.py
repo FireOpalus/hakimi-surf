@@ -314,9 +314,7 @@ def create_app(
             or region != "CN"
             or websocket.query_params
         ):
-            logging.getLogger("hakimi").warning(
-                "event=node_auth_rejected source_ip=%s", source_ip
-            )
+            logging.getLogger("hakimi").warning("event=node_auth_rejected source_ip=%s", source_ip)
             await websocket.close(code=1008)
             return
         await websocket.accept()

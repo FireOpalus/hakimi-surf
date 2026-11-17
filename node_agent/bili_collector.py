@@ -45,9 +45,7 @@ REQUEST_GET_PATHS = frozenset(
     }
 )
 REQUEST_POST_PATHS = frozenset({"/x/web-interface/archive/like", "/x/v3/fav/resource/deal"})
-SUBTITLE_HOSTS = frozenset(
-    {"aisubtitle.hdslb.com", "i0.hdslb.com", "i1.hdslb.com", "i2.hdslb.com"}
-)
+SUBTITLE_HOSTS = frozenset({"aisubtitle.hdslb.com", "i0.hdslb.com", "i1.hdslb.com", "i2.hdslb.com"})
 COVER_URL_RE = re.compile(
     r"^https://(?:i[0-2]\.hdslb\.com|archive\.biliimg\.com)/bfs/[A-Za-z0-9_./-]+$"
 )

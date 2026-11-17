@@ -180,9 +180,7 @@ async def test_surf_mirror_decrypts_owner_session_world_roaming_and_isolates_gro
             "INSERT INTO cold_history_slices VALUES (?,?,?,?,?,?,?)",
             ("slice-1", svc.sessions.vault.seal(key + ":cold:slice-1", []), 0, 1, 2, "fold", now),
         )
-        await db.execute(
-            "INSERT INTO memory_slice_jobs(id,status) VALUES ('slice-1','attempted')"
-        )
+        await db.execute("INSERT INTO memory_slice_jobs(id,status) VALUES ('slice-1','attempted')")
         await db.execute(
             "UPDATE recent_messages SET expires=? WHERE id=1",
             (now + 86400,),
@@ -702,7 +700,6 @@ def test_extract_safe_tar_stream_and_sync_owner_memory_sh(tmp_path: Path):
         capture_output=True,
     )
     assert bad_cli.returncode == 2
-
 
 
 async def test_owner_memory_bridge_self_heals_overwritten_files_and_force(tmp_path: Path):

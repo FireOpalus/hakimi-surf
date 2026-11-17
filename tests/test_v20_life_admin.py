@@ -394,3 +394,46 @@ async def test_life_cancel_intent_validation_404_and_state_transition(life_api):
     # Cancelling again (no longer pending) -> 409
     again = await client.delete(f"/admin/api/life/intents/{intent_id}")
     assert again.status_code == 409
+
+
+async def test_life_status_reports_proactive_sent_today_and_historical_last_proactive(life_api):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    app, client, _ = life_api
+    svc = app.state.service
+    assert svc.life_engine is not None
+    await svc.life_engine.initialize()
+
+    sent_ts = (
+        datetime.fromtimestamp(time.time(), ZoneInfo(svc.s.bot_timezone))
+        .replace(hour=12, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+    async with svc.store.transaction():
+        await svc.store.db.execute(
+            "INSERT INTO pending_owner_dms("
+            "id,scope,day,kind,created,expires_at,status,sent_at"
+            ") VALUES ('dm-1', ?, ?, 'companion', ?, ?, 'sent', ?)",
+            (
+                "20000",
+                svc.proactive.local(sent_ts).date().isoformat(),
+                sent_ts,
+                sent_ts + 3600.0,
+                sent_ts,
+            ),
+        )
+        await svc.store.db.execute(
+            "INSERT INTO scheduled_intents("
+            "id,created_at,execute_after,expire_at,target_module,target_scope,"
+            "action_type,mood,gate_condition_json,intent_note_json,status,updated_at"
+            ") VALUES ('0123456789abcdef', ?, ?, ?, 'qq_social', 'onebot:40000', "
+            "'group_share', 'happy', '{}', '{}', 'done', ?)",
+            (sent_ts - 60.0, sent_ts - 30.0, sent_ts + 600.0, sent_ts + 30.0),
+        )
+
+    res = await client.get("/admin/api/life")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["engine"]["proactive_sent_today"] == 1
+    assert body["world_state"]["last_proactive_at"] == pytest.approx(sent_ts + 30.0, abs=1.0)

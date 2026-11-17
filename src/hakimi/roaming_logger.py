@@ -244,9 +244,7 @@ class RoamingLogger:
             if ("event_kind" not in r.keys() or (r["event_kind"] or "patrol") == "patrol")
         ]
         world_rows = [
-            r
-            for r in rows
-            if "event_kind" in r.keys() and r["event_kind"] == "world_life"
+            r for r in rows if "event_kind" in r.keys() and r["event_kind"] == "world_life"
         ]
         chat_rows = [
             r

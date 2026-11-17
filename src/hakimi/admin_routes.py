@@ -1,5 +1,6 @@
 """Small, authenticated control plane; simulation never calls Service.accept or Sender."""
 
+import asyncio
 import re
 import time
 import uuid
@@ -700,12 +701,25 @@ async def save_bot_thresholds(request: Request):
     return _bot_thresholds_status(svc)
 
 
+async def _dual_stats(svc, msg, enabled: bool) -> dict[str, int]:
+    dual_mgr = getattr(svc.sessions, "dual", None)
+    if not (enabled and dual_mgr is not None and hasattr(dual_mgr, "view")):
+        return {"dual_entries_count": 0, "dual_chars": 0}
+    view = await dual_mgr.view(msg)
+    active = [e for e in view.get("entries", []) if not e.get("deleted")]
+    return {
+        "dual_entries_count": len(active),
+        "dual_chars": sum(len(str(e.get("text", ""))) for e in active),
+    }
+
+
 @router.get("/api/sessions")
 async def sessions(request: Request):
     svc = service(request)
     result = []
     for key, msg in await svc.store.runtime.sessions():
         snap = await svc.sessions.snapshot(msg)
+        stats = await _dual_stats(svc, msg, bool(snap["enabled"]))
         result.append(
             {
                 "id": key,
@@ -713,8 +727,10 @@ async def sessions(request: Request):
                 "kind": msg.kind,
                 "conversation_id": msg.conversation_id,
                 "enabled": snap["enabled"],
+                "dual_ready": bool(snap.get("dual_ready")),
                 "summary_chars": len(snap["rolling_summary"]),
                 "recent_count": len(snap["recent_messages"]),
+                **stats,
             }
         )
     return result
@@ -791,9 +807,12 @@ async def session_message(request, key):
 
 @router.get("/api/sessions/{key}")
 async def session_detail(request: Request, key: str):
-    snap = await service(request).sessions.snapshot(await session_message(request, key))
+    svc = service(request)
+    msg = await session_message(request, key)
+    snap = await svc.sessions.snapshot(msg)
     # Admin needs summary and hot-window count, not automatic disclosure of raw conversations.
     snap["recent_count"] = len(snap.pop("recent_messages"))
+    snap.update(await _dual_stats(svc, msg, bool(snap["enabled"])))
     return snap
 
 
@@ -827,7 +846,12 @@ async def compress_session(request: Request, key: str):
 
 @router.get("/api/notebook")
 async def notebook(request: Request):
-    return service(request).notebook.status()
+    svc = service(request)
+    status = dict(svc.notebook.status())
+    cloud = getattr(svc, "cloud_memory", None)
+    if cloud is not None and hasattr(cloud, "admin_preview"):
+        status["antigravity_memory"] = await asyncio.to_thread(cloud.admin_preview)
+    return status
 
 
 @router.put("/api/notebook")

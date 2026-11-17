@@ -279,13 +279,39 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
     ws = getattr(svc, "world_state", None)
     if ws is not None:
         snap = ws.current
+        last_proactive_at = snap.last_proactive_at
+    else:
+        snap = None
+        last_proactive_at = 0.0
+
+    store = getattr(svc, "store", None)
+    if last_proactive_at <= 0.0 and store is not None:
+        async with store.lock:
+            candidates: list[float] = []
+            if await _table_exists(store, "pending_owner_dms"):
+                row = await store.one(
+                    "SELECT MAX(COALESCE(sent_at, created)) FROM pending_owner_dms "
+                    "WHERE status IN ('sent','delivered')"
+                )
+                if row and row[0]:
+                    candidates.append(float(row[0]))
+            if await _table_exists(store, "scheduled_intents"):
+                row = await store.one(
+                    "SELECT MAX(updated_at) FROM scheduled_intents WHERE status='done'"
+                )
+                if row and row[0]:
+                    candidates.append(float(row[0]))
+            if candidates:
+                last_proactive_at = max(candidates)
+
+    if snap is not None and ws is not None:
         world_state_data = {
             "current_module": snap.current_module,
             "focus_level": snap.focus_level,
             "mood": snap.mood,
             "energy": snap.energy,
             "boredom": snap.boredom,
-            "last_proactive_at": snap.last_proactive_at,
+            "last_proactive_at": last_proactive_at,
             "updated_at": snap.updated_at,
             "proactive_suspended": bool(ws.proactive_suspended()),
             "modules": await _collect_modules_status(svc),
@@ -297,7 +323,7 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
             "mood": "calm",
             "energy": 80,
             "boredom": 20,
-            "last_proactive_at": 0.0,
+            "last_proactive_at": last_proactive_at,
             "updated_at": 0.0,
             "proactive_suspended": False,
             "modules": await _collect_modules_status(svc),

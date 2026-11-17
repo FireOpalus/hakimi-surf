@@ -663,9 +663,7 @@ async def test_video_watch_lane2_skipped_for_non_fallback_errors_or_offline(
         {"mime_type": "image/jpeg", "data_b64": "not-valid-b64!"},
     ],
 )
-async def test_video_watch_lane2_failure_preserves_lane1_reason(
-    settings, store, tmp_path, bad_sb
-):
+async def test_video_watch_lane2_failure_preserves_lane1_reason(settings, store, tmp_path, bad_sb):
     def node_handler(*_args):
         if isinstance(bad_sb, Exception):
             raise bad_sb

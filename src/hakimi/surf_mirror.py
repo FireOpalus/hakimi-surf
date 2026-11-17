@@ -227,9 +227,7 @@ def _read_owner_session_sync(
     try:
         tables = {
             row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
         if "session_meta" not in tables:
             return empty
@@ -417,9 +415,7 @@ class SurfMirror:
         async with self.store.lock:
             tables = {
                 row[0]
-                for row in await self.store.all(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
+                for row in await self.store.all("SELECT name FROM sqlite_master WHERE type='table'")
             }
             if "world_state" in tables:
                 row = await self.store.one("SELECT * FROM world_state WHERE singleton=1")
@@ -508,8 +504,7 @@ class SurfMirror:
             updated = self._format_ts(world.get("updated_at"))
             lines.append(
                 f"- 当前模块：`{mod}` | 专注度：`{focus}` | 心情：`{mood}` | "
-                f"精力：{energy} | 无聊度：{boredom}"
-                + (f" | 更新于：{updated}" if updated else "")
+                f"精力：{energy} | 无聊度：{boredom}" + (f" | 更新于：{updated}" if updated else "")
             )
             snapshot = world.get("snapshot")
             if isinstance(snapshot, dict) and snapshot:
@@ -587,9 +582,9 @@ class SurfMirror:
                             msg.get("speaker") or default_speaker, self.s, limit=40
                         )
                         ts_label = self._format_ts(msg.get("created_at"))
-                        body = sanitize_mirror_text(
-                            msg.get("text", ""), self.s, limit=800
-                        ).replace("\n", " ")
+                        body = sanitize_mirror_text(msg.get("text", ""), self.s, limit=800).replace(
+                            "\n", " "
+                        )
                         if not body:
                             continue
                         head = f"[{ts_label}] " if ts_label else ""
@@ -626,9 +621,7 @@ class SurfMirror:
                 watched_at = sanitize_mirror_text(item.get("watched_at", ""), self.s, limit=32)
                 notes = sanitize_mirror_text(item.get("notes", ""), self.s, limit=320)
                 actions = item.get("actions") or []
-                clean_actions = [
-                    sanitize_mirror_text(a, self.s, limit=24) for a in actions
-                ]
+                clean_actions = [sanitize_mirror_text(a, self.s, limit=24) for a in actions]
                 act_str = " [" + ", ".join(clean_actions) + "]" if clean_actions else ""
                 lines.append(f"  - `{bvid}` ({watched_at}){act_str}：{notes}")
         else:
@@ -655,9 +648,7 @@ class SurfMirror:
             raise Rejected("drive_file_outside_scope")
         return file_id
 
-    async def _drive_json(
-        self, method: str, url: str, token: str, **kwargs: Any
-    ) -> dict[str, Any]:
+    async def _drive_json(self, method: str, url: str, token: str, **kwargs: Any) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {token}", **kwargs.pop("headers", {})}
         async with self.drive.http.stream(
             method, url, headers=headers, follow_redirects=False, **kwargs
@@ -805,16 +796,12 @@ class SurfMirror:
                 token = await self.drive._access_token()
                 daily_drive_name = f"surf-mirror-{day}.md"
                 if need_latest:
-                    fid = await self._upload_drive_file(
-                        DRIVE_LATEST_NAME, latest_md, marker, token
-                    )
+                    fid = await self._upload_drive_file(DRIVE_LATEST_NAME, latest_md, marker, token)
                     drive_digests["latest"] = latest_digest
                     drive_file_ids[DRIVE_LATEST_NAME] = fid
                     uploaded.append(DRIVE_LATEST_NAME)
                 if need_daily:
-                    fid = await self._upload_drive_file(
-                        daily_drive_name, daily_md, marker, token
-                    )
+                    fid = await self._upload_drive_file(daily_drive_name, daily_md, marker, token)
                     drive_digests[day] = daily_digest
                     drive_file_ids[daily_drive_name] = fid
                     uploaded.append(daily_drive_name)

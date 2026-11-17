@@ -183,9 +183,7 @@ class DatabaseBackup:
             return (ts - stat_result.st_mtime) >= self.interval_seconds
         return False
 
-    def _create_local_backup(
-        self, day_str: str, cutoff_date: date
-    ) -> tuple[dict[str, Any], bytes]:
+    def _create_local_backup(self, day_str: str, cutoff_date: date) -> tuple[dict[str, Any], bytes]:
         db_path = Path(self.s.data_dir) / "hakimi.sqlite3"
         if not db_path.exists():
             raise FileNotFoundError(db_path)

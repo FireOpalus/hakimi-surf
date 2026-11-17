@@ -17,9 +17,7 @@ AttentionLevel = Literal["LOW", "MEDIUM", "HIGH"]
 ATTENTION_RANK: dict[str, int] = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 NodeRegion = Literal["KR", "CN"]
 
-_AUTH_HEADER_RE = re.compile(
-    r"(?i)\bauthorization\b\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]{4,}"
-)
+_AUTH_HEADER_RE = re.compile(r"(?i)\bauthorization\b\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]{4,}")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
 _SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}")
 _AIZA_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{8,}")

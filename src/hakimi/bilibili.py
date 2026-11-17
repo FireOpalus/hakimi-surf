@@ -131,11 +131,7 @@ class Bilibili:
                         },
                     )
                 code = result.get("code") if isinstance(result, dict) else None
-                if (
-                    isinstance(code, bool)
-                    or code != 0
-                    or not isinstance(result.get("data"), dict)
-                ):
+                if isinstance(code, bool) or code != 0 or not isinstance(result.get("data"), dict):
                     if not isinstance(code, bool) and code in {-412, -352}:
                         risk_412 = True
                         logging.getLogger("hakimi").warning("event=bilibili_http_412")
@@ -145,9 +141,7 @@ class Bilibili:
                     status_detail = getattr(exc, "detail", "")
                     risk_412 = status_detail == "412"
                     if status_detail in {"403", "412", "429"}:
-                        logging.getLogger("hakimi").warning(
-                            "event=bilibili_http_%s", status_detail
-                        )
+                        logging.getLogger("hakimi").warning("event=bilibili_http_%s", status_detail)
                 self.blocked_until = time.monotonic() + 900
                 raise Rejected("bilibili_unavailable") from None
             except httpx.HTTPStatusError as exc:
@@ -223,9 +217,7 @@ class Bilibili:
             if self._can_delegate():
                 resp = None
                 try:
-                    resp = await self.node_transport.call(
-                        "bili.resolve_short", {"url": url}
-                    )
+                    resp = await self.node_transport.call("bili.resolve_short", {"url": url})
                 except Rejected as exc:
                     if str(exc) in NODE_TRANSPORT_ERRORS and getattr(
                         self.s, "node_bili_fallback_local", True

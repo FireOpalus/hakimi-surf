@@ -371,9 +371,7 @@ class WorldStateManager:
         """Return True iff world focus_level is currently HIGH."""
         return self.current.focus_level == "HIGH"
 
-    async def enqueue_intent(
-        self, ticket: IntentTicketCreate, *, now: float | None = None
-    ) -> str:
+    async def enqueue_intent(self, ticket: IntentTicketCreate, *, now: float | None = None) -> str:
         """Validate and persist a scheduled intent ticket as plaintext JSON."""
         validated = (
             ticket
@@ -549,9 +547,7 @@ class WorldStateManager:
             )
             return cur.rowcount > 0
 
-    async def record_group_proactive(
-        self, scope: str, now: float | None = None
-    ) -> None:
+    async def record_group_proactive(self, scope: str, now: float | None = None) -> None:
         """Record the timestamp of the latest proactive group interaction for cooldown gating."""
         ts = self.clock() if now is None else now
         async with self.store.transaction():
@@ -621,17 +617,14 @@ class WorldStateManager:
                     if summary:
                         sensor_parts.append(summary)
 
-        sensor_text = sanitize_sensor_text(
-            " | ".join(sensor_parts), self.settings, max_tokens=45
-        )
+        sensor_text = sanitize_sensor_text(" | ".join(sensor_parts), self.settings, max_tokens=45)
         payload: dict[str, Any] = {
             "current_module": sanitize_sensor_text(
                 self.current.current_module, self.settings, max_tokens=16
             )
             or "idle",
             "focus_level": self.current.focus_level,
-            "mood": sanitize_sensor_text(self.current.mood, self.settings, max_tokens=16)
-            or "calm",
+            "mood": sanitize_sensor_text(self.current.mood, self.settings, max_tokens=16) or "calm",
             "energy": self.current.energy,
             "boredom": self.current.boredom,
             "sensor": sensor_text,
@@ -640,9 +633,7 @@ class WorldStateManager:
             payload["attention_note"] = ATTENTION_SWITCH_NOTE
 
         def _encoded_tokens() -> int:
-            return estimate_tokens(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            )
+            return estimate_tokens(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
         if _encoded_tokens() > 100 and payload["sensor"]:
             lo, hi = 0, len(payload["sensor"])

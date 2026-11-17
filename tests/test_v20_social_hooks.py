@@ -64,9 +64,7 @@ def test_hot_ring_recent_group_activity_filters_bots_recalls_and_window(message)
         ring.observe(item)
     ring.recall(probe, "rec")
 
-    res = ring.recent_group_activity(
-        probe, window_seconds=300, now=now, bot_ids={"60000"}
-    )
+    res = ring.recent_group_activity(probe, window_seconds=300, now=now, bot_ids={"60000"})
     assert res["count"] == 3
     assert res["unique_users"] == 2
     assert res["user_ids"] == ["30001", "30002"]
@@ -292,9 +290,7 @@ async def test_roaming_logger_world_event_and_backward_compat_render(settings, s
     await diary.patrol("p-1", "今天看了一个科普视频。", now=now)
     empty_md = await diary.render("2026-11-17")
     assert "## 🌍 今日生活与跨模块轨迹" not in empty_md
-    counts = dict(
-        await store.all("SELECT kind,n FROM roaming_counts WHERE day=?", ("2026-11-17",))
-    )
+    counts = dict(await store.all("SELECT kind,n FROM roaming_counts WHERE day=?", ("2026-11-17",)))
     rows = await store.all(
         "SELECT id,payload,event_kind FROM roaming_events WHERE day=? ORDER BY rowid",
         ("2026-11-17",),

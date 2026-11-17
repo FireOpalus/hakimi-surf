@@ -128,9 +128,7 @@ def test_assemble_chat_input_jit_intent_and_byte_identity(settings, message, mon
     grp = group(message, event_id="101")
 
     for cont in (False, True):
-        out_plain = assemble_chat_input(
-            dict(base_payload), grp, settings, continuation=cont
-        )
+        out_plain = assemble_chat_input(dict(base_payload), grp, settings, continuation=cont)
         out_empty_jit = assemble_chat_input(
             {**base_payload, "jit_proactive_intent": None}, grp, settings, continuation=cont
         )
@@ -167,9 +165,7 @@ def test_assemble_chat_input_jit_intent_and_byte_identity(settings, message, mon
 
     # Last-resort trimming: drop world_state_summary & recent_bili_surfed BEFORE jit_intent,
     # and pop jit_proactive_intent only if still over budget.
-    tight_settings = Settings(
-        _env_file=None, **{**settings.model_dump(), "chat_tail_tokens": 700}
-    )
+    tight_settings = Settings(_env_file=None, **{**settings.model_dump(), "chat_tail_tokens": 700})
     mid_out = assemble_chat_input(
         {
             "current_message": "触发主动消息",
@@ -185,9 +181,7 @@ def test_assemble_chat_input_jit_intent_and_byte_identity(settings, message, mon
     assert "world_state_summary" not in mid_out
     assert "recent_bili_surfed" not in mid_out
 
-    very_tight = Settings(
-        _env_file=None, **{**settings.model_dump(), "chat_tail_tokens": 560}
-    )
+    very_tight = Settings(_env_file=None, **{**settings.model_dump(), "chat_tail_tokens": 560})
     dropped_out = assemble_chat_input(
         {
             "current_message": "触发主动消息",
@@ -325,9 +319,7 @@ async def test_deliver_proactive_jit_semantics_and_ambiguity(settings, store, me
                 "image_digest": None,
             }
         )
-        res_abs = await deliver_proactive_jit(
-            svc, grp_msg, abstain_json, reply_id="jit:abstain-1"
-        )
+        res_abs = await deliver_proactive_jit(svc, grp_msg, abstain_json, reply_id="jit:abstain-1")
         assert res_abs == {"status": "abstained", "bubbles_sent": 0}
         assert len(wire.calls) == 0
 
@@ -371,9 +363,7 @@ async def test_deliver_proactive_jit_semantics_and_ambiguity(settings, store, me
         assert len(pub_rows) == 1
         assert len(diary.replies) == 1
         assert svc.world_state.current.last_proactive_at > 0
-        assert not await svc.world_state.group_cooldown_ok(
-            store.session_scope(grp_msg), 1500.0
-        )
+        assert not await svc.world_state.group_cooldown_ok(store.session_scope(grp_msg), 1500.0)
 
         # 2b. Plain-text fallback (>220 chars truncated cleanly and delivered as 1 bubble)
         wire.calls.clear()
@@ -389,9 +379,7 @@ async def test_deliver_proactive_jit_semantics_and_ambiguity(settings, store, me
                 raise Rejected("onebot_not_dispatched")
 
         svc.sender.onebot = NotDispatchedWire()
-        res_nd = await deliver_proactive_jit(
-            svc, grp_msg, "纯文本降级测试", reply_id="jit:nd-1"
-        )
+        res_nd = await deliver_proactive_jit(svc, grp_msg, "纯文本降级测试", reply_id="jit:nd-1")
         assert res_nd == {"status": "not_dispatched", "bubbles_sent": 0}
 
         # 4. Partial failure after bubble 0 confirmed -> applies bubble 0 and returns uncertain
@@ -481,8 +469,10 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
         assert svc.world_state.current.mood == "sleeping"
         assert svc.world_state.current.energy == 100
         assert svc.world_state.current.boredom == 5
-        assert _stamp("2026-11-17T09:00:00") <= sleep_res["next_plan_at"] <= _stamp(
-            "2026-11-17T09:30:00"
+        assert (
+            _stamp("2026-11-17T09:00:00")
+            <= sleep_res["next_plan_at"]
+            <= _stamp("2026-11-17T09:30:00")
         )
         assert svc.ai.calls == []
 
@@ -613,9 +603,9 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
             now=quiet_now - 5,
         )
         await engine.tick_gatekeeper_once(now=quiet_now)
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (q_id,))
-        )["status"] == "gated_skip"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (q_id,)))[
+            "status"
+        ] == "gated_skip"
 
         # 3. Attention Lock -> defers non-matching module
         await svc.world_state.update_state(current_module="minecraft", focus_level="HIGH")
@@ -644,12 +634,8 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
         aff = svc.store.runtime.affection
         await aff.set_user_score("31001", 10, platform="onebot")
         await aff.set_user_score("32001", 65, platform="onebot")  # Lv.4 familiar
-        svc.hot.observe(
-            group(message, event_id="h1", user_id="31001", created_at=now - 120)
-        )
-        svc.hot.observe(
-            group(message, event_id="h2", user_id="31001", created_at=now - 60)
-        )
+        svc.hot.observe(group(message, event_id="h1", user_id="31001", created_at=now - 120))
+        svc.hot.observe(group(message, event_id="h2", user_id="31001", created_at=now - 60))
         cold_id = await svc.world_state.enqueue_intent(
             {
                 "target_module": "qq_social",
@@ -662,9 +648,9 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
             now=now - 5,
         )
         await engine.tick_gatekeeper_once(now=now)
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (cold_id,))
-        )["status"] == "gated_skip"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (cold_id,)))[
+            "status"
+        ] == "gated_skip"
         assert svc.ai.calls == []
 
         # Now a Lv.4 friend speaks ONCE -> effective_min_msgs=1 -> passes and fires JIT!
@@ -683,9 +669,9 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
             now=now - 5,
         )
         await engine.tick_gatekeeper_once(now=now)
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (warm_grp_id,))
-        )["status"] == "done"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (warm_grp_id,)))[
+            "status"
+        ] == "done"
         gen_call = next(c for c in svc.ai.calls if c[0] == "generate")
         assert gen_call[3]["scenario"] == Scenario.FAST_CHAT
         assert gen_call[3]["budget_lane"] == "proactive"
@@ -707,9 +693,9 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
             now=now - 5,
         )
         await engine.tick_gatekeeper_once(now=now)
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (g_cool_id,))
-        )["status"] == "gated_skip"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (g_cool_id,)))[
+            "status"
+        ] == "gated_skip"
 
         # 6. Owner DM + Desktop Antigravity_Memory Synergy Gate
         mem_file = mem_dir / "short_term_memory.json"
@@ -739,9 +725,9 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
         )
         calls_before = len(svc.ai.calls)
         await engine.tick_gatekeeper_once(now=now)
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (sil_id,))
-        )["status"] == "gated_skip"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (sil_id,)))[
+            "status"
+        ] == "gated_skip"
         assert len(svc.ai.calls) == calls_before
 
         # 6b) owner_desktop_warm_care -> passes and injects desktop_context_hint!
@@ -758,9 +744,9 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
             now=now - 5,
         )
         await engine.tick_gatekeeper_once(now=now)
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (warm_dm_id,))
-        )["status"] == "done"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (warm_dm_id,)))[
+            "status"
+        ] == "done"
         dm_gen = [c for c in svc.ai.calls if c[0] == "generate"][-1]
         assert dm_gen[3]["scenario"] == Scenario.OWNER_PRIVATE
         assert dm_gen[1]["jit_proactive_intent"]["desktop_context_hint"] == DESKTOP_CONTEXT_HINT
@@ -801,9 +787,9 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
         )
         calls_before = len(svc.ai.calls)
         await engine.tick_gatekeeper_once(now=now)
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (cap_id,))
-        )["status"] == "gated_skip"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (cap_id,)))[
+            "status"
+        ] == "gated_skip"
         assert len(svc.ai.calls) == calls_before
 
 
@@ -852,9 +838,9 @@ async def test_jit_executor_bili_dispatch_not_dispatched_and_run_loop(settings, 
         assert dispatched == [bili_id]
         gen_call = next(c for c in svc.ai.calls if c[0] == "generate")
         assert "[untrusted_role=OWNER]" in gen_call[1]["jit_proactive_intent"]["module_material"]
-        assert (
-            await store.one("SELECT status FROM scheduled_intents WHERE id=?", (bili_id,))
-        )["status"] == "done"
+        assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (bili_id,)))[
+            "status"
+        ] == "done"
 
         # Verify onebot_not_dispatched keeps ticket pending and defers execute_after
         class NotDispatchedWire(Wire):

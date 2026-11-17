@@ -29,9 +29,7 @@ async def test_app_lifespan_initializes_world_state_and_modules(settings):
         assert json.loads(row["snapshot_json"]) == {}
 
 
-async def test_service_start_roaming_enabled_gates_tasks_and_healthz(
-    settings, store, tmp_path
-):
+async def test_service_start_roaming_enabled_gates_tasks_and_healthz(settings, store, tmp_path):
     async with httpx.AsyncClient() as http:
         svc_off = Service(
             settings, store, FakeGateway(), FakeBili(), Sender(settings, http, Wire())
@@ -128,9 +126,7 @@ async def test_attention_lock_suppresses_non_urgent_ticks_and_keeps_alerts(
         day = local.date().isoformat()
         slot_name = "13:00"
         due_min = svc.bili_watcher.slot_due_minute(day, slot_name)
-        due_dt = local.replace(
-            hour=due_min // 60, minute=due_min % 60, second=10, microsecond=0
-        )
+        due_dt = local.replace(hour=due_min // 60, minute=due_min % 60, second=10, microsecond=0)
         due_ts = due_dt.timestamp()
         svc.bili_watcher.clock = lambda: due_ts
         svc.bili_watcher.policy = BiliPolicy(enabled=True, times=[slot_name])
@@ -213,9 +209,7 @@ async def test_service_chat_payload_injects_world_state_summary(settings, store,
         await svc.world_state.initialize()
 
         # Baseline idle/LOW: no world_state_summary key injected
-        await process(
-            svc, message.model_copy(update={"event_id": "ws-idle-1", "text": "在干嘛"})
-        )
+        await process(svc, message.model_copy(update={"event_id": "ws-idle-1", "text": "在干嘛"}))
         await svc.deliver_once()
         idle_gen = [c for c in ai.calls if c[0] == "generate"][-1]
         assert "world_state_summary" not in idle_gen[1]
@@ -233,9 +227,7 @@ async def test_service_chat_payload_injects_world_state_summary(settings, store,
             }
         )
         await svc.world_state.update_state(current_module="minecraft", focus_level="HIGH")
-        await process(
-            svc, message.model_copy(update={"event_id": "ws-mc-2", "text": "还在挖矿吗"})
-        )
+        await process(svc, message.model_copy(update={"event_id": "ws-mc-2", "text": "还在挖矿吗"}))
         mc_gen = [c for c in ai.calls if c[0] == "generate"][-1]
         ws_summary = mc_gen[1]["world_state_summary"]
         assert ws_summary["current_module"] == "minecraft"

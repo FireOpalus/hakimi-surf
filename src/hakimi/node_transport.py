@@ -395,9 +395,7 @@ class NodeTransport:
 
             remaining = max(0.05, deadline - asyncio.get_running_loop().time())
             hello_waiter = asyncio.create_task(peer.hello_received.wait())
-            ping_task = asyncio.create_task(
-                self._rpc("node.ping", {}, peer, timeout=remaining)
-            )
+            ping_task = asyncio.create_task(self._rpc("node.ping", {}, peer, timeout=remaining))
             try:
                 done_hs, pending_hs = await asyncio.wait(
                     {hello_waiter, ping_task},
@@ -488,9 +486,7 @@ class NodeTransport:
                                 if inspect.isawaitable(res):
                                     await res
                             except Exception:
-                                logging.getLogger("hakimi").info(
-                                    "event=node_state_callback_error"
-                                )
+                                logging.getLogger("hakimi").info("event=node_state_callback_error")
                 await asyncio.gather(handshake_task, *tasks, return_exceptions=True)
                 if not peer.closed:
                     peer.closed = True

@@ -545,7 +545,9 @@ async def test_close_fails_pending_rpcs_and_is_idempotent(settings: Settings) ->
     wire = NodeTransport(node_settings(settings))
     peer = FakeNodePeer()
     await peer.connect(wire)
-    pending = asyncio.create_task(wire.call("bili.cover_thumb", {"url": "https://i0.hdslb.com/bfs/a.jpg"}))
+    pending = asyncio.create_task(
+        wire.call("bili.cover_thumb", {"url": "https://i0.hdslb.com/bfs/a.jpg"})
+    )
     await asyncio.wait_for(peer.outgoing.get(), 1)
     await wire.close()
     await wire.close()

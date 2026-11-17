@@ -194,9 +194,7 @@ class Settings(BaseSettings):
         default=1_048_576,
         ge=65536,
         le=2_097_152,
-        validation_alias=AliasChoices(
-            "NODE_WS_MAX_FRAME_BYTES", "HAKIMI_NODE_WS_MAX_FRAME_BYTES"
-        ),
+        validation_alias=AliasChoices("NODE_WS_MAX_FRAME_BYTES", "HAKIMI_NODE_WS_MAX_FRAME_BYTES"),
     )
     node_ws_rpc_timeout: float = Field(
         default=15.0,

@@ -737,8 +737,7 @@ async def test_daemon_live_bridge_forwarding_multiplex_and_reconnect(tmp_path: P
 
         for _ in range(60):
             if any(
-                ev["event"] == "mc.snapshot"
-                and ev["payload"].get("activity") == "MC容器重连中"
+                ev["event"] == "mc.snapshot" and ev["payload"].get("activity") == "MC容器重连中"
                 for ev in upstream_events
             ):
                 break

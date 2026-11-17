@@ -97,12 +97,15 @@ class BilibiliSurfModule(BaseModule):
                 watched_count = max(watched_count, recent_count)
 
         state = "待机"
+        watcher_enabled = bool(getattr(getattr(self.watcher, "policy", None), "enabled", False))
         if self.bili is not None and getattr(self.bili, "blocked_until", 0.0) > time.monotonic():
             state = "冷却中"
+        elif watcher_enabled or (
+            self.settings is not None and getattr(self.settings, "bili_autonomous_enabled", False)
+        ):
+            state = "巡逻开启"
         elif self.settings is not None:
-            if getattr(self.settings, "bili_autonomous_enabled", False):
-                state = "巡逻开启"
-            elif getattr(self.settings, "bilibili_enabled", False):
+            if getattr(self.settings, "bilibili_enabled", False):
                 state = "手动可看"
             else:
                 state = "未启用"
