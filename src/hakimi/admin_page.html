@@ -914,6 +914,7 @@ body.authenticated footer { margin-left: 238px; }
         <button id="nav-bili-account" type="button" role="tab" data-tab="bili-account" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>B 站小号</span></button>
         <button id="nav-patrol" type="button" role="tab" data-tab="patrol" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻与日记</span></button>
         <button id="nav-proactive" type="button" role="tab" data-tab="proactive" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
+        <button id="nav-life" type="button" role="tab" data-tab="life" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
       </div>
     </nav>
     <div class="sidebar-foot"><strong>状态可见，记忆有界。</strong><br>仅通过受保护的管理入口访问<br>Asia/Shanghai · UTC+8</div>
@@ -1534,6 +1535,78 @@ body.authenticated footer { margin-left: 238px; }
   <div class="card"><h2>最近运维告警</h2><div id="proactive-alerts" class="table"></div></div>
 </section>
 
+<section id="life" class="tab" role="tabpanel" aria-labelledby="nav-life" hidden>
+  <div class="card"><div class="row between"><h2>世界状态看板与跨节点通道</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
+    <p class="muted">实时查看世界状态、Attention Lock 注意力锁、CN 躯干通道与桌面端 Antigravity_Memory 协同状态。</p>
+    <div id="life-stats" class="stats"></div>
+    <div id="life-node-pills" class="pill-row"></div>
+    <p id="life-world-status" class="muted"></p>
+    <p id="life-desktop-status" class="muted"></p>
+    <form id="life-world-form" class="quick-bar">
+      <label for="life-world-module">当前模块（current_module）
+        <input id="life-world-module" list="life-module-options" type="text" maxlength="64" required placeholder="idle / minecraft / bilibili_surf">
+      </label>
+      <datalist id="life-module-options">
+        <option value="idle"></option>
+        <option value="minecraft"></option>
+        <option value="bilibili_surf"></option>
+        <option value="qq_social"></option>
+      </datalist>
+      <label for="life-world-focus">专注等级（focus_level）
+        <select id="life-world-focus">
+          <option value="LOW">LOW · 低专注（开放主动）</option>
+          <option value="MEDIUM">MEDIUM · 中等专注</option>
+          <option value="HIGH">HIGH · 高专注（触发 Attention Lock）</option>
+        </select>
+      </label>
+      <label for="life-world-mood">心情（mood）<input id="life-world-mood" type="text" maxlength="64" required placeholder="calm / focused / sleeping"></label>
+      <label for="life-world-energy">精力（0–100）<input id="life-world-energy" type="number" min="0" max="100" step="1" required></label>
+      <label for="life-world-boredom">无聊度（0–100）<input id="life-world-boredom" type="number" min="0" max="100" step="1" required></label>
+      <button id="life-world-save" type="submit" disabled>更新世界状态</button>
+    </form>
+    <h3>能力模块传感器摘要</h3>
+    <div id="life-modules-table" class="table"></div>
+  </div>
+  <div class="card"><h2>双层主动引擎（LifeBlockPlanner + Zero-Token Gatekeeper）</h2>
+    <p class="muted">规划层仅在唤醒周期或高重要度脉冲时写入模糊意图与门控条件；门控层每分钟零 Token 扫描，命中窗口后再由 JIT 临场生成回复。</p>
+    <p id="life-source" class="muted"></p>
+    <form id="life-config-form">
+      <div class="row"><label><input id="life-enabled" type="checkbox"> 启用双层生命与主动引擎</label></div>
+      <div class="grid">
+        <label for="life-active-hours">活跃时段（HH:MM-HH:MM）<input id="life-active-hours" type="text" maxlength="11" placeholder="09:00-01:00" required></label>
+        <label for="life-group-cooldown">群聊统一主动冷却（秒，300–86400）<input id="life-group-cooldown" type="number" min="300" max="86400" step="1" required></label>
+        <label for="life-max-daily">每日主动触发上限（次，0–30）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label>
+      </div>
+      <details>
+        <summary>高级节律与门控参数</summary>
+        <div class="grid">
+          <label for="life-planner-min">活跃规划最小间隔（分钟，30–720）<input id="life-planner-min" type="number" min="30" max="720" step="1" required></label>
+          <label for="life-planner-max">活跃规划最大间隔（分钟，60–720）<input id="life-planner-max" type="number" min="60" max="720" step="1" required></label>
+          <label for="life-sleep-min">夜间休眠最小间隔（分钟，120–960）<input id="life-sleep-min" type="number" min="120" max="960" step="1" required></label>
+          <label for="life-sleep-max">夜间休眠最大间隔（分钟，180–960）<input id="life-sleep-max" type="number" min="180" max="960" step="1" required></label>
+          <label for="life-group-window">群聊活跃观察窗口（秒，60–7200）<input id="life-group-window" type="number" min="60" max="7200" step="1" required></label>
+          <label for="life-group-min-msgs">群聊门控最少有效消息数（1–50）<input id="life-group-min-msgs" type="number" min="1" max="50" step="1" required></label>
+          <label for="life-desktop-suppress">桌面协同抑制窗口（秒，300–86400）<input id="life-desktop-suppress" type="number" min="300" max="86400" step="1" required></label>
+        </div>
+      </details>
+      <div class="row">
+        <button id="life-save-config" type="submit" disabled>保存引擎配置</button>
+        <button id="life-reset-config" type="button" class="secondary" disabled>恢复 .env 默认配置</button>
+        <button id="life-plan-now" type="button" class="secondary" disabled>立即规划生活切片</button>
+        <button id="life-gatekeeper-now" type="button" class="secondary" disabled>执行零Token门控扫描</button>
+      </div>
+    </form>
+  </div>
+  <div class="card"><h2>模糊意图队列（scheduled_intents · 近 40 条）</h2>
+    <p class="muted">只记录触发时间窗、门控条件与模糊动机，绝不预写台词；状态为 pending 时可手动取消。</p>
+    <div id="life-intents-table" class="table"></div>
+  </div>
+  <div class="card"><h2>跨模块里程碑事件（global_events · 近 30 条）</h2>
+    <p class="muted">能力模块发布的脱敏里程碑事件（明文 JSON 存储，供规划器与镜像消费）。</p>
+    <div id="life-events-table" class="table"></div>
+  </div>
+</section>
+
 <section id="memes" class="tab" role="tabpanel" aria-labelledby="nav-memes" hidden>
   <div class="card"><div class="row between"><h2>本地白名单表情包</h2><button id="meme-refresh" class="secondary">刷新列表</button></div>
     <p class="muted">只有本页或 Owner 用 /存表情 收录的图片可用于公开聊天；模型只能选标签。标签支持 1～24 个汉字、英文字母、数字、下划线或短横线；同名标签可上传多张并在发送时轮换；相同图片不会重复入库。</p>
@@ -1674,6 +1747,7 @@ function logout(){
   gcpBillingState=null;
   accountBalanceState=null;
   affectionState=null;
+  lifeState=null;
   text('rest-overview-badge','作息读取中');
   $('toggle-rest-quick').hidden=true;
   $('toggle-rest-quick').disabled=true;
@@ -1682,9 +1756,9 @@ function logout(){
   $('overview-gcp-strip').replaceChildren();
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
-  for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit'])$(id).disabled=true;
-  ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-grants-list','gcp-mon-pills','aff-tiers-table','aff-users-table'].forEach(id=>$(id).replaceChildren());
-  ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count'].forEach(id=>text(id,''));
+  for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
+  ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-grants-list','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-modules-table','life-intents-table','life-events-table'].forEach(id=>$(id).replaceChildren());
+  ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
   thinkingReady=false;thinkingDirty=false;
   $('thinking-fields').replaceChildren();$('thinking-environment').replaceChildren();
@@ -2337,6 +2411,158 @@ $('proactive-form').addEventListener('submit',e=>{e.preventDefault();busy(e.subm
 $('reset-proactive').addEventListener('click',e=>busy(e.target,async()=>{await api('proactive','DELETE');await proactive();notice('已恢复启动时的 .env 配置');}));
 for(const [id,action] of [['dm-test','test'],['dm-now','digest']])$(id).addEventListener('click',e=>busy(e.target,async()=>{notice(action==='test'?'正在验证私信通路…':'正在准备今日汇报…');const r=await api('proactive/'+action,'POST');const state=r.delivery&&r.delivery!=='not_queued'?r.delivery:r.status;notice((dmStatus[state]||state)+(r.reason?' · '+r.reason:''));await proactive();}));
 
+let lifeState=null;
+const lifeIntentStatus={pending:'待触发',executing:'执行中',done:'已完成',gated_skip:'门控跳过',expired:'已过期',uncertain:'结果不确定'};
+const lifeIntentVariant={pending:'warn',executing:'paid',done:'ok',gated_skip:'muted',expired:'muted',uncertain:'err'};
+function lifeFmt(t,tz){
+  if(!t)return '—';
+  try{return new Intl.DateTimeFormat('zh-CN',{timeZone:tz||'Asia/Shanghai',dateStyle:'short',timeStyle:'short'}).format(new Date(t*1000));}
+  catch{return dateTime(t);}
+}
+function lifeSummaryJson(obj){
+  if(obj===null||obj===undefined)return '—';
+  if(typeof obj==='string')return obj.length>72?obj.slice(0,72)+'…':(obj||'—');
+  if(typeof obj==='object'){
+    if(typeof obj.note==='string'&&Object.keys(obj).length===1)return obj.note.length>72?obj.note.slice(0,72)+'…':(obj.note||'—');
+    const raw=JSON.stringify(obj);
+    return raw==='{}'?'—':(raw.length>88?raw.slice(0,88)+'…':raw);
+  }
+  return String(obj);
+}
+function renderLife(d){
+  lifeState=d;
+  const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
+  const stats=[
+    ['当前活动 / 专注',(ws.current_module||'idle')+' · '+(ws.focus_level||'LOW')],
+    ['心情 / 精力 / 无聊',(ws.mood||'calm')+' · '+(ws.energy??80)+' / '+(ws.boredom??20)],
+    ['Attention Lock',ws.proactive_suspended?'HIGH 锁定中':'正常开放'],
+    ['今日主动触发',(eng.proactive_sent_today??0)+' / '+(c.max_proactive_per_day??6)]
+  ];
+  $('life-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
+  const nap=nodes.onebot_cn_napcat||{},sh=nodes.shanghai_node_agent||{};
+  $('life-node-pills').replaceChildren(
+    nap.connected?pill('NapCat CN 在线 ('+(nap.mode||'http')+')','ok'):pill('NapCat CN 未连接 ('+(nap.mode||'http')+')','warn'),
+    sh.connected?pill('上海躯干节点在线 (CN)','ok'):sh.configured?pill('上海躯干节点等待接入 (CN)','warn'):pill('上海躯干节点预留 (Phase 3)','muted'),
+    dm.enabled?(dm.latest_timestamp?pill('桌面记忆活跃 '+lifeFmt(dm.latest_timestamp,tz),'ok'):pill('桌面记忆已启用（暂无活跃时间）','muted')):pill('桌面记忆未启用','muted'),
+    ws.proactive_suspended?pill('Attention Lock 已触发：非核心主动已暂停','warn'):pill('Attention Lock 未锁定','ok')
+  );
+  text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 上海节点说明：'+(sh.phase_note||'Phase 3 /ws/node 躯干通道预留'));
+  text('life-desktop-status',dm.enabled?('桌面端 Antigravity_Memory 最近活跃：'+(dm.latest_iso||lifeFmt(dm.latest_timestamp,tz))+(dm.latest_tag?' · 标签 '+dm.latest_tag:'')):'桌面端 Antigravity_Memory 协同当前未启用。');
+  $('life-world-module').value=ws.current_module||'idle';
+  $('life-world-focus').value=ws.focus_level||'LOW';
+  $('life-world-mood').value=ws.mood||'calm';
+  $('life-world-energy').value=ws.energy??80;
+  $('life-world-boredom').value=ws.boredom??20;
+  table('life-modules-table',['模块 ID','节点区域','注意力等级','主动暂停','传感器摘要'],(ws.modules||[]).map(m=>[
+    m.module_id,
+    pill(m.node_region||'KR',m.node_region==='CN'?'vertex':'muted'),
+    pill(m.attention_level||'LOW',m.attention_level==='HIGH'?'warn':m.attention_level==='MEDIUM'?'paid':'muted'),
+    m.proactive_paused?pill('已暂停','warn'):pill('开放','ok'),
+    m.sensor_summary||'—'
+  ]));
+  $('life-enabled').checked=Boolean(c.enabled);
+  $('life-active-hours').value=c.active_hours||'09:00-01:00';
+  $('life-group-cooldown').value=c.group_cooldown_seconds??1500;
+  $('life-max-daily').value=c.max_proactive_per_day??6;
+  $('life-planner-min').value=c.planner_min_minutes??120;
+  $('life-planner-max').value=c.planner_max_minutes??240;
+  $('life-sleep-min').value=c.sleep_min_minutes??360;
+  $('life-sleep-max').value=c.sleep_max_minutes??480;
+  $('life-group-window').value=c.group_active_window_seconds??1800;
+  $('life-group-min-msgs').value=c.group_min_recent_messages??2;
+  $('life-desktop-suppress').value=c.desktop_active_suppress_seconds??7200;
+  const srcLabel=(d.source==='admin'||d.source==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
+  text('life-source','配置来源：'+srcLabel+' · 时区 '+tz+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz):'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
+  for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
+  table('life-intents-table',['ID','模块 / 目标','动作 / 情绪','执行窗口','门控与模糊动机','状态','操作'],(d.intents||[]).map(it=>[
+    el('span',String(it.id||'').slice(0,10),'code-mono'),
+    (it.target_module||'—')+(it.target_scope?' · '+it.target_scope:''),
+    (it.action_type||'—')+(it.mood?' · '+it.mood:''),
+    lifeFmt(it.execute_after,tz)+' ~ '+lifeFmt(it.expire_at,tz),
+    '门控 '+lifeSummaryJson(it.gate_condition)+' | 动机 '+lifeSummaryJson(it.intent_note),
+    pill(lifeIntentStatus[it.status]||it.status,lifeIntentVariant[it.status]||'muted'),
+    it.status==='pending'?button('取消',async()=>{const next=await api('life/intents/'+encodeURIComponent(it.id),'DELETE');renderLife(next);notice('已取消待执行意图 '+String(it.id).slice(0,8));},'danger'):el('span','—','muted')
+  ]));
+  table('life-events-table',['时间','来源模块','事件类型','重要度','消费状态','脱敏载荷'],(d.events||[]).map(ev=>[
+    lifeFmt(ev.created_at,tz),
+    ev.source_module||'—',
+    ev.event_type||'—',
+    pill(ev.importance||'normal',ev.importance==='high'?'warn':'muted'),
+    ev.consumed?pill('已消费','muted'):pill('未消费','ok'),
+    lifeSummaryJson(ev.payload)
+  ]));
+}
+async function life(){
+  const d=await api('life');
+  if(!token)return;
+  renderLife(d);
+}
+$('refresh-life').addEventListener('click',e=>busy(e.target,life));
+$('life-world-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('life-world-save'),async()=>{
+    const mod=$('life-world-module').value.trim();
+    const mood=$('life-world-mood').value.trim();
+    const energy=Number($('life-world-energy').value);
+    const boredom=Number($('life-world-boredom').value);
+    if(!mod)throw Error('current_module 不能为空');
+    if(!mood)throw Error('mood 不能为空');
+    if(!Number.isInteger(energy)||energy<0||energy>100)throw Error('精力须为 0～100 的整数');
+    if(!Number.isInteger(boredom)||boredom<0||boredom>100)throw Error('无聊度须为 0～100 的整数');
+    const next=await api('life/world','PUT',{current_module:mod,focus_level:$('life-world-focus').value,mood,energy,boredom});
+    renderLife(next);
+    notice('世界状态已更新（Attention Lock：'+((next.world_state&&next.world_state.proactive_suspended)?'已锁定':'已释放')+'）');
+  });
+});
+$('life-config-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('life-save-config'),async()=>{
+    const activeHours=$('life-active-hours').value.trim();
+    if(!/^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$/.test(activeHours))throw Error('活跃时段格式须为 HH:MM-HH:MM');
+    const intVal=(id,min,max,label)=>{const v=Number($(id).value);if(!Number.isInteger(v)||v<min||v>max)throw Error(label+'须为 '+min+'～'+max+' 的整数');return v;};
+    const pMin=intVal('life-planner-min',30,720,'活跃规划最小间隔');
+    const pMax=intVal('life-planner-max',60,720,'活跃规划最大间隔');
+    if(pMin>pMax)throw Error('活跃规划最小间隔不能大于最大间隔');
+    const sMin=intVal('life-sleep-min',120,960,'夜间休眠最小间隔');
+    const sMax=intVal('life-sleep-max',180,960,'夜间休眠最大间隔');
+    if(sMin>sMax)throw Error('夜间休眠最小间隔不能大于最大间隔');
+    const payload={
+      enabled:$('life-enabled').checked,
+      active_hours:activeHours,
+      planner_min_minutes:pMin,
+      planner_max_minutes:pMax,
+      sleep_min_minutes:sMin,
+      sleep_max_minutes:sMax,
+      group_cooldown_seconds:intVal('life-group-cooldown',300,86400,'群聊统一主动冷却'),
+      group_active_window_seconds:intVal('life-group-window',60,7200,'群聊活跃观察窗口'),
+      group_min_recent_messages:intVal('life-group-min-msgs',1,50,'群聊门控最少消息数'),
+      desktop_active_suppress_seconds:intVal('life-desktop-suppress',300,86400,'桌面协同抑制窗口'),
+      max_proactive_per_day:intVal('life-max-daily',0,30,'每日主动触发上限')
+    };
+    const next=await api('life','PUT',payload);
+    renderLife(next);
+    notice('双层主动引擎配置已保存并立即生效');
+  });
+});
+$('life-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!confirm('移除后台覆盖值，恢复默认双层主动引擎配置？'))return;
+  const next=await api('life','DELETE');
+  renderLife(next);
+  notice('已恢复默认双层主动引擎配置');
+}));
+$('life-plan-now').addEventListener('click',e=>busy(e.target,async()=>{
+  notice('正在规划生活切片，请稍候…');
+  const r=await api('life/plan','POST');
+  await life();
+  notice('生活切片规划完成：'+(r.status||'ok'));
+}));
+$('life-gatekeeper-now').addEventListener('click',e=>busy(e.target,async()=>{
+  notice('正在执行零 Token 门控扫描…');
+  const r=await api('life/gatekeeper','POST');
+  await life();
+  notice('门控扫描完成：'+(r.status||'ok'));
+}));
+
 let admissionState=null;
 const admissionLists=[['allowed_groups','admission-groups','QQ群号'],['allowed_users','admission-users','好友 QQ']];
 async function admission(){const d=await api('admission');admissionState=d;const c=d.config;$('admission-private-mode').value=c.private_mode;$('admission-bot-threshold').value=c.bot_reply_threshold??0.85;text('admission-source',d.source==='admin'?'当前名单来自 SQLite 后台配置':'当前名单来自本次启动时的 .env');text('admission-owner','Owner（固定保留）：'+(d.owner_qq_id||'尚未配置')+' · 机器人自身：'+d.onebot_self_id);text('admission-group-scope','群白名单仅决定群准入：该群所有非黑名单成员均可按群互动策略交流，不受私聊用户白名单限制。私聊仍单独按右侧模式与好友名单判断。');text('admission-environment',JSON.stringify(d.environment,null,2));for(const [key,id,label] of admissionLists)table(id,[label,'操作'],c[key].map(value=>[value,button('移除',async()=>{await api('admission/change','POST',{list:key,action:'remove',id:value});await admission();await groups();await bots();notice('名单已更新，立即生效');},'danger')]));table('admission-bots',['外部 Bot QQ','当前生效阈值','专属阈值调整','操作'],c.ignored_bot_ids.map(uid=>{const custom=c.bot_reply_thresholds?.[uid],effective=custom??c.bot_reply_threshold??0.85;return[uid,botThresholdLabel(custom,effective),botThresholdControl(uid,custom,effective,syncBotViews),button('移除',async()=>{await api('admission/change','POST',{list:'ignored_bot_ids',action:'remove',id:uid});await syncBotViews();notice('已移除外部 Bot '+uid);},'danger')];}));}
@@ -2598,6 +2824,7 @@ async function refreshTab(){
   if(tab==='community'){const [cRes,aRes]=await Promise.allSettled([community(),affection()]);if(cRes.status!=='fulfilled')throw cRes.reason;if(aRes.status!=='fulfilled')notice('好感度接口暂不可用：'+aRes.reason.message,true);}
   if(tab==='memes')await memes();
   if(tab==='proactive')await proactive();
+  if(tab==='life')return life();
   if(tab==='patrol')await Promise.all([patrolLimits(),subscriptions(),diaries()]);
   if(tab==='notebook')await notebook();
   if(tab==='logs')await logs();
@@ -2622,7 +2849,8 @@ const tabInfo={
   notebook:['只读小本本','只留给 Owner 私聊的那一点背景。','记忆与表达'],
   'bili-account':['B 站小号','管理账号凭证、低频巡逻与看片额度。','巡逻与陪伴'],
   patrol:['巡逻与日记','关注喜欢的创作者，收好今天的见闻。','巡逻与陪伴'],
-  proactive:['主动私信','安排日报与问候，也留出安静的时间。','巡逻与陪伴']
+  proactive:['主动私信','安排日报与问候，也留出安静的时间。','巡逻与陪伴'],
+  life:['世界与主动引擎','管理世界状态看板、模糊意图队列、上海节点与双层主动引擎。','巡逻与陪伴']
 };
 function selectTab(key){
   if(!tabInfo[key])return;
