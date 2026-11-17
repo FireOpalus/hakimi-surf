@@ -6,6 +6,7 @@ WBI references: docs/BILI_ACCOUNT.md. Source content never selects a URL or tool
 """
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -23,7 +24,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-from .bilibili import BVID, bounded_json
+from .bilibili import BVID, NODE_TRANSPORT_ERRORS, bounded_json
 from .bot_server import is_persona_owner, untrusted_input
 from .generation_policy import Scenario
 from .models import Video
@@ -147,6 +148,10 @@ COOKIE_NAMES = {
 }
 USER_AGENT = "HakimiSurf/0.4 text patrol"
 SPI_PATH = "/x/frontend/finger/spi"
+COVER_URL_RE = re.compile(
+    r"^https://(?:i[0-2]\.hdslb\.com|archive\.biliimg\.com)/bfs/[A-Za-z0-9_./-]+$"
+)
+MAX_COVER_THUMB_BYTES = 98_304
 
 
 def secret_value(value):
@@ -458,6 +463,60 @@ class BiliWatcher:
             self._protect_secrets()
         return await self.status()
 
+    def _node_transport(self):
+        return getattr(self.svc, "node_transport", None)
+
+    def _can_delegate(self) -> bool:
+        nt = self._node_transport()
+        return bool(
+            nt is not None
+            and nt.connected()
+            and getattr(self.s, "node_bili_delegate_enabled", True)
+        )
+
+    async def _delegated_bili_request(
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        post: dict | None = None,
+        subtitle: bool = False,
+        cookies: dict[str, str],
+    ) -> dict | None:
+        """Run one bili.request RPC via CN node; return None when local fallback applies."""
+        nt = self._node_transport()
+        try:
+            res = await nt.call(
+                "bili.request",
+                {
+                    "method": "POST" if post is not None else "GET",
+                    "path": path,
+                    "params": params or {},
+                    "post": post,
+                    "subtitle": bool(subtitle),
+                    "cookies": cookies,
+                },
+            )
+        except Rejected as exc:
+            code = str(exc)
+            if code in NODE_TRANSPORT_ERRORS:
+                if (
+                    post is None or code in {"node_disconnected", "node_not_dispatched"}
+                ) and getattr(self.s, "node_bili_fallback_local", True):
+                    return None
+                raise Rejected("bili_account_unavailable") from None
+            if code == "bili_http_status":
+                if getattr(exc, "detail", "") in {"401", "403", "412", "429"}:
+                    await self._risk("bili_account_risk")
+                raise Rejected("bili_account_unavailable") from None
+            raise Rejected("bili_account_unavailable") from None
+        except (httpx.HTTPError, ValueError):
+            raise Rejected("bili_account_unavailable") from None
+        envelope = res.get("envelope") if isinstance(res, dict) else None
+        if not isinstance(envelope, dict):
+            raise Rejected("bili_account_unavailable")
+        return envelope
+
     def _headers(self, *, subtitle=False):
         return {
             "Referer": "https://www.bilibili.com/",
@@ -500,20 +559,32 @@ class BiliWatcher:
         await self._pace_request()
         status, value = "unavailable", ""
         try:
-            obj = await bounded_json(
-                self.http,
-                "GET",
-                "https://api.bilibili.com" + SPI_PATH,
-                headers=self._headers(),
-                max_bytes=16384,
-                timeout=5,
-                follow_redirects=False,
-            )
+            obj = None
+            if self._can_delegate():
+                obj = await self._delegated_bili_request(
+                    SPI_PATH,
+                    cookies={k: v for k, v in self.creds.items() if v},
+                )
+            if obj is None:
+                obj = await bounded_json(
+                    self.http,
+                    "GET",
+                    "https://api.bilibili.com" + SPI_PATH,
+                    headers=self._headers(),
+                    max_bytes=16384,
+                    timeout=5,
+                    follow_redirects=False,
+                )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in {401, 403, 412, 429}:
                 await self._risk("bili_account_risk")
             obj = None
-        except (httpx.HTTPError, ValueError, RecursionError, Rejected):
+        except Rejected as exc:
+            if str(exc) in {"bili_account_risk", "bili_cookie_expired"}:
+                raise
+            # Bad availability or payloads must not make a missing optional cookie mandatory.
+            obj = None
+        except (httpx.HTTPError, ValueError, RecursionError):
             # Bad availability or payloads must not make a missing optional cookie mandatory.
             obj = None
         finally:
@@ -620,16 +691,31 @@ class BiliWatcher:
             headers = self._headers(subtitle=subtitle)
             url = path if subtitle else "https://api.bilibili.com" + path
             try:
-                obj = await bounded_json(
-                    self.http,
-                    "POST" if post is not None else "GET",
-                    url,
-                    params=params,
-                    headers=headers,
-                    data=post,
-                    max_bytes=524288,
-                    follow_redirects=False,
-                )
+                obj = None
+                if self._can_delegate():
+                    req_cookies = (
+                        {}
+                        if (subtitle or (public and not self.creds["sessdata"]))
+                        else {k: v for k, v in self.creds.items() if v}
+                    )
+                    obj = await self._delegated_bili_request(
+                        path,
+                        params,
+                        post=post,
+                        subtitle=subtitle,
+                        cookies=req_cookies,
+                    )
+                if obj is None:
+                    obj = await bounded_json(
+                        self.http,
+                        "POST" if post is not None else "GET",
+                        url,
+                        params=params,
+                        headers=headers,
+                        data=post,
+                        max_bytes=524288,
+                        follow_redirects=False,
+                    )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code in {401, 403, 412, 429}:
                     await self._risk("bili_account_risk")
@@ -668,6 +754,40 @@ class BiliWatcher:
             if obj.get("code") != 0 and not anonymous_nav:
                 raise Rejected("bili_account_upstream_error")
             return obj.get("data") or {}
+
+    async def fetch_cover_thumbnail(self, cover_url: str) -> dict | None:
+        """Fetch a bounded JPEG cover thumbnail via CN node when online."""
+        if (
+            not isinstance(cover_url, str)
+            or ".." in cover_url
+            or not COVER_URL_RE.fullmatch(cover_url)
+            or not self._can_delegate()
+        ):
+            return None
+        nt = self._node_transport()
+        try:
+            res = await nt.call("bili.cover_thumb", {"url": cover_url})
+        except (Rejected, TimeoutError, ValueError):
+            return None
+        if not isinstance(res, dict) or res.get("mime_type") != "image/jpeg":
+            return None
+        n_bytes = res.get("bytes")
+        data_b64 = res.get("data_b64")
+        if (
+            isinstance(n_bytes, bool)
+            or not isinstance(n_bytes, int)
+            or not (1 <= n_bytes <= MAX_COVER_THUMB_BYTES)
+            or not isinstance(data_b64, str)
+            or not data_b64
+        ):
+            return None
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except ValueError:
+            return None
+        if not (1 <= len(raw) <= MAX_COVER_THUMB_BYTES):
+            return None
+        return dict(res)
 
     async def nav(self):
         epoch = self.credentials_epoch
