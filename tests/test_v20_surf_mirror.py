@@ -702,3 +702,94 @@ def test_extract_safe_tar_stream_and_sync_owner_memory_sh(tmp_path: Path):
         capture_output=True,
     )
     assert bad_cli.returncode == 2
+
+
+
+async def test_owner_memory_bridge_self_heals_overwritten_files_and_force(tmp_path: Path):
+    repo, mem_dir, creds, env_file = await asyncio.to_thread(_seed_bridge_repo, tmp_path)
+
+    real_short = json.dumps(
+        [{"id": "real_1", "timestamp": "2026-11-17 20:53:43", "tag": "life"}],
+        ensure_ascii=False,
+    )
+    payload = json.dumps(
+        {
+            "version": 1,
+            "updated_at": "2026-11-17T20:55:00Z",
+            "notebook_md": "# 真实小本本\n",
+            "short_term_json": real_short,
+            "long_term_md": {},
+            "notes_md": {},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    remote_md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()
+    state = {
+        "downloads": 0,
+        "file": {
+            "id": "bridge-heal-1",
+            "name": BRIDGE_FILENAME,
+            "parents": [FOLDER],
+            "mimeType": "application/json",
+            "trashed": False,
+            "appProperties": {BRIDGE_APP_KEY: BRIDGE_APP_VALUE},
+            "md5Checksum": remote_md5,
+            "modifiedTime": "2026-11-17T20:55:00Z",
+            "size": str(len(payload)),
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URI:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "tok-heal",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                    "scope": "https://www.googleapis.com/auth/drive.file",
+                },
+            )
+        if request.url.path == f"/drive/v3/files/{FOLDER}":
+            return httpx.Response(200, json=_folder_meta())
+        if request.url.path == "/drive/v3/files" and request.method == "GET":
+            return httpx.Response(200, json={"files": [state["file"]]})
+        if request.method == "GET" and request.url.path == "/drive/v3/files/bridge-heal-1":
+            state["downloads"] += 1
+            return httpx.Response(200, content=payload)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    cfg = await asyncio.to_thread(
+        resolve_config, repo_root=repo, credentials=creds, env_file=env_file
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        res1 = await run_pull(cfg, client=http)
+        assert res1["status"] == "pulled"
+        assert state["downloads"] == 1
+        saved_raw = await asyncio.to_thread(cfg["state_file"].read_text, encoding="utf-8")
+        saved_state = json.loads(saved_raw)
+        assert saved_state["notebook_sha256"]
+        assert saved_state["short_term_sha256"]
+
+        # Unchanged remote & local -> unchanged
+        res2 = await run_pull(cfg, client=http)
+        assert res2["status"] == "unchanged"
+        assert state["downloads"] == 1
+
+        # Overwritten short_term_memory.json self-heals on pull despite matching remote md5
+        stale = json.dumps([{"id": "stale_fixture", "timestamp": "2026-11-12 00:05:00"}])
+        await asyncio.to_thread(
+            (mem_dir / "short_term_memory.json").write_text, stale, encoding="utf-8"
+        )
+        res3 = await run_pull(cfg, client=http)
+        assert res3["status"] == "pulled"
+        assert state["downloads"] == 2
+        repaired = await asyncio.to_thread(
+            (mem_dir / "short_term_memory.json").read_text, encoding="utf-8"
+        )
+        assert "real_1" in repaired
+
+        # force=True re-pulls even when both remote and local hashes match
+        res4 = await run_pull(cfg, client=http, force=True)
+        assert res4["status"] == "pulled"
+        assert state["downloads"] == 3

@@ -86,8 +86,15 @@ case "${ACTION}" in
     exec "${PY}" "${SCRIPT_DIR}/owner_memory_bridge.py" --init --repo-root "${REPO_ROOT}" --memory-dir "${DEST_DIR}"
     ;;
   --pull|--pull-drive)
+    FORCE_ARG=()
+    if [[ "${2:-}" == "--force" ]]; then
+      FORCE_ARG=("--force")
+    elif [[ -n "${2:-}" ]]; then
+      echo "usage: $0 [--pull|--pull-drive [--force]|--init-bridge|--stdin-tar]" >&2
+      exit 2
+    fi
     PY="$(resolve_python)"
-    exec "${PY}" "${SCRIPT_DIR}/owner_memory_bridge.py" --pull --repo-root "${REPO_ROOT}" --memory-dir "${DEST_DIR}"
+    exec "${PY}" "${SCRIPT_DIR}/owner_memory_bridge.py" --pull --repo-root "${REPO_ROOT}" --memory-dir "${DEST_DIR}" "${FORCE_ARG[@]}"
     ;;
   --stdin-tar)
     PY="$(resolve_python)"

@@ -348,6 +348,25 @@ def extract_safe_tar_stream(raw_bytes: bytes, staging_dir: Path) -> int:
     return count
 
 
+def _file_sha256_sync(path: Path) -> str:
+    if not path.is_file() or path.is_symlink():
+        return ""
+    try:
+        st = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            return ""
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _core_hashes_sync(mem_dir: Path) -> dict[str, str]:
+    return {
+        "notebook_sha256": _file_sha256_sync(mem_dir / "notebook.md"),
+        "short_term_sha256": _file_sha256_sync(mem_dir / "short_term_memory.json"),
+    }
+
+
 def _read_state_sync(state_file: Path) -> dict[str, Any]:
     if not state_file.is_file() or state_file.is_symlink():
         return {}
@@ -518,7 +537,7 @@ async def run_init(
 
 
 async def run_pull(
-    cfg: dict[str, Any], *, client: httpx.AsyncClient | None = None
+    cfg: dict[str, Any], *, client: httpx.AsyncClient | None = None, force: bool = False
 ) -> dict[str, Any]:
     async def _execute(http: httpx.AsyncClient) -> dict[str, Any]:
         auth = OAuthDriveAuth(cfg["credentials_path"], cfg["folder_id"], http)
@@ -538,12 +557,16 @@ async def run_pull(
 
         prev_state = await asyncio.to_thread(_read_state_sync, cfg["state_file"])
         mem_dir: Path = cfg["memory_dir"]
-        has_core = await asyncio.to_thread(
-            lambda: (mem_dir / "notebook.md").is_file()
-            and (mem_dir / "short_term_memory.json").is_file()
+        local_hashes = await asyncio.to_thread(_core_hashes_sync, mem_dir)
+        has_core = bool(local_hashes["notebook_sha256"]) and bool(local_hashes["short_term_sha256"])
+        local_matches = (
+            prev_state.get("notebook_sha256") == local_hashes["notebook_sha256"]
+            and prev_state.get("short_term_sha256") == local_hashes["short_term_sha256"]
         )
         if (
-            has_core
+            not force
+            and has_core
+            and local_matches
             and prev_state.get("file_id") == file_id
             and (
                 (remote_md5 and prev_state.get("md5Checksum") == remote_md5)
@@ -580,10 +603,13 @@ async def run_pull(
 
         validated = validate_bridge_payload(parsed)
         written = await asyncio.to_thread(write_memory_dir_atomic, mem_dir, validated)
+        saved_hashes = await asyncio.to_thread(_core_hashes_sync, mem_dir)
         new_state = {
             "file_id": file_id,
             "md5Checksum": remote_md5,
             "modifiedTime": remote_mtime,
+            "notebook_sha256": saved_hashes["notebook_sha256"],
+            "short_term_sha256": saved_hashes["short_term_sha256"],
             "updated_at": datetime.now(UTC).isoformat(),
             "scope": SCOPE,
         }
@@ -608,6 +634,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--memory-dir", type=Path, help="Override secrets/antigravity-memory")
     parser.add_argument("--state-file", type=Path, help="Override .owner_bridge_state.json")
     parser.add_argument("--env-file", type=Path, help="Override .env file path")
+    parser.add_argument(
+        "--force", action="store_true", help="Force re-pull even if remote/local hashes match"
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -628,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.init:
             result = asyncio.run(run_init(cfg))
         else:
-            result = asyncio.run(run_pull(cfg))
+            result = asyncio.run(run_pull(cfg, force=args.force))
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except Rejected as exc:
