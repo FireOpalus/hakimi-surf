@@ -172,6 +172,50 @@ class Settings(BaseSettings):
     ws_ping_timeout: float = Field(default=30, ge=1, le=60)
     ws_rpc_timeout: float = Field(default=10, ge=1, le=30)
     ws_reconnect_max: float = Field(default=30, ge=1, le=120)
+    node_ws_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("NODE_WS_ENABLED", "HAKIMI_NODE_WS_ENABLED"),
+    )
+    node_ws_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("NODE_WS_TOKEN", "HAKIMI_NODE_WS_TOKEN"),
+    )
+    node_ws_path: str = Field(
+        default="/ws/node",
+        validation_alias=AliasChoices("NODE_WS_PATH", "HAKIMI_NODE_WS_PATH"),
+        pattern=r"^/ws/node(?:/[A-Za-z0-9_-]{24,128})?$",
+    )
+    node_id: str = Field(
+        default="shanghai-cn-1",
+        pattern=r"^[a-zA-Z0-9_-]{1,64}$",
+        validation_alias=AliasChoices("NODE_ID", "HAKIMI_NODE_ID"),
+    )
+    node_ws_max_frame_bytes: int = Field(
+        default=1_048_576,
+        ge=65536,
+        le=2_097_152,
+        validation_alias=AliasChoices(
+            "NODE_WS_MAX_FRAME_BYTES", "HAKIMI_NODE_WS_MAX_FRAME_BYTES"
+        ),
+    )
+    node_ws_rpc_timeout: float = Field(
+        default=15.0,
+        ge=2.0,
+        le=120.0,
+        validation_alias=AliasChoices("NODE_WS_RPC_TIMEOUT", "HAKIMI_NODE_WS_RPC_TIMEOUT"),
+    )
+    node_bili_delegate_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "NODE_BILI_DELEGATE_ENABLED", "HAKIMI_NODE_BILI_DELEGATE_ENABLED"
+        ),
+    )
+    node_bili_fallback_local: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "NODE_BILI_FALLBACK_LOCAL", "HAKIMI_NODE_BILI_FALLBACK_LOCAL"
+        ),
+    )
     group_policies: dict[str, Literal["at_only", "smart_reply", "muted"]] = Field(
         default_factory=dict
     )
@@ -460,6 +504,14 @@ class Settings(BaseSettings):
                 raise ValueError("Use a universal OneBot WS URL without query credentials")
             if ws.scheme == "ws" and ws.hostname not in {"127.0.0.1", "localhost", "::1", "onebot"}:
                 raise ValueError("Remote OneBot WS requires wss")
+        if self.node_ws_enabled:
+            if (
+                not valid_token(self.node_ws_token)
+                or len(self.node_ws_token.get_secret_value()) < 32
+            ):
+                raise ValueError("Node WebSocket requires a >=32-character access token")
+            if self.node_ws_path == self.onebot_ws_path:
+                raise ValueError("node_ws_path must differ from onebot_ws_path")
         if any(
             not re.fullmatch(r"(onebot|qq):[A-Za-z0-9_-]{1,128}", key)
             for key in self.group_policies | dict.fromkeys(self.roaming_group_ids)
