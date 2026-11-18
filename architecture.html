@@ -153,7 +153,7 @@
         <p class="return"><strong>回执与恢复</strong>　QQ 气泡逐条确认。重启时完整文本回执可还原成功，部分回执和执行中失联的游戏动作记为待核实。意图分别记录 <code>done</code>、<code>gated_skip</code>、<code>expired</code> 或 <code>uncertain</code>；仍在有效期内的暂时冲突可以延后。</p>
         <figcaption class="caption">进入游戏且未暂停时可切换为 <code>minecraft / HIGH</code>；暂停或离线后可回到 <code>idle / LOW</code>。高专注暂停低专注模块的主动行为；被点名的 QQ 消息仍可回复，普通群聊新消息优先做上下文。脱敏传感摘要只加在动态消息尾部，空闲基线不注入。</figcaption>
         <p class="bridge"><strong>第四个模块 · 定点天气</strong>　本地时段 → <code>weather.read</code> → 气温与天气代码。打开 Owner 天气提醒后，<code>weather.owner_report</code> 单独排队 <code>qq.speak</code>。天气读取默认关闭。</p>
-        <p class="ref"><b>源码</b><a href="src/hakimi/service.py">模块装配</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
+        <p class="ref"><b>源码</b><a href="src/hakimi/service.py">模块装配</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/platforms/minecraft/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
       </figure>
     </section>
 
@@ -177,7 +177,7 @@
           <li><span class="step">境内 → 境外</span><h3>回报实际进展</h3><p><code>mc.snapshot</code> 更新角色状态；<code>mc.milestone</code> 记录事件。游戏高重要性事件可生成 <code>qq.speak</code>。专注期间凭持久化来源事件放行，发送仍检查 QQ 接收权限。</p></li>
         </ol>
         <p class="return"><strong>回到对话：</strong>新的世界状态可成为下一次 QQ 回复的背景。桥就绪但未进服时，后台分别显示连接状态，不会把桥心跳描述为玩家在线。</p>
-        <figcaption class="ref"><b>源码</b><a href="src/hakimi/life_rules.py">规则消费与游标</a><a href="src/hakimi/modules/minecraft_slot.py">境外游戏模块</a><a href="node_agent/daemon.py">节点分派</a><a href="node_agent/mc_bridge_slot.py">桥接事件</a><a href="mc_agent/src/behaviors.mjs">游戏目标的实际行为</a></figcaption>
+        <figcaption class="ref"><b>源码</b><a href="src/hakimi/life_rules.py">规则消费与游标</a><a href="src/hakimi/modules/platforms/minecraft/minecraft_slot.py">境外游戏模块</a><a href="node_agent/daemon.py">节点分派</a><a href="node_agent/mc_bridge_slot.py">桥接事件</a><a href="mc_agent/src/behaviors.mjs">游戏目标的实际行为</a></figcaption>
       </figure>
     </section>
 

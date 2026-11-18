@@ -169,11 +169,20 @@ docker compose up -d
 
 ### 模块仓库与管理开关
 
-[hakimi-modules](https://github.com/FireOpalus/hakimi-modules) 是私有能力模块仓库。主仓用 Git 子模块在 `src/hakimi/modules` 固定一个提交。开发机和部署机需要两个仓库的读取权限。
+四个能力各有自己的私有 GitHub 仓库。在[模块目录的 platforms 文件夹](https://github.com/FireOpalus/hakimi-modules/tree/main/platforms)可以一起浏览。主仓固定目录仓库的提交，目录仓库再分别固定四个实现版本。
+
+| 模块 | 独立仓库 | 主仓检出路径 |
+| --- | --- | --- |
+| QQ 社交 | [hakimi-module-qq](https://github.com/FireOpalus/hakimi-module-qq) | `src/hakimi/modules/platforms/qq/` |
+| B 站巡逻 | [hakimi-module-bilibili](https://github.com/FireOpalus/hakimi-module-bilibili) | `src/hakimi/modules/platforms/bilibili/` |
+| Minecraft | [hakimi-module-minecraft](https://github.com/FireOpalus/hakimi-module-minecraft) | `src/hakimi/modules/platforms/minecraft/` |
+| 天气观测 | [hakimi-module-weather](https://github.com/FireOpalus/hakimi-module-weather) | `src/hakimi/modules/platforms/weather/` |
+
+首次检出需要主仓、目录仓库和四个实现仓库的读取权限。
 
 ```sh
 git clone --recurse-submodules https://github.com/FireOpalus/hakimi-surf.git
-# 已有检出，更新主仓后同步到它指定的模块版本
+# 已有检出，更新主仓后同步到各自指定的版本
 git submodule update --init --recursive
 ```
 
@@ -183,7 +192,7 @@ git submodule update --init --recursive
 
 新增模块时，在模块上声明 `schedule_options`（继承 `ScheduleOptions`，使用有标题的布尔、数字、文本或枚举字段），并在 `Service` 注册。后台会根据字段类型生成表单并验证保存值。动作可通过 `window` 选择执行时段，通过 `quotas` 指定共用次数及本模块的豁免开关。每日任务用 `schedules()` 声明，`DailyAction.time_option` 可绑定本模块的 `ScheduleTime` 字段，后台改时间后下次排程随之更新。本地兜底意图用 `local_activity()` 提供，事件订阅用 `event_rules()` 声明。注册后即可参与排程。[调度模块验收示例](tests/test_module_scheduling.py)
 
-现有例子见 [天气模块](https://github.com/FireOpalus/hakimi-modules/blob/main/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
+现有例子见 [天气模块](https://github.com/FireOpalus/hakimi-module-weather/blob/main/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
 
 ### 消息处理全链路
 ```mermaid

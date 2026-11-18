@@ -8,8 +8,15 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-if not (root / "src/hakimi/modules/__init__.py").is_file():
-    raise SystemExit("Run git submodule update --init --recursive before packaging.")
+platforms = root / "src/hakimi/modules/platforms"
+for entry in (
+    "qq/qq_social.py",
+    "bilibili/bilibili_surf.py",
+    "minecraft/minecraft_slot.py",
+    "weather/weather.py",
+):
+    if not (platforms / entry).is_file():
+        raise SystemExit(f"Missing {entry}. Run git submodule update --init --recursive.")
 output = root / "dist"
 output.mkdir(exist_ok=True)
 files = [
@@ -44,7 +51,7 @@ for directory, pattern in (
     ("deploy", "*.json.example"),
     ("docs", "*.md"),
 ):
-    files.extend((root / directory).rglob(pattern))
+    files.extend(p for p in (root / directory).rglob(pattern) if ".git" not in p.parts)
 files = sorted(set(files))
 if any(p.is_symlink() or not p.is_file() for p in files):
     raise RuntimeError("Delivery source must be regular files")
