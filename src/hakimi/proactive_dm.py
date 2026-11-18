@@ -587,7 +587,7 @@ class OwnerProactive:
             now + 43200,
         )
         async with self.policy_lock:
-            reason = await self._generation_reason(now, automatic=automatic)
+            # Joining the same paid result does not depend on another ledger read.
             async with self.store.transaction():
                 row = await self.store.one(
                     "SELECT status,reason FROM proactive_schedule WHERE id=?", (key,)
@@ -596,8 +596,10 @@ class OwnerProactive:
                     await self.digests.link_tx(key, intent_id)
                     await self.digests.sync_intents_tx(key, now)
                     return {"status": row["status"], "reason": row["reason"], "id": key}
-                if reason or expires <= now:
-                    return {"status": "skipped", "reason": reason or "expired", "id": key}
+            reason = await self._generation_reason(now, automatic=automatic)
+            if reason or expires <= now:
+                return {"status": "skipped", "reason": reason or "expired", "id": key}
+            async with self.store.transaction():
                 await self.store.db.execute(
                     "INSERT INTO proactive_schedule VALUES (?,?,?,'digest',?,?,'generating',NULL)",
                     (key, self.scope, day, now, expires),

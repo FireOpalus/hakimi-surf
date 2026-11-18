@@ -261,3 +261,18 @@ async def test_replacement_owner_cannot_access_queued_report(settings):
         )
         assert tuple(discarded) == ("cancelled", None)
         assert not wire.calls
+
+
+async def test_retry_of_paid_manual_digest_needs_no_budget_lookup(dm, monkeypatch):
+    dm.service.sender.onebot.ready.clear()
+    first = await dm.manual_digest()
+    assert first["receipt"]["stage"] == "awaiting_qq"
+
+    async def ledger_unavailable():
+        raise AssertionError("zero-token delivery read the paid-call ledger")
+
+    monkeypatch.setattr(dm.store, "budget_status", ledger_unavailable)
+    dm.service.sender.onebot.ready.set()
+    result = await dm.manual_digest()
+    assert result["id"] == first["id"] and result["receipt"]["stage"] == "confirmed"
+    assert len(dm.service.ai.calls) == 2 and len(dm.service.sender.onebot.calls) == 1
