@@ -1197,18 +1197,16 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 <section id="login" class="login" aria-labelledby="login-title">
   <div class="login-sky">
     <div class="sky-map" aria-hidden="true"><i class="orbit outer"></i><i class="orbit"></i><i class="sky-star"></i></div>
-    <div class="sky-copy"><h1 id="login-title">洁米奈星夜</h1><p>QQ · B 站 · Minecraft</p></div>
+    <div class="sky-copy"><h1 id="login-title">洁米奈星夜</h1></div>
   </div>
   <div class="login-fields">
     <h2>管理员登录</h2>
-    <p class="muted">通过 SSH 隧道连接后，输入管理口令。</p>
     <form id="login-form">
       <label for="token">管理口令</label>
       <input id="token" type="password" autocomplete="off" placeholder="ADMIN_TOKEN" aria-describedby="login-error" required>
       <p id="login-error" role="alert" hidden></p>
       <button type="submit">进入控制台</button>
     </form>
-    <p class="login-note">口令仅保存在页面内存中，刷新或退出后需重新登录。</p>
   </div>
 </section>
 <div id="app" hidden>
