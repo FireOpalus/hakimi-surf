@@ -4,6 +4,7 @@ import inspect
 import json
 import math
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -35,7 +36,7 @@ from .prefix_runtime import MAX_CHAIN_TURNS, PrefixRuntime, StaticPrefixes
 from .provider_routing import ProviderRoutingManager
 from .routing import RouteDecision, select_tier
 from .security import Rejected
-from .store import Store
+from .store import DigestReviewCredit, Store
 from .streaming import StreamProgress, cancellable, consume_stream, upstream_http_status
 from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
@@ -626,6 +627,7 @@ class GeminiGateway:
         *,
         image_tokens: int = 0,
         work_kind: str | None = None,
+        digest_review: DigestReviewCredit | None = None,
         before_call=None,
         context_limit=None,
         carbon_reserve_fallback=False,
@@ -711,6 +713,7 @@ class GeminiGateway:
                         budget_lane,
                         reserve_usd,
                         **self._reserve_kwargs(model_lane, thinking_level, provider),
+                        **({"digest_review": digest_review} if digest_review is not None else {}),
                     )
             except Rejected as exc:
                 # Only a failure before dispatch permits a second model attempt.
@@ -912,18 +915,24 @@ class GeminiGateway:
                 if actual is None
                 else None
             )
-            await self.store.settle(
-                reservation,
-                actual,
-                **self._settle_kwargs(
-                    usage=usage,
-                    discounted_actual=discounted,
-                    fallback_actual=fallback,
-                    model_lane=model_lane,
-                    thinking_level=thinking_level,
-                    provider=provider,
-                ),
-            )
+            try:
+                await self.store.settle(
+                    reservation,
+                    actual,
+                    **self._settle_kwargs(
+                        usage=usage,
+                        discounted_actual=discounted,
+                        fallback_actual=fallback,
+                        model_lane=model_lane,
+                        thinking_level=thinking_level,
+                        provider=provider,
+                    ),
+                )
+            except Rejected as exc:
+                # settle already booked the provider's real charge and opened the fuse.
+                # Only a paired digest may keep this completed response for its funded review.
+                if digest_review is None or str(exc) != "budget_reservation_exceeded":
+                    raise
             await run_guard(before_call)
             return result
 
@@ -1049,6 +1058,7 @@ class GeminiGateway:
         audit_id: str | None = None,
         audit_job_id: str | None = None,
         known_bot: bool | None = None,
+        _digest_review: DigestReviewCredit | None = None,
     ) -> str:
         await self._ensure_routing_ready()
         privacy_level = self.routing.privacy_for(message, self.s)
@@ -1182,6 +1192,19 @@ class GeminiGateway:
             ),
             "thinking_level": "none",
         }
+        if _digest_review is not None:
+            if (
+                purpose != "output"
+                or budget_lane != "proactive"
+                or context.role != "OWNER"
+                or context.surface != "private"
+                or set(payload) != {"generated_text"}
+                or not isinstance(payload["generated_text"], str)
+                or images
+                or video is not None
+            ):
+                raise Rejected("invalid_digest_review")
+            call_kwargs["digest_review"] = _digest_review
         decision_timeout = (
             max(self.s.decision_timeout, 60) if video is not None else self.s.decision_timeout
         )
@@ -1707,6 +1730,16 @@ class GeminiGateway:
         used_system_digest = self.store.vault.digest("static-prefix", system)
         used_provider = "gemini_paid"
 
+        review = None
+        if scenario == Scenario.OWNER_DIGEST and budget_lane == "proactive":
+            # _call enforces this serialization limit for every accepted Decisions output
+            # request, plus its normal 2048-token allowance. Store reserves both costs
+            # atomically immediately before it authorizes the first model dispatch.
+            ceiling = self.s.max_context_bytes + 12000 + 2048
+            review = DigestReviewCredit(
+                uuid.uuid4().hex, Decimal(ceiling) * self._price("decision")[0] / 1_000_000
+            )
+
         async def _dispatch_once(
             active_plan: GenerationPlan,
             progress: StreamProgress | None,
@@ -2017,6 +2050,7 @@ class GeminiGateway:
                 deadline_seconds,
                 controlled_operation,
                 work_kind="world.plan" if life_plan else scenario.value,
+                **({"digest_review": review} if review is not None else {}),
                 stream_retryable=chat,
                 image_tokens=len(images) * self.s.image_token_reserve
                 + (video.tokens if video else 0),
@@ -2184,6 +2218,10 @@ class GeminiGateway:
                 except BaseException:
                     mark_chain_invalid()
                     raise
+        except BaseException:
+            if review is not None:
+                await asyncio.shield(self.store.release_digest_review(review))
+            raise
         finally:
             if carbon_acquired:
                 self.carbon_slots.release()
@@ -2227,6 +2265,7 @@ class GeminiGateway:
                     subject,
                     purpose="output",
                     budget_lane=budget_lane,
+                    **({"_digest_review": review} if review is not None else {}),
                     message=None if life_plan else message,
                     audit_source=audit_source,
                     before_call=before_call,
@@ -2234,6 +2273,9 @@ class GeminiGateway:
         except BaseException:
             mark_chain_invalid()
             raise
+        finally:
+            if review is not None:
+                await asyncio.shield(self.store.release_digest_review(review))
         if stateful_chat and not abstained_chat and getattr(result, "id", None):
             covered_seq = max((int(r.get("seq", 0)) for r in used_rows), default=0)
             expires = time.time() + min(

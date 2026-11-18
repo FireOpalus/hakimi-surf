@@ -3,6 +3,7 @@ import fcntl
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from typing import Any
@@ -48,6 +49,12 @@ CREATE TABLE IF NOT EXISTS ledger (
   amount INTEGER NOT NULL, reserved INTEGER NOT NULL, status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ledger_day ON ledger(day, subject);
+CREATE TABLE IF NOT EXISTS owner_digest_review_holds (
+  id TEXT PRIMARY KEY, day TEXT NOT NULL, subject TEXT NOT NULL, amount INTEGER NOT NULL
+);
+CREATE VIEW IF NOT EXISTS budget_commitments AS
+  SELECT day,subject,lane,amount FROM ledger UNION ALL
+  SELECT day,subject,'proactive',amount FROM owner_digest_review_holds;
 CREATE TABLE IF NOT EXISTS ledger_usage (
   id TEXT PRIMARY KEY, input_tokens INTEGER, output_tokens INTEGER,
   cached_tokens INTEGER, thought_tokens INTEGER, model_lane TEXT,
@@ -115,6 +122,14 @@ def _resolve_provider(provider: str | None) -> str:
 
 def microdollars(value: Decimal) -> int:
     return int((value * 1_000_000).to_integral_value(rounding=ROUND_CEILING))
+
+
+@dataclass(frozen=True)
+class DigestReviewCredit:
+    """One local authorization for a daily digest's mandatory Decisions output review."""
+
+    id: str
+    usd: Decimal
 
 
 class Store:
@@ -189,6 +204,10 @@ class Store:
                 "INSERT OR IGNORE INTO meta VALUES ('namespace',?)",
                 (self.vault.seal("namespace", self.s.namespace),),
             )
+            # Only unsubmitted output checks have holds. An actual review atomically
+            # converts its hold to a normal reservation and follows normal crash accounting.
+            for hold in await self.all("SELECT * FROM owner_digest_review_holds"):
+                await self._release_digest_review_tx(hold)
             # A crash may have occurred after charging/sending. Never blindly repeat it.
             await self.db.execute(
                 "UPDATE jobs SET status='abandoned',payload=NULL WHERE status='working'"
@@ -859,7 +878,7 @@ class Store:
         global_total = (daily_row[0] if daily_row else 0) + await self._calendar_carry("day:" + day)
         personal = (
             await self.one(
-                "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND subject=?",
+                "SELECT COALESCE(SUM(amount),0) FROM budget_commitments WHERE day=? AND subject=?",
                 (day, subject),
             )
         )[0]
@@ -871,7 +890,8 @@ class Store:
         )[0]
         lane_total = (
             await self.one(
-                "SELECT COALESCE(SUM(amount),0) FROM ledger WHERE day=? AND lane=?", (day, lane)
+                "SELECT COALESCE(SUM(amount),0) FROM budget_commitments WHERE day=? AND lane=?",
+                (day, lane),
             )
         )[0]
         extra_limit = {
@@ -910,6 +930,19 @@ class Store:
         async with self.lock:
             return not await self._budget_refusal(day, subject, lane, amount)
 
+    async def _release_digest_review_tx(self, hold):
+        await self.db.execute("DELETE FROM owner_digest_review_holds WHERE id=?", (hold["id"],))
+        await self.db.execute("UPDATE budget_totals SET amount=amount-?", (hold["amount"],))
+        await self._charge_aggregates(hold["day"], -hold["amount"])
+
+    async def release_digest_review(self, credit: DigestReviewCredit):
+        async with self.transaction():
+            hold = await self.one(
+                "SELECT * FROM owner_digest_review_holds WHERE id=?", (credit.id,)
+            )
+            if hold:
+                await self._release_digest_review_tx(hold)
+
     async def reserve(
         self,
         subject: str,
@@ -919,6 +952,7 @@ class Store:
         model_lane: str | None = None,
         thinking_level: str | None = None,
         provider: str | None = None,
+        digest_review: DigestReviewCredit | None = None,
     ) -> str:
         if not isinstance(usd, Decimal) or not usd.is_finite() or usd < 0:
             raise Rejected("invalid_budget_amount")
@@ -928,11 +962,44 @@ class Store:
         amount = 0 if lane == "search" else microdollars(usd)
         reservation = uuid.uuid4().hex
         async with self.transaction():
-            budget_detail = await self._budget_refusal(day, subject, lane, amount)
-            if budget_detail == "circuit":
-                raise Rejected("budget_circuit_open")
-            if budget_detail:
-                raise Rejected("budget_exhausted", budget_detail)
+            hold = None
+            extra = 0
+            if digest_review is not None:
+                if (
+                    lane != "proactive"
+                    or model_lane not in {"hydrogen", "decision"}
+                    or not digest_review.usd.is_finite()
+                    or digest_review.usd < 0
+                ):
+                    raise Rejected("invalid_digest_review")
+                hold = await self.one(
+                    "SELECT * FROM owner_digest_review_holds WHERE id=?", (digest_review.id,)
+                )
+                if hold and (hold["day"] != day or hold["subject"] != subject):
+                    raise Rejected("invalid_digest_review")
+                if model_lane == "decision":
+                    if resolved_provider not in {"gemini_paid", "gemini_free"}:
+                        raise Rejected("invalid_digest_review")
+                    if not hold or amount > hold["amount"]:
+                        raise Rejected("digest_review_unfunded")
+                    # A free first attempt may fall back; only the paid attempt spends the hold.
+                    if resolved_provider != "gemini_free":
+                        await self._release_digest_review_tx(hold)
+                elif hold is None:
+                    extra = microdollars(digest_review.usd)
+            if not (digest_review is not None and model_lane == "decision"):
+                budget_detail = await self._budget_refusal(day, subject, lane, amount + extra)
+                if budget_detail == "circuit":
+                    raise Rejected("budget_circuit_open")
+                if budget_detail:
+                    raise Rejected("budget_exhausted", budget_detail)
+            if digest_review is not None and model_lane == "hydrogen" and hold is None:
+                await self.db.execute(
+                    "INSERT INTO owner_digest_review_holds VALUES (?,?,?,?)",
+                    (digest_review.id, day, subject, extra),
+                )
+                await self.db.execute("UPDATE budget_totals SET amount=amount+?", (extra,))
+                await self._charge_aggregates(day, extra)
             await self.db.execute(
                 "INSERT INTO ledger VALUES (?,?,?,?,?,?,'reserved')",
                 (reservation, day, subject, lane, amount, amount),
@@ -1332,13 +1399,14 @@ class Store:
             circuit = bool(await self.one("SELECT 1 FROM meta WHERE key='budget_overrun'"))
             user_top_row = await self.one(
                 "SELECT COALESCE(MAX(total),0) FROM ("
-                "SELECT SUM(amount) AS total FROM ledger WHERE day=? GROUP BY subject"
+                "SELECT SUM(amount) AS total FROM budget_commitments WHERE day=? GROUP BY subject"
                 ")",
                 (day,),
             )
             lane_rows = await self.all(
                 "SELECT lane, COALESCE(SUM(amount),0) AS total "
-                "FROM ledger WHERE day=? AND lane IN ('patrol','memory','proactive','admin') "
+                "FROM budget_commitments WHERE day=? "
+                "AND lane IN ('patrol','memory','proactive','admin') "
                 "GROUP BY lane",
                 (day,),
             )
