@@ -152,7 +152,7 @@
         </ol>
         <p class="return"><strong>回执与恢复</strong>　QQ 气泡逐条确认。重启时完整文本回执可还原成功，部分回执和执行中失联的游戏动作记为待核实。意图分别记录 <code>done</code>、<code>gated_skip</code>、<code>expired</code> 或 <code>uncertain</code>；仍在有效期内的暂时冲突可以延后。</p>
         <figcaption class="caption">进入游戏且未暂停时可切换为 <code>minecraft / HIGH</code>；暂停或离线后可回到 <code>idle / LOW</code>。高专注暂停低专注模块的主动行为；被点名的 QQ 消息仍可回复，普通群聊新消息优先做上下文。脱敏传感摘要只加在动态消息尾部，空闲基线不注入。</figcaption>
-        <p class="bridge"><strong>第四个模块 · 定点天气</strong>　本地时段 → <code>weather.read</code> → 气温与天气代码。打开 Owner 天气提醒后，<code>weather.owner_report</code> 单独排队 <code>qq.speak</code>。天气读取默认关闭。</p>
+        <p class="bridge"><strong>第四个模块 · 定点天气</strong>　对话 AI、其他模块和后台按需调用 <code>weather.read</code>，读取配置地点的当前天气。数据有效期内共用一份观测，到期后由下一次查询更新。</p>
         <p class="ref"><b>源码</b><a href="src/hakimi/modules/.gitmodules">安装清单</a><a href="src/hakimi/modules/__init__.py">启动注册</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/platforms/minecraft/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
       </figure>
     </section>

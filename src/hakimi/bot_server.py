@@ -296,7 +296,12 @@ def assemble_chat_input(
             if "world" not in prev or prev.get("world") != world_dig:
                 metadata["world_state_summary"] = world_obj
         if not sandbox_mode:
-            for key in ("file_attachments", "web_search_findings", "web_search_status"):
+            for key in (
+                "file_attachments",
+                "web_search_findings",
+                "web_search_status",
+                "module_query_result",
+            ):
                 if payload.get(key):
                     metadata[key] = payload[key]
             if payload.get("jit_proactive_intent"):
@@ -340,7 +345,12 @@ def assemble_chat_input(
                 world_obj = dict(raw_world) if isinstance(raw_world, dict) else raw_world
                 metadata["world_state_summary"] = world_obj
                 next_world_dig = _state_digest(world_obj)
-            for key in ("file_attachments", "web_search_findings", "web_search_status"):
+            for key in (
+                "file_attachments",
+                "web_search_findings",
+                "web_search_status",
+                "module_query_result",
+            ):
                 if payload.get(key):
                     metadata[key] = payload[key]
             if payload.get("jit_proactive_intent"):

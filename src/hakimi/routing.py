@@ -14,6 +14,7 @@ class RouteDecision(str):
         sandbox_mode=False,
         need_memory_recall=False,
         need_external_lookup=False,
+        module_query=None,
         reply_score=None,
         reply_threshold=None,
     ):
@@ -22,6 +23,7 @@ class RouteDecision(str):
         value.sandbox_mode = sandbox_mode
         value.need_memory_recall = need_memory_recall
         value.need_external_lookup = need_external_lookup
+        value.module_query = module_query
         value.reply_score = reply_score
         value.reply_threshold = reply_threshold
         return value

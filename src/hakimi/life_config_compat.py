@@ -37,6 +37,11 @@ def migrate_flat(raw):
     if not isinstance(modules, dict):
         return result
     modules = dict(modules)
+    # The on-demand weather module retired its last scheduled setting.
+    if isinstance(modules.get("weather"), dict) and "observation_time" in modules["weather"]:
+        modules["weather"] = {
+            k: v for k, v in modules["weather"].items() if k != "observation_time"
+        }
     for name, (schema, fields) in OLD_MODULES.items():
         flat = {k: result.pop(k) for k in fields if k in result}
         if flat:

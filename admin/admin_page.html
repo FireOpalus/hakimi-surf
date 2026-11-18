@@ -1289,7 +1289,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       </div>
       <div class="nav-group" role="presentation" data-module="weather">
         <div class="nav-group-label">天气</div>
-        <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="设置观测地点，查看每小时天气采样和每日提醒排程。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
+        <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="设置观测地点，按需查询当前天气。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
       </div>
       <div class="nav-group" role="presentation" data-module="minecraft">
         <div class="nav-group-label">游戏</div>
@@ -1453,7 +1453,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div class="row"><button id="weather-save" type="button" disabled>保存地点</button><button id="weather-reset" type="button" class="secondary" hidden>恢复环境默认</button></div>
     </fieldset>
   </div>
-  <div class="card"><h2>天气观测与提醒</h2><div id="weather-actions" class="module-tools"></div></div>
+  <div class="card"><h2>当前天气</h2><div id="weather-actions" class="module-tools"></div></div>
 </section>
 
 <section id="minecraft" class="tab" role="tabpanel" aria-labelledby="nav-minecraft" hidden>
@@ -2246,7 +2246,7 @@ async function api(path,method='GET',data){
   if(signal.aborted)throw new DOMException('请求已取消','AbortError');
   if(!r.ok){
     if(r.status===401||r.status===403)logout();
-    const hints={module_disabled:'模块已关闭，可在模块详情中开启。',weather_location_missing:'请先保存观测地点。',weather_city_lookup_unavailable:'城市查询暂时不可用，可重试或输入经纬度。',weather_ip_lookup_unavailable:'暂时无法识别服务器地点，可重试或搜索城市。',module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
+    const hints={module_disabled:'模块已关闭，可在模块详情中开启。',weather_location_missing:'请先保存观测地点。',weather_unavailable:'天气服务暂时不可用，请稍后再查。',weather_stale:'天气数据已过期，请稍后再查。',weather_location_changed:'地点已更改，请重新查询。',weather_city_lookup_unavailable:'城市查询暂时不可用，可重试或输入经纬度。',weather_ip_lookup_unavailable:'暂时无法识别服务器地点，可重试或搜索城市。',module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
     throw Error(hints[value.detail]||value.detail||('HTTP '+r.status));
   }
   return value;
@@ -3702,13 +3702,13 @@ async function lookupWeather(method){
 }
 async function persistWeatherPlace(reset){
   if(weatherSaving||(!reset&&!weatherCandidate))return;
-  if(reset&&!confirm('恢复环境变量中的默认地点？若未配置经纬度，天气采样将等待设置地点。'))return;
+  if(reset&&!confirm('恢复环境变量中的默认地点？若未配置经纬度，需要先选择地点才能查询天气。'))return;
   weatherSaving=true;$('weather-editor').disabled=true;
   try{
     const result=await api(weatherLocationPath,reset?'DELETE':'PUT',reset?undefined:weatherCandidate);
     resetWeatherEditor();
     applyModuleDetail(result);
-    notice(reset?'已恢复环境默认地点':'地点已保存，下次采样将使用此地点');
+    notice(reset?'已恢复环境默认地点':'地点已保存，下次查询将使用此地点');
   }catch(error){if(error.name!=='AbortError')notice(error.message,true);}
   finally{weatherSaving=false;if(token)$('weather-editor').disabled=false;}
 }
@@ -3747,7 +3747,7 @@ function renderModuleActions(target,actions){
     control.addEventListener('change',()=>busy(control,async()=>{
       try{
         const result=await api('life/actions/'+encodeURIComponent(a.name),'PUT',{mode:control.value,view:'module'});
-        renderModuleActions(target,result.actions);
+        applyModuleDetail(result);
         notice('已保存 '+a.name+' 的路由方式');
       }catch(error){control.value=a.mode;throw error;}
     }));
@@ -3857,13 +3857,16 @@ function moduleSwitch(d){
 function renderModuleTools(container,d){
   container.dataset.moduleTools=d.id;
   const actions=el('div',undefined,'table'),summary=el('p',undefined,'muted');
-  const read=el('button','读取传感器摘要','secondary');read.type='button';
+  const weather=d.id==='weather';
+  const read=el('button',weather?'查询当前天气':'读取传感器摘要','secondary');read.type='button';
+  summary.setAttribute('aria-live','polite');
   read.addEventListener('click',()=>busy(read,async()=>{
-    const result=await api('life/modules/'+encodeURIComponent(d.id)+'/sensor');
-    summary.textContent=result.summary||'暂无传感器摘要';
+    summary.textContent='';
+    const result=await api('life/modules/'+encodeURIComponent(d.id)+(weather?'/current':'/sensor'));
+    summary.textContent=weather?result.summary+' · '+result.source:result.summary||'暂无传感器摘要';
   }));
-  read.disabled=!d.enabled||!!d.configuration_issue;
-  const state=el('p',regionName(d.region)+' · '+(!d.enabled?'模块已关闭':moduleIssue(d)||(d.proactive_paused?'主动动作已暂停':'允许调度主动动作')),'muted');
+  read.disabled=!d.enabled||!!d.configuration_issue||(weather&&!d.actions.some(a=>a.name==='weather.read'&&a.available));
+  const state=el('p',regionName(d.region)+' · '+(!d.enabled?'模块已关闭':moduleIssue(d)||(weather?'按需查询':d.proactive_paused?'主动动作已暂停':'允许调度主动动作')),'muted');
   container.replaceChildren(state,moduleSchedulePanel(d),actions,read,summary);
   renderModuleActions(actions,d.actions);
 }

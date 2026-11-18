@@ -165,7 +165,7 @@ docker compose up -d
 | 生活引擎 → 主动动作 | 查看动作的执行模块、就绪状态及原因。可逐项切换按动作名路由、旧票据路由、对照模式或停用。对照模式只比较本地映射，实际处理一次。 |
 | 生活引擎 → 意图与事件 | 追踪来源事件、目标、门控与投递结果。每条规则独立消费同一事实。明确未派发可以在票据有效期内再试，回执不明记为 `uncertain`。 |
 | 升级旧库 | 启动时增补列、索引与规则游标，保留旧票据和终态。新规则从启用时开始消费；重启从已保存的位置补读。 |
-| 天气观测 | 在后台「功能模块 → 天气观测」搜索城市、填写经纬度，或按服务器出口 IP 识别城市。确认地点并保存后立即生效，重启后保留。也可恢复到 `.env` 的 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE`。模块名旁的开关单独控制采样。世界引擎在本地整点读取 Open-Meteo 当前天气，夜间照常，重启只补当前小时。每条 `weather_observed` 记录数据时刻、采样区间、气温、天气代码及可用的区间降水量、太阳辐射和昼夜标记。采样不调用模型。启用 `HAKIMI_WEATHER_OWNER_REPORT=true` 后，QQ 每天最多发送一次提醒，默认 09:30，可在模块调度面板调整。[天气数据接口](https://open-meteo.com/en/docs) |
+| 天气观测 | 在后台「功能模块 → 天气观测」搜索城市、填写经纬度，或按服务器出口 IP 识别城市。确认地点并保存后立即生效，重启后保留。也可恢复到 `.env` 的 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE`。AI 可按需选择只读动作 `weather.read`，其他模块可调用 `await service.life_engine.query("weather.read")`，后台的「查询当前天气」使用受鉴权的 `GET /admin/api/life/modules/weather/current`。三者共用同一份观测，数据有效期取自 Open-Meteo 的时间戳和采样区间。查询返回气温、天气状况及可用的降水等观测值。[天气数据接口](https://open-meteo.com/en/docs) |
 
 ### 模块仓库与管理开关
 
@@ -186,7 +186,7 @@ git clone --recurse-submodules https://github.com/FireOpalus/hakimi-surf.git
 git submodule update --init --recursive
 ```
 
-在后台「功能模块」总览或详情切换模块，状态即时保存到 SQLite。关闭后仍可查看配置；世界引擎停止为其排程，待执行的相关任务会取消。设备连接与后台独立，关闭 QQ 后仍可在后台重新开启。天气默认沿用环境设置，开关打开且地点已配置后才会采样。
+在后台「功能模块」总览或详情切换模块，状态即时保存到 SQLite。关闭后仍可查看配置；世界引擎停止为其排程，待执行的相关任务会取消。设备连接与后台独立，关闭 QQ 后仍可在后台重新开启。天气默认沿用环境设置，开关打开且地点已配置后可随时查询。
 
 世界引擎管理活跃时段、免打扰、规划间隔和共用次数。各功能模块的「模块调度」管理自己的选项、每日任务和下次排程。
 

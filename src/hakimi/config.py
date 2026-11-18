@@ -124,8 +124,6 @@ class Settings(BaseSettings):
     weather_enabled: bool = False
     weather_latitude: float | None = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
     weather_longitude: float | None = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
-    weather_time: str = Field(default="09:30", pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
-    weather_owner_report: bool = False
 
     bili_autonomous_enabled: bool = Field(default=False, validation_alias="BILI_AUTONOMOUS_ENABLED")
     bili_proxy: SecretStr = Field(default=SecretStr(""), validation_alias="BILI_PROXY")

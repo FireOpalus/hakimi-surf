@@ -1011,6 +1011,37 @@ class LifeEngine:
         module = self.service.modules.get(self.catalog.owners[spec.name])
         return module.scheduling(cfg)
 
+    def query_options(self) -> dict[str, str]:
+        """Trusted, read-only capabilities available to this turn's router."""
+        return {
+            spec.name: spec.description
+            for spec in self.catalog.actions.values()
+            if "query" in spec.origins and not self._query_issue(spec)
+        }
+
+    def _query_issue(self, spec) -> str | None:
+        if self.config.action_modes.get(spec.name) == "off":
+            return "action_disabled"
+        return self.catalog.inactive_reason(self.catalog.owners[spec.name]) or spec.unavailable()
+
+    async def query(self, name: str) -> Outcome:
+        """Serve an immediate read for chat, an installed module or the admin console."""
+        spec = self.catalog.actions.get(name)
+        if not spec or "query" not in spec.origins:
+            return Outcome("gated_skip", "unknown_query")
+        if reason := self._query_issue(spec):
+            return Outcome("gated_skip", reason)
+        call = ActionCall(
+            {"origin": "query", "action_name": name},
+            spec.arguments(),
+            self.clock(),
+            still_allowed=lambda: not self._query_issue(spec),
+        )
+        result = await spec.run(call)
+        if reason := self._query_issue(spec):
+            return Outcome("gated_skip", reason)
+        return result
+
     def resolve(self, ticket: dict, *, admin: bool = False):
         if (ticket.get("origin") == "admin") != admin:
             raise ValueError("action_origin_forbidden")

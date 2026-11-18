@@ -1259,6 +1259,7 @@ class Service:
         job["_audit_id"] = audit_id
         try:
             relevance = frozen_relevance
+            module_queries = self.life_engine.query_options()
             intent = await self.ai.screen(
                 current,
                 job["subject"],
@@ -1268,6 +1269,7 @@ class Service:
                 before_call=message_guard,
                 audit_id=audit_id,
                 audit_job_id=job["id"],
+                **({"module_queries": module_queries} if module_queries else {}),
                 **({"relevance_context": relevance} if relevance else {}),
                 **({"images": [i.gate() for i in images]} if images else {}),
             )
@@ -1733,14 +1735,23 @@ class Service:
             result = self.output(text)
             # Sources and generated summaries are deliberately excluded from conversation memory.
         else:
-            if (
-                not sandbox
-                and not self.bot_guard.known_bot(message)
+            allow_lookup = not sandbox and not self.bot_guard.known_bot(message)
+            explicit_web = explicit_search(members[-1].command_text or members[-1].text)
+            query_name = getattr(intent, "module_query", None)
+            if allow_lookup and query_name and not explicit_web:
+                await message_guard()
+                outcome = await self.life_engine.query(query_name)
+                await message_guard()
+                payload["module_query_result"] = {
+                    "name": query_name,
+                    "status": outcome.status,
+                    "reason": outcome.reason,
+                    **({"data": outcome.details} if outcome.status == "done" else {}),
+                }
+            elif (
+                allow_lookup
                 and (not aff_active or caps.allow_search)
-                and (
-                    explicit_search(members[-1].command_text or members[-1].text)
-                    or getattr(intent, "need_external_lookup", False)
-                )
+                and (explicit_web or getattr(intent, "need_external_lookup", False))
             ):
                 controller = self.store.runtime.web_search
                 if not controller.config.enabled:
@@ -1822,6 +1833,7 @@ class Service:
                     sandbox_mode=intent.sandbox_mode,
                     need_memory_recall=intent.need_memory_recall,
                     need_external_lookup=intent.need_external_lookup,
+                    module_query=intent.module_query,
                     reply_score=getattr(intent, "reply_score", None),
                     reply_threshold=getattr(intent, "reply_threshold", None),
                 )

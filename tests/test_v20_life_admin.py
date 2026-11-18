@@ -165,6 +165,54 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
     assert not gateway.calls
 
 
+async def test_admin_current_weather_reads_only_on_click_and_honors_access(life_api):
+    app, client, gateway = life_api
+    root = "/admin/api/life/modules/weather"
+    requests = []
+
+    def provider(req):
+        requests.append(req)
+        if len(requests) > 1:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": 1800000000,
+                    "interval": 900,
+                    "temperature_2m": 16.5,
+                    "weather_code": 61,
+                }
+            },
+        )
+
+    svc = app.state.service
+    svc.life_engine.clock = lambda: 1800000000
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as upstream:
+        svc.weather.http = upstream
+        assert (await client.get(root + "/current")).status_code == 409
+        await client.put(root + "/enabled", json={"enabled": True})
+        assert (await client.get(root + "/current")).json()["detail"] == "weather_location_missing"
+        detail = (
+            await client.put(root + "/location", json={"latitude": 40, "longitude": 120})
+        ).json()
+        assert detail["scheduling"] == {"fields": {}, "values": {}, "timers": []}
+        assert [a["name"] for a in detail["actions"]] == ["weather.read"]
+        assert (await client.get(root + "/sensor")).is_success
+        assert (
+            await client.get(root + "/current", headers={"Authorization": ""})
+        ).status_code == 401
+        assert not requests
+        result = (await client.get(root + "/current")).json()
+        assert result["observation"]["temperature_2m"] == 16.5 and "小雨" in result["summary"]
+        assert (await svc.life_engine.query("weather.read")).details == result
+        assert len(requests) == 1
+        svc.life_engine.clock = lambda: 1800000900
+        res = await client.get(root + "/current")
+        assert res.status_code == 503 and res.json()["detail"] == "weather_unavailable"
+        assert len(requests) == 2 and not gateway.calls
+
+
 async def test_admin_weather_location_previews_and_upstream_failure(life_api):
     app, client, gateway = life_api
     root = "/admin/api/life/modules/weather"

@@ -17,7 +17,6 @@ from hakimi.modules.actions import Action, ActionCall, ActionCatalog, NoArgs, Ou
 from hakimi.modules.base import BaseModule, ModuleRegistry
 from hakimi.modules.weather import WeatherModule
 from hakimi.modules.weather_location import WeatherLocation
-from hakimi.rest_policy import RestHoursConfig
 from hakimi.security import Rejected
 from hakimi.service import Service
 from hakimi.world_state import WorldStateManager
@@ -301,7 +300,6 @@ async def test_changing_weather_location_discards_old_cache_and_inflight_result(
         assert (await weather.read(call)).reason == "observation_recorded"
         await weather.set_location(WeatherLocation(latitude=12, longitude=15))
         assert "等待首次" in await weather.get_sensor_summary()
-        assert (await weather.daily_report(call)).reason == "awaiting_weather_sample"
         pending = asyncio.create_task(weather.read(call))
         await asyncio.wait_for(started.wait(), 2)
         try:
@@ -311,8 +309,7 @@ async def test_changing_weather_location_discards_old_cache_and_inflight_result(
         assert (await pending).reason == "weather_location_changed"
         assert (await weather.read(call)).reason == "observation_recorded"
         assert (await weather.read(call)).reason == "observation_cached"
-        assert (await weather.daily_report(call)).reason == "weather_report_ready"
-        last = await world.latest_event("weather", "weather_report_due")
+        last = await world.latest_event("weather", "weather_observed")
         assert last.payload == {
             "time": int(NOW),
             "interval": 900,
@@ -325,127 +322,158 @@ async def test_changing_weather_location_discards_old_cache_and_inflight_result(
         assert readings == [31.23, 12, 0]
 
 
-@pytest.mark.parametrize("notify_owner", [False, True])
-async def test_fourth_module_timer_observation_and_optional_owner_report(
-    settings, store, notify_owner
-):
+async def test_on_demand_weather_for_modules_has_no_timer_or_paid_calls(settings, store):
     settings.weather_enabled = True
     settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
-    settings.weather_time = "14:00"
-    settings.weather_owner_report = notify_owner
     requests = []
-    data_time = int(NOW)
+    at = int(NOW)
+    current = {
+        "time": at,
+        "interval": 900,
+        "temperature_2m": 17.5,
+        "weather_code": 63,
+        "precipitation": 0.4,
+        "shortwave_radiation": 100.0,
+        "is_day": 1,
+    }
 
-    def weather(req):
+    async def upstream(req):
         requests.append(req)
         assert req.url.host == "api.open-meteo.com" and req.url.path == "/v1/forecast"
-        assert (
-            req.url.params["latitude"] == "31.23"
-            and "Authorization" not in req.headers
-            and "Cookie" not in req.headers
-        )
-        assert (
-            req.url.params["timeformat"] == "unixtime"
-            and "shortwave_radiation" in req.url.params["current"]
-        )
+        assert req.url.params["latitude"] == "31.23" and req.url.params["timeformat"] == "unixtime"
+        assert "Authorization" not in req.headers and "Cookie" not in req.headers
+        await asyncio.sleep(0)
         return httpx.Response(
-            200,
-            json={
-                "current": {
-                    "time": data_time,
-                    "interval": 900,
-                    "temperature_2m": 17.5,
-                    "weather_code": 3,
-                    "precipitation": 0.4,
-                    "shortwave_radiation": 100.0,
-                    "is_day": 1,
-                }
-            },
+            200, json={"current": current, "latitude": 31.23, "longitude": 121.47}
         )
 
-    async with setup(settings, store, weather) as (svc, wire, node):
+    async with setup(settings, store, upstream) as (svc, wire, _):
         engine = svc.life_engine
-        events = []
-        svc.world_state.subscribe(events.append)
-        assert any(a["name"] == "weather.read" for a in (await engine.status())["actions"])
-        svc.ai.chat_json = "现在气温大约 17.5 度。"
-        before = await engine.tick_gatekeeper_once(now=NOW)
-        assert before["outcomes"] == {"done": 1 + int(notify_owner)}
-        await engine.tick_gatekeeper_once(now=NOW + 10)
-        assert len(requests) == 1 and not svc.ai.calls and not wire.calls and not node.calls
-        ev = await svc.world_state.latest_event("weather", "weather_observed")
-        assert (
-            ev in events and ev.payload["time"] == data_time and ev.payload["precipitation"] == 0.4
+        assert set(engine.query_options()) == {"weather.read"}
+        assert "weather.read" in {a["name"] for a in engine.catalog.view({}, planner=True)}
+        assert not svc.weather.schedules() and "weather.owner_report" not in svc.modules.rules
+        for ts in (at, at + 3600, at + 7200):
+            await engine.tick_gatekeeper_once(now=ts)
+            await svc.modules.collect_sensor_summaries()
+        assert not requests
+        assert (await engine.query("qq.speak")).reason == "unknown_query"
+
+        observed = []
+
+        async def greenhouse(event):
+            if event.event_type == "weather_observed":
+                # A consumer may query again from the event handler.
+                observed.append((await engine.query("weather.read")).details["observation"])
+
+        svc.world_state.subscribe(greenhouse)
+        results = await asyncio.wait_for(
+            asyncio.gather(*(engine.query("weather.read") for _ in range(4))), 2
         )
-        assert not await svc.world_state.unconsumed_events()
-        assert not await svc.world_state.list_due_intents(now=NOW + 30)
-        await engine.tick_gatekeeper_once(now=NOW + 65)
-        assert len(wire.calls) == int(notify_owner) and len(svc.ai.calls) == int(notify_owner)
-        if notify_owner:
-            assert (
-                wire.calls[0][0] == "send_private_msg"
-                and str(wire.calls[0][1]["user_id"]) == "20000"
-            )
-            assert "17.5" in svc.ai.calls[0][1]["jit_proactive_intent"]["module_material"]
-        data_time += 3600
-        await engine.tick_gatekeeper_once(now=NOW + 3600)
-        await engine.tick_gatekeeper_once(now=NOW + 3665)
-        assert len(requests) == 2
-        assert len(wire.calls) == int(notify_owner) and len(svc.ai.calls) == int(notify_owner)
-        assert [e.payload["time"] for e in events if e.event_type == "weather_observed"] == [
-            int(NOW),
-            data_time,
+        assert len(requests) == 1 and observed == [current]
+        assert all(result.details["observation"] == current for result in results)
+        assert all(
+            "中雨" in result.details["summary"] and "17.5" in result.details["summary"]
+            for result in results
+        )
+        assert sorted(r.reason for r in results) == ["observation_cached"] * 3 + [
+            "observation_recorded"
         ]
+        assert (
+            not await svc.world_state.unconsumed_events()
+            and not await svc.world_state.list_due_intents(now=at)
+        )
+        assert not wire.calls and not svc.ai.calls
+
+    # A restart reuses only the provider interval for this location.
+    async with setup(settings, store, upstream) as (svc, wire, _):
+        svc.life_engine.clock = lambda: at + 899
+        assert (await svc.life_engine.query("weather.read")).reason == "observation_cached"
+        assert len(requests) == 1
+        svc.life_engine.clock = lambda: at + 900
+        stale = await svc.life_engine.query("weather.read")
+        assert stale.reason == "weather_stale" and not stale.details
+        current.update(time=at + 900, temperature_2m=19.25)
+        assert (await svc.life_engine.query("weather.read")).details["observation"][
+            "temperature_2m"
+        ] == 19.25
+        await svc.life_engine.set_config({"action_modes": {"weather.read": "off"}})
+        assert "weather.read" not in svc.life_engine.query_options()
+        assert (await svc.life_engine.query("weather.read")).reason == "action_disabled"
+        await svc.life_engine.set_module_enabled(svc.weather, False)
+        assert not svc.life_engine.query_options() and len(requests) == 3
 
 
-async def test_hourly_weather_survives_restart_sleep_and_stale_data(settings, store):
+async def test_disabling_weather_during_lookup_returns_no_reading(settings, store):
     settings.weather_enabled = True
     settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
-    midnight = NOW + 10 * 3600  # 00:00, inside the engine's quiet hours.
-    data_time = int(midnight)
-    requests = []
+    started, resume = asyncio.Event(), asyncio.Event()
 
-    def weather(req):
-        requests.append(req)
+    async def provider(request):
+        started.set()
+        await resume.wait()
         return httpx.Response(
             200,
             json={
                 "current": {
-                    "time": data_time,
+                    "time": int(NOW),
                     "interval": 900,
-                    "temperature_2m": 12.0,
-                    "weather_code": 2,
+                    "temperature_2m": 18,
+                    "weather_code": 0,
                 }
             },
         )
 
-    async with setup(settings, store, weather) as (svc, wire, _):
-        await store.runtime.set_rest_hours(RestHoursConfig(enabled=True, rest_hours="23:00-08:00"))
-        await svc.world_state.experience.mc_snapshot("mine", midnight)
-        assert store.runtime.is_resting(midnight) and svc.world_state.proactive_suspended()
-        await svc.life_engine.tick_gatekeeper_once(now=midnight + 10)
-        assert len(requests) == 1 and not svc.ai.calls and not wire.calls
-    await store.close()
-    await store.open()
-    async with setup(settings, store, weather) as (svc, wire, _):
-        module = svc.modules.get("weather")
-        slot = module.schedules()[0]
-        await svc.life_engine.tick_gatekeeper_once(now=midnight + 600)
-        assert len(requests) == 1
-        assert await svc.life_engine.next_slot_at(module, slot, midnight + 600) == midnight + 3600
-        # Miss two hours. A stale response must not replace the midnight sample.
-        await svc.life_engine.tick_gatekeeper_once(now=midnight + 3 * 3600)
-        assert len(requests) == 2
-        last = await svc.world_state.latest_event("weather", "weather_observed")
-        assert last.payload["time"] == midnight
-        data_time += 4 * 3600
-        await svc.life_engine.tick_gatekeeper_once(now=midnight + 4 * 3600)
-        assert len(requests) == 3
-        assert "04:00" in await module.get_sensor_summary()
-        assert not svc.ai.calls and not wire.calls
-        await svc.life_engine.set_config({"action_modes": {"weather.read": "off"}})
-        await svc.life_engine.tick_gatekeeper_once(now=midnight + 5 * 3600)
-        assert len(requests) == 3
+    async with setup(settings, store, provider) as (svc, _, _):
+        task = asyncio.create_task(svc.life_engine.query("weather.read"))
+        await asyncio.wait_for(started.wait(), 2)
+        try:
+            await svc.life_engine.set_module_enabled(svc.weather, False)
+        finally:
+            resume.set()
+        result = await task
+        assert result.reason == "module_disabled" and not result.details
+        assert not await svc.world_state.latest_event("weather", "weather_observed")
+
+
+async def test_upgrade_retires_only_old_weather_timer_and_reminder(settings, store):
+    async with setup(settings, store) as (svc, _, _):
+        engine = svc.life_engine
+        config = engine.config.model_dump()
+        config["module_settings"]["weather"] = {"observation_time": "19:55"}
+        config["action_modes"].update({"weather.daily_report": "off", "weather.read": "off"})
+        await store.runtime.save_config("life_engine", config)
+        pending = await svc.world_state.enqueue_intent(ticket("weather.read", origin="timer"))
+        reminder = await svc.world_state.enqueue_intent(
+            ticket("qq.speak", origin="rule", scope="owner:10000")
+        )
+        other = await svc.world_state.enqueue_intent(
+            ticket("qq.speak", origin="planner", scope="owner:10000")
+        )
+        async with store.transaction():
+            await store.db.execute(
+                "INSERT INTO life_rule_receipts VALUES (?,?,?,?,?,?)",
+                ("weather.owner_report", "old-observation", "", NOW, "enqueued", reminder),
+            )
+            await store.db.execute(
+                "UPDATE scheduled_intents SET status='executing',handler_started=0 WHERE id=?",
+                (reminder,),
+            )
+        restarted = LifeEngine(svc, clock=lambda: NOW)
+        await restarted.initialize()
+        async with svc.weather.lifespan():
+            await svc.world_state.recover_actions()
+            for ident in (pending, reminder):
+                assert (
+                    await store.one(
+                        "SELECT result_reason FROM scheduled_intents WHERE id=?", (ident,)
+                    )
+                )[0] == "weather_schedule_retired"
+            assert (await store.one("SELECT status FROM scheduled_intents WHERE id=?", (other,)))[
+                0
+            ] == "pending"
+            assert svc.weather.scheduling(restarted.config).model_dump() == {}
+            assert restarted.config.action_modes.get("weather.read") == "off"
+            assert "weather.daily_report" not in restarted.config.action_modes
 
 
 @pytest.mark.parametrize(
