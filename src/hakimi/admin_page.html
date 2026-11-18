@@ -3,98 +3,94 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>哈基米 · 星夜控制台 2.0</title>
+<title>星夜控制台 · 哈基米</title>
 <style>
 :root {
   color-scheme: light;
-  --bg: #f5f4fa;
-  --card: #ffffff;
-  --card-2: #faf9fd;
-  --ink: #242031;
-  --muted: #6c677c;
-  --accent: #6c4ec2;
-  --accent-hover: #583bad;
-  --on-accent: #ffffff;
-  --soft: #f1ecfa;
-  --soft-2: #f8f6fc;
-  --line: #e7e2f0;
-  --bad: #c03953;
-  --bad-bg: #fdf1f3;
-  --bad-line: #f6ccd5;
-  --good: #1f8069;
-  --good-bg: #eef9f5;
-  --good-line: #bfead9;
-  --warn: #a6670a;
-  --warn-bg: #fef7ea;
-  --warn-line: #f5ddb0;
-  --paid-ink: #5a3db8;
-  --paid-bg: #f1ecfc;
-  --paid-line: #d6c8f7;
-  --free-ink: #0f766e;
-  --free-bg: #ecfdf9;
-  --free-line: #b5ece0;
-  --vertex-ink: #1d5fc4;
-  --vertex-bg: #eef4fe;
-  --vertex-line: #c4d9fb;
-  --sidebar: #1f1c2b;
-  --side-ink: #d7d1e6;
-  --side-accent: #d9c3ff;
-  --topbar-bg: rgba(255, 255, 255, .82);
-  --glow-1: rgba(115, 85, 188, .12);
-  --glow-2: rgba(56, 132, 232, .09);
-  --shadow: 0 6px 24px rgba(31, 25, 48, .05), 0 1px 3px rgba(31, 25, 48, .04);
-  --shadow-lg: 0 22px 54px rgba(31, 25, 48, .10);
-  --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+  --bg: #f3f4f7;
+  --card: #fff;
+  --card-2: #f8f8fb;
+  --ink: #252333;
+  --muted: #646273;
+  --accent: #6149ad;
+  --accent-hover: #4e3798;
+  --on-accent: #fff;
+  --soft: #eeeaf9;
+  --soft-2: #f7f6fb;
+  --line: #dedee7;
+  --bad: #a52e49;
+  --bad-bg: #fff0f3;
+  --bad-line: #efc2cd;
+  --good: #216957;
+  --good-bg: #e6f5ed;
+  --good-line: #b8dcca;
+  --warn: #83560b;
+  --warn-bg: #fff3d8;
+  --warn-line: #ead19b;
+  --paid-ink: #5b419f;
+  --paid-bg: #efeafb;
+  --paid-line: #d7cdec;
+  --free-ink: #196d60;
+  --free-bg: #e7f6ef;
+  --free-line: #bedfd2;
+  --vertex-ink: #315c9c;
+  --vertex-bg: #ecf2ff;
+  --vertex-line: #cbdaf3;
+  --sidebar: #252335;
+  --side-ink: #e3dfef;
+  --side-muted: #b5adc8;
+  --side-active: #daceff;
+  --glow-1: #8872c729;
+  --shadow: 0 1px 2px #2522390a;
+  --shadow-lg: 0 18px 56px #15112729;
+  --sans: "Work Sans", system-ui, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  --rail: 224px;
+  --bar: 64px;
 }
-
 :root[data-theme=dark] {
   color-scheme: dark;
-  --bg: #14131a;
-  --card: #1d1b25;
-  --card-2: #24212e;
-  --ink: #efecf7;
-  --muted: #ada6bf;
-  --accent: #b69af0;
-  --accent-hover: #cab5f6;
-  --on-accent: #1d1430;
-  --soft: #2b243b;
-  --soft-2: #231f2e;
-  --line: #342f42;
-  --bad: #f48fa1;
-  --bad-bg: #361d25;
-  --bad-line: #61303f;
-  --good: #6fd3b5;
-  --good-bg: #172e28;
-  --good-line: #285649;
-  --warn: #f0b85b;
-  --warn-bg: #332615;
-  --warn-line: #5d4421;
-  --paid-ink: #ccb7fa;
-  --paid-bg: #2d2345;
-  --paid-line: #4d3b75;
-  --free-ink: #6bd9c7;
-  --free-bg: #162e2c;
-  --free-line: #265450;
-  --vertex-ink: #8cb8ff;
-  --vertex-bg: #1b2842;
-  --vertex-line: #2d4675;
-  --sidebar: #111017;
-  --side-ink: #d4cce2;
-  --side-accent: #d9c3ff;
-  --topbar-bg: rgba(24, 22, 32, .80);
-  --glow-1: rgba(182, 154, 240, .14);
-  --glow-2: rgba(102, 160, 255, .10);
-  --shadow: 0 8px 26px rgba(0, 0, 0, .28);
-  --shadow-lg: 0 24px 60px rgba(0, 0, 0, .48);
+  --bg: #171720;
+  --card: #21212e;
+  --card-2: #272735;
+  --ink: #f0edf7;
+  --muted: #b3aec3;
+  --accent: #c5adfa;
+  --accent-hover: #d9c9ff;
+  --on-accent: #241a3a;
+  --soft: #352d49;
+  --soft-2: #292635;
+  --line: #3b394b;
+  --bad: #ffa5b6;
+  --bad-bg: #3c2531;
+  --bad-line: #684052;
+  --good: #8adbbc;
+  --good-bg: #1c332b;
+  --good-line: #325b4a;
+  --warn: #f1c77c;
+  --warn-bg: #372c1e;
+  --warn-line: #604b2c;
+  --paid-ink: #d2bfff;
+  --paid-bg: #352b49;
+  --paid-line: #53436f;
+  --free-ink: #88d8ba;
+  --free-bg: #20372e;
+  --free-line: #365e4d;
+  --vertex-ink: #a9c7ff;
+  --vertex-bg: #243147;
+  --vertex-line: #394e71;
+  --sidebar: #1a1925;
+  --glow-1: #ae91ef2b;
+  --shadow-lg: 0 18px 56px #0007;
 }
 
 * { box-sizing: border-box; }
-html { scroll-padding-top: 85px; }
+html { scroll-padding-top: calc(var(--bar) + 20px); scrollbar-gutter: stable; }
 body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 14px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font: 14px/1.55 var(--sans);
   -webkit-font-smoothing: antialiased;
 }
 button, input, select, textarea { font: inherit; }
@@ -128,233 +124,147 @@ svg {
 .skip:focus { top: 10px; }
 
 .topbar {
-  height: 70px;
+  height: var(--bar);
   position: sticky;
   top: 0;
   z-index: 30;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 0 30px;
-  background: var(--topbar-bg);
-  backdrop-filter: blur(16px) saturate(160%);
-  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  gap: 22px;
+  padding-right: clamp(16px, 3vw, 44px);
+  background: var(--card);
   border-bottom: 1px solid var(--line);
 }
-.brand, .topbar-actions, .brand-copy { display: flex; align-items: center; gap: 12px; }
-.brand-copy { align-items: flex-start; flex-direction: column; gap: 1px; }
-.brand-copy strong { font-size: 16px; letter-spacing: .05em; }
-.brand-copy small { font-size: 10px; letter-spacing: .14em; color: var(--muted); }
-.brand-mark {
-  width: 36px;
-  height: 36px;
-  border-radius: 11px;
-  background: linear-gradient(135deg, var(--soft), var(--card-2));
-  border: 1px solid var(--paid-line);
-  color: var(--accent);
-  display: grid;
-  place-items: center;
-  box-shadow: 0 2px 10px var(--glow-1);
+.brand, .topbar-actions, .page-meta, .connection-state { display: flex; align-items: center; }
+.brand {
+  align-self: stretch;
+  gap: 11px;
+  padding: 0 21px;
+  width: var(--rail);
+  flex: none;
+  color: #faf8ff;
+  background: var(--sidebar);
 }
-.brand-mark svg { width: 22px; height: 22px; }
-.topbar-actions { gap: 10px; }
-.version {
-  font: 600 11px var(--mono);
-  color: var(--accent);
-  background: var(--soft);
-  border: 1px solid var(--paid-line);
-  padding: 3px 10px;
-  border-radius: 999px;
-}
-.icon-button {
-  width: 36px;
+.brand-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; background: #daceff; color: #35294c; }
+.brand-mark svg { width: 23px; height: 23px; fill: currentColor; stroke-width: 1; }
+.brand-copy { display: grid; line-height: 1.3; }
+.brand-copy strong { font-size: 17px; letter-spacing: .04em; }
+.brand-copy small { font-size: 11px; color: var(--side-muted); }
+.topbar-actions { margin-left: auto; gap: 10px; }
+.version { color: var(--muted); font: 12px var(--mono); }
+.icon-button, .finder-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   height: 36px;
-  padding: 0;
-  display: grid;
-  place-items: center;
+  padding: 0 10px;
   background: var(--card);
   color: var(--muted);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  transition: background .15s ease, color .15s ease, border-color .15s ease;
+  border-radius: 8px;
 }
-.icon-button:hover { background: var(--soft); color: var(--accent); border-color: var(--accent); }
-#menu-toggle { display: none; }
-.topbar button.secondary { padding: 7px 14px; font-size: 12px; }
+.icon-button { width: 36px; padding: 0; }
+.icon-button:hover, .finder-button:hover { background: var(--soft); color: var(--accent); }
+.icon-button svg, .finder-button svg { width: 17px; height: 17px; }
+kbd { color: var(--muted); font: 11px var(--mono); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+#menu-toggle, #drawer-close { display: none; }
+.topbar .secondary { padding: 7px 12px; }
+body:not(.authenticated) .brand { color: var(--ink); background: transparent; }
+body:not(.authenticated) .brand-copy small { color: var(--muted); }
+.page-meta { gap: 14px; min-width: 0; font-size: 12px; color: var(--muted); }
+body:not(.authenticated) .page-meta { display: none; }
+.connection-state { gap: 8px; font-weight: 600; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.status-dot.online { background: var(--good); box-shadow: 0 0 0 3px var(--good-bg); }
+.status-dot.offline { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-bg); }
+#last-updated { padding-left: 14px; border-left: 1px solid var(--line); font-variant-numeric: tabular-nums; }
 
 main { min-width: 0; }
 .sidebar {
   position: fixed;
-  top: 70px;
-  bottom: 0;
-  left: 0;
-  width: 238px;
+  inset: var(--bar) auto 0 0;
+  width: var(--rail);
+  z-index: 25;
   background: var(--sidebar);
   color: var(--side-ink);
-  padding: 22px 14px 14px;
+  padding: 13px 13px 16px;
   overflow-y: auto;
-  z-index: 25;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid rgba(255, 255, 255, .06);
+  overscroll-behavior: contain;
   scrollbar-width: thin;
-  scrollbar-color: #514961 transparent;
+  scrollbar-color: #645c77 var(--sidebar);
 }
-.sidebar-intro {
-  padding: 0 14px 16px;
-  font-size: 10px;
-  letter-spacing: .18em;
-  color: #9e93b4;
-}
-.nav-group { margin-bottom: 16px; }
+.drawer-head { display: none; }
+.nav-group + .nav-group { margin-top: 15px; }
 .nav-group-label {
-  padding: 0 14px 7px;
-  font-size: 10px;
-  letter-spacing: .09em;
-  color: #9f94b6;
+  color: var(--side-muted);
+  padding: 0 12px 4px;
+  font-size: 11px;
   font-weight: 600;
 }
 nav button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 12px;
+  min-height: 34px;
+  margin: 1px 0;
   border: 0;
   background: transparent;
   color: var(--side-ink);
-  width: 100%;
+  border-radius: 7px;
   text-align: left;
-  display: flex;
-  gap: 11px;
-  align-items: center;
-  border-radius: 9px;
-  padding: 9px 14px;
-  font-size: 12px;
-  line-height: 1.55;
-  margin: 2px 0;
-  position: relative;
-  transition: background .16s ease, color .16s ease, transform .16s ease;
+  font-size: 13px;
+  font-weight: 500;
 }
-nav button svg { width: 17px; height: 17px; opacity: .76; transition: opacity .16s ease; }
-nav button:hover { background: rgba(255, 255, 255, .07); color: #fff; transform: translateX(2px); }
-nav button:hover svg { opacity: 1; }
-nav button[aria-selected=true] {
-  background: linear-gradient(90deg, rgba(168, 136, 240, .28), rgba(168, 136, 240, .12));
-  color: #fff;
-  font-weight: 600;
-  box-shadow: inset 3px 0 0 var(--side-accent);
-}
-nav button[aria-selected=true] svg { opacity: 1; color: var(--side-accent); }
-nav button[aria-selected=true]::after {
-  content: "";
-  position: absolute;
-  right: 12px;
-  width: 6px;
-  height: 6px;
-  background: var(--side-accent);
-  border-radius: 50%;
-  box-shadow: 0 0 8px var(--side-accent);
-}
+nav button svg { width: 16px; height: 16px; }
+nav button:hover { background: #ffffff12; color: #fff; }
+nav button[aria-selected=true] { background: var(--side-active); color: #2b203c; font-weight: 700; }
+nav button:focus-visible, .drawer-head button:focus-visible { outline-color: #ddd0ff; }
 nav button:disabled { opacity: 1; cursor: progress; }
-.sidebar-foot {
-  margin-top: auto;
-  padding: 16px 14px 8px;
-  border-top: 1px solid rgba(255, 255, 255, .09);
-  font-size: 10px;
-  color: #a69cb9;
-  line-height: 1.85;
-}
-.sidebar-foot strong { color: #e8dff6; font-weight: 600; font-size: 11px; }
+.sidebar-foot { margin: 22px 10px 0; border-top: 1px solid #ffffff24; padding-top: 12px; color: var(--side-muted); font: 11px var(--mono); }
 
-.page-content {
-  margin-left: 238px;
-  padding: 30px clamp(22px, 3vw, 48px) 40px;
-  max-width: 1800px;
-  min-width: 0;
-}
-.page-heading {
-  position: relative;
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 18px;
-  margin-bottom: 24px;
-  padding: 20px 24px;
-  border-radius: 16px;
-  border: 1px solid var(--line);
-  background:
-    radial-gradient(520px circle at 8% 0%, var(--glow-1), transparent 72%),
-    radial-gradient(460px circle at 96% 18%, var(--glow-2), transparent 68%),
-    var(--card);
-  box-shadow: var(--shadow);
-}
-.eyebrow { font-size: 10px; letter-spacing: .15em; color: var(--accent); font-weight: 700; }
-.page-heading h1 {
-  font-size: 26px;
-  letter-spacing: -.03em;
-  line-height: 1.3;
-  margin: 5px 0 6px;
-  font-weight: 700;
-}
-.page-heading p { margin: 0; color: var(--muted); font-size: 12px; }
-.page-meta { text-align: right; flex-shrink: 0; font-size: 11px; color: var(--muted); }
-.status-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
-  margin-right: 6px;
-}
-.status-dot.online { background: var(--good); box-shadow: 0 0 0 3px var(--good-bg); }
-.status-dot.offline { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-bg); }
-#last-updated { display: block; margin-top: 4px; font: 10px var(--mono); }
-
-.tab[aria-busy=true] { opacity: .65; cursor: progress; }
+.page-content { margin-left: var(--rail); max-width: 1570px; min-width: 0; padding: 28px clamp(20px, 3vw, 46px) 36px; }
+.page-heading { display: flex; justify-content: space-between; align-items: end; flex-wrap: wrap; gap: 12px; margin-bottom: 22px; }
+.eyebrow { display: flex; align-items: center; gap: 8px; color: var(--accent); font-size: 12px; font-weight: 650; }
+.eyebrow::before { content: ""; width: 16px; height: 2px; background: currentColor; }
+.page-heading h1 { font-size: clamp(26px, 3vw, 37px); line-height: 1.18; letter-spacing: -.04em; margin: 6px 0; }
+.page-heading p { margin: 0; color: var(--muted); font-size: 13px; }
+#overview-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+#overview-day { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+#refresh { display: inline-flex; gap: 7px; align-items: center; }
+#refresh svg { width: 15px; height: 15px; }
+.tab[aria-busy=true] { opacity: .72; cursor: progress; }
 .card {
   background: var(--card);
   border: 1px solid var(--line);
-  border-radius: 16px;
-  padding: 24px;
-  margin-bottom: 20px;
+  border-radius: 14px;
+  padding: clamp(17px, 2vw, 26px);
+  margin-bottom: 16px;
   box-shadow: var(--shadow);
   min-width: 0;
-  transition: border-color .18s ease;
 }
-.card h2 { font-size: 16px; letter-spacing: -.02em; margin: 0 0 14px; font-weight: 700; }
-.card h3 { font-size: 13px; margin: 22px 0 10px; font-weight: 650; color: var(--ink); }
-.card > p { font-size: 12px; line-height: 1.8; }
-.card > p.muted { max-width: 1040px; }
+.card h2 { font-size: 17px; line-height: 1.4; letter-spacing: -.025em; margin: 0 0 14px; font-weight: 700; }
+.card h3 { font-size: 14px; margin: 22px 0 10px; font-weight: 650; color: var(--ink); }
+.card > p { font-size: 13px; line-height: 1.75; }
+.card > p.muted { max-width: 90ch; }
 .row h2 { margin: 0; }
 .card > .row:first-child { margin-bottom: 16px; }
 .muted, small { color: var(--muted); }
-
-.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .grid > * { min-width: 0; }
 .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .between { justify-content: space-between; }
 .grow { flex: 1; min-width: 0; }
 
-.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
-.stat {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 18px;
-  min-width: 0;
-  background: var(--card-2);
-  transition: border-color .15s ease;
-}
-.stat:hover { border-color: var(--accent); }
-.stat small { font-size: 11px; }
-.stat strong {
-  display: block;
-  font: 650 26px/1.38 var(--mono);
-  letter-spacing: -.06em;
-  margin: 8px 0 4px;
-  overflow-wrap: anywhere;
-}
-.stat .stat-note { font-size: 10px; color: var(--muted); }
-.stat:nth-child(2) { background: var(--soft); border-color: var(--paid-line); }
-.stat:nth-child(2) strong { font-size: 22px; line-height: 1.55; font-family: inherit; letter-spacing: -.02em; }
-.stat-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.stat-top svg { color: var(--accent); width: 16px; height: 16px; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 0 0 16px; }
+.stat { min-width: 0; border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; background: var(--card); }
+.stat dt { color: var(--muted); font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.stat > small { display: block; font-size: 12px; }
+.stat > strong { display: block; margin-top: 5px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.stat dt svg { color: var(--accent); width: 17px; height: 17px; }
+.stat dd { margin: 8px 0 0; font: 650 clamp(21px, 2.2vw, 31px)/1.2 var(--sans); font-variant-numeric: tabular-nums; letter-spacing: -.04em; overflow-wrap: anywhere; }
 
 .kpi-strip {
   display: grid;
@@ -458,45 +368,69 @@ fieldset.panel-group > legend {
 }
 .quick-bar label { margin: 0; flex: 1 1 135px; min-width: 120px; }
 
-.overview-budget {
-  display: grid;
-  grid-template-columns: 1.1fr 1fr;
-  gap: 26px;
-  margin-top: 22px;
-  padding-top: 22px;
-  border-top: 1px solid var(--line);
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1.28fr) minmax(290px, 1fr); gap: 16px; margin-bottom: 16px; }
+.overview-grid > .card { margin: 0; }
+#overview .card h2 { margin: 0 0 15px; }
+.budget-card {
+  position: relative;
+  overflow: hidden;
+  display: flex; flex-direction: column;
+  background: #312946;
+  border-color: #44375d;
+  color: #fcfaff;
 }
-.overview-budget h3 { margin: 0 0 12px; }
-.overview-budget p { font-size: 11px; }
-.budget-value { font-family: var(--mono); font-size: 13px !important; }
-.lane-summary { align-content: start; border-left: 1px solid var(--line); padding-left: 26px; }
-.badge {
-  padding: 4px 9px;
-  background: var(--soft);
-  color: var(--accent);
-  border: 1px solid var(--paid-line);
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 600;
+.budget-card::before {
+  content: "";
+  position: absolute;
+  width: 195px; height: 195px; top: -150px; right: -48px;
+  border: 1px solid #ffffff24;
+  border-radius: 50%;
+  box-shadow: 0 0 0 25px #ffffff06, 0 0 0 26px #ffffff1c, 0 0 0 50px #ffffff05, 0 0 0 51px #ffffff15;
+  pointer-events: none;
 }
-.quick-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.budget-card > * { position: relative; }
+.budget-numbers { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+.budget-numbers strong { font: 600 clamp(31px, 3.2vw, 50px)/1.2 var(--sans); letter-spacing: -.045em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+#budget-limit, .budget-card p, .budget-meter { color: #dfd7ed; }
+#budget-limit, .budget-meter { font-size: 13px; }
+.budget-meter { display: flex; align-items: center; gap: 11px; margin: 15px 0 10px; }
+.budget-meter output { min-width: 3.2em; text-align: right; font: 12px var(--mono); }
+#budget { --track: #584969; --fill: #c8afff; }
+#budget[data-level=warning] { --fill: #f5ce83; }
+#budget[data-level=stop] { --fill: #ffabb5; }
+.budget-card p { font-size: 12px; margin: 3px 0 0; overflow-wrap: anywhere; }
+.budget-foot { display: flex; flex-wrap: wrap; gap: 10px 30px; margin-top: auto; padding-top: 14px; }
+.budget-foot > div { display: grid; gap: 2px; }
+.budget-foot span { color: #d5cbe5; font-size: 12px; }
+.budget-foot strong { font: 600 15px var(--mono); }
+.node-details { margin: 0; }
+.node-details > div { display: flex; gap: 12px; justify-content: space-between; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.node-details > div:first-child { padding-top: 0; }
+.node-details dt { flex: none; color: var(--muted); font-size: 12px; }
+.node-details dd { margin: 0; font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.rest-row { margin-top: 10px; }
+.rest-row button { font-size: 12px; padding: 5px 10px; }
+.badge { padding: 3px 8px; background: var(--soft); color: var(--accent); border-radius: 5px; font-size: 12px; font-weight: 600; }
+.lanes { display: grid; gap: 12px; margin: 0; }
+.lane { display: grid; grid-template-columns: minmax(80px, 1fr) minmax(60px, 1.7fr) minmax(86px, auto); gap: 12px; align-items: center; }
+.lane dt { font-size: 13px; overflow-wrap: anywhere; }
+.lane dd { display: flex; align-items: center; margin: 0; min-width: 0; }
+.lane .lane-amount { display: grid; text-align: right; font: 12px var(--mono); }
+.lane-amount small { font: 11px var(--sans); }
+.lane progress { height: 6px; }
+.empty-state { color: var(--muted); }
+.quick-actions { display: grid; gap: 0; }
 .quick-action {
-  background: var(--card-2);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  text-align: left;
-  padding: 17px 15px;
-  color: var(--ink);
-  transition: background .15s ease, border-color .15s ease, transform .15s ease;
+  width: 100%; display: flex; align-items: center; gap: 12px; text-align: left;
+  padding: 10px 6px; background: transparent; color: var(--ink); border: 0; border-radius: 6px;
 }
-.quick-action:hover { background: var(--soft); border-color: var(--accent); transform: translateY(-1px); }
-.quick-action > svg { width: 23px; height: 23px; color: var(--accent); }
-.quick-action strong { display: block; font-size: 12px; font-weight: 650; }
-.quick-action small { display: block; font-size: 10px; margin-top: 3px; }
-.quick-action .action-arrow { margin-left: auto; color: var(--muted); }
+.quick-action + .quick-action { border-top: 1px solid var(--line); }
+.quick-action:hover { background: var(--soft-2); }
+.quick-action > svg { box-sizing: content-box; width: 18px; height: 18px; padding: 7px; color: var(--accent); border-radius: 8px; background: var(--soft); }
+.quick-action strong { display: block; font-size: 13px; }
+.quick-action small { display: block; font-size: 11px; font-weight: 400; }
+.action-arrow { margin-left: auto; color: var(--muted); }
+.overview-footnote { font-size: 12px !important; color: var(--muted); margin: 14px 0 0; }
 
 label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 7px; }
 label > input:not([type=checkbox]), label > select, label > textarea { display: block; width: 100%; margin-top: 7px; }
@@ -549,25 +483,17 @@ button {
 }
 button:hover { background: var(--accent-hover); }
 button:active:not(:disabled) { transform: translateY(1px); }
-button.secondary { background: var(--soft); color: var(--accent); border-color: var(--paid-line); }
+button.secondary { background: var(--card); color: var(--ink); border-color: var(--line); }
 button.secondary:hover { background: var(--soft); border-color: var(--accent); }
 button.danger { background: var(--bad-bg); border-color: var(--bad-line); color: var(--bad); }
 button.danger:hover { border-color: var(--bad); background: var(--bad-bg); }
 button[aria-busy=true] { cursor: progress; }
 .error { color: var(--bad); }
 
-progress {
-  width: 100%;
-  height: 8px;
-  border: 0;
-  border-radius: 999px;
-  overflow: hidden;
-  background: var(--soft);
-  accent-color: var(--accent);
-}
-progress::-webkit-progress-bar { background: var(--soft); border-radius: 999px; }
-progress::-webkit-progress-value { background: var(--accent); border-radius: 999px; }
-progress::-moz-progress-bar { background: var(--accent); border-radius: 999px; }
+progress { width: 100%; height: 8px; border: 0; border-radius: 8px; overflow: hidden; background: var(--track, var(--soft)); accent-color: var(--fill, var(--accent)); }
+progress::-webkit-progress-bar { background: var(--track, var(--soft)); border-radius: 8px; }
+progress::-webkit-progress-value { background: var(--fill, var(--accent)); border-radius: 8px; }
+progress::-moz-progress-bar { background: var(--fill, var(--accent)); border-radius: 8px; }
 
 table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
 td, th {
@@ -652,7 +578,7 @@ footer {
   padding: 0 20px 26px;
   letter-spacing: .04em;
 }
-body.authenticated footer { margin-left: 238px; }
+body.authenticated footer { margin-left: var(--rail); }
 #notice {
   position: fixed;
   top: 84px;
@@ -673,40 +599,53 @@ body.authenticated footer { margin-left: 238px; }
 #notice.error { border-left-color: var(--bad); color: var(--bad); }
 
 .login {
-  position: relative;
-  max-width: 450px;
-  margin: clamp(42px, 11vh, 130px) auto 80px;
-  padding: 38px;
-  background:
-    radial-gradient(420px circle at 18% 0%, var(--glow-1), transparent 70%),
-    radial-gradient(320px circle at 92% 10%, var(--glow-2), transparent 65%),
-    var(--card);
+  display: grid;
+  grid-template-columns: 0.9fr 1fr;
+  width: min(840px, calc(100% - 40px));
+  margin: clamp(38px, 12vh, 130px) auto 38px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  overflow: hidden;
+  background: var(--card);
   box-shadow: var(--shadow-lg);
 }
-.login .login-symbol {
-  width: 54px;
-  height: 54px;
-  display: grid;
-  place-items: center;
-  background: linear-gradient(135deg, var(--soft), var(--card-2));
-  border: 1px solid var(--paid-line);
-  color: var(--accent);
-  border-radius: 16px;
-  margin-bottom: 24px;
+.login-sky {
+  position: relative; isolation: isolate; overflow: hidden; display: flex; align-items: end;
+  color: #fff; padding: 32px; min-height: 355px;
+  background: radial-gradient(ellipse at 64% 28%, #493b61, #2d263f 67%);
 }
-.login-symbol svg { width: 30px; height: 30px; }
-.login h1 { font-size: 25px; margin: 6px 0 12px; }
-.login p { font-size: 12px; line-height: 1.9; }
-.login form { margin-top: 26px; }
-.login input { width: 100%; margin-bottom: 16px; }
-.login button[type=submit] { width: 100%; padding: 12px; }
-.login-note {
-  border-top: 1px solid var(--line);
-  padding-top: 18px;
-  margin-top: 24px;
-  font-size: 10px;
-  color: var(--muted);
-}
+.sky-copy, .sky-map { pointer-events: none; }
+.sky-copy h1 { font-size: 30px; letter-spacing: -.045em; margin: 0; }
+.sky-copy p { margin: 4px 0 0; color: #d7cee8; font-size: 13px; }
+.sky-map { position: absolute; inset: 0 0 75px; z-index: -1; }
+.orbit { position: absolute; left: 50%; top: 53%; width: 73%; height: 58%; border: 1px solid #dccef54a; border-radius: 50%; transform: translate(-50%,-50%) rotate(-26deg); }
+.orbit.outer { width: 104%; height: 82%; border-style: dashed; border-color: #cfbdea38; }
+.orbit::after { content: ""; position: absolute; width: 6px; height: 6px; border-radius: 50%; background: #e5d2ff; left: 11%; top: 15%; }
+.orbit.outer::after { background: #abddc7; left: 75%; top: 6%; }
+.sky-star { position: absolute; left: 50%; top: 53%; width: clamp(65px, 10vw, 98px); aspect-ratio: 1; transform: translate(-50%,-50%) rotate(12deg); background: linear-gradient(135deg, #f3e5ff, #a887e5); clip-path: polygon(50% 0, 63% 37%, 100% 50%, 63% 63%, 50% 100%, 37% 63%, 0 50%, 37% 37%); }
+.login-fields { align-self: center; padding: clamp(23px, 4vw, 46px); }
+.login-fields h2 { margin: 0 0 6px; font-size: 24px; letter-spacing: -.035em; }
+.login-fields p { margin: 0; font-size: 13px; }
+.login form { margin-top: 24px; }
+.login label { font-weight: 600; color: var(--ink); }
+.login input, .login button[type=submit] { display: block; width: 100%; min-height: 43px; }
+.login button[type=submit] { margin-top: 14px; }
+.login-fields .login-note { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 18px; color: var(--muted); font-size: 12px; }
+#login-error { margin: 8px 0 0; color: var(--bad); }
+
+.finder { padding: 0; width: min(570px, calc(100% - 24px)); max-height: min(620px, 85dvh); overflow: hidden; }
+.finder[open] { display: flex; flex-direction: column; }
+.finder-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px 8px; }
+.finder-head h2 { margin: 0; font-size: 17px; }
+.finder-field { display: flex; align-items: center; gap: 10px; margin: 6px 20px 10px; }
+.finder-field svg { color: var(--muted); }
+.finder-field input { width: 100%; min-width: 0; }
+.finder-results { margin: 0; padding: 4px 10px 12px; overflow-y: auto; min-height: 0; border-top: 1px solid var(--line); }
+.finder-option { display: flex; align-items: center; gap: 8px; justify-content: space-between; padding: 10px; border-radius: 7px; cursor: pointer; }
+.finder-option[aria-selected=true], .finder-option:hover { background: var(--soft); }
+.finder-option strong { font-size: 13px; overflow-wrap: anywhere; }
+.finder-option small { flex: none; font-size: 11px; }
+.finder-empty { padding: 8px 20px 16px; color: var(--muted); }
 
 .meme-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 16px; }
 .meme-item {
@@ -756,78 +695,70 @@ body.authenticated footer { margin-left: 238px; }
   border-radius: 6px;
 }
 .meme-q-item input { flex: 1; min-width: 160px; }
-.nav-scrim {
-  position: fixed;
-  inset: 70px 0 0;
-  background: #16101c80;
-  z-index: 24;
-  border: 0;
-  border-radius: 0;
-  backdrop-filter: blur(2px);
-}
+.nav-scrim { position: fixed; inset: var(--bar) 0 0; background: #14121e80; z-index: 24; border: 0; border-radius: 0; }
+.nav-scrim:hover { background: #14121e80; }
 .bot-th-input { width: 92px; }
 
-@media(min-width:1650px) {
-  .page-content { padding-left: 52px; padding-right: 52px; }
-}
 @media(max-width:1180px) {
-  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .quick-actions { grid-template-columns: 1fr; }
-  .quick-action { padding: 14px 16px; }
-  .grid { gap: 14px; }
-  .page-content { padding: 26px 22px; }
-  .sidebar { width: 214px; }
-  .page-content, body.authenticated footer { margin-left: 214px; }
+  :root { --rail: 202px; }
+  .page-content { padding-inline: 22px; }
+  .stats { gap: 10px; }
+  .stat { padding: 14px; }
+  .overview-grid { grid-template-columns: minmax(0, 1.15fr) minmax(260px, 1fr); }
 }
 @media(max-width:900px) {
-  #menu-toggle:not([hidden]) { display: grid; }
-  .sidebar { width: 248px; transform: translateX(-100%); transition: transform .2s ease; }
-  .sidebar.open { transform: translateX(0); }
+  #menu-toggle:not([hidden]), #drawer-close { display: inline-flex; }
+  .brand { width: auto; background: transparent; color: var(--ink); gap: 8px; padding: 0 0 0 15px; }
+  .brand-copy small { color: var(--muted); }
+  .sidebar { width: min(300px, calc(100vw - 52px)); transform: translateX(-100%); visibility: hidden; transition: transform .18s ease; }
+  .sidebar.open { transform: translateX(0); visibility: visible; }
+  .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 12px; }
+  .drawer-head button { color: var(--side-ink); border-color: #ffffff38; background: transparent; }
+  nav button { min-height: 42px; }
   body.nav-open { overflow: hidden; }
   .page-content, body.authenticated footer { margin-left: 0; }
-  .topbar { padding: 0 20px; }
-  .page-content { padding: 24px 18px; }
-  .overview-budget { grid-template-columns: 1fr; }
-  .lane-summary { padding: 0; border-left: 0; border-top: 1px solid var(--line); padding-top: 18px; }
-  .page-heading { padding: 18px 20px; }
-  .page-heading h1 { font-size: 24px; }
+  .page-content { padding: 22px 18px; }
+  .topbar { gap: 16px; padding-right: 15px; }
+  #last-updated { display: none; }
   .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-@media(max-width:600px) {
-  .topbar { height: 64px; padding: 0 14px; gap: 9px; }
-  .brand { gap: 8px; }
-  .brand-copy strong { font-size: 14px; }
-  .brand-copy small { font-size: 8px; }
-  .brand-mark { width: 30px; height: 30px; }
-  .version { display: none; }
+@media(max-width:680px) {
+  :root { --bar: 58px; }
+  .topbar { gap: 10px; padding-right: 12px; }
   .topbar-actions { gap: 6px; }
-  .topbar button.secondary { padding: 7px 10px; }
-  .sidebar { top: 64px; }
-  .nav-scrim { top: 64px; }
-  .page-content { padding: 20px 14px; }
-  .page-heading { flex-direction: column; align-items: flex-start; gap: 10px; padding: 16px; }
-  .page-heading p { line-height: 1.75; }
-  .page-meta { text-align: left; font-size: 10px; margin-top: 2px; }
-  #last-updated { font-size: 9px; }
-  .page-heading h1 { font-size: 22px; }
-  .card { padding: 18px 15px; border-radius: 13px; }
-  .grid { grid-template-columns: 1fr; }
-  .stats { gap: 10px; }
-  .stat { padding: 15px 13px; }
-  .stat strong { font-size: 22px; }
-  .stat:nth-child(2) strong { font-size: 20px; }
-  .kpi-strip { grid-template-columns: 1fr; }
-  .grant-row { grid-template-columns: 1fr; }
-  .quick-bar label { flex: 1 1 100%; }
+  .brand { padding-left: 10px; }
+  .brand-copy strong { font-size: 14px; }
+  .brand-copy small { font-size: 10px; }
+  .brand-mark { width: 29px; height: 29px; }
+  body.authenticated .brand-mark, .version, .finder-button span, .finder-button kbd { display: none; }
+  .finder-button { width: 36px; padding: 0; }
+  .page-meta { font-size: 11px; }
+  .page-content { padding: 19px 12px; }
+  .page-heading { align-items: center; margin-bottom: 16px; }
+  .page-heading h1 { font-size: 26px; }
+  #overview-tools { gap: 5px; }
+  .card { padding: 17px 14px; border-radius: 12px; }
+  .grid, .overview-grid, .grant-row { grid-template-columns: minmax(0, 1fr); }
+  .overview-grid { gap: 12px; margin-bottom: 12px; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .stat { padding: 12px; }
+  .stat dd { font-size: 24px; }
+  .kpi-strip { grid-template-columns: repeat(auto-fit,minmax(min(145px,100%),1fr)); }
+  .quick-bar label { flex: 1 1 100%; min-width: 0; }
   .row { gap: 8px; }
-  .card > .row h2 { font-size: 15px; }
-  .login { margin: 36px 14px; padding: 26px; }
-  .table { margin-top: 14px; }
-  #notice { top: 74px; right: 14px; }
-  dialog { padding: 20px; }
-  .quick-action small { font-size: 10px; }
-  .topbar .brand-copy { gap: 1px; }
+  .login { width: min(425px, calc(100% - 24px)); grid-template-columns: minmax(0,1fr); margin: 24px auto; }
+  .login-sky { min-height: 125px; padding: 20px; }
+  .sky-copy h1 { font-size: 24px; }
+  .sky-map { inset: -2px -15px 0 43%; }
+  .sky-star { width: 54px; }
+  .login-fields { padding: 24px 20px; }
+  .login-fields h2 { font-size: 22px; }
+  .table { margin-top: 10px; }
+  #notice { top: calc(var(--bar) + 8px); right: 12px; }
+  dialog:not(.finder) { padding: 18px; }
+  .finder-option small { flex-shrink: 1; }
 }
+
 .aff-meter {
   min-width: 118px;
   max-width: 170px;
@@ -861,104 +792,129 @@ body.authenticated footer { margin-left: 238px; }
   <div class="brand">
     <button id="menu-toggle" class="icon-button" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16"/></svg></button>
     <span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></span>
-    <div class="brand-copy"><strong>哈基米 · 星夜控制台 2.0</strong><small>HAKIMI CONSOLE 2.0</small></div>
+    <div class="brand-copy"><strong>哈基米</strong><small>星夜控制台</small></div>
+  </div>
+  <div class="page-meta">
+    <span class="connection-state"><span id="connection-dot" class="status-dot" aria-hidden="true"></span><span id="connection-label">等待连接状态</span></span>
+    <time id="last-updated">尚未刷新</time>
   </div>
   <div class="topbar-actions">
+    <button id="open-finder" type="button" class="finder-button" aria-label="查找模块或设置" aria-haspopup="dialog" aria-controls="module-finder" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg><span>查找设置</span><kbd id="finder-shortcut">Ctrl K</kbd></button>
     <span class="version">v2.1.0</span>
     <button id="theme-toggle" type="button" class="icon-button" aria-label="切换深色主题" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14a8 8 0 0 1-10-10 8 8 0 1 0 10 10"/></svg></button>
-    <button id="logout" class="secondary" hidden>退出登录</button>
+    <button id="logout" class="secondary" hidden>退出</button>
   </div>
 </header>
 <main id="workspace" tabindex="-1">
 <div id="notice" role="status" aria-live="polite" hidden></div>
-<section id="login" class="card login">
-  <div class="login-symbol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></div>
-  <div class="eyebrow">YOUR PRIVATE WORKSPACE</div>
-  <h1>欢迎回到星夜</h1>
-  <p class="muted">看看哈基米的近况，管理路由、赠金与下一次回应。<br>通过 SSH 隧道连接后，输入管理口令继续。</p>
-  <form id="login-form">
-    <label for="token">管理口令 · ADMIN_TOKEN</label>
-    <input id="token" type="password" autocomplete="off" placeholder="输入你的管理口令" required>
-    <button type="submit">进入控制台 →</button>
-  </form>
-  <div class="login-note">口令仅保留在当前页面内存，刷新或退出后需重新登录。</div>
+<section id="login" class="login" aria-labelledby="login-title">
+  <div class="login-sky">
+    <div class="sky-map" aria-hidden="true"><i class="orbit outer"></i><i class="orbit"></i><i class="sky-star"></i></div>
+    <div class="sky-copy"><h1 id="login-title">星夜控制台</h1><p>QQ · B 站 · Minecraft</p></div>
+  </div>
+  <div class="login-fields">
+    <h2>管理员登录</h2>
+    <p class="muted">通过 SSH 隧道连接后，输入管理口令。</p>
+    <form id="login-form">
+      <label for="token">管理口令</label>
+      <input id="token" type="password" autocomplete="off" placeholder="ADMIN_TOKEN" aria-describedby="login-error" required>
+      <p id="login-error" role="alert" hidden></p>
+      <button type="submit">进入控制台</button>
+    </form>
+    <p class="login-note">口令仅保存在页面内存中，刷新或退出后需重新登录。</p>
+  </div>
 </section>
 <div id="app" hidden>
   <aside id="sidebar" class="sidebar" aria-label="控制台导航">
-    <div class="sidebar-intro">WORKSPACE / 星夜</div>
+    <div class="drawer-head"><strong>功能导航</strong><button id="drawer-close" class="icon-button" type="button" aria-label="关闭导航"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
     <nav role="tablist" aria-label="管理模块" aria-orientation="vertical">
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">运行与模型</div>
-        <button id="nav-overview" type="button" role="tab" data-tab="overview" aria-controls="overview" aria-selected="true" tabindex="0"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg><span>运行概览</span></button>
-        <button id="nav-ledger" type="button" role="tab" data-tab="ledger" aria-controls="ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span>账本与预算</span></button>
-        <button id="nav-api-routing" type="button" role="tab" data-tab="api-routing" aria-controls="api-routing" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z M9 12h6 M12 9v6"/></svg><span>API 与隐私路由</span></button>
-        <button id="nav-thinking" type="button" role="tab" data-tab="thinking" aria-controls="thinking" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6 M10 21h4 M8 14a6 6 0 1 1 8 0l-1 2H9z"/></svg><span>模型与思考</span></button>
-        <button id="nav-reply-settings" type="button" role="tab" data-tab="reply-settings" aria-controls="reply-settings" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span>回复与联网</span></button>
+        <div class="nav-group-label">运行监控</div>
+        <button id="nav-overview" type="button" role="tab" data-tab="overview" data-description="查看本日调用、预算和消息处理状态。" aria-controls="overview" aria-selected="true" tabindex="0"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg><span>运行概览</span></button>
+        <button id="nav-ledger" type="button" role="tab" data-tab="ledger" data-description="查看调用明细、账户余额及 GCP 赠金对账。" aria-controls="ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span>账本与预算</span></button>
+        <button id="nav-life" type="button" role="tab" data-tab="life" data-description="管理跨节点动作、意图队列和执行回执。" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
+        <button id="nav-logs" type="button" role="tab" data-tab="logs" data-description="查看最近的脱敏拦截记录与系统告警。" aria-controls="logs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span>安全日志</span></button>
       </div>
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">对话与安全</div>
-        <button id="nav-sandbox" type="button" role="tab" data-tab="sandbox" aria-controls="sandbox" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6 M10 3v7L4 20h16l-6-10V3 M7 15h10"/></svg><span>沙盒测试</span></button>
-        <button id="nav-filter" type="button" role="tab" data-tab="filter" aria-controls="filter" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6z M8 12l3 3 5-6"/></svg><span>网关与审计</span></button>
-        <button id="nav-admission" type="button" role="tab" data-tab="admission" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
-        <button id="nav-logs" type="button" role="tab" data-tab="logs" aria-controls="logs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span>安全日志</span></button>
+        <div class="nav-group-label">对话与权限</div>
+        <button id="nav-reply-settings" type="button" role="tab" data-tab="reply-settings" data-description="调整作息、防抖、请求限流和联网检索。" aria-controls="reply-settings" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span>回复与联网</span></button>
+        <button id="nav-filter" type="button" role="tab" data-tab="filter" data-description="调整 Decisions 阈值，核对消息判定和投递结果。" aria-controls="filter" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6z M8 12l3 3 5-6"/></svg><span>网关与审计</span></button>
+        <button id="nav-admission" type="button" role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
+        <button id="nav-sandbox" type="button" role="tab" data-tab="sandbox" data-description="用模拟身份测试门卫判定与回复。" aria-controls="sandbox" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6 M10 3v7L4 20h16l-6-10V3 M7 15h10"/></svg><span>沙盒测试</span></button>
       </div>
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">记忆与表达</div>
-        <button id="nav-memory" type="button" role="tab" data-tab="memory" aria-controls="memory" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span>群聊与记忆</span></button>
-        <button id="nav-memes" type="button" role="tab" data-tab="memes" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包</span></button>
-        <button id="nav-community" type="button" role="tab" data-tab="community" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
-        <button id="nav-notebook" type="button" role="tab" data-tab="notebook" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
+        <div class="nav-group-label">模型与记忆</div>
+        <button id="nav-api-routing" type="button" role="tab" data-tab="api-routing" data-description="管理凭据、隐私分级和会话路由。" aria-controls="api-routing" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z M9 12h6 M12 9v6"/></svg><span>API 与隐私路由</span></button>
+        <button id="nav-thinking" type="button" role="tab" data-tab="thinking" data-description="设置各场景的思考强度与输出上限。" aria-controls="thinking" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6 M10 21h4 M8 14a6 6 0 1 1 8 0l-1 2H9z"/></svg><span>模型与思考</span></button>
+        <button id="nav-memory" type="button" role="tab" data-tab="memory" data-description="管理群聊策略、压缩参数及独立会话。" aria-controls="memory" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span>群聊与记忆</span></button>
+        <button id="nav-notebook" type="button" role="tab" data-tab="notebook" data-description="管理仅供 Owner 私聊使用的脱敏快照。" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
       </div>
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">巡逻与陪伴</div>
-        <button id="nav-bili-account" type="button" role="tab" data-tab="bili-account" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>B 站小号</span></button>
-        <button id="nav-patrol" type="button" role="tab" data-tab="patrol" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻与日记</span></button>
-        <button id="nav-proactive" type="button" role="tab" data-tab="proactive" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
-        <button id="nav-life" type="button" role="tab" data-tab="life" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
+        <div class="nav-group-label">巡逻与社区</div>
+        <button id="nav-bili-account" type="button" role="tab" data-tab="bili-account" data-description="管理小号凭据、巡逻时段与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>B 站小号</span></button>
+        <button id="nav-patrol" type="button" role="tab" data-tab="patrol" data-description="管理 B 站订阅，查看巡逻日记与网盘同步状态。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻与日记</span></button>
+        <button id="nav-proactive" type="button" role="tab" data-tab="proactive" data-description="管理 Owner 汇报、问候与免打扰时段。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
+        <button id="nav-memes" type="button" role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包</span></button>
+        <button id="nav-community" type="button" role="tab" data-tab="community" data-description="管理好感度、小黑屋和心情个签。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
       </div>
     </nav>
-    <div class="sidebar-foot"><strong>状态可见，记忆有界。</strong><br>仅通过受保护的管理入口访问<br>Asia/Shanghai · UTC+8</div>
+    <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">Asia/Shanghai</span></div>
   </aside>
-  <button id="nav-scrim" type="button" class="nav-scrim" aria-label="关闭导航" hidden></button>
+  <button id="nav-scrim" type="button" class="nav-scrim" aria-label="关闭导航" tabindex="-1" hidden></button>
   <div class="page-content">
     <div class="page-heading">
       <div>
-        <div id="page-kicker" class="eyebrow">WORKSPACE / 运行与模型</div>
+        <div id="page-kicker" class="eyebrow">运行监控</div>
         <h1 id="page-title" tabindex="-1">运行概览</h1>
-        <p id="page-description">连接、用量与今日动态，一眼掌握。</p>
+        <p id="page-description" hidden></p><time id="overview-day"></time>
       </div>
-      <div class="page-meta">
-        <span id="connection-dot" class="status-dot"></span>
-        <span id="connection-label">等待连接状态</span>
-        <time id="last-updated">尚未刷新</time>
+      <div id="overview-tools">
+        <button id="refresh" type="button" class="secondary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M5.5 8a7 7 0 0 1 12-2l2.5 4M18.5 16a7 7 0 0 1-12 2L4 14"/></svg>刷新概览</button>
       </div>
     </div>
 
 <section id="overview" class="tab" role="tabpanel" aria-labelledby="nav-overview">
-  <div class="card">
-    <div class="row between">
-      <h2>此刻的哈基米</h2>
-      <div class="row">
-        <span id="rest-overview-badge" class="badge">作息读取中</span>
-        <button id="toggle-rest-quick" type="button" class="secondary" hidden>切换休息</button>
-        <button id="refresh" class="secondary">刷新状态 ↻</button>
+  <dl id="stats" class="stats">
+    <div class="stat"><dt>今日 API 尝试<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h5l2-8 4 14 3-9 1 3h3"/></svg></dt><dd id="stat-calls">—</dd></div>
+    <div class="stat"><dt>注入拦截<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6zM9 12l2 2 4-5"/></svg></dt><dd id="stat-injection">—</dd></div>
+    <div class="stat"><dt>噪音忽略<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg></dt><dd id="stat-noise">—</dd></div>
+    <div class="stat"><dt>运行时长<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg></dt><dd id="stat-uptime">—</dd></div>
+  </dl>
+  <div class="overview-grid">
+    <article class="card budget-card">
+      <h2>今日预算</h2>
+      <div class="budget-numbers"><strong id="budget-spend">—</strong><span id="budget-limit"></span></div>
+      <div id="budget-meter" class="budget-meter"><progress id="budget" max="100" value="0" aria-label="今日预算使用比例"></progress><output id="budget-percent" for="budget">—</output></div>
+      <p id="budget-label" hidden></p>
+      <div class="budget-foot">
+        <div><span>日预算余量</span><strong id="budget-left">—</strong></div>
+        <div><span>本分钟入队</span><strong id="rate-label">—</strong></div>
       </div>
-    </div>
-    <div id="stats" class="stats"></div>
-    <p id="ws-details" class="muted"></p>
-    <div class="overview-budget">
-      <div>
-        <h3>今日预算</h3>
-        <progress id="budget" aria-label="今日预算使用比例" max="100" value="0"></progress>
-        <p id="budget-label" class="budget-value"></p>
-        <p id="rate-label" class="muted"></p>
+    </article>
+    <article class="card">
+      <h2>连接与处理状态</h2>
+      <dl id="ws-details" class="node-details">
+        <div><dt>最近心跳</dt><dd id="ws-heartbeat">—</dd></div>
+        <div><dt>连接来源</dt><dd id="ws-source">—</dd></div>
+        <div><dt>处理中</dt><dd id="pipeline-state">—</dd></div>
+        <div><dt>图片缓存</dt><dd id="image-cache">—</dd></div>
+      </dl>
+      <div class="row between rest-row"><span id="rest-overview-badge" class="badge">作息读取中</span><button id="toggle-rest-quick" type="button" class="secondary" hidden>切换休息</button></div>
+    </article>
+    <article class="card">
+      <h2>费用分布</h2><dl id="lane-stats" class="lanes"></dl>
+      <p id="lanes-empty" class="muted" hidden>今天还没有 API 调用。</p>
+      <p class="overview-footnote">按用途统计当日费用，包含预留额度，联网检索费除外。</p>
+    </article>
+    <article class="card">
+      <h2>快捷操作</h2>
+      <div class="quick-actions">
+        <button type="button" class="quick-action" data-action="patrol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span><strong>执行 B 站巡逻</strong><small>拉取订阅更新</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-action="diary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span><strong>汇总今日日记</strong><small>同步至 Google Drive</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-action="notebook" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span><strong>刷新小本本</strong><small id="notebook-action-note">读取快照状态中</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
       </div>
-      <div class="lane-summary">
-        <h3>费用去向</h3>
-        <div id="lane-stats" class="row"></div>
-        <p class="muted">按 Bot 时区统计，费用包含已预留额度（联网搜索已排除在计费之外）。</p>
-      </div>
-    </div>
+      <p class="overview-footnote">手动巡逻和汇总使用现有 API 额度。</p>
+    </article>
   </div>
   <div id="overview-routing-gcp" class="card" hidden>
     <div class="row between">
@@ -972,15 +928,6 @@ body.authenticated footer { margin-left: 238px; }
     <div id="overview-gcp-strip" class="kpi-strip" hidden></div>
     <p id="overview-gcp-note" class="muted"></p>
   </div>
-  <div class="card">
-    <h2>让她去做点什么</h2>
-    <div class="quick-actions">
-      <button type="button" class="quick-action" data-action="patrol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span><strong>去 B 站逛逛</strong><small>立即执行一次订阅巡逻</small></span><span class="action-arrow" aria-hidden="true">↗</span></button>
-      <button type="button" class="quick-action" data-action="diary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span><strong>整理今日日记</strong><small>汇总并同步到 Google Drive</small></span><span class="action-arrow" aria-hidden="true">↗</span></button>
-      <button type="button" class="quick-action" data-action="notebook"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span><strong>更新小本本</strong><small>刷新已启用的只读快照</small></span><span class="action-arrow" aria-hidden="true">↗</span></button>
-    </div>
-    <p class="muted">手动巡逻也会检查预算与风控；汇总和内容筛查使用现有 API 额度。</p>
-  </div>
 </section>
 
 <section id="ledger" class="tab" role="tabpanel" aria-labelledby="nav-ledger" hidden>
@@ -989,21 +936,20 @@ body.authenticated footer { margin-left: 238px; }
       <h2>Token 与费用账本</h2>
       <button id="refresh-ledger" class="secondary">刷新账本</button>
     </div>
-    <p class="muted">Token 来自 API 返回的 usage。缓存率使用已观测缓存 Token / Interactions 已报告输入；未报告缓存字段时标注为下界，不将其解释为真实零命中。缺失的 Token 明细显示未知。</p>
-    <p class="muted">本账本记录 Gemini 与 Vertex AI 调用；Google Drive 文件同步不计入其中。“历史未归属”是旧版未保存模型和 Token 明细的调用，金额保留，不能据此推断为 Drive 费用。联网搜索次数与 Token 仍可观测，但检索费用已从账本扣账、预算上限与账户余额中排除。</p>
     <p id="ledger-coverage" class="muted"></p>
     <div id="token-ledger" class="table"></div>
-    <h3>按 API 通道统计 (by_provider)</h3>
-    <p class="muted">区分 Paid Gemini（高隐私与默认主对话）、Free Tier Gemini（低隐私门卫）与 Vertex AI（GCP Credit 赠金通道）的调用量、Token 明细及预算扣账。</p>
+    <details><summary>账本与缓存统计口径</summary>
+      <p>账本记录 Gemini 与 Vertex AI 调用。Google Drive 文件同步单独记录。历史未归属调用保留费用，缺失的模型与 Token 明细显示为未知。联网检索费用不计入预算扣账。</p>
+      <p>缓存率使用已观测缓存 Token 除以 Interactions 报告的输入。遇到缺失的缓存字段，页面显示下界。有效覆盖率仅计输入至少 6144 Token 的非首轮、非截断聊天，分母为合资格输入减去 2050。</p>
+      <p>调用前预留预算，完成后按返回用量和配置价格结算。流中断或超时会使用可用用量、片段和耗时估算费用。最终账单以 Google 的结算为准。</p>
+    </details>
+    <h3>按 API 通道统计</h3>
     <div id="provider-ledger" class="table"></div>
-    <h3>账单估算与熔断口径</h3>
-    <p class="muted">调用前仍按最坏上界预留以防并发超支与异常熔断；调用完成后按返回 usage 与配置价格结算估算费用，含已报告的缓存折扣与联网查询费。尚未收到流事件的指定 HTTP 错误释放预留；流中断或超时按可用用量、输出片段和耗时回退估算。未知用量仍标为未知；本地估算不等于 Google 最终账单。</p>
+    <h3>费用估算与熔断</h3>
     <div id="cost-ledger" class="table"></div>
-    <h3>按模型与有效缓存覆盖率</h3>
-    <p class="muted">有效覆盖率 = 缓存输入 /（合资格输入 − 2050），仅计输入 ≥6144、非首轮与非截断轮聊天。90% 是稳态观察目标，不是服务保证。旧版本已清理的模型明细无法补造。</p>
+    <h3>模型与有效缓存覆盖率</h3>
     <div id="model-ledger" class="table"></div>
     <h3>按思考档位统计</h3>
-    <p class="muted">统计每次模型调用实际下发的 thinking_level（含 auto 动态分档、Carbon 专家档、记忆 Flex 固定 medium 与联网检索固定 medium；Decisions 门卫标为 none，升级前未记录档位的历史调用归入历史未记录）。</p>
     <div id="thinking-ledger" class="table"></div>
     <div id="effective-cache" class="table"></div>
     <p id="cache-alert" role="status"></p>
@@ -1536,13 +1482,11 @@ body.authenticated footer { margin-left: 238px; }
 </section>
 
 <section id="life" class="tab" role="tabpanel" aria-labelledby="nav-life" hidden>
-  <div class="card"><div class="row between"><h2>世界状态看板与跨节点通道</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
-    <p class="muted">实时查看世界状态、Attention Lock 注意力锁、CN 躯干通道与桌面端 Antigravity_Memory 协同状态。</p>
+  <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
     <div id="life-stats" class="stats"></div>
     <div id="life-node-pills" class="pill-row"></div>
     <p id="life-world-status" class="muted"></p>
     <p id="life-node-status" class="muted"></p>
-    <p id="life-mc-status" class="muted"></p>
     <p id="life-desktop-status" class="muted"></p>
     <form id="life-world-form" class="quick-bar">
       <label for="life-world-module">当前模块（current_module）
@@ -1563,6 +1507,9 @@ body.authenticated footer { margin-left: 238px; }
       <label for="life-world-boredom">无聊度（0–100）<input id="life-world-boredom" type="number" min="0" max="100" step="1" required></label>
       <button id="life-world-save" type="submit" disabled>更新世界状态</button>
     </form>
+  </div>
+  <div class="card"><h2>Minecraft 控制</h2>
+    <p id="life-mc-status" class="muted"></p>
     <form id="life-mc-form" class="quick-bar">
       <label for="life-mc-topic">Mineflayer 建造 / 活动目标
         <input id="life-mc-topic" type="text" maxlength="80" placeholder="例如：红石自动门、探索雪原">
@@ -1573,12 +1520,14 @@ body.authenticated footer { margin-left: 238px; }
       <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
       <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
     </form>
-    <h3>能力模块传感器摘要</h3>
+  </div>
+  <div class="card"><h2>模块与主动动作</h2>
+    <h3>模块状态</h3>
     <div id="life-modules-table" class="table"></div>
     <h3>主动动作</h3>
     <div id="life-actions-table" class="table"></div>
   </div>
-  <div class="card"><h2>双层主动引擎（LifeBlockPlanner + Zero-Token Gatekeeper）</h2>
+  <div class="card"><h2>主动引擎调度</h2>
     <p class="muted">规划层仅在唤醒周期或高重要度脉冲时写入模糊意图与门控条件；门控层每分钟零 Token 扫描，命中窗口后再由 JIT 临场生成回复。</p>
     <p id="life-source" class="muted"></p>
     <form id="life-config-form">
@@ -1608,11 +1557,11 @@ body.authenticated footer { margin-left: 238px; }
       </div>
     </form>
   </div>
-  <div class="card"><h2>模糊意图队列（scheduled_intents · 近 40 条）</h2>
+  <div class="card"><h2>意图队列（最近 40 条）</h2>
     <p class="muted">只记录触发时间窗、门控条件与模糊动机，绝不预写台词；状态为 pending 时可手动取消。</p>
     <div id="life-intents-table" class="table"></div>
   </div>
-  <div class="card"><h2>跨模块里程碑事件（global_events · 近 30 条）</h2>
+  <div class="card"><h2>跨模块事件（最近 30 条）</h2>
     <p class="muted">能力模块发布的脱敏里程碑事件（明文 JSON 存储，供规划器与镜像消费）。</p>
     <div id="life-events-table" class="table"></div>
     <h3>规则处理记录</h3><div id="life-rules-table" class="table"></div>
@@ -1694,7 +1643,7 @@ body.authenticated footer { margin-left: 238px; }
     <p class="muted">当「Antigravity_Memory 双端记忆桥」已启用时，Owner 私聊实时挂载只读《小本本》与云端长期记忆；此处的单文件快照（Drive 6 小时刷新或本地兜底）仅作可选兼容模式。只用于真实 Owner 私聊，不用于沙盒、群聊或日记。</p>
     <p id="notebook-state"></p>
     <textarea id="notebook-text" maxlength="4000" rows="12" aria-label="小本本快照"></textarea>
-    <div class="row"><button data-action="notebook">刷新快照</button><button id="save-notebook">筛查并更新本地快照</button></div>
+    <div class="row"><button data-action="notebook" disabled>刷新快照</button><button id="save-notebook">筛查并更新本地快照</button></div>
   </div>
 </section>
 
@@ -1725,12 +1674,20 @@ body.authenticated footer { margin-left: 238px; }
   </div>
 </dialog>
 
-<footer>哈基米 · 星夜控制台 2.0 &nbsp; / &nbsp; v2.1.0 &nbsp; / &nbsp; Asia/Shanghai</footer>
+<dialog id="module-finder" class="finder" aria-labelledby="finder-title">
+  <div class="finder-head"><h2 id="finder-title">查找模块或设置</h2><button id="finder-close" type="button" class="icon-button" aria-label="关闭搜索"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+  <label class="finder-field"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg><input id="finder-query" type="search" autocomplete="off" maxlength="100" placeholder="输入名称，例如「防抖」" aria-label="搜索模块和设置" role="combobox" aria-autocomplete="list" aria-controls="finder-results" aria-expanded="true"></label>
+  <div id="finder-results" class="finder-results" role="listbox" aria-label="匹配的模块和设置"></div>
+  <p id="finder-empty" class="finder-empty" role="status" hidden>没有匹配的设置，试试模块名称。</p>
+</dialog>
+<footer>哈基米 · 星夜控制台 &nbsp; / &nbsp; v2.1.0</footer>
 </main>
 <script>
 'use strict';
 (()=>{
 let token='',tab='overview',session=null,timer=null;
+let sessionRequests=new AbortController();
+let displayZone='Asia/Shanghai';
 const $=id=>document.getElementById(id), text=(id,value)=>{$(id).textContent=String(value??'');};
 const el=(tag,value,cls)=>{const n=document.createElement(tag);if(value!==undefined)n.textContent=String(value);if(cls)n.className=cls;return n;};
 const pill=(label,variant='muted')=>el('span',label,'pill pill-'+variant);
@@ -1738,22 +1695,57 @@ const pillRow=(...nodes)=>{const d=el('div',undefined,'pill-row');d.append(...no
 const usd=(value,digits=4)=>{if(value===null||value===undefined||value==='')return '—';const n=Number(value);if(!Number.isFinite(n))return String(value);return (n<0?'-$':'$')+Math.abs(n).toFixed(digits);};
 let noticeTimer;
 function notice(value,error=false){clearTimeout(noticeTimer);text('notice',value);$('notice').hidden=false;$('notice').className=error?'error':'';if(!error)noticeTimer=setTimeout(()=>$('notice').hidden=true,6000);}
-async function api(path,method='GET',data){const r=await fetch('/admin/api/'+path,{method,headers:{'Authorization':'Bearer '+token,...(data===undefined?{}:{'Content-Type':'application/json'})},body:data===undefined?undefined:JSON.stringify(data),cache:'no-store',credentials:'omit',redirect:'error'});let value;try{value=await r.json();}catch{throw Error('服务器未返回有效 JSON');}if(!r.ok){if(r.status===401||r.status===403)logout();throw Error(value.detail||('HTTP '+r.status));}return value;}
-async function busy(button,fn){button.disabled=true;button.setAttribute('aria-busy','true');try{await fn();}catch(e){notice(e.message,true);}finally{button.disabled=false;button.removeAttribute('aria-busy');}}
+async function api(path,method='GET',data){
+  const signal=sessionRequests.signal;
+  const r=await fetch('/admin/api/'+path,{
+    method,signal,headers:{Authorization:'Bearer '+token,...(data===undefined?{}:{'Content-Type':'application/json'})},
+    body:data===undefined?undefined:JSON.stringify(data),cache:'no-store',credentials:'omit',redirect:'error'
+  });
+  let value;
+  try{value=await r.json();}catch(e){if(signal.aborted)throw e;throw Error('服务器未返回有效 JSON');}
+  if(signal.aborted)throw new DOMException('请求已取消','AbortError');
+  if(!r.ok){
+    if(r.status===401||r.status===403)logout();
+    const hints={authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
+    throw Error(hints[value.detail]||value.detail||('HTTP '+r.status));
+  }
+  return value;
+}
+async function busy(button,fn){
+  button.disabled=true;button.setAttribute('aria-busy','true');
+  try{await fn();}catch(e){if(e.name!=='AbortError')notice(e.message,true);}
+  finally{button.disabled=false;button.removeAttribute('aria-busy');}
+}
 function button(label,fn,cls='secondary'){const b=el('button',label,cls);b.type='button';b.addEventListener('click',()=>busy(b,fn));return b;}
 function table(id,headers,rows){const t=el('table'),thead=el('thead'),head=el('tr'),body=el('tbody');headers.forEach(v=>{const th=el('th',v);th.scope='col';head.append(th);});thead.append(head);t.append(thead,body);rows.forEach(values=>{const row=el('tr');values.forEach(v=>{const cell=el('td');if(v instanceof Node)cell.append(v);else cell.textContent=String(v??'—');row.append(cell);});body.append(row);});$(id).replaceChildren(t);if(!rows.length)$(id).append(el('p','还没有记录，新的动态会出现在这里。','empty-state'));}
 function kpiCard(label,value,note,variant=''){const card=el('div',undefined,'kpi-card'+(variant?' kpi-'+variant:''));card.append(el('span',label,'kpi-label'),el('strong',value,'kpi-value'));if(note)card.append(el('span',note,'kpi-note'));return card;}
 async function loadJsonFileInto(fileInput,textarea){const file=fileInput.files?.[0];if(!file)return;if(file.size>65536){fileInput.value='';throw Error('Service Account JSON 文件超过 64 KiB 上限');}const raw=await file.text();JSON.parse(raw);textarea.value=raw;fileInput.value='';notice('已读取 JSON 文件：'+file.name);}
 
 function logout(){
+  sessionRequests.abort();
+  sessionRequests=new AbortController();
   closeNavigation();
   document.body.classList.remove('authenticated');
   $('menu-toggle').hidden=true;
+  $('open-finder').hidden=true;
+  if($('module-finder').open)$('module-finder').close();
+  $('finder-query').value='';
+  $('finder-results').replaceChildren();
+  $('login-error').hidden=true;
+  $('token').removeAttribute('aria-invalid');
+  text('login-error','');
+  document.title='星夜控制台 · 哈基米';
   clearTimeout(noticeTimer);
   $('notice').hidden=true;
   text('connection-label','等待连接状态');
   $('connection-dot').className='status-dot';
   text('last-updated','尚未刷新');
+  $('last-updated').removeAttribute('datetime');
+  for(const id of ['stat-calls','stat-injection','stat-noise','stat-uptime','budget-spend','budget-left','ws-heartbeat','ws-source','pipeline-state','image-cache'])text(id,'—');
+  for(const id of ['overview-day','budget-limit','budget-label','budget-percent','rate-label'])text(id,'');
+  $('overview-day').removeAttribute('datetime');
+  $('budget').value=0;
+  $('lane-stats').replaceChildren();
   restState=null;
   providersState=null;
   gcpBillingState=null;
@@ -1782,14 +1774,15 @@ function logout(){
   token='';$('token').value='';
   $('login').hidden=false;$('app').hidden=true;$('logout').hidden=true;
   if(timer)clearInterval(timer);
-  $('session-dialog').close();
+  $('session-dialog').close();session=null;
+  $('token').focus();
   ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search','life-mc-topic'].forEach(id=>{$(id).value='';});
   $('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
   ['memory-entries','decision-audit','token-ledger','provider-ledger','cost-ledger','budget-periods','model-ledger','thinking-ledger','effective-cache','prov-sessions-table','gcp-credits-table','gcp-mon-compare-table','gcp-mon-models-table'].forEach(id=>$(id).replaceChildren());
 }
 
-function dateTime(t){return t?new Date(t*1000).toLocaleString():'—';}
+function dateTime(t){return t?new Date(t*1000).toLocaleString('zh-CN',{timeZone:displayZone,hour12:false}):'—';}
 let restState=null;
 function renderRestHours(r){
   if(!r||!r.config)return;
@@ -1884,27 +1877,73 @@ function renderOverviewRoutingGcp(d,prov,gcp){
   }
 }
 
-async function dashboard(){
-  const [dashRes,provRes,gcpRes]=await Promise.allSettled([api('dashboard'),api('providers'),api('gcp-billing')]);
+const laneNames={chat:'主对话',patrol:'B 站巡逻',memory:'记忆',memory_flex:'记忆 Flex',admin:'管理测试',proactive:'主动私信',search:'联网检索'};
+const percent=new Intl.NumberFormat('zh-CN',{style:'percent',maximumFractionDigits:1});
+function renderLanes(lanes,total){
+  const rows=[...lanes].sort((a,b)=>b.amount-a.amount||b.calls-a.calls);
+  $('lanes-empty').hidden=rows.length>0;
+  $('lane-stats').replaceChildren(...rows.map(lane=>{
+    const label=laneNames[lane.lane]||lane.lane;
+    const row=el('div',undefined,'lane'),track=el('dd'),bar=el('progress');
+    bar.max=100;
+    bar.value=total>0?100*lane.amount/total:0;
+    bar.setAttribute('aria-label',label+'占当日分项费用的比例');
+    track.append(bar);
+    const amount=el('dd',undefined,'lane-amount');
+    amount.append(el('span',usd(lane.amount/1e6)),el('small',lane.calls+' 次'));
+    row.append(el('dt',label),track,amount);
+    return row;
+  }));
+}
+async function dashboard(initial){
+  const signal=sessionRequests.signal;
+  const [dashRes,provRes,gcpRes]=await Promise.allSettled([initial??api('dashboard'),api('providers'),api('gcp-billing')]);
   if(dashRes.status!=='fulfilled')throw dashRes.reason;
-  const d=dashRes.value;
-  if(!token)return;
-  const gcpVal=gcpRes.status==='fulfilled'?gcpRes.value:null;
+  if(!token||signal.aborted)return;
+  const d=dashRes.value,gcp=gcpRes.status==='fulfilled'?gcpRes.value:null;
+  displayZone=d.usage.timezone||d.usage.budget_timezone||'Asia/Shanghai';
+  text('sidebar-zone',displayZone);
   updateConnection(d);
   renderRestHours(d.rest_hours);
-  const lanes=d.usage.lanes,total=lanes.reduce((n,v)=>n+v.amount/1e6,0),calls=lanes.reduce((n,v)=>n+v.calls,0),metric=code=>d.metrics.filter(v=>v.code===code&&v.source==='production').reduce((n,v)=>n+v.n,0);
-  const stats=[['运行时长',Math.floor(d.uptime_seconds/3600)+'h '+Math.floor(d.uptime_seconds%3600/60)+'m'],['OneBot',({online:'在线',reconnecting:'重连中',http_mode:'HTTP 模式'})[d.onebot]||'未连接'],['今日 API 尝试',calls],['注入 / 噪音拦截',metric('prompt_injection')+' / '+metric('noise_ignored')]];
-  $('stats').replaceChildren(...stats.map(([k,v],i)=>{const n=el('div',undefined,'stat');const top=el('div',undefined,'stat-top');top.append(el('small',k),el('span',['◷','◈','↗','◇'][i]));n.append(top,el('strong',v),el('span',['本次进程持续运行','OneBot v11 协议连接','包含门卫与主脑调用','生产消息 · 今日累计'][i],'stat-note'));return n;}));
-  const ws=d.onebot_detail||{},pipeline=d.pipeline||{};
-  text('ws-details','最近心跳：'+(ws.last_heartbeat_at?new Date(ws.last_heartbeat_at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}):'尚无')+' · 来源 IP：'+(ws.source_ip||'尚无连接')+' · 守门 '+(pipeline.gate||0)+' / 推理 '+(pipeline.generating||0)+' · 图片缓存 '+((pipeline.image_cache_bytes||0)/1048576).toFixed(1)+' MiB');
-  $('budget').value=Number(d.daily_limit_usd)?Math.min(100,total/Number(d.daily_limit_usd)*100):100;
-  const uBal=resolveUnifiedBalance(d.budget_status?.account_balance,gcpVal,d.budget_status?.gcp_billing);
-  const modeTag={merged:'（GCP + 手动合并）',gcp:'（GCP 赠金实时）',manual:'（手动校准）'}[uBal.mode]||'';
-  const balSummary=uBal.mode==='none'?' · 余额未设定':(' · 统一可用余额 '+usd(uBal.unifiedRem,4)+modeTag);
-  text('budget-label','$'+total.toFixed(4)+' / $'+d.daily_limit_usd+balSummary+((d.budget_circuit_open||d.budget_status?.hard_stop||uBal.exhausted)?' · 预算熔断中':''));
-  text('rate-label','本分钟消息入队 '+d.minute_requests+' / '+d.minute_limit+' · 统计日期 '+(d.usage.day_local||d.usage.day||d.usage.day_utc)+' '+(d.usage.timezone||d.usage.budget_timezone||'Asia/Shanghai'));
-  $('lane-stats').replaceChildren(...lanes.map(v=>el('span',(({chat:'主对话',patrol:'B 站巡逻',memory:'记忆',memory_flex:'记忆 Flex',admin:'管理测试',proactive:'主动私信',search:'联网'})[v.lane]||v.lane)+': $'+(v.amount/1e6).toFixed(4)+' · '+v.calls+' 次','badge')));
-  renderOverviewRoutingGcp(d,provRes.status==='fulfilled'?provRes.value:null,gcpVal);
+  showNotebookAvailability(Boolean(d.notebook?.enabled));
+  const usage=d.usage,lanes=usage.lanes;
+  const laneTotal=lanes.reduce((sum,lane)=>sum+lane.amount,0);
+  const calls=lanes.reduce((sum,lane)=>sum+lane.calls,0);
+  const metric=code=>d.metrics.filter(m=>m.source==='production'&&m.code===code).reduce((sum,m)=>sum+m.n,0);
+  text('stat-calls',calls.toLocaleString('zh-CN'));
+  text('stat-injection',metric('prompt_injection').toLocaleString('zh-CN'));
+  text('stat-noise',metric('noise_ignored').toLocaleString('zh-CN'));
+  const hours=Math.floor(d.uptime_seconds/3600),minutes=Math.floor(d.uptime_seconds%3600/60);
+  text('stat-uptime',hours>=24?Math.floor(hours/24)+'天 '+(hours%24)+'时':hours?hours+'时 '+minutes+'分':minutes+'分');
+  const day=usage.day_local||usage.day||usage.day_utc||'';
+  $('overview-day').dateTime=day;
+  text('overview-day',day+' · '+(displayZone==='Asia/Shanghai'?'上海时间':displayZone));
+  const ws=d.onebot_detail||{},pipe=d.pipeline||{};
+  text('ws-heartbeat',ws.last_heartbeat_at?dateTime(ws.last_heartbeat_at):'暂无心跳');
+  text('ws-source',ws.source_ip||'—');
+  text('pipeline-state','守门 '+(pipe.gate??0)+' / 推理 '+(pipe.generating??0));
+  text('image-cache',((pipe.image_cache_bytes??0)/1048576).toFixed(1)+' MiB');
+  const budget=d.budget_status||{};
+  const spent=(budget.daily??laneTotal)/1e6;
+  const limit=budget.daily_limit!=null?budget.daily_limit/1e6:Number(d.daily_limit_usd);
+  const ratio=limit>0?spent/limit:0;
+  const balance=resolveUnifiedBalance(budget.account_balance,gcp,budget.gcp_billing);
+  const stopped=d.budget_circuit_open||budget.hard_stop||balance.exhausted;
+  text('budget-spend',usd(spent));
+  text('budget-limit','日上限 '+usd(limit,limit>0&&limit<0.01?4:2));
+  $('budget-meter').hidden=!(limit>0);
+  $('budget').value=Math.min(100,ratio*100);
+  $('budget').dataset.level=stopped?'stop':ratio>=0.85?'warning':'normal';
+  text('budget-percent',percent.format(ratio));
+  const budgetNotes=[];
+  if(stopped)budgetNotes.push(limit===0?'日预算为零，已暂停扣费':'预算已熔断');
+  if(balance.mode!=='none')budgetNotes.push('统一可用余额 '+usd(balance.unifiedRem));
+  text('budget-label',budgetNotes.join(' · '));
+  $('budget-label').hidden=budgetNotes.length===0;
+  text('budget-left',usd(Math.max(0,limit-spent)));
+  text('rate-label',d.minute_requests+' / '+d.minute_limit);
+  renderLanes(lanes,laneTotal);
+  renderOverviewRoutingGcp(d,provRes.status==='fulfilled'?provRes.value:null,gcp);
 }
 $('overview-go-routing').addEventListener('click',()=>$('nav-api-routing').click());
 $('overview-go-ledger').addEventListener('click',()=>$('nav-ledger').click());
@@ -2418,7 +2457,11 @@ const subKindLabels={up:'UP 主',live:'直播间'};
 async function subscriptions(){table('subs',['类型','ID','下次巡逻 / 状态','操作'],(await api('subscriptions')).map(s=>[subKindLabels[s.kind]||s.kind,s.uid,dateTime(s.next_poll)+(s.kind==='live'?' · '+(({0:'未开播',1:'直播中',2:'轮播'})[s.last_status]??'尚未巡逻'):' '),button('删除',async()=>{if(!confirm('删除此订阅？'))return;await api('subscriptions/'+s.kind+'/'+encodeURIComponent(s.id),'DELETE');await subscriptions();},'danger')]));}
 async function diaries(){table('diaries',['日期','Drive 同步','操作'],(await api('diaries')).map(d=>[d.day,d.last_error?d.last_error+' · 重试 '+dateTime(d.next_attempt):d.last_success?'成功 '+dateTime(d.last_success):'尚未同步',button('预览',async()=>text('diary-preview',(await api('diaries/'+d.day)).markdown))]));}
 const notebookSourceLabels={drive:'Google Drive 单文件',local:'本地快照文件'};
-async function notebook(){const n=await api('notebook'),am=n.antigravity_memory||{},refreshBtn=document.querySelector('[data-action="notebook"]');if(refreshBtn)refreshBtn.disabled=!n.enabled;if(!n.enabled&&am.enabled){text('notebook-state','双端记忆桥 Antigravity_Memory 已接管（只读挂载） · 常驻备忘 '+(am.pinned_chars??0)+' 字 · 索引切片 '+(am.indexed_chunks??0)+' 条 · 桌面活跃 '+(am.latest_iso||dateTime(am.latest_timestamp))+'（旧版单文件快照未启用）');$('notebook-text').value=am.pinned_text||'（Antigravity_Memory 已连接，当前未解析到常驻备忘段落）';$('notebook-text').readOnly=true;$('save-notebook').disabled=true;return;}text('notebook-state',(n.enabled?'已启用':'未启用')+' · '+(notebookSourceLabels[n.source]||n.source)+' · '+(n.loaded_at?dateTime(n.loaded_at):'尚未加载')+(n.last_error?' · '+n.last_error:''));$('notebook-text').value=n.text||'';$('notebook-text').placeholder=n.enabled?'':'旧版单文件《小本本》快照未启用';$('notebook-text').readOnly=!n.enabled||n.source!=='local';$('save-notebook').disabled=!n.enabled||n.source!=='local';}
+function showNotebookAvailability(enabled){
+  document.querySelectorAll('[data-action="notebook"]').forEach(b=>b.disabled=!enabled||b.hasAttribute('aria-busy'));
+  text('notebook-action-note',enabled?'读取 Owner 的只读快照':'只读快照未启用');
+}
+async function notebook(){const n=await api('notebook'),am=n.antigravity_memory||{};showNotebookAvailability(n.enabled);if(!n.enabled&&am.enabled){text('notebook-state','双端记忆桥 Antigravity_Memory 已接管（只读挂载） · 常驻备忘 '+(am.pinned_chars??0)+' 字 · 索引切片 '+(am.indexed_chunks??0)+' 条 · 桌面活跃 '+(am.latest_iso||dateTime(am.latest_timestamp))+'（旧版单文件快照未启用）');$('notebook-text').value=am.pinned_text||'（Antigravity_Memory 已连接，当前未解析到常驻备忘段落）';$('notebook-text').readOnly=true;$('save-notebook').disabled=true;return;}text('notebook-state',(n.enabled?'已启用':'未启用')+' · '+(notebookSourceLabels[n.source]||n.source)+' · '+(n.loaded_at?dateTime(n.loaded_at):'尚未加载')+(n.last_error?' · '+n.last_error:''));$('notebook-text').value=n.text||'';$('notebook-text').placeholder=n.enabled?'':'旧版单文件《小本本》快照未启用';$('notebook-text').readOnly=!n.enabled||n.source!=='local';$('save-notebook').disabled=!n.enabled||n.source!=='local';}
 async function logs(){table('log-list',['时间','来源','事件'],(await api('logs')).map(v=>[dateTime(v.at),v.source,v.code]));}
 
 const dmStatus={pending:'等待投递',sent:'已发送并处理记忆',delivered:'已确认发送，等待记忆写入',uncertain:'发送结果不确定，不重发',expired:'已过期',skipped:'已跳过',failed:'生成未完成',queued:'已排队',generating:'生成中',cancelled:'已取消',not_queued:'未入队'};
@@ -2875,7 +2918,16 @@ for(const [id,action] of [['bili-test','test'],['bili-run','run']])$(id).addEven
 let memeGeneration=0;
 const memeObjectURLs=new Set();
 function clearMemePreviews(){memeGeneration++;for(const url of memeObjectURLs)URL.revokeObjectURL(url);memeObjectURLs.clear();$('meme-list').replaceChildren();text('meme-state','');}
-async function memeRequest(path,method='GET',body){const r=await fetch('/admin/api/memes'+path,{method,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':body.type||'application/octet-stream'}:{})},body,cache:'no-store',credentials:'omit',redirect:'error'});if(!r.ok){let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}if(r.status===401||r.status===403)logout();throw Error(detail);}return r;}
+async function memeRequest(path,method='GET',body){
+  const signal=sessionRequests.signal;
+  const r=await fetch('/admin/api/memes'+path,{method,signal,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':body.type||'application/octet-stream'}:{})},body,cache:'no-store',credentials:'omit',redirect:'error'});
+  if(!r.ok){
+    let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}
+    if(!signal.aborted&&(r.status===401||r.status===403))logout();
+    throw Error(detail);
+  }
+  return r;
+}
 async function memes(){clearMemePreviews();const generation=memeGeneration,d=await api('memes');if(!token||generation!==memeGeneration)return;text('meme-prompt-count','当前已加载到 Prompt 的有效表情数量：'+(d.loaded_prompt_count??0));text('meme-state',d.items.length+' / 100 张 · '+(d.items.reduce((n,item)=>n+item.byte_size,0)/1048576).toFixed(2)+' / 50 MiB');if(!d.items.length){$('meme-list').append(el('p','还没有表情包。上传一张即可加入可选标签。','muted'));return;}const queue=d.items.map(item=>{const card=el('article',undefined,'meme-item'),img=el('img');img.alt=item.label;card.append(img,el('h3',item.label),el('small',item.width+' × '+item.height+' · '+Math.ceil(item.byte_size/1024)+' KiB'),button('删除',async()=>{await api('memes/'+encodeURIComponent(item.id),'DELETE');notice('表情已移除，白名单立即更新');await memes();},'danger'));$('meme-list').append(card);return{item,img,card};});await Promise.all(Array.from({length:Math.min(4,queue.length)},async()=>{while(queue.length&&token&&generation===memeGeneration){const{item,img,card}=queue.shift();try{const response=await memeRequest('/'+encodeURIComponent(item.id)+'/image'),blob=await response.blob();if(!token||generation!==memeGeneration)return;const url=URL.createObjectURL(blob);memeObjectURLs.add(url);img.src=url;}catch{if(token&&generation===memeGeneration)card.append(el('small','预览暂不可用'));}}}));}
 $('meme-refresh').addEventListener('click',e=>busy(e.target,memes));
 const memeQueue=[],memeLabelOk=s=>/^[A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff]{1,24}$/.test(s);
@@ -2892,91 +2944,214 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
-async function refreshTab(){
-  if(tab==='reply-settings'){await replySettings();return;}
-  if(tab==='overview')await dashboard();
-  if(tab==='ledger')await ledger();
-  if(tab==='api-routing')await providers();
-  if(tab==='thinking')await Promise.all([thinking(),generationCaps()]);
-  if(tab==='filter')await filters();
-  if(tab==='admission')await admission();
-  if(tab==='memory')await Promise.all([groups(),bots(),sessions(),compression()]);
-  if(tab==='bili-account')await biliAccount();
-  if(tab==='community'){const [cRes,aRes]=await Promise.allSettled([community(),affection()]);if(cRes.status!=='fulfilled')throw cRes.reason;if(aRes.status!=='fulfilled')notice('好感度接口暂不可用：'+aRes.reason.message,true);}
-  if(tab==='memes')await memes();
-  if(tab==='proactive')await proactive();
-  if(tab==='life')return life();
-  if(tab==='patrol')await Promise.all([patrolLimits(),subscriptions(),diaries()]);
-  if(tab==='notebook')await notebook();
-  if(tab==='logs')await logs();
-  if(tab==='sandbox')await groups();
-}
-$('login-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{token=$('token').value;$('token').value='';await dashboard();$('login').hidden=true;$('app').hidden=false;$('logout').hidden=false;$('notice').hidden=true;document.body.classList.add('authenticated');$('menu-toggle').hidden=false;selectTab('overview');await groups();timer=setInterval(()=>{if(!document.hidden&&token&&['overview','logs'].includes(tab))refreshTab().catch(e=>notice(e.message,true));if(!document.hidden&&token&&tab==='filter')decisionAudit().catch(e=>notice(e.message,true));},15000);});});
-$('logout').addEventListener('click',logout);
-// Presentation only: credentials never enter browser storage.
-const tabInfo={
-  overview:['运行概览','连接、用量与今日动态，一眼掌握。','运行与模型'],
-  ledger:['账本与预算','看清每一份用量、统一账户余额、GCP 赠金与 Cloud Monitoring 对账。','运行与模型'],
-  'api-routing':['API 与隐私路由','管理 Free/Paid/Vertex 凭据、隐私分级门卫与逐会话模型路由。','运行与模型'],
-  thinking:['模型与思考','给不同场景安排合适的思考强度与输出空间。','运行与模型'],
-  'reply-settings':['回复与联网','调整每日休息时间、回应节奏、请求限流与联网查证。','运行与模型'],
-  sandbox:['沙盒测试','试一句话，看看门卫怎么判断、哈基米怎么回应。','对话与安全'],
-  filter:['网关与审计','校准判断尺度，追踪隐私路由与从放行到投递的结果。','对话与安全'],
-  admission:['准入与防互刷','决定在哪里聊天、和谁聊天。','对话与安全'],
-  logs:['安全日志','查看最近的脱敏拦截记录与运行告警。','对话与安全'],
-  memory:['群聊与记忆','管理互动策略，以及每个会话独立的记忆。','记忆与表达'],
-  memes:['表情包','给恰到好处的吐槽，配一张熟悉的表情。','记忆与表达'],
-  community:['好感度与小黑屋','管理好感度系统、用户档案调分、小黑屋屏蔽与心情个签。','记忆与表达'],
-  notebook:['只读小本本','只留给 Owner 私聊的那一点背景。','记忆与表达'],
-  'bili-account':['B 站小号','管理账号凭证、低频巡逻与看片额度。','巡逻与陪伴'],
-  patrol:['巡逻与日记','关注喜欢的创作者，收好今天的见闻。','巡逻与陪伴'],
-  proactive:['主动私信','安排日报与问候，也留出安静的时间。','巡逻与陪伴'],
-  life:['世界与主动引擎','管理世界状态看板、模糊意图队列、上海节点与双层主动引擎。','巡逻与陪伴']
+const tabLoaders={
+  overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
+  thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
+  memory:()=>Promise.all([groups(),bots(),sessions(),compression()]),
+  'bili-account':biliAccount, community:async()=>{
+    const [moderation,profiles]=await Promise.allSettled([community(),affection()]);
+    if(moderation.status==='rejected')throw moderation.reason;
+    if(profiles.status==='rejected'&&profiles.reason.name!=='AbortError')notice('好感度接口暂不可用：'+profiles.reason.message,true);
+  },
+  memes, proactive, life, patrol:()=>Promise.all([patrolLimits(),subscriptions(),diaries()]),
+  notebook, logs, sandbox:groups
 };
+function refreshTab(key=tab){return tabLoaders[key]();}
+$('login-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy(e.submitter,async()=>{
+    $('login-error').hidden=true;$('token').removeAttribute('aria-invalid');
+    token=$('token').value;$('token').value='';
+    try{
+      const first=await api('dashboard');
+      await dashboard(first);
+    }catch(err){
+      if(err.name==='AbortError')return;
+      token='';text('login-error',err.message);$('login-error').hidden=false;
+      $('token').setAttribute('aria-invalid','true');$('token').focus();return;
+    }
+    if(!token)return;
+    $('login').hidden=true;$('app').hidden=false;$('notice').hidden=true;
+    for(const id of ['logout','open-finder','menu-toggle'])$(id).hidden=false;
+    document.body.classList.add('authenticated');
+    selectTab('overview');$('page-title').focus({preventScroll:true});
+    timer=setInterval(()=>{
+      if(document.hidden||!token)return;
+      const read=tab==='filter'?decisionAudit:['overview','logs'].includes(tab)?refreshTab:null;
+      if(read)read().catch(e=>{if(e.name!=='AbortError')notice(e.message,true);});
+    },15000);
+  });
+});
+$('logout').addEventListener('click',logout);
+
+const tabButtons=[...$('sidebar').querySelectorAll('[role=tab]')];
+const sections=new Map(tabButtons.map(button=>[button.dataset.tab,{
+  button,title:button.querySelector('span').textContent,
+  group:button.closest('.nav-group').querySelector('.nav-group-label').textContent
+}]));
 function selectTab(key){
-  if(!tabInfo[key])return;
+  const section=sections.get(key);
+  if(!section)return;
   tab=key;
-  document.querySelectorAll('.tab').forEach(n=>n.hidden=n.id!==key);
-  document.querySelectorAll('[data-tab]').forEach(n=>{const active=n.dataset.tab===key;n.setAttribute('aria-selected',String(active));n.tabIndex=active?0:-1;});
-  const [title,description,group]=tabInfo[key];
-  text('page-title',title);text('page-description',description);text('page-kicker','WORKSPACE / '+group);
-  document.title=title+' · 哈基米星夜';
+  for(const [id,{button}] of sections){
+    const active=id===key;
+    $(id).hidden=!active;button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
+  }
+  text('page-title',section.title);
+  text('page-kicker',section.group);
+  text('page-description',section.button.dataset.description);
+  $('page-description').hidden=key==='overview';
+  $('overview-day').hidden=$('overview-tools').hidden=key!=='overview';
+  document.title=section.title+' · 哈基米星夜';
   window.scrollTo({top:0,behavior:'instant'});
+}
+
+const panelLoads=new WeakMap();
+let lastVisit=0;
+async function navigate(key,{focusContent=false,heading=null}={}){
+  if(!token||!sections.has(key))return;
+  const panel=$(key),visit=++lastVisit;
+  const drawerOpen=$('sidebar').classList.contains('open');
+  closeNavigation();selectTab(key);
+  if(drawerOpen||focusContent)$('page-title').focus({preventScroll:true});
+  let loading=panelLoads.get(panel);
+  if(!loading){
+    panel.inert=true;panel.setAttribute('aria-busy','true');
+    loading=refreshTab(key).finally(()=>{
+      panel.inert=false;panel.removeAttribute('aria-busy');panelLoads.delete(panel);
+    });
+    panelLoads.set(panel,loading);
+  }
+  try{await loading;}
+  catch(e){if(visit===lastVisit&&token&&e.name!=='AbortError')notice(e.message,true);return;}
+  if(!heading||visit!==lastVisit||!token||heading.closest('[hidden]'))return;
+  for(let parent=heading.parentElement;parent&&parent!==panel;parent=parent.parentElement){
+    if(parent.tagName==='DETAILS')parent.open=true;
+  }
+  heading.focus({preventScroll:true});heading.scrollIntoView({block:'start'});
 }
 function updateConnection(d){
   text('connection-label',({online:'OneBot 在线',reconnecting:'OneBot 重连中',http_mode:'HTTP 接入'})[d.onebot]||'OneBot 未连接');
   $('connection-dot').className='status-dot '+(d.onebot==='online'?'online':d.onebot==='reconnecting'?'offline':'');
   const now=new Date();$('last-updated').dateTime=now.toISOString();
-  text('last-updated','更新于 '+now.toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}));
+  text('last-updated','更新于 '+now.toLocaleTimeString('zh-CN',{timeZone:displayZone,hour12:false}));
 }
+const narrowLayout=matchMedia('(max-width:900px)');
 function closeNavigation(){
   $('sidebar').classList.remove('open');$('nav-scrim').hidden=true;
   $('menu-toggle').setAttribute('aria-expanded','false');document.body.classList.remove('nav-open');
-  // The off-screen mobile drawer must not remain in the keyboard tab sequence.
-  $('sidebar').inert=matchMedia('(max-width:900px)').matches;
+  $('sidebar').inert=narrowLayout.matches;
+  tabButtons.forEach(b=>b.tabIndex=b.dataset.tab===tab?0:-1);
 }
 function openNavigation(){
   $('sidebar').inert=false;$('sidebar').classList.add('open');$('nav-scrim').hidden=false;
   $('menu-toggle').setAttribute('aria-expanded','true');document.body.classList.add('nav-open');
   $('nav-'+tab).focus();
 }
-$('menu-toggle').addEventListener('click',()=>{$('sidebar').classList.contains('open')?closeNavigation():openNavigation();});
-$('nav-scrim').addEventListener('click',()=>{closeNavigation();$('menu-toggle').focus();});
-document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&$('sidebar').classList.contains('open')){e.preventDefault();closeNavigation();$('menu-toggle').focus();}
-  if(e.key==='Tab'&&$('sidebar').classList.contains('open')){
-    const target=$('nav-'+tab);e.preventDefault();target.focus();
+function dismissNavigation(){closeNavigation();$('menu-toggle').focus();}
+$('menu-toggle').addEventListener('click',()=>$('sidebar').classList.contains('open')?dismissNavigation():openNavigation());
+$('drawer-close').addEventListener('click',dismissNavigation);
+$('nav-scrim').addEventListener('click',dismissNavigation);
+$('sidebar').addEventListener('keydown',e=>{
+  if(!$('sidebar').classList.contains('open'))return;
+  if(e.key==='Escape'){e.preventDefault();dismissNavigation();}
+  if(e.key==='Tab'){
+    e.preventDefault();
+    const current=tabButtons.find(b=>b.tabIndex===0)||$('nav-'+tab);
+    (document.activeElement===$('drawer-close')?current:$('drawer-close')).focus();
   }
 });
 document.querySelector('[role=tablist]').addEventListener('keydown',e=>{
   if(!['ArrowDown','ArrowUp','Home','End'].includes(e.key))return;
-  const buttons=[...document.querySelectorAll('[data-tab]')],index=buttons.indexOf(document.activeElement);
-  if(index<0)return;e.preventDefault();
-  const next=e.key==='Home'?0:e.key==='End'?buttons.length-1:(index+(e.key==='ArrowDown'?1:-1)+buttons.length)%buttons.length;
-  buttons[next].focus();buttons[next].click();
+  const index=tabButtons.indexOf(document.activeElement);
+  if(index<0)return;
+  e.preventDefault();
+  const last=tabButtons.length-1;
+  const next=e.key==='Home'?0:e.key==='End'?last:(index+(e.key==='ArrowDown'?1:-1)+tabButtons.length)%tabButtons.length;
+  tabButtons.forEach((b,i)=>b.tabIndex=i===next?0:-1);tabButtons[next].focus();
 });
-matchMedia('(max-width:900px)').addEventListener('change',closeNavigation);
+narrowLayout.addEventListener('change',closeNavigation);
 closeNavigation();
+
+const finder=$('module-finder'),query=$('finder-query'),resultList=$('finder-results');
+const finderEntries=[];
+for(const [key,section] of sections){
+  finderEntries.push({key,label:section.title,context:section.group});
+  // Index only static headings before login. Session data never enters navigation search.
+  for(const heading of $(key).querySelectorAll('.card h2, .card h3')){
+    const label=heading.textContent.trim();
+    if(!label||label===section.title)continue;
+    heading.tabIndex=-1;
+    finderEntries.push({key,label,context:section.title,heading});
+  }
+}
+let matches=[],activeResult=0;
+function markResult(index,scroll=false){
+  activeResult=index;
+  [...resultList.children].forEach((item,i)=>item.setAttribute('aria-selected',String(i===index)));
+  const option=resultList.children[index];
+  if(option){
+    query.setAttribute('aria-activedescendant',option.id);
+    if(scroll)option.scrollIntoView({block:'nearest'});
+  }else query.removeAttribute('aria-activedescendant');
+}
+function filterFinder(){
+  const normalize=s=>s.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,'');
+  const term=normalize(query.value);
+  matches=finderEntries.filter(item=>{
+    if(!term)return !item.heading;
+    if(item.heading?.closest('[hidden]:not(.tab)'))return false;
+    return normalize([item.label,item.context,item.key].join(' ')).includes(term);
+  });
+  if(term){
+    const rank=item=>normalize(item.label)===term?0:normalize(item.label).startsWith(term)?1:normalize(item.label).includes(term)?2:3;
+    matches.sort((a,b)=>rank(a)-rank(b));
+  }
+  resultList.replaceChildren(...matches.map((item,i)=>{
+    const option=el('div',undefined,'finder-option');
+    option.id='finder-option-'+i;option.dataset.result=String(i);option.setAttribute('role','option');
+    option.append(el('strong',item.label),el('small',item.context));
+    return option;
+  }));
+  resultList.scrollTop=0;$('finder-empty').hidden=matches.length>0;markResult(0);
+}
+function openFinder(){
+  if(!token||$('app').hidden||$('session-dialog').open)return;
+  if(!finder.open){
+    closeNavigation();query.value='';filterFinder();finder.showModal();
+  }
+  query.focus();
+}
+function chooseResult(index){
+  const item=matches[index];if(!item)return;
+  finder.close();navigate(item.key,{focusContent:true,heading:item.heading});
+}
+$('open-finder').addEventListener('click',openFinder);
+$('finder-close').addEventListener('click',()=>finder.close());
+finder.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&!e.isComposing){e.preventDefault();finder.close();}
+});
+finder.addEventListener('close',()=>{
+  if(finder.open)return;
+  query.value='';matches=[];resultList.replaceChildren();query.removeAttribute('aria-activedescendant');
+});
+query.addEventListener('input',filterFinder);
+query.addEventListener('keydown',e=>{
+  if(e.isComposing||!matches.length)return;
+  if(e.key==='Enter'){e.preventDefault();chooseResult(activeResult);}
+  if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+    e.preventDefault();markResult((activeResult+(e.key==='ArrowDown'?1:-1)+matches.length)%matches.length,true);
+  }
+});
+resultList.addEventListener('click',e=>{
+  const option=e.target.closest('[data-result]');if(option)chooseResult(Number(option.dataset.result));
+});
+if(/Mac|iPhone|iPad/i.test(navigator.platform))text('finder-shortcut','⌘ K');
+document.addEventListener('keydown',e=>{
+  if(token&&!e.isComposing&&(e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'&&!$('session-dialog').open){
+    e.preventDefault();openFinder();
+  }
+});
 function setTheme(dark){
   document.documentElement.dataset.theme=dark?'dark':'light';
   $('theme-toggle').setAttribute('aria-pressed',String(dark));
@@ -2986,9 +3161,9 @@ let preferredTheme;try{preferredTheme=localStorage.getItem('hakimi-theme');}catc
 setTheme(preferredTheme?preferredTheme==='dark':matchMedia('(prefers-color-scheme:dark)').matches);
 $('theme-toggle').addEventListener('click',()=>{const dark=document.documentElement.dataset.theme!=='dark';setTheme(dark);try{localStorage.setItem('hakimi-theme',dark?'dark':'light');}catch{}});
 
-document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()=>busy(b,async()=>{const drawer=$('sidebar').classList.contains('open');selectTab(b.dataset.tab);closeNavigation();if(drawer)$('page-title').focus();const panel=$(tab);panel.inert=true;panel.setAttribute('aria-busy','true');try{await refreshTab();}finally{panel.inert=false;panel.removeAttribute('aria-busy');}})));
+tabButtons.forEach(button=>button.addEventListener('click',()=>navigate(button.dataset.tab)));
 document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>busy(b,async()=>{notice('正在执行，请稍候…');const v=await api('actions/'+b.dataset.action,'POST');notice(v.note||v.status||'快照已刷新');await refreshTab();})));
-$('refresh').addEventListener('click',e=>busy(e.target,dashboard));$('refresh-logs').addEventListener('click',e=>busy(e.target,logs));$('refresh-sessions').addEventListener('click',e=>busy(e.target,sessions));
+$('refresh').addEventListener('click',e=>busy(e.currentTarget,dashboard));$('refresh-logs').addEventListener('click',e=>busy(e.target,logs));$('refresh-sessions').addEventListener('click',e=>busy(e.target,sessions));
 $('add-bot').addEventListener('click',e=>busy(e.target,async()=>{const th=parseBotThreshold($('bot-custom-threshold').value,true);await api('bots','PUT',{user_id:$('bot-id').value.trim(),action:'add',threshold:th});$('bot-id').value='';$('bot-custom-threshold').value='';await syncBotViews();notice('外部 Bot 已加入管理');}));
 $('add-sub').addEventListener('click',e=>busy(e.target,async()=>{await api('subscriptions','POST',{kind:$('sub-kind').value,uid:$('sub-uid').value.trim()});$('sub-uid').value='';await subscriptions();}));
 $('save-notebook').addEventListener('click',e=>busy(e.target,async()=>{await api('notebook','PUT',{text:$('notebook-text').value});notice('本地快照已通过筛查并保存');await notebook();}));
