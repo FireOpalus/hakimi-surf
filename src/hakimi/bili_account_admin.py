@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException, Request
 
 from .admin_routes import body, service
-from .bili_watcher import BiliPolicy, CredentialUpdate
+from .modules.bili_watcher import BiliPolicy, CredentialUpdate
 from .video_policy import VideoWatchConfig
 
 router = APIRouter(prefix="/admin/api/bili-account")
@@ -54,7 +54,10 @@ async def action(request: Request, action: str):
     if lock.locked():
         raise HTTPException(409, "admin_action_busy")
     async with lock:
-        watcher = service(request).bili_watcher
+        svc = service(request)
+        watcher = svc.bili_watcher
+        if action in {"test", "run"} and svc.modules.inactive_reason("bilibili_surf"):
+            raise HTTPException(409, "module_disabled")
         if action == "test":
             return await watcher.nav()
         if action == "run":

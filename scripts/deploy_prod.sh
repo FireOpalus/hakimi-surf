@@ -8,6 +8,25 @@ compose=(docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml)
 revision=$(git rev-parse HEAD)
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
 
+build_context() (
+    local tree=$1 context=$2
+    if [[ $context != . ]]; then
+        git archive --format=tar "$tree:$context"
+        return
+    fi
+    local modules=src/hakimi/modules pin staging
+    pin=$(git rev-parse "$tree:$modules")
+    if ! git -C "$modules" cat-file -e "$pin^{commit}" 2>/dev/null || [[ ! -f "$modules/.git" && ! -d "$modules/.git" ]]; then
+        git submodule update --init -- "$modules" >&2
+    fi
+    staging=$(mktemp -d)
+    trap 'rm -r -- "$staging"' EXIT
+    git archive "$tree" | tar -x -C "$staging"
+    mkdir -p "$staging/$modules"
+    git -C "$modules" archive "$pin" | tar -x -C "$staging/$modules"
+    tar -c -C "$staging" .
+)
+
 deploy() {
     local service=$1 context=$2 port=$3
     shift 3
@@ -29,9 +48,7 @@ deploy() {
     fi
 
     candidate="$image:rev-${revision:0:12}"
-    local tree="$revision"
-    if [[ $context != . ]]; then tree="$revision:$context"; fi
-    git archive --format=tar "$tree" | docker build --label "org.opencontainers.image.revision=$revision" \
+    build_context "$revision" "$context" | docker build --label "org.opencontainers.image.revision=$revision" \
         --label "org.opencontainers.image.version=$version" -t "$candidate" -
     if [[ $service == hakimi-admin ]]; then
         docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL "$candidate" -t

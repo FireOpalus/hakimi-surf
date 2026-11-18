@@ -18,7 +18,6 @@ from .admission_policy import (
     is_bot_hard_blocked,
 )
 from .attention import can_watch_video, direct_attention
-from .bilibili import extract_bvid
 from .bot_server import prompt_context
 from .budget_policy import BudgetConfig
 from .compression_policy import CompressionConfig
@@ -35,6 +34,7 @@ from .limits_policy import (
 from .memory_compressor import check_memory_text
 from .mentions import parse_reply
 from .models import Message
+from .modules.bilibili import extract_bvid
 from .outbound_actions import parse_actions
 from .output_links import filter_reply_links
 from .rest_policy import RestHoursConfig
@@ -544,6 +544,8 @@ async def action(request: Request, action: str):
         raise HTTPException(409, "admin_action_busy")
     async with lock:
         if action == "patrol":
+            if svc.modules.inactive_reason("bilibili_surf"):
+                raise HTTPException(409, "module_disabled")
             await svc.poll_once(force=True)
             return {
                 "status": "polled_updates_queued",

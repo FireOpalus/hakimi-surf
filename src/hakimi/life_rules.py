@@ -131,6 +131,11 @@ class RuleDispatcher:
 
     async def apply(self, rule: Rule, row, now: float) -> str | None:
         ev = self.world.event_from_row(row)
+        source = self.registry.get(ev.source_module)
+        if self.registry.inactive_reason(self.registry.rule_owners[rule.name]) or (
+            source and source.inactive_reason
+        ):
+            return None
         reaction = rule.match(ev)
         if not reaction or (
             ev.payload.get("private_first")

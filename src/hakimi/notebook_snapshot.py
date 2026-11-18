@@ -6,9 +6,9 @@ import stat
 import tempfile
 import time
 
-from .bilibili import bounded_json
 from .bot_server import is_persona_owner
 from .drive_client import API, DriveAuth
+from .http_json import bounded_json
 from .memory_compressor import check_memory_text
 from .security import Rejected
 from .work_usage import model_work

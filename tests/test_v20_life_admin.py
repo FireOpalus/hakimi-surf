@@ -14,7 +14,7 @@ from pydantic import SecretStr
 from hakimi.app import create_app
 from hakimi.life_admin import LifeConfigMirror
 from hakimi.life_admin import router as life_router
-from hakimi.modules.weather import WeatherModule
+from hakimi.security import Rejected
 from hakimi.world_state import IntentTicketCreate
 from tests.fakes import FakeGateway
 from tests.test_admin import TOKEN
@@ -85,6 +85,7 @@ LIFE_ROUTES = [
     ("GET", "/admin/api/life/overview"),
     ("GET", "/admin/api/life/modules/qq_social"),
     ("GET", "/admin/api/life/modules/minecraft/sensor"),
+    ("PUT", "/admin/api/life/modules/qq_social/enabled"),
     ("PUT", "/admin/api/life/modules/qq_social/schedule"),
     ("DELETE", "/admin/api/life/modules/qq_social/schedule"),
     ("PUT", "/admin/api/life"),
@@ -103,8 +104,7 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
     app, client, gateway = life_api
     svc = app.state.service
     root = "/admin/api/life/modules"
-    assert (await client.get(root + "/weather")).status_code == 404
-    svc.modules.register(WeatherModule(svc.s, None, None))
+    assert (await client.get(root + "/not-installed")).status_code == 404
 
     reads = []
 
@@ -118,9 +118,12 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
     catalog = (await client.get(root)).json()
     assert {m["id"] for m in catalog} == {"qq_social", "bilibili_surf", "minecraft", "weather"}
     for entry in catalog:
-        assert set(entry) == {"id", "action_count", "region"}
+        assert set(entry) == {"id", "action_count", "region", "enabled", "configuration_issue"}
         details = (await client.get(root + "/" + entry["id"])).json()
+        assert details["enabled"] == entry["enabled"] == (entry["id"] != "weather")
         assert set(details) == {
+            "enabled",
+            "configuration_issue",
             "id",
             "actions",
             "status",
@@ -141,7 +144,8 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
     core = await client.get("/admin/api/life/overview")
     assert core.status_code == 200
     assert reads == []
-    assert (await client.get(root + "/weather/sensor")).json() == {"summary": "本地测试摘要"}
+    assert (await client.get(root + "/weather/sensor")).status_code == 409
+    assert (await client.get(root + "/qq_social/sensor")).json() == {"summary": "本地测试摘要"}
     assert reads == ["sensor"]
     assert not gateway.calls
 
@@ -552,7 +556,9 @@ async def test_catalog_action_hot_switch_is_persisted_and_restricts_admin(life_a
     info = (await client.get("/admin/api/life")).json()
     names = {r["name"] for r in info["engine"]["actions"]}
     assert {"mc.status", "mc.build_plan", "qq.speak", "bili.patrol"} <= names
-    assert "weather.read" not in names
+    assert next(r for r in info["engine"]["actions"] if r["name"] == "weather.read")["reason"] == (
+        "module_disabled"
+    )
     for name, mode in (
         ("not.registered", "active"),
         ("mc.status", "legacy"),
@@ -569,3 +575,93 @@ async def test_catalog_action_hot_switch_is_persisted_and_restricts_admin(life_a
         "mc.status": "off"
     }
     assert not gateway.calls
+
+
+async def test_module_master_switch_blocks_ingress_actions_and_preserves_settings(
+    life_api, message
+):
+    app, client, gateway = life_api
+    svc = app.state.service
+    root = "/admin/api/life/modules"
+    qq = root + "/qq_social"
+    assert (await client.put(qq + "/enabled", json={"enabled": "false"})).status_code == 400
+    assert (await client.put(root + "/absent/enabled", json={"enabled": False})).status_code == 404
+    await client.put("/admin/api/life/actions/qq.speak", json={"mode": "off"})
+    before = (await client.get(qq)).json()
+    now = time.time()
+    pending = await svc.world_state.enqueue_intent(
+        IntentTicketCreate(
+            target_module="qq_social",
+            target_scope="onebot:40000",
+            action_type="group_share",
+            execute_after=now + 10,
+            expire_at=now + 900,
+        )
+    )
+    for _ in range(2):
+        response = await client.put(qq + "/enabled", json={"enabled": False})
+        assert response.status_code == 200
+        assert not response.json()["enabled"]
+        assert all(a["reason"] == "module_disabled" for a in response.json()["actions"])
+    assert (await svc.store.one("SELECT status FROM scheduled_intents WHERE id=?", (pending,)))[
+        0
+    ] == "gated_skip"
+    assert await svc.accept(message) == "ignored"
+    assert not svc.batch_authorized(message, [message])
+    assert not svc.proactive.delivery_enabled
+    with pytest.raises(Rejected, match="module_disabled"):
+        await svc.sender.onebot.call("send_private_msg", {})
+    assert "qq_social" not in {m.module_id for m in svc.modules.active()}
+    assert (await client.get(root + "/bilibili_surf")).json()["enabled"]
+    assert (await client.put(root + "/bilibili_surf/enabled", json={"enabled": False})).is_success
+    with pytest.raises(Rejected, match="module_disabled"):
+        await svc.bili.resolve_short("https://b23.tv/hello")
+    with pytest.raises(Rejected, match="module_disabled"):
+        await svc.bili_watcher.run_once()
+    assert (await client.post("/admin/api/actions/patrol")).status_code == 409
+    assert (await client.put(root + "/minecraft/enabled", json={"enabled": False})).is_success
+    assert await svc.node_transport.on_event({"event": "mc.milestone", "payload": {}}) == "ignored"
+    blocked = await client.post("/admin/api/life/mc/goal", json={"action_type": "status"})
+    assert blocked.json()["detail"] == "module_disabled"
+    assert not svc.modules.active()
+    assert {row["id"] for row in (await client.get(root)).json()} == {
+        "qq_social",
+        "minecraft",
+        "weather",
+        "bilibili_surf",
+    }
+    after = (await client.put(qq + "/enabled", json={"enabled": True})).json()
+    assert after["enabled"] and after["scheduling"]["values"] == before["scheduling"]["values"]
+    assert next(a for a in after["actions"] if a["name"] == "qq.speak")["mode"] == "off"
+    assert svc.batch_authorized(message, [message])
+    assert not gateway.calls
+
+
+async def test_switch_restores_after_restart_and_weather_waits_for_location(settings):
+    settings.admin_token = SecretStr(TOKEN)
+    root = "/admin/api/life/modules"
+    for first_start in (True, False):
+        app = create_app(settings, gateway_factory=FakeGateway, start_workers=False)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:12141",
+                headers={"Authorization": "Bearer " + TOKEN},
+            ) as client,
+        ):
+            if first_start:
+                assert (
+                    await client.put(root + "/weather/enabled", json={"enabled": True})
+                ).is_success
+                assert (
+                    await client.put(root + "/qq_social/enabled", json={"enabled": False})
+                ).is_success
+            rows = {r["id"]: r for r in (await client.get(root)).json()}
+            assert rows["weather"]["enabled"] and not rows["qq_social"]["enabled"]
+            assert rows["weather"]["configuration_issue"] == "weather_location_missing"
+            detail = (await client.get(root + "/weather")).json()
+            assert all(t["next_at"] is None for t in detail["scheduling"]["timers"])
+            assert all(a["reason"] == "weather_location_missing" for a in detail["actions"])
+            assert (await client.get(root + "/weather/sensor")).status_code == 409
+            assert not app.state.service.ai.calls

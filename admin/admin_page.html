@@ -859,6 +859,19 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
 .module-icon svg { width: 26px; height: 26px; }
 .module-card[data-module-id=bilibili_surf] .module-icon { color: var(--vertex-ink); background: var(--vertex-bg); }
 .module-card[data-module-id=minecraft] .module-icon { color: var(--good); background: var(--good-bg); }
+.module-switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; min-height: 40px; width: fit-content; margin: 0; position: relative; font-size: 13px; font-weight: 600; color: var(--muted); }
+.module-switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.module-switch .track { display: inline-flex; align-items: center; flex: none; width: 36px; height: 21px; box-sizing: border-box; padding: 2px; border: 1px solid var(--muted); border-radius: 20px; background: var(--soft); }
+.module-switch .track::after { content: ""; width: 15px; height: 15px; border-radius: 50%; background: var(--muted); transition: transform .15s ease; }
+.module-switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+.module-switch input:checked + .track::after { transform: translateX(15px); background: var(--panel, #191724); }
+.module-switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 3px; }
+.module-switch:has(input:disabled) { opacity: .65; cursor: progress; }
+.module-detail-state { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.module-detail-state h2 { margin: 0; }
+.module-card .module-state-note, .module-detail-state p { font-size: 12px; margin: 3px 0; color: var(--muted); }
+.module-card .module-foot { flex-wrap: wrap; }
+@media (prefers-reduced-motion: reduce) { .module-switch .track::after { transition: none; } }
 .module-card .module-region { font-size: 12px; color: var(--muted); }
 .module-card:has(details[open]) { grid-column: 1 / -1; }
 .module-card summary { cursor: pointer; font-weight: 650; color: var(--accent); padding: 7px 0; }
@@ -1260,6 +1273,10 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-bili-account" type="button" data-subpage hidden role="tab" data-tab="bili-account" data-description="管理小号凭据、互动权限与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>账号与看片设置</span></button>
         <button id="nav-patrol" type="button" data-subpage hidden role="tab" data-tab="patrol" data-description="管理 B 站订阅，查看巡逻日记与网盘同步状态。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻与日记</span></button>
       </div>
+      <div class="nav-group" role="presentation" data-module="weather">
+        <div class="nav-group-label">天气</div>
+        <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="查看每小时气象观测和每日提醒的排程。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
+      </div>
       <div class="nav-group" role="presentation" data-module="minecraft">
         <div class="nav-group-label">游戏</div>
         <button id="nav-minecraft" type="button" role="tab" data-tab="minecraft" data-description="查看游戏连接和角色状态，下达活动目标。" aria-controls="minecraft" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5v10l-9 5-9-5V7z M3 7l9 5 9-5 M12 12v10"/></svg><span>Minecraft</span></button>
@@ -1335,11 +1352,12 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="modules" class="tab" role="tabpanel" aria-labelledby="nav-modules" hidden>
-  <div class="directory-heading"><h2>已注册模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
+  <div class="directory-heading"><h2>已安装模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
   <div id="module-catalog" class="module-catalog" aria-live="polite"></div>
 </section>
 
 <section id="qq" class="tab" role="tabpanel" aria-labelledby="nav-qq" hidden>
+  <div id="qq-module-state" class="card module-detail-state"></div>
   <div class="card"><h2>OneBot 连接</h2>
     <span class="connection-state"><span id="connection-dot" class="status-dot" aria-hidden="true"></span><span id="connection-label">等待连接状态</span></span>
     <dl id="ws-details" class="node-details">
@@ -1375,6 +1393,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="bili" class="tab" role="tabpanel" aria-labelledby="nav-bili" hidden>
+  <div id="bili-module-state" class="card module-detail-state"></div>
   <div class="card"><h2>巡逻设置</h2>
     <dl class="node-details"><div><dt>执行节点</dt><dd id="bili-module-backend">—</dd></div><div><dt>小号自主巡逻</dt><dd id="bili-module-autonomous">—</dd></div></dl>
     <div class="module-shortcuts">
@@ -1394,7 +1413,13 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   </div>
 </section>
 
+<section id="weather" class="tab" role="tabpanel" aria-labelledby="nav-weather" hidden>
+  <div id="weather-module-state" class="card module-detail-state"></div>
+  <div class="card"><h2>天气观测与提醒</h2><div id="weather-actions" class="module-tools"></div></div>
+</section>
+
 <section id="minecraft" class="tab" role="tabpanel" aria-labelledby="nav-minecraft" hidden>
+  <div id="minecraft-module-state" class="card module-detail-state"></div>
   <div class="card"><h2>Minecraft 控制</h2>
     <dl id="mc-overview" class="node-details"></dl>
     <p id="life-mc-status" class="muted"></p>
@@ -2184,7 +2209,7 @@ async function api(path,method='GET',data){
   if(signal.aborted)throw new DOMException('请求已取消','AbortError');
   if(!r.ok){
     if(r.status===401||r.status===403)logout();
-    const hints={module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
+    const hints={module_disabled:'模块已关闭，可在模块详情中开启。',weather_location_missing:'请先配置天气地点的经纬度。',module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
     throw Error(hints[value.detail]||value.detail||('HTTP '+r.status));
   }
   return value;
@@ -3533,7 +3558,7 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
-const modulePage=new Map([['qq_social','qq'],['bilibili_surf','bili'],['minecraft','minecraft']]);
+const modulePage=new Map([['qq_social','qq'],['bilibili_surf','bili'],['minecraft','minecraft'],['weather','weather']]);
 const moduleDescriptions=new Map([
   ['qq_social','OneBot 连接、群聊管理与主动私信'],
   ['bilibili_surf','账号、视频订阅与巡逻日记'],
@@ -3632,15 +3657,61 @@ function moduleSchedulePanel(d){
   }));
   return panel;
 }
+const switchingModules=new Set();
+const moduleTitle=id=>modulePage.has(id)?sections.get(modulePage.get(id)).title:id;
+function moduleIssue(d){
+  return d.configuration_issue==='weather_location_missing'?'待配置地点 · 在 .env 填写天气经纬度':d.configuration_issue||'';
+}
+function syncModuleSwitches(id,enabled){
+  for(const input of document.querySelectorAll('input[data-module-switch]')){
+    if(input.dataset.moduleSwitch!==id)continue;
+    input.checked=enabled;
+    input.disabled=switchingModules.has(id);
+    input.closest('label').lastElementChild.textContent=enabled?'已开启':'已关闭';
+  }
+}
+function moduleSwitch(d){
+  const label=el('label',undefined,'module-switch'),input=el('input'),track=el('span',undefined,'track');
+  input.type='checkbox';input.setAttribute('role','switch');input.dataset.moduleSwitch=d.id;
+  input.checked=d.enabled;input.disabled=switchingModules.has(d.id);
+  input.setAttribute('aria-label',moduleTitle(d.id)+'模块开关');track.setAttribute('aria-hidden','true');
+  label.append(input,track,el('span',d.enabled?'已开启':'已关闭'));
+  input.addEventListener('change',async()=>{
+    const wanted=input.checked;
+    if(switchingModules.has(d.id))return;
+    switchingModules.add(d.id);
+    syncModuleSwitches(d.id,wanted);
+    let confirmed=!wanted;
+    try{
+      const result=await api('life/modules/'+encodeURIComponent(d.id)+'/enabled','PUT',{enabled:wanted});
+      confirmed=result.enabled;
+      applyModuleDetail(result);
+      notice(moduleTitle(d.id)+(confirmed?'已开启':'已关闭'));
+    }catch(error){
+      if(error.name!=='AbortError'){
+        notice(error.message,true);
+        if(token){
+          try{const current=await api('life/modules/'+encodeURIComponent(d.id));confirmed=current.enabled;applyModuleDetail(current);}catch{}
+        }
+      }
+    }finally{
+      switchingModules.delete(d.id);syncModuleSwitches(d.id,confirmed);
+    }
+  });
+  return label;
+}
 function renderModuleTools(container,d){
+  container.dataset.moduleTools=d.id;
   const actions=el('div',undefined,'table'),summary=el('p',undefined,'muted');
   const read=el('button','读取传感器摘要','secondary');read.type='button';
   read.addEventListener('click',()=>busy(read,async()=>{
     const result=await api('life/modules/'+encodeURIComponent(d.id)+'/sensor');
     summary.textContent=result.summary||'暂无传感器摘要';
   }));
-  const state=el('p',regionName(d.region)+' · '+(d.proactive_paused?'主动动作已暂停':'允许调度主动动作'),'muted');
+  read.disabled=!d.enabled||!!d.configuration_issue;
+  const state=el('p',regionName(d.region)+' · '+(!d.enabled?'模块已关闭':moduleIssue(d)||(d.proactive_paused?'主动动作已暂停':'允许调度主动动作')),'muted');
   container.replaceChildren(state,moduleSchedulePanel(d),actions,read,summary);
+  if(!modulePage.has(d.id))container.prepend(moduleSwitch(d));
   renderModuleActions(actions,d.actions);
 }
 async function loadModule(id){
@@ -3656,23 +3727,44 @@ async function loadModule(id){
     mcControls.forEach(control=>$(control).disabled=true);
   }
   const d=await api('life/modules/'+encodeURIComponent(id));
+  applyModuleDetail(d);
+}
+function applyModuleDetail(d){
+  const id=d.id,key=modulePage.get(id);
+  if(key){
+    const banner=$(key+'-module-state'),label=el('div');
+    label.append(el('h2','模块开关'));
+    if(moduleIssue(d))label.append(el('p',moduleIssue(d)));
+    if(!banner.querySelector('input'))banner.replaceChildren(label,moduleSwitch(d));
+    else banner.replaceChild(label,banner.firstElementChild);
+    renderModuleTools($(key+'-actions'),d);
+  }else{
+    for(const target of document.querySelectorAll('[data-module-tools]')){
+      if(target.dataset.moduleTools===id)renderModuleTools(target,d);
+    }
+  }
+  syncModuleSwitches(id,d.enabled);
   if(id==='qq_social')updateConnection(d.status);
   if(id==='bilibili_surf'){
     text('bili-module-backend',d.status.cn_delegate?'境内专线':d.status.backend==='remote_node'?'境内代理模式':'境外本机');
     text('bili-module-autonomous',d.status.autonomous?'已开启':'已关闭');
   }
-  if(id==='minecraft')renderMinecraft(d.status);
-  renderModuleTools(tools,d);
+  if(id==='minecraft'){
+    renderMinecraft(d.status);
+    for(const control of mcControls)$(control).disabled=!d.enabled;
+  }
+  if(id==='bilibili_surf')$('bili').querySelector('[data-action="patrol"]').disabled=!d.enabled;
 }
 function moduleCard(m){
-  const key=modulePage.get(m.id),title=key?sections.get(key).title:m.id==='weather'?'天气观测':m.id;
+  const key=modulePage.get(m.id),title=moduleTitle(m.id);
   const card=el('article',undefined,'module-card');card.dataset.moduleId=m.id;
   const header=el('header'),glyph=el('span',undefined,'module-icon');
   glyph.append($('nav-'+(key||'modules')).querySelector('svg').cloneNode(true));
-  header.append(glyph,el('span','注册于'+regionName(m.region),'module-region'));
+  header.append(glyph,moduleSwitch(m));
   const foot=el('div',undefined,'module-foot');
-  foot.append(el('small',m.action_count+' 项动作'));
+  foot.append(el('small',regionName(m.region)+' · '+m.action_count+' 项动作'));
   card.append(header,el('h3',title),el('p',moduleDescriptions.get(m.id)||m.id),foot);
+  if(moduleIssue(m))foot.before(el('p',moduleIssue(m),'module-state-note'));
   if(key){
     const open=el('button','打开模块 →','module-open');open.type='button';
     open.setAttribute('aria-label','打开'+title);open.dataset.openTab=key;foot.append(open);
@@ -3697,7 +3789,7 @@ async function moduleDirectory(){
     const registered=new Set(list.map(m=>m.id));
     for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=!registered.has(group.dataset.module);
     container.replaceChildren(...list.map(moduleCard));
-    if(!list.length)container.append(el('p','当前没有已注册的模块。','empty-state'));
+    if(!list.length)container.append(el('p','当前没有已安装的模块。','empty-state'));
   }catch(error){
     if(error.name==='AbortError')throw error;
     container.replaceChildren(el('p','模块目录暂时无法读取，请点击刷新目录重试。','empty-state'));
@@ -3708,7 +3800,7 @@ const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
   modules:moduleDirectory, qq:()=>loadModule('qq_social'), bili:()=>loadModule('bilibili_surf'),
-  minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
+  weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{
     const [moderation,profiles]=await Promise.allSettled([community(),affection()]);
@@ -3757,7 +3849,7 @@ const sections=new Map(tabButtons.map(button=>[button.dataset.tab,{
 function resetWorkspaces(){
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
-  for(const id of ['module-catalog','qq-actions','bili-actions','minecraft-actions','mc-overview'])$(id).replaceChildren();
+  for(const id of ['module-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview',...Array.from(modulePage.values(),key=>key+'-module-state')])$(id).replaceChildren();
   for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=false;
   for(const id of ['bili-module-backend','bili-module-autonomous'])text(id,'—');
 }

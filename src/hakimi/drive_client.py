@@ -12,8 +12,8 @@ import httpx
 from google.auth import jwt
 from google.oauth2 import service_account
 
-from .bilibili import bounded_json
 from .config import Settings
+from .http_json import bounded_json
 from .security import Rejected
 
 SCOPE = "https://www.googleapis.com/auth/drive.file"

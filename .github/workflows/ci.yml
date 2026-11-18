@@ -7,6 +7,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read the pinned capability revision
+        id: modules
+        run: echo "sha=$(git rev-parse HEAD:src/hakimi/modules)" >> "$GITHUB_OUTPUT"
+      - name: Check out private capability modules
+        uses: actions/checkout@v4
+        with:
+          repository: FireOpalus/hakimi-modules
+          ref: ${{ steps.modules.outputs.sha }}
+          path: src/hakimi/modules
+          ssh-key: ${{ secrets.HAKIMI_MODULES_DEPLOY_KEY }}
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.13.8'

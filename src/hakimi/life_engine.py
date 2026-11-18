@@ -231,10 +231,11 @@ class LifeBlockPlanner:
         if automatic and ts < state["next_at"]:
             self.next_plan_at = state["next_at"]
             return {"status": "not_due", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
-        if not cfg.enabled:
+        if not cfg.enabled or not self.service.modules.active():
+            reason = "disabled" if not cfg.enabled else "no_active_modules"
             self.next_plan_at = ts + 1800.0
-            await self.journal.pause(day, ts, self.next_plan_at, "disabled")
-            return {"status": "disabled", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
+            await self.journal.pause(day, ts, self.next_plan_at, reason)
+            return {"status": reason, "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
 
         await ws.experience.advance(ts)
         local_dt = self._local(ts)
@@ -254,9 +255,9 @@ class LifeBlockPlanner:
         modules_reg = self.service.modules
         module_data = await modules_reg.context_data(limit=4, now=ts)
         sensors = await modules_reg.collect_sensor_summaries()
-        known_modules = {"idle", *(m.module_id for m in modules_reg.all())}
+        known_modules = {"idle", *(m.module_id for m in modules_reg.active())}
         planning_context = {}
-        for module in modules_reg.all():
+        for module in modules_reg.active():
             planning_context.update(await module.planning_context(self.service, cfg, ts))
 
         budget = await self.store.budget_status()
@@ -412,7 +413,9 @@ class LifeBlockPlanner:
             await self.journal.checkpoint(run_id, plan_source, plan.model_dump(), reasons)
 
         resolved_module = sanitize_sensor_text(plan.current_module, self.s, max_tokens=16) or "idle"
-        if resolved_module not in known_modules:
+        if resolved_module not in known_modules or (
+            resolved_module != "idle" and modules_reg.inactive_reason(resolved_module)
+        ):
             resolved_module = "idle"
         resolved_focus: Literal["LOW", "MEDIUM", "HIGH"] = plan.focus_level
         if resolved_focus == "HIGH":
@@ -845,6 +848,14 @@ class JITExecutor:
                     local = datetime.fromtimestamp(current, _zone(self.s.bot_timezone))
                     return (
                         self.engine.config.enabled
+                        and not self.engine.catalog.inactive_reason(
+                            self.engine.catalog.owners[spec.name]
+                        )
+                        and not (
+                            ticket.get("source_module")
+                            and self.service.modules.get(ticket["source_module"])
+                            and self.service.modules.inactive_reason(ticket["source_module"])
+                        )
                         and (
                             spec.window == "any"
                             or (
@@ -964,6 +975,38 @@ class LifeEngine:
         self.catalog = service.modules.catalog
         self.rules = RuleDispatcher(self, service.modules)
 
+    async def set_module_enabled(self, module, enabled: bool) -> None:
+        await self.initialize()
+        async with self._config_lock:
+            changed = module.enabled != enabled
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "INSERT INTO module_switches VALUES (?,?) ON CONFLICT(module_id) "
+                    "DO UPDATE SET enabled=excluded.enabled",
+                    (module.module_id, int(enabled)),
+                )
+                if not enabled:
+                    names = [
+                        n for n, owner in self.catalog.owners.items() if owner == module.module_id
+                    ]
+                    await self.store.db.execute(
+                        "UPDATE scheduled_intents SET status='gated_skip',"
+                        "result_reason='module_disabled',updated_at=? WHERE status='pending' AND "
+                        "(target_module=? OR source_module=? OR action_name IN "
+                        "(SELECT value FROM json_each(?)))",
+                        (self.clock(), module.module_id, module.module_id, json.dumps(names)),
+                    )
+                    await self.store.db.execute(
+                        "UPDATE world_state SET current_module='idle',focus_level='LOW' "
+                        "WHERE singleton=1 AND current_module=?",
+                        (module.module_id,),
+                    )
+            module.enabled = enabled
+            self.wakeup.set()
+            if changed:
+                await module.on_switch(self.service)
+                await self.service.world_state.refresh()
+
     def options_for(self, spec, cfg):
         module = self.service.modules.get(self.catalog.owners[spec.name])
         return module.scheduling(cfg)
@@ -972,6 +1015,9 @@ class LifeEngine:
         if (ticket.get("origin") == "admin") != admin:
             raise ValueError("action_origin_forbidden")
         spec = self.catalog.resolve(ticket)
+        source = self.service.modules.get(ticket.get("source_module", ""))
+        if source and source.inactive_reason:
+            raise ValueError(source.inactive_reason)
         mode = self.config.action_modes.get(spec.name, "active")
         if mode == "off":
             raise ValueError("action_disabled")
@@ -1045,6 +1091,9 @@ class LifeEngine:
             if self.initialized:
                 return
             async with self.store.transaction():
+                for switch in await self.store.all("SELECT module_id,enabled FROM module_switches"):
+                    if module := self.service.modules.get(switch["module_id"]):
+                        module.enabled = bool(switch["enabled"])
                 row = await self.store.one(
                     "SELECT payload FROM admin_config WHERE key='life_engine'"
                 )
@@ -1273,7 +1322,7 @@ class LifeEngine:
         journal = self.planner.journal
         poll = await journal.observe_tick(day, now)
         readers = {}
-        for module in self.service.modules.all():
+        for module in self.service.modules.active():
             for slot in module.schedules():
                 if poll and slot.receipts:
                     readers[slot.name] = slot.receipts

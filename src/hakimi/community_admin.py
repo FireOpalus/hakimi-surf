@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from .admin_routes import body, service
-from .longnick import LongnickConfig
+from .modules.longnick import LongnickConfig
 
 router = APIRouter(prefix="/admin/api")
 

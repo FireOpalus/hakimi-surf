@@ -2,6 +2,7 @@
 .env.*
 .venv
 .git
+**/.git
 data
 tests
 __pycache__

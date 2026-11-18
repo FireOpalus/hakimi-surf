@@ -8,6 +8,8 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+if not (root / "src/hakimi/modules/__init__.py").is_file():
+    raise SystemExit("Run git submodule update --init --recursive before packaging.")
 output = root / "dist"
 output.mkdir(exist_ok=True)
 files = [

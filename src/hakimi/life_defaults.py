@@ -6,7 +6,7 @@ from .gemini import WireLifePlan
 async def fallback_plan(engine, context, local_dt, now, available, planner_funded):
     focus_module, focus, mood = "idle", "LOW", "calm"
     choices = []
-    for module in engine.service.modules.all():
+    for module in engine.service.modules.active():
         if hint := module.local_focus(context, local_dt.hour):
             focus_module, (focus, mood) = module.module_id, hint
         choice = module.local_activity(context, available, not planner_funded)

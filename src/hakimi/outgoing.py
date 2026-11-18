@@ -7,9 +7,9 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 
-from .adapters import farewell_send_bypass
 from .bot_server import is_persona_owner
 from .models import Message
+from .modules.adapters import farewell_send_bypass
 from .outbound_actions import bubble_segments, parse_actions, valid_receipt
 from .output_links import filter_reply_links
 from .security import Rejected, authorize, configured_secrets, safe_output

@@ -31,6 +31,9 @@ from .thinking_policy import THINKING_LEVELS, ThinkingConfig
 from .web_search import WebSearch
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS module_switches (
+  module_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0, 1))
+);
 CREATE TABLE IF NOT EXISTS admin_config (key TEXT PRIMARY KEY, payload BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS session_registry (id TEXT PRIMARY KEY, identity BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_events (

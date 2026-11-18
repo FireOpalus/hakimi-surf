@@ -902,7 +902,7 @@ class WorldStateManager:
                 if self.current.current_module != "idle"
                 else None
             )
-            if active_mod is not None:
+            if active_mod is not None and not active_mod.inactive_reason:
                 summary = await active_mod.get_sensor_summary()
                 if summary:
                     sensor_parts.append(summary)

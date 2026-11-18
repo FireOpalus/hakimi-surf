@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .bilibili import BVID
+from .modules.bilibili import BVID
 from .security import Rejected
 from .video_policy import MAX_VIDEO_SECONDS
 

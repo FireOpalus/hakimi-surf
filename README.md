@@ -167,11 +167,23 @@ docker compose up -d
 | 升级旧库 | 启动时增补列、索引与规则游标，保留旧票据和终态。新规则从启用时开始消费；重启从已保存的位置补读。 |
 | 可选定点天气 | 在 `.env` 设置 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE` 和 `HAKIMI_WEATHER_ENABLED=true`。世界引擎按本地整点读取 Open-Meteo 当前天气，在夜间也采样，重启只补当前小时。每条 `weather_observed` 记录数据时刻、采样区间、气温、天气代码及可用的降水、太阳辐射和昼夜标记。降水量对应上游采样区间。各模块可独立订阅，采样不调用模型。启用 `HAKIMI_WEATHER_OWNER_REPORT=true` 后，QQ 每天最多发送一次提醒，默认 09:30，由 `HAKIMI_WEATHER_TIME` 或模块调度面板设置。[天气数据接口](https://open-meteo.com/en/docs) |
 
+### 模块仓库与管理开关
+
+[hakimi-modules](https://github.com/FireOpalus/hakimi-modules) 是私有能力模块仓库。主仓用 Git 子模块在 `src/hakimi/modules` 固定一个提交。开发机和部署机需要两个仓库的读取权限。
+
+```sh
+git clone --recurse-submodules https://github.com/FireOpalus/hakimi-surf.git
+# 已有检出，更新主仓后同步到它指定的模块版本
+git submodule update --init --recursive
+```
+
+在后台「功能模块」总览或详情切换模块，状态即时保存到 SQLite。关闭后仍可查看配置；世界引擎停止为其排程，待执行的相关任务会取消。设备连接与后台独立，关闭 QQ 后仍可在后台重新开启。天气默认沿用环境设置，开关打开且地点已配置后才会采样。
+
 世界引擎管理活跃时段、免打扰、规划间隔和共用次数。各功能模块的「模块调度」管理自己的选项、每日任务和下次排程。
 
 新增模块时，在模块上声明 `schedule_options`（继承 `ScheduleOptions`，使用有标题的布尔、数字、文本或枚举字段），并在 `Service` 注册。后台会根据字段类型生成表单并验证保存值。动作可通过 `window` 选择执行时段，通过 `quotas` 指定共用次数及本模块的豁免开关。每日任务用 `schedules()` 声明，`DailyAction.time_option` 可绑定本模块的 `ScheduleTime` 字段，后台改时间后下次排程随之更新。本地兜底意图用 `local_activity()` 提供，事件订阅用 `event_rules()` 声明。注册后即可参与排程。[调度模块验收示例](tests/test_module_scheduling.py)
 
-现有例子见 [天气模块](src/hakimi/modules/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
+现有例子见 [天气模块](https://github.com/FireOpalus/hakimi-modules/blob/main/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
 
 ### 消息处理全链路
 ```mermaid

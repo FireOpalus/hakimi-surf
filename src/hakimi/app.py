@@ -10,12 +10,10 @@ from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .adapters import Sender, qq_message
 from .admin_auth import AdminAuth
 from .admin_routes import router as admin_router
 from .affection_admin import router as affection_router
 from .bili_account_admin import router as bili_account_router
-from .bilibili import Bilibili
 from .community_admin import router as community_router
 from .config import Settings
 from .drive_client import FolderDrive
@@ -23,9 +21,11 @@ from .gcp_admin import router as gcp_billing_router
 from .gemini import GeminiGateway
 from .life_admin import router as life_router
 from .meme_admin import router as meme_router
+from .modules.adapters import Sender, qq_message
+from .modules.bilibili import Bilibili
+from .modules.onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
 from .node_transport import NodeTransport
 from .notebook_snapshot import NotebookSnapshot
-from .onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
 from .provider_admin import router as provider_router
 from .roaming_logger import RoamingLogger
 from .security import Rejected, check_fresh, qq_signing_key, verify_onebot, verify_qq

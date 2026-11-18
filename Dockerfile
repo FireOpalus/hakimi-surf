@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
-RUN uv sync --frozen --no-dev && \
+RUN test -f src/hakimi/modules/__init__.py && uv sync --frozen --no-dev && \
     groupadd --gid 10001 hakimi && useradd --uid 10001 --gid 10001 --no-create-home hakimi && \
     mkdir -p /app/data /tmp/bili_video_cache && \
     chown 10001:10001 /app/data /tmp/bili_video_cache && \

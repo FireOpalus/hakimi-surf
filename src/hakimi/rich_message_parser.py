@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
-from .bilibili import extract_bvid
 from .models import FileRef, ImageRef
+from .modules.bilibili import extract_bvid
 from .security import Rejected, clean_text
 
 BV = re.compile(r"(?<![A-Za-z0-9])BV[1-9A-HJ-NP-Za-km-z]{10}(?![A-Za-z0-9])")

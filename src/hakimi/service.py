@@ -9,11 +9,8 @@ import uuid
 from collections import Counter
 from contextlib import nullcontext
 
-from .adapters import Sender, farewell_send_bypass, identifier, onebot_message
 from .affection import _validate_platform_user
 from .attention import can_watch_video
-from .bili_watcher import BiliWatcher
-from .bilibili import Bilibili, extract_bvid
 from .bot_server import is_persona_owner, untrusted_input
 from .config import Settings
 from .db_backup import DatabaseBackup
@@ -26,7 +23,6 @@ from .group_pipeline import other_mentions
 from .hot_ring import HotRing
 from .life_engine import LifeEngine
 from .link_preview import preview_links
-from .longnick import Longnick
 from .media import ImageLoader
 from .memes import MAX_UPLOAD_BYTES, MemeLibrary, validate_meme_label
 from .memory_compressor import MemoryCompressor, check_memory_text
@@ -36,7 +32,13 @@ from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
 from .modules import BilibiliSurfModule, MinecraftSlotModule, ModuleRegistry, QQSocialModule
+from .modules.adapters import Sender, farewell_send_bypass, identifier, onebot_message
+from .modules.bili_watcher import BiliWatcher
+from .modules.bilibili import Bilibili, extract_bvid
+from .modules.longnick import Longnick
 from .modules.mc_node import MinecraftNodeAdapter
+from .modules.onebot_transport import HTTPTransport, WebSocketTransport
+from .modules.proactive_dm import OwnerProactive
 from .modules.qq_delivery import LifeSpeaker
 from .modules.qq_policy import QQPolicy
 from .modules.weather import WeatherModule
@@ -44,7 +46,6 @@ from .node_transport import NodeTransport
 from .outbound_actions import normalize_emoji_like, parse_actions
 from .output_links import filter_reply_links
 from .owner_cloud_memory import OwnerCloudMemory
-from .proactive_dm import OwnerProactive
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
 from .roaming_logger import RoamingLogger, redact_public_summary
@@ -186,8 +187,17 @@ class Service:
         adapter = MinecraftNodeAdapter(minecraft, lambda: self.node_transport, self.background)
         minecraft.remote_dispatcher = adapter.dispatch
         self.modules.register(minecraft)
-        if settings.weather_enabled:
-            self.modules.register(WeatherModule(settings, sender.http, self.world_state))
+        self.modules.register(
+            WeatherModule(settings, getattr(sender, "http", None), self.world_state)
+        )
+        self.longnick.module_enabled = lambda: not self.modules.inactive_reason("qq_social")
+        self.bili_watcher.module_enabled = lambda: not self.modules.inactive_reason("bilibili_surf")
+        if isinstance(bili, Bilibili):
+            bili.module_enabled = self.bili_watcher.module_enabled
+        if isinstance(sender, Sender):
+            sender.module_enabled = self.longnick.module_enabled
+            if isinstance(sender.onebot, (HTTPTransport, WebSocketTransport)):
+                sender.onebot.module_enabled = sender.module_enabled
         if getattr(self.node_transport, "on_event", None) is None:
             self.node_transport.on_event = adapter.on_event
         if getattr(self.node_transport, "on_state", None) is None:
@@ -253,6 +263,8 @@ class Service:
             return []
 
     async def accept_event(self, payload):
+        if self.modules.inactive_reason("qq_social"):
+            return "ignored"
         if str(payload.get("self_id")) != self.s.onebot_self_id:
             raise Rejected("wrong_bot")
         typ = payload.get("post_type")
@@ -266,7 +278,7 @@ class Service:
                 await self.store.runtime.attention.record_sent(echo, {"message_id": echo.event_id})
             return "ignored"
         if typ == "notice":
-            from .adapters import notice_message
+            from .modules.adapters import notice_message
 
             message = notice_message(payload, self.s)
             if message is None:
@@ -308,6 +320,8 @@ class Service:
         return await self.accept(onebot_message(payload, self.s))
 
     async def accept(self, message: Message | None) -> str:
+        if self.modules.inactive_reason("qq_social"):
+            return "ignored"
         if other_mentions(message):
             self.counters["addressed_to_others"] += 1
             return "ignored"
@@ -523,7 +537,7 @@ class Service:
         if match[1] == "退订":
             await self.store.remove_subscription(subject, match[2])
             return "已取消该 UP 主的巡逻订阅。"
-        if not self.s.bilibili_enabled:
+        if self.modules.inactive_reason("bilibili_surf") or not self.s.bilibili_enabled:
             return "B 站读取功能尚未开启。"
         await self.store.add_subscription(message, match[2])
         tip = (
@@ -703,6 +717,8 @@ class Service:
         return authorize(candidate, self.s)
 
     def batch_authorized(self, message, members, *, bypass_mute_user_id: str | None = None):
+        if self.modules.inactive_reason("qq_social"):
+            return False
         # An accepted @Bot batch may include subsequent unaddressed follow-up text.
         # This relaxes attention only, never group admission, identity or blacklists.
         addressed_batch = (
@@ -1677,6 +1693,7 @@ class Service:
         is_watch_cmd = bool(re.search(r"(?:^|\s)/watch-video(?:\s|$)", direct))
         allow_video = (
             not sandbox
+            and not self.modules.inactive_reason("bilibili_surf")
             and not self.bot_guard.known_bot(message)
             and can_watch_video(message, members)
             and (
@@ -1705,6 +1722,8 @@ class Service:
                     )
 
             async def video_guard():
+                if self.modules.inactive_reason("bilibili_surf"):
+                    raise Rejected("module_disabled")
                 if not self.batch_authorized(message, members) or time.time() >= deadline:
                     raise Rejected("video_watch_invalidated")
                 if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
@@ -2059,6 +2078,8 @@ class Service:
         await self.store.runtime.filters.update_audit(audit_id, "queued")
 
     async def handle_patrol(self, job: dict):
+        if self.modules.inactive_reason("bilibili_surf"):
+            return
         sub_id = job["payload"]["subscription"]
         subs = await self.store.subscriptions(job["subject"])
         sub = next((s for s in subs if s["id"] == sub_id), None)
@@ -2241,6 +2262,8 @@ class Service:
                 await self.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
 
                 async def valid_after_delay():
+                    if self.modules.inactive_reason("qq_social"):
+                        return False
                     async with self.store.lock:
                         row = await self.store.one(
                             "SELECT status FROM outbox WHERE id=?", (reply["id"],)
@@ -2446,7 +2469,11 @@ class Service:
             await self._poll_once(force=force)
 
     async def _poll_once(self, *, force=False):
-        if not self.s.bilibili_enabled or (not force and self.store.runtime.is_resting()):
+        if (
+            self.modules.inactive_reason("bilibili_surf")
+            or not self.s.bilibili_enabled
+            or (not force and self.store.runtime.is_resting())
+        ):
             return
         for sub in await self.store.subscriptions():
             if not force and sub["next_poll"] > time.time():

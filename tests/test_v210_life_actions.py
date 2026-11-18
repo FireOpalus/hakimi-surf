@@ -246,6 +246,7 @@ async def test_weather_publishes_without_qq_or_greenhouse(settings, store):
     world = WorldStateManager(settings, store, registry)
     seen, requests = [], []
     settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
+    settings.weather_enabled = True
 
     def provider(request):
         requests.append(request)

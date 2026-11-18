@@ -159,12 +159,17 @@ async def _collect_modules_status(svc: Any, *, include_sensors: bool) -> list[di
     items: list[dict[str, Any]] = []
     for mod in registry.all():
         try:
-            summary = await mod.get_sensor_summary() if include_sensors else ""
+            summary = (
+                await mod.get_sensor_summary()
+                if include_sensors and not mod.inactive_reason
+                else ""
+            )
         except Exception:
             summary = ""
         items.append(
             {
                 "module_id": mod.module_id,
+                "enabled": mod.enabled,
                 "node_region": mod.node_region,
                 "attention_level": mod.attention_level,
                 "proactive_paused": bool(mod.proactive_paused),
@@ -380,7 +385,7 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
         observations = await world_observations.overview(svc.store, now, svc.s.bot_timezone)
         if observations is not None:
             upcoming = observations["next_action"]
-            for module in svc.modules.all():
+            for module in svc.modules.active():
                 for slot in module.schedules():
                     due = await engine.next_slot_at(module, slot, now)
                     if due is not None and (upcoming is None or due < upcoming["execute_after"]):
@@ -431,6 +436,8 @@ async def module_directory(request: Request):
             "id": module.module_id,
             "region": module.node_region,
             "action_count": counts[module.module_id],
+            "enabled": module.enabled,
+            "configuration_issue": module.configuration_issue,
         }
         for module in registry.all()
     ]
@@ -463,6 +470,8 @@ async def module_detail(request: Request, module_id: str):
         status = _collect_mc_agent_status(svc)
     return {
         "id": module_id,
+        "enabled": module.enabled,
+        "configuration_issue": module.configuration_issue,
         "region": module.node_region,
         "proactive_paused": module.proactive_paused,
         "actions": actions,
@@ -482,6 +491,23 @@ async def module_detail(request: Request, module_id: str):
             ],
         },
     }
+
+
+class ModuleSwitch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool
+
+
+@router.put("/modules/{module_id}/enabled")
+async def set_module_switch(request: Request, module_id: str):
+    svc = service(request)
+    module = svc.modules.get(module_id)
+    if module is None:
+        raise HTTPException(404, "module_not_registered")
+    value = await body(request, ModuleSwitch)
+    async with request.app.state.admin_config_lock:
+        await svc.life_engine.set_module_enabled(module, value.enabled)
+        return await module_detail(request, module_id)
 
 
 @router.put("/modules/{module_id}/schedule")
@@ -522,6 +548,8 @@ async def module_sensor(request: Request, module_id: str):
     module = service(request).modules.get(module_id)
     if module is None:
         raise HTTPException(404, "module_not_registered")
+    if module.inactive_reason:
+        raise HTTPException(409, module.inactive_reason)
     try:
         summary = await module.get_sensor_summary()
     except Exception:

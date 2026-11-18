@@ -1,0 +1,3 @@
+[submodule "src/hakimi/modules"]
+	path = src/hakimi/modules
+	url = ../hakimi-modules.git

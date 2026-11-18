@@ -127,14 +127,6 @@ class Settings(BaseSettings):
     weather_time: str = Field(default="09:30", pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
     weather_owner_report: bool = False
 
-    @model_validator(mode="after")
-    def _weather_location(self) -> Self:
-        if self.weather_enabled and (
-            self.weather_latitude is None or self.weather_longitude is None
-        ):
-            raise ValueError("weather_enabled requires both location coordinates")
-        return self
-
     bili_autonomous_enabled: bool = Field(default=False, validation_alias="BILI_AUTONOMOUS_ENABLED")
     bili_proxy: SecretStr = Field(default=SecretStr(""), validation_alias="BILI_PROXY")
     enable_video_file_watch: bool = Field(default=False, validation_alias="ENABLE_VIDEO_FILE_WATCH")
