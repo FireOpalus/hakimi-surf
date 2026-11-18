@@ -3,7 +3,7 @@
 import inspect
 from typing import Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from .admin_routes import body, service
 from .provider_routing import (
@@ -12,6 +12,7 @@ from .provider_routing import (
     ProviderCredentialsUpdate,
     ProviderRoutingConfig,
     ProviderRoutingManager,
+    ProviderView,
     SessionPrivacyUpdate,
 )
 from .security import configured_secrets
@@ -42,13 +43,28 @@ async def _reload_ai_clients(svc) -> None:
 
 @router.get("/providers")
 async def provider_status(request: Request):
-    svc = service(request)
-    return await _routing_manager(svc).status()
+    return await _routing_manager(service(request)).status()
+
+
+@router.get("/global/providers")
+async def global_provider_status(request: Request):
+    return await _routing_manager(service(request)).status(view="global")
 
 
 @router.put("/providers")
 async def provider_save(request: Request):
+    return await _save_policy(request, "full")
+
+
+@router.put("/global/providers")
+async def global_provider_save(request: Request):
+    return await _save_policy(request, "global")
+
+
+async def _save_policy(request: Request, view: ProviderView):
     value = await body(request, ProviderRoutingConfig)
+    if view == "global" and value.model_fields_set.intersection(QQ_PRIVACY_FIELDS):
+        raise HTTPException(400, "invalid_admin_input")
     svc = service(request)
     routing = _routing_manager(svc)
     async with request.app.state.admin_config_lock:
@@ -58,31 +74,49 @@ async def provider_save(request: Request):
         )
         if preserved:
             value = value.model_copy(update=preserved)
-        result = await routing.set_config(value)
+        result = await routing.set_config(value, view=view)
         await _reload_ai_clients(svc)
         return result
 
 
 @router.delete("/providers")
 async def provider_reset(request: Request):
+    return await _reset_policy(request, "full")
+
+
+@router.delete("/global/providers")
+async def global_provider_reset(request: Request):
+    return await _reset_policy(request, "global")
+
+
+async def _reset_policy(request: Request, view: ProviderView):
     svc = service(request)
     routing = _routing_manager(svc)
     async with request.app.state.admin_config_lock:
         await routing.initialize()
         privacy = routing.config.model_dump(include=set(QQ_PRIVACY_FIELDS))
         reset = routing.env_config.model_copy(update=privacy)
-        result = await routing.set_config(None if reset == routing.env_config else reset)
+        result = await routing.set_config(None if reset == routing.env_config else reset, view=view)
         await _reload_ai_clients(svc)
         return result
 
 
 @router.post("/providers/credentials")
 async def provider_credentials(request: Request):
+    return await _save_credentials(request, "full")
+
+
+@router.post("/global/providers/credentials")
+async def global_provider_credentials(request: Request):
+    return await _save_credentials(request, "global")
+
+
+async def _save_credentials(request: Request, view: ProviderView):
     value = await body(request, ProviderCredentialsUpdate)
     svc = service(request)
     routing = _routing_manager(svc)
     async with request.app.state.admin_config_lock:
-        result = await routing.update_credentials(value)
+        result = await routing.update_credentials(value, view=view)
         svc.secrets = configured_secrets(svc.s)
         await _reload_ai_clients(svc)
         return result

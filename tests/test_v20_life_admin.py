@@ -336,10 +336,14 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
     assert {"modules", "qq", "bili", "minecraft", "group-policy", "admission", "patrol"} <= tabs[
         "modules"
     ]
+    for key in tabs["core"]:
+        shortcuts = set(re.findall(r'data-open-tab="([^"]+)"', panels[key]))
+        assert shortcuts <= tabs["core"] | {"modules"}, (key, shortcuts)
     for marker, owner in (
         ('id="module-catalog"', "modules"),
         ('id="weather-editor"', "weather"),
         ('id="ws-heartbeat"', "qq"),
+        ('id="qq-privacy-card"', "qq"),
         ('id="groups"', "group-policy"),
         ('id="sessions"', "memory"),
         ('id="life-mc-form"', "minecraft"),

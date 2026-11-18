@@ -38,6 +38,7 @@ from .models import Message
 from .modules.bilibili import extract_bvid
 from .outbound_actions import parse_actions
 from .output_links import filter_reply_links
+from .provider_routing import ProviderView
 from .rest_policy import RestHoursConfig
 from .rich_message_parser import parse_message
 from .security import Rejected, authorize, configured_secrets
@@ -213,6 +214,17 @@ def onebot_connection(request: Request, svc) -> dict:
 
 @router.get("/api/dashboard")
 async def dashboard(request: Request):
+    snapshot = await _dashboard(request, "full")
+    snapshot.update(onebot_connection(request, service(request)))
+    return snapshot
+
+
+@router.get("/api/global/dashboard")
+async def global_dashboard(request: Request):
+    return await _dashboard(request, "global")
+
+
+async def _dashboard(request: Request, view: ProviderView):
     svc = service(request)
     await svc.store.runtime.flush()
     usage = await svc.store.usage()
@@ -226,6 +238,8 @@ async def dashboard(request: Request):
         circuit = bool(await svc.store.one("SELECT 1 FROM meta WHERE key='budget_overrun'"))
     notebook = svc.notebook.status() if svc.notebook else {"enabled": False}
     notebook.pop("text", None)
+    routing = svc.store.runtime.provider_routing
+    await routing.initialize()
     return {
         "uptime_seconds": int(time.monotonic() - svc.started_at),
         "pipeline": {
@@ -234,7 +248,6 @@ async def dashboard(request: Request):
             "hot_sessions": len(svc.hot.rings),
             "image_cache_bytes": getattr(svc.images, "cache_bytes", 0),
         },
-        **onebot_connection(request, svc),
         "usage": usage,
         "budget_status": await svc.store.budget_status(),
         "daily_limit_usd": str(svc.s.daily_usd),
@@ -249,7 +262,7 @@ async def dashboard(request: Request):
         "metrics": [dict(row) for row in metrics],
         "notebook": notebook,
         "rest_hours": svc.store.runtime.rest_hours_status(),
-        "provider_routing": (await svc.store.runtime.provider_routing.status())["config"],
+        "provider_routing": routing.config.for_admin(view),
     }
 
 

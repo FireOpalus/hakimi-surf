@@ -69,6 +69,8 @@ QQ_PRIVACY_FIELDS = (
     "private_privacy",
 )
 
+ProviderView = Literal["global", "full"]
+
 
 class ProviderRoutingConfig(PrivacyDefaults):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -87,6 +89,11 @@ class ProviderRoutingConfig(PrivacyDefaults):
     vertex_hydrogen_model: str = Field(default="gemini-4-hydrogen", max_length=128)
     vertex_protocol: Literal["auto", "interactions", "generate_content"] = "auto"
     vertex_fallback_to_gemini: bool = True
+
+    def for_admin(self, view: ProviderView) -> dict[str, Any]:
+        return self.model_dump(
+            mode="json", exclude=set(QQ_PRIVACY_FIELDS) if view == "global" else None
+        )
 
     @field_validator("group_privacy", "private_privacy")
     @classmethod
@@ -331,7 +338,9 @@ class ProviderRoutingManager:
             return "vertex"
         return "gemini"
 
-    async def set_config(self, value: ProviderRoutingConfig | dict[str, Any] | None) -> dict:
+    async def set_config(
+        self, value: ProviderRoutingConfig | dict[str, Any] | None, *, view: ProviderView = "full"
+    ) -> dict:
         await self.initialize()
         async with self.lock:
             if value is None:
@@ -349,9 +358,11 @@ class ProviderRoutingManager:
                 self.config = cfg
                 self.overridden = True
             self.generation += 1
-        return await self.status()
+        return await self.status(view=view)
 
-    async def update_credentials(self, value: ProviderCredentialsUpdate | dict[str, Any]) -> dict:
+    async def update_credentials(
+        self, value: ProviderCredentialsUpdate | dict[str, Any], *, view: ProviderView = "full"
+    ) -> dict:
         await self.initialize()
         upd = ProviderCredentialsUpdate.model_validate(value)
         async with self.lock:
@@ -393,7 +404,7 @@ class ProviderRoutingManager:
             self._sa_info = next_sa
             self._sync_runtime_secrets()
             self.generation += 1
-        return await self.status()
+        return await self.status(view=view)
 
     async def set_session_policy(self, value: SessionPrivacyUpdate | dict[str, Any]) -> None:
         await self.initialize()
@@ -506,12 +517,12 @@ class ProviderRoutingManager:
             )
         return rows
 
-    async def status(self) -> dict[str, Any]:
+    async def status(self, *, view: ProviderView = "full") -> dict[str, Any]:
         await self.initialize()
         sa_info, _ = self.service_account_info()
-        return {
-            "config": self.config.model_dump(mode="json"),
-            "environment": self.env_config.model_dump(mode="json"),
+        snapshot = {
+            "config": self.config.for_admin(view),
+            "environment": self.env_config.for_admin(view),
             "source": "sqlite" if self.overridden else "env",
             "credentials": {
                 "gemini_paid_configured": bool(self.s.gemini_api_key.get_secret_value()),
@@ -527,12 +538,14 @@ class ProviderRoutingManager:
                     str(sa_info.get("project_id") or "") if sa_info is not None else ""
                 ),
             },
-            "sessions_matrix": [
+        }
+        if view == "full":
+            snapshot["sessions_matrix"] = [
                 {
                     **row,
                     "override_hydrogen_provider": "default",
                     "effective_hydrogen_provider": self.hydrogen_provider_for(),
                 }
                 for row in await self._sessions_matrix()
-            ],
-        }
+            ]
+        return snapshot

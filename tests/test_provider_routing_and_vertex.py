@@ -984,3 +984,43 @@ async def test_qq_privacy_controls_are_independent_of_provider_controls(admin_ap
         next(r for r in cleared["sessions"] if r["key"] == "onebot:40000")["effective_privacy"]
         == "high"
     )
+
+
+async def test_global_admin_works_without_loading_qq_sessions(admin_api, monkeypatch):
+    app, client, _ = admin_api
+    routing = app.state.service.store.runtime.provider_routing
+    root = "/admin/api/global/providers"
+    privacy_path = "/admin/api/qq/privacy"
+    policy = {"kind": "group", "platform": "onebot", "target_id": "40000", "privacy": "high"}
+    saved = (await client.post(privacy_path, json=policy)).json()
+    privacy_fields = {
+        "default_group_privacy",
+        "default_private_privacy",
+        "group_privacy",
+        "private_privacy",
+    }
+
+    async def unavailable():
+        pytest.fail("Global admin accessed the QQ conversation list")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(routing, "_sessions_matrix", unavailable)
+        dashboard = await client.get("/admin/api/global/dashboard")
+        assert dashboard.is_success
+        assert {"onebot", "onebot_detail"}.isdisjoint(dashboard.json())
+        assert privacy_fields.isdisjoint(dashboard.json()["provider_routing"])
+        for response in (
+            await client.get(root),
+            await client.put(root, json={"vertex_enabled": True}),
+            await client.post(root + "/credentials", json={"clear": True}),
+            await client.delete(root),
+        ):
+            assert response.is_success
+            data = response.json()
+            assert "sessions_matrix" not in data
+            assert "decision_context_tokens" in data["config"]
+            assert privacy_fields.isdisjoint(data["config"])
+            assert privacy_fields.isdisjoint(data["environment"])
+        assert (await client.put(root, json={"group_privacy": {}})).status_code == 400
+        assert (await client.get(root, headers={"Authorization": ""})).status_code == 401
+    assert (await client.get(privacy_path)).json() == saved

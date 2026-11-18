@@ -1659,7 +1659,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <h2>API 密钥与 GCP 服务账号凭据中心</h2>
       <button id="refresh-providers" type="button" class="secondary">刷新路由与凭据</button>
     </div>
-    <p class="muted">统一管理多通道 API 凭据：Paid Gemini 来自环境主密钥，用于高隐私私聊、主对话与回退兜底；Free Tier Gemini 专用于低隐私群聊 Decisions 门卫；Vertex AI 凭据与 GCP Service Account JSON 加密存库后，同时与「账本与预算」中的 BigQuery 账单导出及 Cloud Monitoring 对账共享。</p>
+    <p class="muted">Paid Gemini 使用环境主密钥，可用于安全审核和主模型。Free Tier 密钥可用于低隐私审核。GCP 服务账号也可供 BigQuery 账单和 Cloud Monitoring 对账使用。</p>
     <div id="prov-cred-pills" class="pill-row"></div>
     <p id="prov-cred-status" class="muted"></p>
     <form id="prov-cred-form">
@@ -1690,7 +1690,6 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 
   <div class="card">
     <h2>全局模型通道</h2>
-    <p class="muted">在这里设置安全审核和 Hydrogen 主模型通道。<button type="button" class="secondary" data-open-tab="qq">打开 QQ 会话隐私</button></p>
     <p id="prov-policy-source" class="muted"></p>
     <form id="prov-policy-form">
       <fieldset class="panel-group">
@@ -2335,14 +2334,13 @@ function renderOverviewRoutingGcp(d,prov,gcp){
   const gSummary=d.budget_status?.gcp_billing||null;
   const gCfg=gcp?.config||null,bq=gcp?.bigquery||null,mon=gcp?.monitoring||null;
   const u=resolveUnifiedBalance(d.budget_status?.account_balance,gcp,gSummary);
-  const routingActive=Boolean(pCfg&&(pCfg.vertex_enabled||pCreds?.gemini_free_configured||pCreds?.vertex_api_key_configured||pCreds?.gcp_service_account_configured||pCfg.default_group_privacy!=='low'||pCfg.default_private_privacy!=='high'));
+  const routingActive=Boolean(pCfg&&(pCfg.vertex_enabled||pCreds?.gemini_free_configured||pCreds?.vertex_api_key_configured||pCreds?.gcp_service_account_configured));
   const gcpEnabled=Boolean(gSummary?.bigquery_enabled||gSummary?.monitoring_enabled||gSummary?.configured||gCfg?.bigquery_enabled||gCfg?.monitoring_enabled||bq?.synced);
   const balActive=u.mode!=='none';
   if(!routingActive&&!gcpEnabled&&!balActive){box.hidden=true;return;}
   box.hidden=false;
   if(pCfg){
     pills.append(
-      pill('Decisions 默认: 群 '+pCfg.default_group_privacy+' / 私 '+pCfg.default_private_privacy,pCfg.default_group_privacy==='low'?'free':'paid'),
       pCreds?.gemini_free_configured?pill('Free Tier 门卫就绪','free'):pill('Free Tier 未配（走 Paid）','muted'),
       pCfg.vertex_enabled?pill('Hydrogen 主脑: Vertex AI ('+pCfg.vertex_hydrogen_model+')','vertex'):pill('Hydrogen 主脑: Gemini API','paid'),
       pCreds?.gcp_service_account_configured?pill('GCP SA 已绑定','ok'):pill('GCP SA 未配置','muted')
@@ -2403,7 +2401,7 @@ function renderLanes(lanes,total){
 }
 async function dashboard(initial){
   const signal=sessionRequests.signal;
-  const [dashRes,provRes,gcpRes]=await Promise.allSettled([initial??api('dashboard'),api('providers'),api('gcp-billing')]);
+  const [dashRes,provRes,gcpRes]=await Promise.allSettled([initial??api('global/dashboard'),api('global/providers'),api('gcp-billing')]);
   if(dashRes.status!=='fulfilled')throw dashRes.reason;
   if(!token||signal.aborted)return;
   const d=dashRes.value,gcp=gcpRes.status==='fulfilled'?gcpRes.value:null;
@@ -2542,7 +2540,7 @@ $('qq-privacy-defaults').addEventListener('submit',e=>{
   });
 });
 async function providers(){
-  const d=await api('providers');
+  const d=await api('global/providers');
   if(!token)return;
   renderProviders(d);
 }
@@ -2566,7 +2564,7 @@ $('prov-cred-form').addEventListener('submit',e=>{
     if(payload.gcp_service_account_json){
       try{const parsed=JSON.parse(payload.gcp_service_account_json);if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw 0;}catch{throw Error('Service Account JSON 格式无效，请检查内容');}
     }
-    const next=await api('providers/credentials','POST',payload);
+    const next=await api('global/providers/credentials','POST',payload);
     $('prov-free-key').value='';$('prov-vertex-key').value='';$('prov-sa-json').value='';$('prov-sa-file').value='';
     $('prov-clear-free').checked=false;$('prov-clear-vertex').checked=false;$('prov-clear-sa').checked=false;
     renderProviders(next);
@@ -2589,14 +2587,14 @@ $('prov-policy-form').addEventListener('submit',e=>{
       vertex_protocol:$('prov-vertex-protocol').value,
       vertex_fallback_to_gemini:$('prov-vertex-fallback').checked
     };
-    const next=await api('providers','PUT',payload);
+    const next=await api('global/providers','PUT',payload);
     renderProviders(next);
     notice('全局模型通道已保存并立即生效');
   });
 });
 $('prov-reset-policy').addEventListener('click',e=>busy(e.target,async()=>{
   if(!confirm('恢复 .env 中的全局模型通道设置？'))return;
-  const next=await api('providers','DELETE');
+  const next=await api('global/providers','DELETE');
   renderProviders(next);
   notice('已恢复 .env 默认路由策略');
 }));
@@ -2871,7 +2869,7 @@ $('gcp-sa-form').addEventListener('submit',e=>{e.preventDefault();busy($('gcp-sa
 $('gcp-clear-sa').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('清除独立覆盖的 Service Account JSON，回退共享「全局模型通道」凭据？'))return;const g=await api('gcp-billing/credentials','POST',{gcp_service_account_json:'',clear:true});$('gcp-sa-json').value='';$('gcp-sa-file').value='';renderGcpBilling(g);notice('已清除独立 Service Account 覆盖');}));
 
 async function ledger(){
-  const [dashRes,polRes,gcpRes,balRes]=await Promise.allSettled([api('dashboard'),api('budget'),api('gcp-billing'),api('account-balance')]);
+  const [dashRes,polRes,gcpRes,balRes]=await Promise.allSettled([api('global/dashboard'),api('budget'),api('gcp-billing'),api('account-balance')]);
   if(dashRes.status!=='fulfilled')throw dashRes.reason;
   if(polRes.status!=='fulfilled')throw polRes.reason;
   const d=dashRes.value,policy=polRes.value;
@@ -3962,7 +3960,7 @@ $('login-form').addEventListener('submit',e=>{
     $('login-error').hidden=true;$('token').removeAttribute('aria-invalid');
     token=$('token').value;$('token').value='';
     try{
-      const first=await api('dashboard');
+      const first=await api('global/dashboard');
       await dashboard(first);
     }catch(err){
       if(err.name==='AbortError')return;
