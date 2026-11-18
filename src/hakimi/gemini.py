@@ -33,6 +33,7 @@ from .modules.bilibili import extract_bvid
 from .outbound_actions import CHAT_RESPONSE_FORMAT, Anchor, ChatActions, Sticker
 from .persona import SYSTEM_INSTRUCTION, identity_anchor
 from .prefix_runtime import MAX_CHAIN_TURNS, PrefixRuntime, StaticPrefixes
+from .provider_diagnostics import MAX_ATTEMPTS, error_facts
 from .provider_routing import ProviderRoutingManager
 from .routing import RouteDecision, select_tier
 from .security import Rejected
@@ -651,11 +652,42 @@ class GeminiGateway:
         thinking_level: str | None = None,
         price_override: tuple[Decimal, Decimal] | None = None,
         provider: str = "gemini_paid",
+        audit_stage: str = "generation",
+        attempts: list[dict] | None = None,
         free_fallback_eligible: bool = False,
         vertex_fallback_eligible: bool = False,
     ) -> Any:
-        if provider == "gemini_paid" and self.blocked_until > time.monotonic():
-            raise Rejected("gemini_circuit_open")
+        attempts = attempts if attempts is not None else []
+
+        def observe(facts, elapsed):
+            entry = {
+                "stage": audit_stage,
+                "provider": provider,
+                "model_lane": model_lane,
+                "timeout_ms": round(deadline_seconds * 1000),
+                "elapsed_ms": round(elapsed * 1000),
+                **facts,
+            }
+            if stream_progress is not None:
+                entry["stream_phase"] = (
+                    "partial_output"
+                    if stream_progress.output_text
+                    else "started"
+                    if stream_progress.started
+                    else "waiting"
+                )
+            attempts.append(entry)
+            del attempts[:-MAX_ATTEMPTS]
+
+        def rejected(code, detail=""):
+            exc = Rejected(code, detail)
+            exc.provider_diagnostics = list(attempts)
+            return exc
+
+        remaining = self.blocked_until - time.monotonic()
+        if provider == "gemini_paid" and remaining > 0:
+            observe({"cause": "circuit_open", "cooldown_ms": round(remaining * 1000)}, 0)
+            raise rejected("gemini_circuit_open")
         # Count text bytes and separately reserve bounded image tokens, never base64 as text.
         serialized = json.dumps(input_payload, ensure_ascii=False)
         byte_count = len(serialized.encode("utf-8"))
@@ -755,8 +787,9 @@ class GeminiGateway:
                 )
                 raise
             started_at = time.monotonic()
+            deadline = asyncio.timeout(deadline_seconds)
             try:
-                async with asyncio.timeout(deadline_seconds):
+                async with deadline:
                     result = await operation()
             except asyncio.CancelledError:
                 not_dispatched = (
@@ -790,8 +823,17 @@ class GeminiGateway:
                         )
                     )
                 raise
-            except (TimeoutError, httpx.TimeoutException, APITimeoutError):
+            except (TimeoutError, httpx.TimeoutException, APITimeoutError) as exc:
                 elapsed = max(0.0, time.monotonic() - started_at)
+                observe(
+                    error_facts(
+                        exc,
+                        expired=deadline.expired(),
+                        http_status=None,
+                        stream_code=stream_progress.error_code if stream_progress else None,
+                    ),
+                    elapsed,
+                )
                 await asyncio.shield(
                     self.store.settle(
                         reservation,
@@ -826,9 +868,22 @@ class GeminiGateway:
                         or (stream_progress is not None and stream_progress.started)
                     ):
                         raise GenerationTimeout() from None
-                raise Rejected("gemini_unavailable") from None
-            except Rejected:
+                raise rejected("gemini_unavailable") from None
+            except Rejected as exc:
                 elapsed = max(0.0, time.monotonic() - started_at)
+                if str(exc) == "stream_provider_error":
+                    observe(
+                        error_facts(
+                            exc,
+                            expired=False,
+                            http_status=None,
+                            stream_code=stream_progress.error_code
+                            if stream_progress
+                            else "unknown",
+                        ),
+                        elapsed,
+                    )
+                    exc.provider_diagnostics = list(attempts)
                 await asyncio.shield(
                     self.store.settle(
                         reservation,
@@ -845,6 +900,10 @@ class GeminiGateway:
             except Exception as exc:
                 stream_started = bool(stream_progress and stream_progress.started)
                 status = self._http_status(exc)
+                observe(
+                    error_facts(exc, expired=False, http_status=status, stream_code=None),
+                    max(0.0, time.monotonic() - started_at),
+                )
                 if stream_progress is not None and status is not None and 400 <= status <= 599:
                     stream_progress.error_code = str(status)
                 non_billable = self._non_billable_http_error(exc, stream_started) or (
@@ -898,8 +957,8 @@ class GeminiGateway:
                 if non_billable and (
                     status == 429 or (model_lane == "memory_flex" and status == 503)
                 ):
-                    raise Rejected("gemini_unavailable", detail="rate_limited") from None
-                raise Rejected("gemini_unavailable") from None
+                    raise rejected("gemini_unavailable", "rate_limited") from None
+                raise rejected("gemini_unavailable") from None
             elapsed = max(0.0, time.monotonic() - started_at)
             if provider == "gemini_paid":
                 await self.store.runtime.provider_result(
@@ -1025,6 +1084,7 @@ class GeminiGateway:
                 4096,
                 min(60, self.s.generation_timeout),
                 operation,
+                audit_stage="search",
                 before_call=guard,
                 image_tokens=16000,  # Grounding tool text reserve, not image upload.
                 additional_reserve=Decimal(0),
@@ -1189,7 +1249,10 @@ class GeminiGateway:
             report["answers"][name] = {"noul": p, "confidence": confidence}
             return p, confidence
 
+        attempts: list[dict] = []
         call_kwargs: dict[str, Any] = {
+            "audit_stage": "decision_" + purpose,
+            "attempts": attempts,
             "work_kind": budget_lane + ".screen." + purpose,
             "image_tokens": len(images) * self.s.image_token_reserve
             + (video.tokens if video else 0),
@@ -1259,6 +1322,8 @@ class GeminiGateway:
                         **call_kwargs,
                         provider="gemini_paid",
                     )
+                    if attempts:
+                        attempts[0]["fallback"] = "succeeded"
             else:
                 report["decision_tier"] = "paid"
                 result = await self._call(
@@ -1383,8 +1448,13 @@ class GeminiGateway:
             )
         except Rejected as exc:
             report.update(result="blocked", reason=str(exc))
+            if attempts:
+                if report["decision_tier"] == "paid_fallback" and "fallback" not in attempts[0]:
+                    dispatched = len(attempts) > 1 and attempts[-1]["cause"] != "circuit_open"
+                    attempts[0]["fallback"] = "failed" if dispatched else "not_dispatched"
+                exc.provider_diagnostics = list(attempts)
             if not exc.audited:
-                await self.store.runtime.event(str(exc), audit_source)
+                await self.store.runtime.event(str(exc), audit_source, diagnostics=attempts)
                 exc.audited = True
             raise
         except (KeyError, AttributeError, TypeError, ValueError):
@@ -1392,6 +1462,8 @@ class GeminiGateway:
             await self.store.runtime.event("invalid_decision", audit_source)
             raise Rejected("invalid_decision", audited=True) from None
         finally:
+            if attempts:
+                report["provider_diagnostics"] = attempts
             if inbound:
                 await self.filters.record(
                     message,
@@ -1752,6 +1824,8 @@ class GeminiGateway:
                 uuid.uuid4().hex, Decimal(ceiling) * self._price("decision")[0] / 1_000_000
             )
 
+        attempts: list[dict] = []
+
         async def _dispatch_once(
             active_plan: GenerationPlan,
             progress: StreamProgress | None,
@@ -2061,6 +2135,7 @@ class GeminiGateway:
                 active_plan.output_tokens,
                 deadline_seconds,
                 controlled_operation,
+                attempts=attempts,
                 work_kind="world.plan" if life_plan else scenario.value,
                 **({"digest_review": review} if review is not None else {}),
                 stream_retryable=chat,
@@ -2126,23 +2201,27 @@ class GeminiGateway:
                 if used_provider != "vertex_paid":
                     raise
                 rate_limited = upstream_http_status(code) == 429
+                skip = None
                 if not self.routing.config.vertex_fallback_to_gemini:
-                    incident["fallback"] = "disabled"
-                    raise
-                if primary and primary.output_text:
-                    incident["fallback"] = "partial_output"
-                    raise
-                if not (
+                    skip = "disabled"
+                elif primary and primary.output_text:
+                    skip = "partial_output"
+                elif not (
                     unavailable_before_stream
                     or (
                         rate_limited and str(exc) in {"stream_provider_error", "gemini_unavailable"}
                     )
                 ):
-                    incident["fallback"] = "ineligible"
+                    skip = "ineligible"
+                if skip:
+                    incident["fallback"] = skip
+                    if attempts:
+                        attempts[-1]["fallback"] = skip
                     raise
 
             # Always rebuild from the local session. A Vertex interaction ID cannot be
             # continued on the Developer API. Both attempts have their own budget reservation.
+            primary_detail = attempts[-1] if attempts else None
             backup = StreamProgress() if chat else None
             incident["fallback"] = "failed"
             try:
@@ -2164,12 +2243,16 @@ class GeminiGateway:
                     # The normal thinking-level downgrade must not start a third request.
                     raise Rejected("generation_incomplete") from None
                 raise
-            if getattr(result, "status", None) != "completed":
-                incident["fallback_detail"] = "generation_incomplete"
-                if rate_limited:
-                    raise Rejected("generation_incomplete")
             else:
-                incident["fallback"] = "succeeded"
+                if getattr(result, "status", None) != "completed":
+                    incident["fallback_detail"] = "generation_incomplete"
+                    if rate_limited:
+                        raise Rejected("generation_incomplete")
+                else:
+                    incident["fallback"] = "succeeded"
+            finally:
+                if primary_detail is not None:
+                    primary_detail["fallback"] = incident["fallback"]
             return result
 
         def mark_chain_invalid():
@@ -2230,11 +2313,23 @@ class GeminiGateway:
                 except BaseException:
                     mark_chain_invalid()
                     raise
-        except BaseException:
+        except BaseException as exc:
             if review is not None:
                 await asyncio.shield(self.store.release_digest_review(review))
+            if attempts and isinstance(exc, Rejected):
+                exc.provider_diagnostics = list(attempts)
+                if not exc.audited and str(exc) in {
+                    "gemini_unavailable",
+                    "gemini_circuit_open",
+                    "generation_incomplete",
+                    "stream_provider_error",
+                }:
+                    await self.store.runtime.event(str(exc), audit_source, diagnostics=attempts)
+                    exc.audited = True
             raise
         finally:
+            if attempts and generation_trace is not None:
+                generation_trace["provider_diagnostics"] = list(attempts)
             if carbon_acquired:
                 self.carbon_slots.release()
         abstained_chat = False

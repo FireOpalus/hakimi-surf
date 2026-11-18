@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .admission_policy import effective_bot_reply_threshold
 from .affection import level_for_score
+from .provider_diagnostics import LANES, PROVIDERS, append_attempts, safe_attempts
 from .security import Rejected, clean_text, configured_secrets
 from .streaming import upstream_error_code, upstream_http_status
 
@@ -283,6 +284,8 @@ class FilterManager:
             "execution_status": "processing" if tracked else "",
             "execution_detail": "",
         }
+        if attempts := safe_attempts(trace.get("provider_diagnostics")):
+            value["provider_diagnostics"] = attempts
         if job_id:
             value["job_id"] = job_id
         async with self.store.transaction():
@@ -296,7 +299,9 @@ class FilterManager:
             )
         return key
 
-    async def update_audit(self, audit_id: str | None, status: str, detail: str = ""):
+    async def update_audit(
+        self, audit_id: str | None, status: str, detail: str = "", *, diagnostics=None
+    ):
         if not audit_id or not re.fullmatch(r"[a-z0-9_]{1,32}", status):
             return
         await self.initialize()
@@ -309,6 +314,10 @@ class FilterManager:
                 return
             value["execution_status"] = status
             value["execution_detail"] = _safe_detail(detail)
+            if diagnostics:
+                value["provider_diagnostics"] = append_attempts(
+                    value.get("provider_diagnostics"), diagnostics
+                )
             await self.store.db.execute(
                 "UPDATE decision_audit SET payload=? WHERE id=?",
                 (self.store.vault.seal("decision-audit:" + audit_id, value), audit_id),
@@ -321,6 +330,7 @@ class FilterManager:
         thinking_level: str | None = None,
         model_lane: str | None = None,
         provider_incident: dict | None = None,
+        diagnostics=None,
     ):
         if not audit_id:
             return
@@ -358,7 +368,8 @@ class FilterManager:
                 incident["fallback_code"] = upstream_error_code(provider_incident["fallback_code"])
             if detail := _safe_detail(provider_incident.get("fallback_detail", "")):
                 incident["fallback_detail"] = detail
-        if not valid_level and not valid_lane and not incident:
+        attempts = safe_attempts(diagnostics)
+        if not valid_level and not valid_lane and not incident and not attempts:
             return
         await self.initialize()
         async with self.store.transaction():
@@ -370,12 +381,40 @@ class FilterManager:
                 value["thinking_level"] = valid_level
             if valid_lane:
                 value["model_lane"] = valid_lane
+            if attempts:
+                value["provider_diagnostics"] = append_attempts(
+                    value.get("provider_diagnostics"), attempts
+                )
             if incident:
                 value["provider_incident"] = incident
             await self.store.db.execute(
                 "UPDATE decision_audit SET payload=? WHERE id=?",
                 (self.store.vault.seal("decision-audit:" + audit_id, value), audit_id),
             )
+
+    async def _legacy_call(self, job_id):
+        # Old failures have no exception metadata. Only report facts tied to this exact
+        # QQ job; another conversation can make a paid call at the same timestamp.
+        row = await self.store.one(
+            "SELECT t.created,p.provider,a.model_lane,u.input_tokens FROM ledger_work w "
+            "JOIN ledger_times t ON t.id=w.id JOIN ledger_provider p ON p.id=w.id "
+            "JOIN ledger_attribution a ON a.id=w.id LEFT JOIN ledger_usage u ON u.id=w.id "
+            "WHERE w.root_kind='qq.reply' AND w.root_id=? AND w.kind=w.root_kind "
+            "AND w.work_id=w.root_id ORDER BY t.created DESC,t.rowid DESC LIMIT 1",
+            (job_id,),
+        )
+        if (
+            row
+            and row["input_tokens"] is None
+            and row["provider"] in PROVIDERS
+            and row["model_lane"] in LANES
+        ):
+            return {
+                "started_at": row["created"],
+                "provider": row["provider"],
+                "model_lane": row["model_lane"],
+            }
+        return None
 
     async def recent_audit(self, limit=30):
         await self.initialize()
@@ -389,6 +428,13 @@ class FilterManager:
             for row in rows:
                 item = self.store.vault.open("decision-audit:" + row["id"], row["payload"])
                 job_id = item.pop("job_id", None)
+                if (
+                    job_id
+                    and not item.get("provider_diagnostics")
+                    and "gemini_unavailable" in (item.get("reason"), item.get("execution_detail"))
+                ):
+                    if legacy := await self._legacy_call(job_id):
+                        item["legacy_ledger_call"] = legacy
                 if job_id and item.get("execution_status") in {"processing", "queued", "sending"}:
                     outbox = await self.store.one("SELECT status FROM outbox WHERE id=?", (job_id,))
                     if outbox:

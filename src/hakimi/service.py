@@ -1831,7 +1831,15 @@ class Service:
                                 raise
                             if str(exc) == "web_search_disabled":
                                 payload["web_search_status"] = "disabled"
-                            self.record("web_search_failed")
+                            diagnostics = exc.provider_diagnostics
+                            self.record("web_search_failed", emit_audit=not diagnostics)
+                            if diagnostics:
+                                await self.store.runtime.event(
+                                    "web_search_failed", "production", diagnostics=diagnostics
+                                )
+                                await self.store.runtime.filters.record_generation(
+                                    audit_id, diagnostics=diagnostics
+                                )
                         await message_guard()
             self.store.groups.phase(message, "generating")
             batch = self.store.groups.active.get(self.store.session_scope(message))
@@ -1888,12 +1896,13 @@ class Service:
                     await self.sessions.invalidate_chains(message)
                 raise
             finally:
-                if gen_trace.get("thinking_level"):
+                if gen_trace.get("thinking_level") or gen_trace.get("provider_diagnostics"):
                     await self.store.runtime.filters.record_generation(
                         audit_id,
                         thinking_level=gen_trace.get("thinking_level"),
                         model_lane=gen_trace.get("model_lane"),
                         provider_incident=gen_trace.get("provider_incident"),
+                        diagnostics=gen_trace.get("provider_diagnostics"),
                     )
             await message_guard()
             allowed_reply = payload["allowed_reply_ids"]
@@ -2126,7 +2135,9 @@ class Service:
                 await self.store.finish(job["id"], "cancelled")
                 return
             self.record(str(exc), emit_audit=not exc.audited)
-            await self.store.runtime.filters.update_audit(audit_id, "rejected", exc.audit_detail)
+            await self.store.runtime.filters.update_audit(
+                audit_id, "rejected", exc.audit_detail, diagnostics=exc.provider_diagnostics
+            )
             if self.diary and str(exc) == "prompt_injection":
                 await self.diary.injection(job["id"])
             if job["kind"] == "message":

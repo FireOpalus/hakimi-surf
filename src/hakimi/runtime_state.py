@@ -1,6 +1,7 @@
 """Encrypted mutable settings and bounded, content-free operational telemetry."""
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -24,6 +25,7 @@ from .limits_policy import (
     RateLimitConfig,
 )
 from .models import Message
+from .provider_diagnostics import safe_attempts
 from .provider_routing import ProviderRoutingManager
 from .rest_policy import RestHoursConfig
 from .security import Rejected
@@ -37,7 +39,8 @@ CREATE TABLE IF NOT EXISTS module_switches (
 CREATE TABLE IF NOT EXISTS admin_config (key TEXT PRIMARY KEY, payload BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS session_registry (id TEXT PRIMARY KEY, identity BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_events (
-  id INTEGER PRIMARY KEY, at REAL NOT NULL, code TEXT NOT NULL, source TEXT NOT NULL);
+  id INTEGER PRIMARY KEY, at REAL NOT NULL, code TEXT NOT NULL, source TEXT NOT NULL,
+  diagnostics TEXT);
 CREATE TABLE IF NOT EXISTS daily_metrics (
   day TEXT NOT NULL, code TEXT NOT NULL, source TEXT NOT NULL, n INTEGER NOT NULL,
   PRIMARY KEY(day,code,source));
@@ -71,6 +74,9 @@ CODES = frozenset(
         "patrol_worker_error",
         "budget_exhausted",
         "gemini_unavailable",
+        "gemini_circuit_open",
+        "generation_incomplete",
+        "stream_provider_error",
         "web_search_failed",
         "compression_failed",
         "memory_worker_failed",
@@ -160,14 +166,21 @@ class RuntimeState:
         self.gcp_billing = GcpBillingManager(store)
         self.affection = AffectionManager(store)
 
-    async def event(self, code, source="system"):
+    async def event(self, code, source="system", *, diagnostics=None):
         if code not in CODES or source not in {"system", "production", "sandbox", "memory"}:
             return
         now = time.time()
         day = datetime.fromtimestamp(now, ZoneInfo(self.s.bot_timezone)).date().isoformat()
+        details = safe_attempts(diagnostics)
         async with self.store.transaction():
             await self.store.db.execute(
-                "INSERT INTO audit_events(at,code,source) VALUES (?,?,?)", (now, code, source)
+                "INSERT INTO audit_events(at,code,source,diagnostics) VALUES (?,?,?,?)",
+                (
+                    now,
+                    code,
+                    source,
+                    json.dumps(details, separators=(",", ":")) if details else None,
+                ),
             )
             await self.store.db.execute(
                 "INSERT INTO daily_metrics VALUES (?,?,?,1) ON "

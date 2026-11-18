@@ -2188,7 +2188,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 
 <section id="logs" class="tab" role="tabpanel" aria-labelledby="nav-logs" hidden>
   <div class="card"><div class="row between"><h2>最近 50 条脱敏事件</h2><button id="refresh-logs" class="secondary">刷新</button></div>
-    <p class="muted">只展示事件类别与时间，不保存聊天原文、身份信息、注入内容或凭证。页面每 15 秒更新。</p>
+    <p class="muted">模型异常可展开查看调用阶段、通道、耗时和上游错误码。页面每 15 秒更新。</p>
     <div id="log-list" class="table"></div>
   </div>
 </section>
@@ -2949,6 +2949,46 @@ $('refresh-ledger').addEventListener('click',e=>busy(e.target,ledger));
 
 function auditScore(value,direct=false){const box=el('div');if(value?.skipped){box.append(el('span',direct?'直接回应，跳过相关性':'未执行相关性判定'));return box;}if(!value||value.noul===null||value.noul===undefined){box.append(el('span','未知'));return box;}const bar=el('progress');bar.max=1;bar.value=value.noul;bar.setAttribute('aria-label','判定概率 '+value.noul);box.append(bar,el('small','p='+Number(value.noul).toFixed(3)+' · c='+(value.confidence===null||value.confidence===undefined?'未知':Number(value.confidence).toFixed(3))));return box;}
 const rejectDetails={budget_exhausted_user_daily:'budget_exhausted · 单用户日上限',budget_exhausted_daily:'budget_exhausted · 全局日上限',budget_exhausted_monthly:'budget_exhausted · 全局月上限',budget_exhausted_patrol_daily:'budget_exhausted · 巡逻日上限',budget_exhausted_memory_daily:'budget_exhausted · 记忆日上限',budget_exhausted_proactive_daily:'budget_exhausted · 主动私信日上限',budget_exhausted_admin_daily:'budget_exhausted · 沙盒日上限',budget_exhausted_search_daily:'budget_exhausted · 联网日上限',budget_exhausted_total:'budget_exhausted · 累计总上限',budget_exhausted_gcp_credit_exhausted:'gcp_credit_exhausted · GCP 赠金已耗尽'};
+const modelFailureLabels={
+  stage:{decision_message:'来信安全检查',decision_source:'来源安全检查',decision_output:'回复发送前检查',generation:'主模型生成',search:'联网搜索'},
+  cause:{deadline:'达到本地调用时限',connect_timeout:'建立连接超时',read_timeout:'读取上游响应超时',write_timeout:'发送请求超时',pool_timeout:'等待连接池超时',sdk_timeout:'SDK 超时',timeout:'请求超时',http:'上游返回 HTTP 错误',dns:'域名解析失败',tls:'TLS 连接失败',connection:'连接失败',transport:'网络传输异常',stream_error:'上游流返回错误',circuit_open:'本地熔断冷却',unknown:'未识别的上游异常'},
+  provider:{gemini_free:'Gemini Developer API（免费）',gemini_paid:'Gemini Developer API（付费）',vertex_paid:'Vertex AI'},
+  lane:{decision:'gemini-decision-1',hydrogen:'Hydrogen',carbon:'Carbon',memory_flex:'记忆 Flex'},
+  stream:{waiting:'等待上游首个流事件',started:'已收流事件，尚无正文',partial_output:'已收到部分正文'},
+  fallback:{succeeded:'回退成功',failed:'回退失败',cancelled:'回退已取消',not_dispatched:'备用请求未发出',disabled:'回退已关闭',ineligible:'此类错误跳过回退',partial_output:'已有部分正文，跳过回退'}
+};
+function diagnosticCell(row){
+  const attempts=row.provider_diagnostics||[];
+  if(!attempts.length){
+    const old=row.legacy_ledger_call;
+    if(old){
+      const box=el('details');box.append(el('summary','历史账本 · '+modelFailureLabels.lane[old.model_lane]));
+      box.append(el('p',dateTime(old.started_at)+' · '+modelFailureLabels.provider[old.provider]+' · 同一任务最后一次模型调用，账本未记录用量。'));
+      box.append(el('small','当时未记录异常类型、耗时和 HTTP 状态码。'));
+      return box;
+    }
+    const known=[row.reason,row.code,row.execution_detail].some(v=>/^(gemini_unavailable|gemini_circuit_open|stream_provider_error|generation_incomplete)/.test(v||''));
+    return known?'旧记录未保存调用详情':'—';
+  }
+  const tags=modelFailureLabels, box=el('details'),last=attempts[attempts.length-1];
+  box.append(el('summary',tags.stage[last.stage]+' · '+tags.cause[last.cause]));
+  const seconds=ms=>(ms/1000).toLocaleString('zh-CN',{maximumFractionDigits:3})+' 秒';
+  for(const a of attempts){
+    const parts=[tags.stage[a.stage],tags.provider[a.provider],tags.lane[a.model_lane],tags.cause[a.cause]];
+    if(a.http_status)parts.push('HTTP '+a.http_status);
+    if(a.upstream_code)parts.push(a.upstream_code);
+    if(a.exception_type)parts.push(a.exception_type);
+    if(a.cause==='circuit_open')parts.push('本次未发出请求','剩余冷却 '+seconds(a.cooldown_ms));
+    else{
+      if(a.elapsed_ms!=null)parts.push('耗时 '+seconds(a.elapsed_ms));
+      if(a.timeout_ms!=null)parts.push('时限 '+seconds(a.timeout_ms));
+      if(a.stream_phase)parts.push(tags.stream[a.stream_phase]);
+    }
+    if(a.fallback)parts.push(tags.fallback[a.fallback]);
+    box.append(el('p',parts.filter(Boolean).join(' · ')));
+  }
+  return box;
+}
 function auditOutcome(r){
   const s=r.execution_status, raw=r.execution_detail||'', incident=r.provider_incident;
   const details=[], reason=rejectDetails[raw]||raw;
@@ -2980,7 +3020,7 @@ function auditOutcome(r){
 }
 async function decisionAudit(){
   const rows=await api('decision-audit');if(!token)return;
-  table('decision-audit',['时间 / 场景','隐私 / 门卫路由','脱敏摘要','注入 p / c','违规 p / c','回应 p / c','结果 / 原因'],rows.map(r=>{
+  table('decision-audit',['时间 / 场景','隐私 / 门卫路由','脱敏摘要','注入 p / c','违规 p / c','回应 p / c','结果 / 原因','调用详情'],rows.map(r=>{
     const routeBox=el('div',undefined,'stack-xs');
     if(r.privacy_level)routeBox.append(privacyBadge(r.privacy_level));
     if(r.decision_tier)routeBox.append(decisionTierBadge(r.decision_tier));
@@ -2992,7 +3032,7 @@ async function decisionAudit(){
       auditScore(r.scores?.is_prompt_injection),
       auditScore(r.scores?.is_unsafe_or_spam),
       auditScore(r.scores?.should_reply,r.reply_bypassed),
-      r.result+' · '+r.reason+(r.reply_bypassed?' · 明确请求，跳过插话门槛':'')+(r.attention_reason?' · '+r.attention_reason:'')+(r.thinking_level?' · 思考 '+(r.model_lane==='carbon'?'Carbon/':'')+r.thinking_level:'')+auditOutcome(r)
+      (r.result==='blocked'&&/^gemini_(?:unavailable|circuit_open)/.test(r.reason)?'检查未完成':r.result)+' · '+r.reason+(r.reply_bypassed?' · 明确请求，跳过插话门槛':'')+(r.attention_reason?' · '+r.attention_reason:'')+(r.thinking_level?' · 思考 '+(r.model_lane==='carbon'?'Carbon/':'')+r.thinking_level:'')+auditOutcome(r),diagnosticCell(r)
     ];
   }));
 }
@@ -3033,7 +3073,7 @@ function showNotebookAvailability(enabled){
   text('notebook-action-note',enabled?'读取 Owner 的只读快照':'只读快照未启用');
 }
 async function notebook(){const n=await api('notebook'),am=n.antigravity_memory||{};showNotebookAvailability(n.enabled);if(!n.enabled&&am.enabled){text('notebook-state','双端记忆桥 Antigravity_Memory 已接管（只读挂载） · 常驻备忘 '+(am.pinned_chars??0)+' 字 · 索引切片 '+(am.indexed_chunks??0)+' 条 · 桌面活跃 '+(am.latest_iso||dateTime(am.latest_timestamp))+'（旧版单文件快照未启用）');$('notebook-text').value=am.pinned_text||'（Antigravity_Memory 已连接，当前未解析到常驻备忘段落）';$('notebook-text').readOnly=true;$('save-notebook').disabled=true;return;}text('notebook-state',(n.enabled?'已启用':'未启用')+' · '+(notebookSourceLabels[n.source]||n.source)+' · '+(n.loaded_at?dateTime(n.loaded_at):'尚未加载')+(n.last_error?' · '+n.last_error:''));$('notebook-text').value=n.text||'';$('notebook-text').placeholder=n.enabled?'':'旧版单文件《小本本》快照未启用';$('notebook-text').readOnly=!n.enabled||n.source!=='local';$('save-notebook').disabled=!n.enabled||n.source!=='local';}
-async function logs(){table('log-list',['时间','来源','事件'],(await api('logs')).map(v=>[dateTime(v.at),v.source,v.code]));}
+async function logs(){table('log-list',['时间','来源','事件','调用详情'],(await api('logs')).map(v=>[dateTime(v.at),v.source,v.code,diagnosticCell(v)]));}
 
 const dmStatus={pending:'等待投递',sent:'已发送并处理记忆',delivered:'已确认发送，等待记忆写入',uncertain:'发送结果不确定，不重发',expired:'已过期',skipped:'已跳过',failed:'生成未完成',queued:'已排队',generating:'生成中',cancelled:'已取消',not_queued:'未入队'};
 const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};

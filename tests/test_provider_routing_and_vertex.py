@@ -346,6 +346,9 @@ async def test_decision_privacy_routing_free_tier_and_429_fallback(settings, sto
         )
         assert len(free_calls) == 2 and len(paid_calls) == 2
         assert trace_fb["decision_tier"] == "paid_fallback"
+        [failed_attempt] = trace_fb["provider_diagnostics"]
+        assert failed_attempt["provider"] == "gemini_free"
+        assert failed_attempt["http_status"] == 429 and failed_attempt["fallback"] == "succeeded"
         assert gate.blocked_until == 0.0
 
         # 4. With fallback disabled, Free Tier 503 fails without Paid call or circuit trip

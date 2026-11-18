@@ -787,3 +787,146 @@ async def test_abstain_skips_output_screen_and_screen_rejection_avoids_duplicate
         assert svc.counters["content_blocked"] == 1
     finally:
         await svc.stop()
+
+
+async def test_decision_deadline_and_subsequent_local_circuit_are_recorded(
+    settings, store, sdk_pair, message
+):
+    calls = 0
+
+    async def stall(_):
+        nonlocal calls
+        calls += 1
+        await asyncio.Event().wait()
+
+    settings.decision_timeout = 1
+    gateway = GeminiGateway(settings, store, *sdk_pair(stall))
+    for cause in ("deadline", "circuit_open"):
+        with pytest.raises(Rejected) as failure:
+            await gateway.screen(
+                {"current_message": "hi"}, "subject", purpose="message", message=message
+            )
+        [attempt] = failure.value.provider_diagnostics
+        assert attempt["cause"] == cause
+        assert attempt["stage"] == "decision_message"
+        assert attempt["provider"] == "gemini_paid" and attempt["model_lane"] == "decision"
+        assert attempt["timeout_ms"] == 1000 and "http_status" not in attempt
+        if cause == "deadline":
+            assert attempt["elapsed_ms"] >= 990
+        else:
+            assert attempt["elapsed_ms"] == 0 and 0 < attempt["cooldown_ms"] <= 60000
+        [audit] = await gateway.filters.recent_audit(1)
+        assert audit["provider_diagnostics"] == [attempt]
+        logged = await store.one("SELECT diagnostics FROM audit_events ORDER BY id DESC LIMIT 1")
+        assert json.loads(logged[0]) == [attempt]
+    assert calls == 1
+
+
+async def test_output_review_http_error_reaches_both_audits_without_provider_text(
+    settings, store, sdk_pair, message
+):
+    from hakimi.service import Service
+    from tests.fakes import FakeBili, FakeSender
+
+    marker = "PRIVATE_PROVIDER_ECHO"
+    decisions = 0
+
+    def handler(request):
+        nonlocal decisions
+        if request.url.path.endswith("decisions"):
+            decisions += 1
+            if decisions == 2:
+                return httpx.Response(
+                    503, json={"error": {"code": 503, "status": "UNAVAILABLE", "message": marker}}
+                )
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(200, json=interaction_response())
+
+    ai = GeminiGateway(settings, store, *sdk_pair(handler))
+    svc = Service(settings, store, ai, FakeBili(), FakeSender())
+    try:
+        assert (
+            await svc.accept(
+                group(message, addressed=True, mentioned_ids=["10000"], attention_reason="mention")
+            )
+            == "accepted"
+        )
+        job = await store.claim()
+        await svc.process(job)
+        [audit] = await ai.filters.recent_audit()
+        assert audit["result"] == "chat" and audit["execution_detail"] == "gemini_unavailable"
+        [detail] = audit["provider_diagnostics"]
+        assert detail["stage"] == "decision_output" and detail["cause"] == "http"
+        assert detail["http_status"] == 503 and detail["upstream_code"] == "UNAVAILABLE"
+        logs = await store.all(
+            "SELECT diagnostics FROM audit_events WHERE code='gemini_unavailable'"
+        )
+        assert len(logs) == 1 and json.loads(logs[0][0]) == [detail]
+        assert marker not in json.dumps(audit) + logs[0][0]
+        assert not await svc.deliver_once()
+
+        # An upgraded historical row may identify its ledger call, but has no observed error code.
+        audit_id = job["_audit_id"]
+        async with store.transaction():
+            row = await store.one("SELECT payload FROM decision_audit WHERE id=?", (audit_id,))
+            saved = store.vault.open("decision-audit:" + audit_id, row[0])
+            del saved["provider_diagnostics"]
+            await store.db.execute(
+                "UPDATE decision_audit SET payload=? WHERE id=?",
+                (store.vault.seal("decision-audit:" + audit_id, saved), audit_id),
+            )
+        [legacy] = await ai.filters.recent_audit()
+        assert set(legacy["legacy_ledger_call"]) == {"provider", "model_lane", "started_at"}
+        assert legacy["legacy_ledger_call"]["model_lane"] == "decision"
+        assert "provider_diagnostics" not in legacy
+    finally:
+        await svc.stop()
+
+
+def test_provider_diagnostics_use_only_known_types_and_codes():
+    import socket
+
+    from hakimi.provider_diagnostics import error_facts, safe_attempts
+
+    err = httpx.ConnectError("arbitrary secret or private URL")
+    err.__cause__ = socket.gaierror("private-host")
+    assert error_facts(err, expired=False, http_status=None, stream_code=None) == {
+        "cause": "dns",
+        "exception_type": "ConnectError",
+    }
+    assert error_facts(
+        httpx.ReadTimeout("private text"), expired=False, http_status=None, stream_code=None
+    ) == {"cause": "read_timeout", "exception_type": "ReadTimeout"}
+    assert error_facts(
+        RuntimeError("secret"), expired=False, http_status=None, stream_code="ARBITRARY_SECRET"
+    ) == {"cause": "stream_error"}
+    safe = {
+        "stage": "decision_source",
+        "provider": "gemini_free",
+        "cause": "http",
+        "model_lane": "decision",
+        "http_status": 429,
+    }
+    assert safe_attempts(
+        [{**safe, "upstream_code": "ARBITRARY_SECRET", "message": "raw", "url": "private"}]
+    ) == [safe]
+    assert safe_attempts([dict(safe, stage="private text")]) == []
+
+
+async def test_existing_audit_table_gains_nullable_diagnostics_once(settings):
+    import sqlite3
+
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings.data_dir / "hakimi.sqlite3") as older:
+        older.execute(
+            "CREATE TABLE audit_events (id INTEGER PRIMARY KEY,at REAL,code TEXT,source TEXT)"
+        )
+        older.execute("INSERT INTO audit_events VALUES(1,100,'gemini_unavailable','production')")
+    for _ in range(2):
+        store = Store(settings)
+        await store.open()
+        try:
+            row = await store.one("SELECT code,diagnostics FROM audit_events WHERE id=1")
+            assert tuple(row) == ("gemini_unavailable", None)
+        finally:
+            await store.close()

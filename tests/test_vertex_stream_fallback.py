@@ -88,6 +88,13 @@ async def test_thought_only_429_delivers_once_and_retains_audit(settings, store,
             "http_status": 429,
             "fallback": "succeeded",
         }
+        [failure] = audit["provider_diagnostics"]
+        assert (failure["stage"], failure["cause"], failure["fallback"]) == (
+            "generation",
+            "stream_error",
+            "succeeded",
+        )
+        assert failure["stream_phase"] == "started" and "http_status" not in failure
         assert "private text" not in json.dumps(audit)
         rows = await store.all(
             "SELECT p.provider,l.status FROM ledger l JOIN ledger_usage u ON u.id=l.id "
@@ -132,6 +139,7 @@ async def test_stream_fallback_boundaries(routes, message, stage, code, enabled,
             {"current_message": "hi"}, "subject", message=message, generation_trace=trace
         )
     assert len(calls["vertex"]) == 1 and not calls["developer"]
+    assert trace["provider_diagnostics"][0]["fallback"] == reason
     assert trace["provider_incident"] == {
         "provider": "vertex_paid",
         "code": "unknown" if " " in code else code,

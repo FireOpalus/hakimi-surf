@@ -591,3 +591,28 @@ async def test_sessions_and_notebook_admin_accuracy_fixes(
     assert "热窗口 / 长期记忆" in page.text
     assert "(Phase 3)" not in page.text
     assert "innerHTML" not in page.text
+
+
+async def test_operational_audit_exposes_whitelisted_diagnostics_to_admin(admin_api):
+    app, client, _ = admin_api
+    store = app.state.service.store
+    attempt = {
+        "stage": "decision_source",
+        "provider": "gemini_paid",
+        "model_lane": "decision",
+        "cause": "http",
+        "http_status": 429,
+        "upstream_code": "RESOURCE_EXHAUSTED",
+        "timeout_ms": 20000,
+        "elapsed_ms": 87,
+    }
+    await store.runtime.event(
+        "gemini_unavailable",
+        "production",
+        diagnostics=[{**attempt, "error_body": TOKEN, "request_url": "private"}],
+    )
+    response = await client.get("/admin/api/logs")
+    assert response.status_code == 200
+    assert response.json()[0]["provider_diagnostics"] == [attempt]
+    assert TOKEN not in response.text
+    assert (await client.get("/admin/api/logs", headers={"Authorization": ""})).status_code == 401

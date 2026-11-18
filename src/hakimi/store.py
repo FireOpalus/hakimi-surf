@@ -183,6 +183,10 @@ class Store:
             await self.db.execute(
                 "INSERT OR IGNORE INTO budget_totals SELECT 1,COALESCE(SUM(amount),0) FROM ledger"
             )
+            if "diagnostics" not in {
+                r["name"] for r in await self.all("PRAGMA table_info(audit_events)")
+            }:
+                await self.db.execute("ALTER TABLE audit_events ADD COLUMN diagnostics TEXT")
             if "public" not in {r["name"] for r in await self.all("PRAGMA table_info(reports)")}:
                 await self.db.execute(
                     "ALTER TABLE reports ADD COLUMN public INTEGER NOT NULL DEFAULT 0"

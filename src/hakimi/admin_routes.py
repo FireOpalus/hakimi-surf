@@ -1,6 +1,7 @@
 """Small, authenticated control plane; simulation never calls Service.accept or Sender."""
 
 import asyncio
+import json
 import re
 import time
 from datetime import date
@@ -527,12 +528,22 @@ async def logs(request: Request):
     store = service(request).store
     await store.runtime.flush()
     async with store.lock:
-        return [
-            dict(row)
-            for row in await store.all(
-                "SELECT at,code,source FROM audit_events ORDER BY id DESC LIMIT 50"
-            )
-        ]
+        rows = await store.all(
+            "SELECT at,code,source,diagnostics FROM audit_events ORDER BY id DESC LIMIT 50"
+        )
+    return [
+        {
+            "at": row["at"],
+            "code": row["code"],
+            "source": row["source"],
+            **(
+                {"provider_diagnostics": json.loads(row["diagnostics"])}
+                if row["diagnostics"]
+                else {}
+            ),
+        }
+        for row in rows
+    ]
 
 
 @router.post("/api/actions/{action}")
@@ -1075,6 +1086,7 @@ async def _sandbox(request: Request, audit_id: str):
             "recent_messages": [],
             "rolling_summary": "",
         }
+        rejection = None
         try:
             intent = await svc.ai.screen(
                 payload,
@@ -1171,18 +1183,26 @@ async def _sandbox(request: Request, audit_id: str):
                         audit_id, "cancelled", "empty_reply"
                     )
         except Rejected as exc:
-            await svc.store.runtime.filters.update_audit(audit_id, "rejected", exc.audit_detail)
+            rejection = exc
             result["decisions"].setdefault("reason", str(exc))
             result["decisions"]["final_result"] = "blocked_or_unavailable"
             if not preview["text"]:
                 preview["status"] = "blocked_or_unavailable"
         finally:
-            if preview.get("provider"):
+            if preview.get("provider") or preview.get("provider_diagnostics"):
                 await svc.store.runtime.filters.record_generation(
                     audit_id,
                     thinking_level=preview.get("thinking_level"),
                     model_lane=preview.get("model_lane"),
                     provider_incident=preview.get("provider_incident"),
+                    diagnostics=preview.get("provider_diagnostics"),
+                )
+            if rejection is not None:
+                await svc.store.runtime.filters.update_audit(
+                    audit_id,
+                    "rejected",
+                    rejection.audit_detail,
+                    diagnostics=rejection.provider_diagnostics,
                 )
         return result
 

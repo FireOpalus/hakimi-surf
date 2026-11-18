@@ -41,6 +41,7 @@ class Rejected(Exception):
         super().__init__(code)
         self.detail = detail
         self.audited = audited
+        self.provider_diagnostics: list[dict] = []
 
     @property
     def audit_detail(self) -> str:
