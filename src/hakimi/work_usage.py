@@ -24,7 +24,7 @@ _current: ContextVar[ModelWork | None] = ContextVar("hakimi_model_work", default
 def model_work(
     kind: str, key: str | None = None, *, independent: bool = False
 ) -> Iterator[ModelWork]:
-    """Attribute an operation; independently scheduled work owns its own root and budget trace."""
+    """Use application names and opaque IDs. Independently scheduled jobs own their root."""
     parent = None if independent else _current.get()
     if parent is not None and key is None:
         yield parent

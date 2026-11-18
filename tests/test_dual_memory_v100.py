@@ -822,6 +822,12 @@ async def test_flex_dedicated_timeout_and_rate_limit_zero_cost_backoff_requeue(
     mode[0] = "ok"
     r2 = await comp.extract(msg, background=True)
     assert r2["status"] == "compressed"
+    assert [
+        row[0]
+        for row in await store.all(
+            "SELECT DISTINCT work_id FROM ledger_work WHERE kind='memory.extract'"
+        )
+    ] == [r2["batch_id"]]
 
     # Ambiguous 500 never requeues and still settles unknown + marks slice failed.
     await seed(sessions, msg, text="第三批", count=2)
@@ -829,4 +835,9 @@ async def test_flex_dedicated_timeout_and_rate_limit_zero_cost_backoff_requeue(
     mode[0] = "outage"
     r3 = await comp.extract(msg, background=True)
     assert r3["status"] == "failed"
+    assert (
+        await store.one(
+            "SELECT COUNT(DISTINCT work_id) FROM ledger_work WHERE kind='memory.extract'"
+        )
+    )[0] == 2
     assert (await sessions.dual.view(msg))["jobs"]["failed"] == 1

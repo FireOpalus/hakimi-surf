@@ -12,7 +12,6 @@ import re
 import struct
 import sys
 import time
-import uuid
 from collections import OrderedDict
 from typing import Literal
 
@@ -392,7 +391,8 @@ class DualMemory:
             if not selected:
                 return None
             ids, messages, created = selected
-            batch = "flex-" + uuid.uuid4().hex
+            # Requeued slices retain their accounting ID when the selected work is identical.
+            batch = "flex-" + self.vault.digest("memory-batch", key, epoch, version, ids)[:32]
             now = time.time()
             await db.executemany(
                 "UPDATE memory_slice_jobs SET "
