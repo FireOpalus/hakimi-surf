@@ -21,7 +21,7 @@ async def test_disconnect_after_first_guard_preserves_pending_then_sends_once(dm
     original = wire.send_onebot_action_with_retry
 
     async def lost_before_dispatch(action, params, **kwargs):
-        # Sender already ran the first policy guard and marked the queue row sending.
+        # Owner authorization succeeded, but the connection vanished before a frame could be sent.
         await wire.close()
         return await original(action, params, **kwargs, max_wait=0.03)
 

@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from .bot_server import is_persona_owner, untrusted_input
 from .budget_policy import PROACTIVE_LANE, paid_lane_available
+from .digest_receipts import DigestReceipts, world_outcome
 from .generation_policy import Scenario
 from .models import Message
 from .modules.actions import ActionCall, Outcome
@@ -23,6 +24,7 @@ from .output_links import filter_reply_links
 from .reply_style import trim_complete_text
 from .roaming_logger import redact_public_summary
 from .security import Rejected, configured_secrets, safe_output
+from .work_usage import model_work
 
 log = logging.getLogger("hakimi")
 TEST_MESSAGE = "BOISER，这是哈基米的主动私信通路测试喵~"
@@ -36,6 +38,8 @@ class OwnerProactive:
         self.scope = self.store.vault.digest(
             "owner-dm", self.s.namespace, self.s.onebot_self_id, self.s.owner_qq_id
         )
+        self.owner, self.bot = self.s.owner_qq_id, self.s.onebot_self_id
+        self.digests = DigestReceipts(self.store, self.scope, self.owner)
         self.policy_lock = asyncio.Lock()
         self.delivery_lock = asyncio.Lock()
         self.wakeup = asyncio.Event()
@@ -50,7 +54,13 @@ class OwnerProactive:
 
     @property
     def configured(self):
-        return bool(self.s.onebot_enabled and self.s.owner_qq_id and self.s.onebot_self_id)
+        return bool(
+            self.s.onebot_enabled
+            and self.owner
+            and self.owner == self.s.owner_qq_id
+            and self.bot
+            and self.bot == self.s.onebot_self_id
+        )
 
     def target(self):
         if not self.configured:
@@ -89,6 +99,25 @@ class OwnerProactive:
             await self.store.db.execute(
                 "INSERT OR IGNORE INTO owner_dm_state(scope) VALUES (?)", (self.scope,)
             )
+            # An owner/config change invalidates every unsent private body from another scope.
+            await self.store.db.execute(
+                "UPDATE owner_digest_receipts SET payload=NULL WHERE payload IS NOT NULL AND "
+                "id IN (SELECT id FROM proactive_schedule WHERE scope!=?)",
+                (self.scope,),
+            )
+            await self.store.db.execute(
+                "UPDATE proactive_schedule SET status='cancelled',reason='owner_changed' "
+                "WHERE scope!=? AND status='generated'",
+                (self.scope,),
+            )
+            # Existing queued digests have no known generation timestamp; future submits
+            # and confirmations can still be timed without reconstructing historical data.
+            await self.store.db.execute(
+                "INSERT OR IGNORE INTO owner_digest_receipts(id) SELECT id FROM pending_owner_dms "
+                "WHERE kind='digest' AND scope=?",
+                (self.scope,),
+            )
+            await self.digests.enqueue_generated_tx(now)
             # A server restart is also an offline interval; preserve an earlier disconnect.
             await self.store.db.execute(
                 "UPDATE owner_dm_state SET online=0,disconnected_at=CASE "
@@ -97,7 +126,8 @@ class OwnerProactive:
                 (now, self.scope),
             )
             await self.store.db.execute(
-                "UPDATE pending_owner_dms SET status='cancelled',payload=NULL,receipt=NULL,"
+                "UPDATE pending_owner_dms SET status=CASE status WHEN 'delivered' THEN 'sent' "
+                "WHEN 'sending' THEN 'uncertain' ELSE 'cancelled' END,payload=NULL,receipt=NULL,"
                 "reason='owner_changed' WHERE scope!=? AND status IN "
                 "('pending','sending','delivered')",
                 (self.scope,),
@@ -155,6 +185,7 @@ class OwnerProactive:
                     "UPDATE outbox SET status=?,payload=NULL WHERE id=?",
                     ("migrated" if allowed else "cancelled", row["id"]),
                 )
+            await self.digests.recover_links_tx(now)
         # Complete confirmed deliveries before workers can read Owner memory.
         async with self.service.owner_dialogue_lock:
             await self._repair_confirmed()
@@ -192,30 +223,36 @@ class OwnerProactive:
                 )
             self.wakeup.set()
 
-    async def _eligible(self, kind, now, *, automatic=False, generating=False):
+    def _delivery_reason(self, kind, now, *, automatic=False):
         if not self.configured or not self.delivery_enabled:
             return "disabled"
-        if automatic:
+        if kind == "digest":
             engine = self.service.life_engine
+            local = self.local(now)
             if (
                 not engine.config.enabled
                 or engine.config.action_modes.get("qq.owner_digest") == "off"
-                or not engine.digest_due(now)
+                or not engine.config.is_active_time(local)
+                or engine.config.quiet(local)
+                or self.store.runtime.is_resting(now)
+                or (automatic and not engine.digest_due(now))
             ):
                 return "outside_digest_window"
-        if kind == "digest":
-            budget = await self.store.budget_status()
-            if budget["hard_stop"]:
-                return "budget_hard_stop"
-            if generating and not paid_lane_available(budget, PROACTIVE_LANE):
-                return "budget_exhausted"
         return None
 
-    async def _insert(self, key, kind, text, expires, now, *, automatic=False):
+    async def _generation_reason(self, now, *, automatic):
+        if reason := self._delivery_reason("digest", now, automatic=automatic):
+            return reason
+        budget = await self.store.budget_status()
+        if budget["hard_stop"]:
+            return "budget_hard_stop"
+        if not paid_lane_available(budget, PROACTIVE_LANE):
+            return "budget_exhausted"
+        return None
+
+    async def _insert(self, key, kind, text, expires, now):
         # Caller holds store transaction. No queue row can choose a destination.
         payload = {"owner": self.s.owner_qq_id, "bot": self.s.onebot_self_id, "text": text}
-        if automatic:
-            payload["world_digest"] = True
         await self.store.db.execute(
             "INSERT OR IGNORE INTO pending_owner_dms"
             "(id,scope,day,kind,payload,created,expires_at,status) VALUES "
@@ -231,15 +268,15 @@ class OwnerProactive:
             ),
         )
 
-    async def enqueue(self, kind, text, *, key=None, expires=None, automatic=False):
+    async def enqueue(self, kind, text, *, key=None, expires=None):
         now = self.clock()
-        if kind not in {"test", "patrol", "digest"}:
+        if kind not in {"test", "patrol"}:
             raise Rejected("invalid_owner_dm_kind")
         maximum = now + 43200
         expires = min(expires, maximum) if expires is not None else maximum
         key = key or uuid.uuid4().hex
         async with self.policy_lock:
-            reason = await self._eligible(kind, now, automatic=automatic)
+            reason = self._delivery_reason(kind, now)
             if expires is not None and expires <= now:
                 reason = "expired"
             if reason:
@@ -251,7 +288,6 @@ class OwnerProactive:
                     self.service.output(text),
                     expires or now + 43200,
                     now,
-                    automatic=automatic,
                 )
         self.wakeup.set()
         return key
@@ -538,41 +574,57 @@ class OwnerProactive:
             payload.pop(key, None)
         return payload
 
-    async def prepare_digest(self, *, automatic=False, expires=None):
-        daily_longnick = None
+    async def prepare_digest(self, *, automatic=False, expires=None, intent_id=None):
         now = self.clock()
         day = self.local(now).date().isoformat()
         key = self.store.vault.digest(self.scope, day, "digest")
-        expires = expires if expires is not None else self.day_bounds(now)[1]
+        closing = self.service.life_engine.digest_window(self.local(now).date())
+        day_end = self.day_bounds(now)[1]
+        expires = min(
+            day_end,
+            closing[1] if closing else day_end,
+            expires if expires is not None else day_end,
+            now + 43200,
+        )
         async with self.policy_lock:
-            reason = await self._eligible("digest", now, automatic=automatic, generating=True)
+            reason = await self._generation_reason(now, automatic=automatic)
             async with self.store.transaction():
                 row = await self.store.one(
                     "SELECT status,reason FROM proactive_schedule WHERE id=?", (key,)
                 )
                 if row:
+                    await self.digests.link_tx(key, intent_id)
+                    await self.digests.sync_intents_tx(key, now)
                     return {"status": row["status"], "reason": row["reason"], "id": key}
-                if reason:
-                    return {"status": "skipped", "reason": reason, "id": key}
+                if reason or expires <= now:
+                    return {"status": "skipped", "reason": reason or "expired", "id": key}
                 await self.store.db.execute(
                     "INSERT INTO proactive_schedule VALUES (?,?,?,'digest',?,?,'generating',NULL)",
                     (key, self.scope, day, now, expires),
                 )
+                await self.digests.link_tx(key, intent_id)
+        daily_longnick = None
         try:
             payload = await self._public_digest(now)
-            subject = self.store.subject(self.target())
-            await self.service.ai.screen(
-                payload, subject, purpose="source", budget_lane=PROACTIVE_LANE
-            )
+            owner_message = self.target()
+            subject = self.store.subject(owner_message)
             requested_longnick = self.service.longnick.config.enabled
-            generated = await self.service.ai.generate(
-                payload,
-                subject,
-                scenario=Scenario.OWNER_DIGEST,
-                message=self.target(),
-                budget_lane=PROACTIVE_LANE,
-                **({"with_longnick": True} if requested_longnick else {}),
-            )
+            with model_work("qq.owner_digest", key):
+                await self.service.ai.screen(
+                    payload, subject, purpose="source", budget_lane=PROACTIVE_LANE
+                )
+                after_screen = self.clock()
+                reason = await self._generation_reason(after_screen, automatic=automatic)
+                if reason or after_screen >= expires:
+                    raise Rejected(reason or "expired")
+                generated = await self.service.ai.generate(
+                    payload,
+                    subject,
+                    scenario=Scenario.OWNER_DIGEST,
+                    message=owner_message,
+                    budget_lane=PROACTIVE_LANE,
+                    **({"with_longnick": True} if requested_longnick else {}),
+                )
             if requested_longnick:
                 try:
                     value = json.loads(generated)
@@ -584,12 +636,11 @@ class OwnerProactive:
             generated = filter_reply_links(self.service.output(generated), public=False)
             body = trim_complete_text(generated, 450)
             cost = payload["approximate_api_usd_including_reservations"]
-            text = (
+            text = self.service.output(
                 f"{day} 巡逻小报\n{body}\n今日 API 约 ${cost}（本地估算，含预留，不含本次汇报）。"
             )
-            await self.enqueue("digest", text, key=key, expires=expires, automatic=automatic)
         except asyncio.CancelledError:
-            raise  # 'generating' is durable; restart never repeats an ambiguous paid call.
+            raise  # A paid call without a durable result must never be repeated automatically.
         except Exception as exc:
             reason = (
                 str(exc)
@@ -613,28 +664,51 @@ class OwnerProactive:
                     "UPDATE proactive_schedule SET status='failed',reason=? WHERE id=?",
                     (reason, key),
                 )
+                await self.digests.sync_intents_tx(key, self.clock())
             log.info("event=owner_dm_failed")
             return {"status": "failed", "reason": reason, "id": key}
+        # The daily result is durable before the queue handoff. Subsequent work is local
+        # and can resume after a crash even if this model call just exhausted the budget.
+        encrypted = self.store.vault.seal(
+            key, {"owner": self.owner, "bot": self.bot, "text": text, "world_digest": automatic}
+        )
         async with self.store.transaction():
             await self.store.db.execute(
-                "UPDATE proactive_schedule SET status='queued' WHERE id=?", (key,)
+                "INSERT INTO owner_digest_receipts(id,generated_at,payload) VALUES (?,?,?)",
+                (key, self.clock(), encrypted),
             )
+            await self.store.db.execute(
+                "UPDATE proactive_schedule SET status='generated' WHERE id=?", (key,)
+            )
+        async with self.store.transaction():
+            await self.digests.enqueue_generated_tx(self.clock(), key)
+        self.wakeup.set()
         if daily_longnick is not None:
-            await self.service.longnick.apply_digest(daily_longnick)
+            try:
+                await self.service.longnick.apply_digest(daily_longnick)
+            except Exception:
+                log.warning("event=owner_digest_longnick_failed")
         return {"status": "queued", "id": key}
 
     async def world_digest(self, call: ActionCall) -> Outcome:
         if call.ticket["target_scope"] != "owner:" + self.s.owner_qq_id or not call.still_allowed():
             return Outcome("gated_skip", "unauthorized_scope")
-        result = await self.prepare_digest(automatic=True, expires=call.ticket["expire_at"])
-        if result["status"] == "queued":
-            return Outcome("done", "owner_digest_queued")
+        result = await self.prepare_digest(
+            automatic=True, expires=call.ticket["expire_at"], intent_id=call.ticket["id"]
+        )
+        async with self.store.lock:
+            receipt = await self.digests.get_tx(result["id"])
+        if receipt:
+            return world_outcome(receipt["stage"])
         return Outcome("gated_skip", result.get("reason") or result["status"])
 
     async def manual_digest(self):
         result = await self.prepare_digest()
-        await self.deliver_once()
-        return {**result, "delivery": await self.delivery_status(result["id"])}
+        if result["status"] in {"queued", "generated"}:
+            await self.deliver_once()
+        async with self.store.lock:
+            receipt = await self.digests.get_tx(result["id"], connected=self.connected())
+        return {**result, "delivery": await self.delivery_status(result["id"]), "receipt": receipt}
 
     async def test_dm(self):
         # Fixed template, not even Decisions or a post-send compression call.
@@ -652,17 +726,21 @@ class OwnerProactive:
     async def _expire_and_disable(self):
         now = self.clock()
         async with self.store.transaction():
-            await self.store.db.execute(
+            await self.digests.enqueue_generated_tx(now)
+            changed = await self.store.all(
                 "UPDATE pending_owner_dms SET status='expired',payload=NULL,reason='expired' "
-                "WHERE status='pending' AND expires_at<=?",
-                (now,),
+                "WHERE status='pending' AND scope=? AND expires_at<=? RETURNING id,kind",
+                (self.scope, now),
             )
-            if not self.delivery_enabled:
-                await self.store.db.execute(
+            if not self.configured or not self.delivery_enabled:
+                changed += await self.store.all(
                     "UPDATE pending_owner_dms SET status='cancelled',payload=NULL, "
-                    "reason='disabled' WHERE scope=? AND status='pending'",
+                    "reason='disabled' WHERE scope=? AND status='pending' RETURNING id,kind",
                     (self.scope,),
                 )
+            for row in changed:
+                if row["kind"] == "digest":
+                    await self.digests.sync_intents_tx(row["id"], now)
 
     async def _finish_memory(self, row):
         payload = self.store.vault.open(row["id"], row["payload"])
@@ -719,29 +797,39 @@ class OwnerProactive:
 
                 async def before_send():
                     nonlocal submitted
-                    now = self.clock()
-                    reason = await self._eligible(
-                        row["kind"], now, automatic=payload.get("world_digest", False)
-                    )
-                    if row["expires_at"] <= now:
-                        reason = "expired"
-                    if reason:
-                        async with self.store.transaction():
+                    if not self.configured or not self.connected():
+                        return False
+                    epoch = await self.service.sessions.current_epoch(self.target())
+                    async with self.store.transaction():
+                        now = self.clock()
+                        reason = self._delivery_reason(
+                            row["kind"], now, automatic=payload.get("world_digest", False)
+                        )
+                        if row["expires_at"] <= now:
+                            reason = "expired"
+                        if reason:
                             await self.store.db.execute(
                                 "UPDATE pending_owner_dms SET "
                                 "status='skipped',payload=NULL,reason=? WHERE id=?",
                                 (reason, key),
                             )
-                        return False
-                    if not self.connected():
-                        return False  # No request submitted: keep durable pending state.
-                    epoch = (await self.service.sessions.snapshot(self.target()))["epoch"]
-                    async with self.store.transaction():
-                        await self.store.db.execute(
+                            if row["kind"] == "digest":
+                                await self.digests.sync_intents_tx(key, now)
+                            return False
+                        if not self.connected():
+                            return False
+                        cur = await self.store.db.execute(
                             "UPDATE pending_owner_dms SET status='sending',session_epoch=? "
-                            "WHERE id=?",
+                            "WHERE id=? AND status='pending'",
                             (epoch, key),
                         )
+                        if cur.rowcount != 1:
+                            return False
+                        if row["kind"] == "digest":
+                            await self.store.db.execute(
+                                "UPDATE owner_digest_receipts SET submitted_at=? WHERE id=?",
+                                (now, key),
+                            )
                     submitted = True
                     return True
 
@@ -760,6 +848,11 @@ class OwnerProactive:
                                 "WHERE id=? AND status='sending' AND payload IS NOT NULL",
                                 (key,),
                             )
+                            if row["kind"] == "digest":
+                                await self.store.db.execute(
+                                    "UPDATE owner_digest_receipts SET submitted_at=NULL WHERE id=?",
+                                    (key,),
+                                )
                         return False
                     if submitted:
                         async with self.store.transaction():
@@ -769,14 +862,18 @@ class OwnerProactive:
                                 "WHERE id=?",
                                 (key,),
                             )
+                            if row["kind"] == "digest":
+                                await self.digests.sync_intents_tx(key, self.clock())
                         log.info("event=owner_dm_uncertain")
-                    return True
+                    return submitted
                 async with self.store.transaction():
                     await self.store.db.execute(
                         "UPDATE pending_owner_dms SET status='delivered',sent_at=?,receipt=? "
                         "WHERE id=?",
                         (self.clock(), self.store.vault.seal("receipt:" + key, receipt), key),
                     )
+                    if row["kind"] == "digest":
+                        await self.digests.sync_intents_tx(key, self.clock())
                     confirmed = await self.store.one(
                         "SELECT * FROM pending_owner_dms WHERE id=?", (key,)
                     )
@@ -847,6 +944,7 @@ class OwnerProactive:
             "connected": self.connected(),
             "day": day,
             "next_digest_at": await self.service.life_engine.next_digest_at(now),
+            "digest_history": await self.digest_history(),
             "queue": [dict(row) for row in pending],
             "alerts": [
                 {**dict(row), "alert_key": row["alert_key"][len(self.scope) + 1 :]}
@@ -855,6 +953,12 @@ class OwnerProactive:
             "budget": await self.store.budget_status(),
             "proactive_daily_limit_usd": str(self.s.proactive_daily_usd),
         }
+
+    async def digest_history(self):
+        return await self.digests.history(connected=self.connected())
+
+    async def has_digest_attempt(self, now):
+        return await self.digest_attempted(self.local(now).date().isoformat())
 
     async def digest_attempted(self, day):
         async with self.store.lock:
@@ -871,11 +975,19 @@ class OwnerProactive:
         day = self.local(now - 9 * 86400).date().isoformat()
         async with self.store.transaction():
             await self.store.db.execute(
-                "DELETE FROM pending_owner_dms WHERE created<? AND status!='delivered'",
-                (now - 8 * 86400,),
+                "DELETE FROM pending_owner_dms WHERE status!='delivered' AND "
+                "((kind!='digest' AND created<?) OR (kind='digest' AND day<?))",
+                (now - 8 * 86400, day),
             )
             await self.store.db.execute(
                 "DELETE FROM alert_cooldown WHERE cooldown_until<?", (now - 8 * 86400,)
             )
+            for statement in (
+                "DELETE FROM owner_digest_intents WHERE digest_id IN ",
+                "DELETE FROM owner_digest_receipts WHERE id IN ",
+            ):
+                await self.store.db.execute(
+                    statement + "(SELECT id FROM proactive_schedule WHERE day<?)", (day,)
+                )
             await self.store.db.execute("DELETE FROM proactive_schedule WHERE day<?", (day,))
             await self.store.db.execute("DELETE FROM proactive_days WHERE day<?", (day,))

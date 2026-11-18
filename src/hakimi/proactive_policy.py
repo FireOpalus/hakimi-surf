@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS pending_owner_dms (
   session_epoch INTEGER, sent_at REAL, receipt BLOB, reason TEXT
 );
 CREATE INDEX IF NOT EXISTS owner_dm_delivery ON pending_owner_dms(status,created);
+CREATE TABLE IF NOT EXISTS owner_digest_receipts (
+  id TEXT PRIMARY KEY, generated_at REAL, payload BLOB, submitted_at REAL
+);
+CREATE TABLE IF NOT EXISTS owner_digest_intents (
+  intent_id TEXT PRIMARY KEY, digest_id TEXT NOT NULL, scheduled_for REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS owner_digest_intent_lookup ON owner_digest_intents(digest_id);
 CREATE TABLE IF NOT EXISTS alert_cooldown (
   alert_key TEXT PRIMARY KEY, queued_at REAL NOT NULL, cooldown_until REAL NOT NULL,
   dm_id TEXT NOT NULL, sent_at REAL

@@ -247,7 +247,9 @@ class WebSocketTransport:
             raise Rejected("onebot_disconnected")
         return await self._rpc(action, params, self._peer)
 
-    async def _rpc(self, action: str, params: dict, peer: _Peer | None) -> dict:
+    async def _rpc(
+        self, action: str, params: dict, peer: _Peer | None, *, before_send=None
+    ) -> dict:
         validate_action(self.s, action, params)
         if peer is None or peer is not self._peer:
             raise Rejected("onebot_not_dispatched")
@@ -262,6 +264,13 @@ class WebSocketTransport:
                 async with peer.send_lock:
                     if peer is not self._peer:
                         raise Rejected("onebot_not_dispatched")
+                    if before_send is not None:
+                        valid = before_send()
+                        valid = await valid if inspect.isawaitable(valid) else valid
+                        if valid is False:
+                            raise Rejected("onebot_dispatch_revoked")
+                        if peer is not self._peer:
+                            raise Rejected("onebot_dispatch_revoked")
                     # Mark before await: even a transport exception can follow a delivered frame.
                     dispatched = True
                     await peer.send(json.dumps({"action": action, "params": params, "echo": echo}))
@@ -309,17 +318,14 @@ class WebSocketTransport:
                         await self.ready.wait()
                 except TimeoutError:
                     continue
-            if before_send is not None:
-                valid = before_send()
-                valid = await valid if inspect.isawaitable(valid) else valid
-                if valid is False:
-                    raise Rejected("onebot_not_dispatched")
             peer = self._peer
             if not self.ready.is_set() or peer is None or not peer.ready.is_set():
                 continue
             try:
-                return await self._rpc(action, params, peer)
+                return await self._rpc(action, params, peer, before_send=before_send)
             except Rejected as exc:
+                if str(exc) == "onebot_dispatch_revoked":
+                    raise Rejected("onebot_not_dispatched") from None
                 if str(exc) != "onebot_not_dispatched":
                     raise
         raise Rejected("onebot_not_dispatched")

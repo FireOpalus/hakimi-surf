@@ -460,10 +460,11 @@ async def test_proactive_panel_policy_and_zero_token_delivery(admin_api):
 
 
 async def test_proactive_manual_digest_uses_shared_daily_attempt(admin_api):
-    from tests.test_proactive_dm import Wire
+    from tests.test_proactive_dm import Wire, stamp
 
     app, client, gateway = admin_api
     app.state.service.sender.onebot = Wire()
+    app.state.service.proactive.clock = lambda: stamp("2026-11-14T12:00:00")
     first = await client.post("/admin/api/proactive/digest")
     assert first.status_code == 200 and first.json()["delivery"] == "sent"
     second = await client.post("/admin/api/proactive/digest")

@@ -101,6 +101,7 @@ class QQSocialModule(BaseModule):
                 owner_only=True,
                 budget_lane=PROACTIVE_LANE,
                 origins=frozenset({"timer"}),
+                reuses_paid_work=self.proactive.has_digest_attempt if self.proactive else None,
                 window="closing",
                 interrupts_focus=True,
                 quotas=(),

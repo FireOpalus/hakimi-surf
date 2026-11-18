@@ -210,7 +210,15 @@ async def test_world_bili_and_qq_actions_check_their_actual_budget_lanes(
     }
     assert len(patrol_calls) == int(bool(patrol))
     assert (rows["bili.patrol"]["status"] == "done") == bool(patrol)
-    assert (rows["qq.owner_digest"]["status"] == "done") == bool(proactive)
+    assert (rows["qq.owner_digest"]["status"] == "executing") == bool(proactive)
+    if proactive:
+        assert rows["qq.owner_digest"]["result_reason"] == "owner_digest_awaiting_delivery"
+        assert await dm.deliver_once()
+        assert (
+            await dm.store.one(
+                "SELECT status FROM scheduled_intents WHERE action_name='qq.owner_digest'"
+            )
+        )[0] == "done"
     assert [c[0] for c in svc.ai.calls] == (["screen", "generate"] if proactive else [])
     if not patrol:
         assert rows["bili.patrol"]["result_reason"] == "budget_limit"

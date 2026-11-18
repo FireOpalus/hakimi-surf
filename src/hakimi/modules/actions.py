@@ -34,7 +34,7 @@ class ActionCall:
 
 @dataclass(frozen=True)
 class Outcome:
-    status: Literal["done", "gated_skip", "not_dispatched", "uncertain"]
+    status: Literal["done", "gated_skip", "not_dispatched", "uncertain", "executing", "expired"]
     reason: str
     details: dict = field(default_factory=dict)
 
@@ -59,6 +59,8 @@ class Action:
     social: bool = False
     owner_only: bool = False
     budget_lane: Literal["patrol", "proactive"] | None = None
+    # A previously attempted operation may have a durable result and need no further paid call.
+    reuses_paid_work: Callable[[float], Awaitable[bool]] | None = None
     window: Literal["any", "active", "closing"] = "any"
     interrupts_focus: bool = False
     # Paid or social actions share the daily allowance by default; () opts out.

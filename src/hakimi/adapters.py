@@ -192,7 +192,8 @@ class Sender:
     ) -> dict | None:
         async with self.send_lock:
             await asyncio.sleep(random.uniform(self.s.send_delay_min, self.s.send_delay_max))
-            if before_send is not None and not await before_send():
+            # A durable proactive row records submission only at the actual transport write.
+            if not proactive and before_send is not None and not await before_send():
                 raise Rejected("reply_invalidated")
             return await self._send_once(message, text, proactive, before_send=before_send)
 
@@ -498,19 +499,22 @@ class Sender:
             if proactive and hasattr(self.onebot, "send_onebot_action_with_retry"):
 
                 async def still_owner():
-                    if before_send is not None and not await before_send():
-                        return False
-                    return (
-                        bool(self.s.owner_qq_id)
+                    if not (
+                        self.s.owner_qq_id
                         and message.user_id == self.s.owner_qq_id
+                        and message.bot_id == self.s.onebot_self_id
                         and int(message.conversation_id) == int(self.s.owner_qq_id)
                         and authorize(message, self.s)
-                    )
+                    ):
+                        return False
+                    return before_send is None or await before_send()
 
                 receipt = await self.onebot.send_onebot_action_with_retry(
                     action, params, before_send=still_owner
                 )
             else:
+                if proactive and before_send is not None and not await before_send():
+                    raise Rejected("onebot_not_dispatched")
                 receipt = await self.onebot.call(action, params)
             if proactive and (
                 isinstance(receipt.get("message_id"), bool)

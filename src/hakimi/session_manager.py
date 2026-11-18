@@ -222,6 +222,11 @@ class SessionManager:
             if items[n]["role"] == "user" and items[n + 1]["role"] == "assistant"
         ]
 
+    async def current_epoch(self, message: Message) -> int:
+        async with self.database(message) as (db, _key):
+            async with db.execute("SELECT epoch FROM rolling_state") as cur:
+                return (await cur.fetchone())[0]
+
     async def snapshot(self, message: Message) -> dict:
         async with self.database(message) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
