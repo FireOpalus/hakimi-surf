@@ -165,6 +165,7 @@ class RuntimeState:
         self.rest_hours = self.env_rest_hours
         self.rest_hours_overridden = False
         self.rest_hours_lock = asyncio.Lock()
+        self.day_rest = (0.0, 0.0)
         self.web_search = WebSearch(store)
         self.provider_routing = ProviderRoutingManager(store)
         self.gcp_billing = GcpBillingManager(store)
@@ -513,6 +514,7 @@ class RuntimeState:
         self.s.rest_hours_enabled = value.enabled
         self.s.rest_hours = value.rest_hours
         self.s.rest_allow_owner_private = value.allow_owner_private
+        self.s.day_rest_enabled = value.day_rest_enabled
         self.rest_hours = value
 
     def _local_time(self, now: float | None = None) -> datetime:
@@ -520,10 +522,21 @@ class RuntimeState:
         return datetime.fromtimestamp(stamp, ZoneInfo(self.s.bot_timezone))
 
     def is_resting(self, now: float | None = None) -> bool:
+        """Scheduled sleep. Obligatory closing-time deliveries use this gate."""
         return self.rest_hours.active(self._local_time(now))
 
+    def day_rest_end(self, now: float) -> float:
+        start, end = self.day_rest
+        return end if self.rest_hours.day_rest_enabled and start <= now < end else 0.0
+
+    def rest_kind(self, now: float | None = None) -> str:
+        now = self.clock() if now is None else now
+        if self.is_resting(now):
+            return "sleep"
+        return "day_rest" if self.day_rest_end(now) else "awake"
+
     def is_resting_for(self, message: Message | None, now: float | None = None) -> bool:
-        if not self.is_resting(now):
+        if self.rest_kind(now) == "awake":
             return False
         if (
             message is not None
@@ -535,13 +548,17 @@ class RuntimeState:
         return True
 
     def rest_hours_status(self, now: float | None = None):
+        now = self.clock() if now is None else now
         local = self._local_time(now)
+        kind = self.rest_kind(now)
         return {
             "config": self.rest_hours.model_dump(),
             "source": "admin" if self.rest_hours_overridden else "env",
             "environment": self.env_rest_hours.model_dump(),
             "timezone": self.s.bot_timezone,
-            "resting_now": self.rest_hours.active(local),
+            "resting_now": kind != "awake",
+            "rest_kind": kind,
+            "day_rest_until": self.day_rest_end(now) or None,
             "local_time": local.strftime("%H:%M"),
         }
 

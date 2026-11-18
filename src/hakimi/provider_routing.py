@@ -56,7 +56,21 @@ def validate_service_account_json(raw: str) -> dict[str, Any]:
     return info
 
 
-class ProviderRoutingConfig(BaseModel):
+class PrivacyDefaults(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    default_group_privacy: Literal["high", "low"]
+    default_private_privacy: Literal["high", "low"]
+
+
+QQ_PRIVACY_FIELDS = (
+    "default_group_privacy",
+    "default_private_privacy",
+    "group_privacy",
+    "private_privacy",
+)
+
+
+class ProviderRoutingConfig(PrivacyDefaults):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     default_group_privacy: Literal["high", "low"] = "low"
@@ -73,19 +87,8 @@ class ProviderRoutingConfig(BaseModel):
     vertex_hydrogen_model: str = Field(default="gemini-4-hydrogen", max_length=128)
     vertex_protocol: Literal["auto", "interactions", "generate_content"] = "auto"
     vertex_fallback_to_gemini: bool = True
-    group_hydrogen_provider: dict[str, Literal["default", "gemini", "vertex"]] = Field(
-        default_factory=dict
-    )
-    private_hydrogen_provider: dict[str, Literal["default", "gemini", "vertex"]] = Field(
-        default_factory=dict
-    )
 
-    @field_validator(
-        "group_privacy",
-        "private_privacy",
-        "group_hydrogen_provider",
-        "private_hydrogen_provider",
-    )
+    @field_validator("group_privacy", "private_privacy")
     @classmethod
     def validate_session_keys(cls, values: dict[str, Any]) -> dict[str, Any]:
         if len(values) > 1000 or any(not SESSION_KEY_RE.fullmatch(key) for key in values):
@@ -167,16 +170,13 @@ class SessionPrivacyUpdate(BaseModel):
     kind: Literal["group", "private"]
     platform: Literal["onebot", "qq"] = "onebot"
     target_id: str = Field(min_length=1, max_length=128)
-    privacy: Literal["default", "high", "low"] | None = None
-    hydrogen_provider: Literal["default", "gemini", "vertex"] | None = None
+    privacy: Literal["default", "high", "low"]
 
     @model_validator(mode="after")
     def validate_target_and_changes(self) -> Self:
         pattern = ONEBOT_TARGET_RE if self.platform == "onebot" else QQ_TARGET_RE
         if not pattern.fullmatch(self.target_id):
             raise ValueError("Invalid target_id for platform")
-        if self.privacy is None and self.hydrogen_provider is None:
-            raise ValueError("At least one policy override must be supplied")
         return self
 
 
@@ -211,12 +211,24 @@ class ProviderRoutingManager:
                 )
             if routing_row:
                 saved = self.store.vault.open("admin:provider_routing", routing_row[0])
+                legacy_channels = {"group_hydrogen_provider", "private_hydrogen_provider"}
+                retire_channels = isinstance(saved, dict) and bool(
+                    legacy_channels.intersection(saved)
+                )
+                if retire_channels:
+                    saved = {
+                        key: value for key, value in saved.items() if key not in legacy_channels
+                    }
                 merged = (
                     {**self.env_config.model_dump(mode="json"), **saved}
                     if isinstance(saved, dict)
                     else saved
                 )
                 self.config = ProviderRoutingConfig.model_validate(merged)
+                if retire_channels:
+                    await self.store.runtime.save_config(
+                        "provider_routing", self.config.model_dump()
+                    )
                 self.overridden = True
             else:
                 self.config = self.env_config
@@ -314,23 +326,7 @@ class ProviderRoutingManager:
             return "high"
         return self.config.default_private_privacy
 
-    def session_hydrogen_override(
-        self, message: Message | None
-    ) -> Literal["default", "gemini", "vertex"]:
-        if message is None:
-            return "default"
-        key = f"{message.platform}:{message.conversation_id}"
-        mapping = (
-            self.config.group_hydrogen_provider
-            if message.kind == "group"
-            else self.config.private_hydrogen_provider
-        )
-        return mapping.get(key, "default")
-
-    def hydrogen_provider_for(self, message: Message | None) -> Literal["gemini", "vertex"]:
-        override = self.session_hydrogen_override(message)
-        if override in {"gemini", "vertex"}:
-            return override
+    def hydrogen_provider_for(self, message: Message | None = None) -> Literal["gemini", "vertex"]:
         if self.config.vertex_enabled and self.has_vertex_credentials():
             return "vertex"
         return "gemini"
@@ -399,34 +395,35 @@ class ProviderRoutingManager:
             self.generation += 1
         return await self.status()
 
-    async def set_session_policy(self, value: SessionPrivacyUpdate | dict[str, Any]) -> dict:
+    async def set_session_policy(self, value: SessionPrivacyUpdate | dict[str, Any]) -> None:
         await self.initialize()
         upd = SessionPrivacyUpdate.model_validate(value)
         async with self.lock:
             data = self.config.model_dump(mode="json")
             key = f"{upd.platform}:{upd.target_id}"
-            if upd.privacy is not None:
-                privacy_field = "group_privacy" if upd.kind == "group" else "private_privacy"
-                if upd.privacy == "default":
-                    data[privacy_field].pop(key, None)
-                else:
-                    data[privacy_field][key] = upd.privacy
-            if upd.hydrogen_provider is not None:
-                provider_field = (
-                    "group_hydrogen_provider"
-                    if upd.kind == "group"
-                    else "private_hydrogen_provider"
-                )
-                if upd.hydrogen_provider == "default":
-                    data[provider_field].pop(key, None)
-                else:
-                    data[provider_field][key] = upd.hydrogen_provider
-            cfg = ProviderRoutingConfig.model_validate(data)
-            await self.store.runtime.save_config("provider_routing", cfg.model_dump(mode="json"))
-            self.config = cfg
-            self.overridden = True
-            self.generation += 1
-        return await self.status()
+            privacy_field = "group_privacy" if upd.kind == "group" else "private_privacy"
+            if upd.privacy == "default":
+                data[privacy_field].pop(key, None)
+            else:
+                data[privacy_field][key] = upd.privacy
+            await self._save_privacy(ProviderRoutingConfig.model_validate(data))
+
+    async def set_privacy_defaults(self, value: PrivacyDefaults):
+        await self.initialize()
+        async with self.lock:
+            await self._save_privacy(self.config.model_copy(update=value.model_dump()))
+
+    async def _save_privacy(self, config):
+        await self.store.runtime.save_config("provider_routing", config.model_dump())
+        self.config = config
+        self.overridden = True
+
+    async def privacy_status(self):
+        await self.initialize()
+        return {
+            "defaults": self.config.model_dump(include=set(PrivacyDefaults.model_fields)),
+            "sessions": await self._sessions_matrix(),
+        }
 
     async def _sessions_matrix(self) -> list[dict[str, Any]]:
         entries: dict[tuple[str, str, str], None] = {}
@@ -456,9 +453,7 @@ class ProviderRoutingManager:
 
         for mapping, kind in (
             (self.config.group_privacy, "group"),
-            (self.config.group_hydrogen_provider, "group"),
             (self.config.private_privacy, "private"),
-            (self.config.private_hydrogen_provider, "private"),
         ):
             for session_key in mapping:
                 platform, _, target_id = session_key.partition(":")
@@ -493,16 +488,9 @@ class ProviderRoutingManager:
             privacy_map = (
                 self.config.group_privacy if kind == "group" else self.config.private_privacy
             )
-            provider_map = (
-                self.config.group_hydrogen_provider
-                if kind == "group"
-                else self.config.private_hydrogen_provider
-            )
             override_privacy = privacy_map.get(key, "default")
             effective_privacy = self.privacy_for(synthetic, self.s)
             effective_tier = "free" if (effective_privacy == "low" and has_free_key) else "paid"
-            override_provider = provider_map.get(key, "default")
-            effective_provider = self.hydrogen_provider_for(synthetic)
             is_owner = kind == "private" and is_persona_owner(synthetic, self.s)
             rows.append(
                 {
@@ -514,8 +502,6 @@ class ProviderRoutingManager:
                     "override_privacy": override_privacy,
                     "effective_privacy": effective_privacy,
                     "effective_decision_tier": effective_tier,
-                    "override_hydrogen_provider": override_provider,
-                    "effective_hydrogen_provider": effective_provider,
                 }
             )
         return rows
@@ -541,5 +527,12 @@ class ProviderRoutingManager:
                     str(sa_info.get("project_id") or "") if sa_info is not None else ""
                 ),
             },
-            "sessions_matrix": await self._sessions_matrix(),
+            "sessions_matrix": [
+                {
+                    **row,
+                    "override_hydrogen_provider": "default",
+                    "effective_hydrogen_provider": self.hydrogen_provider_for(),
+                }
+                for row in await self._sessions_matrix()
+            ],
         }

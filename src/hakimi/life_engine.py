@@ -36,6 +36,7 @@ from .planning_journal import PlannerJournal
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
 from .work_usage import model_work
+from .world_experience import MAX_DAY_REST_MINUTES
 from .world_state import (
     IntentTicketCreate,
     MilestoneEvent,
@@ -221,7 +222,8 @@ class LifeBlockPlanner:
     async def plan_once(
         self, now: float | None = None, *, automatic: bool = False
     ) -> dict[str, Any]:
-        ts = self.clock() if now is None else now
+        entered = self.clock()
+        ts = entered if now is None else now
         state = await self.journal.initialize(
             ts, initial_interval=self.config.planner_min_minutes * 60
         )
@@ -238,6 +240,13 @@ class LifeBlockPlanner:
             return {"status": reason, "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
 
         await ws.experience.advance(ts)
+        await self.engine.rest_if_tired(ts)
+        if nap_end := self.store.runtime.day_rest_end(ts):
+            # An encrypted checkpoint, if any, stays available for the next wake.
+            self.next_plan_at = nap_end
+            await self.journal.pause(day, ts, nap_end, "day_rest")
+            self.last_plan_at, self.last_plan_source = ts, "day_rest"
+            return {"status": "day_rest", "next_plan_at": nap_end, "intents_enqueued": 0}
         local_dt = self._local(ts)
         if (
             not cfg.is_active_time(local_dt)
@@ -262,6 +271,9 @@ class LifeBlockPlanner:
 
         budget = await self.store.budget_status()
         preferences = await ws.experience.preferences(ts)
+        preferences["day_rest_available"] = (
+            preferences["day_rest_available"] and self.engine.day_rest_limit(ts) >= ts + 360
+        )
         available_actions = [
             action
             for action in self.engine.catalog.view(cfg.action_modes, planner=True)
@@ -514,10 +526,18 @@ class LifeBlockPlanner:
             if tickets
             else "all_filtered"
             if plan.intents
-            else "model_chose_rest"
+            else "model_chose_idle"
             if plan_source == "llm"
-            else "local_rest"
+            else "local_idle"
         )
+        day_rest = None
+        if plan.rest_minutes and not plan.intents and resolved_module == "idle":
+            # A delayed/checkpointed plan cannot backdate rest or restart an expired nap.
+            decision_at = ts + max(0, self.clock() - entered)
+            end = min(
+                self.engine.day_rest_limit(decision_at), scheduled_at + plan.rest_minutes * 60
+            )
+            day_rest = (decision_at, end)
         enqueued_ids = await self.journal.commit(
             ws,
             run_id,
@@ -528,7 +548,10 @@ class LifeBlockPlanner:
             reasons=reasons,
             avoided=False,
             plan=(resolved_module, resolved_focus, resolved_mood),
+            day_rest=day_rest,
         )
+        if day_rest:
+            await ws.refresh()
         self.next_plan_at = (await self.journal.clock())["next_at"]
 
         longnick_text = str(plan.mood_longnick or "").strip()
@@ -730,6 +753,9 @@ class GatekeeperWorker:
             self.store.runtime.is_resting(now) or cfg.quiet(local_dt)
         ):
             return await reject("quiet_hours")
+        if not spec.background_sensor and spec.window != "closing":
+            if nap_end := self.store.runtime.day_rest_end(now):
+                return await defer("day_rest", nap_end - now)
         if spec.window == "closing" and not self.engine.closing_due(now):
             return await reject("outside_digest_window")
         if spec.window == "active" and not cfg.is_active_time(local_dt):
@@ -868,6 +894,10 @@ class JITExecutor:
                             or (
                                 not self.engine.config.quiet(local)
                                 and not self.store.runtime.is_resting(current)
+                                and (
+                                    spec.window == "closing"
+                                    or not self.store.runtime.day_rest_end(current)
+                                )
                             )
                         )
                         and self.engine.config.action_modes.get(spec.name) != "off"
@@ -958,8 +988,6 @@ class LifeEngine:
         self.rng = rng or random.SystemRandom()
         self.env_config = LifeEngineConfig.from_settings(self.s, service.modules)
         self.config: LifeEngineConfig = self.env_config
-        if world := getattr(service, "world_state", None):
-            world.experience.schedule = lambda: (self.config.active_hours, self.config.quiet_hours)
         self.overridden: bool = False
         self.initialized: bool = False
         self._running: bool = False
@@ -1170,6 +1198,7 @@ class LifeEngine:
                     await world_state.initialize()
                 await self.rules.initialize()
                 await self.planner.initialize()
+                await self.trim_day_rest(self.clock())
                 world_state.subscribe(self.planner.on_milestone_event)
             elif self.planner.next_plan_at <= 0.0:
                 self.planner.next_plan_at = self.clock() + 120.0
@@ -1220,6 +1249,7 @@ class LifeEngine:
                 await self.store.runtime.save_config("life_engine", cfg.model_dump())
                 self.config = cfg
                 self.overridden = True
+            await self.trim_day_rest(self.clock())
         self.wakeup.set()
         return await self.status()
 
@@ -1257,12 +1287,65 @@ class LifeEngine:
         ts = self.clock() if now is None else now
         await self.service.world_state.experience.advance(ts)
         if self.config.enabled:
+            await self.rest_if_tired(ts)
             async with self._gate_lock:
                 await self.schedule_due(ts)
             rules = self._start_background("rules", self.rules.catch_up, ts)
             if wait:
                 await asyncio.shield(rules)
         return await self.gatekeeper.tick(now=ts, wait=wait)
+
+    def day_rest_limit(self, now):
+        """First minute unavailable for a daytime nap, including the reserved daily report."""
+        runtime = self.store.runtime
+        if not self.config.enabled or not runtime.rest_hours.day_rest_enabled:
+            return now
+        end = now + MAX_DAY_REST_MINUTES * 60
+        point = now
+        zone = _zone(self.s.bot_timezone)
+        while point < end:
+            local = datetime.fromtimestamp(point, zone)
+            if (
+                not self.config.is_active_time(local)
+                or self.config.quiet(local)
+                or runtime.is_resting(point)
+                or self.closing_due(point)
+            ):
+                return point
+            point = (int(point // 60) + 1) * 60
+        return end
+
+    async def rest_if_tired(self, now):
+        world = self.service.world_state
+        if not world.tired or self.store.runtime.day_rest_end(now):
+            return
+        until = min(self.day_rest_limit(now), now + (45 - world.current.energy) * 360)
+        if until - now >= 360:
+            async with self.store.transaction():
+                started = await world.experience.start_day_rest_tx(now, until, "low_energy")
+            if started:
+                await world.refresh()
+
+    async def trim_day_rest(self, now):
+        start, end = self.store.runtime.day_rest
+        if start <= now < end:
+            limit = self.day_rest_limit(now)
+            if limit < end:
+                async with self.store.transaction():
+                    await self.store.db.execute(
+                        "UPDATE world_day_rest SET ends=MIN(ends,?) WHERE id=1 AND started=?",
+                        (limit, start),
+                    )
+                await self.service.world_state.refresh()
+
+    async def set_rest_policy(self, value):
+        async with self._config_lock:
+            now = self.clock()
+            await self.service.world_state.experience.advance(now)
+            await self.store.runtime.set_rest_hours(value)
+            await self.trim_day_rest(now)
+        self.wakeup.set()
+        return self.store.runtime.rest_hours_status(now)
 
     def closing_window(self, local_day: date) -> tuple[int, int] | None:
         rest = self.store.runtime.rest_hours

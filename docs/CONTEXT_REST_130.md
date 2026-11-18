@@ -22,7 +22,7 @@
 
 ## 每日休息时段
 
-默认 `REST_HOURS_ENABLED=true`、`REST_HOURS=23:00-08:00`、`REST_ALLOW_OWNER_PRIVATE=false`，按 `BOT_TIMEZONE` 判断，起点包含、终点不包含，支持跨午夜。`/admin` 概览可快捷开关，“回复与联网”可编辑时间与 Owner 私聊例外，通过 `/admin/api/rest-hours` 加密持久化并热生效。
+默认 `REST_HOURS_ENABLED=true`、`REST_HOURS=23:00-08:00`、`REST_ALLOW_OWNER_PRIVATE=false`，按 `BOT_TIMEZONE` 判断，起点包含、终点不包含，支持跨午夜。当前版本在「世界引擎 → 睡眠与白天小憩」编辑时间与 Owner 私聊例外。设置经 `/admin/api/life/rest-hours` 加密保存，原 `/admin/api/rest-hours` 入口兼容已有客户端。
 
 | 入口 | 休息期间行为 |
 | --- | --- |

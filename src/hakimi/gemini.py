@@ -101,6 +101,7 @@ class WireLifePlan(BaseModel):
         return value
 
     mood_longnick: str = ""
+    rest_minutes: Literal[0, 30, 60, 90] = 0
     intents: list[WireLifeIntent] = Field(default_factory=list)
 
 
@@ -112,7 +113,9 @@ LIFE_PLAN_INSTRUCTION = """当前任务是自主生活区块规划器（LifeBloc
 只输出符合 schema 的 JSON 对象，包含 current_module、focus_level（LOW|MEDIUM|HIGH）、mood、
 mood_longnick（≤30字纯文本心情个签或空串""）与 intents。
 精力、无聊度和探索倾向由本地实际经历结算。
-exploration_preferred 为真时优先挑选可用探索，精力低时可休息。计划内容只表达意向。
+exploration_preferred 为真时优先挑选可用探索。day_rest_available 为真时可以主动小憩，
+填写 rest_minutes 为 30、60 或 90，current_module 为 idle，intents 为空。清醒放空或安排活动时
+rest_minutes 为 0。睡眠和小憩时间由世界引擎结算。计划内容只表达意向。
 从 available_actions 选择 action_name，arguments_json 仅填该动作声明的 JSON 参数。
 internal 不填接收人，social 仅选提供的群或 owner。
 【严禁预写台词】每条 intent 的 intent_note 只能写 ≤120 字的抽象意图方向，
@@ -442,13 +445,8 @@ class GeminiGateway:
         if self._routing_generation != self.routing.generation:
             self.reload_provider_clients()
 
-    def _should_use_vertex(self, message: Message | None) -> bool:
-        override = self.routing.session_hydrogen_override(message)
-        if override == "gemini":
-            return False
-        if override == "vertex":
-            return True
-        if self.routing.hydrogen_provider_for(message) == "vertex":
+    def _should_use_vertex(self) -> bool:
+        if self.routing.hydrogen_provider_for() == "vertex":
             return True
         return bool(
             self.routing.config.vertex_enabled and self._injected_vertex_chat_client is not None
@@ -1868,7 +1866,7 @@ class GeminiGateway:
                 and not memory_archive
                 and video is None
                 and active_plan.model_lane == "hydrogen"
-                and self._should_use_vertex(message)
+                and self._should_use_vertex()
             )
             vertex_client = self.vertex_chat_client if use_vertex else None
             if use_vertex and vertex_client is None:

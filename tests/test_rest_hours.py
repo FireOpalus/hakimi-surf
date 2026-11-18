@@ -347,6 +347,7 @@ async def test_rest_hours_admin_api_dashboard_encryption_reload_and_reset(admin_
     data = updated.json()
     assert data["source"] == "admin"
     assert data["config"] == {
+        "day_rest_enabled": True,
         "enabled": True,
         "rest_hours": "22:00-07:30",
         "allow_owner_private": True,

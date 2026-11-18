@@ -467,7 +467,8 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
         sleep_res = await engine.trigger_plan_once(now=now)
         assert sleep_res["status"] == "sleeping"
         assert sleep_res["intents_enqueued"] == 0
-        assert svc.world_state.current.mood == "sleeping"
+        # Night-time planning pauses, but this fixture has explicitly disabled scheduled sleep.
+        assert svc.world_state.current.mood == "calm"
         assert svc.world_state.current.energy == 80
         assert svc.world_state.current.boredom == 20
         assert (

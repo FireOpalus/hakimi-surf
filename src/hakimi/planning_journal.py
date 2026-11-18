@@ -157,6 +157,7 @@ class PlannerJournal:
         reasons,
         avoided,
         plan=(None, None, None),
+        day_rest=None,
     ):
         async with self.store.transaction():
             row = await self.store.one(
@@ -165,6 +166,12 @@ class PlannerJournal:
             )
             if row is None:
                 return []
+            if day_rest:
+                started, ends = day_rest
+                if await world.experience.start_day_rest_tx(started, ends, "planner"):
+                    outcome = "day_rest"
+                else:
+                    reasons["day_rest_unavailable"] = 1
             ids = [await world.insert_intent_tx(ticket, now=row["started"]) for ticket in tickets]
             await self.store.db.executemany(
                 "UPDATE global_events SET consumed=1 WHERE id=?",

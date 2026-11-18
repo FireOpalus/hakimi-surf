@@ -32,6 +32,7 @@ from hakimi.provider_routing import (
 from hakimi.security import Rejected, configured_secrets
 from hakimi.store import Store
 from tests.test_admin import TOKEN
+from tests.test_admin import admin_api as admin_api
 from tests.test_gateway import group
 from tests.test_sdk_contract import decision_response, interaction_response, stream_response
 
@@ -212,16 +213,23 @@ async def test_privacy_and_hydrogen_routing_rules_and_persistence(settings, stor
     assert routing.privacy_for(other_dm, settings) == "high"
 
     # Even if default_private_privacy is set to "low", Owner DM stays "high" unless overridden.
-    await routing.set_config(
-        ProviderRoutingConfig(
-            default_group_privacy="low",
-            default_private_privacy="low",
-            group_privacy={"onebot:40000": "high"},
-            vertex_enabled=True,
-            group_hydrogen_provider={"onebot:40000": "gemini"},
-            private_hydrogen_provider={"onebot:20000": "vertex"},
-        )
+    # Upgrade previously encrypted privacy levels and opposing per-session model settings.
+    await store.runtime.save_config(
+        "provider_routing",
+        {
+            "default_group_privacy": "low",
+            "default_private_privacy": "low",
+            "group_privacy": {"onebot:40000": "high"},
+            "vertex_enabled": True,
+            "group_hydrogen_provider": {"onebot:40000": "gemini"},
+            "private_hydrogen_provider": {"onebot:20000": "vertex"},
+        },
     )
+    routing = ProviderRoutingManager(store)
+    await routing.initialize()
+    row = await store.one("SELECT payload FROM admin_config WHERE key='provider_routing'")
+    saved = store.vault.open("admin:provider_routing", row[0])
+    assert "private_hydrogen_provider" not in saved and "group_hydrogen_provider" not in saved
     assert routing.privacy_for(grp, settings) == "high"
     assert routing.privacy_for(other_dm, settings) == "low"
     assert routing.privacy_for(owner_dm, settings) == "high"
@@ -232,12 +240,11 @@ async def test_privacy_and_hydrogen_routing_rules_and_persistence(settings, stor
     )
     assert routing.privacy_for(owner_dm, settings) == "low"
 
-    # Global vertex_enabled=True without credentials falls back to gemini unless overridden.
+    # Every conversation uses the global channel before and after credential changes.
     assert routing.hydrogen_provider_for(other_dm) == "gemini"
     assert routing.hydrogen_provider_for(grp) == "gemini"
-    assert routing.hydrogen_provider_for(owner_dm) == "vertex"
+    assert routing.hydrogen_provider_for(owner_dm) == "gemini"
 
-    # Adding Vertex API key enables global Vertex for default sessions (not forced-gemini group).
     await routing.update_credentials(
         ProviderCredentialsUpdate(
             gemini_free_api_key="free-key-sqlite-1234",
@@ -246,7 +253,7 @@ async def test_privacy_and_hydrogen_routing_rules_and_persistence(settings, stor
         )
     )
     assert routing.hydrogen_provider_for(other_dm) == "vertex"
-    assert routing.hydrogen_provider_for(grp) == "gemini"
+    assert routing.hydrogen_provider_for(grp) == routing.hydrogen_provider_for(owner_dm) == "vertex"
     sa_info, sa_src = routing.service_account_info()
     assert sa_info is not None and sa_src == "sqlite"
     assert "free-key-sqlite-1234" in configured_secrets(settings)
@@ -793,20 +800,21 @@ async def test_provider_admin_endpoints_crud_session_policy_and_secret_masking(s
 
             # 3. Session policy override -> reflected in matrix
             sp_res = await client.post(
-                "/admin/api/providers/session-policy",
+                "/admin/api/qq/privacy",
                 json={
                     "kind": "group",
                     "platform": "onebot",
                     "target_id": "40000",
                     "privacy": "high",
-                    "hydrogen_provider": "vertex",
                 },
             )
             assert sp_res.status_code == 200
-            grp_row = next(r for r in sp_res.json()["sessions_matrix"] if r["target_id"] == "40000")
+            grp_row = next(r for r in sp_res.json()["sessions"] if r["target_id"] == "40000")
             assert grp_row["effective_privacy"] == "high"
             assert grp_row["effective_decision_tier"] == "paid"
-            assert grp_row["effective_hydrogen_provider"] == "vertex"
+            assert (
+                "credentials" not in sp_res.json() and "override_hydrogen_provider" not in grp_row
+            )
 
             # 4. PUT /admin/api/providers without group_privacy keeps per-session override
             put_res = await client.put(
@@ -841,7 +849,7 @@ async def test_provider_admin_endpoints_crud_session_policy_and_secret_masking(s
 
             del_res = await client.delete("/admin/api/providers")
             assert del_res.status_code == 200
-            assert del_res.json()["source"] == "env"
+            assert del_res.json()["config"]["group_privacy"] == {"onebot:40000": "high"}
             assert del_res.json()["config"]["decision_context_tokens"] == 2500
 
             # 6. Validation errors (bad SA JSON, unknown key) and missing auth rejected cleanly
@@ -942,3 +950,37 @@ async def test_vertex_multimodal_max_tokens_downgrade_and_by_provider_ledger(
             [dec_client, chat_client, free_client, free_unused, *v_clients],
             g_transports + f_transports + v_transports,
         )
+
+
+async def test_qq_privacy_controls_are_independent_of_provider_controls(admin_api):
+    app, client, _ = admin_api
+    routing = app.state.service.store.runtime.provider_routing
+    path = "/admin/api/qq/privacy"
+    original = (await client.get(path)).json()
+    assert set(original) == {"defaults", "sessions"}
+    high = {"default_group_privacy": "high", "default_private_privacy": "low"}
+    assert (await client.put(path, json=high)).json()["defaults"] == high
+    one = {"kind": "group", "platform": "onebot", "target_id": "40000", "privacy": "low"}
+    assert (await client.post(path, json=one)).is_success
+    assert (await client.post(path, json={**one, "hydrogen_provider": "vertex"})).status_code == 400
+    # Existing consoles may have cached the retired selector; it never changes the global route.
+    old = await client.post(
+        "/admin/api/providers/session-policy", json={**one, "hydrogen_provider": "vertex"}
+    )
+    assert old.is_success
+    group_row = next(r for r in old.json()["sessions_matrix"] if r["key"] == "onebot:40000")
+    assert group_row["effective_hydrogen_provider"] == routing.hydrogen_provider_for()
+    await client.put("/admin/api/providers", json={"vertex_enabled": True})
+    await client.delete("/admin/api/providers")
+    saved = (await client.get(path)).json()
+    assert saved["defaults"] == high
+    assert next(r for r in saved["sessions"] if r["is_owner"])["effective_privacy"] == "high"
+    assert (
+        next(r for r in saved["sessions"] if r["key"] == "onebot:40000")["effective_privacy"]
+        == "low"
+    )
+    cleared = (await client.post(path, json={**one, "privacy": "default"})).json()
+    assert (
+        next(r for r in cleared["sessions"] if r["key"] == "onebot:40000")["effective_privacy"]
+        == "high"
+    )

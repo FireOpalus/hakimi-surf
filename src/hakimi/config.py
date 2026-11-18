@@ -237,6 +237,7 @@ class Settings(BaseSettings):
         default="23:00-08:00",
         validation_alias=AliasChoices("REST_HOURS", "HAKIMI_REST_HOURS"),
     )
+    day_rest_enabled: bool = Field(default=True, validation_alias="DAY_REST_ENABLED")
     rest_allow_owner_private: bool = Field(
         default=False,
         validation_alias=AliasChoices(

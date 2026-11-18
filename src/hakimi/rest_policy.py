@@ -16,6 +16,7 @@ class RestHoursConfig(BaseModel):
     enabled: StrictBool = True
     rest_hours: str = "23:00-08:00"
     allow_owner_private: StrictBool = False
+    day_rest_enabled: StrictBool = True
 
     @field_validator("rest_hours")
     @classmethod
@@ -31,6 +32,7 @@ class RestHoursConfig(BaseModel):
             enabled=settings.rest_hours_enabled,
             rest_hours=settings.rest_hours,
             allow_owner_private=settings.rest_allow_owner_private,
+            day_rest_enabled=settings.day_rest_enabled,
         )
 
     def active(self, local: datetime) -> bool:

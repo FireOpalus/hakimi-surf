@@ -5,12 +5,13 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from .proactive_policy import hours_bounds, within_hours
+from .proactive_policy import hours_bounds
 
 MC_TASKS = frozenset({"goto", "explore", "mine", "gather", "follow"})
 NEWS_TTL = 48 * 3600
 SOCIAL_LOW = 30
-HOURLY_RATES = {"rest": (6, -2), "idle": (0.5, 4), "mc_work": (-12, -4)}
+HOURLY_RATES = {"sleep": (15, -2), "day_rest": (10, -2), "idle": (0, 4), "mc_work": (-8, -4)}
+MAX_DAY_REST_MINUTES = 90
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS world_rhythm (
@@ -19,6 +20,10 @@ CREATE TABLE IF NOT EXISTS world_rhythm (
  mc_until REAL DEFAULT 0, mc_seen REAL DEFAULT 0, mood_until REAL DEFAULT 0,
  bili_until REAL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS world_day_rest (
+ id INTEGER PRIMARY KEY CHECK(id=1), started REAL NOT NULL, ends REAL NOT NULL, source TEXT NOT NULL
+);
+INSERT OR IGNORE INTO world_day_rest VALUES (1,0,0,'');
 CREATE TABLE IF NOT EXISTS world_changes (
  receipt TEXT PRIMARY KEY, at REAL NOT NULL, reason TEXT NOT NULL, energy_before INTEGER,
  energy_after INTEGER, boredom_before INTEGER, boredom_after INTEGER,
@@ -58,7 +63,6 @@ class WorldExperience:
         self.store = world.store
         self.s = world.settings
         self.ready = False
-        self.schedule = lambda: ("09:00-01:00", self.s.quiet_hours)
         self.zone = ZoneInfo(self.s.bot_timezone)
 
     async def initialize_tx(self, now):
@@ -81,35 +85,25 @@ class WorldExperience:
 
         elif not self.ready:
             # A fresh process needs fresh positive evidence to resume a live task.
+            await self.advance_tx(now)
             row = await self._values()
             if row["mc_task"]:
                 await self._release_mc_tx()
             if row["bili_until"]:
                 await self.finish_read_tx()
 
-    def _windows(self):
-        active, quiet = self.schedule()
+    def periods(self, start, end, row):
+        """Split actual elapsed time at sleep, nap and confirmed work boundaries."""
         rest = self.store.runtime.rest_hours
-        return hours_bounds(active), [
-            hours_bounds(spec)
-            for spec in (quiet, rest.rest_hours if rest.enabled else None)
-            if spec
-        ]
-
-    def _rest(self, t, windows):
-        local = datetime.fromtimestamp(t, self.zone)
-        minute = local.hour * 60 + local.minute
-        active, quiet = windows
-        return not within_hours(minute, active) or any(within_hours(minute, b) for b in quiet)
-
-    def periods(self, start, end, mc_until, bili_until):
-        """Split wall-clock time at local schedule boundaries and the last confirmed MC lease."""
-        windows = self._windows()
         cuts = {start, end}
-        cuts.update(t for t in (mc_until, bili_until) if start < t < end)
+        cuts.update(
+            row[key]
+            for key in ("mc_until", "bili_until", "started", "ends")
+            if start < row[key] < end
+        )
         day = datetime.fromtimestamp(start, self.zone).date()
         last = datetime.fromtimestamp(end, self.zone).date()
-        minutes = set(windows[0]).union(*windows[1])
+        minutes = hours_bounds(rest.rest_hours) if rest.enabled else ()
         while day <= last:
             midnight = datetime.combine(day, time.min, self.zone)
             for m in minutes:
@@ -121,19 +115,22 @@ class WorldExperience:
         for left, right in zip(points, points[1:], strict=False):
             kind = (
                 "mc_work"
-                if left < mc_until
+                if left < row["mc_until"]
                 else "bili_read"
-                if left < bili_until
-                else "rest"
-                if self._rest(left, windows)
+                if left < row["bili_until"]
+                else "sleep"
+                if rest.active(datetime.fromtimestamp(left, self.zone))
+                else "day_rest"
+                if rest.day_rest_enabled and row["started"] <= left < row["ends"]
                 else "idle"
             )
             yield kind, left, right
 
     async def _values(self):
         return await self.store.one(
-            "SELECT r.*,w.energy,w.boredom FROM world_rhythm r CROSS JOIN "
-            "world_state w WHERE r.id=1"
+            "SELECT r.*,w.energy,w.boredom,w.focus_level,w.mood,d.started,d.ends,d.source "
+            "FROM world_rhythm r JOIN world_state w ON w.singleton=r.id "
+            "JOIN world_day_rest d ON d.id=r.id WHERE r.id=1"
         )
 
     async def _change_tx(
@@ -142,7 +139,13 @@ class WorldExperience:
         row = await self._values()
         energy = bounded(row["energy"] + row["energy_fraction"] + energy_delta)
         boredom = bounded(row["boredom"] + row["boredom_fraction"] + boredom_delta)
-        next_energy, next_boredom = round(energy), round(boredom)
+        # Earn or spend complete points; retain fractional work across ticks and restarts.
+        whole = int(energy_delta)
+        fraction = row["energy_fraction"] + (energy_delta - whole)
+        next_energy = (
+            int(energy) if energy in (0, 100) else row["energy"] + whole + int(round(fraction, 9))
+        )
+        next_boredom = round(boredom)
         if receipt or (next_energy, next_boredom) != (row["energy"], row["boredom"]):
             inserted = await self.store.db.execute(
                 "INSERT OR IGNORE INTO world_changes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -181,7 +184,7 @@ class WorldExperience:
         start = row["settled"]
         if now < start:
             return
-        for reason, left, right in self.periods(start, now, row["mc_until"], row["bili_until"]):
+        for reason, left, right in self.periods(start, now, row):
             seconds = right - left
             if reason == "bili_read":
                 continue  # Debit reading time only on a confirmed learning receipt.
@@ -192,8 +195,12 @@ class WorldExperience:
         await self.store.db.execute("UPDATE world_rhythm SET settled=? WHERE id=1", (now,))
         if row["mc_task"] and now >= row["mc_until"]:
             await self._release_mc_tx()
-        if row["mood_until"] <= now:
-            mood = "sleeping" if self._rest(now, self._windows()) else "calm"
+        sleep = self.store.runtime.is_resting(now)
+        napping = (
+            self.store.runtime.rest_hours.day_rest_enabled and row["started"] <= now < row["ends"]
+        )
+        if sleep or napping or row["mood_until"] <= now or row["mood"] in {"sleeping", "resting"}:
+            mood = "sleeping" if sleep else "resting" if napping else "calm"
             await self.store.db.execute(
                 "UPDATE world_state SET mood=? WHERE singleton=1 AND "
                 "current_module='idle' AND mood!=?",
@@ -207,12 +214,53 @@ class WorldExperience:
             await self.advance_tx(now)
         await self.world.refresh()
 
+    async def _can_rest_tx(self, row, now):
+        if (
+            now < row["settled"]
+            or (row["source"] and now < row["ends"] + 1800)
+            or row["mc_until"] > now
+            or row["bili_until"] > now
+            or row["focus_level"] == "HIGH"
+            or not self.store.runtime.rest_hours.day_rest_enabled
+            or self.store.runtime.is_resting(now)
+        ):
+            return False
+        return not await self.store.one(
+            "SELECT 1 FROM scheduled_intents WHERE status='executing' AND expire_at>? LIMIT 1",
+            (now,),
+        )
+
+    async def start_day_rest_tx(self, now, until, source):
+        """The caller owns the transaction and has bounded the nap to the active window."""
+        await self.advance_tx(now)
+        row = await self._values()
+        if (
+            until - now < 360
+            or (source == "low_energy" and not row["tired"])
+            or not await self._can_rest_tx(row, now)
+        ):
+            return False
+        await self.store.db.execute(
+            "UPDATE world_day_rest SET started=?,ends=?,source=? WHERE id=1", (now, until, source)
+        )
+        await self.store.db.execute(
+            "UPDATE world_state SET mood='resting' WHERE singleton=1 AND current_module='idle'"
+        )
+        return True
+
+    async def end_day_rest_tx(self, now):
+        await self.store.db.execute(
+            "UPDATE world_day_rest SET ends=? WHERE id=1 AND started<=? AND ends>?", (now, now, now)
+        )
+
     async def finish_read_tx(self):
         await self.store.db.execute("UPDATE world_rhythm SET bili_until=0 WHERE id=1")
 
     async def bili_reading(self, active, now):
         async with self.store.transaction():
             await self.advance_tx(now)
+            if active:
+                await self.end_day_rest_tx(now)
             await self.store.db.execute(
                 "UPDATE world_rhythm SET bili_until=? WHERE id=1", (now + 3600 if active else 0,)
             )
@@ -237,6 +285,7 @@ class WorldExperience:
                 return
             await self.advance_tx(now)
             if task in MC_TASKS and observed + 40 > now and not disconnected:
+                await self.end_day_rest_tx(now)
                 await self.store.db.execute(
                     "UPDATE world_rhythm SET mc_task=?,mc_until=? WHERE id=1", (task, observed + 40)
                 )
@@ -267,7 +316,7 @@ class WorldExperience:
             "event:" + event.id,
             now,
             reason,
-            -2 - seconds / 600 if video else -1,
+            -2 - seconds / 300 if video else -1,
             -7 - seconds / 600 if video else -6,
             seconds=seconds,
         ):
@@ -344,7 +393,7 @@ class WorldExperience:
             "qq:" + reply,
             now,
             "qq_delivered",
-            0,
+            -1,
             -2,
             social=(label, round(charge), round(bounded(charge - 12))),
         ):
@@ -432,6 +481,7 @@ class WorldExperience:
     async def preferences(self, now):
         async with self.store.lock:
             row = await self._values()
+            can_rest = await self._can_rest_tx(row, now)
             count = (
                 await self.store.one(
                     "SELECT COUNT(*) FROM world_news WHERE audience='' AND "
@@ -440,6 +490,7 @@ class WorldExperience:
                 )
             )[0]
         return {
+            "day_rest_available": can_rest,
             "low_energy": bool(row["tired"]),
             "exploration_preferred": not row["tired"] and row["boredom"] >= 65,
             "public_unshared_count": count,
@@ -451,7 +502,8 @@ class WorldExperience:
         async with self.store.transaction():
             # Keep confirmed activity once by its durable source ID. Time samples are disposable.
             await self.store.db.execute(
-                "DELETE FROM world_changes WHERE reason IN ('rest','idle','mc_work') AND at<?",
+                "DELETE FROM world_changes WHERE reason IN "
+                "('rest','sleep','day_rest','idle','mc_work') AND at<?",
                 (now - 14 * 86400,),
             )
             await self.store.db.execute("DELETE FROM world_social WHERE at<?", (now - 30 * 86400,))
@@ -501,10 +553,14 @@ class WorldExperience:
                 if row["bili_until"] > now
                 else "bili_patrol"
                 if working
-                else "rest"
-                if self._rest(now, self._windows())
+                else "sleep"
+                if self.store.runtime.is_resting(now)
+                else "day_rest"
+                if row["started"] <= now < row["ends"]
                 else "idle",
                 "mc_task": mc,
+                "day_rest_until": row["ends"] if row["started"] <= now < row["ends"] else None,
+                "day_rest_source": row["source"] if row["started"] <= now < row["ends"] else None,
                 "last": dict(last) if last else None,
             },
             "low_energy": bool(row["tired"]),

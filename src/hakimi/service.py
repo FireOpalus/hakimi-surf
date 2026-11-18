@@ -2454,7 +2454,7 @@ class Service:
         if (
             self.modules.inactive_reason("bilibili_surf")
             or not self.s.bilibili_enabled
-            or (not force and self.store.runtime.is_resting())
+            or (not force and self.store.runtime.rest_kind() != "awake")
         ):
             return
         for sub in await self.store.subscriptions():

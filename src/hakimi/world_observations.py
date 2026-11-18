@@ -41,7 +41,7 @@ def _plan(row):
     }
     budget_closed = "planner_budget_closed" in r["reasons"]
     cost["missing"] = not cost["calls"] and not (
-        r["source"] in {"disabled", "sleeping", "local_idle"} or budget_closed
+        r["source"] in {"disabled", "sleeping", "day_rest", "local_idle"} or budget_closed
     )
     if not cost["calls"] and not cost["missing"]:
         cost["estimated_microdollars"] = 0

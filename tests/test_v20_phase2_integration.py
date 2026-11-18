@@ -274,7 +274,7 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
             )
             plans = await svc.store.all(
                 "SELECT id FROM life_plan_runs WHERE outcome IN "
-                "('accepted','all_filtered','model_chose_rest','local_rest')"
+                "('accepted','all_filtered','model_chose_idle','local_idle','day_rest')"
             )
             # High milestones can now wake an automatic plan independently of the
             # manual one. Each actual plan and each milestone has exactly one diary row.

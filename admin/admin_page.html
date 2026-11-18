@@ -1249,14 +1249,14 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <div class="nav-group-label">运行管理</div>
         <button id="nav-overview" type="button" role="tab" data-tab="overview" data-description="查看本日调用、预算和消息处理状态。" aria-controls="overview" aria-selected="true" tabindex="0"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg><span>运行概览</span></button>
         <button id="nav-ledger" type="button" role="tab" data-tab="ledger" data-description="查看调用明细、账户余额及 GCP 赠金对账。" aria-controls="ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span>账本与预算</span></button>
-        <button id="nav-life" type="button" role="tab" data-tab="life" data-description="管理跨节点动作、意图队列和执行回执。" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
+        <button id="nav-life" type="button" role="tab" data-tab="life" data-description="管理作息、精力、跨节点动作和执行回执。" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
         <button id="nav-logs" type="button" role="tab" data-tab="logs" data-description="查看最近的脱敏拦截记录与系统告警。" aria-controls="logs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span>安全日志</span></button>
       </div>
       <div class="nav-group" role="presentation">
         <div class="nav-group-label">模型与对话</div>
-        <button id="nav-api-routing" type="button" role="tab" data-tab="api-routing" data-description="管理凭据、隐私分级和会话路由。" aria-controls="api-routing" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z M9 12h6 M12 9v6"/></svg><span>API 与隐私路由</span></button>
+        <button id="nav-api-routing" type="button" role="tab" data-tab="api-routing" data-description="管理模型凭据、安全审核和全局模型通道。" aria-controls="api-routing" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z M9 12h6 M12 9v6"/></svg><span>全局模型通道</span></button>
         <button id="nav-thinking" type="button" role="tab" data-tab="thinking" data-description="设置各场景的思考强度与输出上限。" aria-controls="thinking" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6 M10 21h4 M8 14a6 6 0 1 1 8 0l-1 2H9z"/></svg><span>模型与思考</span></button>
-        <button id="nav-reply-settings" type="button" role="tab" data-tab="reply-settings" data-description="调整作息、防抖、请求限流和联网检索。" aria-controls="reply-settings" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span>回复与联网</span></button>
+        <button id="nav-reply-settings" type="button" role="tab" data-tab="reply-settings" data-description="调整防抖、请求限流和联网检索。" aria-controls="reply-settings" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span>回复与联网</span></button>
         <button id="nav-filter" type="button" role="tab" data-tab="filter" data-description="调整 Decisions 阈值，核对消息判定和投递结果。" aria-controls="filter" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6z M8 12l3 3 5-6"/></svg><span>网关与审计</span></button>
         <button id="nav-sandbox" type="button" role="tab" data-tab="sandbox" data-description="用模拟身份测试门卫判定与回复。" aria-controls="sandbox" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6 M10 3v7L4 20h16l-6-10V3 M7 15h10"/></svg><span>沙盒测试</span></button>
       </div>
@@ -1274,7 +1274,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div class="nav-group-label module-nav-caption" role="presentation">模块工作区</div>
       <div class="nav-group" role="presentation" data-module="qq_social">
         <div class="nav-group-label">QQ</div>
-        <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接，管理群聊互动、社区和 Owner 私信。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
+        <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接，管理会话隐私、群聊互动、社区和 Owner 私信。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
         <button id="nav-group-policy" type="button" data-subpage hidden role="tab" data-tab="group-policy" data-description="设置白名单群的互动方式、外部 Bot 回复阈值与冷却。" aria-controls="group-policy" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18 M3 12h18 M3 18h18 M8 3v6 M16 9v6 M8 15v6"/></svg><span>群聊互动策略</span></button>
         <button id="nav-admission" type="button" data-subpage hidden role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
         <button id="nav-community" type="button" data-subpage hidden role="tab" data-tab="community" data-description="管理好感度、小黑屋和心情个签。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
@@ -1336,7 +1336,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <div><dt>处理中</dt><dd id="pipeline-state">—</dd></div>
         <div><dt>图片缓存</dt><dd id="image-cache">—</dd></div>
       </dl>
-      <div class="row between rest-row"><span id="rest-overview-badge" class="badge">作息读取中</span><button id="toggle-rest-quick" type="button" class="secondary" hidden>切换休息</button></div>
+      <div class="row between rest-row"><span id="rest-overview-badge" class="badge">作息读取中</span><button data-open-tab="life" type="button" class="secondary">管理作息</button></div>
     </article>
     <article class="card">
       <h2>费用分布</h2><dl id="lane-stats" class="lanes"></dl>
@@ -1345,7 +1345,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </article>
     <article class="card"><h2>常用设置</h2>
       <div class="quick-actions">
-        <button type="button" class="quick-action" data-open-tab="reply-settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span><strong>回复与联网</strong><small>调整作息、防抖和检索</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="reply-settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span><strong>回复与联网</strong><small>调整防抖和检索</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
         <button type="button" class="quick-action" data-open-tab="memory"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span><strong>会话与记忆</strong><small>查看隔离会话和滚动摘要</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
         <button type="button" class="quick-action" data-open-tab="logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span><strong>安全日志</strong><small>排查拦截和服务告警</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
       </div>
@@ -1355,7 +1355,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <div class="row between">
       <h2>路由策略与统一余额概览</h2>
       <div class="row">
-        <button id="overview-go-routing" type="button" class="secondary">API 与隐私路由</button>
+        <button id="overview-go-routing" type="button" class="secondary">全局模型通道</button>
         <button id="overview-go-ledger" type="button" class="secondary">账本与统一余额</button>
       </div>
     </div>
@@ -1386,6 +1386,24 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <button type="button" class="secondary" data-open-tab="memes">表情包 <span aria-hidden="true">→</span></button>
       <button type="button" class="secondary" data-open-tab="proactive">主动私信 <span aria-hidden="true">→</span></button>
     </div>
+  </div>
+  <div class="card" id="qq-privacy-card">
+    <h2>群聊与私聊隐私</h2>
+    <p class="muted">高隐私使用付费安全审核。低隐私可使用已配置的免费审核。所有会话的主模型通道跟随全局。Owner 私聊默认使用高隐私。</p>
+    <form id="qq-privacy-defaults" class="quick-bar">
+      <label>群聊默认等级<select id="prov-default-group-privacy"><option value="low">低隐私</option><option value="high">高隐私</option></select></label>
+      <label>普通私聊默认等级<select id="prov-default-private-privacy"><option value="high">高隐私</option><option value="low">低隐私</option></select></label>
+      <button id="qq-privacy-default-save" disabled>保存默认等级</button>
+    </form>
+    <div id="prov-sessions-table" class="table"></div>
+    <details><summary>为其他会话指定隐私等级</summary>
+      <form id="prov-custom-session-form" class="quick-bar">
+        <label>会话类型<select id="prov-custom-kind"><option value="group">群聊</option><option value="private">私聊</option></select></label>
+        <label>群号或用户 ID<input id="prov-custom-id" maxlength="131" placeholder="QQ 号码或 qq:OpenID" required></label>
+        <label>隐私等级<select id="prov-custom-privacy"><option value="default">跟随默认</option><option value="high">高隐私</option><option value="low">低隐私</option></select></label>
+        <button id="prov-add-session-policy" disabled>保存等级</button>
+      </form>
+    </details>
   </div>
   <div class="card"><h2>模块动作</h2>
     <div id="qq-actions" class="module-tools"></div>
@@ -1573,11 +1591,11 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       </div>
     </form>
     <details>
-      <summary>GCP Service Account 凭据状态与独立覆盖（默认共享「API 与隐私路由」已存 JSON）</summary>
+      <summary>GCP Service Account 凭据状态与独立覆盖（默认共享「全局模型通道」已存 JSON）</summary>
       <p id="gcp-sa-status" class="muted"></p>
       <form id="gcp-sa-form">
         <label for="gcp-sa-file">从本地 .json 文件加载 Service Account 密钥<input id="gcp-sa-file" type="file" accept=".json,application/json"></label>
-        <label for="gcp-sa-json">独立 Service Account JSON（留空则继续共享「API 与隐私路由」凭据）<textarea id="gcp-sa-json" maxlength="65536" placeholder='粘贴 Service Account JSON（包含 "type": "service_account"）...'></textarea></label>
+        <label for="gcp-sa-json">独立 Service Account JSON（留空则继续共享「全局模型通道」凭据）<textarea id="gcp-sa-json" maxlength="65536" placeholder='粘贴 Service Account JSON（包含 "type": "service_account"）...'></textarea></label>
         <div class="row">
           <button id="gcp-save-sa" type="submit">加密保存独立 Service Account</button>
           <button id="gcp-clear-sa" type="button" class="danger">清除独立覆盖（回退共享凭据）</button>
@@ -1671,25 +1689,13 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   </div>
 
   <div class="card">
-    <h2>Decisions 隐私分级策略 &amp; Vertex AI (Hydrogen) 全局开关</h2>
-    <p class="muted">按会话隐私级别路由 Decisions 门卫（low 默认走 Free Tier、high 走 Paid Tier，Owner 私聊默认高隐私受保护），并配置 Hydrogen 主脑是否启用 Vertex AI 通道以消耗 GCP 赠金。</p>
+    <h2>全局模型通道</h2>
+    <p class="muted">在这里设置安全审核和 Hydrogen 主模型通道。<button type="button" class="secondary" data-open-tab="qq">打开 QQ 会话隐私</button></p>
     <p id="prov-policy-source" class="muted"></p>
     <form id="prov-policy-form">
       <fieldset class="panel-group">
-        <legend>Decisions 隐私分级与上下文预算</legend>
+        <legend>Decisions 上下文预算与回退</legend>
         <div class="grid">
-          <label for="prov-default-group-privacy">群聊默认隐私等级（default_group_privacy）
-            <select id="prov-default-group-privacy">
-              <option value="low">low · 低隐私（默认走 Free Tier 门卫）</option>
-              <option value="high">high · 高隐私（走 Paid Tier 门卫）</option>
-            </select>
-          </label>
-          <label for="prov-default-private-privacy">私聊默认隐私等级（default_private_privacy）
-            <select id="prov-default-private-privacy">
-              <option value="high">high · 高隐私（走 Paid Tier 门卫）</option>
-              <option value="low">low · 低隐私（普通私聊走 Free Tier 门卫）</option>
-            </select>
-          </label>
           <label for="prov-decision-tokens">Decisions 上下文 Token 上限（600–4200，默认 2500）<input id="prov-decision-tokens" type="number" min="600" max="4200" step="50" required></label>
         </div>
         <label><input id="prov-free-fallback" type="checkbox"> Free Tier 门卫遇到 429 限流 / 超时 / 5xx 时自动回退至 Paid Tier（且不触发全局熔断）</label>
@@ -1726,53 +1732,9 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </form>
   </div>
 
-  <div class="card">
-    <h2>全量群聊 &amp; 私聊隐私与模型路由矩阵</h2>
-    <p class="muted">集中查看所有已纳入管理的群聊、白名单私聊与 Owner 私聊当前生效的 Decisions 门卫通道及 Hydrogen 主脑路由，支持行内逐会话覆盖或手动新增自定义会话策略。</p>
-    <form id="prov-custom-session-form" class="quick-bar">
-      <label for="prov-custom-kind">会话类型
-        <select id="prov-custom-kind">
-          <option value="group">群聊 (group)</option>
-          <option value="private">私聊 (private)</option>
-        </select>
-      </label>
-      <label for="prov-custom-platform">平台
-        <select id="prov-custom-platform">
-          <option value="onebot">onebot (QQ)</option>
-          <option value="qq">qq (官方)</option>
-        </select>
-      </label>
-      <label for="prov-custom-id">群号 / 用户 ID<input id="prov-custom-id" type="text" maxlength="128" placeholder="输入目标群号 / QQ 号 / OpenID" required></label>
-      <label for="prov-custom-privacy">隐私覆盖
-        <select id="prov-custom-privacy">
-          <option value="default">default · 跟随默认</option>
-          <option value="high">high · 强制高隐私 (Paid)</option>
-          <option value="low">low · 强制低隐私 (Free)</option>
-        </select>
-      </label>
-      <label for="prov-custom-hydrogen">Hydrogen 覆盖
-        <select id="prov-custom-hydrogen">
-          <option value="default">default · 跟随全局</option>
-          <option value="gemini">gemini · Gemini API</option>
-          <option value="vertex">vertex · Vertex AI</option>
-        </select>
-      </label>
-      <button id="prov-add-session-policy" type="submit">保存自定义会话策略</button>
-    </form>
-    <div id="prov-sessions-table" class="table"></div>
-  </div>
 </section>
 
 <section id="reply-settings" class="tab" role="tabpanel" aria-labelledby="nav-reply-settings" hidden>
-  <div class="card"><div class="row between"><h2>每日休息时间</h2><button id="refresh-rest-hours" type="button" class="secondary">刷新作息</button></div>
-    <p class="muted">按 Bot 时区控制每日休息时段（默认 23:00–08:00）。启用并处于休息时段时，只保留群聊被动上下文并停止 AI 生成、B 站巡逻与主动陪伴消息；撤回通知仍正常处理，热开关与时间修改立即生效（进行中的生成不会中断）。</p>
-    <p id="rest-hours-status" class="muted"></p>
-    <form id="rest-hours-form">
-      <div class="row"><label><input id="rest-enabled" type="checkbox"> 启用每日休息时间</label><label><input id="rest-owner-private" type="checkbox"> 休息时仍响应主人私聊</label></div>
-      <div class="grid"><label>开始休息（HH:MM）<input id="rest-start" type="time" required></label><label>结束休息（HH:MM，早于开始表示跨夜）<input id="rest-end" type="time" required></label></div>
-      <div class="row"><button id="save-rest-hours" disabled>保存并立即生效</button><button id="reset-rest-hours" type="button" class="secondary" disabled>恢复 .env 初始值</button></div>
-    </form>
-  </div>
   <div class="card"><div class="row between"><h2>回复防抖时间</h2><button id="refresh-reply-settings" class="secondary">刷新配置</button></div>
     <p class="muted">单位为秒，范围 0–30。消息连续到达时重新计时，但不超过最长等待；当前已开始生成的回复不受影响。普通群聊等待或最长等待设为 0 时，全场景关闭合并等待。命令仍即时处理。</p>
     <p id="debounce-source" class="muted"></p>
@@ -2030,12 +1992,21 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <p id="world-evening-coverage"></p><div id="world-evenings" class="table"></div>
     </details>
   </div>
+  <div class="card"><div class="row between"><h2>睡眠与白天小憩</h2><button id="refresh-rest-hours" type="button" class="secondary">刷新作息</button></div>
+    <p class="muted">定时睡眠每 4 分钟恢复 1 点精力。活跃时段可自主小憩，每 6 分钟恢复 1 点。精力低于 30 时会主动休息，单次最长 90 分钟，临近日报时提前醒来。</p>
+    <p id="rest-hours-status" class="muted"></p>
+    <form id="rest-hours-form">
+      <div class="row"><label><input id="rest-enabled" type="checkbox"> 启用定时睡眠</label><label><input id="rest-day-enabled" type="checkbox"> 允许白天自主小憩</label><label><input id="rest-owner-private" type="checkbox"> 休息时仍响应主人私聊</label></div>
+      <div class="grid"><label>入睡时间<input id="rest-start" type="time" required></label><label>起床时间<input id="rest-end" type="time" required></label></div>
+      <div class="row"><button id="save-rest-hours" disabled>保存并立即生效</button><button id="reset-rest-hours" type="button" class="secondary" disabled>恢复 .env 初始值</button></div>
+    </form>
+  </div>
   <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
     <div id="life-stats" class="stats"></div>
     <h3>最近的状态变化</h3><div id="life-changes" class="table"></div>
     <details><summary>精力与无聊度怎样结算</summary>
-      <p class="muted">每小时休息恢复 6 点精力、减少 2 点无聊。清醒空闲每小时恢复 0.5 点精力、增加 4 点无聊。执行 MC 任务每小时消耗 12 点精力、减少 4 点无聊。</p>
-      <p class="muted">完成一次视频学习消耗 2 点精力、减少 7 点无聊，每实际学习 10 分钟再各减 1 点。完成 MC 任务或发现稀有资源时精力减 1、无聊减 6。QQ 回复确认送达后，无聊减 2。数值在 0 至 100 之间，界面显示四舍五入后的整数。</p>
+      <p class="muted">定时睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。清醒空闲时精力持平。MC 任务每小时消耗 8 点精力。</p>
+      <p class="muted">完成视频学习消耗 2 点精力，每学习 5 分钟再扣 1 点。QQ 每轮确认送达、MC 完成任务或发现稀有资源各扣 1 点。精力范围为 0 至 100，零头跨轮累计。</p>
     </details>
     <details><summary>各会话社交电量与待分享见闻</summary>
       <p class="muted">每轮确认送达消耗 12 点社交电量，间隔 5 分钟恢复 1 点。各会话独立结算。</p>
@@ -2286,8 +2257,6 @@ function logout(){
   $('overview-day').removeAttribute('datetime');
   $('budget').value=0;
   $('lane-stats').replaceChildren();
-  restState=null;
-  providersState=null;
   gcpBillingState=null;
   accountBalanceState=null;
   affectionState=null;
@@ -2295,14 +2264,12 @@ function logout(){
   text('life-node-status','');
   text('life-mc-status','');
   text('rest-overview-badge','作息读取中');
-  $('toggle-rest-quick').hidden=true;
-  $('toggle-rest-quick').disabled=true;
   $('overview-routing-gcp').hidden=true;
   $('overview-routing-pills').replaceChildren();
   $('overview-gcp-strip').replaceChildren();
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
-  for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
+  for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
   $('world-observation-card').hidden=true;
   ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-changes','life-batteries','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
@@ -2324,20 +2291,18 @@ function logout(){
 }
 
 function dateTime(t){return t?new Date(t*1000).toLocaleString('zh-CN',{timeZone:displayZone,hour12:false}):'—';}
-let restState=null;
 function renderRestHours(r){
   if(!r||!r.config)return;
-  restState=r;const c=r.config;
-  const mode=!c.enabled?'休息已暂停':(r.resting_now?'正在休息中':'作息运行中');
-  text('rest-overview-badge',mode+' · '+c.rest_hours);
-  $('toggle-rest-quick').textContent=c.enabled?'关闭休息':'开启休息';
-  $('toggle-rest-quick').hidden=false;$('toggle-rest-quick').disabled=false;
+  const c=r.config;
+  const mode=({sleep:'定时睡眠中',day_rest:'白天小憩中',awake:'清醒中'})[r.rest_kind]||'清醒中';
+  text('rest-overview-badge',mode+(c.enabled?' · '+c.rest_hours:' · 定时睡眠已关闭'));
   $('rest-enabled').checked=Boolean(c.enabled);
+  $('rest-day-enabled').checked=c.day_rest_enabled!==false;
   $('rest-owner-private').checked=Boolean(c.allow_owner_private);
   const parts=String(c.rest_hours||'23:00-08:00').split('-');
   $('rest-start').value=(parts[0]||'23:00').slice(0,5);
   $('rest-end').value=(parts[1]||'08:00').slice(0,5);
-  text('rest-hours-status',mode+' · 当前时间 '+r.local_time+'（'+zoneLabel(r.timezone)+'）· 主人私聊'+(c.allow_owner_private?'照常响应':'同步休息')+' · 来源 '+(r.source==='admin'?'后台 SQLite（重启保留）':'.env 初始值'));
+  text('rest-hours-status',mode+(r.day_rest_until?' · 预计 '+lifeFmt(r.day_rest_until,r.timezone)+' 醒来':'')+' · 当前时间 '+r.local_time+'（'+zoneLabel(r.timezone)+'）· 主人私聊'+(c.allow_owner_private?'照常响应':'同步休息')+' · 来源 '+(r.source==='admin'?'后台 SQLite（重启保留）':'.env 初始值'));
   for(const id of ['save-rest-hours','reset-rest-hours'])$(id).disabled=false;
 }
 
@@ -2505,7 +2470,6 @@ async function groups(){
   items.filter(g=>g.platform==='onebot').forEach(g=>{const o=el('option',g.group_id+' · '+g.mode);o.value=g.group_id;$('sim-group').append(o);});
 }
 
-let providersState=null;
 function providerBadge(key){
   if(key==='vertex'||key==='vertex_paid')return pill('Vertex AI','vertex');
   if(key==='gemini_free'||key==='free')return pill('Free Tier','free');
@@ -2524,7 +2488,6 @@ function privacyBadge(level){
 }
 function renderProviders(d){
   if(!d||!d.config)return;
-  providersState=d;
   const c=d.config,creds=d.credentials||{};
   $('prov-cred-pills').replaceChildren(
     creds.gemini_paid_configured?pill('Paid Gemini · 已配置 (.env)','paid'):pill('Paid Gemini · 未配置','err'),
@@ -2533,8 +2496,6 @@ function renderProviders(d){
     creds.gcp_service_account_configured?pill('GCP SA JSON · 已配置 ('+(creds.gcp_service_account_email||'已加密')+(creds.gcp_service_account_project?' · '+creds.gcp_service_account_project:'')+')','ok'):pill('GCP Service Account JSON · 未配置','muted')
   );
   text('prov-cred-status','凭据来源汇总：Free Key '+(creds.gemini_free_source||'none')+' · Vertex Key '+(creds.vertex_api_key_source||'none')+(creds.gcp_service_account_configured?' · SA 邮箱 '+(creds.gcp_service_account_email||'已隐藏')+'（项目 '+(creds.gcp_service_account_project||'未指定')+'）':' · 尚未上传 Service Account JSON'));
-  $('prov-default-group-privacy').value=c.default_group_privacy||'low';
-  $('prov-default-private-privacy').value=c.default_private_privacy||'high';
   $('prov-decision-tokens').value=c.decision_context_tokens??2500;
   $('prov-free-fallback').checked=c.free_tier_fallback_to_paid!==false;
   $('prov-vertex-enabled').checked=Boolean(c.vertex_enabled);
@@ -2544,35 +2505,42 @@ function renderProviders(d){
   $('prov-vertex-model').value=c.vertex_hydrogen_model||'gemini-4-hydrogen';
   $('prov-vertex-protocol').value=c.vertex_protocol||'auto';
   $('prov-vertex-fallback').checked=c.vertex_fallback_to_gemini!==false;
-  text('prov-policy-source','当前策略来源：'+(d.source==='admin'||d.source==='sqlite'?'后台 SQLite（重启保留）':'.env 初始值')+' · 群聊默认 '+c.default_group_privacy+' · 私聊默认 '+c.default_private_privacy+' · Vertex '+(c.vertex_enabled?'开启':'关闭'));
-  for(const id of ['prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy'])$(id).disabled=false;
+  text('prov-policy-source','当前策略来源：'+(d.source==='admin'||d.source==='sqlite'?'后台 SQLite（重启保留）':'.env 初始值')+' · Vertex '+(c.vertex_enabled?'开启':'关闭'));
+  for(const id of ['prov-save-creds','prov-save-policy','prov-reset-policy'])$(id).disabled=false;
 
-  const matrix=d.sessions_matrix||[];
-  table('prov-sessions-table',['会话类型','平台 / ID','生效 Decisions 门卫','生效 Hydrogen 通道','隐私覆盖','Hydrogen 覆盖','操作'],matrix.map(item=>{
-    const typeNode=item.is_owner?pill('Owner 私聊','paid'):item.kind==='private'?pill('私聊','muted'):pill('群聊','ok');
-    const idBox=el('div',undefined,'stack-xs');
-    idBox.append(el('span',item.key||(item.platform+':'+item.target_id),'code-mono'));
-    if(item.is_owner)idBox.append(el('small','主人特权默认高隐私保护'));
-    const decBox=el('div',undefined,'row');
-    decBox.append(decisionTierBadge(item.effective_decision_tier),privacyBadge(item.effective_privacy));
-    const hydBox=el('div',undefined,'row');
-    hydBox.append(providerBadge(item.effective_hydrogen_provider));
-    const pSel=el('select',undefined,'table-select');
-    pSel.setAttribute('aria-label',(item.key||item.target_id)+' 隐私覆盖');
-    for(const [val,lbl] of [['default','跟随默认'],['high','high · 高隐私 (Paid)'],['low','low · 低隐私 (Free)']]){const o=el('option',lbl);o.value=val;pSel.append(o);}
-    pSel.value=item.override_privacy||'default';
-    const hSel=el('select',undefined,'table-select');
-    hSel.setAttribute('aria-label',(item.key||item.target_id)+' Hydrogen 覆盖');
-    for(const [val,lbl] of [['default','跟随全局'],['gemini','Gemini API'],['vertex','Vertex AI']]){const o=el('option',lbl);o.value=val;hSel.append(o);}
-    hSel.value=item.override_hydrogen_provider||'default';
-    const saveBtn=button('保存',async()=>{
-      const next=await api('providers/session-policy','POST',{kind:item.kind,platform:item.platform,target_id:item.target_id,privacy:pSel.value,hydrogen_provider:hSel.value});
-      renderProviders(next);
-      notice('已更新 '+(item.key||item.target_id)+' 的隐私与模型路由');
-    },'');
-    return[typeNode,idBox,decBox,hydBox,pSel,hSel,saveBtn];
+}
+function renderQqPrivacy(data){
+  if(!token)return;
+  $('prov-default-group-privacy').value=data.defaults.default_group_privacy;
+  $('prov-default-private-privacy').value=data.defaults.default_private_privacy;
+  $('qq-privacy-default-save').disabled=$('prov-add-session-policy').disabled=false;
+  table('prov-sessions-table',['会话','群号或用户 ID','当前等级','隐私设置'],data.sessions.map(item=>{
+    const choice=el('select',undefined,'table-select');
+    choice.setAttribute('aria-label',(item.key||item.target_id)+' 隐私等级');
+    for(const [value,label] of [['default','跟随默认'],['high','高隐私'],['low','低隐私']]){
+      const opt=el('option',label);opt.value=value;choice.append(opt);
+    }
+    choice.value=item.override_privacy;
+    choice.addEventListener('change',()=>busy(choice,async()=>{
+      try {
+        renderQqPrivacy(await api('qq/privacy','POST',{kind:item.kind,platform:item.platform,target_id:item.target_id,privacy:choice.value}));
+        notice('会话隐私等级已保存');
+      } catch(error){choice.value=item.override_privacy;throw error;}
+    }));
+    return [item.is_owner?'Owner 私聊':item.kind==='group'?'群聊':'私聊',item.key,privacyBadge(item.effective_privacy),choice];
   }));
 }
+async function qqPrivacy(){renderQqPrivacy(await api('qq/privacy'));}
+$('qq-privacy-defaults').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('qq-privacy-default-save'),async()=>{
+    renderQqPrivacy(await api('qq/privacy','PUT',{
+      default_group_privacy:$('prov-default-group-privacy').value,
+      default_private_privacy:$('prov-default-private-privacy').value
+    }));
+    notice('QQ 默认隐私等级已保存');
+  });
+});
 async function providers(){
   const d=await api('providers');
   if(!token)return;
@@ -2611,8 +2579,6 @@ $('prov-policy-form').addEventListener('submit',e=>{
     const tokens=Number($('prov-decision-tokens').value);
     if(!Number.isInteger(tokens)||tokens<600||tokens>4200)throw Error('Decisions 上下文 Token 上限须为 600～4200 的整数');
     const payload={
-      default_group_privacy:$('prov-default-group-privacy').value,
-      default_private_privacy:$('prov-default-private-privacy').value,
       decision_context_tokens:tokens,
       free_tier_fallback_to_paid:$('prov-free-fallback').checked,
       vertex_enabled:$('prov-vertex-enabled').checked,
@@ -2625,11 +2591,11 @@ $('prov-policy-form').addEventListener('submit',e=>{
     };
     const next=await api('providers','PUT',payload);
     renderProviders(next);
-    notice('隐私分级策略与 Vertex AI 路由已保存并立即生效');
+    notice('全局模型通道已保存并立即生效');
   });
 });
 $('prov-reset-policy').addEventListener('click',e=>busy(e.target,async()=>{
-  if(!confirm('移除后台覆盖值，恢复 .env 默认隐私与 Vertex 路由策略？'))return;
+  if(!confirm('恢复 .env 中的全局模型通道设置？'))return;
   const next=await api('providers','DELETE');
   renderProviders(next);
   notice('已恢复 .env 默认路由策略');
@@ -2637,20 +2603,14 @@ $('prov-reset-policy').addEventListener('click',e=>busy(e.target,async()=>{
 $('prov-custom-session-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('prov-add-session-policy'),async()=>{
-    const kind=$('prov-custom-kind').value,platform=$('prov-custom-platform').value,tid=$('prov-custom-id').value.trim();
-    if(!tid)throw Error('请填写目标群号或用户 ID');
-    if(platform==='onebot'&&!/^[1-9][0-9]{0,19}$/.test(tid))throw Error('OneBot 群号 / QQ 号须为不含前导零的纯数字');
-    if(platform==='qq'&&!/^[A-Za-z0-9_-]{1,128}$/.test(tid))throw Error('QQ 官方 ID 仅支持字母、数字、下划线或短横线');
-    const next=await api('providers/session-policy','POST',{
-      kind,
-      platform,
-      target_id:tid,
-      privacy:$('prov-custom-privacy').value,
-      hydrogen_provider:$('prov-custom-hydrogen').value
-    });
+    const kind=$('prov-custom-kind').value,id=$('prov-custom-id').value.trim();
+    const official=id.startsWith('qq:'),target=official?id.slice(3):id;
+    if(official?!/^[A-Za-z0-9_-]{1,128}$/.test(target):!/^[1-9][0-9]{0,19}$/.test(target)){
+      throw Error('请填写 QQ 号码，官方机器人的会话写作 qq:OpenID');
+    }
+    renderQqPrivacy(await api('qq/privacy','POST',{kind,platform:official?'qq':'onebot',target_id:target,privacy:$('prov-custom-privacy').value}));
     $('prov-custom-id').value='';
-    renderProviders(next);
-    notice('会话路由策略已保存并生效');
+    notice('会话隐私等级已保存');
   });
 });
 
@@ -2689,8 +2649,8 @@ const debounceFields=[['group_debounce_seconds','普通群聊等待'],['mention_
 const rateLimitFields=[['user_requests_per_minute','单用户每分钟消息上限（1–100）',1,100,'1',true],['global_requests_per_minute','全局每分钟消息上限（1–1000）',1,1000,'1',true],['queue_capacity','待处理队列容量（1–10000）',1,10000,'1',true],['send_delay_min','发送最短延迟（0–5 秒）',0,5,'0.1',false],['send_delay_max','发送最长延迟（0–10 秒）',0,10,'0.1',false]];
 
 async function replySettings(){
-  const [d,w,rl,rh,il,ct]=await Promise.all([api('debounce'),api('web-search'),api('rate-limits'),api('rest-hours'),api('image-limits'),api('content-tools')]);if(!token)return;
-  renderRestHours(rh);
+  const [d,w,rl,il,ct]=await Promise.all([api('debounce'),api('web-search'),api('rate-limits'),api('image-limits'),api('content-tools')]);if(!token)return;
+
   $('debounce-fields').replaceChildren(...debounceFields.map(([key,label])=>{const f=el('label',label),n=el('input');n.id='debounce-'+key;n.type='number';n.min='0';n.max='30';n.step='0.1';n.required=true;n.value=d.config[key];f.append(n);return f;}));
   text('debounce-source','当前来源：'+(d.source==='sqlite'?'后台 SQLite（重启保留）':'.env 初始值'));
   $('rate-limits-fields').replaceChildren(...rateLimitFields.map(([key,label,min,max,step])=>{const f=el('label',label),n=el('input');n.id='rate-limit-'+key;n.type='number';n.min=String(min);n.max=String(max);n.step=step;n.required=true;n.value=rl.config[key];f.append(n);return f;}));
@@ -2710,15 +2670,19 @@ async function replySettings(){
   text('search-status',(w.config.enabled?'已开启':'已关闭')+' · 来源 '+w.source+' · 今日 '+w.today.attempts+'/'+w.config.daily_limit+' · 本月 Google '+(wm.google_queries??0)+'/'+(wm.google_limit??5000)+' 次 · 本月 DeepSeek '+(wm.deepseek_attempts??0)+' 次 · 当前引擎 '+(wm.active_provider==='deepseek'?'DeepSeek':'Google Search')+'（联网不计费）');
   $('deepseek-base-url').value=ds.base_url||'https://api.deepseek.com';$('deepseek-model').value=ds.model||'deepseek-flash';
   text('deepseek-status','API Key：'+(ds.api_key_configured?'已加密保存（隐藏 · 来源 '+ds.source+'）':'未配置')+' · 端点 '+ds.base_url+' · 备选模型 '+ds.model);
-  for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek'])$(id).disabled=false;
+  for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek'])$(id).disabled=false;
 }
-$('toggle-rest-quick').addEventListener('click',e=>busy(e.target,async()=>{if(!restState||!restState.config)return;const next=await api('rest-hours','PUT',{enabled:!restState.config.enabled,rest_hours:restState.config.rest_hours,allow_owner_private:restState.config.allow_owner_private});renderRestHours(next);notice(next.config.enabled?'每日休息时间已开启（'+next.config.rest_hours+'）':'每日休息时间已关闭，恢复正常互动');}));
-$('refresh-rest-hours').addEventListener('click',e=>busy(e.target,replySettings));
+async function restHours(){const data=await api('life/rest-hours');if(token)renderRestHours(data);}
+$('refresh-rest-hours').addEventListener('click',e=>busy(e.target,restHours));
+$('reset-rest-hours').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!confirm('恢复 .env 中的作息设置？'))return;
+  renderRestHours(await api('life/rest-hours','DELETE'));await life();
+}));
 $('refresh-reply-settings').addEventListener('click',e=>busy(e.target,replySettings));
 $('refresh-rate-limits').addEventListener('click',e=>busy(e.target,replySettings));
 $('refresh-image-limits').addEventListener('click',e=>busy(e.target,replySettings));
 $('refresh-content-tools').addEventListener('click',e=>busy(e.target,replySettings));
-$('rest-hours-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-rest-hours'),async()=>{const s=$('rest-start').value.slice(0,5),t=$('rest-end').value.slice(0,5);if(!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(s)||!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t))throw Error('请输入有效的 HH:MM 时间');if(s===t)throw Error('休息开始与结束时间不能相同');const next=await api('rest-hours','PUT',{enabled:$('rest-enabled').checked,rest_hours:s+'-'+t,allow_owner_private:$('rest-owner-private').checked});renderRestHours(next);notice('每日休息时间已保存并立即生效');});});
+$('rest-hours-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-rest-hours'),async()=>{const s=$('rest-start').value.slice(0,5),t=$('rest-end').value.slice(0,5);if(!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(s)||!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t))throw Error('请输入有效的 HH:MM 时间');if(s===t)throw Error('休息开始与结束时间不能相同');const next=await api('life/rest-hours','PUT',{day_rest_enabled:$('rest-day-enabled').checked,enabled:$('rest-enabled').checked,rest_hours:s+'-'+t,allow_owner_private:$('rest-owner-private').checked});renderRestHours(next);notice('作息已保存并立即生效');await life();});});
 $('debounce-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-debounce'),async()=>{const c={};for(const [key] of debounceFields)c[key]=Number($('debounce-'+key).value);await api('debounce','PUT',c);notice('防抖时间已热更新，未开始的等待批次已调整');await replySettings();});});
 $('rate-limits-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-rate-limits'),async()=>{const c={};for(const [key,label,min,max,_,isInt] of rateLimitFields){const v=Number($('rate-limit-'+key).value);if(!Number.isFinite(v)||v<min||v>max||(isInt&&!Number.isInteger(v)))throw Error(label+' 参数超出有效范围');c[key]=v;}if(c.send_delay_max<c.send_delay_min)throw Error('发送最长延迟不得小于最短延迟');await api('rate-limits','PUT',c);notice('请求限流与发送延迟已保存并立即生效');await replySettings();});});
 $('image-limits-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-image-limits'),async()=>{const mib=Number($('img-max-mib').value),mp=Number($('img-max-mp').value),std=Number($('img-std-edge').value),tall=Number($('img-tall-edge').value);if(!Number.isFinite(mib)||mib<1||mib>20)throw Error('原图大小上限须为 1–20 MiB');if(!Number.isFinite(mp)||mp<1||mp>80)throw Error('原图总像素上限须为 1–80 MP');if(!Number.isInteger(std)||std<512||std>2560)throw Error('常规图长边须为 512–2560 的整数');if(!Number.isInteger(tall)||tall<1024||tall>4096||tall<std)throw Error('长截图长边须为 1024–4096 的整数且不得小于常规图长边');const bytes=Math.min(20971520,Math.max(1048576,Math.round(mib*1048576))),pixels=Math.min(80000000,Math.max(65536,Math.round(mp*1000000)));await api('image-limits','PUT',{image_max_bytes:bytes,image_max_pixels:pixels,image_standard_max_edge:std,image_tall_max_edge:tall});notice('图片尺寸与压缩设置已保存并立即生效');await replySettings();});});
@@ -2726,7 +2690,7 @@ $('content-tools-form').addEventListener('submit',e=>{e.preventDefault();busy($(
 $('search-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-search'),async()=>{const daily=Number($('search-limit').value),monthly=Number($('search-monthly-limit').value);if(!Number.isInteger(daily)||daily<0||daily>500)throw Error('每日搜索上限须为 0–500 的整数');if(!Number.isInteger(monthly)||monthly<0||monthly>100000)throw Error('每月 Google 免费上限须为 0–100000 的整数');await api('web-search','PUT',{enabled:$('search-enabled').checked,daily_limit:daily,monthly_google_limit:monthly});notice('联网配置已保存并立即生效');await replySettings();});});
 $('deepseek-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-deepseek'),async()=>{await api('web-search/deepseek','POST',{api_key:$('deepseek-key').value.trim(),base_url:$('deepseek-base-url').value.trim(),model:$('deepseek-model').value.trim()});$('deepseek-key').value='';notice('DeepSeek 备用搜索配置已加密保存');await replySettings();});});
 $('clear-deepseek').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('清除已保存的 DeepSeek 密钥与端点覆盖？'))return;await api('web-search/deepseek','POST',{clear:true});$('deepseek-key').value='';notice('已清除 DeepSeek 后台密钥');await replySettings();}));
-for(const [id,path] of [['reset-rest-hours','rest-hours'],['reset-debounce','debounce'],['reset-rate-limits','rate-limits'],['reset-image-limits','image-limits'],['reset-content-tools','content-tools'],['reset-search','web-search']])$(id).addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('恢复本次启动读取的 .env 初始值？'))return;await api(path,'DELETE');notice('已恢复 .env 初始值');await replySettings();}));
+for(const [id,path] of [['reset-debounce','debounce'],['reset-rate-limits','rate-limits'],['reset-image-limits','image-limits'],['reset-content-tools','content-tools'],['reset-search','web-search']])$(id).addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('恢复本次启动读取的 .env 初始值？'))return;await api(path,'DELETE');notice('已恢复 .env 初始值');await replySettings();}));
 
 let gcpBillingState=null;
 function appendGrantRow(g){
@@ -2790,7 +2754,7 @@ function renderGcpBilling(d){
     exhausted?pill('赠金硬熔断已触发','err'):rescuedByManual?pill('赠金已耗尽（手动余额接管）','warn'):c.enforce_credit_hard_stop?pill('硬熔断保护开启','warn'):pill('仅监测不硬熔断','muted')
   );
   text('gcp-bq-status','配置来源：'+(d.source||'env')+' · 最近查询：'+dateTime(bq.last_sync_at||bq.synced_at)+(bq.full_table?' · 表 '+bq.full_table:'')+(bq.last_error?' · 最近错误：'+bq.last_error:''));
-  text('gcp-sa-status',creds.service_account_configured?('已配置（来源：'+(creds.service_account_source||'shared')+' · 邮箱：'+(creds.service_account_email||'已隐藏')+' · 项目：'+(creds.service_account_project||'未指定')+'）'):'尚未配置 Service Account JSON，可在「API 与隐私路由」或此处上传。');
+  text('gcp-sa-status',creds.service_account_configured?('已配置（来源：'+(creds.service_account_source||'shared')+' · 邮箱：'+(creds.service_account_email||'已隐藏')+' · 项目：'+(creds.service_account_project||'未指定')+'）'):'尚未配置 Service Account JSON，可在「全局模型通道」或此处上传。');
 
   const rtRem=bq.realtime_remaining_usd;
   $('gcp-kpi-strip').replaceChildren(
@@ -2904,7 +2868,7 @@ $('gcp-mon-form').addEventListener('submit',e=>{e.preventDefault();busy($('gcp-s
 $('gcp-reset-config').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('移除后台覆盖值，恢复 .env 默认 GCP Billing 与对账配置？'))return;const g=await api('gcp-billing','DELETE');await refreshUnifiedAfterGcp(g);notice('已恢复 .env 默认 GCP 账单配置');}));
 $('gcp-sa-file').addEventListener('change',e=>busy($('gcp-save-sa'),()=>loadJsonFileInto(e.target,$('gcp-sa-json'))));
 $('gcp-sa-form').addEventListener('submit',e=>{e.preventDefault();busy($('gcp-save-sa'),async()=>{const raw=$('gcp-sa-json').value.trim();if(!raw)throw Error('请先粘贴或导入 Service Account JSON');try{const parsed=JSON.parse(raw);if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw 0;}catch{throw Error('Service Account JSON 格式无效，请检查内容');}const g=await api('gcp-billing/credentials','POST',{gcp_service_account_json:raw,clear:false});$('gcp-sa-json').value='';$('gcp-sa-file').value='';renderGcpBilling(g);notice('独立 Service Account JSON 已加密保存');});});
-$('gcp-clear-sa').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('清除独立覆盖的 Service Account JSON，回退共享「API 与隐私路由」凭据？'))return;const g=await api('gcp-billing/credentials','POST',{gcp_service_account_json:'',clear:true});$('gcp-sa-json').value='';$('gcp-sa-file').value='';renderGcpBilling(g);notice('已清除独立 Service Account 覆盖');}));
+$('gcp-clear-sa').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('清除独立覆盖的 Service Account JSON，回退共享「全局模型通道」凭据？'))return;const g=await api('gcp-billing/credentials','POST',{gcp_service_account_json:'',clear:true});$('gcp-sa-json').value='';$('gcp-sa-file').value='';renderGcpBilling(g);notice('已清除独立 Service Account 覆盖');}));
 
 async function ledger(){
   const [dashRes,polRes,gcpRes,balRes]=await Promise.allSettled([api('dashboard'),api('budget'),api('gcp-billing'),api('account-balance')]);
@@ -3137,7 +3101,7 @@ function lifeSummaryJson(obj){
   return String(obj);
 }
 const planLabels={
-  accepted:'已采纳',all_filtered:'所有建议均被过滤',model_chose_rest:'模型决定休息',local_rest:'本地规划决定休息',
+  accepted:'已采纳',all_filtered:'所有建议均被过滤',day_rest:'白天小憩',day_rest_unavailable:'当前不适合小憩',model_chose_idle:'选择清醒空闲',model_chose_rest:'模型决定休息',local_rest:'本地规划决定休息',
   unchanged_state:'状态与可用动作未变，延后付费规划',no_available_actions:'当前没有可用动作',
   sleeping:'休眠时段',disabled:'引擎关闭',running:'规划进行中',prepared:'规划已保存，待登记动作',
   interrupted:'规划中断',local_idle:'本地延后',local_fallback:'本地规划',llm:'模型规划',pending:'处理中',
@@ -3188,13 +3152,13 @@ function renderLife(d){
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
   renderWorldObservation(d.observation,eng,tz);
   const exp=ws.experience||{},plan=exp.plan,actual=exp.actual||{};
-  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息中',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',qq_processing:'正在处理 QQ 消息',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
+  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',qq_processing:'正在处理 QQ 消息',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
   const name=k=>labels[k]||k||'—';
-  const restingPlan=plan&&['model_chose_rest','sleeping','local_rest','unchanged_state','no_available_actions'].includes(plan.outcome);
-  const planned=plan?(restingPlan?'本轮未安排动作':plan.plan_module?name(plan.plan_module)+' · '+(plan.accepted||0)+' 个动作':'本轮已结束'):'等待首次规划';
+  const restingPlan=plan&&['model_chose_rest','model_chose_idle','sleeping','local_rest','local_idle','unchanged_state','no_available_actions'].includes(plan.outcome);
+  const planned=plan?(plan.outcome==='day_rest'?'白天小憩':restingPlan?'本轮未安排动作':plan.plan_module?name(plan.plan_module)+' · '+(plan.accepted||0)+' 个动作':'本轮已结束'):'等待首次规划';
   const stats=[
     ['本时段计划',planned],
-    ['实际活动',name(actual.state)+(actual.mc_task?' · '+name(actual.mc_task):'')],
+    ['实际活动',name(actual.state)+(actual.day_rest_until?' · '+(actual.day_rest_source==='low_energy'?'精力偏低':'自主选择')+' · '+lifeFmt(actual.day_rest_until,tz)+' 醒来':'')+(actual.mc_task?' · '+name(actual.mc_task):'')],
     ['最近确认完成',actual.last?name(actual.last.reason)+' · '+lifeFmt(actual.last.at,tz):'等待活动回执'],
     ['心情 / 精力 / 无聊',name(ws.mood)+' · '+(ws.energy??80)+' / '+(ws.boredom??20)],
     ['最近会话的社交电量',exp.social?.length?exp.social[0].label+' · '+exp.social[0].charge+' / 100':'等待首次回复'],
@@ -3276,9 +3240,9 @@ function renderLife(d){
   ]));
 }
 async function life(){
-  const d=await api('life/overview');
+  const [d,rest]=await Promise.all([api('life/overview'),api('life/rest-hours')]);
   if(!token)return;
-  renderLife(d);
+  renderRestHours(rest);renderLife(d);
 }
 $('refresh-life').addEventListener('click',e=>busy(e.target,life));
 $('life-world-form').addEventListener('submit',e=>{
@@ -3980,7 +3944,7 @@ async function moduleDirectory(){
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  modules:moduleDirectory, qq:()=>loadModule('qq_social'), bili:()=>loadModule('bilibili_surf'),
+  modules:moduleDirectory, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
   weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{

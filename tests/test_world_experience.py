@@ -4,6 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from hakimi.planning_journal import PlannerJournal
+from hakimi.rest_policy import RestHoursConfig
 from hakimi.world_experience import NEWS_TTL
 from hakimi.world_state import SCHEMA, WorldStateManager, private_event_audience
 from tests.test_social_integration import group
@@ -17,6 +18,7 @@ def stamp(hour, minute=0):
 
 async def test_migration_elapsed_rest_and_restart(settings, store):
     now = stamp(23)
+    await store.runtime.set_rest_hours(RestHoursConfig(rest_hours="23:30-08:30"))
     async with store.lock:
         await store.db.executescript(SCHEMA)
         await store.db.execute(
@@ -28,17 +30,17 @@ async def test_migration_elapsed_rest_and_restart(settings, store):
     assert world.current.current_module == "idle"
     initial = world.current.energy, world.current.boredom
     assert initial == (52, 48)
-    # Half an hour awake, then two hours in quiet time across midnight.
+    # Half an hour awake, then two hours of scheduled sleep across midnight.
     end = now + 9000
     await world.experience.advance(now + 1800)
     await world.experience.advance(now + 2700)
     restarted = WorldStateManager(settings, store, clock=lambda: end)
     await restarted.initialize()
     await asyncio.gather(*(restarted.experience.advance(end) for _ in range(4)))
-    assert (restarted.current.energy, restarted.current.boredom) == (64, 46)
+    assert (restarted.current.energy, restarted.current.boredom) == (82, 46)
     assert restarted.current.mood == "sleeping"
     rows = await store.all("SELECT reason,energy_after-energy_before AS d FROM world_changes")
-    assert sum(r["d"] for r in rows if r["reason"] == "rest") == 12
+    assert sum(r["d"] for r in rows if r["reason"] == "sleep") == 30
     assert sum(r["reason"] == "baseline" for r in rows) == 1
 
 
@@ -63,7 +65,7 @@ async def test_confirmed_activity_lease_and_history(settings, store):
     await asyncio.gather(*(world.publish_event(*args, business_key="v1") for _ in range(2)))
     await x.bili_reading(False, now)
     view = await x.view(now)
-    assert (world.current.energy, world.current.boredom) == (77, 12)
+    assert (world.current.energy, world.current.boredom) == (76, 12)
     assert view["actual"]["last"]["reason"] == "video_learned" and view["news_count"] == 1
     assert view["plan"] is None
     await x.mc_snapshot("mine", now)
