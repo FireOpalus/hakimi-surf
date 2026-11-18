@@ -40,3 +40,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.isort]
+# The four Git checkouts contribute to the same first-party Python namespace.
+known-first-party = ["hakimi"]
