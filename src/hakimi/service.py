@@ -187,9 +187,8 @@ class Service:
         adapter = MinecraftNodeAdapter(minecraft, lambda: self.node_transport, self.background)
         minecraft.remote_dispatcher = adapter.dispatch
         self.modules.register(minecraft)
-        self.modules.register(
-            WeatherModule(settings, getattr(sender, "http", None), self.world_state)
-        )
+        self.weather = WeatherModule(settings, getattr(sender, "http", None), self.world_state)
+        self.modules.register(self.weather)
         self.longnick.module_enabled = lambda: not self.modules.inactive_reason("qq_social")
         self.bili_watcher.module_enabled = lambda: not self.modules.inactive_reason("bilibili_surf")
         if isinstance(bili, Bilibili):

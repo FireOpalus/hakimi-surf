@@ -22,6 +22,12 @@ from . import world_observations
 from .admin_routes import body, onebot_connection, service
 from .life_engine import LifeEngineConfig
 from .modules.actions import ActionCall, HourlyAction, Mode, reject_reason
+from .modules.weather_location import (
+    LocationLookupUnavailable,
+    WeatherLocation,
+    find_cities,
+    locate_server,
+)
 
 router = APIRouter(prefix="/admin/api/life")
 
@@ -468,6 +474,8 @@ async def module_detail(request: Request, module_id: str):
         }
     elif module_id == "minecraft":
         status = _collect_mc_agent_status(svc)
+    elif module_id == "weather":
+        status = {"location": module.location_status()}
     return {
         "id": module_id,
         "enabled": module.enabled,
@@ -496,6 +504,39 @@ async def module_detail(request: Request, module_id: str):
 class ModuleSwitch(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool
+
+
+class WeatherCityQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    query: str = Field(min_length=2, max_length=80)
+
+
+@router.post("/modules/weather/location/cities")
+async def weather_cities(request: Request):
+    query = await body(request, WeatherCityQuery)
+    try:
+        return {"places": await find_cities(service(request).weather.http, query.query)}
+    except LocationLookupUnavailable:
+        raise HTTPException(503, "weather_city_lookup_unavailable") from None
+
+
+@router.post("/modules/weather/location/detect")
+async def weather_detect_location(request: Request):
+    try:
+        return await locate_server(service(request).weather.http)
+    except LocationLookupUnavailable:
+        raise HTTPException(503, "weather_ip_lookup_unavailable") from None
+
+
+@router.put("/modules/weather/location")
+@router.delete("/modules/weather/location")
+async def weather_set_location(request: Request):
+    svc = service(request)
+    place = await body(request, WeatherLocation) if request.method == "PUT" else None
+    async with request.app.state.admin_config_lock:
+        await svc.weather.set_location(place)
+        svc.life_engine.wakeup.set()
+        return await module_detail(request, "weather")
 
 
 @router.put("/modules/{module_id}/enabled")

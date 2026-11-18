@@ -16,6 +16,7 @@ from hakimi.life_engine import LifeEngine
 from hakimi.modules.actions import Action, ActionCall, ActionCatalog, NoArgs, Outcome
 from hakimi.modules.base import BaseModule, ModuleRegistry
 from hakimi.modules.weather import WeatherModule
+from hakimi.modules.weather_location import WeatherLocation
 from hakimi.rest_policy import RestHoursConfig
 from hakimi.security import Rejected
 from hakimi.service import Service
@@ -266,6 +267,62 @@ async def test_weather_publishes_without_qq_or_greenhouse(settings, store):
     assert len(requests) == 1 and [event.event_type for event in seen] == ["weather_observed"]
     assert not await world.unconsumed_events()
     assert not await world.list_due_intents(now=NOW)
+
+
+async def test_changing_weather_location_discards_old_cache_and_inflight_result(settings, store):
+    settings.weather_enabled = True
+    settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
+    world = WorldStateManager(settings, store, ModuleRegistry())
+    await world.initialize()
+    started, resume = asyncio.Event(), asyncio.Event()
+    readings = []
+
+    async def provider(request):
+        latitude = float(request.url.params["latitude"])
+        readings.append(latitude)
+        if len(readings) == 2:
+            started.set()
+            await resume.wait()
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": int(NOW),
+                    "interval": 900,
+                    "temperature_2m": latitude,
+                    "weather_code": 2,
+                }
+            },
+        )
+
+    call = ActionCall({}, NoArgs(), NOW)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        weather = WeatherModule(settings, client, world)
+        assert (await weather.read(call)).reason == "observation_recorded"
+        await weather.set_location(WeatherLocation(latitude=12, longitude=15))
+        assert "等待首次" in await weather.get_sensor_summary()
+        assert (await weather.daily_report(call)).reason == "awaiting_weather_sample"
+        pending = asyncio.create_task(weather.read(call))
+        await asyncio.wait_for(started.wait(), 2)
+        try:
+            await weather.set_location(WeatherLocation(latitude=0, longitude=0))
+        finally:
+            resume.set()
+        assert (await pending).reason == "weather_location_changed"
+        assert (await weather.read(call)).reason == "observation_recorded"
+        assert (await weather.read(call)).reason == "observation_cached"
+        assert (await weather.daily_report(call)).reason == "weather_report_ready"
+        last = await world.latest_event("weather", "weather_report_due")
+        assert last.payload == {
+            "time": int(NOW),
+            "interval": 900,
+            "temperature_2m": 0,
+            "weather_code": 2,
+        }
+        restarted = WeatherModule(settings, client, world)
+        await restarted.load_location()
+        assert (await restarted.read(call)).reason == "observation_cached"
+        assert readings == [31.23, 12, 0]
 
 
 @pytest.mark.parametrize("notify_owner", [False, True])

@@ -127,6 +127,7 @@ def create_app(
                     await service.bili_watcher.initialize()
                     await service.video_watch.initialize()
                     await service.memes.initialize()
+                    await service.weather.load_location()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
                     await service.proactive.initialize()

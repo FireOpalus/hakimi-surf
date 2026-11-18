@@ -844,9 +844,11 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
   background: var(--card); color: var(--ink); border: 1px solid var(--line);
   border-radius: 16px; padding: 22px; box-shadow: var(--shadow); text-align: left;
 }
-.module-card header, .module-shortcuts { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-.module-card header { justify-content: space-between; }
-.module-card h3 { margin: 18px 0 3px; font-size: 22px; line-height: 1.3; }
+.module-shortcuts { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.module-name-row { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.module-name-row .module-switch { flex: none; white-space: nowrap; }
+.module-card .module-name-row { margin: 12px 0 3px; gap: 9px; }
+.module-card h3 { margin: 0; font-size: 22px; line-height: 1.3; }
 .module-card p { color: var(--muted); font-size: 13px; margin: 0 0 22px; }
 .module-card .module-foot {
   margin: auto 0 0; border-top: 1px solid var(--line); padding-top: 12px;
@@ -867,15 +869,27 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
 .module-switch input:checked + .track::after { transform: translateX(15px); background: var(--panel, #191724); }
 .module-switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 3px; }
 .module-switch:has(input:disabled) { opacity: .65; cursor: progress; }
-.module-detail-state { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.module-detail-state h2 { margin: 0; }
-.module-card .module-state-note, .module-detail-state p { font-size: 12px; margin: 3px 0; color: var(--muted); }
+.module-card .module-state-note { font-size: 12px; margin: 3px 0; color: var(--muted); }
 .module-card .module-foot { flex-wrap: wrap; }
 @media (prefers-reduced-motion: reduce) { .module-switch .track::after { transition: none; } }
 .module-card .module-region { font-size: 12px; color: var(--muted); }
 .module-card:has(details[open]) { grid-column: 1 / -1; }
 .module-card summary { cursor: pointer; font-weight: 650; color: var(--accent); padding: 7px 0; }
 .module-tools > button { margin-top: 12px; }
+.weather-editor, .weather-methods { border: 0; padding: 0; margin: 0; min-width: 0; }
+.weather-editor { max-width: 38rem; }
+.weather-methods { display: flex; flex-wrap: wrap; gap: 4px; margin: 16px 0; }
+.weather-methods legend { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.weather-methods label { position: relative; display: inline-flex; margin: 0; cursor: pointer; }
+.weather-methods label input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.weather-methods label span { padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.weather-methods input:checked + span { border-color: var(--accent); background: var(--soft); color: var(--accent); }
+.weather-methods input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+.weather-editor .row > input { flex: 1 1 10em; min-width: 0; }
+.weather-editor .grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.weather-editor .row:last-child { margin-top: 14px; }
+#weather-current { color: var(--ink); }
+#weather-preview { color: var(--accent); font-size: 13px; }
 .module-shortcuts { margin: 12px 0 0; }
 .module-shortcuts button { font-size: 13px; }
 .module-shortcuts button span { margin-left: 4px; color: var(--accent); }
@@ -1275,7 +1289,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       </div>
       <div class="nav-group" role="presentation" data-module="weather">
         <div class="nav-group-label">天气</div>
-        <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="查看每小时气象观测和每日提醒的排程。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
+        <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="设置观测地点，查看每小时天气采样和每日提醒排程。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
       </div>
       <div class="nav-group" role="presentation" data-module="minecraft">
         <div class="nav-group-label">游戏</div>
@@ -1289,7 +1303,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <div class="page-heading">
       <div>
         <div id="page-kicker" class="eyebrow">主控台 / 运行管理</div>
-        <h1 id="page-title" tabindex="-1">运行概览</h1>
+        <div class="module-name-row"><h1 id="page-title" tabindex="-1">运行概览</h1><span id="module-heading-switch" hidden></span></div>
         <p id="page-description" hidden></p><time id="overview-day"></time>
       </div>
       <button type="button" class="secondary" id="refresh-module" hidden>刷新模块状态</button>
@@ -1357,7 +1371,6 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="qq" class="tab" role="tabpanel" aria-labelledby="nav-qq" hidden>
-  <div id="qq-module-state" class="card module-detail-state"></div>
   <div class="card"><h2>OneBot 连接</h2>
     <span class="connection-state"><span id="connection-dot" class="status-dot" aria-hidden="true"></span><span id="connection-label">等待连接状态</span></span>
     <dl id="ws-details" class="node-details">
@@ -1393,7 +1406,6 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="bili" class="tab" role="tabpanel" aria-labelledby="nav-bili" hidden>
-  <div id="bili-module-state" class="card module-detail-state"></div>
   <div class="card"><h2>巡逻设置</h2>
     <dl class="node-details"><div><dt>执行节点</dt><dd id="bili-module-backend">—</dd></div><div><dt>小号自主巡逻</dt><dd id="bili-module-autonomous">—</dd></div></dl>
     <div class="module-shortcuts">
@@ -1414,12 +1426,37 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="weather" class="tab" role="tabpanel" aria-labelledby="nav-weather" hidden>
-  <div id="weather-module-state" class="card module-detail-state"></div>
+  <div class="card"><h2>观测地点</h2>
+    <p id="weather-current" aria-live="polite">正在读取地点…</p>
+    <fieldset id="weather-editor" class="weather-editor" aria-label="设置观测地点" disabled>
+      <fieldset id="weather-methods" class="weather-methods"><legend>设置方式</legend>
+        <label><input type="radio" name="weather-method" value="city" checked><span>搜索城市</span></label>
+        <label><input type="radio" name="weather-method" value="coordinates"><span>输入经纬度</span></label>
+        <label><input type="radio" name="weather-method" value="server_ip"><span>IP 自动定位</span></label>
+      </fieldset>
+      <div id="weather-mode-city">
+        <form id="weather-city-form">
+          <label for="weather-query">城市名</label>
+          <div class="row"><input id="weather-query" type="search" minlength="2" maxlength="80" placeholder="例如 上海、首尔" required><button type="submit" class="secondary">查找城市</button></div>
+        </form>
+        <label id="weather-results" hidden>匹配地点<select id="weather-city-select"></select></label>
+      </div>
+      <div id="weather-mode-coordinates" class="grid" hidden>
+        <label>纬度<input id="weather-lat" type="number" min="-90" max="90" step="any" placeholder="−90 至 90" required></label>
+        <label>经度<input id="weather-lon" type="number" min="-180" max="180" step="any" placeholder="−180 至 180" required></label>
+      </div>
+      <div id="weather-mode-server_ip" hidden>
+        <p class="muted">通过天气服务所在服务器的出口 IP 估算城市。若要查看你所在城市的天气，请使用城市搜索。</p>
+        <button id="weather-detect" type="button" class="secondary">识别服务器地点</button>
+      </div>
+      <p id="weather-preview" role="status"></p>
+      <div class="row"><button id="weather-save" type="button" disabled>保存地点</button><button id="weather-reset" type="button" class="secondary" hidden>恢复环境默认</button></div>
+    </fieldset>
+  </div>
   <div class="card"><h2>天气观测与提醒</h2><div id="weather-actions" class="module-tools"></div></div>
 </section>
 
 <section id="minecraft" class="tab" role="tabpanel" aria-labelledby="nav-minecraft" hidden>
-  <div id="minecraft-module-state" class="card module-detail-state"></div>
   <div class="card"><h2>Minecraft 控制</h2>
     <dl id="mc-overview" class="node-details"></dl>
     <p id="life-mc-status" class="muted"></p>
@@ -2209,7 +2246,7 @@ async function api(path,method='GET',data){
   if(signal.aborted)throw new DOMException('请求已取消','AbortError');
   if(!r.ok){
     if(r.status===401||r.status===403)logout();
-    const hints={module_disabled:'模块已关闭，可在模块详情中开启。',weather_location_missing:'请先配置天气地点的经纬度。',module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
+    const hints={module_disabled:'模块已关闭，可在模块详情中开启。',weather_location_missing:'请先保存观测地点。',weather_city_lookup_unavailable:'城市查询暂时不可用，可重试或输入经纬度。',weather_ip_lookup_unavailable:'暂时无法识别服务器地点，可重试或搜索城市。',module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
     throw Error(hints[value.detail]||value.detail||('HTTP '+r.status));
   }
   return value;
@@ -3563,9 +3600,92 @@ const moduleDescriptions=new Map([
   ['qq_social','OneBot 连接、群聊管理与主动私信'],
   ['bilibili_surf','账号、视频订阅与巡逻日记'],
   ['minecraft','游戏连接、活动目标与建造计划'],
-  ['weather','天气观测与定时动作']
+  ['weather','观测地点、每小时天气与每日提醒']
 ]);
 const regionName=code=>({CN:'境内节点',KR:'境外节点'})[code]||code;
+const weatherLocationPath='life/modules/weather/location';
+const weatherSources={environment:'环境默认',coordinates:'手动经纬度',city:'城市搜索',server_ip:'服务器 IP'};
+let weatherCandidate=null,weatherPlaces=[],weatherLookupVersion=0,weatherSaving=false;
+function formatWeatherPlace(place){
+  const coordinates=[place.latitude,place.longitude].map(n=>Number(n.toFixed(5))).join(', ');
+  return place.label?place.label+'（'+coordinates+'）':coordinates;
+}
+function showWeatherLocation(place){
+  text('weather-current',place?'当前地点 · '+formatWeatherPlace(place)+' · '+weatherSources[place.source]:'尚未设置观测地点');
+  $('weather-reset').hidden=!place||place.source==='environment';
+  $('weather-editor').disabled=weatherSaving;
+}
+function setWeatherCandidate(place,message=''){
+  weatherCandidate=place;
+  $('weather-save').disabled=!place;
+  text('weather-preview',place?'待保存 · '+formatWeatherPlace(place):message);
+}
+function clearWeatherLookup(){
+  weatherLookupVersion++;
+  weatherPlaces=[];
+  $('weather-city-select').replaceChildren();
+  $('weather-results').hidden=true;
+  setWeatherCandidate(null);
+}
+function previewCoordinates(){
+  const lat=$('weather-lat'),lon=$('weather-lon');
+  const valid=lat.validity.valid&&lon.validity.valid;
+  setWeatherCandidate(valid?{source:'coordinates',latitude:lat.valueAsNumber,longitude:lon.valueAsNumber}:null,
+    lat.value||lon.value?'纬度范围为 −90 至 90，经度范围为 −180 至 180。':'');
+}
+function changeWeatherMethod(){
+  clearWeatherLookup();
+  const method=$('weather-methods').querySelector('input:checked').value;
+  for(const name of ['city','coordinates','server_ip'])$('weather-mode-'+name).hidden=name!==method;
+  if(method==='coordinates')previewCoordinates();
+}
+function resetWeatherEditor(){
+  for(const id of ['weather-query','weather-lat','weather-lon'])$(id).value='';
+  $('weather-methods').querySelector('[value=city]').checked=true;
+  changeWeatherMethod();
+}
+async function lookupWeather(method){
+  clearWeatherLookup();
+  const version=weatherLookupVersion,city=method==='city';
+  const query=$('weather-query').value.trim();
+  if(city&&query.length<2){setWeatherCandidate(null,'请输入至少两个字符。');return;}
+  setWeatherCandidate(null,city?'正在查找城市…':'正在识别服务器地点…');
+  try{
+    const result=await api(weatherLocationPath+(city?'/cities':'/detect'),'POST',city?{query}:undefined);
+    if(version!==weatherLookupVersion)return;
+    if(!city){setWeatherCandidate(result);return;}
+    weatherPlaces=result.places;
+    if(!weatherPlaces.length){setWeatherCandidate(null,'没有找到该城市，可换个名称或输入经纬度。');return;}
+    const select=$('weather-city-select');
+    select.add(new Option('请选择地点',''));
+    weatherPlaces.forEach((p,i)=>select.add(new Option(formatWeatherPlace(p),String(i))));
+    $('weather-results').hidden=false;
+    if(weatherPlaces.length===1){select.value='0';setWeatherCandidate(weatherPlaces[0]);}
+    else{setWeatherCandidate(null,'找到 '+weatherPlaces.length+' 个地点，请按地区选择。');select.focus();}
+  }catch(error){
+    if(error.name!=='AbortError'&&version===weatherLookupVersion)setWeatherCandidate(null,error.message);
+  }
+}
+async function persistWeatherPlace(reset){
+  if(weatherSaving||(!reset&&!weatherCandidate))return;
+  if(reset&&!confirm('恢复环境变量中的默认地点？若未配置经纬度，天气采样将等待设置地点。'))return;
+  weatherSaving=true;$('weather-editor').disabled=true;
+  try{
+    const result=await api(weatherLocationPath,reset?'DELETE':'PUT',reset?undefined:weatherCandidate);
+    resetWeatherEditor();
+    applyModuleDetail(result);
+    notice(reset?'已恢复环境默认地点':'地点已保存，下次采样将使用此地点');
+  }catch(error){if(error.name!=='AbortError')notice(error.message,true);}
+  finally{weatherSaving=false;if(token)$('weather-editor').disabled=false;}
+}
+$('weather-methods').addEventListener('change',changeWeatherMethod);
+$('weather-city-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,()=>lookupWeather('city'));});
+$('weather-query').addEventListener('input',clearWeatherLookup);
+$('weather-city-select').addEventListener('change',e=>setWeatherCandidate(weatherPlaces[e.target.value]||null));
+$('weather-detect').addEventListener('click',e=>busy(e.currentTarget,()=>lookupWeather('server_ip')));
+for(const id of ['weather-lat','weather-lon'])$(id).addEventListener('input',previewCoordinates);
+$('weather-save').addEventListener('click',()=>persistWeatherPlace(false));
+$('weather-reset').addEventListener('click',()=>persistWeatherPlace(true));
 const mcControls=['life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
 function renderMinecraft(mc){
   const fields=[
@@ -3660,7 +3780,7 @@ function moduleSchedulePanel(d){
 const switchingModules=new Set();
 const moduleTitle=id=>modulePage.has(id)?sections.get(modulePage.get(id)).title:id;
 function moduleIssue(d){
-  return d.configuration_issue==='weather_location_missing'?'待配置地点 · 在 .env 填写天气经纬度':d.configuration_issue||'';
+  return d.configuration_issue==='weather_location_missing'?'尚未设置观测地点':d.configuration_issue||'';
 }
 function syncModuleSwitches(id,enabled){
   for(const input of document.querySelectorAll('input[data-module-switch]')){
@@ -3711,7 +3831,6 @@ function renderModuleTools(container,d){
   read.disabled=!d.enabled||!!d.configuration_issue;
   const state=el('p',regionName(d.region)+' · '+(!d.enabled?'模块已关闭':moduleIssue(d)||(d.proactive_paused?'主动动作已暂停':'允许调度主动动作')),'muted');
   container.replaceChildren(state,moduleSchedulePanel(d),actions,read,summary);
-  if(!modulePage.has(d.id))container.prepend(moduleSwitch(d));
   renderModuleActions(actions,d.actions);
 }
 async function loadModule(id){
@@ -3732,11 +3851,11 @@ async function loadModule(id){
 function applyModuleDetail(d){
   const id=d.id,key=modulePage.get(id);
   if(key){
-    const banner=$(key+'-module-state'),label=el('div');
-    label.append(el('h2','模块开关'));
-    if(moduleIssue(d))label.append(el('p',moduleIssue(d)));
-    if(!banner.querySelector('input'))banner.replaceChildren(label,moduleSwitch(d));
-    else banner.replaceChild(label,banner.firstElementChild);
+    if(key===tab){
+      const slot=$('module-heading-switch');
+      if(slot.querySelector('input')?.dataset.moduleSwitch!==id)slot.replaceChildren(moduleSwitch(d));
+      slot.hidden=false;
+    }
     renderModuleTools($(key+'-actions'),d);
   }else{
     for(const target of document.querySelectorAll('[data-module-tools]')){
@@ -3745,6 +3864,7 @@ function applyModuleDetail(d){
   }
   syncModuleSwitches(id,d.enabled);
   if(id==='qq_social')updateConnection(d.status);
+  if(id==='weather')showWeatherLocation(d.status.location);
   if(id==='bilibili_surf'){
     text('bili-module-backend',d.status.cn_delegate?'境内专线':d.status.backend==='remote_node'?'境内代理模式':'境外本机');
     text('bili-module-autonomous',d.status.autonomous?'已开启':'已关闭');
@@ -3758,12 +3878,12 @@ function applyModuleDetail(d){
 function moduleCard(m){
   const key=modulePage.get(m.id),title=moduleTitle(m.id);
   const card=el('article',undefined,'module-card');card.dataset.moduleId=m.id;
-  const header=el('header'),glyph=el('span',undefined,'module-icon');
+  const heading=el('div',undefined,'module-name-row'),glyph=el('span',undefined,'module-icon');
   glyph.append($('nav-'+(key||'modules')).querySelector('svg').cloneNode(true));
-  header.append(glyph,moduleSwitch(m));
+  heading.append(el('h3',title),moduleSwitch(m));
   const foot=el('div',undefined,'module-foot');
   foot.append(el('small',regionName(m.region)+' · '+m.action_count+' 项动作'));
-  card.append(header,el('h3',title),el('p',moduleDescriptions.get(m.id)||m.id),foot);
+  card.append(glyph,heading,el('p',moduleDescriptions.get(m.id)||m.id),foot);
   if(moduleIssue(m))foot.before(el('p',moduleIssue(m),'module-state-note'));
   if(key){
     const open=el('button','打开模块 →','module-open');open.type='button';
@@ -3849,7 +3969,12 @@ const sections=new Map(tabButtons.map(button=>[button.dataset.tab,{
 function resetWorkspaces(){
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
-  for(const id of ['module-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview',...Array.from(modulePage.values(),key=>key+'-module-state')])$(id).replaceChildren();
+  for(const id of ['module-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch'])$(id).replaceChildren();
+  $('module-heading-switch').hidden=true;
+  resetWeatherEditor();
+  $('weather-editor').disabled=true;
+  $('weather-reset').hidden=true;
+  text('weather-current','正在读取地点…');
   for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=false;
   for(const id of ['bili-module-backend','bili-module-autonomous'])text(id,'—');
 }
@@ -3871,6 +3996,10 @@ function selectTab(key){
     $(id).hidden=!active;button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
   }
   text('page-title',section.title);
+  const headingSwitch=$('module-heading-switch');
+  if(modulePage.get(headingSwitch.querySelector('input')?.dataset.moduleSwitch)!==key){
+    headingSwitch.replaceChildren();headingSwitch.hidden=true;
+  }
   text('page-kicker',workspaceNames[workspace]+' / '+section.group);
   if(section.module){
     const crumb=(label,key)=>{

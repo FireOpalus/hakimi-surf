@@ -88,6 +88,10 @@ LIFE_ROUTES = [
     ("PUT", "/admin/api/life/modules/qq_social/enabled"),
     ("PUT", "/admin/api/life/modules/qq_social/schedule"),
     ("DELETE", "/admin/api/life/modules/qq_social/schedule"),
+    ("POST", "/admin/api/life/modules/weather/location/cities"),
+    ("POST", "/admin/api/life/modules/weather/location/detect"),
+    ("PUT", "/admin/api/life/modules/weather/location"),
+    ("DELETE", "/admin/api/life/modules/weather/location"),
     ("PUT", "/admin/api/life"),
     ("DELETE", "/admin/api/life"),
     ("DELETE", "/admin/api/life/schedule"),
@@ -150,6 +154,102 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
     assert not gateway.calls
 
 
+async def test_admin_weather_location_previews_and_upstream_failure(life_api):
+    app, client, gateway = life_api
+    root = "/admin/api/life/modules/weather"
+    place = {"latitude": 37.56, "longitude": 126.98}
+    calls = []
+
+    def provider(request):
+        calls.append(request.url.host)
+        assert request.url.scheme == "https"
+        assert all(h not in request.headers for h in ("Authorization", "Cookie", "X-Forwarded-For"))
+        if request.url.host == "geocoding-api.open-meteo.com":
+            assert request.url.path == "/v1/search"
+            assert request.url.params["name"] == "首尔" and request.url.params["language"] == "zh"
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {**place, "name": "首尔", "admin1": "首尔", "country": "韩国"},
+                        {**place, "name": "另一个地点", "latitude": 200},
+                    ]
+                },
+            )
+        assert request.url.host == "ipwho.is" and request.url.path == "/"
+        if len(calls) == 2:
+            return httpx.Response(
+                200,
+                json={
+                    **place,
+                    "city": "Seoul",
+                    "country": "South Korea",
+                    "success": True,
+                    "ip": "192.0.2.7",
+                },
+            )
+        return httpx.Response(429)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as upstream:
+        app.state.service.weather.http = upstream
+        res = await client.post(root + "/location/cities", json={"query": " 首尔 "})
+        assert res.json() == {"places": [{**place, "label": "首尔 · 韩国", "source": "city"}]}
+        res = await client.post(root + "/location/detect", headers={"X-Forwarded-For": "192.0.2.9"})
+        candidate = {**place, "label": "Seoul · South Korea", "source": "server_ip"}
+        assert res.json() == candidate
+        assert (await client.get(root)).json()["status"]["location"] is None
+        saved = (await client.put(root + "/location", json=candidate)).json()
+        assert not saved["enabled"] and saved["configuration_issue"] is None
+        assert saved["status"]["location"] == candidate
+        assert (await client.post(root + "/location/detect")).status_code == 503
+        assert (await client.get(root)).json()["status"]["location"] == candidate
+    assert calls == ["geocoding-api.open-meteo.com", "ipwho.is", "ipwho.is"] and not gateway.calls
+
+
+async def test_admin_weather_location_survives_restart_and_resets_to_environment(settings):
+    settings.admin_token = SecretStr(TOKEN)
+    settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
+    root = "/admin/api/life/modules/weather"
+    place = {"source": "coordinates", "latitude": 0.0, "longitude": -180.0, "label": ""}
+    for first_start in (True, False):
+        app = create_app(settings, gateway_factory=FakeGateway, start_workers=False)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1",
+                headers={"Authorization": "Bearer " + TOKEN},
+            ) as client,
+        ):
+            loc = (await client.get(root)).json()["status"]["location"]
+            if first_start:
+                assert loc["source"] == "environment" and loc["latitude"] == 31.23
+                for extra in (
+                    {"latitude": True},
+                    {"longitude": -181},
+                    {"latitude": 91},
+                    {"latitude": "0"},
+                    {"source": "environment"},
+                    {"url": "arbitrary"},
+                ):
+                    assert (
+                        await client.put(root + "/location", json=place | extra)
+                    ).status_code == 400
+                assert (await client.put(root + "/location", json=place)).json()["status"][
+                    "location"
+                ] == place
+            else:
+                assert loc == place
+                detail = (await client.delete(root + "/location")).json()
+                assert detail["status"]["location"] == {
+                    "latitude": 31.23,
+                    "longitude": 121.47,
+                    "label": "",
+                    "source": "environment",
+                }
+            assert not app.state.service.ai.calls
+
+
 async def test_minecraft_control_returns_only_its_module_snapshot(life_api):
     _, client, gateway = life_api
     response = await client.post(
@@ -171,12 +271,15 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
     panels = dict(re.findall(r'<section id="([^"]+)" class="tab"[^>]*>(.*?)</section>', html, re.S))
     assert tabs["core"].isdisjoint(tabs["modules"])
     assert tabs["core"] | tabs["modules"] == set(panels)
+    assert html.count('id="module-heading-switch"') == 1
+    assert "module-detail-state" not in html
     assert {"overview", "ledger", "life", "api-routing", "memory", "notebook"} <= tabs["core"]
     assert {"modules", "qq", "bili", "minecraft", "group-policy", "admission", "patrol"} <= tabs[
         "modules"
     ]
     for marker, owner in (
         ('id="module-catalog"', "modules"),
+        ('id="weather-editor"', "weather"),
         ('id="ws-heartbeat"', "qq"),
         ('id="groups"', "group-policy"),
         ('id="sessions"', "memory"),
