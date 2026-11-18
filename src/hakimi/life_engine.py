@@ -969,8 +969,9 @@ class LifeEngine:
                     if now - last_gate_tick >= 60.0:
                         await self.tick_gatekeeper_once(now=now)
                         last_gate_tick = self.clock()
+                    now = self.clock()
                     if self.planner.next_plan_at <= 0.0 or now >= self.planner.next_plan_at:
-                        await self.trigger_plan_once(now=self.clock())
+                        await self.trigger_plan_once(now=now)
             except asyncio.CancelledError:
                 self._running = False
                 raise
