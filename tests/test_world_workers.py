@@ -163,6 +163,25 @@ async def test_recover_prepared_and_submitted_reservations_on_their_local_day(dm
     assert (await gate.daily_usage(dm.clock(), gate.config))["counted"] == 0
 
 
+async def test_two_simultaneous_claims_compete_for_one_daily_slot(dm):
+    engine, ws, now = dm.service.life_engine, dm.service.world_state, dm.clock()
+    await engine.set_config({"max_proactive_per_day": 1})
+    keys = [await enqueue(dm, "bili.patrol"), await enqueue(dm, "qq.speak", scope="owner:20000")]
+
+    async def gated_claim(key):
+        return await ws.claim(
+            key, now, quota_gate=lambda ticket: engine.gatekeeper.quota_gate_tx(ticket, now)
+        )
+
+    rows = await asyncio.gather(*(gated_claim(key) for key in keys))
+    assert sorted(row["status"] for row in rows) == ["executing", "pending"]
+    pending = next(row for row in rows if row["status"] == "pending")
+    assert pending["result_reason"] == "daily_capacity_reserved"
+    assert (
+        await dm.store.one("SELECT COUNT(*) FROM scheduled_intents WHERE claimed_at=?", (now,))
+    )[0] == 1
+
+
 async def test_manual_and_clock_serialize_audience_and_cancel_running_only(dm, monkeypatch):
     engine = dm.service.life_engine
     active, peak, calls = {}, {}, []
@@ -187,13 +206,29 @@ async def test_manual_and_clock_serialize_audience_and_cancel_running_only(dm, m
         for s in ("owner:20000", "owner:20000", "onebot:40000")
     ]
     runner = asyncio.create_task(engine.run())
+    manual = None
     try:
         async with asyncio.timeout(5):
             await entered.wait()
             assert set(calls) == {ids[0], ids[2]}
-            await engine.tick_gatekeeper_once(wait=False)
+            waiting = asyncio.Event()
+            original = engine.gatekeeper.workers._wait_for_ticket
+
+            async def join(ticket, now):
+                waiting.set()
+                return await original(ticket, now)
+
+            monkeypatch.setattr(engine.gatekeeper.workers, "_wait_for_ticket", join)
+            manual = asyncio.create_task(engine.tick_gatekeeper_once())
+            await waiting.wait()
+            manual.cancel()
+            await asyncio.gather(manual, return_exceptions=True)
+            assert active == {"owner:20000": 1, "onebot:40000": 1}
             assert (await state(dm, ids[1]))[0] == "pending"
     finally:
+        if manual and not manual.done():
+            manual.cancel()
+            await asyncio.gather(manual, return_exceptions=True)
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
     assert peak == {"owner:20000": 1, "onebot:40000": 1}
