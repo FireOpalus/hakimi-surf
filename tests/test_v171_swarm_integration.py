@@ -61,7 +61,7 @@ async def test_admin_page_csp_hashes_and_security_invariants(settings):
             assert not re.search(r"\son[a-z]+\s*=", html, re.I)
             assert "innerHTML" not in html
             assert "unpkg.com" not in html
-            assert html.count("v2.0.0") >= 2
+            assert html.count("v2.1.0") >= 2
             for marker in (
                 'id="nav-api-routing"',
                 'id="api-routing"',

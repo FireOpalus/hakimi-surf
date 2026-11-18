@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..config import Settings
 from ..context_budget import truncate_tokens
 from ..security import clean_text, configured_secrets
+from .actions import Action, ActionCatalog, DailyAction
 
 AttentionLevel = Literal["LOW", "MEDIUM", "HIGH"]
 ATTENTION_RANK: dict[str, int] = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -91,6 +92,21 @@ class BaseModule(ABC):
         self.settings = settings
         self.proactive_paused = False
 
+    def actions(self) -> tuple[Action, ...]:
+        return ()
+
+    async def social_material(self, ticket: dict) -> str:
+        return await self.get_sensor_summary()
+
+    async def context_data(self, *, limit: int, now: float) -> dict:
+        return {}
+
+    def schedules(self) -> tuple[DailyAction, ...]:
+        return ()
+
+    def event_rules(self) -> tuple:
+        return ()
+
     @final
     async def get_sensor_summary(self) -> str:
         """Return a strictly sanitized, <=90-token summary of current module sensor state."""
@@ -101,9 +117,9 @@ class BaseModule(ABC):
     async def _raw_sensor_summary(self) -> str:
         """Produce raw module status string before mandatory sanitization."""
 
-    @abstractmethod
     async def dispatch_goal(self, ticket: dict[str, Any]) -> GoalResult:
-        """Execute an autonomous goal ticket targeted at this module."""
+        """Compatibility entry for 2.0 module callers."""
+        return GoalResult(ok=False, module_id=self.module_id, reason="unsupported_goal", summary="")
 
     async def pause_proactive(self) -> None:
         """Suspend autonomous proactive behavior when another high-attention task locks focus."""
@@ -119,11 +135,13 @@ class ModuleRegistry:
 
     def __init__(self) -> None:
         self._modules: dict[str, BaseModule] = {}
+        self.catalog = ActionCatalog()
 
     def register(self, module: BaseModule) -> None:
         """Register a capability module by its unique module_id."""
-        if not module.module_id:
-            raise ValueError("module_id must be non-empty")
+        if not module.module_id or module.module_id in self._modules:
+            raise ValueError("module_id must be non-empty and unique")
+        self.catalog.install(module.module_id, module.actions())
         self._modules[module.module_id] = module
 
     def get(self, module_id: str) -> BaseModule | None:
@@ -133,6 +151,12 @@ class ModuleRegistry:
     def all(self) -> list[BaseModule]:
         """Return all registered modules in registration order."""
         return list(self._modules.values())
+
+    async def context_data(self, *, limit: int, now: float) -> dict:
+        data = {}
+        for module in self.all():
+            data.update(await module.context_data(limit=limit, now=now))
+        return data
 
     async def collect_sensor_summaries(self) -> dict[str, str]:
         """Collect sanitized sensor summaries across all registered modules."""

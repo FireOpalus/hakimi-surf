@@ -141,7 +141,7 @@ async def test_mounted_affection_admin_csp_and_merged_balance(settings):
             assert not re.search(r"\sstyle\s*=", html)
             assert not re.search(r"\son[a-z]+\s*=", html, re.I)
             assert "innerHTML" not in html and "unpkg.com" not in html
-            for marker in ("aff-config-form", "aff-tiers-table", "aff-users-table", "v2.0.0"):
+            for marker in ("aff-config-form", "aff-tiers-table", "aff-users-table", "v2.1.0"):
                 assert marker in html
 
             # 2. Mounted /admin/api/affection CRUD & moderation sync

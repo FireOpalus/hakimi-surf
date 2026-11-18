@@ -1,6 +1,6 @@
 # 哈基米跨平台冲浪助手（Hakimi Surf）
 
-**当前版本：v2.0.0** · 基于 Python 3.12+ 与 FastAPI 的 QQ AI 冲浪后端，支持 OneBot v11（NapCat HTTP / 正向 WS / 反向 WS）与官方 QQ Bot Webhook，后端默认对接 Gemini `Interactions` 与 `Decisions`。
+**当前版本：v2.1.0** · 基于 Python 3.12+ 与 FastAPI 的 QQ AI 冲浪后端，支持 OneBot v11（NapCat HTTP / 正向 WS / 反向 WS）与官方 QQ Bot Webhook，后端默认对接 Gemini `Interactions` 与 `Decisions`。
 
 设计目标很直接：**在群里像个懂分寸的活人损友，在私聊只偏心真正的主人；记性好、会贴表情回戳、能结合记忆逛 B 站，同时把注入和越权操作关在服务端裁决边界内。**
 
@@ -143,6 +143,19 @@ docker compose up -d
 ---
 
 ## 系统架构与安全隐私底座
+
+### 主动动作与扩展模块 · v2.1.0
+
+生活引擎按注册的动作名调度。B 站每学完一个视频产生一条观看事实，建造灵感规则可据此创建内部 `mc.build_plan`。上海确认后记录“已登记计划”。MC 的重要进展可以另起一张 `qq.speak` 票据，发送前重新检查 Owner 或群白名单、预算、免打扰与会话状态。
+
+| 入口 | v2.1.0 的行为 |
+| --- | --- |
+| 生活引擎 → 主动动作 | 查看动作的执行模块、就绪状态及原因。可逐项切换按动作名路由、旧票据路由、对照模式或停用。对照模式只比较本地映射，实际处理一次。 |
+| 生活引擎 → 意图与事件 | 追踪来源事件、目标、门控与投递结果。每条规则独立消费同一事实。明确未派发可以在票据有效期内再试，回执不明记为 `uncertain`。 |
+| 升级旧库 | 启动时增补列、索引与规则游标，保留旧票据和终态。新规则从启用时开始消费；重启从已保存的位置补读。 |
+| 可选定点天气 | 在 `.env` 填写 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE` 并启用 `HAKIMI_WEATHER_ENABLED=true`。默认每天 09:30（可用 `HAKIMI_WEATHER_TIME` 调整）读取气温与天气代码。坐标仅发给天气服务。设置 `HAKIMI_WEATHER_OWNER_REPORT=true` 后可由 QQ 单独给 Owner 汇报。[天气数据接口](https://open-meteo.com/en/docs) |
+
+新增能力时，在模块中声明动作、参数及处理函数，按需声明定时和事件规则，并在 `Service` 装配。动作清单、执行和后台展示共用注册表。完整示例见 [天气模块](src/hakimi/modules/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
 
 ### 消息处理全链路
 ```mermaid

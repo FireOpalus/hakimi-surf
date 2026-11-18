@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from ..config import Settings
 from ..security import Rejected
+from .actions import Action, ActionCall, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion, sanitize_sensor_text
 
 if TYPE_CHECKING:
@@ -43,6 +44,53 @@ class BilibiliSurfModule(BaseModule):
         self.backend_mode: BackendMode = backend_mode
         self.remote_fetcher = remote_fetcher
         self.node_transport = node_transport
+
+    def actions(self) -> tuple[Action, ...]:
+        return (
+            Action(
+                name="bili.patrol",
+                description="按既有订阅、凭证、冷却及预算执行一轮巡逻",
+                budgeted=True,
+                run=self.patrol,
+                aliases=(("bilibili_surf", "patrol", False), ("bilibili_surf", "run_once", False)),
+                unavailable=self.patrol_unavailable,
+            ),
+        )
+
+    def patrol_unavailable(self) -> str | None:
+        if self.backend_mode == "remote_node":
+            return None if self.remote_fetcher else "remote_fetcher_unconfigured"
+        if self.watcher is None or not self.watcher.policy.enabled:
+            return "bili_patrol_disabled"
+        if not self.watcher.creds.get("sessdata"):
+            return "bili_credentials_missing"
+        if self.watcher.blocked_until > self.watcher.clock():
+            return "bili_account_cooling_down"
+        return None
+
+    async def patrol(self, call: ActionCall) -> Outcome:
+        res = await self.dispatch_goal(
+            {"action_type": "patrol", "slot": "life-" + call.ticket["id"]}
+        )
+        run = res.artifacts.get("result", {})
+        status = run.get("status")
+        if res.reason == "bili_invalid_receipt":
+            return Outcome("uncertain", res.reason)
+        if not res.ok or (self.backend_mode == "local" and status not in {"done", "empty"}):
+            return Outcome(
+                "gated_skip", res.reason or run.get("reason") or status or "patrol_unavailable"
+            )
+        return Outcome("done", res.reason or status or "patrol_completed")
+
+    async def social_material(self, ticket: dict) -> str:
+        if self.backend_mode == "remote_node":
+            return await self.get_sensor_summary()
+        return (await self.dispatch_goal({"id": ticket["id"], "action_type": "status"})).summary
+
+    async def context_data(self, *, limit: int, now: float) -> dict:
+        if self.watcher:
+            return {"recent_bili_surfed": await self.watcher.recent_surfed(limit=limit, now=now)}
+        return {}
 
     async def _call_remote(self, request: dict[str, Any]) -> Any:
         if self.remote_fetcher is None:
@@ -164,16 +212,17 @@ class BilibiliSurfModule(BaseModule):
                     else None
                 )
                 return GoalResult(
-                    ok=bool(res.get("ok", True)),
+                    ok=res.get("ok") is True,
                     module_id=self.module_id,
                     summary=summary,
                     artifacts={"backend_mode": "remote_node"},
-                    reason=reason,
+                    reason=reason if isinstance(res.get("ok"), bool) else "bili_invalid_receipt",
                 )
             return GoalResult(
-                ok=True,
+                ok=False,
                 module_id=self.module_id,
-                summary=await self.get_sensor_summary(),
+                reason="bili_invalid_receipt",
+                summary="巡逻回执不完整",
                 artifacts={"backend_mode": "remote_node"},
             )
 

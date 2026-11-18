@@ -228,10 +228,10 @@ async def test_casual_image_and_recall_stay_low_while_search_and_long_text_upgra
 
 def test_version_170_consistent_across_repo():
     root = Path(__file__).resolve().parent.parent
-    assert hakimi.__version__ == "2.0.0"
-    assert 'version = "2.0.0"' in (root / "pyproject.toml").read_text()
+    assert hakimi.__version__ == "2.1.0"
+    assert 'version = "2.1.0"' in (root / "pyproject.toml").read_text()
     lock_text = (root / "uv.lock").read_text()
-    assert re.search(r'name = "hakimi-surf"\nversion = "2\.0\.0"', lock_text)
+    assert re.search(r'name = "hakimi-surf"\nversion = "2\.1\.0"', lock_text)
     admin_html = (root / "src/hakimi/admin_page.html").read_text()
-    assert admin_html.count("v2.0.0") >= 2
-    assert "**当前版本：v2.0.0**" in (root / "README.md").read_text()
+    assert admin_html.count("v2.1.0") >= 2
+    assert "**当前版本：v2.1.0**" in (root / "README.md").read_text()

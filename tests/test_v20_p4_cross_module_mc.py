@@ -624,10 +624,12 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         await engine.set_config(LifeEngineConfig(max_proactive_per_day=0))
         svc.life_engine = engine
 
-        # 1. BiliWatcher watches MC tutorial -> publishes bili_mc_inspiration -> build_plan.
+        # 1. The watcher publishes a watched fact; the independent rule queues the build plan.
         await svc.bili_watcher.run_once(slot="manual")
         events = await svc.world_state.unconsumed_events()
-        insp_ev = next(e for e in events if e.event_type == "bili_mc_inspiration")
+        insp_ev = next(
+            e for e in events if e.event_type == "bili_video_watched" and e.payload["bvid"] == BV
+        )
         assert insp_ev.source_module == "bilibili_surf"
         assert insp_ev.importance == "normal"
         assert insp_ev.payload["bvid"] == BV
@@ -640,7 +642,11 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         ai.share_owner = True
         await svc.bili_watcher.run_once(slot="manual-2")
         events2 = await svc.world_state.unconsumed_events()
-        watch_ev = next(e for e in events2 if e.event_type == "bili_video_watched")
+        watch_ev = next(
+            e
+            for e in events2
+            if e.event_type == "bili_video_watched" and e.payload["bvid"] == OTHER
+        )
         assert watch_ev.importance == "high"
 
         tickets = await store.all(
@@ -665,6 +671,7 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         # Gatekeeper still dispatches build_plan with 0 LLM tokens and 0 QQ quota usage!
         nt._connected = True
         await svc.proactive.on_connection(False)
+        svc.modules.get("minecraft").apply_status({"bridge_ready": True})
         exec_now2 = exec_now + 130.0
         engine.clock = lambda: exec_now2
         engine.gatekeeper.clock = lambda: exec_now2
@@ -712,6 +719,9 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
                     )
                 return await super().generate(payload, subject, **kwargs)
 
+        svc.modules.get("minecraft").apply_status(
+            {"bridge_ready": True, "snapshot": {"connected": True}}
+        )
         svc.ai = McPlanGateway()
         plan_res = await engine.trigger_plan_once(now=exec_now2)
         assert plan_res["intents_enqueued"] == 1

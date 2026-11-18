@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="hakimi-surf v2.0.0 源码架构图：上海与首尔双 WebSocket、QQ 回复、生活引擎、B 站与 Minecraft 事件、会话记忆和备份边界。">
-  <title>hakimi-surf v2.0.0 · 架构图</title>
+  <meta name="description" content="hakimi-surf v2.1.0 源码架构图：上海与首尔双 WebSocket、QQ 回复、生活引擎、B 站与 Minecraft 事件、会话记忆和备份边界。">
+  <title>hakimi-surf v2.1.0 · 架构图</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -96,7 +96,7 @@
   <a class="skip" href="#overview">跳到部署总图</a>
   <main id="top">
     <header>
-      <div class="mast"><strong>hakimi-surf</strong><span class="release">v2.0.0 · 2026-11-18 · 源码架构图</span></div>
+      <div class="mast"><strong>hakimi-surf</strong><span class="release">v2.1.0 · 2026-11-18 · 源码架构图</span></div>
       <div class="hero">
         <span class="kicker">01 上海 / 02 首尔</span>
         <h1>哈基米怎样回复，又怎样主动行动？</h1>
@@ -133,7 +133,7 @@
 
     <section class="chapter" id="life" aria-labelledby="life-title">
       <div class="heading"><span class="num">02</span><h2 id="life-title">从世界状态到一次主动行动</h2></div>
-      <p class="intro"><code>Service</code> 向 <code>ModuleRegistry</code> 注册三个模块。它们提供短传感摘要、接受有限的目标；<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
+      <p class="intro"><code>Service</code> 向 <code>ModuleRegistry</code> 注册 QQ、B 站、MC，以及按配置启用的天气模块。每个模块声明动作名、参数、允许来源、就绪条件和执行函数。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
       <div class="grid three">
         <article class="tile sea"><span class="step">LOW · qq_social</span><h3>QQ 社交</h3><p>汇总传输状态、活跃群和缓冲条数。这里不读取 Owner 私聊正文。</p></article>
         <article class="tile blue"><span class="step">MEDIUM · bilibili_surf</span><h3>B 站冲浪</h3><p>首尔组织巡逻；国内节点在线且启用委派时，可由上海代采。传感摘要区分采集状态和最近记录。</p></article>
@@ -141,13 +141,14 @@
       </div>
       <figure class="sheet" style="margin-top:.85rem" aria-label="生活引擎：规划、门控、临场执行">
         <ol class="flow sea">
-          <li><span class="step">01 / LifeBlockPlanner</span><h3>安排活动，不预写台词</h3><p>读取模块摘要、近期冲浪和未消费事件。活跃时段默认每 2–4 小时规划；预算允许时请求结构化 <code>life_plan</code>，不可用则用本地计划。每轮最多接纳 3 条有效意图。</p></li>
-          <li><span class="step">02 / GatekeeperWorker</span><h3>到点再判断能否做</h3><p>约每分钟检查 <code>scheduled_intents</code>：过期、休息、专注、目标连接和会话占用。社交意图还查主动预算、日上限，以及群冷却和活跃度或 Owner 的近期活动。</p></li>
-          <li><span class="step">03 / JITExecutor</span><h3>按目标执行</h3><p>聊天意图临场读取目标会话，生成时可选择不发；内部 B 站目标调用巡逻；无聊天目标的 MC 动作走节点 RPC，不用聊天模型，也不向 QQ 发话。</p></li>
+          <li><span class="step">01 / LifeBlockPlanner</span><h3>安排活动，不预写台词</h3><p>从同一动作目录读取当下可规划的动作、参数、模块摘要和待规划事件。活跃时段默认每 2–4 小时规划；预算允许时请求结构化 <code>life_plan</code>，不可用则用本地计划。每轮最多接纳 3 条有效意图。</p></li>
+          <li><span class="step">02 / GatekeeperWorker</span><h3>到点再判断能否做</h3><p>每分钟检查待办的有效期、免打扰和专注状态。QQ 与 B 站巡逻核对预算。QQ 另查接收人、会话占用和冷却，进服类 MC 动作核对角色在线。</p></li>
+          <li><span class="step">03 / JITExecutor</span><h3>按目标执行</h3><p>SQLite 原子领取票据，再调用登记好的处理器。<code>qq.speak</code> 临场生成并逐气泡确认，<code>bili.patrol</code> 运行既有巡逻，<code>mc.*</code> 走上海固定 RPC。</p></li>
         </ol>
-        <p class="return"><strong>反馈：</strong>QQ 投递只应用已确认的回执；游戏回传快照和里程碑。意图分别记录 <code>done</code>、<code>gated_skip</code>、<code>expired</code> 或 <code>uncertain</code>；仍在有效期内的暂时冲突可以延后。</p>
+        <p class="return"><strong>回执与恢复</strong>　QQ 气泡逐条确认。重启时完整文本回执可还原成功，部分回执和执行中失联的游戏动作记为待核实。意图分别记录 <code>done</code>、<code>gated_skip</code>、<code>expired</code> 或 <code>uncertain</code>；仍在有效期内的暂时冲突可以延后。</p>
         <figcaption class="caption">进入游戏且未暂停时可切换为 <code>minecraft / HIGH</code>；暂停或离线后可回到 <code>idle / LOW</code>。高专注暂停低专注模块的主动行为；被点名的 QQ 消息仍可回复，普通群聊新消息优先做上下文。脱敏传感摘要只加在动态消息尾部，空闲基线不注入。</figcaption>
-        <p class="ref"><b>源码</b><a href="src/hakimi/service.py">注册与专注切换</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
+        <p class="bridge"><strong>第四个模块 · 定点天气</strong>　本地时段 → <code>weather.read</code> → 气温与天气代码。打开 Owner 天气提醒后，<code>weather.owner_report</code> 单独排队 <code>qq.speak</code>。天气读取默认关闭。</p>
+        <p class="ref"><b>源码</b><a href="src/hakimi/service.py">模块装配</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
       </figure>
     </section>
 
@@ -165,13 +166,13 @@
       </figure>
       <figure class="sheet" aria-label="B 站灵感回到 Minecraft 并进入世界状态">
         <ol class="flow plum" style="--n:4">
-          <li><span class="step">B 站 → 事件</span><h3>识别游戏灵感</h3><p>巡逻完成后按视频标题与摘要识别 MC 主题，写入 <code>bili_mc_inspiration</code>；普通观看有自己的事件类型。</p></li>
-          <li><span class="step">事件 → 意图</span><h3>登记建造想法</h3><p>里程碑订阅者经冷却生成内部 <code>build_plan</code> 票据，不指定 QQ 接收人。票据有执行时间和截止时间。</p></li>
+          <li><span class="step">B 站 → 事件</span><h3>记录观看事实</h3><p>学习完成后按 BV 号去重，写入 <code>bili_video_watched</code>，只带标题、BV 号与已读摘要。</p></li>
+          <li><span class="step">事件 → 意图</span><h3>登记建造想法</h3><p>独立规则 <code>bili.build_inspiration</code> 识别 MC 主题，在同一事务写入消费凭证和 <code>mc.build_plan</code> 票据。每条规则有自己的游标、冷却及截止时间。</p></li>
           <li><span class="step">首尔 → 上海</span><h3>递交有限目标</h3><p><code>MinecraftSlotModule → NodeTransport → McBridgeSlot → Mineflayer</code>。<code>build_plan</code> 更新“筹备建造”的活动状态，不代表方块已经建好。</p></li>
-          <li><span class="step">上海 → 首尔</span><h3>回报实际进展</h3><p><code>mc.snapshot</code> 更新角色状态；<code>mc.milestone</code> 记录事件。高重要性事件可再生成分享意图，到期仍须通过门控。</p></li>
+          <li><span class="step">上海 → 首尔</span><h3>回报实际进展</h3><p><code>mc.snapshot</code> 更新角色状态；<code>mc.milestone</code> 记录事件。游戏高重要性事件可生成 <code>qq.speak</code>。专注期间凭持久化来源事件放行，发送仍检查 QQ 接收权限。</p></li>
         </ol>
         <p class="return"><strong>回到对话：</strong>新的世界状态可成为下一次 QQ 回复的背景。桥就绪但未进服时，后台分别显示连接状态，不会把桥心跳描述为玩家在线。</p>
-        <figcaption class="ref"><b>源码</b><a href="src/hakimi/modules/minecraft_slot.py">首尔游戏模块</a><a href="node_agent/daemon.py">节点分派</a><a href="node_agent/mc_bridge_slot.py">桥接事件</a><a href="mc_agent/src/behaviors.mjs">游戏目标的实际行为</a></figcaption>
+        <figcaption class="ref"><b>源码</b><a href="src/hakimi/life_rules.py">规则消费与游标</a><a href="src/hakimi/modules/minecraft_slot.py">首尔游戏模块</a><a href="node_agent/daemon.py">节点分派</a><a href="node_agent/mc_bridge_slot.py">桥接事件</a><a href="mc_agent/src/behaviors.mjs">游戏目标的实际行为</a></figcaption>
       </figure>
     </section>
 
@@ -245,9 +246,9 @@
       <p class="intro">管理请求经 SSH 隧道到回环端口；API 校验 <code>ADMIN_TOKEN</code>、Host 和浏览器来源。下面列的是面板读数的依据，不能从这张离线图推断线上健康状态。</p>
       <div class="grid two">
         <article class="tile blue"><span class="step">/admin/api/life</span><h3>生活引擎与节点</h3>
-          <div class="row"><p>分开看 NapCat、上海节点（含心跳、RPC 错误与 B 站委派）、MC 桥与游戏连接。可热调规划参数、修改世界状态、立即规划、检查门控、取消待执行意图，或提交受限的 MC 目标。手动触发规划、门控和游戏动作受频控与操作锁约束。</p></div>
+          <div class="row"><p>分开看 NapCat、上海节点（含心跳、RPC 错误与 B 站委派）、MC 桥与游戏连接。后台按登记动作显示执行模块、接收范围、就绪原因与路由模式。票据列出来源、关联事件、结果及旧路由对照。可热调规划参数、修改世界状态、立即规划、检查门控、取消待执行意图，或提交受限的 MC 目标。手动触发规划、门控和游戏动作受频控与操作锁约束。</p></div>
           <div class="row"><h4>“今日主动”怎样计数？</h4><p>按机器人时区统计有聊天目标且状态为 <code>done</code> 或 <code>uncertain</code> 的生活引擎意图，用于限制每日主动次数。它不等于 QQ 已确认送达数，内部游戏目标也不计入。</p></div>
-          <div class="row"><h4>“上次主动”来自哪里？</h4><p>JIT 发送和常规 Owner 主动私信确认后会更新世界状态。若旧库没有该时间戳，面板取已发 Owner 私信与已完成意图中的最近记录作为回退。</p></div>
+          <div class="row"><h4>“上次主动”来自哪里？</h4><p>JIT 发送和常规 Owner 主动私信确认后会更新世界状态。若旧库没有该时间戳，面板取已发 Owner 私信与已完成社交意图中的最近记录作为回退。</p></div>
         </article>
         <article class="tile sea"><span class="step">/admin/api/sessions · /admin/api/notebook</span><h3>会话与 Owner 桌面桥</h3>
           <div class="row"><p>会话面板分列热窗口条数、旧滚动摘要字数、双轨是否就绪，以及未删除的双轨条目数和正文总字数。旧摘要为零，不能据此判断记忆库为空。</p></div>
@@ -261,7 +262,7 @@
       </div>
       <p class="ref" id="sources"><b>源码</b><a href="src/hakimi/life_admin.py">生活面板与操作</a><a href="src/hakimi/admin_routes.py">会话与快照</a><a href="src/hakimi/admin_page.html">后台展示</a><a href="src/hakimi/admin_auth.py">鉴权</a><a href="src/hakimi/proactive_dm.py">Owner 私信</a><a href="src/hakimi/model_accounting.py">分档账本</a><a href="src/hakimi/gcp_billing.py">账单核对</a></p>
     </section>
-    <footer class="end"><span>hakimi-surf · v2.0.0 · 离线源码图，不读取生产数据</span><a href="#top">返回图首 ↑</a></footer>
+    <footer class="end"><span>hakimi-surf · v2.1.0 · 离线源码图，不读取生产数据</span><a href="#top">返回图首 ↑</a></footer>
   </main>
 </body>
 </html>

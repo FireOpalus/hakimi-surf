@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import Settings
+from .actions import AUTONOMOUS, Action, ActionCall, NoArgs, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion, sanitize_sensor_text
 
 if TYPE_CHECKING:
@@ -86,6 +87,24 @@ class MinecraftSnapshot(BaseModel):
     updated_at: float = 0.0
 
 
+class BuildArgs(NoArgs):
+    topic: str = Field(default="", max_length=80)
+
+
+class BlockArgs(NoArgs):
+    block_type: str = Field(default="", max_length=48, pattern=r"^[a-z0-9_:]*$")
+
+
+class PositionArgs(NoArgs):
+    x: float = Field(ge=-30000000, le=30000000)
+    y: float = Field(ge=-2048, le=2048)
+    z: float = Field(ge=-30000000, le=30000000)
+
+
+class FollowArgs(NoArgs):
+    target_player: str = Field(pattern=r"^[A-Za-z0-9_]{1,16}$")
+
+
 class MinecraftSlotModule(BaseModule):
     """Tracks sanitized remote Mineflayer snapshots and publishes MilestoneEvents."""
 
@@ -98,17 +117,104 @@ class MinecraftSlotModule(BaseModule):
         settings: Settings | None = None,
         *,
         world_state: WorldStateManager | None = None,
+        node_online: Callable[[], bool] | None = None,
         remote_dispatcher: Callable[..., Any] | None = None,
     ) -> None:
         super().__init__(settings)
         self.world_state = world_state
         self.remote_dispatcher = remote_dispatcher
+        self.node_online = node_online
         self.snapshot = MinecraftSnapshot()
         self._has_snapshot = False
         self.bridge_ready: bool = False
         self.mc_enabled: bool = False
         self.mc_configured: bool = False
         self.paused: bool = False
+
+    def event_rules(self):
+        from ..life_rules import Rule, build_from_video
+
+        return (Rule("bili.build_inspiration", build_from_video),)
+
+    def actions(self) -> tuple[Action, ...]:
+        verbs = {
+            "build_plan": ("登记建造计划", BuildArgs),
+            "explore": ("在游戏中探索", NoArgs),
+            "mine": ("采矿", BlockArgs),
+            "gather": ("采集", BlockArgs),
+            "goto": ("前往坐标", PositionArgs),
+            "follow": ("跟随指定玩家", FollowArgs),
+            "observe": ("观察周围", NoArgs),
+            "look_signs": ("查看告示牌", NoArgs),
+            "stop": ("停止当前行为", NoArgs),
+            "idle": ("原地待机", NoArgs),
+            "status": ("读取桥及游戏状态", NoArgs),
+            "pause": ("暂停游戏动作", NoArgs),
+            "resume": ("恢复游戏动作", NoArgs),
+        }
+
+        def declare(verb, description, schema):
+            async def dispatch(call: ActionCall) -> Outcome:
+                args = call.args.model_dump()
+                if verb == "build_plan" and not args.get("topic") and call.evidence:
+                    args["topic"] = sanitize_sensor_text(
+                        str(call.evidence["payload"].get("title", "")), self.settings, max_tokens=20
+                    )
+                res = await self.dispatch_goal({"action_type": verb, **args})
+                if res.ok:
+                    status, reason = (
+                        "done",
+                        "plan_registered" if verb == "build_plan" else "mc_acknowledged",
+                    )
+                elif res.artifacts.get("not_dispatched") or res.reason == "node_not_dispatched":
+                    status, reason = "not_dispatched", res.reason
+                elif res.reason in {
+                    "mc_rpc_timeout",
+                    "mc_invalid_response",
+                    "node_rpc_timeout",
+                    "node_disconnected",
+                    "mc_invalid_receipt",
+                    "node_invalid_response",
+                    "mc_bridge_timeout",
+                    "mc_bridge_disconnected",
+                    "mc_bridge_invalid_response",
+                    "node_rpc_failed",
+                }:
+                    status, reason = "uncertain", res.reason
+                else:
+                    status, reason = "gated_skip", res.reason
+                return Outcome(
+                    status, reason or "mc_rejected", {"result": res.model_dump(mode="json")}
+                )
+
+            admin_only = verb in {"status", "pause", "resume"}
+            return Action(
+                name="mc." + verb,
+                description=description,
+                run=dispatch,
+                arguments=schema,
+                origins=frozenset({"admin"}) if admin_only else AUTONOMOUS | {"admin"},
+                unavailable=lambda: self.action_unavailable(verb),
+                aliases=() if admin_only else (("minecraft", verb, False),),
+            )
+
+        return tuple(declare(verb, *entry) for verb, entry in verbs.items())
+
+    def action_unavailable(self, verb: str) -> str | None:
+        if self.remote_dispatcher is None or (self.node_online and not self.node_online()):
+            return "node_disconnected"
+        if verb == "status":
+            return None
+        if not self.bridge_ready:
+            return "mc_bridge_disconnected"
+        if self.paused and verb not in {"stop", "idle", "resume", "pause"}:
+            return "mc_paused"
+        if (
+            verb not in {"build_plan", "idle", "stop", "pause", "resume"}
+            and not self.snapshot.connected
+        ):
+            return "mc_server_not_connected"
+        return None
 
     def bind_world_state(self, world_state: WorldStateManager) -> None:
         """Attach a WorldStateManager for publishing MilestoneEvents."""
@@ -411,14 +517,15 @@ class MinecraftSlotModule(BaseModule):
                 else None
             )
             return GoalResult(
-                ok=bool(res.get("ok", True)),
+                ok=res.get("ok") is True and res.get("accepted", True) is True,
                 module_id=self.module_id,
                 summary=summary,
                 artifacts=dict(res.get("artifacts") or {}),
                 reason=reason,
             )
         return GoalResult(
-            ok=True,
+            ok=False,
             module_id=self.module_id,
+            reason="mc_invalid_receipt",
             summary=await self.get_sensor_summary(),
         )

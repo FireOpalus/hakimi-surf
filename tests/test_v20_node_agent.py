@@ -540,7 +540,7 @@ async def test_daemon_hello_concurrent_nonblocking_ping_and_reconnect_backoff(
             assert hello_msg["event"] == "node.hello"
             assert hello_msg["node_id"] == "shanghai-cn-1"
             assert hello_msg["region"] == "CN"
-            assert hello_msg["payload"]["version"] == "2.0.0"
+            assert hello_msg["payload"]["version"] == "2.1.0"
             assert hello_msg["payload"]["capabilities"] == [
                 "bili.public_get",
                 "bili.resolve_short",
@@ -587,7 +587,7 @@ def test_packaging_hardening_invariants() -> None:
 
     compose_text = (repo / "node_agent/compose.cn.yaml").read_text(encoding="utf-8")
     for expected in (
-        "image: hakimi-node-agent:v2.0",
+        "image: hakimi-node-agent:v2.1.0",
         "env_file: .env.node",
         "read_only: true",
         "/tmp:size=64m,uid=10001,gid=10001,mode=700,noexec,nosuid,nodev",

@@ -1,6 +1,6 @@
 services:
   hakimi-node-agent:
-    image: hakimi-node-agent:v2.0
+    image: hakimi-node-agent:v2.1.0
     env_file: .env.node
     read_only: true
     tmpfs:
@@ -23,7 +23,7 @@ services:
         max-file: "3"
 
   hakimi-mc-agent:
-    image: hakimi-mc-agent:v2.0
+    image: hakimi-mc-agent:v2.1.0
     env_file: .env.mc
     read_only: true
     tmpfs:

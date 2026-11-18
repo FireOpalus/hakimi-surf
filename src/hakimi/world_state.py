@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .config import Settings
 from .context_budget import estimate_tokens, truncate_tokens
+from .modules.actions import Origin
 from .modules.base import (
     ATTENTION_RANK,
     AttentionLevel,
@@ -68,6 +69,19 @@ CREATE TABLE IF NOT EXISTS group_proactive_cooldown (
   scope TEXT PRIMARY KEY,
   last_proactive_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS life_event_order (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE
+);
+CREATE TRIGGER IF NOT EXISTS life_sequence_new_event AFTER INSERT ON global_events BEGIN
+  INSERT INTO life_event_order(event_id) VALUES(NEW.id);
+END;
+CREATE TABLE IF NOT EXISTS life_rule_cursors (rule_id TEXT PRIMARY KEY, last_row INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS life_rule_receipts (
+  rule_id TEXT NOT NULL, event_id TEXT NOT NULL, cooldown_key TEXT NOT NULL,
+  created_at REAL NOT NULL, outcome TEXT NOT NULL, intent_id TEXT, PRIMARY KEY(rule_id,event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_life_rule_cooldown
+ON life_rule_receipts(rule_id,cooldown_key,created_at) WHERE intent_id IS NOT NULL;
 """
 
 _VALID_INTENT_STATUSES = frozenset(
@@ -170,6 +184,12 @@ class IntentTicketCreate(BaseModel):
     target_module: str = Field(min_length=1, max_length=64)
     target_scope: str = Field(default="", max_length=128)
     action_type: str = Field(min_length=1, max_length=64)
+    action_name: str | None = Field(default=None, max_length=64)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    origin: Origin = "legacy"
+    source_module: str = Field(default="", max_length=64)
+    source_event_id: str = Field(default="", max_length=64)
+    dedupe_key: str | None = Field(default=None, max_length=160)
     execute_after: float = Field(ge=0.0)
     expire_at: float = Field(ge=0.0)
     mood: str = Field(default="", max_length=64)
@@ -250,6 +270,28 @@ class WorldStateManager:
             await self.store.db.executescript(SCHEMA)
         now = self.clock()
         async with self.store.transaction():
+            existing = {
+                row["name"] for row in await self.store.all("PRAGMA table_info(scheduled_intents)")
+            }
+            for name, declaration in {
+                "action_name": "TEXT",
+                "expected_bubbles": "INTEGER",
+                "arguments_json": "TEXT NOT NULL DEFAULT '{}'",
+                "source_module": "TEXT NOT NULL DEFAULT ''",
+                "source_event_id": "TEXT NOT NULL DEFAULT ''",
+                "origin": "TEXT NOT NULL DEFAULT 'legacy'",
+                "dedupe_key": "TEXT",
+                "result_reason": "TEXT NOT NULL DEFAULT ''",
+                "shadow_result": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if name not in existing:
+                    await self.store.db.execute(
+                        f"ALTER TABLE scheduled_intents ADD COLUMN {name} {declaration}"
+                    )
+            await self.store.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_dedupe "
+                "ON scheduled_intents(dedupe_key)"
+            )
             await self.store.db.execute(
                 "INSERT OR IGNORE INTO world_state("
                 "singleton, current_module, focus_level, mood, energy, boredom, "
@@ -372,14 +414,19 @@ class WorldStateManager:
         return self.current.focus_level == "HIGH"
 
     async def enqueue_intent(self, ticket: IntentTicketCreate, *, now: float | None = None) -> str:
-        """Validate and persist a scheduled intent ticket as plaintext JSON."""
-        validated = (
-            ticket
-            if isinstance(ticket, IntentTicketCreate)
-            else IntentTicketCreate.model_validate(ticket)
-        )
+        async with self.store.transaction():
+            return await self.insert_intent_tx(ticket, now=self.clock() if now is None else now)
+
+    async def insert_intent_tx(self, ticket: IntentTicketCreate, *, now: float) -> str:
+        """Caller owns the transaction, so a rule receipt and its ticket commit together."""
+        validated = IntentTicketCreate.model_validate(ticket)
+        if validated.dedupe_key:
+            existing = await self.store.one(
+                "SELECT id FROM scheduled_intents WHERE dedupe_key=?", (validated.dedupe_key,)
+            )
+            if existing:
+                return existing[0]
         intent_id = uuid.uuid4().hex
-        created_at = self.clock() if now is None else now
         gate_json = json.dumps(
             _sanitize_payload(validated.gate_condition, self.settings),
             ensure_ascii=False,
@@ -392,27 +439,31 @@ class WorldStateManager:
             note_obj = {}
         note_json = json.dumps(note_obj, ensure_ascii=False)
 
-        async with self.store.transaction():
-            await self.store.db.execute(
-                "INSERT INTO scheduled_intents("
-                "id, created_at, execute_after, expire_at, target_module, target_scope, "
-                "action_type, mood, gate_condition_json, intent_note_json, status, updated_at"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    intent_id,
-                    created_at,
-                    validated.execute_after,
-                    validated.expire_at,
-                    validated.target_module,
-                    validated.target_scope,
-                    validated.action_type,
-                    validated.mood,
-                    gate_json,
-                    note_json,
-                    "pending",
-                    created_at,
-                ),
-            )
+        await self.store.db.execute(
+            "INSERT INTO scheduled_intents(id,created_at,execute_after,expire_at,target_module,"
+            "target_scope,action_type,mood,gate_condition_json,intent_note_json,updated_at,"
+            "action_name,arguments_json,origin,source_module,source_event_id,dedupe_key)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                intent_id,
+                now,
+                validated.execute_after,
+                validated.expire_at,
+                validated.target_module,
+                validated.target_scope,
+                validated.action_type,
+                validated.mood,
+                gate_json,
+                note_json,
+                now,
+                validated.action_name,
+                json.dumps(_sanitize_payload(validated.arguments, self.s), ensure_ascii=False),
+                validated.origin,
+                validated.source_module,
+                validated.source_event_id,
+                validated.dedupe_key,
+            ),
+        )
         return intent_id
 
     async def list_due_intents(
@@ -427,43 +478,75 @@ class WorldStateManager:
                 "ORDER BY execute_after ASC, created_at ASC LIMIT ?",
                 (current, current, max(1, int(limit))),
             )
-        result: list[dict[str, Any]] = []
-        for row in rows:
-            result.append(
-                {
-                    "id": row["id"],
-                    "created_at": float(row["created_at"]),
-                    "execute_after": float(row["execute_after"]),
-                    "expire_at": float(row["expire_at"]),
-                    "target_module": row["target_module"],
-                    "target_scope": row["target_scope"],
-                    "action_type": row["action_type"],
-                    "mood": row["mood"],
-                    "gate_condition": json.loads(row["gate_condition_json"] or "{}"),
-                    "intent_note": json.loads(row["intent_note_json"] or "{}"),
-                    "status": row["status"],
-                    "updated_at": float(row["updated_at"]),
-                }
+        return [self.intent_from_row(row) for row in rows]
+
+    @staticmethod
+    def intent_from_row(row) -> dict:
+        ticket = dict(row)
+        for key in ("arguments", "gate_condition", "intent_note"):
+            ticket[key] = json.loads(ticket.pop(key + "_json") or "{}")
+        return ticket
+
+    async def claim(self, intent_id: str, now: float) -> dict | None:
+        """Claim and load the same persisted action inside SQLite's write transaction."""
+        async with self.store.transaction():
+            cur = await self.store.db.execute(
+                "UPDATE scheduled_intents SET status='executing',updated_at=? "
+                "WHERE id=? AND status='pending' AND execute_after<=? AND expire_at>? RETURNING *",
+                (now, intent_id, now, now),
             )
-        return result
+            row = await cur.fetchone()
+            await cur.close()
+            return self.intent_from_row(row) if row else None
 
     async def mark_intent(
         self,
         intent_id: str,
-        status: Literal["pending", "gated_skip", "executing", "done", "expired", "uncertain"],
+        status: str,
         *,
         now: float | None = None,
+        reason: str = "",
+        expected: str = "pending",
+        retry_at: float | None = None,
     ) -> bool:
-        """Update the lifecycle status of a scheduled intent."""
         if status not in _VALID_INTENT_STATUSES:
-            raise ValueError(f"Invalid intent status: {status}")
-        ts = self.clock() if now is None else now
+            raise ValueError("invalid intent status")
         async with self.store.transaction():
             cur = await self.store.db.execute(
-                "UPDATE scheduled_intents SET status=?, updated_at=? WHERE id=?",
-                (status, ts, intent_id),
+                "UPDATE scheduled_intents SET status=?,result_reason=?,updated_at=?,"
+                "execute_after=COALESCE(?,execute_after) WHERE id=? AND status=?",
+                (
+                    status,
+                    sanitize_sensor_text(reason, self.s, max_tokens=32),
+                    self.clock() if now is None else now,
+                    retry_at,
+                    intent_id,
+                    expected,
+                ),
             )
-            return cur.rowcount > 0
+            return cur.rowcount == 1
+
+    async def recover_actions(self) -> None:
+        # Boot runs after QQ receipt application. A partial ACK cannot confirm a whole intent.
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "UPDATE scheduled_intents SET status='done',"
+                "result_reason='recovered_complete_receipts',"
+                "updated_at=? WHERE status='executing' AND expected_bubbles>0 "
+                "AND expected_bubbles="
+                "(SELECT COUNT(*) FROM outbox_bubble_receipts "
+                "WHERE reply_id='jit:'||scheduled_intents.id "
+                "AND applied=1 AND position>=0 AND position<scheduled_intents.expected_bubbles)",
+                (self.clock(),),
+            )
+            await self.store.db.execute(
+                "UPDATE scheduled_intents SET status='uncertain', updated_at=?, result_reason=CASE "
+                "WHEN EXISTS(SELECT 1 FROM outbox_bubble_receipts b "
+                "WHERE b.reply_id='jit:'||scheduled_intents.id)"
+                " THEN 'recovered_partial_receipt' ELSE 'interrupted_without_final_receipt' END "
+                "WHERE status='executing'",
+                (self.clock(),),
+            )
 
     def subscribe(self, handler: Callable[[MilestoneEvent], Any]) -> None:
         """Register an in-process listener invoked when milestone events are published."""
@@ -478,10 +561,18 @@ class WorldStateManager:
         importance: Literal["low", "normal", "high"] = "normal",
         *,
         now: float | None = None,
+        business_key: str | None = None,
     ) -> MilestoneEvent:
         """Sanitize, persist to global_events as plaintext JSON, and notify subscribers."""
         sanitized_payload = _sanitize_payload(payload or {}, self.settings)
         event = MilestoneEvent(
+            id=(
+                self.store.vault.digest(
+                    "life-event", f"{source_module}:{event_type}:{business_key}"
+                )
+                if business_key
+                else uuid.uuid4().hex
+            ),
             created_at=self.clock() if now is None else now,
             source_module=source_module,
             event_type=event_type,
@@ -491,8 +582,8 @@ class WorldStateManager:
         )
         payload_json = json.dumps(event.payload, ensure_ascii=False)
         async with self.store.transaction():
-            await self.store.db.execute(
-                "INSERT INTO global_events("
+            cur = await self.store.db.execute(
+                "INSERT OR IGNORE INTO global_events("
                 "id, created_at, source_module, event_type, importance, consumed, payload_json"
                 ") VALUES (?,?,?,?,?,?,?)",
                 (
@@ -505,6 +596,9 @@ class WorldStateManager:
                     payload_json,
                 ),
             )
+            if not cur.rowcount:
+                row = await self.store.one("SELECT * FROM global_events WHERE id=?", (event.id,))
+                return self.event_from_row(row)
         for handler in list(self._subscribers):
             try:
                 res = handler(event)
@@ -523,20 +617,19 @@ class WorldStateManager:
                 "SELECT * FROM global_events WHERE consumed=0 ORDER BY created_at ASC LIMIT ?",
                 (max(1, int(limit)),),
             )
-        events: list[MilestoneEvent] = []
-        for row in rows:
-            events.append(
-                MilestoneEvent(
-                    id=row["id"],
-                    created_at=float(row["created_at"]),
-                    source_module=row["source_module"],
-                    event_type=row["event_type"],
-                    importance=row["importance"],
-                    consumed=bool(row["consumed"]),
-                    payload=json.loads(row["payload_json"] or "{}"),
-                )
-            )
-        return events
+        return [self.event_from_row(row) for row in rows]
+
+    @staticmethod
+    def event_from_row(row) -> MilestoneEvent:
+        return MilestoneEvent(
+            id=row["id"],
+            created_at=float(row["created_at"]),
+            source_module=row["source_module"],
+            event_type=row["event_type"],
+            importance=row["importance"],
+            consumed=bool(row["consumed"]),
+            payload=json.loads(row["payload_json"]),
+        )
 
     async def mark_event_consumed(self, event_id: str) -> bool:
         """Mark a global event row as consumed."""

@@ -313,7 +313,7 @@ test("auth rejection, duplicate-key & oversized WS close, SSRF guard, and standb
       Authorization: `Bearer ${VALID_TOKEN}`,
     });
     const hello = await inbox.next((m) => m.event === "mc.hello");
-    assert.equal(hello.payload.version, "2.0.0");
+    assert.equal(hello.payload.version, "2.1.0");
     assert.equal(hello.payload.bridge_ready, true);
     assert.equal(hello.payload.mc_enabled, false);
     assert.equal(hello.payload.mc_configured, false);

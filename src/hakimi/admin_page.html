@@ -864,7 +864,7 @@ body.authenticated footer { margin-left: 238px; }
     <div class="brand-copy"><strong>哈基米 · 星夜控制台 2.0</strong><small>HAKIMI CONSOLE 2.0</small></div>
   </div>
   <div class="topbar-actions">
-    <span class="version">v2.0.0</span>
+    <span class="version">v2.1.0</span>
     <button id="theme-toggle" type="button" class="icon-button" aria-label="切换深色主题" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14a8 8 0 0 1-10-10 8 8 0 1 0 10 10"/></svg></button>
     <button id="logout" class="secondary" hidden>退出登录</button>
   </div>
@@ -1546,13 +1546,10 @@ body.authenticated footer { margin-left: 238px; }
     <p id="life-desktop-status" class="muted"></p>
     <form id="life-world-form" class="quick-bar">
       <label for="life-world-module">当前模块（current_module）
-        <input id="life-world-module" list="life-module-options" type="text" maxlength="64" required placeholder="idle / minecraft / bilibili_surf">
+        <input id="life-world-module" list="life-module-options" type="text" maxlength="64" required placeholder="选择模块或输入模块 ID">
       </label>
       <datalist id="life-module-options">
         <option value="idle"></option>
-        <option value="minecraft"></option>
-        <option value="bilibili_surf"></option>
-        <option value="qq_social"></option>
       </datalist>
       <label for="life-world-focus">专注等级（focus_level）
         <select id="life-world-focus">
@@ -1578,6 +1575,8 @@ body.authenticated footer { margin-left: 238px; }
     </form>
     <h3>能力模块传感器摘要</h3>
     <div id="life-modules-table" class="table"></div>
+    <h3>主动动作</h3>
+    <div id="life-actions-table" class="table"></div>
   </div>
   <div class="card"><h2>双层主动引擎（LifeBlockPlanner + Zero-Token Gatekeeper）</h2>
     <p class="muted">规划层仅在唤醒周期或高重要度脉冲时写入模糊意图与门控条件；门控层每分钟零 Token 扫描，命中窗口后再由 JIT 临场生成回复。</p>
@@ -1616,6 +1615,7 @@ body.authenticated footer { margin-left: 238px; }
   <div class="card"><h2>跨模块里程碑事件（global_events · 近 30 条）</h2>
     <p class="muted">能力模块发布的脱敏里程碑事件（明文 JSON 存储，供规划器与镜像消费）。</p>
     <div id="life-events-table" class="table"></div>
+    <h3>规则处理记录</h3><div id="life-rules-table" class="table"></div>
   </div>
 </section>
 
@@ -1725,7 +1725,7 @@ body.authenticated footer { margin-left: 238px; }
   </div>
 </dialog>
 
-<footer>哈基米 · 星夜控制台 2.0 &nbsp; / &nbsp; v2.0.0 &nbsp; / &nbsp; Asia/Shanghai</footer>
+<footer>哈基米 · 星夜控制台 2.0 &nbsp; / &nbsp; v2.1.0 &nbsp; / &nbsp; Asia/Shanghai</footer>
 </main>
 <script>
 'use strict';
@@ -1771,7 +1771,7 @@ function logout(){
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
   for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
-  ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-grants-list','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-modules-table','life-intents-table','life-events-table'].forEach(id=>$(id).replaceChildren());
+  ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-module-options','life-modules-table','life-actions-table','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
   thinkingReady=false;thinkingDirty=false;
@@ -2477,6 +2477,12 @@ function renderLife(d){
   text('life-mc-status','Mineflayer 躯干：'+mcMode+' · '+(mc.paused?'已暂停':'未暂停')+' · MC开关/配置 '+(mc.mc_enabled?'开':'关')+'/'+(mc.mc_configured?'已配':'未配')+' · 维度 '+(mc.dimension||'—')+' · 坐标 '+mcPos+' · 生命/饱食 '+(mc.health??'—')+'/'+(mc.food??'—')+' · 活动 '+(mc.activity||'—')+' · 更新 '+lifeFmt(mc.updated_at,tz));
   text('life-desktop-status',dm.enabled?('桌面端 Antigravity_Memory 最近活跃：'+(dm.latest_iso||lifeFmt(dm.latest_timestamp,tz))+(dm.latest_tag?' · 标签 '+dm.latest_tag:'')):'桌面端 Antigravity_Memory 协同当前未启用。');
   $('life-world-module').value=ws.current_module||'idle';
+  const moduleIds=new Set(['idle',...(ws.modules||[]).map(m=>m.module_id)]);
+  $('life-module-options').replaceChildren(...Array.from(moduleIds,id=>{
+    const option=el('option');
+    option.value=id;
+    return option;
+  }));
   $('life-world-focus').value=ws.focus_level||'LOW';
   $('life-world-mood').value=ws.mood||'calm';
   $('life-world-energy').value=ws.energy??80;
@@ -2488,6 +2494,21 @@ function renderLife(d){
     m.proactive_paused?pill('已暂停','warn'):pill('开放','ok'),
     m.sensor_summary||'—'
   ]));
+  const modes={active:'按动作名',shadow:'对照旧路由',legacy:'仅旧路由',off:'停用'};
+  table('life-actions-table',['动作','执行模块','发送范围','当前状态','路由方式'],(eng.actions||[]).map(a=>{
+    const select=el('select');
+    select.setAttribute('aria-label',a.name+' 路由方式');
+    for(const key of (a.compatibility?Object.keys(modes):['active','off'])){
+      const option=el('option',modes[key]);option.value=key;select.append(option);
+    }
+    select.value=a.mode;
+    select.onchange=()=>busy(select,async()=>{
+      try{renderLife(await api('life/actions/'+encodeURIComponent(a.name),'PUT',{mode:select.value}));}
+      catch(error){select.value=a.mode;throw error;}
+    });
+    return [a.name+' · '+a.description,a.module,a.audience==='social'?'获准群 / Owner':'模块内部',
+      a.available?'可用':a.reason,select];
+  }));
   $('life-enabled').checked=Boolean(c.enabled);
   $('life-active-hours').value=c.active_hours||'09:00-01:00';
   $('life-group-cooldown').value=c.group_cooldown_seconds??1500;
@@ -2504,16 +2525,19 @@ function renderLife(d){
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
   text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+tz+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
   for(const id of ['life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
-  table('life-intents-table',['ID','模块 / 目标','动作 / 情绪','执行窗口','门控与模糊动机','状态','操作'],(d.intents||[]).map(it=>[
+  table('life-intents-table',['ID','动作 / 接收人','来源 / 事件','执行窗口','门控与模糊动机','状态 / 结果','操作'],(d.intents||[]).map(it=>[
     el('span',String(it.id||'').slice(0,10),'code-mono'),
-    (it.target_module||'—')+(it.target_scope?' · '+it.target_scope:''),
-    (it.action_type||'—')+(it.mood?' · '+it.mood:''),
+    (it.action_name||it.action_type)+(it.target_scope?' · '+it.target_scope:''),
+    [it.origin,it.source_module,it.source_event_id?.slice(0,10)].filter(Boolean).join(' · '),
     lifeFmt(it.execute_after,tz)+' ~ '+lifeFmt(it.expire_at,tz),
     '门控 '+lifeSummaryJson(it.gate_condition)+' | 动机 '+lifeSummaryJson(it.intent_note),
-    pill(lifeIntentStatus[it.status]||it.status,lifeIntentVariant[it.status]||'muted'),
+    [lifeIntentStatus[it.status]||it.status,it.result_reason,it.shadow_result].filter(Boolean).join(' · '),
     it.status==='pending'?button('取消',async()=>{const next=await api('life/intents/'+encodeURIComponent(it.id),'DELETE');renderLife(next);notice('已取消待执行意图 '+String(it.id).slice(0,8));},'danger'):el('span','—','muted')
   ]));
-  table('life-events-table',['时间','来源模块','事件类型','重要度','消费状态','脱敏载荷'],(d.events||[]).map(ev=>[
+  table('life-rules-table',['处理时间','规则','事件 ID','结果','意图 ID'],(d.rule_receipts||[]).map(row=>[
+    lifeFmt(row.created_at,tz),row.rule_id,row.event_id.slice(0,10),row.outcome,row.intent_id?.slice(0,10)||'—'
+  ]));
+  table('life-events-table',['时间','来源模块','事件类型','重要度','规划器已读','脱敏载荷'],(d.events||[]).map(ev=>[
     lifeFmt(ev.created_at,tz),
     ev.source_module||'—',
     ev.event_type||'—',

@@ -11,6 +11,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 
+from . import __version__
 from .adapters import Sender, qq_message
 from .admin_auth import AdminAuth
 from .admin_routes import router as admin_router
@@ -134,6 +135,7 @@ def create_app(
                     from .outgoing import recover_receipts
 
                     await recover_receipts(service)
+                    await service.world_state.recover_actions()
                     if hasattr(ai, "cleanup_video_files"):
                         await ai.cleanup_video_files()
                     if isinstance(onebot, WebSocketTransport):
@@ -176,6 +178,7 @@ def create_app(
 
     app = FastAPI(
         title="哈基米跨平台冲浪助手",
+        version=__version__,
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,

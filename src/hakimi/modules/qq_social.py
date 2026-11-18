@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from ..config import Settings
 from ..hot_ring import HotRing
+from .actions import Action, ActionCall, Handler, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion
 
 
@@ -23,16 +25,72 @@ class QQSocialModule(BaseModule):
         hot_ring: HotRing | None = None,
         transport: Any = None,
         service: Any = None,
+        speak: Handler | None = None,
+        preflight=None,
+        connected: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(settings)
-        self._hot_ring = hot_ring
-        self._transport = transport
-        self._service = service
+        self._hot_ring = hot_ring or getattr(service, "hot", None)
+        self._transport = transport or getattr(getattr(service, "sender", None), "onebot", None)
+        self.speak = speak or self._offline
+        self.preflight = preflight
+        self.connected = connected or (lambda: False)
+        if service is not None:
+            # Older composition roots supplied the Service object.
+            from .qq_delivery import LifeSpeaker
+            from .qq_policy import QQPolicy
+
+            self.speak = LifeSpeaker(service).speak
+            self.preflight = QQPolicy(service).evaluate
+            self.connected = service.proactive.connected
+
+    def actions(self) -> tuple[Action, ...]:
+        aliases = {
+            "qq_social": (
+                "group_share",
+                "group_chat_share",
+                "owner_silence_care",
+                "owner_desktop_warm_care",
+                "owner_companion",
+                "companion",
+                "check_in",
+                "minecraft_milestone_share",
+                "qq_social_milestone_share",
+                "proactive_share",
+            ),
+            "bilibili_surf": (
+                "group_share",
+                "group_chat_share",
+                "bili_share",
+                "bilibili_surf_milestone_share",
+            ),
+            "minecraft": ("mc_share", "minecraft_milestone_share", "group_share"),
+        }
+        return (
+            Action(
+                name="qq.speak",
+                description="结合最新会话向获准的群或 Owner 临场发言",
+                social=True,
+                budgeted=True,
+                run=self.speak,
+                preflight=self.preflight,
+                unavailable=lambda: None if self.connected() else "onebot_offline",
+                aliases=tuple(
+                    (module, verb, True) for module, verbs in aliases.items() for verb in verbs
+                ),
+            ),
+        )
+
+    def event_rules(self):
+        from ..life_rules import milestone_sharing
+
+        return (milestone_sharing(self.settings),)
+
+    async def _offline(self, call: ActionCall) -> Outcome:
+        return Outcome("not_dispatched", "onebot_offline")
 
     def _resolve_connection_label(self) -> str:
-        transport = self._transport or getattr(
-            getattr(self._service, "sender", None), "onebot", None
-        )
+        transport = self._transport
         if transport is not None:
             status_fn = getattr(transport, "status", None)
             if callable(status_fn):
@@ -44,7 +102,7 @@ class QQSocialModule(BaseModule):
             if callable(is_set):
                 return "在线" if is_set() else "离线"
             return "HTTP就绪"
-        settings = self.settings or getattr(self._service, "s", None)
+        settings = self.settings
         if settings is not None:
             if getattr(settings, "onebot_enabled", False) or getattr(settings, "qq_enabled", False):
                 return "已启用"
@@ -53,7 +111,7 @@ class QQSocialModule(BaseModule):
 
     async def _raw_sensor_summary(self) -> str:
         conn_label = self._resolve_connection_label()
-        hot_ring = self._hot_ring or getattr(self._service, "hot", None)
+        hot_ring = self._hot_ring
         rings = getattr(hot_ring, "rings", {}) if hot_ring is not None else {}
         active_groups = 0
         group_buffered = 0

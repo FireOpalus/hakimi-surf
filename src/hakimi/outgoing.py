@@ -4,6 +4,7 @@ import asyncio
 import random
 import re
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 
 from .adapters import farewell_send_bypass
@@ -400,9 +401,17 @@ async def _record_proactive_side_effects(service, message: Message) -> None:
 
 
 async def deliver_proactive_jit(
-    service, message: Message, raw_action_or_text: str, *, reply_id: str
+    service,
+    message: Message,
+    raw_action_or_text: str,
+    *,
+    reply_id: str,
+    intent_id: str | None = None,
+    still_allowed: Callable[[], bool] = lambda: True,
 ) -> dict:
     """Deliver JIT proactive bubbles sequentially with at-most-once ambiguity safety."""
+    from .modules.qq_audience import allowed_proactive_message
+
     is_group = message.kind == "group"
     public_chat = is_group or not is_persona_owner(message, service.s)
     secrets = getattr(service, "secrets", None) or configured_secrets(service.s)
@@ -466,7 +475,15 @@ async def deliver_proactive_jit(
 
     if (abstain or not bubbles) and not can_emoji and not can_poke:
         return {"status": "abstained", "bubbles_sent": 0}
-    if not authorize(message, service.s):
+
+    def permitted() -> bool:
+        return (
+            still_allowed()
+            and allowed_proactive_message(message, service.s)
+            and authorize(message, service.s)
+        )
+
+    if not permitted():
         return {"status": "cancelled", "bubbles_sent": 0}
 
     epoch = (await service.sessions.snapshot(message))["epoch"]
@@ -476,6 +493,17 @@ async def deliver_proactive_jit(
         "participants": [message.model_dump()],
     }
 
+    if intent_id is not None:
+        # Only an entirely text-based dispatch can be recovered from bubble ACKs alone.
+        expected = len(bubbles) if not (can_emoji or can_poke) else None
+        async with service.store.transaction():
+            cur = await service.store.db.execute(
+                "UPDATE scheduled_intents SET expected_bubbles=? WHERE id=? AND status='executing'",
+                (expected, intent_id),
+            )
+            if cur.rowcount != 1:
+                return {"status": "cancelled", "bubbles_sent": 0}
+
     confirmed: list[dict] = []
     position = 0
     dispatched = False
@@ -483,9 +511,8 @@ async def deliver_proactive_jit(
     applied_done = False
 
     async def valid() -> bool:
-        if not authorize(message, service.s):
-            return False
-        return (await service.sessions.snapshot(message))["epoch"] == epoch
+        current_epoch = (await service.sessions.snapshot(message))["epoch"]
+        return current_epoch == epoch and permitted()
 
     async def targets() -> set[str]:
         return set()

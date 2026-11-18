@@ -105,7 +105,7 @@ def test_compose_and_env_example_mc_hardening() -> None:
     for expected in (
         "hakimi_cn_net:",
         "hakimi-mc-agent:",
-        "image: hakimi-mc-agent:v2.0",
+        "image: hakimi-mc-agent:v2.1.0",
         "env_file: .env.mc",
         "mem_limit: 768m",
         "cpus: 1.5",

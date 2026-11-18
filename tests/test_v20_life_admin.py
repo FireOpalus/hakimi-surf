@@ -80,6 +80,7 @@ LIFE_ROUTES = [
     ("PUT", "/admin/api/life"),
     ("DELETE", "/admin/api/life"),
     ("PUT", "/admin/api/life/world"),
+    ("PUT", "/admin/api/life/actions/qq.speak"),
     ("POST", "/admin/api/life/plan"),
     ("POST", "/admin/api/life/gatekeeper"),
     ("DELETE", "/admin/api/life/intents/0123456789abcdef0123456789abcdef"),
@@ -437,3 +438,28 @@ async def test_life_status_reports_proactive_sent_today_and_historical_last_proa
     body = res.json()
     assert body["engine"]["proactive_sent_today"] == 1
     assert body["world_state"]["last_proactive_at"] == pytest.approx(sent_ts + 30.0, abs=1.0)
+
+
+async def test_catalog_action_hot_switch_is_persisted_and_restricts_admin(life_api):
+    app, client, gateway = life_api
+    path = "/admin/api/life/actions/"
+    info = (await client.get("/admin/api/life")).json()
+    names = {r["name"] for r in info["engine"]["actions"]}
+    assert {"mc.status", "mc.build_plan", "qq.speak", "bili.patrol"} <= names
+    assert "weather.read" not in names
+    for name, mode in (
+        ("not.registered", "active"),
+        ("mc.status", "legacy"),
+        ("qq.speak", "invalid"),
+    ):
+        assert (await client.put(path + name, json={"mode": mode})).status_code == 400
+    response = await client.put(path + "mc.status", json={"mode": "off"})
+    assert response.status_code == 200 and response.json()["config"]["action_modes"] == {
+        "mc.status": "off"
+    }
+    blocked = await client.post("/admin/api/life/mc/goal", json={"action_type": "status"})
+    assert blocked.status_code == 400 and blocked.json()["detail"] == "action_disabled"
+    assert (await client.get("/admin/api/life")).json()["config"]["action_modes"] == {
+        "mc.status": "off"
+    }
+    assert not gateway.calls

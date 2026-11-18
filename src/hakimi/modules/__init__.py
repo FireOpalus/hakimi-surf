@@ -1,4 +1,4 @@
-"""Hakimi v2.0 capability modules and registry."""
+"""Hakimi capability modules and registry."""
 
 from .base import (
     ATTENTION_RANK,

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 
 export const MAX_WS_PAYLOAD_BYTES = 262144;
-export const BRIDGE_VERSION = "2.0.0";
+export const BRIDGE_VERSION = "2.1.0";
 
 const FORBIDDEN_TARGET_KEYS = new Set([
   "host",

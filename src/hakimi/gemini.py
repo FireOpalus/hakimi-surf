@@ -72,9 +72,11 @@ OWNER_COMPANION_INSTRUCTION = """当前任务是写一条主动发给 BOISER 的
 
 class WireLifeIntent(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    target_module: str
+    action_name: str = Field(default="", max_length=64)
+    arguments_json: str = Field(default="{}", max_length=512)
+    target_module: str = ""
     target_scope: str = ""
-    action_type: str
+    action_type: str = ""
     delay_minutes: int = 15
     ttl_minutes: int = 60
     intent_note: str
@@ -99,6 +101,8 @@ LIFE_PLAN_INSTRUCTION = """当前任务是自主生活区块规划器（LifeBloc
 规划未来2至4小时的当前活动、专注度、心情、精力/无聊度与模糊意图队列（最多3条）。
 只输出符合 schema 的 JSON 对象，包含 current_module、focus_level（LOW|MEDIUM|HIGH）、mood、
 energy（0..100）、boredom（0..100）、mood_longnick（≤30字纯文本心情个签或空串""）与 intents。
+从 available_actions 选择 action_name，arguments_json 仅填该动作声明的 JSON 参数。
+internal 不填接收人，social 仅选提供的群或 owner。
 【严禁预写台词】每条 intent 的 intent_note 只能写 ≤120 字的抽象意图方向，
 例如“想顺口聊聊刚刷到的散热评测”，绝不允许出现预先写好的台词、引号原话、
 称呼开场白（如“主人，”“BOISER，”“回复：”“say:”）、颜文字或“喵~”。

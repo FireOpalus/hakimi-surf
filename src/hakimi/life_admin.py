@@ -1,4 +1,4 @@
-"""Authenticated control plane for the v2.0 WorldState and dual-layer LifeEngine."""
+"""Authenticated control plane for the world state, registered life actions and routing modes."""
 
 from __future__ import annotations
 
@@ -18,47 +18,18 @@ from pydantic import (
 )
 
 from .admin_routes import body, service
-from .proactive_policy import minute_of_day
+from .life_engine import LifeEngineConfig
+from .modules.actions import ActionCall, Mode, reject_reason
 
 router = APIRouter(prefix="/admin/api/life")
+
 
 INTENT_ID_RE = re.compile(r"^[a-f0-9]{16,64}$")
 LIFE_INTENT_LIMIT = 40
 LIFE_EVENT_LIMIT = 30
 
 
-class LifeConfigMirror(BaseModel):
-    """Strict mirror of LifeEngineConfig used for standalone validation and defaults."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    enabled: bool = True
-    active_hours: str = "09:00-01:00"
-    planner_min_minutes: int = Field(default=120, ge=30, le=720)
-    planner_max_minutes: int = Field(default=240, ge=60, le=720)
-    sleep_min_minutes: int = Field(default=360, ge=120, le=960)
-    sleep_max_minutes: int = Field(default=480, ge=180, le=960)
-    group_cooldown_seconds: int = Field(default=1500, ge=300, le=86400)
-    group_active_window_seconds: int = Field(default=1800, ge=60, le=7200)
-    group_min_recent_messages: int = Field(default=2, ge=1, le=50)
-    desktop_active_suppress_seconds: int = Field(default=7200, ge=300, le=86400)
-    max_proactive_per_day: int = Field(default=6, ge=0, le=30)
-
-    @field_validator("active_hours")
-    @classmethod
-    def _valid_active_hours(cls, value: str) -> str:
-        parts = value.split("-")
-        if len(parts) != 2 or minute_of_day(parts[0]) == minute_of_day(parts[1]):
-            raise ValueError("Active hours must be two different HH:MM times")
-        return value
-
-    @model_validator(mode="after")
-    def _valid_ranges(self) -> LifeConfigMirror:
-        if self.planner_min_minutes > self.planner_max_minutes:
-            raise ValueError("planner_min_minutes must be <= planner_max_minutes")
-        if self.sleep_min_minutes > self.sleep_max_minutes:
-            raise ValueError("sleep_min_minutes must be <= sleep_max_minutes")
-        return self
+LifeConfigMirror = LifeEngineConfig
 
 
 class WorldStateAdminUpdate(BaseModel):
@@ -125,14 +96,6 @@ class MinecraftAdminGoalRequest(BaseModel):
     @classmethod
     def _strip_text(cls, value: str) -> str:
         return value.strip()
-
-
-def _life_config_model() -> type[BaseModel]:
-    try:
-        from .life_engine import LifeEngineConfig
-    except ImportError:
-        return LifeConfigMirror
-    return LifeEngineConfig
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -214,7 +177,8 @@ async def _read_intents(store: Any) -> list[dict[str, Any]]:
             return []
         rows = await store.all(
             "SELECT id, created_at, execute_after, expire_at, target_module, target_scope, "
-            "action_type, mood, gate_condition_json, intent_note_json, status, updated_at "
+            "action_type, mood, gate_condition_json, intent_note_json, status, updated_at, "
+            "action_name,source_module,source_event_id,origin,result_reason,shadow_result "
             "FROM scheduled_intents ORDER BY created_at DESC LIMIT ?",
             (LIFE_INTENT_LIMIT,),
         )
@@ -227,6 +191,12 @@ async def _read_intents(store: Any) -> list[dict[str, Any]]:
             "target_module": row["target_module"],
             "target_scope": row["target_scope"],
             "action_type": row["action_type"],
+            "action_name": row["action_name"],
+            "source_module": row["source_module"],
+            "source_event_id": row["source_event_id"],
+            "origin": row["origin"],
+            "result_reason": row["result_reason"],
+            "shadow_result": row["shadow_result"],
             "mood": row["mood"],
             "gate_condition": _parse_json_value(row["gate_condition_json"], {}),
             "intent_note": _parse_json_value(row["intent_note_json"], {}),
@@ -297,7 +267,8 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
                     candidates.append(float(row[0]))
             if await _table_exists(store, "scheduled_intents"):
                 row = await store.one(
-                    "SELECT MAX(updated_at) FROM scheduled_intents WHERE status='done'"
+                    "SELECT MAX(updated_at) FROM scheduled_intents "
+                    "WHERE status='done' AND target_scope!=''"
                 )
                 if row and row[0]:
                     candidates.append(float(row[0]))
@@ -375,7 +346,21 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
         desktop_memory = {"enabled": bool(svc.s.enable_antigravity_memory)}
 
     intents = await _read_intents(svc.store)
+    catalog = getattr(engine, "catalog", None)
+    if catalog is not None:
+        for item in intents:
+            name = item["action_name"] or catalog.old_name(item)
+            item.update(action_name=name, executor_module=catalog.owners.get(name))
     events = await _read_events(svc.store)
+    async with svc.store.lock:
+        receipts = (
+            await svc.store.all(
+                "SELECT rule_id,event_id,outcome,intent_id,created_at FROM life_rule_receipts "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 30"
+            )
+            if await _table_exists(svc.store, "life_rule_receipts")
+            else []
+        )
 
     return {
         "config": config,
@@ -386,6 +371,7 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
         "nodes": nodes,
         "desktop_memory": desktop_memory,
         "intents": intents,
+        "rule_receipts": [dict(row) for row in receipts],
         "events": events,
     }
 
@@ -415,14 +401,37 @@ async def life_save_config(request: Request):
             )
         else:
             current = LifeConfigMirror().model_dump(mode="json")
-        model_cls = _life_config_model()
         try:
-            value = model_cls.model_validate({**current, **raw})
+            value = LifeEngineConfig.model_validate({**current, **raw})
         except ValidationError:
             raise HTTPException(400, "invalid_admin_input") from None
         if engine is None:
             raise HTTPException(503, "life_engine_unavailable")
-        await _maybe_await(engine.set_config(value))
+        try:
+            await _maybe_await(engine.set_config(value))
+        except ValueError:
+            raise HTTPException(400, "unsupported_action_mode") from None
+        return await _build_life_status(svc)
+
+
+class ActionModeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Mode
+
+
+@router.put("/actions/{name}")
+async def life_action_mode(request: Request, name: str):
+    value = await body(request, ActionModeUpdate)
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        engine = svc.life_engine
+        await engine.initialize()
+        config = engine.config.model_dump()
+        config["action_modes"][name] = value.mode
+        try:
+            await engine.set_config(config)
+        except ValueError:
+            raise HTTPException(400, "unsupported_action_mode") from None
         return await _build_life_status(svc)
 
 
@@ -508,9 +517,9 @@ async def life_cancel_intent(request: Request, intent_id: str):
             raise HTTPException(404, "intent_not_found")
         if row["status"] != "pending":
             raise HTTPException(409, "intent_not_pending")
-        changed = await ws.mark_intent(intent_id, "gated_skip")
+        changed = await ws.mark_intent(intent_id, "gated_skip", reason="admin_cancelled")
         if not changed:
-            raise HTTPException(404, "intent_not_found")
+            raise HTTPException(409, "intent_not_pending")
         return await _build_life_status(svc)
 
 
@@ -527,24 +536,22 @@ async def life_mc_goal(request: Request):
     if lock.locked():
         raise HTTPException(409, "admin_action_busy")
     async with lock:
-        ticket: dict[str, Any] = {"action_type": value.action_type}
-        if value.topic:
-            ticket["topic"] = value.topic
-        if value.block_type:
-            ticket["block_type"] = value.block_type
-        for axis in ("x", "y", "z"):
-            coord = getattr(value, axis)
-            if coord is not None:
-                ticket[axis] = coord
-        res = await _maybe_await(mc_mod.dispatch_goal(ticket))
-        if isinstance(res, dict):
-            res_dict = res
-            ok = bool(res.get("ok", False))
-        else:
-            res_dict = res.model_dump(mode="json")
-            ok = bool(res.ok)
+        args = value.model_dump(exclude={"action_type"}, exclude_defaults=True, exclude_none=True)
+        ticket = {
+            "action_name": "mc." + value.action_type,
+            "target_scope": "",
+            "origin": "admin",
+            "action_type": value.action_type,
+            "target_module": "minecraft",
+            "arguments": args,
+        }
+        try:
+            spec, validated = svc.life_engine.resolve(ticket, admin=True)
+        except ValueError as exc:
+            raise HTTPException(400, reject_reason(exc)) from None
+        result = await spec.run(ActionCall(ticket, validated, svc.life_engine.clock()))
         return {
-            "status": "ok" if ok else "unavailable",
-            "result": res_dict,
+            "status": "ok" if result.status == "done" else "unavailable",
+            "result": result.details["result"],
             "life": await _build_life_status(svc),
         }
