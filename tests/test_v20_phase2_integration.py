@@ -174,7 +174,9 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
                     "SELECT status FROM scheduled_intents WHERE id=?", (cold_intent_id,)
                 )
             )["status"] == "gated_skip"
-            assert interaction_reqs == []
+            assert not any(
+                PUBLIC_STATIC_CHARTER in r["system_instruction"] for r in interaction_reqs
+            )
 
             # 3. Group becomes active in HotRing -> second milestone passes -> JIT + receipt + reply
             cur_now = now + 700.0
@@ -270,7 +272,19 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
             world_diary = await svc.store.all(
                 "SELECT * FROM roaming_events WHERE event_kind='world_life'"
             )
-            assert len(world_diary) == 3  # ev1 + ev2 + life_block
+            plans = await svc.store.all(
+                "SELECT id FROM life_plan_runs WHERE outcome IN "
+                "('accepted','all_filtered','model_chose_rest','local_rest')"
+            )
+            # High milestones can now wake an automatic plan independently of the
+            # manual one. Each actual plan and each milestone has exactly one diary row.
+            expected_entries = ["milestone:" + e.id for e in (ev1, ev2)] + [
+                "life-block:" + plan["id"] for plan in plans
+            ]
+            assert {r["id"] for r in world_diary} == {
+                svc.store.vault.digest("diary-event", entry, "world_event")
+                for entry in expected_entries
+            }
 
             # 5. /admin/api/life reflects updated world_state, intents (done), and events (consumed)
             life_view = await client.get("/admin/api/life")
