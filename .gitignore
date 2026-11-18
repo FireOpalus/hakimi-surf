@@ -23,6 +23,9 @@ secrets/
 htmlcov/
 .DS_Store
 
+# Local development handbook
+/开发手册.md
+
 # Local deployment overrides; publish only their sanitized examples.
 docker-compose.napcat.official-node.yml
 docker-compose.*.local.yml
