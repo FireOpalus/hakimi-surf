@@ -155,6 +155,16 @@ class ActionCatalog:
 
 
 @dataclass(frozen=True)
+class DailyReceipt:
+    """Public execution evidence a module elects to expose for its daily slot."""
+
+    day: str
+    stage: str
+    started: float | None = None
+    confirmed: float | None = None
+
+
+@dataclass(frozen=True)
 class DailyAction:
     """A module-provided local schedule; idempotency uses the local day and slot."""
 
@@ -167,6 +177,7 @@ class DailyAction:
     enabled: Callable[[], bool] | None = None
 
     time_option: str = ""  # The declared at value also identifies this daily slot in old receipts.
+    receipts: Callable[[], Awaitable[list[DailyReceipt]]] | None = None
 
     def __post_init__(self):
         if self.ttl <= 0 or (self.time_option and self.at is None):

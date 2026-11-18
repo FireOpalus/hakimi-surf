@@ -1250,14 +1250,22 @@ class LifeEngine:
 
     async def schedule_due(self, now: float) -> None:
         local = datetime.fromtimestamp(now, _zone(self.s.bot_timezone))
+        day = local.date().isoformat()
+        journal = self.planner.journal
+        poll = await journal.observe_tick(day, now)
+        readers = {}
         for module in self.service.modules.all():
             for slot in module.schedules():
+                if poll and slot.receipts:
+                    readers[slot.name] = slot.receipts
                 window = self.slot_window(module, slot, local.date())
                 if not window or not window[0] <= now < window[1]:
                     continue
                 if not self.slot_available(module, slot) or (slot.enabled and not slot.enabled()):
                     continue
                 start, end = window
+                if slot.receipts and await journal.observe_slot(day, slot, start, end):
+                    readers[slot.name] = slot.receipts
                 ticket = IntentTicketCreate(
                     action_name=slot.name,
                     target_module=module.module_id,
@@ -1269,6 +1277,8 @@ class LifeEngine:
                     dedupe_key=f"timer:{slot.name}:{local.date()}:{slot.at or int(start)}",
                 )
                 await self.service.world_state.enqueue_intent(ticket, now=now)
+        if readers:
+            await asyncio.gather(*(journal.sample_receipts(k, read) for k, read in readers.items()))
 
     async def run(self) -> None:
         self._running = True

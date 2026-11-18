@@ -1956,6 +1956,18 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="life" class="tab" role="tabpanel" aria-labelledby="nav-life" hidden>
+  <div class="card" id="world-observation-card" hidden>
+    <h2>今天的行动与规划</h2>
+    <div id="world-day-stats" class="stats"></div>
+    <p id="world-next"></p>
+    <p id="world-quiet" class="muted"></p>
+    <div id="world-daily-actions" class="pill-row"></div>
+    <details><summary>最近 30 轮规划</summary><div id="world-plans" class="table"></div></details>
+    <details><summary>七日规划基线与定时送达</summary>
+      <p id="world-day-coverage"></p><div id="world-days" class="table"></div>
+      <p id="world-evening-coverage"></p><div id="world-evenings" class="table"></div>
+    </details>
+  </div>
   <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
     <div id="life-stats" class="stats"></div>
     <div id="life-node-pills" class="pill-row"></div>
@@ -2219,7 +2231,8 @@ function logout(){
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
   for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
-  ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
+  $('world-observation-card').hidden=true;
+  ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
   thinkingReady=false;thinkingDirty=false;
@@ -2979,8 +2992,58 @@ function lifeSummaryJson(obj){
   }
   return String(obj);
 }
+const planLabels={
+  accepted:'已采纳',all_filtered:'所有建议均被过滤',model_chose_rest:'模型决定休息',local_rest:'本地规划决定休息',
+  unchanged_state:'状态与可用动作未变，延后付费规划',no_available_actions:'当前没有可用动作',
+  sleeping:'休眠时段',disabled:'引擎关闭',running:'规划进行中',prepared:'规划已保存，待登记动作',
+  interrupted:'规划中断',local_idle:'本地延后',local_fallback:'本地规划',llm:'模型规划',pending:'处理中',
+  manual:'手动',timer:'定时',milestone:'新事件',exploration:'自主探索',opportunities_changed:'可用动作变化',unchanged:'状态未变',
+  model_unavailable_or_invalid:'模型不可用或返回无效结果',planner_budget_closed:'规划预算已用尽',
+  process_interrupted:'运行时中断',empty_note:'缺少动机',prewritten_speech:'建议含预写发言',
+  recipient_unavailable:'接收人不可用',invalid_action:'动作无效',unknown_action:'动作未注册',unavailable_action:'动作当前不可用',
+  window_expired:'执行窗口已过',invalid_ticket:'任务数据无效',round_cap:'超过单轮名额'
+};
+const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
+const planLabel=value=>planLabels[value]||value||'—';
+function planCost(c){
+  const parts=[];
+  if(c.estimated_microdollars!=null)parts.push('已知估算 '+usd(c.estimated_microdollars/1e6,6));
+  if(c.unknown_calls)parts.push(c.unknown_calls+' 笔费用未知，账本暂计 '+usd(c.unknown_budget_microdollars/1e6,6));
+  if(c.open_reservations)parts.push(c.open_reservations+' 笔预留 '+usd(c.reserved_microdollars/1e6,6));
+  if(c.missing)parts.push('账本明细缺失');
+  return parts.join(' · ')||'暂无明细';
+}
+function planReasons(r){
+  return Object.entries(r.reasons||{}).filter(([k])=>k!==r.outcome).map(([k,n])=>planLabel(k)+' ×'+n).join('、');
+}
+function renderWorldObservation(o,eng,tz){
+  $('world-observation-card').hidden=!o;
+  if(!o)return;
+  const day=o.today,latest=o.recent_plans[0],job=o.next_action;
+  const kpis=[['今日规划',day.runs+' 轮'],['候选 / 采纳',day.candidates+' / '+day.accepted],['本地省下的付费规划',day.avoided+' 轮'],['今日规划费用',planCost(day.cost)]];
+  $('world-day-stats').replaceChildren(...kpis.map(([k,v])=>{const stat=el('div',undefined,'stat');stat.append(el('small',k),el('strong',v));return stat;}));
+  text('world-next','下次规划 '+lifeFmt(eng.next_plan_at,tz)+' · '+(job?(job.origin==='timer'?'下个定时动作 ':'下个待执行动作 ')+(job.label||job.action)+'，可执行时间 '+lifeFmt(job.execute_after,tz):'当前没有待执行动作'));
+  text('world-quiet',latest?'上轮规划 '+lifeFmt(latest.started,tz)+' · '+planLabel(latest.outcome)+(planReasons(latest)?' · '+planReasons(latest):''):'尚未记录规划');
+  $('world-daily-actions').replaceChildren(...(o.today_actions.length?o.today_actions.map(a=>pill(a.action+' · '+(lifeIntentStatus[a.status]||a.status)+' '+a.count,lifeIntentVariant[a.status]||'muted')):[el('span','今天尚无动作状态更新','muted')]));
+  table('world-plans',['时间','触发 / 来源','候选 / 采纳','结果及原因','规划费用'],o.recent_plans.map(r=>[
+    lifeFmt(r.started,tz),planLabel(r.trigger)+' / '+planLabel(r.source),r.candidates+' / '+r.accepted,
+    [planLabel(r.outcome),planReasons(r)].filter(Boolean).join(' · '),planCost(r.cost)
+  ]));
+  text('world-day-coverage','已结束的观测日 '+o.baseline_days.length+' / 7'+(o.unobserved_recent_days.length?' · 最近七个自然日无采样 '+o.unobserved_recent_days.join('、'):''));
+  table('world-days',['观测日','首次 / 最近采样','规划轮数','省下付费规划','候选 / 采纳','规划费用'],o.baseline_days.map(r=>[
+    r.day,lifeFmt(r.first_tick,tz)+' / '+lifeFmt(r.last_tick,tz),r.runs,r.avoided,r.candidates+' / '+r.accepted,planCost(r.cost)
+  ]));
+  const progress=Object.values(o.delivery_progress);
+  text('world-evening-coverage',progress.length?progress.map(r=>r.label+' · 已结束 '+r.closed+' / 7 晚 · 90 秒内启动 '+r.timely+' 晚 · 有送达回执 '+r.confirmed+' 晚 · 两项均达标 '+r.successful+' 晚'+(r.unobserved_recent_days.length?' · 近七晚无时段采样 '+r.unobserved_recent_days.join('、'):'')).join('；'):'尚无已结束且实际观测到的投递时段');
+  table('world-evenings',['日期 / 安排','到期时间','生成或投递启动','送达确认','观察结果'],[...o.open_windows,...o.delivery_windows].map(w=>[
+    w.day+' · '+w.label,lifeFmt(w.due,tz),w.started==null?'尚无开始记录':lifeFmt(w.started,tz)+(w.started<w.due?'（提前启动）':'（延迟 '+Math.ceil(w.start_delay_seconds)+' 秒）'),
+    w.delivery_confirmed?lifeFmt(w.confirmed,tz):deliveryStages[w.stage]&&w.stage!=='confirmed'?deliveryStages[w.stage]:'尚无带时间的回执',
+    !w.closed?'时段进行中':w.successful?'已达标':w.within_90s===false?'启动超过 90 秒':w.delivery_confirmed?'启动或窗口待核实':'尚无达标回执'
+  ]));
+}
 function renderLife(d){
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
+  renderWorldObservation(d.observation,eng,tz);
   const stats=[
     ['当前活动 / 专注',(ws.current_module||'idle')+' · '+(ws.focus_level||'LOW')],
     ['心情 / 精力 / 无聊',(ws.mood||'calm')+' · '+(ws.energy??80)+' / '+(ws.boredom??20)],

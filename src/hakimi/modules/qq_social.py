@@ -8,7 +8,7 @@ from typing import Any
 from ..budget_policy import PROACTIVE_LANE
 from ..config import Settings
 from ..hot_ring import HotRing
-from .actions import Action, ActionCall, DailyAction, Handler, Outcome
+from .actions import Action, ActionCall, DailyAction, DailyReceipt, Handler, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion
 from .qq_schedule import QQScheduleOptions
 from .scheduling import ActivityQuota, LocalActivity
@@ -112,6 +112,25 @@ class QQSocialModule(BaseModule):
             ),
         )
 
+    async def daily_receipts(self):
+        history = await self.proactive.digest_history()
+        return [
+            DailyReceipt(
+                day=row["day"],
+                stage=row["stage"],
+                started=next(
+                    (
+                        row[k]
+                        for k in ("generation_started_at", "generated_at", "queued_at")
+                        if row.get(k) is not None
+                    ),
+                    None,
+                ),
+                confirmed=row.get("confirmed_at") if row["stage"] == "confirmed" else None,
+            )
+            for row in history
+        ]
+
     def schedules(self):
         if self.settings and self.settings.onebot_enabled and self.settings.owner_qq_id:
             return (
@@ -120,6 +139,9 @@ class QQSocialModule(BaseModule):
                     at=None,
                     target_scope="owner:" + self.settings.owner_qq_id,
                     label="Owner 每日汇报",
+                    receipts=self.daily_receipts
+                    if hasattr(self.proactive, "digest_history")
+                    else None,
                     enabled=(lambda: self.proactive.configured) if self.proactive else None,
                     attempted=(lambda day: self.proactive.digest_attempted(day))
                     if self.proactive

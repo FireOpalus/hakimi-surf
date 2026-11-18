@@ -1,7 +1,11 @@
 """Durable planning clock, paid-result checkpoints, and atomic event acknowledgements."""
 
+import asyncio
 import json
+import logging
 import uuid
+
+RECEIPT_READ_TIMEOUT = 2.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS life_planner_clock (
@@ -18,8 +22,11 @@ CREATE TABLE IF NOT EXISTS life_plan_runs (
 CREATE INDEX IF NOT EXISTS life_plans_day ON life_plan_runs(day,started);
 CREATE INDEX IF NOT EXISTS life_plans_outcome ON life_plan_runs(outcome,started);
 CREATE TABLE IF NOT EXISTS life_observed_days (
-    day TEXT PRIMARY KEY, first_tick REAL NOT NULL, last_tick REAL NOT NULL,
-    digest_due REAL, digest_end REAL
+    day TEXT PRIMARY KEY, first_tick REAL NOT NULL, last_tick REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS life_observed_slots (
+    day TEXT NOT NULL, action TEXT NOT NULL, due REAL NOT NULL, until_at REAL NOT NULL,
+    label TEXT NOT NULL, started REAL, confirmed REAL, stage TEXT, PRIMARY KEY(day,action)
 );
 """
 
@@ -154,11 +161,45 @@ class PlannerJournal:
                 )
         return ids
 
-    async def observed(self, day, now, *, digest_due=None, digest_end=None):
+    async def observe_tick(self, day, now):
+        """Throttle receipt polling across ticks and restarts using the last recorded sample."""
+        if not self.ready:
+            await self.initialize(now)
         async with self.store.transaction():
-            await self.store.db.execute(
-                "INSERT INTO life_observed_days VALUES (?,?,?,?,?) ON CONFLICT(day) DO UPDATE SET "
-                "last_tick=excluded.last_tick,digest_due=COALESCE(digest_due,excluded.digest_due),"
-                "digest_end=COALESCE(digest_end,excluded.digest_end)",
-                (day, now, now, digest_due, digest_end),
+            cur = await self.store.db.execute(
+                "INSERT INTO life_observed_days(day,first_tick,last_tick) VALUES (?,?,?) "
+                "ON CONFLICT(day) DO UPDATE SET last_tick=excluded.last_tick "
+                "WHERE last_tick<=excluded.last_tick-900",
+                (day, now, now),
+            )
+            return cur.rowcount == 1
+
+    async def observe_slot(self, day, slot, start, end):
+        async with self.store.transaction():
+            cur = await self.store.db.execute(
+                "INSERT OR IGNORE INTO life_observed_slots(day,action,due,until_at,label) "
+                "VALUES (?,?,?,?,?)",
+                (day, slot.name, start, end, slot.label or slot.name),
+            )
+            return cur.rowcount == 1
+
+    async def sample_receipts(self, name, read):
+        try:
+            async with asyncio.timeout(RECEIPT_READ_TIMEOUT):
+                receipts = await read()
+            await self.record_receipts(name, receipts)
+        except Exception:
+            logging.getLogger("hakimi").warning("event=world_receipt_sample_failed action=%s", name)
+
+    async def record_receipts(self, name, receipts):
+        # Only a window actually observed while the timer was enabled can be measured.
+        # The module may prune its outbox; confirmed evidence and its timestamps persist.
+        if not receipts:
+            return
+        async with self.store.transaction():
+            await self.store.db.executemany(
+                "UPDATE life_observed_slots SET started=COALESCE(MIN(started,?),started,?), "
+                "confirmed=COALESCE(confirmed,?), stage=CASE WHEN confirmed IS NULL "
+                "THEN ? ELSE stage END WHERE day=? AND action=?",
+                [(r.started, r.started, r.confirmed, r.stage, r.day, name) for r in receipts],
             )

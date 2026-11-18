@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import world_observations
 from .admin_routes import body, onebot_connection, service
 from .life_engine import LifeEngineConfig
 from .modules.actions import ActionCall, Mode, reject_reason
@@ -368,11 +369,30 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
             else []
         )
 
+    observations = None
+    if engine is not None and hasattr(engine, "clock"):
+        now = engine.clock()
+        observations = await world_observations.overview(svc.store, now, svc.s.bot_timezone)
+        if observations is not None:
+            upcoming = observations["next_action"]
+            for module in svc.modules.all():
+                for slot in module.schedules():
+                    due = await engine.next_slot_at(module, slot, now)
+                    if due is not None and (upcoming is None or due < upcoming["execute_after"]):
+                        upcoming = {
+                            "action": slot.name,
+                            "label": slot.label or slot.name,
+                            "execute_after": due,
+                            "origin": "timer",
+                        }
+            observations["next_action"] = upcoming
+
     return {
         "config": config,
         "source": source,
         "timezone": svc.s.bot_timezone,
         "engine": engine_meta,
+        "observation": observations,
         "digest_history": await proactive_mgr.digest_history()
         if hasattr(proactive_mgr, "digest_history")
         else [],
