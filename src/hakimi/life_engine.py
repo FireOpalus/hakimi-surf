@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .budget_policy import PROACTIVE_LANE, paid_lane_available
 from .config import Settings
 from .gemini import WireLifePlan
 from .life_defaults import fallback_plan
@@ -237,7 +238,12 @@ class LifeBlockPlanner:
             and 0 <= (ts - desktop_info["latest_timestamp"]) < cfg.desktop_active_suppress_seconds
         )
 
-        available_actions = self.engine.catalog.view(cfg.action_modes, planner=True)
+        budget = await self.store.budget_status()
+        available_actions = [
+            action
+            for action in self.engine.catalog.view(cfg.action_modes, planner=True)
+            if not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"])
+        ]
         offered = {action["name"] for action in available_actions}
         planner_payload: dict[str, Any] = {
             "local_time": local_dt.strftime("%Y-%m-%d %H:%M"),
@@ -259,6 +265,7 @@ class LifeBlockPlanner:
                     "payload": ev.payload,
                 }
                 for ev in events
+                if not (ev.event_type == "bili_video_watched" and ev.payload.get("private_first"))
             ],
             **module_data,
             "available_actions": available_actions,
@@ -270,19 +277,14 @@ class LifeBlockPlanner:
 
         plan: WireLifePlan | None = None
         plan_source = "local_fallback"
-        budget = await self.store.budget_status()
-        pro_sub = budget.get("sub_budgets", {}).get("proactive") or {}
-        budget_ok = not budget.get("hard_stop") and (
-            not pro_sub
-            or (pro_sub.get("limit", 0) > 0 and pro_sub.get("used", 0) < pro_sub["limit"])
-        )
-        if budget_ok:
+        planner_funded = paid_lane_available(budget, PROACTIVE_LANE)
+        if planner_funded:
             subject = self.store.vault.digest("life-planner", self.s.namespace)
             try:
                 raw_plan = await self.service.ai.generate(
                     planner_payload,
                     subject,
-                    budget_lane="proactive",
+                    budget_lane=PROACTIVE_LANE,
                     life_plan=True,
                 )
                 plan = WireLifePlan.model_validate_json(raw_plan)
@@ -293,15 +295,30 @@ class LifeBlockPlanner:
                 plan = None
 
         if plan is None:
+            patrol_without_paid_plan = False
+            if (
+                not planner_funded
+                and "bili.patrol" in offered
+                and await self.engine.gatekeeper._count_today_proactive(ts)
+                < cfg.max_proactive_per_day
+            ):
+                async with self.store.lock:
+                    outstanding = await self.store.one(
+                        "SELECT 1 FROM scheduled_intents WHERE action_name='bili.patrol' "
+                        "AND status IN ('pending','executing') AND expire_at>? LIMIT 1",
+                        (ts,),
+                    )
+                patrol_without_paid_plan = outstanding is None
             plan = fallback_plan(
                 self.s,
                 local_dt=local_dt,
                 current_energy=current.energy,
                 current_boredom=current.boredom,
                 module_data=module_data,
-                groups=groups,
-                owner_available=owner_available,
+                groups=groups if "qq.speak" in offered else [],
+                owner_available=owner_available and "qq.speak" in offered,
                 desktop_recent=desktop_recent,
+                patrol_without_paid_plan=patrol_without_paid_plan,
             )
             plan_source = "local_fallback"
 
@@ -523,10 +540,9 @@ class GatekeeperWorker:
                 if remaining <= 120:
                     return await reject("attention_lock")
                 return await defer("attention_lock", min(900, max(60, remaining * 0.5)))
-        if spec.budgeted:
+        if spec.budget_lane is not None:
             budget = await self.store.budget_status()
-            sub = budget.get("sub_budgets", {}).get("proactive") or {}
-            if budget.get("hard_stop") or (sub and sub.get("used", 0) >= sub.get("limit", 0)):
+            if not paid_lane_available(budget, spec.budget_lane):
                 return await reject("budget_limit")
             if (
                 not daily_digest

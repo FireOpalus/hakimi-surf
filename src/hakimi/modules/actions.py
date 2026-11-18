@@ -56,7 +56,7 @@ class Action:
     arguments: type[BaseModel] = NoArgs
     social: bool = False
     owner_only: bool = False
-    budgeted: bool = False
+    budget_lane: Literal["patrol", "proactive"] | None = None
     origins: frozenset[str] = AUTONOMOUS
     unavailable: Callable[[], str | None] = lambda: None
     preflight: Callable[[dict, float, Any], Awaitable[GateDecision]] | None = None
@@ -127,6 +127,7 @@ class ActionCatalog:
                     "module": self.owners[name],
                     "description": spec.description,
                     "audience": audience,
+                    "budget_lane": spec.budget_lane,
                     "arguments": schema["properties"],
                     "required": schema.get("required", []),
                     "mode": mode,

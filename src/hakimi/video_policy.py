@@ -2,12 +2,14 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+MAX_VIDEO_SECONDS = 15 * 60
+
 
 class VideoWatchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     enabled: bool = False
-    max_seconds: int = Field(default=480, ge=30, le=480)
+    max_seconds: int = Field(default=MAX_VIDEO_SECONDS, ge=30, le=MAX_VIDEO_SECONDS)
     daily_limit: int = Field(default=3, ge=0, le=20)
 
     @classmethod

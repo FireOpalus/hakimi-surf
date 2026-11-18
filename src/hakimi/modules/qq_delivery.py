@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from ..bot_server import is_persona_owner
+from ..budget_policy import PROACTIVE_LANE
 from ..generation_policy import Scenario
 from ..outgoing import deliver_proactive_jit
 from ..routing import RouteDecision
@@ -140,7 +141,7 @@ class LifeSpeaker:
         if ws_summary:
             payload["world_state_summary"] = ws_summary
 
-        payload.update(await self.service.modules.context_data(limit=3, now=ts))
+        payload.update(await self.service.modules.context_data(limit=3, now=ts, message=target_msg))
 
         if private_owner:
             if not call.evidence:
@@ -189,7 +190,7 @@ class LifeSpeaker:
                 scenario=scenario,
                 message=target_msg,
                 route=route,
-                budget_lane="proactive",
+                budget_lane=PROACTIVE_LANE,
             )
         except asyncio.CancelledError:
             raise

@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
+from ..budget_policy import PATROL_LANE
 from ..config import Settings
 from ..security import Rejected
 from .actions import Action, ActionCall, Outcome
@@ -15,6 +16,7 @@ from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion, sanitize_s
 if TYPE_CHECKING:
     from ..bili_watcher import BiliWatcher
     from ..bilibili import Bilibili
+    from ..models import Message
 
 BackendMode = Literal["local", "remote_node"]
 
@@ -50,7 +52,7 @@ class BilibiliSurfModule(BaseModule):
             Action(
                 name="bili.patrol",
                 description="按既有订阅、凭证、冷却及预算执行一轮巡逻",
-                budgeted=True,
+                budget_lane=PATROL_LANE,
                 run=self.patrol,
                 aliases=(("bilibili_surf", "patrol", False), ("bilibili_surf", "run_once", False)),
                 unavailable=self.patrol_unavailable,
@@ -87,9 +89,13 @@ class BilibiliSurfModule(BaseModule):
             return await self.get_sensor_summary()
         return (await self.dispatch_goal({"id": ticket["id"], "action_type": "status"})).summary
 
-    async def context_data(self, *, limit: int, now: float) -> dict:
+    async def context_data(self, *, limit: int, now: float, message: Message | None = None) -> dict:
         if self.watcher:
-            return {"recent_bili_surfed": await self.watcher.recent_surfed(limit=limit, now=now)}
+            return {
+                "recent_bili_surfed": await self.watcher.recent_surfed(
+                    limit=limit, now=now, message=message
+                )
+            }
         return {}
 
     async def _call_remote(self, request: dict[str, Any]) -> Any:

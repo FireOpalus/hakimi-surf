@@ -1602,7 +1602,10 @@ class GeminiGateway:
                 "并优先参考 memory_preferences 中的主人喜好（owner_interests）"
                 "与近期群聊/好友话题（community_topics）。"
                 '仅输出JSON：{"selected":[{"bvid":"候选BV号","like":false,'
-                '"favorite":false,"share_owner":false}],"mood_longnick":""}。'
+                '"favorite":false,"share_owner":false,"private_topic_ref":""}],"mood_longnick":""}。'
+                "若一条视频是为某个私聊需求或兴趣选的，把对应的 private_topic_refs 引用"
+                "原样填入 private_topic_ref（字段名:从0起的数组下标），由服务优先回到该会话分享。"
+                "无匹配则留空，不得填写QQ号、昵称或自行指定收件人。"
                 "只能选择输入存在的BV；非常喜欢时才建议like/favorite；"
                 "只有某条极度契合主人近期兴趣、值得立刻私聊安利时才把那1条设 share_owner:true；"
                 "mood_longnick 可选填不超过30字的逛完后主观心情个签"

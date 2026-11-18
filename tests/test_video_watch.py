@@ -153,9 +153,17 @@ async def test_no_subtitle_uses_video_and_does_not_generate_text_again(rig):
     assert [c[0] for c in rig.gateway.calls] == ["screen"]
 
 
+@pytest.mark.parametrize("duration", [481, 900])
+async def test_fifteen_minute_video_passes_effective_policy(rig, duration):
+    result = await rig.watch.analyze(BV, material(duration=duration), "subject", "patrol")
+    assert result.mode == "video"
+    assert rig.downloader.calls[0][1]["max_seconds"] == 900
+    assert rig.gateway.video_calls[0][3]["budget_lane"] == "patrol"
+
+
 @pytest.mark.parametrize(
     "enabled,duration,limit,reason",
-    [(False, 60, 3, "disabled"), (True, 481, 3, "too_long"), (True, 60, 0, "daily_limit")],
+    [(False, 60, 3, "disabled"), (True, 901, 3, "too_long"), (True, 60, 0, "daily_limit")],
 )
 async def test_configuration_gates_download_but_allows_honest_text_fallback(
     rig, enabled, duration, limit, reason

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from ..budget_policy import PROACTIVE_LANE
 from ..config import Settings
 from ..hot_ring import HotRing
 from .actions import Action, ActionCall, DailyAction, Handler, Outcome
@@ -74,7 +75,7 @@ class QQSocialModule(BaseModule):
                 name="qq.speak",
                 description="结合最新会话向获准的群或 Owner 临场发言",
                 social=True,
-                budgeted=True,
+                budget_lane=PROACTIVE_LANE,
                 run=self.speak,
                 preflight=self.preflight,
                 unavailable=lambda: None if self.connected() else "onebot_offline",
@@ -87,7 +88,7 @@ class QQSocialModule(BaseModule):
                 description="在活跃时段结束前汇总当天的公开巡逻记录，投递到 Owner 私聊",
                 social=True,
                 owner_only=True,
-                budgeted=True,
+                budget_lane=PROACTIVE_LANE,
                 origins=frozenset({"timer"}),
                 run=self.digest,
             ),

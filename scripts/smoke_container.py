@@ -168,7 +168,7 @@ for path in ("admission", "moderation", "longnick", "bili-account", "bili-accoun
         elif path == "longnick":
             assert data["config"]["enabled"] is False
         elif path == "bili-account/video-watch":
-            assert data["config"] == {"enabled":False,"max_seconds":480,"daily_limit":3}
+            assert data["config"] == {"enabled":False,"max_seconds":900,"daily_limit":3}
             assert data["attempts_today"] == 0 and data["remote_cleanup_pending"] == 0
         elif path == "filter":
             assert data["config"]["injection_threshold"] == 0.78

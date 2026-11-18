@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .bot_server import is_persona_owner, untrusted_input
+from .budget_policy import PROACTIVE_LANE, paid_lane_available
 from .generation_policy import Scenario
 from .models import Message
 from .modules.actions import ActionCall, Outcome
@@ -187,7 +188,7 @@ class OwnerProactive:
                 )
             self.wakeup.set()
 
-    async def _eligible(self, kind, now, *, automatic=False):
+    async def _eligible(self, kind, now, *, automatic=False, generating=False):
         if not self.configured or not self.delivery_enabled:
             return "disabled"
         if automatic:
@@ -198,8 +199,12 @@ class OwnerProactive:
                 or not engine.digest_due(now)
             ):
                 return "outside_digest_window"
-        if kind == "digest" and (await self.store.budget_status())["hard_stop"]:
-            return "budget_hard_stop"
+        if kind == "digest":
+            budget = await self.store.budget_status()
+            if budget["hard_stop"]:
+                return "budget_hard_stop"
+            if generating and not paid_lane_available(budget, PROACTIVE_LANE):
+                return "budget_exhausted"
         return None
 
     async def _insert(self, key, kind, text, expires, now, *, automatic=False):
@@ -462,7 +467,7 @@ class OwnerProactive:
         try:
             watcher = getattr(self.service, "bili_watcher", None)
             if watcher is not None and hasattr(watcher, "recent_surfed"):
-                for item in await watcher.recent_surfed(limit=2, now=now):
+                for item in await watcher.recent_surfed(limit=2, now=now, message=target_msg):
                     bvid = item.get("bvid", "")
                     gist = str(item.get("notes", ""))[:150]
                     if bvid and gist:
@@ -536,7 +541,7 @@ class OwnerProactive:
         key = self.store.vault.digest(self.scope, day, "digest")
         expires = expires if expires is not None else self.day_bounds(now)[1]
         async with self.policy_lock:
-            reason = await self._eligible("digest", now, automatic=automatic)
+            reason = await self._eligible("digest", now, automatic=automatic, generating=True)
             async with self.store.transaction():
                 row = await self.store.one(
                     "SELECT status,reason FROM proactive_schedule WHERE id=?", (key,)
@@ -553,7 +558,7 @@ class OwnerProactive:
             payload = await self._public_digest(now)
             subject = self.store.subject(self.target())
             await self.service.ai.screen(
-                payload, subject, purpose="source", budget_lane="proactive"
+                payload, subject, purpose="source", budget_lane=PROACTIVE_LANE
             )
             requested_longnick = self.service.longnick.config.enabled
             generated = await self.service.ai.generate(
@@ -561,7 +566,7 @@ class OwnerProactive:
                 subject,
                 scenario=Scenario.OWNER_DIGEST,
                 message=self.target(),
-                budget_lane="proactive",
+                budget_lane=PROACTIVE_LANE,
                 **({"with_longnick": True} if requested_longnick else {}),
             )
             if requested_longnick:

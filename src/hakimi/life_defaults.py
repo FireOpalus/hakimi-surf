@@ -18,10 +18,11 @@ def fallback_plan(
     groups: list[str],
     owner_available: bool,
     desktop_recent: bool,
+    patrol_without_paid_plan: bool = False,
 ) -> WireLifePlan:
     bili_surfed = module_data.get("recent_bili_surfed", [])
     hour = local_dt.hour
-    if bili_surfed or hour in {13, 14, 20, 21}:
+    if patrol_without_paid_plan or bili_surfed or hour in {13, 14, 20, 21}:
         module = "bilibili_surf"
         focus: Literal["LOW", "MEDIUM", "HIGH"] = "MEDIUM"
         mood = "curious"
@@ -32,7 +33,16 @@ def fallback_plan(
     energy = max(15, min(100, current_energy - 5))
     boredom = max(0, min(95, current_boredom + 8))
     intents: list[dict[str, Any]] = []
-    if bili_surfed and groups:
+    if patrol_without_paid_plan:
+        intents.append(
+            {
+                "action_name": "bili.patrol",
+                "delay_minutes": 1,
+                "ttl_minutes": 60,
+                "intent_note": "用可用的巡逻额度去看看首页和关注动态",
+            }
+        )
+    elif bili_surfed and groups:
         intents.append(
             {
                 "target_module": "bilibili_surf",

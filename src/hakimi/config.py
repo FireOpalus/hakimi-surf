@@ -15,6 +15,7 @@ from .compression_policy import CompressionConfig
 from .proactive_policy import hours_bounds
 from .rest_policy import RestHoursConfig
 from .thinking_policy import ChatThinkingLevel, ThinkingConfig, ThinkingLevel
+from .video_policy import MAX_VIDEO_SECONDS
 
 
 class Settings(BaseSettings):
@@ -138,7 +139,10 @@ class Settings(BaseSettings):
     bili_proxy: SecretStr = Field(default=SecretStr(""), validation_alias="BILI_PROXY")
     enable_video_file_watch: bool = Field(default=False, validation_alias="ENABLE_VIDEO_FILE_WATCH")
     max_video_watch_seconds: int = Field(
-        default=480, ge=30, le=480, validation_alias="MAX_VIDEO_WATCH_SECONDS"
+        default=MAX_VIDEO_SECONDS,
+        ge=30,
+        le=MAX_VIDEO_SECONDS,
+        validation_alias="MAX_VIDEO_WATCH_SECONDS",
     )
     daily_video_watch_limit: int = Field(
         default=3, ge=0, le=20, validation_alias="DAILY_VIDEO_WATCH_LIMIT"

@@ -4,6 +4,15 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+PATROL_LANE = "patrol"
+PROACTIVE_LANE = "proactive"
+
+
+def paid_lane_available(status: dict, lane: str) -> bool:
+    """Cheap preflight; the ledger still reserves the actual request atomically."""
+    sub = status.get("sub_budgets", {}).get(lane)
+    return not status.get("hard_stop") and (sub is None or sub["used"] < sub["limit"])
+
 
 class BudgetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)

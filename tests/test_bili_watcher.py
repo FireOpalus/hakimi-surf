@@ -8,8 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from hakimi.bili_watcher import BiliPolicy, BiliWatcher, CredentialUpdate, wbi_sign
+from hakimi.budget_policy import BudgetConfig
 from hakimi.generation_policy import Scenario
+from hakimi.life_rules import milestone_sharing
 from hakimi.security import Rejected
+from hakimi.session_manager import SessionManager
+from hakimi.world_state import MilestoneEvent
 from tests.fakes import FakeGateway
 
 BV = "BV1xx411c7mD"
@@ -436,3 +440,87 @@ async def test_disable_then_enable_invalidates_old_round_but_manual_nav_remains_
     assert [c[0] for c in watcher.svc.ai.calls] == ["screen"]
     await watcher.set_policy(BiliPolicy(enabled=False))
     assert (await watcher.nav())["status"] == "valid"
+
+
+async def test_manual_patrol_with_no_patrol_budget_skips_network_and_model(watcher):
+    await watcher.set_policy(BiliPolicy(enabled=True))
+    await watcher.store.set_budget_config(BudgetConfig(patrol_daily_usd=0))
+    watcher.calls.clear()
+    with pytest.raises(Rejected, match="budget_exhausted"):
+        await watcher.run_once()
+    assert not watcher.calls and not watcher.svc.ai.calls
+
+
+@pytest.mark.parametrize(
+    "sender,reference,expected_importance",
+    [
+        ("20000", "recent_chat_topics:0", "high"),
+        ("30000", "recent_chat_topics:0", "normal"),
+        ("30000", "owner:20000", "normal"),
+    ],
+)
+async def test_private_patrol_recommendation_prefers_real_source(
+    watcher, message, sender, reference, expected_importance
+):
+    source = message.model_copy(update={"user_id": sender, "conversation_id": sender})
+    other_id = "30000" if sender == "20000" else "20000"
+    other_dm = message.model_copy(update={"user_id": other_id, "conversation_id": other_id})
+    group = message.model_copy(update={"kind": "group", "conversation_id": "40000"})
+    sessions = watcher.svc.sessions = SessionManager(watcher.s, watcher.store)
+    await sessions.remember(source, "给我找个科学视频", "可以")
+    events = []
+
+    async def publish(module, kind, payload, *, importance, business_key):
+        events.append(
+            MilestoneEvent(
+                source_module=module, event_type=kind, importance=importance, payload=payload
+            )
+        )
+
+    class Picks(Gateway):
+        async def generate(self, payload, subject, **kwargs):
+            if kwargs["scenario"] == Scenario.BILI_SELECTION:
+                assert payload["memory_preferences"]["private_topic_refs"] == [
+                    "recent_chat_topics:0"
+                ]
+                return json.dumps(
+                    {
+                        "selected": [
+                            {
+                                "bvid": BV,
+                                "private_topic_ref": reference,
+                                "share_owner": sender != "20000",
+                            }
+                        ]
+                    }
+                )
+            return await super().generate(payload, subject, **kwargs)
+
+    watcher.svc.world_state = SimpleNamespace(publish_event=publish)
+    watcher.svc.ai = Picks()
+    await watcher.set_policy(BiliPolicy(enabled=True))
+    assert (await watcher.run_once())["learned"] == 1
+    assert [e.importance for e in events] == [expected_importance]
+    reaction = milestone_sharing(watcher.s).match(events[0])
+    assert (reaction.recipient if reaction else None) == (
+        "owner:20000" if expected_importance == "high" else None
+    )
+    bound = reference == "recent_chat_topics:0"
+    assert not events[0].payload.get("private_topic_ref")
+    assert bool(events[0].payload.get("private_first")) == bound
+    assert await watcher.lookup_watched(BV)
+    assert bool(await watcher.recent_surfed(message=other_dm)) != bound
+    assert bool(await watcher.recent_surfed(message=group)) != bound
+    assert bool(await watcher.recent_surfed()) != bound
+    assert [r["bvid"] for r in await watcher.recent_surfed(message=source)] == [BV]
+    assert [r["bvid"] for r in await watcher.recent_surfed(now=watcher.clock() + 86401)] == [BV]
+    if bound:
+        row = await watcher.store.one("SELECT session_scope FROM bili_private_share_priority")
+        assert row[0] == watcher.store.session_scope(source)
+        now = watcher.clock()
+        await watcher.store.db.execute(
+            "INSERT INTO bili_watched_history VALUES (?, 'other', 'done', ?, ?)",
+            (OTHER, now + 1, watcher.store.vault.seal("bili-learn:" + OTHER, "普通视频")),
+        )
+        assert (await watcher.recent_surfed(message=source, limit=1))[0]["bvid"] == BV
+        assert (await watcher.recent_surfed(message=group, limit=1))[0]["bvid"] == OTHER

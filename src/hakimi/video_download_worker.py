@@ -457,8 +457,8 @@ def main():
         config = json.loads(Path("request.json").read_text())
         if (
             not re.fullmatch(BVID, config["bvid"])
-            or not isinstance(config["max_seconds"], int)
-            or not 1 <= config["max_seconds"] <= 480
+            or type(config["max_seconds"]) is not int
+            or not 1 <= config["max_seconds"] <= 15 * 60
         ):
             raise WorkerError("video_download_restricted")
         with contextlib.redirect_stdout(NullOutput()), contextlib.redirect_stderr(NullOutput()):

@@ -1628,7 +1628,7 @@ class Service:
             if not self.bot_guard.known_bot(message) and hasattr(
                 self.bili_watcher, "recent_surfed"
             ):
-                surfed = await self.bili_watcher.recent_surfed(limit=4)
+                surfed = await self.bili_watcher.recent_surfed(limit=4, message=message)
                 if surfed:
                     payload["recent_bili_surfed"] = surfed
             if not self.bot_guard.known_bot(message) and hasattr(self, "world_state"):

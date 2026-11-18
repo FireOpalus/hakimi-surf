@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .security import Rejected
+from .video_policy import MAX_VIDEO_SECONDS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS gemini_video_files (
@@ -38,7 +39,7 @@ def video_tokens(duration: float) -> int:
         isinstance(duration, bool)
         or not isinstance(duration, (int, float))
         or not math.isfinite(duration)
-        or not 0 < duration <= 480
+        or not 0 < duration <= MAX_VIDEO_SECONDS
     ):
         raise Rejected("video_duration_invalid")
     # Static 1 FPS + low resolution is ~66 visual + 32 audio tokens/second.

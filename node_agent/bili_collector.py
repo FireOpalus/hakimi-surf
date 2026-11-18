@@ -778,11 +778,11 @@ class BiliCollector:
         bvid = params.get("bvid", "")
         if not isinstance(bvid, str) or not BVID_RE.fullmatch(bvid):
             raise CollectorError("invalid_bvid")
-        max_seconds = params.get("max_seconds", 300)
+        max_seconds = params.get("max_seconds", 15 * 60)
         if (
             isinstance(max_seconds, bool)
             or not isinstance(max_seconds, int)
-            or not 30 <= max_seconds <= 480
+            or not 30 <= max_seconds <= 15 * 60
         ):
             raise CollectorError("video_download_duration")
         cookies = _normalize_cookies(params.get("cookies"))

@@ -266,7 +266,7 @@ async def test_budget_stops_upload_and_video_call_reservation_is_not_uri_sized(
     assert files.calls == []
 
 
-@pytest.mark.parametrize("duration", [0, -1, float("nan"), float("inf"), True, 481])
+@pytest.mark.parametrize("duration", [0, -1, float("nan"), float("inf"), True, 901])
 def test_video_duration_reservation_is_bounded(duration):
     with pytest.raises(Rejected):
         video_tokens(duration)
@@ -274,7 +274,7 @@ def test_video_duration_reservation_is_bounded(duration):
 
 def test_video_reference_cannot_be_external_or_unrelated_file():
     name = "files/hv-" + "a" * 32
-    assert video_tokens(60) > 60 * (66 + 32)
+    assert video_tokens(900) > video_tokens(480) > video_tokens(60) > 60 * (66 + 32)
     for uri in [
         "https://evil.example/v1beta/" + name,
         "https://generativelanguage.googleapis.com/v1beta/files/foreign",

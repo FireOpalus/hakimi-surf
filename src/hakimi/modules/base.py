@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import Settings
 from ..context_budget import truncate_tokens
+from ..models import Message
 from ..security import clean_text, configured_secrets
 from .actions import Action, ActionCatalog, DailyAction
 
@@ -98,7 +99,7 @@ class BaseModule(ABC):
     async def social_material(self, ticket: dict) -> str:
         return await self.get_sensor_summary()
 
-    async def context_data(self, *, limit: int, now: float) -> dict:
+    async def context_data(self, *, limit: int, now: float, message: Message | None = None) -> dict:
         return {}
 
     def schedules(self) -> tuple[DailyAction, ...]:
@@ -152,10 +153,10 @@ class ModuleRegistry:
         """Return all registered modules in registration order."""
         return list(self._modules.values())
 
-    async def context_data(self, *, limit: int, now: float) -> dict:
+    async def context_data(self, *, limit: int, now: float, message: Message | None = None) -> dict:
         data = {}
         for module in self.all():
-            data.update(await module.context_data(limit=limit, now=now))
+            data.update(await module.context_data(limit=limit, now=now, message=message))
         return data
 
     async def collect_sensor_summaries(self) -> dict[str, str]:

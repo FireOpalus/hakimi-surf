@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from .bilibili import BVID
 from .security import Rejected
+from .video_policy import MAX_VIDEO_SECONDS
 
 MAX_VIDEO_BYTES = 80 * 1024 * 1024
 MAX_JOB_BYTES = 192 * 1024 * 1024
@@ -232,13 +233,15 @@ class VideoDownloader:
                 await asyncio.gather(reader, wait, return_exceptions=True)
 
     @asynccontextmanager
-    async def download(self, bvid, *, max_seconds=480, cookies=None, proxy="", guard=None):
+    async def download(
+        self, bvid, *, max_seconds=MAX_VIDEO_SECONDS, cookies=None, proxy="", guard=None
+    ):
         if not isinstance(bvid, str) or not re.fullmatch(BVID, bvid):
             raise Rejected("invalid_bvid")
         if (
             isinstance(max_seconds, bool)
             or not isinstance(max_seconds, int)
-            or not 1 <= max_seconds <= 480
+            or not 1 <= max_seconds <= MAX_VIDEO_SECONDS
         ):
             raise Rejected("video_download_duration")
         valid_proxy(proxy)

@@ -4,6 +4,8 @@ import asyncio
 
 import pytest
 
+from hakimi.bili_watcher import BiliPolicy
+from hakimi.budget_policy import BudgetConfig
 from hakimi.life_engine import LifeEngine
 from hakimi.rest_policy import RestHoursConfig
 from tests.test_proactive_dm import dm as dm
@@ -165,3 +167,66 @@ async def test_bili_and_social_share_one_discretionary_allowance(dm):
     assert await engine.gatekeeper._count_today_proactive(now) == 1
     row = await dm.store.one("SELECT result_reason FROM scheduled_intents WHERE id=?", (key,))
     assert row[0] == "daily_proactive_limit" and not dm.service.ai.calls
+
+
+@pytest.mark.parametrize("patrol,proactive", [(0, 1), (1, 0), (0, 0)])
+async def test_world_bili_and_qq_actions_check_their_actual_budget_lanes(
+    dm, monkeypatch, patrol, proactive
+):
+    svc = dm.service
+    engine = svc.life_engine
+    await engine.set_config({"active_hours": "09:00-22:30"})
+    await dm.store.set_budget_config(
+        BudgetConfig(patrol_daily_usd=patrol, proactive_daily_usd=proactive)
+    )
+    now = dm.time[0] = stamp("2026-11-14T22:16:00")
+    watcher = svc.bili_watcher
+    watcher.policy = BiliPolicy(enabled=True)
+    watcher.creds["sessdata"] = "test"
+    patrol_calls = []
+
+    async def run(*, slot):
+        patrol_calls.append(slot)
+        return {"status": "done", "learned": 1}
+
+    monkeypatch.setattr(watcher, "run_once", run)
+    await svc.world_state.enqueue_intent(
+        dict(
+            action_name="bili.patrol",
+            origin="planner",
+            target_module="bilibili_surf",
+            action_type="patrol",
+            execute_after=now - 1,
+            expire_at=now + 600,
+        ),
+        now=now,
+    )
+    await engine.tick_gatekeeper_once()
+    rows = {
+        r["action_name"]: r
+        for r in await dm.store.all(
+            "SELECT action_name,status,result_reason FROM scheduled_intents"
+        )
+    }
+    assert len(patrol_calls) == int(bool(patrol))
+    assert (rows["bili.patrol"]["status"] == "done") == bool(patrol)
+    assert (rows["qq.owner_digest"]["status"] == "done") == bool(proactive)
+    assert [c[0] for c in svc.ai.calls] == (["screen", "generate"] if proactive else [])
+    if not patrol:
+        assert rows["bili.patrol"]["result_reason"] == "budget_limit"
+    if not proactive:
+        assert rows["qq.owner_digest"]["result_reason"] == "budget_limit"
+
+
+async def test_unfunded_planner_can_schedule_one_patrol_from_its_own_lane(dm):
+    svc, engine = dm.service, dm.service.life_engine
+    watcher = svc.bili_watcher
+    watcher.policy = BiliPolicy(enabled=True)
+    watcher.creds["sessdata"] = "test"
+    await dm.store.set_budget_config(BudgetConfig(patrol_daily_usd=1, proactive_daily_usd=0))
+    for _ in range(2):
+        plan = await engine.trigger_plan_once(now=dm.clock())
+        assert plan["source"] == "local_fallback"
+    tickets = await dm.store.all("SELECT action_name FROM scheduled_intents")
+    assert [t[0] for t in tickets] == ["bili.patrol"]
+    assert not svc.ai.calls

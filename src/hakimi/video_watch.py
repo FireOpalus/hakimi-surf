@@ -347,6 +347,8 @@ class VideoWatch:
             and raw_dur > 0
             else None
         )
+        if sb_duration is None or sb_duration > config.max_seconds:
+            return None
         storyboard_img = ModelImage(
             data=base64.b64encode(raw_bytes).decode("ascii"),
             mime_type="image/jpeg",

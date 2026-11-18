@@ -358,7 +358,7 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
             return 0, b"", b""
         if tool == "ffprobe":
             observed["cookie_wiped_before_ffprobe"] = not (cwd / "cookies.txt").exists()
-            payload = {"format": {"duration": "90.0", "format_name": "mp4"}}
+            payload = {"format": {"duration": "900.0", "format_name": "mp4"}}
             return 0, json.dumps(payload).encode(), b""
         if tool == "ffmpeg":
             out_path = Path(argv[-1])
@@ -375,7 +375,7 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
         sb = await collector.video_storyboard(
             {
                 "bvid": TEST_BVID,
-                "max_seconds": 120,
+                "max_seconds": 900,
                 "cookies": {"sessdata": "cn-temp-cookie-val"},
             }
         )
@@ -389,7 +389,7 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
 
         raw_jpeg = base64.b64decode(sb["data_b64"])
         assert sb["bvid"] == TEST_BVID
-        assert sb["duration"] == 90.0
+        assert sb["duration"] == 900.0
         assert sb["mime_type"] == "image/jpeg"
         assert sb["grid"] == "3x3"
         assert sb["bytes"] == len(raw_jpeg)

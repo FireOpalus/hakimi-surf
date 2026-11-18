@@ -26,10 +26,13 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 
 from .bilibili import BVID, NODE_TRANSPORT_ERRORS, bounded_json
 from .bot_server import is_persona_owner, untrusted_input
+from .budget_policy import PATROL_LANE, paid_lane_available
 from .generation_policy import Scenario
-from .models import Video
+from .models import Message, Video
 from .roaming_logger import redact_public_summary
 from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
+
+PRIVATE_SHARE_PRIORITY_SECONDS = 24 * 3600
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bili_credentials (
@@ -49,6 +52,10 @@ CREATE TABLE IF NOT EXISTS bili_patrol_runs (
 CREATE TABLE IF NOT EXISTS bili_watched_history (
  bvid TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL,
  summary BLOB
+);
+CREATE TABLE IF NOT EXISTS bili_private_share_priority (
+ bvid TEXT PRIMARY KEY REFERENCES bili_watched_history(bvid) ON DELETE CASCADE,
+ session_scope TEXT NOT NULL, expires_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS bili_actions (
  id TEXT PRIMARY KEY, day TEXT NOT NULL, bvid TEXT NOT NULL, kind TEXT NOT NULL,
@@ -201,6 +208,7 @@ class Pick(BaseModel):
     like: bool = False
     favorite: bool = False
     share_owner: bool = False
+    private_topic_ref: str = Field(default="", max_length=48)
 
 
 class Selection(BaseModel):
@@ -1092,20 +1100,32 @@ class BiliWatcher:
             raise Rejected("context_too_large")
         return payload
 
-    async def _memory_preferences(self) -> dict:
+    async def _memory_preferences(self) -> tuple[dict, dict[str, Message]]:
         sessions = getattr(self.svc, "sessions", None)
         runtime = getattr(self.store, "runtime", None)
         if sessions is None or runtime is None or not hasattr(runtime, "sessions"):
-            return {}
+            return {}, {}
         secrets = getattr(self.svc, "secrets", None) or configured_secrets(self.s)
-        owner_interests: list[str] = []
-        community_topics: list[str] = []
-        recent_topics: list[str] = []
+        topics: dict[str, list[str]] = {}
+        private_sources: dict[str, Message] = {}
         now = self.clock()
         try:
             session_list = await runtime.sessions()
         except Exception:
-            return {}
+            return {}, {}
+
+        def add_topic(field: str, raw: str, msg: Message, *, count: int, length: int):
+            values = topics.get(field, [])
+            if len(values) >= count:
+                return
+            text = redact_public_summary(safe_output(raw, secrets, limit=length))
+            if not text or text in values:
+                return
+            if msg.kind == "private":
+                # The model cites an index. Only this process knows its real conversation.
+                private_sources[f"{field}:{len(values)}"] = msg
+            topics.setdefault(field, []).append(text)
+
         for _, msg in session_list[:20]:
             try:
                 if not authorize(msg.model_copy(update={"addressed": True}), self.s):
@@ -1118,21 +1138,20 @@ class BiliWatcher:
                 for e in view.get("entries", [])
                 if not e.get("deleted") and (not e.get("expires") or e["expires"] > now)
             ]
-            owner_private = msg.kind == "private" and is_persona_owner(msg, self.s)
-            if owner_private:
+            if msg.kind == "private" and is_persona_owner(msg, self.s):
                 for entry in entries:
                     if (
                         entry.get("kind") == "profile"
                         and entry.get("slot") in {"preferences", "state"}
                     ) or entry.get("kind") == "chronicle":
                         topic = f"{entry.get('topic')}: " if entry.get("topic") else ""
-                        text = redact_public_summary(
-                            safe_output(f"{topic}{entry.get('text', '')}", secrets, limit=140)
+                        add_topic(
+                            "owner_interests",
+                            f"{topic}{entry.get('text', '')}",
+                            msg,
+                            count=8,
+                            length=140,
                         )
-                        if text and text not in owner_interests:
-                            owner_interests.append(text)
-                        if len(owner_interests) >= 8:
-                            break
             else:
                 profiles = [
                     e
@@ -1146,41 +1165,41 @@ class BiliWatcher:
                 )
                 for entry in [*profiles[:4], *chronicles[:6]]:
                     topic = f"{entry.get('topic')}: " if entry.get("topic") else ""
-                    text = redact_public_summary(
-                        safe_output(f"{topic}{entry.get('text', '')}", secrets, limit=120)
+                    add_topic(
+                        "community_topics",
+                        f"{topic}{entry.get('text', '')}",
+                        msg,
+                        count=10,
+                        length=120,
                     )
-                    if text and text not in community_topics and len(community_topics) < 10:
-                        community_topics.append(text)
-            if len(owner_interests) >= 8 and len(community_topics) >= 10:
+            if (
+                len(topics.get("owner_interests", [])) >= 8
+                and len(topics.get("community_topics", [])) >= 10
+            ):
                 break
-        if not owner_interests and not community_topics:
-            for _, msg in session_list[:10]:
-                try:
-                    if not authorize(msg.model_copy(update={"addressed": True}), self.s):
-                        continue
-                    snap = await sessions.snapshot(msg)
-                except Exception:
+        # Recent explicit video requests still matter when other sessions have saved profiles.
+        fallback = not topics
+        recent_field = "recent_chat_topics" if fallback else "private_video_requests"
+        for _, msg in session_list[:10]:
+            if not fallback and msg.kind != "private":
+                continue
+            try:
+                if not authorize(msg.model_copy(update={"addressed": True}), self.s):
                     continue
-                for item in reversed(snap.get("recent_messages", [])[-6:]):
-                    if item.get("role") != "user":
-                        continue
-                    text = redact_public_summary(
-                        safe_output(str(item.get("text", "")), secrets, limit=80)
-                    )
-                    if text and text not in recent_topics:
-                        recent_topics.append(text)
-                    if len(recent_topics) >= 5:
-                        break
-                if len(recent_topics) >= 5:
-                    break
-        result = {}
-        if owner_interests:
-            result["owner_interests"] = owner_interests[:8]
-        if community_topics:
-            result["community_topics"] = community_topics[:10]
-        elif recent_topics:
-            result["recent_chat_topics"] = recent_topics[:5]
-        return result
+                snap = await sessions.snapshot(msg)
+            except Exception:
+                continue
+            for item in reversed(snap.get("recent_messages", [])[-6:]):
+                text = str(item.get("text", ""))
+                if item.get("role") == "user" and (
+                    fallback or re.search(r"视频|[Bb]站|哔哩哔哩|bilibili", text, re.I)
+                ):
+                    add_topic(recent_field, text, msg, count=5, length=80)
+            if len(topics.get(recent_field, [])) >= 5:
+                break
+        if private_sources:
+            topics["private_topic_refs"] = list(private_sources)
+        return topics, private_sources
 
     async def _actions_by_bvid(self, bvids: list[str]) -> dict[str, list[str]]:
         if not bvids:
@@ -1206,9 +1225,15 @@ class BiliWatcher:
         return redact_public_summary(safe_output(str(raw), secrets, limit=limit))
 
     async def recent_surfed(
-        self, *, limit: int = 4, max_age: float = 172800.0, now: float | None = None
+        self,
+        *,
+        limit: int = 4,
+        max_age: float = 172800.0,
+        now: float | None = None,
+        message: Message | None = None,
     ) -> list[dict]:
         current = self.clock() if now is None else now
+        scope = self.store.session_scope(message) if message and message.kind == "private" else ""
         async with self.store.lock:
             has_bili = await self.store.one(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bili_watched_history'"
@@ -1216,10 +1241,12 @@ class BiliWatcher:
             if not has_bili:
                 return []
             rows = await self.store.all(
-                "SELECT bvid,created,summary FROM bili_watched_history "
-                "WHERE status='done' AND summary IS NOT NULL AND created>=? "
-                "ORDER BY created DESC LIMIT ?",
-                (current - max_age, max(1, int(limit))),
+                "SELECT h.bvid,h.created,h.summary FROM bili_watched_history h "
+                "LEFT JOIN bili_private_share_priority p ON p.bvid=h.bvid AND p.expires_at>? "
+                "WHERE h.status='done' AND h.summary IS NOT NULL AND h.created>=? "
+                "AND (p.bvid IS NULL OR p.session_scope=?) "
+                "ORDER BY (p.bvid IS NOT NULL) DESC,h.created DESC LIMIT ?",
+                (current, current - max_age, scope, max(1, int(limit))),
             )
             actions = await self._actions_by_bvid([r[0] for r in rows])
         items: list[dict] = []
@@ -1278,8 +1305,9 @@ class BiliWatcher:
                 raise Rejected("bili_credentials_missing")
             if self.blocked_until > self.clock():
                 raise Rejected("bili_account_cooling_down")
-            if (await self.store.budget_status())["hard_stop"]:
-                raise Rejected("budget_hard_stop")
+            budget = await self.store.budget_status()
+            if not paid_lane_available(budget, PATROL_LANE):
+                raise Rejected("budget_hard_stop" if budget["hard_stop"] else "budget_exhausted")
             day = self.local().date().isoformat()
             key = uuid.uuid4().hex
             async with self.store.transaction():
@@ -1299,18 +1327,22 @@ class BiliWatcher:
                 self._ensure_current()
                 if not candidates:
                     return await self._finish(key, "empty", 0)
-                prefs = await self._memory_preferences()
+                prefs, private_sources = await self._memory_preferences()
                 raw_payload = {
                     "candidates": candidates,
                     **({"memory_preferences": prefs} if prefs else {}),
                 }
                 payload = self._bounded(raw_payload)
+                if "memory_preferences" not in payload:
+                    private_sources.clear()
                 subject = self.store.vault.digest("bili-account-budget", self.s.namespace)
                 self._ensure_current()
-                await self.svc.ai.screen(payload, subject, purpose="source", budget_lane="patrol")
+                await self.svc.ai.screen(
+                    payload, subject, purpose="source", budget_lane=PATROL_LANE
+                )
                 self._ensure_current()
                 raw = await self.svc.ai.generate(
-                    payload, subject, scenario=Scenario.BILI_SELECTION, budget_lane="patrol"
+                    payload, subject, scenario=Scenario.BILI_SELECTION, budget_lane=PATROL_LANE
                 )
                 self._ensure_current()
                 selection = Selection.model_validate(json.loads(raw))
@@ -1340,7 +1372,7 @@ class BiliWatcher:
                             pick.bvid,
                             material,
                             subject,
-                            "patrol",
+                            PATROL_LANE,
                             guard=lambda: self._ensure_current(allow_cooldown=True),
                         )
                         summary = result.text
@@ -1354,14 +1386,14 @@ class BiliWatcher:
                         )
                     else:
                         await self.svc.ai.screen(
-                            material, subject, purpose="source", budget_lane="patrol"
+                            material, subject, purpose="source", budget_lane=PATROL_LANE
                         )
                         self._ensure_current()
                         summary = await self.svc.ai.generate(
                             material,
                             subject,
                             scenario=Scenario.BILI_LEARNING,
-                            budget_lane="patrol",
+                            budget_lane=PATROL_LANE,
                         )
                         label = "公开文本学习"
                     # Persist the fallback summary, then stop Bili requests on risk.
@@ -1371,11 +1403,32 @@ class BiliWatcher:
                         safe_output(summary, self.svc.secrets, limit=1000)
                     )
                     text = f"{label} · {pick.bvid}\n{summary}"
+                    preferred = private_sources.get(pick.private_topic_ref)
+                    share_owner = (
+                        is_persona_owner(preferred, self.s)
+                        if preferred is not None
+                        else pick.share_owner and not pick.private_topic_ref
+                    )
                     async with self.store.transaction():
                         await self.store.db.execute(
                             "UPDATE bili_watched_history SET status='done',summary=? WHERE bvid=?",
                             (self.store.vault.seal("bili-learn:" + pick.bvid, text), pick.bvid),
                         )
+                        if preferred is not None:
+                            now = self.clock()
+                            await self.store.db.execute(
+                                "DELETE FROM bili_private_share_priority WHERE expires_at<=?",
+                                (now,),
+                            )
+                            await self.store.db.execute(
+                                "INSERT INTO bili_private_share_priority "
+                                "(bvid,session_scope,expires_at) VALUES (?,?,?)",
+                                (
+                                    pick.bvid,
+                                    self.store.session_scope(preferred),
+                                    now + PRIVATE_SHARE_PRIORITY_SECONDS,
+                                ),
+                            )
                     ws_mgr = getattr(self.svc, "world_state", None)
                     if ws_mgr is not None:
                         if hasattr(ws_mgr, "store") and hasattr(ws_mgr, "initialize"):
@@ -1394,8 +1447,9 @@ class BiliWatcher:
                                 "bvid": pick.bvid,
                                 "title": title_str[:80],
                                 "summary": summary[:140],
+                                **({"private_first": True} if preferred is not None else {}),
                             },
-                            importance="high" if pick.share_owner else "normal",
+                            importance="high" if share_owner else "normal",
                             business_key=pick.bvid,
                         )
                     if self.svc.diary:
