@@ -31,8 +31,10 @@ from .modules.actions import ActionCall, GateDecision, Mode, Outcome, reject_rea
 from .modules.base import sanitize_sensor_text
 from .modules.qq_delivery import JIT_TRIGGER_MESSAGE as JIT_TRIGGER_MESSAGE
 from .modules.qq_policy import DESKTOP_CONTEXT_HINT as DESKTOP_CONTEXT_HINT
+from .planning_journal import PlannerJournal
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
+from .work_usage import model_work
 from .world_state import (
     IntentTicketCreate,
     MilestoneEvent,
@@ -161,6 +163,7 @@ class LifeBlockPlanner:
         self.engine = engine
         self.clock = clock
         self.rng = rng or random.SystemRandom()
+        self.journal = PlannerJournal(self.store)
         self.next_plan_at: float = 0.0
         self.last_plan_at: float = 0.0
         self.last_plan_source: str = "none"
@@ -205,12 +208,25 @@ class LifeBlockPlanner:
         self.next_plan_at = wake_at
         return wake_at
 
-    async def plan_once(self, now: float | None = None) -> dict[str, Any]:
+    async def initialize(self):
+        state = await self.journal.initialize(self.clock())
+        self.next_plan_at = state["next_at"]
+        self.last_plan_at, self.last_plan_source = state["last_at"], state["last_source"]
+
+    async def plan_once(
+        self, now: float | None = None, *, automatic: bool = False
+    ) -> dict[str, Any]:
         ts = self.clock() if now is None else now
+        state = await self.journal.initialize(ts)
+        day = self._local(ts).date().isoformat()
         cfg = self.config
         ws = self.service.world_state
+        if automatic and ts < state["next_at"]:
+            self.next_plan_at = state["next_at"]
+            return {"status": "not_due", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
         if not cfg.enabled:
             self.next_plan_at = ts + 1800.0
+            await self.journal.pause(day, ts, self.next_plan_at, "disabled")
             return {"status": "disabled", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
 
         local_dt = self._local(ts)
@@ -230,6 +246,7 @@ class LifeBlockPlanner:
             wake_at = self._schedule_sleep_wakeup(ts, cfg)
             self.last_plan_at = ts
             self.last_plan_source = "sleeping"
+            await self.journal.pause(day, ts, wake_at, "sleeping")
             return {"status": "sleeping", "next_plan_at": wake_at, "intents_enqueued": 0}
 
         current = ws.current
@@ -277,30 +294,111 @@ class LifeBlockPlanner:
             "available_modules": sorted(known_modules),
         }
 
-        plan: WireLifePlan | None = None
-        plan_source = "local_fallback"
-        planner_funded = paid_lane_available(budget, PROACTIVE_LANE)
-        if planner_funded:
-            subject = self.store.vault.digest("life-planner", self.s.namespace)
-            try:
-                raw_plan = await self.service.ai.generate(
-                    planner_payload,
-                    subject,
-                    budget_lane=PROACTIVE_LANE,
-                    life_plan=True,
-                )
-                plan = WireLifePlan.model_validate_json(raw_plan)
-                plan_source = "llm"
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                plan = None
-
-        if plan is None:
-            plan = await fallback_plan(
-                self.engine, planner_payload, current, local_dt, ts, offered, planner_funded
+        signature = self.store.vault.digest(
+            "planner-opportunities",
+            json.dumps(
+                {
+                    "actions": sorted(offered),
+                    "modules": sorted(known_modules),
+                    "audiences": planning_context.get("available_groups", []),
+                    "owner_available": planning_context.get("owner_dm_available", False),
+                    "focus_lock": current.current_module if ws.proactive_suspended() else None,
+                    "funded": paid_lane_available(budget, PROACTIVE_LANE),
+                },
+                sort_keys=True,
+            ),
+        )
+        public_events = planner_payload["unconsumed_events"]
+        checkpoint = await self.journal.prepared()
+        if checkpoint:
+            row, body = checkpoint
+            run_id, scheduled_at, next_at = row["id"], row["started"], row["next_at"]
+            plan = WireLifePlan.model_validate(body)
+            plan_source = row["source"]
+            reasons = json.loads(row["reasons"])
+        else:
+            scheduled_at = ts
+            next_at = ts + self.rng.uniform(
+                cfg.planner_min_minutes * 60, cfg.planner_max_minutes * 60
             )
+            planner_funded = paid_lane_available(budget, PROACTIVE_LANE)
+            quiet = bool(
+                automatic
+                and not public_events
+                and state["signature"] == signature
+                and ts < state["explore_at"]
+                and planner_funded
+            )
+            trigger = (
+                "manual"
+                if not automatic
+                else "milestone"
+                if public_events
+                else "opportunities_changed"
+                if state["signature"] != signature
+                else "unchanged"
+                if quiet
+                else "exploration"
+            )
+            explore_at = (
+                state["explore_at"]
+                if quiet
+                else ts
+                + self.rng.uniform(cfg.planner_max_minutes * 120, cfg.planner_max_minutes * 180)
+            )
+            run_id = await self.journal.start(
+                day,
+                ts,
+                trigger=trigger,
+                next_at=next_at,
+                signature=signature,
+                explore_at=explore_at,
+                events=[ev.id for ev in events],
+            )
+            if quiet or not offered:
+                reason = "unchanged_state" if quiet else "no_available_actions"
+                await self.journal.commit(
+                    ws,
+                    run_id,
+                    tickets=[],
+                    candidates=0,
+                    source="local_idle",
+                    outcome=reason,
+                    reasons={reason: 1},
+                    avoided=planner_funded,
+                )
+                self.last_plan_at, self.last_plan_source = ts, "local_idle"
+                self.next_plan_at = (await self.journal.clock())["next_at"]
+                return {
+                    "status": "resting",
+                    "reason": reason,
+                    "intents_enqueued": 0,
+                    "next_plan_at": self.next_plan_at,
+                }
+
+            plan = None
+            reasons = {}
             plan_source = "local_fallback"
+            if planner_funded:
+                subject = self.store.vault.digest("life-planner", self.s.namespace)
+                try:
+                    with model_work("world.plan", run_id):
+                        raw_plan = await self.service.ai.generate(
+                            planner_payload, subject, budget_lane=PROACTIVE_LANE, life_plan=True
+                        )
+                    plan = WireLifePlan.model_validate_json(raw_plan)
+                    plan_source = "llm"
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    reasons["model_unavailable_or_invalid"] = 1
+            else:
+                reasons["planner_budget_closed"] = 1
+            if plan is None:
+                plan = await fallback_plan(
+                    self.engine, planner_payload, current, local_dt, ts, offered, planner_funded
+                )
+            await self.journal.checkpoint(run_id, plan_source, plan.model_dump(), reasons)
 
         resolved_module = sanitize_sensor_text(plan.current_module, self.s, max_tokens=16) or "idle"
         if resolved_module not in known_modules:
@@ -314,52 +412,28 @@ class LifeBlockPlanner:
         resolved_energy = max(0, min(100, int(plan.energy)))
         resolved_boredom = max(0, min(100, int(plan.boredom)))
 
-        await ws.update_state(
-            current_module=resolved_module,
-            focus_level=resolved_focus,
-            mood=resolved_mood,
-            energy=resolved_energy,
-            boredom=resolved_boredom,
-        )
+        tickets = []
 
-        for ev in events:
-            await ws.mark_event_consumed(ev.id)
+        def skip(reason):
+            reasons[reason] = reasons.get(reason, 0) + 1
 
-        longnick_text = str(plan.mood_longnick or "").strip()
-        if longnick_text:
-            longnick = getattr(self.service, "longnick", None)
-            if longnick is not None:
-                if hasattr(longnick, "apply_life_block"):
-                    await longnick.apply_life_block(longnick_text)
-                elif hasattr(longnick, "apply_patrol"):
-                    await longnick.apply_patrol(longnick_text)
-
-        diary = getattr(self.service, "diary", None)
-        if diary is not None and hasattr(diary, "world_event"):
-            await diary.world_event(
-                f"life-block:{int(ts)}",
-                resolved_module,
-                "life_block",
-                (
-                    f"切换状态为 {resolved_module}({resolved_focus})"
-                    f" · 心情 {resolved_mood}，精力 {resolved_energy}"
-                ),
-                now=ts,
-            )
-
-        enqueued_ids: list[str] = []
-        for item in plan.intents[:3]:
+        if len(plan.intents) > 3:
+            reasons["round_cap"] = len(plan.intents) - 3
+        for index, item in enumerate(plan.intents[:3]):
             raw_note = str(item.intent_note or "").strip()
             if not raw_note:
+                skip("empty_note")
                 continue
             try:
                 _check_no_prewritten_speech(raw_note)
             except ValueError:
+                skip("prewritten_speech")
                 continue
             bounded_note = trim_complete_text(raw_note, 120)
             raw_scope = item.target_scope.strip()
             resolved_scope = modules_reg.normalize_recipient(raw_scope) if raw_scope else ""
             if resolved_scope is None:
+                skip("recipient_unavailable")
                 continue
             catalog = self.engine.catalog
             target_module, action_type = item.target_module, item.action_type
@@ -367,6 +441,7 @@ class LifeBlockPlanner:
                 target_module = catalog.owners.get(item.action_name, "")
                 spec = catalog.actions.get(item.action_name)
                 if not spec:
+                    skip("unknown_action")
                     continue
                 alias = next((a for a in spec.aliases if a[0] == target_module), None)
                 action_type = alias[1] if alias else item.action_name
@@ -383,19 +458,25 @@ class LifeBlockPlanner:
                     }
                 )
             except ValueError:
+                skip("invalid_action")
                 continue
 
             if spec.name not in offered:
+                skip("unavailable_action")
                 continue
 
             delay_sec = max(60.0, min(float(item.delay_minutes) * 60.0, 4.0 * 3600.0))
             ttl_sec = max(600.0, min(float(item.ttl_minutes) * 60.0, 6.0 * 3600.0))
-            execute_after = ts + delay_sec
+            execute_after = scheduled_at + delay_sec
             expire_at = execute_after + ttl_sec
+            if expire_at <= ts:
+                skip("window_expired")
+                continue
             gate_cond = {"allow_desktop_care": True} if item.allow_desktop_care else {}
             try:
                 ticket = IntentTicketCreate(
                     origin="planner",
+                    dedupe_key=f"plan:{run_id}:{index}",
                     action_name=spec.name,
                     arguments=args.model_dump(),
                     target_module=target_module,
@@ -408,13 +489,60 @@ class LifeBlockPlanner:
                     intent_note=bounded_note,
                 )
             except (ValidationError, ValueError):
+                skip("invalid_ticket")
                 continue
-            enqueued_ids.append(await ws.enqueue_intent(ticket, now=ts))
+            tickets.append(ticket)
 
-        self.next_plan_at = ts + self.rng.uniform(
-            cfg.planner_min_minutes * 60.0,
-            cfg.planner_max_minutes * 60.0,
+        outcome = (
+            "accepted"
+            if tickets
+            else "all_filtered"
+            if plan.intents
+            else "model_chose_rest"
+            if plan_source == "llm"
+            else "local_rest"
         )
+        enqueued_ids = await self.journal.commit(
+            ws,
+            run_id,
+            tickets=tickets,
+            candidates=len(plan.intents),
+            source=plan_source,
+            outcome=outcome,
+            reasons=reasons,
+            avoided=False,
+        )
+        self.next_plan_at = (await self.journal.clock())["next_at"]
+        await ws.update_state(
+            current_module=resolved_module,
+            focus_level=resolved_focus,
+            mood=resolved_mood,
+            energy=resolved_energy,
+            boredom=resolved_boredom,
+        )
+
+        longnick_text = str(plan.mood_longnick or "").strip()
+        if longnick_text:
+            longnick = getattr(self.service, "longnick", None)
+            if longnick is not None:
+                if hasattr(longnick, "apply_life_block"):
+                    await longnick.apply_life_block(longnick_text)
+                elif hasattr(longnick, "apply_patrol"):
+                    await longnick.apply_patrol(longnick_text)
+
+        diary = getattr(self.service, "diary", None)
+        if diary is not None and hasattr(diary, "world_event"):
+            await diary.world_event(
+                f"life-block:{run_id}",
+                resolved_module,
+                "life_block",
+                (
+                    f"切换状态为 {resolved_module}({resolved_focus})"
+                    f" · 心情 {resolved_mood}，精力 {resolved_energy}"
+                ),
+                now=ts,
+            )
+
         self.last_plan_at = ts
         self.last_plan_source = plan_source
         return {
@@ -429,7 +557,20 @@ class LifeBlockPlanner:
         }
 
     async def on_milestone_event(self, event: MilestoneEvent) -> str | None:
-        return await self.engine.rules.notify(event, self.clock())
+        result = await self.engine.rules.notify(event, self.clock())
+        if (
+            self.engine.config.enabled
+            and event.importance == "high"
+            and not event.payload.get("private_first")
+        ):
+            now = self.clock()
+            await self.journal.initialize(now)
+            # Coalesce bursts and avoid waking the model for every row in a burst.
+            wake = max(now + 5, self.last_plan_at + 60)
+            await self.journal.signal(wake)
+            self.next_plan_at = min(self.next_plan_at or wake, wake)
+            self.engine.wakeup.set()
+        return result
 
 
 class GatekeeperWorker:
