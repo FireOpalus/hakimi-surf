@@ -189,7 +189,7 @@ async def test_bili_patrol_memory_preferences_and_error_classification(settings,
                 sleep=no_sleep,
             )
             await watcher.initialize()
-            await watcher.set_policy(BiliPolicy(enabled=True, times=["13:00", "20:30"]))
+            await watcher.set_policy(BiliPolicy(enabled=True))
             await watcher.update_credentials(CredentialUpdate(sessdata="s", buvid3="b"))
             res = await watcher.run_once(slot="13:00")
             assert res["status"] == "done"

@@ -247,17 +247,17 @@
       <div class="grid two">
         <article class="tile blue"><span class="step">/admin/api/life</span><h3>生活引擎与节点</h3>
           <div class="row"><p>分开看 NapCat、上海节点（含心跳、RPC 错误与 B 站委派）、MC 桥与游戏连接。后台按登记动作显示执行模块、接收范围、就绪原因与路由模式。票据列出来源、关联事件、结果及旧路由对照。可热调规划参数、修改世界状态、立即规划、检查门控、取消待执行意图，或提交受限的 MC 目标。手动触发规划、门控和游戏动作受频控与操作锁约束。</p></div>
-          <div class="row"><h4>“今日主动”怎样计数？</h4><p>按机器人时区统计有聊天目标且状态为 <code>done</code> 或 <code>uncertain</code> 的生活引擎意图，用于限制每日主动次数。它不等于 QQ 已确认送达数，内部游戏目标也不计入。</p></div>
+          <div class="row"><h4>“今日主动”怎样计数？</h4><p>按机器人当地自然日统计世界引擎完成或结果不确定的自主聊天与 B 站小号巡逻。每日报告有独立的一次机会，游戏目标另行统计。</p></div>
           <div class="row"><h4>“上次主动”来自哪里？</h4><p>JIT 发送和常规 Owner 主动私信确认后会更新世界状态。若旧库没有该时间戳，面板取已发 Owner 私信与已完成社交意图中的最近记录作为回退。</p></div>
         </article>
         <article class="tile sea"><span class="step">/admin/api/sessions · /admin/api/notebook</span><h3>会话与 Owner 桌面桥</h3>
           <div class="row"><p>会话面板分列热窗口条数、旧滚动摘要字数、双轨是否就绪，以及未删除的双轨条目数和正文总字数。旧摘要为零，不能据此判断记忆库为空。</p></div>
           <div class="row"><h4>“小本本关闭”不等于桌面桥关闭</h4><p>Notebook 与 Antigravity 只读挂载分别报告。桌面桥启用时，受保护的接口返回脱敏常驻备忘预览、索引片段数和最近活动；私人备忘正文不进入普通群聊和国内节点的状态数据。</p></div>
-          <div class="row" id="rest-hours"><h4>原有 Owner 私信调度仍独立</h4><p>运维告警用本地模板，日报和陪伴受各自的开关、预算、时段约束。断线时待发私信保留有效期；不要把旧调度器的预约槽位当作生活引擎意图。</p></div>
+          <div class="row" id="rest-hours"><h4>世界引擎统一安排巡逻与主动私信</h4><p>世界引擎用 bili.patrol 安排小号巡逻，用 qq.speak 发起聊天。qq.owner_digest 在当日可发送时段结束前安排一次日报，与手动汇报共用 SQLite 回执。QQ 负责向 Owner 投递、离线暂存和零 Token 运维告警。</p></div>
         </article>
       </div>
       <div class="note" id="billing"><h3>一笔模型费用，从预留到核对</h3>
-        <p id="thinking-accounting">SQLite 事务预留 → 发起请求 → 按供应方用量结算或标注估算 → 按日期、模型、来源与实际思考档汇总。输入、缓存、输出和思考 Token 分开记录；有聊天目标的每日活动次数与这些费用是不同指标。</p>
+        <p id="thinking-accounting">SQLite 事务预留 → 发起请求 → 按供应方用量结算或标注估算 → 按日期、模型、来源与实际思考档汇总。输入、缓存、输出和思考 Token 分开记录；自主聊天与巡逻的次数单独统计。</p>
         <p id="search-routing">可选外部检索独立取证并筛查来源，再把材料放入 C 区；搜索次数单独计量。GCP 账单与用量同步也是可选的核对途径，不能把本地未知模型费用直接归作 Drive 费用。</p>
       </div>
       <p class="ref" id="sources"><b>源码</b><a href="src/hakimi/life_admin.py">生活面板与操作</a><a href="src/hakimi/admin_routes.py">会话与快照</a><a href="src/hakimi/admin_page.html">后台展示</a><a href="src/hakimi/admin_auth.py">鉴权</a><a href="src/hakimi/proactive_dm.py">Owner 私信</a><a href="src/hakimi/model_accounting.py">分档账本</a><a href="src/hakimi/gcp_billing.py">账单核对</a></p>

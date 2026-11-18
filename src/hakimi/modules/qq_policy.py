@@ -20,15 +20,6 @@ if TYPE_CHECKING:
     from ..life_engine import LifeEngineConfig
 
 DESKTOP_CONTEXT_HINT = "BOISER 近期刚在电脑端忙正事，默契关心一句注意休息喝水，绝不问怎么没回消息"
-_GENERIC_OWNER_SILENCE_ACTIONS = frozenset(
-    {
-        "owner_silence_care",
-        "owner_companion",
-        "owner_desktop_warm_care",
-        "companion",
-        "check_in",
-    }
-)
 
 
 def _parse_memory_timestamp(raw_ts: Any, tz_name: str) -> float:
@@ -223,23 +214,11 @@ class QQPolicy:
         self, ticket: dict[str, Any], now: float, cfg: LifeEngineConfig
     ) -> tuple[bool, str | None]:
         proactive = self.service.proactive
-        if not proactive.configured:
+        if not proactive.configured or not cfg.owner_delivery_enabled:
             return False, None
-        async with self.store.lock:
-            row = await self.store.one(
-                "SELECT last_private_at FROM owner_dm_state WHERE scope=?",
-                (proactive.scope,),
-            )
-        last_private_at = float(row["last_private_at"]) if row and row["last_private_at"] else 0.0
+        if await self.owner_recently_active(ticket, now):
+            return False, None
         action_type = str(ticket.get("action_type", ""))
-        is_generic = action_type in _GENERIC_OWNER_SILENCE_ACTIONS or not action_type.endswith(
-            "_milestone_share"
-        )
-        if ticket.get("origin") == "planner":
-            is_generic = True
-        if last_private_at > 0 and 0.0 <= (now - last_private_at) < 3600.0 and is_generic:
-            return False, None
-
         desktop = await _desktop_latest_activity(self.service)
         desktop_ts = float(desktop.get("latest_timestamp", 0.0) or 0.0)
         desktop_recent = bool(
@@ -255,3 +234,13 @@ class QQPolicy:
             if allow_desktop_care or action_type == "owner_desktop_warm_care":
                 return True, DESKTOP_CONTEXT_HINT
         return True, None
+
+    async def owner_recently_active(self, ticket: dict, now: float) -> bool:
+        if ticket.get("origin") != "planner" and ticket["action_type"].endswith("_milestone_share"):
+            return False
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT last_private_at FROM owner_dm_state WHERE scope=?",
+                (self.service.proactive.scope,),
+            )
+        return bool(row and row[0] and 0 <= now - row[0] < 3 * 3600)

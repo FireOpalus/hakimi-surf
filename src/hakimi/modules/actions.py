@@ -55,6 +55,7 @@ class Action:
     run: Handler
     arguments: type[BaseModel] = NoArgs
     social: bool = False
+    owner_only: bool = False
     budgeted: bool = False
     origins: frozenset[str] = AUTONOMOUS
     unavailable: Callable[[], str | None] = lambda: None
@@ -117,12 +118,15 @@ class ActionCatalog:
             if planner and (reason or "planner" not in spec.origins):
                 continue
             schema = spec.arguments.model_json_schema()
+            audience = "social" if spec.social else "internal"
+            if spec.owner_only:
+                audience = "owner"
             rows.append(
                 {
                     "name": name,
                     "module": self.owners[name],
                     "description": spec.description,
-                    "audience": "social" if spec.social else "internal",
+                    "audience": audience,
                     "arguments": schema["properties"],
                     "required": schema.get("required", []),
                     "mode": mode,
@@ -140,8 +144,9 @@ class DailyAction:
     """A module-provided local schedule; idempotency uses the local day and slot."""
 
     name: str
-    at: str
-    ttl: int = 1800
+    at: str | None  # None closes the active window for the local day.
+    ttl: int = 1800  # Fixed-time actions; a closing action expires at the end of its window.
+    target_scope: str = ""
 
 
 def reject_reason(exc: ValueError) -> str:

@@ -7,7 +7,7 @@ from typing import Any
 
 from ..config import Settings
 from ..hot_ring import HotRing
-from .actions import Action, ActionCall, Handler, Outcome
+from .actions import Action, ActionCall, DailyAction, Handler, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion
 
 
@@ -26,12 +26,14 @@ class QQSocialModule(BaseModule):
         transport: Any = None,
         service: Any = None,
         speak: Handler | None = None,
+        digest: Handler | None = None,
         preflight=None,
         connected: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(settings)
         self._hot_ring = hot_ring or getattr(service, "hot", None)
         self._transport = transport or getattr(getattr(service, "sender", None), "onebot", None)
+        self.digest = digest or self._offline
         self.speak = speak or self._offline
         self.preflight = preflight
         self.connected = connected or (lambda: False)
@@ -40,6 +42,7 @@ class QQSocialModule(BaseModule):
             from .qq_delivery import LifeSpeaker
             from .qq_policy import QQPolicy
 
+            self.digest = service.proactive.world_digest
             self.speak = LifeSpeaker(service).speak
             self.preflight = QQPolicy(service).evaluate
             self.connected = service.proactive.connected
@@ -79,7 +82,25 @@ class QQSocialModule(BaseModule):
                     (module, verb, True) for module, verbs in aliases.items() for verb in verbs
                 ),
             ),
+            Action(
+                name="qq.owner_digest",
+                description="在活跃时段结束前汇总当天的公开巡逻记录，投递到 Owner 私聊",
+                social=True,
+                owner_only=True,
+                budgeted=True,
+                origins=frozenset({"timer"}),
+                run=self.digest,
+            ),
         )
+
+    def schedules(self):
+        if self.settings and self.settings.onebot_enabled and self.settings.owner_qq_id:
+            return (
+                DailyAction(
+                    "qq.owner_digest", at=None, target_scope="owner:" + self.settings.owner_qq_id
+                ),
+            )
+        return ()
 
     def event_rules(self):
         from ..life_rules import milestone_sharing

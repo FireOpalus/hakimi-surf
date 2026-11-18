@@ -161,6 +161,7 @@ class Service:
                 hot_ring=self.hot,
                 transport=getattr(sender, "onebot", None),
                 speak=LifeSpeaker(self).speak,
+                digest=self.proactive.world_digest,
                 preflight=QQPolicy(self).evaluate,
                 connected=self.proactive.connected,
             )
@@ -407,9 +408,8 @@ class Service:
             asyncio.create_task(self.compressor.run(), name="memory-archive"),
             asyncio.create_task(self.patrol(), name="patrol"),
             asyncio.create_task(self.janitor(), name="janitor"),
-            asyncio.create_task(self.proactive.run(), name="owner-proactive"),
+            asyncio.create_task(self.proactive.run(), name="owner-operational-alerts"),
             asyncio.create_task(self.proactive.delivery(), name="owner-dm-delivery"),
-            asyncio.create_task(self.bili_watcher.run(), name="bili-account-patrol"),
             asyncio.create_task(self.gcp_billing_worker(), name="gcp-billing-sync"),
             asyncio.create_task(self.life_engine.run(), name="life-engine"),
         ]
@@ -522,7 +522,7 @@ class Service:
         await self.store.add_subscription(message, match[2])
         tip = (
             "发现更新后会私聊汇报。"
-            if is_persona_owner(message, self.s) and self.proactive.config.enabled
+            if is_persona_owner(message, self.s) and self.proactive.delivery_enabled
             else "新摘要会保存在 /哈基米 报告 中。"
         )
         return "已订阅；首次巡逻仅建立基线。" + tip
@@ -2071,7 +2071,7 @@ class Service:
         await self.store.save_report(job["subject"], result)
         if self.diary:
             await self.diary.patrol(job["id"], result)
-        if is_persona_owner(target, self.s) and self.proactive.config.enabled:
+        if is_persona_owner(target, self.s) and self.proactive.delivery_enabled:
             await self.proactive.enqueue("patrol", result, key=job["id"])
 
     async def process(self, job: dict):
@@ -2523,7 +2523,7 @@ class Service:
         if (
             target.kind == "private"
             and is_persona_owner(target, self.s)
-            and self.proactive.config.enabled
+            and self.proactive.delivery_enabled
         ):
             live_key = self.store.vault.digest("live-open", room_id, int(time.time() // 1800))
             try:

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -10,8 +9,9 @@ import pytest
 from pydantic import ValidationError
 
 from hakimi.adapters import Sender
-from hakimi.proactive_dm import TEST_MESSAGE, OwnerProactive
-from hakimi.proactive_policy import ProactiveConfig
+from hakimi.life_engine import LifeEngine, LifeEngineConfig
+from hakimi.modules.qq_policy import QQPolicy
+from hakimi.proactive_dm import TEST_MESSAGE
 from hakimi.roaming_logger import RoamingLogger
 from hakimi.security import Rejected
 from hakimi.service import Service
@@ -49,7 +49,11 @@ async def dm(settings, store):
     wire = Wire()
     async with httpx.AsyncClient() as http:
         svc = Service(settings, store, FakeGateway(), FakeBili(), Sender(settings, http, wire))
-        module = OwnerProactive(svc, clock=lambda: clock[0], rng=random.Random(123))
+        module = svc.proactive
+        module.clock = lambda: clock[0]
+        svc.life_engine = LifeEngine(svc, clock=module.clock)
+        svc.world_state.clock = module.clock
+        await svc.life_engine.initialize()
         module.time = clock
         svc.proactive = module
         await module.initialize()
@@ -154,20 +158,15 @@ async def test_offline_queue_encrypted_then_fifo_after_reconnect(dm):
     assert texts == [TEST_MESSAGE, "BOISER，测试运维状态"]
 
 
-async def test_offline_companion_expires_without_next_morning_replay(dm):
+async def test_offline_world_digest_expires_at_end_of_active_day(dm):
     dm.time[0] = stamp("2026-11-14T23:20:00")
     dm.service.sender.onebot.ready.clear()
-    key = await slot(dm)
-    # Production plans cap expiry at the quiet boundary.
-    await dm.store.db.execute(
-        "UPDATE proactive_schedule SET expires_at=? WHERE id=?",
-        (dm._companion_expiry(dm.clock()), key),
-    )
-    assert (await dm.generate_slot(key))["status"] == "queued"
+    result = await dm.prepare_digest(automatic=True, expires=stamp("2026-11-14T23:30:00"))
+    assert result["status"] == "queued"
     dm.time[0] = stamp("2026-11-15T08:30:00")
     dm.service.sender.onebot.ready.set()
     await dm.deliver_once()
-    assert await dm.delivery_status(key) == "expired"
+    assert await dm.delivery_status(result["id"]) == "expired"
     assert not dm.service.sender.onebot.calls
 
 
@@ -185,7 +184,7 @@ async def test_alert_expires_at_twelve_hours(dm):
     [("23:29", False), ("23:30", True), ("00:00", True), ("08:29", True), ("08:30", False)],
 )
 def test_quiet_boundaries(time_text, quiet):
-    assert ProactiveConfig().quiet(datetime.fromisoformat("2026-11-14T" + time_text)) is quiet
+    assert LifeEngineConfig().quiet(datetime.fromisoformat("2026-11-14T" + time_text)) is quiet
 
 
 @pytest.mark.parametrize(
@@ -202,22 +201,22 @@ def test_quiet_boundaries(time_text, quiet):
 )
 def test_invalid_policy_is_rejected(override):
     with pytest.raises(ValidationError):
-        ProactiveConfig(**override)
+        LifeEngineConfig(**override)
 
 
-async def test_local_schedule_persists_no_llm_polling_and_no_quiet_slots(dm):
-    await dm.set_config(ProactiveConfig(max_per_day=2))
-    before = [dict(r) for r in await dm.store.all("SELECT * FROM proactive_schedule ORDER BY id")]
-    assert len(before) == 3
-    for r in before:
-        if r["kind"] == "companion":
-            assert not dm.config.quiet(dm.local(r["due_at"]))
-    restored = OwnerProactive(dm.service, clock=dm.clock, rng=random.Random(999))
-    await restored.initialize()
-    await restored.ensure_plan()
-    after = [dict(r) for r in await dm.store.all("SELECT * FROM proactive_schedule ORDER BY id")]
-    assert after == before
+async def test_restart_retires_old_timers_without_polling_or_sending(dm):
+    await slot(dm)
+    await slot(dm, "digest")
+    async with dm.store.transaction():
+        await dm._insert("old", "companion", "旧问候", dm.clock() + 3600, dm.clock())
+    alert = await dm.alert("ops", "例行告警")
+    await dm.initialize()
+    await dm.tick()
+    assert not await dm.store.all("SELECT id FROM proactive_schedule")
+    assert await dm.delivery_status("old") == "cancelled"
+    assert await dm.delivery_status(alert) == "pending"
     assert not dm.service.ai.calls
+    assert not dm.service.sender.onebot.calls
 
 
 @pytest.mark.parametrize(
@@ -230,64 +229,15 @@ async def test_local_schedule_persists_no_llm_polling_and_no_quiet_slots(dm):
 )
 async def test_only_owner_private_activity_skips_before_any_paid_call(dm, changes, skip):
     await dm.note_activity(dm.target().model_copy(update=changes))
-    key = await slot(dm)
-    result = await dm.generate_slot(key)
-    assert (result["status"] == "skipped") is skip
-    assert bool(dm.service.ai.calls) is not skip
-    if skip:
-        assert result["reason"] == "owner_recently_active"
-
-
-async def test_activity_after_generation_and_before_send_cancels_companion(dm):
-    key = await slot(dm)
-    assert (await dm.generate_slot(key))["status"] == "queued"
-    await dm.note_activity(dm.target())
-    assert await dm.deliver_once()
-    assert await dm.delivery_status(key) == "skipped"
-    assert not dm.service.sender.onebot.calls
-
-
-async def test_delay_crossing_quiet_boundary_prevents_send(dm, monkeypatch):
-    dm.time[0] = stamp("2026-11-14T23:29:59")
-    key = await dm.enqueue("companion", "喵", expires=dm._companion_expiry(dm.clock()))
-    original = dm.service.sender.send
-
-    async def delayed(*args, **kwargs):
-        dm.time[0] += 2
-        return await original(*args, **kwargs)
-
-    monkeypatch.setattr(dm.service.sender, "send", delayed)
-    await dm.deliver_once()
-    assert await dm.delivery_status(key) in {"skipped", "expired"}
-    assert not dm.service.sender.onebot.calls
-
-
-async def test_two_hour_companion_expiry_and_daily_cap(dm):
-    key = await slot(dm)
-    await dm.generate_slot(key)
-    await dm.deliver_once()
-    assert (await dm.status())["companion_sent_today"] == 1
-    assert await dm._eligible("companion", dm.clock()) == "daily_limit"
-    await dm.set_config(ProactiveConfig(max_per_day=2))
-    dm.service.sender.onebot.ready.clear()
-    second = await dm.enqueue("companion", "第二条", expires=dm.clock() + 7200)
-    dm.time[0] += 7201
-    dm.service.sender.onebot.ready.set()
-    await dm.deliver_once()
-    assert await dm.delivery_status(second) == "expired"
-    assert len(dm.service.sender.onebot.calls) == 1
-
-
-async def test_missed_greeting_is_skipped_without_generation(dm):
-    key = await slot(dm, due=dm.clock() - 301)
-    assert (await dm.generate_slot(key))["reason"] == "missed_slot"
+    ticket = {"action_type": "qq.speak", "origin": "planner"}
+    policy = QQPolicy(dm.service)
+    assert await policy.owner_recently_active(ticket, dm.clock() + 10799) is skip
+    assert not await policy.owner_recently_active(ticket, dm.clock() + 10800)
     assert not dm.service.ai.calls
 
 
 async def test_all_model_work_skipped_when_hard_stopped_but_templates_send(dm):
     await dm.store.db.execute("INSERT INTO meta VALUES ('budget_overrun','1')")
-    key = await slot(dm)
-    assert (await dm.generate_slot(key))["reason"] == "budget_hard_stop"
     assert (await dm.manual_digest())["reason"] == "budget_hard_stop"
     await dm.check_alerts()
     await dm.deliver_once()
@@ -376,16 +326,14 @@ async def test_failed_source_gate_never_generates_or_retries(dm):
 async def test_config_disable_cancels_pending_and_survives_store_restart(dm):
     dm.service.sender.onebot.ready.clear()
     result = await dm.test_dm()
-    saved = ProactiveConfig(
-        enabled=False, daily_digest_time="21:15", quiet_hours="22:00-09:00", max_per_day=2
-    )
-    await dm.set_config(saved)
+    await dm.service.life_engine.set_config({"owner_delivery_enabled": False})
+    await dm.tick()
     assert await dm.delivery_status(result["id"]) == "cancelled"
-    await dm.store.runtime.load_config()
-    assert dm.config == saved and dm.store.runtime.proactive_overridden
-    await dm.set_config(None)
-    assert dm.config == dm.store.runtime.env_proactive
-    assert not dm.store.runtime.proactive_overridden
+    restored = LifeEngine(dm.service, clock=dm.clock)
+    await restored.initialize()
+    assert restored.config.owner_delivery_enabled is False
+    await dm.service.life_engine.set_config(None)
+    assert dm.delivery_enabled
     assert not dm.service.ai.calls
 
 

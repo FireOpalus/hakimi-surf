@@ -50,7 +50,6 @@ async def test_admin_group_admission_reports_effective_decoupled_policy(admin_ap
         ("/admin/api/compression", "PUT"),
         ("/admin/api/compression", "DELETE"),
         ("/admin/api/proactive", "GET"),
-        ("/admin/api/proactive", "PUT"),
         ("/admin/api/proactive/test", "POST"),
         ("/admin/api/proactive/digest", "POST"),
     ],
@@ -78,7 +77,6 @@ async def test_unconfigured_admin_is_disabled(settings, path, method):
         ("/admin/api/compression", "PUT"),
         ("/admin/api/compression", "DELETE"),
         ("/admin/api/proactive", "GET"),
-        ("/admin/api/proactive", "PUT"),
         ("/admin/api/proactive/test", "POST"),
         ("/admin/api/proactive/digest", "POST"),
     ],
@@ -454,24 +452,11 @@ async def test_proactive_panel_policy_and_zero_token_delivery(admin_api):
     svc = app.state.service
     svc.sender.onebot = Wire()
     initial = (await client.get("/admin/api/proactive")).json()
-    assert initial["config"]["daily_digest_time"] == "22:30"
-    assert initial["timezone"] == "Asia/Shanghai"
-    changed = initial["config"] | {"daily_digest_time": "21:30", "max_per_day": 2}
-    result = await client.put("/admin/api/proactive", json=changed)
-    assert result.status_code == 200 and result.json()["source"] == "admin"
-    await svc.store.runtime.load_config()
-    assert svc.proactive.config.daily_digest_time == "21:30"
-    assert (
-        await client.put("/admin/api/proactive", json=changed | {"max_per_day": 3})
-    ).status_code == 400
-    assert (
-        await client.put("/admin/api/proactive", json=changed | {"target_user_id": 30000})
-    ).status_code == 400
+    assert initial["scheduler"] == "life_engine" and "config" not in initial
+    assert (await client.put("/admin/api/proactive", json={"max_per_day": 2})).status_code == 405
+    assert (await client.delete("/admin/api/proactive")).status_code == 405
     assert (await client.post("/admin/api/proactive/test")).json()["status"] == "sent"
-    assert svc.sender.onebot.calls[0][1]["user_id"] == 20000
-    assert not gateway.calls and not await svc.store.all("SELECT * FROM ledger")
-    reset = (await client.delete("/admin/api/proactive")).json()
-    assert reset["source"] == "env" and reset["config"] == initial["environment"]
+    assert not gateway.calls
 
 
 async def test_proactive_manual_digest_uses_shared_daily_attempt(admin_api):

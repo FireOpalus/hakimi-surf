@@ -28,8 +28,6 @@ from .bilibili import BVID, NODE_TRANSPORT_ERRORS, bounded_json
 from .bot_server import is_persona_owner, untrusted_input
 from .generation_policy import Scenario
 from .models import Video
-from .proactive_policy import minute_of_day
-from .reply_style import trim_complete_text
 from .roaming_logger import redact_public_summary
 from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
 
@@ -171,21 +169,10 @@ def validate_cookie(value):
 class BiliPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     enabled: bool = False
-    times: list[str] = Field(default_factory=lambda: ["13:00", "20:30"], min_length=1, max_length=2)
-    jitter_minutes: int = Field(default=25, ge=0, le=60)
     allow_like: bool = False
     allow_favorite: bool = False
     favorite_folder_id: str = Field(default="", pattern=r"^[1-9][0-9]{0,19}$|^$")
     daily_action_limit: int = Field(default=1, ge=1, le=2)
-
-    @field_validator("times")
-    @classmethod
-    def times_valid(cls, value):
-        for item in value:
-            minute_of_day(item)
-        if len(set(value)) != len(value):
-            raise ValueError("Duplicate times")
-        return sorted(value)
 
     @model_validator(mode="after")
     def folder_required(self):
@@ -315,7 +302,6 @@ class BiliWatcher:
         self.zone = ZoneInfo(self.s.bot_timezone)
         self.env_policy = BiliPolicy(
             enabled=getattr(self.s, "bili_autonomous_enabled", False),
-            times=getattr(self.s, "bili_patrol_times", ["13:00", "20:30"]),
         )
         self.policy, self.overridden = self.env_policy, False
         self.creds = {
@@ -366,9 +352,15 @@ class BiliWatcher:
                 "SELECT payload FROM admin_config WHERE key='bili_account'"
             )
             if policy:
-                self.policy = BiliPolicy.model_validate(
-                    self.store.vault.open("admin:bili_account", policy[0])
-                )
+                saved = self.store.vault.open("admin:bili_account", policy[0])
+                # Older installations stored the standalone patrol timer in this policy.
+                current = {k: v for k, v in saved.items() if k not in {"times", "jitter_minutes"}}
+                self.policy = BiliPolicy.model_validate(current)
+                if current != saved:
+                    await self.store.db.execute(
+                        "UPDATE admin_config SET payload=? WHERE key='bili_account'",
+                        (self.store.vault.seal("admin:bili_account", self.policy.model_dump()),),
+                    )
                 self.overridden = True
             state = await self.store.one("SELECT * FROM bili_account_state WHERE id=1")
             self.blocked_until = state["blocked_until"]
@@ -1276,63 +1268,7 @@ class BiliWatcher:
             "prior_patrol_notes": notes,
         }
 
-    async def _maybe_share_owner(self, day: str, bvid: str, title: str, summary: str) -> bool:
-        proactive = getattr(self.svc, "proactive", None)
-        now = self.clock()
-        if (
-            not self.s.owner_qq_id
-            or proactive is None
-            or not hasattr(proactive, "config")
-            or not hasattr(proactive, "enqueue")
-            or not getattr(proactive, "configured", True)
-            or not proactive.config.enabled
-            or self.store.runtime.is_resting(now)
-            or proactive.config.quiet(self.local(now))
-        ):
-            return False
-        share_key = self.store.vault.digest("bili-instant-share", self.s.namespace, day)
-        async with self.store.lock:
-            has_dms = await self.store.one(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_owner_dms'"
-            )
-            if has_dms and await self.store.one(
-                "SELECT 1 FROM pending_owner_dms WHERE id=?", (share_key,)
-            ):
-                return False
-        secrets = getattr(self.svc, "secrets", None) or configured_secrets(self.s)
-        clean_title = redact_public_summary(safe_output(title, secrets, limit=80)) if title else ""
-        title_part = f"《{clean_title}》" if clean_title else bvid
-        header = f"诶我刚摸鱼刷B站刷到个超对胃口的视频{title_part}，感觉你会感兴趣！\n"
-        footer = f"\nhttps://www.bilibili.com/video/{bvid}"
-        body_budget = max(120, self.s.send_max_chars - len(header) - len(footer) - 8)
-        body = trim_complete_text(summary.strip(), body_budget)
-        share_text = f"{header}{body}{footer}"
-        expires = (
-            proactive._companion_expiry(now)
-            if hasattr(proactive, "_companion_expiry")
-            else now + 7200
-        )
-        try:
-            await proactive.enqueue("patrol", share_text, key=share_key, expires=expires)
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return False
-
-    def slot_due_minute(self, day: str, slot: str) -> int:
-        base = minute_of_day(slot)
-        jitter = self.policy.jitter_minutes
-        if jitter <= 0:
-            return base
-        digest = hashlib.blake2b(
-            f"{self.s.namespace}:{day}:{slot}".encode(), digest_size=4
-        ).digest()
-        span = 2 * jitter + 1
-        offset = (int.from_bytes(digest, "big") % span) - jitter
-        return max(0, min(1439, base + offset))
-
-    async def run_once(self, *, slot="manual"):
+    async def run_once(self, *, slot: str | None = None):
         if self.run_lock.locked():
             return {"status": "busy"}
         async with self.run_lock:
@@ -1347,23 +1283,14 @@ class BiliWatcher:
             day = self.local().date().isoformat()
             key = uuid.uuid4().hex
             async with self.store.transaction():
-                # Manual and scheduled work share a hard maximum of two attempted rounds/day.
-                count = (
-                    await self.store.one(
-                        "SELECT COUNT(*) FROM bili_patrol_runs WHERE day=?", (day,)
-                    )
-                )[0]
-                if count >= len(self.policy.times):
-                    return {"status": "daily_limit"}
                 cur = await self.store.db.execute(
                     "INSERT OR IGNORE INTO bili_patrol_runs VALUES (?,?,?,'working',?,NULL)",
-                    (key, day, slot, self.clock()),
+                    (key, day, slot or "manual-" + key, self.clock()),
                 )
                 if cur.rowcount != 1:
                     return {"status": "already_attempted"}
             reason = None
             completed = 0
-            shared_today = False
             token = self.patrol_context.set((self.policy_epoch, self.credentials_epoch))
             try:
                 epoch = self.credentials_epoch
@@ -1482,10 +1409,6 @@ class BiliWatcher:
                         reason = "bili_account_risk"
                         break
                     await self._interaction(pick.bvid, aid, pick, epoch)
-                    if pick.share_owner and not shared_today:
-                        shared_today = await self._maybe_share_owner(
-                            day, pick.bvid, str(material.get("title", "")), summary
-                        )
                 if completed > 0 and not reason and selection.mood_longnick.strip():
                     longnick = getattr(self.svc, "longnick", None)
                     if longnick is not None and hasattr(longnick, "apply_patrol"):
@@ -1517,34 +1440,6 @@ class BiliWatcher:
             )
         return {"status": status, "learned": completed, "reason": reason}
 
-    async def tick(self):
-        world_state = getattr(self.svc, "world_state", None)
-        modules = getattr(self.svc, "modules", None)
-        bili_mod = modules.get("bilibili_surf") if modules is not None else None
-        if (world_state is not None and world_state.proactive_suspended()) or (
-            bili_mod is not None and getattr(bili_mod, "proactive_paused", False)
-        ):
-            return
-        if not self.policy.enabled or self.store.runtime.is_resting(self.clock()):
-            return
-        local = self.local()
-        day = local.date().isoformat()
-        for value in self.policy.times:
-            minute = self.slot_due_minute(day, value)
-            due = local.replace(hour=minute // 60, minute=minute % 60, second=0, microsecond=0)
-            if 0 <= self.clock() - due.timestamp() < 300:
-                await self.run_once(slot=value)
-
-    async def run(self):
-        while True:
-            try:
-                await self.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logging.getLogger("hakimi").info("event=bili_account_failed")
-            await self.sleep(30)
-
     async def status(self):
         day = self.local().date().isoformat()
         async with self.store.lock:
@@ -1563,11 +1458,6 @@ class BiliWatcher:
                 await self.store.one("SELECT COUNT(*) FROM bili_actions WHERE day=?", (day,))
             )[0]
             watched = (await self.store.one("SELECT COUNT(*) FROM bili_watched_history"))[0]
-        today_schedule = [
-            f"{m // 60:02d}:{m % 60:02d}"
-            for v in self.policy.times
-            for m in (self.slot_due_minute(day, v),)
-        ]
         return {
             "config": self.policy.model_dump(),
             "source": "sqlite" if self.overridden else "env",
@@ -1589,7 +1479,7 @@ class BiliWatcher:
             "recent_runs": runs,
             "actions_today": actions,
             "watched_count": watched,
-            "today_schedule": today_schedule,
+            "scheduler": "life_engine",
             "timezone": self.s.bot_timezone,
             "heartbeat_supported": False,
         }

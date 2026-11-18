@@ -21,7 +21,6 @@ from hakimi.generation_policy import Scenario
 from hakimi.life_engine import LifeEngine, LifeEngineConfig
 from hakimi.modules.minecraft_slot import MinecraftSlotModule
 from hakimi.prefix_runtime import StaticPrefixes
-from hakimi.proactive_policy import ProactiveConfig
 from hakimi.security import Rejected
 from hakimi.service import Service
 from tests.fakes import FakeBili, FakeGateway
@@ -421,11 +420,10 @@ async def test_mc_milestone_to_qq_with_receipts_and_reply_resolution(settings, s
         svc.world_state.clock = lambda: now
         await svc.world_state.initialize()
         await svc.proactive.initialize()
-        await svc.proactive.set_config(ProactiveConfig(enabled=True, quiet_hours="23:55-00:05"))
         await svc.proactive.on_connection(True)
 
         engine = LifeEngine(svc, clock=lambda: now)
-        await engine.initialize()
+        await engine.set_config({"quiet_hours": "23:55-00:05"})
         svc.life_engine = engine
 
         mc_mod = svc.modules.get("minecraft")
@@ -607,7 +605,6 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         svc.world_state.clock = lambda: now
         await svc.world_state.initialize()
         await svc.proactive.initialize()
-        await svc.proactive.set_config(ProactiveConfig(enabled=True, quiet_hours="23:55-00:05"))
         await svc.bili_watcher.initialize()
         await svc.bili_watcher.set_policy(BiliPolicy(enabled=True))
         await svc.bili_watcher.update_credentials(
@@ -620,7 +617,7 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         )
 
         engine = LifeEngine(svc, clock=lambda: now)
-        await engine.initialize()
+        await engine.set_config({"quiet_hours": "23:55-00:05"})
         await engine.set_config(LifeEngineConfig(max_proactive_per_day=0))
         svc.life_engine = engine
 

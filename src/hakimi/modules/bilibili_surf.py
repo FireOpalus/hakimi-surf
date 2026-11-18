@@ -227,7 +227,7 @@ class BilibiliSurfModule(BaseModule):
             )
 
         if action_type in {"patrol", "run_once"} and self.watcher is not None:
-            slot = str(ticket.get("slot", "manual"))[:32] or "manual"
+            slot = str(ticket["slot"])[:80] if ticket.get("slot") else None
             try:
                 res = await self.watcher.run_once(slot=slot)
             except Rejected as exc:

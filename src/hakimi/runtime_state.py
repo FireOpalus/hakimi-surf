@@ -24,7 +24,6 @@ from .limits_policy import (
     RateLimitConfig,
 )
 from .models import Message
-from .proactive_policy import ProactiveConfig
 from .provider_routing import ProviderRoutingManager
 from .rest_policy import RestHoursConfig
 from .security import Rejected
@@ -112,9 +111,6 @@ class RuntimeState:
         self.compression_overridden = False
         self.s.history_high_tokens = self.env_compression.history_high_tokens
         self.compression_lock = asyncio.Lock()
-        self.env_proactive = ProactiveConfig.from_settings(self.s)
-        self.proactive = self.env_proactive
-        self.proactive_overridden = False
         self.env_admission = AdmissionConfig.from_settings(self.s)
         self.admission = self.env_admission
         self.admission_overridden = False
@@ -208,8 +204,6 @@ class RuntimeState:
         self.compression = self.env_compression
         self.compression_overridden = False
         self.s.history_high_tokens = self.env_compression.history_high_tokens
-        self.proactive = self.env_proactive
-        self.proactive_overridden = False
         self.rate_limits = self.env_rate_limits
         self.rate_limits_overridden = False
         self._apply_fields(self.env_rate_limits)
@@ -261,9 +255,6 @@ class RuntimeState:
                 self.compression = CompressionConfig.model_validate(merged)
                 self.compression_overridden = True
                 self.s.history_high_tokens = self.compression.history_high_tokens
-            elif row["key"] == "proactive":
-                self.proactive = ProactiveConfig.model_validate(value)
-                self.proactive_overridden = True
             elif row["key"] == "thinking":
                 self.s._thinking_override = ThinkingConfig.model_validate(value)
             elif row["key"] == "debounce":

@@ -214,7 +214,9 @@ async def test_text_round_dedups_no_media_or_cookies_to_subtitle_and_defaults_re
     before = len(watcher.svc.ai.calls)
     assert (await watcher.run_once(slot="20:30"))["status"] == "empty"
     assert len(watcher.svc.ai.calls) == before
-    assert (await watcher.run_once(slot="manual"))["status"] == "daily_limit"
+    assert (await watcher.run_once(slot="life-third"))["status"] == "empty"
+    assert (await watcher.run_once(slot="life-third"))["status"] == "already_attempted"
+    assert len(watcher.svc.ai.calls) == before
 
 
 async def test_reading_absent_subtitle_is_honest(watcher):

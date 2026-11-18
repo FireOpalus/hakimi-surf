@@ -4,7 +4,7 @@ import asyncio
 import random
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 
 from .adapters import farewell_send_bypass
@@ -408,6 +408,7 @@ async def deliver_proactive_jit(
     reply_id: str,
     intent_id: str | None = None,
     still_allowed: Callable[[], bool] = lambda: True,
+    before_delivery: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict:
     """Deliver JIT proactive bubbles sequentially with at-most-once ambiguity safety."""
     from .modules.qq_audience import allowed_proactive_message
@@ -512,7 +513,11 @@ async def deliver_proactive_jit(
 
     async def valid() -> bool:
         current_epoch = (await service.sessions.snapshot(message))["epoch"]
-        return current_epoch == epoch and permitted()
+        return (
+            current_epoch == epoch
+            and permitted()
+            and (before_delivery is None or await before_delivery())
+        )
 
     async def targets() -> set[str]:
         return set()

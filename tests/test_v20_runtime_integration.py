@@ -6,10 +6,8 @@ import httpx
 
 from hakimi.adapters import Sender
 from hakimi.app import create_app
-from hakimi.bili_watcher import BiliPolicy
 from hakimi.config import Settings
 from hakimi.models import Message
-from hakimi.proactive_policy import ProactiveConfig
 from hakimi.service import Service
 from tests.fakes import FakeBili, FakeGateway
 from tests.test_social_integration import Wire, process
@@ -96,15 +94,6 @@ async def test_attention_lock_suppresses_non_urgent_ticks_and_keeps_alerts(
         await svc.proactive.initialize()
         await svc.bili_watcher.initialize()
         await svc.world_state.initialize()
-        await svc.proactive.set_config(
-            ProactiveConfig(
-                enabled=True,
-                daily_digest_enabled=False,
-                companion_ping_enabled=True,
-                max_per_day=2,
-                quiet_hours="23:55-00:05",
-            )
-        )
 
         # 1. Service.patrol skips poll_once while focus_level == "HIGH"
         poll_calls = 0
@@ -121,57 +110,15 @@ async def test_attention_lock_suppresses_non_urgent_ticks_and_keeps_alerts(
         patrol_task.cancel()
         await asyncio.gather(patrol_task, return_exceptions=True)
 
-        # 2. BiliWatcher.tick skips run_once under HIGH focus, runs when dropped to LOW
-        local = svc.bili_watcher.local()
-        day = local.date().isoformat()
-        slot_name = "13:00"
-        due_min = svc.bili_watcher.slot_due_minute(day, slot_name)
-        due_dt = local.replace(hour=due_min // 60, minute=due_min % 60, second=10, microsecond=0)
-        due_ts = due_dt.timestamp()
-        svc.bili_watcher.clock = lambda: due_ts
-        svc.bili_watcher.policy = BiliPolicy(enabled=True, times=[slot_name])
-        bili_runs = []
-
-        async def fake_bili_run_once(*, slot="manual"):
-            bili_runs.append(slot)
-            return {"status": "done"}
-
-        monkeypatch.setattr(svc.bili_watcher, "run_once", fake_bili_run_once)
-        await svc.bili_watcher.tick()
-        assert bili_runs == []
-
-        await svc.world_state.update_state(current_module="idle", focus_level="LOW")
-        await svc.bili_watcher.tick()
-        assert bili_runs == [slot_name]
-
-        # 3. OwnerProactive.tick keeps urgent alerts under HIGH focus while skipping companion slots
-        now = due_ts
-        svc.proactive.clock = lambda: now
-        await svc.world_state.update_state(current_module="minecraft", focus_level="HIGH")
-        slot_id = "slot-high-focus"
+        # Focus gates automatic actions in the world; the separate alert worker only delivers ops.
+        now = svc.proactive.clock()
         async with store.transaction():
             await store.db.execute(
-                "UPDATE proactive_schedule SET status='skipped' WHERE scope=?",
-                (svc.proactive.scope,),
+                "INSERT OR REPLACE INTO operational_health VALUES ('bilibili_412', 3, ?)", (now,)
             )
-            await store.db.execute(
-                "INSERT INTO proactive_schedule VALUES (?,?,?,?,?,?,'planned',NULL)",
-                (slot_id, svc.proactive.scope, day, "companion", now - 10, now + 1800),
-            )
-            await store.db.execute(
-                "INSERT OR REPLACE INTO operational_health VALUES ('bilibili_412', 3, ?)",
-                (now,),
-            )
-
-        gen_calls = []
-
-        async def fake_generate_slot(sid, *, manual=False):
-            gen_calls.append(sid)
-            return {"status": "queued", "id": sid}
-
-        monkeypatch.setattr(svc.proactive, "generate_slot", fake_generate_slot)
         await svc.proactive.tick()
-        assert gen_calls == []
+        assert not await store.all("SELECT id FROM proactive_schedule")
+        assert not ai.calls
 
         # Urgent operational alert and WS recovery alert still enqueue while HIGH focus is active
         alert_rows = await store.all(
@@ -192,10 +139,10 @@ async def test_attention_lock_suppresses_non_urgent_ticks_and_keeps_alerts(
         )
         assert len(ws_alert_rows) == 1
 
-        # Dropping below HIGH allows planned companion slot generation to proceed
         await svc.world_state.update_state(current_module="idle", focus_level="LOW")
         await svc.proactive.tick()
-        assert gen_calls == [slot_id]
+        assert not await store.all("SELECT id FROM proactive_schedule")
+        assert not ai.calls
 
 
 async def test_service_chat_payload_injects_world_state_summary(settings, store, message):

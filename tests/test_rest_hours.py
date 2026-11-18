@@ -1,5 +1,4 @@
 import asyncio
-import random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,11 +8,8 @@ from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 from hakimi.adapters import Sender
-from hakimi.bili_watcher import BiliPolicy, BiliWatcher, CredentialUpdate
 from hakimi.config import Settings
 from hakimi.models import Video
-from hakimi.proactive_dm import OwnerProactive
-from hakimi.proactive_policy import ProactiveConfig
 from hakimi.rest_policy import RestHoursConfig
 from hakimi.service import Service
 from tests.fakes import FakeBili, FakeGateway, FakeSender
@@ -309,34 +305,19 @@ async def test_scheduled_patrols_and_companion_pause_during_rest_while_manual_ru
             await svc.poll_once(force=True)
             assert bili.update_calls == ["12345"]
 
-            # BiliWatcher autonomous tick pauses during rest and resumes when hot-disabled.
-            watcher = BiliWatcher(svc, http, clock=lambda: clock[0])
-            await watcher.initialize()
-            await watcher.update_credentials(CredentialUpdate(sessdata="cookie-val"))
-            await watcher.set_policy(BiliPolicy(enabled=True, times=["23:30"], jitter_minutes=0))
-            await watcher.tick()
-            assert http_calls == []
+            # A closing report must precede both the engine's quiet window and system rest.
+            dm = svc.proactive
+            dm.clock = lambda: clock[0]
+            await dm.initialize()
+            engine = svc.life_engine
+            await engine.initialize()
+            assert engine.digest_window(dm.local().date())[1] == _stamp("2026-11-16T23:00:00")
             await store.runtime.set_rest_hours(
                 RestHoursConfig(enabled=False, rest_hours="23:00-08:00")
             )
-            await watcher.tick()
-            assert "/x/web-interface/nav" in http_calls
-
-            # OwnerProactive skips companion pings inside rest hours while alerts still work.
-            clock[0] = _stamp("2026-11-16T12:00:00")
-            await store.runtime.set_rest_hours(
-                RestHoursConfig(enabled=True, rest_hours="09:00-22:00")
-            )
-            dm = OwnerProactive(svc, clock=lambda: clock[0], rng=random.Random(7))
-            await dm.initialize()
-            await dm.set_config(ProactiveConfig(max_per_day=1, quiet_hours="23:30-08:30"))
-            await dm.ensure_plan()
-            rows = await store.all(
-                "SELECT * FROM proactive_schedule WHERE scope=? AND kind='companion'",
-                (dm.scope,),
-            )
-            assert all(not store.runtime.rest_hours.active(dm.local(r["due_at"])) for r in rows)
-            assert await dm._eligible("companion", clock[0]) == "quiet_hours"
+            assert engine.digest_window(dm.local().date())[1] == _stamp("2026-11-16T23:30:00")
+            assert not engine.digest_due(clock[0])
+            assert not http_calls
             assert (await dm.test_dm())["status"] == "sent"
             alert_id = await dm.alert("health", "BOISER，运维测试通知")
             assert await dm.deliver_once()

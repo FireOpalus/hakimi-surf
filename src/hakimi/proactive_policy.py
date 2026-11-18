@@ -1,9 +1,6 @@
 """Local-only scheduling policy. No message or model output can change it."""
 
 import re
-from datetime import datetime
-
-from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def minute_of_day(value: str) -> int:
@@ -13,45 +10,16 @@ def minute_of_day(value: str) -> int:
     return hour * 60 + minute
 
 
-class ProactiveConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+def hours_bounds(value: str) -> tuple[int, int]:
+    parts = value.split("-")
+    if len(parts) != 2 or parts[0] == parts[1]:
+        raise ValueError("Use two distinct HH:MM times")
+    return minute_of_day(parts[0]), minute_of_day(parts[1])
 
-    enabled: bool = True
-    daily_digest_enabled: bool = True
-    daily_digest_time: str = "22:30"
-    companion_ping_enabled: bool = True
-    max_per_day: int = Field(default=1, ge=1, le=2)
-    quiet_hours: str = "23:30-08:30"
 
-    @field_validator("daily_digest_time")
-    @classmethod
-    def valid_time(cls, value):
-        minute_of_day(value)
-        return value
-
-    @field_validator("quiet_hours")
-    @classmethod
-    def valid_quiet(cls, value):
-        parts = value.split("-")
-        if len(parts) != 2 or minute_of_day(parts[0]) == minute_of_day(parts[1]):
-            raise ValueError("Quiet hours must be two different HH:MM times")
-        return value
-
-    @classmethod
-    def from_settings(cls, s):
-        return cls(
-            enabled=s.proactive_dm_enabled,
-            daily_digest_enabled=s.daily_digest_enabled,
-            daily_digest_time=s.daily_digest_time,
-            companion_ping_enabled=s.companion_ping_enabled,
-            max_per_day=s.proactive_chat_max_per_day,
-            quiet_hours=s.quiet_hours,
-        )
-
-    def quiet(self, local: datetime) -> bool:
-        start, end = map(minute_of_day, self.quiet_hours.split("-"))
-        current = local.hour * 60 + local.minute
-        return start <= current < end if start < end else current >= start or current < end
+def within_hours(minute: int, bounds: tuple[int, int]) -> bool:
+    start, end = bounds
+    return start <= minute < end if start < end else minute >= start or minute < end
 
 
 SCHEMA = """

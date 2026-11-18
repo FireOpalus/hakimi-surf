@@ -1,22 +1,18 @@
-# Owner 专属主动私信（0.3.2 增量升级）
+# Owner 通知和世界引擎
 
-本模块沿用 FastAPI、OneBot、SQLite 和现有 Gemini 网关，无新增 Python 依赖、前端构建或外部 CDN。管理入口仍是 `http://127.0.0.1:12141/admin`，进入「主动私信」。
+在管理后台的「世界与主动引擎」设置活跃时段、主动免打扰时段及每日自主活动上限。B 站小号巡逻和主动聊天共用这一套调度。Owner 最近三小时在私聊互动过时，世界引擎跳过普通陪伴问候。高价值巡逻发现可进入世界事件队列，由引擎决定是否分享。
 
-## 行为与费用
+## 每日汇报
 
-| 类型 | 触发 | 模型与预算 | 离线处理 |
-| --- | --- | --- | --- |
-| 运维告警 | 日预算／累计预算 85%、100%；B 站实际巡逻请求连续 3 次 412；Gemini 同一接口连续 5 次错误；NapCat 断线至少 5 分钟后恢复 | 本地模板，0 Token，预算熔断和夜间仍能投递 | 最多保留 12 小时 |
-| 每日汇报 | 默认 22:30，也可后台手动触发 | Hydrogen、Interactions v1、`store=False`、`medium`，输入和输出经过 Decisions v1beta | 保留到该计划的有效期；定时汇报最迟当天结束，手动创建最多 12 小时 |
-| 陪伴冒泡 | 每天本地随机抽取 1／2 个时间点；最近 3 小时私聊活跃则跳过 | Hydrogen、`low`；到点才调用，不轮询模型 | 最多 2 小时，且不跨免打扰开始或当地午夜 |
+引擎按 `BOT_TIMEZONE` 的自然日，在活跃时段、免打扰和全局休息时段共同允许的最后 15 分钟内安排一份日报。例如活跃时段在 22:30 结束时，日报从 22:15 起可执行。跨午夜的活跃时段按当地自然日分账，完全没有可用窗口的日子跳过。日报单独保留每日一次机会，仍受模型预算、引擎开关以及 Owner 投递权限约束。
 
-随机计划在每日零点后的第一轮调度中保存，首次启动也会补建当天计划。调度每 10 秒检查本地表；错过超过 5 分钟的陪伴时间点直接跳过，不在重启或免打扰结束后补发。正常断线期间，已生成且尚未过期的消息可在重连后按序投递。HTTP OneBot 模式没有 WS 在线信号，提交失败按结果不确定处理；本部署使用反向 WS。
+「QQ → 主动私信」可查看投递状态、离线队列和告警，也可以测试通路或提前发送今日汇报。手动和自动共用同一份 SQLite 生成记录。重启或重复点击保留已生成结果。日报仅取公开巡逻素材和脱敏群聊统计，断线期间保存在本地，定时汇报到窗口结束即过期。
 
-日报和手动按钮共享当天唯一的生成记录。失败、取消或服务崩溃后不自动重复付费；再次点击只返回已有状态。日报仅取公开 B 站标题／简介摘要，以及明确获准记录的群聊活动类别和次数；不会猜测群内趣事、读取私聊原文或《小本本》。无素材时如实报告暂无更新。汇报不会触发一次新的 Drive 总结生成；Drive 的原有日记同步继续独立运行。
+## 运维和迁移
 
-付费主动生成另有 `HAKIMI_PROACTIVE_DAILY_USD=0.10` 子预算，仍同时受全局、用户和累计上限约束。发送前检查硬熔断，每个真实模型请求仍执行事务预留。模板告警、测试消息与它们的记忆写入不触发模型或压缩调用。
+预算、平台风控和断线恢复告警使用本地模板，独立于生命引擎的规划周期及免打扰。接收人锁定为 Owner，投递确认后才写入私聊记忆。预算子限额在「Token 与预算账本」中维护。
 
-费用是本地按配置价格估算，包含未结算预留；日报金额不包含生成它自身的调用。新账本按 `BOT_TIMEZONE` 汇总时间戳，升级前缺少精确时间的账目暂按 UTC 日近似归属。既有每日额度仍按 UTC 重置，后台明确显示这一点。累计计数以升级时仍保留的账目为起点，之后不随 32 天账目清理而归零；无法恢复升级前已清理的历史花销。**累计上限不是 Google 账户余额查询。**
+升级时，原 QQ 投递许可、免打扰和已关停的日报迁入世界引擎。旧表中未开始的时刻表及待发随机问候退休，已提交、已送达和结果不确定的投递保留其记录。旧 B 站时间点和随机偏移停止参与排程。小号凭证、订阅、账号冷却、互动及原片费用上限沿用已有配置。
 
 ## 安全与发送确认
 
@@ -32,10 +28,6 @@
 ```dotenv
 BOT_TIMEZONE=Asia/Shanghai
 PROACTIVE_DM_ENABLED=true
-DAILY_DIGEST_ENABLED=true
-DAILY_DIGEST_TIME=22:30
-COMPANION_PING_ENABLED=true
-PROACTIVE_CHAT_MAX_PER_DAY=1
 QUIET_HOURS=23:30-08:30
 HAKIMI_PROACTIVE_DAILY_USD=0.10
 HAKIMI_TOTAL_USD=40.00
@@ -43,16 +35,14 @@ HAKIMI_PROACTIVE_ALERT_COOLDOWN_SECONDS=21600
 HAKIMI_PROACTIVE_WS_ALERT_AFTER_SECONDS=300
 ```
 
-后台可修改三个开关、日报时间、免打扰时段和每日上限，保存在加密的 `admin_config['proactive']`，优先于 `.env`。修改 `.env` 需重启；「恢复 .env 配置」移除覆盖。时区需使用有效 IANA 名称，修改后重启。`HAKIMI_TOTAL_USD=0` 可关闭累计上限，仍保留日额度。
-
-页面展示今日已确认发送的陪伴次数、下次计划时间、离线／不确定队列状态、告警冷却和预算。页面操作仍经过原有 `ADMIN_TOKEN`、Origin／Host 校验和操作频控。关闭主动私信总开关时，两种手动发送也被禁用。
+世界引擎的后台配置覆盖启动默认值，保存在加密的 `admin_config['life_engine']`。QQ 页提供投递状态、离线队列、告警和手动操作，继续使用现有后台鉴权和频控。投递许可关闭时同样禁止手动发送。
 
 ## SQLite 增量结构
 
 | 表／改动 | 用途 |
 | --- | --- |
-| `proactive_days(scope, day)` | 当日计划已建立，防止重启重新抽签 |
-| `proactive_schedule(id, scope, day, kind, due_at, expires_at, status, reason)` | 持久化本地时间计划和付费尝试状态 |
+| `proactive_days(scope, day)` | 旧随机日程的迁移记录 |
+| `proactive_schedule(id, scope, day, kind, due_at, expires_at, status, reason)` | 每日汇报的幂等凭据与付费尝试状态 |
 | `pending_owner_dms(id, scope, day, kind, payload, created, expires_at, status, session_epoch, sent_at, receipt, reason)` | 加密待发正文、确认状态、有效期和记忆恢复 |
 | `alert_cooldown(alert_key, queued_at, cooldown_until, dm_id, sent_at)` | 同类告警去重，包含预算阈值和日期 |
 | `owner_dm_state(scope, last_private_at, ever_online, online, disconnected_at)` | 私聊活跃窗口和长断线恢复检测 |
@@ -66,12 +56,12 @@ HAKIMI_PROACTIVE_WS_ALERT_AFTER_SECONDS=300
 
 ## 部署与验收
 
-本服务器已使用 NapCat 与 Drive OAuth 叠加配置；更新时保留三个 Compose 文件：
+首尔后端使用 Drive OAuth 叠加配置。
 
 ```bash
 cd /root/Document/hakimi-surf
-docker compose -f docker-compose.yml -f compose.napcat.yml -f compose.roaming-oauth.yaml build hakimi-bot
-docker compose -f docker-compose.yml -f compose.napcat.yml -f compose.roaming-oauth.yaml up -d --no-deps hakimi-bot
+docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml build hakimi-bot
+docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml up -d --no-deps hakimi-bot
 ```
 
 在自己的电脑保持 SSH 隧道运行：
@@ -84,7 +74,7 @@ ssh -N -L 12141:127.0.0.1:12141 用户名@服务器地址
 
 全量单元测试使用假 OneBot 与模拟 SDK HTTP，不连接真实 QQ／Gemini／Drive。可运行 `.venv/bin/pytest -q` 和 `.venv/bin/ruff check src tests scripts`。生产只需一个后端进程，SQLite 的进程锁仍会拒绝第二个实例。
 
-## 本服务器验收记录
+## 0.3.2 历史验收记录
 
 2026-11-14：426 项测试全部通过，Ruff 检查和格式检查通过。Chromium 实测了设置保存、0 Token 测试按钮、模拟日报按钮和手机宽度布局；没有页面脚本错误或外部资源请求。
 

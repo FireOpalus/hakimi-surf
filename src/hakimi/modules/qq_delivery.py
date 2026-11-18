@@ -14,6 +14,7 @@ from ..security import authorize
 from .actions import ActionCall, Outcome
 from .base import sanitize_sensor_text
 from .qq_audience import _scope_to_message
+from .qq_policy import QQPolicy
 
 JIT_TRIGGER_MESSAGE = (
     "[系统主动意图触发：请结合 jit_proactive_intent 与最新上下文自然临场发言，"
@@ -142,6 +143,8 @@ class LifeSpeaker:
         payload.update(await self.service.modules.context_data(limit=3, now=ts))
 
         if private_owner:
+            if not call.evidence:
+                payload["companion_context"] = await self.service.proactive.companion_context(ts)
             cloud_mem = getattr(self.service, "cloud_memory", None)
             if cloud_mem is not None:
                 mem_data = await asyncio.to_thread(
@@ -193,6 +196,11 @@ class LifeSpeaker:
         except Exception:
             return Outcome("gated_skip", "generation_failed")
 
+        async def owner_available():
+            return not await QQPolicy(self.service).owner_recently_active(
+                ticket, max(ts, self.service.life_engine.clock())
+            )
+
         delivery = await deliver_proactive_jit(
             self.service,
             target_msg,
@@ -200,6 +208,7 @@ class LifeSpeaker:
             reply_id=f"jit:{intent_id}",
             intent_id=intent_id,
             still_allowed=call.still_allowed,
+            before_delivery=owner_available if private_owner else None,
         )
         status = delivery["status"]
         if status == "sent":

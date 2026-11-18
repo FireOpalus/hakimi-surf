@@ -15,7 +15,6 @@ from hakimi.generation_policy import Scenario
 from hakimi.longnick import LongnickConfig
 from hakimi.models import Video
 from hakimi.prefix_runtime import StaticPrefixes
-from hakimi.proactive_policy import ProactiveConfig
 from hakimi.security import Rejected
 from hakimi.service import Service
 from tests.fakes import FakeBili, FakeGateway
@@ -293,7 +292,7 @@ async def test_hot_comments_surf_prompt_and_gemini_instructions(settings, store,
             await svc.stop()
 
 
-async def test_patrol_jitter_instant_share_and_mood_longnick(settings, store, message):
+async def test_world_patrol_share_intent_and_mood_longnick(settings, store, message):
     settings.owner_qq_id = "20000"
     settings.onebot_mode = "ws_reverse"
 
@@ -354,27 +353,13 @@ async def test_patrol_jitter_instant_share_and_mood_longnick(settings, store, me
             await svc.longnick.initialize()
             await svc.longnick.set_config(LongnickConfig(enabled=True, cooldown_hours=20))
             await svc.proactive.initialize()
-            await svc.proactive.set_config(ProactiveConfig(enabled=True, quiet_hours="23:30-08:30"))
             await watcher.initialize()
             await watcher.update_credentials(CredentialUpdate(sessdata="cookie-val"))
-            await watcher.set_policy(BiliPolicy(enabled=True, times=["13:00"], jitter_minutes=25))
+            await watcher.set_policy(BiliPolicy(enabled=True))
+            await svc.life_engine.initialize()
+            assert (await watcher.status())["scheduler"] == "life_engine"
+            assert (await watcher.run_once(slot="life-first"))["learned"] == 2
 
-            due_minute = watcher.slot_due_minute("2026-11-16", "13:00")
-            assert abs(due_minute - 13 * 60) <= 25
-            status = await watcher.status()
-            assert status["today_schedule"] == [f"{due_minute // 60:02d}:{due_minute % 60:02d}"]
-
-            # Tick fires at the jittered minute (and skips an earlier unscheduled hour if positive).
-            if due_minute > 13 * 60:
-                clock[0] = _stamp("2026-11-16T12:00:00")
-                await watcher.tick()
-                assert not ai.calls
-            due_iso = f"2026-11-16T{due_minute // 60:02d}:{due_minute % 60:02d}:15"
-            clock[0] = _stamp(due_iso)
-            await watcher.tick()
-
-            # Both videos analyzed, zero extra LLM calls beyond selection + 2*learning,
-            # at most 1 instant share DM queued, and patrol mood longnick applied!
             assert [c[0] for c in ai.calls] == [
                 "screen",
                 "generate",
@@ -383,21 +368,18 @@ async def test_patrol_jitter_instant_share_and_mood_longnick(settings, store, me
                 "screen",
                 "generate",
             ]
-            dms = await store.all("SELECT id,kind,payload FROM pending_owner_dms")
-            assert len(dms) == 1 and dms[0]["kind"] == "patrol"
-            dm_text = store.vault.open(dms[0]["id"], dms[0]["payload"])["text"]
-            assert bv1 in dm_text and f"标题-{bv1}" in dm_text
+            assert not await store.all("SELECT id FROM pending_owner_dms")
+            tickets = await store.all(
+                "SELECT target_scope FROM scheduled_intents WHERE action_name='qq.speak'"
+            )
+            assert [r[0] for r in tickets] == ["owner:20000"]
 
             sign_calls = [c for c in wire.calls if c[0] == "set_self_longnick"]
             assert len(sign_calls) == 1
             assert "脑子要长出来了" in sign_calls[0][1]["longNick"]
 
-            # Second patrol longnick within 6h hits cooldown without extra RPC; quiet skips share.
+            # A second longnick change within 6h hits cooldown without extra RPC.
             assert (await svc.longnick.apply_patrol("刚刷完二轮"))["status"] == "cooldown"
-            clock[0] = _stamp("2026-11-16T23:45:00")
-            assert (
-                await watcher._maybe_share_owner("2026-11-17", bv2, "夜猫视频", "摘要")
-            ) is False
         finally:
             await svc.stop()
 
@@ -422,7 +404,6 @@ async def test_live_watch_open_notification_and_up_patrol_persona(settings, stor
         svc = Service(settings, store, ai, bili, Sender(settings, http, wire))
         try:
             await svc.proactive.initialize()
-            await svc.proactive.set_config(ProactiveConfig(enabled=True))
             async with store.transaction():
                 await store.db.execute(
                     "INSERT INTO live_watches(room_id,target) VALUES (?,?)",

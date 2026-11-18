@@ -5,7 +5,7 @@ import asyncio
 from hakimi.onebot_transport import WebSocketTransport
 from tests.test_crossborder_transport import Peer, response
 from tests.test_proactive_dm import dm as dm
-from tests.test_proactive_dm import queued, slot, stamp
+from tests.test_proactive_dm import queued, stamp
 
 
 async def make_wire(dm):
@@ -90,12 +90,12 @@ async def test_second_guard_expiry_preserves_terminal_skip_instead_of_uncertain(
         await wire.close()
 
 
-async def test_second_guard_quiet_boundary_does_not_send_or_replay_companion(dm, monkeypatch):
+async def test_second_guard_quiet_boundary_does_not_send_or_replay_digest(dm, monkeypatch):
     wire, peer = await make_wire(dm)
     original = wire.send_onebot_action_with_retry
     dm.time[0] = stamp("2026-11-14T23:29:00")
-    key = await slot(dm)
-    assert (await dm.generate_slot(key))["status"] == "queued"
+    result = await dm.prepare_digest(automatic=True, expires=dm.clock() + 60)
+    assert result["status"] == "queued"
 
     async def quiet_before_second_guard(action, params, **kwargs):
         dm.time[0] = stamp("2026-11-14T23:30:00")
@@ -105,7 +105,7 @@ async def test_second_guard_quiet_boundary_does_not_send_or_replay_companion(dm,
     try:
         await dm.deliver_once()
         row = (await queued(dm))[0]
-        assert row["status"] == "skipped" and row["reason"] in {"quiet_hours", "expired"}
+        assert row["status"] == "skipped" and row["reason"] in {"outside_digest_window", "expired"}
         assert sum(r["action"] == "send_private_msg" for r in peer.sent) == 0
         dm.time[0] = stamp("2026-11-15T09:00:00")
         assert not await dm.deliver_once()

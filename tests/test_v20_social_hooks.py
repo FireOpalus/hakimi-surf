@@ -242,12 +242,12 @@ async def test_owner_cloud_memory_activity_and_proactive_synergy(settings, store
             assert dm._desktop_recent_activity(expected_ts + 5400) is None
             assert dm._desktop_recent_activity(expected_ts - 10) is None
 
-            recent_payload = await dm._companion_payload(now_recent)
+            recent_payload = await dm.companion_context(now_recent)
             assert "desktop_recent_activity" in recent_payload
             assert "切勿问怎么半天没出现" in recent_payload["desktop_recent_activity"]
             assert "电脑前忙正事" in recent_payload["topic"]
 
-            stale_payload = await dm._companion_payload(expected_ts + 5500)
+            stale_payload = await dm.companion_context(expected_ts + 5500)
             assert "desktop_recent_activity" not in stale_payload
         finally:
             await svc.stop()

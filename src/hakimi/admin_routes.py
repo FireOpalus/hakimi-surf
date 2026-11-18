@@ -39,7 +39,6 @@ from .mentions import parse_reply
 from .models import Message
 from .outbound_actions import parse_actions
 from .output_links import filter_reply_links
-from .proactive_policy import ProactiveConfig
 from .rest_policy import RestHoursConfig
 from .rich_message_parser import parse_message
 from .security import Rejected, authorize, configured_secrets
@@ -378,8 +377,7 @@ async def rest_hours_save(request: Request):
     svc = service(request)
     async with request.app.state.admin_config_lock:
         status = await svc.store.runtime.set_rest_hours(value)
-        if svc.proactive:
-            await svc.proactive.replan_unattempted()
+        svc.life_engine.wakeup.set()
         return status
 
 
@@ -388,8 +386,7 @@ async def rest_hours_reset(request: Request):
     svc = service(request)
     async with request.app.state.admin_config_lock:
         status = await svc.store.runtime.set_rest_hours(None)
-        if svc.proactive:
-            await svc.proactive.replan_unattempted()
+        svc.life_engine.wakeup.set()
         return status
 
 
@@ -757,22 +754,7 @@ async def compression_config(request: Request):
 
 @router.get("/api/proactive")
 async def proactive_status(request: Request):
-    svc = service(request)
-    await svc.proactive.ensure_plan()
-    return await svc.proactive.status()
-
-
-@router.put("/api/proactive")
-async def proactive_config(request: Request):
-    data = await body(request, ProactiveConfig)
-    await service(request).proactive.set_config(data)
-    return await proactive_status(request)
-
-
-@router.delete("/api/proactive")
-async def proactive_reset(request: Request):
-    await service(request).proactive.set_config(None)
-    return await proactive_status(request)
+    return await service(request).proactive.status()
 
 
 @router.post("/api/proactive/{action}")

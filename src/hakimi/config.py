@@ -12,7 +12,7 @@ from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, model_validato
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .compression_policy import CompressionConfig
-from .proactive_policy import ProactiveConfig
+from .proactive_policy import hours_bounds
 from .rest_policy import RestHoursConfig
 from .thinking_policy import ChatThinkingLevel, ThinkingConfig, ThinkingLevel
 
@@ -136,9 +136,6 @@ class Settings(BaseSettings):
 
     bili_autonomous_enabled: bool = Field(default=False, validation_alias="BILI_AUTONOMOUS_ENABLED")
     bili_proxy: SecretStr = Field(default=SecretStr(""), validation_alias="BILI_PROXY")
-    bili_patrol_times: list[str] = Field(
-        default_factory=lambda: ["13:00", "20:30"], validation_alias="BILI_PATROL_TIMES"
-    )
     enable_video_file_watch: bool = Field(default=False, validation_alias="ENABLE_VIDEO_FILE_WATCH")
     max_video_watch_seconds: int = Field(
         default=480, ge=30, le=480, validation_alias="MAX_VIDEO_WATCH_SECONDS"
@@ -258,11 +255,6 @@ class Settings(BaseSettings):
     )
     proactive_dm_enabled: bool = Field(default=True, validation_alias="PROACTIVE_DM_ENABLED")
     daily_digest_enabled: bool = Field(default=True, validation_alias="DAILY_DIGEST_ENABLED")
-    daily_digest_time: str = Field(default="22:30", validation_alias="DAILY_DIGEST_TIME")
-    companion_ping_enabled: bool = Field(default=True, validation_alias="COMPANION_PING_ENABLED")
-    proactive_chat_max_per_day: int = Field(
-        default=1, ge=1, le=2, validation_alias="PROACTIVE_CHAT_MAX_PER_DAY"
-    )
     quiet_hours: str = Field(default="23:30-08:30", validation_alias="QUIET_HOURS")
     proactive_daily_usd: Decimal = Field(default=Decimal("0.10"), ge=0, le=100)
     total_usd: Decimal = Field(default=Decimal("40"), ge=0, le=10000)
@@ -452,7 +444,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def check_secrets_and_destinations(self) -> Self:
         CompressionConfig.from_settings(self)
-        ProactiveConfig.from_settings(self)
+        hours_bounds(self.quiet_hours)
         RestHoursConfig.from_settings(self)
         if self.image_tall_max_edge < self.image_standard_max_edge:
             raise ValueError("image_tall_max_edge must be >= image_standard_max_edge")

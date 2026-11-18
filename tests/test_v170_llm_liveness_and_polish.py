@@ -1,23 +1,19 @@
 import hashlib
 import json
 import re
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 
 import hakimi
 from hakimi.adapters import Sender
-from hakimi.bili_watcher import BiliWatcher
 from hakimi.bot_server import prompt_context
 from hakimi.context_budget import estimate_tokens
 from hakimi.gemini import GeminiGateway, ModelImage
 from hakimi.outbound_actions import ACTION_INSTRUCTION
 from hakimi.persona import OWNER_PERSONA_PROMPT, PUBLIC_PERSONA_PROMPT, SYSTEM_INSTRUCTION
 from hakimi.prefix_runtime import StaticPrefixes
-from hakimi.proactive_policy import ProactiveConfig
 from hakimi.reply_style import trim_complete_text
 from hakimi.service import Service
 from hakimi.web_search import WebSearchConfig
@@ -26,12 +22,6 @@ from tests.test_controls_search_v110 import grounded_response
 from tests.test_sdk_contract import decision_response, interaction_response
 from tests.test_sdk_contract import sdk_pair as sdk_pair
 from tests.test_social_integration import Wire, group, process
-
-TZ = ZoneInfo("Asia/Shanghai")
-
-
-def _stamp(iso: str) -> float:
-    return datetime.fromisoformat(iso).replace(tzinfo=TZ).timestamp()
 
 
 async def test_help_command_documents_all_new_commands(settings, store, message):
@@ -78,59 +68,26 @@ def test_trim_complete_text_respects_sentence_and_clause_boundaries():
     assert clause_trimmed == "前戏铺垫先讲到这里…"
 
 
-async def test_patrol_instant_share_preserves_full_summary_and_trims_cleanly(settings, store):
-    settings.owner_qq_id = "20000"
-    settings.onebot_mode = "ws_reverse"
-    clock = [_stamp("2026-11-16T13:15:00")]
+async def test_patrol_share_is_owned_by_world_rule_and_never_defaults_to_group(settings, store):
+    from hakimi.life_rules import milestone_sharing
+    from hakimi.world_state import MilestoneEvent
 
-    long_summary = (
-        "刚刷完这个BLG在S16决赛3比1拿下GEN的复盘长视频。正片最精彩的是前三局的博弈："
-        "第一局BLG龙魂团大招交太急、阵容缺伤害被翻盘；第二局打满53分钟神仙打架，"
-        "Viper掏出炸弹人狂轰九万四输出，阿Bin纳尔一命换大龙，硬是顶住Canyon绝境抢远古龙把比分扳平；"
-        "第三局BLG又选出下路法核岩雀反制冲阵，抓死Ruler断掉龙魂节奏彻底起势。\n\n"
-        "评论区玩梗吐槽也很有节目效果，UP主委屈解释自己肝了21小时是为了让云玩家看懂，"
-        "结果热评毫不留情吐槽根本看不懂，笑死。"
+    event = MilestoneEvent(
+        id="watch",
+        source_module="bilibili_surf",
+        event_type="bili_video_watched",
+        created_at=1,
+        importance="high",
+        payload={"title": "一次精彩复盘"},
     )
-    assert len(long_summary) > 220
-
-    async with httpx.AsyncClient() as http:
-        svc = Service(settings, store, FakeGateway(), FakeBili(), Sender(settings, http, Wire()))
-        watcher = BiliWatcher(svc, http, clock=lambda: clock[0])
-        svc.bili_watcher = watcher
-        svc.proactive.clock = lambda: clock[0]
-        try:
-            await svc.proactive.initialize()
-            await svc.proactive.set_config(ProactiveConfig(enabled=True, quiet_hours="23:30-08:30"))
-            await watcher.initialize()
-
-            # 1) Default send_max_chars (1800) preserves full summary without 220-char chop.
-            assert await watcher._maybe_share_owner(
-                "2026-11-16",
-                "BV1i2sW6xEV9",
-                "BLG决战GEN!全4局2万字复盘!",
-                long_summary,
-            )
-            row = await store.one("SELECT id,payload FROM pending_owner_dms")
-            full_dm = store.vault.open(row["id"], row["payload"])["text"]
-            assert "结果热评毫不留情吐槽根本看不懂，笑死。" in full_dm
-            assert "https://www.bilibili.com/video/BV1i2sW6xEV9" in full_dm
-
-            # 2) Tight limit stops on a full sentence rather than mid-word "结果热评毫".
-            clock[0] += 86400
-            settings.send_max_chars = 260
-            assert await watcher._maybe_share_owner(
-                "2026-11-17",
-                "BV1i2sW6xEV9",
-                "BLG决战GEN!全4局2万字复盘!",
-                long_summary,
-            )
-            rows = await store.all("SELECT id,payload FROM pending_owner_dms ORDER BY created DESC")
-            tight_dm = store.vault.open(rows[0]["id"], rows[0]["payload"])["text"]
-            assert len(tight_dm) <= 260
-            assert "结果热评毫\n" not in tight_dm
-            assert "https://www.bilibili.com/video/BV1i2sW6xEV9" in tight_dm
-        finally:
-            await svc.stop()
+    settings.owner_qq_id = ""
+    assert milestone_sharing(settings).match(event) is None
+    settings.owner_qq_id = "20000"
+    reaction = milestone_sharing(settings).match(event)
+    assert reaction.action == "qq.speak" and reaction.recipient == "owner:20000"
+    assert (
+        milestone_sharing(settings).match(event.model_copy(update={"importance": "normal"})) is None
+    )
 
 
 @pytest.mark.parametrize(

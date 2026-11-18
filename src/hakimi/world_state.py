@@ -475,7 +475,9 @@ class WorldStateManager:
             rows = await self.store.all(
                 "SELECT * FROM scheduled_intents "
                 "WHERE status='pending' AND execute_after <= ? AND expire_at > ? "
-                "ORDER BY execute_after ASC, created_at ASC LIMIT ?",
+                "ORDER BY CASE WHEN origin='timer' AND action_name='qq.owner_digest' "
+                "THEN 0 ELSE 1 END, "
+                "execute_after,created_at LIMIT ?",
                 (current, current, max(1, int(limit))),
             )
         return [self.intent_from_row(row) for row in rows]

@@ -68,11 +68,9 @@ def milestone_sharing(settings) -> Rule:
     from .modules.qq_audience import _allowlisted_groups
 
     def match(ev):
-        # Video patrol has its own one-per-day Owner share.
-        if ev.importance != "high" or ev.event_type in {
-            "bili_video_watched",
-            "bili_mc_inspiration",
-        }:
+        if ev.importance != "high" or ev.event_type == "bili_mc_inspiration":
+            return None
+        if ev.event_type == "bili_video_watched" and not settings.owner_qq_id:
             return None
         if settings.owner_qq_id:
             recipient = "owner:" + settings.owner_qq_id

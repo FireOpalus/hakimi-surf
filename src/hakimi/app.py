@@ -124,7 +124,6 @@ def create_app(
                         node_transport=node_transport,
                     )
                     await service.sessions.index_existing()
-                    await service.proactive.initialize()
                     await service.moderation.initialize()
                     await service.longnick.initialize()
                     await service.bili_watcher.initialize()
@@ -132,6 +131,7 @@ def create_app(
                     await service.memes.initialize()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
+                    await service.proactive.initialize()
                     from .outgoing import recover_receipts
 
                     await recover_receipts(service)

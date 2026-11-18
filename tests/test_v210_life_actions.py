@@ -15,7 +15,6 @@ from hakimi.adapters import Sender
 from hakimi.life_engine import LifeEngine
 from hakimi.modules.actions import Action, ActionCatalog, NoArgs, Outcome
 from hakimi.modules.base import BaseModule
-from hakimi.proactive_policy import ProactiveConfig
 from hakimi.security import Rejected
 from hakimi.service import Service
 from hakimi.world_state import WorldStateManager
@@ -47,7 +46,7 @@ async def setup(settings, store, handler=None):
         svc.world_state.clock = lambda: NOW
         await svc.world_state.initialize()
         await svc.proactive.initialize()
-        await svc.proactive.set_config(ProactiveConfig(enabled=True, quiet_hours="23:55-00:05"))
+        await svc.life_engine.set_config({"quiet_hours": "23:55-00:05"})
         await svc.life_engine.initialize()
         yield svc, wire, node
 

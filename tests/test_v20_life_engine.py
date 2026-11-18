@@ -26,7 +26,6 @@ from hakimi.life_engine import (
 )
 from hakimi.modules.base import GoalResult
 from hakimi.outgoing import deliver_proactive_jit
-from hakimi.proactive_policy import ProactiveConfig
 from hakimi.security import Rejected
 from hakimi.service import Service
 from tests.fakes import FakeBili, FakeGateway
@@ -561,15 +560,7 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
         await svc.proactive.initialize()
         await svc.store.runtime.affection.initialize()
         await svc.store.runtime.affection.set_config(AffectionConfig(enabled=True))
-        await svc.proactive.set_config(
-            ProactiveConfig(
-                enabled=True,
-                daily_digest_enabled=False,
-                companion_ping_enabled=True,
-                max_per_day=2,
-                quiet_hours="23:30-08:30",
-            )
-        )
+
         engine = LifeEngine(svc, clock=lambda: now)
         await engine.initialize()
 

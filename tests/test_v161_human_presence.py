@@ -197,33 +197,11 @@ async def test_proactive_companion_uses_memory_and_bili_finds_while_digest_stays
                     ),
                 )
 
-            slot_id = "companion-rich"
-            async with store.transaction():
-                await store.db.execute(
-                    "INSERT INTO proactive_schedule VALUES (?,?,?,?,?,?,'planned',NULL)",
-                    (
-                        slot_id,
-                        dm.scope,
-                        dm.local(now).date().isoformat(),
-                        "companion",
-                        now,
-                        now + 3600,
-                    ),
-                )
-            res = await dm.generate_slot(slot_id, manual=True)
-            assert res["status"] == "queued"
-            companion_call = next(
-                c for c in svc.ai.calls if c[3].get("scenario") == Scenario.OWNER_COMPANION
-            )
-            p = companion_call[1]
+            p = await dm.companion_context(now)
             assert p["weekday"] == "周一" and p["day_phase"] == "下午摸鱼时段"
             assert any("重构异步测试" in h for h in p["owner_memory_hints"])
             assert any("测试全部跑通" in t for t in p["recent_private_topics"])
             assert p["recent_bili_finds"][0]["bvid"] == "BV1xx411c7mD"
-
-            assert await dm.deliver_once()
-            sent_text = wire.calls[-1][1]["message"][0]["data"]["text"]
-            assert sent_text == "周一摸鱼时间到，顺手给你推个 Rust 视频"
 
             # Digest must stay strictly public and never touch notebook.
             svc.diary = RoamingLogger(settings, store)
