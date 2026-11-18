@@ -92,7 +92,9 @@ class PlannerJournal:
             return None
         return dict(row), self.store.vault.open("world-plan:" + row["id"], row["checkpoint"])
 
-    async def start(self, day, now, *, trigger, next_at, signature, explore_at, events):
+    async def start(
+        self, day, now, *, trigger, next_at, signature, explore_at, events, prior_signal
+    ):
         run_id = uuid.uuid4().hex
         async with self.store.transaction():
             await self.store.db.execute(
@@ -103,7 +105,9 @@ class PlannerJournal:
             )
             # Reserve the next wake before a possibly billable dispatch.
             await self.store.db.execute(
-                "UPDATE life_planner_clock SET next_at=?,signal_at=NULL WHERE id=1", (next_at,)
+                "UPDATE life_planner_clock SET next_at=?,signal_at=CASE WHEN signal_at IS ? "
+                "THEN NULL ELSE signal_at END WHERE id=1",
+                (next_at, prior_signal),
             )
         return run_id
 

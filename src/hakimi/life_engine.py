@@ -354,6 +354,7 @@ class LifeBlockPlanner:
                 signature=signature,
                 explore_at=explore_at,
                 events=[ev.id for ev in events],
+                prior_signal=state["signal_at"],
             )
             if quiet or not offered:
                 reason = "unchanged_state" if quiet else "no_available_actions"
@@ -384,7 +385,14 @@ class LifeBlockPlanner:
                 try:
                     with model_work("world.plan", run_id):
                         raw_plan = await self.service.ai.generate(
-                            planner_payload, subject, budget_lane=PROACTIVE_LANE, life_plan=True
+                            {
+                                k: v
+                                for k, v in planner_payload.items()
+                                if k != "desktop_active_recently"
+                            },
+                            subject,
+                            budget_lane=PROACTIVE_LANE,
+                            life_plan=True,
                         )
                     plan = WireLifePlan.model_validate_json(raw_plan)
                     plan_source = "llm"
