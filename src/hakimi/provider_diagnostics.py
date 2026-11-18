@@ -147,6 +147,16 @@ def safe_attempts(attempts):
                 row[key] = item[key]
         if type(item.get("http_status")) is int and 400 <= item["http_status"] <= 599:
             row["http_status"] = item["http_status"]
+        number, due = item.get("retry_number"), item.get("next_retry_at")
+        if (
+            row["model_lane"] == "memory_flex"
+            and row.get("http_status") == 503
+            and type(number) is int
+            and 1 <= number <= 4
+            and type(due) is int
+            and 0 < due <= 2**32
+        ):
+            row.update(retry_number=number, next_retry_at=due)
         for key, choices in (
             ("upstream_code", CODES | NUMERIC_CODES),
             ("exception_type", EXCEPTION_TYPES),

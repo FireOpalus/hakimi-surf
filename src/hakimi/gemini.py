@@ -954,9 +954,9 @@ class GeminiGateway:
                         and (status == 429 or (status is not None and 500 <= status < 600))
                     ):
                         raise _FreeTierFallback() from None
-                if non_billable and (
-                    status == 429 or (model_lane == "memory_flex" and status == 503)
-                ):
+                if non_billable and model_lane == "memory_flex" and status == 503:
+                    raise rejected("gemini_unavailable", "flex_capacity_busy") from None
+                if non_billable and status == 429:
                     raise rejected("gemini_unavailable", "rate_limited") from None
                 raise rejected("gemini_unavailable") from None
             elapsed = max(0.0, time.monotonic() - started_at)
@@ -2336,12 +2336,23 @@ class GeminiGateway:
                 await asyncio.shield(self.store.release_digest_review(review))
             if attempts and isinstance(exc, Rejected):
                 exc.provider_diagnostics = list(attempts)
-                if not exc.audited and str(exc) in {
-                    "gemini_unavailable",
-                    "gemini_circuit_open",
-                    "generation_incomplete",
-                    "stream_provider_error",
-                }:
+                # The archive worker audits a Flex refusal with the committed queue outcome.
+                archive_will_audit = (
+                    memory_archive
+                    and audit_source == "memory"
+                    and exc.detail == "flex_capacity_busy"
+                )
+                if (
+                    not exc.audited
+                    and not archive_will_audit
+                    and str(exc)
+                    in {
+                        "gemini_unavailable",
+                        "gemini_circuit_open",
+                        "generation_incomplete",
+                        "stream_provider_error",
+                    }
+                ):
                     await self.store.runtime.event(str(exc), audit_source, diagnostics=attempts)
                     exc.audited = True
             raise

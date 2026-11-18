@@ -25,6 +25,8 @@
 
 后台串行执行 `check_memory_text` → Decisions `purpose=source` → Interactions `service_tier=flex, thinking_level=medium, store=False, tools=[]` → 输出筛查 → epoch/version/人工锁核验。Flex 有独立执行槽，超时不打开聊天熔断；不降级标准价、不自动重试不明确付费结果。`/admin` 立即压缩才允许 `force=True` 同步等待，默认最长 900 秒。`memory` 日预算沿用 $0.20，包含门卫费用。
 
+Flex 生成明确返回 HTTP 503 时，当前批次的切片、失败次数和下次重试时间保存在该会话的 SQLite 中。后台依次等待 1 分钟、2 分钟、15 分钟和 1 小时，到期后按预算和安全检查重新尝试。第五次仍收到 503 时，该批次标为最终失败，原始冷史保留。服务重启或手动点击压缩都会遵守已排定的时间。在 `/admin` 的「会话与记忆」可查看等待中的切片数和下次重试时间，「安全日志」可查看每次安排及最终结果。
+
 默认 Hydrogen Flex 价格为每百万输入 $0.75、缓存输入 $0.0375、输出（含思考）$3.75，来自 [Google Flex 文档](https://aistudio.google.com/docs/flex-inference) 和 [官方 Hydrogen 价格](https://aistudio.google.com/docs/pricing#gemini-4-hydrogen)，核对日期 2026-11-15。程序按配置标准价的一半估算，保留安全系数与完整预留的熔断口径，另列观测缓存折后估算；不是云端账单余额。Flex 为尽力可用的预览通道，可能需要数分钟。
 
 画像必须包含数字账号本人发言的 seq 和匹配原话；他人贴标签、助手猜测不能写成画像。识别到玩梗标志的自述也不进事实槽。短期状态 1–14 天自动到期。事件按主题合并，人工修订受保护；删除正文后保留加密匹配向量及来源序列以抑制同一事件换个措辞复活。自然语言归因并不保证完美，仍需管理台人工纠偏。

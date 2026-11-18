@@ -34,7 +34,9 @@ def check_memory_text(text, settings):
 
 
 class MemoryCompressor:
-    def __init__(self, settings, sessions, gateway, store, *, clock=time.monotonic):
+    def __init__(
+        self, settings, sessions, gateway, store, *, clock=time.monotonic, wall_clock=time.time
+    ):
         self.s, self.sessions, self.ai, self.store = settings, sessions, gateway, store
         self.tasks = {}
         self.locks = [asyncio.Lock() for _ in range(32)]
@@ -42,6 +44,7 @@ class MemoryCompressor:
         self.wakeup = asyncio.Event()
         self.mirror = None
         self.clock = clock
+        self.wall_clock = wall_clock
         self.slice_backoff: OrderedDict[str, tuple[int, float]] = OrderedDict()
 
     def schedule(self, message):
@@ -184,9 +187,13 @@ class MemoryCompressor:
                 return {"status": "budget_hard_stop"}
             if force:
                 await self.sessions.dual.snapshot_cold(message, force=True)
-            candidate = await self.sessions.dual.peek(message, background=background and not force)
+            candidate = await self.sessions.dual.peek(
+                message, background=background and not force, now=self.wall_clock()
+            )
             if candidate is None:
                 return {"status": "not_due_or_cooling_down"}
+            if candidate.get("status") == "provider_backoff":
+                return candidate
             backoff_entry = self.slice_backoff.get(candidate["id"])
             if background and not force and backoff_entry and self.clock() < backoff_entry[1]:
                 return {"status": "provider_backoff"}
@@ -208,7 +215,10 @@ class MemoryCompressor:
             ):
                 return {"status": "budget_hard_stop"}
             snapshot = await self.sessions.dual.claim(
-                message, background=background and not force, expected_ids=candidate["ids"]
+                message,
+                background=background and not force,
+                expected_ids=candidate["ids"],
+                now=self.wall_clock(),
             )
             if snapshot is None:
                 return {"status": "not_due_or_cooling_down"}
@@ -249,20 +259,29 @@ class MemoryCompressor:
                 check_memory_text(result, self.s)
                 extraction = parse_extraction(result)
                 committed = await self.sessions.dual.commit(message, snapshot, extraction)
-                if committed:
-                    self.slice_backoff.pop(snapshot["id"], None)
-                else:
-                    await self.sessions.dual.finish(message, snapshot, "compression_stale")
-                    await self.store.runtime.event("compression_stale", "memory")
-                return {
-                    "status": "compressed" if committed else "stale",
-                    "compressed_messages": len(snapshot["messages"]) if committed else 0,
-                    "batch_id": snapshot["batch_id"],
-                }
             except asyncio.CancelledError:
                 # Persisted attempted status deliberately survives a cancelled/unknown paid request.
                 raise
             except Exception as exc:
+                if isinstance(exc, Rejected) and exc.detail == "flex_capacity_busy":
+                    self.slice_backoff.pop(snapshot["id"], None)
+                    result = await self.sessions.dual.defer_capacity(
+                        message, snapshot, now=self.wall_clock()
+                    )
+                    code = {
+                        "provider_backoff": "memory_flex_retry_scheduled",
+                        "failed": "memory_flex_retry_exhausted",
+                        "stale": "compression_stale",
+                    }[result["status"]]
+                    attempts = list(exc.provider_diagnostics)
+                    if attempts and result["status"] == "provider_backoff":
+                        attempts[-1] = {
+                            **attempts[-1],
+                            "retry_number": result["retry_number"],
+                            "next_retry_at": result["next_retry_at"],
+                        }
+                    await self.store.runtime.event(code, "memory", diagnostics=attempts)
+                    return result
                 if isinstance(exc, Rejected) and str(exc) == "compression_stale":
                     await self.sessions.dual.finish(message, snapshot, "compression_stale")
                     await self.store.runtime.event("compression_stale", "memory")
@@ -306,6 +325,19 @@ class MemoryCompressor:
                 await self.sessions.dual.finish(message, snapshot, "failed", error=err_code)
                 await self.store.runtime.event("compression_failed", "memory")
                 return {"status": "failed"}
+
+            if committed:
+                self.slice_backoff.pop(snapshot["id"], None)
+                if snapshot["flex_failures"]:
+                    await self.store.runtime.event("memory_flex_retry_succeeded", "memory")
+            else:
+                await self.sessions.dual.finish(message, snapshot, "compression_stale")
+                await self.store.runtime.event("compression_stale", "memory")
+            return {
+                "status": "compressed" if committed else "stale",
+                "compressed_messages": len(snapshot["messages"]) if committed else 0,
+                "batch_id": snapshot["batch_id"],
+            }
 
     async def nightly(self, now=None):
         now = now or datetime.now(ZoneInfo(self.s.bot_timezone))

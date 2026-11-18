@@ -2971,7 +2971,8 @@ function diagnosticCell(row){
     return known?'旧记录未保存调用详情':'—';
   }
   const tags=modelFailureLabels, box=el('details'),last=attempts[attempts.length-1];
-  box.append(el('summary',tags.stage[last.stage]+' · '+tags.cause[last.cause]));
+  const capacity=last.model_lane==='memory_flex'&&last.http_status===503;
+  box.append(el('summary',capacity?'Flex 容量繁忙（HTTP 503）':tags.stage[last.stage]+' · '+tags.cause[last.cause]));
   const seconds=ms=>(ms/1000).toLocaleString('zh-CN',{maximumFractionDigits:3})+' 秒';
   for(const a of attempts){
     const parts=[tags.stage[a.stage],tags.provider[a.provider],tags.lane[a.model_lane],tags.cause[a.cause]];
@@ -2985,6 +2986,7 @@ function diagnosticCell(row){
       if(a.stream_phase)parts.push(tags.stream[a.stream_phase]);
     }
     if(a.fallback)parts.push(tags.fallback[a.fallback]);
+    if(a.next_retry_at)parts.push('第 '+a.retry_number+' 次重试安排在 '+dateTime(a.next_retry_at));
     box.append(el('p',parts.filter(Boolean).join(' · ')));
   }
   return box;
@@ -3051,10 +3053,20 @@ $('bot-default-threshold-form').addEventListener('submit',e=>{e.preventDefault()
 const compressionFields={group:['messages','chars','keep','min_chars','max_messages'],private:['messages','chars','keep']};
 async function compression(){const d=await api('compression'),c=d.config;$('compression-enabled').checked=c.enabled;$('compression-high-tokens').value=c.history_high_tokens??d.history_high_tokens_estimate;for(const [kind,fields] of Object.entries(compressionFields))for(const name of fields)$(kind+'-'+name).value=c[kind][name];text('compression-source',d.source==='admin'?'当前使用 SQLite 热配置（优先于 .env）':'当前使用启动时的 .env / 默认配置');text('compression-summary',d.history_strategy==='prefix_half'?'当前：追加历史，估算超过 '+(c.history_high_tokens??d.history_high_tokens_estimate)+' Token 或 '+d.history_max_bytes+' 字节时整批折半。半价双轨归档使用 medium；手动提炼只做快照，不裁切活跃历史。下列条数设置仅用于兼容模式。':'群聊：'+c.group.messages+' 条或 ≥'+c.group.chars+' 字；不足 '+c.group.min_chars+' 字且少于 '+c.group.max_messages+' 条时暂缓条数触发，保留 '+c.group.keep+' 条。私聊：'+c.private.messages+' 条或 ≥'+c.private.chars+' 字，保留 '+c.private.keep+' 条。');}
 function formatSessionMemorySummary(s){if(!s.enabled)return s.recent_count+' 条 · 记忆已关闭';if(s.dual_ready||(s.dual_entries_count??0)>0)return '热窗口 '+s.recent_count+' 条 · 双轨 '+(s.dual_entries_count??0)+' 条（'+(s.dual_chars??0)+' 字）';return '热窗口 '+s.recent_count+' 条 · 旧摘要 '+s.summary_chars+' 字';}
-async function sessions(){table('sessions',['会话','热窗口 / 长期记忆','操作'],(await api('sessions')).map(s=>[s.platform+' '+s.kind+':'+s.conversation_id,formatSessionMemorySummary(s),button('查看与管理',()=>openSession(s))]));}
+function flexRetryText(retry){
+  if(!retry)return '';
+  const when=dateTime(retry.next_retry_at);
+  const schedule=retry.next_retry_at*1000>Date.now()?'下次重试 '+when:'已到重试时间 '+when+'，等待调度';
+  return 'Flex 容量繁忙，等待重试 · '+retry.slices+' 段 · 第 '+retry.retry_number+' 次 · '+schedule;
+}
+async function sessions(){table('sessions',['会话','热窗口 / 长期记忆','归档状态','操作'],(await api('sessions')).map(s=>[
+  s.platform+' '+s.kind+':'+s.conversation_id,formatSessionMemorySummary(s),
+  [flexRetryText(s.flex_retry),s.archive_failed_slices?'最终失败 '+s.archive_failed_slices+' 段':''].filter(Boolean).join(' / ')||'—',
+  button('查看与管理',()=>openSession(s))
+]));}
 async function openSession(s){session=s;const d=await api('sessions/'+s.id);session.version=d.version;text('session-title',s.kind+':'+s.conversation_id);text('session-info','热窗口 '+d.recent_count+' 条 · 记忆'+(d.enabled?'开启':'关闭')+(d.dual_ready?' · 双轨已接管（有效 '+(d.dual_entries_count??0)+' 条 / '+(d.dual_chars??0)+' 字）':''));$('summary-text').value=d.rolling_summary;$('summary-text').placeholder=d.dual_ready?'当前会话已升级为下方「双轨记忆治理」，旧版单体滚动摘要已停用（此处为空属正常状态）':'暂无旧版滚动摘要';$('save-summary').disabled=!!d.dual_ready;$('summary-text').readOnly=!!d.dual_ready;await dualMemory();if(!$('session-dialog').open)$('session-dialog').showModal();}
 let memoryView=null;
-async function dualMemory(){const d=await api('sessions/'+session.id+'/memory/search','POST',{query:$('memory-query').value});memoryView=d;session.version=d.version;const jobNames={pending:'待提炼',attempted:'提炼中',done:'已归档',failed:'失败'};const jobEntries=Object.entries(d.jobs||{});const jobText=jobEntries.length?jobEntries.map(([k,v])=>(jobNames[k]||k)+':'+v).join(' / '):'无积压切片';text('memory-state',(d.ready?'双轨已就绪':'兼容旧摘要，等待首次提炼')+' · 版本 '+d.version+' · 归档 '+jobText);table('memory-entries',['条目 / 类型','正文','状态','操作'],d.entries.map(v=>{const actions=el('div',undefined,'row');if(!v.deleted)actions.append(button('编辑',async()=>{const value=prompt('编辑记忆正文（保存后人工锁定）',v.text);if(value===null)return;let expires=v.expires;if(v.slot==='state'){const days=Number(prompt('短期状态有效天数（1–14）','3'));if(!Number.isInteger(days)||days<1||days>14)throw Error('有效天数需为 1–14');expires=Date.now()/1000+days*86400;}await memoryChange(v,'edit',value,expires);}));if(!v.deleted)actions.append(button('擦除',async()=>{if(confirm('擦除此条并保留保护墓碑？'))await memoryChange(v,'delete');},'danger'));if(v.locked)actions.append(button('解锁',async()=>{if(confirm('允许后续新批次更新这条记忆？'))await memoryChange(v,'unlock');}));return[v.id+' / '+v.kind,v.deleted?'已擦除':v.text,(v.deleted?'墓碑 · ':'')+(v.locked?'人工保护':'自动更新')+(v.expires?' · 到期 '+dateTime(v.expires):''),actions];}));$('memory-mirror').hidden=session.kind!=='group';$('memory-mirror-enabled').checked=!!d.mirror_enabled;text('memory-mirror-state','最近同步 '+dateTime(d.mirror.last_success)+(d.mirror.last_error?' · '+d.mirror.last_error:''));}
+async function dualMemory(){const d=await api('sessions/'+session.id+'/memory/search','POST',{query:$('memory-query').value});memoryView=d;session.version=d.version;const jobNames={pending:'待提炼',attempted:'提炼中',done:'已归档',failed:'最终失败'};const jobEntries=Object.entries(d.jobs||{});const jobText=jobEntries.length?jobEntries.map(([k,v])=>(jobNames[k]||k)+':'+v).join(' / '):'无积压切片';text('memory-state',(d.ready?'双轨已就绪':'兼容旧摘要，等待首次提炼')+' · 版本 '+d.version+' · 归档 '+jobText+(d.flex_retry?' · '+flexRetryText(d.flex_retry):''));table('memory-entries',['条目 / 类型','正文','状态','操作'],d.entries.map(v=>{const actions=el('div',undefined,'row');if(!v.deleted)actions.append(button('编辑',async()=>{const value=prompt('编辑记忆正文（保存后人工锁定）',v.text);if(value===null)return;let expires=v.expires;if(v.slot==='state'){const days=Number(prompt('短期状态有效天数（1–14）','3'));if(!Number.isInteger(days)||days<1||days>14)throw Error('有效天数需为 1–14');expires=Date.now()/1000+days*86400;}await memoryChange(v,'edit',value,expires);}));if(!v.deleted)actions.append(button('擦除',async()=>{if(confirm('擦除此条并保留保护墓碑？'))await memoryChange(v,'delete');},'danger'));if(v.locked)actions.append(button('解锁',async()=>{if(confirm('允许后续新批次更新这条记忆？'))await memoryChange(v,'unlock');}));return[v.id+' / '+v.kind,v.deleted?'已擦除':v.text,(v.deleted?'墓碑 · ':'')+(v.locked?'人工保护':'自动更新')+(v.expires?' · 到期 '+dateTime(v.expires):''),actions];}));$('memory-mirror').hidden=session.kind!=='group';$('memory-mirror-enabled').checked=!!d.mirror_enabled;text('memory-mirror-state','最近同步 '+dateTime(d.mirror.last_success)+(d.mirror.last_error?' · '+d.mirror.last_error:''));}
 async function memoryChange(v,action,value='',expires=0){await api('sessions/'+session.id+'/memory','PUT',{id:v.id,version:memoryView.version,action,text:value,expires});await dualMemory();notice('记忆修改已生效');}
 $('memory-search').addEventListener('click',e=>busy(e.target,dualMemory));
 $('memory-mirror-save').addEventListener('click',e=>busy(e.target,async()=>{await api('sessions/'+session.id+'/memory/mirror','PUT',{enabled:$('memory-mirror-enabled').checked,version:memoryView.version});await dualMemory();notice('镜像开关已保存');}));
@@ -3073,7 +3085,15 @@ function showNotebookAvailability(enabled){
   text('notebook-action-note',enabled?'读取 Owner 的只读快照':'只读快照未启用');
 }
 async function notebook(){const n=await api('notebook'),am=n.antigravity_memory||{};showNotebookAvailability(n.enabled);if(!n.enabled&&am.enabled){text('notebook-state','双端记忆桥 Antigravity_Memory 已接管（只读挂载） · 常驻备忘 '+(am.pinned_chars??0)+' 字 · 索引切片 '+(am.indexed_chunks??0)+' 条 · 桌面活跃 '+(am.latest_iso||dateTime(am.latest_timestamp))+'（旧版单文件快照未启用）');$('notebook-text').value=am.pinned_text||'（Antigravity_Memory 已连接，当前未解析到常驻备忘段落）';$('notebook-text').readOnly=true;$('save-notebook').disabled=true;return;}text('notebook-state',(n.enabled?'已启用':'未启用')+' · '+(notebookSourceLabels[n.source]||n.source)+' · '+(n.loaded_at?dateTime(n.loaded_at):'尚未加载')+(n.last_error?' · '+n.last_error:''));$('notebook-text').value=n.text||'';$('notebook-text').placeholder=n.enabled?'':'旧版单文件《小本本》快照未启用';$('notebook-text').readOnly=!n.enabled||n.source!=='local';$('save-notebook').disabled=!n.enabled||n.source!=='local';}
-async function logs(){table('log-list',['时间','来源','事件','调用详情'],(await api('logs')).map(v=>[dateTime(v.at),v.source,v.code,diagnosticCell(v)]));}
+const archiveLogLabels={
+  memory_flex_retry_scheduled:'Flex 容量繁忙，等待重试',
+  memory_flex_retry_succeeded:'Flex 重试成功，已归档',
+  memory_flex_retry_exhausted:'Flex 归档最终失败，已用完重试'
+};
+async function logs(){table('log-list',['时间','来源','事件','调用详情'],(await api('logs')).map(v=>{
+  const flex503=v.code==='gemini_unavailable'&&v.provider_diagnostics?.some(a=>a.model_lane==='memory_flex'&&a.http_status===503);
+  return [dateTime(v.at),v.source,archiveLogLabels[v.code]||(flex503?'Flex 容量繁忙（HTTP 503）':v.code),diagnosticCell(v)];
+}));}
 
 const dmStatus={pending:'等待投递',sent:'已发送并处理记忆',delivered:'已确认发送，等待记忆写入',uncertain:'发送结果不确定，不重发',expired:'已过期',skipped:'已跳过',failed:'生成未完成',queued:'已排队',generating:'生成中',cancelled:'已取消',not_queued:'未入队'};
 const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
@@ -4242,7 +4262,7 @@ $('save-notebook').addEventListener('click',e=>busy(e.target,async()=>{await api
 $('compression-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{const ht=Number($('compression-high-tokens').value);if(!Number.isInteger(ht)||ht<1000||ht>40000)throw Error('热历史折半阈值须为 1000～40000 的整数');const c={enabled:$('compression-enabled').checked,history_high_tokens:ht};for(const [kind,fields] of Object.entries(compressionFields)){c[kind]={};for(const name of fields)c[kind][name]=Number($(kind+'-'+name).value);}await api('compression','PUT',c);await compression();notice('压缩参数已保存并立即生效');});});
 $('reset-compression').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('移除后台覆盖值，恢复本次启动读取的 .env 配置？'))return;await api('compression','DELETE');await compression();notice('已恢复启动时的环境配置');}));
 $('save-summary').addEventListener('click',e=>busy(e.target,async()=>{await api('sessions/'+session.id+'/summary','PUT',{text:$('summary-text').value,version:session.version});notice('摘要已保存，旧压缩结果已失效');await openSession(session);await sessions();}));
-$('compress-session').addEventListener('click',e=>busy(e.target,async()=>{const v=await api('sessions/'+session.id+'/compress','POST');notice('压缩结果：'+v.status);await openSession(session);await sessions();}));
+$('compress-session').addEventListener('click',e=>busy(e.target,async()=>{const v=await api('sessions/'+session.id+'/compress','POST');notice(v.reason==='flex_capacity_busy'?'Flex 容量繁忙，下次重试 '+dateTime(v.next_retry_at):v.reason==='flex_capacity_exhausted'?'Flex 归档最终失败，已用完重试':'压缩结果：'+v.status);await openSession(session);await sessions();}));
 $('reset-session').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('删除此会话的滚动摘要和全部热消息？'))return;await api('sessions/'+session.id+'/reset','POST');notice('会话已彻底重置');await openSession(session);await sessions();}));$('close-dialog').addEventListener('click',()=>$('session-dialog').close());
 $('simulate').addEventListener('click',e=>busy(e.target,async()=>{text('preview-text','正在筛查与生成…');const v=await api('sandbox','POST',{identity:$('sim-identity').value,scene:$('sim-scene').value,group_id:$('sim-group').value,text:$('sim-text').value});$('scores').replaceChildren();for(const k of ['is_prompt_injection','is_unsafe_or_spam','should_reply','need_memory_recall','need_external_lookup']){const a=v.decisions.answers?.[k];const n=el('div',undefined,'score');n.append(el('p',k));if(a?.skipped){n.append(el('small',v.decisions.reply_bypassed?'直接回应，跳过相关性':'未执行相关性判定'));}else if(a?.noul===null||a?.noul===undefined){n.append(el('small','未调用 / 未知'));}else{n.append(auditScore(a));}$('scores').append(n);}text('decision-result',(v.decisions.final_result||v.decisions.result||'未调用')+(v.decisions.reason?' · '+v.decisions.reason:''));text('decision-raw',JSON.stringify(v.decisions,null,2));text('preview-meta',v.preview.persona+' 人设 · '+(v.preview.model||'')+' · thinking_level='+v.preview.thinking_level+' · 群策略 '+v.group_policy);text('preview-text',v.preview.text||'本次没有生成回复');}));
 })();

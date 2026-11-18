@@ -41,8 +41,10 @@ CREATE TRIGGER IF NOT EXISTS cold_immutable BEFORE UPDATE ON cold_history_slices
  BEGIN SELECT RAISE(ABORT,'immutable cold history'); END;
 CREATE TABLE IF NOT EXISTS memory_slice_jobs (
  id TEXT PRIMARY KEY REFERENCES cold_history_slices(id), status TEXT NOT NULL DEFAULT 'pending',
- attempt TEXT, batch_id TEXT, attempted_at REAL, error TEXT
+ attempt TEXT, batch_id TEXT, attempted_at REAL, error TEXT,
+ flex_failures INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS memory_jobs_by_status_batch ON memory_slice_jobs(status,batch_id);
 CREATE TABLE IF NOT EXISTS memory_covered (seq INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS memory_message_times (seq INTEGER PRIMARY KEY, created REAL NOT NULL);
 CREATE TRIGGER IF NOT EXISTS memory_message_clock AFTER INSERT ON recent_messages
@@ -57,6 +59,7 @@ INSERT OR IGNORE INTO memory_control(singleton) VALUES (1);
 """
 SLOTS = {"alias", "preferences", "boundaries", "state"}
 MAX_ENTRIES = 512
+FLEX_CAPACITY_DELAYS = (60, 120, 15 * 60, 60 * 60)
 
 
 class Strict(BaseModel):
@@ -215,6 +218,13 @@ class DualMemory:
 
     async def migrate(self, db, key):
         # Runs within the session transaction; preserves every legacy payload byte.
+        async with db.execute("PRAGMA table_info(memory_slice_jobs)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        for column in ("flex_failures", "retry_at"):
+            if column not in columns:
+                await db.execute(
+                    f"ALTER TABLE memory_slice_jobs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                )
         await db.execute(
             "INSERT OR IGNORE INTO memory_message_times SELECT id,expires-? FROM recent_messages",
             (self.s.memory_ttl_seconds,),
@@ -301,12 +311,37 @@ class DualMemory:
                 rows = [{**self.vault.open(key, r[1]), "seq": r[0]} for r in await cur.fetchall()]
             return await self.append_slice(db, key, rows, epoch, "manual" if force else "nightly")
 
-    async def _select_pending(self, db, key, epoch, *, background=False, expected_ids=None):
+    async def _capacity_retry(self, db, epoch):
+        async with db.execute(
+            "SELECT j.batch_id,j.flex_failures,j.retry_at,COUNT(*) FROM memory_slice_jobs j "
+            "JOIN cold_history_slices c ON c.id=j.id WHERE c.epoch=? AND j.status='pending' "
+            "AND j.flex_failures>0 GROUP BY j.batch_id,j.flex_failures,j.retry_at "
+            "ORDER BY j.retry_at,MIN(c.created),j.batch_id LIMIT 1",
+            (epoch,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            return dict(
+                zip(("batch_id", "retry_number", "next_retry_at", "slices"), row, strict=True)
+            )
+        return None
+
+    async def _select_pending(self, db, key, epoch, *, now, background=False, expected_ids=None):
+        retry = await self._capacity_retry(db, epoch)
+        if retry and now < retry["next_retry_at"]:
+            return {
+                "status": "provider_backoff",
+                "reason": "flex_capacity_busy",
+                "next_retry_at": retry["next_retry_at"],
+                "retry_number": retry["retry_number"],
+            }
+        # Keep the original slices together. New arrivals get their own attempts and delay.
         async with db.execute(
             "SELECT c.id,c.payload,c.created,c.kind FROM cold_history_slices c JOIN "
             "memory_slice_jobs j ON j.id=c.id WHERE j.status='pending' AND c.epoch=? "
-            "ORDER BY c.created,c.id",
-            (epoch,),
+            + ("AND j.batch_id=? " if retry else "")
+            + "ORDER BY c.created,c.id LIMIT 64",
+            (epoch, retry["batch_id"]) if retry else (epoch,),
         ) as cur:
             pending = await cur.fetchall()
         if not pending:
@@ -331,14 +366,14 @@ class DualMemory:
         else:
             unpacked = []
             running_bytes = 0
-            for row in pending[:64]:
+            for row in pending:
                 rows = [
                     r
                     for r in self.vault.open(key + ":cold:" + row[0], row[1])
                     if r.get("archive_eligible", True)
                 ]
                 item_bytes = len(json.dumps(rows, ensure_ascii=False).encode("utf-8"))
-                if unpacked and running_bytes + item_bytes > self.s.history_max_bytes:
+                if not retry and unpacked and running_bytes + item_bytes > self.s.history_max_bytes:
                     break
                 unpacked.append((row[0], rows, row[2], row[3]))
                 running_bytes += item_bytes
@@ -347,36 +382,20 @@ class DualMemory:
         kinds = [item[3] for item in unpacked]
         min_created = min(item[2] for item in unpacked)
         max_created = max(item[2] for item in unpacked)
-        if background and expected_ids is None and all(k == "expiry" for k in kinds):
+        if not retry and background and expected_ids is None and all(k == "expiry" for k in kinds):
             combined_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
             if len(messages) < 24 and combined_bytes < 4096 and time.time() - min_created < 1800:
                 return None
-        return ids, messages, max_created
+        return {
+            "id": ids[0],
+            "ids": ids,
+            "messages": messages,
+            "created": max_created,
+            "batch_id": retry["batch_id"] if retry else None,
+            "flex_failures": retry["retry_number"] if retry else 0,
+        }
 
-    async def peek(self, message, *, background=False):
-        async with self.sessions.database(message, preserve_history=True) as (db, key):
-            async with db.execute("SELECT enabled FROM session_meta") as cur:
-                if not (await cur.fetchone())[0]:
-                    return None
-            async with db.execute(
-                "SELECT epoch,version,summary,(SELECT ready FROM memory_control) FROM rolling_state"
-            ) as cur:
-                epoch, version, summary, ready = await cur.fetchone()
-            selected = await self._select_pending(db, key, epoch, background=background)
-            if not selected:
-                return None
-            ids, messages, created = selected
-            return {
-                "id": ids[0],
-                "ids": ids,
-                "epoch": epoch,
-                "version": version,
-                "messages": messages,
-                "old_summary": self.vault.open(key, summary) if summary and not ready else "",
-                "created": created,
-            }
-
-    async def claim(self, message, *, background=False, expected_ids=None):
+    async def peek(self, message, *, background=False, now=None):
         async with self.sessions.database(message, preserve_history=True) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 if not (await cur.fetchone())[0]:
@@ -386,14 +405,37 @@ class DualMemory:
             ) as cur:
                 epoch, version, summary, ready = await cur.fetchone()
             selected = await self._select_pending(
-                db, key, epoch, background=background, expected_ids=expected_ids
+                db, key, epoch, background=background, now=time.time() if now is None else now
             )
-            if not selected:
+            if not selected or selected.get("status") == "provider_backoff":
+                return selected
+            return {
+                **selected,
+                "epoch": epoch,
+                "version": version,
+                "old_summary": self.vault.open(key, summary) if summary and not ready else "",
+            }
+
+    async def claim(self, message, *, background=False, expected_ids=None, now=None):
+        async with self.sessions.database(message, preserve_history=True) as (db, key):
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                if not (await cur.fetchone())[0]:
+                    return None
+            async with db.execute(
+                "SELECT epoch,version,summary,(SELECT ready FROM memory_control) FROM rolling_state"
+            ) as cur:
+                epoch, version, summary, ready = await cur.fetchone()
+            now = time.time() if now is None else now
+            selected = await self._select_pending(
+                db, key, epoch, now=now, background=background, expected_ids=expected_ids
+            )
+            if not selected or selected.get("status") == "provider_backoff":
                 return None
-            ids, messages, created = selected
+            ids = selected["ids"]
             # Requeued slices retain their accounting ID when the selected work is identical.
-            batch = "flex-" + self.vault.digest("memory-batch", key, epoch, version, ids)[:32]
-            now = time.time()
+            batch = selected["batch_id"] or (
+                "flex-" + self.vault.digest("memory-batch", key, epoch, version, ids)[:32]
+            )
             await db.executemany(
                 "UPDATE memory_slice_jobs SET "
                 "status='attempted',attempt=?,batch_id=?,attempted_at=?,error=NULL "
@@ -404,24 +446,51 @@ class DualMemory:
                 ],
             )
             return {
-                "id": ids[0],
-                "ids": ids,
+                **selected,
                 "epoch": epoch,
                 "version": version,
-                "messages": messages,
                 "old_summary": self.vault.open(key, summary) if summary and not ready else "",
-                "created": created,
                 "batch_id": batch,
             }
+
+    async def defer_capacity(self, message, snapshot, *, now):
+        """Only called after an acknowledged, zero-settled Flex generation HTTP 503."""
+        failures = snapshot["flex_failures"] + 1
+        exhausted = failures > len(FLEX_CAPACITY_DELAYS)
+        retry_at = 0 if exhausted else math.ceil(now + FLEX_CAPACITY_DELAYS[failures - 1])
+        reason = "flex_capacity_exhausted" if exhausted else "flex_capacity_busy"
+        async with self.sessions.database(message, preserve_history=True) as (db, _):
+            batch = snapshot["batch_id"]
+            async with db.execute(
+                "SELECT COUNT(*) FROM memory_slice_jobs WHERE batch_id=? AND status='attempted'",
+                (batch,),
+            ) as cur:
+                if (await cur.fetchone())[0] != len(snapshot["ids"]):
+                    return {"status": "stale"}
+            await db.execute(
+                "UPDATE memory_slice_jobs SET status=?,error=?,flex_failures=?,retry_at=? "
+                "WHERE batch_id=? AND status='attempted'",
+                ("failed" if exhausted else "pending", reason, failures, retry_at, batch),
+            )
+        if exhausted:
+            return {"status": "failed", "reason": reason}
+        return {
+            "status": "provider_backoff",
+            "reason": reason,
+            "retry_number": failures,
+            "next_retry_at": retry_at,
+        }
 
     async def requeue(self, message, snapshot):
         ids = snapshot.get("ids") or [snapshot["id"]]
         async with self.sessions.database(message, preserve_history=True) as (db, _):
             await db.executemany(
                 "UPDATE memory_slice_jobs SET "
-                "status='pending',attempt=NULL,batch_id=NULL,attempted_at=NULL,error=NULL "
-                "WHERE id=? AND status='attempted'",
-                [(ident,) for ident in ids],
+                "status='pending',attempt=NULL,"
+                "batch_id=CASE WHEN flex_failures>0 THEN batch_id END,"
+                "attempted_at=NULL,error=CASE WHEN flex_failures>0 THEN 'flex_capacity_busy' END "
+                "WHERE id=? AND status='attempted' AND batch_id=?",
+                [(ident, snapshot["batch_id"]) for ident in ids],
             )
 
     async def finish(self, message, snapshot, status, *, error=None):
@@ -429,8 +498,9 @@ class DualMemory:
         detail = None if status == "done" else str(error or status)[:64]
         async with self.sessions.database(message, preserve_history=True) as (db, _):
             await db.executemany(
-                "UPDATE memory_slice_jobs SET status=?,error=? WHERE id=?",
-                [(status, detail, ident) for ident in ids],
+                "UPDATE memory_slice_jobs SET status=?,error=?,retry_at=0 "
+                "WHERE id=? AND status='attempted' AND batch_id=?",
+                [(status, detail, ident, snapshot["batch_id"]) for ident in ids],
             )
 
     async def view(self, message, query=""):
@@ -446,6 +516,7 @@ class DualMemory:
                 "SELECT status,COUNT(*) FROM memory_slice_jobs GROUP BY status"
             ) as cur:
                 jobs = dict(await cur.fetchall())
+            retry = await self._capacity_retry(db, epoch)
             state = self.vault.open(key + ":mirror", mirror) if mirror else {}
             return {
                 "epoch": epoch,
@@ -457,6 +528,9 @@ class DualMemory:
                     if not query or query.lower() in (e["id"] + e["text"]).lower()
                 ],
                 "jobs": jobs,
+                "flex_retry": {k: v for k, v in retry.items() if k != "batch_id"}
+                if retry
+                else None,
                 "mirror_enabled": enabled
                 if enabled is not None
                 else f"{message.platform}:{message.conversation_id}" in self.s.roaming_group_ids,
@@ -621,7 +695,8 @@ class DualMemory:
             await db.execute("UPDATE memory_control SET ready=1")
             await db.execute("UPDATE rolling_state SET version=version+1")
             await db.executemany(
-                "UPDATE memory_slice_jobs SET status='done',error=NULL WHERE id=?",
+                "UPDATE memory_slice_jobs SET status='done',error=NULL,flex_failures=0,retry_at=0 "
+                "WHERE id=?",
                 [(ident,) for ident in ids],
             )
         self.index.discard(key)

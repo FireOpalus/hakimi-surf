@@ -741,7 +741,7 @@ async def save_bot_thresholds(request: Request):
     return _bot_thresholds_status(svc)
 
 
-async def _dual_stats(svc, msg, enabled: bool) -> dict[str, int]:
+async def _dual_stats(svc, msg, enabled: bool) -> dict:
     dual_mgr = getattr(svc.sessions, "dual", None)
     if not (enabled and dual_mgr is not None and hasattr(dual_mgr, "view")):
         return {"dual_entries_count": 0, "dual_chars": 0}
@@ -750,6 +750,8 @@ async def _dual_stats(svc, msg, enabled: bool) -> dict[str, int]:
     return {
         "dual_entries_count": len(active),
         "dual_chars": sum(len(str(e.get("text", ""))) for e in active),
+        "flex_retry": view.get("flex_retry"),
+        "archive_failed_slices": view.get("jobs", {}).get("failed", 0),
     }
 
 

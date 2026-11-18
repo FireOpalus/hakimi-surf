@@ -616,3 +616,20 @@ async def test_operational_audit_exposes_whitelisted_diagnostics_to_admin(admin_
     assert response.json()[0]["provider_diagnostics"] == [attempt]
     assert TOKEN not in response.text
     assert (await client.get("/admin/api/logs", headers={"Authorization": ""})).status_code == 401
+
+
+async def test_admin_session_reports_persisted_flex_schedule(admin_api, message):
+    from tests.test_dual_memory_v100 import group, seed
+
+    app, client, _ = admin_api
+    sessions, msg = app.state.service.sessions, group(message)
+    await seed(sessions, msg)
+    await sessions.dual.snapshot_cold(msg, force=True)
+    batch = await sessions.dual.claim(msg)
+    await sessions.dual.defer_capacity(msg, batch, now=1_800_000_000)
+    [row] = (await client.get("/admin/api/sessions")).json()
+    expected = {"next_retry_at": 1_800_000_060, "retry_number": 1, "slices": 1}
+    assert row["flex_retry"] == expected and row["archive_failed_slices"] == 0
+    url = "/admin/api/sessions/" + row["id"] + "/memory/search"
+    detail = (await client.post(url, json={"query": ""})).json()
+    assert detail["flex_retry"] == expected and detail["jobs"] == {"pending": 1}
