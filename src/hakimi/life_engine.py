@@ -27,6 +27,7 @@ from .life_config_compat import (
 )
 from .life_defaults import fallback_plan
 from .life_rules import RuleDispatcher
+from .life_workers import ActionWorkers
 from .modules.actions import ActionCall, GateDecision, Mode, Outcome, reject_reason
 from .modules.base import sanitize_sensor_text
 from .modules.qq_delivery import JIT_TRIGGER_MESSAGE as JIT_TRIGGER_MESSAGE
@@ -596,6 +597,7 @@ class GatekeeperWorker:
         self.store = service.store
         self.engine = engine
         self.clock = clock
+        self.workers = ActionWorkers(engine, self._evaluate_ticket)
 
     @property
     def config(self) -> LifeEngineConfig:
@@ -622,6 +624,12 @@ class GatekeeperWorker:
         return getattr(options, rule.unlimited_option)
 
     async def daily_usage(self, now: float, cfg: LifeEngineConfig) -> dict[str, int]:
+        async with self.store.lock:
+            usage, _ = await self._usage_tx(now, cfg)
+            return usage
+
+    async def _usage_tx(self, now, cfg):
+        """Caller owns the SQLite lock. Settled usage and live reservations share a snapshot."""
         start, end = _day_bounds(now, self.s.bot_timezone)
         catalog = self.engine.catalog
         usage = {
@@ -631,41 +639,64 @@ class GatekeeperWorker:
             if q.counter
         }
         usage.update(total=0, counted=0)
-        async with self.store.lock:
-            rows = await self.store.all(
-                "SELECT action_name,target_module,action_type,target_scope,COUNT(*) AS n "
-                "FROM scheduled_intents "
-                "WHERE status IN ('done','uncertain') AND updated_at>=? AND updated_at<? "
-                "GROUP BY action_name,target_module,action_type,target_scope",
-                (start, end),
-            )
+        reserved = 0
+        rows = await self.store.all(
+            "SELECT action_name,target_module,action_type,target_scope,COUNT(*) AS n,"
+            "SUM(status='executing') AS held FROM scheduled_intents "
+            "WHERE status IN ('executing','done','uncertain') "
+            "AND COALESCE(claimed_at,updated_at)>=? AND COALESCE(claimed_at,updated_at)<? "
+            "GROUP BY action_name,target_module,action_type,target_scope",
+            (start, end),
+        )
         for row in rows:
             name = row["action_name"] or catalog.old_name(row)
             spec = catalog.actions.get(name)
+            settled = row["n"] - row["held"]
             if not spec:
                 # Preserve historical deliveries from actions no longer registered.
                 if row["target_scope"]:
-                    usage["total"] += row["n"]
-                    usage["counted"] += row["n"]
+                    usage["total"] += settled
+                    usage["counted"] += settled
+                    reserved += row["held"]
                 continue
             rule = self.quota_for(spec, row["target_scope"])
             if rule is None:
                 continue
-            usage["total"] += row["n"]
+            usage["total"] += settled
             if rule.counter:
-                usage[rule.counter] += row["n"]
+                usage[rule.counter] += settled
             if not self.is_unlimited(spec, rule, cfg):
-                usage["counted"] += row["n"]
-        return usage
+                usage["counted"] += settled
+                reserved += row["held"]
+        return usage, reserved
 
     async def daily_limit_allows(
-        self, action: str, scope: str, now: float, cfg: LifeEngineConfig
+        self, action: str, scope: str, now: float, cfg: LifeEngineConfig, *, settled_only=False
     ) -> bool:
         spec = self.engine.catalog.actions[action]
         rule = self.quota_for(spec, scope)
         if rule is None or self.is_unlimited(spec, rule, cfg):
             return True
-        return (await self.daily_usage(now, cfg))["counted"] < cfg.max_proactive_per_day
+        async with self.store.lock:
+            usage, held = await self._usage_tx(now, cfg)
+        return usage["counted"] + (0 if settled_only else held) < cfg.max_proactive_per_day
+
+    async def quota_gate_tx(self, ticket, now):
+        try:
+            spec, _ = self.engine.resolve(ticket)
+        except ValueError as exc:
+            return GateDecision(reject_reason(exc))
+        cfg = self.config
+        rule = self.quota_for(spec, ticket["target_scope"])
+        if rule is None or self.is_unlimited(spec, rule, cfg):
+            return GateDecision()
+        usage, held = await self._usage_tx(now, cfg)
+        if usage["counted"] >= cfg.max_proactive_per_day:
+            return GateDecision("daily_proactive_limit")
+        if usage["counted"] + held >= cfg.max_proactive_per_day:
+            # A running action may yet be proven unsent and release its reservation.
+            return GateDecision("daily_capacity_reserved", delay=60)
+        return GateDecision()
 
     async def _evaluate_ticket(
         self,
@@ -719,7 +750,9 @@ class GatekeeperWorker:
             if not paid_lane_available(budget, spec.budget_lane):
                 if not spec.reuses_paid_work or not await spec.reuses_paid_work(now):
                     return await reject("budget_limit")
-        if not await self.daily_limit_allows(spec.name, ticket["target_scope"], now, cfg):
+        if not await self.daily_limit_allows(
+            spec.name, ticket["target_scope"], now, cfg, settled_only=True
+        ):
             return await reject("daily_proactive_limit")
         if reason := spec.unavailable():
             return await defer(reason, 120)
@@ -737,33 +770,25 @@ class GatekeeperWorker:
         res = await self.engine.jit.execute(ticket, desktop_context_hint=desktop_hint, now=now)
         return str(res.get("status", "done"))
 
-    async def tick(self, now: float | None = None) -> dict[str, Any]:
+    async def tick(self, now: float | None = None, *, wait=True) -> dict[str, Any]:
         ts = self.clock() if now is None else now
         expired = await self._expire_stale(ts)
         cfg = self.config
         if not cfg.enabled:
             return {"status": "disabled", "expired": expired, "checked": 0, "executed": 0}
 
-        due = await self.service.world_state.list_due_intents(now=ts, limit=20)
+        due = await self.service.world_state.list_due_intents(
+            now=ts, limit=20, distinct_lanes=not wait
+        )
         if not due:
             return {"status": "idle", "expired": expired, "checked": 0, "executed": 0}
 
-        results: dict[str, int] = {}
-        executed = 0
-        for ticket in due:
-            outcome = await self._evaluate_ticket(
-                ticket,
-                ts,
-                cfg,
-            )
-            results[outcome] = results.get(outcome, 0) + 1
-            if outcome in {"done", "uncertain"}:
-                executed += 1
+        results = await self.workers.dispatch(due, ts, wait=wait)
         return {
             "status": "ok",
             "expired": expired,
             "checked": len(due),
-            "executed": executed,
+            "executed": results.get("done", 0) + results.get("uncertain", 0),
             "outcomes": results,
         }
 
@@ -794,14 +819,22 @@ class JITExecutor:
         ts = self.clock() if now is None else now
         ws = self.service.world_state
         intent_id = ticket["id"]
-        ticket = await ws.claim(intent_id, ts)
+        ticket = await ws.claim(
+            intent_id, ts, quota_gate=lambda row: self.engine.gatekeeper.quota_gate_tx(row, ts)
+        )
         if ticket is None:
             return {"status": "not_claimed"}
+        if ticket["status"] != "executing":
+            return {
+                "status": "deferred" if ticket["status"] == "pending" else ticket["status"],
+                "reason": ticket["result_reason"],
+            }
         try:
             spec, args = self.engine.resolve(ticket)
         except ValueError as exc:
             result = Outcome("gated_skip", reject_reason(exc))
         else:
+            entered_handler = False
             try:
                 evidence = await self.engine.evidence(ticket)
 
@@ -833,28 +866,42 @@ class JITExecutor:
                         and current < ticket["expire_at"]
                     )
 
-                if still_allowed():
-                    result = await spec.run(
-                        ActionCall(ticket, args, ts, evidence, desktop_context_hint, still_allowed)
-                    )
+                if still_allowed() and await ws.start_handler(intent_id) and still_allowed():
+                    entered_handler = True
+                    with model_work(spec.name, intent_id):
+                        result = await spec.run(
+                            ActionCall(
+                                ticket, args, ts, evidence, desktop_context_hint, still_allowed
+                            )
+                        )
                 else:
                     result = Outcome("gated_skip", "action_no_longer_eligible")
             except PrivateEventScope:
                 result = Outcome("gated_skip", "private_event_scope")
             except asyncio.CancelledError:
+                end = self.clock()
+                status = (
+                    "uncertain"
+                    if entered_handler
+                    else ("pending" if end < ticket["expire_at"] else "expired")
+                )
                 await asyncio.shield(
                     ws.mark_intent(
                         intent_id,
-                        "uncertain",
+                        status,
                         expected="executing",
-                        reason="interrupted",
-                        now=self.clock(),
+                        reason="interrupted" if entered_handler else "interrupted_before_dispatch",
+                        now=end,
                     )
                 )
                 raise
             except Exception:
                 log.warning("event=life_action_failed action=%s", spec.name)
-                result = Outcome("uncertain", "handler_interrupted")
+                result = (
+                    Outcome("uncertain", "handler_interrupted")
+                    if entered_handler
+                    else Outcome("not_dispatched", "preparation_interrupted")
+                )
         end = self.clock()
         status = result.status
         retry_at = None
@@ -900,6 +947,7 @@ class LifeEngine:
         self._config_lock = asyncio.Lock()
         self._plan_lock = asyncio.Lock()
         self._gate_lock = asyncio.Lock()
+        self._background: dict[str, asyncio.Task] = {}
         self.wakeup = asyncio.Event()
         self.planner = LifeBlockPlanner(service, self, clock=self.clock, rng=self.rng)
         self.gatekeeper = GatekeeperWorker(service, self, clock=self.clock)
@@ -1030,6 +1078,7 @@ class LifeEngine:
                 if not has_intents_table and hasattr(world_state, "initialize"):
                     await world_state.initialize()
                 await self.rules.initialize()
+                await self.planner.initialize()
                 world_state.subscribe(self.planner.on_milestone_event)
             if self.planner.next_plan_at <= 0.0:
                 self.planner.next_plan_at = self.clock() + 120.0
@@ -1082,19 +1131,45 @@ class LifeEngine:
         self.wakeup.set()
         return await self.status()
 
-    async def trigger_plan_once(self, *, now: float | None = None) -> dict[str, Any]:
+    async def trigger_plan_once(
+        self, *, now: float | None = None, automatic: bool = False
+    ) -> dict[str, Any]:
         await self.initialize()
         async with self._plan_lock:
-            return await self.planner.plan_once(now=now)
+            if automatic and self.planner.next_plan_at > (self.clock() if now is None else now):
+                return {"status": "scheduled", "next_plan_at": self.planner.next_plan_at}
+            return await self.planner.plan_once(now=now, automatic=automatic)
 
-    async def tick_gatekeeper_once(self, *, now: float | None = None) -> dict[str, Any]:
+    def _start_background(self, name, call, *args, **kwargs):
+        if current := self._background.get(name):
+            if not current.done():
+                return current
+        task = asyncio.create_task(call(*args, **kwargs), name=f"life-{name}")
+        self._background[name] = task
+
+        def finished(worker):
+            if self._background.get(name) is worker:
+                self._background.pop(name)
+            if not worker.cancelled() and (error := worker.exception()) is not None:
+                log.warning(
+                    "event=life_background_failed work=%s type=%s", name, type(error).__name__
+                )
+
+        task.add_done_callback(finished)
+        return task
+
+    async def tick_gatekeeper_once(
+        self, *, now: float | None = None, wait: bool = True
+    ) -> dict[str, Any]:
         await self.initialize()
-        async with self._gate_lock:
-            ts = self.clock() if now is None else now
-            if self.config.enabled:
-                await self.rules.catch_up(ts)
+        ts = self.clock() if now is None else now
+        if self.config.enabled:
+            async with self._gate_lock:
                 await self.schedule_due(ts)
-            return await self.gatekeeper.tick(now=ts)
+            rules = self._start_background("rules", self.rules.catch_up, ts)
+            if wait:
+                await asyncio.shield(rules)
+        return await self.gatekeeper.tick(now=ts, wait=wait)
 
     def closing_window(self, local_day: date) -> tuple[int, int] | None:
         rest = self.store.runtime.rest_hours
@@ -1196,26 +1271,42 @@ class LifeEngine:
 
     async def run(self) -> None:
         self._running = True
-        last_gate_tick = 0.0
-        while True:
-            try:
-                if not self.initialized:
-                    await self.initialize()
-                now = self.clock()
-                if self.config.enabled:
-                    if now - last_gate_tick >= 60.0:
-                        await self.tick_gatekeeper_once(now=now)
-                        last_gate_tick = self.clock()
+        self.gatekeeper.workers.stopping = False
+        next_gate = 0.0
+        try:
+            while True:
+                self.wakeup.clear()
+                try:
+                    if not self.initialized:
+                        await self.initialize()
                     now = self.clock()
-                    if self.planner.next_plan_at <= 0.0 or now >= self.planner.next_plan_at:
-                        await self.trigger_plan_once(now=now)
-            except asyncio.CancelledError:
-                self._running = False
-                raise
-            except Exception:
-                log.warning("event=life_engine_error")
-            self.wakeup.clear()
-            try:
-                await asyncio.wait_for(self.wakeup.wait(), 60.0)
-            except TimeoutError:
-                pass
+                    if self.config.enabled:
+                        if now >= next_gate:
+                            next_gate = now + 60
+                            await self.tick_gatekeeper_once(now=now, wait=False)
+                        if now >= self.planner.next_plan_at and not self._plan_lock.locked():
+                            self._start_background(
+                                "planner", self.trigger_plan_once, now=now, automatic=True
+                            )
+                except Exception:
+                    log.warning("event=life_engine_error")
+                now = self.clock()
+                delay = 60.0
+                if self.config.enabled and next_gate:
+                    delay = max(0.1, min(delay, next_gate - now))
+                    if self.planner.next_plan_at > now:
+                        delay = min(delay, self.planner.next_plan_at - now)
+                try:
+                    await asyncio.wait_for(self.wakeup.wait(), delay)
+                except TimeoutError:
+                    pass
+        finally:
+            self._running = False
+            await self.close()
+
+    async def close(self) -> None:
+        tasks = list(self._background.values())
+        for task in tasks:
+            task.cancel()
+        await self.gatekeeper.workers.close()
+        await asyncio.gather(*tasks, return_exceptions=True)

@@ -437,6 +437,7 @@ class Service:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.life_engine.close()
         await self.compressor.close()
         await self.bili_watcher.close()
         close_nt = getattr(self.node_transport, "close", None)

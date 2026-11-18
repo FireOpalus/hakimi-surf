@@ -54,6 +54,9 @@ class FakeLifeEngine:
         self.gatekeeper_calls += 1
         return {"status": "scanned", "calls": self.gatekeeper_calls}
 
+    async def close(self) -> None:
+        pass
+
 
 def _mount_life_router(app) -> None:
     if not any(getattr(r, "path", "").startswith("/admin/api/life") for r in app.routes):

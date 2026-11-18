@@ -9,14 +9,14 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import Settings
 from .context_budget import estimate_tokens, truncate_tokens
-from .modules.actions import Origin
+from .modules.actions import GateDecision, Origin
 from .modules.base import (
     ATTENTION_RANK,
     AttentionLevel,
@@ -295,6 +295,9 @@ class WorldStateManager:
                 "dedupe_key": "TEXT",
                 "result_reason": "TEXT NOT NULL DEFAULT ''",
                 "shadow_result": "TEXT NOT NULL DEFAULT ''",
+                "claimed_at": "REAL",
+                # NULL is a legacy claim with unknown dispatch state.
+                "handler_started": "INTEGER",
             }.items():
                 if name not in existing:
                     await self.store.db.execute(
@@ -303,6 +306,11 @@ class WorldStateManager:
             await self.store.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_dedupe "
                 "ON scheduled_intents(dedupe_key)"
+            )
+            await self.store.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intent_activity_day "
+                "ON scheduled_intents(COALESCE(claimed_at,updated_at)) "
+                "WHERE status IN ('executing','done','uncertain')"
             )
             await self.store.db.execute(
                 "INSERT OR IGNORE INTO world_state("
@@ -479,39 +487,98 @@ class WorldStateManager:
         return intent_id
 
     async def list_due_intents(
-        self, now: float | None = None, *, limit: int = 50
+        self, now: float | None = None, *, limit: int = 50, distinct_lanes: bool = False
     ) -> list[dict[str, Any]]:
         """Return pending intents whose execution window is currently active."""
         current = self.clock() if now is None else now
+        closing = (
+            tuple(
+                name
+                for name, spec in self.registry.catalog.actions.items()
+                if spec.window == "closing"
+            )
+            if self.registry
+            else ()
+        )
+        closing_match = (
+            "action_name IN (" + ",".join("?" for _ in closing) + ")" if closing else "0"
+        )
+        order = "priority,execute_after,created_at,row_order"
+        select = "SELECT * FROM due"
+        if distinct_lanes:
+            # A backlog for a single audience/module cannot hide other runnable lanes.
+            select = (
+                "SELECT * FROM (SELECT due.*,ROW_NUMBER() OVER (PARTITION BY target_scope,"
+                "CASE WHEN target_scope='' THEN target_module END "
+                f"ORDER BY {order}) AS lane_position FROM due) WHERE lane_position=1"
+            )
         async with self.store.lock:
             rows = await self.store.all(
-                "SELECT * FROM scheduled_intents "
-                "WHERE status='pending' AND execute_after <= ? AND expire_at > ? "
-                "ORDER BY CASE WHEN origin='timer' AND action_name='qq.owner_digest' "
-                "THEN 0 ELSE 1 END, "
-                "execute_after,created_at LIMIT ?",
-                (current, current, max(1, int(limit))),
+                "WITH due AS (SELECT rowid AS row_order,*,CASE "
+                f"WHEN origin='timer' AND {closing_match} THEN 0 "
+                "WHEN origin='timer' THEN 1 ELSE 2 END AS priority FROM scheduled_intents "
+                "WHERE status='pending' AND execute_after<=? AND expire_at>?) "
+                f"{select} ORDER BY {order} LIMIT ?",
+                (*closing, current, current, max(1, int(limit))),
             )
         return [self.intent_from_row(row) for row in rows]
 
     @staticmethod
     def intent_from_row(row) -> dict:
         ticket = dict(row)
+        for key in ("row_order", "priority", "lane_position"):
+            ticket.pop(key, None)
         for key in ("arguments", "gate_condition", "intent_note"):
             ticket[key] = json.loads(ticket.pop(key + "_json") or "{}")
         return ticket
 
-    async def claim(self, intent_id: str, now: float) -> dict | None:
-        """Claim and load the same persisted action inside SQLite's write transaction."""
+    async def claim(
+        self,
+        intent_id: str,
+        now: float,
+        *,
+        quota_gate: Callable[[dict], Awaitable[GateDecision]] | None = None,
+    ) -> dict | None:
+        """Check capacity and reserve a slot using the persisted ticket in one transaction."""
+        async with self.store.transaction():
+            row = await self.store.one(
+                "SELECT * FROM scheduled_intents WHERE id=? AND status='pending' "
+                "AND execute_after<=? AND expire_at>?",
+                (intent_id, now, now),
+            )
+            if row is None:
+                return None
+            ticket = self.intent_from_row(row)
+            decision = await quota_gate(ticket) if quota_gate else GateDecision()
+            if decision.reason:
+                status = "pending" if decision.delay else "gated_skip"
+                retry_at = (
+                    min(now + decision.delay, ticket["expire_at"]) if decision.delay else None
+                )
+                await self.store.db.execute(
+                    "UPDATE scheduled_intents SET status=?,result_reason=?,updated_at=?,"
+                    "execute_after=COALESCE(?,execute_after) WHERE id=?",
+                    (status, decision.reason, now, retry_at, intent_id),
+                )
+                return dict(ticket, status=status, result_reason=decision.reason)
+            # A direct legacy caller of claim() may already be submitting the action.
+            started = int(quota_gate is None)
+            await self.store.db.execute(
+                "UPDATE scheduled_intents SET status='executing',updated_at=?,claimed_at=?,"
+                "handler_started=?,result_reason='' WHERE id=?",
+                (now, now, started, intent_id),
+            )
+            return dict(ticket, status="executing", claimed_at=now, handler_started=started)
+
+    async def start_handler(self, intent_id: str) -> bool:
+        """Commit the external-submission boundary before invoking a module."""
         async with self.store.transaction():
             cur = await self.store.db.execute(
-                "UPDATE scheduled_intents SET status='executing',updated_at=? "
-                "WHERE id=? AND status='pending' AND execute_after<=? AND expire_at>? RETURNING *",
-                (now, intent_id, now, now),
+                "UPDATE scheduled_intents SET handler_started=1 WHERE id=? "
+                "AND status='executing' AND handler_started=0",
+                (intent_id,),
             )
-            row = await cur.fetchone()
-            await cur.close()
-            return self.intent_from_row(row) if row else None
+            return cur.rowcount == 1
 
     async def mark_intent(
         self,
@@ -528,11 +595,14 @@ class WorldStateManager:
         async with self.store.transaction():
             cur = await self.store.db.execute(
                 "UPDATE scheduled_intents SET status=?,result_reason=?,updated_at=?,"
+                "claimed_at=CASE WHEN ? IN ('pending','gated_skip','expired') "
+                "THEN NULL ELSE claimed_at END,"
                 "execute_after=COALESCE(?,execute_after) WHERE id=? AND status=?",
                 (
                     status,
                     sanitize_sensor_text(reason, self.s, max_tokens=32),
                     self.clock() if now is None else now,
+                    status,
                     retry_at,
                     intent_id,
                     expected,
@@ -543,6 +613,18 @@ class WorldStateManager:
     async def recover_actions(self) -> None:
         # Boot runs after QQ receipt application. A partial ACK cannot confirm a whole intent.
         async with self.store.transaction():
+            now = self.clock()
+            await self.store.db.execute(
+                "UPDATE scheduled_intents SET status=CASE WHEN expire_at>? THEN 'pending' "
+                "ELSE 'expired' END, claimed_at=NULL,updated_at=?,"
+                "result_reason='interrupted_before_dispatch' "
+                "WHERE status='executing' AND handler_started=0",
+                (now, now),
+            )
+            await self.store.db.execute(
+                "UPDATE scheduled_intents SET claimed_at=updated_at "
+                "WHERE status='executing' AND claimed_at IS NULL"
+            )
             await self.store.db.execute(
                 "UPDATE scheduled_intents SET status='done',"
                 "result_reason='recovered_complete_receipts',"
