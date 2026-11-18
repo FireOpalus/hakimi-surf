@@ -618,7 +618,7 @@ async def test_operational_audit_exposes_whitelisted_diagnostics_to_admin(admin_
     assert (await client.get("/admin/api/logs", headers={"Authorization": ""})).status_code == 401
 
 
-async def test_admin_session_reports_persisted_flex_schedule(admin_api, message):
+async def test_admin_session_reports_persisted_flex_schedule(admin_api, message, monkeypatch):
     from tests.test_dual_memory_v100 import group, seed
 
     app, client, _ = admin_api
@@ -633,3 +633,7 @@ async def test_admin_session_reports_persisted_flex_schedule(admin_api, message)
     url = "/admin/api/sessions/" + row["id"] + "/memory/search"
     detail = (await client.post(url, json={"query": ""})).json()
     assert detail["flex_retry"] == expected and detail["jobs"] == {"pending": 1}
+    assert await sessions.dual.claim(msg, now=expected["next_retry_at"])
+    monkeypatch.setattr("hakimi.dual_memory._PROCESS_STARTED_AT", expected["next_retry_at"] + 1)
+    [row] = (await client.get("/admin/api/sessions")).json()
+    assert row["archive_unconfirmed_slices"] == 1 and row["flex_retry"] is None

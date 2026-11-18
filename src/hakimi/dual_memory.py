@@ -60,6 +60,8 @@ INSERT OR IGNORE INTO memory_control(singleton) VALUES (1);
 SLOTS = {"alias", "preferences", "boundaries", "state"}
 MAX_ENTRIES = 512
 FLEX_CAPACITY_DELAYS = (60, 120, 15 * 60, 60 * 60)
+# The single archive worker cannot still own a claim from a previous process.
+_PROCESS_STARTED_AT = time.time()
 
 
 class Strict(BaseModel):
@@ -497,11 +499,12 @@ class DualMemory:
         ids = snapshot.get("ids") or [snapshot["id"]]
         detail = None if status == "done" else str(error or status)[:64]
         async with self.sessions.database(message, preserve_history=True) as (db, _):
-            await db.executemany(
+            changed = await db.executemany(
                 "UPDATE memory_slice_jobs SET status=?,error=?,retry_at=0 "
                 "WHERE id=? AND status='attempted' AND batch_id=?",
                 [(status, detail, ident, snapshot["batch_id"]) for ident in ids],
             )
+            return changed.rowcount > 0
 
     async def view(self, message, query=""):
         async with self.sessions.database(message, preserve_history=True) as (db, key):
@@ -513,7 +516,9 @@ class DualMemory:
                 ready, enabled, mirror = await cur.fetchone()
             entries = await self._entries(db, key)
             async with db.execute(
-                "SELECT status,COUNT(*) FROM memory_slice_jobs GROUP BY status"
+                "SELECT CASE WHEN status='attempted' AND COALESCE(attempted_at,0)<? "
+                "THEN 'unconfirmed' ELSE status END,COUNT(*) FROM memory_slice_jobs GROUP BY 1",
+                (_PROCESS_STARTED_AT,),
             ) as cur:
                 jobs = dict(await cur.fetchall())
             retry = await self._capacity_retry(db, epoch)

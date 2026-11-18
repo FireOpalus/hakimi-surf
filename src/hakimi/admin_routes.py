@@ -752,6 +752,7 @@ async def _dual_stats(svc, msg, enabled: bool) -> dict:
         "dual_chars": sum(len(str(e.get("text", ""))) for e in active),
         "flex_retry": view.get("flex_retry"),
         "archive_failed_slices": view.get("jobs", {}).get("failed", 0),
+        "archive_unconfirmed_slices": view.get("jobs", {}).get("unconfirmed", 0),
     }
 
 

@@ -260,7 +260,11 @@ class MemoryCompressor:
                 extraction = parse_extraction(result)
                 committed = await self.sessions.dual.commit(message, snapshot, extraction)
             except asyncio.CancelledError:
-                # Persisted attempted status deliberately survives a cancelled/unknown paid request.
+                # A dispatched archive may have been billed. Keep its slices out of the retry queue.
+                if await self.sessions.dual.finish(
+                    message, snapshot, "unconfirmed", error="archive_interrupted"
+                ):
+                    await self.store.runtime.event("memory_archive_unconfirmed", "memory")
                 raise
             except Exception as exc:
                 if isinstance(exc, Rejected) and exc.detail == "flex_capacity_busy":

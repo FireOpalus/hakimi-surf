@@ -82,6 +82,7 @@ CODES = frozenset(
         "memory_flex_retry_scheduled",
         "memory_flex_retry_exhausted",
         "memory_flex_retry_succeeded",
+        "memory_archive_unconfirmed",
         "memory_worker_failed",
         "memory_mirror_failed",
         "cache_prefix_busted",

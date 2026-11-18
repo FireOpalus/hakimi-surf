@@ -1,5 +1,7 @@
+import asyncio
 import json
 import sqlite3
+import time
 
 import httpx
 import pytest
@@ -7,6 +9,7 @@ import pytest
 from hakimi.gemini import GeminiGateway
 from hakimi.memory_compressor import MemoryCompressor
 from hakimi.session_manager import SessionManager
+from tests.fakes import FakeGateway
 from tests.test_dual_memory_v100 import group, seed
 from tests.test_sdk_contract import decision_response, interaction_response
 from tests.test_sdk_contract import sdk_pair as sdk_pair
@@ -159,3 +162,34 @@ async def test_existing_failed_and_uncertain_jobs_stay_terminal_on_upgrade(
         assert (
             db.execute("SELECT id,payload FROM cold_history_slices ORDER BY id").fetchall() == rows
         )
+
+
+async def test_interrupted_archive_is_visible_and_never_dispatched_again(settings, store, message):
+    sessions, msg = SessionManager(settings, store), group(message)
+    started = asyncio.Event()
+    gateway = FakeGateway()
+
+    async def wait_for_reply(*args, **kwargs):
+        started.set()
+        await asyncio.Future()
+
+    gateway.generate = wait_for_reply
+    worker = MemoryCompressor(settings, sessions, gateway, store)
+    await seed(sessions, msg)
+    task = asyncio.create_task(worker.extract(msg, force=True))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (await sessions.dual.view(msg))["jobs"] == {"unconfirmed": 1}
+    assert await sessions.dual.claim(msg) is None
+    assert (
+        await store.one("SELECT count(*) FROM audit_events WHERE code='memory_archive_unconfirmed'")
+    )[0] == 1
+
+    # A hard stop may leave only the original durable claim. Render it truthfully on restart.
+    await seed(sessions, msg, text="后来的一批")
+    await sessions.dual.snapshot_cold(msg, force=True)
+    await sessions.dual.claim(msg, now=time.time() - 86400)
+    assert (await sessions.dual.view(msg))["jobs"] == {"unconfirmed": 2}
+    assert await sessions.dual.claim(msg) is None
