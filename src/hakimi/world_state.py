@@ -23,6 +23,7 @@ from .modules.base import (
     ModuleRegistry,
     sanitize_sensor_text,
 )
+from .security import Vault
 from .store import Store
 
 log = logging.getLogger("hakimi")
@@ -137,10 +138,16 @@ class PrivateEventScope(ValueError):
     """A scoped event cannot be material for this recipient or action."""
 
 
+def private_event_audience(settings: Settings, user_id: str) -> str:
+    vault = Vault(settings.encryption_key.get_secret_value())
+    return vault.digest("private-world-event", settings.namespace, settings.onebot_self_id, user_id)
+
+
 def private_event_for_owner(payload: dict, recipient: str, settings: Settings) -> bool:
     return bool(
         settings.owner_qq_id
         and payload.get("owner_private") is True
+        and payload.get("audience") == private_event_audience(settings, settings.owner_qq_id)
         and recipient == "owner:" + settings.owner_qq_id
     )
 
@@ -709,11 +716,20 @@ class WorldStateManager:
                 log.warning("event=world_event_subscriber_failed")
         return event
 
+    _public_high = "importance='high' AND json_extract(payload_json,'$.private_first') IS NOT 1"
+
+    async def remaining_milestone_tx(self):
+        return await self.store.one(
+            "SELECT 1 FROM global_events WHERE consumed=0 AND " + self._public_high + " LIMIT 1"
+        )
+
     async def unconsumed_events(self, limit: int = 50) -> list[MilestoneEvent]:
-        """Load unconsumed MilestoneEvents from SQLite ordered oldest-first."""
+        """Give the signal that woke the planner priority over older routine observations."""
         async with self.store.lock:
             rows = await self.store.all(
-                "SELECT * FROM global_events WHERE consumed=0 ORDER BY created_at ASC LIMIT ?",
+                "SELECT * FROM global_events WHERE consumed=0 ORDER BY ("
+                + self._public_high
+                + ") DESC,created_at,rowid LIMIT ?",
                 (max(1, int(limit)),),
             )
         return [self.event_from_row(row) for row in rows]

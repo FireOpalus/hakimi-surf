@@ -144,6 +144,14 @@ class PlannerJournal:
                 "UPDATE life_planner_clock SET next_at=?,signature=?,explore_at=? WHERE id=1",
                 (row["next_at"], row["signature"], row["explore_at"]),
             )
+            if await world.remaining_milestone_tx():
+                # A high event can arrive after reading the batch or beyond its 20-row limit.
+                follow_up = row["started"] + 60
+                await self.store.db.execute(
+                    "UPDATE life_planner_clock SET signal_at=MIN(COALESCE(signal_at,?),?) "
+                    "WHERE id=1",
+                    (follow_up, follow_up),
+                )
         return ids
 
     async def observed(self, day, now, *, digest_due=None, digest_end=None):

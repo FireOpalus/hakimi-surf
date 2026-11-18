@@ -745,11 +745,12 @@ class GatekeeperWorker:
                 if remaining <= 120:
                     return await reject("attention_lock")
                 return await defer("attention_lock", min(900, max(60, remaining * 0.5)))
-        if spec.budget_lane is not None:
+        if spec.budget_lane is not None and not (
+            spec.reuses_paid_work and await spec.reuses_paid_work(now)
+        ):
             budget = await self.store.budget_status()
             if not paid_lane_available(budget, spec.budget_lane):
-                if not spec.reuses_paid_work or not await spec.reuses_paid_work(now):
-                    return await reject("budget_limit")
+                return await reject("budget_limit")
         if not await self.daily_limit_allows(
             spec.name, ticket["target_scope"], now, cfg, settled_only=True
         ):
@@ -1028,7 +1029,7 @@ class LifeEngine:
         return {
             "source_module": row["source_module"],
             "event_type": row["event_type"],
-            "payload": payload,
+            "payload": {k: v for k, v in payload.items() if k != "audience"},
         }
 
     async def initialize(self) -> None:

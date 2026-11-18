@@ -97,3 +97,27 @@ async def test_uncheckpointed_provider_crash_preserves_input_and_reserved_wake(d
     assert len(fake.calls) == 1
     assert not (await dm.store.one("SELECT consumed FROM global_events WHERE id=?", (ev.id,)))[0]
     assert (await dm.store.one("SELECT outcome FROM life_plan_runs"))[0] == "interrupted"
+
+
+async def test_milestone_backlog_and_arrival_during_planning(dm, monkeypatch):
+    planner, ws = dm.service.life_engine.planner, dm.service.world_state
+    fake = setup_model(dm, intents=[])
+    for i in range(21):
+        await ws.publish_event("minecraft", "routine", {"sample": i}, now=dm.clock())
+    first = await ws.publish_event(
+        "minecraft", "milestone", {}, importance="high", now=dm.clock() + 1
+    )
+    before = planner.journal.start
+
+    async def publish_during_start(*args, **kwargs):
+        await ws.publish_event("minecraft", "second", {}, importance="high", now=dm.clock() + 2)
+        return await before(*args, **kwargs)
+
+    monkeypatch.setattr(planner.journal, "start", publish_during_start)
+    result = await planner.plan_once(now=dm.clock())
+    assert fake.calls[0][1]["unconsumed_events"][0]["id"] == first.id
+    assert result["next_plan_at"] <= dm.clock() + 60
+    monkeypatch.setattr(planner.journal, "start", before)
+    dm.time[0] += 61
+    await planner.plan_once(now=dm.clock(), automatic=True)
+    assert fake.calls[1][1]["unconsumed_events"][0]["event_type"] == "second"

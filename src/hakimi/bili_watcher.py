@@ -31,6 +31,7 @@ from .generation_policy import Scenario
 from .models import Message, Video
 from .roaming_logger import redact_public_summary
 from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
+from .world_state import private_event_audience
 
 PRIVATE_SHARE_PRIORITY_SECONDS = 24 * 3600
 
@@ -1433,7 +1434,13 @@ class BiliWatcher:
                             {
                                 "bvid": pick.bvid,
                                 **(
-                                    {"private_first": True, "owner_private": share_owner}
+                                    {
+                                        "private_first": True,
+                                        "owner_private": share_owner,
+                                        "audience": private_event_audience(
+                                            self.s, preferred.user_id
+                                        ),
+                                    }
                                     if preferred is not None
                                     else {"title": title_str[:80], "summary": summary[:140]}
                                 ),

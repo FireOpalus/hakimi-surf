@@ -31,3 +31,22 @@ def test_private_source_cannot_trigger_build_or_fallback_share(settings):
     )
     assert build_from_video(event) is None
     assert milestone_sharing(settings).match(event) is None
+
+
+def test_owner_private_milestone_is_bound_to_original_account(settings):
+    from hakimi.world_state import private_event_audience
+
+    settings.owner_qq_id = "20000"
+    event = MilestoneEvent(
+        source_module="bilibili_surf",
+        event_type="bili_video_watched",
+        importance="high",
+        payload={
+            "private_first": True,
+            "owner_private": True,
+            "audience": private_event_audience(settings, "20000"),
+        },
+    )
+    assert milestone_sharing(settings).match(event).recipient == "owner:20000"
+    settings.owner_qq_id = "30000"
+    assert milestone_sharing(settings).match(event) is None
