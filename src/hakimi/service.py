@@ -57,6 +57,7 @@ from .streaming import cancellable
 from .surf_mirror import SurfMirror
 from .video_watch import VideoWatch
 from .web_search import explicit_search, search_query
+from .work_usage import model_work
 from .world_state import WorldStateManager
 
 log = logging.getLogger("hakimi")
@@ -1710,7 +1711,7 @@ class Service:
                 and not self.bot_guard.known_bot(message)
                 and hasattr(self.bili_watcher, "lookup_watched")
             ):
-                prior = await self.bili_watcher.lookup_watched(bvid)
+                prior = await self.bili_watcher.lookup_watched(bvid, message=message)
                 if prior:
                     material = {**material, "patrol_deja_vu": prior}
             if not aff_active or caps.allow_video_watch:
@@ -2078,10 +2079,13 @@ class Service:
 
     async def process(self, job: dict):
         try:
-            if job["kind"] == "message":
-                await self.handle_message(job)
-            else:
-                await self.handle_patrol(job)
+            with model_work(
+                "qq.reply" if job["kind"] == "message" else "bili.subscription", job["id"]
+            ):
+                if job["kind"] == "message":
+                    await self.handle_message(job)
+                else:
+                    await self.handle_patrol(job)
         except Rejected as exc:
             audit_id = job.get("_audit_id")
             if str(exc) == "batch_interrupted":

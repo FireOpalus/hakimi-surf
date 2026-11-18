@@ -133,6 +133,18 @@ def _sanitize_payload(
     return value
 
 
+class PrivateEventScope(ValueError):
+    """A scoped event cannot be material for this recipient or action."""
+
+
+def private_event_for_owner(payload: dict, recipient: str, settings: Settings) -> bool:
+    return bool(
+        settings.owner_qq_id
+        and payload.get("owner_private") is True
+        and recipient == "owner:" + settings.owner_qq_id
+    )
+
+
 def _check_no_prewritten_speech(text: str) -> None:
     if len(text) > 240:
         raise ValueError("intent_note exceeds 240 characters")

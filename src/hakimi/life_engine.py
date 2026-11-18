@@ -36,7 +36,9 @@ from .reply_style import trim_complete_text
 from .world_state import (
     IntentTicketCreate,
     MilestoneEvent,
+    PrivateEventScope,
     _check_no_prewritten_speech,
+    private_event_for_owner,
 )
 
 log = logging.getLogger("hakimi")
@@ -554,7 +556,10 @@ class GatekeeperWorker:
             and ws.proactive_suspended()
             and self.engine.catalog.owners[spec.name] != ws.current.current_module
         ):
-            evidence = await self.engine.evidence(ticket) if spec.social else {}
+            try:
+                evidence = await self.engine.evidence(ticket) if spec.social else {}
+            except ValueError:
+                return await reject("private_event_scope")
             if evidence.get("source_module") != ws.current.current_module:
                 remaining = ticket["expire_at"] - now
                 if remaining <= 120:
@@ -684,6 +689,8 @@ class JITExecutor:
                     )
                 else:
                     result = Outcome("gated_skip", "action_no_longer_eligible")
+            except PrivateEventScope:
+                result = Outcome("gated_skip", "private_event_scope")
             except asyncio.CancelledError:
                 await asyncio.shield(
                     ws.mark_intent(
@@ -815,10 +822,15 @@ class LifeEngine:
             return {}
         if not row:
             return {}
+        payload = json.loads(row["payload_json"])
+        if payload.get("private_first") and not private_event_for_owner(
+            payload, ticket["target_scope"], self.s
+        ):
+            raise PrivateEventScope("private_event_scope")
         return {
             "source_module": row["source_module"],
             "event_type": row["event_type"],
-            "payload": json.loads(row["payload_json"]),
+            "payload": payload,
         }
 
     async def initialize(self) -> None:

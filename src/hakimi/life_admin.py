@@ -226,7 +226,11 @@ async def _read_events(store: Any) -> list[dict[str, Any]]:
             "event_type": row["event_type"],
             "importance": row["importance"],
             "consumed": bool(row["consumed"]),
-            "payload": _parse_json_value(row["payload_json"], {}),
+            "payload": (
+                {"private_first": True}
+                if (payload := _parse_json_value(row["payload_json"], {})).get("private_first")
+                else payload
+            ),
         }
         for row in rows
     ]
@@ -369,6 +373,9 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
         "source": source,
         "timezone": svc.s.bot_timezone,
         "engine": engine_meta,
+        "digest_history": await proactive_mgr.digest_history()
+        if hasattr(proactive_mgr, "digest_history")
+        else [],
         "world_state": world_state_data,
         "nodes": nodes,
         "desktop_memory": desktop_memory,

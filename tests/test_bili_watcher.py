@@ -505,10 +505,19 @@ async def test_private_patrol_recommendation_prefers_real_source(
     assert (reaction.recipient if reaction else None) == (
         "owner:20000" if expected_importance == "high" else None
     )
-    bound = reference == "recent_chat_topics:0"
+    bound = True  # private selection always stays bound to the authenticated source
     assert not events[0].payload.get("private_topic_ref")
     assert bool(events[0].payload.get("private_first")) == bound
-    assert await watcher.lookup_watched(BV)
+    assert await watcher.lookup_watched(BV, message=source)
+    assert await watcher.lookup_watched(BV, message=other_dm) is None
+    assert await watcher.lookup_watched(BV, message=group) is None
+    assert await watcher.lookup_watched(BV) is None
+    assert "summary" not in events[0].payload
+    assert "title" not in events[0].payload
+    if sender != "20000":
+        assert not await watcher.store.latest_reports(
+            watcher.store.subject(watcher.svc.proactive.target())
+        )
     assert bool(await watcher.recent_surfed(message=other_dm)) != bound
     assert bool(await watcher.recent_surfed(message=group)) != bound
     assert bool(await watcher.recent_surfed()) != bound

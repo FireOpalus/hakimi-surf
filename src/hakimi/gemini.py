@@ -40,6 +40,7 @@ from .streaming import StreamProgress, cancellable, consume_stream, upstream_htt
 from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
 from .web_search import SEARCH_INSTRUCTION, execute_deepseek_search, parse_result
+from .work_usage import model_work
 
 DIARY_INSTRUCTION = """当前业务是每日巡逻日记总结，不是实时对话。
 结合给定的公开巡逻摘要（public_summaries）、白名单聊天摘录（chat_excerpts）与活动计数，
@@ -624,6 +625,7 @@ class GeminiGateway:
         operation: Callable[[], Awaitable[Any]],
         *,
         image_tokens: int = 0,
+        work_kind: str | None = None,
         before_call=None,
         context_limit=None,
         carbon_reserve_fallback=False,
@@ -703,12 +705,13 @@ class GeminiGateway:
                 return min(reserve_usd, max(floor, est))
 
             try:
-                reservation = await self.store.reserve(
-                    subject,
-                    budget_lane,
-                    reserve_usd,
-                    **self._reserve_kwargs(model_lane, thinking_level, provider),
-                )
+                with model_work(work_kind or budget_lane + "." + model_lane):
+                    reservation = await self.store.reserve(
+                        subject,
+                        budget_lane,
+                        reserve_usd,
+                        **self._reserve_kwargs(model_lane, thinking_level, provider),
+                    )
             except Rejected as exc:
                 # Only a failure before dispatch permits a second model attempt.
                 if carbon_reserve_fallback and str(exc) in {
@@ -1168,6 +1171,7 @@ class GeminiGateway:
             return p, confidence
 
         call_kwargs: dict[str, Any] = {
+            "work_kind": budget_lane + ".screen." + purpose,
             "image_tokens": len(images) * self.s.image_token_reserve
             + (video.tokens if video else 0),
             "before_call": before_call,
@@ -2012,6 +2016,7 @@ class GeminiGateway:
                 active_plan.output_tokens,
                 deadline_seconds,
                 controlled_operation,
+                work_kind="world.plan" if life_plan else scenario.value,
                 stream_retryable=chat,
                 image_tokens=len(images) * self.s.image_token_reserve
                 + (video.tokens if video else 0),

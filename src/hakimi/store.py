@@ -26,6 +26,7 @@ from .runtime_state import SCHEMA as RUNTIME_SCHEMA
 from .runtime_state import RuntimeState
 from .security import Rejected, Vault
 from .usage_accounting import TokenUsage
+from .work_usage import reservation_work
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
@@ -52,6 +53,12 @@ CREATE TABLE IF NOT EXISTS ledger_usage (
   cached_tokens INTEGER, thought_tokens INTEGER, model_lane TEXT,
   estimated_amount INTEGER
 );
+CREATE TABLE IF NOT EXISTS ledger_work (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, work_id TEXT NOT NULL,
+  root_kind TEXT NOT NULL, root_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ledger_work_action ON ledger_work(kind, work_id);
+CREATE INDEX IF NOT EXISTS ledger_work_root ON ledger_work(root_kind, root_id);
 CREATE TABLE IF NOT EXISTS ledger_provider (
   id TEXT PRIMARY KEY, provider TEXT NOT NULL
 );
@@ -925,6 +932,11 @@ class Store:
                 "INSERT INTO ledger VALUES (?,?,?,?,?,?,'reserved')",
                 (reservation, day, subject, lane, amount, amount),
             )
+            work = reservation_work(lane, reservation)
+            await self.db.execute(
+                "INSERT INTO ledger_work VALUES (?,?,?,?,?)",
+                (reservation, work.kind, work.key, work.root_kind, work.root_key),
+            )
             await self.db.execute(
                 "INSERT INTO ledger_times VALUES (?,?)", (reservation, now.timestamp())
             )
@@ -1269,6 +1281,21 @@ class Store:
                     "tail_tokens": 2050,
                     "prefix_busts_today": busts[0],
                 },
+                "recent_work": [
+                    dict(row)
+                    for row in await self.all(
+                        "SELECT COALESCE(w.kind,'legacy') AS kind,w.work_id,w.root_kind,w.root_id,"
+                        "COUNT(*) AS calls,SUM(l.amount) AS charged_microdollars,"
+                        "SUM(u.estimated_amount) AS estimated_microdollars,"
+                        "COUNT(u.estimated_amount) AS known_calls "
+                        "FROM ledger l LEFT JOIN ledger_work w ON w.id=l.id "
+                        "LEFT JOIN ledger_usage u ON u.id=l.id "
+                        "LEFT JOIN ledger_times t ON t.id=l.id "
+                        "WHERE l.day=? GROUP BY w.kind,w.work_id,w.root_kind,w.root_id "
+                        "ORDER BY MAX(t.created) DESC LIMIT 60",
+                        (day,),
+                    )
+                ],
                 "day_local": day,
                 "month_local": day[:7],
                 "timezone": self.budget_zone.key,
@@ -1605,6 +1632,7 @@ class Store:
             await self.db.execute(
                 "DELETE FROM ledger_attribution WHERE id NOT IN (SELECT id FROM ledger)"
             )
+            await self.db.execute("DELETE FROM ledger_work WHERE id NOT IN (SELECT id FROM ledger)")
             await self.db.execute(
                 "DELETE FROM ledger_usage WHERE id NOT IN (SELECT id FROM ledger)"
             )

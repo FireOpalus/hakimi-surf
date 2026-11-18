@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from .modules.actions import reject_reason
 from .reply_style import trim_complete_text
-from .world_state import IntentTicketCreate, MilestoneEvent
+from .world_state import IntentTicketCreate, MilestoneEvent, private_event_for_owner
 
 if TYPE_CHECKING:
     from .life_engine import LifeEngine
@@ -44,6 +44,8 @@ _MC_THEME = re.compile(
 
 
 def build_from_video(event: MilestoneEvent) -> Reaction | None:
+    if event.payload.get("private_first"):
+        return None
     if event.source_module != "bilibili_surf" or event.event_type not in {
         "bili_video_watched",
         "bili_mc_inspiration",
@@ -77,6 +79,10 @@ def milestone_sharing(settings) -> Rule:
         else:
             groups = _allowlisted_groups(settings)
             recipient = "onebot:" + groups[0] if groups else ""
+        if ev.payload.get("private_first") and not private_event_for_owner(
+            ev.payload, recipient, settings
+        ):
+            return None
         if not recipient:
             return None
         return Reaction(
@@ -126,7 +132,13 @@ class RuleDispatcher:
     async def apply(self, rule: Rule, row, now: float) -> str | None:
         ev = self.world.event_from_row(row)
         reaction = rule.match(ev)
-        if not reaction:
+        if not reaction or (
+            ev.payload.get("private_first")
+            and (
+                reaction.action != "qq.speak"
+                or not private_event_for_owner(ev.payload, reaction.recipient, self.engine.s)
+            )
+        ):
             return None
         ts = max(now, ev.created_at)
         async with self.store.transaction():
@@ -189,7 +201,8 @@ class RuleDispatcher:
             return
         ev = self.world.event_from_row(row)
         if (
-            ev.importance != "high"
+            ev.payload.get("private_first")
+            or ev.importance != "high"
             or now >= ev.created_at + 86400
             or ev.event_type in {"bili_video_watched", "bili_mc_inspiration"}
         ):

@@ -1126,77 +1126,54 @@ class BiliWatcher:
                 private_sources[f"{field}:{len(values)}"] = msg
             topics.setdefault(field, []).append(text)
 
+        # A selection sees at most one private audience. Only explicit interests/requests
+        # can leave that session for its own selection; raw turns, mood and diaries stay inside.
         for _, msg in session_list[:20]:
-            try:
-                if not authorize(msg.model_copy(update={"addressed": True}), self.s):
-                    continue
-                view = await sessions.dual.view(msg)
-            except Exception:
-                continue
-            entries = [
-                e
-                for e in view.get("entries", [])
-                if not e.get("deleted") and (not e.get("expires") or e["expires"] > now)
-            ]
-            if msg.kind == "private" and is_persona_owner(msg, self.s):
-                for entry in entries:
-                    if (
-                        entry.get("kind") == "profile"
-                        and entry.get("slot") in {"preferences", "state"}
-                    ) or entry.get("kind") == "chronicle":
-                        topic = f"{entry.get('topic')}: " if entry.get("topic") else ""
-                        add_topic(
-                            "owner_interests",
-                            f"{topic}{entry.get('text', '')}",
-                            msg,
-                            count=8,
-                            length=140,
-                        )
-            else:
-                profiles = [
-                    e
-                    for e in entries
-                    if e.get("kind") == "profile" and e.get("slot") == "preferences"
-                ]
-                chronicles = sorted(
-                    (e for e in entries if e.get("kind") == "chronicle"),
-                    key=lambda item: int(item.get("heat", 1)),
-                    reverse=True,
-                )
-                for entry in [*profiles[:4], *chronicles[:6]]:
-                    topic = f"{entry.get('topic')}: " if entry.get("topic") else ""
-                    add_topic(
-                        "community_topics",
-                        f"{topic}{entry.get('text', '')}",
-                        msg,
-                        count=10,
-                        length=120,
-                    )
-            if (
-                len(topics.get("owner_interests", [])) >= 8
-                and len(topics.get("community_topics", [])) >= 10
+            if msg.kind != "private" or not authorize(
+                msg.model_copy(update={"addressed": True}), self.s
             ):
-                break
-        # Recent explicit video requests still matter when other sessions have saved profiles.
-        fallback = not topics
-        recent_field = "recent_chat_topics" if fallback else "private_video_requests"
-        for _, msg in session_list[:10]:
-            if not fallback and msg.kind != "private":
                 continue
             try:
-                if not authorize(msg.model_copy(update={"addressed": True}), self.s):
-                    continue
                 snap = await sessions.snapshot(msg)
             except Exception:
                 continue
             for item in reversed(snap.get("recent_messages", [])[-6:]):
-                text = str(item.get("text", ""))
-                if item.get("role") == "user" and (
-                    fallback or re.search(r"视频|[Bb]站|哔哩哔哩|bilibili", text, re.I)
+                raw = str(item.get("text", ""))
+                if item.get("role") == "user" and re.search(
+                    r"视频|[Bb]站|哔哩哔哩|bilibili|想了解|感兴趣", raw, re.I
                 ):
-                    add_topic(recent_field, text, msg, count=5, length=80)
-            if len(topics.get(recent_field, [])) >= 5:
+                    add_topic("recent_chat_topics", raw, msg, count=3, length=80)
+            if private_sources:
                 break
+        if not private_sources:
+            for _, msg in session_list[:20]:
+                if msg.kind != "group" or not authorize(
+                    msg.model_copy(update={"addressed": True}), self.s
+                ):
+                    continue
+                try:
+                    view = await sessions.dual.view(msg)
+                    snap = await sessions.snapshot(msg)
+                except Exception:
+                    continue
+                for entry in view.get("entries", []):
+                    if (
+                        not entry.get("deleted")
+                        and (not entry.get("expires") or entry["expires"] > now)
+                        and (entry.get("slot") == "preferences" or entry.get("kind") == "chronicle")
+                    ):
+                        add_topic(
+                            "community_topics",
+                            str(entry.get("text", "")),
+                            msg,
+                            count=10,
+                            length=120,
+                        )
+                for item in reversed(snap.get("recent_messages", [])[-6:]):
+                    if item.get("role") == "user":
+                        add_topic(
+                            "recent_chat_topics", str(item.get("text", "")), msg, count=5, length=80
+                        )
         if private_sources:
             topics["private_topic_refs"] = list(private_sources)
         return topics, private_sources
@@ -1267,7 +1244,7 @@ class BiliWatcher:
             items.append(entry)
         return items
 
-    async def lookup_watched(self, bvid: str) -> dict | None:
+    async def lookup_watched(self, bvid: str, *, message: Message | None = None) -> dict | None:
         if not isinstance(bvid, str) or not re.fullmatch(BVID, bvid):
             return None
         async with self.store.lock:
@@ -1277,9 +1254,17 @@ class BiliWatcher:
             if not has_bili:
                 return None
             row = await self.store.one(
-                "SELECT created,summary FROM bili_watched_history "
-                "WHERE bvid=? AND status='done' AND summary IS NOT NULL",
-                (bvid,),
+                "SELECT h.created,h.summary FROM bili_watched_history h "
+                "LEFT JOIN bili_private_share_priority p ON p.bvid=h.bvid AND p.expires_at>? "
+                "WHERE h.bvid=? AND h.status='done' AND h.summary IS NOT NULL "
+                "AND (p.bvid IS NULL OR p.session_scope=?)",
+                (
+                    self.clock(),
+                    bvid,
+                    self.store.session_scope(message)
+                    if message and message.kind == "private"
+                    else "",
+                ),
             )
             if not row:
                 return None
@@ -1403,7 +1388,9 @@ class BiliWatcher:
                         safe_output(summary, self.svc.secrets, limit=1000)
                     )
                     text = f"{label} · {pick.bvid}\n{summary}"
-                    preferred = private_sources.get(pick.private_topic_ref)
+                    preferred = next(
+                        iter(private_sources.values()), None
+                    )  # actual scoped input, never a model-selected recipient
                     share_owner = (
                         is_persona_owner(preferred, self.s)
                         if preferred is not None
@@ -1445,16 +1432,18 @@ class BiliWatcher:
                             "bili_video_watched",
                             {
                                 "bvid": pick.bvid,
-                                "title": title_str[:80],
-                                "summary": summary[:140],
-                                **({"private_first": True} if preferred is not None else {}),
+                                **(
+                                    {"private_first": True, "owner_private": share_owner}
+                                    if preferred is not None
+                                    else {"title": title_str[:80], "summary": summary[:140]}
+                                ),
                             },
                             importance="high" if share_owner else "normal",
                             business_key=pick.bvid,
                         )
-                    if self.svc.diary:
+                    if self.svc.diary and preferred is None:
                         await self.svc.diary.patrol("bili-account:" + pick.bvid, text)
-                    if self.s.owner_qq_id:
+                    if self.s.owner_qq_id and (preferred is None or share_owner):
                         await self.store.save_report(
                             self.store.subject(self.svc.proactive.target()), text
                         )
@@ -1462,8 +1451,14 @@ class BiliWatcher:
                     if stop_for_risk:
                         reason = "bili_account_risk"
                         break
-                    await self._interaction(pick.bvid, aid, pick, epoch)
-                if completed > 0 and not reason and selection.mood_longnick.strip():
+                    if preferred is None:
+                        await self._interaction(pick.bvid, aid, pick, epoch)
+                if (
+                    completed > 0
+                    and not private_sources
+                    and not reason
+                    and selection.mood_longnick.strip()
+                ):
                     longnick = getattr(self.svc, "longnick", None)
                     if longnick is not None and hasattr(longnick, "apply_patrol"):
                         await longnick.apply_patrol(selection.mood_longnick)

@@ -28,7 +28,9 @@ def model_work(kind: str, key: str | None = None) -> Iterator[ModelWork]:
         yield parent
         return
     key = key or uuid.uuid4().hex
-    work = ModelWork(kind, key, parent.root_kind if parent else kind, parent.root_key if parent else key)
+    work = ModelWork(
+        kind, key, parent.root_kind if parent else kind, parent.root_key if parent else key
+    )
     token = _current.set(work)
     try:
         yield work

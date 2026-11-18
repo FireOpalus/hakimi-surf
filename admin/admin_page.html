@@ -1422,6 +1422,9 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </div>
     <p id="ledger-coverage" class="muted"></p>
     <div id="token-ledger" class="table"></div>
+    <details class="ledger-breakdown"><summary>今日按动作查账</summary>
+      <div id="work-ledger" class="table"></div>
+    </details>
     <details class="ledger-breakdown">
       <summary><h3>按 API 通道统计</h3></summary>
       <div id="provider-ledger" class="table"></div>
@@ -1956,6 +1959,8 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
     <div id="life-stats" class="stats"></div>
     <div id="life-node-pills" class="pill-row"></div>
+    <h3>Owner 日报送达记录</h3>
+    <div id="life-digests" class="table"></div>
     <p id="life-world-status" class="muted"></p>
     <p id="life-node-status" class="muted"></p>
     <p id="life-desktop-status" class="muted"></p>
@@ -2230,7 +2235,7 @@ function logout(){
   ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search','life-mc-topic'].forEach(id=>{$(id).value='';});
   $('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
-  ['memory-entries','decision-audit','token-ledger','provider-ledger','cost-ledger','budget-periods','model-ledger','thinking-ledger','effective-cache','prov-sessions-table','gcp-credits-table','gcp-mon-compare-table','gcp-mon-models-table'].forEach(id=>$(id).replaceChildren());
+  ['memory-entries','decision-audit','token-ledger','work-ledger','provider-ledger','cost-ledger','budget-periods','model-ledger','thinking-ledger','effective-cache','prov-sessions-table','gcp-credits-table','gcp-mon-compare-table','gcp-mon-models-table'].forEach(id=>$(id).replaceChildren());
 }
 
 function dateTime(t){return t?new Date(t*1000).toLocaleString('zh-CN',{timeZone:displayZone,hour12:false}):'—';}
@@ -2831,6 +2836,10 @@ async function ledger(){
   const thinkingStatLabels={low:'low · 轻量',medium:'medium · 均衡',high:'high · 深入',xhigh:'xhigh · 最高',minimal:'minimal · 极简',none:'none · 无思考（门卫）',unknown:'历史未记录档位'};
   table('token-ledger',['范围','API 尝试 / 有用量','输入','缓存输入','输出','思考','观测缓存 / Interactions 输入'],periods.map(([key,label])=>{const t=usage.token_usage?.[key];if(!t)return[label,'未知','未知','未知','未知','未知','未知'];const cache=t.cache_hit_ratio===null||t.cache_hit_ratio===undefined?'未知':(100*t.cache_hit_ratio).toFixed(1)+'%';return[label,t.calls+' / '+t.known_usage_calls+(t.unknown_usage_calls?'（'+t.unknown_usage_calls+' 次用量未知）':''),t.known_usage_calls?t.input_tokens:'未知',t.cache_known_calls?t.cached_tokens:'未知',t.known_usage_calls?t.output_tokens:'未知',t.thought_known_calls?t.thought_tokens:'未知',cache+(t.cache_coverage_complete===false?'（下界）':'')+' · 覆盖 '+t.cache_known_calls+'/'+t.interaction_calls+' 次 Interactions'];}));
   table('provider-ledger',['范围','API 通道','调用次数','输入','输出','思考','缓存 Token','预算扣账','已确认估算'],periods.flatMap(([key,label])=>(usage.token_usage?.[key]?.by_provider||[]).map(p=>[label,providerBadge(p.provider),p.calls,p.input_tokens??0,p.output_tokens??0,p.thought_tokens??0,p.cached_tokens??0,p.provider==='gemini_free'?'$0.000000 (Free)':money(p.charged_amount),p.estimated_amount!=null?money(p.estimated_amount):'未知'])));
+  table('work-ledger',['动作','动作编号','所属任务','模型调用','已确认估算','含预留扣账'],(usage.recent_work||[]).map(w=>[
+    w.kind==='legacy'?'升级前未记录归属':w.kind,w.work_id||'—',w.root_id&&w.root_id!==w.work_id?w.root_id:'—',w.calls,
+    w.known_calls?money(w.estimated_microdollars)+(w.known_calls<w.calls?'（部分）':''):'未知',money(w.charged_microdollars)
+  ]));
   table('cost-ledger',['范围','预算扣账（含在途 / 中断估算）','已确认账单估算','估算覆盖'],periods.map(([key,label])=>{const c=usage.cost_estimates?.[key];if(!c)return[label,'未知','未知','未知'];const diff=c.estimated_microdollars!=null&&c.charged_microdollars>c.estimated_microdollars?'（中断/在途 '+money(c.charged_microdollars-c.estimated_microdollars)+'）':'';return[label,money(c.charged_microdollars),money(c.estimated_microdollars),c.complete?'完整':c.estimated_calls+' 次已确认 / '+c.unknown_estimate_calls+' 次未知'+diff];}));
   table('model-ledger',['范围','模型','调用','输入 / 缓存 / 思考','预算扣账','已确认估算'],periods.flatMap(([key,label])=>(usage.token_usage?.[key]?.by_model||[]).map(m=>[label,modelLabels[m.model_lane]||m.model_lane,m.calls,m.model_lane==='unknown'?'未记录 / 未记录 / 未记录':m.input_tokens+' / '+m.cached_tokens+' / '+m.thought_tokens,money(m.charged_amount),m.estimated_calls?money(m.estimated_amount):'未知'])));
   table('thinking-ledger',['范围','模型','思考档位','调用','输入 / 缓存 / 输出 / 思考','预算扣账','已确认估算'],periods.flatMap(([key,label])=>(usage.token_usage?.[key]?.by_thinking||[]).map(t=>[label,modelLabels[t.model_lane]||t.model_lane,thinkingStatLabels[t.thinking_level]||t.thinking_level,t.calls,t.model_lane==='unknown'?'未记录':t.input_tokens+' / '+t.cached_tokens+' / '+t.output_tokens+' / '+t.thought_tokens,money(t.charged_amount),t.estimated_calls?money(t.estimated_amount):'未知'])));
@@ -3020,6 +3029,10 @@ function renderLife(d){
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
   text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+zoneLabel(tz)+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
   for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
+  const digestStages={generating:'正在生成',generated:'已生成',queued:'已排队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',uncertain:'回执不确定',failed:'生成失败',cancelled:'已取消'};
+  table('life-digests',['日期','进度','已生成','已排队','QQ 已确认'],(d.digest_history||[]).map(r=>[
+    r.day,digestStages[r.stage]||r.stage,lifeFmt(r.generated_at,tz),lifeFmt(r.queued_at,tz),lifeFmt(r.confirmed_at,tz)
+  ]));
   table('life-intents-table',['ID','动作 / 接收人','来源 / 事件','执行窗口','门控与模糊动机','状态 / 结果','操作'],(d.intents||[]).map(it=>[
     el('span',String(it.id||'').slice(0,10),'code-mono'),
     (it.action_name||it.action_type)+(it.target_scope?' · '+it.target_scope:''),
