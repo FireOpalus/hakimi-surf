@@ -255,6 +255,7 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
 
     ws = getattr(svc, "world_state", None)
     if ws is not None:
+        await ws.experience.advance(ws.clock())
         snap = ws.current
         last_proactive_at = snap.last_proactive_at
     else:
@@ -283,7 +284,11 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
                 last_proactive_at = max(candidates)
 
     if snap is not None and ws is not None:
+        experience = await ws.experience.view(ws.clock())
+        if svc.dialogue_scheduler.entries and experience["actual"]["state"] in {"rest", "idle"}:
+            experience["actual"]["state"] = "qq_processing"
         world_state_data = {
+            "experience": experience,
             "current_module": snap.current_module,
             "focus_level": snap.focus_level,
             "mood": snap.mood,
@@ -623,6 +628,7 @@ async def life_update_world(request: Request):
         if ws is None:
             raise HTTPException(503, "world_state_unavailable")
         try:
+            await ws.experience.advance(ws.clock())
             await ws.update_state(
                 current_module=value.current_module,
                 focus_level=value.focus_level,
@@ -632,6 +638,10 @@ async def life_update_world(request: Request):
             )
         except ValidationError:
             raise HTTPException(400, "invalid_admin_input") from None
+        except ValueError as exc:
+            if str(exc) != "mc_task_required":
+                raise
+            raise HTTPException(400, "mc_task_required") from None
         return await _build_life_status(svc)
 
 

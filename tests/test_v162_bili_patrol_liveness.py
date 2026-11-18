@@ -349,6 +349,9 @@ async def test_world_patrol_share_intent_and_mood_longnick(settings, store, mess
         svc.bili_watcher = watcher
         svc.longnick.clock = lambda: clock[0]
         svc.proactive.clock = lambda: clock[0]
+        svc.world_state.clock = watcher.clock
+        svc.life_engine.clock = watcher.clock
+        svc.life_engine.planner.clock = watcher.clock
         try:
             await svc.longnick.initialize()
             await svc.longnick.set_config(LongnickConfig(enabled=True, cooldown_hours=20))

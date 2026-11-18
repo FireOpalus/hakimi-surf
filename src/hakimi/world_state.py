@@ -25,6 +25,8 @@ from .modules.base import (
 )
 from .security import Vault
 from .store import Store
+from .world_experience import SCHEMA as EXPERIENCE_SCHEMA
+from .world_experience import WorldExperience
 
 log = logging.getLogger("hakimi")
 
@@ -280,13 +282,15 @@ class WorldStateManager:
         self.registry = registry
         self.clock = clock
         self.current = WorldStateSnapshot()
+        self.experience = WorldExperience(self)
+        self.mc_until = 0.0
         self._subscribers: list[Callable[[MilestoneEvent], Any]] = []
         self._sensor_overrides: dict[str, str] = {}
 
     async def initialize(self) -> WorldStateSnapshot:
         """Create plaintext JSON tables, ensure singleton row 1 exists, and load state."""
         async with self.store.lock:
-            await self.store.db.executescript(SCHEMA)
+            await self.store.db.executescript(SCHEMA + EXPERIENCE_SCHEMA)
         now = self.clock()
         async with self.store.transaction():
             existing = {
@@ -326,23 +330,33 @@ class WorldStateManager:
                 ") VALUES (1, 'idle', 'LOW', 'calm', 80, 20, 0, ?, '{}')",
                 (now,),
             )
-            row = await self.store.one("SELECT * FROM world_state WHERE singleton=1")
-        if row is not None:
-            raw_snap = json.loads(row["snapshot_json"] or "{}")
-            details = raw_snap.get("details", {}) if isinstance(raw_snap, dict) else {}
-            if not isinstance(details, dict):
-                details = {}
-            self.current = WorldStateSnapshot(
-                current_module=row["current_module"],
-                focus_level=row["focus_level"],
-                mood=row["mood"],
-                energy=int(row["energy"]),
-                boredom=int(row["boredom"]),
-                last_proactive_at=float(row["last_proactive_at"]),
-                updated_at=float(row["updated_at"]),
-                details=_sanitize_payload(details, self.settings),
+            await self.experience.initialize_tx(now)
+        self.experience.ready = True
+        return await self.refresh()
+
+    def _snapshot(self, row):
+        details = json.loads(row["snapshot_json"] or "{}").get("details") or {}
+        return WorldStateSnapshot(
+            current_module=row["current_module"],
+            focus_level=row["focus_level"],
+            mood=row["mood"],
+            energy=row["energy"],
+            boredom=row["boredom"],
+            last_proactive_at=row["last_proactive_at"],
+            updated_at=row["updated_at"],
+            details=_sanitize_payload(details if isinstance(details, dict) else {}, self.settings),
+        )
+
+    async def refresh(self):
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT w.*,r.mc_until FROM world_state w JOIN world_rhythm r ON r.id=w.singleton"
             )
-        await self._sync_attention_lock(prev_focus="LOW", new_focus=self.current.focus_level)
+            self.mc_until = row["mc_until"]
+            prev = self.current.focus_level
+            self.current = self._snapshot(row)
+        if prev != self.current.focus_level:
+            await self._sync_attention_lock(prev_focus=prev, new_focus=self.current.focus_level)
         return self.current
 
     async def _sync_attention_lock(
@@ -388,31 +402,40 @@ class WorldStateManager:
         sensor_overrides: dict[str, str] | None = None,
     ) -> WorldStateSnapshot:
         """Persist updated world state, refresh self.current, and enforce Attention Lock."""
-        prev_focus = self.current.focus_level
-        base = snapshot.model_dump() if snapshot is not None else self.current.model_dump()
-        if current_module is not None:
-            base["current_module"] = sanitize_sensor_text(
-                current_module, self.settings, max_tokens=16
-            )
-        if focus_level is not None:
-            base["focus_level"] = focus_level
-        if mood is not None:
-            base["mood"] = sanitize_sensor_text(mood, self.settings, max_tokens=16)
-        if energy is not None:
-            base["energy"] = energy
-        if boredom is not None:
-            base["boredom"] = boredom
-        if last_proactive_at is not None:
-            base["last_proactive_at"] = last_proactive_at
-        if details is not None:
-            base["details"] = _sanitize_payload(details, self.settings)
-        else:
-            base["details"] = _sanitize_payload(base.get("details") or {}, self.settings)
-        base["updated_at"] = self.clock()
-        next_snap = WorldStateSnapshot.model_validate(base)
-        snapshot_json = json.dumps(next_snap.model_dump(), ensure_ascii=False)
-
         async with self.store.transaction():
+            prior = self._snapshot(
+                await self.store.one("SELECT * FROM world_state WHERE singleton=1")
+            )
+            base = snapshot.model_dump() if snapshot is not None else prior.model_dump()
+            if current_module is not None:
+                base["current_module"] = sanitize_sensor_text(
+                    current_module, self.settings, max_tokens=16
+                )
+            if focus_level is not None:
+                base["focus_level"] = focus_level
+            if mood is not None:
+                base["mood"] = sanitize_sensor_text(mood, self.settings, max_tokens=16)
+            if energy is not None:
+                base["energy"] = energy
+            if boredom is not None:
+                base["boredom"] = boredom
+            if last_proactive_at is not None:
+                base["last_proactive_at"] = last_proactive_at
+            if details is not None:
+                base["details"] = _sanitize_payload(details, self.settings)
+            else:
+                base["details"] = _sanitize_payload(base.get("details") or {}, self.settings)
+            base["updated_at"] = self.clock()
+            next_snap = WorldStateSnapshot.model_validate(base)
+            if (snapshot is not None or current_module is not None or focus_level is not None) and (
+                next_snap.current_module == "minecraft" and next_snap.focus_level == "HIGH"
+            ):
+                lease = await self.store.one(
+                    "SELECT 1 FROM world_rhythm WHERE mc_task!='' AND mc_until>?", (self.clock(),)
+                )
+                if not lease:
+                    raise ValueError("mc_task_required")
+            snapshot_json = json.dumps(next_snap.model_dump(), ensure_ascii=False)
             await self.store.db.execute(
                 "UPDATE world_state SET current_module=?, focus_level=?, mood=?, "
                 "energy=?, boredom=?, last_proactive_at=?, updated_at=?, snapshot_json=? "
@@ -428,17 +451,40 @@ class WorldStateManager:
                     snapshot_json,
                 ),
             )
-        self.current = next_snap
+            if mood is not None and next_snap.mood != prior.mood:
+                await self.store.db.execute(
+                    "UPDATE world_rhythm SET mood_until=? WHERE id=1",
+                    (next_snap.updated_at + 1800,),
+                )
+            if (prior.energy, prior.boredom) != (next_snap.energy, next_snap.boredom):
+                await self.store.db.execute(
+                    "INSERT INTO world_changes(receipt,at,reason,energy_before,energy_after,"
+                    "boredom_before,boredom_after) VALUES (?,?,'manual',?,?,?,?)",
+                    (
+                        uuid.uuid4().hex,
+                        next_snap.updated_at,
+                        prior.energy,
+                        next_snap.energy,
+                        prior.boredom,
+                        next_snap.boredom,
+                    ),
+                )
+                await self.store.db.execute(
+                    "UPDATE world_rhythm SET energy_fraction=0,boredom_fraction=0,"
+                    "tired=(? < 30 OR (tired AND ? < 45)) WHERE id=1",
+                    (next_snap.energy, next_snap.energy),
+                )
         if sensor_overrides is not None:
             self._sensor_overrides.clear()
             for key, val in sensor_overrides.items():
                 self.set_sensor_override(key, val)
-        await self._sync_attention_lock(prev_focus=prev_focus, new_focus=next_snap.focus_level)
-        return self.current
+        return await self.refresh()
 
     def proactive_suspended(self) -> bool:
         """Return True iff world focus_level is currently HIGH."""
-        return self.current.focus_level == "HIGH"
+        return self.current.focus_level == "HIGH" and (
+            not self.mc_until or self.clock() < self.mc_until
+        )
 
     async def enqueue_intent(self, ticket: IntentTicketCreate, *, now: float | None = None) -> str:
         async with self.store.transaction():
@@ -659,7 +705,7 @@ class WorldStateManager:
         if handler not in self._subscribers:
             self._subscribers.append(handler)
 
-    async def publish_event(
+    def make_event(
         self,
         source_module: str,
         event_type: str,
@@ -669,9 +715,8 @@ class WorldStateManager:
         now: float | None = None,
         business_key: str | None = None,
     ) -> MilestoneEvent:
-        """Sanitize, persist to global_events as plaintext JSON, and notify subscribers."""
         sanitized_payload = _sanitize_payload(payload or {}, self.settings)
-        event = MilestoneEvent(
+        return MilestoneEvent(
             id=(
                 self.store.vault.digest(
                     "life-event", f"{source_module}:{event_type}:{business_key}"
@@ -686,25 +731,51 @@ class WorldStateManager:
             consumed=False,
             payload=sanitized_payload,
         )
+
+    async def insert_event_tx(self, event):
         payload_json = json.dumps(event.payload, ensure_ascii=False)
+        cur = await self.store.db.execute(
+            "INSERT OR IGNORE INTO global_events("
+            "id, created_at, source_module, event_type, importance, consumed, payload_json"
+            ") VALUES (?,?,?,?,?,?,?)",
+            (
+                event.id,
+                event.created_at,
+                event.source_module,
+                event.event_type,
+                event.importance,
+                0,
+                payload_json,
+            ),
+        )
+        if not cur.rowcount:
+            row = await self.store.one("SELECT * FROM global_events WHERE id=?", (event.id,))
+            return self.event_from_row(row), False
+        await self.experience.event_tx(event)
+        return event, True
+
+    async def publish_event(
+        self,
+        source_module: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        importance: Literal["low", "normal", "high"] = "normal",
+        *,
+        now: float | None = None,
+        business_key: str | None = None,
+    ) -> MilestoneEvent:
+        """Sanitize, persist to global_events as plaintext JSON, and notify subscribers."""
+        event = self.make_event(
+            source_module, event_type, payload, importance, now=now, business_key=business_key
+        )
         async with self.store.transaction():
-            cur = await self.store.db.execute(
-                "INSERT OR IGNORE INTO global_events("
-                "id, created_at, source_module, event_type, importance, consumed, payload_json"
-                ") VALUES (?,?,?,?,?,?,?)",
-                (
-                    event.id,
-                    event.created_at,
-                    event.source_module,
-                    event.event_type,
-                    event.importance,
-                    0,
-                    payload_json,
-                ),
-            )
-            if not cur.rowcount:
-                row = await self.store.one("SELECT * FROM global_events WHERE id=?", (event.id,))
-                return self.event_from_row(row)
+            event, created = await self.insert_event_tx(event)
+        if created:
+            await self.notify_event(event)
+        return event
+
+    async def notify_event(self, event):
+        await self.refresh()
         for handler in list(self._subscribers):
             try:
                 res = handler(event)
@@ -797,6 +868,14 @@ class WorldStateManager:
             and self.current.focus_level == "LOW"
             and not overrides
         ):
+            if self.current.mood in {"curious", "pleased", "sleeping"}:
+                return {
+                    "current_module": "idle",
+                    "focus_level": "LOW",
+                    "mood": self.current.mood,
+                    "energy": self.current.energy,
+                    "boredom": self.current.boredom,
+                }
             return None
 
         sensor_parts: list[str] = []

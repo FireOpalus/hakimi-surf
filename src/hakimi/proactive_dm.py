@@ -411,6 +411,9 @@ class OwnerProactive:
                     (start, end, self.local(now).date().isoformat()),
                 )
             )[0]
+        world = getattr(self.service, "world_state", None)
+        if world and world.experience.ready:
+            await world.experience.filter_digest(payload, now)
         payload["approximate_api_usd_including_reservations"] = f"{amount / 1000000:.4f}"
         while (
             len(untrusted_input(payload).encode()) > self.s.max_context_bytes
@@ -881,6 +884,11 @@ class OwnerProactive:
                     )
                     if row["kind"] == "digest":
                         await self.digests.sync_intents_tx(key, self.clock())
+                        world = getattr(self.service, "world_state", None)
+                        if world and world.experience.ready:
+                            await world.experience.confirmed_tx(
+                                self.target(), key, self.clock(), [payload["text"]]
+                            )
                     confirmed = await self.store.one(
                         "SELECT * FROM pending_owner_dms WHERE id=?", (key,)
                     )

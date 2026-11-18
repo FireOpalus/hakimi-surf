@@ -1366,6 +1366,10 @@ class BiliWatcher:
                 )
                 if cur.rowcount != 1:
                     return {"status": "already_attempted"}
+            ws_mgr = getattr(self.svc, "world_state", None)
+            experience = getattr(ws_mgr, "experience", None)
+            if experience and not experience.ready:
+                await ws_mgr.initialize()
             reason = None
             completed = 0
             token = self.patrol_context.set((self.policy_epoch, self.credentials_epoch))
@@ -1405,6 +1409,9 @@ class BiliWatcher:
                     self._ensure_current()
                     if not await self.history.claim(pick.bvid, key, self.clock()):
                         continue
+                    learning_start = self.clock()
+                    if experience:
+                        await experience.bili_reading(True, learning_start)
                     aid, material = await self.material(pick.bvid)
                     material = self._bounded(material)
                     await self._check_patrol_budget()
@@ -1433,6 +1440,26 @@ class BiliWatcher:
                         is_persona_owner(preferred, self.s)
                         if preferred is not None
                         else pick.share_owner and not pick.private_topic_ref
+                    )
+                    learned_at = self.clock()
+                    title_str = str(material.get("title", ""))
+                    event_args = (
+                        "bilibili_surf",
+                        "bili_video_watched",
+                        {
+                            "bvid": pick.bvid,
+                            "learning_seconds": max(0, learned_at - learning_start),
+                            **(
+                                {
+                                    "private_first": True,
+                                    "owner_private": share_owner,
+                                    "audience": private_event_audience(self.s, preferred.user_id),
+                                }
+                                if preferred is not None
+                                else {"title": title_str[:80], "summary": summary[:140]}
+                            ),
+                        },
+                        "high" if share_owner else "normal",
                     )
                     async with self.store.transaction():
                         cur = await self.store.db.execute(
@@ -1466,36 +1493,17 @@ class BiliWatcher:
                                     now + PRIVATE_SHARE_PRIORITY_SECONDS,
                                 ),
                             )
-                    ws_mgr = getattr(self.svc, "world_state", None)
-                    if ws_mgr is not None:
-                        if hasattr(ws_mgr, "store") and hasattr(ws_mgr, "initialize"):
-                            async with self.store.lock:
-                                has_events_table = await self.store.one(
-                                    "SELECT 1 FROM sqlite_master "
-                                    "WHERE type='table' AND name='global_events'"
-                                )
-                            if not has_events_table:
-                                await ws_mgr.initialize()
-                        title_str = str(material.get("title", ""))
+                        if experience:
+                            event = ws_mgr.make_event(
+                                *event_args, now=learned_at, business_key=pick.bvid
+                            )
+                            event, created = await ws_mgr.insert_event_tx(event)
+                            await experience.finish_read_tx()
+                    if experience and created:
+                        await ws_mgr.notify_event(event)
+                    elif ws_mgr and not experience:
                         await ws_mgr.publish_event(
-                            "bilibili_surf",
-                            "bili_video_watched",
-                            {
-                                "bvid": pick.bvid,
-                                **(
-                                    {
-                                        "private_first": True,
-                                        "owner_private": share_owner,
-                                        "audience": private_event_audience(
-                                            self.s, preferred.user_id
-                                        ),
-                                    }
-                                    if preferred is not None
-                                    else {"title": title_str[:80], "summary": summary[:140]}
-                                ),
-                            },
-                            importance="high" if share_owner else "normal",
-                            business_key=pick.bvid,
+                            *event_args[:3], importance=event_args[3], business_key=pick.bvid
                         )
                     if self.svc.diary and preferred is None:
                         await self.svc.diary.patrol("bili-account:" + pick.bvid, text)
@@ -1541,6 +1549,8 @@ class BiliWatcher:
                     logging.getLogger("hakimi").info("event=bili_account_failed")
             finally:
                 self.patrol_context.reset(token)
+                if experience:
+                    await experience.bili_reading(False, self.clock())
             return await self._finish(key, "failed" if reason else "done", completed, reason)
 
     async def _learn_video(self, bvid, material, subject):

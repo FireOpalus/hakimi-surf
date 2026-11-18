@@ -432,6 +432,7 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
             Sender(settings, http, Wire()),
             diary=diary,
         )
+        svc.world_state.clock = lambda: now
         await svc.world_state.initialize()
         engine = LifeEngine(svc, clock=lambda: now, rng=random.Random(42))
         await engine.initialize()
@@ -454,6 +455,7 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
             FakeBili(),
             Sender(settings, http, Wire()),
         )
+        svc2.world_state.clock = lambda: now
         await svc2.world_state.initialize()
         reloaded = LifeEngine(svc2, clock=lambda: now)
         st2 = await reloaded.status()
@@ -461,13 +463,13 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
         reset = await reloaded.set_config(None)
         assert reset["source"] == "env" and reset["config"]["max_proactive_per_day"] == 6
 
-        # Deep night 02:00 -> sleeping, energy+25, boredom-15, wakeup clamped to ~09:00, 0 LLM calls
+        # Entering rest does not prepay recovery. Replanning in the same instant is free.
         sleep_res = await engine.trigger_plan_once(now=now)
         assert sleep_res["status"] == "sleeping"
         assert sleep_res["intents_enqueued"] == 0
         assert svc.world_state.current.mood == "sleeping"
-        assert svc.world_state.current.energy == 100
-        assert svc.world_state.current.boredom == 5
+        assert svc.world_state.current.energy == 80
+        assert svc.world_state.current.boredom == 20
         assert (
             _stamp("2026-11-17T09:00:00")
             <= sleep_res["next_plan_at"]
@@ -516,7 +518,9 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
         plan_res = await engine.trigger_plan_once(now=day_now)
         assert plan_res["status"] == "planned" and plan_res["source"] == "llm"
         assert plan_res["intents_enqueued"] == 1
-        assert svc.world_state.current.current_module == "minecraft"
+        assert svc.world_state.current.current_module == "idle"
+        view = await svc.world_state.experience.view(day_now)
+        assert view["plan"]["plan_module"] == "minecraft" and view["actual"]["state"] == "idle"
         assert await svc.world_state.unconsumed_events() == []
         assert 2 * 3600 <= (plan_res["next_plan_at"] - day_now) <= 4 * 3600
         assert len(diary.world_events) == 1
@@ -599,7 +603,7 @@ async def test_gatekeeper_hard_gates_and_desktop_synergy(settings, store, messag
         ] == "gated_skip"
 
         # 3. Attention Lock -> defers non-matching module
-        await svc.world_state.update_state(current_module="minecraft", focus_level="HIGH")
+        await svc.world_state.experience.mc_snapshot("mine", svc.world_state.clock())
         bili_id = await svc.world_state.enqueue_intent(
             {
                 "target_module": "bilibili_surf",

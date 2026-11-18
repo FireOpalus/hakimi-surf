@@ -43,6 +43,14 @@ class PlannerJournal:
                 async with self.store.lock:
                     await self.store.db.executescript(SCHEMA)
                 async with self.store.transaction():
+                    columns = {
+                        r["name"] for r in await self.store.all("PRAGMA table_info(life_plan_runs)")
+                    }
+                    for name in ("plan_module", "plan_focus", "plan_mood"):
+                        if name not in columns:
+                            await self.store.db.execute(
+                                f"ALTER TABLE life_plan_runs ADD COLUMN {name} TEXT"
+                            )
                     # On the first upgrade, the preceding release may already have paid
                     # for a plan. Honor its minimum interval when no saved clock exists.
                     last = await self.store.one(
@@ -138,7 +146,17 @@ class PlannerJournal:
             )
 
     async def commit(
-        self, world, run_id, *, tickets, candidates, source, outcome, reasons, avoided
+        self,
+        world,
+        run_id,
+        *,
+        tickets,
+        candidates,
+        source,
+        outcome,
+        reasons,
+        avoided,
+        plan=(None, None, None),
     ):
         async with self.store.transaction():
             row = await self.store.one(
@@ -154,8 +172,17 @@ class PlannerJournal:
             )
             await self.store.db.execute(
                 "UPDATE life_plan_runs SET outcome=?,source=?,reasons=?,candidates=?,accepted=?,"
-                "avoided=?,checkpoint=NULL WHERE id=?",
-                (outcome, source, json.dumps(reasons), candidates, len(ids), int(avoided), run_id),
+                "avoided=?,checkpoint=NULL,plan_module=?,plan_focus=?,plan_mood=? WHERE id=?",
+                (
+                    outcome,
+                    source,
+                    json.dumps(reasons),
+                    candidates,
+                    len(ids),
+                    int(avoided),
+                    *plan,
+                    run_id,
+                ),
             )
             await self.store.db.execute(
                 "UPDATE life_planner_clock SET next_at=?,signature=?,explore_at=? WHERE id=1",

@@ -24,7 +24,10 @@ async def test_app_lifespan_initializes_world_state_and_modules(settings):
         assert svc.surf_mirror.drive is None
         row = await svc.store.one("SELECT * FROM world_state WHERE singleton=1")
         assert row is not None
-        assert json.loads(row["snapshot_json"]) == {}
+        snapshot = json.loads(row["snapshot_json"])
+        assert snapshot["energy"] == row["energy"] == 80
+        assert snapshot["boredom"] == row["boredom"] == 20
+        assert snapshot["current_module"] == row["current_module"] == "idle"
 
 
 async def test_service_start_roaming_enabled_gates_tasks_and_healthz(settings, store, tmp_path):
@@ -103,7 +106,7 @@ async def test_attention_lock_suppresses_non_urgent_ticks_and_keeps_alerts(
             poll_calls += 1
 
         monkeypatch.setattr(svc, "poll_once", fake_poll_once)
-        await svc.world_state.update_state(current_module="minecraft", focus_level="HIGH")
+        await svc.world_state.experience.mc_snapshot("mine", svc.world_state.clock())
         patrol_task = asyncio.create_task(svc.patrol())
         await asyncio.sleep(0.05)
         assert poll_calls == 0
@@ -173,7 +176,7 @@ async def test_service_chat_payload_injects_world_state_summary(settings, store,
                 "activity": "矿洞挖矿",
             }
         )
-        await svc.world_state.update_state(current_module="minecraft", focus_level="HIGH")
+        await svc.world_state.experience.mc_snapshot("mine", svc.world_state.clock())
         await process(svc, message.model_copy(update={"event_id": "ws-mc-2", "text": "还在挖矿吗"}))
         mc_gen = [c for c in ai.calls if c[0] == "generate"][-1]
         ws_summary = mc_gen[1]["world_state_summary"]

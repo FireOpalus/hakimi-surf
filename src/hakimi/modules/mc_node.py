@@ -42,59 +42,25 @@ class MinecraftNodeAdapter:
             await self.world_state.initialize()
         return self.world_state
 
-    async def _sync_mc_world_focus(
-        self,
-        mc_mod: MinecraftSlotModule,
-        *,
-        prev_connected: bool,
-        prev_paused: bool,
-    ) -> None:
-        ws_mgr = await self._ensure_world_state_ready()
-        curr_connected = mc_mod.snapshot.connected
-        curr_paused = mc_mod.paused
-        cur = ws_mgr.current
-        if not prev_connected and curr_connected and not curr_paused:
-            await ws_mgr.update_state(
-                current_module="minecraft",
-                focus_level="HIGH",
-                mood="focused",
-            )
-        elif prev_connected and not curr_connected and cur.current_module == "minecraft":
-            await ws_mgr.update_state(
-                current_module="idle",
-                focus_level="LOW",
-                mood="calm",
-            )
-        elif curr_paused and cur.current_module == "minecraft" and cur.focus_level == "HIGH":
-            await ws_mgr.update_state(
-                current_module="idle",
-                focus_level="LOW",
-                mood="calm",
-            )
-        elif (
-            prev_paused and not curr_paused and curr_connected and cur.current_module != "minecraft"
-        ):
-            await ws_mgr.update_state(
-                current_module="minecraft",
-                focus_level="HIGH",
-                mood="focused",
-            )
+    async def _sync_mc_world_focus(self, module):
+        world = await self._ensure_world_state_ready()
+        snap = module.snapshot
+        task = (
+            snap.active_task if snap.connected and not module.paused and module.bridge_ready else ""
+        )
+        await world.experience.mc_snapshot(task, snap.updated_at)
 
     async def _apply_mc_status_data(
         self, mc_mod: MinecraftSlotModule, data: dict[str, Any]
     ) -> None:
-        prev_connected = mc_mod.snapshot.connected
-        prev_paused = mc_mod.paused
         if isinstance(data.get("snapshot"), dict):
-            snap_payload = dict(data["snapshot"])
+            snap = dict(data["snapshot"])
             for flag in ("bridge_ready", "mc_enabled", "mc_configured", "paused"):
                 if flag in data:
-                    snap_payload[flag] = data[flag]
-            await mc_mod.update_snapshot(snap_payload)
+                    snap[flag] = data[flag]
+            await mc_mod.update_snapshot(snap)
         mc_mod.apply_status(data)
-        await self._sync_mc_world_focus(
-            mc_mod, prev_connected=prev_connected, prev_paused=prev_paused
-        )
+        await self._sync_mc_world_focus(mc_mod)
 
     async def _sync_mc_node_status(self) -> None:
         nt = self.transport()
@@ -118,8 +84,7 @@ class MinecraftNodeAdapter:
                 {"connected": False, "bridge_ready": False, "activity": "节点连接断开"}
             )
         ws = await self._ensure_world_state_ready()
-        if ws.current.current_module == "minecraft" and ws.current.focus_level == "HIGH":
-            await ws.update_state(current_module="idle", focus_level="LOW", mood="calm")
+        await ws.experience.mc_snapshot("", ws.clock(), disconnected=True)
 
     async def dispatch(self, ticket: dict[str, Any]) -> dict[str, Any]:
         module, transport = self.module, self.transport()
@@ -194,12 +159,8 @@ class MinecraftNodeAdapter:
         payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
         if event_name == "mc.snapshot":
             mc_mod = self.module
-            prev_connected = mc_mod.snapshot.connected
-            prev_paused = mc_mod.paused
             await mc_mod.update_snapshot(payload)
-            await self._sync_mc_world_focus(
-                mc_mod, prev_connected=prev_connected, prev_paused=prev_paused
-            )
+            await self._sync_mc_world_focus(mc_mod)
         elif event_name == "mc.milestone":
             raw_type = payload.get("event_type") or payload.get("type") or "mc_milestone"
             clean_type = (
@@ -215,9 +176,15 @@ class MinecraftNodeAdapter:
                 else {
                     k: v
                     for k, v in payload.items()
-                    if k not in {"event_type", "type", "importance"}
+                    if k not in {"event_type", "type", "importance", "event_id"}
                 }
             )
             ws_mgr = await self._ensure_world_state_ready()
-            await ws_mgr.publish_event("minecraft", clean_type, event_data, importance=importance)
+            await ws_mgr.publish_event(
+                "minecraft",
+                clean_type,
+                event_data,
+                importance=importance,
+                business_key=payload.get("event_id") or frame.get("id"),
+            )
         return "accepted"

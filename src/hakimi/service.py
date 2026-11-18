@@ -58,6 +58,7 @@ from .surf_mirror import SurfMirror
 from .video_watch import VideoWatch
 from .web_search import explicit_search, search_query
 from .work_usage import model_work
+from .world_experience import SOCIAL_LOW
 from .world_state import WorldStateManager
 
 log = logging.getLogger("hakimi")
@@ -369,7 +370,10 @@ class Service:
                 message.kind == "group"
                 and not message.addressed
                 and hasattr(self, "world_state")
-                and self.world_state.proactive_suspended()
+                and (
+                    self.world_state.proactive_suspended()
+                    or await self.world_state.experience.battery(message, time.time()) < SOCIAL_LOW
+                )
             ):
                 # Context-only messages remain local; only an existing addressed batch can wake.
                 await self.store.groups.observe(message)
@@ -1636,6 +1640,9 @@ class Service:
                 if surfed:
                     payload["recent_bili_surfed"] = surfed
             if not self.bot_guard.known_bot(message) and hasattr(self, "world_state"):
+                news = await self.world_state.experience.news(message, time.time(), limit=2)
+                if news:
+                    payload["unshared_world_news"] = news
                 ws_summary = await self.world_state.chat_sensor_payload()
                 if ws_summary:
                     payload["world_state_summary"] = ws_summary
@@ -2571,6 +2578,7 @@ class Service:
             await self.store.prune()
             await self.sessions.prune()
             await self.proactive.prune()
+            await self.world_state.experience.prune(time.time())
             if hasattr(self.ai, "cleanup_video_files"):
                 try:
                     await self.ai.cleanup_video_files()

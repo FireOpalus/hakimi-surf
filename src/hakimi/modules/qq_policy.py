@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from ..bot_server import is_persona_owner
 from ..models import Message
+from ..world_experience import SOCIAL_LOW
 from .actions import GateDecision
 from .qq_audience import _scope_to_message
 
@@ -111,6 +112,9 @@ class QQPolicy:
         )
         if target_msg is None:
             return GateDecision("unauthorized_scope")
+
+        if await ws.experience.battery(target_msg, now) < SOCIAL_LOW:
+            return GateDecision("social_battery_low", delay=900)
 
         # Gate 5: Session concurrency lock avoidance
         scope = self.store.session_scope(target_msg)

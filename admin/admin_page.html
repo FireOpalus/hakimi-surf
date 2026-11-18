@@ -1970,6 +1970,15 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   </div>
   <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
     <div id="life-stats" class="stats"></div>
+    <h3>最近的状态变化</h3><div id="life-changes" class="table"></div>
+    <details><summary>精力与无聊度怎样结算</summary>
+      <p class="muted">每小时休息恢复 6 点精力、减少 2 点无聊。清醒空闲每小时恢复 0.5 点精力、增加 4 点无聊。执行 MC 任务每小时消耗 12 点精力、减少 4 点无聊。</p>
+      <p class="muted">完成一次视频学习消耗 2 点精力、减少 7 点无聊，每实际学习 10 分钟再各减 1 点。完成 MC 任务或发现稀有资源时精力减 1、无聊减 6。QQ 回复确认送达后，无聊减 2。数值在 0 至 100 之间，界面显示四舍五入后的整数。</p>
+    </details>
+    <details><summary>各会话社交电量与待分享见闻</summary>
+      <p class="muted">每轮确认送达消耗 12 点社交电量，间隔 5 分钟恢复 1 点。各会话独立结算。</p>
+      <div id="life-batteries" class="table"></div><div id="life-news" class="table"></div>
+    </details>
     <div id="life-node-pills" class="pill-row"></div>
     <h3>Owner 日报送达记录</h3>
     <div id="life-digests" class="table"></div>
@@ -2233,7 +2242,7 @@ function logout(){
   text('overview-gcp-note','');
   for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
   $('world-observation-card').hidden=true;
-  ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
+  ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-changes','life-batteries','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
   thinkingReady=false;thinkingDirty=false;
@@ -3054,14 +3063,30 @@ function renderWorldObservation(o,eng,tz){
 function renderLife(d){
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
   renderWorldObservation(d.observation,eng,tz);
+  const exp=ws.experience||{},plan=exp.plan,actual=exp.actual||{};
+  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息中',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',qq_processing:'正在处理 QQ 消息',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
+  const name=k=>labels[k]||k||'—';
+  const restingPlan=plan&&['model_chose_rest','sleeping','local_rest','unchanged_state','no_available_actions'].includes(plan.outcome);
+  const planned=plan?(restingPlan?'本轮未安排动作':plan.plan_module?name(plan.plan_module)+' · '+(plan.accepted||0)+' 个动作':'本轮已结束'):'等待首次规划';
   const stats=[
-    ['当前活动 / 专注',(ws.current_module||'idle')+' · '+(ws.focus_level||'LOW')],
-    ['心情 / 精力 / 无聊',(ws.mood||'calm')+' · '+(ws.energy??80)+' / '+(ws.boredom??20)],
+    ['本时段计划',planned],
+    ['实际活动',name(actual.state)+(actual.mc_task?' · '+name(actual.mc_task):'')],
+    ['最近确认完成',actual.last?name(actual.last.reason)+' · '+lifeFmt(actual.last.at,tz):'等待活动回执'],
+    ['心情 / 精力 / 无聊',name(ws.mood)+' · '+(ws.energy??80)+' / '+(ws.boredom??20)],
+    ['最近会话的社交电量',exp.social?.length?exp.social[0].label+' · '+exp.social[0].charge+' / 100':'等待首次回复'],
+    ['待分享见闻',(exp.news_count??0)+' 条'],
     ['Attention Lock',ws.proactive_suspended?'HIGH 锁定中':'正常开放'],
     ['今日自主活动',eng.proactive_sent_today??0],
     ['已用共用次数',(eng.daily_activity_usage?.counted??eng.proactive_sent_today??0)+' / '+(c.max_proactive_per_day??6)]
   ];
   $('life-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
+  const delta=(a,b)=>a===b?'—':a+' → '+b;
+  table('life-changes',['时间','变化原因','精力','无聊','社交电量'],(exp.changes||[]).map(r=>[
+    lifeFmt(r.at,tz),name(r.reason)+(r.reason==='idle'?' · 清醒累计':r.reason==='rest'?' · 休息累计':'')+(r.reason==='video_learned'&&r.seconds>0?' · '+Math.ceil(r.seconds)+' 秒':'')+(r.audience_label?' · '+r.audience_label:''),
+    r.reason==='baseline'?r.energy_after:delta(r.energy_before,r.energy_after),r.reason==='baseline'?r.boredom_after:delta(r.boredom_before,r.boredom_after),delta(r.social_before,r.social_after)
+  ]));
+  table('life-batteries',['会话','当前社交电量','最近一次回复'],(exp.social||[]).map(r=>[r.label,r.charge+' / 100',lifeFmt(r.at,tz)]));
+  table('life-news',['来源','待分享见闻','发生时间'],(exp.news||[]).map(r=>[name(r.source),r.label,lifeFmt(r.at,tz)]));
   const nap=nodes.onebot_cn_napcat||{},sh=nodes.shanghai_node_agent||{},mc=nodes.shanghai_mc_agent||{};
   const nodePills=[
     nap.connected?pill('NapCat CN 在线 ('+(nap.mode||'http')+')','ok'):pill('NapCat CN 未连接 ('+(nap.mode||'http')+')','warn'),

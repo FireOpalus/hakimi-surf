@@ -44,6 +44,8 @@ from .world_state import (
     private_event_for_owner,
 )
 
+EFFORTFUL_ACTIONS = {"bili.patrol", "mc.explore", "mc.goto", "mc.mine", "mc.gather", "mc.follow"}
+
 log = logging.getLogger("hakimi")
 
 
@@ -234,20 +236,13 @@ class LifeBlockPlanner:
             await self.journal.pause(day, ts, self.next_plan_at, "disabled")
             return {"status": "disabled", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
 
+        await ws.experience.advance(ts)
         local_dt = self._local(ts)
         if (
             not cfg.is_active_time(local_dt)
             or cfg.quiet(local_dt)
             or self.store.runtime.is_resting(ts)
         ):
-            current = ws.current
-            await ws.update_state(
-                current_module=current.current_module if ws.proactive_suspended() else "idle",
-                focus_level=current.focus_level if ws.proactive_suspended() else "LOW",
-                mood="sleeping",
-                energy=min(100, current.energy + 25),
-                boredom=max(0, current.boredom - 15),
-            )
             wake_at = self._schedule_sleep_wakeup(ts, cfg)
             self.last_plan_at = ts
             self.last_plan_source = "sleeping"
@@ -265,10 +260,12 @@ class LifeBlockPlanner:
             planning_context.update(await module.planning_context(self.service, cfg, ts))
 
         budget = await self.store.budget_status()
+        preferences = await ws.experience.preferences(ts)
         available_actions = [
             action
             for action in self.engine.catalog.view(cfg.action_modes, planner=True)
-            if not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"])
+            if (not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"]))
+            and not (preferences["low_energy"] and action["name"] in EFFORTFUL_ACTIONS)
         ]
         offered = {action["name"] for action in available_actions}
         planner_payload: dict[str, Any] = {
@@ -278,6 +275,7 @@ class LifeBlockPlanner:
                 "current_module": current.current_module,
                 "focus_level": current.focus_level,
                 "mood": current.mood,
+                **preferences,
                 "energy": current.energy,
                 "boredom": current.boredom,
             },
@@ -409,7 +407,7 @@ class LifeBlockPlanner:
                 reasons["planner_budget_closed"] = 1
             if plan is None:
                 plan = await fallback_plan(
-                    self.engine, planner_payload, current, local_dt, ts, offered, planner_funded
+                    self.engine, planner_payload, local_dt, ts, offered, planner_funded
                 )
             await self.journal.checkpoint(run_id, plan_source, plan.model_dump(), reasons)
 
@@ -417,13 +415,9 @@ class LifeBlockPlanner:
         if resolved_module not in known_modules:
             resolved_module = "idle"
         resolved_focus: Literal["LOW", "MEDIUM", "HIGH"] = plan.focus_level
-        if ws.proactive_suspended():
-            resolved_module, resolved_focus = ws.current.current_module, ws.current.focus_level
-        elif resolved_focus == "HIGH":
+        if resolved_focus == "HIGH":
             resolved_focus = "MEDIUM"
         resolved_mood = sanitize_sensor_text(plan.mood, self.s, max_tokens=16) or "calm"
-        resolved_energy = max(0, min(100, int(plan.energy)))
-        resolved_boredom = max(0, min(100, int(plan.boredom)))
 
         tickets = []
 
@@ -486,6 +480,12 @@ class LifeBlockPlanner:
                 skip("window_expired")
                 continue
             gate_cond = {"allow_desktop_care": True} if item.allow_desktop_care else {}
+            if (
+                plan_source == "local_fallback"
+                and action_type == "group_chat_share"
+                and target_module == "bilibili_surf"
+            ):
+                gate_cond["share_news"] = True
             try:
                 ticket = IntentTicketCreate(
                     origin="planner",
@@ -524,15 +524,9 @@ class LifeBlockPlanner:
             outcome=outcome,
             reasons=reasons,
             avoided=False,
+            plan=(resolved_module, resolved_focus, resolved_mood),
         )
         self.next_plan_at = (await self.journal.clock())["next_at"]
-        await ws.update_state(
-            current_module=resolved_module,
-            focus_level=resolved_focus,
-            mood=resolved_mood,
-            energy=resolved_energy,
-            boredom=resolved_boredom,
-        )
 
         longnick_text = str(plan.mood_longnick or "").strip()
         if longnick_text:
@@ -549,10 +543,7 @@ class LifeBlockPlanner:
                 f"life-block:{run_id}",
                 resolved_module,
                 "life_block",
-                (
-                    f"切换状态为 {resolved_module}({resolved_focus})"
-                    f" · 心情 {resolved_mood}，精力 {resolved_energy}"
-                ),
+                (f"时段计划 {resolved_module}({resolved_focus}) · 预期心情 {resolved_mood}"),
                 now=ts,
             )
 
@@ -947,6 +938,8 @@ class LifeEngine:
         self.rng = rng or random.SystemRandom()
         self.env_config = LifeEngineConfig.from_settings(self.s, service.modules)
         self.config: LifeEngineConfig = self.env_config
+        if world := getattr(service, "world_state", None):
+            world.experience.schedule = lambda: (self.config.active_hours, self.config.quiet_hours)
         self.overridden: bool = False
         self.initialized: bool = False
         self._running: bool = False
@@ -1082,7 +1075,9 @@ class LifeEngine:
                         "SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='scheduled_intents'"
                     )
-                if not has_intents_table and hasattr(world_state, "initialize"):
+                if (not has_intents_table or not world_state.experience.ready) and hasattr(
+                    world_state, "initialize"
+                ):
                     await world_state.initialize()
                 await self.rules.initialize()
                 await self.planner.initialize()
@@ -1112,6 +1107,7 @@ class LifeEngine:
     async def set_config(self, value: LifeEngineConfig | dict[str, Any] | None) -> dict[str, Any]:
         await self.initialize()
         async with self._config_lock:
+            await self.service.world_state.experience.advance(self.clock())
             if value is None:
                 async with self.store.transaction():
                     await self.store.db.execute("DELETE FROM admin_config WHERE key='life_engine'")
@@ -1170,6 +1166,7 @@ class LifeEngine:
     ) -> dict[str, Any]:
         await self.initialize()
         ts = self.clock() if now is None else now
+        await self.service.world_state.experience.advance(ts)
         if self.config.enabled:
             async with self._gate_lock:
                 await self.schedule_due(ts)

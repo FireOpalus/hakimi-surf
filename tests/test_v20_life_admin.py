@@ -400,7 +400,12 @@ async def test_life_world_attention_lock_toggle_and_validation(life_api):
     ):
         assert (await client.put("/admin/api/life/world", json=bad)).status_code == 400
 
-    # Lock focus to HIGH -> qq_social & bilibili_surf pause; minecraft stays unpaused.
+    denied = await client.put(
+        "/admin/api/life/world", json={"current_module": "minecraft", "focus_level": "HIGH"}
+    )
+    assert denied.status_code == 400 and denied.json()["detail"] == "mc_task_required"
+    await svc.world_state.experience.mc_snapshot("explore", svc.world_state.clock())
+    # A real task owns high focus. Admin may still adjust other state during it.
     locked = await client.put(
         "/admin/api/life/world",
         json={

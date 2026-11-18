@@ -455,6 +455,7 @@ test("mock-bot connected behaviors: goto, mine (mc_rare_find + cooldown), look_s
     const spawnSnap = await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
     assert.equal(spawnSnap.payload.dimension, "overworld");
     assert.deepEqual(spawnSnap.payload.pos, [10, 64, -5]);
+    assert.equal(spawnSnap.payload.active_task, "");
 
     const bot = getLastBot();
     assert.equal(bot.createOptions.host, "mock.mc.internal");
@@ -472,6 +473,9 @@ test("mock-bot connected behaviors: goto, mine (mc_rare_find + cooldown), look_s
       z: 15,
     });
     assert.equal(gotoRes.ok, true);
+    const working = await inbox.next((m) => m.event === "mc.snapshot" && m.payload.active_task === "goto");
+    assert.equal(working.payload.connected, true);
+    assert.equal(gotoRes.data.snapshot.active_task, "");
     assert.equal(gotoRes.data.ok, true);
     assert.deepEqual(gotoRes.data.snapshot.pos, [30, 64, 15]);
     const goalDone = await inbox.next(

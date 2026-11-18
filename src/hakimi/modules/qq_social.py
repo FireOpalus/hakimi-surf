@@ -184,7 +184,7 @@ class QQSocialModule(BaseModule):
         if "qq.speak" not in available:
             return None
         groups = context.get("available_groups", [])
-        if context.get("recent_bili_surfed") and groups:
+        if context.get("current_world_state", {}).get("public_unshared_count", 0) and groups:
             return LocalActivity(
                 20,
                 {
@@ -193,7 +193,7 @@ class QQSocialModule(BaseModule):
                     "target_scope": groups[0],
                     "delay_minutes": 15,
                     "ttl_minutes": 90,
-                    "intent_note": "刚刷到一条有意思的公开视频，看看群里气氛合适就聊两句",
+                    "intent_note": "有一条还没分享的公开见闻，群里聊得上就说两句",
                 },
             )
         if context["desktop_active_recently"] and context["owner_dm_available"]:

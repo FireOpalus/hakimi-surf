@@ -351,7 +351,7 @@ async def test_mode_change_during_generation_stops_outgoing(settings, store):
 async def test_rule_source_proof_and_shadow_compare_cannot_escalate(settings, store):
     async with setup(settings, store) as (svc, wire, node):
         engine = svc.life_engine
-        await svc.world_state.update_state(current_module="minecraft", focus_level="HIGH")
+        await svc.world_state.experience.mc_snapshot("mine", svc.world_state.clock())
         ev = await svc.world_state.publish_event(
             "minecraft", "progress", {"block": "stone"}, now=NOW
         )

@@ -64,6 +64,7 @@ _SNAPSHOT_FIELD_KEYS = frozenset(
         "health",
         "food",
         "activity",
+        "active_task",
         "nearby_entities",
         "recent_chat_or_sign",
         "updated_at",
@@ -81,6 +82,7 @@ class MinecraftSnapshot(BaseModel):
     pos: tuple[float, float, float] | str | None = None
     health: float | None = Field(default=None, ge=0)
     food: float | None = Field(default=None, ge=0)
+    active_task: str = ""
     activity: str = ""
     nearby_entities: list[str] = Field(default_factory=list)
     recent_chat_or_sign: str = ""
@@ -295,6 +297,7 @@ class MinecraftSlotModule(BaseModule):
             health=health,
             food=food,
             activity=activity,
+            active_task=str(data.get("active_task") or "")[:16],
             nearby_entities=entities,
             recent_chat_or_sign=recent_chat_or_sign,
             updated_at=updated_at,

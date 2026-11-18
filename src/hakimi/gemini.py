@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 from google.genai._interactions import APITimeoutError
 from google.oauth2 import service_account
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .attention import can_watch_video
 from .bilibili import extract_bvid
@@ -90,8 +90,15 @@ class WireLifePlan(BaseModel):
     current_module: str
     focus_level: Literal["LOW", "MEDIUM", "HIGH"]
     mood: str
-    energy: int
-    boredom: int
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_drives(cls, value):
+        # Paid checkpoints from the previous wire schema remain reusable after upgrade.
+        if isinstance(value, dict):
+            return {k: v for k, v in value.items() if k not in {"energy", "boredom"}}
+        return value
+
     mood_longnick: str = ""
     intents: list[WireLifeIntent] = Field(default_factory=list)
 
@@ -100,9 +107,11 @@ LIFE_PLAN_RESPONSE_SCHEMA = WireLifePlan.model_json_schema()
 
 LIFE_PLAN_INSTRUCTION = """当前任务是自主生活区块规划器（LifeBlockPlanner），不是实时对话。
 结合当前本地时间、world_state、未消费跨模块事件（unconsumed_events）、近期B站冲浪记录与可用社交目标，
-规划未来2至4小时的当前活动、专注度、心情、精力/无聊度与模糊意图队列（最多3条）。
+规划未来2至4小时的计划活动、预期专注度、心情与模糊意图队列（最多3条）。
 只输出符合 schema 的 JSON 对象，包含 current_module、focus_level（LOW|MEDIUM|HIGH）、mood、
-energy（0..100）、boredom（0..100）、mood_longnick（≤30字纯文本心情个签或空串""）与 intents。
+mood_longnick（≤30字纯文本心情个签或空串""）与 intents。
+精力、无聊度和探索倾向由本地实际经历结算。
+exploration_preferred 为真时优先挑选可用探索，精力低时可休息。计划内容只表达意向。
 从 available_actions 选择 action_name，arguments_json 仅填该动作声明的 JSON 参数。
 internal 不填接收人，social 仅选提供的群或 owner。
 【严禁预写台词】每条 intent 的 intent_note 只能写 ≤120 字的抽象意图方向，
@@ -1614,7 +1623,10 @@ class GeminiGateway:
                 EXTRACTION_INSTRUCTION if memory_archive else COMPRESSION_INSTRUCTION
             )
         if scenario == Scenario.OWNER_DIGEST:
-            system += OWNER_DIGEST_INSTRUCTION
+            system += (
+                OWNER_DIGEST_INSTRUCTION
+                + "\n汇报里若提到具体见闻，请保留准确的视频标题或 BV 号，方便 BOISER 回看。"
+            )
         if scenario == Scenario.OWNER_COMPANION:
             system += OWNER_COMPANION_INSTRUCTION
         if with_longnick:

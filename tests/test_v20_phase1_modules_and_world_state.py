@@ -419,7 +419,7 @@ async def test_attention_lock_pauses_and_resumes_non_high_modules(settings, stor
     assert not qq.proactive_paused
     assert not bili.proactive_paused
 
-    await ws.update_state(current_module="minecraft", focus_level="HIGH")
+    await ws.experience.mc_snapshot("mine", ws.clock())
     assert ws.proactive_suspended()
     assert qq.proactive_paused
     assert bili.proactive_paused
@@ -433,7 +433,7 @@ async def test_attention_lock_pauses_and_resumes_non_high_modules(settings, stor
     assert not qq.proactive_paused
     assert not bili.proactive_paused
 
-    await ws.update_state(current_module="minecraft", focus_level="HIGH")
+    await ws.experience.mc_snapshot("mine", ws.clock())
     assert qq.proactive_paused and bili.proactive_paused
     await ws.update_state(current_module="idle", focus_level="LOW")
     assert not qq.proactive_paused and not bili.proactive_paused
@@ -462,7 +462,7 @@ async def test_chat_sensor_payload_idle_and_bounded(settings, store):
             "activity": "在找下界要塞顺便躲烈焰人" + ("探索" * 60),
         }
     )
-    await ws.update_state(current_module="minecraft", focus_level="HIGH", mood="focused")
+    await ws.experience.mc_snapshot("mine", ws.clock())
     sensor_payload = await ws.chat_sensor_payload()
     assert sensor_payload is not None
     assert sensor_payload["current_module"] == "minecraft"

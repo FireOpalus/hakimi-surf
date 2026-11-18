@@ -3,7 +3,7 @@
 from .gemini import WireLifePlan
 
 
-async def fallback_plan(engine, context, current, local_dt, now, available, planner_funded):
+async def fallback_plan(engine, context, local_dt, now, available, planner_funded):
     focus_module, focus, mood = "idle", "LOW", "calm"
     choices = []
     for module in engine.service.modules.all():
@@ -47,8 +47,6 @@ async def fallback_plan(engine, context, current, local_dt, now, available, plan
             "current_module": focus_module,
             "focus_level": focus,
             "mood": mood,
-            "energy": max(15, min(100, current.energy - 5)),
-            "boredom": max(0, min(95, current.boredom + 8)),
             "mood_longnick": "",
             "intents": [intent] if intent else [],
         }

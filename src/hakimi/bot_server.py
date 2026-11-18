@@ -348,6 +348,8 @@ def assemble_chat_input(
                 metadata["jit_proactive_intent"] = (
                     dict(raw_jit) if isinstance(raw_jit, dict) else raw_jit
                 )
+    if not sandbox_mode and payload.get("unshared_world_news"):
+        metadata["待分享见闻（仅供当前会话，有关时再提）"] = payload["unshared_world_news"]
     summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
     dual = payload.get("dual_memory_data", {}) if not sandbox_mode else {}
     background = {}
@@ -430,6 +432,8 @@ def assemble_chat_input(
         parts.append("</transient_turn_context>")
         return "".join(parts)
 
+    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        metadata.pop("待分享见闻（仅供当前会话，有关时再提）", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and dual:
         dual = {"speaker_profile": dual.get("speaker_profile", {})}
     if estimate_tokens(tail()) > settings.chat_tail_tokens:

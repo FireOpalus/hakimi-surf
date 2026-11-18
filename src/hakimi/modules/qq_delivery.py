@@ -45,6 +45,12 @@ class LifeSpeaker:
         if target_msg is None or not authorize(target_msg, self.s):
             return Outcome("gated_skip", "unauthorized_scope")
 
+        selected_news = {}
+        if ticket.get("source_event_id") or ticket.get("gate_condition", {}).get("share_news"):
+            selected_news = await ws.experience.reserve_news(target_msg, ticket, ts)
+            if selected_news is None:
+                return Outcome("gated_skip", "news_already_shared_or_expired")
+
         module = self.service.modules.get(target_module)
         parts = [await module.social_material(ticket)] if module else []
         if call.evidence:
@@ -136,6 +142,11 @@ class LifeSpeaker:
             "allowed_reply_ids": [],
             "jit_proactive_intent": jit_intent,
         }
+        news = (
+            [selected_news] if selected_news else await ws.experience.news(target_msg, ts, limit=2)
+        )
+        if news:
+            payload["unshared_world_news"] = news
         if batch_affection:
             payload["batch_affection"] = batch_affection
         if ws_summary:

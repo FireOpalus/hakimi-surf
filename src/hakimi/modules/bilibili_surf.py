@@ -65,7 +65,9 @@ class BilibiliSurfModule(BaseModule):
         )
 
     def local_activity(self, context, available, unfunded):
-        if unfunded and "bili.patrol" in available:
+        if "bili.patrol" in available and (
+            unfunded or context.get("current_world_state", {}).get("exploration_preferred")
+        ):
             return LocalActivity(
                 30,
                 {

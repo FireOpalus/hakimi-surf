@@ -276,7 +276,18 @@ async def test_auto_high_focus_water_chat_suspension_instant_at_and_disconnect_u
         assert mc_mod.bridge_ready is True
         assert svc.world_state.current.focus_level == "LOW"
 
-        # 2. Live MC snapshot connected=True auto-locks focus_level=HIGH & module=minecraft.
+        # A connected, idle game client does not take attention; only the task marker does.
+        await nt.on_event(
+            {
+                "event": "mc.snapshot",
+                "payload": {
+                    "connected": True,
+                    "bridge_ready": True,
+                    "activity": "筹备建造:矿洞探险",
+                },
+            }
+        )
+        assert not svc.world_state.proactive_suspended()
         await nt.on_event(
             {
                 "type": "event",
@@ -291,6 +302,7 @@ async def test_auto_high_focus_water_chat_suspension_instant_at_and_disconnect_u
                     "pos": [100, 64, -50],
                     "health": 20,
                     "food": 20,
+                    "active_task": "explore",
                     "activity": "矿洞探险",
                 },
             }
@@ -373,7 +385,14 @@ async def test_auto_high_focus_water_chat_suspension_instant_at_and_disconnect_u
         assert svc.world_state.current.focus_level == "LOW"
         assert svc.world_state.current.current_module == "idle"
 
-        # Unpausing while connected restores HIGH/minecraft.
+        # Unpausing is still idle until the next task actually starts.
+        await nt.on_event(
+            {
+                "event": "mc.snapshot",
+                "payload": {"connected": True, "bridge_ready": True, "paused": False},
+            }
+        )
+        assert not svc.world_state.proactive_suspended()
         await nt.on_event(
             {
                 "type": "event",
@@ -382,6 +401,7 @@ async def test_auto_high_focus_water_chat_suspension_instant_at_and_disconnect_u
                     "connected": True,
                     "bridge_ready": True,
                     "paused": False,
+                    "active_task": "mine",
                     "activity": "继续挖矿",
                 },
             }

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import mineflayer from "mineflayer";
 import pathfinderPkg from "mineflayer-pathfinder";
 import {
@@ -176,6 +177,7 @@ export class McRuntime {
       pos: this.pos ? [...this.pos] : null,
       health: this.health,
       food: this.food,
+      active_task: this._activeGoalCancel && this.connected && !this.paused ? this.activeTask : "",
       activity: sanitizeMcText(this.activity, 64) || (this.connected ? "原地待命" : "待机"),
       nearby_entities: [...this.nearbyEntities],
       recent_chat_or_sign: this.chatBuffer.format(),
@@ -210,12 +212,13 @@ export class McRuntime {
   _emitMilestone(eventType, importance, payload) {
     const nowMs = this.nowFn();
     const lastMs = this._milestoneCooldowns.get(eventType) ?? -Infinity;
-    if (nowMs - lastMs < this.milestoneCooldownMs) {
+    if (eventType !== "mc_goal_completed" && nowMs - lastMs < this.milestoneCooldownMs) {
       return false;
     }
     this._milestoneCooldowns.set(eventType, nowMs);
     this.onEvent("mc.milestone", {
       event_type: eventType,
+      event_id: randomUUID(),
       importance,
       payload,
     });
@@ -586,7 +589,7 @@ export class McRuntime {
     }
   }
 
-  async _runBoundedGoal(timeoutMs, fn) {
+  async _runBoundedGoal(actionType, timeoutMs, fn) {
     this._cancelActiveGoal();
     const boundedMs = Math.min(30_000, Math.max(100, timeoutMs ?? this.actionTimeoutMs));
     const controller = new AbortController();
@@ -604,7 +607,9 @@ export class McRuntime {
         // Ignore pathfinder stop errors
       }
     };
+    this.activeTask = actionType;
     this._activeGoalCancel = cancel;
+    this._emitSnapshot();
 
     try {
       const timeoutPromise = new Promise((_, reject) => {
@@ -630,6 +635,7 @@ export class McRuntime {
       if (timer) clearTimeout(timer);
       if (this._activeGoalCancel === cancel) {
         this._activeGoalCancel = null;
+        this._emitSnapshot();
       }
     }
   }
@@ -898,7 +904,7 @@ export class McRuntime {
       }
       this.activity = `前往(${Math.round(coords.x)},${Math.round(coords.y)},${Math.round(coords.z)})`;
       this._emitSnapshot();
-      const outcome = await this._runBoundedGoal(timeoutMs, async (signal) => {
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
         await this._gotoGoal(new GoalNear(coords.x, coords.y, coords.z, 1), signal);
         return { ok: true };
       });
@@ -938,7 +944,7 @@ export class McRuntime {
       const targetZ = Math.round(cur[2] + dz);
       this.activity = `探索(${targetX},${targetZ})`;
       this._emitSnapshot();
-      const outcome = await this._runBoundedGoal(timeoutMs, async (signal) => {
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
         await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
         return { ok: true };
       });
@@ -1020,7 +1026,7 @@ export class McRuntime {
         });
       }
 
-      const outcome = await this._runBoundedGoal(timeoutMs, async (signal) => {
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
         if (bot.pathfinder?.goto) {
           await this._gotoGoal(new GoalNear(coords[0], coords[1], coords[2], 3), signal);
         }
@@ -1100,7 +1106,7 @@ export class McRuntime {
       this.activity = `跟随:${sanitizeMcText(matched.username, 24)}`;
       this._emitSnapshot();
       const followTimeout = Math.min(15_000, timeoutMs);
-      const outcome = await this._runBoundedGoal(followTimeout, async (signal) => {
+      const outcome = await this._runBoundedGoal(actionType, followTimeout, async (signal) => {
         await this._gotoGoal(new GoalFollow(matched.entity, 2), signal);
         return { ok: true };
       });

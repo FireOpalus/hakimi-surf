@@ -398,6 +398,7 @@ async def rest_hours_save(request: Request):
     value = await body(request, RestHoursConfig)
     svc = service(request)
     async with request.app.state.admin_config_lock:
+        await svc.world_state.experience.advance(svc.world_state.clock())
         status = await svc.store.runtime.set_rest_hours(value)
         svc.life_engine.wakeup.set()
         return status
@@ -407,6 +408,7 @@ async def rest_hours_save(request: Request):
 async def rest_hours_reset(request: Request):
     svc = service(request)
     async with request.app.state.admin_config_lock:
+        await svc.world_state.experience.advance(svc.world_state.clock())
         status = await svc.store.runtime.set_rest_hours(None)
         svc.life_engine.wakeup.set()
         return status

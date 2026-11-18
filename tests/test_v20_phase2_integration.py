@@ -290,7 +290,10 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
             life_view = await client.get("/admin/api/life")
             assert life_view.status_code == 200
             data = life_view.json()
-            assert data["world_state"]["current_module"] == "bilibili_surf"
+            state = data["world_state"]
+            assert state["current_module"] == "idle"
+            assert state["experience"]["plan"]["plan_module"] == "bilibili_surf"
+            assert state["experience"]["actual"]["state"] == "idle"
             assert data["world_state"]["last_proactive_at"] > 0
             intents_by_id = {row["id"]: row["status"] for row in data["intents"]}
             assert intents_by_id[cold_intent_id] == "gated_skip"
@@ -304,9 +307,11 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
                 "/admin/api/life/world",
                 json={"current_module": "minecraft", "focus_level": "HIGH"},
             )
-            assert lock_res.status_code == 200
-            assert lock_res.json()["world_state"]["proactive_suspended"] is True
+            assert lock_res.status_code == 400
+            assert lock_res.json()["detail"] == "mc_task_required"
+            await svc.world_state.experience.mc_snapshot("mine", cur_now)
             assert svc.world_state.proactive_suspended() is True
+            await svc.world_state.experience.mc_snapshot("", cur_now)
             unlock_res = await client.put(
                 "/admin/api/life/world",
                 json={"focus_level": "LOW"},

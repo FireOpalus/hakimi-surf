@@ -102,9 +102,30 @@ async def apply_receipts(service, reply_id):
             await service.diary.bot_reply(reply_id, message, combined_text)
     # Idempotent B receipts/public index make crashes before this marker safe to recover.
     async with service.store.transaction():
+        world = getattr(service, "world_state", None)
+        if world and world.experience.ready:
+            dedicated = None
+            if reply_id.startswith("jit:"):
+                ticket = await service.store.one(
+                    "SELECT n.event_id FROM scheduled_intents t JOIN world_news n "
+                    "ON n.intent_id=t.id WHERE t.id=? "
+                    "AND action_name='qq.speak' AND expected_bubbles>0 AND expected_bubbles="
+                    "(SELECT COUNT(*) FROM outbox_bubble_receipts WHERE reply_id=?)",
+                    (reply_id[4:], reply_id),
+                )
+                dedicated = ticket[0] if ticket else None
+            await world.experience.confirmed_tx(
+                message,
+                reply_id,
+                min(r["created"] for r in rows),
+                [item["text"] for item in data],
+                dedicated=dedicated,
+            )
         await service.store.db.execute(
             "UPDATE outbox_bubble_receipts SET applied=1 WHERE reply_id=?", (reply_id,)
         )
+    if world and world.experience.ready:
+        await world.refresh()
     return data if appended else []
 
 
