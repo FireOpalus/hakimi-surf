@@ -101,8 +101,10 @@ class BilibiliSurfModule(BaseModule):
         )
         run = res.artifacts.get("result", {})
         status = run.get("status")
-        if res.reason == "bili_invalid_receipt":
-            return Outcome("uncertain", res.reason)
+        if res.reason == "bili_invalid_receipt" or run.get("requires_review"):
+            return Outcome("uncertain", res.reason or run.get("reason") or "bili_review_required")
+        if res.ok and status == "failed" and run.get("learned", 0) > 0:
+            return Outcome("done", run.get("reason") or "patrol_partly_completed")
         if not res.ok or (self.backend_mode == "local" and status not in {"done", "empty"}):
             return Outcome(
                 "gated_skip", res.reason or run.get("reason") or status or "patrol_unavailable"
@@ -159,6 +161,7 @@ class BilibiliSurfModule(BaseModule):
 
         recent_count = 0
         watched_count = 0
+        uncertain_count = 0
         last_run_status = ""
         if self.watcher is not None:
             try:
@@ -169,6 +172,7 @@ class BilibiliSurfModule(BaseModule):
             try:
                 st = await self.watcher.status()
                 watched_count = int(st.get("watched_count", 0) or 0)
+                uncertain_count = int(st.get("watch_history_counts", {}).get("uncertain", 0))
                 runs = st.get("recent_runs") or []
                 if runs and isinstance(runs[0], dict):
                     last_run_status = str(runs[0].get("status", ""))
@@ -207,6 +211,8 @@ class BilibiliSurfModule(BaseModule):
             else "B站冲浪"
         )
         parts = [f"{prefix}:{state}", f"近期:{recent_count}", f"已看:{watched_count}"]
+        if uncertain_count:
+            parts.append(f"待核实:{uncertain_count}")
         if last_run_status:
             parts.append(f"上次:{last_run_status}")
         if self.proactive_paused:

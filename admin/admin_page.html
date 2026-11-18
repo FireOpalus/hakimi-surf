@@ -2054,6 +2054,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   <div class="card"><div class="row between"><h2>B 站小号巡逻配置</h2><button id="bili-refresh" class="secondary">刷新状态</button></div>
     <p class="muted">仅使用独立小号。优先读取推荐、关注动态、简介、字幕和热评；可单独启用受限原片分析。不伪造播放心跳，不发评论、弹幕、私信或自动关注。遇到凭证过期或验证码风控立即暂停 12 小时。</p>
     <p id="bili-state"></p>
+    <p id="bili-watch-history"></p>
     <form id="bili-credentials">
       <div class="grid">
         <div><label for="bili-sessdata">SESSDATA（仅粘贴值）</label><input id="bili-sessdata" type="password" autocomplete="off" maxlength="4096"></div>
@@ -3428,7 +3429,19 @@ $('sign-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter
 
 const biliRunStatusLabels={ok:'完成',done:'完成',completed:'完成',skipped:'跳过',cooldown:'风控冷却',failed:'失败',uncertain:'结果不确定'};
 const videoStatusLabels={succeeded:'成功',ok:'成功',done:'成功',failed:'失败',uncertain:'结果不确定',working:'处理中'};
-async function biliAccount(){const d=await api('bili-account'),c=d.config;$('bili-enabled').checked=c.enabled;$('bili-like').checked=c.allow_like;$('bili-favorite').checked=c.allow_favorite;$('bili-folder').value=c.favorite_folder_id;$('bili-limit').value=c.daily_action_limit;text('bili-state','账号 '+(d.account_mask||'未验证')+' · 时区 '+zoneLabel(d.timezone)+' · 配置来自 '+(cfgSourceLabels[d.source]||d.source)+' · 今日互动尝试 '+d.actions_today+' 次 · 已处理视频 '+d.watched_count+' 个'+(d.cooldown_until>Date.now()/1000?' · 冷却至 '+dateTime(d.cooldown_until):'')+(d.last_error?' · '+d.last_error:''));text('bili-credential-state','凭证来源 '+(cfgSourceLabels[d.credential_source]||d.credential_source)+' · '+Object.entries(d.credentials).map(([k,v])=>k+': '+(v?'已设置（隐藏）':'未设置')).join(' · '));table('bili-runs',['触发来源','状态','时间','原因'],d.recent_runs.map(x=>[x.slot.startsWith('life-')?'世界引擎':x.slot.startsWith('manual')?'手动':x.slot,biliRunStatusLabels[x.status]||x.status,dateTime(x.created),x.reason||'—']));await videoWatch();}
+async function biliAccount(){
+  const d=await api('bili-account'), c=d.config, h=d.watch_history_counts;
+  $('bili-enabled').checked=c.enabled;
+  $('bili-like').checked=c.allow_like;
+  $('bili-favorite').checked=c.allow_favorite;
+  $('bili-folder').value=c.favorite_folder_id;
+  $('bili-limit').value=c.daily_action_limit;
+  text('bili-state','账号 '+(d.account_mask||'未验证')+' · 时区 '+zoneLabel(d.timezone)+' · 配置来自 '+(cfgSourceLabels[d.source]||d.source)+' · 今日互动尝试 '+d.actions_today+' 次'+(d.uncertain_actions?' · 互动回执待核实 '+d.uncertain_actions+' 条':'')+(d.cooldown_until>Date.now()/1000?' · 冷却至 '+dateTime(d.cooldown_until):'')+(d.last_error?' · '+d.last_error:''));
+  text('bili-watch-history','学习完成 '+h.done+' 条 · 处理中 '+h.processing+' 条 · 读取暂时失败 '+h.retryable+' 条'+(h.exhausted?'（其中 '+h.exhausted+' 条已达重试上限）':'')+' · 结果待核实 '+h.uncertain+' 条');
+  text('bili-credential-state','凭证来源 '+(cfgSourceLabels[d.credential_source]||d.credential_source)+' · '+Object.entries(d.credentials).map(([k,v])=>k+': '+(v?'已设置（隐藏）':'未设置')).join(' · '));
+  table('bili-runs',['触发来源','状态','时间','原因'],d.recent_runs.map(x=>[x.slot.startsWith('life-')?'世界引擎':x.slot.startsWith('manual')?'手动':x.slot,biliRunStatusLabels[x.status]||x.status,dateTime(x.created),x.reason||'—']));
+  await videoWatch();
+}
 for(let n=1;n<=20;n++) $('video-watch-limit').add(new Option(n+' 次',String(n),n===3,n===3));
 async function videoWatch(){
   const d=await api('bili-account/video-watch'),c=d.config;

@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from .bili_history import SCHEMA as HISTORY_SCHEMA
+from .bili_history import WatchHistory
 from .bilibili import BVID, NODE_TRANSPORT_ERRORS, bounded_json
 from .bot_server import is_persona_owner, untrusted_input
 from .budget_policy import PATROL_LANE, paid_lane_available
@@ -31,6 +33,7 @@ from .generation_policy import Scenario
 from .models import Message, Video
 from .roaming_logger import redact_public_summary
 from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
+from .work_usage import model_work
 from .world_state import private_event_audience
 
 PRIVATE_SHARE_PRIORITY_SECONDS = 24 * 3600
@@ -307,6 +310,7 @@ def wbi_keys(data):
 class BiliWatcher:
     def __init__(self, service, client=None, *, clock=time.time, sleep=asyncio.sleep, rng=None):
         self.svc, self.s, self.store = service, service.s, service.store
+        self.history = WatchHistory(self.store)
         self.clock, self.sleep, self.rng = clock, sleep, rng or random.SystemRandom()
         self.zone = ZoneInfo(self.s.bot_timezone)
         self.env_policy = BiliPolicy(
@@ -349,7 +353,7 @@ class BiliWatcher:
 
     async def initialize(self):
         async with self.store.lock:
-            await self.store.db.executescript(SCHEMA)
+            await self.store.db.executescript(SCHEMA + HISTORY_SCHEMA)
             row = await self.store.one("SELECT payload FROM bili_credentials WHERE id=1")
             if row:
                 saved = self.store.vault.open("bili-credentials", row[0])
@@ -384,6 +388,7 @@ class BiliWatcher:
             await self.store.db.execute(
                 "UPDATE bili_actions SET status='uncertain' WHERE status='sending'"
             )
+        await self.history.recover(self.clock(), self.blocked_until)
         self._protect_secrets()
 
     def _protect_secrets(self):
@@ -911,8 +916,7 @@ class BiliWatcher:
                 "category": "关注动态",
                 "tags": [],
             }
-        async with self.store.lock:
-            seen = {r[0] for r in await self.store.all("SELECT bvid FROM bili_watched_history")}
+        seen = await self.history.blocked_candidates(list(found), self.clock())
         return [v for k, v in found.items() if k not in seen][:15]
 
     async def material(self, bvid):
@@ -933,7 +937,10 @@ class BiliWatcher:
             )
             subtitles = (player.get("subtitle") or {}).get("subtitles") or []
         except Rejected as exc:
-            if str(exc) not in {"bili_account_unavailable", "bili_account_upstream_error"}:
+            if self.patrol_context.get() is not None or str(exc) not in {
+                "bili_account_unavailable",
+                "bili_account_upstream_error",
+            }:
                 raise
             subtitles, subtitle_status = [], "unavailable"
         if subtitles:
@@ -958,7 +965,7 @@ class BiliWatcher:
                 body = await self._request(url, subtitle=True)
                 transcript, complete, subtitle_status = subtitle_text(body, duration)
             except Rejected as exc:
-                if str(exc) not in {
+                if self.patrol_context.get() is not None or str(exc) not in {
                     "bili_account_unavailable",
                     "bili_account_upstream_error",
                     "upstream_body_too_large",
@@ -1282,6 +1289,18 @@ class BiliWatcher:
         }
 
     async def run_once(self, *, slot: str | None = None):
+        with model_work("bili.account_patrol") as work:
+            # Manual runs use their ledger work key as the durable patrol ID. World
+            # tickets keep their existing root attribution and unique slot.
+            key = work.key if work.kind == "bili.account_patrol" else uuid.uuid4().hex
+            return await self._run_once(slot, key)
+
+    async def _check_patrol_budget(self):
+        budget = await self.store.budget_status()
+        if not paid_lane_available(budget, PATROL_LANE):
+            raise Rejected("budget_hard_stop" if budget["hard_stop"] else "budget_exhausted")
+
+    async def _run_once(self, slot, key):
         if self.run_lock.locked():
             return {"status": "busy"}
         async with self.run_lock:
@@ -1291,11 +1310,8 @@ class BiliWatcher:
                 raise Rejected("bili_credentials_missing")
             if self.blocked_until > self.clock():
                 raise Rejected("bili_account_cooling_down")
-            budget = await self.store.budget_status()
-            if not paid_lane_available(budget, PATROL_LANE):
-                raise Rejected("budget_hard_stop" if budget["hard_stop"] else "budget_exhausted")
+            await self._check_patrol_budget()
             day = self.local().date().isoformat()
-            key = uuid.uuid4().hex
             async with self.store.transaction():
                 cur = await self.store.db.execute(
                     "INSERT OR IGNORE INTO bili_patrol_runs VALUES (?,?,?,'working',?,NULL)",
@@ -1340,48 +1356,19 @@ class BiliWatcher:
                     seen.add(pick.bvid)
                 for pick in selection.selected:
                     self._ensure_current()
-                    async with self.store.transaction():
-                        cur = await self.store.db.execute(
-                            "INSERT OR IGNORE INTO bili_watched_history "
-                            "VALUES (?,?,'attempted',?,NULL)",
-                            (pick.bvid, key, self.clock()),
-                        )
-                        if cur.rowcount != 1:
-                            continue
+                    if not await self.history.claim(pick.bvid, key, self.clock()):
+                        continue
                     aid, material = await self.material(pick.bvid)
                     material = self._bounded(material)
+                    await self._check_patrol_budget()
                     self._ensure_current()
-                    analyzer = getattr(self.svc, "video_watch", None)
-                    stop_for_risk = False
-                    if analyzer is not None:
-                        result = await analyzer.analyze(
-                            pick.bvid,
-                            material,
-                            subject,
-                            PATROL_LANE,
-                            guard=lambda: self._ensure_current(allow_cooldown=True),
+                    if not await self.history.start_analysis(pick.bvid, key):
+                        raise Rejected("bili_watch_claim_lost")
+                    work_id = self.store.vault.digest("bili-video-study", key, pick.bvid)
+                    with model_work("bili.video_study", work_id):
+                        summary, label, stop_for_risk = await self._learn_video(
+                            pick.bvid, material, subject
                         )
-                        summary = result.text
-                        stop_for_risk = result.reason == "risk" or self.blocked_until > self.clock()
-                        label = (
-                            "公开视频学习"
-                            if result.mode == "video"
-                            else "公开资料摘要"
-                            if result.mode == "metadata"
-                            else "公开文本学习"
-                        )
-                    else:
-                        await self.svc.ai.screen(
-                            material, subject, purpose="source", budget_lane=PATROL_LANE
-                        )
-                        self._ensure_current()
-                        summary = await self.svc.ai.generate(
-                            material,
-                            subject,
-                            scenario=Scenario.BILI_LEARNING,
-                            budget_lane=PATROL_LANE,
-                        )
-                        label = "公开文本学习"
                     # Persist the fallback summary, then stop Bili requests on risk.
                     # The fallback model used only material screened before download.
                     self._ensure_current(epoch=epoch, allow_cooldown=stop_for_risk)
@@ -1398,10 +1385,17 @@ class BiliWatcher:
                         else pick.share_owner and not pick.private_topic_ref
                     )
                     async with self.store.transaction():
-                        await self.store.db.execute(
-                            "UPDATE bili_watched_history SET status='done',summary=? WHERE bvid=?",
-                            (self.store.vault.seal("bili-learn:" + pick.bvid, text), pick.bvid),
+                        cur = await self.store.db.execute(
+                            "UPDATE bili_watched_history SET status='done',summary=? "
+                            "WHERE bvid=? AND run_id=? AND status IN ('analyzing','uncertain')",
+                            (
+                                self.store.vault.seal("bili-learn:" + pick.bvid, text),
+                                pick.bvid,
+                                key,
+                            ),
                         )
+                        if cur.rowcount != 1:
+                            raise Rejected("bili_watch_claim_lost")
                         if preferred is not None:
                             now = self.clock()
                             await self.store.db.execute(
@@ -1472,8 +1466,11 @@ class BiliWatcher:
                     if longnick is not None and hasattr(longnick, "apply_patrol"):
                         await longnick.apply_patrol(selection.mood_longnick)
             except asyncio.CancelledError:
+                await self.history.recover(self.clock(), self.blocked_until, run_id=key)
+                await self._finish(key, "abandoned", completed, "bili_patrol_cancelled")
                 raise
             except Exception as exc:
+                await self.history.recover(self.clock(), self.blocked_until, run_id=key)
                 reason = (
                     str(exc)
                     if isinstance(exc, Rejected) and re.fullmatch(r"[a-z_]{1,80}", str(exc))
@@ -1491,12 +1488,57 @@ class BiliWatcher:
                 self.patrol_context.reset(token)
             return await self._finish(key, "failed" if reason else "done", completed, reason)
 
+    async def _learn_video(self, bvid, material, subject):
+        analyzer = getattr(self.svc, "video_watch", None)
+        stop_for_risk = False
+        if analyzer is not None:
+            result = await analyzer.analyze(
+                bvid,
+                material,
+                subject,
+                PATROL_LANE,
+                guard=lambda: self._ensure_current(allow_cooldown=True),
+            )
+            summary = result.text
+            stop_for_risk = result.reason == "risk" or self.blocked_until > self.clock()
+            label = (
+                "公开视频学习"
+                if result.mode == "video"
+                else "公开资料摘要"
+                if result.mode == "metadata"
+                else "公开文本学习"
+            )
+        else:
+            await self.svc.ai.screen(material, subject, purpose="source", budget_lane=PATROL_LANE)
+            self._ensure_current()
+            summary = await self.svc.ai.generate(
+                material,
+                subject,
+                scenario=Scenario.BILI_LEARNING,
+                budget_lane=PATROL_LANE,
+            )
+            label = "公开文本学习"
+        return summary, label, stop_for_risk
+
     async def _finish(self, key, status, completed, reason=None):
+        result = {"status": status, "learned": completed, "reason": reason}
         async with self.store.transaction():
             await self.store.db.execute(
                 "UPDATE bili_patrol_runs SET status=?,reason=? WHERE id=?", (status, reason, key)
             )
-        return {"status": status, "learned": completed, "reason": reason}
+            if status == "failed":
+                # A later diary/share/write failure cannot undo a stored learning result.
+                row = await self.store.one(
+                    "SELECT COUNT(*) FILTER (WHERE h.status='done' AND length(h.summary)>0), "
+                    "COUNT(*) FILTER (WHERE h.status='uncertain' OR EXISTS "
+                    "(SELECT 1 FROM bili_actions a WHERE a.bvid=h.bvid AND a.status='uncertain')) "
+                    "FROM bili_watched_history h WHERE h.run_id=?",
+                    (key,),
+                )
+                result["learned"] = row[0]
+                if row[1]:
+                    result["requires_review"] = True
+        return result
 
     async def status(self):
         day = self.local().date().isoformat()
@@ -1515,7 +1557,10 @@ class BiliWatcher:
             actions = (
                 await self.store.one("SELECT COUNT(*) FROM bili_actions WHERE day=?", (day,))
             )[0]
-            watched = (await self.store.one("SELECT COUNT(*) FROM bili_watched_history"))[0]
+            watched = await self.history.counts()
+            uncertain_actions = (
+                await self.store.one("SELECT COUNT(*) FROM bili_actions WHERE status='uncertain'")
+            )[0]
         return {
             "config": self.policy.model_dump(),
             "source": "sqlite" if self.overridden else "env",
@@ -1536,7 +1581,9 @@ class BiliWatcher:
             "last_error": state["last_error"],
             "recent_runs": runs,
             "actions_today": actions,
-            "watched_count": watched,
+            "watched_count": watched["done"],
+            "watch_history_counts": watched,
+            "uncertain_actions": uncertain_actions,
             "scheduler": "life_engine",
             "timezone": self.s.bot_timezone,
             "heartbeat_supported": False,
