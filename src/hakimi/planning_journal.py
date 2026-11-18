@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 RECEIPT_READ_TIMEOUT = 2.0
 
@@ -21,6 +23,10 @@ CREATE TABLE IF NOT EXISTS life_plan_runs (
 );
 CREATE INDEX IF NOT EXISTS life_plans_day ON life_plan_runs(day,started);
 CREATE INDEX IF NOT EXISTS life_plans_outcome ON life_plan_runs(outcome,started);
+CREATE UNIQUE INDEX IF NOT EXISTS life_one_morning ON life_plan_runs(day) WHERE trigger='morning';
+CREATE TABLE IF NOT EXISTS life_agenda_items (
+    day TEXT NOT NULL, intent_id TEXT NOT NULL, PRIMARY KEY(day,intent_id)
+);
 CREATE TABLE IF NOT EXISTS life_observed_days (
     day TEXT PRIMARY KEY, first_tick REAL NOT NULL, last_tick REAL NOT NULL
 );
@@ -46,11 +52,37 @@ class PlannerJournal:
                     columns = {
                         r["name"] for r in await self.store.all("PRAGMA table_info(life_plan_runs)")
                     }
-                    for name in ("plan_module", "plan_focus", "plan_mood"):
+                    for name in ("plan_module", "plan_focus", "plan_mood", "thinking_level"):
                         if name not in columns:
                             await self.store.db.execute(
                                 f"ALTER TABLE life_plan_runs ADD COLUMN {name} TEXT"
                             )
+                    if "thinking_level" not in columns and await self.store.one(
+                        "SELECT 1 FROM sqlite_master WHERE name='scheduled_intents'"
+                    ):
+                        # Existing planner tickets already have a run ID in their dedupe key.
+                        # Link them in place; timer/rule/admin work retains its own scheduler.
+                        zone = ZoneInfo(self.store.s.bot_timezone)
+                        today = datetime.fromtimestamp(now, zone).date()
+                        rows = await self.store.all(
+                            "SELECT i.id,i.execute_after FROM scheduled_intents i "
+                            "JOIN life_plan_runs r ON r.id=substr(i.dedupe_key,6,32) "
+                            "WHERE i.origin='planner' AND i.dedupe_key LIKE 'plan:%' "
+                            "AND i.execute_after>=?",
+                            (datetime.combine(today, time.min, zone).timestamp(),),
+                        )
+                        await self.store.db.executemany(
+                            "INSERT OR IGNORE INTO life_agenda_items(day,intent_id) VALUES(?,?)",
+                            [
+                                (
+                                    datetime.fromtimestamp(r["execute_after"], zone)
+                                    .date()
+                                    .isoformat(),
+                                    r["id"],
+                                )
+                                for r in rows
+                            ],
+                        )
                     # On the first upgrade, the preceding release may already have paid
                     # for a plan. Honor its minimum interval when no saved clock exists.
                     last = await self.store.one(
@@ -86,6 +118,7 @@ class PlannerJournal:
             row["next_at"] = min(row["next_at"], row["signal_at"])
         if checkpoint:
             row["next_at"] = 0
+        row["prepared"] = bool(checkpoint)
         row["last_at"], row["last_source"] = tuple(last) if last else (0, "none")
         return row
 
@@ -94,6 +127,14 @@ class PlannerJournal:
             await self.store.db.execute(
                 "UPDATE life_planner_clock SET signal_at=MIN(COALESCE(signal_at,?),?) WHERE id=1",
                 (now, now),
+            )
+
+    async def morning(self, day):
+        async with self.store.lock:
+            return await self.store.one(
+                "SELECT started,source,outcome,thinking_level FROM life_plan_runs "
+                "WHERE day=? AND trigger='morning'",
+                (day,),
             )
 
     async def pause(self, day, now, next_at, reason):
@@ -118,16 +159,39 @@ class PlannerJournal:
         return dict(row), self.store.vault.open("world-plan:" + row["id"], row["checkpoint"])
 
     async def start(
-        self, day, now, *, trigger, next_at, signature, explore_at, events, prior_signal=None
+        self,
+        day,
+        now,
+        *,
+        trigger,
+        next_at,
+        signature,
+        explore_at,
+        events,
+        prior_signal=None,
+        thinking_level=None,
     ):
         run_id = uuid.uuid4().hex
         async with self.store.transaction():
-            await self.store.db.execute(
+            cur = await self.store.db.execute(
                 "INSERT INTO life_plan_runs(id,day,started,trigger,source,outcome,"
-                "next_at,events,signature,explore_at)"
-                " VALUES (?,?,?,?,'pending','running',?,?,?,?)",
-                (run_id, day, now, trigger, next_at, json.dumps(events), signature, explore_at),
+                "next_at,events,signature,explore_at,thinking_level)"
+                " VALUES (?,?,?,?,'pending','running',?,?,?,?,?) "
+                "ON CONFLICT(day) WHERE trigger='morning' DO NOTHING",
+                (
+                    run_id,
+                    day,
+                    now,
+                    trigger,
+                    next_at,
+                    json.dumps(events),
+                    signature,
+                    explore_at,
+                    thinking_level,
+                ),
             )
+            if not cur.rowcount:
+                return None
             # Reserve the next wake before a possibly billable dispatch.
             await self.store.db.execute(
                 "UPDATE life_planner_clock SET next_at=?,signal_at=CASE WHEN signal_at IS ? "
@@ -158,6 +222,8 @@ class PlannerJournal:
         avoided,
         plan=(None, None, None),
         day_rest=None,
+        agenda_changes=(),
+        applied_at=None,
     ):
         async with self.store.transaction():
             row = await self.store.one(
@@ -172,7 +238,58 @@ class PlannerJournal:
                     outcome = "day_rest"
                 else:
                     reasons["day_rest_unavailable"] = 1
-            ids = [await world.insert_intent_tx(ticket, now=row["started"]) for ticket in tickets]
+            edits_applied = 0
+            for key, window in agenda_changes:
+                where = (
+                    "WHERE id=? AND id IN (SELECT intent_id FROM life_agenda_items WHERE day=?) "
+                    "AND origin='planner' AND status='pending' AND execute_after>?"
+                )
+                args = (applied_at, key, row["day"], applied_at)
+                if window is None:
+                    reason = "agenda_cancelled"
+                    cur = await self.store.db.execute(
+                        "UPDATE scheduled_intents SET status='gated_skip',"
+                        "result_reason='agenda_cancelled',updated_at=? " + where,
+                        args,
+                    )
+                else:
+                    reason = "agenda_moved"
+                    cur = await self.store.db.execute(
+                        "UPDATE scheduled_intents SET execute_after=?,expire_at=?,"
+                        "result_reason='agenda_moved',updated_at=? " + where,
+                        (*window, *args),
+                    )
+                if cur.rowcount:
+                    outcome = "agenda_revised"
+                    edits_applied += 1
+                else:
+                    reason = "agenda_item_unavailable"
+                reasons[reason] = reasons.get(reason, 0) + 1
+            ids = []
+            for ticket in tickets:
+                matches = await self.store.all(
+                    "SELECT i.arguments_json FROM life_agenda_items a "
+                    "JOIN scheduled_intents i ON i.id=a.intent_id WHERE a.day=? "
+                    "AND i.action_name=? AND i.target_scope=? AND i.execute_after=? "
+                    "AND i.status IN ('pending','executing','done','uncertain')",
+                    (row["day"], ticket.action_name, ticket.target_scope, ticket.execute_after),
+                )
+                if any(json.loads(m[0]) == ticket.arguments for m in matches):
+                    reasons["agenda_duplicate"] = reasons.get("agenda_duplicate", 0) + 1
+                    continue
+                key = await world.insert_intent_tx(ticket, now=row["started"])
+                await self.store.db.execute(
+                    "INSERT INTO life_agenda_items(day,intent_id) VALUES(?,?)", (row["day"], key)
+                )
+                ids.append(key)
+            if outcome == "accepted" and not ids:
+                outcome = "all_filtered"
+            if outcome == "model_chose_idle" and await self.store.one(
+                "SELECT 1 FROM life_agenda_items a JOIN scheduled_intents i ON i.id=a.intent_id "
+                "WHERE a.day=? AND i.status='pending' AND i.expire_at>? LIMIT 1",
+                (row["day"], applied_at or row["started"]),
+            ):
+                outcome = "agenda_kept"
             await self.store.db.executemany(
                 "UPDATE global_events SET consumed=1 WHERE id=?",
                 [(event,) for event in json.loads(row["events"])],
@@ -185,7 +302,7 @@ class PlannerJournal:
                     source,
                     json.dumps(reasons),
                     candidates,
-                    len(ids),
+                    len(ids) + edits_applied,
                     int(avoided),
                     *plan,
                     run_id,

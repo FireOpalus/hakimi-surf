@@ -80,10 +80,18 @@ class WireLifeIntent(BaseModel):
     target_module: str = ""
     target_scope: str = ""
     action_type: str = ""
+    at_local_time: str = Field(default="", max_length=5)
     delay_minutes: int = 15
     ttl_minutes: int = 60
     intent_note: str
     allow_desktop_care: bool = False
+
+
+class WireAgendaChange(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    intent_id: str = Field(max_length=64)
+    operation: Literal["move", "cancel"]
+    at_local_time: str = Field(default="", max_length=5)
 
 
 class WireLifePlan(BaseModel):
@@ -103,13 +111,18 @@ class WireLifePlan(BaseModel):
     mood_longnick: str = ""
     rest_minutes: Literal[0, 30, 60, 90] = 0
     intents: list[WireLifeIntent] = Field(default_factory=list)
+    agenda_changes: list[WireAgendaChange] = Field(default_factory=list)
 
 
 LIFE_PLAN_RESPONSE_SCHEMA = WireLifePlan.model_json_schema()
 
-LIFE_PLAN_INSTRUCTION = """当前任务是自主生活区块规划器（LifeBlockPlanner），不是实时对话。
-结合当前本地时间、world_state、未消费跨模块事件（unconsumed_events）、近期B站冲浪记录与可用社交目标，
-规划未来2至4小时的计划活动、预期专注度、心情与模糊意图队列（最多3条）。
+LIFE_PLAN_INSTRUCTION = """你是世界引擎的行程规划器。结合当前状态、公开事件与可用动作安排生活。
+planning_mode 为 morning 时，规划从起床到今天结束的行程。参考 activity_windows 内的本地时间，
+按兴趣和精力安排最多六项，可以跨上午、下午和晚间，也可以留白。用 at_local_time 填 HH:MM。
+planning_mode 为 revision 时，先查看 today_agenda 及各项实际状态，再决定是否调整。
+保留合适的安排时无需重新输出它。可以新增最多三项，或在 agenda_changes 中指定未来待办的
+intent_id，用 move 和新的 at_local_time 改期，用 cancel 取消。不要重复已安排或已完成的事项。
+固定日程 reserved_activities 已由模块负责。无需调整时返回空列表。
 只输出符合 schema 的 JSON 对象，包含 current_module、focus_level（LOW|MEDIUM|HIGH）、mood、
 mood_longnick（≤30字纯文本心情个签或空串""）与 intents。
 精力、无聊度和探索倾向由本地实际经历结算。
@@ -1635,6 +1648,7 @@ class GeminiGateway:
         cancel_event=None,
         memory_archive=False,
         life_plan: bool = False,
+        morning_thinking: Literal["medium", "high"] | None = None,
     ) -> str:
         await self._ensure_routing_ready()
         scenario = scenario or (Scenario.BILIBILI_SUMMARY if summary else Scenario.FAST_CHAT)
@@ -1642,6 +1656,10 @@ class GeminiGateway:
             raise Rejected("invalid_generation_scenario")
         if memory_archive and (scenario != Scenario.MEMORY_COMPRESSION or budget_lane != "memory"):
             raise Rejected("invalid_memory_archive")
+        if morning_thinking is not None and (
+            not life_plan or morning_thinking not in ("medium", "high")
+        ):
+            raise Rejected("invalid_life_plan")
         if life_plan and (
             budget_lane != "proactive"
             or memory_archive
@@ -1653,7 +1671,7 @@ class GeminiGateway:
         ):
             raise Rejected("invalid_life_plan")
         plan = (
-            GenerationPlan("medium", 2048)
+            GenerationPlan(morning_thinking or "medium", 4096 if morning_thinking else 2048)
             if life_plan
             else GenerationPlan("medium", 4096, "memory_flex")
             if memory_archive

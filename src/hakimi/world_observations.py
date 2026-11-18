@@ -5,12 +5,14 @@ from collections import Counter, defaultdict
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from .life_agenda import agenda_items
+
 PLAN_LIMIT = 30
 BASELINE_DAYS = 7
 
 _PLAN_SELECT = """
 SELECT r.id,r.day,r.started,r.trigger,r.source,r.outcome,r.candidates,r.accepted,
-       r.reasons,r.avoided,r.next_at,COUNT(l.id) AS calls,
+       r.reasons,r.avoided,r.next_at,r.thinking_level,COUNT(l.id) AS calls,
        COUNT(u.estimated_amount) AS estimated_calls,
        SUM(u.estimated_amount) AS estimated_microdollars,
        COUNT(*) FILTER (WHERE l.status='unknown') AS unknown_calls,
@@ -88,6 +90,7 @@ async def overview(store, now, timezone):
             )
         ]
         today_sample = await store.one("SELECT * FROM life_observed_days WHERE day=?", (today,))
+        itinerary = await agenda_items(store, today)
         days = [today, *(s["day"] for s in sampled)]
         slots = ",".join("?" for _ in days)
         rows = await store.all(
@@ -174,6 +177,8 @@ async def overview(store, now, timezone):
         summary["unobserved_recent_days"] = [d for d in calendar if d not in seen]
     return {
         "today": day_summary(today, today_sample),
+        "morning_plan": next((r for r in by_day[today] if r["trigger"] == "morning"), None),
+        "agenda": itinerary,
         "today_actions": actions,
         "next_action": dict(next_job) if next_job else None,
         "recent_plans": plans[:PLAN_LIMIT],

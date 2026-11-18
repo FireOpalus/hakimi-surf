@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from .budget_policy import PROACTIVE_LANE, paid_lane_available
 from .config import Settings
 from .gemini import WireLifePlan
+from .life_agenda import MORNING_INTENT_LIMIT, REVISION_INTENT_LIMIT, agenda_day, agenda_items
 from .life_config_compat import (
     LegacyScheduleAccess,
     import_old_proactive,
@@ -59,6 +60,7 @@ class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
     enabled: bool = True
     quiet_hours: str = "23:30-08:30"
     active_hours: str = "09:00-01:00"
+    morning_thinking_level: Literal["medium", "high"] = "medium"
     planner_min_minutes: int = Field(default=120, ge=30, le=720)
     planner_max_minutes: int = Field(default=240, ge=60, le=720)
     sleep_min_minutes: int = Field(default=360, ge=120, le=960)
@@ -151,7 +153,7 @@ def _digest_window(day: date, zone: ZoneInfo, active: str, quiet: str, rest: str
 
 
 class LifeBlockPlanner:
-    """Macro 2~4h life block planner + circadian sleep scheduler + milestone impulse subscriber."""
+    """Write one waking-day itinerary and revisit it on events or periodic reviews."""
 
     def __init__(
         self,
@@ -179,28 +181,47 @@ class LifeBlockPlanner:
     def _local(self, stamp: float) -> datetime:
         return datetime.fromtimestamp(stamp, _zone(self.s.bot_timezone))
 
-    def _next_morning_timestamp(self, now: float, cfg: LifeEngineConfig) -> float | None:
-        base_min = int(now // 60) * 60
-        for step in range(5, 24 * 60 + 5, 5):
-            cand = float(base_min + step * 60)
-            if cfg.is_active_time(self._local(cand)) and not self.store.runtime.is_resting(cand):
-                refined = cand
-                for back in range(1, 5):
-                    prev_t = cand - back * 60
-                    if (
-                        prev_t > now
-                        and cfg.is_active_time(self._local(prev_t))
-                        and not self.store.runtime.is_resting(prev_t)
-                    ):
-                        refined = prev_t
-                return refined
-        return None
+    def calendar(self, day):
+        rest = self.store.runtime.rest_hours
+        return agenda_day(
+            day,
+            _zone(self.s.bot_timezone),
+            self.config.active_hours,
+            self.config.quiet_hours,
+            rest.rest_hours if rest.enabled else None,
+        )
+
+    async def sync_wake(self, now, state=None):
+        """A saved review clock cannot push the next morning past wake-up."""
+        state = state or await self.journal.clock()
+        self.next_plan_at = state["next_at"]
+        if not self.config.enabled or not self.service.modules.active():
+            return False
+        today = self.calendar(self._local(now).date())
+        seen = await self.journal.morning(today.day.isoformat())
+        awake_at = max(now, self.store.runtime.day_rest_end(now))
+        due = None if seen else today.morning_due_at(awake_at)
+        if due is None:
+            tomorrow = self.calendar(today.day + timedelta(days=1))
+            due = tomorrow.morning_due_at(awake_at)
+        if due is not None:
+            self.next_plan_at = min(self.next_plan_at, due)
+        return due is not None and due <= now
 
     def _schedule_sleep_wakeup(self, now: float, cfg: LifeEngineConfig) -> float:
         sleep_min = cfg.sleep_min_minutes * 60.0
         sleep_max = cfg.sleep_max_minutes * 60.0
         raw_wake = now + self.rng.uniform(sleep_min, sleep_max)
-        morning_ts = self._next_morning_timestamp(now, cfg)
+        today = self._local(now).date()
+        morning_ts = next(
+            (
+                start
+                for d in (today, today + timedelta(days=1))
+                for start, _ in self.calendar(d).windows
+                if start > now
+            ),
+            None,
+        )
         if morning_ts is not None and morning_ts <= now + sleep_max:
             cap = max(
                 morning_ts,
@@ -216,7 +237,7 @@ class LifeBlockPlanner:
         state = await self.journal.initialize(
             self.clock(), initial_interval=self.config.planner_min_minutes * 60
         )
-        self.next_plan_at = state["next_at"]
+        await self.sync_wake(self.clock(), state)
         self.last_plan_at, self.last_plan_source = state["last_at"], state["last_source"]
 
     async def plan_once(
@@ -230,8 +251,8 @@ class LifeBlockPlanner:
         day = self._local(ts).date().isoformat()
         cfg = self.config
         ws = self.service.world_state
-        if automatic and ts < state["next_at"]:
-            self.next_plan_at = state["next_at"]
+        morning = await self.sync_wake(ts, state)
+        if automatic and ts < self.next_plan_at:
             return {"status": "not_due", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
         if not cfg.enabled or not self.service.modules.active():
             reason = "disabled" if not cfg.enabled else "no_active_modules"
@@ -248,16 +269,24 @@ class LifeBlockPlanner:
             self.last_plan_at, self.last_plan_source = ts, "day_rest"
             return {"status": "day_rest", "next_plan_at": nap_end, "intents_enqueued": 0}
         local_dt = self._local(ts)
-        if (
-            not cfg.is_active_time(local_dt)
-            or cfg.quiet(local_dt)
-            or self.store.runtime.is_resting(ts)
+        calendar = self.calendar(local_dt.date())
+        checkpoint = await self.journal.prepared() if state["prepared"] else None
+        resume_morning = (
+            checkpoint
+            and checkpoint[0]["trigger"] == "morning"
+            and checkpoint[0]["day"] == day
+            and calendar.morning_due_at(ts) == ts
+        )
+        if self.store.runtime.is_resting(ts) or (
+            not (morning or resume_morning)
+            and (not cfg.is_active_time(local_dt) or cfg.quiet(local_dt) or ts < calendar.wake)
         ):
             wake_at = self._schedule_sleep_wakeup(ts, cfg)
             self.last_plan_at = ts
             self.last_plan_source = "sleeping"
             await self.journal.pause(day, ts, wake_at, "sleeping")
-            return {"status": "sleeping", "next_plan_at": wake_at, "intents_enqueued": 0}
+            await self.sync_wake(ts, {"next_at": wake_at})
+            return {"status": "sleeping", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
 
         current = ws.current
         events = await ws.unconsumed_events(limit=20)
@@ -325,10 +354,11 @@ class LifeBlockPlanner:
             ),
         )
         public_events = planner_payload["unconsumed_events"]
-        checkpoint = await self.journal.prepared()
         if checkpoint:
             row, body = checkpoint
             run_id, scheduled_at, next_at = row["id"], row["started"], row["next_at"]
+            morning = row["trigger"] == "morning"
+            calendar = self.calendar(date.fromisoformat(row["day"]))
             plan = WireLifePlan.model_validate(body)
             plan_source = row["source"]
             reasons = json.loads(row["reasons"])
@@ -340,13 +370,16 @@ class LifeBlockPlanner:
             planner_funded = paid_lane_available(budget, PROACTIVE_LANE)
             quiet = bool(
                 automatic
+                and not morning
                 and not public_events
                 and state["signature"] == signature
                 and ts < state["explore_at"]
                 and planner_funded
             )
             trigger = (
-                "manual"
+                "morning"
+                if morning
+                else "manual"
                 if not automatic
                 else "milestone"
                 if public_events
@@ -371,7 +404,15 @@ class LifeBlockPlanner:
                 explore_at=explore_at,
                 events=[ev.id for ev in events],
                 prior_signal=state["signal_at"],
+                thinking_level=cfg.morning_thinking_level if morning else "medium",
             )
+            if run_id is None:
+                await self.sync_wake(ts)
+                return {
+                    "status": "not_due",
+                    "next_plan_at": self.next_plan_at,
+                    "intents_enqueued": 0,
+                }
             if quiet or not offered:
                 reason = "unchanged_state" if quiet else "no_available_actions"
                 await self.journal.commit(
@@ -385,7 +426,7 @@ class LifeBlockPlanner:
                     avoided=planner_funded,
                 )
                 self.last_plan_at, self.last_plan_source = ts, "local_idle"
-                self.next_plan_at = (await self.journal.clock())["next_at"]
+                await self.sync_wake(ts)
                 return {
                     "status": "resting",
                     "reason": reason,
@@ -399,6 +440,7 @@ class LifeBlockPlanner:
             if planner_funded:
                 subject = self.store.vault.digest("life-planner", self.s.namespace)
                 try:
+                    planner_payload.update(await self.agenda_context(calendar, ts, morning))
                     with model_work("world.plan", run_id):
                         raw_plan = await self.service.ai.generate(
                             {
@@ -409,8 +451,19 @@ class LifeBlockPlanner:
                             subject,
                             budget_lane=PROACTIVE_LANE,
                             life_plan=True,
+                            morning_thinking=cfg.morning_thinking_level if morning else None,
                         )
                     plan = WireLifePlan.model_validate_json(raw_plan)
+                    if plan.agenda_changes:
+                        editable = {
+                            i["id"]
+                            for i in planner_payload["today_agenda"]
+                            if i["status"] == "pending" and not morning
+                        }
+                        valid = [edit for edit in plan.agenda_changes if edit.intent_id in editable]
+                        if ignored := len(plan.agenda_changes) - len(valid):
+                            reasons["agenda_item_unavailable"] = ignored
+                        plan = plan.model_copy(update={"agenda_changes": valid})
                     plan_source = "llm"
                 except asyncio.CancelledError:
                     raise
@@ -435,13 +488,18 @@ class LifeBlockPlanner:
         resolved_mood = sanitize_sensor_text(plan.mood, self.s, max_tokens=16) or "calm"
 
         tickets = []
+        # Forged IDs were discarded before checkpointing. They are still audit candidates.
+        edit_candidates = len(plan.agenda_changes) + reasons.get("agenda_item_unavailable", 0)
 
         def skip(reason):
             reasons[reason] = reasons.get(reason, 0) + 1
 
-        if len(plan.intents) > 3:
-            reasons["round_cap"] = len(plan.intents) - 3
-        for index, item in enumerate(plan.intents[:3]):
+        limit = MORNING_INTENT_LIMIT if morning else REVISION_INTENT_LIMIT
+        if len(plan.intents) > limit:
+            reasons["round_cap"] = len(plan.intents) - limit
+        applied_at = ts + max(0, self.clock() - entered)
+        calendar = self.calendar(calendar.day)
+        for index, item in enumerate(plan.intents[:limit]):
             raw_note = str(item.intent_note or "").strip()
             if not raw_note:
                 skip("empty_note")
@@ -487,13 +545,17 @@ class LifeBlockPlanner:
                 skip("unavailable_action")
                 continue
 
-            delay_sec = max(60.0, min(float(item.delay_minutes) * 60.0, 4.0 * 3600.0))
             ttl_sec = max(600.0, min(float(item.ttl_minutes) * 60.0, 6.0 * 3600.0))
-            execute_after = scheduled_at + delay_sec
-            expire_at = execute_after + ttl_sec
-            if expire_at <= ts:
+            window = calendar.window(
+                at=item.at_local_time,
+                earliest=scheduled_at + 1,
+                relative=scheduled_at + max(1, item.delay_minutes) * 60,
+                ttl=ttl_sec,
+            )
+            if not window or window[1] <= applied_at:
                 skip("window_expired")
                 continue
+            execute_after, expire_at = window
             gate_cond = {"allow_desktop_care": True} if item.allow_desktop_care else {}
             if (
                 plan_source == "local_fallback"
@@ -521,11 +583,46 @@ class LifeBlockPlanner:
                 continue
             tickets.append(ticket)
 
+        changes = []
+        if plan.agenda_changes and not morning and plan_source == "llm":
+            async with self.store.lock:
+                items = await agenda_items(self.store, calendar.day.isoformat())
+            pending = {
+                i["id"]: i
+                for i in items
+                if i["status"] == "pending" and i["execute_after"] > applied_at
+            }
+            if len(plan.agenda_changes) > MORNING_INTENT_LIMIT:
+                reasons["round_cap"] = (
+                    reasons.get("round_cap", 0) + len(plan.agenda_changes) - MORNING_INTENT_LIMIT
+                )
+            for change in plan.agenda_changes[:MORNING_INTENT_LIMIT]:
+                item = pending.pop(change.intent_id, None)
+                if not item:
+                    skip("agenda_item_unavailable")
+                    continue
+                window = None
+                if change.operation == "move":
+                    window = (
+                        calendar.window(
+                            at=change.at_local_time,
+                            earliest=applied_at + 1,
+                            relative=0,
+                            ttl=item["expire_at"] - item["execute_after"],
+                        )
+                        if change.at_local_time
+                        else None
+                    )
+                    if not window:
+                        skip("invalid_agenda_time")
+                        continue
+                changes.append((change.intent_id, window))
+
         outcome = (
             "accepted"
             if tickets
             else "all_filtered"
-            if plan.intents
+            if plan.intents or edit_candidates
             else "model_chose_idle"
             if plan_source == "llm"
             else "local_idle"
@@ -542,20 +639,22 @@ class LifeBlockPlanner:
             ws,
             run_id,
             tickets=tickets,
-            candidates=len(plan.intents),
+            candidates=len(plan.intents) + edit_candidates,
             source=plan_source,
             outcome=outcome,
             reasons=reasons,
             avoided=False,
             plan=(resolved_module, resolved_focus, resolved_mood),
             day_rest=day_rest,
+            agenda_changes=changes,
+            applied_at=applied_at,
         )
         if day_rest:
             await ws.refresh()
-        self.next_plan_at = (await self.journal.clock())["next_at"]
+        await self.sync_wake(applied_at)
 
         longnick_text = str(plan.mood_longnick or "").strip()
-        if longnick_text:
+        if longnick_text and any(start <= applied_at < end for start, end in calendar.windows):
             longnick = getattr(self.service, "longnick", None)
             if longnick is not None:
                 if hasattr(longnick, "apply_life_block"):
@@ -577,6 +676,7 @@ class LifeBlockPlanner:
         self.last_plan_source = plan_source
         return {
             "status": "planned",
+            "planning_mode": "morning" if morning else "revision",
             "source": plan_source,
             "current_module": resolved_module,
             "focus_level": resolved_focus,
@@ -584,6 +684,44 @@ class LifeBlockPlanner:
             "intents_enqueued": len(enqueued_ids),
             "intent_ids": enqueued_ids,
             "next_plan_at": self.next_plan_at,
+        }
+
+    async def agenda_context(self, calendar, now, morning):
+        async with self.store.lock:
+            rows = await agenda_items(self.store, calendar.day.isoformat())
+        remaining = [r for r in rows if r["status"] in ("pending", "executing")]
+        history = [r for r in rows if r["status"] not in ("pending", "executing")]
+        reserved = []
+        for module in self.service.modules.active():
+            for slot in module.schedules():
+                at = await self.engine.next_slot_at(module, slot, now)
+                if at is not None and self._local(at).date() == calendar.day:
+                    reserved.append(
+                        {"action": slot.name, "time": self._local(at).strftime("%H:%M")}
+                    )
+        return {
+            "planning_mode": "morning" if morning else "revision",
+            "activity_windows": [
+                [
+                    self._local(a).strftime("%H:%M"),
+                    self._local(b).strftime("%H:%M")
+                    if self._local(b).date() == calendar.day
+                    else "24:00",
+                ]
+                for a, b in calendar.windows
+                if b > now
+            ],
+            "today_agenda": [
+                {
+                    "id": r["id"],
+                    "action": r["action_name"],
+                    "time": self._local(r["execute_after"]).strftime("%H:%M"),
+                    "status": r["status"],
+                    "note": r["note"],
+                }
+                for r in (history[-6:] + remaining[:16])
+            ],
+            "reserved_activities": reserved,
         }
 
     async def on_milestone_event(self, event: MilestoneEvent) -> str | None:
@@ -1030,6 +1168,7 @@ class LifeEngine:
                         (module.module_id,),
                     )
             module.enabled = enabled
+            await self.planner.sync_wake(self.clock())
             self.wakeup.set()
             if changed:
                 await module.on_switch(self.service)
@@ -1250,6 +1389,7 @@ class LifeEngine:
                 self.config = cfg
                 self.overridden = True
             await self.trim_day_rest(self.clock())
+            await self.planner.sync_wake(self.clock())
         self.wakeup.set()
         return await self.status()
 
@@ -1257,7 +1397,10 @@ class LifeEngine:
         self, *, now: float | None = None, automatic: bool = False
     ) -> dict[str, Any]:
         await self.initialize()
+        joined = self._plan_lock.locked()
         async with self._plan_lock:
+            if joined:
+                return {"status": "coalesced", "next_plan_at": self.planner.next_plan_at}
             if automatic and self.planner.next_plan_at > (self.clock() if now is None else now):
                 return {"status": "scheduled", "next_plan_at": self.planner.next_plan_at}
             return await self.planner.plan_once(now=now, automatic=automatic)
@@ -1344,6 +1487,8 @@ class LifeEngine:
             await self.service.world_state.experience.advance(now)
             await self.store.runtime.set_rest_hours(value)
             await self.trim_day_rest(now)
+            if self.planner.journal.ready:
+                await self.planner.sync_wake(now)
         self.wakeup.set()
         return self.store.runtime.rest_hours_status(now)
 

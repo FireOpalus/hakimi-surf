@@ -1982,6 +1982,9 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   <div class="card" id="world-observation-card" hidden>
     <h2>今天的行动与规划</h2>
     <div id="world-day-stats" class="stats"></div>
+    <h3>今日行程</h3>
+    <p id="world-morning" class="muted"></p>
+    <div id="world-agenda" class="table"></div>
     <p id="world-next"></p>
     <p id="world-quiet" class="muted"></p>
     <div id="world-daily-actions" class="pill-row"></div>
@@ -2038,7 +2041,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </form>
   </div>
   <div class="card"><h2>主动引擎调度</h2>
-    <p class="muted">各模块共用下列时段、规划间隔和每日次数。<button type="button" class="secondary" data-open-tab="modules">打开功能模块</button></p>
+    <p class="muted">起床时规划当天的行程。执行时遵守活跃时段与免打扰，白天可根据新事件调整待办。<button type="button" class="secondary" data-open-tab="modules">打开功能模块</button></p>
     <p id="life-source" class="muted"></p>
     <form id="life-config-form">
       <div class="row"><label><input id="life-enabled" type="checkbox"> 启用双层生命与主动引擎</label></div>
@@ -2046,6 +2049,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <label for="life-active-hours">活跃时段（HH:MM-HH:MM）<input id="life-active-hours" type="text" maxlength="11" placeholder="09:00-01:00" required></label>
         <label for="life-quiet-hours">主动免打扰时段<input id="life-quiet-hours" type="text" maxlength="11" placeholder="23:30-08:30" required></label>
         <label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label>
+        <label for="life-morning-thinking">晨间规划思考强度<select id="life-morning-thinking"><option value="medium">medium · 标准</option><option value="high">high · 深入</option></select></label>
       </div>
       <details>
         <summary>规划与休眠间隔</summary>
@@ -2059,7 +2063,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div class="row">
         <button id="life-save-config" type="submit" disabled>保存引擎配置</button>
         <button id="life-reset-config" type="button" class="secondary" disabled>恢复全局调度默认值</button>
-        <button id="life-plan-now" type="button" class="secondary" disabled>立即规划生活切片</button>
+        <button id="life-plan-now" type="button" class="secondary" disabled>立即规划或调整行程</button>
         <button id="life-gatekeeper-now" type="button" class="secondary" disabled>执行零Token门控扫描</button>
       </div>
     </form>
@@ -3099,6 +3103,9 @@ function lifeSummaryJson(obj){
   return String(obj);
 }
 const planLabels={
+  morning:'晨间行程',planned:'已规划',scheduled:'等待下次规划',not_due:'尚未到点',resting:'本轮留白',agenda_revised:'已调整行程',agenda_kept:'沿用已有行程',agenda_moved:'已改期',agenda_cancelled:'已取消',
+  agenda_item_unavailable:'事项已开始或不属于本轮待办',invalid_agenda_time:'改期超出可用时段',
+  agenda_duplicate:'同一时刻已安排该动作',coalesced:'已与正在进行的规划合并',
   accepted:'已采纳',all_filtered:'所有建议均被过滤',day_rest:'白天小憩',day_rest_unavailable:'当前不适合小憩',model_chose_idle:'选择清醒空闲',model_chose_rest:'模型决定休息',local_rest:'本地规划决定休息',
   unchanged_state:'状态与可用动作未变，延后付费规划',no_available_actions:'当前没有可用动作',
   sleeping:'休眠时段',disabled:'引擎关闭',running:'规划进行中',prepared:'规划已保存，待登记动作',
@@ -3125,6 +3132,12 @@ function renderWorldObservation(o,eng,tz){
   $('world-observation-card').hidden=!o;
   if(!o)return;
   const day=o.today,latest=o.recent_plans[0],job=o.next_action;
+  const morning=o.morning_plan;
+  text('world-morning',morning?'晨间规划 '+lifeFmt(morning.started,tz)+' · '+planLabel(morning.source)+(morning.source==='llm'?' · '+morning.thinking_level:'')+' · '+planLabel(morning.outcome):'今天尚无晨间规划');
+  table('world-agenda',['计划时间','活动','意图','进度'],(o.agenda||[]).map(a=>[
+    lifeFmt(a.execute_after,tz),a.action_name,a.note||'—',
+    ['agenda_cancelled','agenda_moved'].includes(a.result_reason)?planLabel(a.result_reason):(lifeIntentStatus[a.status]||a.status)
+  ]));
   const kpis=[['今日规划',day.runs+' 轮'],['候选 / 采纳',day.candidates+' / '+day.accepted],['本地省下的付费规划',day.avoided+' 轮'],['今日规划费用',planCost(day.cost)]];
   $('world-day-stats').replaceChildren(...kpis.map(([k,v])=>{const stat=el('div',undefined,'stat');stat.append(el('small',k),el('strong',v));return stat;}));
   text('world-next','下次规划 '+lifeFmt(eng.next_plan_at,tz)+' · '+(job?(job.origin==='timer'?'下个定时动作 ':'下个待执行动作 ')+(job.label||job.action)+'，可执行时间 '+lifeFmt(job.execute_after,tz):'当前没有待执行动作'));
@@ -3153,7 +3166,7 @@ function renderLife(d){
   const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',qq_processing:'正在处理 QQ 消息',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
   const name=k=>labels[k]||k||'—';
   const restingPlan=plan&&['model_chose_rest','model_chose_idle','sleeping','local_rest','local_idle','unchanged_state','no_available_actions'].includes(plan.outcome);
-  const planned=plan?(plan.outcome==='day_rest'?'白天小憩':restingPlan?'本轮未安排动作':plan.plan_module?name(plan.plan_module)+' · '+(plan.accepted||0)+' 个动作':'本轮已结束'):'等待首次规划';
+  const planned=plan?(plan.outcome==='day_rest'?'白天小憩':plan.outcome==='agenda_kept'||plan.outcome==='agenda_revised'?planLabel(plan.outcome):restingPlan?'本轮未安排动作':plan.plan_module?name(plan.plan_module)+' · '+(plan.accepted||0)+' 个动作':'本轮已结束'):'等待首次规划';
   const stats=[
     ['本时段计划',planned],
     ['实际活动',name(actual.state)+(actual.day_rest_until?' · '+(actual.day_rest_source==='low_energy'?'精力偏低':'自主选择')+' · '+lifeFmt(actual.day_rest_until,tz)+' 醒来':'')+(actual.mc_task?' · '+name(actual.mc_task):'')],
@@ -3204,6 +3217,7 @@ function renderLife(d){
   $('life-quiet-hours').value=c.quiet_hours||'23:30-08:30';
   $('life-active-hours').value=c.active_hours||'09:00-01:00';
   $('life-max-daily').value=c.max_proactive_per_day??6;
+  $('life-morning-thinking').value=c.morning_thinking_level||'medium';
   $('life-planner-min').value=c.planner_min_minutes??120;
   $('life-planner-max').value=c.planner_max_minutes??240;
   $('life-sleep-min').value=c.sleep_min_minutes??360;
@@ -3211,7 +3225,7 @@ function renderLife(d){
   const srcLabel=(d.source==='admin'||d.source==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
   const planSrcLabels={llm:'模型规划',sleeping:'夜间休眠',local_fallback:'本地兜底',milestone:'里程碑重规划',none:'尚未规划'};
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
-  text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+zoneLabel(tz)+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
+  text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+zoneLabel(tz)+(eng.next_plan_at?' · 下次行程规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
   for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
   table('life-digests',['日期','进度','已生成','已排队','QQ 已确认'],(d.digest_history||[]).map(r=>[
     r.day,deliveryStages[r.stage]||r.stage,lifeFmt(r.generated_at,tz),lifeFmt(r.queued_at,tz),lifeFmt(r.confirmed_at,tz)
@@ -3275,6 +3289,7 @@ $('life-config-form').addEventListener('submit',e=>{
       enabled:$('life-enabled').checked,
       active_hours:activeHours,
       quiet_hours:$('life-quiet-hours').value.trim(),
+      morning_thinking_level:$('life-morning-thinking').value,
       planner_min_minutes:pMin,
       planner_max_minutes:pMax,
       sleep_min_minutes:sMin,
@@ -3314,10 +3329,10 @@ $('life-mc-idle').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('idle
 $('life-mc-pause').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('pause')));
 $('life-mc-resume').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('resume')));
 $('life-plan-now').addEventListener('click',e=>busy(e.target,async()=>{
-  notice('正在规划生活切片，请稍候…');
+  notice('正在规划今日行程…');
   const r=await api('life/plan','POST');
   await life();
-  notice('生活切片规划完成：'+(r.status||'ok'));
+  notice('行程规划结果：'+planLabel(r.status||'planned'));
 }));
 $('life-gatekeeper-now').addEventListener('click',e=>busy(e.target,async()=>{
   notice('正在执行零 Token 门控扫描…');

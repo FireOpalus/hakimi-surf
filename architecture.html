@@ -146,7 +146,7 @@
       </div>
       <figure class="sheet" style="margin-top:.85rem" aria-label="生活引擎：规划、门控、临场执行">
         <ol class="flow sea">
-          <li><span class="step">01 / LifeBlockPlanner</span><h3>安排活动，不预写台词</h3><p>从同一动作目录读取当下可规划的动作、参数、模块摘要和待规划事件。活跃时段默认每 2–4 小时规划；预算允许时请求结构化 <code>life_plan</code>，不可用则用本地计划。每轮最多接纳 3 条有效意图。</p></li>
+          <li><span class="step">01 / LifeBlockPlanner</span><h3>起床排行程，白天按需调整</h3><p>每天起床时从动作目录选最多 6 项，按当天的可用时段安排。晨间思考可选 medium 或 high。白天默认每 2–4 小时复查，重要公开事件可提前触发。规划器读取行程与回执，可改期、取消未来待办，或新增最多 3 项。</p></li>
           <li><span class="step">02 / GatekeeperWorker</span><h3>到点再判断能否做</h3><p>每分钟检查待办的有效期、免打扰和专注状态。QQ 与 B 站巡逻核对预算。QQ 另查接收人、会话占用和冷却，进服类 MC 动作核对角色在线。</p></li>
           <li><span class="step">03 / JITExecutor</span><h3>按目标执行</h3><p>SQLite 原子领取票据，再调用登记好的处理器。<code>qq.speak</code> 临场生成并逐气泡确认，<code>bili.patrol</code> 运行既有巡逻，<code>mc.*</code> 走境内固定 RPC。</p></li>
         </ol>
@@ -224,6 +224,7 @@
         <article class="tile sea"><span class="step">SQLite / hakimi.sqlite3</span><h3>全局调度与账本</h3>
           <dl class="kv"><div><dt><code>world_state</code></dt><dd>单行快照与最近主动活动时间。</dd></div>
             <div><dt><code>scheduled_intents</code></dt><dd>目标模块、投递范围、到期时间、门控条件、状态；保存意图而非预写聊天台词。</dd></div>
+            <div><dt><code>life_plan_runs / life_agenda_items</code></dt><dd>按本地日期唯一登记晨间规划。行程项关联执行队列，日内调整和事件消费在同一笔事务提交。</dd></div>
             <div><dt><code>global_events</code></dt><dd>模块里程碑、重要性和消费状态；规划器读取未消费事件。</dd></div>
             <div><dt><code>group_proactive_cooldown</code></dt><dd>各群最近主动发言时间。配置、预算、出站回执与 Owner 私信队列也由主库存储。</dd></div></dl>
         </article>

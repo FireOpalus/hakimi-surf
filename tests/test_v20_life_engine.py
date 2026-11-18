@@ -193,7 +193,10 @@ def test_assemble_chat_input_jit_intent_and_byte_identity(settings, message, mon
     assert "jit_proactive_intent" not in dropped_out
 
 
-async def test_gemini_life_plan_interactions_and_vertex_gc(settings, store, sdk_pair):
+@pytest.mark.parametrize("morning_thinking", [None, "medium", "high"])
+async def test_gemini_life_plan_interactions_and_vertex_gc(
+    settings, store, sdk_pair, morning_thinking
+):
     calls: list[dict] = []
     plan_text = json.dumps(
         {
@@ -226,12 +229,17 @@ async def test_gemini_life_plan_interactions_and_vertex_gc(settings, store, sdk_
             "subj",
             budget_lane="proactive",
             life_plan=True,
+            morning_thinking=morning_thinking,
         )
         assert json.loads(result)["mood"] == "relaxed"
         gen_req = next(c for c in calls if c["path"].endswith("interactions"))
         assert gen_req["body"]["store"] is False
-        assert gen_req["body"]["generation_config"]["thinking_level"] == "medium"
-        assert gen_req["body"]["generation_config"]["max_output_tokens"] == 2048
+        assert gen_req["body"]["generation_config"]["thinking_level"] == (
+            morning_thinking or "medium"
+        )
+        assert gen_req["body"]["generation_config"]["max_output_tokens"] == (
+            4096 if morning_thinking else 2048
+        )
         assert gen_req["body"]["response_format"]["schema"] == LIFE_PLAN_RESPONSE_SCHEMA
         assert LIFE_PLAN_INSTRUCTION in gen_req["body"]["system_instruction"]
         dec_req = next(c for c in calls if c["path"].endswith("decisions"))
@@ -282,12 +290,14 @@ async def test_gemini_life_plan_interactions_and_vertex_gc(settings, store, sdk_
             "subj-v",
             budget_lane="proactive",
             life_plan=True,
+            morning_thinking=morning_thinking,
         )
         assert json.loads(out_v)["current_module"] == "idle"
         gc_req = next(c for c in vertex_calls if "generateContent" in c["path"])
         gen_cfg = gc_req["body"]["generationConfig"]
         assert gen_cfg["responseMimeType"] == "application/json"
         assert gen_cfg["responseJsonSchema"] == LIFE_PLAN_RESPONSE_SCHEMA
+        assert gen_cfg["thinkingConfig"]["thinking_level"] == (morning_thinking or "medium").upper()
     finally:
         await gate_v.close()
         await _close_clients([*v_clients, *d_clients], [*v_transports, *d_transports])
