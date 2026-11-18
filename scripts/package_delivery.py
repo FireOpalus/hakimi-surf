@@ -6,17 +6,14 @@ import tomllib
 import zipfile
 from pathlib import Path
 
+from platform_checkout import CATALOG, check_entry, read_manifest
+
 root = Path(__file__).resolve().parents[1]
 version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-platforms = root / "src/hakimi/modules/platforms"
-for entry in (
-    "qq/qq_social.py",
-    "bilibili/bilibili_surf.py",
-    "minecraft/minecraft_slot.py",
-    "weather/weather.py",
-):
-    if not (platforms / entry).is_file():
-        raise SystemExit(f"Missing {entry}. Run git submodule update --init --recursive.")
+installed = read_manifest(CATALOG)
+platform_names = {p.name for p in installed}
+for platform in installed:
+    check_entry(CATALOG, platform)
 output = root / "dist"
 output.mkdir(exist_ok=True)
 files = [
@@ -52,7 +49,17 @@ for directory, pattern in (
     ("docs", "*.md"),
 ):
     files.extend(p for p in (root / directory).rglob(pattern) if ".git" not in p.parts)
-files = sorted(set(files))
+files.append(CATALOG / ".gitmodules")
+platforms = CATALOG / "platforms"
+files = sorted(
+    {
+        p
+        for p in files
+        if not p.is_relative_to(platforms)
+        or p.parent == platforms
+        or p.relative_to(platforms).parts[0] in platform_names
+    }
+)
 if any(p.is_symlink() or not p.is_file() for p in files):
     raise RuntimeError("Delivery source must be regular files")
 manifest = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}

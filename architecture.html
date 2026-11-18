@@ -138,7 +138,7 @@
 
     <section class="chapter" id="life" aria-labelledby="life-title">
       <div class="heading"><span class="num">02</span><h2 id="life-title">从世界状态到一次主动行动</h2></div>
-      <p class="intro"><code>Service</code> 向 <code>ModuleRegistry</code> 注册 QQ、B 站、MC，以及按配置启用的天气模块。每个模块声明自己的动作、就绪条件与调度设置。世界引擎读取登记的策略来规划时段、检查次数和执行意图。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
+      <p class="intro">启动时，引擎从模块目录的 <code>.gitmodules</code> 读取已安装仓库，逐个加载 <code>plugin.py</code>，并把返回的模块登记到 <code>ModuleRegistry</code>。后台目录显示所有已登记模块及其开关。每个模块声明自己的动作、就绪条件与调度设置。世界引擎读取登记的策略来规划时段、检查次数和执行意图。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
       <div class="grid three">
         <article class="tile sea"><span class="step">LOW · qq_social</span><h3>QQ 社交</h3><p>汇总传输状态、活跃群和缓冲条数。这里不读取 Owner 私聊正文。</p></article>
         <article class="tile blue"><span class="step">MEDIUM · bilibili_surf</span><h3>B 站冲浪</h3><p>境外组织巡逻；境内节点在线且启用委派时，可由境内代采。传感摘要区分采集状态和最近记录。</p></article>
@@ -153,7 +153,7 @@
         <p class="return"><strong>回执与恢复</strong>　QQ 气泡逐条确认。重启时完整文本回执可还原成功，部分回执和执行中失联的游戏动作记为待核实。意图分别记录 <code>done</code>、<code>gated_skip</code>、<code>expired</code> 或 <code>uncertain</code>；仍在有效期内的暂时冲突可以延后。</p>
         <figcaption class="caption">进入游戏且未暂停时可切换为 <code>minecraft / HIGH</code>；暂停或离线后可回到 <code>idle / LOW</code>。高专注暂停低专注模块的主动行为；被点名的 QQ 消息仍可回复，普通群聊新消息优先做上下文。脱敏传感摘要只加在动态消息尾部，空闲基线不注入。</figcaption>
         <p class="bridge"><strong>第四个模块 · 定点天气</strong>　本地时段 → <code>weather.read</code> → 气温与天气代码。打开 Owner 天气提醒后，<code>weather.owner_report</code> 单独排队 <code>qq.speak</code>。天气读取默认关闭。</p>
-        <p class="ref"><b>源码</b><a href="src/hakimi/service.py">模块装配</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/platforms/minecraft/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
+        <p class="ref"><b>源码</b><a href="src/hakimi/modules/.gitmodules">安装清单</a><a href="src/hakimi/modules/__init__.py">启动注册</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/platforms/minecraft/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
       </figure>
     </section>
 

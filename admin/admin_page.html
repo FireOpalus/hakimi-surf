@@ -3636,12 +3636,6 @@ $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
 const modulePage=new Map([['qq_social','qq'],['bilibili_surf','bili'],['minecraft','minecraft'],['weather','weather']]);
-const moduleDescriptions=new Map([
-  ['qq_social','OneBot 连接、群聊管理与主动私信'],
-  ['bilibili_surf','账号、视频订阅与巡逻日记'],
-  ['minecraft','游戏连接、活动目标与建造计划'],
-  ['weather','观测地点、每小时天气与每日提醒']
-]);
 const regionName=code=>({CN:'境内节点',KR:'境外节点'})[code]||code;
 const weatherLocationPath='life/modules/weather/location';
 const weatherSources={environment:'环境默认',coordinates:'手动经纬度',city:'城市搜索',server_ip:'服务器 IP'};
@@ -3818,7 +3812,7 @@ function moduleSchedulePanel(d){
   return panel;
 }
 const switchingModules=new Set();
-const moduleTitle=id=>modulePage.has(id)?sections.get(modulePage.get(id)).title:id;
+const moduleTitle=m=>m.title||(modulePage.has(m.id)?sections.get(modulePage.get(m.id)).title:m.id);
 function moduleIssue(d){
   return d.configuration_issue==='weather_location_missing'?'尚未设置观测地点':d.configuration_issue||'';
 }
@@ -3834,7 +3828,7 @@ function moduleSwitch(d){
   const label=el('label',undefined,'module-switch'),input=el('input'),track=el('span',undefined,'track');
   input.type='checkbox';input.setAttribute('role','switch');input.dataset.moduleSwitch=d.id;
   input.checked=d.enabled;input.disabled=switchingModules.has(d.id);
-  input.setAttribute('aria-label',moduleTitle(d.id)+'模块开关');track.setAttribute('aria-hidden','true');
+  input.setAttribute('aria-label',moduleTitle(d)+'模块开关');track.setAttribute('aria-hidden','true');
   label.append(input,track,el('span',d.enabled?'已开启':'已关闭'));
   input.addEventListener('change',async()=>{
     const wanted=input.checked;
@@ -3846,7 +3840,7 @@ function moduleSwitch(d){
       const result=await api('life/modules/'+encodeURIComponent(d.id)+'/enabled','PUT',{enabled:wanted});
       confirmed=result.enabled;
       applyModuleDetail(result);
-      notice(moduleTitle(d.id)+(confirmed?'已开启':'已关闭'));
+      notice(moduleTitle(d)+(confirmed?'已开启':'已关闭'));
     }catch(error){
       if(error.name!=='AbortError'){
         notice(error.message,true);
@@ -3916,14 +3910,16 @@ function applyModuleDetail(d){
   if(id==='bilibili_surf')$('bili').querySelector('[data-action="patrol"]').disabled=!d.enabled;
 }
 function moduleCard(m){
-  const key=modulePage.get(m.id),title=moduleTitle(m.id);
+  const key=modulePage.get(m.id),title=moduleTitle(m);
   const card=el('article',undefined,'module-card');card.dataset.moduleId=m.id;
   const heading=el('div',undefined,'module-name-row'),glyph=el('span',undefined,'module-icon');
   glyph.append($('nav-'+(key||'modules')).querySelector('svg').cloneNode(true));
   heading.append(el('h3',title),moduleSwitch(m));
   const foot=el('div',undefined,'module-foot');
   foot.append(el('small',regionName(m.region)+' · '+m.action_count+' 项动作'));
-  card.append(glyph,heading,el('p',moduleDescriptions.get(m.id)||m.id),foot);
+  card.append(glyph,heading);
+  if(m.description)card.append(el('p',m.description));
+  card.append(foot);
   if(moduleIssue(m))foot.before(el('p',moduleIssue(m),'module-state-note'));
   if(key){
     const open=el('button','打开模块 →','module-open');open.type='button';

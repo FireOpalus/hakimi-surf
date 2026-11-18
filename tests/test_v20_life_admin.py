@@ -120,15 +120,26 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
         monkeypatch.setattr(module, "_raw_sensor_summary", sensor)
 
     catalog = (await client.get(root)).json()
-    assert {m["id"] for m in catalog} == {"qq_social", "bilibili_surf", "minecraft", "weather"}
+    assert {m["id"] for m in catalog} == {m.module_id for m in svc.modules.all()}
     for entry in catalog:
-        assert set(entry) == {"id", "action_count", "region", "enabled", "configuration_issue"}
+        assert set(entry) == {
+            "id",
+            "title",
+            "description",
+            "action_count",
+            "region",
+            "enabled",
+            "configuration_issue",
+        }
         details = (await client.get(root + "/" + entry["id"])).json()
-        assert details["enabled"] == entry["enabled"] == (entry["id"] != "weather")
+        assert details["enabled"] == entry["enabled"] == svc.modules.get(entry["id"]).enabled
+        assert details["title"] == entry["title"]
         assert set(details) == {
             "enabled",
             "configuration_issue",
             "id",
+            "title",
+            "description",
             "actions",
             "status",
             "region",
@@ -726,12 +737,11 @@ async def test_module_master_switch_blocks_ingress_actions_and_preserves_setting
     assert await svc.node_transport.on_event({"event": "mc.milestone", "payload": {}}) == "ignored"
     blocked = await client.post("/admin/api/life/mc/goal", json={"action_type": "status"})
     assert blocked.json()["detail"] == "module_disabled"
-    assert not svc.modules.active()
+    assert not {"qq_social", "minecraft", "bilibili_surf"} & {
+        m.module_id for m in svc.modules.active()
+    }
     assert {row["id"] for row in (await client.get(root)).json()} == {
-        "qq_social",
-        "minecraft",
-        "weather",
-        "bilibili_surf",
+        m.module_id for m in svc.modules.all()
     }
     after = (await client.put(qq + "/enabled", json={"enabled": True})).json()
     assert after["enabled"] and after["scheduling"]["values"] == before["scheduling"]["values"]

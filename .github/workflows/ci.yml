@@ -3,62 +3,74 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.catalog.outputs.sha }}
+      matrix: ${{ steps.platforms.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: catalog
+        run: |
+          sha=$(git rev-parse HEAD:src/hakimi/modules)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/hakimi-modules
+          ref: ${{ steps.catalog.outputs.sha }}
+          path: src/hakimi/modules
+          ssh-key: ${{ secrets.HAKIMI_MODULES_DEPLOY_KEY }}
+          persist-credentials: false
+      - id: platforms
+        run: |
+          matrix=$(python3 scripts/platform_checkout.py matrix)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  platform:
+    needs: catalog
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.catalog.outputs.matrix) }}
+    name: Fetch ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.sha }}
+          ssh-key: ${{ secrets[format('HAKIMI_MODULE_{0}_DEPLOY_KEY', matrix.key_suffix)] }}
+          persist-credentials: false
+      - name: Export the pinned source
+        env:
+          PLATFORM: ${{ matrix.name }}
+        run: git archive --format=tar --output="$RUNNER_TEMP/$PLATFORM.tar" HEAD
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: platform-${{ matrix.name }}
+          path: ${{ runner.temp }}/${{ matrix.name }}.tar
+          retention-days: 1
+
   offline-tests:
+    needs: [catalog, platform]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Read the pinned capability revision
-        id: modules
-        run: echo "sha=$(git rev-parse HEAD:src/hakimi/modules)" >> "$GITHUB_OUTPUT"
-      - name: Check out the module catalog
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          repository: FireOpalus/hakimi-modules
-          ref: ${{ steps.modules.outputs.sha }}
+          repository: ${{ github.repository_owner }}/hakimi-modules
+          ref: ${{ needs.catalog.outputs.sha }}
           path: src/hakimi/modules
           ssh-key: ${{ secrets.HAKIMI_MODULES_DEPLOY_KEY }}
           persist-credentials: false
-      - name: Read the four module revisions from the catalog
-        id: platforms
-        working-directory: src/hakimi/modules
-        run: |
-          for platform in qq bilibili minecraft weather; do
-            echo "$platform=$(git rev-parse "HEAD:platforms/$platform")" >> "$GITHUB_OUTPUT"
-          done
-      - name: Check out qq
-        uses: actions/checkout@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          repository: FireOpalus/hakimi-module-qq
-          ref: ${{ steps.platforms.outputs.qq }}
-          path: src/hakimi/modules/platforms/qq
-          ssh-key: ${{ secrets.HAKIMI_MODULE_QQ_DEPLOY_KEY }}
-          persist-credentials: false
-      - name: Check out bilibili
-        uses: actions/checkout@v4
-        with:
-          repository: FireOpalus/hakimi-module-bilibili
-          ref: ${{ steps.platforms.outputs.bilibili }}
-          path: src/hakimi/modules/platforms/bilibili
-          ssh-key: ${{ secrets.HAKIMI_MODULE_BILIBILI_DEPLOY_KEY }}
-          persist-credentials: false
-      - name: Check out minecraft
-        uses: actions/checkout@v4
-        with:
-          repository: FireOpalus/hakimi-module-minecraft
-          ref: ${{ steps.platforms.outputs.minecraft }}
-          path: src/hakimi/modules/platforms/minecraft
-          ssh-key: ${{ secrets.HAKIMI_MODULE_MINECRAFT_DEPLOY_KEY }}
-          persist-credentials: false
-      - name: Check out weather
-        uses: actions/checkout@v4
-        with:
-          repository: FireOpalus/hakimi-module-weather
-          ref: ${{ steps.platforms.outputs.weather }}
-          path: src/hakimi/modules/platforms/weather
-          ssh-key: ${{ secrets.HAKIMI_MODULE_WEATHER_DEPLOY_KEY }}
-          persist-credentials: false
+          pattern: platform-*
+          path: ${{ runner.temp }}/platform-archives
+          merge-multiple: true
+      - run: python3 scripts/platform_checkout.py restore "$RUNNER_TEMP/platform-archives"
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.13.8'

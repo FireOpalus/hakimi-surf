@@ -31,17 +31,12 @@ from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
-from .modules import BilibiliSurfModule, MinecraftSlotModule, ModuleRegistry, QQSocialModule
+from .modules import ModuleRegistry, install_modules
 from .modules.adapters import Sender, farewell_send_bypass, identifier, onebot_message
 from .modules.bili_watcher import BiliWatcher
 from .modules.bilibili import Bilibili, extract_bvid
 from .modules.longnick import Longnick
-from .modules.mc_node import MinecraftNodeAdapter
-from .modules.onebot_transport import HTTPTransport, WebSocketTransport
 from .modules.proactive_dm import OwnerProactive
-from .modules.qq_delivery import LifeSpeaker
-from .modules.qq_policy import QQPolicy
-from .modules.weather import WeatherModule
 from .node_transport import NodeTransport
 from .outbound_actions import normalize_emoji_like, parse_actions
 from .output_links import filter_reply_links
@@ -158,54 +153,18 @@ class Service:
         store.runtime.memes = self.memes
         self._lurk_react_at: dict[str, float] = {}
         self.modules = ModuleRegistry()
-        self.modules.register(
-            QQSocialModule(
-                settings,
-                hot_ring=self.hot,
-                transport=getattr(sender, "onebot", None),
-                speak=LifeSpeaker(self).speak,
-                digest=self.proactive.world_digest,
-                proactive=self.proactive,
-                preflight=QQPolicy(self).evaluate,
-                connected=self.proactive.connected,
-            )
-        )
-        self.modules.register(
-            BilibiliSurfModule(
-                settings,
-                watcher=self.bili_watcher,
-                bili=bili,
-                node_transport=self.node_transport,
-            )
-        )
         self.world_state = WorldStateManager(settings, store, self.modules)
-        minecraft = MinecraftSlotModule(
-            settings,
-            world_state=self.world_state,
-            node_online=lambda: self.node_transport.connected(),
-        )
-        adapter = MinecraftNodeAdapter(minecraft, lambda: self.node_transport, self.background)
-        minecraft.remote_dispatcher = adapter.dispatch
-        self.modules.register(minecraft)
-        self.weather = WeatherModule(settings, getattr(sender, "http", None), self.world_state)
-        self.modules.register(self.weather)
-        self.longnick.module_enabled = lambda: not self.modules.inactive_reason("qq_social")
-        self.bili_watcher.module_enabled = lambda: not self.modules.inactive_reason("bilibili_surf")
-        if isinstance(bili, Bilibili):
-            bili.module_enabled = self.bili_watcher.module_enabled
-        if isinstance(sender, Sender):
-            sender.module_enabled = self.longnick.module_enabled
-            if isinstance(sender.onebot, (HTTPTransport, WebSocketTransport)):
-                sender.onebot.module_enabled = sender.module_enabled
-        if getattr(self.node_transport, "on_event", None) is None:
-            self.node_transport.on_event = adapter.on_event
-        if getattr(self.node_transport, "on_state", None) is None:
-            self.node_transport.on_state = adapter.on_state
+        install_modules(self)
         resolved_drive = drive if drive is not None else getattr(diary, "drive", None)
         active_drive = resolved_drive if settings.roaming_enabled else None
         self.db_backup = DatabaseBackup(settings, store, active_drive)
         self.surf_mirror = SurfMirror(self, active_drive)
         self.life_engine = LifeEngine(self)
+
+    @property
+    def weather(self):
+        """Compatibility accessor for existing weather integrations."""
+        return self.modules.get("weather")
 
     def refresh_secrets(self):
         self.secrets = configured_secrets(self.s)

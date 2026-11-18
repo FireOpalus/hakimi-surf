@@ -169,7 +169,7 @@ docker compose up -d
 
 ### 模块仓库与管理开关
 
-四个能力各有自己的私有 GitHub 仓库。在[模块目录的 platforms 文件夹](https://github.com/FireOpalus/hakimi-modules/tree/main/platforms)可以一起浏览。主仓固定目录仓库的提交，目录仓库再分别固定四个实现版本。
+各模块各有自己的 Git 仓库。主仓固定目录仓库的版本，目录的 `.gitmodules` 列出已安装模块，Git 同时记录每个模块的确切提交。服务启动、后台目录和发布流水线共用这份清单。[模块目录](https://github.com/FireOpalus/hakimi-modules/tree/main/platforms)
 
 | 模块 | 独立仓库 | 主仓检出路径 |
 | --- | --- | --- |
@@ -178,7 +178,7 @@ docker compose up -d
 | Minecraft | [hakimi-module-minecraft](https://github.com/FireOpalus/hakimi-module-minecraft) | `src/hakimi/modules/platforms/minecraft/` |
 | 天气观测 | [hakimi-module-weather](https://github.com/FireOpalus/hakimi-module-weather) | `src/hakimi/modules/platforms/weather/` |
 
-首次检出需要主仓、目录仓库和四个实现仓库的读取权限。
+首次检出需要主仓、目录仓库和已安装模块仓库的读取权限。
 
 ```sh
 git clone --recurse-submodules https://github.com/FireOpalus/hakimi-surf.git
@@ -190,7 +190,9 @@ git submodule update --init --recursive
 
 世界引擎管理活跃时段、免打扰、规划间隔和共用次数。各功能模块的「模块调度」管理自己的选项、每日任务和下次排程。
 
-新增模块时，在模块上声明 `schedule_options`（继承 `ScheduleOptions`，使用有标题的布尔、数字、文本或枚举字段），并在 `Service` 注册。后台会根据字段类型生成表单并验证保存值。动作可通过 `window` 选择执行时段，通过 `quotas` 指定共用次数及本模块的豁免开关。每日任务用 `schedules()` 声明，`DailyAction.time_option` 可绑定本模块的 `ScheduleTime` 字段，后台改时间后下次排程随之更新。本地兜底意图用 `local_activity()` 提供，事件订阅用 `event_rules()` 声明。注册后即可参与排程。[调度模块验收示例](tests/test_module_scheduling.py)
+新增模块时，在独立仓库根目录提供 `plugin.py`，导出 `create_module(service)` 并返回一个 `BaseModule`。在目录仓库运行 `git submodule add ../模块仓库.git platforms/模块目录名` 即可登记。私有仓库首次接入时给 CI 配置该仓的只读部署密钥，推送模块和目录的提交，再更新主仓的目录指针。部署新镜像后，后台自动展示模块的名称、说明、开关、传感器和动作。[接入示例与发布步骤](https://github.com/FireOpalus/hakimi-modules#新增模块)
+
+在模块上声明 `schedule_options`（继承 `ScheduleOptions`，使用有标题的布尔、数字、文本或枚举字段），后台会根据字段类型生成表单并验证保存值。动作可通过 `window` 选择执行时段，通过 `quotas` 指定共用次数及本模块的豁免开关。每日任务用 `schedules()` 声明，`DailyAction.time_option` 可绑定本模块的 `ScheduleTime` 字段，后台改时间后下次排程随之更新。本地兜底意图用 `local_activity()` 提供，事件订阅用 `event_rules()` 声明。[调度模块验收示例](tests/test_module_scheduling.py)
 
 现有例子见 [天气模块](https://github.com/FireOpalus/hakimi-module-weather/blob/main/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
 

@@ -19,15 +19,9 @@ from pydantic import (
 )
 
 from . import world_observations
-from .admin_routes import body, onebot_connection, service
+from .admin_routes import body, service
 from .life_engine import LifeEngineConfig
 from .modules.actions import ActionCall, HourlyAction, Mode, reject_reason
-from .modules.weather_location import (
-    LocationLookupUnavailable,
-    WeatherLocation,
-    find_cities,
-    locate_server,
-)
 
 router = APIRouter(prefix="/admin/api/life")
 
@@ -440,6 +434,8 @@ async def module_directory(request: Request):
     return [
         {
             "id": module.module_id,
+            "title": module.display_name or module.module_id,
+            "description": module.description,
             "region": module.node_region,
             "action_count": counts[module.module_id],
             "enabled": module.enabled,
@@ -459,31 +455,16 @@ async def module_detail(request: Request, module_id: str):
     modes = engine.config.action_modes if engine else {}
     actions = svc.modules.catalog.view(modes, module_id=module_id)
     options = module.scheduling(engine.config)
-    status = {}
-    if module_id == "qq_social":
-        status = onebot_connection(request, svc)
-    elif module_id == "bilibili_surf":
-        status = {
-            "autonomous": svc.bili_watcher.policy.enabled,
-            "backend": module.backend_mode,
-            "cn_delegate": bool(
-                svc.s.node_bili_delegate_enabled
-                and svc.node_transport
-                and svc.node_transport.connected()
-            ),
-        }
-    elif module_id == "minecraft":
-        status = _collect_mc_agent_status(svc)
-    elif module_id == "weather":
-        status = {"location": module.location_status()}
     return {
         "id": module_id,
+        "title": module.display_name or module_id,
+        "description": module.description,
         "enabled": module.enabled,
         "configuration_issue": module.configuration_issue,
         "region": module.node_region,
         "proactive_paused": module.proactive_paused,
         "actions": actions,
-        "status": status,
+        "status": module.admin_status(request),
         "scheduling": {
             "fields": module.schedule_options.model_json_schema()["properties"],
             "values": options.model_dump(),
@@ -504,39 +485,6 @@ async def module_detail(request: Request, module_id: str):
 class ModuleSwitch(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool
-
-
-class WeatherCityQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
-    query: str = Field(min_length=2, max_length=80)
-
-
-@router.post("/modules/weather/location/cities")
-async def weather_cities(request: Request):
-    query = await body(request, WeatherCityQuery)
-    try:
-        return {"places": await find_cities(service(request).weather.http, query.query)}
-    except LocationLookupUnavailable:
-        raise HTTPException(503, "weather_city_lookup_unavailable") from None
-
-
-@router.post("/modules/weather/location/detect")
-async def weather_detect_location(request: Request):
-    try:
-        return await locate_server(service(request).weather.http)
-    except LocationLookupUnavailable:
-        raise HTTPException(503, "weather_ip_lookup_unavailable") from None
-
-
-@router.put("/modules/weather/location")
-@router.delete("/modules/weather/location")
-async def weather_set_location(request: Request):
-    svc = service(request)
-    place = await body(request, WeatherLocation) if request.method == "PUT" else None
-    async with request.app.state.admin_config_lock:
-        await svc.weather.set_location(place)
-        svc.life_engine.wakeup.set()
-        return await module_detail(request, "weather")
 
 
 @router.put("/modules/{module_id}/enabled")

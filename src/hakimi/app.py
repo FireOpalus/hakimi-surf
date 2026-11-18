@@ -3,11 +3,12 @@ import hmac
 import json
 import logging
 import re
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from . import __version__
 from .admin_auth import AdminAuth
@@ -21,6 +22,7 @@ from .gcp_admin import router as gcp_billing_router
 from .gemini import GeminiGateway
 from .life_admin import router as life_router
 from .meme_admin import router as meme_router
+from .modules import platform_entries
 from .modules.adapters import Sender, qq_message
 from .modules.bilibili import Bilibili
 from .modules.onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
@@ -101,7 +103,11 @@ def create_app(
                     HTTPTransport(s, http) if s.onebot_mode == "http" else WebSocketTransport(s)
                 )
                 node_transport = NodeTransport(s)
-                try:
+                async with AsyncExitStack() as resources:
+                    resources.push_async_callback(ai.close)
+                    resources.push_async_callback(node_transport.close)
+                    if isinstance(onebot, WebSocketTransport):
+                        resources.push_async_callback(onebot.close)
                     diary = None
                     drive = None
                     if s.roaming_enabled:
@@ -127,9 +133,10 @@ def create_app(
                     await service.bili_watcher.initialize()
                     await service.video_watch.initialize()
                     await service.memes.initialize()
-                    await service.weather.load_location()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
+                    for module in service.modules.all():
+                        await resources.enter_async_context(module.lifespan())
                     await service.proactive.initialize()
                     from .outgoing import recover_receipts
 
@@ -167,11 +174,6 @@ def create_app(
                         logging.getLogger("hakimi").removeHandler(store.runtime.sink)
                         logging.getLogger("hakimi").setLevel(old_log_level)
                         await store.runtime.flush()
-                finally:
-                    if isinstance(onebot, WebSocketTransport):
-                        await onebot.close()
-                    await node_transport.close()
-                    await ai.close()
         finally:
             await store.close()
 
@@ -191,6 +193,13 @@ def create_app(
     app.include_router(gcp_billing_router)
     app.include_router(affection_router)
     app.include_router(life_router)
+    for platform, entry in platform_entries():
+        if (router := getattr(entry, "admin_router", None)) is not None:
+            if any(not isinstance(route, APIRoute) for route in router.routes):
+                raise ValueError(
+                    f"{platform.path}: admin_router supports authenticated HTTP routes only"
+                )
+            app.include_router(router, prefix=f"/admin/api/life/modules/{platform.name}")
 
     @app.middleware("http")
     async def protect_admin(request: Request, call_next):

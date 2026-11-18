@@ -29,4 +29,7 @@ fi
 staging=$(mktemp -d)
 trap 'rm -r -- "$staging"' EXIT
 export_tree . "$revision" "$staging"
+if [[ -f "$staging/scripts/platform_checkout.py" ]]; then
+    PYTHONDONTWRITEBYTECODE=1 python3 "$staging/scripts/platform_checkout.py" check
+fi
 tar -c -C "$staging" .
