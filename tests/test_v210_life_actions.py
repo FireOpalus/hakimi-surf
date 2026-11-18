@@ -419,7 +419,7 @@ async def test_weather_edge_timeout_retries_only_same_tls_host(settings, store, 
             assert dict(req.url.params) == {
                 "name": "api.open-meteo.com",
                 "type": "A",
-                "edns_client_subnet": "0.0.0.0/0",
+                "edns_client_subnet": "193.0.0.0/24",
             }
             return httpx.Response(
                 200,
