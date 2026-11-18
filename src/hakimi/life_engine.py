@@ -57,6 +57,8 @@ class LifeEngineConfig(BaseModel):
     group_min_recent_messages: int = Field(default=2, ge=1, le=50)
     desktop_active_suppress_seconds: int = Field(default=7200, ge=300, le=86400)
     max_proactive_per_day: int = Field(default=6, ge=0, le=30)
+    owner_dms_unlimited: bool = False
+    bili_patrols_unlimited: bool = False
 
     @field_validator("active_hours", "quiet_hours")
     @classmethod
@@ -299,8 +301,7 @@ class LifeBlockPlanner:
             if (
                 not planner_funded
                 and "bili.patrol" in offered
-                and await self.engine.gatekeeper._count_today_proactive(ts)
-                < cfg.max_proactive_per_day
+                and await self.engine.gatekeeper.daily_limit_allows("bili.patrol", "", ts, cfg)
             ):
                 async with self.store.lock:
                     outstanding = await self.store.one(
@@ -482,18 +483,44 @@ class GatekeeperWorker:
             )
             return int(cur.rowcount or 0)
 
-    async def _count_today_proactive(self, now: float) -> int:
+    async def daily_usage(self, now: float, cfg: LifeEngineConfig) -> dict[str, int]:
         day_start, day_end = _day_bounds(now, self.s.bot_timezone)
+        owner_scope = f"owner:{self.s.owner_qq_id}" if self.s.owner_qq_id else None
         async with self.store.lock:
             row = await self.store.one(
-                "SELECT COUNT(*) FROM scheduled_intents "
+                "SELECT COUNT(*) AS total, "
+                "COUNT(*) FILTER (WHERE target_scope=? AND "
+                "COALESCE(NULLIF(action_name,''),'qq.speak')='qq.speak') AS owner_dms, "
+                "COUNT(*) FILTER (WHERE target_scope='') AS bili_patrols "
+                "FROM scheduled_intents "
                 "WHERE (target_scope != '' OR action_name='bili.patrol' OR "
                 "(target_module='bilibili_surf' AND action_type IN ('patrol','run_once'))) "
                 "AND COALESCE(action_name,'')!='qq.owner_digest' "
                 "AND status IN ('done','uncertain') AND updated_at>=? AND updated_at<?",
-                (day_start, day_end),
+                (owner_scope, day_start, day_end),
             )
-        return int(row[0] or 0) if row else 0
+        usage = dict(row)
+        usage["counted"] = usage["total"]
+        if cfg.owner_dms_unlimited:
+            usage["counted"] -= usage["owner_dms"]
+        if cfg.bili_patrols_unlimited:
+            usage["counted"] -= usage["bili_patrols"]
+        return usage
+
+    async def daily_limit_allows(
+        self, action: str, scope: str, now: float, cfg: LifeEngineConfig
+    ) -> bool:
+        if action == "bili.patrol" and not scope and cfg.bili_patrols_unlimited:
+            return True
+        if (
+            action == "qq.speak"
+            and cfg.owner_dms_unlimited
+            and self.s.owner_qq_id
+            and scope == f"owner:{self.s.owner_qq_id}"
+        ):
+            return True
+        usage = await self.daily_usage(now, cfg)
+        return usage["counted"] < cfg.max_proactive_per_day
 
     async def _evaluate_ticket(
         self,
@@ -544,9 +571,8 @@ class GatekeeperWorker:
             budget = await self.store.budget_status()
             if not paid_lane_available(budget, spec.budget_lane):
                 return await reject("budget_limit")
-            if (
-                not daily_digest
-                and await self._count_today_proactive(now) >= cfg.max_proactive_per_day
+            if not daily_digest and not await self.daily_limit_allows(
+                spec.name, ticket["target_scope"], now, cfg
             ):
                 return await reject("daily_proactive_limit")
         if reason := spec.unavailable():
@@ -850,7 +876,7 @@ class LifeEngine:
 
     async def status(self) -> dict[str, Any]:
         await self.initialize()
-        proactive_sent_today = await self.gatekeeper._count_today_proactive(self.clock())
+        usage = await self.gatekeeper.daily_usage(self.clock(), self.config)
         return {
             "actions": self.catalog.view(self.config.action_modes),
             "config": self.config.model_dump(),
@@ -861,7 +887,8 @@ class LifeEngine:
             "next_digest_at": await self.next_digest_at(self.clock()),
             "last_plan_at": self.planner.last_plan_at,
             "last_plan_source": self.planner.last_plan_source,
-            "proactive_sent_today": proactive_sent_today,
+            "proactive_sent_today": usage["total"],
+            "daily_activity_usage": usage,
             "running": self._running,
         }
 

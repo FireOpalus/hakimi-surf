@@ -15,7 +15,7 @@ from .compression_policy import CompressionConfig
 from .proactive_policy import hours_bounds
 from .rest_policy import RestHoursConfig
 from .thinking_policy import ChatThinkingLevel, ThinkingConfig, ThinkingLevel
-from .video_policy import MAX_VIDEO_SECONDS
+from .video_policy import MAX_VIDEO_SECONDS, VideoDailyLimit
 
 
 class Settings(BaseSettings):
@@ -144,8 +144,8 @@ class Settings(BaseSettings):
         le=MAX_VIDEO_SECONDS,
         validation_alias="MAX_VIDEO_WATCH_SECONDS",
     )
-    daily_video_watch_limit: int = Field(
-        default=3, ge=0, le=20, validation_alias="DAILY_VIDEO_WATCH_LIMIT"
+    daily_video_watch_limit: VideoDailyLimit = Field(
+        default=3, validation_alias="DAILY_VIDEO_WATCH_LIMIT"
     )
     owner_qq_id: str = Field(
         default="",
@@ -257,6 +257,8 @@ class Settings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("AFFECTION_ENABLED", "HAKIMI_AFFECTION_ENABLED"),
     )
+    life_engine_owner_dms_unlimited: bool = False
+    life_engine_bili_patrols_unlimited: bool = False
     proactive_dm_enabled: bool = Field(default=True, validation_alias="PROACTIVE_DM_ENABLED")
     daily_digest_enabled: bool = Field(default=True, validation_alias="DAILY_DIGEST_ENABLED")
     quiet_hours: str = Field(default="23:30-08:30", validation_alias="QUIET_HOURS")

@@ -681,7 +681,7 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         assert len(dispatch_calls) == 1
         assert dispatch_calls[0]["action_type"] == "build_plan"
         assert dispatch_calls[0]["topic"] == mc_title
-        assert await engine.gatekeeper._count_today_proactive(exec_now2) == 0
+        assert (await engine.gatekeeper.daily_usage(exec_now2, engine.config))["total"] == 0
 
         mc_mod = svc.modules.get("minecraft")
         assert isinstance(mc_mod, MinecraftSlotModule)

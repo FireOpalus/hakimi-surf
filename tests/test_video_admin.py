@@ -26,7 +26,9 @@ class VideoControls:
             "environment": self.environment.model_dump(),
             "source": "sqlite" if self.overridden else "env",
             "attempts_today": 0,
-            "remaining_today": self.config.daily_limit,
+            "remaining_today": None
+            if self.config.daily_limit == "unlimited"
+            else self.config.daily_limit,
             "recent_attempts": [],
             "remote_cleanup_pending": 0,
         }
@@ -79,17 +81,20 @@ async def test_video_admin_authenticates_before_validation_or_effect(video_admin
     assert not gateway.calls
 
 
-async def test_video_config_updates_and_resets_independently_of_account_patrol(video_admin):
+@pytest.mark.parametrize("limit,remaining", [(0, 0), ("unlimited", None)])
+async def test_video_config_updates_and_resets_independently_of_account_patrol(
+    video_admin, limit, remaining
+):
     app, client, gateway, controls = video_admin
     before = app.state.service.bili_watcher.policy.model_dump()
     original = (await client.get(PATH)).json()
     assert original["config"] == {"enabled": False, "max_seconds": 900, "daily_limit": 3}
-    desired = {"enabled": True, "max_seconds": 900, "daily_limit": 0}
+    desired = {"enabled": True, "max_seconds": 900, "daily_limit": limit}
     saved = await client.put(PATH, json=desired)
     assert saved.status_code == 200
     assert saved.json()["config"] == desired
     assert saved.json()["source"] == "sqlite"
-    assert (await client.get(PATH)).json()["remaining_today"] == 0
+    assert (await client.get(PATH)).json()["remaining_today"] == remaining
     assert isinstance(controls.changes[0], VideoWatchConfig)
     assert app.state.service.bili_watcher.policy.model_dump() == before
     restored = await client.delete(PATH)
@@ -110,6 +115,9 @@ async def test_video_config_updates_and_resets_independently_of_account_patrol(v
         {"max_seconds": 120.5},
         {"daily_limit": -1},
         {"daily_limit": 21},
+        {"daily_limit": None},
+        {"daily_limit": "infinite"},
+        {"daily_limit": True},
         {"daily_limit": "3"},
         {"unknown": "untrusted-sensitive-input"},
     ],
@@ -138,6 +146,13 @@ def test_video_env_aliases_and_policy_defaults(settings, monkeypatch):
         "max_seconds": 180,
         "daily_limit": 2,
     }
+    monkeypatch.setenv("DAILY_VIDEO_WATCH_LIMIT", "unlimited")
+    unlimited = Settings(
+        _env_file=None,
+        gemini_api_key=settings.gemini_api_key,
+        encryption_key=settings.encryption_key,
+    )
+    assert VideoWatchConfig.from_settings(unlimited).daily_limit == "unlimited"
     monkeypatch.setenv("MAX_VIDEO_WATCH_SECONDS", "901")
     with pytest.raises(ValidationError):
         Settings(

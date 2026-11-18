@@ -164,7 +164,7 @@ async def test_bili_and_social_share_one_discretionary_allowance(dm):
         if not scope:
             await dm.service.world_state.mark_intent(key, "done", now=now)
     await engine.tick_gatekeeper_once()
-    assert await engine.gatekeeper._count_today_proactive(now) == 1
+    assert (await engine.gatekeeper.daily_usage(now, engine.config))["total"] == 1
     row = await dm.store.one("SELECT result_reason FROM scheduled_intents WHERE id=?", (key,))
     assert row[0] == "daily_proactive_limit" and not dm.service.ai.calls
 
@@ -218,15 +218,104 @@ async def test_world_bili_and_qq_actions_check_their_actual_budget_lanes(
         assert rows["qq.owner_digest"]["result_reason"] == "budget_limit"
 
 
-async def test_unfunded_planner_can_schedule_one_patrol_from_its_own_lane(dm):
+@pytest.mark.parametrize("cap,unlimited,expected", [(6, False, 1), (0, False, 0), (0, True, 1)])
+async def test_unfunded_planner_can_schedule_one_patrol_from_its_own_lane(
+    dm, cap, unlimited, expected
+):
     svc, engine = dm.service, dm.service.life_engine
     watcher = svc.bili_watcher
     watcher.policy = BiliPolicy(enabled=True)
     watcher.creds["sessdata"] = "test"
     await dm.store.set_budget_config(BudgetConfig(patrol_daily_usd=1, proactive_daily_usd=0))
+    await engine.set_config({"max_proactive_per_day": cap, "bili_patrols_unlimited": unlimited})
     for _ in range(2):
         plan = await engine.trigger_plan_once(now=dm.clock())
         assert plan["source"] == "local_fallback"
     tickets = await dm.store.all("SELECT action_name FROM scheduled_intents")
-    assert [t[0] for t in tickets] == ["bili.patrol"]
+    assert [t[0] for t in tickets] == ["bili.patrol"] * expected
     assert not svc.ai.calls
+
+
+@pytest.mark.parametrize(
+    "owner,patrol", [(False, False), (True, False), (False, True), (True, True)]
+)
+async def test_daily_activity_exemptions_are_scoped_counted_and_reversible(dm, owner, patrol):
+    svc, engine, now = dm.service, dm.service.life_engine, dm.clock()
+    for scope, module, verb, action, state in [
+        ("owner:20000", "qq_social", "owner_companion", None, "done"),
+        ("", "bilibili_surf", "run_once", None, "uncertain"),
+        ("onebot:40000", "qq_social", "group_share", "qq.speak", "done"),
+        ("owner:20000", "qq_social", "qq.owner_digest", "qq.owner_digest", "done"),
+        ("owner:20000", "qq_social", "owner_companion", "qq.speak", "gated_skip"),
+    ]:
+        key = await svc.world_state.enqueue_intent(
+            dict(
+                action_name=action,
+                target_module=module,
+                target_scope=scope,
+                action_type=verb,
+                execute_after=now - 10,
+                expire_at=now + 600,
+            ),
+            now=now,
+        )
+        await svc.world_state.mark_intent(key, state, now=now)
+    await engine.set_config(
+        {"max_proactive_per_day": 1, "owner_dms_unlimited": owner, "bili_patrols_unlimited": patrol}
+    )
+    persisted = LifeEngine(svc, clock=dm.clock)
+    await persisted.initialize()
+    cfg, gate = persisted.config, persisted.gatekeeper
+    status = await persisted.status()
+    usage = status["daily_activity_usage"]
+    assert usage == {
+        "total": 3,
+        "owner_dms": 1,
+        "bili_patrols": 1,
+        "counted": 3 - int(owner) - int(patrol),
+    }
+    assert status["proactive_sent_today"] == 3
+    assert await gate.daily_limit_allows("qq.speak", "owner:20000", now, cfg) is owner
+    assert await gate.daily_limit_allows("bili.patrol", "", now, cfg) is patrol
+    for scope in ("onebot:40000", "owner:30000"):
+        assert not await gate.daily_limit_allows("qq.speak", scope, now, cfg)
+    await persisted.set_config({"max_proactive_per_day": 1})
+    assert (await persisted.status())["daily_activity_usage"]["counted"] == 3
+
+
+async def test_unlimited_owner_dms_go_through_real_gate_and_keep_budget_quiet_and_recipient_checks(
+    dm,
+):
+    svc, engine = dm.service, dm.service.life_engine
+    await engine.set_config({"max_proactive_per_day": 0, "owner_dms_unlimited": True})
+
+    async def run(scope):
+        now = dm.clock()
+        key = await svc.world_state.enqueue_intent(
+            dict(
+                action_name="qq.speak",
+                origin="planner",
+                target_scope=scope,
+                target_module="qq_social",
+                action_type="owner_companion",
+                execute_after=now - 1,
+                expire_at=now + 600,
+            ),
+            now=now,
+        )
+        await engine.tick_gatekeeper_once()
+        return tuple(
+            await dm.store.one(
+                "SELECT status,result_reason FROM scheduled_intents WHERE id=?", (key,)
+            )
+        )
+
+    assert (await run("owner:20000"))[0] == "done"
+    assert await run("onebot:40000") == ("gated_skip", "daily_proactive_limit")
+    assert await run("owner:30000") == ("gated_skip", "unauthorized_scope")
+    calls = len(svc.ai.calls)
+    await dm.store.set_budget_config(BudgetConfig(proactive_daily_usd=0))
+    assert await run("owner:20000") == ("gated_skip", "budget_limit")
+    dm.time[0] = stamp("2026-11-14T23:50:00")
+    assert await run("owner:20000") == ("gated_skip", "quiet_hours")
+    assert len(svc.ai.calls) == calls

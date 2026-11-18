@@ -186,7 +186,11 @@ class VideoWatch:
             "environment": self.env_config.model_dump(),
             "source": "sqlite" if self.overridden else "env",
             "attempts_today": used,
-            "remaining_today": max(0, self.config.daily_limit - used),
+            "remaining_today": (
+                None
+                if self.config.daily_limit == "unlimited"
+                else max(0, self.config.daily_limit - used)
+            ),
             "recent_attempts": [dict(r) for r in recent],
             "reasons": REASONS,
             "remote_cleanup_pending": pending,
@@ -406,24 +410,18 @@ class VideoWatch:
             await valid()
             key = uuid.uuid4().hex
             async with self.store.transaction():
-                count = (
-                    await self.store.one(
-                        "SELECT COUNT(*) FROM video_watch_attempts "
-                        f"WHERE day=? AND {LOCAL_FAILURE_SQL}",
-                        (self.day(),),
+                day = self.day()
+                if config.daily_limit != "unlimited":
+                    used, total = await self.store.one(
+                        f"SELECT COUNT(*) FILTER (WHERE {LOCAL_FAILURE_SQL}), COUNT(*) "
+                        "FROM video_watch_attempts WHERE day=?",
+                        (day,),
                     )
-                )[0]
-                total_attempts = (
-                    await self.store.one(
-                        "SELECT COUNT(*) FROM video_watch_attempts WHERE day=?",
-                        (self.day(),),
-                    )
-                )[0]
-                if count >= config.daily_limit or total_attempts >= max(config.daily_limit * 4, 12):
-                    return None, "daily_limit"
+                    if used >= config.daily_limit or total >= max(config.daily_limit * 4, 12):
+                        return None, "daily_limit"
                 await self.store.db.execute(
                     "INSERT INTO video_watch_attempts VALUES (?,?,?,?,'working',NULL,?,NULL,NULL)",
-                    (key, self.day(), bvid, subject, self.clock()),
+                    (key, day, bvid, subject, self.clock()),
                 )
             state, reason = "failed", "download_failed"
             try:

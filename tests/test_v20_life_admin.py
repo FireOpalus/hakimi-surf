@@ -333,6 +333,8 @@ async def test_life_config_crud_and_strict_validation(life_api):
         {"enabled": "true"},
         {"max_proactive_per_day": True},
         {"max_proactive_per_day": 31},
+        {"owner_dms_unlimited": "on"},
+        {"bili_patrols_unlimited": 1},
         {"group_cooldown_seconds": 299},
         {"active_hours": "09:00-09:00"},
         {"active_hours": "25:00-01:00"},
@@ -348,6 +350,8 @@ async def test_life_config_crud_and_strict_validation(life_api):
             "enabled": False,
             "group_cooldown_seconds": 1800,
             "max_proactive_per_day": 3,
+            "owner_dms_unlimited": True,
+            "bili_patrols_unlimited": True,
         },
     )
     assert saved.status_code == 200
@@ -356,6 +360,7 @@ async def test_life_config_crud_and_strict_validation(life_api):
     assert body["config"]["enabled"] is False
     assert body["config"]["group_cooldown_seconds"] == 1800
     assert body["config"]["max_proactive_per_day"] == 3
+    assert body["config"]["owner_dms_unlimited"] and body["config"]["bili_patrols_unlimited"]
     assert body["config"]["active_hours"] == "09:00-01:00"
 
     reset = await client.delete("/admin/api/life")

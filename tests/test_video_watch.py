@@ -176,6 +176,43 @@ async def test_configuration_gates_download_but_allows_honest_text_fallback(
     assert [c[0] for c in rig.gateway.calls] == ["screen", "generate"]
 
 
+async def test_unlimited_video_records_usage_past_both_daily_limits_and_can_be_restored(rig):
+    watch = rig.watch
+    async with watch.store.transaction():
+        await watch.store.db.executemany(
+            "INSERT INTO video_watch_attempts VALUES (?,?,?,?,?,?,?,NULL,NULL)",
+            [
+                (
+                    str(i),
+                    watch.day(),
+                    BV,
+                    "subject",
+                    "done" if i < 23 else "failed",
+                    None if i < 23 else "download_format",
+                    watch.clock(),
+                )
+                for i in range(85)
+            ],
+        )
+    await watch.set_config(VideoWatchConfig(enabled=True, daily_limit="unlimited"))
+    restored = VideoWatch(rig.svc, downloader=rig.downloader, clock=watch.clock)
+    await restored.initialize()
+    for lane in ("chat", "patrol"):
+        assert (await restored.analyze(BV, material(), "subject", lane)).mode == "video"
+    status = await restored.status()
+    assert status["config"]["daily_limit"] == "unlimited"
+    assert status["attempts_today"] == 25 and status["remaining_today"] is None
+
+    await restored.set_config(VideoWatchConfig(enabled=True, daily_limit=20))
+    assert (await restored.analyze(BV, material(), "subject", "chat")).reason == "daily_limit"
+    assert (await restored.status())["remaining_today"] == 0
+    await restored.set_config(VideoWatchConfig(enabled=True, daily_limit="unlimited"))
+    await watch.store.db.execute("INSERT INTO meta VALUES ('budget_overrun','1')")
+    with pytest.raises(Rejected, match="budget_hard_stop"):
+        await restored.analyze(BV, material(), "subject", "chat")
+    assert len(rig.downloader.calls) == 2
+
+
 async def test_daily_three_attempts_shared_across_users_and_persist_on_reload(rig):
     for n in range(3):
         assert (await rig.watch.analyze(BV, material(), f"subject-{n}", "chat")).mode == "video"
