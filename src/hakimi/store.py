@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS seen (
   PRIMARY KEY(subscription, bvid)
 );
 CREATE TABLE IF NOT EXISTS reports (
-  id INTEGER PRIMARY KEY, subject TEXT NOT NULL, payload BLOB NOT NULL, created REAL NOT NULL
+  id INTEGER PRIMARY KEY, subject TEXT NOT NULL, payload BLOB NOT NULL, created REAL NOT NULL,
+  public INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS group_policies (
   scope TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK(mode IN ('at_only','smart_reply','muted'))
@@ -167,6 +168,10 @@ class Store:
             await self.db.execute(
                 "INSERT OR IGNORE INTO budget_totals SELECT 1,COALESCE(SUM(amount),0) FROM ledger"
             )
+            if "public" not in {r["name"] for r in await self.all("PRAGMA table_info(reports)")}:
+                await self.db.execute(
+                    "ALTER TABLE reports ADD COLUMN public INTEGER NOT NULL DEFAULT 0"
+                )
             await self._initialize_usage_aggregates()
             await initialize_calendar(self)
             row = await self.one("SELECT value FROM meta WHERE key='key_check'")
@@ -1573,11 +1578,11 @@ class Store:
             await self.db.execute("UPDATE subscriptions SET initialized=1 WHERE id=?", (sub_id,))
             return len(fresh) if sub["initialized"] else 0
 
-    async def save_report(self, subject: str, text: str) -> None:
+    async def save_report(self, subject: str, text: str, *, public: bool = False) -> None:
         async with self.transaction():
             await self.db.execute(
-                "INSERT INTO reports(subject,payload,created) VALUES (?,?,?)",
-                (subject, self.vault.seal(subject, text), time.time()),
+                "INSERT INTO reports(subject,payload,created,public) VALUES (?,?,?,?)",
+                (subject, self.vault.seal(subject, text), time.time(), int(public)),
             )
             await self.db.execute(
                 "DELETE FROM reports WHERE subject=? AND id NOT IN "

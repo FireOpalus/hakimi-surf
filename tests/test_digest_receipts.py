@@ -276,3 +276,30 @@ async def test_retry_of_paid_manual_digest_needs_no_budget_lookup(dm, monkeypatc
     result = await dm.manual_digest()
     assert result["id"] == first["id"] and result["receipt"]["stage"] == "confirmed"
     assert len(dm.service.ai.calls) == 2 and len(dm.service.sender.onebot.calls) == 1
+
+
+async def test_digest_admits_only_public_diary_entries_and_public_reports(dm):
+    from hakimi.roaming_logger import RoamingLogger
+
+    now = dm.clock()
+    dm.s.roaming_timezone = dm.s.bot_timezone
+    diary = dm.service.diary = RoamingLogger(dm.s, dm.store)
+    await diary.initialize()
+    day = dm.local(now).date().isoformat()
+    async with dm.store.transaction():
+        for kind in ("patrol", "chat_group", "chat_private", "world_life"):
+            await dm.store.db.execute(
+                "INSERT INTO roaming_events VALUES (?,?,?,?)",
+                (kind, day, dm.store.vault.seal(kind, "marker-" + kind), kind),
+            )
+    payload = str(await dm._public_digest(now))
+    assert "marker-patrol" in payload and "marker-world_life" in payload
+    assert "marker-chat_private" not in payload and "marker-chat_group" not in payload
+    dm.service.diary = None
+    subject = dm.store.subject(dm.target())
+    for body, public in [("known-public", True), ("owner-only-marker", False)]:
+        await dm.store.db.execute(
+            "INSERT INTO reports(subject,payload,created,public) VALUES(?,?,?,?)",
+            (subject, dm.store.vault.seal(subject, body), now, public),
+        )
+    assert (await dm._public_digest(now))["public_summaries"] == ["known-public"]

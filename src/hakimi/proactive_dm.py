@@ -382,14 +382,19 @@ class OwnerProactive:
                     await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
                 )
                 rows = await self.store.all(
-                    "SELECT id,payload FROM roaming_events WHERE day=? ORDER BY rowid", (day,)
+                    "SELECT id,payload,event_kind FROM roaming_events WHERE day=? "
+                    "AND event_kind IN ('patrol','world_life') ORDER BY rowid",
+                    (day,),
                 )
+            counts.pop("private_chat", None)
             payload.update(diary._summary_input(day, counts, rows))
+            payload["group_activity"].pop("私聊日常交流", None)
         if not payload["public_summaries"]:
             subject = self.store.subject(self.target())
             async with self.store.lock:
                 rows = await self.store.all(
-                    "SELECT payload FROM reports WHERE subject=? AND created>=? AND created<? "
+                    "SELECT payload FROM reports WHERE public=1 AND subject=? "
+                    "AND created>=? AND created<? "
                     "ORDER BY id DESC LIMIT 10",
                     (subject, start, end),
                 )

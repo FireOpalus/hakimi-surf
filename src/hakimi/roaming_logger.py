@@ -17,6 +17,7 @@ from .generation_policy import Scenario
 from .models import Message
 from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
 from .store import Store
+from .work_usage import model_work
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS roaming_events (
@@ -238,11 +239,7 @@ class RoamingLogger:
         )
 
     def _summary_input(self, day: str, counts: dict, rows: list) -> dict:
-        patrol_rows = [
-            r
-            for r in rows
-            if ("event_kind" not in r.keys() or (r["event_kind"] or "patrol") == "patrol")
-        ]
+        patrol_rows = [r for r in rows if "event_kind" in r.keys() and r["event_kind"] == "patrol"]
         world_rows = [
             r for r in rows if "event_kind" in r.keys() and r["event_kind"] == "world_life"
         ]
@@ -316,10 +313,11 @@ class RoamingLogger:
             )
         subject = self.store.vault.digest("diary-budget", self.s.namespace)
         try:
-            await self.gateway.screen(payload, subject, purpose="source", budget_lane="patrol")
-            generated = await self.gateway.generate(
-                payload, subject, scenario=Scenario.DAILY_DIARY, budget_lane="patrol"
-            )
+            with model_work("diary.daily_summary", key):
+                await self.gateway.screen(payload, subject, purpose="source", budget_lane="patrol")
+                generated = await self.gateway.generate(
+                    payload, subject, scenario=Scenario.DAILY_DIARY, budget_lane="patrol"
+                )
             summary = format_chat_entry(generated, configured_secrets(self.s), limit=3000)
         except asyncio.CancelledError:
             # Keep attempted on cancellation/restart; do not repeat ambiguous paid work.

@@ -568,7 +568,8 @@ class GatekeeperWorker:
         if spec.budget_lane is not None:
             budget = await self.store.budget_status()
             if not paid_lane_available(budget, spec.budget_lane):
-                return await reject("budget_limit")
+                if not spec.reuses_paid_work or not await spec.reuses_paid_work(now):
+                    return await reject("budget_limit")
         if not await self.daily_limit_allows(spec.name, ticket["target_scope"], now, cfg):
             return await reject("daily_proactive_limit")
         if reason := spec.unavailable():

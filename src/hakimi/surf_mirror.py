@@ -433,7 +433,8 @@ class SurfMirror:
                 for row in rows:
                     item = dict(row)
                     item["payload"] = _parse_json_safe(item.get("payload_json"))
-                    events.append(item)
+                    if not item["payload"].get("private_first"):
+                        events.append(item)
                 result["global_events"] = events
 
             if "roaming_counts" in tables:
@@ -444,7 +445,9 @@ class SurfMirror:
 
             if "roaming_events" in tables:
                 e_rows = await self.store.all(
-                    "SELECT * FROM roaming_events WHERE day=? ORDER BY rowid DESC LIMIT ?",
+                    "SELECT * FROM roaming_events WHERE day=? "
+                    "AND event_kind IN ('patrol','world_life','chat_group') "
+                    "ORDER BY rowid DESC LIMIT ?",
                     (day, MAX_ROAMING_EVENTS),
                 )
                 roaming_events = []

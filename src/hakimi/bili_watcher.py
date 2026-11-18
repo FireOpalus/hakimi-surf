@@ -1445,7 +1445,9 @@ class BiliWatcher:
                         await self.svc.diary.patrol("bili-account:" + pick.bvid, text)
                     if self.s.owner_qq_id and (preferred is None or share_owner):
                         await self.store.save_report(
-                            self.store.subject(self.svc.proactive.target()), text
+                            self.store.subject(self.svc.proactive.target()),
+                            text,
+                            public=preferred is None,
                         )
                     completed += 1
                     if stop_for_risk:

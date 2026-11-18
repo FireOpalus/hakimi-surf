@@ -315,11 +315,33 @@ async def test_surf_mirror_decrypts_owner_session_world_roaming_and_isolates_gro
             ),
         )
 
+    await store.db.execute(
+        "INSERT INTO global_events VALUES (?,?,?,?,?,?,?)",
+        (
+            "ev-private",
+            now,
+            "bilibili_surf",
+            "video",
+            "normal",
+            0,
+            json.dumps({"private_first": True, "title": "OTHER_PRIVATE_LEAK"}),
+        ),
+    )
+
     # 4. Seed today's roaming_events / roaming_counts and recent_surfed
     settings_roam = settings.model_copy(update={"roaming_enabled": True})
     svc.s = settings_roam
     diary = RoamingLogger(settings_roam, store)
     await diary.initialize()
+    await store.db.execute(
+        "INSERT INTO roaming_events VALUES (?,?,?,?)",
+        (
+            "private-ref",
+            diary.local(now).date().isoformat(),
+            store.vault.seal("private-ref", "OTHER_PRIVATE_LEAK"),
+            "chat_private",
+        ),
+    )
     await diary.patrol("patrol-1", "看了科技区新视频《异步调度深入解析》", now=now)
 
     async def fake_recent_surfed(limit: int = 6, now: float | None = None):

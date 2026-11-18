@@ -2071,7 +2071,7 @@ class Service:
         # Recheck unsubscribe requests that arrived while the model was running.
         if not any(s["id"] == sub_id for s in await self.store.subscriptions(job["subject"])):
             return
-        await self.store.save_report(job["subject"], result)
+        await self.store.save_report(job["subject"], result, public=True)
         if self.diary:
             await self.diary.patrol(job["id"], result)
         if is_persona_owner(target, self.s) and self.proactive.delivery_enabled:
@@ -2525,7 +2525,7 @@ class Service:
             f"诶！你蹲的直播间 {room_id} 刚开播啦~ {detail}快去瞄一眼喵！\n"
             f"https://live.bilibili.com/{room_id}"
         )
-        await self.store.save_report(self.store.subject(target), live_text)
+        await self.store.save_report(self.store.subject(target), live_text, public=True)
         if (
             target.kind == "private"
             and is_persona_owner(target, self.s)
