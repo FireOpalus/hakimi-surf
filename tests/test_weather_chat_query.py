@@ -71,12 +71,13 @@ async def test_model_can_select_only_offered_read_only_query(
     assert len(generations) == 1
     model_input = json.dumps(generations[0]["input"], ensure_ascii=False)
     assert "121.47" not in model_input
-    assert "19.75" not in generations[0].get("system_instruction", "")
+    assert "module_query_result" not in generations[0].get("system_instruction", "")
     if choice == "weather.read":
         assert len(weather_requests) == 1 and "module_query_result" in model_input
         assert (
             "19.75" in model_input
             and "小雨" in model_input
+            and "已设地点" in model_input
             and "web_search_status" not in model_input
         )
     else:

@@ -1738,12 +1738,13 @@ class Service:
             allow_lookup = not sandbox and not self.bot_guard.known_bot(message)
             explicit_web = explicit_search(members[-1].command_text or members[-1].text)
             query_name = getattr(intent, "module_query", None)
-            if allow_lookup and query_name and not explicit_web:
+            if allow_lookup and query_name in module_queries and not explicit_web:
                 await message_guard()
                 outcome = await self.life_engine.query(query_name)
                 await message_guard()
                 payload["module_query_result"] = {
                     "name": query_name,
+                    "description": module_queries[query_name],
                     "status": outcome.status,
                     "reason": outcome.reason,
                     **({"data": outcome.details} if outcome.status == "done" else {}),
