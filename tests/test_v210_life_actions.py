@@ -403,6 +403,57 @@ async def test_on_demand_weather_for_modules_has_no_timer_or_paid_calls(settings
         assert not svc.life_engine.query_options() and len(requests) == 3
 
 
+@pytest.mark.parametrize(
+    "address,expected", [("93.184.216.34", "done"), ("127.0.0.1", "gated_skip")]
+)
+async def test_weather_edge_timeout_retries_only_same_tls_host(settings, store, address, expected):
+    settings.weather_enabled = True
+    settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
+    hosts = []
+
+    def provider(req):
+        hosts.append(req.url.host)
+        if req.url.host == "api.open-meteo.com":
+            raise httpx.ConnectTimeout("simulated edge", request=req)
+        if req.url.host == "dns.google":
+            assert dict(req.url.params) == {
+                "name": "api.open-meteo.com",
+                "type": "A",
+                "edns_client_subnet": "0.0.0.0/0",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "Status": 0,
+                    "Answer": [
+                        {"name": "other.example.", "type": 1, "data": "8.8.8.8"},
+                        {"name": "api.open-meteo.com.", "type": 1, "data": address},
+                    ],
+                },
+            )
+        assert req.url.host == "93.184.216.34" and req.url.scheme == "https"
+        assert req.headers["Host"] == req.extensions["sni_hostname"] == "api.open-meteo.com"
+        assert req.url.params["latitude"] == "31.23"
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": int(NOW),
+                    "interval": 900,
+                    "temperature_2m": 17,
+                    "weather_code": 0,
+                }
+            },
+        )
+
+    async with setup(settings, store, provider) as (svc, _, _):
+        result = await svc.life_engine.query("weather.read")
+        assert result.status == expected
+        assert hosts == ["api.open-meteo.com", "dns.google"] + (
+            [address] if expected == "done" else []
+        )
+
+
 async def test_disabling_weather_during_lookup_returns_no_reading(settings, store):
     settings.weather_enabled = True
     settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
