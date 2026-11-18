@@ -42,7 +42,11 @@ class OwnerProactive:
 
     @property
     def delivery_enabled(self):
-        return self.service.life_engine.config.owner_delivery_enabled
+        return (
+            self.service.modules.get("qq_social")
+            .scheduling(self.service.life_engine.config)
+            .owner_delivery_enabled
+        )
 
     @property
     def configured(self):

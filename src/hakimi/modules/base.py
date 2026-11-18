@@ -14,6 +14,7 @@ from ..context_budget import truncate_tokens
 from ..models import Message
 from ..security import clean_text, configured_secrets
 from .actions import Action, ActionCatalog, DailyAction
+from .scheduling import CLOCK_PATTERN, LocalActivity, ScheduleOptions
 
 AttentionLevel = Literal["LOW", "MEDIUM", "HIGH"]
 ATTENTION_RANK: dict[str, int] = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -93,6 +94,32 @@ class BaseModule(ABC):
         self.settings = settings
         self.proactive_paused = False
 
+    schedule_options: type[ScheduleOptions] = ScheduleOptions
+    recipient_namespaces: tuple[str, ...] = ()
+
+    def scheduling(self, config) -> ScheduleOptions:
+        defaults = self.schedule_options.from_settings(self.settings).model_dump()
+        return self.schedule_options.model_validate(
+            {**defaults, **config.module_settings.get(self.module_id, {})}
+        )
+
+    async def planning_context(self, service, config, now: float) -> dict:
+        return {}
+
+    def normalize_recipient(self, scope: str) -> str | None:
+        return None
+
+    def permits_recipient(self, scope: str, config) -> bool:
+        return True
+
+    def local_activity(
+        self, context: dict, available: set[str], unfunded: bool
+    ) -> LocalActivity | None:
+        return None
+
+    def local_focus(self, context: dict, hour: int) -> tuple[AttentionLevel, str] | None:
+        return None
+
     def actions(self) -> tuple[Action, ...]:
         return ()
 
@@ -137,12 +164,46 @@ class ModuleRegistry:
     def __init__(self) -> None:
         self._modules: dict[str, BaseModule] = {}
         self.catalog = ActionCatalog()
+        self.rules = {}
+        self._recipients: dict[str, BaseModule] = {}
 
     def register(self, module: BaseModule) -> None:
         """Register a capability module by its unique module_id."""
         if not module.module_id or module.module_id in self._modules:
             raise ValueError("module_id must be non-empty and unique")
-        self.catalog.install(module.module_id, module.actions())
+        namespaces = set(module.recipient_namespaces)
+        if (
+            len(namespaces) != len(module.recipient_namespaces)
+            or namespaces.intersection(self._recipients)
+            or any(not re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in namespaces)
+        ):
+            raise ValueError("invalid or duplicate recipient namespace")
+        actions = module.actions()
+        for action in actions:
+            for quota in action.quota_rules():
+                if quota.counter in {"total", "counted"}:
+                    raise ValueError("reserved activity counter")
+                if quota.unlimited_option:
+                    field = module.schedule_options.model_fields.get(quota.unlimited_option)
+                    if field is None or field.annotation is not bool:
+                        raise ValueError("quota switch must be a declared boolean module setting")
+        timer_actions = {action.name for action in actions if "timer" in action.origins}
+        fields = module.schedule_options.model_json_schema()["properties"]
+        for slot in module.schedules():
+            if slot.name not in timer_actions:
+                raise ValueError("daily schedule requires a local timer action")
+            if (
+                slot.time_option
+                and fields.get(slot.time_option, {}).get("pattern") != CLOCK_PATTERN
+            ):
+                raise ValueError("daily schedule requires a ScheduleTime field")
+        rules = module.event_rules()
+        names = {rule.name for rule in rules}
+        if len(names) != len(rules) or "diary.milestone" in names or names.intersection(self.rules):
+            raise ValueError("duplicate event rule")
+        self.catalog.install(module.module_id, actions)
+        self.rules.update({rule.name: rule for rule in rules})
+        self._recipients.update(dict.fromkeys(namespaces, module))
         self._modules[module.module_id] = module
 
     def get(self, module_id: str) -> BaseModule | None:
@@ -152,6 +213,23 @@ class ModuleRegistry:
     def all(self) -> list[BaseModule]:
         """Return all registered modules in registration order."""
         return list(self._modules.values())
+
+    def normalize_recipient(self, scope: str) -> str | None:
+        # Canonical addresses belong to one transport. Its checker also handles legacy aliases.
+        owner = self._recipients.get(scope.partition(":")[0])
+        providers = (
+            [owner] if owner else (module for module in self.all() if module.recipient_namespaces)
+        )
+        candidates = set()
+        for module in providers:
+            canonical = module.normalize_recipient(scope)
+            if canonical and self._recipients.get(canonical.partition(":")[0]) is module:
+                candidates.add(canonical)
+        return candidates.pop() if len(candidates) == 1 else None
+
+    def permits_recipient(self, scope: str, config) -> bool:
+        module = self._recipients.get(scope.partition(":")[0])
+        return bool(module and module.permits_recipient(scope, config))
 
     async def context_data(self, *, limit: int, now: float, message: Message | None = None) -> dict:
         data = {}

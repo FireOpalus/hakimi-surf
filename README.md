@@ -155,7 +155,11 @@ docker compose up -d
 | 升级旧库 | 启动时增补列、索引与规则游标，保留旧票据和终态。新规则从启用时开始消费；重启从已保存的位置补读。 |
 | 可选定点天气 | 在 `.env` 填写 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE` 并启用 `HAKIMI_WEATHER_ENABLED=true`。默认每天 09:30（可用 `HAKIMI_WEATHER_TIME` 调整）读取气温与天气代码。坐标仅发给天气服务。设置 `HAKIMI_WEATHER_OWNER_REPORT=true` 后可由 QQ 单独给 Owner 汇报。[天气数据接口](https://open-meteo.com/en/docs) |
 
-新增能力时，在模块中声明动作、参数及处理函数，按需声明定时和事件规则，并在 `Service` 装配。动作清单、执行和后台展示共用注册表。完整示例见 [天气模块](src/hakimi/modules/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
+世界引擎管理活跃时段、免打扰、规划间隔和共用次数。各功能模块的「模块调度」管理自己的选项、每日任务和下次排程。
+
+新增模块时，在模块上声明 `schedule_options`（继承 `ScheduleOptions`，使用有标题的布尔、数字、文本或枚举字段），并在 `Service` 注册。后台会根据字段类型生成表单并验证保存值。动作可通过 `window` 选择执行时段，通过 `quotas` 指定共用次数及本模块的豁免开关。每日任务用 `schedules()` 声明，`DailyAction.time_option` 可绑定本模块的 `ScheduleTime` 字段，后台改时间后下次排程随之更新。本地兜底意图用 `local_activity()` 提供，事件订阅用 `event_rules()` 声明。注册后即可参与排程。[调度模块验收示例](tests/test_module_scheduling.py)
+
+现有例子见 [天气模块](src/hakimi/modules/weather.py) 和 [跨模块验收用例](tests/test_v210_life_actions.py)。
 
 ### 消息处理全链路
 ```mermaid

@@ -12,6 +12,8 @@ from ..config import Settings
 from ..security import Rejected
 from .actions import Action, ActionCall, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion, sanitize_sensor_text
+from .bili_schedule import BiliScheduleOptions
+from .scheduling import ActivityQuota, LocalActivity
 
 if TYPE_CHECKING:
     from ..bili_watcher import BiliWatcher
@@ -25,6 +27,7 @@ class BilibiliSurfModule(BaseModule):
     """Wraps local BiliWatcher/Bilibili or delegates to a remote CN node fetcher."""
 
     module_id: str = "bilibili_surf"
+    schedule_options = BiliScheduleOptions
     node_region: NodeRegion = "KR"
     attention_level: AttentionLevel = "MEDIUM"
 
@@ -53,11 +56,33 @@ class BilibiliSurfModule(BaseModule):
                 name="bili.patrol",
                 description="按既有订阅、凭证、冷却及预算执行一轮巡逻",
                 budget_lane=PATROL_LANE,
+                window="active",
+                quotas=(ActivityQuota("bili_patrols", "bili_patrols_unlimited"),),
                 run=self.patrol,
                 aliases=(("bilibili_surf", "patrol", False), ("bilibili_surf", "run_once", False)),
                 unavailable=self.patrol_unavailable,
             ),
         )
+
+    def local_activity(self, context, available, unfunded):
+        if unfunded and "bili.patrol" in available:
+            return LocalActivity(
+                30,
+                {
+                    "action_name": "bili.patrol",
+                    "delay_minutes": 1,
+                    "ttl_minutes": 60,
+                    "intent_note": "用可用的巡逻额度去看看首页和关注动态",
+                },
+                one_outstanding=True,
+                focus=(self.attention_level, "curious"),
+            )
+        return None
+
+    def local_focus(self, context, hour):
+        if context.get("recent_bili_surfed") or hour in {13, 14, 20, 21}:
+            return self.attention_level, "curious"
+        return None
 
     def patrol_unavailable(self) -> str | None:
         if self.backend_mode == "remote_node":

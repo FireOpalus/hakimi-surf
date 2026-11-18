@@ -162,6 +162,7 @@ class Service:
                 transport=getattr(sender, "onebot", None),
                 speak=LifeSpeaker(self).speak,
                 digest=self.proactive.world_digest,
+                proactive=self.proactive,
                 preflight=QQPolicy(self).evaluate,
                 connected=self.proactive.connected,
             )

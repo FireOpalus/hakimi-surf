@@ -413,6 +413,7 @@ async def module_detail(request: Request, module_id: str):
     engine = getattr(svc, "life_engine", None)
     modes = engine.config.action_modes if engine else {}
     actions = svc.modules.catalog.view(modes, module_id=module_id)
+    options = module.scheduling(engine.config)
     status = {}
     if module_id == "qq_social":
         status = onebot_connection(request, svc)
@@ -434,7 +435,53 @@ async def module_detail(request: Request, module_id: str):
         "proactive_paused": module.proactive_paused,
         "actions": actions,
         "status": status,
+        "scheduling": {
+            "fields": module.schedule_options.model_json_schema()["properties"],
+            "values": options.model_dump(),
+            "timers": [
+                {
+                    "action": slot.name,
+                    "label": slot.label or slot.name,
+                    "at": slot.effective_time(options),
+                    "next_at": await engine.next_slot_at(module, slot, engine.clock()),
+                }
+                for slot in module.schedules()
+            ],
+        },
     }
+
+
+@router.put("/modules/{module_id}/schedule")
+@router.delete("/modules/{module_id}/schedule")
+async def module_schedule(request: Request, module_id: str):
+    from .app import json_object, read_body
+
+    svc = service(request)
+    module = svc.modules.get(module_id)
+    if module is None:
+        raise HTTPException(404, "module_not_registered")
+    raw = None
+    if request.method == "PUT":
+        raw = json_object(await read_body(request, svc.s))
+        if not raw:
+            raise HTTPException(400, "invalid_admin_input")
+    async with request.app.state.admin_config_lock:
+        engine = svc.life_engine
+        await engine.initialize()
+        try:
+            options = (
+                module.schedule_options.from_settings(svc.s)
+                if raw is None
+                else module.schedule_options.model_validate(
+                    {**module.scheduling(engine.config).model_dump(), **raw}
+                )
+            )
+            config = engine.config.model_dump()
+            config["module_settings"][module_id] = options.model_dump()
+            await engine.set_config(config)
+        except ValueError:
+            raise HTTPException(400, "invalid_module_settings") from None
+        return await module_detail(request, module_id)
 
 
 @router.get("/modules/{module_id}/sensor")
@@ -514,6 +561,29 @@ async def life_reset_config(request: Request):
         if engine is None:
             raise HTTPException(503, "life_engine_unavailable")
         await _maybe_await(engine.set_config(None))
+        return await _build_life_status(svc)
+
+
+@router.put("/schedule")
+@router.delete("/schedule")
+async def world_schedule(request: Request):
+    from .app import json_object, read_body
+
+    svc = service(request)
+    global_fields = LifeEngineConfig.model_fields.keys() - {"module_settings", "action_modes"}
+    engine = svc.life_engine
+    if request.method == "PUT":
+        values = json_object(await read_body(request, svc.s))
+        if not values or values.keys() - global_fields:
+            raise HTTPException(400, "invalid_world_settings")
+    else:
+        values = engine.env_config.model_dump(include=global_fields)
+    async with request.app.state.admin_config_lock:
+        await engine.initialize()
+        try:
+            await engine.set_config({**engine.config.model_dump(), **values})
+        except ValueError:
+            raise HTTPException(400, "invalid_world_settings") from None
         return await _build_life_status(svc)
 
 

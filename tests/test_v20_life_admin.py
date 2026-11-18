@@ -82,8 +82,12 @@ LIFE_ROUTES = [
     ("GET", "/admin/api/life/overview"),
     ("GET", "/admin/api/life/modules/qq_social"),
     ("GET", "/admin/api/life/modules/minecraft/sensor"),
+    ("PUT", "/admin/api/life/modules/qq_social/schedule"),
+    ("DELETE", "/admin/api/life/modules/qq_social/schedule"),
     ("PUT", "/admin/api/life"),
     ("DELETE", "/admin/api/life"),
+    ("DELETE", "/admin/api/life/schedule"),
+    ("PUT", "/admin/api/life/schedule"),
     ("PUT", "/admin/api/life/world"),
     ("PUT", "/admin/api/life/actions/qq.speak"),
     ("POST", "/admin/api/life/plan"),
@@ -113,7 +117,14 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
     for entry in catalog:
         assert set(entry) == {"id", "action_count", "region"}
         details = (await client.get(root + "/" + entry["id"])).json()
-        assert set(details) == {"id", "actions", "status", "region", "proactive_paused"}
+        assert set(details) == {
+            "id",
+            "actions",
+            "status",
+            "region",
+            "proactive_paused",
+            "scheduling",
+        }
         assert len(details["actions"]) == entry["action_count"]
         assert all(action["module"] == entry["id"] for action in details["actions"])
 
@@ -244,7 +255,7 @@ async def test_admin_page_life_tab_csp_sha256_and_zero_inline_attributes(life_ap
         "世界与主动引擎",
         'id="life-enabled"',
         'id="life-active-hours"',
-        'id="life-group-cooldown"',
+        "function moduleSchedulePanel(d)",
         'id="life-max-daily"',
         'id="life-world-module"',
         'id="life-world-focus"',
@@ -325,8 +336,7 @@ async def test_life_get_baseline_bounds_and_missing_engine_503(life_api):
 
 async def test_life_config_crud_and_strict_validation(life_api):
     app, client, _ = life_api
-    fake_engine = FakeLifeEngine()
-    app.state.service.life_engine = fake_engine
+    original = (await client.get("/admin/api/life")).json()["config"]
 
     for bad in (
         {},
@@ -356,7 +366,7 @@ async def test_life_config_crud_and_strict_validation(life_api):
     )
     assert saved.status_code == 200
     body = saved.json()
-    assert body["source"] == "sqlite"
+    assert body["source"] == "admin"
     assert body["config"]["enabled"] is False
     assert body["config"]["group_cooldown_seconds"] == 1800
     assert body["config"]["max_proactive_per_day"] == 3
@@ -366,7 +376,7 @@ async def test_life_config_crud_and_strict_validation(life_api):
     reset = await client.delete("/admin/api/life")
     assert reset.status_code == 200
     assert reset.json()["source"] == "env"
-    assert reset.json()["config"] == LifeConfigMirror().model_dump(mode="json")
+    assert reset.json()["config"] == original
 
 
 async def test_life_world_attention_lock_toggle_and_validation(life_api):

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from ..life_rules import Reaction, Rule
 from .actions import Action, ActionCall, DailyAction, Outcome
 from .base import BaseModule
+from .scheduling import ScheduleOptions, ScheduleTime
 
 
 class Observation(BaseModel):
@@ -18,8 +19,17 @@ class Observation(BaseModel):
     weather_code: int = Field(strict=True, ge=0, le=99)
 
 
+class WeatherScheduleOptions(ScheduleOptions):
+    observation_time: ScheduleTime = Field("09:30", title="观测时间（HH:MM）")
+
+    @classmethod
+    def from_settings(cls, settings):
+        return cls(observation_time=settings.weather_time)
+
+
 class WeatherModule(BaseModule):
     module_id = "weather"
+    schedule_options = WeatherScheduleOptions
 
     def __init__(self, settings, http, publish):
         super().__init__(settings)
@@ -37,7 +47,14 @@ class WeatherModule(BaseModule):
         )
 
     def schedules(self):
-        return (DailyAction("weather.read", self.settings.weather_time),)
+        return (
+            DailyAction(
+                "weather.read",
+                self.settings.weather_time,
+                label="天气观测",
+                time_option="observation_time",
+            ),
+        )
 
     def event_rules(self):
         def report(ev):

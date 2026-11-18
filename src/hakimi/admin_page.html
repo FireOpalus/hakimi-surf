@@ -1939,7 +1939,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 
 <section id="proactive" class="tab" role="tabpanel" aria-labelledby="nav-proactive" hidden>
   <div class="card"><div class="row between"><h2>Owner 投递与告警</h2><button id="refresh-proactive" class="secondary">刷新状态</button></div>
-    <p class="muted">接收人固定为 Owner。<button class="secondary" type="button" data-open-tab="life">查看世界引擎排程</button></p>
+    <p class="muted">接收人固定为 Owner。<button class="secondary" type="button" data-open-tab="qq">打开 QQ 模块调度</button></p>
     <div id="proactive-stats" class="stats"></div>
     <p id="proactive-state" class="muted"></p>
     <p id="proactive-budget" class="muted"></p>
@@ -1980,38 +1980,27 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </form>
   </div>
   <div class="card"><h2>主动引擎调度</h2>
-    <p class="muted">世界引擎安排 B 站小号巡逻和主动聊天。每日汇报安排在当天可发送时段结束前 15 分钟，手动汇报也计入当天。</p>
-    <p id="life-digest-next" class="muted"></p>
+    <p class="muted">各模块共用下列时段、规划间隔和每日次数。<button type="button" class="secondary" data-open-tab="modules">打开功能模块</button></p>
     <p id="life-source" class="muted"></p>
     <form id="life-config-form">
       <div class="row"><label><input id="life-enabled" type="checkbox"> 启用双层生命与主动引擎</label></div>
       <div class="grid">
         <label for="life-active-hours">活跃时段（HH:MM-HH:MM）<input id="life-active-hours" type="text" maxlength="11" placeholder="09:00-01:00" required></label>
         <label for="life-quiet-hours">主动免打扰时段<input id="life-quiet-hours" type="text" maxlength="11" placeholder="23:30-08:30" required></label>
-        <label for="life-group-cooldown">群聊统一主动冷却（秒，300–86400）<input id="life-group-cooldown" type="number" min="300" max="86400" step="1" required></label>
         <label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label>
       </div>
-      <div class="row">
-        <label><input id="life-owner-dms-unlimited" type="checkbox"> Owner 主动私信不限次数</label>
-        <label><input id="life-bili-patrols-unlimited" type="checkbox"> B 站自主巡逻不限次数</label>
-      </div>
-      <p class="muted">勾选的活动单独计数。群聊主动发言始终计入共用上限。</p>
       <details>
-        <summary>高级节律与门控参数</summary>
+        <summary>规划与休眠间隔</summary>
         <div class="grid">
-          <label><input id="life-owner-delivery" type="checkbox"> 允许向 Owner 投递私信与运维告警</label>
           <label for="life-planner-min">活跃规划最小间隔（分钟，30–720）<input id="life-planner-min" type="number" min="30" max="720" step="1" required></label>
           <label for="life-planner-max">活跃规划最大间隔（分钟，60–720）<input id="life-planner-max" type="number" min="60" max="720" step="1" required></label>
           <label for="life-sleep-min">夜间休眠最小间隔（分钟，120–960）<input id="life-sleep-min" type="number" min="120" max="960" step="1" required></label>
           <label for="life-sleep-max">夜间休眠最大间隔（分钟，180–960）<input id="life-sleep-max" type="number" min="180" max="960" step="1" required></label>
-          <label for="life-group-window">群聊活跃观察窗口（秒，60–7200）<input id="life-group-window" type="number" min="60" max="7200" step="1" required></label>
-          <label for="life-group-min-msgs">群聊门控最少有效消息数（1–50）<input id="life-group-min-msgs" type="number" min="1" max="50" step="1" required></label>
-          <label for="life-desktop-suppress">桌面协同抑制窗口（秒，300–86400）<input id="life-desktop-suppress" type="number" min="300" max="86400" step="1" required></label>
         </div>
       </details>
       <div class="row">
         <button id="life-save-config" type="submit" disabled>保存引擎配置</button>
-        <button id="life-reset-config" type="button" class="secondary" disabled>恢复 .env 默认配置</button>
+        <button id="life-reset-config" type="button" class="secondary" disabled>恢复全局调度默认值</button>
         <button id="life-plan-now" type="button" class="secondary" disabled>立即规划生活切片</button>
         <button id="life-gatekeeper-now" type="button" class="secondary" disabled>执行零Token门控扫描</button>
       </div>
@@ -2061,7 +2050,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </form>
   </div>
   <div class="card"><h2>低频自主巡逻与互动</h2>
-    <p class="muted">开启后，世界引擎按当时的计划安排小号逛首页和关注动态。 <button type="button" class="secondary" data-open-tab="life">查看世界引擎排程</button></p>
+    <p class="muted">开启后，世界引擎按计划安排小号逛首页和关注动态。 <button type="button" class="secondary" data-open-tab="bili">打开 B 站模块调度</button></p>
     <form id="bili-policy">
       <label><input id="bili-enabled" type="checkbox"> 启用小号自主巡逻</label>
       <div class="row"><label><input id="bili-like" type="checkbox"> 允许低频点赞</label><label><input id="bili-favorite" type="checkbox"> 允许低频收藏</label><label>指定本账号收藏夹 ID <input id="bili-folder" pattern="[1-9][0-9]{0,19}|" maxlength="20" inputmode="numeric"></label><label>每日点赞与收藏合计上限 <select id="bili-limit"><option value="1">1 次</option><option value="2">2 次</option></select></label></div>
@@ -2225,7 +2214,7 @@ function logout(){
   text('overview-gcp-note','');
   for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
   ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
-  ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-digest-next','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
+  ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
   thinkingReady=false;thinkingDirty=false;
   $('thinking-fields').replaceChildren();$('thinking-environment').replaceChildren();
@@ -3018,21 +3007,13 @@ function renderLife(d){
   $('life-world-energy').value=ws.energy??80;
   $('life-world-boredom').value=ws.boredom??20;
   $('life-enabled').checked=Boolean(c.enabled);
-  $('life-owner-delivery').checked=Boolean(c.owner_delivery_enabled);
   $('life-quiet-hours').value=c.quiet_hours||'23:30-08:30';
-  text('life-digest-next','下次 Owner 日报 · '+(d.engine?.next_digest_at?lifeFmt(d.engine.next_digest_at,tz):'暂无可发送时段'));
   $('life-active-hours').value=c.active_hours||'09:00-01:00';
-  $('life-group-cooldown').value=c.group_cooldown_seconds??1500;
   $('life-max-daily').value=c.max_proactive_per_day??6;
-  $('life-owner-dms-unlimited').checked=Boolean(c.owner_dms_unlimited);
-  $('life-bili-patrols-unlimited').checked=Boolean(c.bili_patrols_unlimited);
   $('life-planner-min').value=c.planner_min_minutes??120;
   $('life-planner-max').value=c.planner_max_minutes??240;
   $('life-sleep-min').value=c.sleep_min_minutes??360;
   $('life-sleep-max').value=c.sleep_max_minutes??480;
-  $('life-group-window').value=c.group_active_window_seconds??1800;
-  $('life-group-min-msgs').value=c.group_min_recent_messages??2;
-  $('life-desktop-suppress').value=c.desktop_active_suppress_seconds??7200;
   const srcLabel=(d.source==='admin'||d.source==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
   const planSrcLabels={llm:'模型规划',sleeping:'夜间休眠',local_fallback:'本地兜底',milestone:'里程碑重规划',none:'尚未规划'};
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
@@ -3097,27 +3078,20 @@ $('life-config-form').addEventListener('submit',e=>{
       enabled:$('life-enabled').checked,
       active_hours:activeHours,
       quiet_hours:$('life-quiet-hours').value.trim(),
-      owner_delivery_enabled:$('life-owner-delivery').checked,
       planner_min_minutes:pMin,
       planner_max_minutes:pMax,
       sleep_min_minutes:sMin,
       sleep_max_minutes:sMax,
-      group_cooldown_seconds:intVal('life-group-cooldown',300,86400,'群聊统一主动冷却'),
-      group_active_window_seconds:intVal('life-group-window',60,7200,'群聊活跃观察窗口'),
-      group_min_recent_messages:intVal('life-group-min-msgs',1,50,'群聊门控最少消息数'),
-      desktop_active_suppress_seconds:intVal('life-desktop-suppress',300,86400,'桌面协同抑制窗口'),
       max_proactive_per_day:intVal('life-max-daily',0,30,'自主活动共用每日上限'),
-      owner_dms_unlimited:$('life-owner-dms-unlimited').checked,
-      bili_patrols_unlimited:$('life-bili-patrols-unlimited').checked
     };
-    const next=await api('life','PUT',payload);
+    const next=await api('life/schedule','PUT',payload);
     renderLife(next);
     notice('双层主动引擎配置已保存并立即生效');
   });
 });
 $('life-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
-  if(!confirm('移除后台覆盖值，恢复默认双层主动引擎配置？'))return;
-  const next=await api('life','DELETE');
+  if(!confirm('恢复世界引擎的默认时段、次数和规划间隔？'))return;
+  const next=await api('life/schedule','DELETE');
   renderLife(next);
   notice('已恢复默认双层主动引擎配置');
 }));
@@ -3478,6 +3452,62 @@ function renderModuleActions(target,actions){
     return [a.name+' · '+a.description,({owner:'仅 Owner',social:'获准群 / Owner',internal:'模块内部'})[a.audience],a.available?'可用':a.reason,control];
   }));
 }
+function moduleSchedulePanel(d){
+  const panel=el('section',undefined,'module-schedule'),spec=d.scheduling;
+  if(!spec)return panel;
+  const fields=Object.entries(spec.fields),timers=spec.timers;
+  if(!fields.length&&!timers.length)return panel;
+  panel.append(el('h3','模块调度'));
+  for(const timer of timers){
+    const when=timer.next_at?dateTime(timer.next_at):'暂无可执行时段';
+    panel.append(el('p',timer.label+' · '+(timer.at||'当日可发送时段结束前 15 分钟')+' · 下次排程 '+when,'muted'));
+  }
+  if(!fields.length)return panel;
+  const form=el('form'),grid=el('div',undefined,'grid'),controls=[];
+  for(const [key,field] of fields){
+    const label=el('label'),input=el(field.enum?'select':'input');
+    input.name=key;input.setAttribute('aria-label',field.title||key);
+    if(field.enum){
+      for(const option of field.enum)input.add(new Option(String(option),String(option)));
+      input.value=String(spec.values[key]);
+    }else if(field.type==='boolean'){
+      input.type='checkbox';input.checked=spec.values[key];label.append(input,document.createTextNode(' '+(field.title||key)));
+    }else{
+      input.type=field.type==='integer'||field.type==='number'?'number':'text';
+      if(input.type==='number')input.step=field.type==='integer'?'1':'any';
+      if(field.minimum!==undefined)input.min=field.minimum;
+      if(field.maximum!==undefined)input.max=field.maximum;
+      if(field.minLength!==undefined)input.minLength=field.minLength;
+      if(field.maxLength!==undefined)input.maxLength=field.maxLength;
+      if(field.pattern)input.pattern=field.pattern;
+      input.required=true;input.value=spec.values[key];
+    }
+    if(input.type!=='checkbox')label.append(document.createTextNode(field.title||key),input);
+    if(field.description)label.append(el('small',field.description,'muted'));
+    grid.append(label);controls.push([key,field,input]);
+  }
+  const path='life/modules/'+encodeURIComponent(d.id)+'/schedule';
+  const buttons=el('div',undefined,'row'),save=el('button','保存模块调度'),reset=el('button','恢复模块默认值','secondary');
+  save.type='submit';reset.type='button';buttons.append(save,reset);form.append(grid,buttons);panel.append(form);
+  const refresh=result=>panel.replaceWith(moduleSchedulePanel(result));
+  form.addEventListener('submit',e=>{e.preventDefault();busy(save,async()=>{
+    const values={};
+    for(const [key,field,input] of controls){
+      let value=input.value;
+      if(field.enum)value=field.enum[input.selectedIndex];
+      else if(field.type==='boolean')value=input.checked;
+      else if(input.type==='number')value=input.valueAsNumber;
+      if(value!==spec.values[key])values[key]=value;
+    }
+    if(!Object.keys(values).length){notice('当前设置已保存');return;}
+    refresh(await api(path,'PUT',values));notice('模块调度设置已保存');
+  });});
+  reset.addEventListener('click',()=>busy(reset,async()=>{
+    if(!confirm('恢复此模块的默认调度设置？'))return;
+    refresh(await api(path,'DELETE'));notice('已恢复模块调度默认值');
+  }));
+  return panel;
+}
 function renderModuleTools(container,d){
   const actions=el('div',undefined,'table'),summary=el('p',undefined,'muted');
   const read=el('button','读取传感器摘要','secondary');read.type='button';
@@ -3486,7 +3516,7 @@ function renderModuleTools(container,d){
     summary.textContent=result.summary||'暂无传感器摘要';
   }));
   const state=el('p',regionName(d.region)+' · '+(d.proactive_paused?'主动动作已暂停':'允许调度主动动作'),'muted');
-  container.replaceChildren(state,actions,read,summary);
+  container.replaceChildren(state,moduleSchedulePanel(d),actions,read,summary);
   renderModuleActions(actions,d.actions);
 }
 async function loadModule(id){

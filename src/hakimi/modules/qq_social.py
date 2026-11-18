@@ -10,12 +10,16 @@ from ..config import Settings
 from ..hot_ring import HotRing
 from .actions import Action, ActionCall, DailyAction, Handler, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion
+from .qq_schedule import QQScheduleOptions
+from .scheduling import ActivityQuota, LocalActivity
 
 
 class QQSocialModule(BaseModule):
     """Summarizes active QQ transport and group ring activity without leaking private content."""
 
     module_id: str = "qq_social"
+    schedule_options = QQScheduleOptions
+    recipient_namespaces = ("owner", "onebot")
     node_region: NodeRegion = "KR"
     attention_level: AttentionLevel = "LOW"
 
@@ -29,6 +33,7 @@ class QQSocialModule(BaseModule):
         speak: Handler | None = None,
         digest: Handler | None = None,
         preflight=None,
+        proactive=None,
         connected: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(settings)
@@ -36,6 +41,7 @@ class QQSocialModule(BaseModule):
         self._transport = transport or getattr(getattr(service, "sender", None), "onebot", None)
         self.digest = digest or self._offline
         self.speak = speak or self._offline
+        self.proactive = proactive or getattr(service, "proactive", None)
         self.preflight = preflight
         self.connected = connected or (lambda: False)
         if service is not None:
@@ -76,6 +82,11 @@ class QQSocialModule(BaseModule):
                 description="结合最新会话向获准的群或 Owner 临场发言",
                 social=True,
                 budget_lane=PROACTIVE_LANE,
+                window="active",
+                quotas=(
+                    ActivityQuota("owner_dms", "owner_dms_unlimited", owner_only=True),
+                    ActivityQuota(),
+                ),
                 run=self.speak,
                 preflight=self.preflight,
                 unavailable=lambda: None if self.connected() else "onebot_offline",
@@ -90,6 +101,12 @@ class QQSocialModule(BaseModule):
                 owner_only=True,
                 budget_lane=PROACTIVE_LANE,
                 origins=frozenset({"timer"}),
+                window="closing",
+                interrupts_focus=True,
+                quotas=(),
+                default_mode="off"
+                if self.settings and not self.settings.daily_digest_enabled
+                else "active",
                 run=self.digest,
             ),
         )
@@ -98,10 +115,78 @@ class QQSocialModule(BaseModule):
         if self.settings and self.settings.onebot_enabled and self.settings.owner_qq_id:
             return (
                 DailyAction(
-                    "qq.owner_digest", at=None, target_scope="owner:" + self.settings.owner_qq_id
+                    "qq.owner_digest",
+                    at=None,
+                    target_scope="owner:" + self.settings.owner_qq_id,
+                    label="Owner 每日汇报",
+                    enabled=(lambda: self.proactive.configured) if self.proactive else None,
+                    attempted=(lambda day: self.proactive.digest_attempted(day))
+                    if self.proactive
+                    else None,
                 ),
             )
         return ()
+
+    def normalize_recipient(self, scope):
+        from .qq_audience import _normalize_target_scope
+
+        return _normalize_target_scope(scope, self.settings) if self.settings else None
+
+    def permits_recipient(self, scope, config):
+        return not scope.startswith("owner:") or self.scheduling(config).owner_delivery_enabled
+
+    async def planning_context(self, service, config, now):
+        from .qq_audience import _allowlisted_groups
+        from .qq_policy import _desktop_latest_activity
+
+        options = self.scheduling(config)
+        desktop = await _desktop_latest_activity(service)
+        return {
+            "available_groups": [
+                "onebot:" + group for group in _allowlisted_groups(self.settings)[:20]
+            ],
+            "owner_dm_available": bool(
+                options.owner_delivery_enabled
+                and self.settings.onebot_enabled
+                and self.settings.owner_qq_id
+            ),
+            "desktop_active_recently": bool(
+                desktop["enabled"]
+                and desktop["latest_timestamp"] > 0
+                and 0 <= now - desktop["latest_timestamp"] < options.desktop_active_suppress_seconds
+            ),
+        }
+
+    def local_activity(self, context, available, unfunded):
+        if "qq.speak" not in available:
+            return None
+        groups = context.get("available_groups", [])
+        if context.get("recent_bili_surfed") and groups:
+            return LocalActivity(
+                20,
+                {
+                    "target_module": "bilibili_surf",
+                    "action_type": "group_chat_share",
+                    "target_scope": groups[0],
+                    "delay_minutes": 15,
+                    "ttl_minutes": 90,
+                    "intent_note": "刚刷到一条有意思的公开视频，看看群里气氛合适就聊两句",
+                },
+            )
+        if context["desktop_active_recently"] and context["owner_dm_available"]:
+            return LocalActivity(
+                10,
+                {
+                    "target_module": self.module_id,
+                    "action_type": "owner_desktop_warm_care",
+                    "target_scope": "owner:" + self.settings.owner_qq_id,
+                    "delay_minutes": 20,
+                    "ttl_minutes": 90,
+                    "allow_desktop_care": True,
+                    "intent_note": "留意到对方刚在电脑端忙完正事，合适时关心一句注意休息喝水",
+                },
+            )
+        return None
 
     def event_rules(self):
         from ..life_rules import milestone_sharing

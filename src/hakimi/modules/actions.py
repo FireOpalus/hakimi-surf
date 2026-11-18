@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from .scheduling import CLOCK_PATTERN, ActivityQuota
+
 
 class NoArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
@@ -57,10 +59,20 @@ class Action:
     social: bool = False
     owner_only: bool = False
     budget_lane: Literal["patrol", "proactive"] | None = None
+    window: Literal["any", "active", "closing"] = "any"
+    interrupts_focus: bool = False
+    # Paid or social actions share the daily allowance by default; () opts out.
+    quotas: tuple[ActivityQuota, ...] | None = None
+    default_mode: Mode = "active"
     origins: frozenset[str] = AUTONOMOUS
     unavailable: Callable[[], str | None] = lambda: None
     preflight: Callable[[dict, float, Any], Awaitable[GateDecision]] | None = None
     aliases: tuple[Alias, ...] = ()
+
+    def quota_rules(self) -> tuple[ActivityQuota, ...]:
+        if self.quotas is not None:
+            return self.quotas
+        return (ActivityQuota(),) if self.social or self.budget_lane else ()
 
 
 class ActionCatalog:
@@ -148,6 +160,20 @@ class DailyAction:
     at: str | None  # None closes the active window for the local day.
     ttl: int = 1800  # Fixed-time actions; a closing action expires at the end of its window.
     target_scope: str = ""
+    label: str = ""
+    attempted: Callable[[str], Awaitable[bool]] | None = None
+    enabled: Callable[[], bool] | None = None
+
+    time_option: str = ""  # The declared at value also identifies this daily slot in old receipts.
+
+    def __post_init__(self):
+        if self.ttl <= 0 or (self.time_option and self.at is None):
+            raise ValueError("invalid daily schedule")
+        if self.at is not None and not re.fullmatch(CLOCK_PATTERN, self.at):
+            raise ValueError("expected HH:MM daily schedule")
+
+    def effective_time(self, options):
+        return getattr(options, self.time_option) if self.time_option else self.at
 
 
 def reject_reason(exc: ValueError) -> str:

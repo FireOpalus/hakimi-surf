@@ -92,24 +92,36 @@ def milestone_sharing(settings) -> Rule:
 
 
 class RuleDispatcher:
-    def __init__(self, engine: LifeEngine, rules: list[Rule]):
+    def __init__(self, engine: LifeEngine, registry):
         self.engine = engine
         self.world = engine.service.world_state
         self.store = engine.store
-        self.subscriptions = {rule.name: partial(self.apply, rule) for rule in rules}
+        self.registry = registry
+        self.subscriptions = {}
         self.journal_lock = asyncio.Lock()
-        if len(self.subscriptions) != len(rules) or "diary.milestone" in self.subscriptions:
-            raise ValueError("duplicate event rule")
-        self.subscriptions["diary.milestone"] = self.record_diary
+        self.registration_lock = asyncio.Lock()
 
-    async def initialize(self) -> None:
-        async with self.store.transaction():
-            for name in self.subscriptions:
-                await self.store.db.execute(
-                    "INSERT OR IGNORE INTO life_rule_cursors "
-                    "SELECT ?,COALESCE(MAX(seq),0) FROM life_event_order",
-                    (name,),
-                )
+    async def initialize(self, *, before_event=None) -> None:
+        if len(self.subscriptions) == len(self.registry.rules) + 1:
+            return
+        async with self.registration_lock:
+            new = {
+                name: partial(self.apply, rule)
+                for name, rule in self.registry.rules.items()
+                if name not in self.subscriptions
+            }
+            if "diary.milestone" not in self.subscriptions:
+                new["diary.milestone"] = self.record_diary
+            if not new:
+                return
+            async with self.store.transaction():
+                for name in new:
+                    await self.store.db.execute(
+                        "INSERT OR IGNORE INTO life_rule_cursors "
+                        "SELECT ?,COALESCE(?,MAX(seq),0) FROM life_event_order",
+                        (name, before_event),
+                    )
+            self.subscriptions.update(new)
 
     async def apply(self, rule: Rule, row, now: float) -> str | None:
         ev = self.world.event_from_row(row)
@@ -216,7 +228,8 @@ class RuleDispatcher:
             )
         first = None
         if row:
-            for name, consume in self.subscriptions.items():
+            await self.initialize(before_event=row["seq"] - 1)
+            for name, consume in tuple(self.subscriptions.items()):
                 try:
                     created = await consume(row, now)
                     first = first or created
@@ -228,7 +241,8 @@ class RuleDispatcher:
 
     async def catch_up(self, now: float) -> None:
         # Live publication can finish out of order. Only the ordered scan advances a cursor.
-        for name, consume in self.subscriptions.items():
+        await self.initialize()
+        for name, consume in tuple(self.subscriptions.items()):
             async with self.store.lock:
                 rows = await self.store.all(
                     "SELECT o.seq,e.* FROM life_event_order o "

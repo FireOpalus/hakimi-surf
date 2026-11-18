@@ -19,14 +19,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from .budget_policy import PROACTIVE_LANE, paid_lane_available
 from .config import Settings
 from .gemini import WireLifePlan
+from .life_config_compat import (
+    LegacyScheduleAccess,
+    import_old_proactive,
+    legacy_view,
+    migrate_flat,
+)
 from .life_defaults import fallback_plan
 from .life_rules import RuleDispatcher
 from .modules.actions import ActionCall, GateDecision, Mode, Outcome, reject_reason
 from .modules.base import sanitize_sensor_text
-from .modules.qq_audience import _allowlisted_groups, _normalize_target_scope
 from .modules.qq_delivery import JIT_TRIGGER_MESSAGE as JIT_TRIGGER_MESSAGE
 from .modules.qq_policy import DESKTOP_CONTEXT_HINT as DESKTOP_CONTEXT_HINT
-from .modules.qq_policy import _desktop_latest_activity
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
 from .world_state import (
@@ -38,27 +42,27 @@ from .world_state import (
 log = logging.getLogger("hakimi")
 
 
-class LifeEngineConfig(BaseModel):
+class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
     """Persistent configuration for LifeBlockPlanner and GatekeeperWorker."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     action_modes: dict[str, Mode] = Field(default_factory=dict)
     enabled: bool = True
-    owner_delivery_enabled: bool = True
     quiet_hours: str = "23:30-08:30"
     active_hours: str = "09:00-01:00"
     planner_min_minutes: int = Field(default=120, ge=30, le=720)
     planner_max_minutes: int = Field(default=240, ge=60, le=720)
     sleep_min_minutes: int = Field(default=360, ge=120, le=960)
     sleep_max_minutes: int = Field(default=480, ge=180, le=960)
-    group_cooldown_seconds: int = Field(default=1500, ge=300, le=86400)
-    group_active_window_seconds: int = Field(default=1800, ge=60, le=7200)
-    group_min_recent_messages: int = Field(default=2, ge=1, le=50)
-    desktop_active_suppress_seconds: int = Field(default=7200, ge=300, le=86400)
     max_proactive_per_day: int = Field(default=6, ge=0, le=30)
-    owner_dms_unlimited: bool = False
-    bili_patrols_unlimited: bool = False
+
+    module_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_legacy_flat_settings(cls, value):
+        return migrate_flat(value)
 
     @field_validator("active_hours", "quiet_hours")
     @classmethod
@@ -75,17 +79,20 @@ class LifeEngineConfig(BaseModel):
         return self
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> Self:
-        kwargs: dict[str, Any] = {
-            "owner_delivery_enabled": settings.proactive_dm_enabled,
-            "quiet_hours": settings.quiet_hours,
-            "action_modes": {} if settings.daily_digest_enabled else {"qq.owner_digest": "off"},
-        }
-        for field_name in cls.model_fields:
-            attr = f"life_engine_{field_name}"
-            if hasattr(settings, attr):
-                kwargs[field_name] = getattr(settings, attr)
-        return cls(**kwargs)
+    def from_settings(cls, settings: Settings, registry) -> Self:
+        return cls(
+            quiet_hours=settings.quiet_hours,
+            module_settings={
+                module.module_id: module.schedule_options.from_settings(settings).model_dump()
+                for module in registry.all()
+                if module.schedule_options.model_fields
+            },
+            action_modes={
+                spec.name: spec.default_mode
+                for spec in registry.catalog.actions.values()
+                if spec.default_mode != "active"
+            },
+        )
 
     def is_active_time(self, local: datetime) -> bool:
         return within_hours(local.hour * 60 + local.minute, hours_bounds(self.active_hours))
@@ -225,20 +232,13 @@ class LifeBlockPlanner:
 
         current = ws.current
         events = await ws.unconsumed_events(limit=20)
-        groups = _allowlisted_groups(self.s)
         modules_reg = self.service.modules
         module_data = await modules_reg.context_data(limit=4, now=ts)
         sensors = await modules_reg.collect_sensor_summaries()
         known_modules = {"idle", *(m.module_id for m in modules_reg.all())}
-        owner_available = bool(
-            cfg.owner_delivery_enabled and self.s.onebot_enabled and self.s.owner_qq_id
-        )
-        desktop_info = await _desktop_latest_activity(self.service)
-        desktop_recent = bool(
-            desktop_info["enabled"]
-            and desktop_info["latest_timestamp"] > 0
-            and 0 <= (ts - desktop_info["latest_timestamp"]) < cfg.desktop_active_suppress_seconds
-        )
+        planning_context = {}
+        for module in modules_reg.all():
+            planning_context.update(await module.planning_context(self.service, cfg, ts))
 
         budget = await self.store.budget_status()
         available_actions = [
@@ -267,13 +267,11 @@ class LifeBlockPlanner:
                     "payload": ev.payload,
                 }
                 for ev in events
-                if not (ev.event_type == "bili_video_watched" and ev.payload.get("private_first"))
+                if not ev.payload.get("private_first")
             ],
             **module_data,
             "available_actions": available_actions,
-            "available_groups": [f"onebot:{gid}" for gid in groups[:20]],
-            "owner_dm_available": owner_available,
-            "desktop_active_recently": desktop_recent,
+            **planning_context,
             "available_modules": sorted(known_modules),
         }
 
@@ -297,29 +295,8 @@ class LifeBlockPlanner:
                 plan = None
 
         if plan is None:
-            patrol_without_paid_plan = False
-            if (
-                not planner_funded
-                and "bili.patrol" in offered
-                and await self.engine.gatekeeper.daily_limit_allows("bili.patrol", "", ts, cfg)
-            ):
-                async with self.store.lock:
-                    outstanding = await self.store.one(
-                        "SELECT 1 FROM scheduled_intents WHERE action_name='bili.patrol' "
-                        "AND status IN ('pending','executing') AND expire_at>? LIMIT 1",
-                        (ts,),
-                    )
-                patrol_without_paid_plan = outstanding is None
-            plan = fallback_plan(
-                self.s,
-                local_dt=local_dt,
-                current_energy=current.energy,
-                current_boredom=current.boredom,
-                module_data=module_data,
-                groups=groups if "qq.speak" in offered else [],
-                owner_available=owner_available and "qq.speak" in offered,
-                desktop_recent=desktop_recent,
-                patrol_without_paid_plan=patrol_without_paid_plan,
+            plan = await fallback_plan(
+                self.engine, planner_payload, current, local_dt, ts, offered, planner_funded
             )
             plan_source = "local_fallback"
 
@@ -379,7 +356,7 @@ class LifeBlockPlanner:
                 continue
             bounded_note = trim_complete_text(raw_note, 120)
             raw_scope = item.target_scope.strip()
-            resolved_scope = _normalize_target_scope(raw_scope, self.s) if raw_scope else ""
+            resolved_scope = modules_reg.normalize_recipient(raw_scope) if raw_scope else ""
             if resolved_scope is None:
                 continue
             catalog = self.engine.catalog
@@ -483,44 +460,61 @@ class GatekeeperWorker:
             )
             return int(cur.rowcount or 0)
 
+    def quota_for(self, spec, scope):
+        owner = bool(self.s.owner_qq_id and scope == f"owner:{self.s.owner_qq_id}")
+        return next((rule for rule in spec.quota_rules() if not rule.owner_only or owner), None)
+
+    def is_unlimited(self, spec, rule, cfg):
+        if not rule.unlimited_option:
+            return False
+        options = self.engine.options_for(spec, cfg)
+        return getattr(options, rule.unlimited_option)
+
     async def daily_usage(self, now: float, cfg: LifeEngineConfig) -> dict[str, int]:
-        day_start, day_end = _day_bounds(now, self.s.bot_timezone)
-        owner_scope = f"owner:{self.s.owner_qq_id}" if self.s.owner_qq_id else None
+        start, end = _day_bounds(now, self.s.bot_timezone)
+        catalog = self.engine.catalog
+        usage = {
+            q.counter: 0
+            for spec in catalog.actions.values()
+            for q in spec.quota_rules()
+            if q.counter
+        }
+        usage.update(total=0, counted=0)
         async with self.store.lock:
-            row = await self.store.one(
-                "SELECT COUNT(*) AS total, "
-                "COUNT(*) FILTER (WHERE target_scope=? AND "
-                "COALESCE(NULLIF(action_name,''),'qq.speak')='qq.speak') AS owner_dms, "
-                "COUNT(*) FILTER (WHERE target_scope='') AS bili_patrols "
+            rows = await self.store.all(
+                "SELECT action_name,target_module,action_type,target_scope,COUNT(*) AS n "
                 "FROM scheduled_intents "
-                "WHERE (target_scope != '' OR action_name='bili.patrol' OR "
-                "(target_module='bilibili_surf' AND action_type IN ('patrol','run_once'))) "
-                "AND COALESCE(action_name,'')!='qq.owner_digest' "
-                "AND status IN ('done','uncertain') AND updated_at>=? AND updated_at<?",
-                (owner_scope, day_start, day_end),
+                "WHERE status IN ('done','uncertain') AND updated_at>=? AND updated_at<? "
+                "GROUP BY action_name,target_module,action_type,target_scope",
+                (start, end),
             )
-        usage = dict(row)
-        usage["counted"] = usage["total"]
-        if cfg.owner_dms_unlimited:
-            usage["counted"] -= usage["owner_dms"]
-        if cfg.bili_patrols_unlimited:
-            usage["counted"] -= usage["bili_patrols"]
+        for row in rows:
+            name = row["action_name"] or catalog.old_name(row)
+            spec = catalog.actions.get(name)
+            if not spec:
+                # Preserve historical deliveries from actions no longer registered.
+                if row["target_scope"]:
+                    usage["total"] += row["n"]
+                    usage["counted"] += row["n"]
+                continue
+            rule = self.quota_for(spec, row["target_scope"])
+            if rule is None:
+                continue
+            usage["total"] += row["n"]
+            if rule.counter:
+                usage[rule.counter] += row["n"]
+            if not self.is_unlimited(spec, rule, cfg):
+                usage["counted"] += row["n"]
         return usage
 
     async def daily_limit_allows(
         self, action: str, scope: str, now: float, cfg: LifeEngineConfig
     ) -> bool:
-        if action == "bili.patrol" and not scope and cfg.bili_patrols_unlimited:
+        spec = self.engine.catalog.actions[action]
+        rule = self.quota_for(spec, scope)
+        if rule is None or self.is_unlimited(spec, rule, cfg):
             return True
-        if (
-            action == "qq.speak"
-            and cfg.owner_dms_unlimited
-            and self.s.owner_qq_id
-            and scope == f"owner:{self.s.owner_qq_id}"
-        ):
-            return True
-        usage = await self.daily_usage(now, cfg)
-        return usage["counted"] < cfg.max_proactive_per_day
+        return (await self.daily_usage(now, cfg))["counted"] < cfg.max_proactive_per_day
 
     async def _evaluate_ticket(
         self,
@@ -551,13 +545,12 @@ class GatekeeperWorker:
             return await reject(reject_reason(exc))
         if self.store.runtime.is_resting(now) or cfg.quiet(local_dt):
             return await reject("quiet_hours")
-        daily_digest = spec.name == "qq.owner_digest"
-        if daily_digest and not self.engine.digest_due(now):
+        if spec.window == "closing" and not self.engine.closing_due(now):
             return await reject("outside_digest_window")
-        if spec.name in {"qq.speak", "bili.patrol"} and not cfg.is_active_time(local_dt):
+        if spec.window == "active" and not cfg.is_active_time(local_dt):
             return await reject("outside_active_hours")
         if (
-            not daily_digest
+            not spec.interrupts_focus
             and ws.proactive_suspended()
             and self.engine.catalog.owners[spec.name] != ws.current.current_module
         ):
@@ -571,14 +564,16 @@ class GatekeeperWorker:
             budget = await self.store.budget_status()
             if not paid_lane_available(budget, spec.budget_lane):
                 return await reject("budget_limit")
-            if not daily_digest and not await self.daily_limit_allows(
-                spec.name, ticket["target_scope"], now, cfg
-            ):
-                return await reject("daily_proactive_limit")
+        if not await self.daily_limit_allows(spec.name, ticket["target_scope"], now, cfg):
+            return await reject("daily_proactive_limit")
         if reason := spec.unavailable():
             return await defer(reason, 120)
 
-        decision = await spec.preflight(ticket, now, cfg) if spec.preflight else GateDecision()
+        decision = (
+            await spec.preflight(ticket, now, self.engine.options_for(spec, cfg))
+            if spec.preflight
+            else GateDecision()
+        )
         if decision.reason:
             if decision.delay:
                 return await defer(decision.reason, decision.delay)
@@ -661,17 +656,24 @@ class JITExecutor:
                     return (
                         self.engine.config.enabled
                         and (
-                            spec.name not in {"qq.speak", "bili.patrol", "qq.owner_digest"}
+                            spec.window == "any"
                             or (
                                 self.engine.config.is_active_time(local)
-                                and not self.engine.config.quiet(local)
-                                and not self.store.runtime.is_resting(current)
+                                and (spec.window != "closing" or self.engine.closing_due(current))
                             )
                         )
+                        and not self.engine.config.quiet(local)
+                        and not self.store.runtime.is_resting(current)
                         and self.engine.config.action_modes.get(spec.name) != "off"
                         and (
-                            not ticket["target_scope"].startswith("owner:")
-                            or self.engine.config.owner_delivery_enabled
+                            not spec.social
+                            or (
+                                self.service.modules.normalize_recipient(ticket["target_scope"])
+                                == ticket["target_scope"]
+                                and self.service.modules.permits_recipient(
+                                    ticket["target_scope"], self.engine.config
+                                )
+                            )
                         )
                         and current < ticket["expire_at"]
                     )
@@ -732,7 +734,7 @@ class LifeEngine:
         self.store = service.store
         self.clock = clock
         self.rng = rng or random.SystemRandom()
-        self.env_config = LifeEngineConfig.from_settings(self.s)
+        self.env_config = LifeEngineConfig.from_settings(self.s, service.modules)
         self.config: LifeEngineConfig = self.env_config
         self.overridden: bool = False
         self.initialized: bool = False
@@ -746,8 +748,11 @@ class LifeEngine:
         self.gatekeeper = GatekeeperWorker(service, self, clock=self.clock)
         self.jit = JITExecutor(service, self, clock=self.clock)
         self.catalog = service.modules.catalog
-        rules = [rule for module in service.modules.all() for rule in module.event_rules()]
-        self.rules = RuleDispatcher(self, rules)
+        self.rules = RuleDispatcher(self, service.modules)
+
+    def options_for(self, spec, cfg):
+        module = self.service.modules.get(self.catalog.owners[spec.name])
+        return module.scheduling(cfg)
 
     def resolve(self, ticket: dict, *, admin: bool = False):
         if (ticket.get("origin") == "admin") != admin:
@@ -760,16 +765,12 @@ class LifeEngine:
             spec = self.catalog.resolve(ticket, compatibility=True)
         if spec.owner_only and ticket.get("target_scope") != "owner:" + self.s.owner_qq_id:
             raise ValueError("unauthorized_scope")
-        if (
-            ticket.get("target_scope", "").startswith("owner:")
-            and not self.config.owner_delivery_enabled
-        ):
-            raise ValueError("action_disabled")
-        if (
-            spec.social
-            and _normalize_target_scope(ticket["target_scope"], self.s) != ticket["target_scope"]
-        ):
-            raise ValueError("unauthorized_scope")
+        if spec.social:
+            scope = ticket["target_scope"]
+            if self.service.modules.normalize_recipient(scope) != scope:
+                raise ValueError("unauthorized_scope")
+            if not self.service.modules.permits_recipient(scope, self.config):
+                raise ValueError("action_disabled")
         return spec, spec.arguments.model_validate(ticket.get("arguments", {}))
 
     async def compare_shadow(self, ticket: dict):
@@ -832,20 +833,18 @@ class LifeEngine:
                     "SELECT payload FROM admin_config WHERE key='proactive'"
                 )
                 saved = self.store.vault.open("admin:life_engine", row[0]) if row else {}
+                saved = migrate_flat(saved)
                 merged = {**self.env_config.model_dump(), **saved}
+                merged["module_settings"] = self.env_config.module_settings | saved.get(
+                    "module_settings", {}
+                )
                 merged["action_modes"] = self.env_config.action_modes | saved.get(
                     "action_modes", {}
                 )
                 if legacy:
-                    old = self.store.vault.open("admin:proactive", legacy[0])
-                    if "owner_delivery_enabled" not in saved:
-                        merged["owner_delivery_enabled"] = old.get(
-                            "enabled", self.env_config.owner_delivery_enabled
-                        )
-                    if "quiet_hours" not in saved:
-                        merged["quiet_hours"] = old.get("quiet_hours", self.env_config.quiet_hours)
-                    if not old.get("daily_digest_enabled", True):
-                        merged["action_modes"].setdefault("qq.owner_digest", "off")
+                    import_old_proactive(
+                        self.store.vault.open("admin:proactive", legacy[0]), saved, merged
+                    )
                 merged["action_modes"] = {
                     name: mode
                     for name, mode in merged["action_modes"].items()
@@ -879,7 +878,7 @@ class LifeEngine:
         usage = await self.gatekeeper.daily_usage(self.clock(), self.config)
         return {
             "actions": self.catalog.view(self.config.action_modes),
-            "config": self.config.model_dump(),
+            "config": legacy_view(self.config, self.service.modules),
             "source": "admin" if self.overridden else "env",
             "environment": self.env_config.model_dump(),
             "timezone": self.s.bot_timezone,
@@ -902,6 +901,15 @@ class LifeEngine:
                 self.overridden = False
             else:
                 cfg = LifeEngineConfig.model_validate(value)
+                for module_id in cfg.module_settings:
+                    module = self.service.modules.get(module_id)
+                    if module is None:
+                        if cfg.module_settings[module_id] != self.config.module_settings.get(
+                            module_id
+                        ):
+                            raise ValueError("unknown_module_settings")
+                    else:
+                        module.scheduling(cfg)
                 for name, mode in cfg.action_modes.items():
                     spec = self.catalog.actions.get(name)
                     if not spec or (mode in {"legacy", "shadow"} and not spec.aliases):
@@ -926,7 +934,7 @@ class LifeEngine:
                 await self.schedule_due(ts)
             return await self.gatekeeper.tick(now=ts)
 
-    def digest_window(self, local_day: date) -> tuple[int, int] | None:
+    def closing_window(self, local_day: date) -> tuple[int, int] | None:
         rest = self.store.runtime.rest_hours
         return _digest_window(
             local_day,
@@ -936,54 +944,82 @@ class LifeEngine:
             rest.rest_hours if rest.enabled else None,
         )
 
-    def digest_due(self, stamp: float) -> bool:
-        window = self.digest_window(
+    def closing_due(self, stamp: float) -> bool:
+        window = self.closing_window(
             datetime.fromtimestamp(stamp, _zone(self.s.bot_timezone)).date()
         )
         return bool(window and window[0] <= stamp < window[1])
 
-    async def next_digest_at(self, now: float) -> float | None:
-        if (
-            not self.config.enabled
-            or not self.config.owner_delivery_enabled
-            or self.config.action_modes.get("qq.owner_digest") == "off"
-            or not self.service.proactive.configured
-        ):
+    # Public 2.1 compatibility entry points for the QQ delivery service.
+    digest_window = closing_window
+    digest_due = closing_due
+
+    async def next_digest_at(self, now):
+        from .life_config_compat import next_owner_digest
+
+        return await next_owner_digest(self, now)
+
+    def slot_window(self, module, slot, day):
+        at = slot.effective_time(module.scheduling(self.config))
+        if at is None:
+            return self.closing_window(day)
+        start = datetime.combine(
+            day, day_time.fromisoformat(at), _zone(self.s.bot_timezone)
+        ).timestamp()
+        return start, start + slot.ttl
+
+    async def next_slot_at(self, module, slot, now):
+        if not self.config.enabled or (slot.enabled and not slot.enabled()):
+            return None
+        if not self.slot_available(module, slot):
             return None
         today = datetime.fromtimestamp(now, _zone(self.s.bot_timezone)).date()
         for day in (today, today + timedelta(days=1)):
-            window = self.digest_window(day)
-            if not window or now >= window[1]:
-                continue
-            if await self.service.proactive.digest_attempted(day.isoformat()):
+            window = self.slot_window(module, slot, day)
+            if (
+                not window
+                or now >= window[1]
+                or (slot.attempted and await slot.attempted(day.isoformat()))
+            ):
                 continue
             async with self.store.lock:
                 finished = await self.store.one(
                     "SELECT 1 FROM scheduled_intents WHERE dedupe_key=? "
                     "AND status NOT IN ('pending','executing')",
-                    (f"timer:qq.owner_digest:{day}:{window[0]}",),
+                    (f"timer:{slot.name}:{day}:{slot.at or int(window[0])}",),
                 )
             if not finished:
                 return max(now, window[0])
         return None
 
+    def slot_available(self, module, slot):
+        spec = self.catalog.actions.get(slot.name)
+        if not spec or self.catalog.owners[slot.name] != module.module_id:
+            return False
+        try:
+            self.resolve(
+                dict(
+                    action_name=slot.name,
+                    target_module=module.module_id,
+                    action_type=slot.name,
+                    target_scope=slot.target_scope,
+                    origin="timer",
+                )
+            )
+        except ValueError:
+            return False
+        return True
+
     async def schedule_due(self, now: float) -> None:
         local = datetime.fromtimestamp(now, _zone(self.s.bot_timezone))
         for module in self.service.modules.all():
             for slot in module.schedules():
-                if slot.at is None:
-                    window = self.digest_window(local.date())
-                    if not window:
-                        continue
-                    start, end = window
-                else:
-                    hour, minute = map(int, slot.at.split(":"))
-                    start = local.replace(
-                        hour=hour, minute=minute, second=0, microsecond=0
-                    ).timestamp()
-                    end = start + slot.ttl
-                if not start <= now < end:
+                window = self.slot_window(module, slot, local.date())
+                if not window or not window[0] <= now < window[1]:
                     continue
+                if not self.slot_available(module, slot) or (slot.enabled and not slot.enabled()):
+                    continue
+                start, end = window
                 ticket = IntentTicketCreate(
                     action_name=slot.name,
                     target_module=module.module_id,
@@ -994,10 +1030,6 @@ class LifeEngine:
                     expire_at=end,
                     dedupe_key=f"timer:{slot.name}:{local.date()}:{slot.at or int(start)}",
                 )
-                try:
-                    self.resolve(ticket.model_dump())
-                except ValueError:
-                    continue
                 await self.service.world_state.enqueue_intent(ticket, now=now)
 
     async def run(self) -> None:

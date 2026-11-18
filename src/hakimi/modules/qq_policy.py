@@ -17,7 +17,7 @@ from .actions import GateDecision
 from .qq_audience import _scope_to_message
 
 if TYPE_CHECKING:
-    from ..life_engine import LifeEngineConfig
+    from .qq_schedule import QQScheduleOptions
 
 DESKTOP_CONTEXT_HINT = "BOISER 近期刚在电脑端忙正事，默契关心一句注意休息喝水，绝不问怎么没回消息"
 
@@ -153,7 +153,7 @@ class QQPolicy:
         return GateDecision(desktop_hint=desktop_hint)
 
     async def _group_activity_ok(
-        self, group_msg: Message, now: float, cfg: LifeEngineConfig
+        self, group_msg: Message, now: float, cfg: QQScheduleOptions
     ) -> bool:
         hot = getattr(self.service, "hot", None)
         if hot is None:
@@ -211,7 +211,7 @@ class QQPolicy:
         return eligible_count >= effective_min
 
     async def _owner_dm_gate(
-        self, ticket: dict[str, Any], now: float, cfg: LifeEngineConfig
+        self, ticket: dict[str, Any], now: float, cfg: QQScheduleOptions
     ) -> tuple[bool, str | None]:
         proactive = self.service.proactive
         if not proactive.configured or not cfg.owner_delivery_enabled:
