@@ -469,6 +469,8 @@ async def test_proactive_manual_digest_uses_shared_daily_attempt(admin_api):
     assert first.status_code == 200 and first.json()["delivery"] == "sent"
     second = await client.post("/admin/api/proactive/digest")
     assert second.status_code == 200
+    assert first.json()["receipt"]["stage"] == second.json()["receipt"]["stage"] == "confirmed"
+    assert first.json()["receipt"]["confirmed_at"] == second.json()["receipt"]["confirmed_at"]
     assert len(gateway.calls) == 2
     assert len(app.state.service.sender.onebot.calls) == 1
 

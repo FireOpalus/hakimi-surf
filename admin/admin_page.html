@@ -1949,7 +1949,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <div id="proactive-queue" class="table"></div>
   </div>
   <div class="card"><h2>手动验收</h2>
-    <p class="muted">按钮会向 Owner 发送真实私信。测试消息不调用模型；今日汇报与定时任务共用一次生成机会，预算熔断时跳过。断线时暂存，发送结果不确定时不自动重发。</p>
+    <p class="muted">测试消息会直接发给 Owner，消耗 0 Token。手动与定时汇报每天共用一份。预算熔断会暂停新生成，已通过审核的日报仍可在有效时段投递。QQ 断线时排队，回执待核实的消息不会自动重发。</p>
     <div class="row"><button id="dm-test">发送测试私信（0 Token）</button><button id="dm-now">立即生成并发送今日汇报</button></div>
   </div>
   <div class="card"><h2>最近运维告警</h2><div id="proactive-alerts" class="table"></div></div>
@@ -2965,6 +2965,7 @@ async function notebook(){const n=await api('notebook'),am=n.antigravity_memory|
 async function logs(){table('log-list',['时间','来源','事件'],(await api('logs')).map(v=>[dateTime(v.at),v.source,v.code]));}
 
 const dmStatus={pending:'等待投递',sent:'已发送并处理记忆',delivered:'已确认发送，等待记忆写入',uncertain:'发送结果不确定，不重发',expired:'已过期',skipped:'已跳过',failed:'生成未完成',queued:'已排队',generating:'生成中',cancelled:'已取消',not_queued:'未入队'};
+const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
 const dmKindLabels={companion:'日常陪伴',digest:'每日汇报',alert:'异常告警',test:'通路验证'};
 async function proactive(){
   const d=await api('proactive');
@@ -2974,7 +2975,16 @@ async function proactive(){
   text('proactive-state',d.day+' · '+zoneLabel(d.timezone)+' · '+(!d.configured?'尚未配置 Owner QQ':d.delivery_enabled?'允许投递':'已停用投递'));
   text('proactive-budget','主动生成日预算 $'+d.proactive_daily_limit_usd+' · 本地累计 $'+(d.budget.total/1e6).toFixed(4)+' / '+(d.budget.total_limit>0?'$'+(d.budget.total_limit/1e6).toFixed(2):'未设累计上限')+(d.budget.hard_stop?' · 付费生成已熔断':'')+'（含预留，不代表 Google 赠金余额）');table('proactive-queue',['类型','状态','数量'],d.queue.map(v=>[dmKindLabels[v.kind]||v.kind,dmStatus[v.status]||v.status,v.n]));table('proactive-alerts',['告警','入队时间','状态','冷却截止'],d.alerts.map(v=>[v.alert_key,fmt(v.queued_at),dmStatus[v.status]||v.status,fmt(v.cooldown_until)]));}
 $('refresh-proactive').addEventListener('click',e=>busy(e.target,proactive));
-for(const [id,action] of [['dm-test','test'],['dm-now','digest']])$(id).addEventListener('click',e=>busy(e.target,async()=>{notice(action==='test'?'正在验证私信通路…':'正在准备今日汇报…');const r=await api('proactive/'+action,'POST');const state=r.delivery&&r.delivery!=='not_queued'?r.delivery:r.status;notice((dmStatus[state]||state)+(r.reason?' · '+r.reason:''));await proactive();}));
+for(const [id,action] of [['dm-test','test'],['dm-now','digest']]){
+  $(id).addEventListener('click',e=>busy(e.target,async()=>{
+    notice(action==='test'?'正在验证私信通路…':'正在准备今日汇报…');
+    const result=await api('proactive/'+action,'POST');
+    const state=result.delivery&&result.delivery!=='not_queued'?result.delivery:result.status;
+    const label=deliveryStages[result.receipt?.stage]||dmStatus[state]||state;
+    notice(label+(result.reason?' · '+result.reason:''));
+    await proactive();
+  }));
+}
 
 const lifeIntentStatus={pending:'待触发',executing:'执行中',done:'已完成',gated_skip:'门控跳过',expired:'已过期',uncertain:'结果不确定'};
 const lifeIntentVariant={pending:'warn',executing:'paid',done:'ok',gated_skip:'muted',expired:'muted',uncertain:'err'};
@@ -3004,7 +3014,6 @@ const planLabels={
   recipient_unavailable:'接收人不可用',invalid_action:'动作无效',unknown_action:'动作未注册',unavailable_action:'动作当前不可用',
   window_expired:'执行窗口已过',invalid_ticket:'任务数据无效',round_cap:'超过单轮名额'
 };
-const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
 const planLabel=value=>planLabels[value]||value||'—';
 function planCost(c){
   const parts=[];
