@@ -401,7 +401,7 @@ class Settings(BaseSettings):
     owner_companion_thinking_level: ThinkingLevel = "medium"
     bili_selection_thinking_level: ThinkingLevel = "medium"
     bili_learning_thinking_level: ThinkingLevel = "medium"
-    decision_timeout: float = Field(default=8, ge=1, le=30)
+    decision_timeout: float = Field(default=20, ge=1, le=30)
     generation_timeout: float = Field(default=45, ge=1, le=90)
     injection_threshold: float = Field(default=0.20, ge=0.01, le=0.99)
     unsafe_threshold: float = Field(default=0.50, ge=0.01, le=0.99)

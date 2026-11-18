@@ -327,7 +327,7 @@ class GeminiGateway:
 
     def _files(self):
         if self.files_client is None:
-            # Uploads must not inherit the 8-second Decisions transport deadline.
+            # Large uploads use a separate transport deadline.
             self.files_client = self._client("v1beta", 120)
         return self.files_client.aio.files
 
