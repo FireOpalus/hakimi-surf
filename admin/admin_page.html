@@ -3003,7 +3003,7 @@ const planLabels={
   recipient_unavailable:'接收人不可用',invalid_action:'动作无效',unknown_action:'动作未注册',unavailable_action:'动作当前不可用',
   window_expired:'执行窗口已过',invalid_ticket:'任务数据无效',round_cap:'超过单轮名额'
 };
-const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
+const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
 const planLabel=value=>planLabels[value]||value||'—';
 function planCost(c){
   const parts=[];
@@ -3092,9 +3092,8 @@ function renderLife(d){
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
   text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+zoneLabel(tz)+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
   for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
-  const digestStages={generating:'正在生成',generated:'已生成',queued:'已排队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',uncertain:'回执不确定',generation_uncertain:'生成中断，结果不确定',failed:'生成失败',cancelled:'已取消'};
   table('life-digests',['日期','进度','已生成','已排队','QQ 已确认'],(d.digest_history||[]).map(r=>[
-    r.day,digestStages[r.stage]||r.stage,lifeFmt(r.generated_at,tz),lifeFmt(r.queued_at,tz),lifeFmt(r.confirmed_at,tz)
+    r.day,deliveryStages[r.stage]||r.stage,lifeFmt(r.generated_at,tz),lifeFmt(r.queued_at,tz),lifeFmt(r.confirmed_at,tz)
   ]));
   table('life-intents-table',['ID','动作 / 接收人','来源 / 事件','执行窗口','门控与模糊动机','状态 / 结果','操作'],(d.intents||[]).map(it=>[
     el('span',String(it.id||'').slice(0,10),'code-mono'),
