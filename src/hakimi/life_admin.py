@@ -21,7 +21,7 @@ from pydantic import (
 from . import world_observations
 from .admin_routes import body, onebot_connection, service
 from .life_engine import LifeEngineConfig
-from .modules.actions import ActionCall, Mode, reject_reason
+from .modules.actions import ActionCall, HourlyAction, Mode, reject_reason
 
 router = APIRouter(prefix="/admin/api/life")
 
@@ -475,6 +475,7 @@ async def module_detail(request: Request, module_id: str):
                     "action": slot.name,
                     "label": slot.label or slot.name,
                     "at": slot.effective_time(options),
+                    **({"cadence": "hourly"} if isinstance(slot, HourlyAction) else {}),
                     "next_at": await engine.next_slot_at(module, slot, engine.clock()),
                 }
                 for slot in module.schedules()

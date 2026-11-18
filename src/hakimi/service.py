@@ -187,9 +187,7 @@ class Service:
         minecraft.remote_dispatcher = adapter.dispatch
         self.modules.register(minecraft)
         if settings.weather_enabled:
-            self.modules.register(
-                WeatherModule(settings, sender.http, self.world_state.publish_event)
-            )
+            self.modules.register(WeatherModule(settings, sender.http, self.world_state))
         if getattr(self.node_transport, "on_event", None) is None:
             self.node_transport.on_event = adapter.on_event
         if getattr(self.node_transport, "on_state", None) is None:

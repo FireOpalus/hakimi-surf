@@ -212,9 +212,30 @@ class QQSocialModule(BaseModule):
         return None
 
     def event_rules(self):
-        from ..life_rules import milestone_sharing
+        from ..life_rules import Reaction, Rule, milestone_sharing
 
-        return (milestone_sharing(self.settings),)
+        rules = (milestone_sharing(self.settings),)
+        if not (self.settings and self.settings.weather_owner_report):
+            return rules
+
+        def weather_reminder(event):
+            if (
+                self.settings.owner_qq_id
+                and event.source_module == "weather"
+                and event.event_type == "weather_report_due"
+            ):
+                return Reaction(
+                    "qq.speak",
+                    "根据天气观测给 Owner 简短提醒",
+                    recipient="owner:" + self.settings.owner_qq_id,
+                    cooldown=0,
+                    ttl=1800,
+                    legacy_module="qq_social",
+                    legacy_verb="proactive_share",
+                )
+            return None
+
+        return (*rules, Rule("weather.owner_report", weather_reminder))
 
     async def _offline(self, call: ActionCall) -> Outcome:
         return Outcome("not_dispatched", "onebot_offline")

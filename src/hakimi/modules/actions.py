@@ -63,6 +63,7 @@ class Action:
     reuses_paid_work: Callable[[float], Awaitable[bool]] | None = None
     window: Literal["any", "active", "closing"] = "any"
     interrupts_focus: bool = False
+    background_sensor: bool = False
     # Paid or social actions share the daily allowance by default; () opts out.
     quotas: tuple[ActivityQuota, ...] | None = None
     default_mode: Mode = "active"
@@ -88,6 +89,10 @@ class ActionCatalog:
         for spec in actions:
             if not NAME.fullmatch(spec.name) or spec.name in names:
                 raise ValueError(f"invalid or duplicate action: {spec.name}")
+            if spec.background_sensor and (
+                spec.origins != {"timer"} or spec.social or spec.budget_lane or spec.window != "any"
+            ):
+                raise ValueError("background sensors must be internal unmetered timer actions")
             names.add(spec.name)
             for alias in spec.aliases:
                 if alias in aliases or alias[2] != spec.social:
@@ -187,6 +192,15 @@ class DailyAction:
 
     def effective_time(self, options):
         return getattr(options, self.time_option) if self.time_option else self.at
+
+
+@dataclass(frozen=True)
+class HourlyAction(DailyAction):
+    """One timer slot per elapsed hour, anchored to the local clock."""
+
+    at: str = field(default="00:00", init=False)
+    ttl: int = field(default=3600, init=False)
+    time_option: str = field(default="", init=False)
 
 
 def reject_reason(exc: ValueError) -> str:

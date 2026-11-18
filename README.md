@@ -165,7 +165,7 @@ docker compose up -d
 | 生活引擎 → 主动动作 | 查看动作的执行模块、就绪状态及原因。可逐项切换按动作名路由、旧票据路由、对照模式或停用。对照模式只比较本地映射，实际处理一次。 |
 | 生活引擎 → 意图与事件 | 追踪来源事件、目标、门控与投递结果。每条规则独立消费同一事实。明确未派发可以在票据有效期内再试，回执不明记为 `uncertain`。 |
 | 升级旧库 | 启动时增补列、索引与规则游标，保留旧票据和终态。新规则从启用时开始消费；重启从已保存的位置补读。 |
-| 可选定点天气 | 在 `.env` 填写 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE` 并启用 `HAKIMI_WEATHER_ENABLED=true`。默认每天 09:30（可用 `HAKIMI_WEATHER_TIME` 调整）读取气温与天气代码。坐标仅发给天气服务。设置 `HAKIMI_WEATHER_OWNER_REPORT=true` 后可由 QQ 单独给 Owner 汇报。[天气数据接口](https://open-meteo.com/en/docs) |
+| 可选定点天气 | 在 `.env` 设置 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE` 和 `HAKIMI_WEATHER_ENABLED=true`。世界引擎按本地整点读取 Open-Meteo 当前天气，在夜间也采样，重启只补当前小时。每条 `weather_observed` 记录数据时刻、采样区间、气温、天气代码及可用的降水、太阳辐射和昼夜标记。降水量对应上游采样区间。各模块可独立订阅，采样不调用模型。启用 `HAKIMI_WEATHER_OWNER_REPORT=true` 后，QQ 每天最多发送一次提醒，默认 09:30，由 `HAKIMI_WEATHER_TIME` 或模块调度面板设置。[天气数据接口](https://open-meteo.com/en/docs) |
 
 世界引擎管理活跃时段、免打扰、规划间隔和共用次数。各功能模块的「模块调度」管理自己的选项、每日任务和下次排程。
 

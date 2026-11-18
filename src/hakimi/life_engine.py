@@ -28,7 +28,7 @@ from .life_config_compat import (
 from .life_defaults import fallback_plan
 from .life_rules import RuleDispatcher
 from .life_workers import ActionWorkers
-from .modules.actions import ActionCall, GateDecision, Mode, Outcome, reject_reason
+from .modules.actions import ActionCall, GateDecision, HourlyAction, Mode, Outcome, reject_reason
 from .modules.base import sanitize_sensor_text
 from .modules.qq_delivery import JIT_TRIGGER_MESSAGE as JIT_TRIGGER_MESSAGE
 from .modules.qq_policy import DESKTOP_CONTEXT_HINT as DESKTOP_CONTEXT_HINT
@@ -565,6 +565,7 @@ class LifeBlockPlanner:
         if (
             self.engine.config.enabled
             and event.importance == "high"
+            and not event.consumed
             and not event.payload.get("private_first")
         ):
             now = self.clock()
@@ -722,14 +723,17 @@ class GatekeeperWorker:
             spec, _ = self.engine.resolve(ticket)
         except ValueError as exc:
             return await reject(reject_reason(exc))
-        if self.store.runtime.is_resting(now) or cfg.quiet(local_dt):
+        if not spec.background_sensor and (
+            self.store.runtime.is_resting(now) or cfg.quiet(local_dt)
+        ):
             return await reject("quiet_hours")
         if spec.window == "closing" and not self.engine.closing_due(now):
             return await reject("outside_digest_window")
         if spec.window == "active" and not cfg.is_active_time(local_dt):
             return await reject("outside_active_hours")
         if (
-            not spec.interrupts_focus
+            not spec.background_sensor
+            and not spec.interrupts_focus
             and ws.proactive_suspended()
             and self.engine.catalog.owners[spec.name] != ws.current.current_module
         ):
@@ -848,8 +852,13 @@ class JITExecutor:
                                 and (spec.window != "closing" or self.engine.closing_due(current))
                             )
                         )
-                        and not self.engine.config.quiet(local)
-                        and not self.store.runtime.is_resting(current)
+                        and (
+                            spec.background_sensor
+                            or (
+                                not self.engine.config.quiet(local)
+                                and not self.store.runtime.is_resting(current)
+                            )
+                        )
                         and self.engine.config.action_modes.get(spec.name) != "off"
                         and (
                             not spec.social
@@ -1209,28 +1218,35 @@ class LifeEngine:
         ).timestamp()
         return start, start + slot.ttl
 
+    def slot_occurrences(self, module, slot, now):
+        local = datetime.fromtimestamp(now, _zone(self.s.bot_timezone))
+        if isinstance(slot, HourlyAction):
+            start = int(local.replace(minute=0, second=0, microsecond=0).timestamp())
+            for stamp in (start, start + 3600):
+                day = datetime.fromtimestamp(stamp, local.tzinfo).date()
+                yield day, stamp, stamp + 3600, f"timer:{slot.name}:hour:{stamp}"
+            return
+        for day in (local.date(), local.date() + timedelta(days=1)):
+            if window := self.slot_window(module, slot, day):
+                start, end = window
+                yield day, start, end, f"timer:{slot.name}:{day}:{slot.at or int(start)}"
+
     async def next_slot_at(self, module, slot, now):
         if not self.config.enabled or (slot.enabled and not slot.enabled()):
             return None
         if not self.slot_available(module, slot):
             return None
-        today = datetime.fromtimestamp(now, _zone(self.s.bot_timezone)).date()
-        for day in (today, today + timedelta(days=1)):
-            window = self.slot_window(module, slot, day)
-            if (
-                not window
-                or now >= window[1]
-                or (slot.attempted and await slot.attempted(day.isoformat()))
-            ):
+        for day, start, end, key in self.slot_occurrences(module, slot, now):
+            if now >= end or (slot.attempted and await slot.attempted(day.isoformat())):
                 continue
             async with self.store.lock:
                 finished = await self.store.one(
                     "SELECT 1 FROM scheduled_intents WHERE dedupe_key=? "
                     "AND status NOT IN ('pending','executing')",
-                    (f"timer:{slot.name}:{day}:{slot.at or int(window[0])}",),
+                    (key,),
                 )
             if not finished:
-                return max(now, window[0])
+                return max(now, start)
         return None
 
     def slot_available(self, module, slot):
@@ -1261,12 +1277,14 @@ class LifeEngine:
             for slot in module.schedules():
                 if poll and slot.receipts:
                     readers[slot.name] = slot.receipts
-                window = self.slot_window(module, slot, local.date())
-                if not window or not window[0] <= now < window[1]:
+                occurrence = next(self.slot_occurrences(module, slot, now), None)
+                if occurrence is None:
+                    continue
+                _, start, end, key = occurrence
+                if not start <= now < end:
                     continue
                 if not self.slot_available(module, slot) or (slot.enabled and not slot.enabled()):
                     continue
-                start, end = window
                 if slot.receipts and await journal.observe_slot(day, slot, start, end):
                     readers[slot.name] = slot.receipts
                 ticket = IntentTicketCreate(
@@ -1277,7 +1295,7 @@ class LifeEngine:
                     target_scope=slot.target_scope,
                     execute_after=start,
                     expire_at=end,
-                    dedupe_key=f"timer:{slot.name}:{local.date()}:{slot.at or int(start)}",
+                    dedupe_key=key,
                 )
                 await self.service.world_state.enqueue_intent(ticket, now=now)
         if readers:

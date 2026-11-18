@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS global_events (
   payload_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_global_events_unconsumed ON global_events(consumed, created_at);
+CREATE INDEX IF NOT EXISTS idx_global_events_source_type_at
+  ON global_events(source_module,event_type,created_at);
 CREATE TABLE IF NOT EXISTS group_proactive_cooldown (
   scope TEXT PRIMARY KEY,
   last_proactive_at REAL NOT NULL
@@ -744,7 +746,7 @@ class WorldStateManager:
                 event.source_module,
                 event.event_type,
                 event.importance,
-                0,
+                int(event.consumed),
                 payload_json,
             ),
         )
@@ -763,16 +765,29 @@ class WorldStateManager:
         *,
         now: float | None = None,
         business_key: str | None = None,
+        include_in_plan: bool = True,
     ) -> MilestoneEvent:
         """Sanitize, persist to global_events as plaintext JSON, and notify subscribers."""
         event = self.make_event(
             source_module, event_type, payload, importance, now=now, business_key=business_key
         )
+        # Local subscribers have independent durable cursors. Sampling alone need not
+        # make the next model plan billable or fill its context with sensor readings.
+        event.consumed = not include_in_plan
         async with self.store.transaction():
             event, created = await self.insert_event_tx(event)
         if created:
             await self.notify_event(event)
         return event
+
+    async def latest_event(self, source_module: str, event_type: str) -> MilestoneEvent | None:
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT * FROM global_events WHERE source_module=? AND event_type=? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (source_module, event_type),
+            )
+        return self.event_from_row(row) if row else None
 
     async def notify_event(self, event):
         await self.refresh()

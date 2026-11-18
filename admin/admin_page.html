@@ -3583,7 +3583,8 @@ function moduleSchedulePanel(d){
   panel.append(el('h3','模块调度'));
   for(const timer of timers){
     const when=timer.next_at?dateTime(timer.next_at):'暂无可执行时段';
-    panel.append(el('p',timer.label+' · '+(timer.at||'当日可发送时段结束前 15 分钟')+' · 下次排程 '+when,'muted'));
+    const cadence=timer.cadence==='hourly'?'每小时整点':(timer.at||'当日可发送时段结束前 15 分钟');
+    panel.append(el('p',timer.label+' · '+cadence+' · 下次排程 '+when,'muted'));
   }
   if(!fields.length)return panel;
   const form=el('form'),grid=el('div',undefined,'grid'),controls=[];

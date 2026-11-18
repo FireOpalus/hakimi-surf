@@ -13,8 +13,10 @@ import pytest
 
 from hakimi.adapters import Sender
 from hakimi.life_engine import LifeEngine
-from hakimi.modules.actions import Action, ActionCatalog, NoArgs, Outcome
-from hakimi.modules.base import BaseModule
+from hakimi.modules.actions import Action, ActionCall, ActionCatalog, NoArgs, Outcome
+from hakimi.modules.base import BaseModule, ModuleRegistry
+from hakimi.modules.weather import WeatherModule
+from hakimi.rest_policy import RestHoursConfig
 from hakimi.security import Rejected
 from hakimi.service import Service
 from hakimi.world_state import WorldStateManager
@@ -239,6 +241,32 @@ async def test_upgrade_old_queue_in_place_and_keep_planner_and_rule_cursors_inde
         )[:] == ("legacy", None, "done")
 
 
+async def test_weather_publishes_without_qq_or_greenhouse(settings, store):
+    registry = ModuleRegistry()
+    world = WorldStateManager(settings, store, registry)
+    seen, requests = [], []
+    settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
+
+    def provider(request):
+        requests.append(request)
+        data = {"time": int(NOW), "interval": 900, "temperature_2m": 18, "weather_code": 2}
+        return httpx.Response(200, json={"current": data})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        weather = WeatherModule(settings, client, world)
+        registry.register(weather)
+        await world.initialize()
+        world.subscribe(seen.append)
+        assert (await weather.read(ActionCall({}, NoArgs(), NOW))).reason == "observation_recorded"
+        assert (
+            await weather.read(ActionCall({}, NoArgs(), NOW + 10))
+        ).reason == "observation_cached"
+    assert [module.module_id for module in registry.all()] == ["weather"]
+    assert len(requests) == 1 and [event.event_type for event in seen] == ["weather_observed"]
+    assert not await world.unconsumed_events()
+    assert not await world.list_due_intents(now=NOW)
+
+
 @pytest.mark.parametrize("notify_owner", [False, True])
 async def test_fourth_module_timer_observation_and_optional_owner_report(
     settings, store, notify_owner
@@ -248,6 +276,7 @@ async def test_fourth_module_timer_observation_and_optional_owner_report(
     settings.weather_time = "14:00"
     settings.weather_owner_report = notify_owner
     requests = []
+    data_time = int(NOW)
 
     def weather(req):
         requests.append(req)
@@ -257,18 +286,40 @@ async def test_fourth_module_timer_observation_and_optional_owner_report(
             and "Authorization" not in req.headers
             and "Cookie" not in req.headers
         )
-        return httpx.Response(200, json={"current": {"temperature_2m": 17.5, "weather_code": 3}})
+        assert (
+            req.url.params["timeformat"] == "unixtime"
+            and "shortwave_radiation" in req.url.params["current"]
+        )
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": data_time,
+                    "interval": 900,
+                    "temperature_2m": 17.5,
+                    "weather_code": 3,
+                    "precipitation": 0.4,
+                    "shortwave_radiation": 100.0,
+                    "is_day": 1,
+                }
+            },
+        )
 
     async with setup(settings, store, weather) as (svc, wire, node):
         engine = svc.life_engine
+        events = []
+        svc.world_state.subscribe(events.append)
         assert any(a["name"] == "weather.read" for a in (await engine.status())["actions"])
         svc.ai.chat_json = "现在气温大约 17.5 度。"
         before = await engine.tick_gatekeeper_once(now=NOW)
-        assert before["outcomes"] == {"done": 1}
+        assert before["outcomes"] == {"done": 1 + int(notify_owner)}
         await engine.tick_gatekeeper_once(now=NOW + 10)
         assert len(requests) == 1 and not svc.ai.calls and not wire.calls and not node.calls
-        ev = (await svc.world_state.unconsumed_events())[0]
-        assert ev.payload == {"temperature_2m": 17.5, "weather_code": 3}
+        ev = await svc.world_state.latest_event("weather", "weather_observed")
+        assert (
+            ev in events and ev.payload["time"] == data_time and ev.payload["precipitation"] == 0.4
+        )
+        assert not await svc.world_state.unconsumed_events()
         assert not await svc.world_state.list_due_intents(now=NOW + 30)
         await engine.tick_gatekeeper_once(now=NOW + 65)
         assert len(wire.calls) == int(notify_owner) and len(svc.ai.calls) == int(notify_owner)
@@ -278,6 +329,88 @@ async def test_fourth_module_timer_observation_and_optional_owner_report(
                 and str(wire.calls[0][1]["user_id"]) == "20000"
             )
             assert "17.5" in svc.ai.calls[0][1]["jit_proactive_intent"]["module_material"]
+        data_time += 3600
+        await engine.tick_gatekeeper_once(now=NOW + 3600)
+        await engine.tick_gatekeeper_once(now=NOW + 3665)
+        assert len(requests) == 2
+        assert len(wire.calls) == int(notify_owner) and len(svc.ai.calls) == int(notify_owner)
+        assert [e.payload["time"] for e in events if e.event_type == "weather_observed"] == [
+            int(NOW),
+            data_time,
+        ]
+
+
+async def test_hourly_weather_survives_restart_sleep_and_stale_data(settings, store):
+    settings.weather_enabled = True
+    settings.weather_latitude, settings.weather_longitude = 31.23, 121.47
+    midnight = NOW + 10 * 3600  # 00:00, inside the engine's quiet hours.
+    data_time = int(midnight)
+    requests = []
+
+    def weather(req):
+        requests.append(req)
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": data_time,
+                    "interval": 900,
+                    "temperature_2m": 12.0,
+                    "weather_code": 2,
+                }
+            },
+        )
+
+    async with setup(settings, store, weather) as (svc, wire, _):
+        await store.runtime.set_rest_hours(RestHoursConfig(enabled=True, rest_hours="23:00-08:00"))
+        await svc.world_state.experience.mc_snapshot("mine", midnight)
+        assert store.runtime.is_resting(midnight) and svc.world_state.proactive_suspended()
+        await svc.life_engine.tick_gatekeeper_once(now=midnight + 10)
+        assert len(requests) == 1 and not svc.ai.calls and not wire.calls
+    await store.close()
+    await store.open()
+    async with setup(settings, store, weather) as (svc, wire, _):
+        module = svc.modules.get("weather")
+        slot = module.schedules()[0]
+        await svc.life_engine.tick_gatekeeper_once(now=midnight + 600)
+        assert len(requests) == 1
+        assert await svc.life_engine.next_slot_at(module, slot, midnight + 600) == midnight + 3600
+        # Miss two hours. A stale response must not replace the midnight sample.
+        await svc.life_engine.tick_gatekeeper_once(now=midnight + 3 * 3600)
+        assert len(requests) == 2
+        last = await svc.world_state.latest_event("weather", "weather_observed")
+        assert last.payload["time"] == midnight
+        data_time += 4 * 3600
+        await svc.life_engine.tick_gatekeeper_once(now=midnight + 4 * 3600)
+        assert len(requests) == 3
+        assert "04:00" in await module.get_sensor_summary()
+        assert not svc.ai.calls and not wire.calls
+        await svc.life_engine.set_config({"action_modes": {"weather.read": "off"}})
+        await svc.life_engine.tick_gatekeeper_once(now=midnight + 5 * 3600)
+        assert len(requests) == 3
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"origins": frozenset({"planner"})},
+        {"social": True},
+        {"budget_lane": "proactive"},
+    ],
+)
+def test_background_sensors_cannot_bypass_chat_or_paid_action_gates(options):
+    async def read(call):
+        return Outcome("done", "sampled")
+
+    spec = Action(
+        name="sample.read",
+        description="sample",
+        run=read,
+        background_sensor=True,
+        **({"origins": frozenset({"timer"})} | options),
+    )
+    with pytest.raises(ValueError, match="background sensors"):
+        ActionCatalog().install("sample", (spec,))
 
 
 async def test_planner_discovers_new_action_but_cannot_forge_origin(settings, store):
