@@ -1,4 +1,4 @@
-"""Validated configuration for the standalone Shanghai CN node agent."""
+"""Validated configuration for the standalone domestic node agent."""
 
 from __future__ import annotations
 

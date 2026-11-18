@@ -1,6 +1,6 @@
-# 0.3.1 内嵌管理台、滚动记忆与只读快照
+# 独立管理台、滚动记忆与只读快照
 
-在原 FastAPI 服务中增加 `/admin`，没有 Node.js、npm、CDN、外部字体或前端构建步骤。完整页面位于 `src/hakimi/admin_page.html`，内联 CSS 与原生 Fetch；管理接口均位于 `/admin/api/`。
+独立服务 `hakimi-admin` 提供 `/admin`，原生页面随管理镜像一起发布。完整页面位于 `admin/admin_page.html`，内联 CSS 与原生 Fetch；管理接口均位于 `/admin/api/`。
 
 ## 文件清单
 
@@ -18,7 +18,7 @@
 | `gemini.py`、`generation_policy.py` | 可观测 Decisions 结果、记忆数据边界、压缩 low 档 |
 | `app.py`、`service.py`、`store.py` | 生命周期、管理鉴权、后台任务、预算分区、清空与待发回复联动 |
 | `bilibili.py`、`roaming_logger.py` | 直播间公开状态、412 等固定告警、手动当日日记同步及脱敏错误 |
-| `docker-compose.yml`、`compose.yaml`、`Dockerfile` | 容器服务名 hakimi-bot，宿主端口只绑定 127.0.0.1 |
+| `docker-compose.yml`、`compose.yaml`、`Dockerfile` | 引擎 hakimi-bot（12141）与独立管理台 hakimi-admin（12143），宿主端口均只绑定 127.0.0.1 |
 | `.env.example`、`compose.roaming.yaml`、`deploy/nginx.conf` | 配置说明、Service Account 只读挂载、公共代理明确拒绝后台路径 |
 
 ## 管理鉴权与浏览器边界
@@ -138,16 +138,16 @@ GDRIVE_SERVICE_ACCOUNT_FILE=/run/secrets/roaming-service-account.json
 
 1. 停服并备份现有数据卷与独立保存的加密密钥。保留原 `.env`，补充新配置；不要用初始化脚本覆盖已有密钥。无第三方运行依赖新增，继续使用已锁定的 `google-genai>=3.2.0`。
 2. 设置一个随机 `ADMIN_TOKEN`。例如在服务器本机执行 `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` 后填写到受保护的 `.env`。填好 `OWNER_QQ_ID`，需要快照时再显式开启相关开关并只读挂载 Service Account JSON。
-3. 本次标准 Compose 服务名为 `hakimi-bot`，使用 bridge 网络，**唯一端口映射为 `127.0.0.1:12141:12141`**；容器内监听 `0.0.0.0:12141`。`compose.yaml` 与 `docker-compose.yml` 内容相同，`docker compose` 默认使用前者，也可显式 `-f docker-compose.yml`。
+3. 境外 Compose 在回环地址分别映射后台 `12143`、引擎 `12141`。后台通过容器网络调用引擎的管理 API。`compose.yaml` 与 `docker-compose.yml` 内容相同，`docker compose` 默认使用前者，也可显式 `-f docker-compose.yml`。
 4. 从 0.2.x 的 host 网络版本迁移时，**在覆盖旧 Compose 文件之前**用旧配置运行 `docker compose down` 停掉旧服务（不加 `-v`；若已覆盖，先停止旧 `hakimi` 服务容器），再 `docker compose -f docker-compose.yml up -d --build`。保持项目目录／project name 不变以复用原 `hakimi-data` 卷。查看 `docker compose -f docker-compose.yml logs --tail 30 hakimi-bot`。
 5. 从 0.3.0 升级时默认端口由 8080 改为 12141；同步修改 NapCat 反向 WS 地址、Nginx upstream 和 SSH 隧道。推荐 NapCat 反向 WS：宿主机 NapCat 连接 `ws://127.0.0.1:12141/ws/onebot`。正向 WS／HTTP 模式中，容器的 `127.0.0.1` 已不是宿主机；可配置受保护的 `onebot` Docker host-gateway 地址（例如 `http://onebot:3000`），同时让 NapCat 仅在可达的受保护接口监听，或放在同一个专用 Docker 网络。不要因此把 NapCat API 暴露公网。
 6. 在**自己的电脑**执行：
 
 ```bash
-ssh -N -L 12141:127.0.0.1:12141 user@your-server
+ssh -N -L 12141:127.0.0.1:12143 user@your-server
 ```
 
-保持 SSH 连接，浏览器打开 **http://127.0.0.1:12141/admin**，输入 ADMIN_TOKEN。本地 12141 被占用时用 `-L 18080:127.0.0.1:12141`，访问 `http://127.0.0.1:18080/admin`。后台拒绝公共域名，Nginx 模板也明确拒绝 `/admin`，不能通过公开机器人域名访问它。
+保持 SSH 连接，浏览器打开 **http://127.0.0.1:12141/admin**，输入 ADMIN_TOKEN。本地 12141 被占用时用 `-L 18080:127.0.0.1:12143`，访问 `http://127.0.0.1:18080/admin`。后台拒绝公共域名，Nginx 模板也明确拒绝 `/admin`，不能通过公开机器人域名访问它。
 
 先检查概览；在沙盒选择“已知 Bot”确认显示未调用，再选择普通群友群 @ 进行一次真实付费测试。新建测试私聊后查看摘要／热窗口，进行压缩和重置；确认群与私聊互不影响。未配置 ADMIN_TOKEN 的部署应对管理路径全部返回 403，缺失或错误 Bearer 应返回 401。真实 QQ／B 站／Drive 联调需要你的凭证与网络，本次未调用真实服务。
 

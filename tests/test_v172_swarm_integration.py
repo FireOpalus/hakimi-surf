@@ -63,7 +63,7 @@ def _member_msg(message, *, user_id="30000", event_id="ev-1", text="你好", **u
     )
 
 
-async def test_mounted_affection_admin_csp_and_merged_balance(settings):
+async def test_mounted_affection_admin_csp_and_merged_balance(admin_frontend, settings):
     settings.affection_enabled = True
     settings.admin_token = SecretStr(TOKEN)
     settings.daily_usd = Decimal("100")

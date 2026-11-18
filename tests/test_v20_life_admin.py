@@ -154,7 +154,9 @@ async def test_minecraft_control_returns_only_its_module_snapshot(life_api):
     assert not gateway.calls
 
 
-async def test_admin_workspace_navigation_owns_each_panel_and_control_once(life_api):
+async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
+    admin_frontend, life_api
+):
     _, client, _ = life_api
     html = (await client.get("/admin")).text
     navs = dict(re.findall(r'<nav id="(core|modules)-nav"[^>]*>(.*?)</nav>', html, re.S))
@@ -224,7 +226,7 @@ async def test_life_admin_origin_and_rebinding_protection(life_api, headers):
     assert res.status_code == 403
 
 
-async def test_admin_page_life_tab_csp_sha256_and_zero_inline_attributes(life_api):
+async def test_admin_page_life_tab_csp_sha256_and_zero_inline_attributes(admin_frontend, life_api):
     _, client, _ = life_api
     res = await client.get("/admin", headers={"Authorization": ""})
     assert res.status_code == 200

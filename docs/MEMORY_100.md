@@ -49,4 +49,4 @@ Markdown 条目使用稳定 `<!-- entry:... -->` 锚点。可以改条目正文�
 
 账本保留原缓存命中率，显示扣除 2050 动态窗后的有效覆盖率及前缀击穿告警；`memory_flex` 与 Hydrogen／Carbon／Decisions 分列。双轨后台调用不计入在线前缀稳定命中样本。90% 是稳态观察线而非保证值。
 
-迁移和测试不读取用户原始私聊到输出，不调用真实模型或 Drive。版本包通过 `scripts/package_delivery.py` 显式白名单生成，排除 `.env`、OAuth/SA 凭证与数据卷。部署前备份加密 DB 与 `.env`，只重建首尔 hakimi-bot；上海 NapCat、主域名 DSH 和 Nginx 不动。
+迁移和测试不读取用户原始私聊到输出，不调用真实模型或 Drive。版本包通过 `scripts/package_delivery.py` 显式白名单生成，排除 `.env`、OAuth/SA 凭证与数据卷。部署前备份加密 DB 与 `.env`，只重建境外 hakimi-bot；境内 NapCat、主域名 DSH 和 Nginx 不动。

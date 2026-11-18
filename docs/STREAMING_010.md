@@ -1,6 +1,6 @@
 # v0.10.0：流式防抖与五维出站
 
-本次基于 v0.9.0 增量升级。原三段人设正文、A/B/C 顺序、SQLite 账本、公私聊隔离、上海 NapCat 与首尔反向 WSS 拓扑继续保留。SDK 为 `google-genai >= 3.2.0`；Decisions 使用 v1beta，聊天 Interactions 使用 v1（v1.1.4 起对非沙箱且启用记忆的主对话开启 `store=True` 与 `previous_interaction_id` 差量续链，其余任务与沙盒保持 `store=False`）。v0.9 的 L4 Carbon 与后台思考配置不变。
+本次基于 v0.9.0 增量升级。原三段人设正文、A/B/C 顺序、SQLite 账本、公私聊隔离、境内 NapCat 与境外反向 WSS 拓扑继续保留。SDK 为 `google-genai >= 3.2.0`；Decisions 使用 v1beta，聊天 Interactions 使用 v1（v1.1.4 起对非沙箱且启用记忆的主对话开启 `store=True` 与 `previous_interaction_id` 差量续链，其余任务与沙盒保持 `store=False`）。v0.9 的 L4 Carbon 与后台思考配置不变。
 
 ## 入站与四态机
 
@@ -52,7 +52,7 @@ L3/L4 启动时尽力在 0.9 秒内发本地过渡句，无模型调用、不写
 
 ## 配置、验证与上线
 
-新环境项见 `.env.example`：`HAKIMI_MENTION_DEBOUNCE_SECONDS`、`HAKIMI_MENTION_INCOMPLETE_SECONDS`、`HAKIMI_ORDINARY_INCOMPLETE_SECONDS`；旧 `HAKIMI_GROUP_DEBOUNCE_SECONDS` / `MAX_SECONDS` 默认改 2.0 / 5.0。原两项都为零时保持立即处理；修改环境后只重建后端，上海登录态不动。
+新环境项见 `.env.example`：`HAKIMI_MENTION_DEBOUNCE_SECONDS`、`HAKIMI_MENTION_INCOMPLETE_SECONDS`、`HAKIMI_ORDINARY_INCOMPLETE_SECONDS`；旧 `HAKIMI_GROUP_DEBOUNCE_SECONDS` / `MAX_SECONDS` 默认改 2.0 / 5.0。原两项都为零时保持立即处理；修改环境后只重建后端，境内登录态不动。
 
 仍使用 `127.0.0.1:12141`、只读根目录、768 MiB 内存限制。管理后台展示门卫/推理中的数量和图片缓存大小；表情列表支持同名情绪图池，标签变更立即刷新静态前缀。
 

@@ -95,7 +95,9 @@ def test_ws_node_auth_rejects_invalid_and_keeps_onebot_intact(settings) -> None:
             )
 
 
-async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(settings, tmp_path) -> None:
+async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(
+    admin_frontend, settings, tmp_path
+) -> None:
     cn_requests: list[str] = []
 
     def cn_http_handler(request: httpx.Request) -> httpx.Response:
@@ -109,7 +111,7 @@ async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(settings, 
                         "bvid": BV,
                         "title": "CN Node Video",
                         "owner": {"mid": 1001, "name": "UP主"},
-                        "desc": "来自上海节点的视频简介",
+                        "desc": "来自境内节点的视频简介",
                         "stat": {"view": 1000, "like": 100},
                         "pubdate": 1700000000,
                         "duration": 90,

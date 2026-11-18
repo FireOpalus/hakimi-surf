@@ -114,7 +114,7 @@ async def test_admin_no_cookie_or_query_auth_and_bad_token_limiter(admin_api):
     assert (await client.get("/admin/api/dashboard")).status_code == 200
 
 
-async def test_embedded_page_has_csp_no_external_assets_or_token(admin_api):
+async def test_embedded_page_has_csp_no_external_assets_or_token(admin_frontend, admin_api):
     _, client, _ = admin_api
     r = await client.get("/admin", headers={"Authorization": ""})
     assert r.status_code == 200
@@ -515,7 +515,7 @@ async def test_dual_memory_governance_cas_lock_delete_unlock_and_no_raw_history(
     assert (await client.get(url, headers={"Authorization": "Bearer wrong"})).status_code == 401
 
 
-async def test_dual_memory_admin_page_and_ledger_fields(admin_api):
+async def test_dual_memory_admin_page_and_ledger_fields(admin_frontend, admin_api):
     _, client, _ = admin_api
     page = await client.get("/admin")
     assert "memory-mirror-save" in page.text and "双轨记忆治理" in page.text
@@ -526,7 +526,7 @@ async def test_dual_memory_admin_page_and_ledger_fields(admin_api):
     )
 
 
-async def test_cache_prefix_alert_is_visible_in_ledger(admin_api):
+async def test_cache_prefix_alert_is_visible_in_ledger(admin_frontend, admin_api):
     app, client, _ = admin_api
     await app.state.service.store.runtime.event("cache_prefix_busted", "production")
     health = (await client.get("/admin/api/dashboard")).json()["usage"]["cache_health"]
@@ -534,7 +534,9 @@ async def test_cache_prefix_alert_is_visible_in_ledger(admin_api):
     assert "cache-alert" in (await client.get("/admin")).text
 
 
-async def test_sessions_and_notebook_admin_accuracy_fixes(admin_api, message, tmp_path):
+async def test_sessions_and_notebook_admin_accuracy_fixes(
+    admin_frontend, admin_api, message, tmp_path
+):
     from types import SimpleNamespace
 
     from hakimi.modules.bilibili_surf import BilibiliSurfModule

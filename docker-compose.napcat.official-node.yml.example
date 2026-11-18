@@ -1,4 +1,4 @@
-# Optional official Node loader for the Shanghai protocol host.
+# Optional official Node loader for the domestic protocol host.
 # Copy this example to docker-compose.napcat.official-node.yml before use.
 # docker compose --env-file .env.napcat -f docker-compose.napcat.yml \
 #   -f docker-compose.napcat.official-node.yml up -d

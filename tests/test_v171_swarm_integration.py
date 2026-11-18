@@ -36,7 +36,7 @@ def _png_bytes() -> bytes:
     return buf.getvalue()
 
 
-async def test_admin_page_csp_hashes_and_security_invariants(settings):
+async def test_admin_page_csp_hashes_and_security_invariants(admin_frontend, settings):
     settings.admin_token = SecretStr(TOKEN)
     app = create_app(settings, gateway_factory=FakeGateway, start_workers=False)
     async with app.router.lifespan_context(app):

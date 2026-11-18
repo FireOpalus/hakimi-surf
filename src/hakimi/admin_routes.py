@@ -6,11 +6,10 @@ import time
 import uuid
 from datetime import date
 from decimal import Decimal
-from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+import httpx
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .admission_policy import (
@@ -165,10 +164,33 @@ def owner_target(s):
     )
 
 
-@router.get("", response_class=HTMLResponse)
-@router.get("/", response_class=HTMLResponse)
-async def page():
-    return HTMLResponse(Path(__file__).with_name("admin_page.html").read_text())
+ADMIN_PAGE_URL = "http://hakimi-admin:8080/admin"
+
+
+@router.head("")
+@router.head("/")
+async def page_access():
+    """The private frontend checks access here before serving the login document."""
+    return Response(status_code=204)
+
+
+@router.get("")
+@router.get("/")
+async def page(request: Request):
+    """Check console access or serve the independent UI through a legacy SSH tunnel."""
+    if request.headers.get("accept") == "application/json":
+        return Response(status_code=204)
+    try:
+        async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
+            doc = await client.get(ADMIN_PAGE_URL, headers={"Host": "127.0.0.1"})
+    except httpx.RequestError:
+        raise HTTPException(503, "admin_ui_unavailable") from None
+    policy = doc.headers.get("Content-Security-Policy")
+    if doc.status_code != 200 or not policy:
+        raise HTTPException(503, "admin_ui_unavailable")
+    return Response(
+        doc.content, media_type="text/html", headers={"Content-Security-Policy": policy}
+    )
 
 
 def onebot_connection(request: Request, svc) -> dict:

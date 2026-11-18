@@ -10,7 +10,7 @@ MAX_VIDEO_WATCH_SECONDS=900
 DAILY_VIDEO_WATCH_LIMIT=3
 ```
 
-通过原 SSH 隧道进入 `http://127.0.0.1:12141/admin`，在「B站小号」下的「双轨看片」卡片修改并保存；立即生效，重启优先恢复 SQLite，支持恢复 `.env`。原片开关独立于小号自主巡逻开关：可以关闭自主逛首页，同时按需分析 QQ 链接。原片时长可设 30～900 秒（15 分钟），每日次数可以选择 1～20 次、0 次（暂停）或「不限次数」。在 .env 中使用 `DAILY_VIDEO_WATCH_LIMIT=unlimited` 选择不限。次数按 `BOT_TIMEZONE` 计算，默认上海时区，所有用户／群／巡逻合用一份额度。
+通过原 SSH 隧道进入 `http://127.0.0.1:12141/admin`，在「B站小号」下的「双轨看片」卡片修改并保存；立即生效，重启优先恢复 SQLite，支持恢复 `.env`。原片开关独立于小号自主巡逻开关：可以关闭自主逛首页，同时按需分析 QQ 链接。原片时长可设 30～900 秒（15 分钟），每日次数可以选择 1～20 次、0 次（暂停）或「不限次数」。在 .env 中使用 `DAILY_VIDEO_WATCH_LIMIT=unlimited` 选择不限。次数按 `BOT_TIMEZONE` 计算，默认北京时间，所有用户／群／巡逻合用一份额度。
 
 填写小号 `SESSDATA` 时，字幕读取和下载会使用该凭证；`BILI_PROXY` 同时用于小号 HTTP 与 yt-dlp。凭证可在既有面板热更新，无需写到聊天。没配置 Cookie 也可尝试公开匿名资源，但不保证平台可用。仅匿名 nav 的正常「未登录但提供公开 WBI key」响应不算凭证过期；带凭证的 -101 和任何验证码／-352／-412 始终停止。
 
@@ -62,7 +62,7 @@ docker compose -f docker-compose.yml -f compose.napcat.yml -f compose.roaming-oa
 docker compose -f docker-compose.yml -f compose.napcat.yml -f compose.roaming-oauth.yaml up -d --no-deps hakimi-bot
 ```
 
-验证使用 SDK MockTransport、假下载进程与无网络容器中的本地合成视频，覆盖真实 yt-dlp NativeHttpFD／FFmpegMerger／ffprobe、无声片、Cookie 域隔离、取消与删除重试、热撤销、SQLite 配额与上海跨日。未使用真实 B 站账号下载或调用付费视频模型；开启后实际可用性仍受 B 站资源格式、地区和账号权限影响。
+验证使用 SDK MockTransport、假下载进程与无网络容器中的本地合成视频，覆盖真实 yt-dlp NativeHttpFD／FFmpegMerger／ffprobe、无声片、Cookie 域隔离、取消与删除重试、热撤销、SQLite 配额与北京时间跨日。未使用真实 B 站账号下载或调用付费视频模型；开启后实际可用性仍受 B 站资源格式、地区和账号权限影响。
 
 本次最终 **708 项测试全部通过**，Ruff 和 Chromium 后台交互验证通过。2026-11-14 生产部署已核验 0.5.0 镜像源码摘要、WS 在线、未鉴权接口 401、原片默认关闭／480 秒／3 次、缓存为空且为 256 MiB tmpfs、后端内存限制 768 MiB。既有名单、小号权限和凭证状态、主动私信、个签配置均逐项保持；Drive OAuth 只读挂载和已有同步状态正常，小本本继续关闭，NapCat 未重建。
 

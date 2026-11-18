@@ -42,9 +42,10 @@ python3 scripts/init_env.py
 ```bash
 docker compose up -d --build
 curl --noproxy '*' --fail http://127.0.0.1:12141/healthz
+curl --noproxy '*' --fail http://127.0.0.1:12143/healthz
 ```
 
-日常修改代码后更新上线，推荐直接使用内置发布脚本（自动保留上一版 `rollback` 镜像、构建、运行 `smoke_container.py` 容器内全套单元测试与 API 契约冒烟、重启并验活，失败自动回滚）：
+提交日常改动后运行发布脚本。它按服务构建镜像、验活，并为更新的服务保留回滚镜像。
 ```bash
 bash scripts/deploy_prod.sh
 ```
@@ -52,7 +53,7 @@ bash scripts/deploy_prod.sh
 <details>
 <summary>本机开发启动 &amp; 跨境（境内 NapCat + 境外主脑）推荐拓扑说明</summary>
 
-**本机开发启动（需要 Python 3.12+ 与 `uv`）**：
+**单独启动引擎进行本机开发（需要 Python 3.12+ 与 `uv`）。联调管理页面时使用上面的双服务 Compose**：
 ```bash
 uv sync --frozen
 uv run uvicorn hakimi.app:create_app --factory \
@@ -64,7 +65,7 @@ uv run uvicorn hakimi.app:create_app --factory \
 
 **跨境反向 WSS 拓扑**：
 - **境内节点（NapCat）**：使用 `docker-compose.napcat.yml`，`network.websocketClients` 配置指向 `wss://你的域名/ws/onebot/<随机后缀>`，消息格式选 Array，开启 `enableLocalFile2Url`，25s 心跳 / 5s 重连。
-- **境外主脑（Hakimi）**：宿主机仅监听 `127.0.0.1:12141`，公网 Nginx（模板见 [deploy/hakimi-ws.conf](deploy/hakimi-ws.conf)）**只精确放行随机 `ONEBOT_WS_PATH`**，其余路径统一 404；管理后台永不暴露公网。详见 [跨境部署说明](docs/CROSS_BORDER_DEPLOYMENT.md)。
+- **境外主脑（Hakimi）**：引擎与管理台分别监听回环端口 `12141`、`12143`。公网 Nginx 精确放行 OneBot 和已启用的境内执行节点 WSS 路径，其余路径统一 404（模板见 [deploy/hakimi-ws.conf](deploy/hakimi-ws.conf)）；管理后台永不暴露公网。详见 [跨境部署说明](docs/CROSS_BORDER_DEPLOYMENT.md)。
 
 </details>
 
@@ -101,10 +102,14 @@ uv run uvicorn hakimi.app:create_app --factory \
 
 ## Web 管理台（`/admin`）
 
-管理台只监听服务器回环地址 `127.0.0.1:12141`，在本地电脑建立 SSH 隧道后打开浏览器访问 `http://127.0.0.1:12141/admin`：
+页面、样式、脚本和内容安全策略随管理镜像发布。保存设置和触发任务时，后台把同源请求交给引擎的 `/admin/api/*`。引擎校验口令及来源，独占 SQLite、模型凭证、定时器和两个境内连接。旧隧道指向 12141 时，引擎从管理容器取回同一份页面。12142 供 Drive 授权回调使用。
+
+提交界面改动后运行 `bash scripts/deploy_prod.sh admin`，它只发布管理服务。默认 `bash scripts/deploy_prod.sh` 按两个服务各自的改动选择发布对象。
+
+独立管理台 `hakimi-admin` 只映射服务器回环地址 `127.0.0.1:12143`，在本地电脑建立 SSH 隧道后打开浏览器访问 `http://127.0.0.1:12141/admin`：
 
 ```bash
-ssh -N -L 127.0.0.1:12141:127.0.0.1:12141 你的用户名@服务器IP
+ssh -N -L 127.0.0.1:12141:127.0.0.1:12143 你的用户名@服务器IP
 ```
 
 后台做出的绝大部分修改都会加密保存在 SQLite 中，**无需重启立即生效**，并可一键恢复回 `.env` 初始值：
@@ -146,7 +151,7 @@ docker compose up -d
 
 ### 主动动作与扩展模块 · v2.1.0
 
-生活引擎按注册的动作名调度。B 站每学完一个视频产生一条观看事实，建造灵感规则可据此创建内部 `mc.build_plan`。上海确认后记录“已登记计划”。MC 的重要进展可以另起一张 `qq.speak` 票据，发送前重新检查 Owner 或群白名单、预算、免打扰与会话状态。
+生活引擎按注册的动作名调度。B 站每学完一个视频产生一条观看事实，建造灵感规则可据此创建内部 `mc.build_plan`。境内确认后记录“已登记计划”。MC 的重要进展可以另起一张 `qq.speak` 票据，发送前重新检查 Owner 或群白名单、预算、免打扰与会话状态。
 
 | 入口 | v2.1.0 的行为 |
 | --- | --- |
@@ -165,7 +170,9 @@ docker compose up -d
 ```mermaid
 flowchart LR
   QQ[QQ / OneBot / 官方 Bot] --> Ingress[鉴权、收信日志与引用/图片准备]
-  Admin[管理员 /admin SSH隧道] -.加密热配置.-> Runtime[运行时策略 / 作息 / 预算]
+  Admin[管理员 SSH 隧道] --> UI[境外 hakimi-admin · 12143]
+  UI -->|同源管理 API| Engine[境外 hakimi-bot · 12141]
+  Engine --> Runtime[运行时策略 / 作息 / 预算]
   Ingress --> Policy{白名单 / 小黑屋 / Bot 防互刷}
   Policy --> Rest{休息时段检查}
   Rest -->|休息中| Passive[仅记被动上下文]

@@ -1,4 +1,4 @@
-"""Mineflayer sidecar WebSocket bridge slot for the Shanghai CN node agent."""
+"""Mineflayer sidecar WebSocket bridge slot for the domestic node agent."""
 
 from __future__ import annotations
 

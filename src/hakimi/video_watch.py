@@ -50,7 +50,7 @@ LANE2_FALLBACK_CODES = frozenset(
     }
 )
 MAX_STORYBOARD_BYTES = 262_144
-STORYBOARD_NOTE = "原片由上海节点本地提取 3x3 关键帧拼图回传（未传输大体积原片）"
+STORYBOARD_NOTE = "原片由境内节点本地提取 3x3 关键帧拼图回传（未传输大体积原片）"
 LOCAL_FAILURE_SQL = (
     "NOT (status='failed' AND reason IN ('" + "','".join(LOCAL_DOWNLOAD_REASONS) + "'))"
 )

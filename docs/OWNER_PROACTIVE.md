@@ -58,7 +58,7 @@ HAKIMI_PROACTIVE_WS_ALERT_AFTER_SECONDS=300
 
 ## 部署与验收
 
-首尔后端使用 Drive OAuth 叠加配置。
+境外后端使用 Drive OAuth 叠加配置。
 
 ```bash
 cd /root/Document/hakimi-surf
@@ -69,7 +69,7 @@ docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml up -d --no-de
 在自己的电脑保持 SSH 隧道运行：
 
 ```bash
-ssh -N -L 12141:127.0.0.1:12141 用户名@服务器地址
+ssh -N -L 12141:127.0.0.1:12143 用户名@服务器地址
 ```
 
 打开 `http://127.0.0.1:12141/admin`，使用服务器 `.env` 的 `ADMIN_TOKEN` 登录，进入「主动私信」。检查时区、WS 状态、计划时间，点击「发送测试私信（0 Token）」后在 Owner QQ 查看固定文本。点击「立即生成并发送今日汇报」会消耗当天那一次汇报机会；反复点击不会重复生成。

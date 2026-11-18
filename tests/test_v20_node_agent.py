@@ -1,4 +1,4 @@
-"""Unit tests for the Phase 3 standalone Shanghai CN node_agent."""
+"""Unit tests for the Phase 3 standalone domestic node_agent."""
 
 from __future__ import annotations
 

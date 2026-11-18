@@ -42,6 +42,6 @@ uv lock --check --offline
 docker build -t hakimi-surf:1.1.4 .
 ```
 
-部署前备份主 SQLite、各会话 SQLite 和 `.env`，保留旧镜像以便回滚。沿用现有 Compose 覆盖文件，尤其 Google Drive OAuth 凭证挂载；只重建后端，不重启上海 NapCat。原 `/admin`、0–30 秒防抖、联网开关和预算配置继续使用 SQLite 中的值。
+部署前备份主 SQLite、各会话 SQLite 和 `.env`，保留旧镜像以便回滚。沿用现有 Compose 覆盖文件，尤其 Google Drive OAuth 凭证挂载；只重建后端，不重启境内 NapCat。原 `/admin`、0–30 秒防抖、联网开关和预算配置继续使用 SQLite 中的值。
 
 验收重点：后端健康、WSS 重连与心跳、管理接口鉴权、公开 `/admin` 返回 404；可在后台沙盒查看较长回答是否完整。真实联网会按账本计费，离线测试不代替实际搜索内容验收。

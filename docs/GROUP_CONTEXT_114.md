@@ -19,4 +19,4 @@
 
 新增 `tests/test_group_context_chain_v114.py` 覆盖历史格式、多图上下文、扩容、预算预留、续链与失效路径。本版全量离线测试 **1319 项通过**；Ruff、前端 JavaScript 语法、依赖锁检查及容器断网冒烟均通过。生产数据库副本连续初始化两次后，5 张账本表和 3 个隔离会话的既有数据保持一致，新增续链表与数据库完整性检查通过。验证未调用真实 Gemini API。
 
-部署前备份 `.env`、主 SQLite 及各会话 SQLite，保留旧镜像。沿用 `docker-compose.yml` 与 `compose.roaming-oauth.yaml`，仅替换首尔后端；上海 NapCat 保持运行并自动恢复反向 WSS。后端仅绑定 `127.0.0.1:12141`，管理台仍通过 SSH 隧道访问。
+部署前备份 `.env`、主 SQLite 及各会话 SQLite，保留旧镜像。沿用 `docker-compose.yml` 与 `compose.roaming-oauth.yaml`，仅替换境外后端；境内 NapCat 保持运行并自动恢复反向 WSS。后端仅绑定 `127.0.0.1:12141`，管理台仍通过 SSH 隧道访问。

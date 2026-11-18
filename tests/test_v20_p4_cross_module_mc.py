@@ -750,7 +750,7 @@ async def test_bili_mc_inspiration_zero_token_closed_loop(settings, store, messa
         await svc.stop()
 
 
-async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(settings):
+async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(admin_frontend, settings):
     settings.admin_token = SecretStr(TOKEN)
     settings.owner_qq_id = "20000"
     ai = FakeGateway()

@@ -30,7 +30,7 @@ class AdminAuth:
                 raise HTTPException(403, "cross_origin_forbidden")
         if request.query_params:
             raise HTTPException(400, "admin_query_forbidden")
-        if request.url.path in {"/admin", "/admin/"} and request.method == "GET":
+        if request.url.path in {"/admin", "/admin/"} and request.method in {"HEAD", "GET"}:
             return
         expected = ("Bearer " + token).encode()
         if not hmac.compare_digest(request.headers.get("authorization", "").encode(), expected):

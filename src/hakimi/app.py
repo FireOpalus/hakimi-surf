@@ -1,11 +1,9 @@
 import asyncio
-import hashlib
 import hmac
 import json
 import logging
 import re
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
@@ -192,13 +190,6 @@ def create_app(
     app.include_router(gcp_billing_router)
     app.include_router(affection_router)
     app.include_router(life_router)
-    html = Path(__file__).with_name("admin_page.html").read_text()
-    import base64
-
-    hashes = {}
-    for tag in ("script", "style"):
-        content = re.search(rf"<{tag}>(.*?)</{tag}>", html, re.S)[1]
-        hashes[tag] = base64.b64encode(hashlib.sha256(content.encode()).digest()).decode()
 
     @app.middleware("http")
     async def protect_admin(request: Request, call_next):
@@ -222,12 +213,12 @@ def create_app(
                 "Referrer-Policy": "no-referrer",
                 "X-Content-Type-Options": "nosniff",
                 "X-Frame-Options": "DENY",
-                "Content-Security-Policy": (
-                    f"default-src 'none'; script-src 'sha256-{hashes['script']}'; "
-                    f"style-src 'sha256-{hashes['style']}'; connect-src 'self'; img-src blob:; "
-                    "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
-                ),
             }
+        )
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'none'; img-src blob:; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'none'",
         )
         return response
 

@@ -1,6 +1,6 @@
-"""Offline Docker smoke test. Creates and removes only its own temporary container.
+"""Offline Docker smoke test for the engine and optional independent admin image.
 
-Run with the project venv: python scripts/smoke_container.py hakimi-surf:upgrade-test
+Run with the project venv: python scripts/smoke_container.py ENGINE_IMAGE [ADMIN_IMAGE]
 No real credentials, external network, QQ account or paid model calls are used.
 """
 
@@ -117,8 +117,8 @@ with sqlite3.connect("/app/data/hakimi.sqlite3") as db:
     assert db.execute("SELECT COUNT(*) FROM bot_turns").fetchone()[0] == 0
     assert db.execute("SELECT COALESCE(SUM(amount),0) FROM ledger").fetchone()[0] == 0
 assert os.getuid() == 10001
-page = urllib.request.urlopen(origin + "/admin", timeout=3)
-assert page.status == 200 and b"<!doctype html>" in page.read()
+gate = urllib.request.Request(origin + "/admin", method="HEAD")
+assert urllib.request.urlopen(gate, timeout=3).status == 204
 try:
     urllib.request.urlopen(origin + "/admin/api/dashboard", timeout=3)
     raise AssertionError("admin API accepted no token")
@@ -285,13 +285,46 @@ print("PASS: rootless container, reverse WS login/replies, strict bot ignore, "
 """
 
 
+PAIR_PROBE = """
+import base64, hashlib, os, re
+import httpx
+
+host = "127.0.0.1:12141"
+auth = {"Authorization": "Bearer " + os.environ["ADMIN_TOKEN"], "Origin": "http://" + host}
+with httpx.Client(base_url="http://hakimi-admin:8080", headers={"Host": host},
+                  trust_env=False, timeout=5) as ui:
+    page = ui.get("/admin")
+    page.raise_for_status()
+    assert page.headers["cache-control"] == "no-store"
+    old = ui.get("http://hakimi-bot:12141/admin")
+    assert old.status_code == 200 and page.content == old.content
+    policy = page.headers["content-security-policy"]
+    assert policy == old.headers["content-security-policy"]
+    for tag in ("style", "script"):
+        block = re.search(f"<{tag}>(.*?)</{tag}>", page.text, re.S)[1].encode()
+        digest = base64.b64encode(hashlib.sha256(block).digest()).decode()
+        assert f"{tag}-src 'sha256-{digest}'" in policy
+    assert ui.get("/ws/onebot").status_code == 404
+    assert ui.get("/admin/api/dashboard").status_code == 401
+    assert ui.get("/admin", headers={"Host":"external.invalid"}).status_code == 403
+    assert ui.get("/admin/api/dashboard", headers=auth).status_code == 200
+    route = "/admin/api/budget"
+    limits = ui.get(route, headers=auth).raise_for_status().json()["config"]
+    saved = ui.put(route, headers=auth, json={"daily_usd":limits["daily_usd"]})
+    assert saved.raise_for_status().json()["config"]["daily_usd"] == limits["daily_usd"]
+print("Admin container passed: SSH entry points, page hashes, bearer auth and SQLite settings")
+"""
+
+
 def run(*args, **kwargs):
     return subprocess.run(["docker", *args], check=True, capture_output=True, text=True, **kwargs)
 
 
 def main():
     image = sys.argv[1] if len(sys.argv) > 1 else "hakimi-surf:upgrade-test"
+    admin_image = sys.argv[2] if len(sys.argv) > 2 else None
     name = "hakimi-upgrade-smoke-" + uuid.uuid4().hex[:12]
+    network = name + "-net" if admin_image else "none"
     with tempfile.TemporaryDirectory(prefix="hakimi-smoke-") as temp:
         env = Path(temp) / "test.env"
         env.write_text(
@@ -323,13 +356,16 @@ def main():
         )
         os.chmod(env, 0o600)
         try:
+            if admin_image:
+                run("network", "create", "--internal", network)
             run(
                 "run",
                 "-d",
                 "--name",
                 name,
                 "--network",
-                "none",
+                network,
+                *(["--network-alias", "hakimi-bot"] if admin_image else []),
                 "--read-only",
                 "--cap-drop",
                 "ALL",
@@ -366,8 +402,33 @@ def main():
                 )
             result = run("exec", name, "python", "-c", PROBE)
             print(result.stdout.strip())
+            if admin_image:
+                run(
+                    "run",
+                    "-d",
+                    "--name",
+                    name + "-admin",
+                    "--network",
+                    network,
+                    "--network-alias",
+                    "hakimi-admin",
+                    "--read-only",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges:true",
+                    "--tmpfs",
+                    "/tmp:rw,mode=1777,size=32m",
+                    admin_image,
+                )
+                result = run("exec", name, "python", "-c", PAIR_PROBE)
+                print(result.stdout.strip())
         finally:
+            if admin_image:
+                subprocess.run(["docker", "rm", "-f", name + "-admin"], capture_output=True)
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+            if admin_image:
+                subprocess.run(["docker", "network", "rm", network], capture_output=True)
 
 
 if __name__ == "__main__":

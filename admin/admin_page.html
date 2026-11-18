@@ -1265,7 +1265,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-minecraft" type="button" role="tab" data-tab="minecraft" data-description="查看游戏连接和角色状态，下达活动目标。" aria-controls="minecraft" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5v10l-9 5-9-5V7z M3 7l9 5 9-5 M12 12v10"/></svg><span>Minecraft</span></button>
       </div>
     </nav>
-    <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">Asia/Shanghai</span></div>
+    <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
   </aside>
   <button id="nav-scrim" type="button" class="nav-scrim" aria-label="关闭导航" tabindex="-1" hidden></button>
   <div class="page-content">
@@ -2138,6 +2138,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 let token='',tab='overview',session=null,timer=null;
 let sessionRequests=new AbortController();
 let displayZone='Asia/Shanghai';
+const zoneLabel=zone=>zone==='Asia/Shanghai'?'北京时间':zone;
 const $=id=>document.getElementById(id), text=(id,value)=>{$(id).textContent=String(value??'');};
 const el=(tag,value,cls)=>{const n=document.createElement(tag);if(value!==undefined)n.textContent=String(value);if(cls)n.className=cls;return n;};
 const pill=(label,variant='muted')=>el('span',label,'pill pill-'+variant);
@@ -2246,7 +2247,7 @@ function renderRestHours(r){
   const parts=String(c.rest_hours||'23:00-08:00').split('-');
   $('rest-start').value=(parts[0]||'23:00').slice(0,5);
   $('rest-end').value=(parts[1]||'08:00').slice(0,5);
-  text('rest-hours-status',mode+' · 当前时间 '+r.local_time+'（'+r.timezone+'）· 主人私聊'+(c.allow_owner_private?'照常响应':'同步休息')+' · 来源 '+(r.source==='admin'?'后台 SQLite（重启保留）':'.env 初始值'));
+  text('rest-hours-status',mode+' · 当前时间 '+r.local_time+'（'+zoneLabel(r.timezone)+'）· 主人私聊'+(c.allow_owner_private?'照常响应':'同步休息')+' · 来源 '+(r.source==='admin'?'后台 SQLite（重启保留）':'.env 初始值'));
   for(const id of ['save-rest-hours','reset-rest-hours'])$(id).disabled=false;
 }
 
@@ -2352,7 +2353,7 @@ async function dashboard(initial){
   if(!token||signal.aborted)return;
   const d=dashRes.value,gcp=gcpRes.status==='fulfilled'?gcpRes.value:null;
   displayZone=d.usage.timezone||d.usage.budget_timezone||'Asia/Shanghai';
-  text('sidebar-zone',displayZone);
+  text('sidebar-zone',zoneLabel(displayZone));
   stampDashboard();
   renderRestHours(d.rest_hours);
   showNotebookAvailability(Boolean(d.notebook?.enabled));
@@ -2367,7 +2368,7 @@ async function dashboard(initial){
   text('stat-uptime',hours>=24?Math.floor(hours/24)+'天 '+(hours%24)+'时':hours?hours+'时 '+minutes+'分':minutes+'分');
   const day=usage.day_local||usage.day||usage.day_utc||'';
   $('overview-day').dateTime=day;
-  text('overview-day',day+' · '+(displayZone==='Asia/Shanghai'?'上海时间':displayZone));
+  text('overview-day',day+' · '+zoneLabel(displayZone));
   const pipe=d.pipeline||{};
   text('pipeline-state','守门 '+(pipe.gate??0)+' / 推理 '+(pipe.generating??0));
   text('image-cache',((pipe.image_cache_bytes??0)/1048576).toFixed(1)+' MiB');
@@ -2825,7 +2826,7 @@ async function ledger(){
   const balVal=balRes.status==='fulfilled'?balRes.value:(d.budget_status?.account_balance||null);
   if(gcpVal)gcpBillingState=gcpVal;
   if(balVal)accountBalanceState=balVal;
-  const usage=d.usage,periods=[['today','今日 '+(usage.timezone||usage.budget_timezone||'Asia/Shanghai')],['month','本月 '+(usage.timezone||usage.budget_timezone||'Asia/Shanghai')],['lifetime','累计可追溯']];
+  const usage=d.usage,periods=[['today','今日 '+zoneLabel(usage.timezone||usage.budget_timezone||'Asia/Shanghai')],['month','本月 '+zoneLabel(usage.timezone||usage.budget_timezone||'Asia/Shanghai')],['lifetime','累计可追溯']];
   const modelLabels={hydrogen:'Hydrogen',carbon:'Carbon',memory_flex:'记忆 Flex（半价）',decision:'Decisions',unknown:'历史未归属（Gemini）'};
   const thinkingStatLabels={low:'low · 轻量',medium:'medium · 均衡',high:'high · 深入',xhigh:'xhigh · 最高',minimal:'minimal · 极简',none:'none · 无思考（门卫）',unknown:'历史未记录档位'};
   table('token-ledger',['范围','API 尝试 / 有用量','输入','缓存输入','输出','思考','观测缓存 / Interactions 输入'],periods.map(([key,label])=>{const t=usage.token_usage?.[key];if(!t)return[label,'未知','未知','未知','未知','未知','未知'];const cache=t.cache_hit_ratio===null||t.cache_hit_ratio===undefined?'未知':(100*t.cache_hit_ratio).toFixed(1)+'%';return[label,t.calls+' / '+t.known_usage_calls+(t.unknown_usage_calls?'（'+t.unknown_usage_calls+' 次用量未知）':''),t.known_usage_calls?t.input_tokens:'未知',t.cache_known_calls?t.cached_tokens:'未知',t.known_usage_calls?t.output_tokens:'未知',t.thought_known_calls?t.thought_tokens:'未知',cache+(t.cache_coverage_complete===false?'（下界）':'')+' · 覆盖 '+t.cache_known_calls+'/'+t.interaction_calls+' 次 Interactions'];}));
@@ -2947,7 +2948,7 @@ async function proactive(){
   const fmt=t=>t?lifeFmt(t,d.timezone):'—';
   const stats=[['NapCat',d.connected?'在线':'等待连接'],['下次日报',fmt(d.next_digest_at)]];
   $('proactive-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
-  text('proactive-state',d.day+' · '+d.timezone+' · '+(!d.configured?'尚未配置 Owner QQ':d.delivery_enabled?'允许投递':'已停用投递'));
+  text('proactive-state',d.day+' · '+zoneLabel(d.timezone)+' · '+(!d.configured?'尚未配置 Owner QQ':d.delivery_enabled?'允许投递':'已停用投递'));
   text('proactive-budget','主动生成日预算 $'+d.proactive_daily_limit_usd+' · 本地累计 $'+(d.budget.total/1e6).toFixed(4)+' / '+(d.budget.total_limit>0?'$'+(d.budget.total_limit/1e6).toFixed(2):'未设累计上限')+(d.budget.hard_stop?' · 付费生成已熔断':'')+'（含预留，不代表 Google 赠金余额）');table('proactive-queue',['类型','状态','数量'],d.queue.map(v=>[dmKindLabels[v.kind]||v.kind,dmStatus[v.status]||v.status,v.n]));table('proactive-alerts',['告警','入队时间','状态','冷却截止'],d.alerts.map(v=>[v.alert_key,fmt(v.queued_at),dmStatus[v.status]||v.status,fmt(v.cooldown_until)]));}
 $('refresh-proactive').addEventListener('click',e=>busy(e.target,proactive));
 for(const [id,action] of [['dm-test','test'],['dm-now','digest']])$(id).addEventListener('click',e=>busy(e.target,async()=>{notice(action==='test'?'正在验证私信通路…':'正在准备今日汇报…');const r=await api('proactive/'+action,'POST');const state=r.delivery&&r.delivery!=='not_queued'?r.delivery:r.status;notice((dmStatus[state]||state)+(r.reason?' · '+r.reason:''));await proactive();}));
@@ -2982,7 +2983,7 @@ function renderLife(d){
   const nap=nodes.onebot_cn_napcat||{},sh=nodes.shanghai_node_agent||{},mc=nodes.shanghai_mc_agent||{};
   const nodePills=[
     nap.connected?pill('NapCat CN 在线 ('+(nap.mode||'http')+')','ok'):pill('NapCat CN 未连接 ('+(nap.mode||'http')+')','warn'),
-    sh.connected?pill('上海躯干节点在线 ('+(sh.node_id||'CN')+')','ok'):sh.configured?pill('上海躯干节点等待接入 ('+(sh.node_id||'CN')+')','warn'):pill('上海躯干节点未启用','muted'),
+    sh.connected?pill('境内躯干节点在线 ('+(sh.node_id||'CN')+')','ok'):sh.configured?pill('境内躯干节点等待接入 ('+(sh.node_id||'CN')+')','warn'):pill('境内躯干节点未启用','muted'),
     mc.connected?pill('MC躯干在线'+(mc.paused?' (已暂停)':'')+(mc.dimension?' · '+mc.dimension:''),mc.paused?'warn':'ok'):mc.bridge_ready?pill('MC躯干就绪(待机)'+(mc.paused?' (已暂停)':''),mc.paused?'warn':'ok'):mc.mc_enabled?pill('MC躯干等待接入','warn'):pill('MC躯干未就绪','muted')
   ];
   if(sh.bili_delegate_active)nodePills.push(pill('B站 CN 专线托管中','ok'));
@@ -2991,9 +2992,9 @@ function renderLife(d){
     ws.proactive_suspended?pill('Attention Lock 已触发：非核心主动已暂停','warn'):pill('Attention Lock 未锁定','ok')
   );
   $('life-node-pills').replaceChildren(...nodePills);
-  text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 上海节点说明：'+(sh.phase_note||'CN 反向 WSS 躯干专线'));
+  text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 境内节点说明：'+(sh.phase_note||'CN 反向 WSS 躯干专线'));
   const caps=Array.isArray(sh.capabilities)&&sh.capabilities.length?sh.capabilities.join(', '):'—';
-  text('life-node-status','上海节点 '+(sh.node_id||'shanghai-cn-1')+' ('+(sh.region||'CN')+')：'+(sh.connected?'在线':sh.configured?'等待连接':'未配置')+' · 来源 IP '+(sh.source_ip||'—')+' · 建连 '+lifeFmt(sh.connected_at,tz)+' · 心跳 '+lifeFmt(sh.last_heartbeat_at,tz)+' · RPC 成功/失败 '+(sh.rpc_calls??0)+'/'+(sh.rpc_errors??0)+' · B站托管 '+(sh.bili_delegate_active?'开启':'未激活')+' · 能力 '+caps);
+  text('life-node-status','境内节点 '+(sh.node_id||'—')+' ('+(sh.region||'CN')+')：'+(sh.connected?'在线':sh.configured?'等待连接':'未配置')+' · 来源 IP '+(sh.source_ip||'—')+' · 建连 '+lifeFmt(sh.connected_at,tz)+' · 心跳 '+lifeFmt(sh.last_heartbeat_at,tz)+' · RPC 成功/失败 '+(sh.rpc_calls??0)+'/'+(sh.rpc_errors??0)+' · B站托管 '+(sh.bili_delegate_active?'开启':'未激活')+' · 能力 '+caps);
   text('life-desktop-status',dm.enabled?('桌面端 Antigravity_Memory 最近活跃：'+(dm.latest_iso||lifeFmt(dm.latest_timestamp,tz))+(dm.latest_tag?' · 标签 '+dm.latest_tag:'')):'桌面端 Antigravity_Memory 协同当前未启用。');
   $('life-world-module').value=ws.current_module||'idle';
   const moduleIds=new Set(['idle',...(ws.modules||[]).map(m=>m.module_id)]);
@@ -3017,7 +3018,7 @@ function renderLife(d){
   const srcLabel=(d.source==='admin'||d.source==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
   const planSrcLabels={llm:'模型规划',sleeping:'夜间休眠',local_fallback:'本地兜底',milestone:'里程碑重规划',none:'尚未规划'};
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
-  text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+tz+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
+  text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+zoneLabel(tz)+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
   for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
   table('life-intents-table',['ID','动作 / 接收人','来源 / 事件','执行窗口','门控与模糊动机','状态 / 结果','操作'],(d.intents||[]).map(it=>[
     el('span',String(it.id||'').slice(0,10),'code-mono'),
@@ -3352,7 +3353,7 @@ $('sign-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter
 
 const biliRunStatusLabels={ok:'完成',done:'完成',completed:'完成',skipped:'跳过',cooldown:'风控冷却',failed:'失败',uncertain:'结果不确定'};
 const videoStatusLabels={succeeded:'成功',ok:'成功',done:'成功',failed:'失败',uncertain:'结果不确定',working:'处理中'};
-async function biliAccount(){const d=await api('bili-account'),c=d.config;$('bili-enabled').checked=c.enabled;$('bili-like').checked=c.allow_like;$('bili-favorite').checked=c.allow_favorite;$('bili-folder').value=c.favorite_folder_id;$('bili-limit').value=c.daily_action_limit;text('bili-state','账号 '+(d.account_mask||'未验证')+' · 时区 '+d.timezone+' · 配置来自 '+(cfgSourceLabels[d.source]||d.source)+' · 今日互动尝试 '+d.actions_today+' 次 · 已处理视频 '+d.watched_count+' 个'+(d.cooldown_until>Date.now()/1000?' · 冷却至 '+dateTime(d.cooldown_until):'')+(d.last_error?' · '+d.last_error:''));text('bili-credential-state','凭证来源 '+(cfgSourceLabels[d.credential_source]||d.credential_source)+' · '+Object.entries(d.credentials).map(([k,v])=>k+': '+(v?'已设置（隐藏）':'未设置')).join(' · '));table('bili-runs',['触发来源','状态','时间','原因'],d.recent_runs.map(x=>[x.slot.startsWith('life-')?'世界引擎':x.slot.startsWith('manual')?'手动':x.slot,biliRunStatusLabels[x.status]||x.status,dateTime(x.created),x.reason||'—']));await videoWatch();}
+async function biliAccount(){const d=await api('bili-account'),c=d.config;$('bili-enabled').checked=c.enabled;$('bili-like').checked=c.allow_like;$('bili-favorite').checked=c.allow_favorite;$('bili-folder').value=c.favorite_folder_id;$('bili-limit').value=c.daily_action_limit;text('bili-state','账号 '+(d.account_mask||'未验证')+' · 时区 '+zoneLabel(d.timezone)+' · 配置来自 '+(cfgSourceLabels[d.source]||d.source)+' · 今日互动尝试 '+d.actions_today+' 次 · 已处理视频 '+d.watched_count+' 个'+(d.cooldown_until>Date.now()/1000?' · 冷却至 '+dateTime(d.cooldown_until):'')+(d.last_error?' · '+d.last_error:''));text('bili-credential-state','凭证来源 '+(cfgSourceLabels[d.credential_source]||d.credential_source)+' · '+Object.entries(d.credentials).map(([k,v])=>k+': '+(v?'已设置（隐藏）':'未设置')).join(' · '));table('bili-runs',['触发来源','状态','时间','原因'],d.recent_runs.map(x=>[x.slot.startsWith('life-')?'世界引擎':x.slot.startsWith('manual')?'手动':x.slot,biliRunStatusLabels[x.status]||x.status,dateTime(x.created),x.reason||'—']));await videoWatch();}
 for(let n=1;n<=20;n++) $('video-watch-limit').add(new Option(n+' 次',String(n),n===3,n===3));
 async function videoWatch(){
   const d=await api('bili-account/video-watch'),c=d.config;
@@ -3417,11 +3418,11 @@ const moduleDescriptions=new Map([
   ['minecraft','游戏连接、活动目标与建造计划'],
   ['weather','天气观测与定时动作']
 ]);
-const regionName=code=>({CN:'上海节点',KR:'首尔节点'})[code]||code;
+const regionName=code=>({CN:'境内节点',KR:'境外节点'})[code]||code;
 const mcControls=['life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
 function renderMinecraft(mc){
   const fields=[
-    ['上海连接',mc.bridge_ready?'桥接就绪':'未就绪'],['游戏连接',mc.connected?'游戏在线':'未进入游戏'],
+    ['境内连接',mc.bridge_ready?'桥接就绪':'未就绪'],['游戏连接',mc.connected?'游戏在线':'未进入游戏'],
     ['游戏配置',(mc.mc_enabled?'已启用':'未启用')+' / '+(mc.mc_configured?'已配置':'未配置')],
     ['角色活动',mc.paused?'已暂停':mc.activity||'—']
   ];
@@ -3534,7 +3535,7 @@ async function loadModule(id){
   const d=await api('life/modules/'+encodeURIComponent(id));
   if(id==='qq_social')updateConnection(d.status);
   if(id==='bilibili_surf'){
-    text('bili-module-backend',d.status.cn_delegate?'上海专线':d.status.backend==='remote_node'?'上海代理模式':'首尔本机');
+    text('bili-module-backend',d.status.cn_delegate?'境内专线':d.status.backend==='remote_node'?'境内代理模式':'境外本机');
     text('bili-module-autonomous',d.status.autonomous?'已开启':'已关闭');
   }
   if(id==='minecraft')renderMinecraft(d.status);

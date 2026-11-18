@@ -1,4 +1,4 @@
-# Shanghai only. Do not combine this with the Seoul compose project.
+# Domestic node only. Do not combine this with the offshore compose project.
 # docker compose --env-file .env.napcat -f docker-compose.napcat.yml up -d
 name: hakimi-napcat-shanghai
 services:
@@ -8,7 +8,7 @@ services:
     environment:
       TZ: Asia/Shanghai
       MODE: reverse_ws
-      ONEBOT_URL: ${ONEBOT_URL:?Set the Seoul wss URL in .env.napcat}
+      ONEBOT_URL: ${ONEBOT_URL:?Set the offshore WSS URL in .env.napcat}
       WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:?Set a strong local WebUI token}
       NAPCAT_UID: ${NAPCAT_UID:-1000}
       NAPCAT_GID: ${NAPCAT_GID:-1000}

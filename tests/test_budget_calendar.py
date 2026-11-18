@@ -1,4 +1,4 @@
-"""Shanghai budget boundaries and lossless/explicit migration from the old UTC buckets."""
+"""UTC+8 budget boundaries and lossless/explicit migration from the old UTC buckets."""
 
 import sqlite3
 from datetime import UTC, datetime
@@ -159,7 +159,7 @@ async def test_unknown_legacy_timestamps_add_conservative_carry_without_inventin
         store.s.daily_usd = Decimal(".02")
         with pytest.raises(Rejected, match="budget_exhausted"):
             await store.reserve("u", "chat", Decimal(".000001"))
-        # Day carry expires at the Shanghai boundary, month carry remains until next month.
+        # Day carry expires at the configured UTC+8 boundary, month carry remains until next month.
         set_clock(monkeypatch, "2026-12-01T16:00:00+00:00")
         assert (await store.budget_status())["daily"] == 0
         assert (await store.budget_status())["monthly"] == 20000

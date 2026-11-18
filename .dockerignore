@@ -12,3 +12,4 @@ secrets
 *service-account*.json
 *oauth*.json
 dist
+admin/

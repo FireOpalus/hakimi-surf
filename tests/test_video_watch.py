@@ -223,7 +223,7 @@ async def test_daily_three_attempts_shared_across_users_and_persist_on_reload(ri
     assert len(rig.downloader.calls) == 3
     assert (await restored.status())["attempts_today"] == 3
     assert restored.config.enabled and restored.overridden
-    # It is 23:59 on the 14th in Shanghai, while still 15:59 UTC.
+    # It is 23:59 on the 14th in UTC+8, while still 15:59 UTC.
     assert restored.day() == "2026-11-14"
     rig.clock[0] += 120
     assert restored.day() == "2026-11-15"

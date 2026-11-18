@@ -7,6 +7,8 @@ from hakimi.config import Settings
 from hakimi.models import Message
 from hakimi.store import Store
 
+pytest_plugins = ["tests.admin_frontend"]
+
 
 @pytest.fixture
 def settings(tmp_path):

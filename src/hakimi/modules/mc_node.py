@@ -1,4 +1,4 @@
-"""Shanghai MC adapter owns the fixed RPC surface and translates authenticated node events."""
+"""domestic MC adapter owns the fixed RPC surface and translates authenticated node events."""
 
 from __future__ import annotations
 

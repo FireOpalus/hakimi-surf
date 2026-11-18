@@ -1,4 +1,4 @@
-"""Standalone Shanghai CN node agent for hakimi-surf v2.1."""
+"""Standalone domestic node agent for hakimi-surf v2.1."""
 
 __version__ = "2.1.0"
 

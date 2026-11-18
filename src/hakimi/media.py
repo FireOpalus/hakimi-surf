@@ -280,7 +280,7 @@ class ImageHTTPFailure(Rejected):
 class ImageLoader:
     def __init__(self, settings: Settings, transport=None):
         self.s, self.transport = settings, transport
-        # Shared by all sessions; only one image transfer can occupy the Shanghai uplink.
+        # Shared by all sessions; only one image transfer can occupy the domestic uplink.
         self.ws_images = asyncio.Semaphore(1)
         self.decode_slots = asyncio.Semaphore(1)
         self.download_slots = asyncio.Semaphore(2)

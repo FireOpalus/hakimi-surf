@@ -1,4 +1,4 @@
-"""Standalone Shanghai CN WebSocket node agent daemon."""
+"""Standalone domestic WebSocket node agent daemon."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ __all__ = [
 
 
 class NodeDaemon:
-    """Outbound WSS reverse-RPC daemon running on the Shanghai CN node."""
+    """Outbound WSS reverse-RPC daemon running on the domestic node."""
 
     def __init__(
         self,

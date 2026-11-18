@@ -27,4 +27,4 @@
 
 发布执行全量离线测试、依赖锁与 Ruff 检查；使用临时 SQLite 和模拟模型，通过 Chromium 检查全部模块、热配置保存、深浅主题、登录退出、手机排版及导航。浏览器验收不修改生产设置，不调用真实模型。
 
-沿用首尔 `docker-compose.yml` 和 `compose.roaming-oauth.yaml`。部署前备份数据库与 `.env`，仅替换后端并保留回滚镜像；上海 NapCat 自动恢复 WSS。`/admin` 仍通过 SSH 隧道访问回环 12141，公网保持 404。
+沿用境外 `docker-compose.yml` 和 `compose.roaming-oauth.yaml`。部署前备份数据库与 `.env`，仅替换后端并保留回滚镜像；境内 NapCat 自动恢复 WSS。`/admin` 仍通过 SSH 隧道访问回环 12141，公网保持 404。
