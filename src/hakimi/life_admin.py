@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from collections import Counter
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -17,7 +18,7 @@ from pydantic import (
     model_validator,
 )
 
-from .admin_routes import body, service
+from .admin_routes import body, onebot_connection, service
 from .life_engine import LifeEngineConfig
 from .modules.actions import ActionCall, Mode, reject_reason
 
@@ -74,6 +75,7 @@ class MinecraftAdminGoalRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
+    view: Literal["life", "module"] = "life"
     action_type: Literal[
         "status",
         "explore",
@@ -149,14 +151,14 @@ def _collect_mc_agent_status(svc: Any) -> dict[str, Any]:
     }
 
 
-async def _collect_modules_status(svc: Any) -> list[dict[str, Any]]:
+async def _collect_modules_status(svc: Any, *, include_sensors: bool) -> list[dict[str, Any]]:
     registry = getattr(svc, "modules", None)
     if registry is None:
         return []
     items: list[dict[str, Any]] = []
     for mod in registry.all():
         try:
-            summary = await mod.get_sensor_summary()
+            summary = await mod.get_sensor_summary() if include_sensors else ""
         except Exception:
             summary = ""
         items.append(
@@ -230,7 +232,7 @@ async def _read_events(store: Any) -> list[dict[str, Any]]:
     ]
 
 
-async def _build_life_status(svc: Any) -> dict[str, Any]:
+async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[str, Any]:
     engine = getattr(svc, "life_engine", None)
     engine_meta: dict[str, Any] = {}
     if engine is not None and hasattr(engine, "status"):
@@ -285,7 +287,7 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
             "last_proactive_at": last_proactive_at,
             "updated_at": snap.updated_at,
             "proactive_suspended": bool(ws.proactive_suspended()),
-            "modules": await _collect_modules_status(svc),
+            "modules": await _collect_modules_status(svc, include_sensors=include_sensors),
         }
     else:
         world_state_data = {
@@ -297,7 +299,7 @@ async def _build_life_status(svc: Any) -> dict[str, Any]:
             "last_proactive_at": last_proactive_at,
             "updated_at": 0.0,
             "proactive_suspended": False,
-            "modules": await _collect_modules_status(svc),
+            "modules": await _collect_modules_status(svc, include_sensors=include_sensors),
         }
 
     proactive_mgr = getattr(svc, "proactive", None)
@@ -381,6 +383,72 @@ async def life_status(request: Request):
     return await _build_life_status(service(request))
 
 
+@router.get("/overview")
+async def life_overview(request: Request):
+    return await _build_life_status(service(request), include_sensors=False)
+
+
+@router.get("/modules")
+async def module_directory(request: Request):
+    """Read the local registry without polling sensors or loading conversation data."""
+    svc = service(request)
+    registry = svc.modules
+    counts = Counter(registry.catalog.owners.values())
+    return [
+        {
+            "id": module.module_id,
+            "region": module.node_region,
+            "action_count": counts[module.module_id],
+        }
+        for module in registry.all()
+    ]
+
+
+@router.get("/modules/{module_id}")
+async def module_detail(request: Request, module_id: str):
+    svc = service(request)
+    module = svc.modules.get(module_id)
+    if module is None:
+        raise HTTPException(404, "module_not_registered")
+    engine = getattr(svc, "life_engine", None)
+    modes = engine.config.action_modes if engine else {}
+    actions = svc.modules.catalog.view(modes, module_id=module_id)
+    status = {}
+    if module_id == "qq_social":
+        status = onebot_connection(request, svc)
+    elif module_id == "bilibili_surf":
+        status = {
+            "autonomous": svc.bili_watcher.policy.enabled,
+            "backend": module.backend_mode,
+            "cn_delegate": bool(
+                svc.s.node_bili_delegate_enabled
+                and svc.node_transport
+                and svc.node_transport.connected()
+            ),
+        }
+    elif module_id == "minecraft":
+        status = _collect_mc_agent_status(svc)
+    return {
+        "id": module_id,
+        "region": module.node_region,
+        "proactive_paused": module.proactive_paused,
+        "actions": actions,
+        "status": status,
+    }
+
+
+@router.get("/modules/{module_id}/sensor")
+async def module_sensor(request: Request, module_id: str):
+    module = service(request).modules.get(module_id)
+    if module is None:
+        raise HTTPException(404, "module_not_registered")
+    try:
+        summary = await module.get_sensor_summary()
+    except Exception:
+        raise HTTPException(503, "module_sensor_unavailable") from None
+    return {"summary": summary}
+
+
 @router.put("")
 async def life_save_config(request: Request):
     from .app import json_object, read_body
@@ -417,6 +485,7 @@ async def life_save_config(request: Request):
 class ActionModeUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Mode
+    view: Literal["life", "module"] = "life"
 
 
 @router.put("/actions/{name}")
@@ -432,6 +501,8 @@ async def life_action_mode(request: Request, name: str):
             await engine.set_config(config)
         except ValueError:
             raise HTTPException(400, "unsupported_action_mode") from None
+        if value.view == "module":
+            return await module_detail(request, engine.catalog.owners[name])
         return await _build_life_status(svc)
 
 
@@ -536,7 +607,9 @@ async def life_mc_goal(request: Request):
     if lock.locked():
         raise HTTPException(409, "admin_action_busy")
     async with lock:
-        args = value.model_dump(exclude={"action_type"}, exclude_defaults=True, exclude_none=True)
+        args = value.model_dump(
+            exclude={"action_type", "view"}, exclude_defaults=True, exclude_none=True
+        )
         ticket = {
             "action_name": "mc." + value.action_type,
             "target_scope": "",
@@ -550,8 +623,12 @@ async def life_mc_goal(request: Request):
         except ValueError as exc:
             raise HTTPException(400, reject_reason(exc)) from None
         result = await spec.run(ActionCall(ticket, validated, svc.life_engine.clock()))
-        return {
+        response = {
             "status": "ok" if result.status == "done" else "unavailable",
             "result": result.details["result"],
-            "life": await _build_life_status(svc),
         }
+        if value.view == "module":
+            response["mc_status"] = _collect_mc_agent_status(svc)
+        else:
+            response["life"] = await _build_life_status(svc)
+        return response

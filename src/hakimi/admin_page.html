@@ -781,6 +781,69 @@ body.authenticated footer { margin-left: var(--rail); }
 @media(max-width:600px) {
   .aff-search-label { max-width: 100%; }
 }
+
+.workspace-switch {
+  display: flex; gap: 3px; flex: none; padding: 3px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
+}
+.workspace-switch button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 6px 13px; border: 0; border-radius: 7px; color: var(--muted);
+  background: transparent; font-size: 13px; font-weight: 600;
+}
+.workspace-switch button[aria-pressed=true] { background: var(--card); color: var(--accent); box-shadow: 0 1px 4px #15112724; }
+.workspace-switch button:hover { color: var(--accent); }
+.workspace-switch svg { width: 16px; height: 16px; }
+#last-updated { padding: 0; border: 0; }
+nav button[data-subpage] { padding-left: 32px; }
+nav button[data-subpage] svg { width: 14px; height: 14px; }
+#modules-nav .nav-group[data-module] .nav-group-label { display: none; }
+#modules-nav .nav-group[data-module] { margin-top: 6px; }
+.module-nav-caption { margin-top: 18px; }
+.eyebrow .crumb-link { color: inherit; font: inherit; background: none; padding: 1px 0; border: 0; }
+.eyebrow .crumb-link:hover { text-decoration: underline; }
+.directory-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.directory-heading h2 { margin: 0; font-size: 16px; }
+.module-catalog { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
+.module-card {
+  display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere;
+  background: var(--card); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 16px; padding: 22px; box-shadow: var(--shadow); text-align: left;
+}
+.module-card header, .module-shortcuts { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.module-card header { justify-content: space-between; }
+.module-card h3 { margin: 18px 0 3px; font-size: 22px; line-height: 1.3; }
+.module-card p { color: var(--muted); font-size: 13px; margin: 0 0 22px; }
+.module-card .module-foot {
+  margin: auto 0 0; border-top: 1px solid var(--line); padding-top: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.module-card small { color: var(--muted); font-variant-numeric: tabular-nums; }
+.module-card .module-open { background: transparent; border: 0; color: var(--accent); padding: 5px 0 5px 6px; }
+.module-open:hover { text-decoration: underline; }
+.module-icon { display: inline-grid; place-items: center; width: 46px; height: 46px; border-radius: 13px; color: var(--accent); background: var(--soft); }
+.module-icon svg { width: 26px; height: 26px; }
+.module-card[data-module-id=bilibili_surf] .module-icon { color: var(--vertex-ink); background: var(--vertex-bg); }
+.module-card[data-module-id=minecraft] .module-icon { color: var(--good); background: var(--good-bg); }
+.module-card .module-region { font-size: 12px; color: var(--muted); }
+.module-card:has(details[open]) { grid-column: 1 / -1; }
+.module-card summary { cursor: pointer; font-weight: 650; color: var(--accent); padding: 7px 0; }
+.module-tools > button { margin-top: 12px; }
+.module-shortcuts { margin: 12px 0 0; }
+.module-shortcuts button { font-size: 13px; }
+.module-shortcuts button span { margin-left: 4px; color: var(--accent); }
+#qq .connection-state { margin: 12px 0; }
+@media(max-width:740px) {
+  :root:has(body.authenticated) { --bar: 100px; }
+  body.authenticated .topbar { display: grid; grid-template: 51px 44px / 1fr auto; gap: 0 8px; align-content: start; }
+  body.authenticated .brand { grid-area: 1 / 1; }
+  body.authenticated .topbar-actions { grid-area: 1 / 2; }
+  .page-meta { display: none; }
+  .workspace-switch { grid-area: 2 / 1 / 3 / -1; margin-left: 12px; }
+  .workspace-switch button { flex: 1; }
+  .module-catalog { gap: 10px; }
+  .module-card { padding: 17px; }
+}
 @media(prefers-reduced-motion:reduce) {
   *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; }
 }
@@ -794,8 +857,11 @@ body.authenticated footer { margin-left: var(--rail); }
     <span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></span>
     <div class="brand-copy"><strong>哈基米</strong><small>星夜控制台</small></div>
   </div>
+  <div id="workspace-switch" class="workspace-switch" role="group" aria-label="选择工作区" hidden>
+    <button type="button" data-workspace-target="core" aria-controls="core-nav" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg>主控台</button>
+    <button type="button" data-workspace-target="modules" aria-controls="modules-nav" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5-9 5-9-5z M3 12l9 5 9-5 M3 17l9 5 9-5"/></svg>功能模块</button>
+  </div>
   <div class="page-meta">
-    <span class="connection-state"><span id="connection-dot" class="status-dot" aria-hidden="true"></span><span id="connection-label">等待连接状态</span></span>
     <time id="last-updated">尚未刷新</time>
   </div>
   <div class="topbar-actions">
@@ -826,36 +892,53 @@ body.authenticated footer { margin-left: var(--rail); }
 </section>
 <div id="app" hidden>
   <aside id="sidebar" class="sidebar" aria-label="控制台导航">
-    <div class="drawer-head"><strong>功能导航</strong><button id="drawer-close" class="icon-button" type="button" aria-label="关闭导航"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
-    <nav role="tablist" aria-label="管理模块" aria-orientation="vertical">
+    <div class="drawer-head"><strong id="drawer-title">主控台</strong><button id="drawer-close" class="icon-button" type="button" aria-label="关闭导航"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <nav id="core-nav" data-workspace="core" role="tablist" aria-label="主控台" aria-orientation="vertical">
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">运行监控</div>
+        <div class="nav-group-label">运行管理</div>
         <button id="nav-overview" type="button" role="tab" data-tab="overview" data-description="查看本日调用、预算和消息处理状态。" aria-controls="overview" aria-selected="true" tabindex="0"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg><span>运行概览</span></button>
         <button id="nav-ledger" type="button" role="tab" data-tab="ledger" data-description="查看调用明细、账户余额及 GCP 赠金对账。" aria-controls="ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span>账本与预算</span></button>
         <button id="nav-life" type="button" role="tab" data-tab="life" data-description="管理跨节点动作、意图队列和执行回执。" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
         <button id="nav-logs" type="button" role="tab" data-tab="logs" data-description="查看最近的脱敏拦截记录与系统告警。" aria-controls="logs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span>安全日志</span></button>
       </div>
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">对话与权限</div>
+        <div class="nav-group-label">模型与对话</div>
+        <button id="nav-api-routing" type="button" role="tab" data-tab="api-routing" data-description="管理凭据、隐私分级和会话路由。" aria-controls="api-routing" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z M9 12h6 M12 9v6"/></svg><span>API 与隐私路由</span></button>
+        <button id="nav-thinking" type="button" role="tab" data-tab="thinking" data-description="设置各场景的思考强度与输出上限。" aria-controls="thinking" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6 M10 21h4 M8 14a6 6 0 1 1 8 0l-1 2H9z"/></svg><span>模型与思考</span></button>
         <button id="nav-reply-settings" type="button" role="tab" data-tab="reply-settings" data-description="调整作息、防抖、请求限流和联网检索。" aria-controls="reply-settings" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span>回复与联网</span></button>
         <button id="nav-filter" type="button" role="tab" data-tab="filter" data-description="调整 Decisions 阈值，核对消息判定和投递结果。" aria-controls="filter" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6z M8 12l3 3 5-6"/></svg><span>网关与审计</span></button>
-        <button id="nav-admission" type="button" role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
         <button id="nav-sandbox" type="button" role="tab" data-tab="sandbox" data-description="用模拟身份测试门卫判定与回复。" aria-controls="sandbox" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6 M10 3v7L4 20h16l-6-10V3 M7 15h10"/></svg><span>沙盒测试</span></button>
       </div>
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">模型与记忆</div>
-        <button id="nav-api-routing" type="button" role="tab" data-tab="api-routing" data-description="管理凭据、隐私分级和会话路由。" aria-controls="api-routing" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z M9 12h6 M12 9v6"/></svg><span>API 与隐私路由</span></button>
-        <button id="nav-thinking" type="button" role="tab" data-tab="thinking" data-description="设置各场景的思考强度与输出上限。" aria-controls="thinking" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6 M10 21h4 M8 14a6 6 0 1 1 8 0l-1 2H9z"/></svg><span>模型与思考</span></button>
-        <button id="nav-memory" type="button" role="tab" data-tab="memory" data-description="管理群聊策略、压缩参数及独立会话。" aria-controls="memory" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span>群聊与记忆</span></button>
+        <div class="nav-group-label">记忆管理</div>
+        <button id="nav-memory" type="button" role="tab" data-tab="memory" data-description="管理隔离会话、历史压缩与长期记忆。" aria-controls="memory" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span>会话与记忆</span></button>
         <button id="nav-notebook" type="button" role="tab" data-tab="notebook" data-description="管理仅供 Owner 私聊使用的脱敏快照。" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
       </div>
+    </nav>
+    <nav id="modules-nav" data-workspace="modules" role="tablist" aria-label="功能模块" aria-orientation="vertical" hidden>
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">巡逻与社区</div>
-        <button id="nav-bili-account" type="button" role="tab" data-tab="bili-account" data-description="管理小号凭据、巡逻时段与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>B 站小号</span></button>
-        <button id="nav-patrol" type="button" role="tab" data-tab="patrol" data-description="管理 B 站订阅，查看巡逻日记与网盘同步状态。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻与日记</span></button>
-        <button id="nav-proactive" type="button" role="tab" data-tab="proactive" data-description="管理 Owner 汇报、问候与免打扰时段。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
-        <button id="nav-memes" type="button" role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包</span></button>
-        <button id="nav-community" type="button" role="tab" data-tab="community" data-description="管理好感度、小黑屋和心情个签。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
+        <div class="nav-group-label">模块导航</div>
+        <button id="nav-modules" type="button" role="tab" data-tab="modules" data-description="选择模块，查看它的运行状态、设置和可执行动作。" aria-controls="modules" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5-9 5-9-5z M3 12l9 5 9-5 M3 17l9 5 9-5"/></svg><span>模块目录</span></button>
+      </div>
+      <div class="nav-group-label module-nav-caption" role="presentation">模块工作区</div>
+      <div class="nav-group" role="presentation" data-module="qq_social">
+        <div class="nav-group-label">QQ</div>
+        <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接，管理群聊互动、社区和 Owner 私信。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
+        <button id="nav-group-policy" type="button" data-subpage hidden role="tab" data-tab="group-policy" data-description="设置白名单群的互动方式、外部 Bot 回复阈值与冷却。" aria-controls="group-policy" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18 M3 12h18 M3 18h18 M8 3v6 M16 9v6 M8 15v6"/></svg><span>群聊互动策略</span></button>
+        <button id="nav-admission" type="button" data-subpage hidden role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
+        <button id="nav-community" type="button" data-subpage hidden role="tab" data-tab="community" data-description="管理好感度、小黑屋和心情个签。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
+        <button id="nav-memes" type="button" data-subpage hidden role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包</span></button>
+        <button id="nav-proactive" type="button" data-subpage hidden role="tab" data-tab="proactive" data-description="管理 Owner 汇报、问候与免打扰时段。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
+      </div>
+      <div class="nav-group" role="presentation" data-module="bilibili_surf">
+        <div class="nav-group-label">哔哩哔哩</div>
+        <button id="nav-bili" type="button" role="tab" data-tab="bili" data-description="管理账号、视频订阅、巡逻任务和日记。" aria-controls="bili" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v13H3z M8 3l3 4 M16 3l-3 4 M7 12v3 M17 12v3 M10 15l2 1 2-1"/></svg><span>B 站巡逻</span></button>
+        <button id="nav-bili-account" type="button" data-subpage hidden role="tab" data-tab="bili-account" data-description="管理小号凭据、巡逻时段与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>账号与看片设置</span></button>
+        <button id="nav-patrol" type="button" data-subpage hidden role="tab" data-tab="patrol" data-description="管理 B 站订阅，查看巡逻日记与网盘同步状态。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻与日记</span></button>
+      </div>
+      <div class="nav-group" role="presentation" data-module="minecraft">
+        <div class="nav-group-label">游戏</div>
+        <button id="nav-minecraft" type="button" role="tab" data-tab="minecraft" data-description="查看游戏连接和角色状态，下达活动目标。" aria-controls="minecraft" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5v10l-9 5-9-5V7z M3 7l9 5 9-5 M12 12v10"/></svg><span>Minecraft</span></button>
       </div>
     </nav>
     <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">Asia/Shanghai</span></div>
@@ -864,10 +947,11 @@ body.authenticated footer { margin-left: var(--rail); }
   <div class="page-content">
     <div class="page-heading">
       <div>
-        <div id="page-kicker" class="eyebrow">运行监控</div>
+        <div id="page-kicker" class="eyebrow">主控台 / 运行管理</div>
         <h1 id="page-title" tabindex="-1">运行概览</h1>
         <p id="page-description" hidden></p><time id="overview-day"></time>
       </div>
+      <button type="button" class="secondary" id="refresh-module" hidden>刷新模块状态</button>
       <div id="overview-tools">
         <button id="refresh" type="button" class="secondary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M5.5 8a7 7 0 0 1 12-2l2.5 4M18.5 16a7 7 0 0 1-12 2L4 14"/></svg>刷新概览</button>
       </div>
@@ -892,10 +976,8 @@ body.authenticated footer { margin-left: var(--rail); }
       </div>
     </article>
     <article class="card">
-      <h2>连接与处理状态</h2>
-      <dl id="ws-details" class="node-details">
-        <div><dt>最近心跳</dt><dd id="ws-heartbeat">—</dd></div>
-        <div><dt>连接来源</dt><dd id="ws-source">—</dd></div>
+      <h2>消息处理</h2>
+      <dl class="node-details">
         <div><dt>处理中</dt><dd id="pipeline-state">—</dd></div>
         <div><dt>图片缓存</dt><dd id="image-cache">—</dd></div>
       </dl>
@@ -906,14 +988,12 @@ body.authenticated footer { margin-left: var(--rail); }
       <p id="lanes-empty" class="muted" hidden>今天还没有 API 调用。</p>
       <p class="overview-footnote">按用途统计当日费用，包含预留额度，联网检索费除外。</p>
     </article>
-    <article class="card">
-      <h2>快捷操作</h2>
+    <article class="card"><h2>常用设置</h2>
       <div class="quick-actions">
-        <button type="button" class="quick-action" data-action="patrol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span><strong>执行 B 站巡逻</strong><small>拉取订阅更新</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
-        <button type="button" class="quick-action" data-action="diary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span><strong>汇总今日日记</strong><small>同步至 Google Drive</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
-        <button type="button" class="quick-action" data-action="notebook" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span><strong>刷新小本本</strong><small id="notebook-action-note">读取快照状态中</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="reply-settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span><strong>回复与联网</strong><small>调整作息、防抖和检索</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="memory"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span><strong>会话与记忆</strong><small>查看隔离会话和滚动摘要</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span><strong>安全日志</strong><small>排查拦截和服务告警</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
       </div>
-      <p class="overview-footnote">手动巡逻和汇总使用现有 API 额度。</p>
     </article>
   </div>
   <div id="overview-routing-gcp" class="card" hidden>
@@ -927,6 +1007,86 @@ body.authenticated footer { margin-left: var(--rail); }
     <div id="overview-routing-pills" class="pill-row"></div>
     <div id="overview-gcp-strip" class="kpi-strip" hidden></div>
     <p id="overview-gcp-note" class="muted"></p>
+  </div>
+</section>
+
+<section id="modules" class="tab" role="tabpanel" aria-labelledby="nav-modules" hidden>
+  <div class="directory-heading"><h2>已注册模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
+  <div id="module-catalog" class="module-catalog" aria-live="polite"></div>
+</section>
+
+<section id="qq" class="tab" role="tabpanel" aria-labelledby="nav-qq" hidden>
+  <div class="card"><h2>OneBot 连接</h2>
+    <span class="connection-state"><span id="connection-dot" class="status-dot" aria-hidden="true"></span><span id="connection-label">等待连接状态</span></span>
+    <dl id="ws-details" class="node-details">
+        <div><dt>最近心跳</dt><dd id="ws-heartbeat">—</dd></div>
+        <div><dt>连接来源</dt><dd id="ws-source">—</dd></div>
+    </dl>
+  </div>
+  <div class="card"><h2>社交设置</h2>
+    <div class="module-shortcuts">
+      <button type="button" class="secondary" data-open-tab="group-policy">群聊互动策略 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="admission">准入与防互刷 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="community">好感度与小黑屋 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="memes">表情包 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="proactive">主动私信 <span aria-hidden="true">→</span></button>
+    </div>
+  </div>
+  <div class="card"><h2>模块动作</h2>
+    <div id="qq-actions" class="module-tools"></div>
+  </div>
+</section>
+
+<section id="group-policy" class="tab" role="tabpanel" aria-labelledby="nav-group-policy" hidden>
+  <div class="card"><h2>群聊互动策略</h2>
+    <p class="muted">仅管理已有白名单群；保存后立即生效，重启保留。at_only 接收真实 @、对机器人的已验证回复和顶层昵称点名（群内看视频需真实 @）；muted 始终静默。活跃度只调整 smart_reply 的自由插话门槛。</p>
+    <div id="groups" class="table"></div>
+  </div>
+  <div class="card"><h2>Bot 回复阈值与冷却</h2>
+    <p class="muted">此处与「准入与防互刷」共用外部 Bot 名单与回复阈值（0.01–1.00，1.00=完全屏蔽）。显式 /bot-interact 窗口内允许 2 轮对话及点名，不改变日常阈值。</p>
+    <form id="bot-default-threshold-form" class="row"><label for="bot-default-threshold">全局默认 Bot 阈值 <input id="bot-default-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" required></label><button type="submit">保存默认阈值</button></form>
+    <div class="row"><input id="bot-id" inputmode="numeric" placeholder="其他机器人 QQ 号" aria-label="机器人 QQ"><input id="bot-custom-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" placeholder="专属阈值（可留空）" aria-label="机器人专属回复阈值"><button id="add-bot" type="button">加入管理</button></div>
+    <div id="bots" class="table"></div>
+  </div>
+</section>
+
+<section id="bili" class="tab" role="tabpanel" aria-labelledby="nav-bili" hidden>
+  <div class="card"><h2>巡逻设置</h2>
+    <dl class="node-details"><div><dt>执行节点</dt><dd id="bili-module-backend">—</dd></div><div><dt>小号自主巡逻</dt><dd id="bili-module-autonomous">—</dd></div></dl>
+    <div class="module-shortcuts">
+      <button type="button" class="secondary" data-open-tab="bili-account">账号与看片设置 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="patrol">巡逻与日记 <span aria-hidden="true">→</span></button>
+    </div>
+  </div>
+  <div class="card"><h2>手动巡逻</h2>
+      <div class="quick-actions">
+        <button type="button" class="quick-action" data-action="patrol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span><strong>执行 B 站巡逻</strong><small>拉取订阅更新</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-action="diary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span><strong>汇总今日日记</strong><small>同步至 Google Drive</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+      </div>
+    <p class="overview-footnote">手动巡逻和汇总使用现有 API 额度。</p>
+  </div>
+  <div class="card"><h2>模块动作</h2>
+    <div id="bili-actions" class="module-tools"></div>
+  </div>
+</section>
+
+<section id="minecraft" class="tab" role="tabpanel" aria-labelledby="nav-minecraft" hidden>
+  <div class="card"><h2>Minecraft 控制</h2>
+    <dl id="mc-overview" class="node-details"></dl>
+    <p id="life-mc-status" class="muted"></p>
+    <form id="life-mc-form" class="quick-bar">
+      <label for="life-mc-topic">Mineflayer 建造 / 活动目标
+        <input id="life-mc-topic" type="text" maxlength="80" placeholder="例如：红石自动门、探索雪原">
+      </label>
+      <button id="life-mc-build" type="submit" disabled>筹备建造 (build_plan)</button>
+      <button id="life-mc-status-btn" type="button" class="secondary" disabled>刷新 MC 状态</button>
+      <button id="life-mc-idle" type="button" class="secondary" disabled>MC 待命 (idle)</button>
+      <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
+      <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
+    </form>
+  </div>
+  <div class="card"><h2>模块动作</h2>
+    <div id="minecraft-actions" class="module-tools"></div>
   </div>
 </section>
 
@@ -1302,7 +1462,7 @@ body.authenticated footer { margin-left: var(--rail); }
         <label for="filter-owner-injection">真实 Owner 来信注入阈值 <input id="filter-owner-injection" type="number" min="0.01" max="0.99" step="0.01" required></label>
         <label for="filter-owner-unsafe">真实 Owner 来信违规阈值 <input id="filter-owner-unsafe" type="number" min="0.01" max="0.99" step="0.01" required></label>
       </div>
-      <p class="muted">私聊与明确点名、回复机器人通过安全检查后可直接回应（群聊仅在明确 @ 机器人时解析视频）；外部 Bot 即使主动 @ 或引用回复也不会跳过门槛（默认 0.85，设为 1.00 为 0 Token 完全屏蔽；仅 Owner 发起 /bot-interact 时临时豁免 2 轮）。群内自由插话仍看 should_reply，每个群可在「群聊与记忆」选择安静、自然或活跃预设；Owner 普通群聊的插话门槛最高为 0.28。</p>
+      <p class="muted">私聊与明确点名、回复机器人通过安全检查后可直接回应（群聊仅在明确 @ 机器人时解析视频）；外部 Bot 即使主动 @ 或引用回复也不会跳过门槛（默认 0.85，设为 1.00 为 0 Token 完全屏蔽；仅 Owner 发起 /bot-interact 时临时豁免 2 轮）。群内自由插话仍看 should_reply，每个群可在 QQ 的「群聊互动策略」中选择安静、自然或活跃预设；Owner 普通群聊的插话门槛最高为 0.28。</p>
       <div class="row"><button type="submit">保存网关阈值</button><button id="reset-filter" type="button" class="secondary">恢复 .env 阈值与群预设</button></div>
     </form>
   </div>
@@ -1339,7 +1499,7 @@ body.authenticated footer { margin-left: var(--rail); }
     <details><summary>查看启动时的初始名单</summary><pre id="admission-environment"></pre></details>
   </div>
   <div class="card"><h2>群聊白名单</h2>
-    <p class="muted">空名单拒绝全部群聊。新增群默认由点名或回复触发（群内看视频需明确 @），并立即加入「群聊与记忆」的策略列表。</p>
+    <p class="muted">空名单拒绝全部群聊。新增群默认由点名或回复触发（群内看视频需明确 @），并立即加入 QQ 的「群聊互动策略」列表。</p>
     <p id="admission-group-scope" class="muted"></p>
     <form id="admission-groups-form" class="row"><input id="admission-group-id" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" required placeholder="QQ 群号（纯数字）" aria-label="添加群白名单"><button type="submit">添加群</button></form>
     <div id="admission-groups" class="table"></div>
@@ -1360,16 +1520,6 @@ body.authenticated footer { margin-left: var(--rail); }
 </section>
 
 <section id="memory" class="tab" role="tabpanel" aria-labelledby="nav-memory" hidden>
-  <div class="card"><h2>群聊互动策略</h2>
-    <p class="muted">仅管理已有白名单群；保存后立即生效，重启保留。at_only 接收真实 @、对机器人的已验证回复和顶层昵称点名（群内看视频需真实 @）；muted 始终静默。活跃度只调整 smart_reply 的自由插话门槛。</p>
-    <div id="groups" class="table"></div>
-  </div>
-  <div class="card"><h2>Bot 回复阈值与冷却</h2>
-    <p class="muted">此处与「准入与防互刷」共用外部 Bot 名单与回复阈值（0.01–1.00，1.00=完全屏蔽）。显式 /bot-interact 窗口内允许 2 轮对话及点名，不改变日常阈值。</p>
-    <form id="bot-default-threshold-form" class="row"><label for="bot-default-threshold">全局默认 Bot 阈值 <input id="bot-default-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" required></label><button type="submit">保存默认阈值</button></form>
-    <div class="row"><input id="bot-id" inputmode="numeric" placeholder="其他机器人 QQ 号" aria-label="机器人 QQ"><input id="bot-custom-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" placeholder="专属阈值（可留空）" aria-label="机器人专属回复阈值"><button id="add-bot" type="button">加入管理</button></div>
-    <div id="bots" class="table"></div>
-  </div>
   <div class="card"><h2>滚动压缩参数</h2>
     <p class="muted">默认追加历史达到 14000 估算 Token（可下方热调）或 96KB 后整批折半。裁切片段进入加密冷史，后台按 Flex 半价提炼；凌晨只读快照不改变热窗口。下面的条数参数仅用于兼容模式；自动压缩开关即时生效。设置不会清空现有会话。</p>
     <p id="compression-source" class="muted"></p>
@@ -1508,25 +1658,6 @@ body.authenticated footer { margin-left: var(--rail); }
       <button id="life-world-save" type="submit" disabled>更新世界状态</button>
     </form>
   </div>
-  <div class="card"><h2>Minecraft 控制</h2>
-    <p id="life-mc-status" class="muted"></p>
-    <form id="life-mc-form" class="quick-bar">
-      <label for="life-mc-topic">Mineflayer 建造 / 活动目标
-        <input id="life-mc-topic" type="text" maxlength="80" placeholder="例如：红石自动门、探索雪原">
-      </label>
-      <button id="life-mc-build" type="submit" disabled>筹备建造 (build_plan)</button>
-      <button id="life-mc-status-btn" type="button" class="secondary" disabled>刷新 MC 状态</button>
-      <button id="life-mc-idle" type="button" class="secondary" disabled>MC 待命 (idle)</button>
-      <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
-      <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
-    </form>
-  </div>
-  <div class="card"><h2>模块与主动动作</h2>
-    <h3>模块状态</h3>
-    <div id="life-modules-table" class="table"></div>
-    <h3>主动动作</h3>
-    <div id="life-actions-table" class="table"></div>
-  </div>
   <div class="card"><h2>主动引擎调度</h2>
     <p class="muted">规划层仅在唤醒周期或高重要度脉冲时写入模糊意图与门控条件；门控层每分钟零 Token 扫描，命中窗口后再由 JIT 临场生成回复。</p>
     <p id="life-source" class="muted"></p>
@@ -1642,6 +1773,7 @@ body.authenticated footer { margin-left: var(--rail); }
   <div class="card"><h2>Owner 只读《小本本》快照</h2>
     <p class="muted">当「Antigravity_Memory 双端记忆桥」已启用时，Owner 私聊实时挂载只读《小本本》与云端长期记忆；此处的单文件快照（Drive 6 小时刷新或本地兜底）仅作可选兼容模式。只用于真实 Owner 私聊，不用于沙盒、群聊或日记。</p>
     <p id="notebook-state"></p>
+    <p id="notebook-action-note" class="muted"></p>
     <textarea id="notebook-text" maxlength="4000" rows="12" aria-label="小本本快照"></textarea>
     <div class="row"><button data-action="notebook" disabled>刷新快照</button><button id="save-notebook">筛查并更新本地快照</button></div>
   </div>
@@ -1706,7 +1838,7 @@ async function api(path,method='GET',data){
   if(signal.aborted)throw new DOMException('请求已取消','AbortError');
   if(!r.ok){
     if(r.status===401||r.status===403)logout();
-    const hints={authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
+    const hints={module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
     throw Error(hints[value.detail]||value.detail||('HTTP '+r.status));
   }
   return value;
@@ -1717,7 +1849,7 @@ async function busy(button,fn){
   finally{button.disabled=false;button.removeAttribute('aria-busy');}
 }
 function button(label,fn,cls='secondary'){const b=el('button',label,cls);b.type='button';b.addEventListener('click',()=>busy(b,fn));return b;}
-function table(id,headers,rows){const t=el('table'),thead=el('thead'),head=el('tr'),body=el('tbody');headers.forEach(v=>{const th=el('th',v);th.scope='col';head.append(th);});thead.append(head);t.append(thead,body);rows.forEach(values=>{const row=el('tr');values.forEach(v=>{const cell=el('td');if(v instanceof Node)cell.append(v);else cell.textContent=String(v??'—');row.append(cell);});body.append(row);});$(id).replaceChildren(t);if(!rows.length)$(id).append(el('p','还没有记录，新的动态会出现在这里。','empty-state'));}
+function table(id,headers,rows){const target=typeof id==='string'?$(id):id;const t=el('table'),thead=el('thead'),head=el('tr'),body=el('tbody');headers.forEach(v=>{const th=el('th',v);th.scope='col';head.append(th);});thead.append(head);t.append(thead,body);rows.forEach(values=>{const row=el('tr');values.forEach(v=>{const cell=el('td');if(v instanceof Node)cell.append(v);else cell.textContent=String(v??'—');row.append(cell);});body.append(row);});target.replaceChildren(t);if(!rows.length)target.append(el('p','还没有记录，新的动态会出现在这里。','empty-state'));}
 function kpiCard(label,value,note,variant=''){const card=el('div',undefined,'kpi-card'+(variant?' kpi-'+variant:''));card.append(el('span',label,'kpi-label'),el('strong',value,'kpi-value'));if(note)card.append(el('span',note,'kpi-note'));return card;}
 async function loadJsonFileInto(fileInput,textarea){const file=fileInput.files?.[0];if(!file)return;if(file.size>65536){fileInput.value='';throw Error('Service Account JSON 文件超过 64 KiB 上限');}const raw=await file.text();JSON.parse(raw);textarea.value=raw;fileInput.value='';notice('已读取 JSON 文件：'+file.name);}
 
@@ -1751,7 +1883,7 @@ function logout(){
   gcpBillingState=null;
   accountBalanceState=null;
   affectionState=null;
-  lifeState=null;
+  resetWorkspaces();
   text('life-node-status','');
   text('life-mc-status','');
   text('rest-overview-badge','作息读取中');
@@ -1763,7 +1895,7 @@ function logout(){
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
   for(const id of ['save-rest-hours','reset-rest-hours','save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','cap-carbon-enabled','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
-  ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-module-options','life-modules-table','life-actions-table','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
+  ['debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
   thinkingReady=false;thinkingDirty=false;
@@ -1903,7 +2035,7 @@ async function dashboard(initial){
   const d=dashRes.value,gcp=gcpRes.status==='fulfilled'?gcpRes.value:null;
   displayZone=d.usage.timezone||d.usage.budget_timezone||'Asia/Shanghai';
   text('sidebar-zone',displayZone);
-  updateConnection(d);
+  stampDashboard();
   renderRestHours(d.rest_hours);
   showNotebookAvailability(Boolean(d.notebook?.enabled));
   const usage=d.usage,lanes=usage.lanes;
@@ -1918,9 +2050,7 @@ async function dashboard(initial){
   const day=usage.day_local||usage.day||usage.day_utc||'';
   $('overview-day').dateTime=day;
   text('overview-day',day+' · '+(displayZone==='Asia/Shanghai'?'上海时间':displayZone));
-  const ws=d.onebot_detail||{},pipe=d.pipeline||{};
-  text('ws-heartbeat',ws.last_heartbeat_at?dateTime(ws.last_heartbeat_at):'暂无心跳');
-  text('ws-source',ws.source_ip||'—');
+  const pipe=d.pipeline||{};
   text('pipeline-state','守门 '+(pipe.gate??0)+' / 推理 '+(pipe.generating??0));
   text('image-cache',((pipe.image_cache_bytes??0)/1048576).toFixed(1)+' MiB');
   const budget=d.budget_status||{};
@@ -2472,7 +2602,6 @@ $('proactive-form').addEventListener('submit',e=>{e.preventDefault();busy(e.subm
 $('reset-proactive').addEventListener('click',e=>busy(e.target,async()=>{await api('proactive','DELETE');await proactive();notice('已恢复启动时的 .env 配置');}));
 for(const [id,action] of [['dm-test','test'],['dm-now','digest']])$(id).addEventListener('click',e=>busy(e.target,async()=>{notice(action==='test'?'正在验证私信通路…':'正在准备今日汇报…');const r=await api('proactive/'+action,'POST');const state=r.delivery&&r.delivery!=='not_queued'?r.delivery:r.status;notice((dmStatus[state]||state)+(r.reason?' · '+r.reason:''));await proactive();}));
 
-let lifeState=null;
 const lifeIntentStatus={pending:'待触发',executing:'执行中',done:'已完成',gated_skip:'门控跳过',expired:'已过期',uncertain:'结果不确定'};
 const lifeIntentVariant={pending:'warn',executing:'paid',done:'ok',gated_skip:'muted',expired:'muted',uncertain:'err'};
 function lifeFmt(t,tz){
@@ -2491,7 +2620,6 @@ function lifeSummaryJson(obj){
   return String(obj);
 }
 function renderLife(d){
-  lifeState=d;
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
   const stats=[
     ['当前活动 / 专注',(ws.current_module||'idle')+' · '+(ws.focus_level||'LOW')],
@@ -2515,9 +2643,6 @@ function renderLife(d){
   text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 上海节点说明：'+(sh.phase_note||'CN 反向 WSS 躯干专线'));
   const caps=Array.isArray(sh.capabilities)&&sh.capabilities.length?sh.capabilities.join(', '):'—';
   text('life-node-status','上海节点 '+(sh.node_id||'shanghai-cn-1')+' ('+(sh.region||'CN')+')：'+(sh.connected?'在线':sh.configured?'等待连接':'未配置')+' · 来源 IP '+(sh.source_ip||'—')+' · 建连 '+lifeFmt(sh.connected_at,tz)+' · 心跳 '+lifeFmt(sh.last_heartbeat_at,tz)+' · RPC 成功/失败 '+(sh.rpc_calls??0)+'/'+(sh.rpc_errors??0)+' · B站托管 '+(sh.bili_delegate_active?'开启':'未激活')+' · 能力 '+caps);
-  const mcPos=Array.isArray(mc.pos)?'('+mc.pos.join(', ')+')':(mc.pos||'—');
-  const mcMode=mc.connected?'游戏在线':mc.bridge_ready?'躯干就绪(待机)':'未就绪';
-  text('life-mc-status','Mineflayer 躯干：'+mcMode+' · '+(mc.paused?'已暂停':'未暂停')+' · MC开关/配置 '+(mc.mc_enabled?'开':'关')+'/'+(mc.mc_configured?'已配':'未配')+' · 维度 '+(mc.dimension||'—')+' · 坐标 '+mcPos+' · 生命/饱食 '+(mc.health??'—')+'/'+(mc.food??'—')+' · 活动 '+(mc.activity||'—')+' · 更新 '+lifeFmt(mc.updated_at,tz));
   text('life-desktop-status',dm.enabled?('桌面端 Antigravity_Memory 最近活跃：'+(dm.latest_iso||lifeFmt(dm.latest_timestamp,tz))+(dm.latest_tag?' · 标签 '+dm.latest_tag:'')):'桌面端 Antigravity_Memory 协同当前未启用。');
   $('life-world-module').value=ws.current_module||'idle';
   const moduleIds=new Set(['idle',...(ws.modules||[]).map(m=>m.module_id)]);
@@ -2530,28 +2655,6 @@ function renderLife(d){
   $('life-world-mood').value=ws.mood||'calm';
   $('life-world-energy').value=ws.energy??80;
   $('life-world-boredom').value=ws.boredom??20;
-  table('life-modules-table',['模块 ID','节点区域','注意力等级','主动暂停','传感器摘要'],(ws.modules||[]).map(m=>[
-    m.module_id,
-    pill(m.node_region||'KR',m.node_region==='CN'?'vertex':'muted'),
-    pill(m.attention_level||'LOW',m.attention_level==='HIGH'?'warn':m.attention_level==='MEDIUM'?'paid':'muted'),
-    m.proactive_paused?pill('已暂停','warn'):pill('开放','ok'),
-    m.sensor_summary||'—'
-  ]));
-  const modes={active:'按动作名',shadow:'对照旧路由',legacy:'仅旧路由',off:'停用'};
-  table('life-actions-table',['动作','执行模块','发送范围','当前状态','路由方式'],(eng.actions||[]).map(a=>{
-    const select=el('select');
-    select.setAttribute('aria-label',a.name+' 路由方式');
-    for(const key of (a.compatibility?Object.keys(modes):['active','off'])){
-      const option=el('option',modes[key]);option.value=key;select.append(option);
-    }
-    select.value=a.mode;
-    select.onchange=()=>busy(select,async()=>{
-      try{renderLife(await api('life/actions/'+encodeURIComponent(a.name),'PUT',{mode:select.value}));}
-      catch(error){select.value=a.mode;throw error;}
-    });
-    return [a.name+' · '+a.description,a.module,a.audience==='social'?'获准群 / Owner':'模块内部',
-      a.available?'可用':a.reason,select];
-  }));
   $('life-enabled').checked=Boolean(c.enabled);
   $('life-active-hours').value=c.active_hours||'09:00-01:00';
   $('life-group-cooldown').value=c.group_cooldown_seconds??1500;
@@ -2567,7 +2670,7 @@ function renderLife(d){
   const planSrcLabels={llm:'模型规划',sleeping:'夜间休眠',local_fallback:'本地兜底',milestone:'里程碑重规划',none:'尚未规划'};
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
   text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+tz+(eng.next_plan_at?' · 下次生活切片规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
-  for(const id of ['life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
+  for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
   table('life-intents-table',['ID','动作 / 接收人','来源 / 事件','执行窗口','门控与模糊动机','状态 / 结果','操作'],(d.intents||[]).map(it=>[
     el('span',String(it.id||'').slice(0,10),'code-mono'),
     (it.action_name||it.action_type)+(it.target_scope?' · '+it.target_scope:''),
@@ -2590,7 +2693,7 @@ function renderLife(d){
   ]));
 }
 async function life(){
-  const d=await api('life');
+  const d=await api('life/overview');
   if(!token)return;
   renderLife(d);
 }
@@ -2648,10 +2751,10 @@ $('life-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
   notice('已恢复默认双层主动引擎配置');
 }));
 async function sendMcGoal(actionType,topic=''){
-  const body={action_type:actionType};
+  const body={action_type:actionType,view:'module'};
   if(topic)body.topic=topic;
   const res=await api('life/mc/goal','POST',body);
-  if(res&&res.life)renderLife(res.life);
+  if(res.mc_status)renderMinecraft(res.mc_status);
   const summary=res?.result?.summary||res?.result?.reason||res?.status||'ok';
   notice('MC 指令 ['+actionType+']：'+(res?.status==='ok'?'成功':'不可用')+' · '+summary,res?.status!=='ok');
 }
@@ -2944,10 +3047,126 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
+const modulePage=new Map([['qq_social','qq'],['bilibili_surf','bili'],['minecraft','minecraft']]);
+const moduleDescriptions=new Map([
+  ['qq_social','OneBot 连接、群聊管理与主动私信'],
+  ['bilibili_surf','账号、视频订阅与巡逻日记'],
+  ['minecraft','游戏连接、活动目标与建造计划'],
+  ['weather','天气观测与定时动作']
+]);
+const regionName=code=>({CN:'上海节点',KR:'首尔节点'})[code]||code;
+const mcControls=['life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
+function renderMinecraft(mc){
+  const fields=[
+    ['上海连接',mc.bridge_ready?'桥接就绪':'未就绪'],['游戏连接',mc.connected?'游戏在线':'未进入游戏'],
+    ['游戏配置',(mc.mc_enabled?'已启用':'未启用')+' / '+(mc.mc_configured?'已配置':'未配置')],
+    ['角色活动',mc.paused?'已暂停':mc.activity||'—']
+  ];
+  $('mc-overview').replaceChildren(...fields.map(([name,value])=>{
+    const row=el('div');row.append(el('dt',name),el('dd',value));return row;
+  }));
+  const position=Array.isArray(mc.pos)?mc.pos.join(', '):mc.pos;
+  text('life-mc-status','维度 '+(mc.dimension||'—')+' · 坐标 '+(position||'—')+' · 生命 / 饱食 '+(mc.health??'—')+' / '+(mc.food??'—')+' · 更新 '+lifeFmt(mc.updated_at,displayZone));
+  mcControls.forEach(id=>$(id).disabled=false);
+}
+function renderModuleActions(target,actions){
+  if(!actions.length){target.replaceChildren(el('p','当前模块没有注册动作。','muted'));return;}
+  const modes={active:'按动作名',shadow:'对照旧路由',legacy:'仅旧路由',off:'停用'};
+  table(target,['动作','发送范围','当前状态','路由方式'],actions.map(a=>{
+    const control=el('select');
+    control.setAttribute('aria-label',a.name+' 路由方式');
+    for(const mode of (a.compatibility?Object.keys(modes):['active','off'])){
+      const option=el('option',modes[mode]);option.value=mode;control.append(option);
+    }
+    control.value=a.mode;
+    control.addEventListener('change',()=>busy(control,async()=>{
+      try{
+        const result=await api('life/actions/'+encodeURIComponent(a.name),'PUT',{mode:control.value,view:'module'});
+        renderModuleActions(target,result.actions);
+        notice('已保存 '+a.name+' 的路由方式');
+      }catch(error){control.value=a.mode;throw error;}
+    }));
+    return [a.name+' · '+a.description,a.audience==='social'?'获准群 / Owner':'模块内部',a.available?'可用':a.reason,control];
+  }));
+}
+function renderModuleTools(container,d){
+  const actions=el('div',undefined,'table'),summary=el('p',undefined,'muted');
+  const read=el('button','读取传感器摘要','secondary');read.type='button';
+  read.addEventListener('click',()=>busy(read,async()=>{
+    const result=await api('life/modules/'+encodeURIComponent(d.id)+'/sensor');
+    summary.textContent=result.summary||'暂无传感器摘要';
+  }));
+  const state=el('p',regionName(d.region)+' · '+(d.proactive_paused?'主动动作已暂停':'允许调度主动动作'),'muted');
+  container.replaceChildren(state,actions,read,summary);
+  renderModuleActions(actions,d.actions);
+}
+async function loadModule(id){
+  const tools=$(modulePage.get(id)+'-actions');
+  tools.replaceChildren();
+  if(id==='qq_social'){
+    text('connection-label','等待连接状态');$('connection-dot').className='status-dot';
+    text('ws-source','—');text('ws-heartbeat','—');
+  }else if(id==='bilibili_surf'){
+    text('bili-module-backend','—');text('bili-module-autonomous','—');
+  }else if(id==='minecraft'){
+    $('mc-overview').replaceChildren();text('life-mc-status','');
+    mcControls.forEach(control=>$(control).disabled=true);
+  }
+  const d=await api('life/modules/'+encodeURIComponent(id));
+  if(id==='qq_social')updateConnection(d.status);
+  if(id==='bilibili_surf'){
+    text('bili-module-backend',d.status.cn_delegate?'上海专线':d.status.backend==='remote_node'?'上海代理模式':'首尔本机');
+    text('bili-module-autonomous',d.status.autonomous?'已开启':'已关闭');
+  }
+  if(id==='minecraft')renderMinecraft(d.status);
+  renderModuleTools(tools,d);
+}
+function moduleCard(m){
+  const key=modulePage.get(m.id),title=key?sections.get(key).title:m.id==='weather'?'天气观测':m.id;
+  const card=el('article',undefined,'module-card');card.dataset.moduleId=m.id;
+  const header=el('header'),glyph=el('span',undefined,'module-icon');
+  glyph.append($('nav-'+(key||'modules')).querySelector('svg').cloneNode(true));
+  header.append(glyph,el('span','注册于'+regionName(m.region),'module-region'));
+  const foot=el('div',undefined,'module-foot');
+  foot.append(el('small',m.action_count+' 项动作'));
+  card.append(header,el('h3',title),el('p',moduleDescriptions.get(m.id)||m.id),foot);
+  if(key){
+    const open=el('button','打开模块 →','module-open');open.type='button';
+    open.setAttribute('aria-label','打开'+title);open.dataset.openTab=key;foot.append(open);
+  }else{
+    const details=el('details'),summary=el('summary','查看模块'),body=el('div');
+    details.append(summary,body);card.append(details);
+    let loaded=false,loading=false;
+    details.addEventListener('toggle',async()=>{
+      if(!details.open||loaded||loading)return;
+      loading=true;body.textContent='正在读取模块…';
+      try{renderModuleTools(body,await api('life/modules/'+encodeURIComponent(m.id)));loaded=true;}
+      catch(error){if(error.name!=='AbortError')body.textContent='读取失败，重新展开可重试。';}
+      finally{loading=false;}
+    });
+  }
+  return card;
+}
+async function moduleDirectory(){
+  const container=$('module-catalog');
+  try{
+    const list=await api('life/modules');
+    const registered=new Set(list.map(m=>m.id));
+    for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=!registered.has(group.dataset.module);
+    container.replaceChildren(...list.map(moduleCard));
+    if(!list.length)container.append(el('p','当前没有已注册的模块。','empty-state'));
+  }catch(error){
+    if(error.name==='AbortError')throw error;
+    container.replaceChildren(el('p','模块目录暂时无法读取，请点击刷新目录重试。','empty-state'));
+  }
+}
+
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  memory:()=>Promise.all([groups(),bots(),sessions(),compression()]),
+  modules:moduleDirectory, qq:()=>loadModule('qq_social'), bili:()=>loadModule('bilibili_surf'),
+  minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
+  memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{
     const [moderation,profiles]=await Promise.allSettled([community(),affection()]);
     if(moderation.status==='rejected')throw moderation.reason;
@@ -2972,7 +3191,7 @@ $('login-form').addEventListener('submit',e=>{
     }
     if(!token)return;
     $('login').hidden=true;$('app').hidden=false;$('notice').hidden=true;
-    for(const id of ['logout','open-finder','menu-toggle'])$(id).hidden=false;
+    for(const id of ['logout','open-finder','menu-toggle','workspace-switch'])$(id).hidden=false;
     document.body.classList.add('authenticated');
     selectTab('overview');$('page-title').focus({preventScroll:true});
     timer=setInterval(()=>{
@@ -2985,20 +3204,52 @@ $('login-form').addEventListener('submit',e=>{
 $('logout').addEventListener('click',logout);
 
 const tabButtons=[...$('sidebar').querySelectorAll('[role=tab]')];
+const workspaceNames={core:'主控台',modules:'功能模块'};
+const lastTab={core:'overview',modules:'modules'};
 const sections=new Map(tabButtons.map(button=>[button.dataset.tab,{
+  workspace:button.closest('nav').dataset.workspace,module:button.closest('.nav-group').dataset.module,
   button,title:button.querySelector('span').textContent,
   group:button.closest('.nav-group').querySelector('.nav-group-label').textContent
 }]));
+function resetWorkspaces(){
+  lastTab.core='overview';lastTab.modules='modules';
+  $('workspace-switch').hidden=true;
+  for(const id of ['module-catalog','qq-actions','bili-actions','minecraft-actions','mc-overview'])$(id).replaceChildren();
+  for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=false;
+  for(const id of ['bili-module-backend','bili-module-autonomous'])text(id,'—');
+}
 function selectTab(key){
   const section=sections.get(key);
   if(!section)return;
   tab=key;
-  for(const [id,{button}] of sections){
+  const workspace=section.workspace;
+  lastTab[workspace]=key;
+  $('core-nav').hidden=workspace!=='core';
+  $('modules-nav').hidden=workspace!=='modules';
+  for(const b of $('workspace-switch').querySelectorAll('button')){
+    b.setAttribute('aria-pressed',String(b.dataset.workspaceTarget===workspace));
+  }
+  text('drawer-title',workspaceNames[workspace]);
+  for(const [id,{button,module}] of sections){
+    if(button.hasAttribute('data-subpage'))button.hidden=module!==section.module;
     const active=id===key;
     $(id).hidden=!active;button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
   }
   text('page-title',section.title);
-  text('page-kicker',section.group);
+  text('page-kicker',workspaceNames[workspace]+' / '+section.group);
+  if(section.module){
+    const crumb=(label,key)=>{
+      const b=el('button',label,'crumb-link');b.type='button';b.dataset.openTab=key;return b;
+    };
+    const kicker=$('page-kicker');
+    kicker.replaceChildren(crumb('模块目录','modules'));
+    if(section.button.hasAttribute('data-subpage')){
+      const parent=modulePage.get(section.module);
+      kicker.append(' / ',crumb(sections.get(parent).title,parent));
+    }
+  }
+  $('last-updated').hidden=key!=='overview';
+  $('refresh-module').hidden=!section.module||section.button.hasAttribute('data-subpage');
   text('page-description',section.button.dataset.description);
   $('page-description').hidden=key==='overview';
   $('overview-day').hidden=$('overview-tools').hidden=key!=='overview';
@@ -3033,6 +3284,11 @@ async function navigate(key,{focusContent=false,heading=null}={}){
 function updateConnection(d){
   text('connection-label',({online:'OneBot 在线',reconnecting:'OneBot 重连中',http_mode:'HTTP 接入'})[d.onebot]||'OneBot 未连接');
   $('connection-dot').className='status-dot '+(d.onebot==='online'?'online':d.onebot==='reconnecting'?'offline':'');
+  const ws=d.onebot_detail||{};
+  text('ws-heartbeat',ws.last_heartbeat_at?dateTime(ws.last_heartbeat_at):'暂无心跳');
+  text('ws-source',ws.source_ip||'—');
+}
+function stampDashboard(){
   const now=new Date();$('last-updated').dateTime=now.toISOString();
   text('last-updated','更新于 '+now.toLocaleTimeString('zh-CN',{timeZone:displayZone,hour12:false}));
 }
@@ -3061,14 +3317,15 @@ $('sidebar').addEventListener('keydown',e=>{
     (document.activeElement===$('drawer-close')?current:$('drawer-close')).focus();
   }
 });
-document.querySelector('[role=tablist]').addEventListener('keydown',e=>{
+$('sidebar').addEventListener('keydown',e=>{
   if(!['ArrowDown','ArrowUp','Home','End'].includes(e.key))return;
-  const index=tabButtons.indexOf(document.activeElement);
+  const visible=tabButtons.filter(button=>!button.closest('[hidden]'));
+  const index=visible.indexOf(document.activeElement);
   if(index<0)return;
   e.preventDefault();
-  const last=tabButtons.length-1;
-  const next=e.key==='Home'?0:e.key==='End'?last:(index+(e.key==='ArrowDown'?1:-1)+tabButtons.length)%tabButtons.length;
-  tabButtons.forEach((b,i)=>b.tabIndex=i===next?0:-1);tabButtons[next].focus();
+  const last=visible.length-1;
+  const next=e.key==='Home'?0:e.key==='End'?last:(index+(e.key==='ArrowDown'?1:-1)+visible.length)%visible.length;
+  visible.forEach((b,i)=>b.tabIndex=i===next?0:-1);visible[next].focus();
 });
 narrowLayout.addEventListener('change',closeNavigation);
 closeNavigation();
@@ -3076,13 +3333,14 @@ closeNavigation();
 const finder=$('module-finder'),query=$('finder-query'),resultList=$('finder-results');
 const finderEntries=[];
 for(const [key,section] of sections){
-  finderEntries.push({key,label:section.title,context:section.group});
+  const location=workspaceNames[section.workspace]+' / '+section.group;
+  finderEntries.push({key,label:section.title,context:location});
   // Index only static headings before login. Session data never enters navigation search.
   for(const heading of $(key).querySelectorAll('.card h2, .card h3')){
     const label=heading.textContent.trim();
     if(!label||label===section.title)continue;
     heading.tabIndex=-1;
-    finderEntries.push({key,label,context:section.title,heading});
+    finderEntries.push({key,label,context:location+' / '+section.title,heading});
   }
 }
 let matches=[],activeResult=0;
@@ -3099,6 +3357,7 @@ function filterFinder(){
   const normalize=s=>s.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,'');
   const term=normalize(query.value);
   matches=finderEntries.filter(item=>{
+    if(sections.get(item.key).button.closest('.nav-group').hidden)return false;
     if(!term)return !item.heading;
     if(item.heading?.closest('[hidden]:not(.tab)'))return false;
     return normalize([item.label,item.context,item.key].join(' ')).includes(term);
@@ -3162,6 +3421,16 @@ setTheme(preferredTheme?preferredTheme==='dark':matchMedia('(prefers-color-schem
 $('theme-toggle').addEventListener('click',()=>{const dark=document.documentElement.dataset.theme!=='dark';setTheme(dark);try{localStorage.setItem('hakimi-theme',dark?'dark':'light');}catch{}});
 
 tabButtons.forEach(button=>button.addEventListener('click',()=>navigate(button.dataset.tab)));
+$('workspace-switch').addEventListener('click',e=>{
+  const button=e.target.closest('[data-workspace-target]');
+  if(button)navigate(lastTab[button.dataset.workspaceTarget],{focusContent:true});
+});
+$('app').addEventListener('click',e=>{
+  const button=e.target.closest('[data-open-tab]');
+  if(button)navigate(button.dataset.openTab,{focusContent:true});
+});
+$('reload-modules').addEventListener('click',()=>navigate('modules'));
+$('refresh-module').addEventListener('click',()=>navigate(tab));
 document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>busy(b,async()=>{notice('正在执行，请稍候…');const v=await api('actions/'+b.dataset.action,'POST');notice(v.note||v.status||'快照已刷新');await refreshTab();})));
 $('refresh').addEventListener('click',e=>busy(e.currentTarget,dashboard));$('refresh-logs').addEventListener('click',e=>busy(e.target,logs));$('refresh-sessions').addEventListener('click',e=>busy(e.target,sessions));
 $('add-bot').addEventListener('click',e=>busy(e.target,async()=>{const th=parseBotThreshold($('bot-custom-threshold').value,true);await api('bots','PUT',{user_id:$('bot-id').value.trim(),action:'add',threshold:th});$('bot-id').value='';$('bot-custom-threshold').value='';await syncBotViews();notice('外部 Bot 已加入管理');}));

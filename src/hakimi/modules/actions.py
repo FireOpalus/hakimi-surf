@@ -105,9 +105,13 @@ class ActionCatalog:
             raise ValueError("incompatible_action")
         return spec
 
-    def view(self, modes: dict[str, Mode], *, planner: bool = False) -> list[dict[str, Any]]:
+    def view(
+        self, modes: dict[str, Mode], *, planner: bool = False, module_id: str | None = None
+    ) -> list[dict[str, Any]]:
         rows = []
         for name, spec in sorted(self.actions.items()):
+            if module_id is not None and self.owners[name] != module_id:
+                continue
             mode = modes.get(name, "active")
             reason = "action_disabled" if mode == "off" else spec.unavailable()
             if planner and (reason or "planner" not in spec.origins):

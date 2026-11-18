@@ -172,6 +172,23 @@ async def page():
     return HTMLResponse(Path(__file__).with_name("admin_page.html").read_text())
 
 
+def onebot_connection(request: Request, svc) -> dict:
+    transport = request.app.state.onebot
+    ws = (
+        "http_mode"
+        if svc.s.onebot_mode == "http"
+        else "online"
+        if transport.ready.is_set()
+        else "reconnecting"
+    )
+    return {
+        "onebot": ws,
+        "onebot_detail": transport.status()
+        if hasattr(transport, "status")
+        else {"online": None, "last_heartbeat_at": None, "source_ip": None, "connected_at": None},
+    }
+
+
 @router.get("/api/dashboard")
 async def dashboard(request: Request):
     svc = service(request)
@@ -185,14 +202,6 @@ async def dashboard(request: Request):
             "SELECT n FROM counters WHERE key=?", (f"global:{int(time.time() // 60)}",)
         )
         circuit = bool(await svc.store.one("SELECT 1 FROM meta WHERE key='budget_overrun'"))
-    transport = request.app.state.onebot
-    ws = (
-        "http_mode"
-        if svc.s.onebot_mode == "http"
-        else "online"
-        if transport.ready.is_set()
-        else "reconnecting"
-    )
     notebook = svc.notebook.status() if svc.notebook else {"enabled": False}
     notebook.pop("text", None)
     return {
@@ -203,10 +212,7 @@ async def dashboard(request: Request):
             "hot_sessions": len(svc.hot.rings),
             "image_cache_bytes": getattr(svc.images, "cache_bytes", 0),
         },
-        "onebot": ws,
-        "onebot_detail": transport.status()
-        if hasattr(transport, "status")
-        else {"online": None, "last_heartbeat_at": None, "source_ip": None, "connected_at": None},
+        **onebot_connection(request, svc),
         "usage": usage,
         "budget_status": await svc.store.budget_status(),
         "daily_limit_usd": str(svc.s.daily_usd),

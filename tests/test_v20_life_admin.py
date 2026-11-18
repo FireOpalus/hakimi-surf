@@ -14,6 +14,7 @@ from pydantic import SecretStr
 from hakimi.app import create_app
 from hakimi.life_admin import LifeConfigMirror
 from hakimi.life_admin import router as life_router
+from hakimi.modules.weather import WeatherModule
 from hakimi.world_state import IntentTicketCreate
 from tests.fakes import FakeGateway
 from tests.test_admin import TOKEN
@@ -77,6 +78,10 @@ async def life_api(settings):
 
 LIFE_ROUTES = [
     ("GET", "/admin/api/life"),
+    ("GET", "/admin/api/life/modules"),
+    ("GET", "/admin/api/life/overview"),
+    ("GET", "/admin/api/life/modules/qq_social"),
+    ("GET", "/admin/api/life/modules/minecraft/sensor"),
     ("PUT", "/admin/api/life"),
     ("DELETE", "/admin/api/life"),
     ("PUT", "/admin/api/life/world"),
@@ -85,6 +90,82 @@ LIFE_ROUTES = [
     ("POST", "/admin/api/life/gatekeeper"),
     ("DELETE", "/admin/api/life/intents/0123456789abcdef0123456789abcdef"),
 ]
+
+
+async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api, monkeypatch):
+    app, client, gateway = life_api
+    svc = app.state.service
+    root = "/admin/api/life/modules"
+    assert (await client.get(root + "/weather")).status_code == 404
+    svc.modules.register(WeatherModule(svc.s, None, None))
+
+    reads = []
+
+    async def sensor():
+        reads.append("sensor")
+        return "本地测试摘要"
+
+    for module in svc.modules.all():
+        monkeypatch.setattr(module, "_raw_sensor_summary", sensor)
+
+    catalog = (await client.get(root)).json()
+    assert {m["id"] for m in catalog} == {"qq_social", "bilibili_surf", "minecraft", "weather"}
+    for entry in catalog:
+        assert set(entry) == {"id", "action_count", "region"}
+        details = (await client.get(root + "/" + entry["id"])).json()
+        assert set(details) == {"id", "actions", "status", "region", "proactive_paused"}
+        assert len(details["actions"]) == entry["action_count"]
+        assert all(action["module"] == entry["id"] for action in details["actions"])
+
+    response = await client.put(
+        "/admin/api/life/actions/qq.speak", json={"mode": "off", "view": "module"}
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == "qq_social"
+    assert any(a["name"] == "qq.speak" and a["mode"] == "off" for a in response.json()["actions"])
+    assert "world_state" not in response.json()
+    core = await client.get("/admin/api/life/overview")
+    assert core.status_code == 200
+    assert reads == []
+    assert (await client.get(root + "/weather/sensor")).json() == {"summary": "本地测试摘要"}
+    assert reads == ["sensor"]
+    assert not gateway.calls
+
+
+async def test_minecraft_control_returns_only_its_module_snapshot(life_api):
+    _, client, gateway = life_api
+    response = await client.post(
+        "/admin/api/life/mc/goal", json={"action_type": "status", "view": "module"}
+    )
+    assert response.status_code == 200
+    assert set(response.json()) == {"status", "result", "mc_status"}
+    assert response.json()["mc_status"]["connected"] is False
+    assert not gateway.calls
+
+
+async def test_admin_workspace_navigation_owns_each_panel_and_control_once(life_api):
+    _, client, _ = life_api
+    html = (await client.get("/admin")).text
+    navs = dict(re.findall(r'<nav id="(core|modules)-nav"[^>]*>(.*?)</nav>', html, re.S))
+    tabs = {key: set(re.findall(r'data-tab="([^"]+)"', nav)) for key, nav in navs.items()}
+    panels = dict(re.findall(r'<section id="([^"]+)" class="tab"[^>]*>(.*?)</section>', html, re.S))
+    assert tabs["core"].isdisjoint(tabs["modules"])
+    assert tabs["core"] | tabs["modules"] == set(panels)
+    assert {"overview", "ledger", "life", "api-routing", "memory", "notebook"} <= tabs["core"]
+    assert {"modules", "qq", "bili", "minecraft", "group-policy", "admission", "patrol"} <= tabs[
+        "modules"
+    ]
+    for marker, owner in (
+        ('id="module-catalog"', "modules"),
+        ('id="ws-heartbeat"', "qq"),
+        ('id="groups"', "group-policy"),
+        ('id="sessions"', "memory"),
+        ('id="life-mc-form"', "minecraft"),
+        ('data-action="patrol"', "bili"),
+        ('data-action="diary"', "bili"),
+        ('data-action="notebook"', "notebook"),
+    ):
+        assert [key for key, content in panels.items() if marker in content] == [owner]
 
 
 @pytest.mark.parametrize("method,path", LIFE_ROUTES)
