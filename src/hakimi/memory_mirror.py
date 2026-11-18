@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .memory_compressor import check_memory_text
 from .security import Rejected
+from .work_usage import model_work
 
 HEADER = (
     "# 哈基米 · 群聊双轨记忆\n\n修改条目正文或删除整个条目可同步回本地；请保留文件与条目锚点。\n"
@@ -111,7 +112,8 @@ class MemoryMirror:
                 raise Rejected("memory_mirror_disabled")
             state = await self.state(message)
             try:
-                return await self._sync(message, key, view, state, push)
+                with model_work("memory.mirror_review", independent=True):
+                    return await self._sync(message, key, view, state, push)
             except Exception as exc:
                 # Only fixed internal labels, never remote text, URLs, secrets
                 # or arbitrary exceptions.

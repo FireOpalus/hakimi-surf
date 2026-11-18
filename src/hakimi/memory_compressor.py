@@ -13,6 +13,7 @@ from .bot_server import is_persona_owner, untrusted_input
 from .dual_memory import EXTRACTION_INSTRUCTION, parse_extraction
 from .generation_policy import Scenario
 from .security import Rejected, configured_secrets
+from .work_usage import model_work
 
 MAX_RATE_LIMIT_RETRIES = 2
 RATE_LIMIT_BACKOFF_SECONDS = 60.0
@@ -71,13 +72,14 @@ class MemoryCompressor:
             raise Rejected("summary_too_long")
         check_memory_text(text, self.s)
         if text:
-            await self.ai.screen(
-                {"proposed_memory_summary": text},
-                subject,
-                purpose="source",
-                budget_lane=lane,
-                audit_source="memory",
-            )
+            with model_work("memory.summary_edit", independent=True):
+                await self.ai.screen(
+                    {"proposed_memory_summary": text},
+                    subject,
+                    purpose="source",
+                    budget_lane=lane,
+                    audit_source="memory",
+                )
         return text
 
     async def compress(self, message, *, force=False):
@@ -124,16 +126,21 @@ class MemoryCompressor:
             subject = self.store.vault.digest("compression-budget", self.sessions.key(message))
             try:
                 check_memory_text(str(payload), self.s)
-                await self.ai.screen(
-                    payload, subject, purpose="source", budget_lane="memory", audit_source="memory"
-                )
-                summary = await self.ai.generate(
-                    payload,
-                    subject,
-                    scenario=Scenario.MEMORY_COMPRESSION,
-                    budget_lane="memory",
-                    audit_source="memory",
-                )
+                with model_work("memory.compress", snapshot["attempt_id"], independent=True):
+                    await self.ai.screen(
+                        payload,
+                        subject,
+                        purpose="source",
+                        budget_lane="memory",
+                        audit_source="memory",
+                    )
+                    summary = await self.ai.generate(
+                        payload,
+                        subject,
+                        scenario=Scenario.MEMORY_COMPRESSION,
+                        budget_lane="memory",
+                        audit_source="memory",
+                    )
                 summary = summary.strip()[:800]
                 check_memory_text(summary, self.s)
                 # generate already screens the output; no additional redundant paid call.
@@ -222,18 +229,23 @@ class MemoryCompressor:
 
             try:
                 check_memory_text(str(payload), self.s)
-                await self.ai.screen(
-                    payload, subject, purpose="source", budget_lane="memory", audit_source="memory"
-                )
-                result = await self.ai.generate(
-                    payload,
-                    subject,
-                    scenario=Scenario.MEMORY_COMPRESSION,
-                    budget_lane="memory",
-                    audit_source="memory",
-                    memory_archive=True,
-                    before_call=guard,
-                )
+                with model_work("memory.extract", snapshot["batch_id"], independent=True):
+                    await self.ai.screen(
+                        payload,
+                        subject,
+                        purpose="source",
+                        budget_lane="memory",
+                        audit_source="memory",
+                    )
+                    result = await self.ai.generate(
+                        payload,
+                        subject,
+                        scenario=Scenario.MEMORY_COMPRESSION,
+                        budget_lane="memory",
+                        audit_source="memory",
+                        memory_archive=True,
+                        before_call=guard,
+                    )
                 check_memory_text(result, self.s)
                 extraction = parse_extraction(result)
                 committed = await self.sessions.dual.commit(message, snapshot, extraction)

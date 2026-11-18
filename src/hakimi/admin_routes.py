@@ -3,7 +3,6 @@
 import asyncio
 import re
 import time
-import uuid
 from datetime import date
 from decimal import Decimal
 from typing import Literal
@@ -43,6 +42,7 @@ from .rich_message_parser import parse_message
 from .security import Rejected, authorize, configured_secrets
 from .thinking_policy import ThinkingConfig
 from .web_search import WebSearchConfig
+from .work_usage import model_work
 
 router = APIRouter(prefix="/admin")
 
@@ -958,6 +958,11 @@ async def diary(request: Request, day: str):
 
 @router.post("/api/sandbox")
 async def sandbox(request: Request):
+    with model_work("admin.sandbox", independent=True) as work:
+        return await _sandbox(request, work.key)
+
+
+async def _sandbox(request: Request, audit_id: str):
     data = await body(request, Sandbox)
     svc = service(request)
     request.app.state.admin_auth.costly()
@@ -1066,7 +1071,6 @@ async def sandbox(request: Request):
             "recent_messages": [],
             "rolling_summary": "",
         }
-        audit_id = uuid.uuid4().hex
         try:
             intent = await svc.ai.screen(
                 payload,
@@ -1221,13 +1225,14 @@ async def dual_memory_edit(request: Request, key: str):
     if data.action == "edit":
         check_memory_text(data.text, svc.s)
         request.app.state.admin_auth.costly()
-        await svc.ai.screen(
-            {"proposed_memory": data.text},
-            svc.store.vault.digest("admin-memory", key),
-            purpose="source",
-            budget_lane="admin",
-            audit_source="memory",
-        )
+        with model_work("memory.entry_edit", independent=True):
+            await svc.ai.screen(
+                {"proposed_memory": data.text},
+                svc.store.vault.digest("admin-memory", key),
+                purpose="source",
+                budget_lane="admin",
+                audit_source="memory",
+            )
     return await svc.sessions.dual.edit(
         msg, data.id, version=data.version, action=data.action, text=data.text, expires=data.expires
     )

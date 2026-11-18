@@ -756,6 +756,7 @@ class SessionManager:
             return {
                 "old_summary": self.vault.open(key, state[0]) if state[0] else "",
                 "messages": texts[: -policy.keep],
+                "attempt_id": digest,
                 "ids": ids,
                 "epoch": state[1],
                 "version": state[2],

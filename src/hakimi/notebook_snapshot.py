@@ -11,6 +11,7 @@ from .bot_server import is_persona_owner
 from .drive_client import API, DriveAuth
 from .memory_compressor import check_memory_text
 from .security import Rejected
+from .work_usage import model_work
 
 
 class SnapshotDrive(DriveAuth):
@@ -107,13 +108,14 @@ class NotebookSnapshot:
     async def _screen(self, text):
         check_memory_text(text, self.s)
         if text:
-            await self.ai.screen(
-                {"readonly_owner_snapshot": text},
-                self.store.vault.digest("notebook-budget"),
-                purpose="source",
-                budget_lane="admin",
-                audit_source="memory",
-            )
+            with model_work("memory.notebook_review", independent=True):
+                await self.ai.screen(
+                    {"readonly_owner_snapshot": text},
+                    self.store.vault.digest("notebook-budget"),
+                    purpose="source",
+                    budget_lane="admin",
+                    audit_source="memory",
+                )
 
     async def refresh(self):
         if not self.s.enable_notebook_snapshot:

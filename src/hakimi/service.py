@@ -2503,15 +2503,17 @@ class Service:
     async def _notify_live_open(self, room_id: str, target: Message, info: dict) -> None:
         raw_title = str(info.get("title", "") or "").strip()
         raw_area = str(info.get("area", "") or "").strip()
+        live_key = self.store.vault.digest("live-open", room_id, int(time.time() // 1800))
         safe_title, safe_area = "", ""
         if raw_title or raw_area:
             try:
-                await self.ai.screen(
-                    {"room_id": room_id, "title": raw_title, "area": raw_area},
-                    self.store.subject(target),
-                    purpose="source",
-                    budget_lane="patrol",
-                )
+                with model_work("bili.live_open", live_key):
+                    await self.ai.screen(
+                        {"room_id": room_id, "title": raw_title, "area": raw_area},
+                        self.store.subject(target),
+                        purpose="source",
+                        budget_lane="patrol",
+                    )
                 safe_title = redact_public_summary(safe_output(raw_title, self.secrets, limit=80))
                 safe_area = redact_public_summary(safe_output(raw_area, self.secrets, limit=30))
             except asyncio.CancelledError:
@@ -2533,7 +2535,6 @@ class Service:
             and is_persona_owner(target, self.s)
             and self.proactive.delivery_enabled
         ):
-            live_key = self.store.vault.digest("live-open", room_id, int(time.time() // 1800))
             try:
                 await self.proactive.enqueue(
                     "patrol", live_text, key=live_key, expires=time.time() + 7200
