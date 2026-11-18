@@ -35,24 +35,34 @@ class PlannerJournal:
     def __init__(self, store):
         self.store = store
         self.ready = False
+        self.start_lock = asyncio.Lock()
 
-    async def initialize(self, now):
-        if not self.ready:
-            async with self.store.lock:
-                await self.store.db.executescript(SCHEMA)
-            async with self.store.transaction():
-                await self.store.db.execute(
-                    "INSERT OR IGNORE INTO life_planner_clock(id,next_at) VALUES (1,?)",
-                    (now + 120,),
-                )
-                # An uncheckpointed provider request has an unknown result. Preserve the
-                # wake reserved before dispatch and leave its event IDs unconsumed.
-                await self.store.db.execute(
-                    "UPDATE life_plan_runs SET outcome='interrupted',reasons=? "
-                    "WHERE outcome='running'",
-                    ('{"process_interrupted":1}',),
-                )
-            self.ready = True
+    async def initialize(self, now, *, initial_interval=0):
+        async with self.start_lock:
+            if not self.ready:
+                async with self.store.lock:
+                    await self.store.db.executescript(SCHEMA)
+                async with self.store.transaction():
+                    # On the first upgrade, the preceding release may already have paid
+                    # for a plan. Honor its minimum interval when no saved clock exists.
+                    last = await self.store.one(
+                        "SELECT MAX(t.created) FROM ledger_work w JOIN ledger_times t ON t.id=w.id "
+                        "WHERE w.kind='world.plan' AND t.created<=?",
+                        (now,),
+                    )
+                    initial = max(now + 120, (last[0] or 0) + initial_interval)
+                    await self.store.db.execute(
+                        "INSERT OR IGNORE INTO life_planner_clock(id,next_at) VALUES (1,?)",
+                        (initial,),
+                    )
+                    # An uncheckpointed provider request has an unknown result. Preserve the
+                    # wake reserved before dispatch and leave its event IDs unconsumed.
+                    await self.store.db.execute(
+                        "UPDATE life_plan_runs SET outcome='interrupted',reasons=? "
+                        "WHERE outcome='running'",
+                        ('{"process_interrupted":1}',),
+                    )
+                self.ready = True
         return await self.clock()
 
     async def clock(self):
@@ -100,7 +110,7 @@ class PlannerJournal:
         return dict(row), self.store.vault.open("world-plan:" + row["id"], row["checkpoint"])
 
     async def start(
-        self, day, now, *, trigger, next_at, signature, explore_at, events, prior_signal
+        self, day, now, *, trigger, next_at, signature, explore_at, events, prior_signal=None
     ):
         run_id = uuid.uuid4().hex
         async with self.store.transaction():

@@ -121,3 +121,18 @@ async def test_milestone_backlog_and_arrival_during_planning(dm, monkeypatch):
     dm.time[0] += 61
     await planner.plan_once(now=dm.clock(), automatic=True)
     assert fake.calls[1][1]["unconsumed_events"][0]["event_type"] == "second"
+
+
+async def test_first_upgrade_honors_observed_recent_plan_without_counting_an_unseen_run(dm):
+    from hakimi.planning_journal import PlannerJournal
+
+    then = dm.clock() - 300
+    async with dm.store.transaction():
+        await dm.store.db.execute("DELETE FROM life_planner_clock")
+        await dm.store.db.execute(
+            "INSERT INTO ledger_work VALUES('call','world.plan','work','world.plan','work')"
+        )
+        await dm.store.db.execute("INSERT INTO ledger_times VALUES('call', ?)", (then,))
+    journal = PlannerJournal(dm.store)
+    assert (await journal.initialize(dm.clock(), initial_interval=7200))["next_at"] == then + 7200
+    assert not await dm.store.one("SELECT 1 FROM life_plan_runs")

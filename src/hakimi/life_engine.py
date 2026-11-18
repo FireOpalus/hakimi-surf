@@ -210,7 +210,9 @@ class LifeBlockPlanner:
         return wake_at
 
     async def initialize(self):
-        state = await self.journal.initialize(self.clock())
+        state = await self.journal.initialize(
+            self.clock(), initial_interval=self.config.planner_min_minutes * 60
+        )
         self.next_plan_at = state["next_at"]
         self.last_plan_at, self.last_plan_source = state["last_at"], state["last_source"]
 
@@ -218,7 +220,9 @@ class LifeBlockPlanner:
         self, now: float | None = None, *, automatic: bool = False
     ) -> dict[str, Any]:
         ts = self.clock() if now is None else now
-        state = await self.journal.initialize(ts)
+        state = await self.journal.initialize(
+            ts, initial_interval=self.config.planner_min_minutes * 60
+        )
         day = self._local(ts).date().isoformat()
         cfg = self.config
         ws = self.service.world_state
@@ -573,7 +577,9 @@ class LifeBlockPlanner:
             and not event.payload.get("private_first")
         ):
             now = self.clock()
-            await self.journal.initialize(now)
+            await self.journal.initialize(
+                now, initial_interval=self.config.planner_min_minutes * 60
+            )
             # Coalesce bursts and avoid waking the model for every row in a burst.
             wake = max(now + 5, self.last_plan_at + 60)
             await self.journal.signal(wake)
@@ -1081,7 +1087,7 @@ class LifeEngine:
                 await self.rules.initialize()
                 await self.planner.initialize()
                 world_state.subscribe(self.planner.on_milestone_event)
-            if self.planner.next_plan_at <= 0.0:
+            elif self.planner.next_plan_at <= 0.0:
                 self.planner.next_plan_at = self.clock() + 120.0
             self.initialized = True
 
