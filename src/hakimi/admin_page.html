@@ -2865,7 +2865,35 @@ $('refresh-ledger').addEventListener('click',e=>busy(e.target,ledger));
 
 function auditScore(value,direct=false){const box=el('div');if(value?.skipped){box.append(el('span',direct?'直接回应，跳过相关性':'未执行相关性判定'));return box;}if(!value||value.noul===null||value.noul===undefined){box.append(el('span','未知'));return box;}const bar=el('progress');bar.max=1;bar.value=value.noul;bar.setAttribute('aria-label','判定概率 '+value.noul);box.append(bar,el('small','p='+Number(value.noul).toFixed(3)+' · c='+(value.confidence===null||value.confidence===undefined?'未知':Number(value.confidence).toFixed(3))));return box;}
 const rejectDetails={budget_exhausted_user_daily:'budget_exhausted · 单用户日上限',budget_exhausted_daily:'budget_exhausted · 全局日上限',budget_exhausted_monthly:'budget_exhausted · 全局月上限',budget_exhausted_patrol_daily:'budget_exhausted · 巡逻日上限',budget_exhausted_memory_daily:'budget_exhausted · 记忆日上限',budget_exhausted_proactive_daily:'budget_exhausted · 主动私信日上限',budget_exhausted_admin_daily:'budget_exhausted · 沙盒日上限',budget_exhausted_search_daily:'budget_exhausted · 联网日上限',budget_exhausted_total:'budget_exhausted · 累计总上限',budget_exhausted_gcp_credit_exhausted:'gcp_credit_exhausted · GCP 赠金已耗尽'};
-function auditOutcome(r){const s=r.execution_status,raw=r.execution_detail||'',d=raw?(' ('+(rejectDetails[raw]||raw)+')'):'';if(!s)return '';const m={sent:'已发送',abstained:'主模型弃权'+d,rejected:'下游拦截'+d,cancelled:'已取消'+d,blocked:'发送拦截'+d,expired:'发送过期',uncertain:'发送待确认',interrupted:'批次合并重排',failed:'执行异常',queued:'待发送',sending:'发送中',processing:'处理中',no_reply:'未生成回复'};return ' · '+(m[s]||(s+d));}
+function auditOutcome(r){
+  const s=r.execution_status, raw=r.execution_detail||'', incident=r.provider_incident;
+  const details=[], reason=rejectDetails[raw]||raw;
+  if(incident){
+    const provider=incident.provider==='vertex_paid'?'Vertex AI':'Gemini Developer API';
+    const code=incident.code==='unknown'?'上游未提供可识别错误码':incident.code;
+    const status=incident.http_status&&String(incident.http_status)!==code?incident.http_status+' / ':'';
+    details.push(provider+' · '+status+code);
+    const fallbackLabels={
+      succeeded:'Gemini Developer API 回退成功',failed:'Gemini Developer API 回退失败',
+      cancelled:'回退已取消',not_dispatched:'备用请求未发出',partial_output:'已产生部分正文，跳过回退',
+      disabled:'回退开关已关闭',ineligible:'此错误不触发跨服务回退'
+    };
+    if(incident.fallback){
+      const cause=incident.fallback_code||rejectDetails[incident.fallback_detail]||incident.fallback_detail;
+      details.push((fallbackLabels[incident.fallback]||incident.fallback)+(cause?'（'+cause+'）':''));
+    }
+  }
+  const outcomes={sent:'已发送',abstained:'主模型弃权',cancelled:'已取消',blocked:'发送拦截',
+    expired:'发送过期',uncertain:'发送待确认',interrupted:'批次合并重排',failed:'执行异常',
+    queued:'待发送',sending:'发送中',processing:'处理中',no_reply:'未生成回复'};
+  if(s==='rejected'&&raw==='stream_provider_error'){
+    details.push(incident?'模型流中断':'模型流中断（历史记录未保存上游错误码）');
+  }else if(s){
+    const outcome=s==='rejected'?(raw.startsWith('budget_')?'预算限制':raw==='content_blocked'?'内容安全拦截':'处理未完成'):(outcomes[s]||s);
+    details.push(outcome+(reason?'（'+reason+'）':''));
+  }
+  return details.length?' · '+details.join(' · '):'';
+}
 async function decisionAudit(){
   const rows=await api('decision-audit');if(!token)return;
   table('decision-audit',['时间 / 场景','隐私 / 门卫路由','脱敏摘要','注入 p / c','违规 p / c','回应 p / c','结果 / 原因'],rows.map(r=>{

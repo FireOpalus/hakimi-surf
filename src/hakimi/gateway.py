@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .admission_policy import effective_bot_reply_threshold
 from .affection import level_for_score
 from .security import Rejected, clean_text, configured_secrets
+from .streaming import upstream_error_code, upstream_http_status
 
 PRESETS = {"quiet": 0.65, "natural": 0.42, "active": 0.28}
 OWNER_REPLY_CEILING = 0.28
@@ -319,6 +320,7 @@ class FilterManager:
         *,
         thinking_level: str | None = None,
         model_lane: str | None = None,
+        provider_incident: dict | None = None,
     ):
         if not audit_id:
             return
@@ -330,7 +332,33 @@ class FilterManager:
         valid_lane = (
             model_lane if model_lane in {"hydrogen", "carbon", "memory_flex", "decision"} else None
         )
-        if not valid_level and not valid_lane:
+        incident = None
+        if provider_incident and provider_incident.get("provider") in {
+            "vertex_paid",
+            "gemini_paid",
+        }:
+            incident = {
+                "provider": provider_incident["provider"],
+                "code": upstream_error_code(provider_incident.get("code")),
+            }
+            if status := upstream_http_status(incident["code"]):
+                incident["http_status"] = status
+            fallback = provider_incident.get("fallback")
+            if fallback in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "partial_output",
+                "disabled",
+                "ineligible",
+                "not_dispatched",
+            }:
+                incident["fallback"] = fallback
+            if provider_incident.get("fallback_code"):
+                incident["fallback_code"] = upstream_error_code(provider_incident["fallback_code"])
+            if detail := _safe_detail(provider_incident.get("fallback_detail", "")):
+                incident["fallback_detail"] = detail
+        if not valid_level and not valid_lane and not incident:
             return
         await self.initialize()
         async with self.store.transaction():
@@ -342,6 +370,8 @@ class FilterManager:
                 value["thinking_level"] = valid_level
             if valid_lane:
                 value["model_lane"] = valid_lane
+            if incident:
+                value["provider_incident"] = incident
             await self.store.db.execute(
                 "UPDATE decision_audit SET payload=? WHERE id=?",
                 (self.store.vault.seal("decision-audit:" + audit_id, value), audit_id),

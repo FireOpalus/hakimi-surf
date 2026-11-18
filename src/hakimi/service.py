@@ -1866,6 +1866,7 @@ class Service:
                         audit_id,
                         thinking_level=gen_trace.get("thinking_level"),
                         model_lane=gen_trace.get("model_lane"),
+                        provider_incident=gen_trace.get("provider_incident"),
                     )
             await message_guard()
             allowed_reply = payload["allowed_reply_ids"]

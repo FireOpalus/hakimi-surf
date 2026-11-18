@@ -36,7 +36,7 @@ from .provider_routing import ProviderRoutingManager
 from .routing import RouteDecision, select_tier
 from .security import Rejected
 from .store import Store
-from .streaming import StreamProgress, cancellable, consume_stream
+from .streaming import StreamProgress, cancellable, consume_stream, upstream_http_status
 from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
 from .web_search import SEARCH_INSTRUCTION, execute_deepseek_search, parse_result
@@ -830,6 +830,8 @@ class GeminiGateway:
             except Exception as exc:
                 stream_started = bool(stream_progress and stream_progress.started)
                 status = self._http_status(exc)
+                if stream_progress is not None and status is not None and 400 <= status <= 599:
+                    stream_progress.error_code = str(status)
                 non_billable = self._non_billable_http_error(exc, stream_started) or (
                     model_lane == "memory_flex" and not stream_started and status == 503
                 )
@@ -1702,7 +1704,10 @@ class GeminiGateway:
         used_provider = "gemini_paid"
 
         async def _dispatch_once(
-            active_plan: GenerationPlan, *, try_vertex: bool, allow_chain_local: bool
+            active_plan: GenerationPlan,
+            progress: StreamProgress | None,
+            *,
+            developer_fallback=False,
         ):
             nonlocal \
                 used_lane, \
@@ -1718,7 +1723,7 @@ class GeminiGateway:
             used_rows = rows
 
             use_vertex = (
-                try_vertex
+                not developer_fallback
                 and not memory_archive
                 and video is None
                 and active_plan.model_lane == "hydrogen"
@@ -1758,7 +1763,7 @@ class GeminiGateway:
             wire_rows = rows
             prev_created_at = None
             chain = None
-            if stateful_chat and allow_chain and allow_chain_local and try_interactions:
+            if stateful_chat and allow_chain and not developer_fallback and try_interactions:
                 chain = (payload.get("interaction_chains") or {}).get(active_plan.model_lane)
                 if (
                     isinstance(chain, dict)
@@ -1839,7 +1844,6 @@ class GeminiGateway:
                     sandbox_mode=getattr(route, "sandbox_mode", False),
                 )
 
-            progress = StreamProgress() if chat else None
             call_state = {"dispatched": False}
             cached_prefix = (
                 max(0, estimate_tokens(reserve_data) - estimate_tokens(wire_data)) if prev_id else 0
@@ -2000,51 +2004,38 @@ class GeminiGateway:
             async def controlled_operation():
                 return await cancellable(operation, cancel_event) if chat else await operation()
 
-            try:
-                result = await self._call(
-                    subject,
-                    budget_lane,
-                    active_plan.model_lane,
-                    {"input": reserve_data, "system_instruction": system},
-                    active_plan.output_tokens,
-                    deadline_seconds,
-                    controlled_operation,
-                    stream_retryable=chat,
-                    image_tokens=len(images) * self.s.image_token_reserve
-                    + (video.tokens if video else 0),
-                    before_call=before_call,
-                    context_limit=(
-                        self.s.history_max_bytes + 48000
-                        if chat
-                        else self.s.history_max_bytes + 12000
-                        if scenario == Scenario.MEMORY_COMPRESSION and self.s.prefix_history_enabled
-                        else None
-                    ),
-                    carbon_reserve_fallback=active_plan.model_lane == "carbon",
-                    fallback_media_tokens=(
-                        sum(1120 if i.resolution == "high" else 560 for i in images)
-                        + (video.tokens if video else 0)
-                    ),
-                    cached_prefix_tokens=cached_prefix,
-                    stream_progress=progress,
-                    call_state=call_state,
-                    thinking_level=active_plan.thinking_level,
-                    provider=provider_name,
-                    vertex_fallback_eligible=(
-                        use_vertex and self.routing.config.vertex_fallback_to_gemini
-                    ),
-                )
-            except Rejected as exc:
-                if (
-                    use_vertex
-                    and self.routing.config.vertex_fallback_to_gemini
-                    and str(exc) == "gemini_unavailable"
-                    and not (progress and progress.started)
-                ):
-                    return await _dispatch_once(
-                        active_plan, try_vertex=False, allow_chain_local=False
-                    )
-                raise
+            result = await self._call(
+                subject,
+                budget_lane,
+                active_plan.model_lane,
+                {"input": reserve_data, "system_instruction": system},
+                active_plan.output_tokens,
+                deadline_seconds,
+                controlled_operation,
+                stream_retryable=chat,
+                image_tokens=len(images) * self.s.image_token_reserve
+                + (video.tokens if video else 0),
+                before_call=before_call,
+                context_limit=(
+                    self.s.history_max_bytes + 48000
+                    if chat
+                    else self.s.history_max_bytes + 12000
+                    if scenario == Scenario.MEMORY_COMPRESSION and self.s.prefix_history_enabled
+                    else None
+                ),
+                carbon_reserve_fallback=active_plan.model_lane == "carbon",
+                fallback_media_tokens=(
+                    sum(1120 if i.resolution == "high" else 560 for i in images)
+                    + (video.tokens if video else 0)
+                ),
+                cached_prefix_tokens=cached_prefix,
+                stream_progress=progress,
+                call_state=call_state,
+                thinking_level=active_plan.thinking_level,
+                provider=provider_name,
+                vertex_fallback_eligible=use_vertex
+                and self.routing.config.vertex_fallback_to_gemini,
+            )
 
             usage = self._usage(
                 result, active_plan.model_lane, thinking_level=active_plan.thinking_level
@@ -2068,7 +2059,67 @@ class GeminiGateway:
             return result
 
         async def dispatch(active_plan):
-            return await _dispatch_once(active_plan, try_vertex=True, allow_chain_local=True)
+            primary = StreamProgress() if chat else None
+            try:
+                return await _dispatch_once(active_plan, primary)
+            except (Rejected, GenerationTimeout) as exc:
+                code = primary.error_code if primary else None
+                unavailable_before_stream = str(exc) == "gemini_unavailable" and not (
+                    primary and primary.started
+                )
+                if not code and not (used_provider == "vertex_paid" and unavailable_before_stream):
+                    raise
+                incident = {"provider": used_provider, "code": code or "unknown"}
+                if generation_trace is not None:
+                    generation_trace["provider_incident"] = incident
+                if used_provider != "vertex_paid":
+                    raise
+                rate_limited = upstream_http_status(code) == 429
+                if not self.routing.config.vertex_fallback_to_gemini:
+                    incident["fallback"] = "disabled"
+                    raise
+                if primary and primary.output_text:
+                    incident["fallback"] = "partial_output"
+                    raise
+                if not (
+                    unavailable_before_stream
+                    or (
+                        rate_limited and str(exc) in {"stream_provider_error", "gemini_unavailable"}
+                    )
+                ):
+                    incident["fallback"] = "ineligible"
+                    raise
+
+            # Always rebuild from the local session. A Vertex interaction ID cannot be
+            # continued on the Developer API. Both attempts have their own budget reservation.
+            backup = StreamProgress() if chat else None
+            incident["fallback"] = "failed"
+            try:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError
+                result = await _dispatch_once(active_plan, backup, developer_fallback=True)
+            except asyncio.CancelledError:
+                incident["fallback"] = "cancelled"
+                raise
+            except (Rejected, GenerationTimeout) as exc:
+                if backup and not backup.dispatched:
+                    incident["fallback"] = "not_dispatched"
+                if backup and backup.error_code:
+                    incident["fallback_code"] = backup.error_code
+                incident["fallback_detail"] = (
+                    exc.audit_detail if isinstance(exc, Rejected) else "timeout"
+                )
+                if rate_limited and isinstance(exc, GenerationTimeout):
+                    # The normal thinking-level downgrade must not start a third request.
+                    raise Rejected("generation_incomplete") from None
+                raise
+            if getattr(result, "status", None) != "completed":
+                incident["fallback_detail"] = "generation_incomplete"
+                if rate_limited:
+                    raise Rejected("generation_incomplete")
+            else:
+                incident["fallback"] = "succeeded"
+            return result
 
         def mark_chain_invalid():
             if stateful_chat:

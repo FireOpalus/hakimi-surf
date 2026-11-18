@@ -1146,6 +1146,14 @@ async def sandbox(request: Request):
             result["decisions"]["final_result"] = "blocked_or_unavailable"
             if not preview["text"]:
                 preview["status"] = "blocked_or_unavailable"
+        finally:
+            if preview.get("provider"):
+                await svc.store.runtime.filters.record_generation(
+                    audit_id,
+                    thinking_level=preview.get("thinking_level"),
+                    model_lane=preview.get("model_lane"),
+                    provider_incident=preview.get("provider_incident"),
+                )
         return result
 
 

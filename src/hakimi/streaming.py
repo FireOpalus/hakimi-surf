@@ -2,9 +2,35 @@
 
 import asyncio
 import inspect
+import re
 from types import SimpleNamespace
 
 from .security import Rejected
+
+
+def upstream_error_code(value: object) -> str:
+    """Keep only bounded machine codes. Provider error messages can contain private input."""
+    if isinstance(value, (str, int)):
+        code = str(value)
+        if re.fullmatch(r"[45][0-9]{2}|[a-z][a-z0-9_]{0,47}|[A-Z][A-Z0-9_]{0,47}", code):
+            return code
+    return "unknown"
+
+
+def upstream_http_status(code: str | None) -> int | None:
+    if not code:
+        return None
+    if re.fullmatch(r"[45][0-9]{2}", code):
+        return int(code)
+    if code.lower() in {
+        "rate_limit_exceeded",
+        "quota_exceeded",
+        "too_many_requests",
+        "resource_exhausted",
+        "rate_limited",
+    }:
+        return 429
+    return None
 
 
 class StreamProgress:
@@ -15,6 +41,7 @@ class StreamProgress:
         self.started = False
         self.text_parts: list[str] = []
         self.thought_steps = 0
+        self.error_code: str | None = None
 
     @property
     def output_text(self) -> str:
@@ -61,7 +88,10 @@ async def consume_stream(stream, progress: StreamProgress | None = None):
                     if progress is not None and text:
                         progress.text_parts.append(text)
             elif kind == "error":
-                if getattr(event.error, "code", "") in {"gateway_timeout", "deadline_exceeded"}:
+                code = upstream_error_code(getattr(event.error, "code", None))
+                if progress is not None:
+                    progress.error_code = code
+                if code.lower() in {"gateway_timeout", "deadline_exceeded"}:
                     raise TimeoutError
                 raise Rejected("stream_provider_error")
             elif kind == "interaction.completed":
