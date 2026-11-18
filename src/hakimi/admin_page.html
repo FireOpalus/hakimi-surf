@@ -3,21 +3,21 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>星夜控制台 · 哈基米</title>
+<title>洁米奈星夜</title>
 <style>
 :root {
   color-scheme: light;
-  --bg: #f3f4f7;
+  --bg: #f4f2fa;
   --card: #fff;
-  --card-2: #f8f8fb;
-  --ink: #252333;
-  --muted: #646273;
-  --accent: #6149ad;
-  --accent-hover: #4e3798;
+  --card-2: #f9f7fd;
+  --ink: #241f35;
+  --muted: #645f78;
+  --accent: #6447c4;
+  --accent-hover: #5134ad;
   --on-accent: #fff;
-  --soft: #eeeaf9;
-  --soft-2: #f7f6fb;
-  --line: #dedee7;
+  --soft: #efe9fb;
+  --soft-2: #f8f6fd;
+  --line: #e2dded;
   --bad: #a52e49;
   --bad-bg: #fff0f3;
   --bad-line: #efc2cd;
@@ -41,8 +41,21 @@
   --side-muted: #b5adc8;
   --side-active: #daceff;
   --glow-1: #8872c729;
-  --shadow: 0 1px 2px #2522390a;
+  --glow-2: #e480b41c;
+  --shadow: 0 1px 2px #2522390a, 0 4px 18px #4b36900a;
   --shadow-lg: 0 18px 56px #15112729;
+  --topbar-bg: #ffffffd1;
+  --grad-accent: linear-gradient(135deg, #6a4bd6 0%, #8d55d9 55%, #cf679f 100%);
+  --grad-accent-hover: linear-gradient(135deg, #5b3dc6 0%, #7f46ce 55%, #c25891 100%);
+  --grad-text: linear-gradient(120deg, #5638c2 0%, #9550d4 52%, #cc5d98 100%);
+  --grad-title: linear-gradient(120deg, #241f35 0%, #3d2f6e 45%, #7b4fd0 80%, #c65f99 100%);
+  --grad-line: linear-gradient(90deg, transparent, #7c58e28c, #e078b08c, transparent);
+  --grad-soft: linear-gradient(135deg, #7a56e01a, #e078b012);
+  --star: #6d4bd84d;
+  --star-2: #d99a2b57;
+  --ring: 0 0 0 4px #6d4bd824;
+  --btn-glow: 0 6px 18px #6f4ddb42;
+  --lift: 0 14px 36px #4c34961a, 0 2px 6px #2522390d;
   --sans: "Work Sans", system-ui, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
   --rail: 224px;
@@ -50,14 +63,14 @@
 }
 :root[data-theme=dark] {
   color-scheme: dark;
-  --bg: #171720;
-  --card: #21212e;
-  --card-2: #272735;
+  --bg: #121019;
+  --card: #1c1a28;
+  --card-2: #231f31;
   --ink: #f0edf7;
   --muted: #b3aec3;
   --accent: #c5adfa;
   --accent-hover: #d9c9ff;
-  --on-accent: #241a3a;
+  --on-accent: #fff;
   --soft: #352d49;
   --soft-2: #292635;
   --line: #3b394b;
@@ -79,9 +92,23 @@
   --vertex-ink: #a9c7ff;
   --vertex-bg: #243147;
   --vertex-line: #394e71;
-  --sidebar: #1a1925;
+  --sidebar: #15121f;
   --glow-1: #ae91ef2b;
+  --glow-2: #f29cc71c;
+  --shadow: 0 1px 2px #0000002e, 0 6px 22px #00000038;
   --shadow-lg: 0 18px 56px #0007;
+  --topbar-bg: #1a1726d1;
+  --grad-accent: linear-gradient(135deg, #7653e2 0%, #9b5fe3 55%, #d870ab 100%);
+  --grad-accent-hover: linear-gradient(135deg, #8463ec 0%, #a96eea 55%, #e27fb6 100%);
+  --grad-text: linear-gradient(120deg, #cdb9ff 0%, #e4a9ff 52%, #ffabd1 100%);
+  --grad-title: linear-gradient(120deg, #f2eefb 0%, #ddcdff 50%, #ffb6d8 100%);
+  --grad-line: linear-gradient(90deg, transparent, #b49bff8c, #f29cc780, transparent);
+  --grad-soft: linear-gradient(135deg, #9676ff24, #f29cc714);
+  --star: #ffffff9e;
+  --star-2: #f3c76b9e;
+  --ring: 0 0 0 4px #b49bff2e;
+  --btn-glow: 0 8px 22px #7c56e661;
+  --lift: 0 16px 42px #0000006b, 0 0 0 1px #b49bff10;
 }
 
 * { box-sizing: border-box; }
@@ -132,7 +159,9 @@ svg {
   align-items: center;
   gap: 22px;
   padding-right: clamp(16px, 3vw, 44px);
-  background: var(--card);
+  background: var(--topbar-bg);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
   border-bottom: 1px solid var(--line);
 }
 .brand, .topbar-actions, .page-meta, .connection-state { display: flex; align-items: center; }
@@ -143,7 +172,7 @@ svg {
   width: var(--rail);
   flex: none;
   color: #faf8ff;
-  background: var(--sidebar);
+  background: radial-gradient(200px 90px at 18% 0%, #8c64ff52, transparent 72%), #1c1633;
 }
 .brand-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; background: #daceff; color: #35294c; }
 .brand-mark svg { width: 23px; height: 23px; fill: currentColor; stroke-width: 1; }
@@ -220,7 +249,7 @@ nav button {
 }
 nav button svg { width: 16px; height: 16px; }
 nav button:hover { background: #ffffff12; color: #fff; }
-nav button[aria-selected=true] { background: var(--side-active); color: #2b203c; font-weight: 700; }
+nav button[aria-selected=true] { background: linear-gradient(90deg, #e6dcff, #f6d8ec); color: #2b203c; font-weight: 700; box-shadow: 0 6px 18px #6a46e04d, inset 0 0 0 1px #ffffff80; }
 nav button:focus-visible, .drawer-head button:focus-visible { outline-color: #ddd0ff; }
 nav button:disabled { opacity: 1; cursor: progress; }
 .sidebar-foot { margin: 22px 10px 0; border-top: 1px solid #ffffff24; padding-top: 12px; color: var(--side-muted); font: 11px var(--mono); }
@@ -475,13 +504,13 @@ button {
   border: 1px solid transparent;
   border-radius: 9px;
   padding: 9px 15px;
-  background: var(--accent);
+  background: var(--grad-accent);
   color: var(--on-accent);
   font-size: 12px;
   font-weight: 600;
-  transition: background .15s ease, border-color .15s ease, transform .12s ease;
+  transition: background .15s ease, border-color .15s ease, box-shadow .2s ease, transform .12s ease;
 }
-button:hover { background: var(--accent-hover); }
+button:hover { background: var(--grad-accent-hover); }
 button:active:not(:disabled) { transform: translateY(1px); }
 button.secondary { background: var(--card); color: var(--ink); border-color: var(--line); }
 button.secondary:hover { background: var(--soft); border-color: var(--accent); }
@@ -844,8 +873,300 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
   .module-catalog { gap: 10px; }
   .module-card { padding: 17px; }
 }
+/* ==================== 洁米奈星夜 · 视觉美化层（仅样式，不改结构与功能） ==================== */
+body {
+  background:
+    radial-gradient(1100px 620px at 92% -14%, var(--glow-2), transparent 62%),
+    radial-gradient(980px 620px at 4% -6%, var(--glow-1), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+}
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+body::before {
+  background-image:
+    radial-gradient(1.2px 1.2px at 6% 14%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 18% 62%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.6px 1.6px at 31% 28%, var(--star-2) 50%, transparent 54%),
+    radial-gradient(1px 1px at 44% 82%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.3px 1.3px at 57% 9%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 69% 47%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.5px 1.5px at 81% 73%, var(--star-2) 50%, transparent 54%),
+    radial-gradient(1px 1px at 93% 33%, var(--star) 50%, transparent 54%);
+  background-size: 560px 560px;
+  opacity: .85;
+}
+body::after {
+  background-image:
+    radial-gradient(1.4px 1.4px at 12% 38%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 26% 88%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.8px 1.8px at 49% 54%, var(--star-2) 50%, transparent 54%),
+    radial-gradient(1px 1px at 63% 21%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.3px 1.3px at 77% 92%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 89% 6%, var(--star) 50%, transparent 54%);
+  background-size: 760px 760px;
+  animation: star-twinkle 7s ease-in-out infinite alternate;
+}
+::selection { background: #7c58e23d; }
+* { scrollbar-width: thin; scrollbar-color: var(--paid-line) transparent; }
+
+/* 顶栏与品牌 */
+.topbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--grad-line);
+  pointer-events: none;
+}
+.brand-mark {
+  background: var(--grad-accent);
+  color: #fff;
+  box-shadow: var(--btn-glow);
+  animation: star-breathe 5.5s ease-in-out infinite;
+}
+.brand-mark svg { fill: #ffffff47; stroke: currentColor; stroke-width: 1.5; }
+.brand-copy strong {
+  font-weight: 750;
+  letter-spacing: .14em;
+  background: linear-gradient(120deg, #f1e7ff 0%, #e3c8ff 50%, #ffc3df 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.brand-copy small { letter-spacing: .26em; font-size: 9px; text-transform: uppercase; }
+body:not(.authenticated) .brand .brand-copy strong {
+  background: var(--grad-text);
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+.version {
+  padding: 2px 9px;
+  border: 1px solid var(--paid-line);
+  border-radius: 999px;
+  background: var(--grad-soft), var(--card);
+  color: var(--accent);
+}
+.icon-button:hover, .finder-button:hover { box-shadow: var(--ring); border-color: var(--paid-line); }
+
+/* 侧边栏：夜空与极光 */
+.sidebar {
+  background:
+    radial-gradient(1px 1px at 20% 12%, #ffffffb8 50%, transparent 54%),
+    radial-gradient(1px 1px at 74% 20%, #ffffff8c 50%, transparent 54%),
+    radial-gradient(1.5px 1.5px at 46% 34%, #f3c76bbf 50%, transparent 54%),
+    radial-gradient(1px 1px at 86% 50%, #ffffff80 50%, transparent 54%),
+    radial-gradient(1px 1px at 12% 63%, #ffffff73 50%, transparent 54%),
+    radial-gradient(1.3px 1.3px at 62% 77%, #e4cfffbf 50%, transparent 54%),
+    radial-gradient(1px 1px at 32% 91%, #ffffff6b 50%, transparent 54%),
+    radial-gradient(260px 240px at 100% 100%, #e678b42e, transparent 70%),
+    linear-gradient(180deg, #1c1633 0%, var(--sidebar) 58%, #0f0c1c 100%);
+  border-right: 1px solid #c8b4ff14;
+  scrollbar-color: #c8b4ff38 transparent;
+}
+.nav-group-label { display: flex; align-items: center; gap: 10px; letter-spacing: .08em; }
+.nav-group-label::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, #dcc8ff2e, transparent);
+}
+nav button { border-radius: 9px; transition: background .16s ease, color .16s ease, box-shadow .2s ease; }
+nav button:hover { background: #ffffff10; }
+.sidebar-foot { border-top-color: #dcc8ff1f; }
+.sidebar-foot::before { content: "\2726"; color: #f3c76b; margin-right: 7px; }
+
+/* 页面标题 */
+.eyebrow::before { width: 18px; background: var(--grad-accent); border-radius: 2px; }
+.page-heading h1 {
+  background: var(--grad-title);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.page-heading h1:focus-visible { color: var(--ink); background: none; }
+
+/* 卡片 */
+.card {
+  position: relative;
+  border-radius: 16px;
+  transition: border-color .2s ease, box-shadow .25s ease;
+}
+.card:not(.budget-card)::before {
+  content: "";
+  position: absolute;
+  left: 22px;
+  right: 22px;
+  top: 0;
+  height: 1px;
+  background: var(--grad-line);
+  opacity: .45;
+  transition: opacity .25s ease;
+  pointer-events: none;
+}
+.card:not(.budget-card):hover { border-color: var(--paid-line); box-shadow: var(--lift); }
+.card:not(.budget-card):hover::before { opacity: 1; }
+.card h2::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 10px;
+  vertical-align: .16em;
+  border-radius: 2px;
+  background: var(--grad-accent);
+  transform: rotate(45deg);
+  box-shadow: 0 0 10px var(--glow-1);
+}
+.budget-card {
+  background:
+    radial-gradient(1px 1px at 14% 22%, #ffffffa6 50%, transparent 54%),
+    radial-gradient(1.4px 1.4px at 38% 70%, #f3c76bb3 50%, transparent 54%),
+    radial-gradient(1px 1px at 62% 34%, #ffffff8c 50%, transparent 54%),
+    radial-gradient(1px 1px at 84% 80%, #ffffff73 50%, transparent 54%),
+    radial-gradient(420px 260px at 100% 0%, #d870ab33, transparent 70%),
+    radial-gradient(380px 260px at 0% 100%, #7653e240, transparent 70%),
+    linear-gradient(150deg, #3a2d5f 0%, #2b2243 58%, #34213f 100%);
+  border-color: #4d3d6e;
+  box-shadow: 0 14px 38px #2a1d5233;
+}
+
+/* 统计与指标 */
+.stat {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  transition: border-color .18s ease, transform .18s ease, box-shadow .2s ease;
+}
+.stat::after {
+  content: "";
+  position: absolute;
+  right: -34px;
+  top: -34px;
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--glow-1), transparent 70%);
+  pointer-events: none;
+}
+.stat:hover { transform: translateY(-2px); border-color: var(--paid-line); box-shadow: var(--lift); }
+.stat dd, .stat > strong {
+  background: var(--grad-text);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.kpi-card { border-radius: 14px; transition: border-color .18s ease, transform .18s ease, box-shadow .2s ease; }
+.kpi-card:hover { transform: translateY(-2px); box-shadow: var(--lift); }
+.badge { background: var(--grad-soft), var(--soft); border-radius: 999px; padding: 3px 10px; }
+.pill { letter-spacing: .02em; }
+.quick-action { transition: background .15s ease; }
+.quick-action > svg { background: var(--grad-soft), var(--soft); border-radius: 10px; }
+.quick-action:hover .action-arrow { color: var(--accent); }
+.quick-bar, fieldset.panel-group { background: var(--grad-soft), var(--soft-2); border-radius: 14px; }
+fieldset.panel-group > legend { box-shadow: 0 2px 10px var(--glow-1); }
+
+/* 功能模块 */
+.module-card { transition: border-color .2s ease, box-shadow .25s ease; position: relative; }
+.module-card:hover { border-color: var(--paid-line); box-shadow: var(--lift); }
+.module-icon { box-shadow: inset 0 0 0 1px #ffffff40, 0 6px 16px var(--glow-1); }
+.workspace-switch { background: var(--grad-soft), var(--bg); }
+.workspace-switch button[aria-pressed=true] { box-shadow: 0 1px 4px #15112724, 0 0 0 1px var(--paid-line); }
+
+/* 表单控件与按钮 */
+input:hover, select:hover, textarea:hover { border-color: var(--paid-line); }
+input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: var(--ring); outline: none; }
+input[type=file]::file-selector-button { background: var(--grad-soft), var(--soft); font-weight: 600; }
+button:not([class]):not([role=tab]):not([data-workspace-target]) { box-shadow: 0 2px 10px #6f4ddb2e; letter-spacing: .02em; }
+button:not([class]):not([role=tab]):not([data-workspace-target]):hover:not(:disabled) { box-shadow: var(--btn-glow); }
+button.secondary:hover:not(:disabled) { box-shadow: 0 3px 12px var(--glow-1); }
+button.danger:hover:not(:disabled) { box-shadow: 0 3px 12px #c0395329; }
+progress::-webkit-progress-value { background: var(--fill, var(--grad-accent)); }
+progress::-moz-progress-bar { background: var(--fill, var(--grad-accent)); }
+
+/* 表格与代码 */
+.table { border-radius: 12px; }
+th { background: linear-gradient(180deg, var(--soft), var(--soft-2)); letter-spacing: .04em; }
+tbody tr { transition: background .14s ease; }
+pre, details { border-radius: 12px; }
+summary::marker { color: var(--accent); }
+
+/* 弹窗与通知 */
+dialog { border-radius: 20px; border-color: var(--paid-line); }
+dialog[open] { animation: dialog-pop .24s cubic-bezier(.2, .8, .2, 1); }
+dialog::backdrop {
+  background: radial-gradient(900px 500px at 50% 0%, #7c58e238, transparent 70%), #0e0a1a8c;
+  backdrop-filter: blur(6px);
+}
+.finder-option[aria-selected=true], .finder-option:hover { background: var(--grad-soft), var(--soft); }
+#notice { border-radius: 12px; backdrop-filter: blur(10px); animation: notice-in .28s cubic-bezier(.2, .8, .2, 1); }
+
+/* 登录页 */
+.login { border-color: var(--paid-line); box-shadow: var(--shadow-lg), 0 0 0 6px #7c58e20d; }
+.login-sky {
+  background:
+    radial-gradient(1px 1px at 12% 18%, #ffffffbf 50%, transparent 54%),
+    radial-gradient(1.4px 1.4px at 28% 64%, #f3c76bc7 50%, transparent 54%),
+    radial-gradient(1px 1px at 44% 12%, #ffffff99 50%, transparent 54%),
+    radial-gradient(1px 1px at 72% 82%, #ffffff8c 50%, transparent 54%),
+    radial-gradient(1.2px 1.2px at 86% 22%, #e4cfffd9 50%, transparent 54%),
+    radial-gradient(1px 1px at 92% 58%, #ffffff80 50%, transparent 54%),
+    radial-gradient(360px 260px at 100% 100%, #d870ab3d, transparent 70%),
+    radial-gradient(ellipse at 64% 28%, #4f3d70, #2a2240 67%);
+}
+.sky-star { animation: sky-pulse 4.5s ease-in-out infinite; }
+.sky-copy h1 {
+  letter-spacing: .02em;
+  background: linear-gradient(120deg, #f6eeff 0%, #e3c8ff 50%, #ffc3df 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.sky-copy p { letter-spacing: .08em; }
+
+/* 表情包 */
+.meme-item { border-radius: 14px; transition: border-color .18s ease, transform .18s ease, box-shadow .2s ease; }
+.meme-item:hover { border-color: var(--paid-line); transform: translateY(-2px); box-shadow: var(--lift); }
+.meme-drop { border-radius: 14px; background: var(--grad-soft), var(--soft); transition: border-color .15s ease, box-shadow .2s ease; }
+.meme-drop:hover, .meme-drop.drag { border-color: var(--accent); box-shadow: var(--ring); }
+
+/* 页脚与状态 */
+footer { letter-spacing: .14em; }
+footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
+.status-dot.online { animation: dot-pulse 2.4s ease-out infinite; }
+.tab:not([hidden]) { animation: tab-rise .36s cubic-bezier(.2, .7, .2, 1) backwards; }
+
+@keyframes star-twinkle { from { opacity: .25; } to { opacity: .9; } }
+@keyframes star-breathe { 0%, 100% { box-shadow: var(--btn-glow); } 50% { box-shadow: 0 0 22px #aa78ff8c; } }
+@keyframes sky-pulse { 0%, 100% { transform: translate(-50%, -50%) rotate(12deg) scale(1); } 50% { transform: translate(-50%, -50%) rotate(12deg) scale(1.06); } }
+@keyframes tab-rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes dialog-pop { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes notice-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+@keyframes dot-pulse { 0% { box-shadow: 0 0 0 0 #1fa07873; } 100% { box-shadow: 0 0 0 8px #1fa07800; } }
+
+@media(max-width:900px) {
+  .brand .brand-copy strong {
+    background: var(--grad-text);
+    -webkit-background-clip: text;
+    background-clip: text;
+  }
+}
+@media(max-width:680px) {
+  .card { border-radius: 13px; }
+  .card:not(.budget-card)::before { left: 16px; right: 16px; }
+  .brand-copy strong { letter-spacing: .08em; }
+}
 @media(prefers-reduced-motion:reduce) {
-  *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; }
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
 </style>
 </head>
@@ -855,7 +1176,7 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
   <div class="brand">
     <button id="menu-toggle" class="icon-button" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16"/></svg></button>
     <span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></span>
-    <div class="brand-copy"><strong>哈基米</strong><small>星夜控制台</small></div>
+    <div class="brand-copy"><strong>洁米奈星夜</strong><small>STARRY NIGHT</small></div>
   </div>
   <div id="workspace-switch" class="workspace-switch" role="group" aria-label="选择工作区" hidden>
     <button type="button" data-workspace-target="core" aria-controls="core-nav" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg>主控台</button>
@@ -876,7 +1197,7 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
 <section id="login" class="login" aria-labelledby="login-title">
   <div class="login-sky">
     <div class="sky-map" aria-hidden="true"><i class="orbit outer"></i><i class="orbit"></i><i class="sky-star"></i></div>
-    <div class="sky-copy"><h1 id="login-title">星夜控制台</h1><p>QQ · B 站 · Minecraft</p></div>
+    <div class="sky-copy"><h1 id="login-title">洁米奈星夜</h1><p>QQ · B 站 · Minecraft</p></div>
   </div>
   <div class="login-fields">
     <h2>管理员登录</h2>
@@ -1806,7 +2127,7 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
   <div id="finder-results" class="finder-results" role="listbox" aria-label="匹配的模块和设置"></div>
   <p id="finder-empty" class="finder-empty" role="status" hidden>没有匹配的设置，试试模块名称。</p>
 </dialog>
-<footer>哈基米 · 星夜控制台 &nbsp; / &nbsp; v2.1.0</footer>
+<footer>洁米奈星夜 &nbsp; / &nbsp; v2.1.0</footer>
 </main>
 <script>
 'use strict';
@@ -1860,7 +2181,7 @@ function logout(){
   $('login-error').hidden=true;
   $('token').removeAttribute('aria-invalid');
   text('login-error','');
-  document.title='星夜控制台 · 哈基米';
+  document.title='洁米奈星夜';
   clearTimeout(noticeTimer);
   $('notice').hidden=true;
   text('connection-label','等待连接状态');
@@ -3256,7 +3577,7 @@ function selectTab(key){
   text('page-description',section.button.dataset.description);
   $('page-description').hidden=key==='overview';
   $('overview-day').hidden=$('overview-tools').hidden=key!=='overview';
-  document.title=section.title+' · 哈基米星夜';
+  document.title=section.title+' · 洁米奈星夜';
   window.scrollTo({top:0,behavior:'instant'});
 }
 
