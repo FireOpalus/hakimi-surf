@@ -17,6 +17,7 @@ import re
 import time
 import uuid
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote, urlencode, urlsplit
 from zoneinfo import ZoneInfo
@@ -57,6 +58,9 @@ CREATE TABLE IF NOT EXISTS bili_watched_history (
  bvid TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL,
  summary BLOB
 );
+CREATE TABLE IF NOT EXISTS bili_served_private_topics (
+ receipt TEXT PRIMARY KEY
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS bili_private_share_priority (
  bvid TEXT PRIMARY KEY REFERENCES bili_watched_history(bvid) ON DELETE CASCADE,
  session_scope TEXT NOT NULL, expires_at REAL NOT NULL
@@ -204,6 +208,15 @@ class CredentialUpdate(BaseModel):
     @classmethod
     def valid(cls, value):
         return validate_cookie(value)
+
+
+@dataclass(frozen=True)
+class PrivateVideoTopic:
+    source: Message
+    epoch: int
+    receipt: str
+    text: str
+    priority: tuple[int, float, int]
 
 
 class Pick(BaseModel):
@@ -1108,83 +1121,117 @@ class BiliWatcher:
             raise Rejected("context_too_large")
         return payload
 
-    async def _memory_preferences(self) -> tuple[dict, dict[str, Message]]:
-        sessions = getattr(self.svc, "sessions", None)
-        runtime = getattr(self.store, "runtime", None)
-        if sessions is None or runtime is None or not hasattr(runtime, "sessions"):
-            return {}, {}
-        secrets = getattr(self.svc, "secrets", None) or configured_secrets(self.s)
-        topics: dict[str, list[str]] = {}
-        private_sources: dict[str, Message] = {}
-        now = self.clock()
-        try:
-            session_list = await runtime.sessions()
-        except Exception:
-            return {}, {}
-
-        def add_topic(field: str, raw: str, msg: Message, *, count: int, length: int):
-            values = topics.get(field, [])
-            if len(values) >= count:
-                return
-            text = redact_public_summary(safe_output(raw, secrets, limit=length))
-            if not text or text in values:
-                return
-            if msg.kind == "private":
-                # The model cites an index. Only this process knows its real conversation.
-                private_sources[f"{field}:{len(values)}"] = msg
-            topics.setdefault(field, []).append(text)
-
-        # A selection sees at most one private audience. Only explicit interests/requests
-        # can leave that session for its own selection; raw turns, mood and diaries stay inside.
-        for _, msg in session_list[:20]:
+    async def _next_private_topic(self, sessions, session_list, secrets):
+        best = None
+        for _, msg in session_list:
             if msg.kind != "private" or not authorize(
                 msg.model_copy(update={"addressed": True}), self.s
             ):
                 continue
             try:
+                epoch, turns = await sessions.private_request_window(msg)
+            except Exception:
+                continue
+            candidates = []
+            scope = self.store.session_scope(msg)
+            for item in turns:
+                raw = str(item.get("text", ""))
+                if item.get("role") != "user":
+                    continue
+                video = re.search(r"视频|[Bb]站|哔哩哔哩|bilibili", raw, re.I)
+                interest = re.search(r"想了解|感兴趣", raw)
+                if not video and not interest:
+                    continue
+                requested = video and re.search(r"找|想看|推荐|帮我|给我|有没有|求", raw)
+                specificity = 2 if requested else int(bool(interest))
+                try:
+                    text = redact_public_summary(safe_output(raw, secrets, limit=80))
+                except Rejected:
+                    continue
+                seq = item["seq"]
+                event = item.get("event_id")
+                # Legacy turns have a stable local row number instead of a platform event ID.
+                receipt = self.store.vault.digest(
+                    "bili-private-request-v1",
+                    scope,
+                    epoch,
+                    ("event", event) if event else ("seq", seq),
+                )
+                stamp = item.get("created_at")
+                if not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+                    stamp = 0
+                rank = (specificity, stamp, seq)
+                candidates.append(PrivateVideoTopic(msg, epoch, receipt, text, rank))
+            if not candidates:
+                continue
+            keys = tuple(t.receipt for t in candidates)
+            async with self.store.lock:
+                served = {
+                    r[0]
+                    for r in await self.store.all(
+                        "SELECT receipt FROM bili_served_private_topics WHERE receipt IN ("
+                        + ",".join("?" for _ in keys)
+                        + ")",
+                        keys,
+                    )
+                }
+            for topic in candidates:
+                if topic.receipt not in served and (best is None or topic.priority > best.priority):
+                    best = topic
+        return best
+
+    async def _memory_preferences(self) -> tuple[dict, PrivateVideoTopic | None]:
+        sessions = getattr(self.svc, "sessions", None)
+        runtime = getattr(self.store, "runtime", None)
+        if sessions is None or runtime is None or not hasattr(runtime, "sessions"):
+            return {}, None
+        secrets = getattr(self.svc, "secrets", None) or configured_secrets(self.s)
+        try:
+            session_list = await runtime.sessions()
+        except Exception:
+            return {}, None
+
+        private = await self._next_private_topic(sessions, session_list, secrets)
+        if private is not None:
+            # Each selection serves one request and one authenticated audience. The receipt
+            # never enters the model input and a fabricated output ref cannot change the owner.
+            return {
+                "recent_chat_topics": [private.text],
+                "private_topic_refs": ["recent_chat_topics:0"],
+            }, private
+
+        topics: dict[str, list[str]] = {}
+        now = self.clock()
+
+        def add_topic(field: str, raw: str, *, count: int, length: int):
+            values = topics.get(field, [])
+            if len(values) >= count:
+                return
+            text = redact_public_summary(safe_output(raw, secrets, limit=length))
+            if text and text not in values:
+                topics.setdefault(field, []).append(text)
+
+        for _, msg in session_list[:20]:
+            if msg.kind != "group" or not authorize(
+                msg.model_copy(update={"addressed": True}), self.s
+            ):
+                continue
+            try:
+                view = await sessions.dual.view(msg)
                 snap = await sessions.snapshot(msg)
             except Exception:
                 continue
+            for entry in view.get("entries", []):
+                if (
+                    not entry.get("deleted")
+                    and (not entry.get("expires") or entry["expires"] > now)
+                    and (entry.get("slot") == "preferences" or entry.get("kind") == "chronicle")
+                ):
+                    add_topic("community_topics", str(entry.get("text", "")), count=10, length=120)
             for item in reversed(snap.get("recent_messages", [])[-6:]):
-                raw = str(item.get("text", ""))
-                if item.get("role") == "user" and re.search(
-                    r"视频|[Bb]站|哔哩哔哩|bilibili|想了解|感兴趣", raw, re.I
-                ):
-                    add_topic("recent_chat_topics", raw, msg, count=3, length=80)
-            if private_sources:
-                break
-        if not private_sources:
-            for _, msg in session_list[:20]:
-                if msg.kind != "group" or not authorize(
-                    msg.model_copy(update={"addressed": True}), self.s
-                ):
-                    continue
-                try:
-                    view = await sessions.dual.view(msg)
-                    snap = await sessions.snapshot(msg)
-                except Exception:
-                    continue
-                for entry in view.get("entries", []):
-                    if (
-                        not entry.get("deleted")
-                        and (not entry.get("expires") or entry["expires"] > now)
-                        and (entry.get("slot") == "preferences" or entry.get("kind") == "chronicle")
-                    ):
-                        add_topic(
-                            "community_topics",
-                            str(entry.get("text", "")),
-                            msg,
-                            count=10,
-                            length=120,
-                        )
-                for item in reversed(snap.get("recent_messages", [])[-6:]):
-                    if item.get("role") == "user":
-                        add_topic(
-                            "recent_chat_topics", str(item.get("text", "")), msg, count=5, length=80
-                        )
-        if private_sources:
-            topics["private_topic_refs"] = list(private_sources)
-        return topics, private_sources
+                if item.get("role") == "user":
+                    add_topic("recent_chat_topics", str(item.get("text", "")), count=5, length=80)
+        return topics, None
 
     async def _actions_by_bvid(self, bvids: list[str]) -> dict[str, list[str]]:
         if not bvids:
@@ -1329,14 +1376,14 @@ class BiliWatcher:
                 self._ensure_current()
                 if not candidates:
                     return await self._finish(key, "empty", 0)
-                prefs, private_sources = await self._memory_preferences()
+                prefs, private = await self._memory_preferences()
                 raw_payload = {
                     "candidates": candidates,
                     **({"memory_preferences": prefs} if prefs else {}),
                 }
                 payload = self._bounded(raw_payload)
                 if "memory_preferences" not in payload:
-                    private_sources.clear()
+                    private = None
                 subject = self.store.vault.digest("bili-account-budget", self.s.namespace)
                 self._ensure_current()
                 await self.svc.ai.screen(
@@ -1376,9 +1423,12 @@ class BiliWatcher:
                         safe_output(summary, self.svc.secrets, limit=1000)
                     )
                     text = f"{label} · {pick.bvid}\n{summary}"
-                    preferred = next(
-                        iter(private_sources.values()), None
-                    )  # actual scoped input, never a model-selected recipient
+                    preferred = private.source if private is not None else None
+                    if private is not None and (
+                        not authorize(preferred.model_copy(update={"addressed": True}), self.s)
+                        or await self.svc.sessions.current_epoch(preferred) != private.epoch
+                    ):
+                        raise Rejected("bili_private_request_revoked")
                     share_owner = (
                         is_persona_owner(preferred, self.s)
                         if preferred is not None
@@ -1396,7 +1446,12 @@ class BiliWatcher:
                         )
                         if cur.rowcount != 1:
                             raise Rejected("bili_watch_claim_lost")
-                        if preferred is not None:
+                        if private is not None:
+                            await self.store.db.execute(
+                                "INSERT OR IGNORE INTO bili_served_private_topics(receipt) "
+                                "VALUES (?)",
+                                (private.receipt,),
+                            )
                             now = self.clock()
                             await self.store.db.execute(
                                 "DELETE FROM bili_private_share_priority WHERE expires_at<=?",
@@ -1458,7 +1513,7 @@ class BiliWatcher:
                         await self._interaction(pick.bvid, aid, pick, epoch)
                 if (
                     completed > 0
-                    and not private_sources
+                    and private is None
                     and not reason
                     and selection.mood_longnick.strip()
                 ):

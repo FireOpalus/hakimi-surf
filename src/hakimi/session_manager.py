@@ -227,6 +227,23 @@ class SessionManager:
             async with db.execute("SELECT epoch FROM rolling_state") as cur:
                 return (await cur.fetchone())[0]
 
+    async def private_request_window(self, message: Message) -> tuple[int, list[dict]]:
+        """Six recent entries in one consenting private session, without opening summaries."""
+        if message.kind != "private":
+            raise Rejected("invalid_private_scope")
+        async with self.database(message, preserve_history=True) as (db, key):
+            async with db.execute("SELECT epoch,enabled FROM rolling_state,session_meta") as cur:
+                epoch, enabled = await cur.fetchone()
+            if not enabled:
+                return epoch, []
+            async with db.execute(
+                "SELECT id,payload FROM recent_messages WHERE expires>? ORDER BY id DESC LIMIT 6",
+                (time.time(),),
+            ) as cur:
+                return epoch, [
+                    {**self.vault.open(key, blob), "seq": seq} for seq, blob in await cur.fetchall()
+                ]
+
     async def snapshot(self, message: Message) -> dict:
         async with self.database(message) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
