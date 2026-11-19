@@ -1998,43 +1998,6 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="life" class="tab" role="tabpanel" aria-labelledby="nav-life" hidden>
-  <div class="card" id="world-observation-card" hidden>
-    <h2>今天的行动与规划</h2>
-    <div id="world-day-stats" class="stats"></div>
-    <h3>今日行程</h3>
-    <p id="world-morning" class="muted"></p>
-    <div id="world-agenda" class="table"></div>
-    <p id="world-next"></p>
-    <p id="world-quiet" class="muted"></p>
-    <div id="world-daily-actions" class="pill-row"></div>
-    <details><summary>最近 30 轮规划</summary><div id="world-plans" class="table"></div></details>
-    <details><summary>七日规划基线与定时送达</summary>
-      <p id="world-day-coverage"></p><div id="world-days" class="table"></div>
-      <p id="world-evening-coverage"></p><div id="world-evenings" class="table"></div>
-    </details>
-  </div>
-  <div class="card" id="world-rhythm"><div class="row between"><h2>世界作息与调度</h2><button id="refresh-rest-hours" type="button" class="secondary">刷新作息</button></div>
-    <p id="rest-hours-status" class="muted" role="status"></p>
-    <form id="life-config-form">
-      <div class="row"><label><input id="life-enabled" type="checkbox"> 启用世界引擎</label><label><input id="rest-enabled" type="checkbox"> 定时睡眠</label><label><input id="rest-day-enabled" type="checkbox"> 自主小憩</label><label><input id="rest-owner-private" type="checkbox"> 休息时响应 Owner 私聊</label></div>
-      <div class="grid"><label>入睡时间<input id="rest-start" type="time" required></label><label>起床时间<input id="rest-end" type="time" required></label></div>
-      <p id="wake-window" class="rhythm-preview" aria-live="polite"></p>
-      <div class="grid"><label for="life-quiet-hours">主动消息免打扰时段<input id="life-quiet-hours" type="text" maxlength="11" placeholder="23:30-08:30" required></label><label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label></div>
-      <p class="muted">清醒时可规划和巡逻，免打扰时暂停主动发消息。睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。</p>
-      <details>
-        <summary>规划与休眠间隔</summary>
-        <div class="grid">
-          <label for="life-planner-min">活跃规划最小间隔（分钟，30–720）<input id="life-planner-min" type="number" min="30" max="720" step="1" required></label>
-          <label for="life-planner-max">活跃规划最大间隔（分钟，60–720）<input id="life-planner-max" type="number" min="60" max="720" step="1" required></label>
-          <label for="life-sleep-min">夜间休眠最小间隔（分钟，120–960）<input id="life-sleep-min" type="number" min="120" max="960" step="1" required></label>
-          <label for="life-sleep-max">夜间休眠最大间隔（分钟，180–960）<input id="life-sleep-max" type="number" min="180" max="960" step="1" required></label>
-        </div>
-      </details>
-      <div class="row"><button id="life-save-config" type="submit" disabled>保存作息与调度</button><button id="life-reset-config" type="button" class="secondary" disabled>恢复默认作息与调度</button></div>
-    </form>
-    <p id="life-source" class="muted"></p>
-    <div class="row"><button id="life-plan-now" type="button" class="secondary" disabled>立即规划或调整行程</button><button id="life-gatekeeper-now" type="button" class="secondary" disabled>执行零 Token 门控扫描</button></div>
-  </div>
   <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
     <div id="life-stats" class="stats"></div>
     <h3>最近的状态变化</h3><div id="life-changes" class="table"></div>
@@ -2073,6 +2036,43 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </form>
   </div>
 
+  <div class="card" id="world-observation-card" hidden>
+    <h2>今天的行动与规划</h2>
+    <div id="world-day-stats" class="stats"></div>
+    <h3>今日行程</h3>
+    <p id="world-morning" class="muted"></p>
+    <div id="world-agenda" class="table"></div>
+    <p id="world-next"></p>
+    <p id="world-quiet" class="muted"></p>
+    <div id="world-daily-actions" class="pill-row"></div>
+    <details><summary>最近 30 轮规划</summary><div id="world-plans" class="table"></div></details>
+    <details><summary>七日规划基线与定时送达</summary>
+      <p id="world-day-coverage"></p><div id="world-days" class="table"></div>
+      <p id="world-evening-coverage"></p><div id="world-evenings" class="table"></div>
+    </details>
+  </div>
+  <div class="card" id="world-rhythm"><div class="row between"><h2>世界作息与调度</h2><button id="refresh-rest-hours" type="button" class="secondary">刷新作息</button></div>
+    <p id="rest-hours-status" class="muted" role="status"></p>
+    <form id="life-config-form">
+      <div class="row"><label><input id="life-enabled" type="checkbox"> 启用世界引擎</label><label><input id="rest-enabled" type="checkbox"> 定时睡眠</label><label><input id="rest-day-enabled" type="checkbox"> 自主小憩</label><label><input id="rest-owner-private" type="checkbox"> 休息时响应 Owner 私聊</label></div>
+      <div class="grid"><label>入睡时间<input id="rest-start" type="time" required></label><label>起床时间<input id="rest-end" type="time" required></label></div>
+      <p id="wake-window" class="rhythm-preview" aria-live="polite"></p>
+      <div class="grid"><label for="life-quiet-hours">主动消息免打扰时段<input id="life-quiet-hours" type="text" maxlength="11" placeholder="23:30-08:30" required></label><label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label></div>
+      <p class="muted">清醒时可规划和巡逻，免打扰时暂停主动发消息。睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。</p>
+      <details>
+        <summary>规划与休眠间隔</summary>
+        <div class="grid">
+          <label for="life-planner-min">活跃规划最小间隔（分钟，30–720）<input id="life-planner-min" type="number" min="30" max="720" step="1" required></label>
+          <label for="life-planner-max">活跃规划最大间隔（分钟，60–720）<input id="life-planner-max" type="number" min="60" max="720" step="1" required></label>
+          <label for="life-sleep-min">夜间休眠最小间隔（分钟，120–960）<input id="life-sleep-min" type="number" min="120" max="960" step="1" required></label>
+          <label for="life-sleep-max">夜间休眠最大间隔（分钟，180–960）<input id="life-sleep-max" type="number" min="180" max="960" step="1" required></label>
+        </div>
+      </details>
+      <div class="row"><button id="life-save-config" type="submit" disabled>保存作息与调度</button><button id="life-reset-config" type="button" class="secondary" disabled>恢复默认作息与调度</button></div>
+    </form>
+    <p id="life-source" class="muted"></p>
+    <div class="row"><button id="life-plan-now" type="button" class="secondary" disabled>立即规划或调整行程</button><button id="life-gatekeeper-now" type="button" class="secondary" disabled>执行零 Token 门控扫描</button></div>
+  </div>
   <div class="card"><h2>意图队列（最近 40 条）</h2>
     <p class="muted">只记录触发时间窗、门控条件与模糊动机，绝不预写台词；状态为 pending 时可手动取消。</p>
     <div id="life-intents-table" class="table"></div>
