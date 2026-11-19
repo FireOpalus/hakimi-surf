@@ -97,6 +97,41 @@ async def process(social, incoming):
     return job
 
 
+async def test_official_qq_only_confirmed_replies_spend_shared_charge(settings, store, message):
+    uid = "friend-openid"
+    settings.qq_allowed_users.add(uid)
+    target = message.model_copy(
+        update={
+            "platform": "qq",
+            "bot_id": settings.qq_app_id,
+            "user_id": uid,
+            "conversation_id": uid,
+        }
+    )
+    acks = iter([{"id": "official-message-id"}, {"code": 1}])
+
+    def transport(request):
+        if request.url.path.endswith("getAppAccessToken"):
+            return httpx.Response(200, json={"access_token": "local-qq-token", "expires_in": 7200})
+        return httpx.Response(200, json=next(acks))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        svc = Service(settings, store, FakeGateway(), FakeBili(), Sender(settings, http))
+        svc.world_state.clock = lambda: target.created_at
+        await svc.world_state.initialize()
+        try:
+            for key, status in (("first", "sent"), ("second", "uncertain")):
+                await store.enqueue_reply(key, target, "你好")
+                assert await svc.deliver_once()
+                assert (await store.one("SELECT status FROM outbox WHERE id=?", (key,)))[
+                    0
+                ] == status
+            assert await svc.world_state.experience.battery(message, target.created_at) == 99.75
+            assert svc.world_state.current.energy == 79.9
+        finally:
+            await svc.stop()
+
+
 def image_ref(name="screen"):
     return ImageRef(url=f"https://gchat.qpic.cn/{name}.jpg")
 

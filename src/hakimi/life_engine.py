@@ -8,6 +8,7 @@ import logging
 import random
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from datetime import time as day_time
 from typing import Any, Literal, Self
@@ -1026,11 +1027,12 @@ class JITExecutor:
                 if still_allowed() and await ws.start_handler(intent_id) and still_allowed():
                     entered_handler = True
                     with model_work(spec.name, intent_id):
-                        result = await spec.run(
-                            ActionCall(
-                                ticket, args, ts, evidence, desktop_context_hint, still_allowed
+                        async with ws.experience.chatting() if spec.social else nullcontext():
+                            result = await spec.run(
+                                ActionCall(
+                                    ticket, args, ts, evidence, desktop_context_hint, still_allowed
+                                )
                             )
-                        )
                 else:
                     result = Outcome("gated_skip", "action_no_longer_eligible")
             except PrivateEventScope:

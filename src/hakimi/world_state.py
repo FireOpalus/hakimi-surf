@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS world_state (
   current_module TEXT NOT NULL DEFAULT 'idle',
   focus_level TEXT NOT NULL DEFAULT 'LOW' CHECK(focus_level IN ('LOW','MEDIUM','HIGH')),
   mood TEXT NOT NULL DEFAULT 'calm',
-  energy INTEGER NOT NULL DEFAULT 80 CHECK(energy BETWEEN 0 AND 100),
+  energy REAL NOT NULL DEFAULT 80 CHECK(energy BETWEEN 0 AND 100),
   boredom INTEGER NOT NULL DEFAULT 20 CHECK(boredom BETWEEN 0 AND 100),
   last_proactive_at REAL NOT NULL DEFAULT 0,
   updated_at REAL NOT NULL DEFAULT 0,
@@ -199,7 +199,7 @@ class WorldStateSnapshot(BaseModel):
     current_module: str = Field(default="idle", min_length=1, max_length=64)
     focus_level: AttentionLevel = "LOW"
     mood: str = Field(default="calm", min_length=1, max_length=64)
-    energy: int = Field(default=80, ge=0, le=100)
+    energy: float = Field(default=80, ge=0, le=100, multiple_of=0.1)
     boredom: int = Field(default=20, ge=0, le=100)
     last_proactive_at: float = Field(default=0.0, ge=0.0)
     updated_at: float = Field(default=0.0, ge=0.0)
@@ -406,7 +406,7 @@ class WorldStateManager:
         current_module: str | None = None,
         focus_level: AttentionLevel | None = None,
         mood: str | None = None,
-        energy: int | None = None,
+        energy: float | None = None,
         boredom: int | None = None,
         last_proactive_at: float | None = None,
         details: dict[str, Any] | None = None,
@@ -483,9 +483,16 @@ class WorldStateManager:
                     ),
                 )
                 await self.store.db.execute(
-                    "UPDATE world_rhythm SET energy_fraction=0,boredom_fraction=0,"
+                    "UPDATE world_rhythm SET "
+                    "energy_fraction=CASE WHEN ? THEN 0 ELSE energy_fraction END,"
+                    "boredom_fraction=CASE WHEN ? THEN 0 ELSE boredom_fraction END,"
                     "tired=(? < 30 OR (tired AND ? < 45)) WHERE id=1",
-                    (next_snap.energy, next_snap.energy),
+                    (
+                        prior.energy != next_snap.energy,
+                        prior.boredom != next_snap.boredom,
+                        next_snap.energy,
+                        next_snap.energy,
+                    ),
                 )
         if sensor_overrides is not None:
             self._sensor_overrides.clear()

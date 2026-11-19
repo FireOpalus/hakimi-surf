@@ -195,7 +195,7 @@ async def test_official_qq_token_and_delivery_fixed_origin_and_reply_id(settings
     settings.qq_allowed_users.add("user-openid")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         sender = Sender(settings, client)
-        await sender.send(target, "hello")
+        assert await sender.send(target, "hello") == {"message_id": "sent-id"}
         await sender.send(target.model_copy(update={"event_id": "another-event"}), "hi")
         with pytest.raises(Rejected, match="proactive_not_authorized"):
             await sender.send(target, "patrol", proactive=True)

@@ -28,7 +28,7 @@ def choose_rest(dm, minutes, *, intents=()):
     return fake
 
 
-async def test_chosen_nap_recovers_whole_points_and_survives_restart(dm, message):
+async def test_chosen_nap_recovers_fractional_energy_and_survives_restart(dm, message):
     engine, world = dm.service.life_engine, dm.service.world_state
     start = dm.clock()
     await engine.set_rest_policy(RestHoursConfig(allow_owner_private=True))
@@ -43,7 +43,7 @@ async def test_chosen_nap_recovers_whole_points_and_survives_restart(dm, message
     assert len(fake.calls) == 1
     dm.time[0] = start + 359
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 27
+    assert world.current.energy == 27.9
     dm.time[0] += 1
     restarted = WorldStateManager(dm.s, dm.store, clock=dm.clock)
     await restarted.initialize()
@@ -119,7 +119,7 @@ async def test_sleep_vs_quiet_time_and_confirmed_energy_charges(dm, message):
     await engine.set_rest_policy(RestHoursConfig(rest_hours="12:10-13:00"))
     dm.time[0] += 239
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 50
+    assert world.current.energy == 50.9
     dm.time[0] += 1
     await world.experience.advance(dm.clock())
     assert world.current.energy == 51
@@ -127,7 +127,7 @@ async def test_sleep_vs_quiet_time_and_confirmed_energy_charges(dm, message):
         for _ in range(2):
             await world.experience.confirmed_tx(message, "one-turn", dm.clock(), [])
     await world.refresh()
-    assert world.current.energy == 50
+    assert world.current.energy == 50.9
     await world.update_state(energy=99)
     dm.time[0] = now + 3500
     await world.experience.advance(dm.clock())

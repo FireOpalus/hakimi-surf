@@ -602,7 +602,7 @@ async def test_life_world_attention_lock_toggle_and_validation(life_api):
             "current_module": "minecraft",
             "focus_level": "HIGH",
             "mood": "focused",
-            "energy": 75,
+            "energy": 75.4,
             "boredom": 10,
         },
     )
@@ -611,7 +611,7 @@ async def test_life_world_attention_lock_toggle_and_validation(life_api):
     assert ws["current_module"] == "minecraft"
     assert ws["focus_level"] == "HIGH"
     assert ws["mood"] == "focused"
-    assert ws["energy"] == 75
+    assert ws["energy"] == 75.4
     assert ws["boredom"] == 10
     assert ws["proactive_suspended"] is True
     mods = {m["module_id"]: m for m in ws["modules"]}
@@ -626,7 +626,7 @@ async def test_life_world_attention_lock_toggle_and_validation(life_api):
     ws2 = unlocked.json()["world_state"]
     assert ws2["focus_level"] == "LOW"
     assert ws2["current_module"] == "minecraft"
-    assert ws2["energy"] == 75
+    assert ws2["energy"] == 75.4
     assert ws2["proactive_suspended"] is False
     mods2 = {m["module_id"]: m for m in ws2["modules"]}
     assert mods2["qq_social"]["proactive_paused"] is False

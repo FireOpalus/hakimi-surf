@@ -2009,11 +2009,11 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </details>
     <details><summary>精力与无聊度怎样结算</summary>
       <p class="muted">定时睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。清醒空闲时精力持平。MC 任务每小时消耗 8 点精力。</p>
-      <p class="muted">完成视频学习消耗 2 点精力，每学习 5 分钟再扣 1 点。QQ 每轮确认送达、MC 完成任务或发现稀有资源各扣 1 点。精力范围为 0 至 100，零头跨轮累计。</p>
+      <p class="muted">每轮成功回复消耗 0.1 点精力。完成视频学习消耗 2 点，每学习 5 分钟再扣 1 点。MC 完成任务或发现稀有资源各扣 1 点。</p>
     </details>
-    <details><summary>各会话社交电量与待分享见闻</summary>
-      <p class="muted">每轮确认送达消耗 12 点社交电量，间隔 5 分钟恢复 1 点。各会话独立结算。</p>
-      <div id="life-batteries" class="table"></div><div id="life-news" class="table"></div>
+    <details><summary>社交电量与待分享见闻</summary>
+      <p class="muted">群聊与私聊共享 100 点电量。每轮成功回复扣 0.25 点，多个气泡合计一次。聊天期间暂停恢复。没在聊天时，清醒每 5 分钟回 1 点，睡眠或小憩每 2 分钟回 1 点。</p>
+      <p id="life-battery-status" class="muted"></p><div id="life-news" class="table"></div>
     </details>
     <div id="life-node-pills" class="pill-row"></div>
     <details class="table-details">
@@ -2038,7 +2038,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         </select>
       </label>
       <label for="life-world-mood">心情（mood）<input id="life-world-mood" type="text" maxlength="64" required placeholder="calm / focused / sleeping"></label>
-      <label for="life-world-energy">精力（0–100）<input id="life-world-energy" type="number" min="0" max="100" step="1" required></label>
+      <label for="life-world-energy">精力（0–100）<input id="life-world-energy" type="number" min="0" max="100" step="0.1" required></label>
       <label for="life-world-boredom">无聊度（0–100）<input id="life-world-boredom" type="number" min="0" max="100" step="1" required></label>
       <button id="life-world-save" type="submit" disabled>更新世界状态</button>
     </form>
@@ -3257,8 +3257,9 @@ function renderLife(d){
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
   renderWorldObservation(d.observation,eng,tz);
   const exp=ws.experience||{},plan=exp.plan,actual=exp.actual||{};
-  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',qq_processing:'正在处理 QQ 消息',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
+  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',chatting:'正在聊天',chat_delivered:'聊天回复已送达',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
   const name=k=>labels[k]||k||'—';
+  const battery=exp.social_battery;
   const restingPlan=plan&&['model_chose_rest','model_chose_idle','sleeping','local_rest','local_idle','unchanged_state','no_available_actions'].includes(plan.outcome);
   let planned='等待首次规划';
   if(plan){
@@ -3272,19 +3273,22 @@ function renderLife(d){
     ['实际活动',name(actual.state)+(actual.day_rest_until?' · '+(actual.day_rest_source==='low_energy'?'精力偏低':'自主选择')+' · '+lifeFmt(actual.day_rest_until,tz)+' 醒来':'')+(actual.mc_task?' · '+name(actual.mc_task):'')],
     ['最近确认完成',actual.last?name(actual.last.reason)+' · '+lifeFmt(actual.last.at,tz):'等待活动回执'],
     ['心情 / 精力 / 无聊',name(ws.mood)+' · '+(ws.energy??80)+' / '+(ws.boredom??20)],
-    ['最近会话的社交电量',exp.social?.length?exp.social[0].label+' · '+exp.social[0].charge+' / 100':'等待首次回复'],
+    ['共享社交电量',battery?battery.charge+' / 100':'—'],
     ['待分享见闻',(exp.news_count??0)+' 条'],
     ['Attention Lock',ws.proactive_suspended?'HIGH 锁定中':'正常开放'],
     ['今日自主活动',eng.proactive_sent_today??0],
     ['已用共用次数',(eng.daily_activity_usage?.counted??eng.proactive_sent_today??0)+' / '+(c.max_proactive_per_day??6)]
   ];
   $('life-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
-  const delta=(a,b)=>a===b?'—':a+' → '+b;
+  const points=n=>Number(n.toFixed(2));
+  const delta=(a,b)=>a==null||b==null||points(a)===points(b)?'—':points(a)+' → '+points(b);
   table('life-changes',['时间','变化原因','精力','无聊','社交电量'],(exp.changes||[]).map(r=>[
     lifeFmt(r.at,tz),name(r.reason)+(r.reason==='idle'?' · 清醒累计':r.reason==='rest'?' · 休息累计':'')+(r.reason==='video_learned'&&r.seconds>0?' · '+Math.ceil(r.seconds)+' 秒':'')+(r.audience_label?' · '+r.audience_label:''),
     r.reason==='baseline'?r.energy_after:delta(r.energy_before,r.energy_after),r.reason==='baseline'?r.boredom_after:delta(r.boredom_before,r.boredom_after),delta(r.social_before,r.social_after)
   ]));
-  table('life-batteries',['会话','当前社交电量','最近一次回复'],(exp.social||[]).map(r=>[r.label,r.charge+' / 100',lifeFmt(r.at,tz)]));
+  text('life-battery-status',battery?
+    (battery.chatting?'聊天中，恢复暂停':battery.charge===100?'电量已满':'电量恢复中')+
+    (battery.last_reply_at?' · 最近一次成功回复 '+lifeFmt(battery.last_reply_at,tz):' · 尚无成功回复'):'');
   table('life-news',['来源','待分享见闻','发生时间'],(exp.news||[]).map(r=>[name(r.source),r.label,lifeFmt(r.at,tz)]));
   const nap=nodes.onebot_cn_napcat||{},sh=nodes.shanghai_node_agent||{},mc=nodes.shanghai_mc_agent||{};
   const nodePills=[
@@ -3364,7 +3368,7 @@ $('life-world-form').addEventListener('submit',e=>{
     const boredom=Number($('life-world-boredom').value);
     if(!mod)throw Error('current_module 不能为空');
     if(!mood)throw Error('mood 不能为空');
-    if(!Number.isInteger(energy)||energy<0||energy>100)throw Error('精力须为 0～100 的整数');
+    if(!Number.isFinite(energy)||energy<0||energy>100||!Number.isInteger(energy*10))throw Error('精力范围为 0～100，最多一位小数');
     if(!Number.isInteger(boredom)||boredom<0||boredom>100)throw Error('无聊度须为 0～100 的整数');
     const next=await api('life/world','PUT',{current_module:mod,focus_level:$('life-world-focus').value,mood,energy,boredom});
     renderLife(next);

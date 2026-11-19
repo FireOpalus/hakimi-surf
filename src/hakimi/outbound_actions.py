@@ -226,7 +226,10 @@ def parse_actions(
     )
 
 
-def valid_receipt(receipt):
+def valid_receipt(receipt, *, platform="onebot"):
+    if platform != "onebot":
+        ident = receipt.get("message_id") if isinstance(receipt, dict) else None
+        return isinstance(ident, str) and bool(ident.strip()) and len(ident) <= 256
     return (
         isinstance(receipt, dict)
         and not isinstance(receipt.get("message_id"), bool)

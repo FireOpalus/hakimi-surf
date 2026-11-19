@@ -17,7 +17,7 @@ from .text_card import should_render_rich_card
 
 
 async def persist_ack(service, reply, position, text, receipt, epoch, digest=None):
-    if not valid_receipt(receipt):
+    if not valid_receipt(receipt, platform=reply["message"]["platform"]):
         raise Rejected("onebot_send_unconfirmed")
     data = {
         "message": reply["message"],
@@ -29,16 +29,20 @@ async def persist_ack(service, reply, position, text, receipt, epoch, digest=Non
         "consumed_image_events": reply.get("consumed_image_events") or [],
         "consumed_file_events": reply.get("consumed_file_events") or [],
     }
+    world = getattr(service, "world_state", None)
     async with service.store.transaction():
+        now = world.clock() if world and world.experience.ready else time.time()
         await service.store.db.execute(
             "INSERT OR IGNORE INTO outbox_bubble_receipts VALUES (?,?,?,?,0)",
             (
                 reply["id"],
                 position,
                 service.store.vault.seal(f"ack:{reply['id']}:{position}", data),
-                time.time(),
+                now,
             ),
         )
+        if world and world.experience.ready:
+            await world.experience.spend_chat_tx(reply["id"], now)
     return data
 
 
@@ -121,8 +125,9 @@ async def apply_receipts(service, reply_id):
                 [item["text"] for item in data],
                 dedicated=dedicated,
             )
-        await service.store.db.execute(
-            "UPDATE outbox_bubble_receipts SET applied=1 WHERE reply_id=?", (reply_id,)
+        await service.store.db.executemany(
+            "UPDATE outbox_bubble_receipts SET applied=1 WHERE reply_id=? AND position=?",
+            [(reply_id, row["position"]) for row in rows],
         )
     if world and world.experience.ready:
         await world.refresh()
@@ -583,7 +588,7 @@ async def deliver_proactive_jit(
                     before_send=before_bubble_send,
                 )
             dispatched = True
-            if not valid_receipt(receipt):
+            if not valid_receipt(receipt, platform=message.platform):
                 raise Rejected("onebot_send_unconfirmed")
             data = await persist_ack(service, synthetic_reply, position, text, receipt, epoch)
             confirmed.append(data)

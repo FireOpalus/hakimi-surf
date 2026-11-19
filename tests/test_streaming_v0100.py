@@ -409,6 +409,9 @@ async def test_receipt_recovery_is_idempotent_and_group_public_index(settings, s
     from hakimi.outgoing import persist_ack
 
     service = Service(settings, store, ActionGateway(), FakeBili(), ActionSender())
+    now = time.time()
+    service.world_state.clock = lambda: now
+    await service.world_state.initialize()
     m = group(message, "123")
     epoch = (await service.sessions.snapshot(m))["epoch"]
     reply = {
@@ -417,6 +420,7 @@ async def test_receipt_recovery_is_idempotent_and_group_public_index(settings, s
         "participants": [m.model_dump()],
     }
     await persist_ack(service, reply, 0, "已确认正文", {"message_id": 900}, epoch, "一只橘猫")
+    assert await service.world_state.experience.battery(message, now) == 99.75
     assert not (await service.sessions.snapshot(m))["recent_messages"]
     await recover_receipts(service)
     original = (await service.sessions.snapshot(m))["recent_messages"]
@@ -424,6 +428,13 @@ async def test_receipt_recovery_is_idempotent_and_group_public_index(settings, s
     assert len(await store.all("SELECT * FROM public_interactions")) == 1
     await recover_receipts(service)
     assert (await service.sessions.snapshot(m))["recent_messages"] == original
+    await persist_ack(service, reply, 1, "第二个气泡", {"message_id": 901}, epoch)
+    await recover_receipts(service)
+    assert service.world_state.current.energy == 79.9
+    assert await service.world_state.experience.battery(message, now) == 99.75
+    with pytest.raises(Rejected):
+        await persist_ack(service, dict(reply, id="unconfirmed"), 0, "未确认", {}, epoch)
+    assert await store.one("SELECT 1 FROM world_changes WHERE receipt='qq:unconfirmed'") is None
 
 
 @pytest.mark.parametrize("unsupported", [True, False])

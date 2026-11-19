@@ -3,6 +3,8 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from hakimi.planning_journal import PlannerJournal
 from hakimi.rest_policy import RestHoursConfig
 from hakimi.world_experience import NEWS_TTL
@@ -89,7 +91,7 @@ async def test_confirmed_activity_lease_and_history(settings, store):
     assert (await x.view(now))["news_count"] == 2
 
 
-async def test_private_news_receipts_and_independent_social_charge(settings, store, message):
+async def test_private_news_stays_scoped_with_one_shared_social_charge(settings, store, message):
     now = stamp(16)
     world = WorldStateManager(settings, store, clock=lambda: now)
     await world.initialize()
@@ -124,8 +126,7 @@ async def test_private_news_receipts_and_independent_social_charge(settings, sto
     async with store.transaction():
         await x.confirmed_tx(grp, "same", now, [secret, public])
         await x.confirmed_tx(grp, "same", now, [public])
-    assert await x.battery(grp, now) == 88
-    assert await x.battery(message, now) == 100
+    assert await x.battery(grp, now) == await x.battery(message, now) == 99.75
     assert await x.battery(grp, now + 3600) == 100
     assert not await x.news(grp, now)
     assert [r["ref"] for r in await x.news(friend, now)] == [secret]
@@ -139,7 +140,85 @@ async def test_private_news_receipts_and_independent_social_charge(settings, sto
     async with store.transaction():
         await x.confirmed_tx(friend, "reference", now, [secret])
     assert not await x.news(friend, now)
-    assert await x.battery(friend, now) == 76
+    assert await x.battery(friend, now) == await x.battery(grp, now) == 99.25
+    assert (await world.refresh()).energy == 75.7
+
+
+async def test_shared_recharge_excludes_overlapping_chats_then_uses_actual_rest(
+    settings, store, message
+):
+    now = stamp(16)
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await store.runtime.set_rest_hours(RestHoursConfig(rest_hours="16:20-16:22"))
+    await world.initialize()
+    x = world.experience
+    async with store.transaction():
+        await store.db.execute("UPDATE world_social_battery SET charge=50")
+    async with x.chatting():
+        now += 300
+        with pytest.raises(asyncio.CancelledError):
+            async with x.chatting():
+                now += 300
+                raise asyncio.CancelledError
+        assert await x.battery(message, now) == 50
+        now += 300
+        async with store.transaction():
+            await x.confirmed_tx(message, "overlap", now, ["第一句", "第二句"])
+    assert await x.battery(group(message), now) == 49.75
+    now = stamp(16, 22)  # Five idle minutes and two sleeping minutes.
+    assert await x.battery(message, now) == 51.75
+    async with store.transaction():
+        assert await x.start_day_rest_tx(now, now + 120)
+    now += 120
+    reopened = WorldStateManager(settings, store, clock=lambda: now)
+    await reopened.initialize()
+    assert await reopened.experience.battery(message, now) == 52.75
+    assert reopened.current.energy == 80.7  # -0.1 chat, +0.5 sleep, +0.3 nap, remainder carried.
+    now += 24 * 3600
+    assert await reopened.experience.battery(message, now) == 100
+
+
+async def test_legacy_latest_battery_and_signed_energy_migrate_once(settings, store, message):
+    now = stamp(16)
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    async with store.transaction():
+        await store.db.execute("DELETE FROM world_social_battery")
+        await store.db.executemany(
+            "INSERT INTO world_social VALUES (?,?,?,?)",
+            [("group", "群聊", 12, now - 600), ("private", "私聊", 65.5, now - 150)],
+        )
+        await store.db.execute("UPDATE world_rhythm SET energy_fraction=-0.42")
+    for _ in range(2):
+        world = WorldStateManager(settings, store, clock=lambda: now)
+        await world.initialize()
+        assert await world.experience.battery(message, now) == 66
+        assert world.current.energy == 79.6
+        assert (await store.one("SELECT energy_fraction FROM world_rhythm"))[0] == pytest.approx(
+            -0.02
+        )
+    async with store.transaction():
+        await store.db.execute("UPDATE world_social_battery SET charge=0.1")
+        await world.experience.confirmed_tx(message, "floor", now, ["收到"])
+    assert await world.experience.battery(message, now) == 0
+
+
+async def test_interrupted_turn_recharges_offline_and_old_ack_stays_charged(
+    settings, store, message
+):
+    now = stamp(15)
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    async with store.transaction():
+        await store.db.execute("UPDATE world_social_battery SET charge=50, active_turns=1")
+        await world.experience.confirmed_tx(message, "delivered", now, ["收到"])
+    now += 600
+    reopened = WorldStateManager(settings, store, clock=lambda: now)
+    await reopened.initialize()
+    async with store.transaction():
+        await reopened.experience.confirmed_tx(message, "delivered", now - 600, ["收到"])
+    assert await reopened.experience.battery(message, now) == 51.75
+    assert reopened.current.energy == 79.9
 
 
 async def test_low_energy_indicator_is_available_in_status(settings, store):
@@ -215,7 +294,8 @@ async def test_low_social_charge_only_gates_ambient_group_speech(settings, store
         )
         now = svc.world_state.clock()
         async with store.transaction():
-            for n in range(6):
+            await store.db.execute("UPDATE world_social_battery SET charge=30.25")
+            for n in range(2):
                 await svc.world_state.experience.confirmed_tx(grp, str(n), now, ["群聊回复"])
         assert await svc.accept(grp) == "ignored"
         assert not await store.all("SELECT id FROM jobs")

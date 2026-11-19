@@ -43,7 +43,7 @@ class WorldStateAdminUpdate(BaseModel):
     current_module: str | None = Field(default=None, min_length=1, max_length=64)
     focus_level: Literal["LOW", "MEDIUM", "HIGH"] | None = None
     mood: str | None = Field(default=None, min_length=1, max_length=64)
-    energy: int | None = Field(default=None, ge=0, le=100)
+    energy: float | None = Field(default=None, ge=0, le=100, multiple_of=0.1, allow_inf_nan=False)
     boredom: int | None = Field(default=None, ge=0, le=100)
 
     @field_validator("current_module", "mood")
@@ -291,8 +291,6 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
 
     if snap is not None and ws is not None:
         experience = await ws.experience.view(ws.clock())
-        if svc.dialogue_scheduler.entries and experience["actual"]["state"] in {"rest", "idle"}:
-            experience["actual"]["state"] = "qq_processing"
         world_state_data = {
             "experience": experience,
             "current_module": snap.current_module,

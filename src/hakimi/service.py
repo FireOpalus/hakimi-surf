@@ -8,7 +8,7 @@ import time
 import uuid
 import weakref
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import AsyncExitStack, nullcontext
 
 import httpx
 
@@ -990,10 +990,10 @@ class Service:
             try:
 
                 async def run():
-                    if message.kind == "private" and is_persona_owner(message, self.s):
-                        async with self.owner_dialogue_lock:
-                            return await self._handle_message(job)
-                    return await self._handle_message(job)
+                    async with AsyncExitStack() as turn:
+                        if message.kind == "private" and is_persona_owner(message, self.s):
+                            await turn.enter_async_context(self.owner_dialogue_lock)
+                        return await self._handle_message(job, turn)
 
                 return await cancellable(run, batch.cancel)
             except asyncio.CancelledError:
@@ -1099,7 +1099,7 @@ class Service:
         if audit_id:
             await self.store.runtime.filters.update_audit(audit_id, "queued")
 
-    async def _handle_message(self, job: dict):
+    async def _handle_message(self, job: dict, turn: AsyncExitStack):
         message = Message.model_validate(job["payload"])
         members = [Message.model_validate(m) for m in job.get("batch_messages", [])] or [message]
         for original in members:
@@ -1128,6 +1128,9 @@ class Service:
         )
         if aff_active and caps.level == 0:
             return
+        direct_chat = message.kind == "private" or message.addressed
+        if direct_chat:
+            await turn.enter_async_context(self.world_state.experience.chatting())
         fixed = await self.command(message)
         if fixed is not None:
             await self.store.enqueue_reply(job["id"], message, self.output(fixed))
@@ -1436,6 +1439,9 @@ class Service:
                             )
                             await self.store.runtime.filters.update_audit(audit_id, "queued")
             return
+        # Ambient group traffic only becomes a conversation once the gate opts in.
+        if not direct_chat:
+            await turn.enter_async_context(self.world_state.experience.chatting())
         invited_bots = set()
         if not sandbox and len(members) == 1 and owner(message, self.s):
             invited_bots = await self.bot_guard.invite(message)
@@ -2251,6 +2257,12 @@ class Service:
         reply = await self.store.claim_reply()
         if not reply:
             return False
+        async with (
+            self.world_state.experience.chatting() if not reply["proactive"] else nullcontext()
+        ):
+            return await self._deliver_reply(reply)
+
+    async def _deliver_reply(self, reply) -> bool:
         reply_actions = reply.get("actions") or {}
         message = Message.model_validate(reply["message"])
         farewell_bypass = bool(reply_actions.get("farewell_bypass_mute")) and (
@@ -2370,19 +2382,19 @@ class Service:
                         reply["proactive"],
                         before_send=valid_after_delay,
                     )
-            if message.platform == "onebot" and reply["text"]:
+            if receipt is not None or reply["text"]:
                 from .outbound_actions import valid_receipt
 
-                if not valid_receipt(receipt):
+                if not valid_receipt(receipt, platform=message.platform):
                     raise Rejected("onebot_send_unconfirmed")
-            text_confirmed = (message.platform not in {"onebot", "qq"} and receipt is not None) or (
-                message.platform == "onebot"
-                and isinstance(receipt, dict)
-                and not isinstance(receipt.get("message_id"), bool)
-                and bool(re.fullmatch(r"-?[0-9]{1,30}", str(receipt.get("message_id", ""))))
-            )
+                text_confirmed = True
             if text_confirmed:
                 retained_text = reply["text"]
+                if not reply["proactive"] and self.world_state.experience.ready:
+                    async with self.store.transaction():
+                        await self.world_state.experience.confirmed_tx(
+                            message, reply["id"], self.world_state.clock(), [retained_text]
+                        )
                 await self.sessions.reply(
                     message, retained_text, reply["id"], expected_epoch=delivery_epoch
                 )
@@ -2431,6 +2443,11 @@ class Service:
                                 message, data, before_send=image_still_allowed
                             )
                             image_confirmed = True  # Sender requires a valid OneBot message_id.
+                            if not text_confirmed and self.world_state.experience.ready:
+                                async with self.store.transaction():
+                                    await self.world_state.experience.spend_chat_tx(
+                                        reply["id"], self.world_state.clock()
+                                    )
                             await self.sessions.receive_outgoing(
                                 message,
                                 image_receipt["message_id"],
@@ -2451,7 +2468,7 @@ class Service:
                         raise
                     except Exception:
                         self.record("meme_send_failed")
-            if not reply["text"] and not image_confirmed:
+            if not text_confirmed and not image_confirmed:
                 status = "cancelled"
         except asyncio.CancelledError:
             # Leave 'sending': startup recovery will mark it uncertain without resending.

@@ -67,6 +67,20 @@ async def test_chat_pipeline_without_qq(settings, store, message, kind):
     incoming = message.model_copy(update={"platform": "forum", "bot_id": "forum-app", "kind": kind})
     qq = svc.modules.get("qq_social")
     try:
+        now = incoming.created_at
+        svc.world_state.clock = lambda: now
+        await svc.world_state.initialize()
+        async with store.transaction():
+            await store.db.execute("UPDATE world_social_battery SET charge=70")
+        generate = svc.ai.generate
+
+        async def slow_reply(*args, **kwargs):
+            nonlocal now
+            now += 150
+            assert await svc.world_state.experience.battery(incoming, now) == 70
+            return await generate(*args, **kwargs)
+
+        svc.ai.generate = slow_reply
         assert await svc.accept_from(forum, message) == "ignored"
         assert await svc.accept_from(qq, incoming) == "ignored"
         assert not is_persona_owner(incoming, settings)
@@ -77,6 +91,8 @@ async def test_chat_pipeline_without_qq(settings, store, message, kind):
         assert job and job["payload"]["platform"] == "forum"
         await svc.process(job)
         assert await svc.deliver_once()
+        assert await svc.world_state.experience.battery(message, now) == 69.75
+        assert svc.world_state.current.energy == 79.9
         assert [m.user_id for m, _ in forum.sent] == [incoming.user_id]
         payload = next(c[1] for c in svc.ai.calls if c[0] == "generate")
         assert "社区公开动态" in payload["module_context"]["forum_chat"]

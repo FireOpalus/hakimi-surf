@@ -1,8 +1,10 @@
-"""Local, receipt-based drives, conversation batteries and audience-scoped discoveries."""
+"""Local, receipt-based drives, a shared social battery and audience-scoped discoveries."""
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
+from math import trunc
 from zoneinfo import ZoneInfo
 
 from .proactive_policy import hours_bounds
@@ -10,6 +12,10 @@ from .proactive_policy import hours_bounds
 MC_TASKS = frozenset({"goto", "explore", "mine", "gather", "follow"})
 NEWS_TTL = 48 * 3600
 SOCIAL_LOW = 30
+CHAT_SOCIAL_COST = 0.25
+CHAT_ENERGY_COST = 0.1
+AWAKE_SECONDS_PER_POINT = 300
+REST_SECONDS_PER_POINT = 120
 HOURLY_RATES = {"sleep": (15, -2), "day_rest": (10, -2), "idle": (0, 4), "mc_work": (-8, -4)}
 MAX_DAY_REST_MINUTES = 90
 
@@ -25,13 +31,17 @@ CREATE TABLE IF NOT EXISTS world_day_rest (
 );
 INSERT OR IGNORE INTO world_day_rest VALUES (1,0,0,'');
 CREATE TABLE IF NOT EXISTS world_changes (
- receipt TEXT PRIMARY KEY, at REAL NOT NULL, reason TEXT NOT NULL, energy_before INTEGER,
- energy_after INTEGER, boredom_before INTEGER, boredom_after INTEGER,
- audience_label TEXT, social_before INTEGER, social_after INTEGER, seconds REAL DEFAULT 0
+ receipt TEXT PRIMARY KEY, at REAL NOT NULL, reason TEXT NOT NULL, energy_before REAL,
+ energy_after REAL, boredom_before INTEGER, boredom_after INTEGER,
+ audience_label TEXT, social_before REAL, social_after REAL, seconds REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS world_changes_at ON world_changes(at);
 CREATE TABLE IF NOT EXISTS world_social (
  scope TEXT PRIMARY KEY, label TEXT NOT NULL, charge REAL NOT NULL, at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS world_social_battery (
+ id INTEGER PRIMARY KEY CHECK(id=1), charge REAL NOT NULL CHECK(charge BETWEEN 0 AND 100),
+ last_reply_at REAL, active_turns INTEGER NOT NULL DEFAULT 0 CHECK(active_turns>=0)
 );
 CREATE TABLE IF NOT EXISTS world_news (
  event_id TEXT PRIMARY KEY, at REAL NOT NULL, expires REAL NOT NULL, audience TEXT NOT NULL,
@@ -53,8 +63,15 @@ def bounded(value):
     return min(100.0, max(0.0, value))
 
 
-def charge_at(row, now):
-    return bounded(row["charge"] + max(0, now - row["at"]) / 300) if row else 100.0
+def energy_parts(points, remainder, delta):
+    """Apply whole tenths immediately and carry sub-tenth timed work between ticks."""
+    total = bounded(points + remainder + delta)
+    if total in (0, 100):
+        return total, 0.0
+    tenths = trunc(round(delta * 10, 8))
+    pending = (remainder + delta) * 10 - tenths
+    visible = round(points + (tenths + trunc(round(pending, 8))) / 10, 1)
+    return visible, round(total - visible, 12)
 
 
 class WorldExperience:
@@ -71,6 +88,34 @@ class WorldExperience:
             "SELECT 1,?,energy<30 FROM world_state WHERE singleton=1",
             (now,),
         )
+        if not await self.store.one("SELECT 1 FROM world_social_battery WHERE id=1"):
+            # Carry forward the last active wallet at the existing world-clock checkpoint.
+            legacy = await self.store.one(
+                "SELECT charge,at FROM world_social ORDER BY at DESC,scope LIMIT 1"
+            )
+            rhythm = await self.store.one("SELECT settled FROM world_rhythm WHERE id=1")
+            charge = (
+                bounded(
+                    legacy["charge"] + max(0, rhythm[0] - legacy["at"]) / AWAKE_SECONDS_PER_POINT
+                )
+                if legacy
+                else 100.0
+            )
+            await self.store.db.execute(
+                "INSERT INTO world_social_battery(id,charge,last_reply_at) VALUES (1,?,?)",
+                (charge, legacy["at"] if legacy else None),
+            )
+            # Older databases stored only whole energy points plus a signed remainder.
+            row = await self._values()
+            visible, remainder = energy_parts(row["energy"], 0, row["energy_fraction"])
+            await self.store.db.execute(
+                "UPDATE world_state SET energy=? WHERE singleton=1", (visible,)
+            )
+            await self.store.db.execute(
+                "UPDATE world_rhythm SET energy_fraction=?,"
+                "tired=(? < 30 OR (tired AND ? < 45)) WHERE id=1",
+                (remainder, visible, visible),
+            )
         if first.rowcount:
             await self.store.db.execute(
                 "INSERT INTO world_changes(receipt,at,reason,energy_before,energy_after,"
@@ -90,7 +135,8 @@ class WorldExperience:
                 "WHERE source='low_energy' AND ends>?",
                 (now, now),
             )
-            # A fresh process needs fresh positive evidence to resume a live task.
+            # The last checkpoint ends any interrupted turn. Downtime is idle time.
+            await self.store.db.execute("UPDATE world_social_battery SET active_turns=0 WHERE id=1")
             await self.advance_tx(now)
             row = await self._values()
             if row["mc_task"]:
@@ -134,23 +180,19 @@ class WorldExperience:
 
     async def _values(self):
         return await self.store.one(
-            "SELECT r.*,w.energy,w.boredom,w.focus_level,w.mood,d.started,d.ends,d.source "
+            "SELECT r.*,w.energy,w.boredom,w.focus_level,w.mood,d.started,d.ends,d.source,"
+            "s.charge,s.last_reply_at,s.active_turns "
             "FROM world_rhythm r JOIN world_state w ON w.singleton=r.id "
-            "JOIN world_day_rest d ON d.id=r.id WHERE r.id=1"
+            "JOIN world_day_rest d ON d.id=r.id "
+            "JOIN world_social_battery s ON s.id=r.id WHERE r.id=1"
         )
 
     async def _change_tx(
         self, receipt, now, reason, energy_delta=0, boredom_delta=0, *, seconds=0, social=None
     ):
         row = await self._values()
-        energy = bounded(row["energy"] + row["energy_fraction"] + energy_delta)
+        next_energy, remainder = energy_parts(row["energy"], row["energy_fraction"], energy_delta)
         boredom = bounded(row["boredom"] + row["boredom_fraction"] + boredom_delta)
-        # Earn or spend complete points; retain fractional work across ticks and restarts.
-        whole = int(energy_delta)
-        fraction = row["energy_fraction"] + (energy_delta - whole)
-        next_energy = (
-            int(energy) if energy in (0, 100) else row["energy"] + whole + int(round(fraction, 9))
-        )
         next_boredom = round(boredom)
         if receipt or (next_energy, next_boredom) != (row["energy"], row["boredom"]):
             inserted = await self.store.db.execute(
@@ -172,7 +214,7 @@ class WorldExperience:
         await self.store.db.execute(
             "UPDATE world_rhythm SET energy_fraction=?,boredom_fraction=?,tired=? WHERE id=1",
             (
-                energy - next_energy,
+                remainder,
                 boredom - next_boredom,
                 next_energy < 30 or (row["tired"] and next_energy < 45),
             ),
@@ -190,8 +232,11 @@ class WorldExperience:
         start = row["settled"]
         if now < start:
             return
+        charge = row["charge"]
         for reason, left, right in self.periods(start, now, row):
             seconds = right - left
+            if not row["active_turns"]:
+                charge = self._recharge(charge, reason, seconds)
             if reason == "bili_read":
                 continue  # Debit reading time only on a confirmed learning receipt.
             rates = HOURLY_RATES[reason]
@@ -199,6 +244,10 @@ class WorldExperience:
                 None, right, reason, *(r * seconds / 3600 for r in rates), seconds=seconds
             )
         await self.store.db.execute("UPDATE world_rhythm SET settled=? WHERE id=1", (now,))
+        if charge != row["charge"]:
+            await self.store.db.execute(
+                "UPDATE world_social_battery SET charge=? WHERE id=1", (charge,)
+            )
         if row["mc_task"] and now >= row["mc_until"]:
             await self._release_mc_tx()
         sleep = self.store.runtime.is_resting(now)
@@ -371,43 +420,72 @@ class WorldExperience:
             else ""
         )
 
+    @staticmethod
+    def _recharge(charge, kind, seconds):
+        interval = (
+            REST_SECONDS_PER_POINT if kind in {"sleep", "day_rest"} else AWAKE_SECONDS_PER_POINT
+        )
+        return bounded(charge + seconds / interval)
+
+    def _charge_at(self, row, now):
+        charge = row["charge"]
+        if charge < 100 and not row["active_turns"] and now > row["settled"]:
+            for kind, start, end in self.periods(row["settled"], now, row):
+                charge = self._recharge(charge, kind, end - start)
+        return charge
+
+    @asynccontextmanager
+    async def chatting(self):
+        """Exclude the union of live reply intervals from recharge, across all sessions."""
+        if not self.ready:
+            yield
+            return
+        async with self.store.transaction():
+            await self.advance_tx(self.world.clock())
+            await self.store.db.execute(
+                "UPDATE world_social_battery SET active_turns=active_turns+1 WHERE id=1"
+            )
+        try:
+            yield
+        finally:
+            async with self.store.transaction():
+                await self.advance_tx(self.world.clock())
+                await self.store.db.execute(
+                    "UPDATE world_social_battery SET active_turns=active_turns-1 WHERE id=1"
+                )
+            await self.world.refresh()
+
     async def battery(self, message, now):
+        """The platform gate may supply its target, but the balance belongs to the bot."""
         if not self.ready:
             return 100
         async with self.store.lock:
-            row = await self.store.one(
-                "SELECT * FROM world_social WHERE scope=?", (self.store.session_scope(message),)
-            )
-        return round(charge_at(row, now))
+            return self._charge_at(await self._values(), now)
 
-    async def confirmed_tx(self, message, reply, now, texts, *, dedicated=None):
-        scope = self.store.session_scope(message)
-        row = await self.store.one("SELECT * FROM world_social WHERE scope=?", (scope,))
-        charge = charge_at(row, now)
-        label = (
-            ("群聊" if message.kind == "group" else "私聊") + " · " + message.conversation_id[-4:]
-        )
-        if (
-            message.kind == "private"
-            and self.audience(message)
-            and message.user_id == self.s.owner_qq_id
-        ):
-            label = "Owner 私聊"
-        # Multiple bubbles, crash recovery and replays all share one conversation turn.
+    async def spend_chat_tx(self, reply, now):
+        # Keep the original receipt namespace so replaying a pre-upgrade ACK is free.
+        receipt = "qq:" + reply
+        if await self.store.one("SELECT 1 FROM world_changes WHERE receipt=?", (receipt,)):
+            return
         await self.advance_tx(now)
+        charge = (await self.store.one("SELECT charge FROM world_social_battery WHERE id=1"))[0]
+        after = bounded(charge - CHAT_SOCIAL_COST)
         if await self._change_tx(
-            "qq:" + reply,
+            receipt,
             now,
-            "qq_delivered",
-            -1,
+            "chat_delivered",
+            -CHAT_ENERGY_COST,
             -2,
-            social=(label, round(charge), round(bounded(charge - 12))),
+            social=(None, charge, after),
         ):
             await self.store.db.execute(
-                "INSERT INTO world_social VALUES (?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
-                "charge=excluded.charge,at=excluded.at,label=excluded.label",
-                (scope, label, bounded(charge - 12), max(now, row["at"] if row else now)),
+                "UPDATE world_social_battery SET charge=?,"
+                "last_reply_at=MAX(COALESCE(last_reply_at,?),?) WHERE id=1",
+                (after, now, now),
             )
+
+    async def confirmed_tx(self, message, reply, now, texts, *, dedicated=None):
+        await self.spend_chat_tx(reply, now)
         audience = self.audience(message)
         rows = await self.store.all(
             "SELECT event_id,ref,title FROM world_news WHERE shared_at IS NULL AND expires>? "
@@ -519,7 +597,7 @@ class WorldExperience:
             changes = await self.store.all(
                 "SELECT * FROM world_changes ORDER BY at DESC,rowid DESC LIMIT 20"
             )
-            social = await self.store.all("SELECT * FROM world_social ORDER BY at DESC LIMIT 10")
+            charge = round(self._charge_at(row, now), 2)
             news = await self.store.all(
                 "SELECT source,ref,title,at,audience!='' AS private FROM world_news "
                 "WHERE shared_at IS NULL AND expires>? ORDER BY at DESC LIMIT 10",
@@ -532,7 +610,8 @@ class WorldExperience:
             )[0]
             last = await self.store.one(
                 "SELECT reason,at FROM world_changes WHERE reason IN "
-                "('video_learned','mc_goal_completed','mc_rare_find','qq_delivered') "
+                "('video_learned','mc_goal_completed','mc_rare_find',"
+                "'qq_delivered','chat_delivered') "
                 "ORDER BY at DESC,rowid DESC LIMIT 1"
             )
             plan = await self.store.one(
@@ -561,6 +640,8 @@ class WorldExperience:
                 if self.store.runtime.is_resting(now)
                 else "day_rest"
                 if row["started"] <= now < row["ends"]
+                else "chatting"
+                if row["active_turns"]
                 else "idle",
                 "mc_task": mc,
                 "day_rest_until": row["ends"] if row["started"] <= now < row["ends"] else None,
@@ -568,10 +649,13 @@ class WorldExperience:
                 "last": dict(last) if last else None,
             },
             "low_energy": bool(row["tired"]),
-            "social": [
-                {"label": r["label"], "charge": round(charge_at(r, now)), "at": r["at"]}
-                for r in social
-            ],
+            "social_battery": {
+                "charge": charge,
+                "last_reply_at": row["last_reply_at"],
+                "chatting": bool(row["active_turns"]),
+            },
+            # Older admin pages read a list. Expose only the shared balance during rollout.
+            "social": [{"label": "共享", "charge": charge, "at": row["last_reply_at"]}],
             "news_count": total,
             "news": [
                 {

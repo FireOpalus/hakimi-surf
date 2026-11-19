@@ -11,6 +11,7 @@ import logging
 import random
 import time
 import uuid
+from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -847,7 +848,11 @@ class OwnerProactive:
             await self._finish_memory(row)
 
     async def deliver_once(self):
-        async with self.delivery_lock, self.service.owner_dialogue_lock:
+        async with (
+            self.delivery_lock,
+            self.service.owner_dialogue_lock,
+            AsyncExitStack() as activity,
+        ):
             await self._repair_confirmed()
             async with self.policy_lock:
                 await self._expire_and_disable()
@@ -865,6 +870,9 @@ class OwnerProactive:
                 payload = self.store.vault.open(key, row["payload"])
                 if not self.matches_payload(payload):
                     raise Rejected("owner_dm_target_forbidden")
+                world = getattr(self.service, "world_state", None)
+                if row["kind"] == "digest" and world:
+                    await activity.enter_async_context(world.experience.chatting())
                 submitted = False
 
                 async def before_send():
@@ -975,7 +983,6 @@ class OwnerProactive:
                     )
                     if row["kind"] == "digest":
                         await self.digests.sync_intents_tx(key, self.clock())
-                        world = getattr(self.service, "world_state", None)
                         if world and world.experience.ready:
                             await world.experience.confirmed_tx(
                                 self.target(), key, self.clock(), [payload["text"]]
