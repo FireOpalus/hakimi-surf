@@ -103,6 +103,8 @@ LIFE_ROUTES = [
     ("POST", "/admin/api/life/plan"),
     ("POST", "/admin/api/life/gatekeeper"),
     ("DELETE", "/admin/api/life/intents/0123456789abcdef0123456789abcdef"),
+    ("POST", "/admin/api/life/ledger"),
+    ("DELETE", "/admin/api/life/ledger/0123456789abcdef0123456789abcdef"),
 ]
 
 

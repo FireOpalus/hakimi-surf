@@ -28,6 +28,7 @@ router = APIRouter(prefix="/admin/api/life")
 
 
 INTENT_ID_RE = re.compile(r"^[a-f0-9]{16,64}$")
+LEDGER_ID_RE = re.compile(r"^[A-Za-z0-9:._-]{1,128}$")
 LIFE_INTENT_LIMIT = 40
 LIFE_EVENT_LIMIT = 30
 
@@ -70,6 +71,34 @@ class WorldStateAdminUpdate(BaseModel):
         ):
             raise ValueError("at least one field must be provided")
         return self
+
+
+class LedgerEventAdminCreate(BaseModel):
+    """Strict manual event creation payload for the built-in event ledger."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    source_module: str = Field(default="owner_admin", min_length=1, max_length=32)
+    target_module: str = Field(default="", max_length=32)
+    event_type: str = Field(default="manual_todo", min_length=1, max_length=32)
+    summary: str = Field(min_length=1, max_length=200)
+    dedupe_key: str = Field(default="", max_length=80)
+    due_in_minutes: int = Field(default=0, ge=0, le=43200)
+    ttl_hours: int = Field(default=72, ge=1, le=336)
+    visibility: Literal["public", "owner_private"] = "owner_private"
+
+    @field_validator("source_module", "event_type", "summary")
+    @classmethod
+    def _non_blank_ledger(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("value must not be blank")
+        return stripped
+
+    @field_validator("target_module", "dedupe_key")
+    @classmethod
+    def _strip_ledger_opt(cls, value: str) -> str:
+        return value.strip()
 
 
 class MinecraftAdminGoalRequest(BaseModel):
@@ -396,6 +425,10 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
                         }
             observations["next_action"] = upcoming
 
+    ledger = getattr(svc, "event_ledger", None)
+    now_ledger = engine.clock() if engine is not None and hasattr(engine, "clock") else None
+    ledger_events = await ledger.admin_list(now=now_ledger, limit=30) if ledger is not None else []
+
     return {
         "config": config,
         "source": source,
@@ -411,6 +444,7 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
         "intents": intents,
         "rule_receipts": [dict(row) for row in receipts],
         "events": events,
+        "ledger_events": ledger_events,
     }
 
 
@@ -719,6 +753,53 @@ async def life_trigger_gatekeeper(request: Request):
     async with lock:
         res = await _maybe_await(engine.tick_gatekeeper_once())
         return res if isinstance(res, dict) else {"status": "ok", "result": res}
+
+
+@router.post("/ledger")
+async def life_create_ledger_event(request: Request):
+    value = await body(request, LedgerEventAdminCreate)
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        ledger = getattr(svc, "event_ledger", None)
+        if ledger is None:
+            raise HTTPException(503, "event_ledger_unavailable")
+        engine = getattr(svc, "life_engine", None)
+        now = engine.clock() if engine is not None and hasattr(engine, "clock") else ledger.clock()
+        due_at = now + value.due_in_minutes * 60.0
+        try:
+            await ledger.post(
+                value.source_module,
+                value.event_type,
+                value.summary,
+                target_module=value.target_module,
+                dedupe_key=value.dedupe_key or None,
+                due_at=due_at,
+                ttl_seconds=value.ttl_hours * 3600.0,
+                visibility=value.visibility,
+                now=now,
+            )
+        except ValueError:
+            raise HTTPException(400, "invalid_admin_input") from None
+        return await _build_life_status(svc, include_sensors=False)
+
+
+@router.delete("/ledger/{item_id}")
+async def life_consume_ledger_event(request: Request, item_id: str):
+    if not LEDGER_ID_RE.fullmatch(item_id):
+        raise HTTPException(400, "invalid_admin_input")
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        ledger = getattr(svc, "event_ledger", None)
+        if ledger is None:
+            raise HTTPException(503, "event_ledger_unavailable")
+        engine = getattr(svc, "life_engine", None)
+        now = engine.clock() if engine is not None and hasattr(engine, "clock") else ledger.clock()
+        consumed = await ledger.consume(
+            item_id, consumer="admin", allow_owner_private=True, now=now
+        )
+        if not consumed:
+            raise HTTPException(404, "ledger_event_not_found")
+        return await _build_life_status(svc, include_sensors=False)
 
 
 @router.delete("/intents/{intent_id}")

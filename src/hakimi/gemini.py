@@ -104,6 +104,16 @@ class WireAgendaChange(BaseModel):
     at_local_time: str = Field(default="", max_length=5)
 
 
+class WireLedgerPost(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    key: str = ""
+    target_module: str = ""
+    due_at_local: str = ""
+    ttl_hours: int = 48
+    visibility: Literal["public", "owner_private"] = "public"
+    summary: str = ""
+
+
 class WireLifePlan(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     current_module: str
@@ -122,6 +132,8 @@ class WireLifePlan(BaseModel):
     rest_minutes: int = Field(default=0, ge=0, le=MAX_DAY_REST_MINUTES, strict=True)
     intents: list[WireLifeIntent] = Field(default_factory=list)
     agenda_changes: list[WireAgendaChange] = Field(default_factory=list)
+    ledger_posts: list[WireLedgerPost] = Field(default_factory=list)
+    ledger_consumes: list[str] = Field(default_factory=list)
 
 
 def _build_life_plan_schema() -> dict[str, Any]:
@@ -192,6 +204,19 @@ LIFE_PLAN_INSTRUCTION = """你是「吉米奈喵」（咕咕噜·吉米尼·吉�
 - 当 boredom >= 60 时主动排进 bili.patrol 或 qq.speak 找事干；当
   owner_longing >= 50 且 owner_dm_available=true 时可考虑温声排一条给 "owner" 的
   qq.speak；若有 interest_lingering，可用它触发心情签名 mood_longnick 或日常分享。
+
+【跨日待办账本与约定记忆】
+- 若输入含 pending_ledger_events（模块待办/种植倒计时、与 BOISER 约定或跨日备忘）：
+  is_due=true 的事项优先在当前轮排入对应动作；未到点但 due_local 在今日清醒时段内的，
+  可用 at_local_time 定点排入 intents。
+- 若含 owner_recent_context（BOISER 近期私聊上下文）：留意其中约好的行程（如约好几点
+  去 MC 挖矿或做某事），在今日则直接排入 intents，在明日及以后则写入 ledger_posts。
+- ledger_posts：需跨时段/跨天记住的主观打算（如攒钱明天买种子、MC 建筑未完、远期约定）
+  可写入账本，due_at_local 填 ""、"HH:MM" 或 "YYYY-MM-DD HH:MM"；无新增时填 []。
+- ledger_consumes：仅当 source 为 "planner" 或 "qq_owner" 的待办已被你落实排妥或完成时
+  填其 key 或 id 核销；外部能力模块（如农场/MC）事件由模块自己执行后核销，勿提前填。
+- 隐私铁律：visibility="owner_private" 事件与 owner_recent_context 严禁用于公开群聊
+  意图，也严禁写入 mood_longnick。
 
 【动作字段硬约束与写法示例】
 - action_name 只选 available_actions 中 available=true 的名字；arguments_json 填

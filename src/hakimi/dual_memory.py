@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .outbound_actions import require_all_schema_fields
 from .security import Rejected
+from .social import bound_owner
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS member_profiles (
@@ -650,6 +651,8 @@ class DualMemory:
                         snapshot["id"],
                     ),
                 )
+            is_owner_dm = message.kind == "private" and bound_owner(message, self.s)
+            owner_commitments: list[tuple[str, str, float]] = []
             async with db.execute(
                 "SELECT id,payload,locked,deleted,vector FROM chronicle_events"
             ) as cur:
@@ -698,6 +701,10 @@ class DualMemory:
                         snapshot["id"],
                     ),
                 )
+                if is_owner_dm and fact.category in {"open_question", "consensus"}:
+                    owner_commitments.append(
+                        (ident, f"{fact.topic}: {fact.text}", float(snapshot["created"]))
+                    )
             await db.execute("UPDATE memory_control SET ready=1")
             await db.execute("UPDATE rolling_state SET version=version+1")
             await db.executemany(
@@ -706,6 +713,21 @@ class DualMemory:
                 [(ident,) for ident in ids],
             )
         self.index.discard(key)
+        ledger = getattr(self.sessions, "event_ledger", None)
+        if owner_commitments and ledger is not None:
+            for ident, summary, created_ts in owner_commitments:
+                try:
+                    await ledger.post(
+                        "qq_owner",
+                        "owner_commitment",
+                        summary,
+                        dedupe_key=f"chronicle:{ident}",
+                        ttl_seconds=5 * 86400.0,
+                        visibility="owner_private",
+                        now=created_ts,
+                    )
+                except Exception:
+                    continue
         return True
 
     async def edit(self, message, ident, *, version, action, text="", expires=0):

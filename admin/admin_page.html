@@ -2085,6 +2085,22 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <p class="muted">只记录触发时间窗、门控条件与模糊动机，绝不预写台词；状态为 pending 时可手动取消。</p>
     <div id="life-intents-table" class="table"></div>
   </div>
+  <div class="card"><h2>跨日待办账本（Event Ledger）</h2>
+    <p class="muted">各能力模块、私聊约定与规划器写入的跨时段待办事项（Fernet 加密落盘，显式核销或到期前持续保留）。</p>
+    <form id="life-ledger-form" class="quick-bar">
+      <label for="life-ledger-summary">待办摘要<input id="life-ledger-summary" type="text" maxlength="160" required placeholder="如：明天下午收农场西边草莓 / 约好两点进MC挖铁矿"></label>
+      <label for="life-ledger-target">目标模块（可选）<input id="life-ledger-target" list="life-module-options" type="text" maxlength="32" placeholder="minecraft / 留空"></label>
+      <label for="life-ledger-due">延后生效（分钟）<input id="life-ledger-due" type="number" min="0" max="43200" step="1" value="0" required></label>
+      <label for="life-ledger-vis">可见域
+        <select id="life-ledger-vis">
+          <option value="owner_private">owner_private · 仅私密排程</option>
+          <option value="public">public · 模块与群聊可见</option>
+        </select>
+      </label>
+      <button id="life-ledger-submit" type="submit">送入待办事件</button>
+    </form>
+    <div id="life-ledger-table" class="table"></div>
+  </div>
   <div class="card"><h2>跨模块事件（最近 30 条）</h2>
     <p class="muted">能力模块发布的脱敏里程碑事件（明文 JSON 存储，供规划器与镜像消费）。</p>
     <div id="life-events-table" class="table"></div>
@@ -3279,6 +3295,7 @@ function renderLife(d){
     ['当前上头余韵',exp.interest_lingering||'暂无特定上头话题'],
     ['共享社交电量',battery?battery.charge+' / 100':'—'],
     ['待分享见闻',(exp.news_count??0)+' 条'],
+    ['跨日待办账本',((d.ledger_events||[]).filter(x=>x.status==='pending').length)+' 条待办'],
     ['Attention Lock',ws.proactive_suspended?'HIGH 锁定中':'正常开放'],
     ['今日自主活动',eng.proactive_sent_today??0],
     ['已用共用次数',(eng.daily_activity_usage?.counted??eng.proactive_sent_today??0)+' / '+(c.max_proactive_per_day??6)]
@@ -3347,6 +3364,22 @@ function renderLife(d){
   table('life-rules-table',['处理时间','规则','事件 ID','结果','意图 ID'],(d.rule_receipts||[]).map(row=>[
     lifeFmt(row.created_at,tz),row.rule_id,row.event_id.slice(0,10),row.outcome,row.intent_id?.slice(0,10)||'—'
   ]));
+  const ledgerStatusLabels={pending:'待处理',consumed:'已核销',expired:'已过期'};
+  table('life-ledger-table',['来源 → 目标','类型 / 可见域','待办摘要','生效 / 过期时间','状态','操作'],(d.ledger_events||[]).map(item=>{
+    const route=(item.source_module||'—')+(item.target_module?' → '+item.target_module:'');
+    const visPill=pill(item.visibility==='owner_private'?'私密排程':'公开可见',item.visibility==='owner_private'?'paid':'muted');
+    const typeBox=el('div',undefined,'row');
+    typeBox.append(el('span',item.event_type||'—'),visPill);
+    const statusPill=pill(ledgerStatusLabels[item.status]||item.status,item.status==='pending'?'ok':'muted');
+    return[
+      route,
+      typeBox,
+      item.summary||'—',
+      lifeFmt(item.due_at,tz)+' ~ '+lifeFmt(item.expires_at,tz),
+      statusPill,
+      item.status==='pending'?button('核销',async()=>{const next=await api('life/ledger/'+encodeURIComponent(item.id),'DELETE');renderLife(next);notice('已核销待办事件');},'secondary'):el('span',item.consumed_by||'—','muted')
+    ];
+  }));
   table('life-events-table',['时间','来源模块','事件类型','重要度','规划器已读','脱敏载荷'],(d.events||[]).map(ev=>[
     lifeFmt(ev.created_at,tz),
     ev.source_module||'—',
@@ -3442,6 +3475,22 @@ $('life-gatekeeper-now').addEventListener('click',e=>busy(e.target,async()=>{
   await life();
   notice('门控扫描完成：'+(r.status||'ok'));
 }));
+$('life-ledger-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('life-ledger-submit'),async()=>{
+    const summary=$('life-ledger-summary').value.trim();
+    const target=$('life-ledger-target').value.trim();
+    const dueMins=Number($('life-ledger-due').value);
+    if(!summary)throw Error('请填写待办摘要');
+    if(!Number.isInteger(dueMins)||dueMins<0||dueMins>43200)throw Error('延后生效分钟须为 0～43200 的整数');
+    const next=await api('life/ledger','POST',{summary,target_module:target,due_in_minutes:dueMins,visibility:$('life-ledger-vis').value});
+    $('life-ledger-summary').value='';
+    $('life-ledger-target').value='';
+    $('life-ledger-due').value='0';
+    renderLife(next);
+    notice('待办事件已加密送入账本');
+  });
+});
 
 let admissionState=null;
 const admissionLists=[['allowed_groups','admission-groups','QQ群号'],['allowed_users','admission-users','好友 QQ']];

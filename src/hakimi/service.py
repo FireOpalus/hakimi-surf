@@ -181,6 +181,9 @@ class Service:
         self.notebook = self.modules.systems["owner_notebook"].snapshot
         self.cloud_memory = self.modules.systems["owner_notebook"].cloud_memory
         self.drive = self.drive_sync.drive
+        self.event_ledger = self.modules.systems["event_ledger"].ledger
+        self.modules.event_ledger = self.event_ledger
+        self.sessions.event_ledger = self.event_ledger
         self.world_state = WorldStateManager(settings, store, self.modules)
         install_modules(self)
         settings._thinking_scenes = self.modules.thinking_scenes

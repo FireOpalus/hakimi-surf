@@ -36,6 +36,7 @@ from .modules.qq_policy import DESKTOP_CONTEXT_HINT as DESKTOP_CONTEXT_HINT
 from .planning_journal import PlannerJournal
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
+from .social import owner_target
 from .thinking_policy import preferences as model_preferences
 from .thinking_policy import supported_level
 from .work_usage import model_work
@@ -49,6 +50,29 @@ from .world_state import (
 )
 
 log = logging.getLogger("hakimi")
+
+GROUP_SCRUBBED_INTENT_NOTE = "去群里看看大家在聊什么，顺势自然接话或结合公开见闻互动"
+
+
+def _parse_local_due(raw: str, local_now: datetime, zone: ZoneInfo) -> float:
+    val = str(raw or "").strip()
+    if not val:
+        return local_now.timestamp()
+    if len(val) >= 11:
+        try:
+            return datetime.strptime(val[:16], "%Y-%m-%d %H:%M").replace(tzinfo=zone).timestamp()
+        except ValueError:
+            pass
+    if ":" in val:
+        try:
+            clock_t = day_time.fromisoformat(val[:5])
+            candidate = datetime.combine(local_now.date(), clock_t, zone)
+            if candidate <= local_now:
+                candidate += timedelta(days=1)
+            return candidate.timestamp()
+        except ValueError:
+            pass
+    return local_now.timestamp()
 
 
 class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
@@ -141,9 +165,111 @@ class LifeBlockPlanner:
         self.clock = clock
         self.rng = rng or random.SystemRandom()
         self.journal = PlannerJournal(self.store)
+        self.ledger = getattr(service, "event_ledger", None)
+        if self.ledger is not None:
+            self.ledger.set_due_listener(self._on_ledger_due)
         self.next_plan_at: float = 0.0
         self.last_plan_at: float = 0.0
         self.last_plan_source: str = "none"
+
+    async def _on_ledger_due(self, due_at: float) -> None:
+        now = self.clock()
+        if not self.planning_enabled or self.store.runtime.is_resting(due_at):
+            return
+        wake = max(now + 1.0, due_at)
+        if not self.journal.ready:
+            await self.journal.initialize(
+                now, initial_interval=self.config.planner_min_minutes * 60
+            )
+        await self.journal.signal(wake)
+        if self.next_plan_at <= 0 or wake < self.next_plan_at:
+            self.next_plan_at = wake
+        self.engine.wakeup.set()
+
+    async def _collect_owner_planning_context(self, ts: float) -> dict[str, Any]:
+        owner_msg = owner_target(self.s, "onebot", ts, "planner-owner-ctx")
+        sessions = getattr(self.service, "sessions", None)
+        if owner_msg is None or sessions is None:
+            return {}
+        path_fn = getattr(sessions, "path", None)
+        if callable(path_fn) and not path_fn(owner_msg).exists():
+            return {}
+        snap: dict[str, Any] = {}
+        try:
+            if hasattr(sessions, "database") and hasattr(sessions, "vault"):
+                async with sessions.database(owner_msg, preserve_history=True) as (db, key):
+                    async with db.execute("SELECT enabled FROM session_meta") as cur:
+                        row_en = await cur.fetchone()
+                    if not row_en or not row_en[0]:
+                        return {}
+                    async with db.execute("SELECT summary FROM rolling_state") as cur:
+                        sum_row = await cur.fetchone()
+                    summary_raw = (
+                        sessions.vault.open(key, sum_row[0]) if sum_row and sum_row[0] else ""
+                    )
+                    async with db.execute(
+                        "SELECT payload FROM recent_messages ORDER BY id DESC LIMIT 8"
+                    ) as cur:
+                        msg_rows = await cur.fetchall()
+                    recent_msgs = [sessions.vault.open(key, r[0]) for r in reversed(msg_rows)]
+                snap = {"rolling_summary": summary_raw, "recent_messages": recent_msgs}
+            else:
+                snap = await sessions.snapshot(owner_msg)
+        except Exception:
+            return {}
+        turns: list[str] = []
+        for item in snap.get("recent_messages", [])[-8:]:
+            created = item.get("created_at")
+            if (
+                isinstance(created, int | float)
+                and not isinstance(created, bool)
+                and created > 0
+                and created < ts - 129600.0
+            ):
+                continue
+            raw_text = str(item.get("text") or "").strip()
+            if not raw_text or raw_text.startswith(("[协议事件", "/")):
+                continue
+            prefix = "BOISER: " if item.get("role") == "user" else "我: "
+            cleaned = sanitize_sensor_text(raw_text, self.s, max_tokens=45)
+            if cleaned:
+                turns.append(prefix + cleaned)
+        out: dict[str, Any] = {}
+        if turns:
+            out["recent_turns"] = turns[-5:]
+        summary_clean = sanitize_sensor_text(
+            str(snap.get("rolling_summary") or ""), self.s, max_tokens=80
+        )
+        if summary_clean:
+            out["rolling_summary"] = summary_clean
+        return out
+
+    async def _recent_completed_intents(self, ts: float) -> list[dict[str, str]]:
+        async with self.store.lock:
+            rows = await self.store.all(
+                "SELECT COALESCE(NULLIF(action_name,''), action_type) AS action, "
+                "updated_at, intent_note_json FROM scheduled_intents "
+                "WHERE status='done' AND updated_at>=? "
+                "AND (target_scope='' OR target_scope LIKE 'owner:%') "
+                "ORDER BY updated_at DESC LIMIT 5",
+                (ts - 86400.0,),
+            )
+        items: list[dict[str, str]] = []
+        for row in rows:
+            try:
+                parsed = json.loads(row["intent_note_json"] or "{}")
+            except ValueError:
+                parsed = {}
+            raw_note = parsed.get("note") if isinstance(parsed, dict) else parsed
+            note_clean = sanitize_sensor_text(str(raw_note or ""), self.s, max_tokens=36)
+            items.append(
+                {
+                    "time": self._local(float(row["updated_at"])).strftime("%m-%d %H:%M"),
+                    "action": str(row["action"] or ""),
+                    "note": note_clean,
+                }
+            )
+        return items
 
     @property
     def config(self) -> LifeEngineConfig:
@@ -261,8 +387,21 @@ class LifeBlockPlanner:
         sensors = await modules_reg.collect_sensor_summaries()
         known_modules = {"idle", *(m.module_id for m in modules_reg.active())}
         planning_context = {}
+        module_fingerprints: dict[str, str] = {}
         for module in modules_reg.active():
             planning_context.update(await module.planning_context(self.service, cfg, ts))
+            fp = sanitize_sensor_text(module.planning_fingerprint(), self.s, max_tokens=32)
+            if fp:
+                module_fingerprints[module.module_id] = fp
+
+        if self.ledger is not None:
+            ledger_items, ledger_due_digest, next_ledger_due = await self.ledger.planner_state(ts)
+        else:
+            ledger_items, ledger_due_digest, next_ledger_due = ([], "", None)
+        owner_ctx = await self._collect_owner_planning_context(ts)
+        tainted_by_owner_memory = bool(owner_ctx) or any(
+            item.visibility == "owner_private" for item in ledger_items
+        )
 
         budget = await self.store.budget_status()
         preferences = await ws.experience.preferences(ts)
@@ -275,6 +414,7 @@ class LifeBlockPlanner:
             if not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"])
         ]
         offered = {action["name"] for action in available_actions}
+        zone = _zone(self.s.bot_timezone)
         planner_payload: dict[str, Any] = {
             "local_time": local_dt.strftime("%Y-%m-%d %H:%M"),
             "weekday": ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[local_dt.weekday()],
@@ -303,6 +443,16 @@ class LifeBlockPlanner:
             **planning_context,
             "available_modules": sorted(known_modules),
         }
+        if ledger_items:
+            planner_payload["pending_ledger_events"] = [
+                item.to_planner_dict(ts, zone) for item in ledger_items
+            ]
+        if owner_ctx:
+            planner_payload["owner_recent_context"] = owner_ctx
+        if morning:
+            recent_done = await self._recent_completed_intents(ts)
+            if recent_done:
+                planner_payload["recent_completed_intents"] = recent_done
 
         signature = self.store.vault.digest(
             "planner-opportunities",
@@ -315,6 +465,8 @@ class LifeBlockPlanner:
                     "owner_available": planning_context.get("owner_dm_available", False),
                     "focus_lock": current.current_module if ws.proactive_suspended() else None,
                     "funded": paid_lane_available(budget, PROACTIVE_LANE),
+                    "ledger_due": ledger_due_digest,
+                    "module_fp": module_fingerprints,
                 },
                 sort_keys=True,
             ),
@@ -333,8 +485,14 @@ class LifeBlockPlanner:
             next_at = ts + self.rng.uniform(
                 cfg.planner_min_minutes * 60, cfg.planner_max_minutes * 60
             )
+            if (
+                next_ledger_due is not None
+                and ts < next_ledger_due < next_at
+                and not self.store.runtime.is_resting(next_ledger_due)
+            ):
+                next_at = max(ts + 5.0, next_ledger_due)
             planner_funded = paid_lane_available(budget, PROACTIVE_LANE)
-            restless_bored = current.boredom >= 65
+            restless_bored = current.boredom >= 70
             owner_longing_wake = preferences.get("owner_longing", 0) >= 65 and bool(
                 planning_context.get("owner_dm_available")
             )
@@ -523,6 +681,15 @@ class LifeBlockPlanner:
                 skip("unavailable_action")
                 continue
 
+            is_owner_scope = bool(
+                resolved_scope
+                and (
+                    resolved_scope.startswith("owner:") or resolved_scope.startswith("boundowner:")
+                )
+            )
+            if spec.social and not is_owner_scope and tainted_by_owner_memory:
+                bounded_note = GROUP_SCRUBBED_INTENT_NOTE
+
             ttl_sec = max(600.0, min(float(item.ttl_minutes) * 60.0, 6.0 * 3600.0))
             window = self.calendar(calendar.day, social=spec.social).window(
                 at=item.at_local_time,
@@ -633,6 +800,37 @@ class LifeBlockPlanner:
         )
         if day_rest:
             await ws.refresh()
+        if plan_source == "llm" and self.ledger is not None:
+            for post_item in plan.ledger_posts[:4]:
+                if not str(post_item.summary or "").strip():
+                    continue
+                vis: Literal["public", "owner_private"] = (
+                    "owner_private" if tainted_by_owner_memory else post_item.visibility
+                )
+                due_ts = _parse_local_due(post_item.due_at_local, local_dt, zone)
+                ttl_sec = max(1, min(int(post_item.ttl_hours), 336)) * 3600.0
+                try:
+                    await self.ledger.post(
+                        "planner",
+                        "self_memo",
+                        post_item.summary,
+                        target_module=post_item.target_module,
+                        dedupe_key=post_item.key or None,
+                        due_at=due_ts,
+                        ttl_seconds=ttl_sec,
+                        visibility=vis,
+                        now=ts,
+                    )
+                except ValueError:
+                    continue
+            for consume_ref in plan.ledger_consumes[:6]:
+                await self.ledger.consume(
+                    consume_ref,
+                    consumer="planner",
+                    allow_owner_private=True,
+                    allowed_sources={"planner", "qq_owner"},
+                    now=ts,
+                )
         await self.sync_wake(applied_at)
 
         longnick_text = str(plan.mood_longnick or "").strip()
@@ -1323,6 +1521,8 @@ class LifeEngine:
                     world_state, "initialize"
                 ):
                     await world_state.initialize()
+                if self.planner.ledger is not None:
+                    await self.planner.ledger.initialize()
                 await self.rules.initialize()
                 await self.planner.initialize()
                 await self.trim_day_rest(self.clock())
