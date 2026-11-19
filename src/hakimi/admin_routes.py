@@ -42,7 +42,7 @@ from .provider_routing import ProviderView
 from .rest_policy import RestHoursConfig
 from .rich_message_parser import parse_message
 from .security import Rejected, authorize, configured_secrets
-from .thinking_policy import ThinkingConfig
+from .thinking_policy import ModelSettingsUpdate, ThinkingConfig, preferences
 from .web_search import WebSearchConfig
 from .work_usage import model_work
 
@@ -242,6 +242,7 @@ async def _dashboard(request: Request, view: ProviderView):
     await routing.initialize()
     return {
         "uptime_seconds": int(time.monotonic() - svc.started_at),
+        "primary_model": preferences(svc.s).primary_model,
         "pipeline": {
             "gate": sum(b.phase == "gate" for b in svc.store.groups.active.values()),
             "generating": sum(b.phase == "generating" for b in svc.store.groups.active.values()),
@@ -375,7 +376,9 @@ async def generation_caps_status(request: Request):
 async def generation_caps_save(request: Request):
     value = await body(request, GenerationCapsConfig)
     async with request.app.state.admin_config_lock:
-        return await service(request).store.runtime.set_generation_caps(value)
+        runtime = service(request).store.runtime
+        merged = runtime.generation_caps.model_dump() | value.model_dump(exclude_unset=True)
+        return await runtime.set_generation_caps(GenerationCapsConfig.model_validate(merged))
 
 
 @router.delete("/api/generation-caps")
@@ -432,6 +435,23 @@ async def rest_hours_reset(request: Request):
 @router.get("/api/filter")
 async def filter_status(request: Request):
     return await service(request).store.runtime.filters.status()
+
+
+@router.get("/api/models")
+async def model_settings(request: Request):
+    svc = service(request)
+    return svc.store.runtime.model_settings_status(svc.modules)
+
+
+@router.put("/api/models")
+@router.delete("/api/models")
+async def save_model_settings(request: Request):
+    svc = service(request)
+    update = await body(request, ModelSettingsUpdate) if request.method == "PUT" else None
+    try:
+        return await svc.store.runtime.set_model_settings(svc.modules, update)
+    except ValueError:
+        raise HTTPException(400, "invalid_model_settings") from None
 
 
 @router.get("/api/thinking")

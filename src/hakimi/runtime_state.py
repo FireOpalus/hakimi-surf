@@ -29,7 +29,16 @@ from .provider_diagnostics import safe_attempts
 from .provider_routing import ProviderRoutingManager
 from .rest_policy import RestHoursConfig
 from .security import Rejected
-from .thinking_policy import THINKING_LEVELS, ThinkingConfig
+from .thinking_policy import (
+    CORE_THINKING_SCENES,
+    PRIMARY_MODELS,
+    SETTING_FIELDS,
+    THINKING_LEVELS,
+    ModelPreferences,
+    ThinkingConfig,
+    preferences,
+    supported_level,
+)
 from .web_search import WebSearch
 
 SCHEMA = """
@@ -245,10 +254,14 @@ class RuntimeState:
         admission = self.env_admission
         self.admission_overridden = False
         legacy_bots = None
+        old_schedule = None
+        model_values = {}
         rows = await self.store.all("SELECT * FROM admin_config")
         for row in rows:
             value = self.store.vault.open("admin:" + row["key"], row["payload"])
-            if row["key"] == "bot_ids":
+            if row["key"] == "life_engine" and isinstance(value, dict):
+                old_schedule = value
+            elif row["key"] == "bot_ids":
                 legacy_bots = value
             elif row["key"] == "admission":
                 merged = (
@@ -276,8 +289,8 @@ class RuntimeState:
                 self.compression = CompressionConfig.model_validate(merged)
                 self.compression_overridden = True
                 self.s.history_high_tokens = self.compression.history_high_tokens
-            elif row["key"] == "thinking":
-                self.s._thinking_override = ThinkingConfig.model_validate(value)
+            elif row["key"] in {"thinking", "model_preferences"}:
+                model_values.update(value)
             elif row["key"] == "debounce":
                 self.debounce_override = DebounceConfig.model_validate(value)
             elif row["key"] == "rate_limits":
@@ -305,6 +318,29 @@ class RuntimeState:
                 self.rest_hours_overridden = True
             elif row["key"].startswith("policy:"):
                 self.s.group_policies[row["key"][7:]] = value
+        if model_values:
+            self.s._thinking_override = ModelPreferences.model_validate(
+                ModelPreferences.from_settings(self.s).model_dump() | model_values
+            )
+        if old_schedule and (
+            "morning_thinking_level" in old_schedule or "active_hours" in old_schedule
+        ):
+            policy = preferences(self.s)
+            level = old_schedule.pop("morning_thinking_level", None)
+            old_schedule.pop("active_hours", None)
+            migrated = level in ("medium", "high") and "world.morning" not in policy.scene_levels
+            async with self.store.transaction():
+                if migrated:
+                    policy = policy.model_copy(
+                        update={"scene_levels": {**policy.scene_levels, "world.morning": level}}
+                    )
+                    await self._persist_model_preferences(policy)
+                await self.store.db.execute(
+                    "UPDATE admin_config SET payload=? WHERE key='life_engine'",
+                    (self.store.vault.seal("admin:life_engine", old_schedule),),
+                )
+            if migrated:
+                self.s._thinking_override = policy
         if (
             not self.image_limits_overridden
             and (self.env_image_limits.image_max_bytes, self.env_image_limits.image_max_pixels)
@@ -367,7 +403,9 @@ class RuntimeState:
 
     def thinking_status(self):
         return {
-            "config": (self.s._thinking_override or self.env_thinking).model_dump(),
+            "config": (self.s._thinking_override or self.env_thinking).model_dump(
+                include=set(SETTING_FIELDS)
+            ),
             "source": "sqlite" if self.s._thinking_override is not None else "env",
             "environment": self.env_thinking.model_dump(),
             "levels": list(THINKING_LEVELS),
@@ -375,18 +413,127 @@ class RuntimeState:
             "carbon_enabled": self.s.carbon_enabled,
         }
 
+    async def _persist_model_preferences(self, value):
+        extra = value.model_dump(include={"primary_model", "scene_levels"})
+        await self.store.db.execute(
+            "INSERT OR REPLACE INTO admin_config VALUES ('model_preferences',?)",
+            (self.store.vault.seal("admin:model_preferences", extra),),
+        )
+
+    async def _write_thinking(self, value):
+        # The original row remains readable by the previous engine during a rollback.
+        async with self.store.transaction():
+            if value is None:
+                await self.store.db.execute(
+                    "DELETE FROM admin_config WHERE key IN ('thinking','model_preferences')"
+                )
+            else:
+                await self.store.db.execute(
+                    "INSERT OR REPLACE INTO admin_config VALUES ('thinking',?)",
+                    (
+                        self.store.vault.seal(
+                            "admin:thinking", value.model_dump(include=set(SETTING_FIELDS))
+                        ),
+                    ),
+                )
+                await self._persist_model_preferences(value)
+        self.s._thinking_override = value
+
     async def set_thinking(self, value: ThinkingConfig | None):
+        # Older consoles only own the original flat scene settings.
         if value is not None and not isinstance(value, ThinkingConfig):
             raise ValueError("Expected a validated ThinkingConfig")
         async with self.thinking_lock:
-            if value is None:
-                async with self.store.transaction():
-                    await self.store.db.execute("DELETE FROM admin_config WHERE key='thinking'")
+            policy = preferences(self.s).model_copy(
+                update=(value or self.env_thinking).model_dump()
+            )
+            await self._write_thinking(
+                None
+                if value is None and policy == ModelPreferences.from_settings(self.s)
+                else policy
+            )
+        return self.thinking_status()
+
+    def model_settings_status(self, registry):
+        policy = preferences(self.s)
+        env = ModelPreferences.from_settings(self.s)
+        groups = []
+        for key, label, scenes in [
+            ("core", "世界引擎与公共服务", CORE_THINKING_SCENES),
+            *(
+                (m.module_id, m.display_name or m.module_id, m.thinking_scenes)
+                for m in registry.all()
+            ),
+        ]:
+            if scenes:
+                groups.append(
+                    {
+                        "id": key,
+                        "label": label,
+                        "scenes": [
+                            {
+                                "key": scene.key,
+                                "label": scene.label,
+                                "levels": scene.levels,
+                                "value": policy.level(scene),
+                                "default": env.level(scene),
+                            }
+                            for scene in scenes
+                        ],
+                    }
+                )
+        return {
+            "primary_model": policy.primary_model,
+            "models": PRIMARY_MODELS,
+            "model_levels": {
+                m: {level: supported_level(m, level) for level in ("auto", *THINKING_LEVELS)}
+                for m in PRIMARY_MODELS
+            },
+            "groups": groups,
+            "source": "sqlite" if self.s._thinking_override else "env",
+        }
+
+    async def set_model_settings(self, registry, update):
+        async with self.thinking_lock:
+            policy = preferences(self.s)
+            levels = dict(policy.scene_levels)
+            fields = {}
+            for key, level in update.levels.items() if update else ():
+                scene = registry.thinking_scenes.get(key)
+                choices = (
+                    [
+                        pref
+                        for pref in scene.levels
+                        if supported_level(update.primary_model, pref) == level
+                    ]
+                    if scene
+                    else []
+                )
+                if not choices:
+                    raise ValueError("Invalid thinking scene or level")
+                (fields if key in SETTING_FIELDS else levels)[key] = (
+                    level if level in choices else choices[0]
+                )
+            if update:
+                policy = policy.model_copy(
+                    update={**fields, "primary_model": update.primary_model, "scene_levels": levels}
+                )
             else:
-                await self.save_config("thinking", value.model_dump())
-            # One immutable snapshot assignment: concurrent requests see one whole policy.
-            self.s._thinking_override = value
-            return self.thinking_status()
+                # Preserve dormant plugin settings so reinstalling restores those preferences.
+                env = ModelPreferences.from_settings(self.s)
+                dormant = {k: v for k, v in levels.items() if k not in registry.thinking_scenes}
+                missing = {
+                    k: getattr(policy, k)
+                    for k in SETTING_FIELDS
+                    if k not in registry.thinking_scenes
+                }
+                policy = env.model_copy(update={**missing, "scene_levels": dormant})
+            await self._write_thinking(
+                None
+                if update is None and policy == ModelPreferences.from_settings(self.s)
+                else policy
+            )
+        return self.model_settings_status(registry)
 
     @staticmethod
     def _validate_loaded(env_model, saved):
@@ -450,9 +597,18 @@ class RuntimeState:
         )
 
     def generation_caps_status(self):
-        return self._limits_status(
+        status = self._limits_status(
             self.generation_caps, self.env_generation_caps, self.generation_caps_overridden
         )
+        used = {scene.output_cap for scene in self.s._thinking_scenes.values()} | {
+            "high_output_tokens"
+        }
+        status["fields"] = {
+            k: v
+            for k, v in GenerationCapsConfig.model_json_schema()["properties"].items()
+            if k in used
+        }
+        return status
 
     async def set_generation_caps(self, value: GenerationCapsConfig | None):
         return await self._save_limits(
@@ -565,20 +721,24 @@ class RuntimeState:
     async def set_rest_hours(self, value: RestHoursConfig | None):
         if value is not None and not isinstance(value, RestHoursConfig):
             raise ValueError("Expected a validated RestHoursConfig")
-        effective = self.env_rest_hours if value is None else value
         async with self.rest_hours_lock:
             async with self.store.transaction():
-                if value is None:
-                    await self.store.db.execute("DELETE FROM admin_config WHERE key='rest_hours'")
-                else:
-                    await self.store.db.execute(
-                        "INSERT INTO admin_config VALUES ('rest_hours',?) ON CONFLICT(key) "
-                        "DO UPDATE SET payload=excluded.payload",
-                        (self.store.vault.seal("admin:rest_hours", value.model_dump()),),
-                    )
-            self._apply_rest_hours(effective)
-            self.rest_hours_overridden = value is not None
+                await self.persist_rest_hours(value)
+            self.apply_rest_override(value)
             return self.rest_hours_status()
+
+    async def persist_rest_hours(self, value):
+        if value is None:
+            await self.store.db.execute("DELETE FROM admin_config WHERE key='rest_hours'")
+        else:
+            await self.store.db.execute(
+                "INSERT OR REPLACE INTO admin_config VALUES ('rest_hours',?)",
+                (self.store.vault.seal("admin:rest_hours", value.model_dump()),),
+            )
+
+    def apply_rest_override(self, value):
+        self._apply_rest_hours(value if value is not None else self.env_rest_hours)
+        self.rest_hours_overridden = value is not None
 
     def _validate_admission(self, value):
         protected = {self.s.owner_qq_id, self.s.onebot_self_id} - {""}

@@ -1,5 +1,7 @@
 """Additive model/cache aggregates. Never rewrites the original financial ledger."""
 
+from .thinking_policy import FLEX_MODELS, MODEL_LANES, PRIMARY_MODELS
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ledger_attribution (
  id TEXT PRIMARY KEY, model_lane TEXT NOT NULL
@@ -31,7 +33,9 @@ CREATE TABLE IF NOT EXISTS thinking_usage_aggregates (
 );
 """
 
-LANE_ORDER = {"hydrogen": 0, "carbon": 1, "memory_flex": 2, "decision": 3, "unknown": 4}
+LANE_ORDER = {
+    name: i for i, name in enumerate((*PRIMARY_MODELS, *FLEX_MODELS, "decision", "unknown"))
+}
 THINKING_ORDER = {
     "low": 0,
     "medium": 1,
@@ -59,7 +63,7 @@ def lane_name(value):
         "hydrogen"
         if value in {"interaction", "chat"}
         else value
-        if value in {"decision", "hydrogen", "carbon", "memory_flex"}
+        if value in MODEL_LANES
         else "unknown"
     )
 

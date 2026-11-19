@@ -70,7 +70,7 @@ async def _save_policy(request: Request, view: ProviderView):
     async with request.app.state.admin_config_lock:
         await routing.initialize()
         preserved = routing.config.model_dump(
-            include=set(QQ_PRIVACY_FIELDS) - value.model_fields_set
+            include=(set(QQ_PRIVACY_FIELDS) | {"vertex_hydrogen_model"}) - value.model_fields_set
         )
         if preserved:
             value = value.model_copy(update=preserved)

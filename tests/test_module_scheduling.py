@@ -147,17 +147,17 @@ async def test_register_controls_timer_quota_fallback_and_live_rule(life_api):  
     assert await svc.store.one(
         "SELECT 1 FROM scheduled_intents WHERE action_name='reading.open' AND origin='planner'"
     )
-    # Quiet hours / active window still apply to a module with unlimited uses.
-    await client.put("/admin/api/life", json={"active_hours": "18:00-22:00"})
+    # Sleep still applies to a module with unlimited uses.
+    await client.put("/admin/api/life/rest-hours", json={"rest_hours": "13:00-18:00"})
     await engine.tick_gatekeeper_once(now=clock + 121)
     assert await svc.store.one(
         "SELECT 1 FROM scheduled_intents WHERE action_name='reading.open' "
-        "AND result_reason='outside_active_hours'"
+        "AND result_reason='sleeping'"
     )
     assert module.reads == [9]
     defaults = (await client.delete(path + "/schedule")).json()["scheduling"]["values"]
     assert defaults == {"unlimited": False, "pages": 3, "read_at": "14:00"}
-    assert engine.config.active_hours == "18:00-22:00"
+    assert svc.store.runtime.rest_hours.rest_hours == "13:00-18:00"
 
 
 async def test_flat_production_settings_migrate_and_survive_independent_edits(life_api):  # noqa: F811
@@ -193,7 +193,7 @@ async def test_flat_production_settings_migrate_and_survive_independent_edits(li
     await restarted.initialize()
     assert (
         restarted.config.max_proactive_per_day == 12
-        and restarted.config.active_hours == "09:00-22:30"
+        and "active_hours" not in restarted.config.model_dump()
     )
     assert not (await settings_for("bilibili_surf"))["bili_patrols_unlimited"]
     qq = await settings_for("qq_social")
@@ -226,3 +226,42 @@ def test_new_module_cannot_authorize_a_qq_recipient(settings):
     with pytest.raises(ValueError, match="duplicate recipient namespace"):
         registry.register(other)
     assert registry.get("duplicate") is None
+
+
+async def test_awake_internal_action_can_run_during_outbound_quiet_hours(life_api):  # noqa: F811
+    from hakimi.rest_policy import RestHoursConfig
+
+    app, _, _ = life_api
+    svc = app.state.service
+    module = ReadingModule(svc.s)
+    svc.modules.register(module)
+    engine = svc.life_engine
+    at = datetime(2026, 11, 19, 7, 31, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+    await engine.set_rhythm(
+        {"quiet_hours": "23:30-08:30"}, RestHoursConfig(rest_hours="23:20-07:30")
+    )
+    for name, owner, target in [
+        ("reading.open", "reading", ""),
+        ("qq.speak", "qq_social", "owner:20000"),
+    ]:
+        await svc.world_state.enqueue_intent(
+            dict(
+                action_name=name,
+                target_module=owner,
+                action_type=name,
+                origin="planner",
+                target_scope=target,
+                execute_after=at - 1,
+                expire_at=at + 120,
+            ),
+            now=at,
+        )
+    engine.clock = engine.jit.clock = lambda: at
+    await engine.tick_gatekeeper_once(now=at)
+    rows = await svc.store.all(
+        "SELECT action_name,status,result_reason FROM scheduled_intents WHERE origin='planner'"
+    )
+    assert {r["action_name"]: (r["status"], r["result_reason"]) for r in rows} == {
+        "reading.open": ("done", "read"),
+        "qq.speak": ("gated_skip", "quiet_hours"),
+    }

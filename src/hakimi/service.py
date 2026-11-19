@@ -155,6 +155,7 @@ class Service:
         self.modules = ModuleRegistry()
         self.world_state = WorldStateManager(settings, store, self.modules)
         install_modules(self)
+        settings._thinking_scenes = self.modules.thinking_scenes
         resolved_drive = drive if drive is not None else getattr(diary, "drive", None)
         active_drive = resolved_drive if settings.roaming_enabled else None
         self.db_backup = DatabaseBackup(settings, store, active_drive)

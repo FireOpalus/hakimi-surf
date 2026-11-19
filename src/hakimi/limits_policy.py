@@ -45,14 +45,16 @@ class RateLimitConfig(_LimitsBase):
 
 
 class GenerationCapsConfig(_LimitsBase):
-    """Carbon auto-expert switch and per-scenario generation max_output_tokens caps."""
+    """Output ceilings and the legacy auto-expert flag retained for older clients."""
 
     carbon_enabled: StrictBool = True
-    chat_output_tokens: StrictInt = Field(default=1536, ge=128, le=4096)
-    owner_output_tokens: StrictInt = Field(default=4096, ge=128, le=8192)
-    summary_output_tokens: StrictInt = Field(default=4096, ge=128, le=8192)
-    diary_output_tokens: StrictInt = Field(default=4096, ge=128, le=8192)
-    high_output_tokens: StrictInt = Field(default=8192, ge=128, le=16384)
+    chat_output_tokens: StrictInt = Field(title="常规对话与记忆压缩", default=1536, ge=128, le=4096)
+    owner_output_tokens: StrictInt = Field(title="Owner 私聊", default=4096, ge=128, le=8192)
+    summary_output_tokens: StrictInt = Field(title="内容摘要", default=4096, ge=128, le=8192)
+    diary_output_tokens: StrictInt = Field(title="巡逻日记", default=4096, ge=128, le=8192)
+    high_output_tokens: StrictInt = Field(
+        title="单次深度分析（/deep）", default=8192, ge=128, le=16384
+    )
 
 
 class PatrolLimitConfig(_LimitsBase):

@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from .thinking_policy import MODEL_LANES
+
 VALID_THINKING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh")
 ThinkingLevelValue = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
@@ -13,9 +15,16 @@ class TokenUsage:
     output_tokens: int
     cached_tokens: int | None = None
     thought_tokens: int | None = None
-    model_lane: Literal["interaction", "decision", "hydrogen", "carbon", "memory_flex"] = (
-        "interaction"
-    )
+    model_lane: Literal[
+        "interaction",
+        "decision",
+        "hydrogen",
+        "neon",
+        "carbon",
+        "memory_flex",
+        "neon_flex",
+        "carbon_flex",
+    ] = "interaction"
     thinking_level: ThinkingLevelValue | None = None
 
     def __post_init__(self):
@@ -31,7 +40,7 @@ class TokenUsage:
                 raise ValueError("Invalid observed token count")
         if self.cached_tokens is not None and self.cached_tokens > self.input_tokens:
             raise ValueError("Cached tokens cannot exceed input tokens")
-        if self.model_lane not in {"interaction", "decision", "hydrogen", "carbon", "memory_flex"}:
+        if self.model_lane != "interaction" and self.model_lane not in MODEL_LANES:
             raise ValueError("Invalid model lane")
         if self.thinking_level is not None and self.thinking_level not in VALID_THINKING_LEVELS:
             raise ValueError("Invalid thinking level")

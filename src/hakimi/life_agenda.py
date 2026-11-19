@@ -60,22 +60,21 @@ class AgendaDay:
 
 
 @lru_cache(maxsize=64)
-def agenda_day(day: date, zone: ZoneInfo, active: str, quiet: str, rest: str | None) -> AgendaDay:
-    active_span, quiet_span = hours_bounds(active), hours_bounds(quiet)
+def agenda_day(day: date, zone: ZoneInfo, rest: str | None, quiet: str | None = None) -> AgendaDay:
+    """Sleep bounds all actions. Quiet hours further limit outbound social actions."""
+    quiet_span = hours_bounds(quiet) if quiet else None
     rest_span = hours_bounds(rest) if rest else None
-    wake_minute = rest_span[1] if rest_span else active_span[0]
+    wake_minute = rest_span[1] if rest_span else 0
     midnight = datetime.combine(day, time.min, zone)
     wake = (midnight + timedelta(minutes=wake_minute)).timestamp()
     tomorrow = int((midnight + timedelta(days=1)).timestamp())
     windows = []
     opened = None
-    for stamp in range(int(wake), tomorrow, 60):
+    for stamp in range(int(midnight.timestamp()), tomorrow, 60):
         wall = datetime.fromtimestamp(stamp, zone)
         minute = wall.hour * 60 + wall.minute
-        if (
-            within_hours(minute, active_span)
-            and not within_hours(minute, quiet_span)
-            and not (rest_span and within_hours(minute, rest_span))
+        if not (quiet_span and within_hours(minute, quiet_span)) and not (
+            rest_span and within_hours(minute, rest_span)
         ):
             if opened is None:
                 opened = stamp

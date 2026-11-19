@@ -94,7 +94,7 @@ def test_auto_and_manual_precedence(settings):
         (1, "low", 1536, "hydrogen"),
         (2, "medium", 4096, "hydrogen"),
         (3, "high", 8192, "hydrogen"),
-        (4, "medium", 12288, "carbon"),
+        (4, "high", 12288, "hydrogen"),
     ]:
         plan = generation_plan(settings, Scenario.FAST_CHAT, route=RouteDecision(tier=tier))
         assert (plan.thinking_level, plan.output_tokens, plan.model_lane) == (level, cap, lane)
@@ -326,10 +326,11 @@ async def test_safe_observer_is_retained_but_rejected_and_sandbox_text_are_not(
     await svc.compressor.close()
 
 
-@pytest.mark.parametrize("reason", ["disabled", "busy", "budget", "ambient"])
-async def test_carbon_fallback_is_local_pre_dispatch_only(
-    settings, store, message, sdk_pair, reason, monkeypatch
+@pytest.mark.parametrize("model", ["hydrogen", "neon", "carbon"])
+async def test_global_primary_controls_manual_and_auto_and_waits_for_carbon(
+    settings, store, message, sdk_pair, model
 ):
+    settings.primary_model = model
     calls = []
 
     def handler(request):
@@ -338,33 +339,27 @@ async def test_carbon_fallback_is_local_pre_dispatch_only(
         return responder(request)
 
     gate = GeminiGateway(settings, store, *sdk_pair(handler))
-    if reason == "disabled":
-        settings.carbon_enabled = False
-    if reason == "busy":
+    if model == "carbon":
         await gate.carbon_slots.acquire()
-    if reason == "ambient":
-        message = group(message, addressed=False)
-    if reason == "budget":
-        original = store.reserve
-        n = 0
-
-        async def reserve(*args, **kwargs):
-            nonlocal n
-            n += 1
-            if n == 1:
-                raise Rejected("budget_exhausted")
-            return await original(*args, **kwargs)
-
-        monkeypatch.setattr(store, "reserve", reserve)
-    await gate.generate(payload(), "s", message=message, route=RouteDecision(tier=4))
-    assert len(calls) == 1 and calls[0]["model"] == "gemini-4-hydrogen"
-    assert calls[0]["generation_config"]["thinking_level"] == "high"
-    if reason == "busy":
-        gate.carbon_slots.release()
+    async with asyncio.timeout(6):
+        future = asyncio.create_task(
+            gate.generate(payload(), "s", message=message, route=RouteDecision(tier=4))
+        )
+        await asyncio.sleep(0)
+        if model == "carbon":
+            assert not future.done() and not calls
+            gate.carbon_slots.release()
+        await future
+    assert len(calls) == 1 and calls[0]["model"] == "gemini-4-" + model
+    assert calls[0]["generation_config"]["thinking_level"] == (
+        "medium" if model == "carbon" else "high"
+    )
     assert not gate.carbon_slots.locked()
+    assert await store.one("SELECT 1 FROM ledger_usage WHERE model_lane=?", (model,))
 
 
 async def test_carbon_provider_503_never_replays_hydrogen(settings, store, message, sdk_pair):
+    settings.primary_model = "carbon"
     calls = []
 
     def handler(request):
@@ -397,6 +392,7 @@ async def test_carbon_cold_12_warm_anchor_epoch_reset_and_exact_price(
         return httpx.Response(200, json=response)
 
     gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    settings.primary_model = "carbon"
     p = payload()
     p["recent_messages"] = [{"seq": i, "role": "user", "text": f"turn-{i}"} for i in range(1, 31)]
     await gate.generate(p, "s", message=message, route=RouteDecision(tier=4))
@@ -474,7 +470,7 @@ def test_v081_persona_hashes_exact_including_boundary_newlines(name, expected):
     assert hashlib.sha256(getattr(persona, name).encode()).hexdigest() == expected
 
 
-async def test_real_carbon_reservation_insufficient_falls_back_under_subject_cap(
+async def test_explicit_carbon_subject_cap_rejects_without_any_other_dispatch(
     settings, store, message, sdk_pair
 ):
     settings.user_daily_usd = Decimal("0.12")
@@ -485,11 +481,10 @@ async def test_real_carbon_reservation_insufficient_falls_back_under_subject_cap
         return responder(request)
 
     gate = GeminiGateway(settings, store, *sdk_pair(handler))
-    await gate.generate(payload(), "real-budget", message=message, route=RouteDecision(tier=4))
-    generation = json.loads(calls[0].content)
-    assert generation["model"] == "gemini-4-hydrogen"
-    assert generation["generation_config"]["thinking_level"] == "high"
-    assert len(calls) == 2
+    settings.primary_model = "carbon"
+    with pytest.raises(Rejected, match="budget_exhausted"):
+        await gate.generate(payload(), "real-budget", message=message, route=RouteDecision(tier=4))
+    assert not calls
     assert not await store.one("SELECT 1 FROM model_usage_aggregates WHERE model_lane='carbon'")
 
 

@@ -14,6 +14,7 @@ from .persona import (
     SYSTEM_INSTRUCTION,
     identity_anchor,
 )
+from .thinking_policy import PRIMARY_MODELS
 
 OWNER_BACKGROUND_RULE = (
     "\n【单向公开背景规则】近期群聊巡逻记忆只来自已参与过的公开互动，"
@@ -142,7 +143,7 @@ class PrefixRuntime:
 
     def invalidate_chain(self, scope, lane=None):
         if lane is None:
-            for item_lane in ("hydrogen", "carbon"):
+            for item_lane in PRIMARY_MODELS:
                 self.chains.pop((scope, item_lane), None)
         else:
             self.chains.pop((scope, lane), None)

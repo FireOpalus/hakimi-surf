@@ -62,7 +62,7 @@ async def test_planner_can_choose_daytime_rest_and_does_not_turn_idle_into_sleep
 
 async def test_nap_defers_discretionary_work_and_ends_before_daily_digest(dm):
     engine = dm.service.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30"})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
     start = dm.time[0] = stamp("2026-11-14T22:04:00")
     await dm.service.world_state.update_state(energy=25)
     await engine.rest_if_tired(start)

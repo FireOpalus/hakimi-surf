@@ -22,6 +22,7 @@ from . import world_observations
 from .admin_routes import body, service
 from .life_engine import LifeEngineConfig
 from .modules.actions import ActionCall, HourlyAction, Mode, reject_reason
+from .rest_policy import RestHoursConfig
 
 router = APIRouter(prefix="/admin/api/life")
 
@@ -612,6 +613,30 @@ async def life_reset_config(request: Request):
             raise HTTPException(503, "life_engine_unavailable")
         await _maybe_await(engine.set_config(None))
         return await _build_life_status(svc)
+
+
+class WorldRhythmUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schedule: dict[str, Any]
+    rest: RestHoursConfig
+
+
+@router.put("/rhythm")
+@router.delete("/rhythm")
+async def world_rhythm(request: Request):
+    svc = service(request)
+    update = await body(request, WorldRhythmUpdate) if request.method == "PUT" else None
+    async with request.app.state.admin_config_lock:
+        try:
+            await svc.life_engine.set_rhythm(
+                update.schedule if update else None, update.rest if update else None
+            )
+        except ValueError:
+            raise HTTPException(400, "invalid_world_rhythm") from None
+        return {
+            "world": await _build_life_status(svc, include_sensors=False),
+            "rest": svc.store.runtime.rest_hours_status(),
+        }
 
 
 @router.put("/schedule")

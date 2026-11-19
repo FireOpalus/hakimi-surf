@@ -26,6 +26,7 @@ from .public_memory import SCHEMA as PUBLIC_MEMORY_SCHEMA
 from .runtime_state import SCHEMA as RUNTIME_SCHEMA
 from .runtime_state import RuntimeState
 from .security import Rejected, Vault
+from .thinking_policy import INTERACTION_LANES, PRIMARY_MODELS
 from .usage_accounting import TokenUsage
 from .work_usage import reservation_work
 
@@ -971,7 +972,7 @@ class Store:
             if digest_review is not None:
                 if (
                     lane != "proactive"
-                    or model_lane not in {"hydrogen", "decision"}
+                    or (model_lane not in PRIMARY_MODELS and model_lane != "decision")
                     or not digest_review.usd.is_finite()
                     or digest_review.usd < 0
                 ):
@@ -997,7 +998,7 @@ class Store:
                     raise Rejected("budget_circuit_open")
                 if budget_detail:
                     raise Rejected("budget_exhausted", budget_detail)
-            if digest_review is not None and model_lane == "hydrogen" and hold is None:
+            if digest_review is not None and model_lane != "decision" and hold is None:
                 await self.db.execute(
                     "INSERT INTO owner_digest_review_holds VALUES (?,?,?,?)",
                     (digest_review.id, day, subject, extra),
@@ -1175,9 +1176,7 @@ class Store:
                     estimated,
                 ),
             )
-            interaction = bool(
-                usage and usage.model_lane in {"interaction", "hydrogen", "carbon", "memory_flex"}
-            )
+            interaction = bool(usage and usage.model_lane in INTERACTION_LANES)
             cache_known = bool(interaction and usage.cached_tokens is not None)
             for period in self._periods(row["day"]):
                 await self.db.execute(

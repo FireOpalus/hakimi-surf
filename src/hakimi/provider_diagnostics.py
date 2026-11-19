@@ -8,9 +8,11 @@ import ssl
 import httpx
 from google.genai._interactions import APIConnectionError, APITimeoutError
 
+from .thinking_policy import FLEX_MODELS, MODEL_LANES
+
 STAGES = {"decision_message", "decision_source", "decision_output", "generation", "search"}
 PROVIDERS = {"gemini_free", "gemini_paid", "vertex_paid"}
-LANES = {"decision", "hydrogen", "carbon", "memory_flex"}
+LANES = MODEL_LANES
 CAUSES = {
     "deadline",
     "connect_timeout",
@@ -149,7 +151,7 @@ def safe_attempts(attempts):
             row["http_status"] = item["http_status"]
         number, due = item.get("retry_number"), item.get("next_retry_at")
         if (
-            row["model_lane"] == "memory_flex"
+            row["model_lane"] in FLEX_MODELS
             and row.get("http_status") == 503
             and type(number) is int
             and 1 <= number <= 4

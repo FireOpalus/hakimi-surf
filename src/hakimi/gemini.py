@@ -6,6 +6,7 @@ import math
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import version
@@ -39,6 +40,7 @@ from .routing import RouteDecision, select_tier
 from .security import Rejected
 from .store import DigestReviewCredit, Store
 from .streaming import StreamProgress, cancellable, consume_stream, upstream_http_status
+from .thinking_policy import FLEX_MODELS, MODEL_LANES, preferences, supported_level
 from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
 from .web_search import SEARCH_INSTRUCTION, execute_deepseek_search, parse_result
@@ -117,7 +119,8 @@ class WireLifePlan(BaseModel):
 LIFE_PLAN_RESPONSE_SCHEMA = WireLifePlan.model_json_schema()
 
 LIFE_PLAN_INSTRUCTION = """你是世界引擎的行程规划器。结合当前状态、公开事件与可用动作安排生活。
-planning_mode 为 morning 时，规划从起床到今天结束的行程。参考 activity_windows 内的本地时间，
+planning_mode 为 morning 时，规划从起床到今天结束的行程。参考 activity_windows 内的清醒时间。
+主动发消息还须避开 outbound_quiet_hours。
 按兴趣和精力安排最多六项，可以跨上午、下午和晚间，也可以留白。用 at_local_time 填 HH:MM。
 planning_mode 为 revision 时，先查看 today_agenda 及各项实际状态，再决定是否调整。
 保留合适的安排时无需重新输出它。可以新增最多三项，或在 agenda_changes 中指定未来待办的
@@ -246,10 +249,6 @@ def probability(answer: Any, attribute: str) -> float:
 
 class GenerationTimeout(Exception):
     pass
-
-
-class CarbonReservationUnavailable(Exception):
-    """Local reserve refusal only: provider operation has not run."""
 
 
 class _FreeTierFallback(Exception):
@@ -490,8 +489,11 @@ class GeminiGateway:
     def _price(self, lane: str, *, at=None) -> tuple[Decimal, Decimal]:
         if lane == "decision":
             return self.s.decision_input_usd_per_m, Decimal(0)
-        if lane == "memory_flex":
-            return self.s.chat_input_usd_per_m / 2, self.s.chat_output_usd_per_m / 2
+        if lane in FLEX_MODELS:
+            base = self._price(FLEX_MODELS[lane], at=at)
+            return base[0] / 2, base[1] / 2
+        if lane == "neon":
+            return self.s.neon_input_usd_per_m, self.s.neon_output_usd_per_m
         if lane == "carbon":
             regular = (at or datetime.now(UTC)).date().isoformat() >= "2026-12-01"
             prefix = "carbon_regular_" if regular else "carbon_"
@@ -499,7 +501,6 @@ class GeminiGateway:
                 getattr(self.s, prefix + "input_usd_per_m"),
                 getattr(self.s, prefix + "output_usd_per_m"),
             )
-        # Background tasks and L1-L3 use Hydrogen prices, including thinking.
         return self.s.chat_input_usd_per_m, self.s.chat_output_usd_per_m
 
     def _actual(self, result: Any, price: tuple[Decimal, Decimal]) -> Decimal | None:
@@ -554,9 +555,7 @@ class GeminiGateway:
                 output_tokens=outgoing,
                 cached_tokens=cached,
                 thought_tokens=optional_count(raw_thought),
-                model_lane=model_lane
-                if model_lane in {"decision", "hydrogen", "carbon", "memory_flex"}
-                else "interaction",
+                model_lane=model_lane if model_lane in MODEL_LANES else "interaction",
                 thinking_level=level,
             )
         except ValueError:
@@ -565,14 +564,16 @@ class GeminiGateway:
     def _cached_input_rate(self, model_lane: str, *, priced_at=None) -> Decimal | None:
         if model_lane == "decision":
             return None
+        if model_lane in FLEX_MODELS:
+            return self._cached_input_rate(FLEX_MODELS[model_lane], priced_at=priced_at) / 2
+        if model_lane == "neon":
+            return self.s.neon_cached_input_usd_per_m
         if model_lane == "carbon":
             regular = (priced_at or datetime.now(UTC)).date().isoformat() >= "2026-12-01"
             prefix = "carbon_regular_" if regular else "carbon_"
             cached_rate = getattr(self.s, prefix + "cached_input_usd_per_m")
         else:
             cached_rate = self.s.chat_cached_input_usd_per_m
-        if model_lane == "memory_flex":
-            cached_rate /= 2
         return cached_rate
 
     def _discounted(self, actual, usage, rates, *, priced_at=None):
@@ -651,7 +652,6 @@ class GeminiGateway:
         digest_review: DigestReviewCredit | None = None,
         before_call=None,
         context_limit=None,
-        carbon_reserve_fallback=False,
         stream_retryable=False,
         additional_reserve=Decimal(0),
         additional_actual=None,
@@ -704,7 +704,12 @@ class GeminiGateway:
         byte_count = len(serialized.encode("utf-8"))
         if byte_count > (context_limit or self.s.max_context_bytes + 12000):
             raise Rejected("context_too_large")
-        async with self.memory_slots if model_lane == "memory_flex" else self.slots:
+        model_slot = (
+            self.carbon_slots
+            if FLEX_MODELS.get(model_lane, model_lane) == "carbon"
+            else nullcontext()
+        )
+        async with model_slot, self.memory_slots if model_lane in FLEX_MODELS else self.slots:
             await run_guard(before_call)
             priced_at = datetime.now(UTC)
             rates = (
@@ -758,28 +763,14 @@ class GeminiGateway:
                 floor = Decimal("0.000001") if reserve_usd > 0 else Decimal(0)
                 return min(reserve_usd, max(floor, est))
 
-            try:
-                with model_work(work_kind or budget_lane + "." + model_lane):
-                    reservation = await self.store.reserve(
-                        subject,
-                        budget_lane,
-                        reserve_usd,
-                        **self._reserve_kwargs(model_lane, thinking_level, provider),
-                        **({"digest_review": digest_review} if digest_review is not None else {}),
-                    )
-            except Rejected as exc:
-                # Only a failure before dispatch permits a second model attempt.
-                if carbon_reserve_fallback and str(exc) in {
-                    "daily_budget",
-                    "monthly_budget",
-                    "user_budget",
-                    "lane_budget",
-                    "budget_exhausted",
-                    "budget_hard_stop",
-                    "total_budget",
-                }:
-                    raise CarbonReservationUnavailable() from None
-                raise
+            with model_work(work_kind or budget_lane + "." + model_lane):
+                reservation = await self.store.reserve(
+                    subject,
+                    budget_lane,
+                    reserve_usd,
+                    **self._reserve_kwargs(model_lane, thinking_level, provider),
+                    **({"digest_review": digest_review} if digest_review is not None else {}),
+                )
             try:
                 await run_guard(before_call)
             except BaseException:
@@ -860,7 +851,7 @@ class GeminiGateway:
                 if provider == "gemini_paid":
                     await self.store.runtime.provider_result(
                         "gemini_memory"
-                        if model_lane == "memory_flex"
+                        if model_lane in FLEX_MODELS
                         else "gemini_chat"
                         if model_lane != "decision"
                         else "gemini_decision",
@@ -868,7 +859,7 @@ class GeminiGateway:
                     )
                     if stream_retryable:
                         raise GenerationTimeout() from None
-                    if model_lane != "memory_flex" and budget_lane != "search":
+                    if model_lane not in FLEX_MODELS and budget_lane != "search":
                         self.blocked_until = time.monotonic() + 60
                 elif provider == "gemini_free":
                     if free_fallback_eligible:
@@ -918,7 +909,7 @@ class GeminiGateway:
                 if stream_progress is not None and status is not None and 400 <= status <= 599:
                     stream_progress.error_code = str(status)
                 non_billable = self._non_billable_http_error(exc, stream_started) or (
-                    model_lane == "memory_flex" and not stream_started and status == 503
+                    model_lane in FLEX_MODELS and not stream_started and status == 503
                 )
                 if non_billable:
                     await asyncio.shield(
@@ -950,13 +941,13 @@ class GeminiGateway:
                 if provider == "gemini_paid":
                     await self.store.runtime.provider_result(
                         "gemini_memory"
-                        if model_lane == "memory_flex"
+                        if model_lane in FLEX_MODELS
                         else "gemini_decision"
                         if model_lane == "decision"
                         else "gemini_chat",
                         True,
                     )
-                    if model_lane != "memory_flex" and budget_lane != "search":
+                    if model_lane not in FLEX_MODELS and budget_lane != "search":
                         self.blocked_until = time.monotonic() + 60
                 elif provider == "gemini_free":
                     if (
@@ -965,7 +956,7 @@ class GeminiGateway:
                         and (status == 429 or (status is not None and 500 <= status < 600))
                     ):
                         raise _FreeTierFallback() from None
-                if non_billable and model_lane == "memory_flex" and status == 503:
+                if non_billable and model_lane in FLEX_MODELS and status == 503:
                     raise rejected("gemini_unavailable", "flex_capacity_busy") from None
                 if non_billable and status == 429:
                     raise rejected("gemini_unavailable", "rate_limited") from None
@@ -974,7 +965,7 @@ class GeminiGateway:
             if provider == "gemini_paid":
                 await self.store.runtime.provider_result(
                     "gemini_memory"
-                    if model_lane == "memory_flex"
+                    if model_lane in FLEX_MODELS
                     else "gemini_decision"
                     if model_lane == "decision"
                     else "gemini_chat",
@@ -1064,11 +1055,15 @@ class GeminiGateway:
         result = None
         call_state = {"dispatched": False}
         try:
+            policy = preferences(self.s)
+            search_level = supported_level(
+                policy.primary_model, policy.scene_levels.get("web.search", "medium")
+            )
 
             async def send_search():
                 call_state["dispatched"] = True
                 return await self.chat_client.aio.interactions.create(
-                    model="gemini-4-hydrogen",
+                    model="gemini-4-" + policy.primary_model,
                     store=False,
                     stream=False,
                     background=False,
@@ -1077,7 +1072,7 @@ class GeminiGateway:
                     input=untrusted_input({"public_search_question": query}),
                     tools=[{"type": "google_search", "search_types": ["web_search"]}],
                     generation_config={
-                        "thinking_level": "medium",
+                        "thinking_level": search_level,
                         "max_output_tokens": 4096,
                         "tool_choice": "auto",
                         "thinking_summaries": "none",
@@ -1090,7 +1085,7 @@ class GeminiGateway:
             result = await self._call(
                 subject,
                 "search",
-                "hydrogen",
+                policy.primary_model,
                 {"system": SEARCH_INSTRUCTION, "query": query},
                 4096,
                 min(60, self.s.generation_timeout),
@@ -1103,7 +1098,7 @@ class GeminiGateway:
                 fallback_media_tokens=2048,
                 fallback_additional=Decimal(0),
                 call_state=call_state,
-                thinking_level="medium",
+                thinking_level=search_level,
             )
             parsed = parse_result(result)
             rendered = parsed.render(self.s)
@@ -1634,7 +1629,7 @@ class GeminiGateway:
         subject: str,
         *,
         summary: bool = False,
-        scenario: Scenario | None = None,
+        scenario: Scenario | str | None = None,
         deep: bool = False,
         budget_lane: str = "chat",
         images: list[ModelImage] | None = None,
@@ -1670,10 +1665,22 @@ class GeminiGateway:
             or video is not None
         ):
             raise Rejected("invalid_life_plan")
+        policy = preferences(self.s)
+        selected_model = policy.primary_model
+        flex_lane = "memory_flex" if selected_model == "hydrogen" else selected_model + "_flex"
         plan = (
-            GenerationPlan(morning_thinking or "medium", 4096 if morning_thinking else 2048)
+            GenerationPlan(
+                supported_level(
+                    selected_model,
+                    morning_thinking or policy.scene_levels.get("world.revision", "medium"),
+                ),
+                4096 if morning_thinking else 2048,
+                selected_model,
+            )
             if life_plan
-            else GenerationPlan("medium", 4096, "memory_flex")
+            else GenerationPlan(
+                supported_level(selected_model, policy.memory_compression), 4096, flex_lane
+            )
             if memory_archive
             else generation_plan(self.s, scenario, deep=deep, route=route)
         )
@@ -1820,16 +1827,6 @@ class GeminiGateway:
             audit_source,
             self.store.session_scope(message) if message else subject,
         )
-        carbon_acquired = False
-        if plan.model_lane == "carbon":
-            permitted = message is not None and (
-                message.kind == "private" or message.addressed or context.role == "OWNER"
-            )
-            if not self.s.carbon_enabled or not permitted or self.carbon_slots.locked():
-                plan = GenerationPlan("high", 8192)
-            else:
-                await self.carbon_slots.acquire()
-                carbon_acquired = True
         sandbox_mode = bool(getattr(route, "sandbox_mode", False)) or audit_source == "sandbox"
         stateful_chat = (
             chat
@@ -1874,7 +1871,7 @@ class GeminiGateway:
                 used_system_digest, \
                 used_provider
             rows = payload.get("recent_messages", [])
-            if active_plan.model_lane == "carbon":
+            if chat and active_plan.model_lane == "carbon":
                 rows = self.prefix_runtime.carbon_history(scope, payload)
             used_lane = active_plan.model_lane
             used_rows = rows
@@ -1883,7 +1880,6 @@ class GeminiGateway:
                 not developer_fallback
                 and not memory_archive
                 and video is None
-                and active_plan.model_lane == "hydrogen"
                 and self._should_use_vertex()
             )
             vertex_client = self.vertex_chat_client if use_vertex else None
@@ -1894,20 +1890,16 @@ class GeminiGateway:
                     raise Rejected("vertex_unavailable")
 
             if use_vertex:
-                model = self.routing.config.vertex_hydrogen_model or self.s.chat_model
+                model = "gemini-4-" + selected_model
                 active_system_digest = self.store.vault.digest(
                     "static-prefix", system, "vertex:" + model
                 )
                 provider_name = "vertex_paid"
                 proto = self.routing.config.vertex_protocol
-                base_model = model.rsplit("/", 1)[-1]
-                is_gemini4 = base_model.startswith("gemini-4")
-                try_interactions = proto == "interactions" or (proto == "auto" and is_gemini4)
-                allow_404_gc_fallback = proto == "auto" and is_gemini4
+                try_interactions = proto != "generate_content"
+                allow_404_gc_fallback = proto == "auto"
             else:
-                model = (
-                    self.s.carbon_model if active_plan.model_lane == "carbon" else self.s.chat_model
-                )
+                model = "gemini-4-" + selected_model
                 active_system_digest = self.store.vault.digest("static-prefix", system)
                 provider_name = "gemini_paid"
                 try_interactions = True
@@ -2053,7 +2045,7 @@ class GeminiGateway:
                 return self._normalize_generate_content([resp])
 
             async def operation():
-                if active_plan.model_lane == "carbon":
+                if chat and active_plan.model_lane == "carbon":
                     self.prefix_runtime.carbon_dispatched(scope, payload, rows)
                 call_state["dispatched"] = True
                 if progress is not None:
@@ -2170,7 +2162,7 @@ class GeminiGateway:
                 deadline_seconds,
                 controlled_operation,
                 attempts=attempts,
-                work_kind="world.plan" if life_plan else scenario.value,
+                work_kind="world.plan" if life_plan else str(scenario),
                 **({"digest_review": review} if review is not None else {}),
                 stream_retryable=chat,
                 image_tokens=len(images) * self.s.image_token_reserve
@@ -2183,7 +2175,6 @@ class GeminiGateway:
                     if scenario == Scenario.MEMORY_COMPRESSION and self.s.prefix_history_enabled
                     else None
                 ),
-                carbon_reserve_fallback=active_plan.model_lane == "carbon",
                 fallback_media_tokens=(
                     sum(1120 if i.resolution == "high" else 560 for i in images)
                     + (video.tokens if video else 0)
@@ -2298,14 +2289,6 @@ class GeminiGateway:
         try:
             try:
                 result = await dispatch(plan)
-            except CarbonReservationUnavailable:
-                if carbon_acquired:
-                    self.carbon_slots.release()
-                    carbon_acquired = False
-                allow_chain = False
-                mark_chain_invalid()
-                plan = GenerationPlan("high", 8192)
-                result = await dispatch(plan)
             except GenerationTimeout:
                 allow_chain = False
                 mark_chain_invalid()
@@ -2319,24 +2302,16 @@ class GeminiGateway:
                     raise asyncio.CancelledError
                 # One bounded lower-tier attempt, with a NEW reservation. Unknown first
                 # usage keeps its fallback charge. Never retry safety errors or arbitrary failures.
-                if carbon_acquired:
-                    self.carbon_slots.release()
-                    carbon_acquired = False
                 allow_chain = False
                 mark_chain_invalid()
-                level = (
-                    "high"
-                    if plan.model_lane == "carbon"
-                    else {
-                        "xhigh": "high",
-                        "high": "medium",
-                        "medium": "low",
-                        "low": "minimal",
-                    }.get(plan.thinking_level)
-                )
+                level = {
+                    "xhigh": "high",
+                    "high": "medium",
+                    "medium": "low",
+                }.get(plan.thinking_level)
                 if not level:
                     raise Rejected("generation_incomplete")
-                plan = GenerationPlan(level, min(plan.output_tokens, 4096))
+                plan = GenerationPlan(level, min(plan.output_tokens, 4096), selected_model)
                 try:
                     result = await dispatch(plan)
                 except GenerationTimeout:
@@ -2375,8 +2350,6 @@ class GeminiGateway:
         finally:
             if attempts and generation_trace is not None:
                 generation_trace["provider_diagnostics"] = list(attempts)
-            if carbon_acquired:
-                self.carbon_slots.release()
         abstained_chat = False
         try:
             if getattr(result, "status", None) != "completed":

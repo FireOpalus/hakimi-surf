@@ -10,6 +10,7 @@ import pytest
 
 from hakimi.adapters import Sender
 from hakimi.life_engine import LifeEngine
+from hakimi.rest_policy import RestHoursConfig
 from hakimi.service import Service
 from hakimi.store import Store
 from tests.fakes import FakeBili, FakeGateway
@@ -53,7 +54,7 @@ async def test_generated_digest_survives_crash_cutoff_and_two_real_restarts(sett
     wire.ready.clear()
     body = "持久化日报正文只属于收件人"
     async with process(settings, lambda: at[0], gateway, wire) as dm:
-        await dm.service.life_engine.set_config({"active_hours": "09:00-22:30"})
+        await dm.service.life_engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
         await dm.service.life_engine.schedule_due(at[0])
         intent = (await dm.service.world_state.list_due_intents(at[0]))[0]
         generation_started, finish = asyncio.Event(), asyncio.Event()
@@ -124,7 +125,7 @@ async def test_generated_digest_survives_crash_cutoff_and_two_real_restarts(sett
 
 async def test_uncertain_qq_submission_never_replays_or_reaches_private_memory(dm):
     engine = dm.service.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30"})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
     dm.time[0] = stamp("2026-11-14T22:15:00")
     await engine.tick_gatekeeper_once()
     started = asyncio.Event()
@@ -181,7 +182,7 @@ async def test_cancel_before_websocket_write_preserves_never_submitted_digest(dm
 @pytest.mark.parametrize("manual", [True, False])
 async def test_digest_expiry_and_quiet_apply_to_paid_manual_and_timer_messages(dm, manual):
     engine = dm.service.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30"})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
     dm.time[0] = stamp("2026-11-14T22:15:00")
     dm.service.sender.onebot.ready.clear()
     if manual:
@@ -205,7 +206,7 @@ async def test_digest_expiry_and_quiet_apply_to_paid_manual_and_timer_messages(d
 
 async def test_legacy_queue_only_world_completion_backfills_real_delivery(dm):
     engine = dm.service.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30"})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
     dm.time[0] = stamp("2026-11-14T22:15:00")
     dm.service.sender.onebot.ready.clear()
     await engine.tick_gatekeeper_once()

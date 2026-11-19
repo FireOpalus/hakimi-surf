@@ -4,6 +4,8 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from .thinking_policy import INTERACTION_LANES
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_calendar_legacy (
  period TEXT PRIMARY KEY, timezone TEXT NOT NULL, payload BLOB NOT NULL
@@ -32,12 +34,7 @@ METRICS = (
 
 def observations(row):
     known = row["input_tokens"] is not None and row["output_tokens"] is not None
-    interaction = known and row["model_lane"] in {
-        "interaction",
-        "hydrogen",
-        "carbon",
-        "memory_flex",
-    }
+    interaction = known and row["model_lane"] in INTERACTION_LANES
     cache_known = interaction and row["cached_tokens"] is not None
     return {
         "charged_amount": row["amount"],

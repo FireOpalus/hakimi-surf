@@ -648,12 +648,12 @@ async def test_vertex_interactions_auto_404_generate_content_and_usage_metadata(
         assert row["input_tokens"] == 100 and row["output_tokens"] == 20
         assert row["thought_tokens"] == 30 and row["estimated_amount"] == 411
 
-        # 3. Non-gemini-4 model under "auto" goes straight to generate_content.
+        # An explicit protocol can use GenerateContent with the selected global model.
         before_count = len(vertex_calls)
         await gate.routing.set_config(
             ProviderRoutingConfig(
                 vertex_enabled=True,
-                vertex_protocol="auto",
+                vertex_protocol="generate_content",
                 vertex_hydrogen_model="gemini-2.5-pro",
                 vertex_fallback_to_gemini=False,
             )
@@ -666,16 +666,22 @@ async def test_vertex_interactions_auto_404_generate_content_and_usage_metadata(
         )
         assert json.loads(diary_out)["bubbles"] == ["Vertex生成回答"]
         assert len(vertex_calls) == before_count + 1
-        assert vertex_calls[-1][0].endswith(":generateContent")
+        assert vertex_calls[-1][0].endswith("gemini-4-hydrogen:generateContent")
     finally:
         await _close_clients([dec_client, chat_client, *v_clients], g_transports + v_transports)
 
 
-async def test_vertex_fallback_to_gemini_and_usage_metadata_helpers(settings, store, message):
+@pytest.mark.parametrize("model", ["hydrogen", "neon", "carbon"])
+async def test_vertex_fallback_to_gemini_and_usage_metadata_helpers(
+    settings, store, message, model
+):
+    settings.primary_model = model
     gemini_calls = []
 
     def gemini_handler(request):
         gemini_calls.append(request.url.path)
+        if request.url.path.endswith("interactions"):
+            assert json.loads(request.content)["model"] == "gemini-4-" + model
         if request.url.path.endswith("decisions"):
             return httpx.Response(200, json=decision_response())
         resp = interaction_response()
@@ -683,6 +689,7 @@ async def test_vertex_fallback_to_gemini_and_usage_metadata_helpers(settings, st
         return httpx.Response(200, json=resp)
 
     def failing_vertex_handler(request):
+        assert "gemini-4-" + model in request.url.path
         return httpx.Response(503, json={"error": {"code": 503, "message": "vertex down"}})
 
     (dec_client, chat_client), g_transports = _client_pair(gemini_handler)

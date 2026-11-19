@@ -146,7 +146,7 @@
       </div>
       <figure class="sheet" style="margin-top:.85rem" aria-label="生活引擎：规划、门控、临场执行">
         <ol class="flow sea">
-          <li><span class="step">01 / LifeBlockPlanner</span><h3>起床排行程，白天按需调整</h3><p>每天起床时从动作目录选最多 6 项，按当天的可用时段安排。晨间思考可选 medium 或 high。白天默认每 2–4 小时复查，重要公开事件可提前触发。规划器读取行程与回执，可改期、取消未来待办，或新增最多 3 项。</p></li>
+          <li><span class="step">01 / LifeBlockPlanner</span><h3>起床排行程，白天按需调整</h3><p>每天起床时从动作目录选最多 6 项，清醒时可规划和执行，主动发消息还须避开免打扰。晨间思考在「模型与思考」选择 medium 或 high。白天默认每 2–4 小时复查，重要公开事件可提前触发。规划器读取行程与回执，可改期、取消未来待办，或新增最多 3 项。</p></li>
           <li><span class="step">02 / GatekeeperWorker</span><h3>到点再判断能否做</h3><p>每分钟检查待办的有效期、免打扰和专注状态。QQ 与 B 站巡逻核对预算。QQ 另查接收人、会话占用和冷却，进服类 MC 动作核对角色在线。</p></li>
           <li><span class="step">03 / JITExecutor</span><h3>按目标执行</h3><p>SQLite 原子领取票据，再调用登记好的处理器。<code>qq.speak</code> 临场生成并逐气泡确认，<code>bili.patrol</code> 运行既有巡逻，<code>mc.*</code> 走境内固定 RPC。</p></li>
         </ol>
@@ -203,7 +203,7 @@
           <p class="ref"><a href="src/hakimi/prefix_runtime.py">前缀与链缓存</a><a href="src/hakimi/bot_server.py">上下文装配与裁剪</a></p>
         </article>
         <article class="tile plum" id="provider-routing"><span class="step">MODEL / PRIVACY</span><h3>谁可以看到什么材料</h3>
-          <p>门卫是 <code>gemini-decision-1</code>。私聊默认高隐私，走付费门卫；低隐私会话可走已配置的免费门卫，回退按策略决定。<code>gemini-4-hydrogen</code> 主对话支持 Gemini Developer 或已配置的 Vertex；Carbon、记忆 Flex、视频 Files 有各自的准入与计量。</p>
+          <p>门卫是 <code>gemini-decision-1</code>。私聊默认高隐私，走付费门卫；低隐私会话可走已配置的免费门卫，回退按策略决定。生成统一选择 Hydrogen、Neon 或 Carbon。已安装插件声明各自的思考场景。开发者 API 与 Vertex 使用选定模型，记忆 Flex 和视频 Files 按实际模型计量。</p>
           <p id="interaction-chain">允许云端短续链的聊天，按会话、模型、前缀和历史版本复用已确认标识；清空、裁剪、失效后重建。生活引擎的临场发言使用当前上下文，不串接现有聊天链。</p>
           <p class="ref"><a href="src/hakimi/provider_routing.py">供应方策略</a><a href="src/hakimi/gemini.py">模型请求</a><a href="src/hakimi/persona.py">人设边界</a></p>
         </article>

@@ -339,9 +339,7 @@ class FilterManager:
             if thinking_level in {"none", "minimal", "low", "medium", "high", "xhigh"}
             else None
         )
-        valid_lane = (
-            model_lane if model_lane in {"hydrogen", "carbon", "memory_flex", "decision"} else None
-        )
+        valid_lane = model_lane if model_lane in LANES else None
         incident = None
         if provider_incident and provider_incident.get("provider") in {
             "vertex_paid",

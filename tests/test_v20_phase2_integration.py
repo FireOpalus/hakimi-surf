@@ -59,6 +59,8 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
     settings.group_policies = {"onebot:40000": "smart_reply"}
     settings.affection_enabled = True
     settings.roaming_enabled = False
+    settings.rest_hours_enabled = True
+    settings.rest_hours = "01:00-09:00"
     settings.enable_daily_longnick = True
     settings.longnick_cooldown_hours = 20
 
@@ -135,7 +137,6 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
                 "/admin/api/life",
                 json=LifeEngineConfig(
                     enabled=True,
-                    active_hours="09:00-01:00",
                     group_cooldown_seconds=1500,
                     group_min_recent_messages=2,
                 ).model_dump(mode="json"),

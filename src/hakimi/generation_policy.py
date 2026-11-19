@@ -5,7 +5,7 @@ from enum import StrEnum
 
 from .config import Settings
 from .security import Rejected
-from .thinking_policy import ThinkingConfig, ThinkingLevel
+from .thinking_policy import ThinkingLevel, preferences, supported_level
 
 
 class Scenario(StrEnum):
@@ -28,7 +28,7 @@ class GenerationPlan:
 
 
 def generation_plan(
-    settings: Settings, scenario: Scenario, *, deep: bool = False, route=None
+    settings: Settings, scenario: Scenario | str, *, deep: bool = False, route=None
 ) -> GenerationPlan:
     caps = {
         Scenario.FAST_CHAT: settings.chat_output_tokens,
@@ -41,22 +41,30 @@ def generation_plan(
         Scenario.BILI_SELECTION: 1536,
         Scenario.BILI_LEARNING: 4096,
     }
-    if scenario not in caps:
+    policy = preferences(settings)
+    scene = settings._thinking_scenes.get(str(scenario))
+    if scene is not None and scene.key not in {"world.morning", "world.revision", "web.search"}:
+        level = policy.level(scene)
+        cap = getattr(settings, scene.output_cap) if scene.output_cap else scene.output_tokens
+    elif not settings._thinking_scenes and scenario in caps:
+        # Standalone clients created without Service still support the original enum.
+        level, cap = getattr(policy, str(scenario)), caps[scenario]
+    else:
         raise Rejected("invalid_generation_scenario")
-    policy = settings._thinking_override or ThinkingConfig.from_settings(settings)
-    level, cap = getattr(policy, str(scenario)), caps[scenario]
+    model = policy.primary_model
+    level = supported_level(model, level)
     if scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}:
         # Security sandbox has precedence over both manual controls and /deep.
         if route is not None and getattr(route, "sandbox_mode", False):
-            return GenerationPlan("low", 1536)
+            return GenerationPlan("low", 1536, model)
         if level == "auto":
             tier = getattr(route, "tier", 2)
             if not deep:
                 return {
-                    1: GenerationPlan("low", 1536),
-                    2: GenerationPlan("medium", 4096),
-                    3: GenerationPlan("high", 8192),
-                    4: GenerationPlan("medium", 12288, "carbon"),
+                    1: GenerationPlan("low", 1536, model),
+                    2: GenerationPlan("medium", 4096, model),
+                    3: GenerationPlan("high", 8192, model),
+                    4: GenerationPlan("medium" if model == "carbon" else "high", 12288, model),
                 }[tier]
             level = "high"
     if deep:
@@ -70,4 +78,4 @@ def generation_plan(
         # Preserve the existing explicit /deep cap. Changing a level in /admin alone
         # never changes output/thought token caps or ledger reservation multipliers.
         cap = settings.high_output_tokens
-    return GenerationPlan(level, cap)
+    return GenerationPlan(level, cap, model)

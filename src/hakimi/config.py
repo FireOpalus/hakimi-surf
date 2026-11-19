@@ -14,7 +14,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from .compression_policy import CompressionConfig
 from .proactive_policy import hours_bounds
 from .rest_policy import RestHoursConfig
-from .thinking_policy import ChatThinkingLevel, ThinkingConfig, ThinkingLevel
+from .thinking_policy import (
+    ChatThinkingLevel,
+    PrimaryModel,
+    ThinkingConfig,
+    ThinkingLevel,
+    ThinkingScene,
+)
 from .video_policy import MAX_VIDEO_SECONDS, VideoDailyLimit
 
 
@@ -321,6 +327,11 @@ class Settings(BaseSettings):
     event_ttl_seconds: int = Field(default=240, ge=30, le=240)
 
     decision_model: Literal["gemini-decision-1"] = "gemini-decision-1"
+    primary_model: PrimaryModel = "hydrogen"
+    _thinking_scenes: dict[str, ThinkingScene] = PrivateAttr(default_factory=dict)
+    neon_input_usd_per_m: Decimal = Field(default=Decimal("3"), gt=0)
+    neon_cached_input_usd_per_m: Decimal = Field(default=Decimal("0.15"), ge=0)
+    neon_output_usd_per_m: Decimal = Field(default=Decimal("15"), gt=0)
     chat_model: Literal["gemini-4-hydrogen"] = "gemini-4-hydrogen"
     vertex_enabled: bool = Field(
         default=False,

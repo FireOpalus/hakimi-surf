@@ -10,7 +10,6 @@ import time
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from datetime import time as day_time
-from functools import lru_cache
 from typing import Any, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,6 +35,8 @@ from .modules.qq_policy import DESKTOP_CONTEXT_HINT as DESKTOP_CONTEXT_HINT
 from .planning_journal import PlannerJournal
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
+from .thinking_policy import preferences as model_preferences
+from .thinking_policy import supported_level
 from .work_usage import model_work
 from .world_experience import MAX_DAY_REST_MINUTES
 from .world_state import (
@@ -59,8 +60,8 @@ class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
     action_modes: dict[str, Mode] = Field(default_factory=dict)
     enabled: bool = True
     quiet_hours: str = "23:30-08:30"
-    active_hours: str = "09:00-01:00"
-    morning_thinking_level: Literal["medium", "high"] = "medium"
+    active_hours: str = Field(default="09:00-01:00", exclude=True)
+    morning_thinking_level: Literal["medium", "high"] = Field(default="medium", exclude=True)
     planner_min_minutes: int = Field(default=120, ge=30, le=720)
     planner_max_minutes: int = Field(default=240, ge=60, le=720)
     sleep_min_minutes: int = Field(default=360, ge=120, le=960)
@@ -104,9 +105,6 @@ class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
             },
         )
 
-    def is_active_time(self, local: datetime) -> bool:
-        return within_hours(local.hour * 60 + local.minute, hours_bounds(self.active_hours))
-
     def quiet(self, local: datetime) -> bool:
         return within_hours(local.hour * 60 + local.minute, hours_bounds(self.quiet_hours))
 
@@ -124,32 +122,6 @@ def _day_bounds(stamp: float, tz_name: str) -> tuple[float, float]:
     start = datetime.combine(local.date(), datetime.min.time(), zone)
     end = datetime.combine(local.date() + timedelta(days=1), datetime.min.time(), zone)
     return start.timestamp(), end.timestamp()
-
-
-@lru_cache(maxsize=64)
-def _digest_window(day: date, zone: ZoneInfo, active: str, quiet: str, rest: str | None):
-    """Last 15 consecutive available minutes of a local reporting day, including DST days."""
-    start = int(datetime.combine(day, day_time.min, zone).timestamp())
-    end = int(datetime.combine(day + timedelta(days=1), day_time.min, zone).timestamp())
-    active_span, quiet_span = hours_bounds(active), hours_bounds(quiet)
-    rest_span = hours_bounds(rest) if rest else None
-    closing = None
-    for stamp in range(end - 60, start - 1, -60):
-        local = datetime.fromtimestamp(stamp, zone)
-        minute = local.hour * 60 + local.minute
-        available = (
-            within_hours(minute, active_span)
-            and not within_hours(minute, quiet_span)
-            and not (rest_span and within_hours(minute, rest_span))
-        )
-        if available:
-            if closing is None:
-                closing = stamp + 60
-            if closing - stamp >= 900:
-                return stamp, closing
-        elif closing is not None:
-            return stamp + 60, closing
-    return (start, closing) if closing is not None else None
 
 
 class LifeBlockPlanner:
@@ -181,14 +153,13 @@ class LifeBlockPlanner:
     def _local(self, stamp: float) -> datetime:
         return datetime.fromtimestamp(stamp, _zone(self.s.bot_timezone))
 
-    def calendar(self, day):
+    def calendar(self, day, *, social=False):
         rest = self.store.runtime.rest_hours
         return agenda_day(
             day,
             _zone(self.s.bot_timezone),
-            self.config.active_hours,
-            self.config.quiet_hours,
             rest.rest_hours if rest.enabled else None,
+            self.config.quiet_hours if social else None,
         )
 
     async def sync_wake(self, now, state=None):
@@ -271,16 +242,7 @@ class LifeBlockPlanner:
         local_dt = self._local(ts)
         calendar = self.calendar(local_dt.date())
         checkpoint = await self.journal.prepared() if state["prepared"] else None
-        resume_morning = (
-            checkpoint
-            and checkpoint[0]["trigger"] == "morning"
-            and checkpoint[0]["day"] == day
-            and calendar.morning_due_at(ts) == ts
-        )
-        if self.store.runtime.is_resting(ts) or (
-            not (morning or resume_morning)
-            and (not cfg.is_active_time(local_dt) or cfg.quiet(local_dt) or ts < calendar.wake)
-        ):
+        if self.store.runtime.is_resting(ts):
             wake_at = self._schedule_sleep_wakeup(ts, cfg)
             self.last_plan_at = ts
             self.last_plan_source = "sleeping"
@@ -395,6 +357,11 @@ class LifeBlockPlanner:
                 else ts
                 + self.rng.uniform(cfg.planner_max_minutes * 120, cfg.planner_max_minutes * 180)
             )
+            policy = model_preferences(self.s)
+            thinking_level = supported_level(
+                policy.primary_model,
+                policy.scene_levels.get("world.morning" if morning else "world.revision", "medium"),
+            )
             run_id = await self.journal.start(
                 day,
                 ts,
@@ -404,7 +371,7 @@ class LifeBlockPlanner:
                 explore_at=explore_at,
                 events=[ev.id for ev in events],
                 prior_signal=state["signal_at"],
-                thinking_level=cfg.morning_thinking_level if morning else "medium",
+                thinking_level=thinking_level,
             )
             if run_id is None:
                 await self.sync_wake(ts)
@@ -451,7 +418,7 @@ class LifeBlockPlanner:
                             subject,
                             budget_lane=PROACTIVE_LANE,
                             life_plan=True,
-                            morning_thinking=cfg.morning_thinking_level if morning else None,
+                            morning_thinking=thinking_level if morning else None,
                         )
                     plan = WireLifePlan.model_validate_json(raw_plan)
                     if plan.agenda_changes:
@@ -546,7 +513,7 @@ class LifeBlockPlanner:
                 continue
 
             ttl_sec = max(600.0, min(float(item.ttl_minutes) * 60.0, 6.0 * 3600.0))
-            window = calendar.window(
+            window = self.calendar(calendar.day, social=spec.social).window(
                 at=item.at_local_time,
                 earliest=scheduled_at + 1,
                 relative=scheduled_at + max(1, item.delay_minutes) * 60,
@@ -603,8 +570,12 @@ class LifeBlockPlanner:
                     continue
                 window = None
                 if change.operation == "move":
+                    spec = self.engine.catalog.actions.get(item["action_name"])
+                    if spec is None:
+                        skip("unavailable_action")
+                        continue
                     window = (
-                        calendar.window(
+                        self.calendar(calendar.day, social=spec.social).window(
                             at=change.at_local_time,
                             earliest=applied_at + 1,
                             relative=0,
@@ -654,7 +625,10 @@ class LifeBlockPlanner:
         await self.sync_wake(applied_at)
 
         longnick_text = str(plan.mood_longnick or "").strip()
-        if longnick_text and any(start <= applied_at < end for start, end in calendar.windows):
+        if longnick_text and any(
+            start <= applied_at < end
+            for start, end in self.calendar(calendar.day, social=True).windows
+        ):
             longnick = getattr(self.service, "longnick", None)
             if longnick is not None:
                 if hasattr(longnick, "apply_life_block"):
@@ -701,6 +675,7 @@ class LifeBlockPlanner:
                     )
         return {
             "planning_mode": "morning" if morning else "revision",
+            "outbound_quiet_hours": self.config.quiet_hours,
             "activity_windows": [
                 [
                     self._local(a).strftime("%H:%M"),
@@ -887,17 +862,15 @@ class GatekeeperWorker:
             spec, _ = self.engine.resolve(ticket)
         except ValueError as exc:
             return await reject(reject_reason(exc))
-        if not spec.background_sensor and (
-            self.store.runtime.is_resting(now) or cfg.quiet(local_dt)
-        ):
+        if not spec.background_sensor and self.store.runtime.is_resting(now):
+            return await reject("sleeping")
+        if spec.social and cfg.quiet(local_dt):
             return await reject("quiet_hours")
         if not spec.background_sensor and spec.window != "closing":
             if nap_end := self.store.runtime.day_rest_end(now):
                 return await defer("day_rest", nap_end - now)
         if spec.window == "closing" and not self.engine.closing_due(now):
             return await reject("outside_digest_window")
-        if spec.window == "active" and not cfg.is_active_time(local_dt):
-            return await reject("outside_active_hours")
         if (
             not spec.background_sensor
             and not spec.interrupts_focus
@@ -1020,17 +993,11 @@ class JITExecutor:
                             and self.service.modules.get(ticket["source_module"])
                             and self.service.modules.inactive_reason(ticket["source_module"])
                         )
-                        and (
-                            spec.window == "any"
-                            or (
-                                self.engine.config.is_active_time(local)
-                                and (spec.window != "closing" or self.engine.closing_due(current))
-                            )
-                        )
+                        and (spec.window != "closing" or self.engine.closing_due(current))
                         and (
                             spec.background_sensor
                             or (
-                                not self.engine.config.quiet(local)
+                                not (spec.social and self.engine.config.quiet(local))
                                 and not self.store.runtime.is_resting(current)
                                 and (
                                     spec.window == "closing"
@@ -1446,15 +1413,8 @@ class LifeEngine:
             return now
         end = now + MAX_DAY_REST_MINUTES * 60
         point = now
-        zone = _zone(self.s.bot_timezone)
         while point < end:
-            local = datetime.fromtimestamp(point, zone)
-            if (
-                not self.config.is_active_time(local)
-                or self.config.quiet(local)
-                or runtime.is_resting(point)
-                or self.closing_due(point)
-            ):
+            if runtime.is_resting(point) or self.closing_due(point):
                 return point
             point = (int(point // 60) + 1) * 60
         return end
@@ -1482,6 +1442,36 @@ class LifeEngine:
                     )
                 await self.service.world_state.refresh()
 
+    async def set_rhythm(self, schedule, rest):
+        """Commit waking and outbound schedules together, preserving module preferences."""
+        await self.initialize()
+        runtime = self.store.runtime
+        async with self._config_lock, runtime.rest_hours_lock:
+            now = self.clock()
+            fields = self.env_config.model_dump(exclude={"module_settings", "action_modes"})
+            if schedule is not None and schedule.keys() - fields.keys():
+                raise ValueError("unknown_schedule_field")
+            cfg = LifeEngineConfig.model_validate(
+                {**self.config.model_dump(), **(fields if schedule is None else schedule)}
+            )
+            overridden = schedule is not None or cfg != self.env_config
+            await self.service.world_state.experience.advance(now)
+            async with self.store.transaction():
+                if overridden:
+                    await self.store.db.execute(
+                        "INSERT OR REPLACE INTO admin_config VALUES ('life_engine',?)",
+                        (self.store.vault.seal("admin:life_engine", cfg.model_dump()),),
+                    )
+                else:
+                    await self.store.db.execute("DELETE FROM admin_config WHERE key='life_engine'")
+                await runtime.persist_rest_hours(rest)
+            self.config = cfg
+            self.overridden = overridden
+            runtime.apply_rest_override(rest)
+            await self.trim_day_rest(now)
+            await self.planner.sync_wake(now)
+        self.wakeup.set()
+
     async def set_rest_policy(self, value):
         async with self._config_lock:
             now = self.clock()
@@ -1494,14 +1484,11 @@ class LifeEngine:
         return self.store.runtime.rest_hours_status(now)
 
     def closing_window(self, local_day: date) -> tuple[int, int] | None:
-        rest = self.store.runtime.rest_hours
-        return _digest_window(
-            local_day,
-            _zone(self.s.bot_timezone),
-            self.config.active_hours,
-            self.config.quiet_hours,
-            rest.rest_hours if rest.enabled else None,
-        )
+        windows = self.planner.calendar(local_day, social=True).windows
+        if windows:
+            start, end = windows[-1]
+            return int(max(start, end - 900)), int(end)
+        return None
 
     def closing_due(self, stamp: float) -> bool:
         window = self.closing_window(

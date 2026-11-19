@@ -13,21 +13,22 @@ from tests.test_proactive_dm import stamp
 
 
 @pytest.mark.parametrize(
-    "active,quiet,rest,expected",
+    "quiet,rest,expected",
     [
-        ("09:00-22:30", "23:30-08:30", None, ("22:15", "22:30")),
-        ("09:00-22:30", "20:00-08:30", None, ("19:45", "20:00")),
-        ("09:00-22:30", "23:30-08:30", "21:00-06:00", ("20:45", "21:00")),
-        ("08:30-08:35", "23:30-08:30", None, ("08:30", "08:35")),
-        ("22:00-02:00", "08:00-09:00", None, ("23:45", "00:00")),
-        ("22:00-08:00", "21:00-09:00", None, None),
+        ("23:30-08:30", None, ("23:15", "23:30")),
+        ("20:00-08:30", None, ("19:45", "20:00")),
+        ("23:30-08:30", "21:00-06:00", ("20:45", "21:00")),
+        ("23:30-08:30", "08:35-08:30", ("08:30", "08:35")),
+        ("08:00-09:00", "02:00-22:00", ("23:45", "00:00")),
+        ("21:00-09:00", "08:00-22:00", None),
     ],
 )
-async def test_report_window(dm, active, quiet, rest, expected):
+async def test_report_window(dm, quiet, rest, expected):
     engine = dm.service.life_engine
-    await engine.set_config({"active_hours": active, "quiet_hours": quiet})
-    if rest:
-        await dm.store.runtime.set_rest_hours(RestHoursConfig(enabled=True, rest_hours=rest))
+    await engine.set_config({"quiet_hours": quiet})
+    await engine.set_rest_policy(
+        RestHoursConfig(enabled=bool(rest), rest_hours=rest or "23:00-08:00")
+    )
     day = dm.local().date()
     window = engine.digest_window(day)
     if expected is None:
@@ -42,7 +43,8 @@ async def test_report_window(dm, active, quiet, rest, expected):
 async def test_concurrent_manual_and_daily_digest_share_generation_outbox_and_receipt(dm):
     svc = dm.service
     engine = svc.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30", "max_proactive_per_day": 0})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
+    await engine.set_config({"max_proactive_per_day": 0})
     dm.time[0] = stamp("2026-11-14T22:14:58")
     await engine.tick_gatekeeper_once()
     assert not await dm.store.all("SELECT id FROM proactive_schedule")
@@ -73,7 +75,8 @@ async def test_concurrent_manual_and_daily_digest_share_generation_outbox_and_re
 
 async def test_world_digest_requires_timer_owner_and_budget_and_works_offline(dm):
     engine = dm.service.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30", "max_proactive_per_day": 0})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
+    await engine.set_config({"max_proactive_per_day": 0})
     now = dm.time[0] = stamp("2026-11-14T22:20:00")
     await engine.schedule_due(now)
     ticket = (await dm.service.world_state.list_due_intents(now=now))[0]
@@ -175,7 +178,7 @@ async def test_world_bili_and_qq_actions_check_their_actual_budget_lanes(
 ):
     svc = dm.service
     engine = svc.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30"})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
     await dm.store.set_budget_config(
         BudgetConfig(patrol_daily_usd=patrol, proactive_daily_usd=proactive)
     )

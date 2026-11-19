@@ -7,6 +7,7 @@ import pytest
 
 from hakimi.modules.actions import GateDecision, Outcome
 from hakimi.modules.scheduling import ActivityQuota
+from hakimi.rest_policy import RestHoursConfig
 from tests.test_proactive_dm import dm as dm
 from tests.test_proactive_dm import stamp
 
@@ -42,7 +43,7 @@ async def state(dm, key):
 
 async def test_slow_patrol_and_planning_leave_digest_clock_free(dm, monkeypatch):
     engine = dm.service.life_engine
-    await engine.set_config({"active_hours": "09:00-22:30"})
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
     start = dm.time[0] = stamp("2026-11-14T22:14:00")
     started, planner_started, generating, release = (asyncio.Event() for _ in range(4))
     plan_calls, generation_times = [], []

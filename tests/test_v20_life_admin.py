@@ -96,6 +96,8 @@ LIFE_ROUTES = [
     ("DELETE", "/admin/api/life"),
     ("DELETE", "/admin/api/life/schedule"),
     ("PUT", "/admin/api/life/schedule"),
+    ("PUT", "/admin/api/life/rhythm"),
+    ("DELETE", "/admin/api/life/rhythm"),
     ("PUT", "/admin/api/life/world"),
     ("PUT", "/admin/api/life/actions/qq.speak"),
     ("POST", "/admin/api/life/plan"),
@@ -429,7 +431,8 @@ async def test_admin_page_life_tab_csp_sha256_and_zero_inline_attributes(admin_f
         'id="life"',
         "世界与主动引擎",
         'id="life-enabled"',
-        'id="life-active-hours"',
+        'id="world-rhythm"',
+        'id="wake-window"',
         "function moduleSchedulePanel(d)",
         'id="life-max-daily"',
         'id="life-world-module"',
@@ -546,7 +549,7 @@ async def test_life_config_crud_and_strict_validation(life_api):
     assert body["config"]["group_cooldown_seconds"] == 1800
     assert body["config"]["max_proactive_per_day"] == 3
     assert body["config"]["owner_dms_unlimited"] and body["config"]["bili_patrols_unlimited"]
-    assert body["config"]["active_hours"] == "09:00-01:00"
+    assert "active_hours" not in body["config"]
 
     reset = await client.delete("/admin/api/life")
     assert reset.status_code == 200

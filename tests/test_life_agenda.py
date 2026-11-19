@@ -9,6 +9,7 @@ import pytest
 from hakimi.life_engine import LifeEngine
 from hakimi.planning_journal import PlannerJournal
 from hakimi.rest_policy import RestHoursConfig
+from hakimi.thinking_policy import ModelSettingsUpdate, preferences
 from hakimi.world_observations import overview
 from tests.test_planning_journal import setup_model
 from tests.test_proactive_dm import dm as dm
@@ -34,7 +35,10 @@ async def waking_day(dm, *, level="medium"):
     engine = dm.service.life_engine
     dm.time[0] = at("07:29")
     await engine.set_rest_policy(RestHoursConfig(rest_hours="23:20-07:30"))
-    await engine.set_config({"active_hours": "09:00-22:30", "morning_thinking_level": level})
+    await dm.store.runtime.set_model_settings(
+        dm.service.modules,
+        ModelSettingsUpdate(primary_model="hydrogen", levels={"world.morning": level}),
+    )
     async with dm.store.transaction():
         await dm.store.db.execute(
             "UPDATE life_planner_clock SET next_at=?,explore_at=?", (at("13:00"), at("20:00"))
@@ -53,23 +57,23 @@ async def test_wake_anchors_to_sleep_end_not_quiet_end_and_covers_whole_day(dm):
     assert not fake.calls
     dm.time[0] += 60
     result = await engine.trigger_plan_once(automatic=True)
-    assert (result["planning_mode"], result["intents_enqueued"]) == ("morning", 4)
+    assert (result["planning_mode"], result["intents_enqueued"]) == ("morning", 5)
     _, payload, _, kwargs = fake.calls[0]
     assert kwargs["morning_thinking"] == "high" and kwargs["budget_lane"] == "proactive"
-    assert payload["activity_windows"] == [["09:00", "22:30"]]
+    assert payload["activity_windows"] == [["07:30", "23:20"]]
     assert payload["today_agenda"] == []
-    assert {"action": "qq.owner_digest", "time": "22:15"} in payload["reserved_activities"]
+    assert {"action": "qq.owner_digest", "time": "23:05"} in payload["reserved_activities"]
     data = await overview(dm.store, dm.clock(), "Asia/Shanghai")
     assert [row["execute_after"] for row in data["agenda"]] == [
-        at(t) for t in ("09:30", "13:00", "16:00", "21:00")
+        at(t) for t in ("09:30", "13:00", "16:00", "21:00", "22:30")
     ]
-    assert data["morning_plan"]["reasons"] == {"window_expired": 2}
+    assert data["morning_plan"]["reasons"] == {"window_expired": 1}
     assert data["morning_plan"]["thinking_level"] == "high"
     assert not dm.service.sender.onebot.calls
     for _ in range(2):
         reboot = LifeEngine(dm.service, clock=dm.clock)
         await reboot.initialize()
-        assert reboot.config.morning_thinking_level == "high"
+        assert preferences(reboot.s).scene_levels["world.morning"] == "high"
         assert (await reboot.trigger_plan_once(automatic=True))["status"] == "scheduled"
     assert len(fake.calls) == 1
     dm.time[0] = at("10:00", day=16)  # slept through the next wake, prior signature unchanged
@@ -188,17 +192,15 @@ async def test_morning_checkpoint_recovered_during_quiet_and_not_generated_twice
     ] == 1
 
 
-async def test_midnight_tail_is_not_next_morning_and_rest_policy_updates_the_clock(dm):
+async def test_disabling_sleep_makes_midnight_eligible_for_a_single_daily_plan(dm):
     engine = await waking_day(dm)
     dm.time[0] = at("00:05", day=16)
     await engine.set_rest_policy(RestHoursConfig(enabled=False))
     await engine.set_config({"active_hours": "08:45-02:00", "quiet_hours": "03:00-06:00"})
     fake = setup_model(dm, intents=[])
-    assert (await engine.trigger_plan_once())["status"] == "sleeping"
-    assert engine.planner.next_plan_at <= at("08:45", day=16)
-    dm.time[0] = at("08:45", day=16)
     result = await engine.trigger_plan_once(automatic=True)
     assert result["planning_mode"] == "morning" and len(fake.calls) == 1
+    assert (await engine.trigger_plan_once(automatic=True))["status"] == "scheduled"
 
 
 async def test_manual_and_timer_get_the_same_itinerary_while_model_is_busy(dm, monkeypatch):
@@ -226,13 +228,15 @@ async def test_manual_and_timer_get_the_same_itinerary_while_model_is_busy(dm, m
 
 async def test_admin_persists_only_supported_morning_levels(life_api):
     app, client, _ = life_api
-    url = "/admin/api/life/schedule"
-    assert (await client.put(url, json={"morning_thinking_level": "low"})).status_code == 400
-    changed = await client.put(url, json={"morning_thinking_level": "high"})
-    assert changed.json()["config"]["morning_thinking_level"] == "high"
-    engine = LifeEngine(app.state.service)
-    await engine.initialize()
-    assert engine.config.morning_thinking_level == "high"
+    url = "/admin/api/models"
+    for level, code in [("low", 400), ("high", 200)]:
+        response = await client.put(
+            url, json={"primary_model": "hydrogen", "levels": {"world.morning": level}}
+        )
+        assert response.status_code == code
+    svc = app.state.service
+    await svc.store.runtime.load_config()
+    assert preferences(svc.s).scene_levels["world.morning"] == "high"
 
 
 async def test_upgrade_and_backup_keep_old_queue_identity_without_adopting_rule_work(dm, tmp_path):
