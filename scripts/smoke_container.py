@@ -340,6 +340,8 @@ def main():
                     "OWNER_QQ_ID=20000",
                     "PROACTIVE_DM_ENABLED=false",
                     "REST_HOURS_ENABLED=false",
+                    # Isolate QQ command costs from the world's independent daytime nap planning.
+                    "DAY_REST_ENABLED=false",
                     'BOT_QQ_IDS=["60000"]',
                     "BOT_REPLY_THRESHOLD=1.00",
                     'HAKIMI_ONEBOT_ALLOWED_USERS=["60000"]',
