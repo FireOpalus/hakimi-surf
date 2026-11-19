@@ -1338,6 +1338,8 @@ class Service:
             await self.store.runtime.filters.update_audit(audit_id, "cancelled", "unauthorized")
             return
         sandbox = getattr(intent, "sandbox_mode", False)
+        if not sandbox and owner(message, self.s) and hasattr(self, "world_state"):
+            await self.world_state.experience.touch_owner(self.world_state.clock())
         if self.diary and not sandbox:
             await self.diary.group(job["id"], message, members=members)
         if not sandbox:
@@ -1663,7 +1665,7 @@ class Service:
                 news = await self.world_state.experience.news(message, time.time(), limit=2)
                 if news:
                     payload["unshared_world_news"] = news
-                ws_summary = await self.world_state.chat_sensor_payload()
+                ws_summary = await self.world_state.chat_sensor_payload(message)
                 if ws_summary:
                     payload["world_state_summary"] = ws_summary
         context_members = list(members)

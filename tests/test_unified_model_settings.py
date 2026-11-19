@@ -127,8 +127,9 @@ async def test_migration_and_atomic_rhythm_validation(admin_api):
         "day_rest_enabled": True,
         "allow_owner_private": True,
     }
-    ok = await client.put(url, json={"schedule": {"quiet_hours": "23:30-08:30"}, "rest": rest})
+    ok = await client.put(url, json={"schedule": {"max_proactive_per_day": 8}, "rest": rest})
     assert ok.is_success and ok.json()["rest"]["config"] == rest
+    assert svc.life_engine.config.quiet_hours == "23:20-07:30"
     failed = await client.put(
         url,
         json={

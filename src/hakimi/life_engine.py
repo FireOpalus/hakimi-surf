@@ -334,10 +334,16 @@ class LifeBlockPlanner:
                 cfg.planner_min_minutes * 60, cfg.planner_max_minutes * 60
             )
             planner_funded = paid_lane_available(budget, PROACTIVE_LANE)
+            restless_bored = current.boredom >= 65
+            owner_longing_wake = preferences.get("owner_longing", 0) >= 65 and bool(
+                planning_context.get("owner_dm_available")
+            )
             quiet = bool(
                 automatic
                 and not morning
                 and not public_events
+                and not restless_bored
+                and not owner_longing_wake
                 and state["signature"] == signature
                 and ts < state["explore_at"]
                 and planner_funded
@@ -1455,6 +1461,8 @@ class LifeEngine:
             fields = self.env_config.model_dump(exclude={"module_settings", "action_modes"})
             if schedule is not None and schedule.keys() - fields.keys():
                 raise ValueError("unknown_schedule_field")
+            if schedule is not None and "quiet_hours" not in schedule and rest is not None:
+                schedule = {**schedule, "quiet_hours": rest.rest_hours}
             cfg = LifeEngineConfig.model_validate(
                 {**self.config.model_dump(), **(fields if schedule is None else schedule)}
             )

@@ -2065,8 +2065,8 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div class="row"><label><input id="life-enabled" type="checkbox"> 启用世界引擎</label><label><input id="rest-enabled" type="checkbox"> 定时睡眠</label><label><input id="rest-day-enabled" type="checkbox"> 自主小憩</label><label><input id="rest-owner-private" type="checkbox"> 休息时响应 Owner 私聊</label></div>
       <div class="grid"><label>入睡时间<input id="rest-start" type="time" required></label><label>起床时间<input id="rest-end" type="time" required></label></div>
       <p id="wake-window" class="rhythm-preview" aria-live="polite"></p>
-      <div class="grid"><label for="life-quiet-hours">主动消息免打扰时段<input id="life-quiet-hours" type="text" maxlength="11" placeholder="23:30-08:30" required></label><label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label></div>
-      <p class="muted">白天由哈基米参考精力和无聊度，自行选择活动或小憩。睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。免打扰时暂停主动发消息。</p>
+      <div class="grid"><label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label></div>
+      <p class="muted">白天由哈基米结合精力、无聊度与挂念值自行安排活动或小憩。入睡–起床时段统一作为睡眠与主动消息免打扰时间；清醒每小时消耗 3 点精力并累积 12 点无聊度，睡眠每 4 分钟恢复 1 点，小憩每 6 分钟恢复 1 点。</p>
       <details>
         <summary>规划与休眠间隔</summary>
         <div class="grid">
@@ -2746,7 +2746,8 @@ function previewWakeWindow(){
   const sleeping=$('rest-enabled').checked;
   $('rest-start').disabled=$('rest-end').disabled=!sleeping;
   const window=sleeping?$('rest-end').value+'–'+$('rest-start').value:'全天';
-  text('wake-window','清醒活动时段 · '+window+($('rest-day-enabled').checked?'，小憩时暂停':''));
+  const quietNote=sleeping?' · 睡眠时段同步免打扰':'';
+  text('wake-window','清醒活动时段 · '+window+($('rest-day-enabled').checked?'，小憩时暂停':'')+quietNote);
 }
 for(const id of ['rest-enabled','rest-day-enabled','rest-start','rest-end'])$(id).addEventListener('input',previewWakeWindow);
 $('refresh-rest-hours').addEventListener('click',e=>busy(e.target,life));
@@ -3257,7 +3258,8 @@ function renderLife(d){
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
   renderWorldObservation(d.observation,eng,tz);
   const exp=ws.experience||{},plan=exp.plan,actual=exp.actual||{};
-  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',chatting:'正在聊天',chat_delivered:'聊天回复已送达',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
+  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',chatting:'正在聊天',chat_delivered:'聊天回复已送达',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',sleepy:'困倦',playful:'活泼',cozy:'惬意',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
+  const circadianLabels={just_woke_up:'刚醒迷糊',bedtime_drowsy:'睡前犯困',late_night_catch:'深夜值守'};
   const name=k=>labels[k]||k||'—';
   const battery=exp.social_battery;
   const restingPlan=plan&&['model_chose_rest','model_chose_idle','sleeping','local_rest','local_idle','unchanged_state','no_available_actions'].includes(plan.outcome);
@@ -3273,6 +3275,8 @@ function renderLife(d){
     ['实际活动',name(actual.state)+(actual.day_rest_until?' · '+(actual.day_rest_source==='low_energy'?'精力偏低':'自主选择')+' · '+lifeFmt(actual.day_rest_until,tz)+' 醒来':'')+(actual.mc_task?' · '+name(actual.mc_task):'')],
     ['最近确认完成',actual.last?name(actual.last.reason)+' · '+lifeFmt(actual.last.at,tz):'等待活动回执'],
     ['心情 / 精力 / 无聊',name(ws.mood)+' · '+(ws.energy??80)+' / '+(ws.boredom??20)],
+    ['挂念值 / 节律',(exp.owner_longing??0)+' / 100 · '+(circadianLabels[exp.circadian_tag]||'日常清醒')],
+    ['当前上头余韵',exp.interest_lingering||'暂无特定上头话题'],
     ['共享社交电量',battery?battery.charge+' / 100':'—'],
     ['待分享见闻',(exp.news_count??0)+' 条'],
     ['Attention Lock',ws.proactive_suspended?'HIGH 锁定中':'正常开放'],
@@ -3318,7 +3322,6 @@ function renderLife(d){
   $('life-world-energy').value=ws.energy??80;
   $('life-world-boredom').value=ws.boredom??20;
   $('life-enabled').checked=Boolean(c.enabled);
-  $('life-quiet-hours').value=c.quiet_hours||'23:30-08:30';
   $('life-max-daily').value=c.max_proactive_per_day??6;
   $('life-planner-min').value=c.planner_min_minutes??120;
   $('life-planner-max').value=c.planner_max_minutes??240;
@@ -3385,23 +3388,24 @@ $('life-config-form').addEventListener('submit',e=>{
     const sMin=intVal('life-sleep-min',120,960,'夜间休眠最小间隔');
     const sMax=intVal('life-sleep-max',180,960,'夜间休眠最大间隔');
     if(sMin>sMax)throw Error('夜间休眠最小间隔不能大于最大间隔');
+    if($('rest-start').value===$('rest-end').value)throw Error('起床与入睡时间须不同');
+    const restHours=$('rest-start').value+'-'+$('rest-end').value;
     const payload={
       enabled:$('life-enabled').checked,
-      quiet_hours:$('life-quiet-hours').value.trim(),
+      quiet_hours:restHours,
       planner_min_minutes:pMin,
       planner_max_minutes:pMax,
       sleep_min_minutes:sMin,
       sleep_max_minutes:sMax,
       max_proactive_per_day:intVal('life-max-daily',0,30,'自主活动共用每日上限'),
     };
-    const rest={enabled:$('rest-enabled').checked,day_rest_enabled:$('rest-day-enabled').checked,allow_owner_private:$('rest-owner-private').checked,rest_hours:$('rest-start').value+'-'+$('rest-end').value};
-    if($('rest-start').value===$('rest-end').value)throw Error('起床与入睡时间须不同');
+    const rest={enabled:$('rest-enabled').checked,day_rest_enabled:$('rest-day-enabled').checked,allow_owner_private:$('rest-owner-private').checked,rest_hours:restHours};
     const next=await api('life/rhythm','PUT',{schedule:payload,rest});
     renderRestHours(next.rest);renderLife(next.world);notice('作息与调度已保存');
   });
 });
 $('life-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
-  if(!confirm('恢复默认作息、主动免打扰和规划间隔？'))return;
+  if(!confirm('恢复默认作息与规划间隔？'))return;
   const next=await api('life/rhythm','DELETE');
   renderRestHours(next.rest);renderLife(next.world);notice('已恢复默认作息与调度');
 }));

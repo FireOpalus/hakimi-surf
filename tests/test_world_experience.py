@@ -39,7 +39,7 @@ async def test_migration_elapsed_rest_and_restart(settings, store):
     restarted = WorldStateManager(settings, store, clock=lambda: end)
     await restarted.initialize()
     await asyncio.gather(*(restarted.experience.advance(end) for _ in range(4)))
-    assert (restarted.current.energy, restarted.current.boredom) == (82, 46)
+    assert (restarted.current.energy, restarted.current.boredom) == (80.5, 46)
     assert restarted.current.mood == "sleeping"
     rows = await store.all("SELECT reason,energy_after-energy_before AS d FROM world_changes")
     assert sum(r["d"] for r in rows if r["reason"] == "sleep") == 30
@@ -126,7 +126,7 @@ async def test_private_news_stays_scoped_with_one_shared_social_charge(settings,
     async with store.transaction():
         await x.confirmed_tx(grp, "same", now, [secret, public])
         await x.confirmed_tx(grp, "same", now, [public])
-    assert await x.battery(grp, now) == await x.battery(message, now) == 99.75
+    assert await x.battery(grp, now) == await x.battery(message, now) == 98.75
     assert await x.battery(grp, now + 3600) == 100
     assert not await x.news(grp, now)
     assert [r["ref"] for r in await x.news(friend, now)] == [secret]
@@ -140,8 +140,8 @@ async def test_private_news_stays_scoped_with_one_shared_social_charge(settings,
     async with store.transaction():
         await x.confirmed_tx(friend, "reference", now, [secret])
     assert not await x.news(friend, now)
-    assert await x.battery(friend, now) == await x.battery(grp, now) == 99.25
-    assert (await world.refresh()).energy == 75.7
+    assert await x.battery(friend, now) == await x.battery(grp, now) == 96.25
+    assert (await world.refresh()).energy == 74.8
 
 
 async def test_shared_recharge_excludes_overlapping_chats_then_uses_actual_rest(
@@ -164,16 +164,16 @@ async def test_shared_recharge_excludes_overlapping_chats_then_uses_actual_rest(
         now += 300
         async with store.transaction():
             await x.confirmed_tx(message, "overlap", now, ["第一句", "第二句"])
-    assert await x.battery(group(message), now) == 49.75
+    assert await x.battery(group(message), now) == 50
     now = stamp(16, 22)  # Five idle minutes and two sleeping minutes.
-    assert await x.battery(message, now) == 51.75
+    assert await x.battery(message, now) == 51.5
     async with store.transaction():
         assert await x.start_day_rest_tx(now, now + 120)
     now += 120
     reopened = WorldStateManager(settings, store, clock=lambda: now)
     await reopened.initialize()
-    assert await reopened.experience.battery(message, now) == 52.75
-    assert reopened.current.energy == 80.7  # -0.1 chat, +0.5 sleep, +0.3 nap, remainder carried.
+    assert await reopened.experience.battery(message, now) == 52.5
+    assert reopened.current.energy == 79.4  # -0.4 chat, -0.5 idle, +0.5 sleep, +0.3 nap.
     now += 24 * 3600
     assert await reopened.experience.battery(message, now) == 100
 
@@ -192,14 +192,14 @@ async def test_legacy_latest_battery_and_signed_energy_migrate_once(settings, st
     for _ in range(2):
         world = WorldStateManager(settings, store, clock=lambda: now)
         await world.initialize()
-        assert await world.experience.battery(message, now) == 66
+        assert await world.experience.battery(message, now) == 65.75
         assert world.current.energy == 79.6
         assert (await store.one("SELECT energy_fraction FROM world_rhythm"))[0] == pytest.approx(
             -0.02
         )
     async with store.transaction():
         await store.db.execute("UPDATE world_social_battery SET charge=0.1")
-        await world.experience.confirmed_tx(message, "floor", now, ["收到"])
+        await world.experience.confirmed_tx(group(message), "floor", now, ["收到"])
     assert await world.experience.battery(message, now) == 0
 
 
@@ -217,8 +217,8 @@ async def test_interrupted_turn_recharges_offline_and_old_ack_stays_charged(
     await reopened.initialize()
     async with store.transaction():
         await reopened.experience.confirmed_tx(message, "delivered", now - 600, ["收到"])
-    assert await reopened.experience.battery(message, now) == 51.75
-    assert reopened.current.energy == 79.9
+    assert await reopened.experience.battery(message, now) == 51.0
+    assert reopened.current.energy == 79.1
 
 
 async def test_low_energy_indicator_is_available_in_status(settings, store):
@@ -303,3 +303,60 @@ async def test_low_social_charge_only_gates_ambient_group_speech(settings, store
         mention = group(message, event_id="g2", text="哈基米，晚饭吃什么", addressed=True)
         assert await svc.accept(mention) == "accepted"
         assert svc.ai.calls == []
+
+
+async def test_living_states_longing_interest_circadian_and_owner_zero_social_cost(
+    settings, store, message
+):
+    now = stamp(7, 40)
+    await store.runtime.set_rest_hours(RestHoursConfig(enabled=True, rest_hours="23:20-07:30"))
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    x = world.experience
+
+    # 1. Migrated/initialized at 07:40 -> just_woke_up (< 25 min after 07:30), longing = 0
+    prefs0 = await x.preferences(now)
+    assert prefs0["circadian_tag"] == "just_woke_up"
+    assert prefs0["owner_longing"] == 0
+    assert prefs0["interest_lingering"] == ""
+
+    # 2. Private DM with real Owner keeps social_battery at 100.0 (OWNER_CHAT_SOCIAL_COST=0.0)
+    async with store.transaction():
+        await x.confirmed_tx(message, "owner-dm-1", now, ["早安"])
+    assert await x.battery(message, now) == 100.0
+
+    # 3. Public event populates interest_lingering for 2.5h; private_first never leaks
+    await world.publish_event(
+        "bilibili_surf",
+        "bili_video_watched",
+        {
+            "bvid": "BV1xx411c7mD",
+            "private_first": True,
+            "audience": private_event_audience(settings, "30000"),
+            "title": "私密推荐内容",
+        },
+        business_key="priv-skip",
+    )
+    assert (await x.preferences(now))["interest_lingering"] == ""
+
+    await world.publish_event(
+        "bilibili_surf",
+        "bili_video_watched",
+        {"bvid": "BV1Q541167Qg", "title": "手搓异步引擎实录"},
+        business_key="pub-ok",
+    )
+    assert "手搓异步引擎实录" in (await x.preferences(now))["interest_lingering"]
+    assert (await x.preferences(now + 9001))["interest_lingering"] == ""
+
+    # 4. Elapsed 10 hours without Owner raises owner_longing; touching Owner resets it to 0
+    later = now + 10 * 3600
+    prefs_later = await x.preferences(later)
+    assert prefs_later["owner_longing"] == 48
+    await x.touch_owner(later)
+    assert (await x.preferences(later))["owner_longing"] == 0
+
+    # 5. Circadian tags at bedtime / sleep window
+    assert x.circadian_tag(stamp(23, 0), energy=80.0) == "bedtime_drowsy"
+    assert x.circadian_tag(stamp(23, 30), energy=80.0) == "late_night_catch"
+    assert x.circadian_tag(stamp(15, 0), energy=30.0) == "bedtime_drowsy"
+    assert x.circadian_tag(stamp(15, 0), energy=80.0) == ""

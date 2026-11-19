@@ -484,6 +484,48 @@ async def test_chat_sensor_payload_idle_and_bounded(settings, store):
         <= 100
     )
 
+    # Privacy boundary: Owner longing & late_night_catch only surface in Owner private DM
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from hakimi.models import Message
+    from hakimi.rest_policy import RestHoursConfig
+
+    ws.set_sensor_override("minecraft", "")
+    settings.owner_qq_id = "20000"
+    night = datetime(2026, 11, 19, 23, 35, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+    ws.clock = lambda: night
+    await store.runtime.set_rest_hours(RestHoursConfig(enabled=True, rest_hours="23:20-07:30"))
+    async with store.transaction():
+        await store.db.execute(
+            "UPDATE world_rhythm SET last_owner_at=?, "
+            "interest_topic=?, interest_until=? WHERE id=1",
+            (night - 12 * 3600, "机械红石自动机", night + 3600),
+        )
+    owner_dm = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="s-owner",
+        user_id="20000",
+        kind="private",
+        conversation_id="20000",
+        text="还没睡？",
+        addressed=True,
+        created_at=night,
+    )
+    owner_grp = owner_dm.model_copy(
+        update={"event_id": "s-grp", "kind": "group", "conversation_id": "40000"}
+    )
+    owner_payload = await ws.chat_sensor_payload(owner_dm)
+    grp_payload = await ws.chat_sensor_payload(owner_grp)
+    assert owner_payload is not None and grp_payload is not None
+    assert "挂念" in owner_payload["state_hints"]
+    assert "早点睡" in owner_payload["state_hints"]
+    assert "机械红石自动机" in owner_payload["state_hints"]
+    assert "挂念" not in grp_payload["state_hints"]
+    assert "早点睡" not in grp_payload["state_hints"]
+    assert "机械红石自动机" in grp_payload["state_hints"]
+
 
 def test_bot_server_world_state_summary_injection(settings, message, monkeypatch):
     monkeypatch.setattr("hakimi.bot_server.datetime", _FixedDateTime)

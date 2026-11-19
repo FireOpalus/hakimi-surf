@@ -50,7 +50,7 @@ async def test_chosen_nap_recovers_fractional_energy_and_survives_restart(dm, me
     assert restarted.current.energy == 28 and dm.store.runtime.day_rest_end(dm.clock()) == end
     dm.time[0] = end + 600
     await restarted.experience.advance(dm.clock())
-    assert restarted.current.energy == 42
+    assert restarted.current.energy == 41.5
     assert dm.store.runtime.rest_kind(dm.clock()) == "awake"
 
 
@@ -73,7 +73,7 @@ async def test_planner_can_choose_daytime_rest_and_does_not_turn_idle_into_sleep
     await engine.set_rest_policy(RestHoursConfig(day_rest_enabled=True))
     dm.time[0] += 600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 82 and not dm.store.runtime.day_rest_end(dm.clock())
+    assert world.current.energy == 81.5 and not dm.store.runtime.day_rest_end(dm.clock())
 
 
 async def test_planner_can_choose_rest_with_all_platforms_disabled(dm):
@@ -115,19 +115,19 @@ async def test_sleep_vs_quiet_time_and_confirmed_energy_charges(dm, message):
     await world.update_state(energy=50)
     dm.time[0] += 600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 50
+    assert world.current.energy == 49.5
     await engine.set_rest_policy(RestHoursConfig(rest_hours="12:10-13:00"))
     dm.time[0] += 239
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 50.9
+    assert world.current.energy == 50.4
     dm.time[0] += 1
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 51
+    assert world.current.energy == 50.5
     async with dm.store.transaction():
         for _ in range(2):
             await world.experience.confirmed_tx(message, "one-turn", dm.clock(), [])
     await world.refresh()
-    assert world.current.energy == 50.9
+    assert world.current.energy == 50.1
     await world.update_state(energy=99)
     dm.time[0] = now + 3500
     await world.experience.advance(dm.clock())
@@ -151,7 +151,7 @@ async def test_work_ends_nap_and_only_confirmed_mc_time_consumes_energy(dm):
     await world.experience.mc_snapshot("", dm.clock())
     dm.time[0] += 3600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 29
+    assert world.current.energy == 26
 
 
 async def test_legacy_forced_nap_ends_on_upgrade_after_settling_elapsed_time(dm):

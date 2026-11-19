@@ -43,7 +43,7 @@ async def persist_ack(service, reply, position, text, receipt, epoch, digest=Non
             ),
         )
         if world and world.experience.ready:
-            await world.experience.spend_chat_tx(reply["id"], now)
+            await world.experience.spend_chat_tx(reply["id"], now, message=reply["message"])
     return data
 
 

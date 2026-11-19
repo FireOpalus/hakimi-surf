@@ -126,8 +126,8 @@ async def test_official_qq_only_confirmed_replies_spend_shared_charge(settings, 
                 assert (await store.one("SELECT status FROM outbox WHERE id=?", (key,)))[
                     0
                 ] == status
-            assert await svc.world_state.experience.battery(message, target.created_at) == 99.75
-            assert svc.world_state.current.energy == 79.9
+            assert await svc.world_state.experience.battery(message, target.created_at) == 98.75
+            assert svc.world_state.current.energy == 79.6
         finally:
             await svc.stop()
 

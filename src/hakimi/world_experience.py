@@ -7,16 +7,21 @@ from datetime import datetime, time, timedelta
 from math import trunc
 from zoneinfo import ZoneInfo
 
+from .modules.base import sanitize_sensor_text
 from .proactive_policy import hours_bounds
 
 MC_TASKS = frozenset({"goto", "explore", "mine", "gather", "follow"})
 NEWS_TTL = 48 * 3600
+INTEREST_TTL = 9000
 SOCIAL_LOW = 30
-CHAT_SOCIAL_COST = 0.25
-CHAT_ENERGY_COST = 0.1
-AWAKE_SECONDS_PER_POINT = 300
+CHAT_SOCIAL_COST = 1.25
+OWNER_CHAT_SOCIAL_COST = 0.0
+CHAT_ENERGY_COST = 0.4
+CHAT_BOREDOM_DELTA = -4
+OWNER_CHAT_BOREDOM_DELTA = -6
+AWAKE_SECONDS_PER_POINT = 600
 REST_SECONDS_PER_POINT = 120
-HOURLY_RATES = {"sleep": (15, -2), "day_rest": (10, -2), "idle": (0, 4), "mc_work": (-8, -4)}
+HOURLY_RATES = {"sleep": (15, -4), "day_rest": (10, -4), "idle": (-3, 12), "mc_work": (-8, -6)}
 MAX_DAY_REST_MINUTES = 90
 
 SCHEMA = """
@@ -24,7 +29,8 @@ CREATE TABLE IF NOT EXISTS world_rhythm (
  id INTEGER PRIMARY KEY CHECK(id=1), settled REAL NOT NULL, energy_fraction REAL DEFAULT 0,
  boredom_fraction REAL DEFAULT 0, tired INTEGER DEFAULT 0, mc_task TEXT DEFAULT '',
  mc_until REAL DEFAULT 0, mc_seen REAL DEFAULT 0, mood_until REAL DEFAULT 0,
- bili_until REAL DEFAULT 0
+ bili_until REAL DEFAULT 0, last_owner_at REAL DEFAULT 0,
+ interest_topic TEXT DEFAULT '', interest_until REAL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS world_day_rest (
  id INTEGER PRIMARY KEY CHECK(id=1), started REAL NOT NULL, ends REAL NOT NULL, source TEXT NOT NULL
@@ -83,6 +89,22 @@ class WorldExperience:
         self.zone = ZoneInfo(self.s.bot_timezone)
 
     async def initialize_tx(self, now):
+        cols = {row[1] for row in await self.store.all("PRAGMA table_info(world_rhythm)")}
+        added_owner = False
+        if cols:
+            if "last_owner_at" not in cols:
+                await self.store.db.execute(
+                    "ALTER TABLE world_rhythm ADD COLUMN last_owner_at REAL DEFAULT 0"
+                )
+                added_owner = True
+            if "interest_topic" not in cols:
+                await self.store.db.execute(
+                    "ALTER TABLE world_rhythm ADD COLUMN interest_topic TEXT DEFAULT ''"
+                )
+            if "interest_until" not in cols:
+                await self.store.db.execute(
+                    "ALTER TABLE world_rhythm ADD COLUMN interest_until REAL DEFAULT 0"
+                )
         first = await self.store.db.execute(
             "INSERT OR IGNORE INTO world_rhythm(id,settled,tired) "
             "SELECT 1,?,energy<30 FROM world_state WHERE singleton=1",
@@ -115,6 +137,13 @@ class WorldExperience:
                 "UPDATE world_rhythm SET energy_fraction=?,"
                 "tired=(? < 30 OR (tired AND ? < 45)) WHERE id=1",
                 (remainder, visible, visible),
+            )
+        if first.rowcount or added_owner:
+            await self.store.db.execute(
+                "UPDATE world_rhythm SET last_owner_at=COALESCE("
+                "(SELECT last_reply_at FROM world_social_battery WHERE id=1), ?) "
+                "WHERE id=1 AND (last_owner_at IS NULL OR last_owner_at<=0)",
+                (now,),
             )
         if first.rowcount:
             await self.store.db.execute(
@@ -380,10 +409,18 @@ class WorldExperience:
             ("curious" if video else "pleased",),
         )
         await self.store.db.execute(
-            "UPDATE world_rhythm SET mood_until=? WHERE id=1", (now + 1800,)
+            "UPDATE world_rhythm SET mood_until=? WHERE id=1", (now + 3600,)
         )
         private = bool(data.get("private_first"))
         audience = data.get("audience", "") if private else ""
+        if not private:
+            raw_topic = str(data.get("title") or data.get("summary") or data.get("block") or "")
+            topic = sanitize_sensor_text(raw_topic, self.s, max_tokens=20)
+            if topic:
+                await self.store.db.execute(
+                    "UPDATE world_rhythm SET interest_topic=?,interest_until=? WHERE id=1",
+                    (topic, now + INTEREST_TTL),
+                )
         if private and not audience:
             return
         title = (
@@ -462,20 +499,75 @@ class WorldExperience:
         async with self.store.lock:
             return self._charge_at(await self._values(), now)
 
-    async def spend_chat_tx(self, reply, now):
+    @staticmethod
+    def _owner_longing(last_owner_at: float, now: float) -> int:
+        if not last_owner_at or last_owner_at <= 0 or now - last_owner_at <= 7200:
+            return 0
+        hours_apart = (now - last_owner_at) / 3600.0
+        return min(100, round((hours_apart - 2.0) * 6))
+
+    def circadian_tag(self, now: float, *, energy: float = 80.0) -> str:
+        local_dt = datetime.fromtimestamp(now, self.zone)
+        rest = self.store.runtime.rest_hours
+        if rest.enabled:
+            if rest.active(local_dt):
+                return "late_night_catch"
+            sleep_min, wake_min = hours_bounds(rest.rest_hours)
+            cur_min = local_dt.hour * 60 + local_dt.minute
+            if 0 <= (cur_min - wake_min) % 1440 < 25:
+                return "just_woke_up"
+            if energy < 35 or 0 < (sleep_min - cur_min) % 1440 <= 30:
+                return "bedtime_drowsy"
+        return "bedtime_drowsy" if energy < 35 else ""
+
+    async def touch_owner_tx(self, now: float) -> None:
+        await self.store.db.execute(
+            "UPDATE world_rhythm SET last_owner_at=MAX(COALESCE(last_owner_at,0),?) WHERE id=1",
+            (now,),
+        )
+
+    async def touch_owner(self, now: float | None = None) -> None:
+        if not self.ready:
+            return
+        ts = self.world.clock() if now is None else now
+        async with self.store.transaction():
+            await self.touch_owner_tx(ts)
+
+    def _classify_message_owner(self, message) -> tuple[bool, bool]:
+        if message is None:
+            return False, False
+        from .bot_server import is_persona_owner
+        from .models import Message
+
+        msg_obj = message
+        if isinstance(message, dict):
+            try:
+                msg_obj = Message.model_validate(message)
+            except Exception:
+                return False, False
+        if not isinstance(msg_obj, Message):
+            return False, False
+        owner_any = bool(is_persona_owner(msg_obj, self.s))
+        owner_dm = bool(owner_any and msg_obj.kind == "private")
+        return owner_any, owner_dm
+
+    async def spend_chat_tx(self, reply, now, *, message=None):
         # Keep the original receipt namespace so replaying a pre-upgrade ACK is free.
         receipt = "qq:" + reply
         if await self.store.one("SELECT 1 FROM world_changes WHERE receipt=?", (receipt,)):
             return
         await self.advance_tx(now)
+        owner_any, owner_dm = self._classify_message_owner(message)
+        social_cost = OWNER_CHAT_SOCIAL_COST if owner_dm else CHAT_SOCIAL_COST
+        boredom_delta = OWNER_CHAT_BOREDOM_DELTA if owner_dm else CHAT_BOREDOM_DELTA
         charge = (await self.store.one("SELECT charge FROM world_social_battery WHERE id=1"))[0]
-        after = bounded(charge - CHAT_SOCIAL_COST)
+        after = bounded(charge - social_cost)
         if await self._change_tx(
             receipt,
             now,
             "chat_delivered",
             -CHAT_ENERGY_COST,
-            -2,
+            boredom_delta,
             social=(None, charge, after),
         ):
             await self.store.db.execute(
@@ -483,9 +575,11 @@ class WorldExperience:
                 "last_reply_at=MAX(COALESCE(last_reply_at,?),?) WHERE id=1",
                 (after, now, now),
             )
+            if owner_any:
+                await self.touch_owner_tx(now)
 
     async def confirmed_tx(self, message, reply, now, texts, *, dedicated=None):
-        await self.spend_chat_tx(reply, now)
+        await self.spend_chat_tx(reply, now, message=message)
         audience = self.audience(message)
         rows = await self.store.all(
             "SELECT event_id,ref,title FROM world_news WHERE shared_at IS NULL AND expires>? "
@@ -562,10 +656,23 @@ class WorldExperience:
             )
         return [dict(r) for r in rows]
 
+    async def sensor_context(self, now: float) -> dict:
+        async with self.store.lock:
+            row = await self._values()
+            charge = round(self._charge_at(row, now), 1)
+        interest = row["interest_topic"] if row["interest_until"] > now else ""
+        return {
+            "social_battery": charge,
+            "owner_longing": self._owner_longing(row["last_owner_at"], now),
+            "interest_lingering": interest,
+            "circadian_tag": self.circadian_tag(now, energy=row["energy"]),
+        }
+
     async def preferences(self, now):
         async with self.store.lock:
             row = await self._values()
             can_rest = await self._can_rest_tx(row, now)
+            charge = round(self._charge_at(row, now), 1)
             count = (
                 await self.store.one(
                     "SELECT COUNT(*) FROM world_news WHERE audience='' AND "
@@ -573,9 +680,14 @@ class WorldExperience:
                     (now,),
                 )
             )[0]
+        interest = row["interest_topic"] if row["interest_until"] > now else ""
         return {
             "day_rest_available": can_rest,
             "public_unshared_count": count,
+            "social_battery": charge,
+            "owner_longing": self._owner_longing(row["last_owner_at"], now),
+            "interest_lingering": interest,
+            "circadian_tag": self.circadian_tag(now, energy=row["energy"]),
         }
 
     async def prune(self, now):
@@ -627,6 +739,7 @@ class WorldExperience:
                 if active:
                     break
         mc = row["mc_task"] if row["mc_until"] > now else ""
+        interest = row["interest_topic"] if row["interest_until"] > now else ""
         return {
             "plan": dict(plan) if plan else None,
             "actual": {
@@ -649,6 +762,9 @@ class WorldExperience:
                 "last": dict(last) if last else None,
             },
             "low_energy": bool(row["tired"]),
+            "owner_longing": self._owner_longing(row["last_owner_at"], now),
+            "interest_lingering": interest,
+            "circadian_tag": self.circadian_tag(now, energy=row["energy"]),
             "social_battery": {
                 "charge": charge,
                 "last_reply_at": row["last_reply_at"],

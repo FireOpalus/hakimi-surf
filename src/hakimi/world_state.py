@@ -893,69 +893,133 @@ class WorldStateManager:
                     overrides[sanitize_sensor_text(str(k), self.settings, max_tokens=16)] = cleaned
         return overrides
 
-    async def chat_sensor_payload(self) -> dict[str, Any] | None:
-        """Return compact <=100-token sensor payload, or None on idle/LOW baseline."""
+    async def chat_sensor_payload(self, message: Any = None) -> dict[str, Any] | None:
+        """Return compact <=100-token sensor payload, or None on calm idle/LOW baseline."""
         overrides = self._active_sensor_overrides()
-        if (
+        owner_dm = False
+        if message is not None:
+            from .bot_server import is_persona_owner
+
+            owner_dm = bool(
+                getattr(message, "kind", None) == "private"
+                and is_persona_owner(message, self.settings)
+            )
+        charge = 100.0
+        longing = 0
+        interest = ""
+        circadian = ""
+        if self.experience.ready:
+            ctx = await self.experience.sensor_context(self.clock())
+            charge = ctx["social_battery"]
+            longing = ctx["owner_longing"]
+            interest = ctx["interest_lingering"]
+            if message is not None:
+                circadian = ctx["circadian_tag"]
+                if circadian == "late_night_catch" and not owner_dm:
+                    circadian = ""
+
+        hints: list[str] = []
+        if circadian == "late_night_catch" and owner_dm:
+            hints.append("深夜睡眠时段被唤醒(可自然督促BOISER早点睡)")
+        elif circadian == "just_woke_up":
+            hints.append("刚睡醒还有点迷糊")
+        elif circadian == "bedtime_drowsy" or self.current.energy < 35:
+            hints.append("精力偏低有点犯困")
+        if charge < 35 and not owner_dm:
+            hints.append("社交电量偏低想简短接话")
+        if self.current.boredom >= 65:
+            hints.append("闲了好久有点无聊")
+        if owner_dm and longing >= 50:
+            hints.append("好一阵没见BOISER有点挂念")
+        if interest:
+            hints.append("近期上头:" + interest)
+        hints_text = "；".join(hints)
+
+        idle_baseline = (
             self.current.current_module == "idle"
             and self.current.focus_level == "LOW"
             and not overrides
-        ):
-            if self.current.mood in {"curious", "pleased", "sleeping", "resting"}:
-                return {
-                    "current_module": "idle",
-                    "focus_level": "LOW",
-                    "mood": self.current.mood,
-                    "energy": self.current.energy,
-                    "boredom": self.current.boredom,
-                }
-            return None
-
-        sensor_parts: list[str] = []
-        if overrides:
-            sensor_parts.extend(overrides.values())
-        elif self.registry is not None:
-            active_mod = (
-                self.registry.get(self.current.current_module)
-                if self.current.current_module != "idle"
-                else None
-            )
-            if active_mod is not None and not active_mod.inactive_reason:
-                summary = await active_mod.get_sensor_summary()
-                if summary:
-                    sensor_parts.append(summary)
-            else:
-                summaries = await self.registry.collect_sensor_summaries()
-                ordered = sorted(
-                    summaries.items(),
-                    key=lambda item: ATTENTION_RANK.get(
-                        getattr(self.registry.get(item[0]), "attention_level", "LOW"), 0
-                    ),
-                    reverse=True,
+        )
+        if idle_baseline:
+            if self.current.mood in {"calm", "focused"} and not hints_text:
+                return None
+            payload: dict[str, Any] = {
+                "current_module": "idle",
+                "focus_level": "LOW",
+                "mood": sanitize_sensor_text(self.current.mood, self.settings, max_tokens=16)
+                or "calm",
+                "energy": self.current.energy,
+                "boredom": self.current.boredom,
+            }
+            if hints_text:
+                payload["state_hints"] = hints_text
+        else:
+            sensor_parts: list[str] = []
+            if overrides:
+                sensor_parts.extend(overrides.values())
+            elif self.registry is not None:
+                active_mod = (
+                    self.registry.get(self.current.current_module)
+                    if self.current.current_module != "idle"
+                    else None
                 )
-                for _, summary in ordered:
+                if active_mod is not None and not active_mod.inactive_reason:
+                    summary = await active_mod.get_sensor_summary()
                     if summary:
                         sensor_parts.append(summary)
+                else:
+                    summaries = await self.registry.collect_sensor_summaries()
+                    ordered = sorted(
+                        summaries.items(),
+                        key=lambda item: ATTENTION_RANK.get(
+                            getattr(self.registry.get(item[0]), "attention_level", "LOW"), 0
+                        ),
+                        reverse=True,
+                    )
+                    for _, summary in ordered:
+                        if summary:
+                            sensor_parts.append(summary)
 
-        sensor_text = sanitize_sensor_text(" | ".join(sensor_parts), self.settings, max_tokens=45)
-        payload: dict[str, Any] = {
-            "current_module": sanitize_sensor_text(
-                self.current.current_module, self.settings, max_tokens=16
+            sensor_text = sanitize_sensor_text(
+                " | ".join(sensor_parts), self.settings, max_tokens=45
             )
-            or "idle",
-            "focus_level": self.current.focus_level,
-            "mood": sanitize_sensor_text(self.current.mood, self.settings, max_tokens=16) or "calm",
-            "energy": self.current.energy,
-            "boredom": self.current.boredom,
-            "sensor": sensor_text,
-        }
-        if self.current.focus_level == "HIGH":
-            payload["attention_note"] = ATTENTION_SWITCH_NOTE
+            payload = {
+                "current_module": sanitize_sensor_text(
+                    self.current.current_module, self.settings, max_tokens=16
+                )
+                or "idle",
+                "focus_level": self.current.focus_level,
+                "mood": sanitize_sensor_text(self.current.mood, self.settings, max_tokens=16)
+                or "calm",
+                "energy": self.current.energy,
+                "boredom": self.current.boredom,
+                "sensor": sensor_text,
+            }
+            if hints_text:
+                payload["state_hints"] = hints_text
+            if self.current.focus_level == "HIGH":
+                payload["attention_note"] = ATTENTION_SWITCH_NOTE
 
         def _encoded_tokens() -> int:
             return estimate_tokens(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
-        if _encoded_tokens() > 100 and payload["sensor"]:
+        if _encoded_tokens() > 100 and payload.get("state_hints"):
+            orig_h = payload["state_hints"]
+            lo, hi = 0, len(orig_h)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                payload["state_hints"] = truncate_tokens(orig_h, mid) if mid > 0 else ""
+                if _encoded_tokens() <= 100:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            trimmed_h = truncate_tokens(orig_h, lo) if lo > 0 else ""
+            if trimmed_h:
+                payload["state_hints"] = trimmed_h
+            else:
+                payload.pop("state_hints", None)
+
+        if _encoded_tokens() > 100 and payload.get("sensor"):
             lo, hi = 0, len(payload["sensor"])
             orig = payload["sensor"]
             while lo < hi:
@@ -966,8 +1030,10 @@ class WorldStateManager:
                 else:
                     hi = mid - 1
             payload["sensor"] = truncate_tokens(orig, lo) if lo > 0 else ""
-        if _encoded_tokens() > 100:
+        if _encoded_tokens() > 100 and "sensor" in payload:
             payload["sensor"] = ""
+        if _encoded_tokens() > 100:
+            payload.pop("state_hints", None)
         if _encoded_tokens() > 100:
             payload["mood"] = truncate_tokens(payload["mood"], 6)
         if _encoded_tokens() > 100:
