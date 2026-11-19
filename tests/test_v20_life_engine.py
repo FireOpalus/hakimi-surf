@@ -16,7 +16,13 @@ from hakimi.adapters import Sender
 from hakimi.affection import AffectionConfig
 from hakimi.bot_server import assemble_chat_input
 from hakimi.config import Settings
-from hakimi.gemini import LIFE_PLAN_INSTRUCTION, LIFE_PLAN_RESPONSE_SCHEMA, GeminiGateway
+from hakimi.gemini import (
+    BILI_SELECTION_RESPONSE_SCHEMA,
+    DIGEST_LONGNICK_RESPONSE_SCHEMA,
+    LIFE_PLAN_INSTRUCTION,
+    LIFE_PLAN_RESPONSE_SCHEMA,
+    GeminiGateway,
+)
 from hakimi.generation_policy import Scenario
 from hakimi.life_engine import (
     DESKTOP_CONTEXT_HINT,
@@ -259,7 +265,26 @@ async def test_gemini_life_plan_interactions_and_vertex_gc(
             "ttl_minutes",
             "intent_note",
             "allow_desktop_care",
+            "target_module",
+            "action_type",
         } <= set(LIFE_PLAN_RESPONSE_SCHEMA["$defs"]["WireLifeIntent"]["required"])
+        assert set(LIFE_PLAN_RESPONSE_SCHEMA["$defs"]["WireAgendaChange"]["required"]) == {
+            "intent_id",
+            "operation",
+            "at_local_time",
+        }
+        assert set(BILI_SELECTION_RESPONSE_SCHEMA["required"]) == {"selected", "mood_longnick"}
+        assert set(BILI_SELECTION_RESPONSE_SCHEMA["$defs"]["WireBiliPick"]["required"]) == {
+            "bvid",
+            "like",
+            "favorite",
+            "share_owner",
+            "private_topic_ref",
+        }
+        assert set(DIGEST_LONGNICK_RESPONSE_SCHEMA["required"]) == {
+            "digest",
+            "daily_longnick",
+        }
         assert LIFE_PLAN_INSTRUCTION in gen_req["body"]["system_instruction"]
         dec_req = next(c for c in calls if c["path"].endswith("decisions"))
         assert dec_req["path"].endswith("/decisions")

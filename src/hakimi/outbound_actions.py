@@ -2,7 +2,7 @@
 
 import json
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -118,7 +118,20 @@ class ChatActions(BaseModel):
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
 MAX_IMAGE_DIGEST_CHARS = 120
-CHAT_RESPONSE_FORMAT = ChatActions.model_json_schema()
+
+
+def require_all_schema_fields(node: Any) -> Any:
+    if isinstance(node, dict):
+        out = {k: require_all_schema_fields(v) for k, v in node.items()}
+        if out.get("type") == "object" and isinstance(out.get("properties"), dict):
+            out["required"] = list(out["properties"])
+        return out
+    if isinstance(node, list):
+        return [require_all_schema_fields(item) for item in node]
+    return node
+
+
+CHAT_RESPONSE_FORMAT = require_all_schema_fields(ChatActions.model_json_schema())
 ACTION_INSTRUCTION = """\n【固定回复协议，优先于旧文本标签示例】
 始终输出符合 response_format 的 JSON。字段说明：
 - abstain=true 表示无需插话（仍可填 emoji_like/poke_qq）；群聊（directly_addressed=false）

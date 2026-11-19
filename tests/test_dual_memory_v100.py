@@ -542,6 +542,14 @@ async def test_extraction_wire_schema_is_serving_safe_and_parses_per_item(
     }
     assert not (_schema_keys(EXTRACTION_RESPONSE_FORMAT) & forbidden)
     assert EXTRACTION_RESPONSE_FORMAT["additionalProperties"] is False
+    assert set(EXTRACTION_RESPONSE_FORMAT["required"]) == {
+        "profiles",
+        "chronicles",
+    }
+    assert "valid_days" in EXTRACTION_RESPONSE_FORMAT["$defs"]["WireProfileFact"]["required"]
+    assert {"tags", "evidence_seqs"} <= set(
+        EXTRACTION_RESPONSE_FORMAT["$defs"]["WireChronicleFact"]["required"]
+    )
     seen = []
 
     def handler(request):

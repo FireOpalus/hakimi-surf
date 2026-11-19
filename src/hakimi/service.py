@@ -26,7 +26,12 @@ from .hot_ring import HotRing
 from .life_engine import LifeEngine
 from .link_preview import preview_links
 from .media import ImageLoader
-from .memes import MAX_UPLOAD_BYTES, MemeLibrary, validate_meme_label
+from .memes import (
+    MAX_UPLOAD_BYTES,
+    MemeLibrary,
+    explicit_meme_request,
+    validate_meme_label,
+)
 from .memory_compressor import MemoryCompressor, check_memory_text
 from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
@@ -2424,8 +2429,12 @@ class Service:
                     await self._finish_delivery_audit(reply, "cancelled", "epoch_changed")
                     return True
             if reply.get("meme_eligible") and not reply["proactive"] and await valid_after_delay():
+                force_meme = explicit_meme_request(*(m.text for m in participants), message.text)
                 allowed = await self.memes.reserve_reply(
-                    self.store.session_scope(message), reply["id"], reply.get("meme_tag")
+                    self.store.session_scope(message),
+                    reply["id"],
+                    reply.get("meme_tag"),
+                    force=force_meme,
                 )
                 if allowed:
                     try:

@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 
 from .bot_server import is_persona_owner
+from .memes import explicit_meme_request
 from .models import Message
 from .modules.adapters import farewell_send_bypass
 from .outbound_actions import bubble_segments, parse_actions, valid_receipt
@@ -281,8 +282,15 @@ async def deliver_actions(service, reply):
                 is_public = bool(actions.get("public", message.kind == "group"))
                 has_text_bubbles = any(b.strip() for b in actions.get("bubbles", [])[:3])
                 if message.platform == "onebot":
+                    force_sticker = (not has_text_bubbles and bool(label)) or explicit_meme_request(
+                        *(m.text for m in members), message.text
+                    )
                     if await service.memes.reserve_reply(
-                        store.session_scope(message), reply["id"], label, public=is_public
+                        store.session_scope(message),
+                        reply["id"],
+                        label,
+                        public=is_public,
+                        force=force_sticker,
                     ):
                         sticker_choice = await service.memes.choose(
                             label, store.session_scope(message)

@@ -31,7 +31,13 @@ from .media import ModelImage
 from .mentions import AT_INSTRUCTION
 from .models import Message
 from .modules.bilibili import extract_bvid
-from .outbound_actions import CHAT_RESPONSE_FORMAT, Anchor, ChatActions, Sticker
+from .outbound_actions import (
+    CHAT_RESPONSE_FORMAT,
+    Anchor,
+    ChatActions,
+    Sticker,
+    require_all_schema_fields,
+)
 from .persona import SYSTEM_INSTRUCTION, identity_anchor
 from .prefix_runtime import MAX_CHAIN_TURNS, PrefixRuntime, StaticPrefixes
 from .provider_diagnostics import MAX_ATTEMPTS, error_facts
@@ -119,24 +125,35 @@ class WireLifePlan(BaseModel):
 
 
 def _build_life_plan_schema() -> dict[str, Any]:
-    schema = WireLifePlan.model_json_schema()
-    schema["required"] = list(schema["properties"])
-    intent_def = schema.get("$defs", {}).get("WireLifeIntent")
-    if isinstance(intent_def, dict) and "properties" in intent_def:
-        intent_def["required"] = [
-            "action_name",
-            "arguments_json",
-            "target_scope",
-            "at_local_time",
-            "delay_minutes",
-            "ttl_minutes",
-            "intent_note",
-            "allow_desktop_care",
-        ]
-    return schema
+    return require_all_schema_fields(WireLifePlan.model_json_schema())
 
 
 LIFE_PLAN_RESPONSE_SCHEMA = _build_life_plan_schema()
+
+
+class WireBiliPick(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    bvid: str
+    like: bool = False
+    favorite: bool = False
+    share_owner: bool = False
+    private_topic_ref: str = ""
+
+
+class WireBiliSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    selected: list[WireBiliPick] = Field(default_factory=list)
+    mood_longnick: str = ""
+
+
+class WireDigestLongnick(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    digest: str
+    daily_longnick: str = ""
+
+
+BILI_SELECTION_RESPONSE_SCHEMA = require_all_schema_fields(WireBiliSelection.model_json_schema())
+DIGEST_LONGNICK_RESPONSE_SCHEMA = require_all_schema_fields(WireDigestLongnick.model_json_schema())
 
 LIFE_PLAN_INSTRUCTION = """你是「吉米奈喵」（咕咕噜·吉米尼·吉米奈，日常也叫「哈基米」或
 「大小姐」），好奇心旺盛、爱逛 B 站科技与整活新片、喜欢在 MC 攒建筑点子
@@ -2091,6 +2108,19 @@ class GeminiGateway:
                     sandbox_mode=getattr(route, "sandbox_mode", False),
                 )
 
+            active_response_schema = (
+                CHAT_RESPONSE_FORMAT
+                if chat
+                else LIFE_PLAN_RESPONSE_SCHEMA
+                if life_plan
+                else EXTRACTION_RESPONSE_FORMAT
+                if memory_archive
+                else BILI_SELECTION_RESPONSE_SCHEMA
+                if scenario == Scenario.BILI_SELECTION
+                else DIGEST_LONGNICK_RESPONSE_SCHEMA
+                if with_longnick
+                else None
+            )
             call_state = {"dispatched": False}
             cached_prefix = (
                 max(0, estimate_tokens(reserve_data) - estimate_tokens(wire_data)) if prev_id else 0
@@ -2114,12 +2144,9 @@ class GeminiGateway:
                     "thinking_config": types.ThinkingConfig(thinking_level=gc_thinking),
                     "http_options": types.HttpOptions(timeout=int(deadline_seconds * 1000)),
                 }
-                if chat:
+                if active_response_schema is not None:
                     config_kwargs["response_mime_type"] = "application/json"
-                    config_kwargs["response_json_schema"] = CHAT_RESPONSE_FORMAT
-                elif life_plan:
-                    config_kwargs["response_mime_type"] = "application/json"
-                    config_kwargs["response_json_schema"] = LIFE_PLAN_RESPONSE_SCHEMA
+                    config_kwargs["response_json_schema"] = active_response_schema
                 gc_config = types.GenerateContentConfig(**config_kwargs)
                 if images:
                     parts = [types.Part.from_text(text=reserve_data)]
@@ -2166,14 +2193,10 @@ class GeminiGateway:
                                     "response_format": {
                                         "type": "text",
                                         "mime_type": "application/json",
-                                        "schema": (
-                                            LIFE_PLAN_RESPONSE_SCHEMA
-                                            if life_plan
-                                            else CHAT_RESPONSE_FORMAT
-                                        ),
+                                        "schema": active_response_schema,
                                     }
                                 }
-                                if (chat or life_plan)
+                                if active_response_schema is not None
                                 else {}
                             ),
                             automatic_continuation=False,
@@ -2208,26 +2231,10 @@ class GeminiGateway:
                             "response_format": {
                                 "type": "text",
                                 "mime_type": "application/json",
-                                "schema": CHAT_RESPONSE_FORMAT,
+                                "schema": active_response_schema,
                             }
                         }
-                        if chat
-                        else {
-                            "response_format": {
-                                "type": "text",
-                                "mime_type": "application/json",
-                                "schema": LIFE_PLAN_RESPONSE_SCHEMA,
-                            }
-                        }
-                        if life_plan
-                        else {
-                            "response_format": {
-                                "type": "text",
-                                "mime_type": "application/json",
-                                "schema": EXTRACTION_RESPONSE_FORMAT,
-                            }
-                        }
-                        if memory_archive
+                        if active_response_schema is not None
                         else {}
                     ),
                     automatic_continuation=False,

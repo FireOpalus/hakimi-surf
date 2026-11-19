@@ -10,7 +10,14 @@ from PIL import Image
 from pydantic import SecretStr
 
 from hakimi.app import create_app
-from hakimi.memes import MemeLibrary, extract_meme, label_from_filename, normalize_meme
+from hakimi.memes import (
+    MemeLibrary,
+    explicit_meme_request,
+    extract_meme,
+    label_from_filename,
+    normalize_meme,
+)
+from hakimi.outbound_actions import CHAT_RESPONSE_FORMAT, ChatActions
 from hakimi.security import Rejected
 from tests.fakes import FakeGateway
 
@@ -423,5 +430,87 @@ async def test_single_image_anti_deadlock_native_sticker_subtype_and_owner_unthr
             card_seg = wire.calls[-1][1]["message"][0]
             assert card_seg["type"] == "image"
             assert "sub_type" not in card_seg["data"]
+        finally:
+            await svc.stop()
+
+
+async def test_chat_schema_required_fields_and_group_explicit_sticker_bypass(
+    settings, store, message
+):
+    from hakimi.adapters import Sender
+    from hakimi.service import Service
+    from tests.fakes import FakeBili, FakeGateway
+    from tests.test_social_integration import Wire, group, process
+    from tests.test_streaming_v0100 import action
+
+    assert set(CHAT_RESPONSE_FORMAT["required"]) == set(ChatActions.model_fields)
+    assert set(CHAT_RESPONSE_FORMAT["$defs"]["Sticker"]["required"]) == {"label", "timing"}
+    assert set(CHAT_RESPONSE_FORMAT["$defs"]["Anchor"]["required"]) == {"reply_id", "mentions"}
+
+    assert explicit_meme_request("@吉米奈喵 发点表情包")
+    assert explicit_meme_request("货呢")
+    assert explicit_meme_request("来张猫猫图")
+    assert explicit_meme_request("图呢")
+    assert not explicit_meme_request("发张截图看看")
+    assert not explicit_meme_request("看下报错图")
+
+    class ScriptedStickerGw(FakeGateway):
+        def __init__(self):
+            super().__init__()
+            self.replies = iter(
+                [
+                    action(
+                        abstain=False,
+                        bubbles=["哈喽"],
+                        sticker={"label": "滑稽", "timing": "after_text"},
+                    ),
+                    action(
+                        abstain=False,
+                        bubbles=["继续聊聊"],
+                        sticker={"label": "滑稽", "timing": "after_text"},
+                    ),
+                    action(
+                        abstain=False,
+                        bubbles=["接好，刚翻出来的存货"],
+                        sticker={"label": "滑稽", "timing": "after_text"},
+                    ),
+                    action(
+                        abstain=False,
+                        bubbles=[""],
+                        sticker={"label": "滑稽", "timing": "after_text"},
+                    ),
+                ]
+            )
+
+        async def generate(self, payload, subject, **kwargs):
+            await super().generate(payload, subject, **kwargs)
+            return next(self.replies)
+
+    wire = Wire()
+    async with httpx.AsyncClient() as http:
+        sender = Sender(settings, http, wire)
+        svc = Service(settings, store, ScriptedStickerGw(), FakeBili(), sender)
+        try:
+            await svc.memes.initialize()
+            await svc.moderation.initialize()
+            await svc.memes.upload_bytes("滑稽", picture("PNG"))
+
+            cases = [
+                ("g-m-1", "正常打个招呼", True),
+                ("g-m-2", "继续随便聊聊", False),
+                ("g-m-3", "@吉米奈喵 发点表情包", True),
+                ("g-m-4", "纯表情测试", True),
+            ]
+            for eid, text, expect_img in cases:
+                wire.calls.clear()
+                await process(svc, group(message, event_id=eid, text=text, command_text=text))
+                assert await svc.deliver_once()
+                sent_types = [
+                    seg["type"]
+                    for act, params in wire.calls
+                    if act == "send_group_msg"
+                    for seg in params["message"]
+                ]
+                assert ("image" in sent_types) is expect_img
         finally:
             await svc.stop()

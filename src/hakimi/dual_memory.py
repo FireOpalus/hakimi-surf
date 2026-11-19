@@ -17,6 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .outbound_actions import require_all_schema_fields
 from .security import Rejected
 
 SCHEMA = """
@@ -115,7 +116,7 @@ class WireExtraction(Strict):
     chronicles: list[WireChronicleFact] = Field(default_factory=list)
 
 
-EXTRACTION_RESPONSE_FORMAT = WireExtraction.model_json_schema()
+EXTRACTION_RESPONSE_FORMAT = require_all_schema_fields(WireExtraction.model_json_schema())
 
 
 def parse_extraction(raw: str) -> Extraction:

@@ -23,6 +23,17 @@ MAX_LIBRARY_BYTES = 50 * 1024 * 1024
 MAX_MEMES = 100
 MAX_PIXELS = 16_000_000
 LABEL = re.compile(r"[A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff]{1,24}\Z")
+EXPLICIT_MEME_REQUEST_RE = re.compile(
+    r"(?:表情包|斗图|(?:货|图|表情)呢"
+    r"|(?:发|来|甩|整|给|求|换|拿|掏|再来).{0,6}(?:张|个|点|些|套)?"
+    r"(?:表情|好图|沙雕图|猫猫图|动图|存货|(?<!报错)(?<!截)图))"
+)
+
+
+def explicit_meme_request(*texts: str) -> bool:
+    return any(isinstance(t, str) and bool(EXPLICIT_MEME_REQUEST_RE.search(t)) for t in texts if t)
+
+
 IDENTIFIER = re.compile(r"[a-f0-9]{32}\Z")
 EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
 ALLOWED_MEME_MIMES = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif"}
@@ -420,7 +431,13 @@ class MemeLibrary:
             return "base64://" + base64.b64encode(raw).decode("ascii")
 
     async def reserve_reply(
-        self, scope: str, reply_id: str, tag: str | None, *, public: bool = True
+        self,
+        scope: str,
+        reply_id: str,
+        tag: str | None,
+        *,
+        public: bool = True,
+        force: bool = False,
     ) -> bool:
         """Count public replies once; throttle memes in public chats, allow freely in owner DM."""
         await self.initialize()
@@ -446,7 +463,7 @@ class MemeLibrary:
                 allowed = (
                     isinstance(tag, str)
                     and tag in self._entries
-                    and (not public or count - row["last_meme_reply"] >= 4)
+                    and (not public or force or count - row["last_meme_reply"] >= 4)
                 )
                 await self.store.db.execute(
                     "UPDATE meme_reply_frequency SET replies=?,last_meme_reply=? WHERE scope=?",
