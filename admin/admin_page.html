@@ -583,11 +583,11 @@ details {
 }
 summary { cursor: pointer; font-size: 12px; color: var(--muted); font-weight: 600; }
 details[open] > summary { margin-bottom: 12px; color: var(--ink); }
-.ledger-breakdown { padding: 0; }
-.ledger-breakdown > summary { padding: 12px 16px; }
-.ledger-breakdown > summary > h3 { display: inline; margin: 0; }
-.ledger-breakdown[open] > summary { margin-bottom: 0; }
-.ledger-breakdown > .table, .ledger-breakdown > p { margin: 0 16px 16px; }
+.table-details { padding: 0; }
+.table-details > summary { padding: 12px 16px; }
+.table-details > summary > h3 { display: inline; margin: 0; }
+.table-details[open] > summary { margin-bottom: 0; }
+.table-details > .table, .table-details > p { margin: 0 16px 16px; }
 
 .score { padding: 12px 0; border-bottom: 1px solid var(--line); }
 .score p { margin: 0 0 7px; font: 12px var(--mono); }
@@ -1527,26 +1527,26 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </div>
     <p id="ledger-coverage" class="muted"></p>
     <div id="token-ledger" class="table"></div>
-    <details class="ledger-breakdown"><summary>今日按动作查账</summary>
+    <details class="table-details"><summary>今日按动作查账</summary>
       <div id="work-ledger" class="table"></div>
     </details>
-    <details class="ledger-breakdown">
+    <details class="table-details">
       <summary><h3>按 API 通道统计</h3></summary>
       <div id="provider-ledger" class="table"></div>
     </details>
-    <details class="ledger-breakdown">
+    <details class="table-details">
       <summary><h3>费用估算与熔断</h3></summary>
       <div id="cost-ledger" class="table"></div>
     </details>
-    <details class="ledger-breakdown">
+    <details class="table-details">
       <summary><h3>按模型统计</h3></summary>
       <div id="model-ledger" class="table"></div>
     </details>
-    <details class="ledger-breakdown">
+    <details class="table-details">
       <summary><h3>按思考档位统计</h3></summary>
       <div id="thinking-ledger" class="table"></div>
     </details>
-    <details class="ledger-breakdown">
+    <details class="table-details">
       <summary><h3>有效缓存覆盖率</h3></summary>
       <div id="effective-cache" class="table"></div>
       <p id="cache-alert" role="status"></p>
@@ -2003,7 +2003,10 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 <section id="life" class="tab" role="tabpanel" aria-labelledby="nav-life" hidden>
   <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
     <div id="life-stats" class="stats"></div>
-    <h3>最近的状态变化</h3><div id="life-changes" class="table"></div>
+    <details class="table-details">
+      <summary><h3>最近的状态变化</h3></summary>
+      <div id="life-changes" class="table"></div>
+    </details>
     <details><summary>精力与无聊度怎样结算</summary>
       <p class="muted">定时睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。清醒空闲时精力持平。MC 任务每小时消耗 8 点精力。</p>
       <p class="muted">完成视频学习消耗 2 点精力，每学习 5 分钟再扣 1 点。QQ 每轮确认送达、MC 完成任务或发现稀有资源各扣 1 点。精力范围为 0 至 100，零头跨轮累计。</p>
@@ -2013,8 +2016,10 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div id="life-batteries" class="table"></div><div id="life-news" class="table"></div>
     </details>
     <div id="life-node-pills" class="pill-row"></div>
-    <h3>Owner 日报送达记录</h3>
-    <div id="life-digests" class="table"></div>
+    <details class="table-details">
+      <summary><h3>Owner 日报送达记录</h3></summary>
+      <div id="life-digests" class="table"></div>
+    </details>
     <p id="life-world-status" class="muted"></p>
     <p id="life-node-status" class="muted"></p>
     <p id="life-desktop-status" class="muted"></p>
