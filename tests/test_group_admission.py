@@ -123,8 +123,9 @@ async def test_group_bot_uses_public_persona_and_stays_isolated_in_private_under
 
 
 @pytest.mark.parametrize("reason", ["bot", "muted", "self", "unknown_group", "muted_group"])
+@pytest.mark.parametrize("attention", ["alias", "possible_alias"])
 async def test_group_exclusions_still_stop_before_jobs_models_and_send(
-    settings, store, message, reason
+    settings, store, message, reason, attention
 ):
     settings.onebot_allowed_users = set()
     settings.allow_group_members = False
@@ -132,7 +133,13 @@ async def test_group_exclusions_still_stop_before_jobs_models_and_send(
     gateway, sender = FakeGateway(), FakeSender()
     service = Service(settings, store, gateway, FakeBili(), sender)
     group = message.model_copy(
-        update={"kind": "group", "conversation_id": "40000", "user_id": "70000"}
+        update={
+            "kind": "group",
+            "conversation_id": "40000",
+            "user_id": "70000",
+            "addressed": attention == "alias",
+            "attention_reason": attention,
+        }
     )
     if reason == "bot":
         settings.bot_qq_ids.add("70000")

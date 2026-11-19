@@ -1,4 +1,4 @@
-"""Verify quoted bot replies using successful transport receipts, never quoted author text."""
+"""Classify incoming attention and verify quoted bot replies against transport receipts."""
 
 import re
 import time
@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS sent_bot_receipts (
 CREATE INDEX IF NOT EXISTS sent_bot_receipts_created ON sent_bot_receipts(created);
 """
 RETENTION_SECONDS = 7 * 86400
-WAKE_WORDS = ("吉米奈喵", "吉米奈", "哈基米", "大小姐")
+WAKE_WORDS = ("吉米奈喵", "吉米奈", "杰米奈喵", "杰米奈", "哈基米", "大小姐")
+POSSIBLE_ALIAS = re.compile(
+    r"小小姐|猫猫小姐|猫猫|(?<![a-z0-9_])gemini(?![a-z0-9_])", re.I | re.ASCII
+)
 
 
 def direct_attention(kind, *, mentioned=False, text="", has_video=False):
@@ -24,6 +27,15 @@ def direct_attention(kind, *, mentioned=False, text="", has_video=False):
     if any(alias in text for alias in WAKE_WORDS):
         return "alias"
     return ""
+
+
+def classify_attention(kind: str, *, mentioned: bool, text: str) -> tuple[str, bool]:
+    """Return the routing reason and whether the sender explicitly addressed the bot."""
+    if reason := direct_attention(kind, mentioned=mentioned, text=text):
+        return reason, True
+    if kind == "group" and not text.lstrip().startswith("/") and POSSIBLE_ALIAS.search(text):
+        return "possible_alias", False
+    return "", False
 
 
 def _explicit_at(message) -> bool:

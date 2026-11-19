@@ -254,7 +254,7 @@ class GroupPipeline:
         )
 
     async def continuation_in_transaction(self, message, now):
-        """Only an already addressed, still-open batch may absorb an at_only follow-up."""
+        """An open at_only batch needs an original that invited a reply or a relevance check."""
         if (
             message.kind != "group"
             or other_mentions(message)
@@ -283,7 +283,12 @@ class GroupPipeline:
         )
         # A historical smart_reply batch cannot turn into an at_only trigger after a
         # policy edit. The invitation must come from an actual admitted original.
-        return any(self.store.vault.open(r["id"], r["payload"])["addressed"] for r in rows)
+        return any(
+            Message.model_validate(
+                self.store.vault.open(r["id"], r["payload"])
+            ).invites_group_review
+            for r in rows
+        )
 
     async def can_continue(self, message):
         # Advisory only; Store.admit repeats this check atomically with job insertion.
@@ -395,6 +400,9 @@ class GroupPipeline:
             addressed = next(
                 (m for m in messages if m.attention_reason == "mention"), None
             ) or next((m for m in messages if m.addressed), None)
+            attention_reason = addressed.attention_reason if addressed else ""
+            if not addressed and any(m.has_possible_qq_alias for m in messages):
+                attention_reason = "possible_alias"
 
             def unique(field, limit):
                 items = []
@@ -411,7 +419,7 @@ class GroupPipeline:
                     "event_id": Message.model_validate(job["payload"]).event_id,
                     "created_at": min(m.created_at for m in messages),
                     "addressed": bool(addressed),
-                    "attention_reason": addressed.attention_reason if addressed else "",
+                    "attention_reason": attention_reason,
                     "images": unique("images", 2),
                     "forward_ids": unique("forward_ids", 4),
                     "video_ids": unique("video_ids", 5),

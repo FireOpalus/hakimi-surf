@@ -18,7 +18,7 @@ from .admission_policy import (
     effective_bot_reply_threshold,
     is_bot_hard_blocked,
 )
-from .attention import can_watch_video, direct_attention
+from .attention import can_watch_video, classify_attention
 from .bot_server import prompt_context
 from .budget_policy import BudgetConfig
 from .compression_policy import CompressionConfig
@@ -1096,11 +1096,8 @@ async def _sandbox(request: Request, audit_id: str):
         uid = {"OWNER": owner_id, "MEMBER": member_id, "BOT": bot_id}[data.identity]
         kind = "private" if data.scene == "private" else "group"
         rich = parse_message([{"type": "text", "data": {"text": data.text}}], s.onebot_self_id)
-        attention = direct_attention(
-            kind,
-            mentioned=data.scene == "group_at",
-            text=rich.command_text,
-            has_video=bool(rich.video_ids or rich.short_urls),
+        attention, addressed = classify_attention(
+            kind, mentioned=data.scene == "group_at", text=rich.command_text
         )
         msg = Message(
             platform="onebot",
@@ -1111,7 +1108,7 @@ async def _sandbox(request: Request, audit_id: str):
             event_id="sandbox",
             text=data.text,
             command_text="",
-            addressed=bool(attention),
+            addressed=addressed,
             attention_reason=attention,
             created_at=time.time(),
         )

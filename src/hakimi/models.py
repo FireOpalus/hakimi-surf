@@ -61,14 +61,26 @@ class Message(BaseModel):
     mentioned_ids: list[str] = Field(default_factory=list, max_length=32)
     # Reply ids come only from top-level protocol segments; authors are verified locally.
     reply_ids: list[str] = Field(default_factory=list, max_length=2)
-    attention_reason: Literal["", "private", "mention", "alias", "bilibili", "reply", "command"] = (
-        ""
-    )
+    attention_reason: Literal[
+        "", "private", "mention", "alias", "possible_alias", "bilibili", "reply", "command"
+    ] = ""
     images: list[ImageRef] = Field(default_factory=list, max_length=2)
     files: list[FileRef] = Field(default_factory=list, max_length=2)
     forward_ids: list[str] = Field(default_factory=list, max_length=4)
     video_ids: list[str] = Field(default_factory=list, max_length=5)
     short_urls: list[str] = Field(default_factory=list, max_length=5)
+
+    @property
+    def has_possible_qq_alias(self) -> bool:
+        return (
+            self.platform == "onebot"
+            and self.kind == "group"
+            and self.attention_reason == "possible_alias"
+        )
+
+    @property
+    def invites_group_review(self) -> bool:
+        return self.addressed or self.has_possible_qq_alias
 
     def session_parts(self, namespace: str) -> list[str]:
         return [namespace, self.platform, self.bot_id, self.kind, self.conversation_id]

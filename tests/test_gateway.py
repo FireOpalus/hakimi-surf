@@ -64,6 +64,42 @@ async def test_direct_attention_skips_relevance_even_ignore_intent(
     assert audit["attention_reason"] == attention
 
 
+@pytest.mark.parametrize(
+    "text,score,expected",
+    [
+        ("猫猫小姐，你在吗？", 0.90, "chat"),
+        ("我家猫猫睡了", 0.10, "ignore"),
+        ("大家用过 Gemini API 吗", 0.10, "ignore"),
+    ],
+)
+async def test_possible_alias_uses_context_and_the_group_threshold(
+    settings, store, sdk_pair, message, text, score, expected
+):
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        response = decision_response()
+        response["answers"]["should_reply"].update(noul=score, confidence=0.9)
+        return httpx.Response(200, json=response)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    current = group(message, addressed=False, attention_reason="possible_alias", text=text)
+    result = await gate.screen(
+        {"current_message": text},
+        "s",
+        purpose="message",
+        message=current,
+        relevance_context=["上一位群友正在问谁"],
+    )
+    assert result == expected and len(calls) == 1
+    assert "上一位群友正在问谁" in calls[0]["input"]
+    assert "third-person" in calls[0]["questions"]["should_reply"]["instructions"]
+    assert {"is_prompt_injection", "is_unsafe_or_spam"} <= calls[0]["questions"].keys()
+    audit = (await gate.filters.recent_audit())[0]
+    assert audit["attention_reason"] == "possible_alias" and not audit["reply_bypassed"]
+
+
 async def test_group_context_is_readonly_and_safety_targets_current_in_one_call(
     settings, store, sdk_pair, message
 ):

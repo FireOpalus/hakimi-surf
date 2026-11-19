@@ -7,8 +7,10 @@ import pytest
 from hakimi.adapters import onebot_message
 from hakimi.bot_server import prompt_context
 from hakimi.group_pipeline import other_mentions
-from hakimi.models import ImageRef
+from hakimi.models import ImageRef, Message
+from hakimi.service import Service
 from hakimi.store import Store
+from tests.fakes import FakeBili, FakeGateway, FakeSender
 
 
 @pytest.fixture
@@ -67,6 +69,41 @@ async def test_resets_debounce_merges_once_and_preserves_member_identity(
     assert len(await store.all("SELECT * FROM jobs WHERE status='done' AND payload IS NULL")) == 2
     assert await store.claim() is None
     assert not await store.all("SELECT * FROM ledger")
+
+
+@pytest.mark.parametrize(
+    "followup,expected", [("在吗？", "possible_alias"), ("杰米奈在吗？", "alias")]
+)
+async def test_at_only_name_review_survives_debounce(settings, store, clock, followup, expected):
+    debounce(settings)
+    service = Service(settings, store, FakeGateway(), FakeBili(), FakeSender())
+    try:
+        for index, text in enumerate(["猫猫", followup], start=1):
+            incoming = onebot_message(
+                {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": "10000",
+                    "group_id": "40000",
+                    "user_id": "30000",
+                    "time": clock[0],
+                    "message_id": index,
+                    "message": [{"type": "text", "data": {"text": text}}],
+                },
+                settings,
+            )
+            assert await service.accept(incoming) == "accepted"
+        clock[0] += 4
+        job = await store.claim()
+        merged = Message.model_validate(job["payload"])
+        assert merged.attention_reason == expected
+        assert merged.addressed == (expected == "alias")
+        assert len(job["batch_messages"]) == 2
+        await service.process(job)
+        assert len([c for c in service.ai.calls if c[0] == "generate"]) == 1
+        assert await service.deliver_once()
+    finally:
+        await service.stop()
 
 
 async def test_continuous_messages_cannot_exceed_3_5_seconds(settings, store, message, clock):
@@ -316,7 +353,7 @@ async def test_group_reset_preserves_working_batch_or_command_and_finish_referen
     assert await store.claim() is None
 
 
-@pytest.mark.parametrize("alias", ["吉米奈喵", "吉米奈", "哈基米", "大小姐"])
+@pytest.mark.parametrize("alias", ["吉米奈喵", "吉米奈", "杰米奈喵", "杰米奈", "哈基米", "大小姐"])
 def test_layer_zero_only_genuine_top_mentions_and_direct_wakewords(settings, alias):
     event = {
         "post_type": "message",

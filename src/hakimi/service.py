@@ -705,14 +705,16 @@ class Service:
     def batch_authorized(self, message, members, *, bypass_mute_user_id: str | None = None):
         if not chat_module(self.s, message.platform):
             return False
-        # An accepted @Bot batch may include subsequent unaddressed follow-up text.
-        # This relaxes attention only, never group admission, identity or blacklists.
-        addressed_batch = (
-            message.kind == "group" and len(members) > 1 and any(m.addressed for m in members)
+        # Followers inherit admission to the batch. The merged message retains the
+        # original attention reason, so a possible name still needs a relevance decision.
+        invited_batch = (
+            message.kind == "group"
+            and len(members) > 1
+            and any(m.invites_group_review for m in members)
         )
         return self._authorize_for_batch(message, bypass_mute_user_id=bypass_mute_user_id) and all(
             self._authorize_for_batch(
-                m.model_copy(update={"addressed": True}) if addressed_batch else m,
+                m.model_copy(update={"addressed": True}) if invited_batch else m,
                 bypass_mute_user_id=bypass_mute_user_id,
             )
             and not other_mentions(m)
@@ -1379,7 +1381,7 @@ class Service:
                 not sandbox
                 and message.platform == "onebot"
                 and message.kind == "group"
-                and not message.addressed
+                and not message.invites_group_review
                 and not self.bot_guard.known_bot(message)
                 and (not aff_active or caps.allow_emoji_like)
             ):

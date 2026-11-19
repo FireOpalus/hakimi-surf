@@ -5,6 +5,7 @@ import time
 from typing import TYPE_CHECKING
 
 from .admission_policy import effective_bot_reply_threshold, is_bot_hard_blocked
+from .attention import WAKE_WORDS
 from .bot_server import is_persona_owner
 from .config import Settings
 from .models import Message
@@ -16,6 +17,11 @@ if TYPE_CHECKING:
 PERMIT_SECONDS = 120
 COOLDOWN_SECONDS = 600
 MAX_TURNS = 2
+_INVITE = re.compile(
+    r"^(?:(?:" + "|".join(map(re.escape, WAKE_WORDS)) + r")[，,：:\s]*)?"
+    r"(?:去|请|帮我|麻烦|你和|你跟|跟它|跟他|跟她|和它|和他|和她)"
+    r".{0,32}(?:互动|聊聊|聊天|聊一下|对话|打个招呼|打招呼|讨论)"
+)
 
 # Retain legacy tables for old databases/admin queries; they never authorize new events.
 SCHEMA = """
@@ -123,15 +129,7 @@ class BotInteractionGuard:
             direct,
         ):
             return None
-        explicit = bool(
-            re.match(r"^/bot-interact\s+\S", direct)
-            or re.match(
-                r"^(?:(?:哈基米|吉米奈喵|吉米奈|大小姐)[，,：:\s]*)?"
-                r"(?:去|请|帮我|麻烦|你和|你跟|跟它|跟他|跟她|和它|和他|和她)"
-                r".{0,32}(?:互动|聊聊|聊天|聊一下|对话|打个招呼|打招呼|讨论)",
-                direct,
-            )
-        )
+        explicit = bool(re.match(r"^/bot-interact\s+\S", direct) or _INVITE.match(direct))
         targets = set(message.mentioned_ids) - {self.s.onebot_self_id}
         if not explicit or len(targets) != 1:
             return None
