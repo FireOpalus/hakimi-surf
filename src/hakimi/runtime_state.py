@@ -462,7 +462,7 @@ class RuntimeState:
             ("core", "世界引擎与公共服务", CORE_THINKING_SCENES),
             *(
                 (m.module_id, m.display_name or m.module_id, m.thinking_scenes)
-                for m in registry.all()
+                for m in (*registry.systems.values(), *registry.all())
             ),
         ]:
             if scenes:

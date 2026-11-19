@@ -838,6 +838,8 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
 .eyebrow .crumb-link:hover { text-decoration: underline; }
 .directory-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .directory-heading h2 { margin: 0; font-size: 16px; }
+.system-heading { margin-top: 26px; }
+.system-status { color: var(--accent); font-size: 13px; font-weight: 650; }
 .module-catalog { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
 .module-card {
   display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere;
@@ -1282,6 +1284,10 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-modules" type="button" role="tab" data-tab="modules" data-description="选择模块，查看它的运行状态、设置和可执行动作。" aria-controls="modules" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5-9 5-9-5z M3 12l9 5 9-5 M3 17l9 5 9-5"/></svg><span>模块目录</span></button>
       </div>
       <div class="nav-group-label module-nav-caption" role="presentation">模块工作区</div>
+      <div class="nav-group" role="presentation">
+        <div class="nav-group-label">系统服务</div>
+        <button id="nav-journal" type="button" role="tab" data-tab="journal" data-description="查看本地巡逻日记与隔离文件夹的同步回执。" aria-controls="journal" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h5"/></svg><span>巡逻日记与同步</span></button>
+      </div>
       <div class="nav-group" role="presentation" data-module="qq_social">
         <div class="nav-group-label">QQ</div>
         <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接，管理会话隐私、群聊互动、社区和 Owner 私信。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
@@ -1293,9 +1299,9 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       </div>
       <div class="nav-group" role="presentation" data-module="bilibili_surf">
         <div class="nav-group-label">哔哩哔哩</div>
-        <button id="nav-bili" type="button" role="tab" data-tab="bili" data-description="管理账号、视频订阅、巡逻任务和日记。" aria-controls="bili" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v13H3z M8 3l3 4 M16 3l-3 4 M7 12v3 M17 12v3 M10 15l2 1 2-1"/></svg><span>B 站巡逻</span></button>
+        <button id="nav-bili" type="button" role="tab" data-tab="bili" data-description="管理账号、视频订阅和巡逻任务。" aria-controls="bili" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v13H3z M8 3l3 4 M16 3l-3 4 M7 12v3 M17 12v3 M10 15l2 1 2-1"/></svg><span>B 站巡逻</span></button>
         <button id="nav-bili-account" type="button" data-subpage hidden role="tab" data-tab="bili-account" data-description="管理小号凭据、互动权限与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>账号与看片设置</span></button>
-        <button id="nav-patrol" type="button" data-subpage hidden role="tab" data-tab="patrol" data-description="管理 B 站订阅，查看巡逻日记与网盘同步状态。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻与日记</span></button>
+        <button id="nav-patrol" type="button" data-subpage hidden role="tab" data-tab="patrol" data-description="管理 B 站订阅与巡逻配额。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻订阅</span></button>
       </div>
       <div class="nav-group" role="presentation" data-module="weather">
         <div class="nav-group-label">天气</div>
@@ -1376,8 +1382,10 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="modules" class="tab" role="tabpanel" aria-labelledby="nav-modules" hidden>
-  <div class="directory-heading"><h2>已安装模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
+  <div class="directory-heading"><h2>平台模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
   <div id="module-catalog" class="module-catalog" aria-live="polite"></div>
+  <div class="directory-heading system-heading"><h2>常驻系统模块</h2></div>
+  <div id="system-catalog" class="module-catalog" aria-live="polite"></div>
 </section>
 
 <section id="qq" class="tab" role="tabpanel" aria-labelledby="nav-qq" hidden>
@@ -1438,15 +1446,14 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <dl class="node-details"><div><dt>执行节点</dt><dd id="bili-module-backend">—</dd></div><div><dt>小号自主巡逻</dt><dd id="bili-module-autonomous">—</dd></div></dl>
     <div class="module-shortcuts">
       <button type="button" class="secondary" data-open-tab="bili-account">账号与看片设置 <span aria-hidden="true">→</span></button>
-      <button type="button" class="secondary" data-open-tab="patrol">巡逻与日记 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="patrol">巡逻订阅 <span aria-hidden="true">→</span></button>
     </div>
   </div>
   <div class="card"><h2>手动巡逻</h2>
       <div class="quick-actions">
         <button type="button" class="quick-action" data-action="patrol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span><strong>执行 B 站巡逻</strong><small>拉取订阅更新</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
-        <button type="button" class="quick-action" data-action="diary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span><strong>汇总今日日记</strong><small>同步至 Google Drive</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
       </div>
-    <p class="overview-footnote">手动巡逻和汇总使用现有 API 额度。</p>
+    <p class="overview-footnote">手动巡逻使用现有 API 额度。</p>
   </div>
   <div class="card"><h2>模块动作</h2>
     <div id="bili-actions" class="module-tools"></div>
@@ -2140,7 +2147,14 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <p class="muted">UP 更新报告与直播间开播通知均投递给已配置 Owner；直播间只读公开状态，不拉流、不发弹幕。</p>
     <div id="subs" class="table"></div>
   </div>
-  <div class="card"><h2>巡逻日记与同步结果</h2><div id="diaries" class="table"></div><pre id="diary-preview">请选择日期预览原始 Markdown。</pre></div>
+</section>
+
+<section id="journal" class="tab" role="tabpanel" aria-labelledby="nav-journal" hidden>
+  <div class="card"><div class="row between"><h2>每日巡逻记录</h2><button type="button" data-action="diary">汇总今日日记</button></div>
+    <p id="journal-drive-status" class="muted" aria-live="polite"></p>
+    <div id="diaries" class="table"></div>
+    <pre id="diary-preview">选择日期即可阅读日记。</pre>
+  </div>
 </section>
 
 <section id="notebook" class="tab" role="tabpanel" aria-labelledby="nav-notebook" hidden>
@@ -3079,7 +3093,15 @@ $('patrol-limits-form').addEventListener('submit',e=>{e.preventDefault();busy($(
 $('reset-patrol-limits').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('恢复本次启动读取的 .env 订阅上限与轮询间隔？'))return;await api('patrol-limits','DELETE');notice('已恢复 .env 巡逻配额与间隔');await Promise.all([patrolLimits(),subscriptions()]);}));
 const subKindLabels={up:'UP 主',live:'直播间'};
 async function subscriptions(){table('subs',['类型','ID','下次巡逻 / 状态','操作'],(await api('subscriptions')).map(s=>[subKindLabels[s.kind]||s.kind,s.uid,dateTime(s.next_poll)+(s.kind==='live'?' · '+(({0:'未开播',1:'直播中',2:'轮播'})[s.last_status]??'尚未巡逻'):' '),button('删除',async()=>{if(!confirm('删除此订阅？'))return;await api('subscriptions/'+s.kind+'/'+encodeURIComponent(s.id),'DELETE');await subscriptions();},'danger')]));}
-async function diaries(){table('diaries',['日期','Drive 同步','操作'],(await api('diaries')).map(d=>[d.day,d.last_error?d.last_error+' · 重试 '+dateTime(d.next_attempt):d.last_success?'成功 '+dateTime(d.last_success):'尚未同步',button('预览',async()=>text('diary-preview',(await api('diaries/'+d.day)).markdown))]));}
+async function diaries(){
+  const [rows,services]=await Promise.all([api('diaries'),api('system-modules')]);
+  const drive=services.find(m=>m.id==='drive_sync')?.status;
+  text('journal-drive-status','Google Drive · '+(drive?.detail||'状态未知'));
+  table('diaries',['日期','Drive 同步','操作'],rows.map(d=>[
+    d.day,d.last_error?d.last_error+' · 重试 '+dateTime(d.next_attempt):d.last_success?'成功 '+dateTime(d.last_success):drive?.state==='unconfigured'?'等待配置':'待同步',
+    button('预览',async()=>text('diary-preview',(await api('diaries/'+d.day)).markdown))
+  ]));
+}
 const notebookSourceLabels={drive:'Google Drive 单文件',local:'本地快照文件'};
 function showNotebookAvailability(enabled){
   document.querySelectorAll('[data-action="notebook"]').forEach(b=>b.disabled=!enabled||b.hasAttribute('aria-busy'));
@@ -3968,6 +3990,30 @@ function moduleCard(m){
   }
   return card;
 }
+function systemCard(m){
+  const card=el('article',undefined,'module-card');card.dataset.systemModule=m.id;
+  const title=el('div',undefined,'module-name-row');title.append(el('h3',m.title));
+  card.append(title,el('p',m.description));
+  const foot=el('div',undefined,'module-foot'),status=m.status;
+  const state=el('span',status.detail,'system-status');
+  foot.append(state);
+  if(status.last_error)card.append(el('small',status.last_error));
+  if(status.last_success)card.append(el('small','上次同步 '+dateTime(status.last_success)));
+  if(m.panel&&sections.has(m.panel)){
+    const open=el('button','查看记录 →','module-open');open.type='button';
+    open.dataset.openTab=m.panel;open.setAttribute('aria-label','查看'+m.title+'记录');foot.append(open);
+  }
+  card.append(foot);return card;
+}
+async function systemDirectory(){
+  const catalog=$('system-catalog');
+  try{
+    const list=await api('system-modules');catalog.replaceChildren(...list.map(systemCard));
+  }catch(error){
+    if(error.name==='AbortError')throw error;
+    catalog.replaceChildren(el('p','系统状态暂时无法读取，请刷新目录。','empty-state'));
+  }
+}
 async function moduleDirectory(){
   const container=$('module-catalog');
   try{
@@ -3985,7 +4031,7 @@ async function moduleDirectory(){
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  modules:moduleDirectory, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
+  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
   weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{
@@ -3993,7 +4039,7 @@ const tabLoaders={
     if(moderation.status==='rejected')throw moderation.reason;
     if(profiles.status==='rejected'&&profiles.reason.name!=='AbortError')notice('好感度接口暂不可用：'+profiles.reason.message,true);
   },
-  memes, proactive, life, patrol:()=>Promise.all([patrolLimits(),subscriptions(),diaries()]),
+  memes, proactive, life, patrol:()=>Promise.all([patrolLimits(),subscriptions()]),
   notebook, logs, sandbox:groups
 };
 function refreshTab(key=tab){return tabLoaders[key]();}
@@ -4035,7 +4081,8 @@ const sections=new Map(tabButtons.map(button=>[button.dataset.tab,{
 function resetWorkspaces(){
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
-  for(const id of ['module-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch'])$(id).replaceChildren();
+  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');
+  for(const id of ['module-catalog','system-catalog','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch'])$(id).replaceChildren();
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;

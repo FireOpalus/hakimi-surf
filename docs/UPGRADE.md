@@ -132,7 +132,7 @@ result = await chat_client.aio.interactions.create(
 
 1. 创建专门用于日记的 Service Account，启用其项目的 Drive API，下载 JSON，文件作为服务器只读 secret 挂载。
 2. 选择 Shared Drive 中一个专用子文件夹，仅向该 Service Account 分享此文件夹的必要编辑权限；不要给它整个 Shared Drive 成员权限，不启用域级委派，不复用接触其他资料的账号。
-3. 配置 `GDRIVE_ROAMING_FOLDER_ID`、`GDRIVE_SERVICE_ACCOUNT_FILE` 和 `HAKIMI_ROAMING_ENABLED=true`。群聊额外通过 `HAKIMI_ROAMING_GROUP_IDS` 选择参加记录的群。
+3. 配置 `GDRIVE_ROAMING_FOLDER_ID` 及所用认证方式的凭据文件。日记在本地常驻。旧版 `HAKIMI_ROAMING_ENABLED` 作为聊天原文和原有敏感导出的授权继续有效。
 
 此模式只请求 `https://www.googleapis.com/auth/drive.file`，固定 Google OAuth 端点，拒绝其他凭证类型和 token_uri。不会使用 ADC、用户 OAuth、账号模拟或主网盘连接器。`drive.file` 不是“目录级 OAuth scope”；实际目录权限来自专用账号的文件夹 ACL，再由代码限制访问范围。[Google scopes 文档](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
 

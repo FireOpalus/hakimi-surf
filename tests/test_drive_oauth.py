@@ -5,7 +5,6 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 from multidict import MultiDict
-from pydantic import ValidationError
 
 from hakimi.config import Settings
 from hakimi.drive_client import API, SCOPE, TOKEN_URI, FolderDrive
@@ -105,8 +104,8 @@ def test_oauth_is_explicit_and_requires_its_own_path(settings, tmp_path):
         gdrive_service_account_file=tmp_path / "sa.json",
         gdrive_roaming_folder_id=FOLDER,
     )
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, **values)
+    missing = Settings(_env_file=None, **values)
+    assert missing.gdrive_oauth_credentials_file is None
     values["gdrive_oauth_credentials_file"] = tmp_path / "oauth.json"
     assert Settings(_env_file=None, **values).gdrive_auth_mode == "oauth"
 

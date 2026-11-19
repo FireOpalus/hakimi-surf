@@ -665,7 +665,7 @@ async def test_journal_failure_does_not_block_qq_and_catches_up_after_restart(se
                 self.records.append((key, source, kind))
 
         diary = Journal()
-        svc.diary = diary
+        svc.diary.world_event = diary.world_event
         ev = await svc.world_state.publish_event(
             "minecraft", "discovery", {"block": "iron"}, importance="high", now=NOW
         )

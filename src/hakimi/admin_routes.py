@@ -597,13 +597,16 @@ async def action(request: Request, action: str):
                 "note": "模型摘要按原工作队列处理；首次巡逻只建立基线。",
             }
         if action == "diary":
-            if not svc.diary or not svc.s.roaming_enabled:
-                raise Rejected("diary_disabled")
-            await svc.diary.sync_due(force=True)
-            return {
-                "status": "sync_attempted",
-                "note": "相同日记不重复上传；每日模型总结仍最多尝试一次。",
+            now = time.time()
+            await svc.diary.prepare_due(now=now, force=True)
+            state = await svc.drive_sync.sync_due(now=now, force=True)
+            notes = {
+                "uploaded": "本地日记已整理，Drive 已确认同步。",
+                "unchanged": "本地日记已整理，Drive 上已是当前版本。",
+                "unconfigured": "本地日记已整理，Drive 等待配置。",
+                "pending": "本地日记已整理，Drive 同步待重试。",
             }
+            return {"status": state, "note": notes[state]}
         if action == "notebook":
             return await svc.notebook.refresh()
         raise HTTPException(404)
@@ -980,17 +983,31 @@ async def delete_subscription(request: Request, kind: str, key: str):
     return {"status": "deleted"}
 
 
+@router.get("/api/system-modules")
+async def system_modules(request: Request):
+    return [
+        {
+            "id": module.module_id,
+            "title": module.display_name,
+            "description": module.description,
+            "panel": module.admin_panel,
+            "status": await module.status(),
+        }
+        for module in service(request).modules.systems.values()
+    ]
+
+
 @router.get("/api/diaries")
 async def diaries(request: Request):
     svc = service(request)
-    if not svc.diary:
-        return []
     async with svc.store.lock:
         return [
             dict(row)
             for row in await svc.store.all(
-                "SELECT day,slot,next_attempt,failures,last_error,last_success "
-                "FROM roaming_sync ORDER BY day DESC LIMIT 8"
+                "SELECT d.day,s.slot,COALESCE(s.next_attempt,0) AS next_attempt,"
+                "COALESCE(s.failures,0) AS failures,s.last_error,s.last_success "
+                "FROM roaming_days d LEFT JOIN roaming_sync s ON d.day=s.day "
+                "ORDER BY d.day DESC LIMIT 8"
             )
         ]
 
@@ -1003,8 +1020,6 @@ async def diary(request: Request, day: str):
     except ValueError:
         raise HTTPException(400, "invalid_day") from None
     svc = service(request)
-    if not svc.diary:
-        raise Rejected("diary_disabled")
     return {"name": day + ".md", "markdown": await svc.diary.render(day)}
 
 

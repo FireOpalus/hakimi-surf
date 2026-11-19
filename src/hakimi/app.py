@@ -17,7 +17,6 @@ from .affection_admin import router as affection_router
 from .bili_account_admin import router as bili_account_router
 from .community_admin import router as community_router
 from .config import Settings
-from .drive_client import FolderDrive
 from .gcp_admin import router as gcp_billing_router
 from .gemini import GeminiGateway
 from .life_admin import router as life_router
@@ -29,7 +28,6 @@ from .modules.onebot_transport import HTTPTransport, WebSocketTransport, websock
 from .node_transport import NodeTransport
 from .notebook_snapshot import NotebookSnapshot
 from .provider_admin import router as provider_router
-from .roaming_logger import RoamingLogger
 from .security import Rejected, check_fresh, qq_signing_key, verify_onebot, verify_qq
 from .service import Service
 from .store import Store
@@ -108,25 +106,18 @@ def create_app(
                     resources.push_async_callback(node_transport.close)
                     if isinstance(onebot, WebSocketTransport):
                         resources.push_async_callback(onebot.close)
-                    diary = None
-                    drive = None
-                    if s.roaming_enabled:
-                        drive = FolderDrive(
-                            s, http, store.vault.digest("diary-writer", s.namespace)
-                        )
-                        diary = RoamingLogger(s, store, drive, gateway=ai)
-                        await diary.initialize()
                     service = Service(
                         s,
                         store,
                         ai,
                         Bilibili(s, http, runtime=store.runtime, node_transport=node_transport),
                         Sender(s, http, onebot),
-                        diary=diary,
                         notebook=NotebookSnapshot(s, http, ai, store),
-                        drive=drive,
+                        http=http,
                         node_transport=node_transport,
                     )
+                    for module in service.modules.systems.values():
+                        await module.initialize()
                     await service.sessions.index_existing()
                     await service.moderation.initialize()
                     await service.longnick.initialize()

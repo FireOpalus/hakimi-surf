@@ -9,6 +9,8 @@ import uuid
 from collections import Counter
 from contextlib import nullcontext
 
+import httpx
+
 from .affection import _validate_platform_user
 from .attention import can_watch_video
 from .bot_server import is_persona_owner, untrusted_input
@@ -43,7 +45,7 @@ from .output_links import filter_reply_links
 from .owner_cloud_memory import OwnerCloudMemory
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
-from .roaming_logger import RoamingLogger, redact_public_summary
+from .roaming_logger import PatrolDiary, redact_public_summary
 from .routing import RouteDecision
 from .security import Rejected, authorize, configured_secrets, owner, safe_output
 from .session_manager import SessionManager
@@ -51,6 +53,7 @@ from .session_scheduler import SessionScheduler
 from .store import Store
 from .streaming import cancellable
 from .surf_mirror import SurfMirror
+from .system_modules import SystemResources, install_system_modules
 from .video_watch import VideoWatch
 from .web_search import explicit_search, search_query
 from .work_usage import model_work
@@ -101,9 +104,10 @@ class Service:
         sender: Sender,
         *,
         image_loader: ImageLoader | None = None,
-        diary: RoamingLogger | None = None,
+        diary: PatrolDiary | None = None,
         notebook=None,
         drive: FolderDrive | None = None,
+        http: httpx.AsyncClient | None = None,
         node_transport: NodeTransport | None = None,
     ):
         self.s, self.store, self.ai, self.bili, self.sender = settings, store, gateway, bili, sender
@@ -130,7 +134,6 @@ class Service:
         self.ingress_scheduler = SessionScheduler()
         self.dialogue_scheduler = SessionScheduler()
         self.public_memory = PublicMemory(store)
-        self.diary = diary
         self.notebook = notebook
         self.cloud_memory = OwnerCloudMemory(settings)
         self.compressor = MemoryCompressor(settings, self.sessions, gateway, store)
@@ -153,11 +156,17 @@ class Service:
         store.runtime.memes = self.memes
         self._lurk_react_at: dict[str, float] = {}
         self.modules = ModuleRegistry()
+        install_system_modules(
+            self.modules,
+            SystemResources(settings, store, gateway, http, diary, drive),
+        )
+        self.diary = self.modules.systems["patrol_diary"].diary
+        self.drive_sync = self.modules.systems["drive_sync"].sync
+        self.drive = self.drive_sync.drive
         self.world_state = WorldStateManager(settings, store, self.modules)
         install_modules(self)
         settings._thinking_scenes = self.modules.thinking_scenes
-        resolved_drive = drive if drive is not None else getattr(diary, "drive", None)
-        active_drive = resolved_drive if settings.roaming_enabled else None
+        active_drive = self.drive if settings.roaming_enabled else None
         self.db_backup = DatabaseBackup(settings, store, active_drive)
         self.surf_mirror = SurfMirror(self, active_drive)
         self.life_engine = LifeEngine(self)
@@ -390,8 +399,9 @@ class Service:
             asyncio.create_task(self.gcp_billing_worker(), name="gcp-billing-sync"),
             asyncio.create_task(self.life_engine.run(), name="life-engine"),
         ]
-        if self.diary and self.s.roaming_enabled:
-            self.tasks.append(asyncio.create_task(self.diary.run(), name="roaming-diary"))
+        for module in self.modules.systems.values():
+            for worker in module.workers():
+                self.tasks.append(asyncio.create_task(worker(), name=module.module_id))
         if self.s.roaming_enabled:
             self.tasks.append(asyncio.create_task(self.db_backup.run(), name="db-backup"))
             self.tasks.append(asyncio.create_task(self.surf_mirror.run(), name="surf-mirror"))
@@ -2592,6 +2602,4 @@ class Service:
                     await self.ai.cleanup_video_files()
                 except Exception:
                     self.record("video_file_cleanup_pending")
-            if self.diary:
-                await self.diary.prune()
             await asyncio.sleep(60)

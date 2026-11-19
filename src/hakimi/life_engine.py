@@ -1401,9 +1401,9 @@ class LifeEngine:
             await self.rest_if_tired(ts)
             async with self._gate_lock:
                 await self.schedule_due(ts)
-            rules = self._start_background("rules", self.rules.catch_up, ts)
-            if wait:
-                await asyncio.shield(rules)
+        rules = self._start_background("rules", self.rules.catch_up, ts)
+        if wait:
+            await asyncio.shield(rules)
         return await self.gatekeeper.tick(now=ts, wait=wait)
 
     def day_rest_limit(self, now):
@@ -1616,6 +1616,8 @@ class LifeEngine:
                             self._start_background(
                                 "planner", self.trigger_plan_once, now=now, automatic=True
                             )
+                    else:
+                        self._start_background("rules", self.rules.catch_up, now)
                 except Exception:
                     log.warning("event=life_engine_error")
                 now = self.clock()

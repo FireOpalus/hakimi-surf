@@ -30,7 +30,7 @@ async def test_app_lifespan_initializes_world_state_and_modules(settings):
         assert snapshot["current_module"] == row["current_module"] == "idle"
 
 
-async def test_service_start_roaming_enabled_gates_tasks_and_healthz(settings, store, tmp_path):
+async def test_local_system_worker_starts_with_or_without_drive(settings, store, tmp_path):
     async with httpx.AsyncClient() as http:
         svc_off = Service(
             settings, store, FakeGateway(), FakeBili(), Sender(settings, http, Wire())
@@ -40,7 +40,8 @@ async def test_service_start_roaming_enabled_gates_tasks_and_healthz(settings, s
             names_off = {t.get_name() for t in svc_off.tasks}
             assert "db-backup" not in names_off
             assert "surf-mirror" not in names_off
-            assert "roaming-diary" not in names_off
+            assert "patrol_diary" in names_off and "drive_sync" not in names_off
+            assert set(svc_off.modules.systems) >= {"drive_sync", "patrol_diary"}
         finally:
             await svc_off.stop()
 
@@ -69,7 +70,7 @@ async def test_service_start_roaming_enabled_gates_tasks_and_healthz(settings, s
     async with app.router.lifespan_context(app):
         svc_on = app.state.service
         names_on = {t.get_name() for t in svc_on.tasks}
-        assert "roaming-diary" in names_on
+        assert {"patrol_diary", "drive_sync"} <= names_on
         assert "db-backup" in names_on
         assert "surf-mirror" in names_on
         assert svc_on.db_backup.drive is not None

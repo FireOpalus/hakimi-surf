@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from collections.abc import Callable
@@ -12,7 +11,6 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from .modules.actions import reject_reason
-from .reply_style import trim_complete_text
 from .world_state import IntentTicketCreate, MilestoneEvent, private_event_for_owner
 
 if TYPE_CHECKING:
@@ -104,11 +102,13 @@ class RuleDispatcher:
         self.store = engine.store
         self.registry = registry
         self.subscriptions = {}
-        self.journal_lock = asyncio.Lock()
+        self.observer_lock = asyncio.Lock()
         self.registration_lock = asyncio.Lock()
 
     async def initialize(self, *, before_event=None) -> None:
-        if len(self.subscriptions) == len(self.registry.rules) + 1:
+        if len(self.subscriptions) == len(self.registry.rules) + len(
+            self.registry.public_event_observers
+        ):
             return
         async with self.registration_lock:
             new = {
@@ -116,8 +116,13 @@ class RuleDispatcher:
                 for name, rule in self.registry.rules.items()
                 if name not in self.subscriptions
             }
-            if "diary.milestone" not in self.subscriptions:
-                new["diary.milestone"] = self.record_diary
+            new.update(
+                {
+                    name: partial(self.observe_public, name, callback)
+                    for name, callback in self.registry.public_event_observers.items()
+                    if name not in self.subscriptions
+                }
+            )
             if not new:
                 return
             async with self.store.transaction():
@@ -200,44 +205,34 @@ class RuleDispatcher:
             )
         return intent_id
 
-    async def record_diary(self, row, now: float) -> None:
-        journal = getattr(getattr(self.engine.service, "diary", None), "world_event", None)
-        if journal is None:
+    async def observe_public(self, name, callback, row, now):
+        event = self.world.event_from_row(row)
+        if event.payload.get("private_first"):
             return
-        ev = self.world.event_from_row(row)
-        if (
-            ev.payload.get("private_first")
-            or ev.importance != "high"
-            or now >= ev.created_at + 86400
-            or ev.event_type in {"bili_video_watched", "bili_mc_inspiration"}
-        ):
-            return
-        async with self.journal_lock:
+        async with self.observer_lock:
             async with self.store.lock:
                 pending = await self.store.one(
-                    "SELECT 1 FROM life_rule_cursors c WHERE c.rule_id='diary.milestone' "
+                    "SELECT 1 FROM life_rule_cursors c WHERE c.rule_id=? "
                     "AND c.last_row<? AND NOT EXISTS(SELECT 1 FROM life_rule_receipts r "
                     "WHERE r.rule_id=c.rule_id AND r.event_id=?)",
-                    (row["seq"], ev.id),
+                    (name, row["seq"], event.id),
                 )
-            if not pending:
+            if not pending or not await callback(event, now):
                 return
-            data = json.dumps(ev.payload, ensure_ascii=False, separators=(",", ":"))
-            summary = trim_complete_text(f"重要动态 {ev.event_type} {data}", 120)
-            # The diary writer deduplicates this stable ID in its own transaction.
-            await journal(
-                "milestone:" + ev.id, ev.source_module, ev.event_type, summary, now=ev.created_at
-            )
             async with self.store.transaction():
                 await self.store.db.execute(
-                    "INSERT OR IGNORE INTO life_rule_receipts "
-                    "VALUES ('diary.milestone',?,?,?,'recorded',NULL)",
-                    (ev.id, ev.source_module, now),
+                    "INSERT OR IGNORE INTO life_rule_receipts VALUES (?,?,?,?,'recorded',NULL)",
+                    (name, event.id, event.source_module, now),
                 )
 
+    def active_subscriptions(self):
+        return [
+            (name, consume)
+            for name, consume in self.subscriptions.items()
+            if self.engine.config.enabled or name in self.registry.public_event_observers
+        ]
+
     async def notify(self, event: MilestoneEvent, now: float) -> str | None:
-        if not self.engine.config.enabled:
-            return None
         async with self.store.lock:
             row = await self.store.one(
                 "SELECT o.seq,e.* FROM life_event_order o JOIN global_events e ON e.id=o.event_id "
@@ -247,7 +242,7 @@ class RuleDispatcher:
         first = None
         if row:
             await self.initialize(before_event=row["seq"] - 1)
-            for name, consume in tuple(self.subscriptions.items()):
+            for name, consume in self.active_subscriptions():
                 try:
                     created = await consume(row, now)
                     first = first or created
@@ -260,7 +255,7 @@ class RuleDispatcher:
     async def catch_up(self, now: float) -> None:
         # Live publication can finish out of order. Only the ordered scan advances a cursor.
         await self.initialize()
-        for name, consume in tuple(self.subscriptions.items()):
+        for name, consume in self.active_subscriptions():
             async with self.store.lock:
                 rows = await self.store.all(
                     "SELECT o.seq,e.* FROM life_event_order o "

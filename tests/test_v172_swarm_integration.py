@@ -749,7 +749,7 @@ async def test_drive_v3_metadata_etag_and_memory_mirror_sync_end_to_end(settings
             sessions=sessions,
             store=store,
             ai=FakeGateway(),
-            diary=SimpleNamespace(drive=drive),
+            drive=drive,
         )
         mirror = MemoryMirror(svc)
         view = await sessions.dual.view(msg)

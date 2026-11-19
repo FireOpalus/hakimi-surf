@@ -108,7 +108,7 @@ class MemoryMirror:
         lock = self.locks[int(key[:8], 16) % len(self.locks)]
         async with lock:
             view = await self.sessions.dual.view(message)
-            if not view["mirror_enabled"] or not self.svc.diary or not self.svc.diary.drive:
+            if not view["mirror_enabled"] or self.svc.drive is None:
                 raise Rejected("memory_mirror_disabled")
             state = await self.state(message)
             try:
@@ -124,7 +124,7 @@ class MemoryMirror:
                 raise
 
     async def _sync(self, message, scope, view, state, push):
-        drive = self.svc.diary.drive
+        drive = self.svc.drive
         head = await drive.memory_head(scope)
         if head:
             if not state.get("entries") and not state.get("digest"):

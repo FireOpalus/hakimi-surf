@@ -409,9 +409,7 @@ async def mirror_fixture(settings, store, message):
     sessions, msg = SessionManager(settings, store), group(message)
     await populate(sessions, msg)
     drive, ai = FakeDrive(), FakeGateway()
-    svc = SimpleNamespace(
-        s=settings, sessions=sessions, store=store, ai=ai, diary=SimpleNamespace(drive=drive)
-    )
+    svc = SimpleNamespace(s=settings, sessions=sessions, store=store, ai=ai, drive=drive)
     mirror = MemoryMirror(svc)
     view = await sessions.dual.view(msg)
     await mirror.configure(msg, True, view["version"])

@@ -86,7 +86,6 @@ CORE_THINKING_SCENES = (
     ThinkingScene("world.morning", "晨间行程规划", levels=("medium", "high")),
     ThinkingScene("world.revision", "日内行程调整"),
     ThinkingScene("memory_compression", "滚动记忆压缩", output_cap="chat_output_tokens"),
-    ThinkingScene("daily_diary", "巡逻日记", output_cap="diary_output_tokens"),
     ThinkingScene("web.search", "联网检索"),
 )
 

@@ -350,7 +350,8 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         ('id="sessions"', "memory"),
         ('id="life-mc-form"', "minecraft"),
         ('data-action="patrol"', "bili"),
-        ('data-action="diary"', "bili"),
+        ('data-action="diary"', "journal"),
+        ('id="system-catalog"', "modules"),
         ('data-action="notebook"', "notebook"),
     ):
         assert [key for key, content in panels.items() if marker in content] == [owner]

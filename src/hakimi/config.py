@@ -274,7 +274,11 @@ class Settings(BaseSettings):
     file_daily_limit_per_user: int = Field(default=15, ge=0, le=100)
     text_card_mode: Literal["rich_auto", "fallback_only"] = "rich_auto"
 
-    roaming_enabled: bool = False
+    # Data export permission carried over from older deployments, independent of module loading.
+    roaming_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("HAKIMI_ARCHIVE_AUTHORIZED_DATA", "HAKIMI_ROAMING_ENABLED"),
+    )
     gdrive_auth_mode: Literal["service_account", "oauth"] = Field(
         default="service_account",
         validation_alias=AliasChoices("GDRIVE_AUTH_MODE", "HAKIMI_GDRIVE_AUTH_MODE"),
@@ -529,18 +533,6 @@ class Settings(BaseSettings):
             for key in self.group_policies | dict.fromkeys(self.roaming_group_ids)
         ):
             raise ValueError("Group keys must use platform:group_id")
-        if self.roaming_enabled:
-            credential_path = (
-                self.gdrive_oauth_credentials_file
-                if self.gdrive_auth_mode == "oauth"
-                else self.gdrive_service_account_file
-            )
-            if (
-                not re.fullmatch(r"[A-Za-z0-9_-]{10,128}", self.gdrive_roaming_folder_id)
-                or self.gdrive_roaming_folder_id == "root"
-                or credential_path is None
-            ):
-                raise ValueError("Roaming requires one folder ID and the selected credential path")
         if len(
             self.gemini_api_key.get_secret_value()
         ) < 8 or self.gemini_api_key.get_secret_value().startswith("REPLACE_"):

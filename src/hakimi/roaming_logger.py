@@ -1,7 +1,6 @@
 """A diary of public patrols and allowlisted group/private chats."""
 
 import asyncio
-import hashlib
 import json
 import logging
 import re
@@ -11,7 +10,6 @@ from zoneinfo import ZoneInfo
 
 from .bot_server import is_persona_owner
 from .config import Settings
-from .drive_client import FolderDrive
 from .gemini import GeminiGateway
 from .generation_policy import Scenario
 from .models import Message
@@ -29,15 +27,18 @@ CREATE TABLE IF NOT EXISTS roaming_receipts (id TEXT PRIMARY KEY, day TEXT NOT N
 CREATE TABLE IF NOT EXISTS roaming_counts (
   day TEXT NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY(day,kind)
 );
-CREATE TABLE IF NOT EXISTS roaming_sync (
-  day TEXT PRIMARY KEY, digest TEXT, file_id TEXT, slot TEXT,
-  next_attempt REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0
-);
+CREATE TABLE IF NOT EXISTS roaming_days (day TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS roaming_public_summaries (day TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS roaming_summaries (
   day TEXT PRIMARY KEY, source_digest TEXT NOT NULL, payload BLOB,
   status TEXT NOT NULL CHECK(status IN ('attempted','done','failed')), created REAL NOT NULL
 );
 """
+# The same eligibility check feeds offline summarization and upload readiness.
+VISIBLE_COUNTS = (
+    "(? OR kind IN ('patrol','world_event','group_chat','group_bilibili',"
+    "'group_image','injection','patrol_omitted'))"
+)
 GROUP_TEXT = {
     "group_chat": "群友与哈基米聊了聊日常话题",
     "group_image": "群友发来图片，一起进行图片交流",
@@ -74,29 +75,44 @@ def format_chat_entry(
     return cleaned.translate(_MARKDOWN_SAFE)
 
 
-class RoamingLogger:
+class PatrolDiary:
     def __init__(
         self,
         settings: Settings,
         store: Store,
-        drive: FolderDrive | None = None,
         *,
         gateway: GeminiGateway | None = None,
     ):
-        self.s, self.store, self.drive = settings, store, drive
+        self.s, self.store = settings, store
         self.gateway = gateway
         self.zone = ZoneInfo(settings.roaming_timezone)
-        self.sync_lock = asyncio.Lock()
+        self.summary_lock = asyncio.Lock()
+        self._initialized = False
 
     async def initialize(self):
-        async with self.store.lock:
-            await self.store.db.executescript(SCHEMA)
-            columns = {row[1] for row in await self.store.all("PRAGMA table_info(roaming_sync)")}
-            for name, kind in [("last_error", "TEXT"), ("last_success", "REAL")]:
-                if name not in columns:
-                    await self.store.db.execute(
-                        f"ALTER TABLE roaming_sync ADD COLUMN {name} {kind}"
-                    )
+        if self._initialized:
+            return
+        async with self.store.transaction():
+            if self._initialized:
+                return
+            new_index = not await self.store.one(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roaming_days'"
+            )
+            for statement in SCHEMA.strip().rstrip(";").split(";"):
+                await self.store.db.execute(statement)
+            await self.store.db.execute(
+                "INSERT OR IGNORE INTO roaming_days SELECT day FROM roaming_counts "
+                "UNION SELECT day FROM roaming_events UNION SELECT day FROM roaming_summaries"
+            )
+            if await self.store.one(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roaming_sync'"
+            ):
+                # Import every legacy date once, and recognize old-binary writes after a rollback.
+                since = "" if new_index else (self.local().date() - timedelta(days=8)).isoformat()
+                await self.store.db.execute(
+                    "INSERT OR IGNORE INTO roaming_days SELECT day FROM roaming_sync WHERE day>=?",
+                    (since,),
+                )
             event_cols = {
                 row[1] for row in await self.store.all("PRAGMA table_info(roaming_events)")
             }
@@ -105,6 +121,8 @@ class RoamingLogger:
                     "ALTER TABLE roaming_events "
                     "ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'patrol'"
                 )
+
+        self._initialized = True
 
     def local(self, now: float | None = None) -> datetime:
         return datetime.fromtimestamp(time.time() if now is None else now, self.zone)
@@ -118,8 +136,7 @@ class RoamingLogger:
         event_kind: str = "patrol",
         now=None,
     ):
-        if not self.s.roaming_enabled:
-            return
+        await self.initialize()
         day = self.local(now).date().isoformat()
         key = self.store.vault.digest("diary-event", event_id, kind)
         async with self.store.transaction():
@@ -143,7 +160,7 @@ class RoamingLogger:
                 (day, kind),
             )
             await self.store.db.execute(
-                "INSERT OR IGNORE INTO roaming_sync(day) VALUES (?)", (day,)
+                "INSERT OR IGNORE INTO roaming_days(day) VALUES (?)", (day,)
             )
 
     async def injection(self, event_id: str, *, now=None):
@@ -198,6 +215,10 @@ class RoamingLogger:
             )
         else:
             kind = "private_chat"
+        if not self.s.roaming_enabled:
+            if message.kind == "group":
+                await self._record(event_id, kind, now=now)
+            return
         event_kind, scope_label = self._chat_scope_label(message)
         ts = self.local(now if now is not None else message.created_at).strftime("%H:%M")
         lines = []
@@ -223,7 +244,7 @@ class RoamingLogger:
         await self._record(event_id, kind, text, event_kind=event_kind, now=now)
 
     async def bot_reply(self, reply_id: str, message: Message, text: str, *, now=None):
-        if not text or not text.strip():
+        if not self.s.roaming_enabled or not text or not text.strip():
             return
         if not authorize(message.model_copy(update={"addressed": True}), self.s):
             return
@@ -238,6 +259,18 @@ class RoamingLogger:
             "reply:" + reply_id, "bot_reply", formatted, event_kind=event_kind, now=now
         )
 
+    async def _source_rows(self, day, *, archive_chats):
+        counts = await self.store.all(
+            f"SELECT kind,n FROM roaming_counts WHERE day=? AND {VISIBLE_COUNTS}",
+            (day, archive_chats),
+        )
+        rows = await self.store.all(
+            "SELECT id,payload,event_kind FROM roaming_events WHERE day=? "
+            "AND (? OR event_kind IN ('patrol','world_life')) ORDER BY rowid",
+            (day, archive_chats),
+        )
+        return dict(counts), rows
+
     def _summary_input(self, day: str, counts: dict, rows: list) -> dict:
         patrol_rows = [r for r in rows if "event_kind" in r.keys() and r["event_kind"] == "patrol"]
         world_rows = [
@@ -246,12 +279,15 @@ class RoamingLogger:
         chat_rows = [
             r
             for r in rows
-            if "event_kind" in r.keys()
-            and (r["event_kind"] or "patrol") not in {"patrol", "world_life"}
+            if self.s.roaming_enabled and r["event_kind"] in {"chat_group", "chat_private"}
         ]
         payload = {
             "day": day,
-            "group_activity": {label: counts.get(kind, 0) for kind, label in GROUP_TEXT.items()},
+            "group_activity": {
+                label: counts.get(kind, 0)
+                for kind, label in GROUP_TEXT.items()
+                if kind != "private_chat" or self.s.roaming_enabled
+            },
             "injection_attempts": counts.get("injection", 0),
             "public_summaries": [],
             "chat_excerpts": [],
@@ -295,13 +331,7 @@ class RoamingLogger:
         async with self.store.transaction():
             if await self.store.one("SELECT 1 FROM roaming_summaries WHERE day=?", (day,)):
                 return
-            counts = dict(
-                await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
-            )
-            rows = await self.store.all(
-                "SELECT id,payload,event_kind FROM roaming_events WHERE day=? ORDER BY rowid",
-                (day,),
-            )
+            counts, rows = await self._source_rows(day, archive_chats=self.s.roaming_enabled)
             if not counts and not rows:
                 return
             payload = self._summary_input(day, counts, rows)
@@ -311,6 +341,12 @@ class RoamingLogger:
                 "INSERT INTO roaming_summaries VALUES (?,?,NULL,'attempted',?)",
                 (day, self.store.vault.digest("diary-input", payload), now),
             )
+            if not payload["chat_excerpts"] and not (
+                self.s.roaming_enabled and counts.get("private_chat")
+            ):
+                await self.store.db.execute(
+                    "INSERT OR IGNORE INTO roaming_public_summaries(day) VALUES (?)", (day,)
+                )
         subject = self.store.vault.digest("diary-budget", self.s.namespace)
         try:
             with model_work("diary.daily_summary", key):
@@ -337,19 +373,24 @@ class RoamingLogger:
                     (self.store.vault.seal(key, summary), day),
                 )
 
-    async def render(self, day: str) -> str:
+    async def public_digest(self, day):
+        await self.initialize()
         async with self.store.lock:
-            counts = dict(
-                await self.store.all("SELECT kind,n FROM roaming_counts WHERE day=?", (day,))
-            )
-            rows = await self.store.all(
-                "SELECT id,payload,event_kind FROM roaming_events WHERE day=? ORDER BY rowid",
-                (day,),
-            )
+            counts, rows = await self._source_rows(day, archive_chats=False)
+        payload = self._summary_input(day, counts, rows)
+        payload["group_activity"].pop(GROUP_TEXT["private_chat"], None)
+        return payload
+
+    async def render(self, day: str) -> str:
+        await self.initialize()
+        async with self.store.lock:
+            counts, rows = await self._source_rows(day, archive_chats=self.s.roaming_enabled)
         patrol_rows = [r for r in rows if (r["event_kind"] or "patrol") == "patrol"]
         world_rows = [r for r in rows if (r["event_kind"] or "patrol") == "world_life"]
         chat_rows = [
-            r for r in rows if (r["event_kind"] or "patrol") not in {"patrol", "world_life"}
+            r
+            for r in rows
+            if self.s.roaming_enabled and r["event_kind"] in {"chat_private", "chat_group"}
         ]
         lines = [
             f"# 分身巡逻日记 · {day}",
@@ -379,7 +420,7 @@ class RoamingLogger:
         activities = [
             f"- {text}：{counts[kind]} 次。"
             for kind, text in GROUP_TEXT.items()
-            if counts.get(kind)
+            if counts.get(kind) and (kind != "private_chat" or self.s.roaming_enabled)
         ]
         if activities:
             lines += activities
@@ -416,7 +457,11 @@ class RoamingLogger:
             "",
         ]
         async with self.store.lock:
-            summary = await self.store.one("SELECT * FROM roaming_summaries WHERE day=?", (day,))
+            summary = await self.store.one(
+                "SELECT * FROM roaming_summaries WHERE day=? AND (? OR day IN "
+                "(SELECT day FROM roaming_public_summaries))",
+                (day, self.s.roaming_enabled),
+            )
         if summary:
             lines += ["## 每日总结", ""]
             if summary["status"] == "done":
@@ -429,99 +474,59 @@ class RoamingLogger:
                 lines += ["当日模型总结未完成；以上保留已记录的日志明细。", ""]
         return "\n".join(lines)
 
-    async def sync_due(self, *, now: float | None = None, force=False):
-        if not self.s.roaming_enabled or self.drive is None:
-            return
+    async def prepare_due(self, *, now=None, force=False):
+        await self.initialize()
         now = time.time() if now is None else now
         local = self.local(now)
-        day = local.date().isoformat()
-        # The 23:55 flush has its own persistent slot, independent of the two-hour cadence.
-        slot = (
-            "final"
-            if (local.hour, local.minute) >= (23, 55)
-            else str(
-                int(
-                    (
-                        local - local.replace(hour=0, minute=0, second=0, microsecond=0)
-                    ).total_seconds()
-                )
-                // self.s.roaming_interval_seconds
-            )
-        )
-        async with self.sync_lock:
+        today = local.date().isoformat()
+        async with self.summary_lock:
             async with self.store.transaction():
                 await self.store.db.execute(
-                    "INSERT OR IGNORE INTO roaming_sync(day) VALUES (?)", (day,)
+                    "INSERT OR IGNORE INTO roaming_days(day) VALUES (?)", (today,)
                 )
-                rows = await self.store.all(
-                    "SELECT * FROM roaming_sync WHERE day=?"
-                    if force
-                    else "SELECT * FROM roaming_sync WHERE day>=? AND next_attempt<=? ORDER BY day",
-                    (day,) if force else ((local.date() - timedelta(days=7)).isoformat(), now),
-                )
-            for row in rows:
-                current_slot = slot if row["day"] == day else "closed"
-                # Finished days are rechecked: events can arrive after the final flush.
-                if not force and row["day"] == day and row["slot"] == current_slot:
-                    continue
-                if force or current_slot in {"final", "closed"}:
-                    await self._daily_summary(row["day"], now)
-                markdown = await self.render(row["day"])
-                digest = hashlib.sha256(markdown.encode()).hexdigest()
-                if digest == row["digest"]:
-                    async with self.store.transaction():
-                        await self.store.db.execute(
-                            "UPDATE roaming_sync SET slot=? WHERE day=?", (current_slot, row["day"])
-                        )
-                    continue
-                try:
-                    file_id = await self.drive.sync_day(row["day"], markdown)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    delay = min(7200, 60 * 2 ** min(row["failures"], 7))
-                    reason = (
-                        str(exc)
-                        if isinstance(exc, Rejected)
-                        and str(exc)
-                        in {
-                            "drive_credentials_invalid",
-                            "drive_shared_folder_required",
-                            "drive_request_failed",
-                            "drive_file_outside_scope",
-                            "drive_ambiguous_file",
-                            "drive_token_failed",
-                            "drive_folder_unavailable",
-                            "drive_oauth_credentials_invalid",
-                            "drive_oauth_folder_mismatch",
-                            "drive_oauth_scope_mismatch",
-                            "drive_oauth_reauthorization_required",
-                            "drive_oauth_client_invalid",
-                        }
-                        else "drive_sync_failed"
-                    )
-                    async with self.store.transaction():
-                        await self.store.db.execute(
-                            "UPDATE roaming_sync SET "
-                            "next_attempt=?,failures=failures+1,last_error=? "
-                            "WHERE day=?",
-                            (now + delay, reason, row["day"]),
-                        )
-                    logging.getLogger("hakimi").info("event=diary_sync_pending")
+                if force:
+                    days = [(today,)]
                 else:
-                    async with self.store.transaction():
-                        await self.store.db.execute(
-                            "UPDATE roaming_sync SET digest=?,file_id=?,slot=?,"
-                            "next_attempt=0,failures=0,last_error=NULL,last_success=? WHERE day=?",
-                            (digest, file_id, current_slot, now, row["day"]),
-                        )
+                    end = (
+                        today
+                        if (local.hour, local.minute) >= (23, 55)
+                        else (local.date() - timedelta(days=1)).isoformat()
+                    )
+                    days = await self.store.all(
+                        "SELECT DISTINCT day FROM roaming_counts WHERE day BETWEEN ? AND ? "
+                        f"AND {VISIBLE_COUNTS} AND day NOT IN "
+                        "(SELECT day FROM roaming_summaries) ORDER BY day",
+                        (
+                            (local.date() - timedelta(days=7)).isoformat(),
+                            end,
+                            self.s.roaming_enabled,
+                        ),
+                    )
+            for (day,) in days:
+                await self._daily_summary(day, now)
 
-    async def run(self):
+    async def markdown_for_sync(self, day, *, final):
+        if not final or self.gateway is None:
+            return await self.render(day)
+        # Let the local producer commit its final attempt before the uploader seals this slot.
+        async with self.summary_lock:
+            async with self.store.lock:
+                pending = await self.store.one(
+                    f"SELECT 1 FROM roaming_counts WHERE day=? AND {VISIBLE_COUNTS} "
+                    "AND day NOT IN (SELECT day FROM roaming_summaries) LIMIT 1",
+                    (day, self.s.roaming_enabled),
+                )
+            return None if pending else await self.render(day)
+
+    async def run_local(self):
+        last_prune = None
         while True:
             try:
-                await self.sync_due()
-            except asyncio.CancelledError:
-                raise
+                await self.prepare_due()
+                day = self.local().date()
+                if last_prune != day:
+                    await self.prune()
+                    last_prune = day
             except Exception:
                 logging.getLogger("hakimi").info("event=diary_worker_error")
             await asyncio.sleep(30)
@@ -530,10 +535,33 @@ class RoamingLogger:
         cutoff = (self.local().date() - timedelta(days=8)).isoformat()
         async with self.store.transaction():
             for table in (
+                "roaming_public_summaries",
                 "roaming_events",
                 "roaming_receipts",
                 "roaming_counts",
-                "roaming_sync",
+                "roaming_days",
                 "roaming_summaries",
             ):
                 await self.store.db.execute(f"DELETE FROM {table} WHERE day<?", (cutoff,))
+
+
+class RoamingLogger(PatrolDiary):
+    """Compatibility entry point for integrations that supply a Drive client directly."""
+
+    def __init__(self, settings, store, drive=None, *, gateway=None):
+        from .diary_sync import DiaryDriveSync
+
+        super().__init__(settings, store, gateway=gateway)
+        self.drive = drive
+        self._sync = DiaryDriveSync(self, drive, store)
+
+    async def sync_due(self, *, now=None, force=False):
+        now = time.time() if now is None else now
+        await self.prepare_due(now=now, force=force)
+        return await self._sync.sync_due(now=now, force=force)
+
+    async def run(self):
+        async with asyncio.TaskGroup() as workers:
+            workers.create_task(self.run_local())
+            if self.drive is not None:
+                workers.create_task(self._sync.run())

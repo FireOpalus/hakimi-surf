@@ -283,7 +283,7 @@ async def test_memory_mirror_end_to_end_with_metadata_only_drive(settings, store
             sessions=sessions,
             store=store,
             ai=FakeGateway(),
-            diary=SimpleNamespace(drive=drive),
+            drive=drive,
         )
         mirror = MemoryMirror(svc)
         view = await sessions.dual.view(msg)
