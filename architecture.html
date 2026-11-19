@@ -130,7 +130,7 @@
           </div>
         </div>
         <div class="bridge"><strong>境内节点</strong>　</strong><code>node_agent ⇄ McBridgeSlot ⇄ mc_agent:8791 ⇄ Minecraft 服务器</code>。8791 是 Compose 网络内的桥接端口，使用独立 Bearer；游戏登录状态与节点心跳分别记录。</div>
-        <div class="bridge"><strong>境外引擎</strong>　<code>FastAPI → Service → Store / SessionManager ⇄ SQLite</code>。聊天、调度和巡逻任务由引擎访问这层存储；模型请求经 <code>GeminiGateway</code>，启用的云端日记、镜像和备份经 <code>FolderDrive</code>。这些服务不经境内的两条 WS。</div>
+        <div class="bridge"><strong>境外引擎</strong>　<code>FastAPI → Service → Store / SessionManager ⇄ SQLite</code>。聊天、调度和巡逻任务由引擎访问这层存储；模型请求经 <code>GeminiGateway</code>，模块向常驻 <code>drive_sync</code> 提交获准导出的文件，经 <code>FolderDrive</code> 投递到隔离目录。这些服务不经境内的两条 WS。</div>
         <figcaption class="caption">跨机 Nginx 模板在 443 精确匹配这两条路径，其余返回 404。引擎映射回环 <code>12141</code>，后台映射回环 <code>12143</code>。旧隧道通过引擎取得同一份后台页面。<code>NODE_WS_ENABLED</code> 默认关闭；架构图描述可用能力，不代表节点已启用或在线。OneBot HTTP、正向 WS 和官方 QQ Webhook 仍是独立适配选项。</figcaption>
         <p class="ref"><b>源码</b><a href="deploy/hakimi-ws.conf">跨机 Nginx</a><a href="docker-compose.yml">境外服务</a><a href="docker-compose.napcat.yml">NapCat</a><a href="node_agent/compose.cn.yaml">境内节点与游戏桥</a><a href="src/hakimi/app.py">握手与启动</a><a href="src/hakimi/node_transport.py">节点协议</a></p>
       </figure>
@@ -138,7 +138,7 @@
 
     <section class="chapter" id="life" aria-labelledby="life-title">
       <div class="heading"><span class="num">02</span><h2 id="life-title">从世界状态到一次主动行动</h2></div>
-      <p class="intro">启动时，引擎从模块目录的 <code>.gitmodules</code> 读取已安装仓库，逐个加载 <code>plugin.py</code>，并把返回的模块登记到 <code>ModuleRegistry</code>。平台模块声明动作、就绪条件与调度设置，后台提供各自的开关。随版本交付的系统模块从 <code>system_modules/</code> 按依赖装载，目录直接展示运行状态。世界引擎读取登记的策略来规划时段、检查次数和执行意图。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
+      <p class="intro">启动时，引擎从模块目录的 <code>.gitmodules</code> 读取已安装仓库，逐个加载 <code>plugin.py</code>，并把返回的模块登记到 <code>ModuleRegistry</code>。平台模块声明动作、就绪条件与调度设置，后台提供各自的开关。随版本交付的系统模块从 <code>system_modules/</code> 按依赖装载，目录直接展示运行状态。日记、Drive 同步、数据库备份、分身镜像、群记忆镜像和 Owner 只读记忆各自装载。世界引擎读取登记的策略来规划时段、检查次数和执行意图。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
       <div class="grid three">
         <article class="tile sea"><span class="step">LOW · qq_social</span><h3>QQ 社交</h3><p>汇总传输状态、活跃群和缓冲条数。这里不读取 Owner 私聊正文。</p></article>
         <article class="tile blue"><span class="step">MEDIUM · bilibili_surf</span><h3>B 站冲浪</h3><p>境外组织巡逻；境内节点在线且启用委派时，可由境内代采。传感摘要区分采集状态和最近记录。</p></article>
@@ -235,15 +235,16 @@
           <p class="ref"><a href="src/hakimi/session_manager.py">物理分库</a><a href="src/hakimi/dual_memory.py">画像与编年史</a><a href="src/hakimi/memory_compressor.py">冷史合批</a><a href="src/hakimi/public_memory.py">单向公开索引</a></p>
         </article>
       </div>
-      <figure class="sheet" style="margin-top:.85rem" aria-label="四种不同用途和访问范围的文件流">
+      <figure class="sheet" style="margin-top:.85rem" aria-label="模块文件同步与 Owner 只读输入">
         <dl class="kv">
+          <div><dt>模块 → Google Drive</dt><dd>平台和常驻模块声明 <code>drive_usage</code>，通过 <code>service.drive_sync.sync_file</code> 提交获准外发的文本或二进制文件。同名文件按调用模块隔离。<code>drive_module_sync</code> 保存每个模块的最近尝试、成功时间和错误状态，供管理后台读取。</dd></div>
           <div id="owner-memory"><dt>桌面 → Owner 私聊</dt><dd><code>owner_memory_bridge.py</code> 同步限定的源文件；拉取比较本地 SHA-256。<code>OwnerCloudMemory</code> 在境外只读索引挂载目录，按需把片段送入 Owner 的 C 区。单文件 <code>NotebookSnapshot</code> 是另一项独立开关。</dd></div>
           <div><dt>分身 → Owner 镜像</dt><dd><code>SurfMirror</code> 不调用模型。读取 Owner 私聊的限定记录、双轨条目、世界事件、巡逻记录，脱敏后原子写入 <code>surf_mirror/latest.md</code> 和 <code>daily/YYYY-MM-DD.md</code>。默认半小时检查一次，按摘要指纹推送变化至指定 Drive 文件夹。导出可能含私聊内容，只供 Owner 阅读。</dd></div>
           <div><dt>巡逻日记与群镜像</dt><dd><code>PatrolDiary</code> 独立整理本地日记及每日总结。<code>DiaryDriveSync</code> 按时从本地读取并向隔离目录同步，失败后重试。<code>MemoryMirror</code> 则仅为显式开启的公开群同步 Markdown。两者都与上面的 Owner 专用导出分别管理。</dd></div>
           <div><dt>主库 → 加密备份</dt><dd><code>DatabaseBackup</code> 对 <code>hakimi.sqlite3</code> 执行 <code>VACUUM INTO</code>，压缩、使用专用派生密钥加密，在本地保存并可上传指定 Drive 文件夹，默认保留 7 天。它不覆盖 <code>sessions/</code> 下的独立会话库，恢复主库不能代替恢复所有聊天记录。</dd></div>
         </dl>
-        <figcaption class="caption">巡逻日记与 Drive 同步常驻。聊天原文归档、Owner 镜像和备份导出沿用独立的数据授权。Drive 文件以指定父目录和应用标记限定范围；服务器的只读记忆输入与写往 Drive 的导出是两个方向。</figcaption>
-        <p class="ref"><b>源码</b><a href="src/hakimi/world_state.py">全局表</a><a href="scripts/owner_memory_bridge.py">桌面桥</a><a href="src/hakimi/owner_cloud_memory.py">只读召回</a><a href="src/hakimi/surf_mirror.py">分身镜像</a><a href="src/hakimi/roaming_logger.py">巡逻日记</a><a href="src/hakimi/memory_mirror.py">群镜像</a><a href="src/hakimi/db_backup.py">备份范围</a></p>
+        <figcaption class="caption">公开日记、加密备份、Owner 分身镜像和已授权群记忆共用隔离目录。每条链路保留自己的数据授权和远端文件标记。Owner 小本本使用单独的只读来源。</figcaption>
+        <p class="ref"><b>源码</b><a href="src/hakimi/world_state.py">全局表</a><a href="scripts/owner_memory_bridge.py">桌面桥</a><a href="src/hakimi/owner_cloud_memory.py">只读召回</a><a href="src/hakimi/surf_mirror.py">分身镜像</a><a href="src/hakimi/roaming_logger.py">巡逻日记</a><a href="src/hakimi/memory_mirror.py">群镜像</a><a href="src/hakimi/db_backup.py">备份范围</a><a href="src/hakimi/system_modules/drive_sync.py">模块同步接口</a></p>
       </figure>
     </section>
 

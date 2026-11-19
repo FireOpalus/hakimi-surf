@@ -334,10 +334,19 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
     assert tabs["core"] | tabs["modules"] == set(panels)
     assert html.count('id="module-heading-switch"') == 1
     assert "module-detail-state" not in html
-    assert {"overview", "ledger", "life", "api-routing", "memory", "notebook"} <= tabs["core"]
-    assert {"modules", "qq", "bili", "minecraft", "group-policy", "admission", "patrol"} <= tabs[
-        "modules"
-    ]
+    assert {"overview", "ledger", "life", "api-routing", "memory"} <= tabs["core"]
+    assert {
+        "modules",
+        "qq",
+        "bili",
+        "minecraft",
+        "group-policy",
+        "admission",
+        "patrol",
+        "notebook",
+        "drive-sync",
+        "journal",
+    } <= tabs["modules"]
     for key in tabs["core"]:
         shortcuts = set(re.findall(r'data-open-tab="([^"]+)"', panels[key]))
         assert shortcuts <= tabs["core"] | {"modules"}, (key, shortcuts)

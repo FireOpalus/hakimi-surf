@@ -599,7 +599,7 @@ async def action(request: Request, action: str):
         if action == "diary":
             now = time.time()
             await svc.diary.prepare_due(now=now, force=True)
-            state = await svc.drive_sync.sync_due(now=now, force=True)
+            state = await svc.diary_sync.sync_due(now=now, force=True)
             notes = {
                 "uploaded": "本地日记已整理，Drive 已确认同步。",
                 "unchanged": "本地日记已整理，Drive 上已是当前版本。",
@@ -997,6 +997,11 @@ async def system_modules(request: Request):
     ]
 
 
+@router.get("/api/drive-sync")
+async def drive_sync(request: Request):
+    return await service(request).drive_sync.overview()
+
+
 @router.get("/api/diaries")
 async def diaries(request: Request):
     svc = service(request)
@@ -1010,6 +1015,11 @@ async def diaries(request: Request):
                 "ORDER BY d.day DESC LIMIT 8"
             )
         ]
+
+
+@router.get("/api/diaries/status")
+async def diary_status(request: Request):
+    return await service(request).diary_sync.status()
 
 
 @router.get("/api/diaries/{day}")

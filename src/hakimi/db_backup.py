@@ -5,13 +5,13 @@ import base64
 import gzip
 import hashlib
 import hmac
-import json
 import logging
 import os
 import re
 import sqlite3
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet, InvalidToken
 
 from .config import Settings
-from .drive_client import API, FILE_FIELDS, UPLOAD, FolderDrive
+from .drive_client import API, FILE_FIELDS, FolderDrive
 from .security import Rejected
 from .store import Store
 
@@ -33,7 +33,6 @@ DRIVE_BACKUP_PROP = "hakimi_db_backup"
 
 _LOCAL_BACKUP_RE = re.compile(r"^hakimi-backup-(\d{4}-\d{2}-\d{2})\.sqlite3\.gz\.enc$")
 _DRIVE_BACKUP_RE = re.compile(r"^db-backup-(\d{4}-\d{2}-\d{2})\.sqlite3\.gz\.enc$")
-_DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _MARKER_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
@@ -149,6 +148,7 @@ class DatabaseBackup:
         store: Store,
         drive: FolderDrive | None = None,
         *,
+        transfer=nullcontext,
         interval_seconds: int = 86400,
         keep_days: int = 7,
         startup_delay_seconds: float = 60.0,
@@ -157,6 +157,7 @@ class DatabaseBackup:
         self.s = settings
         self.store = store
         self.drive = drive
+        self.transfer = transfer
         self.interval_seconds = interval_seconds
         self.keep_days = max(1, int(keep_days))
         self.startup_delay_seconds = startup_delay_seconds
@@ -237,60 +238,24 @@ class DatabaseBackup:
         }
         return summary, enc_bytes
 
-    def _validate_drive_item(
-        self,
-        item: dict[str, Any],
-        marker: str,
-        expected_name: str | None = None,
-    ) -> str:
-        if not isinstance(item, dict) or self.drive is None:
-            raise Rejected("drive_file_outside_scope")
-        file_id = item.get("id", "")
-        props = item.get("appProperties")
+    async def _drive_delete_file(self, file_id: str, filename: str, marker: str) -> None:
+        if self.drive is None:
+            raise Rejected("drive_unavailable")
+        current, etag = await self.drive._json(
+            "GET", f"{API}/{file_id}", params={"fields": FILE_FIELDS, "supportsAllDrives": "true"}
+        )
         if (
-            not isinstance(file_id, str)
-            or not _DRIVE_ID_RE.fullmatch(file_id)
-            or item.get("parents") != [self.drive.folder]
-            or item.get("trashed", False)
-            or not isinstance(props, dict)
-            or props.get(DRIVE_BACKUP_PROP) != marker
-            or item.get("mimeType") != "application/octet-stream"
-            or (expected_name is not None and item.get("name") != expected_name)
+            self.drive.validate_owned_file(
+                current, filename, "application/octet-stream", DRIVE_BACKUP_PROP, marker
+            )
+            != file_id
         ):
             raise Rejected("drive_file_outside_scope")
-        return file_id
-
-    async def _drive_request_json(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
-        if self.drive is None:
-            raise Rejected("drive_unavailable")
-        token = await self.drive._access_token()
-        headers = {"Authorization": f"Bearer {token}", **kwargs.pop("headers", {})}
-        async with self.drive.http.stream(
-            method, url, headers=headers, follow_redirects=False, **kwargs
-        ) as response:
-            if response.status_code not in {200, 201}:
-                raise Rejected("drive_request_failed")
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > 65536:
-                    raise Rejected("drive_response_too_large")
-            try:
-                value = json.loads(body)
-            except ValueError as exc:
-                raise Rejected("drive_invalid_response") from exc
-            if not isinstance(value, dict):
-                raise Rejected("drive_invalid_response")
-            return value
-
-    async def _drive_delete_file(self, file_id: str) -> None:
-        if self.drive is None:
-            raise Rejected("drive_unavailable")
         token = await self.drive._access_token()
         async with self.drive.http.stream(
             "DELETE",
             f"{API}/{file_id}",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token}", **({"If-Match": etag} if etag else {})},
             params={"supportsAllDrives": "true"},
             follow_redirects=False,
         ) as response:
@@ -317,12 +282,16 @@ class DatabaseBackup:
             }
             if page_token:
                 params["pageToken"] = page_token
-            listing = await self._drive_request_json("GET", API, params=params)
+            listing, _ = await self.drive._json("GET", API, params=params)
             files = listing.get("files")
             if not isinstance(files, list) or listing.get("incompleteSearch"):
                 raise Rejected("drive_ambiguous_file")
             for item in files:
-                self._validate_drive_item(item, marker)
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    raise Rejected("drive_invalid_response")
+                self.drive.validate_owned_file(
+                    item, item.get("name"), "application/octet-stream", DRIVE_BACKUP_PROP, marker
+                )
                 items.append(item)
             next_token = listing.get("nextPageToken")
             if not next_token:
@@ -341,7 +310,6 @@ class DatabaseBackup:
             raise Rejected("drive_unavailable")
 
         await self.drive.validate_folder()
-        await self.drive._access_token()
         marker = self.store.vault.digest("db-backup", self.s.namespace)
         if not _MARKER_RE.fullmatch(marker):
             raise Rejected("drive_backup_marker_invalid")
@@ -349,59 +317,18 @@ class DatabaseBackup:
         files = await self._drive_list_backups(marker)
         remote_name = f"{DRIVE_BACKUP_PREFIX}{day_str}{DRIVE_BACKUP_SUFFIX}"
         matches = [item for item in files if item.get("name") == remote_name]
-        if len(matches) > 1:
-            raise Rejected("drive_ambiguous_file")
-
-        if matches:
-            target_id = self._validate_drive_item(matches[0], marker, remote_name)
-            result = await self._drive_request_json(
-                "PATCH",
-                f"{UPLOAD}/{target_id}",
-                params={
-                    "uploadType": "media",
-                    "supportsAllDrives": "true",
-                    "fields": FILE_FIELDS,
-                },
-                headers={"Content-Type": "application/octet-stream"},
-                content=enc_bytes,
-            )
-        else:
-            metadata = {
-                "name": remote_name,
-                "mimeType": "application/octet-stream",
-                "parents": [self.drive.folder],
-                "appProperties": {DRIVE_BACKUP_PROP: marker},
-            }
-            boundary = f"hakimi_{uuid.uuid4().hex}"
-            body = (
-                (
-                    f"--{boundary}\r\n"
-                    "Content-Type: application/json; charset=UTF-8\r\n\r\n"
-                    + json.dumps(metadata, ensure_ascii=True)
-                    + f"\r\n--{boundary}\r\n"
-                    "Content-Type: application/octet-stream\r\n\r\n"
-                ).encode()
-                + enc_bytes
-                + f"\r\n--{boundary}--\r\n".encode()
-            )
-            result = await self._drive_request_json(
-                "POST",
-                UPLOAD,
-                params={
-                    "uploadType": "multipart",
-                    "supportsAllDrives": "true",
-                    "fields": FILE_FIELDS,
-                },
-                headers={"Content-Type": f"multipart/related; boundary={boundary}"},
-                content=body,
-            )
-
-        file_id = self._validate_drive_item(result, marker, remote_name)
+        file_id = await self.drive.write_listed(
+            remote_name,
+            enc_bytes,
+            "application/octet-stream",
+            DRIVE_BACKUP_PROP,
+            marker,
+            matches,
+        )
 
         pruned_drive: list[str] = []
         for item in files:
-            item_id = self._validate_drive_item(item, marker)
-            item_name = str(item.get("name", ""))
+            item_id, item_name = item["id"], item["name"]
             match = _DRIVE_BACKUP_RE.fullmatch(item_name)
             if not match:
                 continue
@@ -410,7 +337,7 @@ class DatabaseBackup:
             except ValueError:
                 continue
             if item_date < cutoff_date and item_id != file_id:
-                await self._drive_delete_file(item_id)
+                await self._drive_delete_file(item_id, item_name, marker)
                 pruned_drive.append(item_name)
 
         return file_id, pruned_drive
@@ -430,9 +357,10 @@ class DatabaseBackup:
             drive_file_id: str | None = None
             pruned_drive: list[str] = []
             if upload_drive and self.drive is not None and self.s.roaming_enabled:
-                drive_file_id, pruned_drive = await self._sync_drive_backup(
-                    day_str, cutoff_date, enc_bytes
-                )
+                async with self.transfer():
+                    drive_file_id, pruned_drive = await self._sync_drive_backup(
+                        day_str, cutoff_date, enc_bytes
+                    )
                 drive_uploaded = True
 
             summary["drive_uploaded"] = drive_uploaded

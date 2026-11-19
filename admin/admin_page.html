@@ -1282,7 +1282,6 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div class="nav-group" role="presentation">
         <div class="nav-group-label">记忆管理</div>
         <button id="nav-memory" type="button" role="tab" data-tab="memory" data-description="管理隔离会话、历史压缩与长期记忆。" aria-controls="memory" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span>会话与记忆</span></button>
-        <button id="nav-notebook" type="button" role="tab" data-tab="notebook" data-description="管理仅供 Owner 私聊使用的脱敏快照。" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
       </div>
     </nav>
     <nav id="modules-nav" data-workspace="modules" role="tablist" aria-label="功能模块" aria-orientation="vertical" hidden>
@@ -1313,7 +1312,9 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       </div>
       <div class="nav-group" role="group" aria-labelledby="system-nav-label">
         <div id="system-nav-label" class="nav-group-label">常驻系统模块</div>
-        <button id="nav-journal" type="button" role="tab" data-tab="journal" data-description="查看本地巡逻日记与隔离文件夹的同步回执。" aria-controls="journal" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h5"/></svg><span>巡逻日记与同步</span></button>
+        <button id="nav-journal" type="button" role="tab" data-tab="journal" data-description="查看本地巡逻日记与隔离文件夹的同步回执。" aria-controls="journal" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h5"/></svg><span>巡逻日记</span></button>
+        <button id="nav-drive-sync" type="button" role="tab" data-tab="drive-sync" data-description="查看已接入模块的同步状态和最近回执。" aria-controls="drive-sync" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18H6a4 4 0 0 1-.5-8 6.5 6.5 0 0 1 12.5-2 5 5 0 0 1 0 10h-1 M12 20v-9 M8.5 14.5 12 11l3.5 3.5"/></svg><span>Google Drive 同步</span></button>
+        <button id="nav-notebook" type="button" role="tab" data-tab="notebook" data-description="管理仅供 Owner 私聊使用的脱敏快照。" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
       </div>
     </nav>
     <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
@@ -1386,7 +1387,9 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="modules" class="tab" role="tabpanel" aria-labelledby="nav-modules" hidden>
-  <template id="catalog-icon-drive_sync"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18H6a4 4 0 0 1-.5-8 6.5 6.5 0 0 1 12.5-2 5 5 0 0 1 0 10h-1 M12 20v-9 M8.5 14.5 12 11l3.5 3.5"/></svg></template>
+  <template id="catalog-icon-database_backup"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6c0-4 16-4 16 0s-16 4-16 0 M4 6v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0"/></svg></template>
+  <template id="catalog-icon-surf_mirror"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h12v14H8z M4 7v14h12 M11 8h6 M11 12h4"/></svg></template>
+  <template id="catalog-icon-group_memory_mirror"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h16v11H8l-5 4z M7 8h8 M7 11h4 M12 19h5l4 3V9"/></svg></template>
   <div class="directory-heading"><h2>平台模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
   <div id="module-catalog" class="module-catalog" aria-live="polite"></div>
   <div class="directory-heading system-heading"><h2>常驻系统模块</h2></div>
@@ -2151,6 +2154,14 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <div class="row"><select id="sub-kind" aria-label="订阅类型"><option value="up">UP 主 UID</option><option value="live">直播间 ID（状态巡逻）</option></select><input id="sub-uid" inputmode="numeric" placeholder="数字 ID" aria-label="订阅 ID"><button id="add-sub">添加订阅</button></div>
     <p class="muted">UP 更新报告与直播间开播通知均投递给已配置 Owner；直播间只读公开状态，不拉流、不发弹幕。</p>
     <div id="subs" class="table"></div>
+  </div>
+</section>
+
+<section id="drive-sync" class="tab" role="tabpanel" aria-labelledby="nav-drive-sync" hidden>
+  <div class="card">
+    <div class="row between"><h2>模块同步回执</h2><button id="refresh-drive-sync" class="secondary" type="button">刷新回执</button></div>
+    <p id="drive-connection" class="muted" aria-live="polite"></p>
+    <div id="drive-consumers" class="table" aria-live="polite"></div>
   </div>
 </section>
 
@@ -3098,9 +3109,19 @@ $('patrol-limits-form').addEventListener('submit',e=>{e.preventDefault();busy($(
 $('reset-patrol-limits').addEventListener('click',e=>busy(e.target,async()=>{if(!confirm('恢复本次启动读取的 .env 订阅上限与轮询间隔？'))return;await api('patrol-limits','DELETE');notice('已恢复 .env 巡逻配额与间隔');await Promise.all([patrolLimits(),subscriptions()]);}));
 const subKindLabels={up:'UP 主',live:'直播间'};
 async function subscriptions(){table('subs',['类型','ID','下次巡逻 / 状态','操作'],(await api('subscriptions')).map(s=>[subKindLabels[s.kind]||s.kind,s.uid,dateTime(s.next_poll)+(s.kind==='live'?' · '+(({0:'未开播',1:'直播中',2:'轮播'})[s.last_status]??'尚未巡逻'):' '),button('删除',async()=>{if(!confirm('删除此订阅？'))return;await api('subscriptions/'+s.kind+'/'+encodeURIComponent(s.id),'DELETE');await subscriptions();},'danger')]));}
+async function driveSync(){
+  const view=await api('drive-sync');
+  text('drive-connection',view.status.detail);
+  const access={unconfigured:'等待配置 Drive',unauthorized:'等待归档授权',inactive:'模块未就绪'};
+  table('drive-consumers',['调用模块','同步内容','当前状态','最近尝试','最近成功'],view.consumers.map(item=>{
+    const result=item.in_progress?'同步中':item.last_error==='unconfirmed'?'回执待核实':
+      item.last_error?'同步失败 · '+item.last_error:item.last_success?'已同步':'等待首次同步';
+    return [item.title,item.usage,access[item.access]||result,dateTime(item.last_attempt),dateTime(item.last_success)];
+  }));
+}
+$('refresh-drive-sync').addEventListener('click',e=>busy(e.target,driveSync));
 async function diaries(){
-  const [rows,services]=await Promise.all([api('diaries'),api('system-modules')]);
-  const drive=services.find(m=>m.id==='drive_sync')?.status;
+  const [rows,drive]=await Promise.all([api('diaries'),api('diaries/status')]);
   text('journal-drive-status','Google Drive · '+(drive?.detail||'状态未知'));
   table('diaries',['日期','Drive 同步','操作'],rows.map(d=>[
     d.day,d.last_error?d.last_error+' · 重试 '+dateTime(d.next_attempt):d.last_success?'成功 '+dateTime(d.last_success):drive?.state==='unconfigured'?'等待配置':'待同步',
@@ -4037,7 +4058,7 @@ async function moduleDirectory(){
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
+  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
   weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{
@@ -4091,8 +4112,8 @@ const sectionLocation=section=>[workspaceNames[section.workspace],section.group]
 function resetWorkspaces(){
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
-  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');
-  for(const id of ['module-catalog','system-catalog','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch'])$(id).replaceChildren();
+  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');
+  for(const id of ['module-catalog','system-catalog','drive-consumers','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch'])$(id).replaceChildren();
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;

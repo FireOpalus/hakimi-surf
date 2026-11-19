@@ -42,7 +42,6 @@ class MemoryCompressor:
         self.locks = [asyncio.Lock() for _ in range(32)]
         self.slots = asyncio.Semaphore(1)
         self.wakeup = asyncio.Event()
-        self.mirror = None
         self.clock = clock
         self.wall_clock = wall_clock
         self.slice_backoff: OrderedDict[str, tuple[int, float]] = OrderedDict()
@@ -371,8 +370,6 @@ class MemoryCompressor:
                         last_scan = time.monotonic()
                     for _, message in await self.store.runtime.sessions():
                         await self.extract(message, background=True)
-                if self.mirror:
-                    await self.mirror.scheduled()
             except asyncio.CancelledError:
                 raise
             except Exception:

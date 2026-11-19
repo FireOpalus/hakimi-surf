@@ -232,6 +232,13 @@ async def test_drive_upload_patch_and_seven_day_pruning(settings, store, tmp_pat
                     _backup_item("id-17", "db-backup-2026-11-17.sqlite3.gz.enc", marker),
                 ]
             return httpx.Response(200, json={"files": files})
+        if request.method == "GET" and request.url.path.startswith("/drive/v3/files/id-"):
+            fid = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json=_backup_item(fid, f"db-backup-2026-11-{fid[-2:]}.sqlite3.gz.enc", marker),
+                headers={"ETag": '"v1"'},
+            )
         if request.method == "POST" and str(request.url).startswith(UPLOAD):
             assert request.url.params["uploadType"] == "multipart"
             payload = _extract_multipart_payload(request.content, request.headers["Content-Type"])
@@ -250,6 +257,7 @@ async def test_drive_upload_patch_and_seven_day_pruning(settings, store, tmp_pat
             )
         if request.method == "DELETE" and str(request.url).startswith(f"{API}/"):
             file_id = request.url.path.rsplit("/", 1)[-1]
+            assert request.headers["If-Match"] == '"v1"'
             deleted_ids.append(file_id)
             return httpx.Response(204)
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")

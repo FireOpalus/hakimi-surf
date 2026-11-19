@@ -15,7 +15,6 @@ from .affection import _validate_platform_user
 from .attention import can_watch_video
 from .bot_server import is_persona_owner, untrusted_input
 from .config import Settings
-from .db_backup import DatabaseBackup
 from .drive_client import FolderDrive
 from .file_reader import FileReader
 from .gateway import redact_excerpt
@@ -28,7 +27,6 @@ from .link_preview import preview_links
 from .media import ImageLoader
 from .memes import MAX_UPLOAD_BYTES, MemeLibrary, validate_meme_label
 from .memory_compressor import MemoryCompressor, check_memory_text
-from .memory_mirror import MemoryMirror
 from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
 from .models import Message, Video
@@ -42,7 +40,6 @@ from .modules.proactive_dm import OwnerProactive
 from .node_transport import NodeTransport
 from .outbound_actions import normalize_emoji_like, parse_actions
 from .output_links import filter_reply_links
-from .owner_cloud_memory import OwnerCloudMemory
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
 from .roaming_logger import PatrolDiary, redact_public_summary
@@ -52,7 +49,6 @@ from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
 from .store import Store
 from .streaming import cancellable
-from .surf_mirror import SurfMirror
 from .system_modules import SystemResources, install_system_modules
 from .video_watch import VideoWatch
 from .web_search import explicit_search, search_query
@@ -134,11 +130,7 @@ class Service:
         self.ingress_scheduler = SessionScheduler()
         self.dialogue_scheduler = SessionScheduler()
         self.public_memory = PublicMemory(store)
-        self.notebook = notebook
-        self.cloud_memory = OwnerCloudMemory(settings)
         self.compressor = MemoryCompressor(settings, self.sessions, gateway, store)
-        self.memory_mirror = MemoryMirror(self)
-        self.compressor.mirror = self.memory_mirror
         self.recovery_task = None
         self.poll_lock = asyncio.Lock()
         self.owner_dialogue_lock = asyncio.Lock()
@@ -158,17 +150,30 @@ class Service:
         self.modules = ModuleRegistry()
         install_system_modules(
             self.modules,
-            SystemResources(settings, store, gateway, http, diary, drive),
+            SystemResources(
+                settings,
+                store,
+                gateway,
+                http,
+                self,
+                notebook=notebook,
+                diary=diary,
+                drive=drive if drive is not None else getattr(diary, "drive", None),
+            ),
         )
+        # Existing chat and maintenance callers use these handles. Workers come from the registry.
         self.diary = self.modules.systems["patrol_diary"].diary
-        self.drive_sync = self.modules.systems["drive_sync"].sync
+        self.drive_sync = self.modules.systems["drive_sync"]
+        self.diary_sync = self.modules.systems["patrol_diary"].delivery
+        self.db_backup = self.modules.systems["database_backup"].backup
+        self.surf_mirror = self.modules.systems["surf_mirror"].mirror
+        self.memory_mirror = self.modules.systems["group_memory_mirror"].mirror
+        self.notebook = self.modules.systems["owner_notebook"].snapshot
+        self.cloud_memory = self.modules.systems["owner_notebook"].cloud_memory
         self.drive = self.drive_sync.drive
         self.world_state = WorldStateManager(settings, store, self.modules)
         install_modules(self)
         settings._thinking_scenes = self.modules.thinking_scenes
-        active_drive = self.drive if settings.roaming_enabled else None
-        self.db_backup = DatabaseBackup(settings, store, active_drive)
-        self.surf_mirror = SurfMirror(self, active_drive)
         self.life_engine = LifeEngine(self)
 
     @property
@@ -402,11 +407,6 @@ class Service:
         for module in self.modules.systems.values():
             for worker in module.workers():
                 self.tasks.append(asyncio.create_task(worker(), name=module.module_id))
-        if self.s.roaming_enabled:
-            self.tasks.append(asyncio.create_task(self.db_backup.run(), name="db-backup"))
-            self.tasks.append(asyncio.create_task(self.surf_mirror.run(), name="surf-mirror"))
-        if self.notebook:
-            self.tasks.append(asyncio.create_task(self.notebook.run(), name="notebook-refresh"))
 
     async def resume_compression(self):
         # Persisted, unattempted folds survive restarts. Paid ambiguous attempts never replay.

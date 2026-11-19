@@ -1,7 +1,9 @@
 import json
 
+from ..diary_sync import DiaryDriveSync
 from ..reply_style import trim_complete_text
 from ..roaming_logger import PatrolDiary
+from ..security import Rejected
 from ..thinking_policy import ThinkingScene
 from . import SystemModule
 
@@ -10,19 +12,41 @@ class Module(SystemModule):
     module_id = "patrol_diary"
     display_name = "巡逻日记"
     description = "在本地整理巡逻记录，并按日生成摘要。"
+    requires = ("drive_sync",)
+    drive_usage = "每日巡逻日记"
     admin_panel = "journal"
     thinking_scenes = (ThinkingScene("daily_diary", "每日总结", output_cap="diary_output_tokens"),)
 
     def __init__(self, resources, registry):
+        super().__init__(resources, registry)
+        self.provider = registry.systems["drive_sync"]
         self.diary = resources.diary or PatrolDiary(
             resources.settings, resources.store, gateway=resources.gateway
         )
+        self.delivery = DiaryDriveSync(
+            self.diary, self.provider.drive, resources.store, write_day=self.write_day
+        )
+
+    async def write_day(self, day, markdown):
+        return await self.provider.sync_file(self, day + ".md", markdown)
+
+    async def write_drive_text(self, drive, key, content):
+        if not key.endswith(".md"):
+            raise Rejected("drive_invalid_diary")
+        return await drive.sync_day(key[:-3], content)
 
     async def initialize(self):
         await self.diary.initialize()
+        await self.delivery.initialize()
+        last_success, last_error = await self.delivery.last_receipt()
+        await self.provider.import_receipt(self, last_success, last_error)
 
     def workers(self):
-        return (self.diary.run_local,)
+        return (
+            (self.diary.run_local, self.delivery.run)
+            if self.provider.drive is not None
+            else (self.diary.run_local,)
+        )
 
     def public_event_observers(self):
         return {"diary.milestone": self.record_milestone}

@@ -26,7 +26,6 @@ from .modules.adapters import Sender, qq_message
 from .modules.bilibili import Bilibili
 from .modules.onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
 from .node_transport import NodeTransport
-from .notebook_snapshot import NotebookSnapshot
 from .provider_admin import router as provider_router
 from .security import Rejected, check_fresh, qq_signing_key, verify_onebot, verify_qq
 from .service import Service
@@ -112,7 +111,6 @@ def create_app(
                         ai,
                         Bilibili(s, http, runtime=store.runtime, node_transport=node_transport),
                         Sender(s, http, onebot),
-                        notebook=NotebookSnapshot(s, http, ai, store),
                         http=http,
                         node_transport=node_transport,
                     )

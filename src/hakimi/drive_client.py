@@ -125,15 +125,19 @@ class FolderDrive(DriveAuth):
                 raise Rejected("drive_invalid_response")
             return value, response.headers.get("etag")
 
-    def _validate_file(self, item: dict, filename: str) -> str:
+    def validate_owned_file(self, item, filename, mime_type, prop, marker) -> str:
+        if not isinstance(item, dict):
+            raise Rejected("drive_file_outside_scope")
         file_id = item.get("id", "")
         if (
-            not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id)
+            not isinstance(file_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id)
             or item.get("parents") != [self.folder]
             or item.get("trashed", False)
             or item.get("name") != filename
-            or item.get("mimeType") != "text/markdown"
-            or item.get("appProperties", {}).get("hakimi_roaming") != self.marker
+            or item.get("mimeType") != mime_type
+            or not isinstance(item.get("appProperties"), dict)
+            or item["appProperties"].get(prop) != marker
         ):
             raise Rejected("drive_file_outside_scope")
         return file_id
@@ -168,64 +172,86 @@ class FolderDrive(DriveAuth):
     async def sync_day(self, day: str, markdown: str) -> str:
         if date.fromisoformat(day).isoformat() != day or len(markdown.encode()) > 262144:
             raise Rejected("drive_invalid_diary")
-        filename = day + ".md"
+        return await self.upsert(
+            day + ".md", markdown.encode(), "text/markdown", "hakimi_roaming", self.marker
+        )
+
+    async def upsert(
+        self, filename: str, content: bytes, mime_type: str, prop: str, marker: str
+    ) -> str:
+        """Write a single application-owned file in the configured folder."""
+        if not re.fullmatch(r"[^\W_][\w.-]{0,159}", filename) or not all(
+            re.fullmatch(r"[A-Za-z0-9_-]{1,128}", v) for v in (prop, marker)
+        ):
+            raise Rejected("drive_invalid_identity")
+        query = f"'{self.folder}' in parents and trashed = false and name = '{filename}'"
+        if prop != "hakimi_roaming":
+            query += f" and appProperties has {{ key='{prop}' and value='{marker}' }}"
         await self.validate_folder()
         listing, _ = await self._json(
             "GET",
             API,
             params={
-                "q": f"'{self.folder}' in parents and trashed = false and name = '{filename}'",
+                "q": query,
                 "fields": f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
-                "pageSize": "100",
+                "pageSize": "2",
                 "supportsAllDrives": "true",
                 "includeItemsFromAllDrives": "true",
                 # Supports both My Drive and a shared subfolder granted to a non-member.
-                # The parent + day predicate is mandatory; never enumerate either Drive.
                 "corpora": "user",
             },
         )
         files = listing.get("files")
         if (
             not isinstance(files, list)
-            or len(files) > 1
             or listing.get("nextPageToken")
             or listing.get("incompleteSearch")
         ):
             raise Rejected("drive_ambiguous_file")
+        return await self.write_listed(filename, content, mime_type, prop, marker, files)
+
+    async def write_listed(self, filename, content, mime_type, prop, marker, files):
+        """Complete a scoped upsert from the exact-name matches in a validated folder listing."""
+        if len(files) > 1:
+            raise Rejected("drive_ambiguous_file")
+        content_type = mime_type + ("; charset=UTF-8" if mime_type.startswith("text/") else "")
         if files:
-            file_id = self._validate_file(files[0], filename)
+            file_id = self.validate_owned_file(files[0], filename, mime_type, prop, marker)
             # Only IDs returned by the folder-constrained listing may be read or updated.
             current, etag = await self._json(
                 "GET",
                 API + "/" + file_id,
                 params={"fields": FILE_FIELDS, "supportsAllDrives": "true"},
             )
-            self._validate_file(current, filename)
+            if self.validate_owned_file(current, filename, mime_type, prop, marker) != file_id:
+                raise Rejected("drive_file_outside_scope")
             result, _ = await self._json(
                 "PATCH",
                 UPLOAD + "/" + file_id,
                 params={"uploadType": "media", "supportsAllDrives": "true", "fields": FILE_FIELDS},
                 headers={
-                    "Content-Type": "text/markdown; charset=UTF-8",
+                    "Content-Type": content_type,
                     **({"If-Match": etag} if etag else {}),
                 },
-                content=markdown.encode(),
+                content=content,
             )
         else:
             metadata = {
                 "name": filename,
-                "mimeType": "text/markdown",
+                "mimeType": mime_type,
                 "parents": [self.folder],
-                "appProperties": {"hakimi_roaming": self.marker},
+                "appProperties": {prop: marker},
             }
             boundary = "hakimi_" + uuid.uuid4().hex
             body = (
-                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
-                + json.dumps(metadata)
-                + f"\r\n--{boundary}\r\nContent-Type: text/markdown; charset=UTF-8\r\n\r\n"
-                + markdown
-                + f"\r\n--{boundary}--\r\n"
-            ).encode()
+                (
+                    f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+                    + json.dumps(metadata)
+                    + f"\r\n--{boundary}\r\nContent-Type: {content_type}\r\n\r\n"
+                ).encode()
+                + content
+                + f"\r\n--{boundary}--\r\n".encode()
+            )
             result, _ = await self._json(
                 "POST",
                 UPLOAD,
@@ -237,7 +263,10 @@ class FolderDrive(DriveAuth):
                 headers={"Content-Type": "multipart/related; boundary=" + boundary},
                 content=body,
             )
-        return self._validate_file(result, filename)
+        result_id = self.validate_owned_file(result, filename, mime_type, prop, marker)
+        if files and result_id != file_id:
+            raise Rejected("drive_file_outside_scope")
+        return result_id
 
     def _memory_identity(self, scope):
         if not re.fullmatch(r"[a-f0-9]{64}", scope):

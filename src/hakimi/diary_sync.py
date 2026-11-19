@@ -17,8 +17,9 @@ CREATE TABLE IF NOT EXISTS roaming_sync (
 
 
 class DiaryDriveSync:
-    def __init__(self, diary, drive, store):
+    def __init__(self, diary, drive, store, *, write_day=None):
         self.diary, self.drive, self.store = diary, drive, store
+        self.write_day = write_day
         self.sync_lock = asyncio.Lock()
         self._initialized = False
 
@@ -99,7 +100,8 @@ class DiaryDriveSync:
                         )
                     continue
                 try:
-                    file_id = await self.drive.sync_day(row["day"], markdown)
+                    write = self.write_day or self.drive.sync_day
+                    file_id = await write(row["day"], markdown)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -144,16 +146,22 @@ class DiaryDriveSync:
 
         return outcome
 
-    async def status(self):
+    async def last_receipt(self):
         async with self.store.lock:
             failed = await self.store.one(
                 "SELECT last_error FROM roaming_sync WHERE last_error IS NOT NULL "
                 "ORDER BY day DESC LIMIT 1"
             )
             last = await self.store.one("SELECT MAX(last_success) FROM roaming_sync")
-        if failed:
+        return last[0], failed[0] if failed else None
+
+    async def status(self):
+        if self.drive is None:
+            return {"state": "unconfigured", "detail": "等待配置 Drive，本地日记照常保存"}
+        last, error = await self.last_receipt()
+        if error:
             detail = "同步待重试"
-            if failed[0] in {
+            if error in {
                 "drive_credentials_invalid",
                 "drive_oauth_credentials_invalid",
                 "drive_oauth_reauthorization_required",
@@ -161,11 +169,16 @@ class DiaryDriveSync:
                 "drive_oauth_scope_mismatch",
             }:
                 detail = "请检查 Drive 授权，日记已保存在本地"
-            return {"state": "retrying", "detail": detail, "last_error": failed[0]}
+            return {
+                "state": "retrying",
+                "detail": detail,
+                "last_error": error,
+                "last_success": last,
+            }
         return {
             "state": "ready",
-            "detail": "已同步" if last[0] else "已配置，等待首次同步",
-            "last_success": last[0],
+            "detail": "已同步" if last else "已配置，等待首次同步",
+            "last_success": last,
         }
 
     async def run(self):

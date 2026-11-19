@@ -125,11 +125,12 @@ ssh -N -L 127.0.0.1:12141:127.0.0.1:12143 你的用户名@服务器IP
 
 ## 进阶配置与日常维护
 
-### 常驻巡逻日记与 Google Drive 同步
+### 巡逻日记与模块文件同步
 
-在「功能模块 → 模块目录」查看两个常驻系统模块的状态，在「巡逻日记与同步」按日期预览本地 Markdown。每天 23:55 生成当日总结，离线后可补办，手动汇总复用同一天的付费尝试。「模型与思考 → 巡逻日记」管理总结档位。
+在「功能模块 → 巡逻日记」按日期预览本地 Markdown 和日记投递记录。「功能模块 → Google Drive 同步」按调用模块展示同步用途、最近尝试、最近成功和失败原因。每天 23:55 生成当日总结，离线后可补办，手动汇总复用同一天的付费尝试。「模型与思考 → 巡逻日记」管理总结档位。
 
 Drive 凭据与隔离文件夹配置齐全后，每两小时及当日收尾同步有变化的日记。缺少配置时照常生成本地日记。授权失效或网络错误会记录失败原因并按退避时间重试，上传任务直接读取本地内容。
+
 - 支持 **Service Account**（需把 Shared Drive 指定子文件夹分享给服务账号，对应 `compose.roaming.yaml`）或 **个人网盘 OAuth**（通过 `ssh -L 12142` 运行 `.venv/bin/python scripts/authorize_drive.py` 引导授权，只申请受限 `drive.file` 权限，对应 `compose.roaming-oauth.yaml`）。
 - 既有 `HAKIMI_ROAMING_ENABLED` 继续作为敏感归档授权，亦可用 `HAKIMI_ARCHIVE_AUTHORIZED_DATA` 配置。授权涵盖白名单聊天原文及原有 Owner 镜像和备份导出。默认只整理公开材料和群活动计数。Owner 日报单独选择标注为公开的巡逻摘要、世界事件和群活动计数。私聊原文、未标明来源的旧报告均不会进入日报输入。群记忆的 Drive 同步仍按群控制。
 
@@ -180,6 +181,20 @@ docker compose up -d
 ### 常驻系统模块的接入
 
 在 `src/hakimi/system_modules/` 随版本交付一个 Python 模块，导出 `Module(SystemModule)`，令 `module_id` 与文件名相同。内置模块在启动时按 `requires` 顺序注册，后台目录自动读取其状态。按需声明 `workers()`、`thinking_scenes` 或 `public_event_observers()`。只有平台模块注册的动作进入世界引擎的活动目录，后台的启停接口只管理平台模块。[日记实现](src/hakimi/system_modules/patrol_diary.py) · [Drive 投递](src/hakimi/system_modules/drive_sync.py)
+
+### 让模块使用 Google Drive
+
+在平台模块或常驻系统模块上声明同步用途，例如 `drive_usage = "公开观测记录"`。后台会自动列出该模块。平台模块在注册完成后使用创建时收到的 `service`。系统模块在 `requires` 中声明 `"drive_sync"`，从 `registry.systems["drive_sync"]` 取得同一个服务。
+
+```python
+# 在已注册模块的方法中，report 是该模块获准导出的材料。
+file_id = await service.drive_sync.sync_file(self, "forecast.json", report)
+```
+
+- `key` 使用带扩展名的文件名，支持中文、字母、数字、下划线和短横线。Markdown、TXT、JSON 传字符串，每份最多 256 KiB。其他扩展名传字节，每份最多 4 MiB，按二进制文件保存。
+- 同一模块再次提交同一文件名会更新原文件。不同模块的同名文件分别存储。服务校验调用方、隔离目录、文件标记和类型，再提交传输。成功返回 Drive 文件 ID，未配置或模块未就绪会返回对应的 `Rejected`。同步授权由模块在选择材料时核验。
+- 日记、数据库加密备份、分身镜像和按群授权的记忆镜像均已接入。旧文件沿用已有名称及标记。备份轮转、群记忆的双向版本校验分别由其模块负责。Owner 只读记忆独立使用原来的只读来源。
+- 管理接口 `GET /admin/api/drive-sync` 需要后台鉴权。回执保存在 SQLite 的 `drive_module_sync`，只记录模块、时间和结果。中断时未确认的写入标为「回执待核实」。
 
 ### 模块仓库与管理开关
 

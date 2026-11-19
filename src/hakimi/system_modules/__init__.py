@@ -18,7 +18,9 @@ if TYPE_CHECKING:
     from ..drive_client import FolderDrive
     from ..gemini import GeminiGateway
     from ..modules import ModuleRegistry
+    from ..notebook_snapshot import NotebookSnapshot
     from ..roaming_logger import PatrolDiary
+    from ..service import Service
     from ..store import Store
     from ..world_state import MilestoneEvent
 
@@ -29,6 +31,8 @@ class SystemResources:
     store: Store
     gateway: GeminiGateway
     http: httpx.AsyncClient | None
+    service: Service
+    notebook: NotebookSnapshot | None = None
     diary: PatrolDiary | None = None
     drive: FolderDrive | None = None
 
@@ -37,6 +41,7 @@ class SystemModule:
     module_id: str
     display_name: str
     description: str
+    drive_usage: str | None = None
     requires: tuple[str, ...] = ()
     thinking_scenes: tuple[ThinkingScene, ...] = ()
     admin_panel: str | None = None

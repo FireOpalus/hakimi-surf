@@ -491,24 +491,29 @@ async def test_flex_capacity_failure_never_opens_live_chat_circuit(settings, sto
     assert row["status"] == "settled" and row["amount"] == 0
 
 
-async def test_mirror_scheduler_remains_available_when_extraction_disabled(settings, store):
+async def test_mirror_scheduler_remains_available_when_extraction_disabled(settings):
+    from hakimi.app import create_app
     from hakimi.compression_policy import CompressionConfig
 
-    await store.runtime.set_compression(CompressionConfig(enabled=False))
-    compressor = MemoryCompressor(settings, SessionManager(settings, store), FakeGateway(), store)
+    settings.gdrive_roaming_folder_id = "test-folder-id"
+    settings.gdrive_service_account_file = settings.data_dir / "mock-credentials.json"
+    app = create_app(settings, gateway_factory=FakeGateway, start_workers=False)
     reached = asyncio.Event()
 
-    class Mirror:
-        async def scheduled(self):
-            reached.set()
+    async def scanned():
+        reached.set()
 
-    compressor.mirror = Mirror()
-    task = asyncio.create_task(compressor.run())
-    try:
-        await asyncio.wait_for(reached.wait(), 1)
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+    async with app.router.lifespan_context(app):
+        await app.state.service.store.runtime.set_compression(CompressionConfig(enabled=False))
+        module = app.state.service.modules.systems["group_memory_mirror"]
+        module.mirror.scheduled = scanned
+        (worker,) = module.workers()
+        task = asyncio.create_task(worker())
+        try:
+            await asyncio.wait_for(reached.wait(), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 def _schema_keys(node):

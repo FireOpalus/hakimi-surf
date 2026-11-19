@@ -481,6 +481,10 @@ async def test_surf_mirror_hash_skip_and_mocked_drive_upload_and_patch(
             }
             drive_files[fid] = item
             return httpx.Response(200, json=item)
+        if request.method == "GET" and request.url.path.rsplit("/", 1)[-1] in drive_files:
+            return httpx.Response(
+                200, json=drive_files[request.url.path.rsplit("/", 1)[-1]], headers={"ETag": '"v1"'}
+            )
         if request.method == "PATCH" and str(request.url).startswith(UPLOAD + "/"):
             fid = request.url.path.rsplit("/", 1)[-1]
             assert fid in drive_files

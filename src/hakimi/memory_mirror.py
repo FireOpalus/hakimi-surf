@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -60,7 +61,9 @@ def fingerprint(markdown):
 
 
 class MemoryMirror:
-    def __init__(self, service):
+    def __init__(self, service, *, drive=None, transfer=nullcontext):
+        self.drive = drive if drive is not None else getattr(service, "drive", None)
+        self.transfer = transfer
         self.svc = service
         self.s, self.sessions, self.store = service.s, service.sessions, service.store
         self.locks = [asyncio.Lock() for _ in range(32)]
@@ -108,12 +111,19 @@ class MemoryMirror:
         lock = self.locks[int(key[:8], 16) % len(self.locks)]
         async with lock:
             view = await self.sessions.dual.view(message)
-            if not view["mirror_enabled"] or self.svc.drive is None:
+            if not view["mirror_enabled"] or self.drive is None:
                 raise Rejected("memory_mirror_disabled")
             state = await self.state(message)
             try:
                 with model_work("memory.mirror_review", independent=True):
-                    return await self._sync(message, key, view, state, push)
+                    async with self.transfer():
+                        # Another group can hold the Drive transfer while consent is revoked.
+                        fresh = await self.sessions.dual.view(message)
+                        if not self.allowed(message) or not fresh["mirror_enabled"]:
+                            raise Rejected("memory_mirror_disabled")
+                        if fresh["epoch"] != view["epoch"]:
+                            raise Rejected("session_changed")
+                        return await self._sync(message, key, fresh, state, push)
             except Exception as exc:
                 # Only fixed internal labels, never remote text, URLs, secrets
                 # or arbitrary exceptions.
@@ -124,7 +134,7 @@ class MemoryMirror:
                 raise
 
     async def _sync(self, message, scope, view, state, push):
-        drive = self.svc.drive
+        drive = self.drive
         head = await drive.memory_head(scope)
         if head:
             if not state.get("entries") and not state.get("digest"):
@@ -259,3 +269,11 @@ class MemoryMirror:
             except Exception:
                 # Mirror errors do not interrupt chat or requeue paid extraction.
                 pass
+
+    async def run(self):
+        while True:
+            try:
+                await self.scheduled()
+            except Exception:
+                await self.store.runtime.event("memory_mirror_failed", "memory")
+            await asyncio.sleep(3600)

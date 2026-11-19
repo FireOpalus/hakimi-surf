@@ -12,13 +12,13 @@ import sqlite3
 import stat
 import tempfile
 import time
-import uuid
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .drive_client import API, FILE_FIELDS, UPLOAD, FolderDrive
+from .drive_client import FolderDrive
 from .models import Message
 from .security import Rejected, clean_text, configured_secrets
 
@@ -347,12 +347,14 @@ class SurfMirror:
         drive: FolderDrive | None = None,
         *,
         interval_seconds: int = 1800,
+        write_file=None,
     ):
         self.svc = service
         self.s = service.s
         self.store = service.store
         self.sessions = service.sessions
         self.drive = drive
+        self.write_file = write_file or partial(self.write_drive_text, drive)
         self.interval_seconds = interval_seconds
         self.zone = ZoneInfo(self.s.bot_timezone)
         self._lock = asyncio.Lock()
@@ -635,108 +637,14 @@ class SurfMirror:
         raw_md = sanitize_mirror_text_post(raw_md, self.s)
         return _cap_markdown_bytes(raw_md, MAX_MIRROR_BYTES)
 
-    def _drive_marker(self) -> str:
-        return self.store.vault.digest("surf-mirror", self.s.namespace)
-
-    def _validate_drive_file(self, item: dict[str, Any], filename: str, marker: str) -> str:
-        file_id = str(item.get("id", ""))
-        if (
-            not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id)
-            or item.get("parents") != [self.drive.folder]
-            or item.get("trashed", False)
-            or item.get("name") != filename
-            or item.get("mimeType") != "text/markdown"
-            or (item.get("appProperties") or {}).get("hakimi_surf_mirror") != marker
-        ):
-            raise Rejected("drive_file_outside_scope")
-        return file_id
-
-    async def _drive_json(self, method: str, url: str, token: str, **kwargs: Any) -> dict[str, Any]:
-        headers = {"Authorization": f"Bearer {token}", **kwargs.pop("headers", {})}
-        async with self.drive.http.stream(
-            method, url, headers=headers, follow_redirects=False, **kwargs
-        ) as response:
-            if response.status_code not in {200, 201}:
-                raise Rejected("drive_request_failed")
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > 65536:
-                    raise Rejected("drive_response_too_large")
-            value = json.loads(body)
-            if not isinstance(value, dict):
-                raise Rejected("drive_invalid_response")
-            return value
-
-    async def _upload_drive_file(
-        self, filename: str, markdown: str, marker: str, token: str
-    ) -> str:
-        if len(markdown.encode("utf-8")) > MAX_MIRROR_BYTES:
+    async def write_drive_text(self, drive, filename, markdown):
+        marker = self.store.vault.digest("surf-mirror", self.s.namespace)
+        if not re.fullmatch(r"surf-mirror-(?:latest|[0-9]{4}-[0-9]{2}-[0-9]{2})\.md", filename):
+            raise Rejected("drive_invalid_key")
+        data = markdown.encode()
+        if len(data) > MAX_MIRROR_BYTES:
             raise Rejected("surf_mirror_too_large")
-        listing = await self._drive_json(
-            "GET",
-            API,
-            token,
-            params={
-                "q": (
-                    f"'{self.drive.folder}' in parents and trashed = false "
-                    f"and name = '{filename}' "
-                    f"and appProperties has {{ key='hakimi_surf_mirror' and value='{marker}' }}"
-                ),
-                "fields": f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
-                "pageSize": "10",
-                "supportsAllDrives": "true",
-                "includeItemsFromAllDrives": "true",
-                "corpora": "user",
-            },
-        )
-        files = listing.get("files")
-        if (
-            not isinstance(files, list)
-            or len(files) > 1
-            or listing.get("nextPageToken")
-            or listing.get("incompleteSearch")
-        ):
-            raise Rejected("drive_ambiguous_file")
-
-        if files:
-            file_id = self._validate_drive_file(files[0], filename, marker)
-            result = await self._drive_json(
-                "PATCH",
-                f"{UPLOAD}/{file_id}",
-                token,
-                params={"uploadType": "media", "supportsAllDrives": "true", "fields": FILE_FIELDS},
-                headers={"Content-Type": "text/markdown; charset=UTF-8"},
-                content=markdown.encode("utf-8"),
-            )
-        else:
-            metadata = {
-                "name": filename,
-                "mimeType": "text/markdown",
-                "parents": [self.drive.folder],
-                "appProperties": {"hakimi_surf_mirror": marker},
-            }
-            boundary = "hakimi_" + uuid.uuid4().hex
-            body = (
-                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
-                + json.dumps(metadata)
-                + f"\r\n--{boundary}\r\nContent-Type: text/markdown; charset=UTF-8\r\n\r\n"
-                + markdown
-                + f"\r\n--{boundary}--\r\n"
-            ).encode("utf-8")
-            result = await self._drive_json(
-                "POST",
-                UPLOAD,
-                token,
-                params={
-                    "uploadType": "multipart",
-                    "supportsAllDrives": "true",
-                    "fields": FILE_FIELDS,
-                },
-                headers={"Content-Type": f"multipart/related; boundary={boundary}"},
-                content=body,
-            )
-        return self._validate_drive_file(result, filename, marker)
+        return await drive.upsert(filename, data, "text/markdown", "hakimi_surf_mirror", marker)
 
     async def export_once(
         self, now: float | None = None, upload_drive: bool = True
@@ -792,26 +700,15 @@ class SurfMirror:
                 and (need_latest or need_daily)
             ):
                 skipped_drive = False
-                marker = self._drive_marker()
-                if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", marker):
-                    raise Rejected("surf_mirror_marker_invalid")
-                await self.drive.validate_folder()
-                token = await self.drive._access_token()
-                daily_drive_name = f"surf-mirror-{day}.md"
-                if need_latest:
-                    fid = await self._upload_drive_file(DRIVE_LATEST_NAME, latest_md, marker, token)
-                    drive_digests["latest"] = latest_digest
-                    drive_file_ids[DRIVE_LATEST_NAME] = fid
-                    uploaded.append(DRIVE_LATEST_NAME)
-                if need_daily:
-                    fid = await self._upload_drive_file(daily_drive_name, daily_md, marker, token)
-                    drive_digests[day] = daily_digest
-                    drive_file_ids[daily_drive_name] = fid
-                    uploaded.append(daily_drive_name)
-                if uploaded:
-                    state["drive_digests"] = drive_digests
-                    state["drive_file_ids"] = drive_file_ids
-                    await asyncio.to_thread(_save_state_sync, mirror_dir, state)
+                for key, filename, markdown, digest, due in (
+                    ("latest", DRIVE_LATEST_NAME, latest_md, latest_digest, need_latest),
+                    (day, f"surf-mirror-{day}.md", daily_md, daily_digest, need_daily),
+                ):
+                    if due:
+                        drive_file_ids[filename] = await self.write_file(filename, markdown)
+                        drive_digests[key] = digest
+                        await asyncio.to_thread(_save_state_sync, mirror_dir, state)
+                        uploaded.append(filename)
 
             return {
                 "day": day,

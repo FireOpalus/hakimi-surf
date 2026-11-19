@@ -38,8 +38,8 @@ async def test_local_system_worker_starts_with_or_without_drive(settings, store,
         svc_off.start()
         try:
             names_off = {t.get_name() for t in svc_off.tasks}
-            assert "db-backup" not in names_off
-            assert "surf-mirror" not in names_off
+            assert "database_backup" not in names_off
+            assert "surf_mirror" not in names_off
             assert "patrol_diary" in names_off and "drive_sync" not in names_off
             assert set(svc_off.modules.systems) >= {"drive_sync", "patrol_diary"}
         finally:
@@ -70,9 +70,10 @@ async def test_local_system_worker_starts_with_or_without_drive(settings, store,
     async with app.router.lifespan_context(app):
         svc_on = app.state.service
         names_on = {t.get_name() for t in svc_on.tasks}
-        assert {"patrol_diary", "drive_sync"} <= names_on
-        assert "db-backup" in names_on
-        assert "surf-mirror" in names_on
+        assert {"patrol_diary", "group_memory_mirror"} <= names_on
+        assert sum(t.get_name() == "patrol_diary" for t in svc_on.tasks) == 2
+        assert "database_backup" in names_on
+        assert "surf_mirror" in names_on
         assert svc_on.db_backup.drive is not None
         assert svc_on.surf_mirror.drive is not None
         assert not any(t.done() for t in svc_on.tasks)
