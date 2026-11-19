@@ -16,6 +16,22 @@ from .output_links import filter_reply_links
 from .security import Rejected, authorize, configured_secrets, safe_output
 from .text_card import should_render_rich_card
 
+PRE_DISPATCH_REJECTED = frozenset(
+    {
+        "onebot_disconnected",
+        "onebot_not_dispatched",
+        "onebot_unavailable",
+        "module_disabled",
+        "delivery_not_authorized",
+        "reply_expired",
+    }
+)
+
+
+def safe_delivery_detail(exc: Rejected) -> str:
+    code = str(exc).strip()
+    return code if re.fullmatch(r"[a-z0-9_]{1,64}", code) else "delivery_uncertain"
+
 
 async def persist_ack(service, reply, position, text, receipt, epoch, digest=None):
     if not valid_receipt(receipt, platform=reply["message"]["platform"]):
@@ -378,10 +394,14 @@ async def deliver_actions(service, reply):
         # ACKs already journalled; restart applies them once. Unknown sends stay uncertain.
         raise
     except Rejected as exc:
-        if str(exc) == "reply_invalidated":
+        code = str(exc).strip()
+        if code == "reply_invalidated":
             status, detail = "cancelled", "reply_invalidated"
+        elif code in PRE_DISPATCH_REJECTED and not confirmed:
+            status, detail = "failed", code
         else:
-            status, detail = "uncertain", "delivery_uncertain"
+            status, detail = "uncertain", safe_delivery_detail(exc)
+            service.record("delivery_uncertain")
     except Exception:
         status, detail = "uncertain", "delivery_uncertain"
         service.record("delivery_uncertain")

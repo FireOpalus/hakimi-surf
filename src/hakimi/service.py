@@ -45,6 +45,7 @@ from .modules.longnick import Longnick
 from .modules.proactive_dm import OwnerProactive
 from .node_transport import NodeTransport
 from .outbound_actions import normalize_emoji_like, parse_actions
+from .outgoing import PRE_DISPATCH_REJECTED, safe_delivery_detail
 from .output_links import filter_reply_links
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
@@ -2292,7 +2293,9 @@ class Service:
 
             return await deliver_actions(self, reply)
         status = "sent"
+        detail = ""
         text_confirmed = False
+        image_confirmed = False
         participants = [Message.model_validate(m) for m in reply.get("participants", [])]
         for original in participants or [message]:
             if self.bot_guard.known_bot(original):
@@ -2487,16 +2490,23 @@ class Service:
         except asyncio.CancelledError:
             # Leave 'sending': startup recovery will mark it uncertain without resending.
             raise
+        except Rejected as exc:
+            code = str(exc).strip()
+            if code == "reply_invalidated":
+                status, detail = "cancelled", "reply_invalidated"
+            elif code in PRE_DISPATCH_REJECTED and not text_confirmed and not image_confirmed:
+                status, detail = "failed", code
+            else:
+                status, detail = "uncertain", safe_delivery_detail(exc)
+                self.record("delivery_uncertain")
         except Exception:
-            status = "uncertain"
+            status, detail = "uncertain", "delivery_uncertain"
             self.record("delivery_uncertain")
         await self.bot_guard.extend_cooldown(message, reply["id"])
         if not await self.store.finish_reply(reply["id"], status):
             await self._finish_delivery_audit(reply, "cancelled", "session_reset")
             return True  # A reset cancelled this delivery while the transport awaited its ACK.
-        await self._finish_delivery_audit(
-            reply, status, "delivery_uncertain" if status == "uncertain" else ""
-        )
+        await self._finish_delivery_audit(reply, status, detail)
         if (
             status == "sent"
             and text_confirmed
