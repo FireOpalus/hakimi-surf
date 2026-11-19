@@ -103,6 +103,7 @@ LIFE_ROUTES = [
     ("POST", "/admin/api/life/plan"),
     ("POST", "/admin/api/life/gatekeeper"),
     ("DELETE", "/admin/api/life/intents/0123456789abcdef0123456789abcdef"),
+    ("GET", "/admin/api/life/ledger"),
     ("POST", "/admin/api/life/ledger"),
     ("DELETE", "/admin/api/life/ledger/0123456789abcdef0123456789abcdef"),
 ]
@@ -353,6 +354,7 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         "admission",
         "patrol",
         "notebook",
+        "event-ledger",
         "drive-sync",
         "journal",
     } <= tabs["modules"]
@@ -371,6 +373,8 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         ('data-action="diary"', "journal"),
         ('id="system-catalog"', "modules"),
         ('data-action="notebook"', "notebook"),
+        ('id="life-ledger-form"', "event-ledger"),
+        ('id="life-ledger-table"', "event-ledger"),
     ):
         assert [key for key, content in panels.items() if marker in content] == [owner]
 

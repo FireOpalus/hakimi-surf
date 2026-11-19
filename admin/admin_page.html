@@ -1315,6 +1315,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-journal" type="button" role="tab" data-tab="journal" data-description="查看本地巡逻日记与隔离文件夹的同步回执。" aria-controls="journal" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h5"/></svg><span>巡逻日记</span></button>
         <button id="nav-drive-sync" type="button" role="tab" data-tab="drive-sync" data-description="查看已接入模块的同步状态和最近回执。" aria-controls="drive-sync" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18H6a4 4 0 0 1-.5-8 6.5 6.5 0 0 1 12.5-2 5 5 0 0 1 0 10h-1 M12 20v-9 M8.5 14.5 12 11l3.5 3.5"/></svg><span>Google Drive 同步</span></button>
         <button id="nav-notebook" type="button" role="tab" data-tab="notebook" data-description="管理仅供 Owner 私聊使用的脱敏快照。" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
+        <button id="nav-event-ledger" type="button" role="tab" data-tab="event-ledger" data-description="查看并管理各模块、私聊约定与规划器写入的跨日待办事件。" aria-controls="event-ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h5 M3 8h2 M3 12h2 M3 16h2"/></svg><span>跨日待办账本</span></button>
       </div>
     </nav>
     <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
@@ -2085,22 +2086,6 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <p class="muted">只记录触发时间窗、门控条件与模糊动机，绝不预写台词；状态为 pending 时可手动取消。</p>
     <div id="life-intents-table" class="table"></div>
   </div>
-  <div class="card"><h2>跨日待办账本（Event Ledger）</h2>
-    <p class="muted">各能力模块、私聊约定与规划器写入的跨时段待办事项（Fernet 加密落盘，显式核销或到期前持续保留）。</p>
-    <form id="life-ledger-form" class="quick-bar">
-      <label for="life-ledger-summary">待办摘要<input id="life-ledger-summary" type="text" maxlength="160" required placeholder="如：明天下午收农场西边草莓 / 约好两点进MC挖铁矿"></label>
-      <label for="life-ledger-target">目标模块（可选）<input id="life-ledger-target" list="life-module-options" type="text" maxlength="32" placeholder="minecraft / 留空"></label>
-      <label for="life-ledger-due">延后生效（分钟）<input id="life-ledger-due" type="number" min="0" max="43200" step="1" value="0" required></label>
-      <label for="life-ledger-vis">可见域
-        <select id="life-ledger-vis">
-          <option value="owner_private">owner_private · 仅私密排程</option>
-          <option value="public">public · 模块与群聊可见</option>
-        </select>
-      </label>
-      <button id="life-ledger-submit" type="submit">送入待办事件</button>
-    </form>
-    <div id="life-ledger-table" class="table"></div>
-  </div>
   <div class="card"><h2>跨模块事件（最近 30 条）</h2>
     <p class="muted">能力模块发布的脱敏里程碑事件（明文 JSON 存储，供规划器与镜像消费）。</p>
     <div id="life-events-table" class="table"></div>
@@ -2201,6 +2186,28 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <p id="notebook-action-note" class="muted"></p>
     <textarea id="notebook-text" maxlength="4000" rows="12" aria-label="小本本快照"></textarea>
     <div class="row"><button data-action="notebook" disabled>刷新快照</button><button id="save-notebook">筛查并更新本地快照</button></div>
+  </div>
+</section>
+
+<section id="event-ledger" class="tab" role="tabpanel" aria-labelledby="nav-event-ledger" hidden>
+  <div class="card">
+    <div class="row between"><h2>跨日待办账本（Event Ledger）</h2><button id="refresh-event-ledger" class="secondary" type="button">刷新账本</button></div>
+    <p class="muted">各能力模块、私聊约定与规划器写入的跨时段待办事项（Fernet 加密落盘，显式核销或到期前持续保留）。</p>
+    <p id="event-ledger-state" class="muted" aria-live="polite"></p>
+    <form id="life-ledger-form" class="quick-bar">
+      <label for="life-ledger-summary">待办摘要<input id="life-ledger-summary" type="text" maxlength="160" required placeholder="如：明天下午收农场西边草莓 / 约好两点进MC挖铁矿"></label>
+      <label for="life-ledger-target">目标模块（可选）<input id="life-ledger-target" list="ledger-module-options" type="text" maxlength="32" placeholder="minecraft / 留空"></label>
+      <datalist id="ledger-module-options"></datalist>
+      <label for="life-ledger-due">延后生效（分钟）<input id="life-ledger-due" type="number" min="0" max="43200" step="1" value="0" required></label>
+      <label for="life-ledger-vis">可见域
+        <select id="life-ledger-vis">
+          <option value="owner_private">owner_private · 仅私密排程</option>
+          <option value="public">public · 模块与群聊可见</option>
+        </select>
+      </label>
+      <button id="life-ledger-submit" type="submit">送入待办事件</button>
+    </form>
+    <div id="life-ledger-table" class="table"></div>
   </div>
 </section>
 
@@ -3364,22 +3371,7 @@ function renderLife(d){
   table('life-rules-table',['处理时间','规则','事件 ID','结果','意图 ID'],(d.rule_receipts||[]).map(row=>[
     lifeFmt(row.created_at,tz),row.rule_id,row.event_id.slice(0,10),row.outcome,row.intent_id?.slice(0,10)||'—'
   ]));
-  const ledgerStatusLabels={pending:'待处理',consumed:'已核销',expired:'已过期'};
-  table('life-ledger-table',['来源 → 目标','类型 / 可见域','待办摘要','生效 / 过期时间','状态','操作'],(d.ledger_events||[]).map(item=>{
-    const route=(item.source_module||'—')+(item.target_module?' → '+item.target_module:'');
-    const visPill=pill(item.visibility==='owner_private'?'私密排程':'公开可见',item.visibility==='owner_private'?'paid':'muted');
-    const typeBox=el('div',undefined,'row');
-    typeBox.append(el('span',item.event_type||'—'),visPill);
-    const statusPill=pill(ledgerStatusLabels[item.status]||item.status,item.status==='pending'?'ok':'muted');
-    return[
-      route,
-      typeBox,
-      item.summary||'—',
-      lifeFmt(item.due_at,tz)+' ~ '+lifeFmt(item.expires_at,tz),
-      statusPill,
-      item.status==='pending'?button('核销',async()=>{const next=await api('life/ledger/'+encodeURIComponent(item.id),'DELETE');renderLife(next);notice('已核销待办事件');},'secondary'):el('span',item.consumed_by||'—','muted')
-    ];
-  }));
+
   table('life-events-table',['时间','来源模块','事件类型','重要度','规划器已读','脱敏载荷'],(d.events||[]).map(ev=>[
     lifeFmt(ev.created_at,tz),
     ev.source_module||'—',
@@ -3394,6 +3386,35 @@ async function life(){
   if(!token)return;
   renderRestHours(rest);renderLife(d);
 }
+const ledgerStatusLabels={pending:'待处理',consumed:'已核销',expired:'已过期'};
+function renderEventLedger(d){
+  const tz=d.timezone||'Asia/Shanghai', c=d.counts||{};
+  text('event-ledger-state','待处理 '+(c.pending??0)+' 条（已到期 '+(c.due??0)+' 条） · 最近已核销 '+(c.consumed??0)+' 条 · 已过期 '+(c.expired??0)+' 条 · 时区 '+zoneLabel(tz));
+  $('ledger-module-options').replaceChildren(...(d.modules||[]).map(id=>{
+    const option=el('option');option.value=id;return option;
+  }));
+  table('life-ledger-table',['来源 → 目标','类型 / 可见域','待办摘要','生效 / 过期时间','状态','操作'],(d.ledger_events||[]).map(item=>{
+    const route=(item.source_module||'—')+(item.target_module?' → '+item.target_module:'');
+    const visPill=pill(item.visibility==='owner_private'?'私密排程':'公开可见',item.visibility==='owner_private'?'paid':'muted');
+    const typeBox=el('div',undefined,'row');
+    typeBox.append(el('span',item.event_type||'—'),visPill);
+    const statusPill=pill(ledgerStatusLabels[item.status]||item.status,item.status==='pending'?'ok':'muted');
+    return[
+      route,
+      typeBox,
+      item.summary||'—',
+      lifeFmt(item.due_at,tz)+' ~ '+lifeFmt(item.expires_at,tz),
+      statusPill,
+      item.status==='pending'?button('核销',async()=>{const next=await api('life/ledger/'+encodeURIComponent(item.id),'DELETE');renderEventLedger(next);notice('已核销待办事件');},'secondary'):el('span',item.consumed_by||'—','muted')
+    ];
+  }));
+}
+async function eventLedger(){
+  const d=await api('life/ledger');
+  if(!token)return;
+  renderEventLedger(d);
+}
+$('refresh-event-ledger').addEventListener('click',e=>busy(e.target,eventLedger));
 $('refresh-life').addEventListener('click',e=>busy(e.target,life));
 $('life-world-form').addEventListener('submit',e=>{
   e.preventDefault();
@@ -3487,7 +3508,7 @@ $('life-ledger-form').addEventListener('submit',e=>{
     $('life-ledger-summary').value='';
     $('life-ledger-target').value='';
     $('life-ledger-due').value='0';
-    renderLife(next);
+    renderEventLedger(next);
     notice('待办事件已加密送入账本');
   });
 });
@@ -4192,7 +4213,7 @@ async function moduleDirectory(){
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
+  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, 'event-ledger':eventLedger, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
   weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{
@@ -4247,8 +4268,8 @@ function resetWorkspaces(){
   for(const remove of pluginPages.values())remove();
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
-  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');
-  for(const id of ['module-catalog','system-catalog','drive-consumers','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch'])$(id).replaceChildren();
+  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');text('event-ledger-state','');
+  for(const id of ['module-catalog','system-catalog','drive-consumers','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch','life-ledger-table','ledger-module-options'])$(id).replaceChildren();
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;

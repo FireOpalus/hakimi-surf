@@ -403,8 +403,20 @@ async def test_ledger_system_module_and_admin_endpoints(settings):
         ) as client:
             sys_mods = {m["id"]: m for m in (await client.get("/admin/api/system-modules")).json()}
             assert "event_ledger" in sys_mods
-            assert sys_mods["event_ledger"]["panel"] == "life"
+            assert sys_mods["event_ledger"]["panel"] == "event-ledger"
             assert sys_mods["event_ledger"]["status"]["state"] == "ready"
+
+            initial = await client.get("/admin/api/life/ledger")
+            assert initial.status_code == 200
+            initial_body = initial.json()
+            assert initial_body["counts"] == {
+                "pending": 0,
+                "due": 0,
+                "consumed": 0,
+                "expired": 0,
+            }
+            assert initial_body["ledger_events"] == []
+            assert isinstance(initial_body["modules"], list)
 
             bad = await client.post("/admin/api/life/ledger", json={"summary": "   "})
             assert bad.status_code == 400

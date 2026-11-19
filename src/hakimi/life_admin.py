@@ -755,6 +755,39 @@ async def life_trigger_gatekeeper(request: Request):
         return res if isinstance(res, dict) else {"status": "ok", "result": res}
 
 
+async def _build_ledger_payload(svc) -> dict:
+    ledger = getattr(svc, "event_ledger", None)
+    if ledger is None:
+        raise HTTPException(503, "event_ledger_unavailable")
+    engine = getattr(svc, "life_engine", None)
+    now = engine.clock() if engine is not None and hasattr(engine, "clock") else ledger.clock()
+    pending, due = await ledger.status_counts(now=now)
+    items = await ledger.admin_list(now=now, limit=50)
+    consumed = sum(1 for item in items if item.get("status") == "consumed")
+    expired = sum(1 for item in items if item.get("status") == "expired")
+    modules = sorted(
+        {m.module_id for m in svc.modules.all()}
+        if getattr(svc, "modules", None) is not None
+        else set()
+    )
+    return {
+        "timezone": svc.s.bot_timezone,
+        "counts": {
+            "pending": pending,
+            "due": due,
+            "consumed": consumed,
+            "expired": expired,
+        },
+        "ledger_events": items,
+        "modules": modules,
+    }
+
+
+@router.get("/ledger")
+async def life_ledger_status(request: Request):
+    return await _build_ledger_payload(service(request))
+
+
 @router.post("/ledger")
 async def life_create_ledger_event(request: Request):
     value = await body(request, LedgerEventAdminCreate)
@@ -780,7 +813,7 @@ async def life_create_ledger_event(request: Request):
             )
         except ValueError:
             raise HTTPException(400, "invalid_admin_input") from None
-        return await _build_life_status(svc, include_sensors=False)
+        return await _build_ledger_payload(svc)
 
 
 @router.delete("/ledger/{item_id}")
@@ -799,7 +832,7 @@ async def life_consume_ledger_event(request: Request, item_id: str):
         )
         if not consumed:
             raise HTTPException(404, "ledger_event_not_found")
-        return await _build_life_status(svc, include_sensors=False)
+        return await _build_ledger_payload(svc)
 
 
 @router.delete("/intents/{intent_id}")
