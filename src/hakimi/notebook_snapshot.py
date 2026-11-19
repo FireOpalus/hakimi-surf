@@ -6,11 +6,11 @@ import stat
 import tempfile
 import time
 
-from .bot_server import is_persona_owner
 from .drive_client import API, DriveAuth
 from .http_json import bounded_json
 from .memory_compressor import check_memory_text
 from .security import Rejected
+from .social import bound_owner
 from .work_usage import model_work
 
 
@@ -76,7 +76,7 @@ class NotebookSnapshot:
         if (
             self.s.enable_notebook_snapshot
             and message.kind == "private"
-            and is_persona_owner(message, self.s)
+            and bound_owner(message, self.s, "notebook")
         ):
             return self.text
         return ""

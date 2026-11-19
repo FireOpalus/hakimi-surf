@@ -21,7 +21,7 @@ WHERE s.kind='digest' AND s.scope=?
 """
 
 
-def project(row, *, connected):
+def project(row, *, connected, qq=True):
     item = dict(row)
     generation = item.pop("generation_state")
     delivery = item.pop("delivery_state")
@@ -30,7 +30,7 @@ def project(row, *, connected):
     if delivery in {"sent", "delivered"}:
         stage = "confirmed"
     elif delivery == "pending":
-        stage = "queued" if connected else "awaiting_qq"
+        stage = "queued" if connected else ("awaiting_qq" if qq else "awaiting_channel")
     elif delivery == "sending":
         stage = "submitting"
     elif delivery == "expired" or reason in {"outside_digest_window", "expired"}:
@@ -51,9 +51,9 @@ def project(row, *, connected):
     return {**item, "stage": stage, "reason": reason}
 
 
-def world_outcome(stage):
+def world_outcome(stage, *, qq=True):
     if stage == "confirmed":
-        return Outcome("done", "owner_digest_qq_confirmed")
+        return Outcome("done", "owner_digest_qq_confirmed" if qq else "owner_digest_confirmed")
     if stage == "expired":
         return Outcome("expired", "owner_digest_expired")
     if stage in {"failed", "cancelled"}:
@@ -66,32 +66,40 @@ def world_outcome(stage):
 
 
 class DigestReceipts:
-    def __init__(self, store, scope, owner):
-        self.store, self.scope, self.target_scope = store, scope, "owner:" + owner
+    def __init__(self, store, scope, owner, *, action_name="qq.owner_digest", target_scope=None):
+        self.store, self.scope, self.target_scope = store, scope, target_scope or "owner:" + owner
+        self.action_name = action_name
 
     async def history(self, *, connected):
         async with self.store.lock:
             rows = await self.store.all(_HISTORY + " ORDER BY s.day DESC LIMIT 8", (self.scope,))
-        return [project(row, connected=connected) for row in rows]
+        return [
+            project(row, connected=connected, qq=self.action_name == "qq.owner_digest")
+            for row in rows
+        ]
 
     async def get_tx(self, key, *, connected=True):
         row = await self.store.one(_HISTORY + " AND s.id=?", (self.scope, key))
-        return project(row, connected=connected) if row else None
+        return (
+            project(row, connected=connected, qq=self.action_name == "qq.owner_digest")
+            if row
+            else None
+        )
 
     async def link_tx(self, key, intent_id):
         if intent_id:
             await self.store.db.execute(
                 "INSERT OR IGNORE INTO owner_digest_intents(intent_id,digest_id,scheduled_for) "
                 "SELECT id,?,execute_after FROM scheduled_intents WHERE id=? AND target_scope=? "
-                "AND action_name='qq.owner_digest' AND origin='timer'",
-                (key, intent_id, self.target_scope),
+                "AND action_name=? AND origin='timer'",
+                (key, intent_id, self.target_scope, self.action_name),
             )
 
     async def sync_intents_tx(self, key, now):
         receipt = await self.get_tx(key)
         if not receipt or not receipt["intent_id"]:
             return
-        result = world_outcome(receipt["stage"])
+        result = world_outcome(receipt["stage"], qq=self.action_name == "qq.owner_digest")
         await self.store.db.execute(
             "UPDATE scheduled_intents SET status=?,result_reason=?,updated_at=? "
             "WHERE id IN (SELECT intent_id FROM owner_digest_intents WHERE digest_id=?) "
@@ -109,11 +117,11 @@ class DigestReceipts:
         await self.store.db.execute(
             "INSERT OR IGNORE INTO owner_digest_intents(intent_id,digest_id,scheduled_for) "
             "SELECT w.id,s.id,w.execute_after FROM scheduled_intents w JOIN proactive_schedule s "
-            "ON w.dedupe_key LIKE 'timer:qq.owner_digest:'||s.day||':%' "
-            "WHERE w.action_name='qq.owner_digest' AND w.origin='timer' AND w.target_scope=? "
+            "ON w.dedupe_key LIKE 'timer:'||?||':'||s.day||':%' "
+            "WHERE w.action_name=? AND w.origin='timer' AND w.target_scope=? "
             "AND s.kind='digest' AND s.scope=? AND (w.status='executing' OR "
             "(w.status='done' AND w.result_reason='owner_digest_queued'))",
-            (self.target_scope, self.scope),
+            (self.action_name, self.action_name, self.target_scope, self.scope),
         )
         rows = await self.store.all(
             "SELECT DISTINCT s.id FROM proactive_schedule s JOIN owner_digest_intents i "

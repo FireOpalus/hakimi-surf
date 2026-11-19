@@ -6,6 +6,7 @@ import random
 import re
 import time
 import uuid
+import weakref
 from collections import Counter
 from contextlib import nullcontext
 
@@ -47,6 +48,7 @@ from .routing import RouteDecision
 from .security import Rejected, authorize, configured_secrets, owner, safe_output
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
+from .social import chat_module, confirmed_message_id
 from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
@@ -107,6 +109,8 @@ class Service:
         node_transport: NodeTransport | None = None,
     ):
         self.s, self.store, self.ai, self.bili, self.sender = settings, store, gateway, bili, sender
+        # Older composition roots supplied their shared HTTP client on the sender.
+        self.http = http if http is not None else getattr(sender, "http", None)
         self.node_transport = (
             node_transport if node_transport is not None else NodeTransport(settings)
         )
@@ -147,7 +151,8 @@ class Service:
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
         self._lurk_react_at: dict[str, float] = {}
-        self.modules = ModuleRegistry()
+        self.modules = ModuleRegistry(owner_delivery=self.proactive)
+        settings._chat_registry = weakref.ref(self.modules)
         install_system_modules(
             self.modules,
             SystemResources(
@@ -292,8 +297,14 @@ class Service:
             return await self.accept(message)
         return await self.accept(onebot_message(payload, self.s))
 
+    async def accept_from(self, module, message: Message):
+        """Authenticated plugin entry point; a transport can only submit its declared platforms."""
+        if module is None or self.modules.chat_platforms.get(message.platform) is not module:
+            return "ignored"
+        return await self.accept(message)
+
     async def accept(self, message: Message | None) -> str:
-        if self.modules.inactive_reason("qq_social"):
+        if message is None or not chat_module(self.s, message.platform):
             return "ignored"
         if other_mentions(message):
             self.counters["addressed_to_others"] += 1
@@ -310,6 +321,11 @@ class Service:
         if message is None or (not authorize(message, self.s) and not eligible_context):
             self.counters["ignored"] += 1
             return "ignored"
+        if message.platform not in {"onebot", "qq"}:
+            # Replies and media references from other transports may never invoke OneBot RPCs.
+            message = message.model_copy(
+                update={"images": [], "files": [], "forward_ids": [], "context_expanded": True}
+            )
         await self.proactive.note_activity(message)
         if any(secret and len(secret) >= 8 and secret in message.text for secret in self.secrets):
             self.counters["credential_in_input"] += 1
@@ -377,6 +393,7 @@ class Service:
             self.store.groups.interrupt(message)
         if (
             result == "limited"
+            and message.platform in {"onebot", "qq"}
             and self.store.runtime.affection.config.enabled
             and not self.bot_guard.known_bot(message)
             and not owner(message, self.s)
@@ -511,7 +528,7 @@ class Service:
         await self.store.add_subscription(message, match[2])
         tip = (
             "发现更新后会私聊汇报。"
-            if is_persona_owner(message, self.s) and self.proactive.delivery_enabled
+            if self.proactive.matches(message) and self.proactive.delivery_enabled
             else "新摘要会保存在 /哈基米 报告 中。"
         )
         return "已订阅；首次巡逻仅建立基线。" + tip
@@ -686,7 +703,7 @@ class Service:
         return authorize(candidate, self.s)
 
     def batch_authorized(self, message, members, *, bypass_mute_user_id: str | None = None):
-        if self.modules.inactive_reason("qq_social"):
+        if not chat_module(self.s, message.platform):
             return False
         # An accepted @Bot batch may include subsequent unaddressed follow-up text.
         # This relaxes attention only, never group admission, identity or blacklists.
@@ -1016,6 +1033,8 @@ class Service:
 
     async def _alert_affection_blacklisted(self, message: Message, update) -> None:
         self.record("affection_blacklisted")
+        if self.s.owner_delivery_platform != "onebot":
+            return
         nick = self.moderation.nickname(message.sender_nickname or getattr(update, "nickname", ""))
         code = f"affection_zero_{message.platform}_{message.user_id}"
         recovery = self.store.runtime.affection.config.unmute_recovery_score
@@ -1100,7 +1119,11 @@ class Service:
             return
         aff = self.store.runtime.affection
         caps = await aff.capabilities_for(message)
-        aff_active = aff.config.enabled and not self.bot_guard.known_bot(message)
+        aff_active = (
+            message.platform in {"onebot", "qq"}
+            and aff.config.enabled
+            and not self.bot_guard.known_bot(message)
+        )
         if aff_active and caps.level == 0:
             return
         fixed = await self.command(message)
@@ -1618,12 +1641,11 @@ class Service:
                     }
                 if batch_aff:
                     payload["batch_affection"] = batch_aff
-            if not self.bot_guard.known_bot(message) and hasattr(
-                self.bili_watcher, "recent_surfed"
-            ):
-                surfed = await self.bili_watcher.recent_surfed(limit=4, message=message)
-                if surfed:
-                    payload["recent_bili_surfed"] = surfed
+            if not self.bot_guard.known_bot(message):
+                material = await self.modules.context_data(
+                    limit=4, now=time.time(), message=message
+                )
+                payload.update({k: v for k, v in material.items() if v})
             if not self.bot_guard.known_bot(message) and hasattr(self, "world_state"):
                 news = await self.world_state.experience.news(message, time.time(), limit=2)
                 if news:
@@ -1849,7 +1871,7 @@ class Service:
                     reply_score=getattr(intent, "reply_score", None),
                     reply_threshold=getattr(intent, "reply_threshold", None),
                 )
-            if tier >= 3 and hasattr(self.sender, "quick_ack"):
+            if tier >= 3 and message.platform == "onebot" and hasattr(self.sender, "quick_ack"):
                 self.background(self.quick_ack(job, message, message_guard))
             if (
                 not sandbox
@@ -1908,7 +1930,7 @@ class Service:
                     settings=self.s,
                     tier=tier,
                     allowed_poke=allowed_poke,
-                    allow_longnick=(not sandbox and is_persona_owner(message, self.s)),
+                    allow_longnick=(not sandbox and owner(message, self.s)),
                     allow_sticker=(not aff_active or caps.allow_sticker),
                     allow_emoji_like=(not aff_active or caps.allow_emoji_like),
                     allow_poke_action=(
@@ -1938,11 +1960,15 @@ class Service:
                         actions.poke_qq = None
                         folded = None
                 if not sandbox and not actions.abstain and not farewell_bypass:
-                    if actions.save_meme_label and not self.bot_guard.known_bot(message):
+                    if (
+                        message.platform == "onebot"
+                        and actions.save_meme_label
+                        and not self.bot_guard.known_bot(message)
+                    ):
                         await self._auto_save_meme(
                             message, [*neighbour_members, *members], actions.save_meme_label
                         )
-                    if actions.set_longnick and is_persona_owner(message, self.s):
+                    if actions.set_longnick and owner(message, self.s):
                         try:
                             await self.longnick.update(actions.set_longnick, automatic=False)
                         except asyncio.CancelledError:
@@ -2093,14 +2119,16 @@ class Service:
         await self.store.save_report(job["subject"], result, public=True)
         if self.diary:
             await self.diary.patrol(job["id"], result)
-        if is_persona_owner(target, self.s) and self.proactive.delivery_enabled:
+        if self.proactive.matches(target) and self.proactive.delivery_enabled:
             await self.proactive.enqueue("patrol", result, key=job["id"])
 
     async def process(self, job: dict):
         try:
-            with model_work(
-                "qq.reply" if job["kind"] == "message" else "bili.subscription", job["id"]
-            ):
+            work = "bili.subscription"
+            if job["kind"] == "message":
+                platform = job["payload"]["platform"]
+                work = "qq.reply" if platform in {"qq", "onebot"} else platform + ".reply"
+            with model_work(work, job["id"]):
                 if job["kind"] == "message":
                     await self.handle_message(job)
                 else:
@@ -2227,10 +2255,14 @@ class Service:
             message.platform != "onebot"
             or await self.moderation.is_affection_muted(message.user_id)
         )
-        if reply_actions and not (
-            bool(reply_actions.get("farewell_bypass_mute"))
-            and "bubbles" not in reply_actions
-            and reply.get("text")
+        if (
+            message.platform in {"onebot", "qq"}
+            and reply_actions
+            and not (
+                bool(reply_actions.get("farewell_bypass_mute"))
+                and "bubbles" not in reply_actions
+                and reply.get("text")
+            )
         ):
             from .outgoing import deliver_actions
 
@@ -2255,7 +2287,7 @@ class Service:
                 await self.bot_guard.extend_cooldown(message, reply["id"], before_send=True)
 
                 async def valid_after_delay():
-                    if self.modules.inactive_reason("qq_social"):
+                    if not chat_module(self.s, message.platform):
                         return False
                     async with self.store.lock:
                         row = await self.store.one(
@@ -2303,7 +2335,22 @@ class Service:
                         *getattr(self.s, "muted_user_ids", set()),
                     }
 
-                if (
+                if message.platform not in {"onebot", "qq"}:
+                    module = chat_module(self.s, message.platform)
+                    if (
+                        reply["proactive"]
+                        or not module
+                        or not reply["text"]
+                        or not await valid_after_delay()
+                    ):
+                        await self.store.finish_reply(reply["id"], "cancelled")
+                        await self._finish_delivery_audit(reply, "cancelled", "unauthorized")
+                        return True
+                    ident = await module.send_chat(
+                        message, self.output(reply["text"]), before_send=valid_after_delay
+                    )
+                    receipt = {"message_id": confirmed_message_id(ident)}
+                elif (
                     reply.get("segments")
                     and any(s["type"] == "at" for s in reply["segments"])
                     and hasattr(self.sender, "send_segments")
@@ -2326,7 +2373,7 @@ class Service:
 
                 if not valid_receipt(receipt):
                     raise Rejected("onebot_send_unconfirmed")
-            text_confirmed = (
+            text_confirmed = (message.platform not in {"onebot", "qq"} and receipt is not None) or (
                 message.platform == "onebot"
                 and isinstance(receipt, dict)
                 and not isinstance(receipt.get("message_id"), bool)
@@ -2557,7 +2604,7 @@ class Service:
         await self.store.save_report(self.store.subject(target), live_text, public=True)
         if (
             target.kind == "private"
-            and is_persona_owner(target, self.s)
+            and self.proactive.matches(target)
             and self.proactive.delivery_enabled
         ):
             try:

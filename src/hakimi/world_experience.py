@@ -301,7 +301,10 @@ class WorldExperience:
 
     async def event_tx(self, event):
         data = event.payload
-        video = (event.source_module, event.event_type) == ("bilibili_surf", "bili_video_watched")
+        video = data.get("activity_kind") == "video_learning" or (
+            event.source_module,
+            event.event_type,
+        ) == ("bilibili_surf", "bili_video_watched")
         mc = event.source_module == "minecraft" and event.event_type in {
             "mc_goal_completed",
             "mc_rare_find",
@@ -355,12 +358,13 @@ class WorldExperience:
         from .world_state import private_event_audience
 
         return (
-            private_event_audience(self.s, message.user_id)
+            private_event_audience(
+                self.s, message.user_id, platform=message.platform, bot_id=message.bot_id
+            )
             if (
                 message.kind == "private"
                 and message.user_id == message.conversation_id
-                and message.platform == "onebot"
-                and message.bot_id == self.s.onebot_self_id
+                and (message.platform != "onebot" or message.bot_id == self.s.onebot_self_id)
             )
             else ""
         )
@@ -537,12 +541,12 @@ class WorldExperience:
                 "WHERE outcome NOT IN ('running','prepared') ORDER BY started "
                 "DESC,rowid DESC LIMIT 1"
             )
-            patrol = await self.store.one(
-                "SELECT 1 FROM sqlite_master WHERE name='bili_patrol_runs'"
-            )
-            working = patrol and await self.store.one(
-                "SELECT 1 FROM bili_patrol_runs WHERE status='working' LIMIT 1"
-            )
+        active = None
+        if self.world.registry:
+            for module in self.world.registry.active():
+                active = await module.current_activity()
+                if active:
+                    break
         mc = row["mc_task"] if row["mc_until"] > now else ""
         return {
             "plan": dict(plan) if plan else None,
@@ -551,8 +555,8 @@ class WorldExperience:
                 if mc
                 else "bili_read"
                 if row["bili_until"] > now
-                else "bili_patrol"
-                if working
+                else active
+                if active
                 else "sleep"
                 if self.store.runtime.is_resting(now)
                 else "day_rest"

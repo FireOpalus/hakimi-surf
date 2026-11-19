@@ -138,10 +138,10 @@
 
     <section class="chapter" id="life" aria-labelledby="life-title">
       <div class="heading"><span class="num">02</span><h2 id="life-title">从世界状态到一次主动行动</h2></div>
-      <p class="intro">启动时，引擎从模块目录的 <code>.gitmodules</code> 读取已安装仓库，逐个加载 <code>plugin.py</code>，并把返回的模块登记到 <code>ModuleRegistry</code>。平台模块声明动作、就绪条件与调度设置，后台提供各自的开关。随版本交付的系统模块从 <code>system_modules/</code> 按依赖装载，目录直接展示运行状态。日记、Drive 同步、数据库备份、分身镜像、群记忆镜像和 Owner 只读记忆各自装载。世界引擎读取登记的策略来规划时段、检查次数和执行意图。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
+      <p class="intro">启动时，引擎从模块目录的 <code>.gitmodules</code> 读取已安装仓库，逐个加载 <code>plugin.py</code>，并把返回的模块登记到 <code>ModuleRegistry</code>。平台模块声明动作、精力需求、会话协议与调度设置，后台据此生成入口、隐私设置和动作表单。随版本交付的系统模块从 <code>system_modules/</code> 按依赖装载，目录直接展示运行状态。日记、Drive 同步、数据库备份、分身镜像、群记忆镜像和 Owner 只读记忆各自装载。世界引擎读取登记的策略来规划时段、检查次数和执行意图。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
       <div class="grid three">
-        <article class="tile sea"><span class="step">LOW · qq_social</span><h3>QQ 社交</h3><p>汇总传输状态、活跃群和缓冲条数。这里不读取 Owner 私聊正文。</p></article>
-        <article class="tile blue"><span class="step">MEDIUM · bilibili_surf</span><h3>B 站冲浪</h3><p>境外组织巡逻；境内节点在线且启用委派时，可由境内代采。传感摘要区分采集状态和最近记录。</p></article>
+        <article class="tile sea"><span class="step">LOW · qq_social</span><h3>QQ 社交</h3><p>处理 OneBot 与官方 QQ 的准入、富媒体和管理命令。社交插件共用防抖、模型网关和按平台与账号隔离的会话。</p></article>
+        <article class="tile blue"><span class="step">MEDIUM · bilibili_surf</span><h3>B 站冲浪</h3><p>境外组织巡逻；境内节点在线且启用委派时，可由境内代采。公开学习事件进入日记，指定私聊的优先分享记录按原会话筛选。</p></article>
         <article class="tile plum"><span class="step">HIGH · minecraft</span><h3>Minecraft</h3><p>境外保存最新的境内游戏快照。桥已连接、游戏已配置、角色已进服和暂停是四种不同的信息。</p></article>
       </div>
       <figure class="sheet" style="margin-top:.85rem" aria-label="生活引擎：规划、门控、临场执行">
@@ -153,7 +153,7 @@
         <p class="return"><strong>回执与恢复</strong>　QQ 气泡逐条确认。重启时完整文本回执可还原成功，部分回执和执行中失联的游戏动作记为待核实。意图分别记录 <code>done</code>、<code>gated_skip</code>、<code>expired</code> 或 <code>uncertain</code>；仍在有效期内的暂时冲突可以延后。</p>
         <figcaption class="caption">进入游戏且未暂停时可切换为 <code>minecraft / HIGH</code>；暂停或离线后可回到 <code>idle / LOW</code>。高专注暂停低专注模块的主动行为；被点名的 QQ 消息仍可回复，普通群聊新消息优先做上下文。脱敏传感摘要只加在动态消息尾部，空闲基线不注入。</figcaption>
         <p class="bridge"><strong>第四个模块 · 定点天气</strong>　对话 AI、其他模块和后台按需调用 <code>weather.read</code>，读取配置地点的当前天气。数据有效期内共用一份观测，到期后由下一次查询更新。</p>
-        <p class="ref"><b>源码</b><a href="src/hakimi/modules/.gitmodules">安装清单</a><a href="src/hakimi/modules/__init__.py">平台注册</a><a href="src/hakimi/system_modules/__init__.py">常驻系统模块</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/platforms/minecraft/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
+        <p class="ref"><b>源码</b><a href="src/hakimi/modules/.gitmodules">安装清单</a><a href="src/hakimi/modules/__init__.py">平台注册</a><a href="src/hakimi/system_modules/__init__.py">常驻系统模块</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/platforms/minecraft/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/social.py">平台身份与资料授权</a><a href="src/hakimi/proactive_dm.py">单目的地日报与回执</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
       </figure>
     </section>
 
@@ -243,7 +243,7 @@
           <div><dt>巡逻日记与群镜像</dt><dd><code>PatrolDiary</code> 独立整理本地日记及每日总结。<code>DiaryDriveSync</code> 按时从本地读取并向隔离目录同步，失败后重试。<code>MemoryMirror</code> 则仅为显式开启的公开群同步 Markdown。两者都与上面的 Owner 专用导出分别管理。</dd></div>
           <div><dt>主库 → 加密备份</dt><dd><code>DatabaseBackup</code> 对 <code>hakimi.sqlite3</code> 执行 <code>VACUUM INTO</code>，压缩、使用专用派生密钥加密，在本地保存并可上传指定 Drive 文件夹，默认保留 7 天。它不覆盖 <code>sessions/</code> 下的独立会话库，恢复主库不能代替恢复所有聊天记录。</dd></div>
         </dl>
-        <figcaption class="caption">公开日记、加密备份、Owner 分身镜像和已授权群记忆共用隔离目录。每条链路保留自己的数据授权和远端文件标记。Owner 小本本使用单独的只读来源。</figcaption>
+        <figcaption class="caption">公开日记、加密备份、Owner 分身镜像和已授权群记忆共用隔离目录。群的同步资格由来源插件核验。备份通过专用接口轮换本命名空间的加密文件。每条链路保留自己的数据授权和远端文件标记。Owner 小本本使用单独的只读来源。</figcaption>
         <p class="ref"><b>源码</b><a href="src/hakimi/world_state.py">全局表</a><a href="scripts/owner_memory_bridge.py">桌面桥</a><a href="src/hakimi/owner_cloud_memory.py">只读召回</a><a href="src/hakimi/surf_mirror.py">分身镜像</a><a href="src/hakimi/roaming_logger.py">巡逻日记</a><a href="src/hakimi/memory_mirror.py">群镜像</a><a href="src/hakimi/db_backup.py">备份范围</a><a href="src/hakimi/system_modules/drive_sync.py">模块同步接口</a></p>
       </figure>
     </section>

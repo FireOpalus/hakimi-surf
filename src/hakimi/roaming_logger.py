@@ -13,7 +13,8 @@ from .config import Settings
 from .gemini import GeminiGateway
 from .generation_policy import Scenario
 from .models import Message
-from .security import Rejected, authorize, clean_text, configured_secrets, safe_output
+from .security import Rejected, clean_text, configured_secrets, safe_output
+from .social import permits_chat_export
 from .store import Store
 from .work_usage import model_work
 
@@ -203,7 +204,7 @@ class PatrolDiary:
     async def group(
         self, event_id: str, message: Message, *, members: list[Message] | None = None, now=None
     ):
-        if not authorize(message.model_copy(update={"addressed": True}), self.s):
+        if not permits_chat_export(message, self.s, "patrol_diary"):
             return
         if message.kind == "group":
             kind = (
@@ -246,7 +247,7 @@ class PatrolDiary:
     async def bot_reply(self, reply_id: str, message: Message, text: str, *, now=None):
         if not self.s.roaming_enabled or not text or not text.strip():
             return
-        if not authorize(message.model_copy(update={"addressed": True}), self.s):
+        if not permits_chat_export(message, self.s, "patrol_diary"):
             return
         event_kind, scope_label = self._chat_scope_label(message)
         ts = self.local(now).strftime("%H:%M")

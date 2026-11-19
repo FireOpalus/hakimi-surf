@@ -178,6 +178,14 @@ docker compose up -d
 | 升级旧库 | 启动时增补列、索引与规则游标，保留旧票据和终态。新规则从启用时开始消费；重启从已保存的位置补读。 |
 | 天气观测 | 在后台「功能模块 → 天气观测」搜索城市、填写经纬度，或按服务器出口 IP 识别城市。确认地点并保存后立即生效，重启后保留。也可恢复到 `.env` 的 `HAKIMI_WEATHER_LATITUDE`、`HAKIMI_WEATHER_LONGITUDE`。AI 可按需选择只读动作 `weather.read`，其他模块可调用 `await service.life_engine.query("weather.read")`，后台的「查询当前天气」使用受鉴权的 `GET /admin/api/life/modules/weather/current`。三者共用同一份观测，数据有效期取自 Open-Meteo 的时间戳和采样区间。查询返回气温、天气状况及可用的降水等观测值。[天气数据接口](https://open-meteo.com/en/docs) |
 
+### 让其他社交平台复用群聊与私聊
+
+社交插件在 `chat_platforms` 声明其协议名，在自己的连接上验证事件后，通过 `service.accept_from(module, message)` 提交消息。插件校验本平台准入并负责文本投递，共享管道处理防抖、安全审核、费用和历史。会话键包含部署命名空间、平台、机器人账号、会话类型和会话 ID。私聊使用已验证的对方用户 ID 作为会话 ID，适配器自行解析平台的投递地址。现有 OneBot 图片、艾特、撤回和管理指令继续由 QQ 处理。
+
+后台从注册表生成平台入口、动作和调度表单。接入共享会话的插件自动获得自己的会话隐私面板，新平台使用高隐私默认值。登记会话不会自动授权日记导出聊天原文或 B 站巡逻读取聊天选题。群记忆镜像需要插件确认群组授权，还须在对应会话开启同步。
+
+`HAKIMI_SOCIAL_OWNER_BINDINGS` 默认是空对象。安装新社交插件后，可按协议分别设置已验证的 `bot_id`、`user_id`，并按需授予 `notebook`（可读 Owner 笔记）和 `mirror`（可导出该平台的 Owner 私聊）。两个授权均默认关闭。`HAKIMI_OWNER_DELIVERY_PLATFORM` 默认是 `onebot`。显式选择另一个已绑定的平台后，日报只投递到选定账号，切换目的地会作废旧目的地的待发私信。QQ 管理指令仍须使用原先绑定的 OneBot 身份。[社交插件契约](src/hakimi/modules/README.md) · [离线验证](tests/test_social_plugins.py)
+
 ### 常驻系统模块的接入
 
 在 `src/hakimi/system_modules/` 随版本交付一个 Python 模块，导出 `Module(SystemModule)`，令 `module_id` 与文件名相同。内置模块在启动时按 `requires` 顺序注册，后台目录自动读取其状态。按需声明 `workers()`、`thinking_scenes` 或 `public_event_observers()`。只有平台模块注册的动作进入世界引擎的活动目录，后台的启停接口只管理平台模块。[日记实现](src/hakimi/system_modules/patrol_diary.py) · [Drive 投递](src/hakimi/system_modules/drive_sync.py)

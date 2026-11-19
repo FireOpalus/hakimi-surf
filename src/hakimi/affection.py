@@ -745,7 +745,7 @@ class AffectionManager:
 
     async def capabilities_for(self, message: Message) -> AffectionCapabilities:
         await self.initialize()
-        if not self.config.enabled:
+        if not self.config.enabled or message.platform not in {"onebot", "qq"}:
             is_owner = self.is_owner_id(message.platform, message.user_id)
             return _neutral_unlocked_caps(
                 tier="owner_bond" if is_owner else "disabled",

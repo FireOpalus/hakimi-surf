@@ -829,19 +829,39 @@ async def compression_config(request: Request):
     }
 
 
+def owner_delivery_for(request: Request, module_id: str):
+    svc = service(request)
+    module = svc.modules.get(module_id)
+    if module is None or svc.modules.chat_platforms.get(svc.proactive.platform) is not module:
+        raise HTTPException(404, "owner_delivery_not_assigned")
+    return svc.proactive
+
+
+@router.get("/api/life/modules/{module_id}/owner-delivery")
+async def module_delivery_status(request: Request, module_id: str):
+    return await owner_delivery_for(request, module_id).status()
+
+
 @router.get("/api/proactive")
 async def proactive_status(request: Request):
-    return await service(request).proactive.status()
+    if service(request).proactive.platform != "onebot":
+        return {"assigned": False}
+    return await module_delivery_status(request, "qq_social")
 
 
 @router.post("/api/proactive/{action}")
 async def proactive_action(request: Request, action: str):
+    return await module_delivery_action(request, "qq_social", action)
+
+
+@router.post("/api/life/modules/{module_id}/owner-delivery/{action}")
+async def module_delivery_action(request: Request, module_id: str, action: str):
+    dm = owner_delivery_for(request, module_id)
     request.app.state.admin_auth.costly()
     lock = request.app.state.admin_action_lock
     if lock.locked():
         raise HTTPException(409, "admin_action_busy")
     async with lock:
-        dm = service(request).proactive
         if action == "test":
             return await dm.test_dm()
         if action == "digest":

@@ -1534,6 +1534,22 @@ class Store:
                 (job_id, self.vault.seal(job_id, payload), now, expires),
             )
 
+    async def cancel_platform_work(self, platforms):
+        async with self.transaction():
+            for table, predicate in (("jobs", "kind='message' AND "), ("outbox", "")):
+                pending = await self.all(
+                    f"SELECT id,payload FROM {table} WHERE {predicate}status='pending'"
+                )
+                ids = []
+                for row in pending:
+                    payload = self.vault.open(row["id"], row["payload"])
+                    message = payload["message"] if table == "outbox" else payload
+                    if message["platform"] in platforms:
+                        ids.append((row["id"],))
+                await self.db.executemany(
+                    f"UPDATE {table} SET status='cancelled',payload=NULL WHERE id=?", ids
+                )
+
     async def claim_reply(self) -> dict | None:
         async with self.transaction():
             await self.db.execute(

@@ -27,16 +27,17 @@ class StaticPrefixes:
     def __init__(self):
         self.pool = {}
 
-    def get(self, context, self_id, meme_prompt=""):
+    def get(self, context, self_id, meme_prompt="", *, platform="onebot"):
         social = context.surface in {"group", "private"}
         key = (
+            platform,
             context.private_owner,
             context.surface,
             self_id,
             "" if context.private_owner or not social else meme_prompt,
         )
         if key not in self.pool:
-            base = SYSTEM_INSTRUCTION + context.persona + identity_anchor(self_id)
+            base = SYSTEM_INSTRUCTION + context.persona + identity_anchor(self_id, platform)
             if context.private_owner:
                 base += OWNER_BACKGROUND_RULE
             elif social:

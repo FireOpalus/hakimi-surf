@@ -142,9 +142,16 @@ class PrivateEventScope(ValueError):
     """A scoped event cannot be material for this recipient or action."""
 
 
-def private_event_audience(settings: Settings, user_id: str) -> str:
+def private_event_audience(
+    settings: Settings, user_id: str, *, platform="onebot", bot_id=None
+) -> str:
     vault = Vault(settings.encryption_key.get_secret_value())
-    return vault.digest("private-world-event", settings.namespace, settings.onebot_self_id, user_id)
+    bot_id = settings.onebot_self_id if bot_id is None else bot_id
+    if platform == "onebot":
+        return vault.digest("private-world-event", settings.namespace, bot_id, user_id)
+    return vault.digest(
+        "private-world-event-platform", settings.namespace, platform, bot_id, user_id
+    )
 
 
 def private_event_for_owner(payload: dict, recipient: str, settings: Settings) -> bool:

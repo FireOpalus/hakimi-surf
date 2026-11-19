@@ -129,6 +129,9 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
             "title",
             "description",
             "action_count",
+            "panel",
+            "chat_platforms",
+            "owner_delivery",
             "region",
             "enabled",
             "configuration_issue",
@@ -142,12 +145,16 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
             "id",
             "title",
             "description",
+            "panel",
+            "chat_platforms",
             "actions",
             "status",
             "region",
             "proactive_paused",
             "scheduling",
         }
+        assert entry["owner_delivery"] == (svc.proactive.platform in entry["chat_platforms"])
+        assert details["panel"] == entry["panel"] == svc.modules.get(entry["id"]).admin_panel
         assert len(details["actions"]) == entry["action_count"]
         assert all(action["module"] == entry["id"] for action in details["actions"])
 

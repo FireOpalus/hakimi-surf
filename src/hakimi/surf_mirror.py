@@ -19,8 +19,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .drive_client import FolderDrive
-from .models import Message
 from .security import Rejected, clean_text, configured_secrets
+from .social import chat_module, owner_binding, owner_target
 
 log = logging.getLogger("hakimi")
 
@@ -200,7 +200,7 @@ def _read_owner_session_sync(
     db_path: Path,
     key: str,
     vault: Any,
-    owner_qq_id: str,
+    owner_id: str,
     now: float,
 ) -> dict[str, Any]:
     empty: dict[str, Any] = {
@@ -276,7 +276,7 @@ def _read_owner_session_sync(
                 "SELECT member_id, slot, payload, updated FROM member_profiles "
                 "WHERE member_id=? AND deleted=0 AND (expires=0 OR expires>?) "
                 "ORDER BY updated DESC LIMIT 16",
-                (owner_qq_id, now),
+                (owner_id, now),
             ).fetchall()
             for row in p_rows:
                 ident = f"p:{row['member_id']}:{row['slot']}"
@@ -367,29 +367,17 @@ class SurfMirror:
         except (OSError, OverflowError, ValueError):
             return ""
 
-    async def _read_owner_session(self, now: float) -> dict[str, Any]:
-        empty: dict[str, Any] = {
-            "enabled": False,
-            "rolling_summary": "",
-            "recent_turns": [],
-            "profiles": [],
-            "chronicles": [],
-        }
-        owner_id = str(getattr(self.s, "owner_qq_id", "") or "")
-        bot_id = str(getattr(self.s, "onebot_self_id", "") or "")
-        if not owner_id or not bot_id or self.sessions is None:
-            return empty
-        owner_msg = Message(
-            platform="onebot",
-            bot_id=bot_id,
-            event_id="surf-mirror-ro",
-            user_id=owner_id,
-            kind="private",
-            conversation_id=owner_id,
-            text="",
-            addressed=True,
-            created_at=now,
-        )
+    async def _read_owner_sessions(self, now: float) -> list[tuple[str, dict]]:
+        result = []
+        for platform in ("onebot", *self.s.social_owner_bindings):
+            binding = owner_binding(self.s, platform)
+            if binding and binding.mirror and self.sessions and chat_module(self.s, platform):
+                target = owner_target(self.s, platform, now, "surf-mirror-ro")
+                result.append((platform, await self._read_owner_session(target, now)))
+        return result
+
+    async def _read_owner_session(self, owner_msg, now):
+        owner_id = owner_msg.user_id
         key = self.sessions.key(owner_msg)
         db_path = self.sessions.path(owner_msg)
         lock = self.sessions.locks[int(key[:8], 16) % len(self.sessions.locks)]
@@ -469,79 +457,11 @@ class SurfMirror:
         return result
 
     async def _read_recent_surfed(self, now: float) -> list[dict[str, Any]]:
-        watcher = getattr(self.svc, "bili_watcher", None)
-        if watcher is None or not hasattr(watcher, "recent_surfed"):
-            return []
-        try:
-            items = await watcher.recent_surfed(limit=6, now=now)
-        except TypeError:
-            items = await watcher.recent_surfed(limit=6)
-        except Exception:
-            return []
-        return list(items or [])
+        material = await self.svc.modules.context_data(limit=6, now=now)
+        return material.get("recent_bili_surfed", [])
 
-    def _render_markdown(
-        self,
-        *,
-        title: str,
-        day: str,
-        owner_data: dict[str, Any],
-        store_data: dict[str, Any],
-        surfed: list[dict[str, Any]],
-    ) -> str:
-        tz_label = sanitize_mirror_text(self.s.bot_timezone, self.s, limit=64)
-        lines = [
-            f"# {title}",
-            "",
-            f"镜像日期：{day} | 时区：{tz_label}",
-            "",
-            "## 世界状态看板",
-            "",
-        ]
-
-        world = store_data.get("world_state")
-        if world:
-            mod = sanitize_mirror_text(world.get("current_module", "idle"), self.s, limit=64)
-            focus = sanitize_mirror_text(world.get("focus_level", "LOW"), self.s, limit=32)
-            mood = sanitize_mirror_text(world.get("mood", "calm"), self.s, limit=64)
-            energy = world.get("energy", "-")
-            boredom = world.get("boredom", "-")
-            updated = self._format_ts(world.get("updated_at"))
-            lines.append(
-                f"- 当前模块：`{mod}` | 专注度：`{focus}` | 心情：`{mood}` | "
-                f"精力：{energy} | 无聊度：{boredom}" + (f" | 更新于：{updated}" if updated else "")
-            )
-            snapshot = world.get("snapshot")
-            if isinstance(snapshot, dict) and snapshot:
-                snap_text = sanitize_mirror_text(
-                    json.dumps(snapshot, ensure_ascii=False), self.s, limit=600
-                )
-                lines.append(f"- 状态快照：{snap_text}")
-        else:
-            lines.append("- 当前暂无世界状态记录（处于基础待机模式）。")
-
-        global_events = store_data.get("global_events") or []
-        if global_events:
-            lines.append("- 近期全局事件：")
-            for ev in global_events:
-                ts_label = self._format_ts(ev.get("created_at"))
-                src = sanitize_mirror_text(ev.get("source_module", ""), self.s, limit=48)
-                etype = sanitize_mirror_text(ev.get("event_type", ""), self.s, limit=48)
-                imp = sanitize_mirror_text(ev.get("importance", "normal"), self.s, limit=24)
-                payload_obj = ev.get("payload")
-                payload_str = (
-                    sanitize_mirror_text(
-                        json.dumps(payload_obj, ensure_ascii=False), self.s, limit=300
-                    )
-                    if payload_obj
-                    else ""
-                )
-                prefix = f"[{ts_label}] " if ts_label else ""
-                suffix = f"：{payload_str}" if payload_str else ""
-                lines.append(f"  - {prefix}[{imp}] `{src}` / `{etype}`{suffix}")
-        lines.append("")
-
-        lines += ["## 近期与 BOISER 的私聊记忆与对话摘要", ""]
+    def _owner_lines(self, owner_data):
+        lines = []
         if not owner_data.get("enabled"):
             lines.append("- 暂无活跃私聊记忆或未开启会话记忆。")
         else:
@@ -599,6 +519,77 @@ class SurfMirror:
                 lines.append("- 会话记忆已开启，当前暂无近期对话记录。")
         lines.append("")
 
+        return lines
+
+    def _render_markdown(
+        self,
+        *,
+        title: str,
+        day: str,
+        owner_data: list[tuple[str, dict]],
+        store_data: dict[str, Any],
+        surfed: list[dict[str, Any]],
+    ) -> str:
+        tz_label = sanitize_mirror_text(self.s.bot_timezone, self.s, limit=64)
+        lines = [
+            f"# {title}",
+            "",
+            f"镜像日期：{day} | 时区：{tz_label}",
+            "",
+            "## 世界状态看板",
+            "",
+        ]
+
+        world = store_data.get("world_state")
+        if world:
+            mod = sanitize_mirror_text(world.get("current_module", "idle"), self.s, limit=64)
+            focus = sanitize_mirror_text(world.get("focus_level", "LOW"), self.s, limit=32)
+            mood = sanitize_mirror_text(world.get("mood", "calm"), self.s, limit=64)
+            energy = world.get("energy", "-")
+            boredom = world.get("boredom", "-")
+            updated = self._format_ts(world.get("updated_at"))
+            lines.append(
+                f"- 当前模块：`{mod}` | 专注度：`{focus}` | 心情：`{mood}` | "
+                f"精力：{energy} | 无聊度：{boredom}" + (f" | 更新于：{updated}" if updated else "")
+            )
+            snapshot = world.get("snapshot")
+            if isinstance(snapshot, dict) and snapshot:
+                snap_text = sanitize_mirror_text(
+                    json.dumps(snapshot, ensure_ascii=False), self.s, limit=600
+                )
+                lines.append(f"- 状态快照：{snap_text}")
+        else:
+            lines.append("- 当前暂无世界状态记录（处于基础待机模式）。")
+
+        global_events = store_data.get("global_events") or []
+        if global_events:
+            lines.append("- 近期全局事件：")
+            for ev in global_events:
+                ts_label = self._format_ts(ev.get("created_at"))
+                src = sanitize_mirror_text(ev.get("source_module", ""), self.s, limit=48)
+                etype = sanitize_mirror_text(ev.get("event_type", ""), self.s, limit=48)
+                imp = sanitize_mirror_text(ev.get("importance", "normal"), self.s, limit=24)
+                payload_obj = ev.get("payload")
+                payload_str = (
+                    sanitize_mirror_text(
+                        json.dumps(payload_obj, ensure_ascii=False), self.s, limit=300
+                    )
+                    if payload_obj
+                    else ""
+                )
+                prefix = f"[{ts_label}] " if ts_label else ""
+                suffix = f"：{payload_str}" if payload_str else ""
+                lines.append(f"  - {prefix}[{imp}] `{src}` / `{etype}`{suffix}")
+        lines.append("")
+
+        lines += ["## 近期与 BOISER 的私聊记忆与对话摘要", ""]
+        if not owner_data:
+            lines.append("- 暂无获准的私聊记忆。")
+        for platform, session in owner_data:
+            if len(owner_data) > 1 or platform != "onebot":
+                lines += [f"### {platform}", ""]
+            lines.extend(self._owner_lines(session))
+
         lines += ["## 今日冲浪与生活轨迹", ""]
         counts = store_data.get("roaming_counts") or {}
         if counts:
@@ -653,7 +644,7 @@ class SurfMirror:
             current = time.time() if now is None else float(now)
             day = datetime.fromtimestamp(current, self.zone).date().isoformat()
             owner_data, store_data, surfed = await asyncio.gather(
-                self._read_owner_session(current),
+                self._read_owner_sessions(current),
                 self._read_store_world_and_roaming(day),
                 self._read_recent_surfed(current),
             )

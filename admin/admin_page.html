@@ -3146,10 +3146,17 @@ async function logs(){table('log-list',['时间','来源','事件','调用详情
 }));}
 
 const dmStatus={pending:'等待投递',sent:'已发送并处理记忆',delivered:'已确认发送，等待记忆写入',uncertain:'发送结果不确定，不重发',expired:'已过期',skipped:'已跳过',failed:'生成未完成',queued:'已排队',generating:'生成中',cancelled:'已取消',not_queued:'未入队'};
-const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',submitting:'等待 QQ 回执',confirmed:'QQ 已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
+const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',awaiting_channel:'等待投递通道上线',submitting:'等待平台回执',confirmed:'平台已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
 const dmKindLabels={companion:'日常陪伴',digest:'每日汇报',alert:'异常告警',test:'通路验证'};
 async function proactive(){
   const d=await api('proactive');
+  const assigned=d.assigned!==false;
+  for(const id of ['dm-test','dm-now'])$(id).disabled=!assigned;
+  if(!assigned){
+    text('proactive-state','Owner 投递已分配给其他社交模块。');
+    for(const id of ['proactive-stats','proactive-budget','proactive-queue','proactive-alerts'])$(id).replaceChildren();
+    return;
+  }
   const fmt=t=>t?lifeFmt(t,d.timezone):'—';
   const stats=[['NapCat',d.connected?'在线':'等待连接'],['下次日报',fmt(d.next_digest_at)]];
   $('proactive-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
@@ -3710,7 +3717,10 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
-const modulePage=new Map([['qq_social','qq'],['bilibili_surf','bili'],['minecraft','minecraft'],['weather','weather']]);
+const modulePage=new Map([...$('platform-nav-group').querySelectorAll('[data-module]')].map(group=>[
+  group.dataset.module,group.querySelector('[role=tab]').dataset.tab
+]));
+const pluginPages=new Map();
 const regionName=code=>({CN:'境内节点',KR:'境外节点'})[code]||code;
 const weatherLocationPath='life/modules/weather/location';
 const weatherSources={environment:'环境默认',coordinates:'手动经纬度',city:'城市搜索',server_ip:'服务器 IP'};
@@ -4006,23 +4016,77 @@ function catalogCard(m,{page,indicator,meta,note}){
   return card;
 }
 function moduleCard(m){
-  const page=modulePage.get(m.id);
+  const page=sections.get(m.panel)?.module===m.id?m.panel:modulePage.get(m.id);
   const card=catalogCard(m,{page,indicator:moduleSwitch(m),
     meta:regionName(m.region)+' · '+m.action_count+' 项动作',note:moduleIssue(m)});
   card.dataset.moduleId=m.id;
-  if(!page){
-    const details=el('details'),summary=el('summary','查看模块'),body=el('div');
-    details.append(summary,body);card.append(details);
-    let loaded=false,loading=false;
-    details.addEventListener('toggle',async()=>{
-      if(!details.open||loaded||loading)return;
-      loading=true;body.textContent='正在读取模块…';
-      try{renderModuleTools(body,await api('life/modules/'+encodeURIComponent(m.id)));loaded=true;}
-      catch(error){if(error.name!=='AbortError')body.textContent='读取失败，重新展开可重试。';}
-      finally{loading=false;}
-    });
-  }
   return card;
+}
+function registerPluginPage(m){
+  if(modulePage.has(m.id))return;
+  const key='plugin-'+m.id, group=el('div'), panel=el('section',undefined,'tab');
+  group.dataset.module=m.id;
+  const button=$('nav-modules').cloneNode(true);
+  button.id='nav-'+key;button.dataset.tab=key;button.dataset.description=m.description||'';
+  button.setAttribute('aria-controls',key);button.setAttribute('aria-selected','false');button.tabIndex=-1;
+  button.querySelector('span').textContent=m.title||m.id;
+  button.addEventListener('click',()=>navigate(key));
+  group.append(button);$('platform-nav-group').append(group);
+  panel.id=key;panel.hidden=true;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',button.id);
+  const tools=el('div',undefined,'card');tools.id=key+'-actions';panel.append(tools);
+  const protocols=m.chat_platforms||[],privacy=el('div',undefined,'table');
+  if(protocols.length){
+    const card=el('section',undefined,'card');card.append(el('h2','会话隐私'),privacy);panel.append(card);
+  }
+  $('modules').after(panel);
+  const section={button,workspace:'modules',module:m.id,title:m.title||m.id,group:'平台模块'};
+  sections.set(key,section);tabButtons.push(button);modulePage.set(m.id,key);
+  finderEntries.push({key,label:section.title,context:sectionLocation(section)});
+  const path='life/modules/'+encodeURIComponent(m.id)+'/privacy';
+  function draw(rows){
+    if(!token)return;
+    table(privacy,['会话','账号','群组或用户','隐私等级'],rows.map(row=>{
+      const select=el('select');select.setAttribute('aria-label',row.target_id+' 隐私等级');
+      for(const [value,label] of [['default','默认（高隐私）'],['high','高隐私'],['low','低隐私']]){
+        const option=el('option',label);option.value=value;select.append(option);
+      }
+      select.value=row.override_privacy;
+      select.addEventListener('change',()=>busy(select,async()=>{
+        try{draw(await api(path,'PUT',{key:row.key,privacy:select.value}));notice('会话隐私等级已保存');}
+        catch(error){select.value=row.override_privacy;throw error;}
+      }));
+      return [row.kind==='group'?'群聊':'私聊',row.platform+' / '+row.bot_id,row.target_id,select];
+    }));
+  }
+  const readers=[()=>loadModule(m.id)];
+  if(protocols.length)readers.push(()=>api(path).then(draw));
+  if(m.owner_delivery){
+    const card=el('section',undefined,'card'),state=el('p',undefined,'muted'),row=el('div',undefined,'row');
+    state.setAttribute('aria-live','polite');
+    const route='life/modules/'+encodeURIComponent(m.id)+'/owner-delivery';
+    const read=async()=>{
+      const d=await api(route);
+      state.textContent=(d.connected?'在线':'等待连接')+' · '+(d.delivery_enabled?'允许投递':'已停用投递')+
+        (d.next_digest_at?' · 下次日报 '+lifeFmt(d.next_digest_at,d.timezone):'');
+    };
+    readers.push(read);
+    for(const [action,label] of [['test','发送测试私信（0 Token）'],['digest','立即生成并发送今日汇报']]){
+      const button=el('button',label,'secondary');button.type='button';
+      button.addEventListener('click',()=>busy(button,async()=>{
+        const result=await api(route+'/'+action,'POST');
+        notice(deliveryStages[result.receipt?.stage]||dmStatus[result.delivery]||dmStatus[result.status]||'已处理');
+        await read();
+      }));row.append(button);
+    }
+    card.append(el('h2','Owner 投递'),state,row);panel.append(card);
+  }
+  tabLoaders[key]=()=>Promise.all(readers.map(read=>read()));
+  pluginPages.set(m.id,()=>{
+    delete tabLoaders[key];sections.delete(key);modulePage.delete(m.id);
+    tabButtons.splice(tabButtons.indexOf(button),1);
+    const index=finderEntries.findIndex(entry=>entry.key===key);if(index>=0)finderEntries.splice(index,1);
+    group.remove();panel.remove();pluginPages.delete(m.id);
+  });
 }
 function systemCard(m){
   const status=m.status;
@@ -4046,6 +4110,8 @@ async function moduleDirectory(){
   try{
     const list=await api('life/modules');
     const registered=new Set(list.map(m=>m.id));
+    for(const [id,remove] of pluginPages)if(!registered.has(id))remove();
+    list.forEach(registerPluginPage);
     for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=!registered.has(group.dataset.module);
     container.replaceChildren(...list.map(moduleCard));
     if(!list.length)container.append(el('p','当前没有已安装的模块。','empty-state'));
@@ -4110,6 +4176,7 @@ const sections=new Map(tabButtons.map(button=>{
 }));
 const sectionLocation=section=>[workspaceNames[section.workspace],section.group].filter(Boolean).join(' / ');
 function resetWorkspaces(){
+  for(const remove of pluginPages.values())remove();
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
   text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');

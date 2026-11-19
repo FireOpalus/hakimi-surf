@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .config import Settings
 from .models import Message
 from .persona import OWNER_PERSONA_PROMPT, PUBLIC_PERSONA_PROMPT
+from .social import bound_owner
 
 
 def _state_digest(value) -> str:
@@ -24,16 +25,7 @@ def _state_digest(value) -> str:
 
 
 def is_persona_owner(message: Message | None, settings: Settings) -> bool:
-    # Official QQ OpenIDs and legacy admin lists cannot prove the configured numeric QQ ID.
-    return bool(
-        message is not None
-        and settings.onebot_enabled
-        and settings.owner_qq_id
-        and message.platform == "onebot"
-        and message.bot_id == settings.onebot_self_id
-        and message.user_id == settings.owner_qq_id
-        and (message.kind == "group" or message.conversation_id == message.user_id)
-    )
+    return bound_owner(message, settings)
 
 
 @dataclass(frozen=True)
@@ -118,6 +110,7 @@ def history_lines(
     timezone_name: str = "Asia/Shanghai",
     *,
     prev_created_at: float | None = None,
+    platform: str = "onebot",
 ) -> str:
     """Stable sequence numbers come from SQLite, not the position in a moving window."""
 
@@ -144,8 +137,10 @@ def history_lines(
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
             seq = position
         role = "assistant" if item.get("role") == "assistant" else "user"
-        qq = self_id if role == "assistant" else str(item.get("user_id", ""))
-        qq = qq if re.fullmatch(r"[0-9]{1,20}", qq) else "unknown"
+        user_id = self_id if role == "assistant" else str(item.get("user_id", ""))
+        channel_label = "QQ" if platform in {"onebot", "qq"} else platform
+        if channel_label == "QQ" and not re.fullmatch(r"[0-9]{1,20}", user_id):
+            user_id = "unknown"
         raw_ts = item.get("created_at")
         ts = (
             float(raw_ts)
@@ -157,10 +152,11 @@ def history_lines(
             lines.append(f"# --- {dt_str} (距上条 {_format_gap(ts - prev_ts)}) ---\n")
         prev_ts = ts
         text = str(item.get("text", ""))
-        if role == "user" and qq != "unknown":
-            text = re.sub(rf"^\[[^\n]{{1,80}}?\(QQ:{re.escape(qq)}\)\]:\s*", "", text)
+        if role == "user" and channel_label == "QQ" and user_id != "unknown":
+            text = re.sub(rf"^\[[^\n]{{1,80}}?\(QQ:{re.escape(user_id)}\)\]:\s*", "", text)
         lines.append(
-            f"{seq}|{role}|QQ:{qq}|{line_data(item.get('speaker', ''))}|{line_data(text)}\n"
+            f"{seq}|{role}|{channel_label}:{line_data(user_id)}|"
+            f"{line_data(item.get('speaker', ''))}|{line_data(text)}\n"
         )
     return "".join(lines)
 
@@ -189,14 +185,22 @@ def assemble_chat_input(
     from .security import Rejected
 
     context = prompt_context(message, settings)
+    platform = message.platform if message else "onebot"
+    qq_surface = platform in {"onebot", "qq"}
+    sender_identity = (
+        {"qq": message.user_id if message else ""}
+        if qq_surface
+        else {"platform": platform, "user_id": message.user_id}
+    )
     messages = payload.get("recent_messages", []) if history is None else history
     b = (
         ""
         if sandbox_mode
         else history_lines(
             messages,
-            settings.onebot_self_id,
+            settings.onebot_self_id if qq_surface else message.bot_id,
             settings.bot_timezone,
+            platform=platform,
             prev_created_at=prev_created_at,
         )
     )
@@ -256,7 +260,7 @@ def assemble_chat_input(
             "verified_sender": {
                 "role": context.role,
                 "surface": context.surface,
-                "qq": message.user_id if message else "",
+                **sender_identity,
             },
             "sandbox_mode": sandbox_mode,
             "current_sender": current_sender,
@@ -318,7 +322,7 @@ def assemble_chat_input(
             "verified_sender": {
                 "role": context.role,
                 "surface": context.surface,
-                "qq": message.user_id if message else "",
+                **sender_identity,
             },
             "sandbox_mode": sandbox_mode,
             "allowed_at_qqs": payload.get("allowed_at_qqs", []) if not sandbox_mode else [],
@@ -358,6 +362,8 @@ def assemble_chat_input(
                 metadata["jit_proactive_intent"] = (
                     dict(raw_jit) if isinstance(raw_jit, dict) else raw_jit
                 )
+    if not sandbox_mode and payload.get("module_context"):
+        metadata["module_context"] = payload["module_context"]
     if not sandbox_mode and payload.get("unshared_world_news"):
         metadata["待分享见闻（仅供当前会话，有关时再提）"] = payload["unshared_world_news"]
     summary = str(payload.get("rolling_summary", ""))[:800] if recall and not sandbox_mode else ""
@@ -442,6 +448,8 @@ def assemble_chat_input(
         parts.append("</transient_turn_context>")
         return "".join(parts)
 
+    if metadata.get("module_context") and estimate_tokens(tail()) > settings.chat_tail_tokens:
+        metadata.pop("module_context")
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         metadata.pop("待分享见闻（仅供当前会话，有关时再提）", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and dual:

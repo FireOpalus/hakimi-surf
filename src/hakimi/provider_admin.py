@@ -4,6 +4,7 @@ import inspect
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 from .admin_routes import body, service
 from .provider_routing import (
@@ -15,7 +16,7 @@ from .provider_routing import (
     ProviderView,
     SessionPrivacyUpdate,
 )
-from .security import configured_secrets
+from .security import Rejected, configured_secrets
 
 router = APIRouter(prefix="/admin/api")
 
@@ -154,3 +155,35 @@ async def qq_session_privacy(request: Request):
     async with request.app.state.admin_config_lock:
         await routing.set_session_policy(value)
         return await routing.privacy_status()
+
+
+class PluginPrivacyEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(pattern=r"^[a-f0-9]{64}$")
+    privacy: Literal["high", "low", "default"]
+
+
+def plugin_protocols(svc, module_id):
+    module = svc.modules.get(module_id)
+    if not module or not module.chat_platforms or module_id == "qq_social":
+        raise HTTPException(404, "chat_module_not_found")
+    return module.chat_platforms
+
+
+@router.get("/life/modules/{module_id}/privacy")
+async def module_privacy(request: Request, module_id: str):
+    svc = service(request)
+    return await _routing_manager(svc).chat_privacy(plugin_protocols(svc, module_id))
+
+
+@router.put("/life/modules/{module_id}/privacy")
+async def update_module_privacy(request: Request, module_id: str):
+    svc = service(request)
+    protocols = plugin_protocols(svc, module_id)
+    value = await body(request, PluginPrivacyEdit)
+    routing = _routing_manager(svc)
+    try:
+        await routing.set_chat_privacy(value.key, value.privacy, protocols)
+    except Rejected as exc:
+        raise HTTPException(404, "session_not_found") from exc
+    return await routing.chat_privacy(protocols)

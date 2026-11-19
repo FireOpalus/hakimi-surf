@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .bot_server import is_persona_owner
 from .reply_style import trim_complete_text
 from .security import clean_text, configured_secrets
+from .social import bound_owner
 
 MAX_FILE_BYTES = 262_144
 MAX_PINNED_CHARS = 1800
@@ -390,7 +390,7 @@ class OwnerCloudMemory:
             not self.s.enable_antigravity_memory
             or message is None
             or message.kind != "private"
-            or not is_persona_owner(message, self.s)
+            or not bound_owner(message, self.s, "notebook")
         ):
             return {}
         with self._lock:

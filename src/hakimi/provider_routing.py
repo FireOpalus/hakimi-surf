@@ -193,6 +193,7 @@ class ProviderRoutingManager:
     def __init__(self, store):
         self.store = store
         self.s: Settings = store.s
+        self.plugin_session_tiers = {}
         self.env_config = ProviderRoutingConfig.from_settings(self.s)
         self.config = self.env_config
         self.overridden = False
@@ -215,6 +216,13 @@ class ProviderRoutingManager:
                 )
                 cred_row = await self.store.one(
                     "SELECT payload FROM admin_config WHERE key='provider_credentials'"
+                )
+                tiers = await self.store.one(
+                    "SELECT payload FROM admin_config WHERE key='chat_session_tiers'"
+                )
+            if tiers:
+                self.plugin_session_tiers = self.store.vault.open(
+                    "admin:chat_session_tiers", tiers[0]
                 )
             if routing_row:
                 saved = self.store.vault.open("admin:provider_routing", routing_row[0])
@@ -324,6 +332,8 @@ class ProviderRoutingManager:
         if message is None:
             return "high"
         active_settings = settings or self.s
+        if message.platform not in {"onebot", "qq"}:
+            return self.plugin_session_tiers.get(self.store.session_scope(message), "high")
         key = f"{message.platform}:{message.conversation_id}"
         if message.kind == "group":
             return self.config.group_privacy.get(key, self.config.default_group_privacy)
@@ -429,6 +439,41 @@ class ProviderRoutingManager:
         self.config = config
         self.overridden = True
 
+    async def chat_privacy(self, protocols):
+        await self.initialize()
+        sessions = []
+        for key, message in await self.store.runtime.sessions():
+            if message.platform not in protocols:
+                continue
+            sessions.append(
+                {
+                    "key": key,
+                    "platform": message.platform,
+                    "bot_id": message.bot_id,
+                    "kind": message.kind,
+                    "target_id": message.conversation_id,
+                    "override_privacy": self.plugin_session_tiers.get(key, "default"),
+                    "effective_privacy": self.privacy_for(message),
+                }
+            )
+        return sessions
+
+    async def set_chat_privacy(self, key, tier, protocols):
+        await self.initialize()
+        message = await self.store.runtime.session(key)
+        if message.platform not in protocols or message.platform in {"onebot", "qq"}:
+            raise Rejected("session_not_found")
+        async with self.lock:
+            values = dict(self.plugin_session_tiers)
+            if tier == "default":
+                values.pop(key, None)
+            elif tier in {"high", "low"}:
+                values[key] = tier
+            else:
+                raise Rejected("invalid_privacy")
+            await self.store.runtime.save_config("chat_session_tiers", values)
+            self.plugin_session_tiers = values
+
     async def privacy_status(self):
         await self.initialize()
         return {
@@ -440,7 +485,7 @@ class ProviderRoutingManager:
         entries: dict[tuple[str, str, str], None] = {}
 
         def add_entry(kind: str, platform: str, target_id: str) -> None:
-            if not target_id:
+            if not target_id or platform not in {"onebot", "qq"}:
                 return
             pattern = ONEBOT_TARGET_RE if platform == "onebot" else QQ_TARGET_RE
             if pattern.fullmatch(target_id):

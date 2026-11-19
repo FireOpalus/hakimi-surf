@@ -81,9 +81,11 @@ def import_old_proactive(old, saved, merged):
 
 
 async def next_owner_digest(engine, now):
-    module = engine.service.modules.get("qq_social")
+    registry = engine.service.modules
+    delivery = engine.service.proactive
+    module = registry.chat_platforms.get(delivery.platform)
     if module:
-        for slot in module.schedules():
-            if slot.name == "qq.owner_digest":
+        for slot in registry.schedules_for(module):
+            if slot.name == delivery.action_name:
                 return await engine.next_slot_at(module, slot, now)
     return None

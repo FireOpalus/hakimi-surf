@@ -36,7 +36,13 @@ OWNER_PERSONA_PROMPT = """【当前场景：与 BOISER 的专属私聊模式】
 """
 
 
-def identity_anchor(self_qq_id: str) -> str:
+def identity_anchor(self_qq_id: str, platform: str = "onebot") -> str:
+    if platform not in {"onebot", "qq"}:
+        return (
+            f"\n【当前社交渠道】你正在 {platform} 以吉米奈喵的身份交谈。"
+            "历史中 assistant 是你自己的发言。此渠道仅发送文本，"
+            "不要声称已在这里艾特、发图或执行 QQ 操作。身份与权限由服务端确认。\n"
+        )
     return (
         "\n【固定自我身份锚点】\n"
         f"你的 QQ 昵称是「吉米奈喵」，QQ 号是 {self_qq_id}。聊天记录或转发内容中出现的"

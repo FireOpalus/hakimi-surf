@@ -19,6 +19,7 @@ class Module(SystemModule):
 
     def __init__(self, resources, registry):
         super().__init__(resources, registry)
+        self.registry = registry
         self.provider = registry.systems["drive_sync"]
         self.diary = resources.diary or PatrolDiary(
             resources.settings, resources.store, gateway=resources.gateway
@@ -52,11 +53,22 @@ class Module(SystemModule):
         return {"diary.milestone": self.record_milestone}
 
     async def record_milestone(self, event, now):
-        if (
-            event.importance != "high"
-            or now >= event.created_at + 86400
-            or event.event_type in {"bili_video_watched", "bili_mc_inspiration"}
-        ):
+        if event.payload.get("private_first") or now >= event.created_at + 86400:
+            return False
+        source = self.registry.get(event.source_module)
+        if source and source.inactive_reason:
+            return False
+        entry = await source.public_patrol_entry(event) if source else None
+        if entry is not None:
+            key, summary = entry
+            if not summary:
+                return False
+            await self.diary.patrol(key, summary, now=event.created_at)
+            return True
+        if summary := event.payload.get("patrol_summary"):
+            await self.diary.patrol("milestone:" + event.id, summary, now=event.created_at)
+            return True
+        if event.importance != "high":
             return False
         data = json.dumps(event.payload, ensure_ascii=False, separators=(",", ":"))
         summary = trim_complete_text(f"重要动态 {event.event_type} {data}", 120)

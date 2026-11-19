@@ -12,8 +12,10 @@ from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, model_validato
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .compression_policy import CompressionConfig
+from .models import PlatformId
 from .proactive_policy import hours_bounds
 from .rest_policy import RestHoursConfig
+from .social import OwnerBinding
 from .thinking_policy import (
     ChatThinkingLevel,
     PrimaryModel,
@@ -105,6 +107,10 @@ class Settings(BaseSettings):
     deepseek_api_key: SecretStr = SecretStr("")
     deepseek_base_url: str = Field(default="https://api.deepseek.com", max_length=256)
     deepseek_model: str = Field(default="deepseek-flash", max_length=80)
+    social_owner_bindings: dict[PlatformId, OwnerBinding] = Field(default_factory=dict)
+    owner_delivery_platform: PlatformId = "onebot"
+    _chat_registry = PrivateAttr(default=None)
+
     onebot_enabled: bool = False
     onebot_self_id: str = Field(default="", pattern=r"^[0-9]{0,20}$")
     onebot_secret: SecretStr = SecretStr("")
@@ -470,6 +476,13 @@ class Settings(BaseSettings):
 
         Fernet(self.encryption_key.get_secret_value().encode("ascii"))
         ZoneInfo(self.roaming_timezone)
+        if {"onebot", "qq"}.intersection(self.social_owner_bindings):
+            raise ValueError("Use the existing QQ identity settings for QQ transports")
+        if (
+            self.owner_delivery_platform != "onebot"
+            and self.owner_delivery_platform not in self.social_owner_bindings
+        ):
+            raise ValueError("Owner delivery requires an explicitly bound account")
         if self.owner_qq_id:
             self.onebot_owner_ids.add(self.owner_qq_id)
         if self.owner_qq_id and self.owner_qq_id == self.onebot_self_id:
@@ -500,10 +513,9 @@ class Settings(BaseSettings):
             raise ValueError("cached input price must not exceed standard input price")
         if self.send_delay_max < self.send_delay_min:
             raise ValueError("send_delay_max must be >= send_delay_min")
-        if self.onebot_mode != "http":
+        if self.onebot_enabled and self.onebot_mode != "http":
             if (
-                not self.onebot_enabled
-                or not valid_token(self.onebot_ws_token)
+                not valid_token(self.onebot_ws_token)
                 or len(self.onebot_ws_token.get_secret_value()) < 32
             ):
                 raise ValueError("WebSocket requires OneBot and a >=32-character access token")

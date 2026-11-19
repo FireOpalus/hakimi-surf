@@ -82,6 +82,7 @@ class PublicMemory:
             epoch = data.pop("session_epoch", None)
             if (
                 origin.kind != "group"
+                or (origin.platform, origin.bot_id) != (message.platform, message.bot_id)
                 or epoch != row["epoch"]
                 or self.store.session_scope(origin) != row["scope"]
                 or not authorize(origin.model_copy(update={"addressed": True}), self.s)

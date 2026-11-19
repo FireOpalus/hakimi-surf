@@ -137,60 +137,29 @@ def clean_text(text: str) -> str:
 
 
 def owner(message: Message, settings: Settings) -> bool:
-    # Management, private persona and snapshots share the same verified numeric identity.
+    # Privileged QQ commands require the verified numeric OneBot identity.
     # Legacy administrator lists and QQ OpenIDs cannot prove OWNER_QQ_ID ownership.
-    return is_persona_owner(message, settings)
+    return message.platform == "onebot" and is_persona_owner(message, settings)
 
 
 def authorize(message: Message, settings: Settings, *, _bot_exempt=False) -> bool:
-    if message.platform == "onebot":
-        enabled, bot, users, groups = (
-            settings.onebot_enabled,
-            settings.onebot_self_id,
-            settings.onebot_allowed_users,
-            settings.onebot_allowed_groups,
-        )
-    else:
-        enabled, bot, users, groups = (
-            settings.qq_enabled,
-            settings.qq_app_id,
-            settings.qq_allowed_users,
-            settings.qq_allowed_groups,
-        )
-    if not enabled or message.bot_id != bot or message.user_id == bot:
-        return False
-    if message.platform == "onebot":
-        if not re.fullmatch(r"[0-9]{1,20}", message.user_id):
-            return False
-        real_owner = bool(settings.owner_qq_id and message.user_id == settings.owner_qq_id)
-        if not real_owner and (
-            (
-                message.user_id in settings.bot_qq_ids
-                and not _bot_exempt
-                and not bot_event_authorized(message, settings)
-            )
-            or message.user_id in getattr(settings, "muted_user_ids", set())
+    from .social import chat_registry
+
+    registry = chat_registry(settings)
+    if registry is not None:
+        module = registry.chat_platforms.get(message.platform)
+        if (
+            not module
+            or module.inactive_reason
+            or message.user_id == message.bot_id
+            or (message.kind == "private" and message.conversation_id != message.user_id)
         ):
             return False
-        if message.kind == "private":
-            return message.conversation_id == message.user_id and (
-                real_owner
-                or (
-                    getattr(settings, "onebot_private_mode", "owner_only") == "owner_and_allowlist"
-                    and message.user_id in users
-                )
-            )
-    if message.kind == "private":
-        trusted_user = owner(message, settings) or message.user_id in users
-        return trusted_user and message.conversation_id == message.user_id
-    # Group admission is controlled by the group list, never by the private-user list.
-    # at_only/smart_reply still decide whether this admitted group message invites a reply.
-    policy = settings.group_policies.get(f"{message.platform}:{message.conversation_id}", "at_only")
-    return (
-        message.conversation_id in groups
-        and policy != "muted"
-        and (message.addressed or policy == "smart_reply")
-    )
+        return module.authorize_chat(message, settings, bot_exempt=_bot_exempt)
+    # Detached settings (including the isolated admin sandbox) have only the built-in transports.
+    from .modules.platforms.qq.chat_policy import qq_authorize
+
+    return qq_authorize(message, settings, _bot_exempt=_bot_exempt)
 
 
 def safe_output(text: str, secrets: list[str], limit: int = 1800) -> str:

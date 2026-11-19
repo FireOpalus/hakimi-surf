@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -36,63 +35,17 @@ class Rule:
     match: Callable[[MilestoneEvent], Reaction | None]
 
 
-_MC_THEME = re.compile(
-    r"我的世界|minecraft|\bmc\b|红石|生电|建筑教程|生存建筑|刷铁机|下界|末地|苦力怕", re.I
-)
+# Compatibility imports for callers of the pre-module rule API.
+def build_from_video(event):
+    from .modules.platforms.minecraft.inspiration import build_from_video as match
+
+    return match(event)
 
 
-def build_from_video(event: MilestoneEvent) -> Reaction | None:
-    if event.payload.get("private_first"):
-        return None
-    if event.source_module != "bilibili_surf" or event.event_type not in {
-        "bili_video_watched",
-        "bili_mc_inspiration",
-    }:
-        return None
-    topic = str(event.payload.get("title", ""))
-    if event.event_type == "bili_mc_inspiration" or _MC_THEME.search(
-        topic + " " + str(event.payload.get("summary", ""))
-    ):
-        return Reaction(
-            "mc.build_plan",
-            "根据已看视频登记建造灵感",
-            ttl=7200,
-            arguments={"topic": topic[:80]},
-            legacy_module="minecraft",
-            legacy_verb="build_plan",
-        )
-    return None
+def milestone_sharing(settings):
+    from .modules.platforms.qq.milestones import milestone_sharing as declare
 
-
-def milestone_sharing(settings) -> Rule:
-    from .modules.qq_audience import _allowlisted_groups
-
-    def match(ev):
-        if ev.importance != "high" or ev.event_type == "bili_mc_inspiration":
-            return None
-        if ev.event_type == "bili_video_watched" and not settings.owner_qq_id:
-            return None
-        if settings.owner_qq_id:
-            recipient = "owner:" + settings.owner_qq_id
-        else:
-            groups = _allowlisted_groups(settings)
-            recipient = "onebot:" + groups[0] if groups else ""
-        if ev.payload.get("private_first") and not private_event_for_owner(
-            ev.payload, recipient, settings
-        ):
-            return None
-        if not recipient:
-            return None
-        return Reaction(
-            "qq.speak",
-            "结合近期活动分享重要进展",
-            recipient,
-            delay=90,
-            legacy_module=ev.source_module,
-            legacy_verb=ev.source_module + "_milestone_share",
-        )
-
-    return Rule("social.milestone", match)
+    return declare(settings)
 
 
 class RuleDispatcher:

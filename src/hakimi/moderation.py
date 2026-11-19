@@ -152,7 +152,7 @@ class Moderation:
                         now + 172800,
                     ),
                 )
-        if proposal:
+        if proposal and self.s.owner_delivery_platform == "onebot":
             text = (
                 f"BOISER，哈基米想请你评评理喵。{nickname}，QQ {uid}，"
                 f"在 24 小时内至少 3 次触发安全拦截，最近类别：{REASONS[reason]}。"
@@ -327,7 +327,11 @@ class Moderation:
         direct = message.command_text if message.command_text is not None else message.text
         if not re.match(r"^/(?:mute-approve|mute-reject|mute|unmute)(?:\s|$)", direct):
             return None
-        if message.kind != "private" or not is_persona_owner(message, self.s):
+        if (
+            message.platform != "onebot"
+            or message.kind != "private"
+            or not is_persona_owner(message, self.s)
+        ):
             raise Rejected("owner_private_only")
         match = re.fullmatch(
             r"/(mute-approve|mute-reject|mute|unmute) ([a-f0-9]+)( --delete-friend)?", direct

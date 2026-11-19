@@ -47,8 +47,6 @@ from .world_state import (
     private_event_for_owner,
 )
 
-EFFORTFUL_ACTIONS = {"bili.patrol", "mc.explore", "mc.goto", "mc.mine", "mc.gather", "mc.follow"}
-
 log = logging.getLogger("hakimi")
 
 
@@ -269,7 +267,7 @@ class LifeBlockPlanner:
             action
             for action in self.engine.catalog.view(cfg.action_modes, planner=True)
             if (not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"]))
-            and not (preferences["low_energy"] and action["name"] in EFFORTFUL_ACTIONS)
+            and not (preferences["low_energy"] and action["effortful"])
         ]
         offered = {action["name"] for action in available_actions}
         planner_payload: dict[str, Any] = {
@@ -667,7 +665,7 @@ class LifeBlockPlanner:
         history = [r for r in rows if r["status"] not in ("pending", "executing")]
         reserved = []
         for module in self.service.modules.active():
-            for slot in module.schedules():
+            for slot in self.service.modules.schedules_for(module):
                 at = await self.engine.next_slot_at(module, slot, now)
                 if at is not None and self._local(at).date() == calendar.day:
                     reserved.append(
@@ -1187,7 +1185,17 @@ class LifeEngine:
             raise ValueError("action_disabled")
         if mode in {"legacy", "shadow"}:
             spec = self.catalog.resolve(ticket, compatibility=True)
-        if spec.owner_only and ticket.get("target_scope") != "owner:" + self.s.owner_qq_id:
+        recipient = ticket.get("target_scope", "")
+        selected = getattr(self.service, "proactive", None)
+        if recipient.startswith("boundowner:") and (
+            not selected or spec.name != selected.action_name
+        ):
+            raise ValueError("unauthorized_scope")
+        if spec.owner_only and recipient != (
+            selected.target_scope
+            if selected and spec.name == selected.action_name
+            else "owner:" + self.s.owner_qq_id
+        ):
             raise ValueError("unauthorized_scope")
         if spec.social:
             scope = ticket["target_scope"]
@@ -1570,7 +1578,7 @@ class LifeEngine:
         poll = await journal.observe_tick(day, now)
         readers = {}
         for module in self.service.modules.active():
-            for slot in module.schedules():
+            for slot in self.service.modules.schedules_for(module):
                 if poll and slot.receipts:
                     readers[slot.name] = slot.receipts
                 occurrence = next(self.slot_occurrences(module, slot, now), None)

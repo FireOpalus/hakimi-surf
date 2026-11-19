@@ -319,7 +319,7 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
         }
 
     proactive_mgr = getattr(svc, "proactive", None)
-    onebot_connected = bool(proactive_mgr.connected()) if proactive_mgr is not None else False
+    onebot_connected = bool(proactive_mgr and proactive_mgr.onebot_connected())
     node_transport = getattr(svc, "node_transport", None)
     status_fn = getattr(node_transport, "status", None)
     raw_node_status = status_fn() if callable(status_fn) else {}
@@ -387,7 +387,7 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
         if observations is not None:
             upcoming = observations["next_action"]
             for module in svc.modules.active():
-                for slot in module.schedules():
+                for slot in svc.modules.schedules_for(module):
                     due = await engine.next_slot_at(module, slot, now)
                     if due is not None and (upcoming is None or due < upcoming["execute_after"]):
                         upcoming = {
@@ -438,6 +438,9 @@ async def module_directory(request: Request):
             "title": module.display_name or module.module_id,
             "description": module.description,
             "region": module.node_region,
+            "panel": module.admin_panel,
+            "chat_platforms": list(module.chat_platforms),
+            "owner_delivery": registry.chat_platforms.get(svc.proactive.platform) is module,
             "action_count": counts[module.module_id],
             "enabled": module.enabled,
             "configuration_issue": module.configuration_issue,
@@ -463,6 +466,8 @@ async def module_detail(request: Request, module_id: str):
         "enabled": module.enabled,
         "configuration_issue": module.configuration_issue,
         "region": module.node_region,
+        "panel": module.admin_panel,
+        "chat_platforms": list(module.chat_platforms),
         "proactive_paused": module.proactive_paused,
         "actions": actions,
         "status": module.admin_status(request),
@@ -477,7 +482,7 @@ async def module_detail(request: Request, module_id: str):
                     **({"cadence": "hourly"} if isinstance(slot, HourlyAction) else {}),
                     "next_at": await engine.next_slot_at(module, slot, engine.clock()),
                 }
-                for slot in module.schedules()
+                for slot in svc.modules.schedules_for(module)
             ],
         },
     }

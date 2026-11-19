@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 from datetime import date
+from typing import Any
 
 import httpx
 from google.auth import jwt
@@ -435,3 +436,116 @@ class FolderDrive(DriveAuth):
                 content=data,
             )
         return self._validate_memory_file(result, scope)
+
+
+class BackupCollection:
+    """Date-keyed, encrypted snapshots in one folder and namespace."""
+
+    property_name = "hakimi_db_backup"
+    names = re.compile(r"^db-backup-(\d{4}-\d{2}-\d{2})\.sqlite3\.gz\.enc$")
+
+    def __init__(self, drive: FolderDrive, marker: str):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", marker):
+            raise Rejected("drive_backup_marker_invalid")
+        self._drive, self.marker = drive, marker
+
+    async def _delete(self, file_id: str, filename: str) -> None:
+        if not self.names.fullmatch(filename) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id):
+            raise Rejected("drive_file_outside_scope")
+        current, etag = await self._drive._json(
+            "GET", f"{API}/{file_id}", params={"fields": FILE_FIELDS, "supportsAllDrives": "true"}
+        )
+        if (
+            self._drive.validate_owned_file(
+                current, filename, "application/octet-stream", self.property_name, self.marker
+            )
+            != file_id
+        ):
+            raise Rejected("drive_file_outside_scope")
+        if not etag:
+            raise Rejected("drive_etag_required")
+        token = await self._drive._access_token()
+        async with self._drive.http.stream(
+            "DELETE",
+            f"{API}/{file_id}",
+            headers={"Authorization": f"Bearer {token}", "If-Match": etag},
+            params={"supportsAllDrives": "true"},
+            follow_redirects=False,
+        ) as response:
+            if response.status_code not in {200, 204, 404}:
+                raise Rejected("drive_request_failed")
+
+    async def _list(self) -> list[dict[str, Any]]:
+        query = (
+            f"'{self._drive.folder}' in parents and trashed = false "
+            f"and appProperties has {{ key='{self.property_name}' and value='{self.marker}' }}"
+        )
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _ in range(20):
+            params: dict[str, str] = {
+                "q": query,
+                "fields": f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
+                "pageSize": "100",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "corpora": "user",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            listing, _ = await self._drive._json("GET", API, params=params)
+            files = listing.get("files")
+            if not isinstance(files, list) or listing.get("incompleteSearch"):
+                raise Rejected("drive_ambiguous_file")
+            for item in files:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    raise Rejected("drive_invalid_response")
+                self._drive.validate_owned_file(
+                    item,
+                    item.get("name"),
+                    "application/octet-stream",
+                    self.property_name,
+                    self.marker,
+                )
+                items.append(item)
+            next_token = listing.get("nextPageToken")
+            if not next_token:
+                return items
+            if not isinstance(next_token, str):
+                raise Rejected("drive_invalid_response")
+            page_token = next_token
+        raise Rejected("drive_ambiguous_file")
+
+    async def sync_day(
+        self, day_str: str, cutoff_date: date, enc_bytes: bytes
+    ) -> tuple[str, list[str]]:
+
+        await self._drive.validate_folder()
+
+        files = await self._list()
+        remote_name = f"db-backup-{date.fromisoformat(day_str).isoformat()}.sqlite3.gz.enc"
+        matches = [item for item in files if item.get("name") == remote_name]
+        file_id = await self._drive.write_listed(
+            remote_name,
+            enc_bytes,
+            "application/octet-stream",
+            self.property_name,
+            self.marker,
+            matches,
+        )
+
+        pruned_drive: list[str] = []
+        for item in files:
+            item_id, item_name = item["id"], item["name"]
+            match = self.names.fullmatch(item_name)
+            if not match:
+                continue
+            try:
+                item_date = date.fromisoformat(match.group(1))
+            except ValueError:
+                continue
+            if item_date < cutoff_date and item_id != file_id:
+                await self._delete(item_id, item_name)
+                pruned_drive.append(item_name)
+
+        return file_id, pruned_drive

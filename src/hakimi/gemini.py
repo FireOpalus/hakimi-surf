@@ -1713,7 +1713,10 @@ class GeminiGateway:
             and not context.private_owner
         ):
             raise Rejected("owner_private_only")
-        system = SYSTEM_INSTRUCTION + context.persona + identity_anchor(self.s.onebot_self_id)
+        platform = message.platform if message else "onebot"
+        qq_surface = platform in {"onebot", "qq"}
+        self_id = self.s.onebot_self_id if qq_surface else message.bot_id
+        system = SYSTEM_INSTRUCTION + context.persona + identity_anchor(self_id, platform)
         if context.private_owner:
             system += (
                 "\n【单向公开背景规则】近期群聊巡逻记忆只来自已参与过的公开互动，"
@@ -1724,6 +1727,7 @@ class GeminiGateway:
             not context.private_owner
             and context.surface in {"group", "private"}
             and scenario == Scenario.FAST_CHAT
+            and qq_surface
         ):
             system += AT_INSTRUCTION
             memes = getattr(self.store.runtime, "memes", None)
@@ -1811,12 +1815,15 @@ class GeminiGateway:
             )
         chat = (not life_plan) and scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}
         memes = getattr(self.store.runtime, "memes", None)
-        allow_memes = chat and context.surface in {"group", "private"}
+        allow_memes = qq_surface and chat and context.surface in {"group", "private"}
         if life_plan:
             system = SYSTEM_INSTRUCTION + LIFE_PLAN_INSTRUCTION
         elif chat:
             system = self.prefixes.get(
-                context, self.s.onebot_self_id, memes.protocol_prompt if memes else ""
+                context,
+                self_id,
+                memes.protocol_prompt if memes and allow_memes else "",
+                platform=platform,
             )
         elif scenario != Scenario.MEMORY_COMPRESSION:
             # Shared user-supplied prompt precedes identity and business instructions.

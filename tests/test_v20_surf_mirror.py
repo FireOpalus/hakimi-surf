@@ -344,7 +344,8 @@ async def test_surf_mirror_decrypts_owner_session_world_roaming_and_isolates_gro
     )
     await diary.patrol("patrol-1", "看了科技区新视频《异步调度深入解析》", now=now)
 
-    async def fake_recent_surfed(limit: int = 6, now: float | None = None):
+    async def fake_recent_surfed(limit: int = 6, now: float | None = None, message=None):
+        assert message is None
         return [
             {
                 "bvid": "BV1xx411c7mD",
@@ -354,7 +355,7 @@ async def test_surf_mirror_decrypts_owner_session_world_roaming_and_isolates_gro
             }
         ][:limit]
 
-    svc.bili_watcher = SimpleNamespace(recent_surfed=fake_recent_surfed)
+    svc.modules.get("bilibili_surf").watcher = SimpleNamespace(recent_surfed=fake_recent_surfed)
 
     mirror = SurfMirror(svc)
     res = await mirror.export_once(now=now, upload_drive=False)
@@ -401,7 +402,8 @@ async def test_surf_mirror_sanitizes_secrets_and_caps_131072_bytes(settings, sto
         "收到 <script>alert(1)</script> " + ("长文片段。" * 9000),
     )
 
-    async def giant_surfed(limit: int = 6, now: float | None = None):
+    async def giant_surfed(limit: int = 6, now: float | None = None, message=None):
+        assert message is None
         return [
             {
                 "bvid": "BV1xx411c7mD",
@@ -410,7 +412,7 @@ async def test_surf_mirror_sanitizes_secrets_and_caps_131072_bytes(settings, sto
             }
         ]
 
-    svc.bili_watcher = SimpleNamespace(recent_surfed=giant_surfed)
+    svc.modules.get("bilibili_surf").watcher = SimpleNamespace(recent_surfed=giant_surfed)
     mirror = SurfMirror(svc)
     res = await mirror.export_once(now=now, upload_drive=False)
 

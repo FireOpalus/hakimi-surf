@@ -77,9 +77,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         s = settings or Settings()
-        if not (s.onebot_enabled or s.qq_enabled):
-            raise RuntimeError("Enable and configure at least one QQ adapter")
-        if s.onebot_mode != "http" and len(s.onebot_ws_token.get_secret_value()) < 32:
+        if (
+            s.onebot_enabled
+            and s.onebot_mode != "http"
+            and len(s.onebot_ws_token.get_secret_value()) < 32
+        ):
             raise RuntimeError("OneBot WebSocket requires a >=32-character access token")
         if s.node_ws_enabled and len(s.node_ws_token.get_secret_value()) < 32:
             raise RuntimeError("Node WebSocket requires a >=32-character access token")
@@ -154,7 +156,11 @@ def create_app(
                     app.state.ws_event = ws_event
                     if start_workers:
                         service.start()
-                        if isinstance(onebot, WebSocketTransport) and s.onebot_mode == "ws_forward":
+                        if (
+                            s.onebot_enabled
+                            and isinstance(onebot, WebSocketTransport)
+                            and s.onebot_mode == "ws_forward"
+                        ):
                             onebot.start_forward(ws_event)
                     try:
                         yield

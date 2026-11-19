@@ -1,6 +1,8 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+PlatformId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,47}$")]
 
 
 class ImageRef(BaseModel):
@@ -37,7 +39,7 @@ class FileRef(BaseModel):
 
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    platform: Literal["onebot", "qq"]
+    platform: PlatformId
     bot_id: str = Field(min_length=1, max_length=64)
     event_id: str = Field(min_length=1, max_length=256)
     user_id: str = Field(min_length=1, max_length=128)

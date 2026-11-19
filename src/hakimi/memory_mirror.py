@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .memory_compressor import check_memory_text
 from .security import Rejected
+from .social import chat_module, chat_registry
 from .work_usage import model_work
 
 HEADER = (
@@ -70,11 +71,15 @@ class MemoryMirror:
         self.last_scan = float("-inf")
 
     def allowed(self, message):
-        return message.kind == "group" and (
-            message.conversation_id in self.s.onebot_allowed_groups
-            if message.platform == "onebot"
-            else message.conversation_id in self.s.qq_allowed_groups
-        )
+        if message.kind != "group":
+            return False
+        if chat_registry(self.s) is None:
+            # Legacy standalone maintenance callers have only the configured QQ transports.
+            from .modules.platforms.qq.chat_policy import permits_memory_mirror
+
+            return permits_memory_mirror(message, self.s)
+        module = chat_module(self.s, message.platform)
+        return bool(module and module.permits_memory_mirror(message, self.s))
 
     async def configure(self, message, enabled, version):
         if message.kind != "group" or (enabled and not self.allowed(message)):
