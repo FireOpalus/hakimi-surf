@@ -1131,7 +1131,6 @@ class LifeEngine:
         self._running: bool = False
         self._init_lock = asyncio.Lock()
         self._config_lock = asyncio.Lock()
-        self._plan_lock = asyncio.Lock()
         self._gate_lock = asyncio.Lock()
         self._background: dict[str, asyncio.Task] = {}
         self.wakeup = asyncio.Event()
@@ -1397,13 +1396,15 @@ class LifeEngine:
         self, *, now: float | None = None, automatic: bool = False
     ) -> dict[str, Any]:
         await self.initialize()
-        joined = self._plan_lock.locked()
-        async with self._plan_lock:
-            if joined:
-                return {"status": "coalesced", "next_plan_at": self.planner.next_plan_at}
-            if automatic and self.planner.next_plan_at > (self.clock() if now is None else now):
-                return {"status": "scheduled", "next_plan_at": self.planner.next_plan_at}
-            return await self.planner.plan_once(now=now, automatic=automatic)
+        running = self._background.get("plan-work")
+        if running and not running.done():
+            return await asyncio.shield(running)
+        if automatic and self.planner.next_plan_at > (self.clock() if now is None else now):
+            return {"status": "scheduled", "next_plan_at": self.planner.next_plan_at}
+        task = self._start_background(
+            "plan-work", self.planner.plan_once, now=now, automatic=automatic
+        )
+        return await asyncio.shield(task)
 
     def _start_background(self, name, call, *args, **kwargs):
         if current := self._background.get(name):
@@ -1624,7 +1625,7 @@ class LifeEngine:
                         if now >= next_gate:
                             next_gate = now + 60
                             await self.tick_gatekeeper_once(now=now, wait=False)
-                        if now >= self.planner.next_plan_at and not self._plan_lock.locked():
+                        if now >= self.planner.next_plan_at and "plan-work" not in self._background:
                             self._start_background(
                                 "planner", self.trigger_plan_once, now=now, automatic=True
                             )

@@ -12,7 +12,7 @@ from pydantic import SecretStr
 
 from hakimi.app import create_app
 from hakimi.gemini import LIFE_PLAN_RESPONSE_SCHEMA, GeminiGateway
-from hakimi.life_engine import LifeEngineConfig
+from hakimi.life_engine import LifeEngine, LifeEngineConfig
 from hakimi.persona import PUBLIC_STATIC_CHARTER
 from hakimi.roaming_logger import RoamingLogger
 from tests.test_admin import TOKEN
@@ -37,10 +37,19 @@ class FakeDrive:
 
 
 async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
-    settings, message, sdk_pair
+    settings, message, sdk_pair, monkeypatch
 ):
     now = _stamp("2026-11-17T15:00:00")
-    cur_now = now
+    cur_now = _stamp("2026-11-17T08:59:00")
+
+    def clock():
+        return cur_now
+
+    def engine_at_test_time(service):
+        service.world_state.clock = clock
+        return LifeEngine(service, clock=clock)
+
+    monkeypatch.setattr("hakimi.service.LifeEngine", engine_at_test_time)
 
     settings.admin_token = SecretStr(TOKEN)
     settings.onebot_enabled = True
@@ -110,16 +119,6 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
         await diary.initialize()
         svc.diary = diary
 
-        def _clock() -> float:
-            return cur_now
-
-        svc.world_state.clock = _clock
-        svc.life_engine.clock = _clock
-        svc.life_engine.planner.clock = _clock
-        svc.life_engine.gatekeeper.clock = _clock
-        svc.life_engine.jit.clock = _clock
-        svc.life_engine.planner.next_plan_at = now + 7200.0
-
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://127.0.0.1:12141",
@@ -142,6 +141,10 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
                 ).model_dump(mode="json"),
             )
             assert cfg_res.status_code == 200
+            cur_now = _stamp("2026-11-17T09:00:00")
+            morning = await svc.life_engine.trigger_plan_once(automatic=True)
+            assert morning["planning_mode"] == "morning"
+            cur_now = now
 
             # 1. MilestoneEvent(importance="high") -> fuzzy intent + deduped diary world_event
             ev1 = await svc.world_state.publish_event(
@@ -153,8 +156,12 @@ async def test_phase2_end_to_end_milestone_gatekeeper_jit_receipts_and_admin(
             )
             # Re-delivering the exact same event must NOT create duplicate diary rows
             await svc.life_engine.planner.on_milestone_event(ev1)
+            milestone_key = svc.store.vault.digest(
+                "diary-event", "milestone:" + ev1.id, "world_event"
+            )
             diary_rows = await svc.store.all(
-                "SELECT * FROM roaming_events WHERE event_kind='world_life'"
+                "SELECT id FROM roaming_events WHERE event_kind='world_life' AND id=?",
+                (milestone_key,),
             )
             assert len(diary_rows) == 1
 

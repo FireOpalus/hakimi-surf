@@ -174,7 +174,8 @@ async def test_morning_checkpoint_recovered_during_quiet_and_not_generated_twice
         release.set()
         with pytest.raises(RuntimeError, match="power cut"):
             await first
-        assert (await manual)["status"] == "coalesced"
+        with pytest.raises(RuntimeError, match="power cut"):
+            await manual
     monkeypatch.setattr(engine.planner.journal, "commit", commit)
     dm.time[0] += 30
     reboot = LifeEngine(dm.service, clock=dm.clock)
@@ -198,6 +199,29 @@ async def test_midnight_tail_is_not_next_morning_and_rest_policy_updates_the_clo
     dm.time[0] = at("08:45", day=16)
     result = await engine.trigger_plan_once(automatic=True)
     assert result["planning_mode"] == "morning" and len(fake.calls) == 1
+
+
+async def test_manual_and_timer_get_the_same_itinerary_while_model_is_busy(dm, monkeypatch):
+    engine = await waking_day(dm)
+    fake = setup_model(dm, intents=[activity("18:00")])
+    dm.time[0] = at("07:30")
+    started, release = asyncio.Event(), asyncio.Event()
+    generate = fake.generate
+
+    async def delayed(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await generate(*args, **kwargs)
+
+    monkeypatch.setattr(fake, "generate", delayed)
+    async with asyncio.timeout(5):
+        timer = asyncio.create_task(engine.trigger_plan_once(automatic=True))
+        await started.wait()
+        manual = asyncio.create_task(engine.trigger_plan_once())
+        await asyncio.sleep(0)
+        release.set()
+        first, second = await asyncio.gather(timer, manual)
+    assert first == second and len(first["intent_ids"]) == len(fake.calls) == 1
 
 
 async def test_admin_persists_only_supported_morning_levels(life_api):
