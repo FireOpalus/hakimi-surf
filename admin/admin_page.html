@@ -831,16 +831,19 @@ body.authenticated footer { margin-left: var(--rail); }
 #last-updated { padding: 0; border: 0; }
 nav button[data-subpage] { padding-left: 32px; }
 nav button[data-subpage] svg { width: 14px; height: 14px; }
-#modules-nav .nav-group[data-module] .nav-group-label { display: none; }
-#modules-nav .nav-group[data-module] { margin-top: 6px; }
-.module-nav-caption { margin-top: 18px; }
+#platform-nav-group:not(:has([data-module]:not([hidden]))) { display: none; }
+#platform-nav-group [data-module] + [data-module] { margin-top: 6px; }
 .eyebrow .crumb-link { color: inherit; font: inherit; background: none; padding: 1px 0; border: 0; }
 .eyebrow .crumb-link:hover { text-decoration: underline; }
 .directory-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
 .directory-heading h2 { margin: 0; font-size: 16px; }
 .system-heading { margin-top: 26px; }
-.system-status { color: var(--accent); font-size: 13px; font-weight: 650; }
-.module-catalog { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
+#modules { container: module-directory / inline-size; }
+.module-catalog { display: grid; grid-template-columns: repeat(var(--catalog-columns, 1), minmax(0, 1fr)); gap: 16px; }
+@container module-directory (min-width: 464px) { .module-catalog { --catalog-columns: 2; } }
+@container module-directory (min-width: 704px) { .module-catalog { --catalog-columns: 3; } }
+@container module-directory (min-width: 944px) { .module-catalog { --catalog-columns: 4; } }
+.module-catalog > .empty-state { grid-column: 1 / -1; }
 .module-card {
   display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere;
   background: var(--card); color: var(--ink); border: 1px solid var(--line);
@@ -849,7 +852,7 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
 .module-shortcuts { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
 .module-name-row { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .module-name-row .module-switch { flex: none; white-space: nowrap; }
-.module-card .module-name-row { margin: 12px 0 3px; gap: 9px; }
+.module-card .module-name-row { margin: 12px 0 3px; min-height: 40px; flex-wrap: wrap; gap: 2px 9px; }
 .module-card h3 { margin: 0; font-size: 22px; line-height: 1.3; }
 .module-card p { color: var(--muted); font-size: 13px; margin: 0 0 22px; }
 .module-card .module-foot {
@@ -857,12 +860,15 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
 .module-card small { color: var(--muted); font-variant-numeric: tabular-nums; }
-.module-card .module-open { background: transparent; border: 0; color: var(--accent); padding: 5px 0 5px 6px; }
+.module-card .module-open { background: transparent; border: 0; color: var(--accent); padding: 5px 0 5px 6px; margin-inline-start: auto; flex: none; }
 .module-open:hover { text-decoration: underline; }
 .module-icon { display: inline-grid; place-items: center; width: 46px; height: 46px; border-radius: 13px; color: var(--accent); background: var(--soft); }
 .module-icon svg { width: 26px; height: 26px; }
 .module-card[data-module-id=bilibili_surf] .module-icon { color: var(--vertex-ink); background: var(--vertex-bg); }
 .module-card[data-module-id=minecraft] .module-icon { color: var(--good); background: var(--good-bg); }
+.module-card[data-system-module=drive_sync] .module-icon { color: var(--vertex-ink); background: var(--vertex-bg); }
+.module-resident { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 12px; background: var(--soft); color: var(--accent); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.module-resident::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .module-switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; min-height: 40px; width: fit-content; margin: 0; position: relative; font-size: 13px; font-weight: 600; color: var(--muted); }
 .module-switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .module-switch .track { display: inline-flex; align-items: center; flex: none; width: 36px; height: 21px; box-sizing: border-box; padding: 2px; border: 1px solid var(--muted); border-radius: 20px; background: var(--soft); }
@@ -871,8 +877,9 @@ nav button[data-subpage] svg { width: 14px; height: 14px; }
 .module-switch input:checked + .track::after { transform: translateX(15px); background: var(--panel, #191724); }
 .module-switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 3px; }
 .module-switch:has(input:disabled) { opacity: .65; cursor: progress; }
-.module-card .module-state-note { font-size: 12px; margin: 3px 0; color: var(--muted); }
+.module-card .module-state-note { font-size: 12px; margin: 0 0 12px; color: var(--muted); }
 .module-card .module-foot { flex-wrap: wrap; }
+.module-foot small { flex: 1 1 6.5rem; }
 @media (prefers-reduced-motion: reduce) { .module-switch .track::after { transition: none; } }
 .module-card .module-region { font-size: 12px; color: var(--muted); }
 .module-card:has(details[open]) { grid-column: 1 / -1; }
@@ -1280,36 +1287,33 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </nav>
     <nav id="modules-nav" data-workspace="modules" role="tablist" aria-label="功能模块" aria-orientation="vertical" hidden>
       <div class="nav-group" role="presentation">
-        <div class="nav-group-label">模块导航</div>
         <button id="nav-modules" type="button" role="tab" data-tab="modules" data-description="选择模块，查看它的运行状态、设置和可执行动作。" aria-controls="modules" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5-9 5-9-5z M3 12l9 5 9-5 M3 17l9 5 9-5"/></svg><span>模块目录</span></button>
       </div>
-      <div class="nav-group-label module-nav-caption" role="presentation">模块工作区</div>
-      <div class="nav-group" role="presentation">
-        <div class="nav-group-label">系统服务</div>
+      <div id="platform-nav-group" class="nav-group" role="group" aria-labelledby="platform-nav-label">
+        <div id="platform-nav-label" class="nav-group-label">平台模块</div>
+        <div data-module="qq_social">
+          <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接，管理会话隐私、群聊互动、社区和 Owner 私信。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
+          <button id="nav-group-policy" type="button" data-subpage hidden role="tab" data-tab="group-policy" data-description="设置白名单群的互动方式、外部 Bot 回复阈值与冷却。" aria-controls="group-policy" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18 M3 12h18 M3 18h18 M8 3v6 M16 9v6 M8 15v6"/></svg><span>群聊互动策略</span></button>
+          <button id="nav-admission" type="button" data-subpage hidden role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
+          <button id="nav-community" type="button" data-subpage hidden role="tab" data-tab="community" data-description="管理好感度、小黑屋和心情个签。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
+          <button id="nav-memes" type="button" data-subpage hidden role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包</span></button>
+          <button id="nav-proactive" type="button" data-subpage hidden role="tab" data-tab="proactive" data-description="查看 Owner 投递、运维告警和当日汇报。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
+        </div>
+        <div data-module="bilibili_surf">
+          <button id="nav-bili" type="button" role="tab" data-tab="bili" data-description="管理账号、视频订阅和巡逻任务。" aria-controls="bili" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v13H3z M8 3l3 4 M16 3l-3 4 M7 12v3 M17 12v3 M10 15l2 1 2-1"/></svg><span>B 站巡逻</span></button>
+          <button id="nav-bili-account" type="button" data-subpage hidden role="tab" data-tab="bili-account" data-description="管理小号凭据、互动权限与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>账号与看片设置</span></button>
+          <button id="nav-patrol" type="button" data-subpage hidden role="tab" data-tab="patrol" data-description="管理 B 站订阅与巡逻配额。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻订阅</span></button>
+        </div>
+        <div data-module="minecraft">
+          <button id="nav-minecraft" type="button" role="tab" data-tab="minecraft" data-description="查看游戏连接和角色状态，下达活动目标。" aria-controls="minecraft" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5v10l-9 5-9-5V7z M3 7l9 5 9-5 M12 12v10"/></svg><span>Minecraft</span></button>
+        </div>
+        <div data-module="weather">
+          <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="设置观测地点，按需查询当前天气。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
+        </div>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="system-nav-label">
+        <div id="system-nav-label" class="nav-group-label">常驻系统模块</div>
         <button id="nav-journal" type="button" role="tab" data-tab="journal" data-description="查看本地巡逻日记与隔离文件夹的同步回执。" aria-controls="journal" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h5"/></svg><span>巡逻日记与同步</span></button>
-      </div>
-      <div class="nav-group" role="presentation" data-module="qq_social">
-        <div class="nav-group-label">QQ</div>
-        <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接，管理会话隐私、群聊互动、社区和 Owner 私信。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
-        <button id="nav-group-policy" type="button" data-subpage hidden role="tab" data-tab="group-policy" data-description="设置白名单群的互动方式、外部 Bot 回复阈值与冷却。" aria-controls="group-policy" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18 M3 12h18 M3 18h18 M8 3v6 M16 9v6 M8 15v6"/></svg><span>群聊互动策略</span></button>
-        <button id="nav-admission" type="button" data-subpage hidden role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
-        <button id="nav-community" type="button" data-subpage hidden role="tab" data-tab="community" data-description="管理好感度、小黑屋和心情个签。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
-        <button id="nav-memes" type="button" data-subpage hidden role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包</span></button>
-        <button id="nav-proactive" type="button" data-subpage hidden role="tab" data-tab="proactive" data-description="查看 Owner 投递、运维告警和当日汇报。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
-      </div>
-      <div class="nav-group" role="presentation" data-module="bilibili_surf">
-        <div class="nav-group-label">哔哩哔哩</div>
-        <button id="nav-bili" type="button" role="tab" data-tab="bili" data-description="管理账号、视频订阅和巡逻任务。" aria-controls="bili" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v13H3z M8 3l3 4 M16 3l-3 4 M7 12v3 M17 12v3 M10 15l2 1 2-1"/></svg><span>B 站巡逻</span></button>
-        <button id="nav-bili-account" type="button" data-subpage hidden role="tab" data-tab="bili-account" data-description="管理小号凭据、互动权限与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>账号与看片设置</span></button>
-        <button id="nav-patrol" type="button" data-subpage hidden role="tab" data-tab="patrol" data-description="管理 B 站订阅与巡逻配额。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻订阅</span></button>
-      </div>
-      <div class="nav-group" role="presentation" data-module="weather">
-        <div class="nav-group-label">天气</div>
-        <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="设置观测地点，按需查询当前天气。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
-      </div>
-      <div class="nav-group" role="presentation" data-module="minecraft">
-        <div class="nav-group-label">游戏</div>
-        <button id="nav-minecraft" type="button" role="tab" data-tab="minecraft" data-description="查看游戏连接和角色状态，下达活动目标。" aria-controls="minecraft" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5v10l-9 5-9-5V7z M3 7l9 5 9-5 M12 12v10"/></svg><span>Minecraft</span></button>
       </div>
     </nav>
     <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
@@ -1382,6 +1386,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 </section>
 
 <section id="modules" class="tab" role="tabpanel" aria-labelledby="nav-modules" hidden>
+  <template id="catalog-icon-drive_sync"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18H6a4 4 0 0 1-.5-8 6.5 6.5 0 0 1 12.5-2 5 5 0 0 1 0 10h-1 M12 20v-9 M8.5 14.5 12 11l3.5 3.5"/></svg></template>
   <div class="directory-heading"><h2>平台模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
   <div id="module-catalog" class="module-catalog" aria-live="polite"></div>
   <div class="directory-heading system-heading"><h2>常驻系统模块</h2></div>
@@ -3961,22 +3966,30 @@ function applyModuleDetail(d){
   }
   if(id==='bilibili_surf')$('bili').querySelector('[data-action="patrol"]').disabled=!d.enabled;
 }
-function moduleCard(m){
-  const key=modulePage.get(m.id),title=moduleTitle(m);
-  const card=el('article',undefined,'module-card');card.dataset.moduleId=m.id;
+function catalogCard(m,{page,indicator,meta,note}){
+  const title=moduleTitle(m),card=el('article',undefined,'module-card');
   const heading=el('div',undefined,'module-name-row'),glyph=el('span',undefined,'module-icon');
-  glyph.append($('nav-'+(key||'modules')).querySelector('svg').cloneNode(true));
-  heading.append(el('h3',title),moduleSwitch(m));
+  const icon=$('catalog-icon-'+m.id)?.content.firstElementChild||$('nav-'+(page||'modules')).querySelector('svg');
+  glyph.append(icon.cloneNode(true));
+  heading.append(el('h3',title),indicator);
   const foot=el('div',undefined,'module-foot');
-  foot.append(el('small',regionName(m.region)+' · '+m.action_count+' 项动作'));
+  foot.append(el('small',meta));
   card.append(glyph,heading);
   if(m.description)card.append(el('p',m.description));
-  card.append(foot);
-  if(moduleIssue(m))foot.before(el('p',moduleIssue(m),'module-state-note'));
-  if(key){
+  if(note)card.append(el('p',note,'module-state-note'));
+  if(page){
     const open=el('button','打开模块 →','module-open');open.type='button';
-    open.setAttribute('aria-label','打开'+title);open.dataset.openTab=key;foot.append(open);
-  }else{
+    open.setAttribute('aria-label','打开'+title);open.dataset.openTab=page;foot.append(open);
+  }
+  card.append(foot);
+  return card;
+}
+function moduleCard(m){
+  const page=modulePage.get(m.id);
+  const card=catalogCard(m,{page,indicator:moduleSwitch(m),
+    meta:regionName(m.region)+' · '+m.action_count+' 项动作',note:moduleIssue(m)});
+  card.dataset.moduleId=m.id;
+  if(!page){
     const details=el('details'),summary=el('summary','查看模块'),body=el('div');
     details.append(summary,body);card.append(details);
     let loaded=false,loading=false;
@@ -3991,19 +4004,12 @@ function moduleCard(m){
   return card;
 }
 function systemCard(m){
-  const card=el('article',undefined,'module-card');card.dataset.systemModule=m.id;
-  const title=el('div',undefined,'module-name-row');title.append(el('h3',m.title));
-  card.append(title,el('p',m.description));
-  const foot=el('div',undefined,'module-foot'),status=m.status;
-  const state=el('span',status.detail,'system-status');
-  foot.append(state);
-  if(status.last_error)card.append(el('small',status.last_error));
-  if(status.last_success)card.append(el('small','上次同步 '+dateTime(status.last_success)));
-  if(m.panel&&sections.has(m.panel)){
-    const open=el('button','查看记录 →','module-open');open.type='button';
-    open.dataset.openTab=m.panel;open.setAttribute('aria-label','查看'+m.title+'记录');foot.append(open);
-  }
-  card.append(foot);return card;
+  const status=m.status;
+  const note=[status.last_error,status.last_success&&'上次同步 '+dateTime(status.last_success)].filter(Boolean).join(' · ');
+  const card=catalogCard(m,{page:sections.has(m.panel)?m.panel:null,indicator:el('span','常驻','module-resident'),
+    meta:status.detail,note});
+  card.dataset.systemModule=m.id;
+  return card;
 }
 async function systemDirectory(){
   const catalog=$('system-catalog');
@@ -4073,11 +4079,15 @@ $('logout').addEventListener('click',logout);
 const tabButtons=[...$('sidebar').querySelectorAll('[role=tab]')];
 const workspaceNames={core:'主控台',modules:'功能模块'};
 const lastTab={core:'overview',modules:'modules'};
-const sections=new Map(tabButtons.map(button=>[button.dataset.tab,{
-  workspace:button.closest('nav').dataset.workspace,module:button.closest('.nav-group').dataset.module,
-  button,title:button.querySelector('span').textContent,
-  group:button.closest('.nav-group').querySelector('.nav-group-label').textContent
-}]));
+const sections=new Map(tabButtons.map(button=>{
+  const platform=button.closest('[data-module]'),group=button.closest('.nav-group');
+  return [button.dataset.tab,{
+    workspace:button.closest('nav').dataset.workspace,module:platform?.dataset.module,
+    button,title:button.querySelector('span').textContent,
+    group:(platform?.querySelector('[role=tab] span')||group.querySelector('.nav-group-label'))?.textContent
+  }];
+}));
+const sectionLocation=section=>[workspaceNames[section.workspace],section.group].filter(Boolean).join(' / ');
 function resetWorkspaces(){
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
@@ -4113,8 +4123,8 @@ function selectTab(key){
   if(modulePage.get(headingSwitch.querySelector('input')?.dataset.moduleSwitch)!==key){
     headingSwitch.replaceChildren();headingSwitch.hidden=true;
   }
-  text('page-kicker',workspaceNames[workspace]+' / '+section.group);
-  if(section.module){
+  text('page-kicker',sectionLocation(section));
+  if(workspace==='modules'&&key!=='modules'){
     const crumb=(label,key)=>{
       const b=el('button',label,'crumb-link');b.type='button';b.dataset.openTab=key;return b;
     };
@@ -4210,7 +4220,7 @@ closeNavigation();
 const finder=$('module-finder'),query=$('finder-query'),resultList=$('finder-results');
 const finderEntries=[];
 for(const [key,section] of sections){
-  const location=workspaceNames[section.workspace]+' / '+section.group;
+  const location=sectionLocation(section);
   finderEntries.push({key,label:section.title,context:location});
   // Index only static headings before login. Session data never enters navigation search.
   for(const heading of $(key).querySelectorAll('.card h2, .card h3')){
@@ -4234,7 +4244,7 @@ function filterFinder(){
   const normalize=s=>s.normalize('NFKC').toLocaleLowerCase().replace(/\s+/g,'');
   const term=normalize(query.value);
   matches=finderEntries.filter(item=>{
-    if(sections.get(item.key).button.closest('.nav-group').hidden)return false;
+    if(sections.get(item.key).button.closest('[data-module][hidden]'))return false;
     if(!term)return !item.heading;
     if(item.heading?.closest('[hidden]:not(.tab)'))return false;
     return normalize([item.label,item.context,item.key].join(' ')).includes(term);
