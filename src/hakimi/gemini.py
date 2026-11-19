@@ -118,7 +118,25 @@ class WireLifePlan(BaseModel):
     agenda_changes: list[WireAgendaChange] = Field(default_factory=list)
 
 
-LIFE_PLAN_RESPONSE_SCHEMA = WireLifePlan.model_json_schema()
+def _build_life_plan_schema() -> dict[str, Any]:
+    schema = WireLifePlan.model_json_schema()
+    schema["required"] = list(schema["properties"])
+    intent_def = schema.get("$defs", {}).get("WireLifeIntent")
+    if isinstance(intent_def, dict) and "properties" in intent_def:
+        intent_def["required"] = [
+            "action_name",
+            "arguments_json",
+            "target_scope",
+            "at_local_time",
+            "delay_minutes",
+            "ttl_minutes",
+            "intent_note",
+            "allow_desktop_care",
+        ]
+    return schema
+
+
+LIFE_PLAN_RESPONSE_SCHEMA = _build_life_plan_schema()
 
 LIFE_PLAN_INSTRUCTION = """你是「吉米奈喵」（咕咕噜·吉米尼·吉米奈，日常也叫「哈基米」或
 「大小姐」），好奇心旺盛、爱逛 B 站科技与整活新片、喜欢在 MC 攒建筑点子

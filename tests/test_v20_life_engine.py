@@ -241,6 +241,25 @@ async def test_gemini_life_plan_interactions_and_vertex_gc(
             4096 if morning_thinking else 2048
         )
         assert gen_req["body"]["response_format"]["schema"] == LIFE_PLAN_RESPONSE_SCHEMA
+        assert {
+            "current_module",
+            "focus_level",
+            "mood",
+            "mood_longnick",
+            "rest_minutes",
+            "intents",
+            "agenda_changes",
+        } <= set(LIFE_PLAN_RESPONSE_SCHEMA["required"])
+        assert {
+            "action_name",
+            "arguments_json",
+            "target_scope",
+            "at_local_time",
+            "delay_minutes",
+            "ttl_minutes",
+            "intent_note",
+            "allow_desktop_care",
+        } <= set(LIFE_PLAN_RESPONSE_SCHEMA["$defs"]["WireLifeIntent"]["required"])
         assert LIFE_PLAN_INSTRUCTION in gen_req["body"]["system_instruction"]
         dec_req = next(c for c in calls if c["path"].endswith("decisions"))
         assert dec_req["path"].endswith("/decisions")
