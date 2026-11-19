@@ -2066,7 +2066,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div class="grid"><label>入睡时间<input id="rest-start" type="time" required></label><label>起床时间<input id="rest-end" type="time" required></label></div>
       <p id="wake-window" class="rhythm-preview" aria-live="polite"></p>
       <div class="grid"><label for="life-quiet-hours">主动消息免打扰时段<input id="life-quiet-hours" type="text" maxlength="11" placeholder="23:30-08:30" required></label><label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label></div>
-      <p class="muted">清醒时可规划和巡逻，免打扰时暂停主动发消息。睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。</p>
+      <p class="muted">白天由哈基米参考精力和无聊度，自行选择活动或小憩。睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。免打扰时暂停主动发消息。</p>
       <details>
         <summary>规划与休眠间隔</summary>
         <div class="grid">
@@ -3200,7 +3200,7 @@ const planLabels={
   morning:'晨间行程',planned:'已规划',scheduled:'等待下次规划',not_due:'尚未到点',resting:'本轮留白',agenda_revised:'已调整行程',agenda_kept:'沿用已有行程',agenda_moved:'已改期',agenda_cancelled:'已取消',
   agenda_item_unavailable:'事项已开始或不属于本轮待办',invalid_agenda_time:'改期超出可用时段',
   agenda_duplicate:'同一时刻已安排该动作',
-  accepted:'已采纳',all_filtered:'所有建议均被过滤',day_rest:'白天小憩',day_rest_unavailable:'当前不适合小憩',model_chose_idle:'选择清醒空闲',model_chose_rest:'模型决定休息',local_rest:'本地规划决定休息',
+  accepted:'已采纳',all_filtered:'所有建议均被过滤',day_rest:'白天小憩',day_rest_unavailable:'当前不适合小憩',model_chose_idle:'选择清醒空闲',model_chose_rest:'模型未安排行动（旧记录）',local_rest:'本地未安排行动（旧记录）',
   unchanged_state:'状态与可用动作未变，延后付费规划',no_available_actions:'当前没有可用动作',
   sleeping:'休眠时段',disabled:'引擎关闭',running:'规划进行中',prepared:'规划已保存，待登记动作',
   interrupted:'规划中断',local_idle:'本地延后',local_fallback:'本地规划',llm:'模型规划',pending:'处理中',
@@ -3260,7 +3260,13 @@ function renderLife(d){
   const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',qq_processing:'正在处理 QQ 消息',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
   const name=k=>labels[k]||k||'—';
   const restingPlan=plan&&['model_chose_rest','model_chose_idle','sleeping','local_rest','local_idle','unchanged_state','no_available_actions'].includes(plan.outcome);
-  const planned=plan?(plan.outcome==='day_rest'?'白天小憩':plan.outcome==='agenda_kept'||plan.outcome==='agenda_revised'?planLabel(plan.outcome):restingPlan?'本轮未安排动作':plan.plan_module?name(plan.plan_module)+' · '+(plan.accepted||0)+' 个动作':'本轮已结束'):'等待首次规划';
+  let planned='等待首次规划';
+  if(plan){
+    if(['day_rest','agenda_kept','agenda_revised'].includes(plan.outcome))planned=planLabel(plan.outcome);
+    else if(restingPlan)planned='本轮未安排动作';
+    else if(plan.accepted>0 && plan.plan_module==='idle')planned='已安排 '+plan.accepted+' 项活动';
+    else planned=plan.plan_module?name(plan.plan_module)+' · '+(plan.accepted||0)+' 个动作':'本轮已结束';
+  }
   const stats=[
     ['本时段计划',planned],
     ['实际活动',name(actual.state)+(actual.day_rest_until?' · '+(actual.day_rest_source==='low_energy'?'精力偏低':'自主选择')+' · '+lifeFmt(actual.day_rest_until,tz)+' 醒来':'')+(actual.mc_task?' · '+name(actual.mc_task):'')],

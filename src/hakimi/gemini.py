@@ -45,6 +45,7 @@ from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
 from .web_search import SEARCH_INSTRUCTION, execute_deepseek_search, parse_result
 from .work_usage import model_work
+from .world_experience import MAX_DAY_REST_MINUTES
 
 DIARY_INSTRUCTION = """当前业务是每日巡逻日记总结，不是实时对话。
 结合给定的公开巡逻摘要（public_summaries）、白名单聊天摘录（chat_excerpts）与活动计数，
@@ -111,7 +112,7 @@ class WireLifePlan(BaseModel):
         return value
 
     mood_longnick: str = ""
-    rest_minutes: Literal[0, 30, 60, 90] = 0
+    rest_minutes: int = Field(default=0, ge=0, le=MAX_DAY_REST_MINUTES, strict=True)
     intents: list[WireLifeIntent] = Field(default_factory=list)
     agenda_changes: list[WireAgendaChange] = Field(default_factory=list)
 
@@ -121,17 +122,16 @@ LIFE_PLAN_RESPONSE_SCHEMA = WireLifePlan.model_json_schema()
 LIFE_PLAN_INSTRUCTION = """你是世界引擎的行程规划器。结合当前状态、公开事件与可用动作安排生活。
 planning_mode 为 morning 时，规划从起床到今天结束的行程。参考 activity_windows 内的清醒时间。
 主动发消息还须避开 outbound_quiet_hours。
-按兴趣和精力安排最多六项，可以跨上午、下午和晚间，也可以留白。用 at_local_time 填 HH:MM。
+从现在到晚间，由你决定想做什么、什么时候做，也可以留白。最多安排六项，用 at_local_time 填 HH:MM。
 planning_mode 为 revision 时，先查看 today_agenda 及各项实际状态，再决定是否调整。
 保留合适的安排时无需重新输出它。可以新增最多三项，或在 agenda_changes 中指定未来待办的
 intent_id，用 move 和新的 at_local_time 改期，用 cancel 取消。不要重复已安排或已完成的事项。
-固定日程 reserved_activities 已由模块负责。无需调整时返回空列表。
+日程为空时也可以新增活动。日内确实无需调整时返回空列表。固定日程 reserved_activities 已由模块负责。
 只输出符合 schema 的 JSON 对象，包含 current_module、focus_level（LOW|MEDIUM|HIGH）、mood、
 mood_longnick（≤30字纯文本心情个签或空串""）与 intents。
-精力、无聊度和探索倾向由本地实际经历结算。
-exploration_preferred 为真时优先挑选可用探索。day_rest_available 为真时可以主动小憩，
-填写 rest_minutes 为 30、60 或 90，current_module 为 idle，intents 为空。清醒放空或安排活动时
-rest_minutes 为 0。睡眠和小憩时间由世界引擎结算。计划内容只表达意向。
+energy 和 boredom 是当前感受的参考。你可以随兴趣探索，也可以清醒放空，即使没有新事件。
+day_rest_available 为真且想小憩时，rest_minutes 填你想休息的分钟数，current_module 填 idle。
+醒来后想做的事可以同时排进 intents。此刻保持清醒时 rest_minutes 为 0。计划内容只表达意向。
 从 available_actions 选择 action_name，arguments_json 仅填该动作声明的 JSON 参数。
 internal 不填接收人，social 仅选提供的群或 owner。
 【严禁预写台词】每条 intent 的 intent_note 只能写 ≤120 字的抽象意图方向，

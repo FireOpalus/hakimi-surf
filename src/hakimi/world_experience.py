@@ -84,6 +84,12 @@ class WorldExperience:
             )
 
         elif not self.ready:
+            # End a pre-upgrade forced nap at startup. Account for the time already spent asleep.
+            await self.store.db.execute(
+                "UPDATE world_day_rest SET ends=MAX(started,?) "
+                "WHERE source='low_energy' AND ends>?",
+                (now, now),
+            )
             # A fresh process needs fresh positive evidence to resume a live task.
             await self.advance_tx(now)
             row = await self._values()
@@ -217,7 +223,7 @@ class WorldExperience:
     async def _can_rest_tx(self, row, now):
         if (
             now < row["settled"]
-            or (row["source"] and now < row["ends"] + 1800)
+            or row["started"] <= now < row["ends"]
             or row["mc_until"] > now
             or row["bili_until"] > now
             or row["focus_level"] == "HIGH"
@@ -230,18 +236,14 @@ class WorldExperience:
             (now,),
         )
 
-    async def start_day_rest_tx(self, now, until, source):
+    async def start_day_rest_tx(self, now, until):
         """The caller owns the transaction and has bounded the nap to the active window."""
         await self.advance_tx(now)
         row = await self._values()
-        if (
-            until - now < 360
-            or (source == "low_energy" and not row["tired"])
-            or not await self._can_rest_tx(row, now)
-        ):
+        if until <= now or not await self._can_rest_tx(row, now):
             return False
         await self.store.db.execute(
-            "UPDATE world_day_rest SET started=?,ends=?,source=? WHERE id=1", (now, until, source)
+            "UPDATE world_day_rest SET started=?,ends=?,source='planner' WHERE id=1", (now, until)
         )
         await self.store.db.execute(
             "UPDATE world_state SET mood='resting' WHERE singleton=1 AND current_module='idle'"
@@ -495,8 +497,6 @@ class WorldExperience:
             )[0]
         return {
             "day_rest_available": can_rest,
-            "low_energy": bool(row["tired"]),
-            "exploration_preferred": not row["tired"] and row["boredom"] >= 65,
             "public_unshared_count": count,
         }
 

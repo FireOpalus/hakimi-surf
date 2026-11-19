@@ -293,7 +293,6 @@ class WorldStateManager:
         self.current = WorldStateSnapshot()
         self.experience = WorldExperience(self)
         self.mc_until = 0.0
-        self.tired = False
         self._subscribers: list[Callable[[MilestoneEvent], Any]] = []
         self._sensor_overrides: dict[str, str] = {}
 
@@ -360,11 +359,10 @@ class WorldStateManager:
     async def refresh(self):
         async with self.store.lock:
             row = await self.store.one(
-                "SELECT w.*,r.mc_until,r.tired,d.started,d.ends FROM world_state w "
+                "SELECT w.*,r.mc_until,d.started,d.ends FROM world_state w "
                 "JOIN world_rhythm r ON r.id=w.singleton JOIN world_day_rest d ON d.id=r.id"
             )
             self.mc_until = row["mc_until"]
-            self.tired = bool(row["tired"])
             self.store.runtime.day_rest = row["started"], row["ends"]
             prev = self.current.focus_level
             self.current = self._snapshot(row)

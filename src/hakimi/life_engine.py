@@ -148,6 +148,12 @@ class LifeBlockPlanner:
     def config(self) -> LifeEngineConfig:
         return self.engine.config
 
+    @property
+    def planning_enabled(self) -> bool:
+        return self.config.enabled and (
+            self.store.runtime.rest_hours.day_rest_enabled or bool(self.service.modules.active())
+        )
+
     def _local(self, stamp: float) -> datetime:
         return datetime.fromtimestamp(stamp, _zone(self.s.bot_timezone))
 
@@ -164,7 +170,7 @@ class LifeBlockPlanner:
         """A saved review clock cannot push the next morning past wake-up."""
         state = state or await self.journal.clock()
         self.next_plan_at = state["next_at"]
-        if not self.config.enabled or not self.service.modules.active():
+        if not self.planning_enabled:
             return False
         today = self.calendar(self._local(now).date())
         seen = await self.journal.morning(today.day.isoformat())
@@ -223,14 +229,13 @@ class LifeBlockPlanner:
         morning = await self.sync_wake(ts, state)
         if automatic and ts < self.next_plan_at:
             return {"status": "not_due", "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
-        if not cfg.enabled or not self.service.modules.active():
+        if not self.planning_enabled:
             reason = "disabled" if not cfg.enabled else "no_active_modules"
             self.next_plan_at = ts + 1800.0
             await self.journal.pause(day, ts, self.next_plan_at, reason)
             return {"status": reason, "next_plan_at": self.next_plan_at, "intents_enqueued": 0}
 
         await ws.experience.advance(ts)
-        await self.engine.rest_if_tired(ts)
         if nap_end := self.store.runtime.day_rest_end(ts):
             # An encrypted checkpoint, if any, stays available for the next wake.
             self.next_plan_at = nap_end
@@ -261,13 +266,12 @@ class LifeBlockPlanner:
         budget = await self.store.budget_status()
         preferences = await ws.experience.preferences(ts)
         preferences["day_rest_available"] = (
-            preferences["day_rest_available"] and self.engine.day_rest_limit(ts) >= ts + 360
+            preferences["day_rest_available"] and self.engine.day_rest_limit(ts) > ts
         )
         available_actions = [
             action
             for action in self.engine.catalog.view(cfg.action_modes, planner=True)
-            if (not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"]))
-            and not (preferences["low_energy"] and action["effortful"])
+            if not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"])
         ]
         offered = {action["name"] for action in available_actions}
         planner_payload: dict[str, Any] = {
@@ -304,6 +308,7 @@ class LifeBlockPlanner:
             json.dumps(
                 {
                     "actions": sorted(offered),
+                    "day_rest_available": preferences["day_rest_available"],
                     "modules": sorted(known_modules),
                     "audiences": planning_context.get("available_groups", []),
                     "owner_available": planning_context.get("owner_dm_available", False),
@@ -378,7 +383,8 @@ class LifeBlockPlanner:
                     "next_plan_at": self.next_plan_at,
                     "intents_enqueued": 0,
                 }
-            if quiet or not offered:
+            can_choose_rest = planner_funded and preferences["day_rest_available"]
+            if quiet or (not offered and not can_choose_rest):
                 reason = "unchanged_state" if quiet else "no_available_actions"
                 await self.journal.commit(
                     ws,
@@ -597,7 +603,7 @@ class LifeBlockPlanner:
             else "local_idle"
         )
         day_rest = None
-        if plan.rest_minutes and not plan.intents and resolved_module == "idle":
+        if plan.rest_minutes and resolved_module == "idle":
             # A delayed/checkpointed plan cannot backdate rest or restart an expired nap.
             decision_at = ts + max(0, self.clock() - entered)
             end = min(
@@ -1406,7 +1412,6 @@ class LifeEngine:
         ts = self.clock() if now is None else now
         await self.service.world_state.experience.advance(ts)
         if self.config.enabled:
-            await self.rest_if_tired(ts)
             async with self._gate_lock:
                 await self.schedule_due(ts)
         rules = self._start_background("rules", self.rules.catch_up, ts)
@@ -1426,17 +1431,6 @@ class LifeEngine:
                 return point
             point = (int(point // 60) + 1) * 60
         return end
-
-    async def rest_if_tired(self, now):
-        world = self.service.world_state
-        if not world.tired or self.store.runtime.day_rest_end(now):
-            return
-        until = min(self.day_rest_limit(now), now + (45 - world.current.energy) * 360)
-        if until - now >= 360:
-            async with self.store.transaction():
-                started = await world.experience.start_day_rest_tx(now, until, "low_energy")
-            if started:
-                await world.refresh()
 
     async def trim_day_rest(self, now):
         start, end = self.store.runtime.day_rest

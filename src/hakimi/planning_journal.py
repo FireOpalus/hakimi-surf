@@ -232,12 +232,6 @@ class PlannerJournal:
             )
             if row is None:
                 return []
-            if day_rest:
-                started, ends = day_rest
-                if await world.experience.start_day_rest_tx(started, ends, "planner"):
-                    outcome = "day_rest"
-                else:
-                    reasons["day_rest_unavailable"] = 1
             edits_applied = 0
             for key, window in agenda_changes:
                 where = (
@@ -284,6 +278,11 @@ class PlannerJournal:
                 ids.append(key)
             if outcome == "accepted" and not ids:
                 outcome = "all_filtered"
+            if day_rest:
+                if not await world.experience.start_day_rest_tx(*day_rest):
+                    reasons["day_rest_unavailable"] = 1
+                elif not ids and not edits_applied:
+                    outcome = "day_rest"
             if outcome == "model_chose_idle" and await self.store.one(
                 "SELECT 1 FROM life_agenda_items a JOIN scheduled_intents i ON i.id=a.intent_id "
                 "WHERE a.day=? AND i.status='pending' AND i.expire_at>? LIMIT 1",

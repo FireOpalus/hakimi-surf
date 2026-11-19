@@ -142,16 +142,17 @@ async def test_private_news_receipts_and_independent_social_charge(settings, sto
     assert await x.battery(friend, now) == 76
 
 
-async def test_drives_filter_by_energy_with_hysteresis(settings, store):
+async def test_low_energy_indicator_is_available_in_status(settings, store):
     now = stamp(16)
     world = WorldStateManager(settings, store, clock=lambda: now)
     await world.initialize()
+    await PlannerJournal(store).initialize(now)
     await world.update_state(energy=29, boredom=70)
-    assert (await world.experience.preferences(now))["low_energy"]
+    assert (await world.experience.view(now))["low_energy"]
     await world.update_state(energy=40)
-    assert not (await world.experience.preferences(now))["exploration_preferred"]
+    assert (await world.experience.view(now))["low_energy"]
     await world.update_state(energy=45)
-    assert (await world.experience.preferences(now))["exploration_preferred"]
+    assert not (await world.experience.view(now))["low_energy"]
 
 
 async def test_sharing_reservation_requires_confirmed_delivery(settings, store, message):
