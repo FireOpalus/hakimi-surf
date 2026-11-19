@@ -134,6 +134,9 @@ async def test_scope_origin_arguments_modes_and_readiness(settings, store):
             "unknown_action",
             "mc_server_not_connected",
         ]
+        planner_names = {a["name"] for a in engine.catalog.view({}, planner=True)}
+        assert "mc.build_plan" in planner_names
+        assert {"mc.idle", "mc.stop"}.isdisjoint(planner_names)
         assert not wire.calls and not svc.ai.calls and not node.calls
         await engine.set_config({"action_modes": {"mc.build_plan": "shadow"}})
         key = await svc.world_state.enqueue_intent(ticket("mc.build_plan"))

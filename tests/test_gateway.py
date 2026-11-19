@@ -100,6 +100,34 @@ async def test_possible_alias_uses_context_and_the_group_threshold(
     assert audit["attention_reason"] == "possible_alias" and not audit["reply_bypassed"]
 
 
+async def test_possible_alias_in_smart_reply_group_keeps_banter_prompt(
+    settings, store, sdk_pair, message
+):
+    settings.group_policies["onebot:40000"] = "smart_reply"
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        response = decision_response()
+        response["answers"]["should_reply"].update(noul=0.85, confidence=0.9)
+        return httpx.Response(200, json=response)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    current = group(
+        message,
+        addressed=False,
+        attention_reason="possible_alias",
+        text="我家猫猫今天晒太阳",
+    )
+    result = await gate.screen(
+        {"current_message": current.text}, "s", purpose="message", message=current
+    )
+    assert result == "chat" and len(calls) == 1
+    instructions = calls[0]["questions"]["should_reply"]["instructions"]
+    assert "Should the assistant naturally join" in instructions
+    assert "third-person cat/tech discussion" in instructions
+
+
 async def test_group_context_is_readonly_and_safety_targets_current_in_one_call(
     settings, store, sdk_pair, message
 ):
