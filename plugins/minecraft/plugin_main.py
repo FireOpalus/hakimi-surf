@@ -14,7 +14,7 @@ import unicodedata
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from hakimi_plugin_sdk import (
     ActionSpec,
@@ -38,6 +38,7 @@ _MC_ALLOWED_DISPATCH_FIELDS = (
     "y",
     "z",
     "target_player",
+    "message",
     "intent_note",
     "mood",
     "gate_condition",
@@ -231,6 +232,20 @@ class FollowArgs(NoArgs):
     target_player: str = Field(pattern=r"^[A-Za-z0-9_]{1,16}$")
 
 
+class ChatArgs(NoArgs):
+    message: str = Field(min_length=1, max_length=120)
+
+    @field_validator("message")
+    @classmethod
+    def _validate_message(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("empty_chat_message")
+        if cleaned.startswith("/"):
+            raise ValueError("mc_command_forbidden")
+        return cleaned
+
+
 _BUILD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -265,6 +280,14 @@ _FOLLOW_SCHEMA: dict[str, Any] = {
     "required": ["target_player"],
     "additionalProperties": False,
 }
+_CHAT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "message": {"type": "string", "minLength": 1, "maxLength": 120},
+    },
+    "required": ["message"],
+    "additionalProperties": False,
+}
 
 _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "build_plan": ("在记事本里记下接下来想在 Minecraft 里搭的建筑点子", _BUILD_SCHEMA, BuildArgs),
@@ -273,6 +296,7 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "gather": ("在游戏里收集指定资源方块", _BLOCK_SCHEMA, BlockArgs),
     "goto": ("在游戏里前往指定坐标位置", _POSITION_SCHEMA, PositionArgs),
     "follow": ("在游戏里跟随指定玩家一起行动", _FOLLOW_SCHEMA, FollowArgs),
+    "chat": ("在游戏公屏里发一句短消息和在线玩家搭话（不可发/指令）", _CHAT_SCHEMA, ChatArgs),
     "observe": ("在游戏里环顾观察周围环境与生物", {}, NoArgs),
     "look_signs": ("在游戏里查看附近的告示牌文字", {}, NoArgs),
     "stop": ("停下当前正在执行的 Minecraft 动作", {}, NoArgs),

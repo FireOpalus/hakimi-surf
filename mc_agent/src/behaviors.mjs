@@ -24,6 +24,7 @@ export const ALLOWED_GOAL_ACTIONS = new Set([
   "look_signs",
   "observe",
   "build_plan",
+  "chat",
   "stop",
   "idle",
 ]);
@@ -105,6 +106,7 @@ export class McRuntime {
     snapshotIntervalMs = 10_000,
     milestoneCooldownMs = 60_000,
     actionTimeoutMs = 25_000,
+    chatCooldownMs = 3_000,
     profilesFolder = "/tmp/mc_cache",
     nowFn = () => Date.now(),
   }) {
@@ -114,6 +116,10 @@ export class McRuntime {
     this.snapshotIntervalMs = snapshotIntervalMs;
     this.milestoneCooldownMs = milestoneCooldownMs;
     this.actionTimeoutMs = Math.min(30_000, Math.max(100, actionTimeoutMs));
+    this.chatCooldownMs =
+      typeof chatCooldownMs === "number" && Number.isFinite(chatCooldownMs)
+        ? Math.max(0, chatCooldownMs)
+        : 3_000;
     this.profilesFolder = profilesFolder;
     this.nowFn = nowFn;
 
@@ -136,6 +142,7 @@ export class McRuntime {
     this._stopped = false;
     this._activeGoalCancel = null;
     this._prevHealth = null;
+    this._lastChatAtMs = -Infinity;
     this._milestoneCooldowns = new Map();
   }
 
@@ -1164,6 +1171,94 @@ export class McRuntime {
         summary,
         signs,
         rare_blocks: rare,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "chat") {
+      if (!this.config.mcAllowChat) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: "mc_chat_disabled",
+          summary: "MC公屏聊天未开启",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      const rawText = String(params.message ?? params.text ?? params.topic ?? "");
+      if (rawText.trim().startsWith("/")) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: "mc_command_forbidden",
+          summary: "禁止在公屏发送斜杠指令",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      const cleanMsg = sanitizeMcText(rawText, 120);
+      if (!cleanMsg) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: "empty_chat_message",
+          summary: "公屏消息为空",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (cleanMsg.startsWith("/")) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: "mc_command_forbidden",
+          summary: "禁止在公屏发送斜杠指令",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      const nowMs = this.nowFn();
+      if (this.chatCooldownMs > 0 && nowMs - this._lastChatAtMs < this.chatCooldownMs) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: "mc_chat_rate_limited",
+          summary: "公屏发言冷却中",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (typeof bot.chat !== "function") {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: "mc_chat_unavailable",
+          summary: "当前连接不支持公屏发言",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      bot.chat(cleanMsg);
+      this._lastChatAtMs = nowMs;
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : "原地待命";
+      this._emitSnapshot();
+      const summary = "公屏发言: " + cleanMsg.slice(0, 40);
+      this._emitMilestone("mc_goal_completed", "normal", { action_type: "chat", summary });
+      return {
+        ok: true,
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        summary,
+        message: cleanMsg,
         snapshot: this.getSnapshot(),
       };
     }

@@ -1936,6 +1936,12 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
       <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
     </form>
+    <form id="life-mc-chat-form" class="quick-bar">
+      <label for="life-mc-chat-msg">MC 公屏喊话 (chat)
+        <input id="life-mc-chat-msg" type="text" maxlength="120" placeholder="例如：大家好，我上线啦（不可发 / 指令）">
+      </label>
+      <button id="life-mc-chat-btn" type="submit" disabled>公屏喊话 (chat)</button>
+    </form>
   </div>
   <div class="card"><h2>模块动作</h2>
     <div id="minecraft-actions" class="module-tools"></div>
@@ -2947,7 +2953,7 @@ function logout(){
   $('overview-gcp-strip').replaceChildren();
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
-  for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','id-link-submit','id-merge-submit','pb-create-submit'])$(id).disabled=true;
+  for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','id-link-submit','id-merge-submit','pb-create-submit'])$(id).disabled=true;
   $('world-observation-card').hidden=true;
   ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','aff-history-table','life-stats','life-changes','life-batteries','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','sign-state','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
@@ -2962,7 +2968,7 @@ function logout(){
   if(timer)clearInterval(timer);
   $('session-dialog').close();session=null;
   $('token').focus();
-  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-cooldown-days','aff-cooldown-target','aff-viol-inj','aff-viol-blk','aff-viol-floor','aff-set-uid','aff-set-nickname','aff-search','sign-text','sign-cooldown','life-mc-topic','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
+  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-cooldown-days','aff-cooldown-target','aff-viol-inj','aff-viol-blk','aff-viol-floor','aff-set-uid','aff-set-nickname','aff-search','sign-text','sign-cooldown','life-mc-topic','life-mc-chat-msg','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
   $('pb-create-region').value='KR';
   $('aff-set-platform').value='onebot';$('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;$('aff-penalize-rl').checked=false;$('aff-penalize-poke').checked=false;$('aff-decouple-safety').checked=false;$('sign-enabled').checked=false;text('aff-history-scope','最近全局 50 条加密审计流水');
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
@@ -4626,9 +4632,10 @@ $('life-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
   const next=await api('life/rhythm','DELETE');
   renderRestHours(next.rest);renderLife(next.world);notice('已恢复默认作息与调度');
 }));
-async function sendMcGoal(actionType,topic=''){
+async function sendMcGoal(actionType,topic='',message=''){
   const body={action_type:actionType,view:'module'};
   if(topic)body.topic=topic;
+  if(message)body.message=message;
   const res=await api('life/mc/goal','POST',body);
   if(res.mc_status)renderMinecraft(res.mc_status);
   const summary=res?.result?.summary||res?.result?.reason||res?.status||'ok';
@@ -4641,6 +4648,16 @@ $('life-mc-form').addEventListener('submit',e=>{
     if(!topic)throw Error('请输入建造或活动目标');
     await sendMcGoal('build_plan',topic);
     $('life-mc-topic').value='';
+  });
+});
+$('life-mc-chat-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('life-mc-chat-btn'),async()=>{
+    const msg=$('life-mc-chat-msg').value.trim();
+    if(!msg)throw Error('请输入公屏发言内容');
+    if(msg.startsWith('/'))throw Error('禁止在公屏发送以 / 开头的斜杠指令');
+    await sendMcGoal('chat','',msg);
+    $('life-mc-chat-msg').value='';
   });
 });
 $('life-mc-status-btn').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('status')));
@@ -5197,7 +5214,7 @@ $('weather-detect').addEventListener('click',e=>busy(e.currentTarget,()=>lookupW
 for(const id of ['weather-lat','weather-lon'])$(id).addEventListener('input',previewCoordinates);
 $('weather-save').addEventListener('click',()=>persistWeatherPlace(false));
 $('weather-reset').addEventListener('click',()=>persistWeatherPlace(true));
-const mcControls=['life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
+const mcControls=['life-mc-build','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
 function renderMinecraft(mc){
   const fields=[
     ['境内连接',mc.bridge_ready?'桥接就绪':'未就绪'],['游戏连接',mc.connected?'游戏在线':'未进入游戏'],

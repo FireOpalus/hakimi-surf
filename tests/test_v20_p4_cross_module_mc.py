@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import re
@@ -20,9 +21,11 @@ from hakimi.bot_server import assemble_chat_input, prompt_context
 from hakimi.generation_policy import Scenario
 from hakimi.life_engine import LifeEngine, LifeEngineConfig
 from hakimi.modules.minecraft_slot import MinecraftSlotModule
+from hakimi.plugin_bus import RemoteModuleProxy
 from hakimi.prefix_runtime import StaticPrefixes
 from hakimi.security import Rejected
 from hakimi.service import Service
+from plugins.minecraft.plugin_main import MinecraftPlugin
 from tests.fakes import FakeBili, FakeGateway
 from tests.test_admin import TOKEN
 from tests.test_bili_watcher import BV, NAV, OTHER
@@ -861,6 +864,9 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(admin_fro
                 'id="life-mc-form"',
                 'id="life-mc-topic"',
                 'id="life-mc-build"',
+                'id="life-mc-chat-form"',
+                'id="life-mc-chat-msg"',
+                'id="life-mc-chat-btn"',
                 'id="life-mc-status-btn"',
                 'id="life-mc-idle"',
                 'id="life-mc-pause"',
@@ -880,6 +886,7 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(admin_fro
                 {"action_type": "goto", "host": "127.0.0.1"},
                 {"action_type": "goto", "x": True},
                 {"action_type": "build_plan", "topic": "x" * 81},
+                {"action_type": "chat", "message": "x" * 121},
             ):
                 assert (await client.post("/admin/api/life/mc/goal", json=bad)).status_code == 400
 
@@ -939,3 +946,161 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(admin_fro
             assert disc_res.status_code == 200
             assert disc_res.json()["status"] == "unavailable"
             assert disc_res.json()["result"]["reason"] == "node_disconnected"
+
+
+async def test_admin_mc_goal_chat_via_external_plugin(settings):
+    s = settings.model_copy(
+        update={
+            "admin_token": SecretStr(TOKEN),
+            "owner_qq_id": "20000",
+            "external_plugins": ["minecraft"],
+        }
+    )
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        bus = getattr(svc, "plugin_bus", None) or svc.modules.systems["plugin_bus"].plugin_bus
+        nt = FakeNodeTransport(is_connected=True)
+        nt.responses["mc.status"] = {
+            "connected": True,
+            "bridge_ready": True,
+            "mc_enabled": True,
+            "mc_configured": True,
+            "paused": False,
+            "snapshot": {"connected": True, "bridge_ready": True, "activity": "原地待命"},
+        }
+        nt.responses["mc.dispatch_goal"] = lambda params: {
+            "ok": True,
+            "accepted": True,
+            "bridge_ready": True,
+            "mc_enabled": True,
+            "mc_configured": True,
+            "paused": False,
+            "summary": f"公屏发言: {params.get('message', '')[:40]}",
+            "message": params.get("message", ""),
+            "snapshot": {"connected": True, "bridge_ready": True, "activity": "原地待命"},
+        }
+        svc.node_transport = nt
+
+        c2s: asyncio.Queue[str] = asyncio.Queue()
+        s2c: asyncio.Queue[str] = asyncio.Queue()
+        closed = False
+        server_task: asyncio.Task[None] | None = None
+
+        async def _server_recv() -> str:
+            item = await c2s.get()
+            if item.startswith("__EOF__:"):
+                raise ConnectionError(item)
+            return item
+
+        async def _server_send(raw: str) -> None:
+            if not closed:
+                await s2c.put(raw)
+
+        async def _close_both(code: int = 1000) -> None:
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            await s2c.put(f"__EOF__:{code}")
+            await c2s.put(f"__EOF__:{code}")
+
+        class _ClientEndpoint:
+            def __init__(self) -> None:
+                self.close_code: int | None = None
+
+            async def send(self, raw: str) -> None:
+                await c2s.put(raw)
+
+            async def recv(self) -> str:
+                item = await s2c.get()
+                if item.startswith("__EOF__:"):
+                    self.close_code = int(item.split(":", 1)[1])
+                    raise ConnectionError(item)
+                return item
+
+            async def close(self, code: int = 1000) -> None:
+                self.close_code = code
+                await _close_both(code)
+
+        def _connect(_url: str, _headers: dict[str, str]) -> _ClientEndpoint:
+            nonlocal server_task
+            server_task = asyncio.create_task(
+                bus.serve(
+                    _server_recv,
+                    _server_send,
+                    _close_both,
+                    source_ip="127.0.0.1",
+                    plugin_id="minecraft",
+                )
+            )
+            return _ClientEndpoint()
+
+        token, _ = await bus.create_plugin(
+            "minecraft", "Minecraft", ["actions", "sensors", "node_bridge"], node_region="CN"
+        )
+        plugin = MinecraftPlugin(
+            ws_url="ws://127.0.0.1:12141/ws/plugin",
+            token=token,
+            connect_factory=_connect,
+            reconnect_min=0.05,
+            reconnect_max=0.1,
+        )
+        await plugin.client.start()
+        try:
+            assert await plugin.client.wait_connected(timeout=2.0)
+            for _ in range(100):
+                mod = svc.modules.get("minecraft")
+                if isinstance(mod, RemoteModuleProxy) and mod.status_dict().get("bridge_ready"):
+                    break
+                await asyncio.sleep(0.01)
+            assert isinstance(svc.modules.get("minecraft"), RemoteModuleProxy)
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:12141",
+                headers={"Authorization": "Bearer " + TOKEN},
+            ) as client:
+                ok_res = await client.post(
+                    "/admin/api/life/mc/goal",
+                    json={
+                        "action_type": "chat",
+                        "message": "哈基米上线报道，公屏打字功能已就绪！",
+                        "view": "module",
+                    },
+                )
+                assert ok_res.status_code == 200
+                payload = ok_res.json()
+                assert payload["status"] == "ok"
+                assert payload["result"]["ok"] is True
+                assert nt.calls[-1] == (
+                    "mc.dispatch_goal",
+                    {"action_type": "chat", "message": "哈基米上线报道，公屏打字功能已就绪！"},
+                )
+
+                calls_before = len(nt.calls)
+                slash_res = await client.post(
+                    "/admin/api/life/mc/goal",
+                    json={"action_type": "chat", "message": "/op Geminy", "view": "module"},
+                )
+                assert slash_res.status_code == 200
+                slash_body = slash_res.json()
+                assert slash_body["status"] == "unavailable"
+                assert slash_body["result"]["ok"] is False
+                assert slash_body["result"]["reason"] == "invalid_action_arguments"
+                assert slash_body["result"]["artifacts"]["not_dispatched"] is True
+
+                empty_res = await client.post(
+                    "/admin/api/life/mc/goal",
+                    json={"action_type": "chat", "message": "   ", "view": "module"},
+                )
+                assert empty_res.status_code == 400
+                assert len(nt.calls) == calls_before
+        finally:
+            await plugin.client.stop()
+            await _close_both(1000)
+            if server_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(server_task, timeout=2.0)
+            await plugin.close()

@@ -596,6 +596,7 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
                 "gather",
                 "goto",
                 "follow",
+                "chat",
                 "observe",
                 "look_signs",
                 "stop",
@@ -613,6 +614,7 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
             "gather",
             "goto",
             "follow",
+            "chat",
             "observe",
             "look_signs",
             "stop",
@@ -709,6 +711,40 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         assert goal_res["ok"] is True
         assert set(nt.calls[-1][1]) == {"action_type", "x", "y", "z"}
 
+        # mc.chat action dispatch, non-effortful origins, and slash/empty validation guards
+        chat_spec = svc.modules.catalog.actions["mc.chat"]
+        assert chat_spec.effortful is False
+        assert "planner" in chat_spec.origins
+        assert "admin" in chat_spec.origins
+        chat_args = chat_spec.arguments.model_validate({"message": "大家好，我是哈基米！"})
+        chat_outcome = await chat_spec.run(
+            ActionCall({"origin": "planner", "target_scope": ""}, chat_args, NOW)
+        )
+        assert chat_outcome.status == "done"
+        assert nt.calls[-1] == (
+            "mc.dispatch_goal",
+            {"action_type": "chat", "message": "大家好，我是哈基米！"},
+        )
+
+        calls_before_reject = len(nt.calls)
+        slash_res = await plugin.dispatch_goal({"action_type": "chat", "message": "/op Geminy"})
+        assert slash_res["ok"] is False
+        assert slash_res["reason"] == "invalid_action_arguments"
+        assert slash_res["artifacts"]["not_dispatched"] is True
+
+        empty_res = await plugin.dispatch_goal({"action_type": "chat", "message": "   "})
+        assert empty_res["ok"] is False
+        assert empty_res["reason"] == "invalid_action_arguments"
+        assert empty_res["artifacts"]["not_dispatched"] is True
+
+        rpc_slash = await proxy.call_custom_rpc(
+            "mc.goal", {"action_type": "chat", "message": " /gamemode creative"}
+        )
+        assert rpc_slash["ok"] is False
+        assert rpc_slash["reason"] == "invalid_action_arguments"
+        assert rpc_slash["artifacts"]["not_dispatched"] is True
+        assert len(nt.calls) == calls_before_reject
+
         # Admin pause & resume keep active_task=explore intact when resumed
         pause_spec = svc.modules.catalog.actions["mc.pause"]
         pause_out = await pause_spec.run(
@@ -789,7 +825,7 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         await plugin.client.stop()
         await pipe.shutdown()
 
-    # Hot disconnect cleanup removes proxy, all 13 actions, and aliases cleanly
+    # Hot disconnect cleanup removes proxy, all 14 actions, and aliases cleanly
     await _wait_until(lambda: svc.modules.get("minecraft") is None)
     assert not any(name.startswith("mc.") for name in svc.modules.catalog.actions)
     assert not any(

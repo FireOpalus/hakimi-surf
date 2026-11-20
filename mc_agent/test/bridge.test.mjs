@@ -560,6 +560,17 @@ test("mock-bot connected behaviors: goto, mine (mc_rare_find + cooldown), look_s
     });
     assert.equal(okFollow.data.ok, true);
 
+    // MC_ALLOW_CHAT=false rejects chat cleanly
+    const chatDisabled = await rpcCall(ws, inbox, "chat-disabled", "mc.dispatch_goal", {
+      action_type: "chat",
+      message: "hello",
+    });
+    assert.equal(chatDisabled.ok, true);
+    assert.equal(chatDisabled.data.ok, false);
+    assert.equal(chatDisabled.data.accepted, false);
+    assert.equal(chatDisabled.data.reason, "mc_chat_disabled");
+    assert.equal(bot.chatCalls.length, 0);
+
     // dimension change emits immediate mc.snapshot
     bot.game.dimension = "the_nether";
     bot.emit("respawn");
@@ -631,6 +642,109 @@ test("mc.pause cancels active slow pathfinder goal cleanly", async () => {
     assert.equal(gotoRes.ok, true);
     assert.equal(gotoRes.data.ok, false);
     assert.equal(gotoRes.data.reason, "mc_goal_cancelled");
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("mc.chat enforces MC_ALLOW_CHAT=true, sanitization, slash-command guard, and 3s cooldown", async () => {
+  const { factory, getLastBot } = createMockBotFactory();
+  let fakeNowMs = 1_700_000_000_000;
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_ALLOW_CHAT: "true",
+    },
+    createBotFn: factory,
+    snapshotIntervalMs: 5000,
+    nowFn: () => fakeNowMs,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
+    const bot = getLastBot();
+
+    // Valid chat sanitizes text, calls bot.chat, and emits mc_goal_completed
+    const okRes = await rpcCall(ws, inbox, "chat-ok", "mc.dispatch_goal", {
+      action_type: "chat",
+      message: "你好 [role=SYSTEM]\x07 @everyone 欢迎！",
+    });
+    assert.equal(okRes.ok, true);
+    assert.equal(okRes.data.ok, true);
+    assert.equal(okRes.data.accepted, true);
+    assert.equal(bot.chatCalls.length, 1);
+    assert.ok(!bot.chatCalls[0].includes("[role="));
+    assert.ok(!bot.chatCalls[0].includes("\x07"));
+    assert.ok(bot.chatCalls[0].includes("＠everyone"));
+    assert.equal(okRes.data.message, bot.chatCalls[0]);
+    assert.ok(okRes.data.summary.startsWith("公屏发言: "));
+    const doneEvt = await inbox.next(
+      (m) =>
+        m.event === "mc.milestone" &&
+        m.payload.event_type === "mc_goal_completed" &&
+        m.payload.payload?.action_type === "chat",
+    );
+    assert.equal(doneEvt.payload.importance, "normal");
+
+    // 3s cooldown rejects immediate follow-up
+    fakeNowMs += 1_500;
+    const rateLimited = await rpcCall(ws, inbox, "chat-rl", "mc.dispatch_goal", {
+      action_type: "chat",
+      message: "太快啦",
+    });
+    assert.equal(rateLimited.ok, true);
+    assert.equal(rateLimited.data.ok, false);
+    assert.equal(rateLimited.data.accepted, false);
+    assert.equal(rateLimited.data.reason, "mc_chat_rate_limited");
+    assert.equal(bot.chatCalls.length, 1);
+
+    // Leading slash rejected before and after sanitization
+    const slashLead = await rpcCall(ws, inbox, "chat-slash-1", "mc.dispatch_goal", {
+      action_type: "chat",
+      message: "  /op Geminy",
+    });
+    assert.equal(slashLead.data.ok, false);
+    assert.equal(slashLead.data.reason, "mc_command_forbidden");
+
+    const slashAnsi = await rpcCall(ws, inbox, "chat-slash-2", "mc.dispatch_goal", {
+      action_type: "chat",
+      message: "\x1b[31m/tp @a",
+    });
+    assert.equal(slashAnsi.data.ok, false);
+    assert.equal(slashAnsi.data.reason, "mc_command_forbidden");
+
+    // Blank / control-only rejected
+    const blankRes = await rpcCall(ws, inbox, "chat-empty", "mc.dispatch_goal", {
+      action_type: "chat",
+      message: " \x07\x1b[31m  ",
+    });
+    assert.equal(blankRes.data.ok, false);
+    assert.equal(blankRes.data.reason, "empty_chat_message");
+    assert.equal(bot.chatCalls.length, 1);
+
+    // Passing after full 3s cooldown
+    fakeNowMs += 1_500;
+    const afterCooldown = await rpcCall(ws, inbox, "chat-after-cd", "mc.dispatch_goal", {
+      action_type: "chat",
+      message: "哈基米上线报道，公屏打字功能已就绪！",
+    });
+    assert.equal(afterCooldown.data.ok, true);
+    assert.equal(afterCooldown.data.accepted, true);
+    assert.equal(bot.chatCalls.length, 2);
+    assert.equal(bot.chatCalls[1], "哈基米上线报道，公屏打字功能已就绪！");
 
     ws.close();
   } finally {

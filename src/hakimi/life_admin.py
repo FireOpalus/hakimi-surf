@@ -122,6 +122,7 @@ class MinecraftAdminGoalRequest(BaseModel):
         "mine",
         "goto",
         "build_plan",
+        "chat",
         "look_signs",
         "stop",
         "idle",
@@ -130,11 +131,12 @@ class MinecraftAdminGoalRequest(BaseModel):
     ]
     topic: str = Field(default="", max_length=80)
     block_type: str = Field(default="", max_length=48)
+    message: str = Field(default="", max_length=120)
     x: float | None = None
     y: float | None = None
     z: float | None = None
 
-    @field_validator("topic", "block_type")
+    @field_validator("topic", "block_type", "message")
     @classmethod
     def _strip_text(cls, value: str) -> str:
         return value.strip()

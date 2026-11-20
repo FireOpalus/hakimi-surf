@@ -454,7 +454,8 @@ async def test_minecraft_hotplug_via_real_ws_plugin_node_bridge_and_world_reacti
             assert detail["status"]["bridge_ready"] is True
             assert detail["status"]["connected"] is True
             assert detail["status"]["dimension"] == "overworld"
-            assert len(detail["actions"]) == 13
+            assert len(detail["actions"]) == 14
+            assert "mc.chat" in {a["name"] for a in detail["actions"]}
 
             goal_res = await client.post(
                 "/admin/api/life/mc/goal",
