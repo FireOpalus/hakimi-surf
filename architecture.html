@@ -4,272 +4,383 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="hakimi-surf v2.1.0 源码架构图：境内与境外双 WebSocket、独立管理服务、QQ 回复、生活引擎、B 站与 Minecraft 事件、会话记忆和备份边界。">
-  <title>hakimi-surf v2.1.0 · 架构图</title>
+  <meta name="description" content="Hakimi Surf v2.1.0 模块架构图。查看四个平台插件、九个常驻系统模块，以及动作、事件与跨日待办如何连接世界引擎。">
+  <title>万物皆模块 · Hakimi Surf 项目架构图</title>
   <style>
     :root {
-      color-scheme: light dark;
-      --bg:#f6f7f4; --paper:#fff; --ink:#192d35; --muted:#495e68; --line:#cdd9dc;
-      --sea:#076467; --sea-bg:#e5f5ef; --blue:#254d96; --blue-bg:#edf2fd;
-      --plum:#684187; --plum-bg:#f3edf8; --amber:#84510d; --amber-bg:#fcf2df;
-      --hero:#143741; --hero-ink:#f6fff9; --hero-muted:#c6dfda;
-      --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+      color-scheme: light;
+      --paper: #f6f4ed;
+      --sheet: #fffef9;
+      --ink: #182f33;
+      --muted: #4e6262;
+      --rule: #c2cdc6;
+      --wire: #718880;
+      --grid: #dce2d9;
+      --platform: #00604e;
+      --platform-bg: #e2f2e9;
+      --system: #85401e;
+      --system-bg: #f9ece1;
+      --kernel: #203f43;
+      --on-kernel: #f5f8f2;
+      --on-kernel-muted: #cbdcd5;
+      --mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
-    @media (prefers-color-scheme:dark) {
-      :root { --bg:#101a1d; --paper:#17272c; --ink:#e1eeec; --muted:#b0c4c7; --line:#3e555a;
-        --sea:#8adaca; --sea-bg:#183934; --blue:#adc8ff; --blue-bg:#20334e;
-        --plum:#dfb7f4; --plum-bg:#382d41; --amber:#f4ca87; --amber-bg:#3a3121;
-        --hero:#13323b; --hero-ink:#effff8; --hero-muted:#c6dfda; }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --paper: #122120;
+        --sheet: #1b2a2a;
+        --ink: #eef3ed;
+        --muted: #bdcdc4;
+        --rule: #445954;
+        --wire: #95aaa0;
+        --grid: #31443e;
+        --platform: #95e4c7;
+        --platform-bg: #193a31;
+        --system: #ffc199;
+        --system-bg: #3c2d24;
+        --kernel: #27494b;
+      }
     }
-    * { box-sizing:border-box; }
-    body { margin:0; background:var(--bg); color:var(--ink); font:1rem/1.65 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
-    main { max-width:80rem; margin:auto; padding:1.2rem clamp(.85rem,3.6vw,3.5rem) 2.5rem; }
-    a { color:var(--blue); text-underline-offset:.22em; }
-    a:hover { text-decoration-thickness:2px; }
-    :focus-visible { outline:3px solid var(--blue); outline-offset:4px; }
-    :target { scroll-margin-block-start:1.4rem; }
-    code,.kicker,.release,.step,.wire,.ref b,.path,.num { font-family:var(--mono); }
-    code { overflow-wrap:anywhere; font-size:.91em; }
-    h1,h2,h3,h4,p,figure,dl,dd { margin:0; }
-    h1,h2,h3,h4 { line-height:1.3; }
-    h1 { font-size:clamp(2.2rem,5.8vw,4.1rem); letter-spacing:-.045em; }
-    h2 { font-size:clamp(1.48rem,3.2vw,2.15rem); letter-spacing:-.025em; }
-    h3 { font-size:1.14rem; } h4 { font-size:1rem; }
-    ul { margin:.45rem 0 0; padding-inline-start:1.15rem; } li+li { margin-top:.3rem; }
-    .skip { position:absolute; left:.6rem; top:-5rem; background:var(--paper); padding:.5rem .9rem; z-index:2; }
-    .skip:focus { top:.5rem; }
-    .mast,.end { display:flex; flex-wrap:wrap; justify-content:space-between; gap:.5rem; align-items:center; }
-    .mast { margin-bottom:.8rem; } .mast strong { letter-spacing:-.03em; }
-    .release { color:var(--sea); font-size:.82rem; }
-    .hero { background:var(--hero); color:var(--hero-ink); padding:clamp(1.4rem,4vw,3rem); border-radius:1.1rem; }
-    .hero .kicker { color:var(--hero-muted); } .hero p { max-width:54rem; color:var(--hero-muted); margin-top:1rem; }
-    .kicker,.step { font-size:.78rem; font-weight:700; letter-spacing:.06em; }
-    .kicker { display:block; margin-bottom:.55rem; color:var(--sea); }
-    .index { display:flex; flex-wrap:wrap; gap:.4rem .55rem; padding:1rem 0 .4rem; }
-    .index a { padding:.27rem .72rem; border:1px solid var(--line); border-radius:2rem; text-decoration:none; color:var(--ink); background:var(--paper); font-size:.91rem; }
-    .index a:hover,.index a:focus-visible { color:var(--sea); border-color:var(--sea); }
-    .chapter { margin:clamp(2.2rem,5vw,3.9rem) 0 0; }
-    .heading { display:flex; align-items:baseline; gap:.7rem; margin-bottom:.35rem; }
-    .num { color:var(--sea); font-size:1rem; font-weight:750; }
-    .intro { margin:0 0 1.1rem; max-width:62rem; color:var(--muted); }
-    .sheet,.note,details { background:var(--paper); border:1px solid var(--line); border-radius:.85rem; }
-    .sheet { padding:clamp(.9rem,2.5vw,1.65rem); }
-    figure+figure,.sheet+.note,.sheet+.grid,.sheet+details,.grid+.note,.grid+details,details+details,.note+details { margin-top:.85rem; }
-    .caption,.ref,.end,.micro { color:var(--muted); font-size:.87rem; }
-    .caption { padding-top:.85rem; } .ref { border-top:1px solid var(--line); padding-top:.65rem; margin-top:.85rem; }
-    .ref b { color:var(--ink); margin-right:.4rem; } .ref a { display:inline-block; margin-right:.7rem; }
-    .grid { display:grid; gap:.8rem; } .two { grid-template-columns:repeat(2,minmax(0,1fr)); }
-    .three { grid-template-columns:repeat(3,minmax(0,1fr)); }
-    .tile,.note { min-width:0; padding:.95rem 1rem; }
-    .tile { background:var(--paper); border:1px solid var(--line); border-top:.23rem solid var(--tone,var(--sea)); border-radius:.55rem; }
-    .tile p,.note p,.flow p,.kv dd,.row p { margin-top:.37rem; font-size:.94rem; color:var(--muted); }
-    .sea { --tone:var(--sea); --wash:var(--sea-bg); } .blue { --tone:var(--blue); --wash:var(--blue-bg); }
-    .plum { --tone:var(--plum); --wash:var(--plum-bg); } .amber { --tone:var(--amber); --wash:var(--amber-bg); }
-    .step { display:block; color:var(--tone,var(--sea)); margin-bottom:.4rem; }
-    .lanes { display:grid; gap:.65rem; }
-    .lane { display:grid; grid-template-columns:minmax(0,1fr) minmax(8.8rem,.72fr) minmax(0,1fr); gap:.6rem; align-items:stretch; }
-    .lane .tile { border:1px solid var(--line); border-inline-start:.25rem solid var(--tone); }
-    .wire { position:relative; align-self:center; text-align:center; color:var(--tone); font-weight:700; font-size:.82rem; padding:.3rem .15rem; overflow-wrap:anywhere; }
-    .wire::after { content:'⟷'; display:block; font:1.6rem/1 system-ui,sans-serif; }
-    .wire small { display:block; color:var(--muted); font:normal .82rem/1.5 system-ui,sans-serif; }
-    .bridge { margin-top:.7rem; border:1px dashed var(--line); background:var(--bg); border-radius:.5rem; padding:.7rem .9rem; }
-    .flow { display:grid; grid-template-columns:repeat(var(--n,3),minmax(0,1fr)); list-style:none; gap:1.6rem; padding:0; margin:0; }
-    .flow li { position:relative; margin:0; min-width:0; padding:.8rem; background:var(--wash,var(--sea-bg)); border-radius:.5rem; }
-    .flow li:not(:last-child)::after { content:'→'; position:absolute; inset-inline-end:-1.27rem; top:40%; color:var(--tone,var(--sea)); font-weight:bold; }
-    .return { margin:.8rem 0 0; padding:.55rem .8rem; border-inline-start:.23rem solid var(--tone,var(--sea)); background:var(--bg); font-size:.93rem; }
-    .kv { display:grid; gap:0; } .kv>div { display:grid; grid-template-columns:minmax(9rem,.75fr) minmax(0,2.2fr); gap:1rem; padding:.64rem 0; }
-    .kv>div+div,.row+.row { border-top:1px solid var(--line); } .kv dt { font-weight:700; } .kv dd { margin:0; }
-    .row { padding:.8rem 0; } .row:first-child { padding-top:0; } .row:last-child { padding-bottom:0; }
-    details { padding:0 .95rem; } summary { cursor:pointer; padding:.7rem 0; font-weight:650; color:var(--blue); } details[open]>:last-child { margin-bottom:.8rem; }
-    .end { margin-top:2.4rem; padding-top:.85rem; border-top:1px solid var(--line); }
-    @media (max-width:760px) { .two,.three { grid-template-columns:1fr; } .flow { grid-template-columns:1fr; gap:1.35rem; }
-      .flow li:not(:last-child)::after { content:'↓'; left:1rem; top:auto; bottom:-1.3rem; } }
-    @media (max-width:560px) { .two,.lane,.kv>div { grid-template-columns:1fr; } .kv>div,.lane { gap:.22rem; }
-      .wire { padding:0 .2rem; text-align:start; } .wire::after { content:'↕'; display:inline; margin-left:.45rem; font-size:1rem; } .wire small { display:inline; margin-left:.4rem; }
-      .lane+.lane { border-top:1px solid var(--line); padding-top:.65rem; } .index { gap:.4rem; } }
-    @media print { :root { color-scheme:light; --bg:white; --paper:white; --ink:#142329; --muted:#34464b; --line:#aab5b6; }
-      body { font-size:10pt; } main,.hero { padding:0; } .hero,.hero p,.hero .kicker { background:none; color:var(--ink); }
-      .skip,.index,.end a { display:none; } .chapter { margin-top:1.2rem; } .tile,.row,.kv>div,.flow li { break-inside:avoid; } h2,h3,summary { break-after:avoid; } }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 1rem/1.65 var(--sans);
+      overflow-wrap: anywhere;
+    }
+    main, footer, .mast { width: min(80rem, calc(100% - 3rem)); margin-inline: auto; }
+    h1, h2, h3, h4, p, figure, ul, ol, dl, dd { margin: 0; }
+    ul, ol { padding: 0; }
+    code, .mono { font-family: var(--mono); font-size: .92em; }
+    h1, h2, h3, h4 { line-height: 1.25; text-wrap: balance; }
+    h2 { font-size: clamp(1.4rem, 2.5vw, 2rem); letter-spacing: -.035em; }
+    h3 { font-size: 1.08rem; }
+    a { color: inherit; text-underline-offset: .22em; text-decoration-thickness: 1px; }
+    a:hover { text-decoration-thickness: 2px; }
+    a:focus-visible { outline: 3px solid currentColor; outline-offset: 3px; }
+    :target { scroll-margin-block-start: 1rem; }
+    .skip { position: absolute; left: .75rem; top: .5rem; transform: translateY(-170%); z-index: 2; background: var(--sheet); padding: .4rem 1rem; }
+    .skip:focus { transform: none; }
+    .mast {
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;
+      gap: .65rem 1.5rem; border-bottom: 1px solid var(--rule); padding-block: 1rem;
+      font-size: .81rem;
+    }
+    .brand, .mast nav { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem 1.15rem; }
+    .brand strong { font: 700 1rem var(--mono); letter-spacing: -.035em; }
+    .brand small { color: var(--muted); font: .78rem var(--mono); }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { text-decoration: underline; color: var(--ink); }
+    .hero {
+      display: grid; grid-template-columns: 1.25fr 1fr; align-items: end;
+      gap: 1.25rem 3rem; padding-block: clamp(2rem, 4vw, 3.7rem) 1.8rem;
+    }
+    .hero h1 { font-size: clamp(3rem, 6.8vw, 5.8rem); letter-spacing: -.075em; line-height: 1.12; }
+    .hero h1 span { color: var(--platform); }
+    .hero p { margin-top: .75rem; max-width: 36rem; color: var(--muted); }
+    .repo-chain { border-left: 2px solid var(--rule); padding: .2rem 0 .2rem 1.1rem; }
+    .repo-chain h2 { font-size: .83rem; letter-spacing: 0; }
+    .repo-chain ol { display: flex; align-items: baseline; flex-wrap: wrap; gap: .2rem .55rem; margin-top: .5rem; list-style: none; }
+    .repo-chain li { font: .8rem/1.7 var(--mono); }
+    .repo-chain li + li::before { content: "→"; margin-right: .55rem; color: var(--wire); }
+    .repo-chain small { display: block; margin-top: .35rem; color: var(--muted); font-size: .78rem; }
+    .atlas {
+      padding: clamp(1rem, 2.5vw, 2rem); border: 1px solid var(--rule); border-radius: 1rem;
+      background-color: var(--sheet);
+      background-image: radial-gradient(var(--grid) .85px, transparent .85px);
+      background-size: .8rem .8rem;
+    }
+    .fig-head, .section-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .45rem 1.3rem; }
+    .fig-head { margin-bottom: 1.25rem; }
+    .fig-head small, .section-head p, figcaption, .refs, footer { font-size: .8rem; color: var(--muted); }
+    .banks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; }
+    .bank { position: relative; min-width: 0; border: 1px solid var(--rule); border-top: 3px solid; border-radius: .5rem; padding: 1.1rem; background: var(--sheet); }
+    .bank.platform { border-top-color: var(--platform); }
+    .bank.resident { border-top-color: var(--system); }
+    .bank header { display: flex; align-items: baseline; flex-wrap: wrap; gap: .5rem; }
+    .bank header code { margin-left: auto; font-size: .72rem; color: var(--muted); }
+    .bank h3 { font-size: 1.15rem; }
+    .bank > p { font-size: .85rem; margin: .4rem 0 .95rem; color: var(--muted); }
+    .platform h3, .platform .action { color: var(--platform); }
+    .resident h3, .deps a { color: var(--system); }
+    .platform-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .55rem; list-style: none; }
+    .platform-list li { min-width: 0; background: var(--platform-bg); border-radius: .3rem; padding: .55rem .7rem; }
+    .platform-list strong, .platform-list .action { display: block; }
+    .platform-list strong { font-size: .94rem; }
+    .platform-list code { font-size: .76rem; }
+    .deps { display: grid; gap: .42rem; }
+    .deps > div { display: grid; grid-template-columns: minmax(0, 1fr) 1.1rem minmax(0, 1.35fr); align-items: center; gap: .42rem; padding: .53rem .6rem; background: var(--system-bg); border-radius: .3rem; font-size: .8rem; }
+    .deps dt { font-weight: 650; }
+    .deps a { text-decoration-color: currentColor; }
+    .arrow { text-align: center; color: var(--system); font-family: var(--mono); }
+    .deps dd { display: flex; flex-wrap: wrap; align-items: baseline; gap: .05rem .65rem; }
+    .deps dt, .deps dd { grid-row: 1; }
+    .deps dt { grid-column: 1 / 3; display: flex; align-items: center; justify-content: space-between; gap: .35rem; }
+    .deps dd { grid-column: 3; }
+    .merge { height: 2.35rem; position: relative; }
+    .merge::before {
+      content: ""; position: absolute; left: calc(25% - .38rem); right: calc(25% - .38rem); height: 46%;
+      border: solid var(--wire); border-width: 0 1px 1px; border-radius: 0 0 5px 5px;
+    }
+    .merge::after { content: ""; position: absolute; left: 50%; top: 46%; bottom: 0; border-left: 1px solid var(--wire); }
+    .pin { position: absolute; z-index: 1; left: 50%; bottom: -.22rem; width: .45rem; height: .45rem; transform: translateX(-50%); border: 1.5px solid var(--wire); border-radius: 50%; background: var(--sheet); }
+    .hub {
+      display: grid; grid-template-columns: 1fr 1.55fr; align-items: center; gap: .75rem 1.5rem;
+      padding: 1rem clamp(1rem, 2.4vw, 2rem); border-radius: .5rem; background: var(--kernel);
+      color: var(--on-kernel); box-shadow: inset 0 0 0 1px #ffffff20;
+    }
+    .hub h3 { font: 650 clamp(1.25rem, 2.5vw, 2rem)/1.2 var(--mono); letter-spacing: -.055em; }
+    .hub .label { display: block; color: var(--on-kernel-muted); font-size: .74rem; margin-bottom: .25rem; }
+    .hub p { padding-left: 1.15rem; border-left: 1px solid #a5c4ba80; font-size: .88rem; }
+    .outlets { position: relative; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; padding-top: 2.35rem; }
+    .outlets::before {
+      content: ""; position: absolute; left: calc(16.6667% - .33rem); right: calc(16.6667% - .33rem); top: 1.1rem;
+      height: 1.25rem; border: solid var(--wire); border-width: 1px 1px 0; border-radius: 5px 5px 0 0;
+    }
+    .outlets::after { content: ""; position: absolute; left: 50%; top: 0; height: 2.35rem; border-left: 1px solid var(--wire); }
+    .outlet { min-width: 0; border: 1px solid var(--rule); border-radius: .35rem; background: var(--sheet); padding: .8rem 1rem; }
+    .outlet h4 { display: flex; justify-content: space-between; gap: .35rem .6rem; flex-wrap: wrap; font-size: 1rem; }
+    .outlet h4 code { font-size: .72rem; color: var(--muted); font-weight: 500; }
+    .outlet p { font-size: .84rem; color: var(--muted); margin-top: .35rem; }
+    figcaption { margin-top: 1rem; }
+    .refs { display: flex; align-items: baseline; flex-wrap: wrap; gap: .3rem 1rem; }
+    .chapter { margin-block-start: clamp(2.3rem, 5vw, 4.5rem); }
+    .section-head { padding-bottom: .75rem; border-bottom: 2px solid var(--ink); margin-bottom: 1rem; }
+    .contracts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.15rem; }
+    .contracts article { padding: .5rem 1rem .2rem 0; }
+    .contracts article + article { border-left: 1px solid var(--rule); padding-left: 1.25rem; }
+    .contract-name { display: block; font: 650 .85rem/1.4 var(--mono); margin-bottom: .45rem; color: var(--platform); }
+    .contracts p, .companion p, .lane p, .notes dd { font-size: .88rem; color: var(--muted); }
+    .contracts p { margin: .45rem 0 .55rem; }
+    .trace {
+      margin-top: 1.4rem; padding: clamp(1rem, 2.3vw, 1.7rem);
+      color: #f5f8f3; background: #193639; border-radius: .75rem;
+    }
+    .trace > h3, .companion > h3 { font-size: clamp(1.08rem, 2vw, 1.4rem); }
+    .route { --route-gap: 1.5rem; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--route-gap); list-style: none; margin: 1.15rem 0 .65rem; }
+    .route > li { position: relative; min-width: 0; padding: .75rem .85rem; border: 1px solid #60847c; border-radius: .35rem; background: #214247; }
+    .route > li:not(:last-child)::after { content: "→"; position: absolute; top: calc(50% - .8rem); left: 100%; width: var(--route-gap); text-align: center; color: #b6d8ca; }
+    .route strong, .route small { display: block; }
+    .route strong { font-size: .97rem; }
+    .route code { font-size: .75rem; color: #a8ebd4; }
+    .route small { color: #d4e4dd; font-size: .79rem; margin-top: .4rem; }
+    .trace figcaption { color: #cfdfd8; }
+    .trace .refs { color: #c0d8ce; margin-top: .6rem; }
+    .companion { padding: 1.2rem 1.4rem; margin-top: 1rem; border: 1px solid var(--rule); border-left: 4px solid var(--system); border-radius: .4rem; background: var(--sheet); }
+    .companion .speech-flow { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .65rem; color: var(--system); margin: .75rem 0; font-size: .88rem; }
+    .speech-flow b { background: var(--system-bg); padding: .22rem .55rem; border-radius: .25rem; }
+    .companion .refs { margin-top: .55rem; }
+    .lanes { border-block-end: 1px solid var(--rule); }
+    .lane { display: grid; grid-template-columns: 1fr minmax(7rem,.68fr) 1.65fr; gap: .7rem 1.2rem; align-items: center; padding: .75rem .8rem; border-top: 1px solid var(--rule); }
+    .lane:nth-child(odd) { background: var(--sheet); }
+    .lane h3 { font-size: 1rem; }
+    .lane strong { font-size: .92rem; }
+    .lane code { font-size: .79rem; }
+    .link-label { font: .76rem/1.35 var(--mono); color: var(--platform); }
+    .link-label::after { content: " →"; }
+    .lanes + .refs { margin-top: .7rem; }
+    .pipeline { list-style: none; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; margin-block: 1rem; }
+    .pipeline li { border-top: 3px solid var(--platform); padding: .7rem .75rem .75rem; background: var(--sheet); }
+    .pipeline h3 { font-size: 1rem; }
+    .pipeline p { font-size: .85rem; color: var(--muted); margin-top: .35rem; }
+    .notes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 1.8rem; }
+    .notes > div { border-top: 1px solid var(--rule); padding: .7rem 0; }
+    .notes dt { font-weight: 680; font-size: .95rem; }
+    .notes dd { margin-top: .25rem; }
+    .footrefs { margin-top: 1rem; }
+    footer { padding-block: 1rem 2rem; margin-top: 2.5rem; border-top: 1px solid var(--rule); display: flex; justify-content: space-between; flex-wrap: wrap; gap: .5rem 1rem; }
+    @media (max-width: 56rem) {
+      .hero { grid-template-columns: 1.15fr 1fr; gap: 1.25rem; }
+      .banks { gap: 1rem; }
+      .merge::before { left: calc(25% - .25rem); right: calc(25% - .25rem); }
+      .bank { padding: .85rem; }
+      .bank header code, .outlet h4 code { display: block; width: 100%; margin: 0; }
+      .deps > div { grid-template-columns: minmax(0,1fr) .8rem minmax(0,1.2fr); }
+      .route { --route-gap: 1.1rem; }
+    }
+    @media (max-width: 44rem) {
+      main, footer, .mast { width: calc(100% - 1.75rem); }
+      .hero, .banks, .hub, .contracts, .route, .notes { grid-template-columns: minmax(0,1fr); }
+      .hero { padding-top: 1.8rem; }
+      .repo-chain { margin-top: .2rem; }
+      .fig-head small { width: 100%; }
+      .banks, .outlets { padding-left: .85rem; border-left: 1px solid var(--wire); }
+      .banks { gap: .8rem; }
+      .bank header code { width: auto; margin-left: auto; }
+      .bank::before, .outlet::before { content: ""; position: absolute; top: 50%; right: 100%; width: .85rem; border-top: 1px solid var(--wire); }
+      .pin { display: none; }
+      .merge { height: .8rem; border-left: 1px solid var(--wire); }
+      .merge::before, .merge::after, .outlets::before, .outlets::after { display: none; }
+      .hub p { border: 0; padding: 0; }
+      .outlets { grid-template-columns: 1fr; gap: .55rem; padding-top: .8rem; }
+      .outlet { position: relative; }
+      .outlet h4 code { width: auto; }
+      .contracts { gap: 0; }
+      .contracts article, .contracts article + article { border: 0; border-bottom: 1px solid var(--rule); padding: .8rem 0; }
+      .contract-name { margin: 0 0 .25rem; }
+      .route { --route-gap: 1.35rem; }
+      .route > li:not(:last-child)::after { content: "↓"; top: 100%; left: 1rem; height: var(--route-gap); line-height: var(--route-gap); }
+      .companion { padding: 1rem; }
+      .lane { grid-template-columns: minmax(0,1fr); gap: .25rem; padding: .85rem; }
+      .link-label::after { content: " ↓"; }
+      .pipeline { grid-template-columns: repeat(2, minmax(0,1fr)); gap: .6rem; }
+    }
+    @media (max-width: 24rem) {
+      .platform-list, .pipeline { grid-template-columns: minmax(0,1fr); }
+      .bank header code { width: 100%; margin: 0; }
+    }
+    @media print {
+      :root { color-scheme: light; --paper: white; --sheet: white; --ink: #172d31; --muted: #354c4a; --platform: #005a49; --system: #773719; --rule: #a6b2ae; --platform-bg: #eaf3ee; --system-bg: #faf0e7; }
+      body { font-size: 10pt; print-color-adjust: exact; }
+      main, footer, .mast { width: 100%; }
+      .mast nav, .skip, footer > a { display: none; }
+      .hero { padding: 1rem 0; }
+      .hero h1 { font-size: 30pt; }
+      .atlas { background-image: none; }
+      .chapter { margin-top: 1.4rem; }
+      .atlas, .trace, .companion, .lane, .notes > div { break-inside: avoid; }
+      .section-head { break-after: avoid; }
+    }
   </style>
 </head>
 <body>
-  <a class="skip" href="#overview">跳到部署总图</a>
-  <main id="top">
-    <header>
-      <div class="mast"><strong>hakimi-surf</strong><span class="release">v2.1.0 · 2026-11-18 · 源码架构图</span></div>
-      <div class="hero">
-        <span class="kicker">01 境内 / 02 境外</span>
-        <h1>哈基米怎样回复，又怎样主动行动？</h1>
-        <p>QQ 消息从境内进入，境外负责判断、记忆与投递。生活引擎则从世界状态出发，先记下可过期的行动意图，到点才决定是否开口或执行游戏目标。两条路径共用模块状态，但各有自己的连接、权限和完成凭证。</p>
+  <a class="skip" href="#overview">跳至模块总图</a>
+  <header class="mast" id="top">
+    <div class="brand"><strong>Hakimi Surf</strong><small>v2.1.0</small></div>
+    <nav aria-label="架构图导航">
+      <a href="#overview">模块总图</a><a href="#fieldwork">跨模块协作</a><a href="#deployment">部署边界</a><a href="#pipeline">对话与记忆</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <div>
+        <h1>万物皆<span>模块</span></h1>
+        <p>从一次群聊回复到一份建造计划，具体能力由模块提供。引擎负责决定何时执行、允许使用哪些数据，以及怎样记录结果。</p>
       </div>
-      <nav class="index" aria-label="图中章节">
-        <a href="#overview">01 跨机拓扑</a><a href="#life">02 生活引擎</a><a href="#fieldwork">03 B 站与 Minecraft</a>
-        <a href="#pipeline">04 QQ 消息流</a><a href="#memory">05 记忆与备份</a><a href="#controls">06 后台与账本</a>
-      </nav>
-    </header>
-
-    <section class="chapter" id="overview" aria-labelledby="overview-title">
-      <div class="heading"><span class="num">01</span><h2 id="overview-title">境内双连接与境外独立管理后台</h2></div>
-      <p class="intro">境内的 NapCat 和执行节点主动连接境外引擎。管理员通过 SSH 进入独立后台，页面发布期间两条 WebSocket 继续由引擎持有。</p>
-      <figure class="sheet" aria-labelledby="overview-title">
-        <div class="lanes">
-          <div class="lane sea">
-            <div class="tile"><span class="step">境内 · QQ 协议端</span><h3>QQ ⇄ NapCat</h3><p>接收入站事件；按 OneBot 动作发送气泡、回传消息 ID 或图片。WebUI 仅绑定 <code>127.0.0.1:6099</code>。</p></div>
-            <div class="wire">/ws/onebot/&lt;后缀&gt;<small>WSS · 事件 / 动作 / 回执</small></div>
-            <div class="tile"><span class="step">境外 · 反向 WS</span><h3>Nginx → WebSocketTransport</h3><p>握手核验路径、Bearer 与机器人身份。<code>Service</code> 处理消息，<code>Sender</code> 使用同一链路回发。</p></div>
-          </div>
-          <div class="lane blue">
-            <div class="tile"><span class="step">境内 · 执行节点</span><h3>node_agent</h3><p>Python 守护进程执行白名单 B 站请求，并通过私网桥连接 Minecraft。节点不持有境外的会话库。</p></div>
-            <div class="wire">/ws/node/&lt;后缀&gt;<small>WSS · RPC / 快照 / 里程碑</small></div>
-            <div class="tile"><span class="step">境外 · 节点 WS</span><h3>Nginx → NodeTransport</h3><p>单独的节点令牌、<code>X-Node-ID</code> 和 <code>X-Node-Region: CN</code>。校验握手、通告能力、按请求 ID 配对结果；仅分派允许的动作和事件。</p></div>
-          </div>
-          <div class="lane plum">
-            <div class="tile"><span class="step">管理访问 · SSH 隧道</span><h3>浏览器 → hakimi-admin</h3><p>本地 <code>12141/admin</code> 转到境外回环 <code>12143</code>。独立 Nginx 镜像提供页面与对应的脚本、样式校验值。</p></div>
-            <div class="wire">/admin/api/*<small>同源 HTTP · 状态 / 配置 / 操作</small></div>
-            <div class="tile"><span class="step">境外 · 引擎</span><h3>hakimi-bot → SQLite</h3><p>引擎检查管理口令、Host 与 Origin，更新数据库和运行状态。只有引擎挂载业务数据与凭证。</p></div>
-          </div>
-        </div>
-        <div class="bridge"><strong>境内节点</strong>　</strong><code>node_agent ⇄ McBridgeSlot ⇄ mc_agent:8791 ⇄ Minecraft 服务器</code>。8791 是 Compose 网络内的桥接端口，使用独立 Bearer；游戏登录状态与节点心跳分别记录。</div>
-        <div class="bridge"><strong>境外引擎</strong>　<code>FastAPI → Service → Store / SessionManager ⇄ SQLite</code>。聊天、调度和巡逻任务由引擎访问这层存储；模型请求经 <code>GeminiGateway</code>，模块向常驻 <code>drive_sync</code> 提交获准导出的文件，经 <code>FolderDrive</code> 投递到隔离目录。这些服务不经境内的两条 WS。</div>
-        <figcaption class="caption">跨机 Nginx 模板在 443 精确匹配这两条路径，其余返回 404。引擎映射回环 <code>12141</code>，后台映射回环 <code>12143</code>。旧隧道通过引擎取得同一份后台页面。<code>NODE_WS_ENABLED</code> 默认关闭；架构图描述可用能力，不代表节点已启用或在线。OneBot HTTP、正向 WS 和官方 QQ Webhook 仍是独立适配选项。</figcaption>
-        <p class="ref"><b>源码</b><a href="deploy/hakimi-ws.conf">跨机 Nginx</a><a href="docker-compose.yml">境外服务</a><a href="docker-compose.napcat.yml">NapCat</a><a href="node_agent/compose.cn.yaml">境内节点与游戏桥</a><a href="src/hakimi/app.py">握手与启动</a><a href="src/hakimi/node_transport.py">节点协议</a></p>
-      </figure>
-    </section>
-
-    <section class="chapter" id="life" aria-labelledby="life-title">
-      <div class="heading"><span class="num">02</span><h2 id="life-title">从世界状态到一次主动行动</h2></div>
-      <p class="intro">启动时，引擎从模块目录的 <code>.gitmodules</code> 读取已安装仓库，逐个加载 <code>plugin.py</code>，并把返回的模块登记到 <code>ModuleRegistry</code>。平台模块声明动作、精力需求、会话协议与调度设置，后台据此生成入口、隐私设置和动作表单。随版本交付的系统模块从 <code>system_modules/</code> 按依赖装载，目录直接展示运行状态。日记、Drive 同步、数据库备份、分身镜像、群记忆镜像和 Owner 只读记忆各自装载。世界引擎读取登记的策略来规划时段、检查次数和执行意图。<code>WorldStateManager</code> 保存当前模块、专注、心情、精力和无聊度。</p>
-      <div class="grid three">
-        <article class="tile sea"><span class="step">LOW · qq_social</span><h3>QQ 社交</h3><p>处理 OneBot 与官方 QQ 的准入、富媒体和管理命令。社交插件共用防抖、模型网关和按平台与账号隔离的会话。</p></article>
-        <article class="tile blue"><span class="step">MEDIUM · bilibili_surf</span><h3>B 站冲浪</h3><p>境外组织巡逻；境内节点在线且启用委派时，可由境内代采。公开学习事件进入日记，指定私聊的优先分享记录按原会话筛选。</p></article>
-        <article class="tile plum"><span class="step">HIGH · minecraft</span><h3>Minecraft</h3><p>境外保存最新的境内游戏快照。桥已连接、游戏已配置、角色已进服和暂停是四种不同的信息。</p></article>
-      </div>
-      <figure class="sheet" style="margin-top:.85rem" aria-label="生活引擎：规划、门控、临场执行">
-        <ol class="flow sea">
-          <li><span class="step">01 / LifeBlockPlanner</span><h3>起床排行程，白天按需调整</h3><p>每天起床时从动作目录选最多 6 项，清醒时可规划和执行，主动发消息还须避开免打扰。晨间思考在「模型与思考」选择 medium 或 high。白天默认每 2–4 小时复查，重要公开事件可提前触发。规划器读取行程与回执，可改期、取消未来待办，或新增最多 3 项。</p></li>
-          <li><span class="step">02 / GatekeeperWorker</span><h3>到点再判断能否做</h3><p>每分钟检查待办的有效期、免打扰和专注状态。QQ 与 B 站巡逻核对预算。QQ 另查接收人、会话占用和冷却，进服类 MC 动作核对角色在线。</p></li>
-          <li><span class="step">03 / JITExecutor</span><h3>按目标执行</h3><p>SQLite 原子领取票据，再调用登记好的处理器。<code>qq.speak</code> 临场生成并逐气泡确认，<code>bili.patrol</code> 运行既有巡逻，<code>mc.*</code> 走境内固定 RPC。</p></li>
+      <aside class="repo-chain" aria-labelledby="repos-title">
+        <h2 id="repos-title">源码如何组成一个版本</h2>
+        <ol aria-label="仓库包含关系">
+          <li><a href=".gitmodules">hakimi-surf</a></li>
+          <li><a href="src/hakimi/modules/.gitmodules">hakimi-modules</a></li>
+          <li>4 个平台仓</li>
         </ol>
-        <p class="return"><strong>回执与恢复</strong>　QQ 气泡逐条确认。重启时完整文本回执可还原成功，部分回执和执行中失联的游戏动作记为待核实。意图分别记录 <code>done</code>、<code>gated_skip</code>、<code>expired</code> 或 <code>uncertain</code>；仍在有效期内的暂时冲突可以延后。</p>
-        <figcaption class="caption">进入游戏且未暂停时可切换为 <code>minecraft / HIGH</code>；暂停或离线后可回到 <code>idle / LOW</code>。高专注暂停低专注模块的主动行为；被点名的 QQ 消息仍可回复，普通群聊新消息优先做上下文。脱敏传感摘要只加在动态消息尾部，空闲基线不注入。</figcaption>
-        <p class="bridge"><strong>第四个模块 · 定点天气</strong>　对话 AI、其他模块和后台按需调用 <code>weather.read</code>，读取配置地点的当前天气。数据有效期内共用一份观测，到期后由下一次查询更新。</p>
-        <p class="ref"><b>源码</b><a href="src/hakimi/modules/.gitmodules">安装清单</a><a href="src/hakimi/modules/__init__.py">平台注册</a><a href="src/hakimi/system_modules/__init__.py">常驻系统模块</a><a href="src/hakimi/modules/actions.py">动作目录</a><a href="src/hakimi/modules/platforms/minecraft/mc_node.py">游戏状态与回执</a><a href="src/hakimi/modules/base.py">模块契约</a><a href="src/hakimi/social.py">平台身份与资料授权</a><a href="src/hakimi/proactive_dm.py">单目的地日报与回执</a><a href="src/hakimi/world_state.py">共享状态与事件</a><a href="src/hakimi/life_engine.py">规划、门控、执行</a></p>
-      </figure>
-    </section>
+        <small>主仓固定目录仓提交，目录仓再固定各平台提交。常驻模块随主仓发布。</small>
+      </aside>
+    </div>
 
-    <section class="chapter" id="fieldwork" aria-labelledby="fieldwork-title">
-      <div class="heading"><span class="num">03</span><h2 id="fieldwork-title">一次冲浪，怎样影响游戏和聊天</h2></div>
-      <p class="intro">视频分析有三种证据：字幕与文字、原片影音、关键帧。分析结果可以成为游戏灵感；视频链接本身不能直接指挥游戏。</p>
-      <figure class="sheet" aria-label="视频分析证据的优先级和回退路径">
-        <ol class="flow blue">
-          <li><span class="step">首选 / 文字</span><h3>先看已有素材</h3><p>QQ 分享或巡逻候选 → 简介、字幕、热评 → 来源筛查。素材足够且不要求看画面或听音频时，直接返回文本摘要。</p></li>
-          <li><span class="step">按需 / 原片</span><h3>境外下载、Files 分析</h3><p>缺字幕、明确要求看画面，或任务要求原片时，先查开关、预算、时长、并发和每日次数。获准后由 <code>yt-dlp</code> 下载受限大小的原片，再交 Files 通道分析。</p></li>
-          <li><span class="step">限定回退 / 关键帧</span><h3>境内返回 3 × 3 JPEG</h3><p>只有指定的下载失败且可委派时才调用 <code>bili.video_storyboard</code>。境内抽帧拼图，境外先筛图再生成；关键帧没有音轨，不能当作完整原片。</p></li>
-        </ol>
-        <figcaption class="caption">无法进入视觉路径时，按已有文字材料说明范围；平台风控或凭证过期进入冷却。重启中断的原片尝试标为 <code>interrupted</code>，不自动重放。公开数据、短链、缩略图和小号请求各有允许范围；修改类请求的回退条件比读取更严格。</figcaption>
-        <p class="ref"><b>源码</b><a href="src/hakimi/bilibili.py">公开读取</a><a href="src/hakimi/bili_watcher.py">小号巡逻</a><a href="src/hakimi/video_watch.py">证据选择与回退</a><a href="node_agent/bili_collector.py">国内采集与拼图</a></p>
-      </figure>
-      <figure class="sheet" aria-label="B 站灵感回到 Minecraft 并进入世界状态">
-        <ol class="flow plum" style="--n:4">
-          <li><span class="step">B 站 → 事件</span><h3>记录观看事实</h3><p>学习完成后按 BV 号去重，写入 <code>bili_video_watched</code>，只带标题、BV 号与已读摘要。</p></li>
-          <li><span class="step">事件 → 意图</span><h3>登记建造想法</h3><p>独立规则 <code>bili.build_inspiration</code> 识别 MC 主题，在同一事务写入消费凭证和 <code>mc.build_plan</code> 票据。每条规则有自己的游标、冷却及截止时间。</p></li>
-          <li><span class="step">境外 → 境内</span><h3>递交有限目标</h3><p><code>MinecraftSlotModule → NodeTransport → McBridgeSlot → Mineflayer</code>。<code>build_plan</code> 更新“筹备建造”的活动状态，不代表方块已经建好。</p></li>
-          <li><span class="step">境内 → 境外</span><h3>回报实际进展</h3><p><code>mc.snapshot</code> 更新角色状态；<code>mc.milestone</code> 记录事件。游戏高重要性事件可生成 <code>qq.speak</code>。专注期间凭持久化来源事件放行，发送仍检查 QQ 接收权限。</p></li>
-        </ol>
-        <p class="return"><strong>回到对话：</strong>新的世界状态可成为下一次 QQ 回复的背景。桥就绪但未进服时，后台分别显示连接状态，不会把桥心跳描述为玩家在线。</p>
-        <figcaption class="ref"><b>源码</b><a href="src/hakimi/life_rules.py">规则消费与游标</a><a href="src/hakimi/modules/platforms/minecraft/minecraft_slot.py">境外游戏模块</a><a href="node_agent/daemon.py">节点分派</a><a href="node_agent/mc_bridge_slot.py">桥接事件</a><a href="mc_agent/src/behaviors.mjs">游戏目标的实际行为</a></figcaption>
-      </figure>
-    </section>
-
-    <section class="chapter" id="pipeline" aria-labelledby="pipeline-title">
-      <div class="heading"><span class="num">04</span><h2 id="pipeline-title">一条 QQ 消息，从收到到记住</h2></div>
-      <p class="intro">收到消息、决定回复、收到发送回执是三个不同的时间点。在同一群里看到消息，不等于 Bot 已经开口；生成了文字，也不等于对方已经收到。</p>
-      <figure class="sheet" aria-label="QQ 消息处理的四个阶段">
-        <ol class="flow sea" style="--n:4">
-          <li><span class="step">01 / 准入</span><h3>先认身份与会话</h3><p>适配器解析事件，核验群或私聊的独立准入规则。自身回环、局部屏蔽等本地过滤先于模型。群内 Owner 仍是公开场景。</p></li>
-          <li><span class="step">02 / 合批</span><h3>先收件，再防抖</h3><p>合资格事件去重、保存收件和相关上下文；同会话用调度锁合批。群热环保留引用、邻近图片与发言线索。后续批次按最新会话状态处理。</p></li>
-          <li><span class="step">03 / 路由</span><h3>Decisions → 生成</h3><p>区分明确寻址和自由插话，判断注入、噪音、记忆及外部资料需求。通过后才按权限、思考档与预算调用适用模型；仍可选择不回复。</p></li>
-          <li><span class="step">04 / 投递</span><h3>动作 → Outbox → ACK</h3><p>解析气泡、引用、受控 @、本地表情等动作，逐条发送。有效回执先写投递账，再幂等应用到助手历史。结果不确定时不冒充成功。</p></li>
-        </ol>
-        <figcaption class="ref"><b>源码</b><a href="src/hakimi/adapters.py">平台事件</a><a href="src/hakimi/service.py">入站编排</a><a href="src/hakimi/session_scheduler.py">会话锁</a><a href="src/hakimi/group_pipeline.py">群合批</a><a href="src/hakimi/gateway.py">决策</a><a href="src/hakimi/outgoing.py">回执与恢复</a></figcaption>
-      </figure>
-      <div class="grid two" id="context">
-        <article class="tile blue"><span class="step">CONTEXT / A → B → C</span><h3>什么可以进入本次请求</h3>
-          <dl class="kv">
-            <div><dt>A：静态前缀</dt><dd>共享规则、人设、自我身份和允许的动作协议。好友私聊与群聊使用公开人设。</dd></div>
-            <div><dt>B：会话热史</dt><dd>按会话组织稳定的消息历史；助手发言以已确认投递的内容为准。</dd></div>
-            <div><dt>C：动态尾部</dt><dd>当前发言、图片、引用、检索证据、召回记忆，以及适用时的 <code>world_state_summary</code>、<code>jit_proactive_intent</code>。它们都是数据，不能提升权限。</dd></div>
+    <figure class="atlas" id="overview" aria-labelledby="map-title">
+      <div class="fig-head"><h2 id="map-title">模块如何接入引擎</h2><small>上方是两种装载方式，下方是注册信息的使用方。</small></div>
+      <div class="banks">
+        <section class="bank platform" aria-labelledby="platform-title">
+          <header><h3 id="platform-title">平台插件 × 4</h3><code>BaseModule</code></header>
+          <p>按目录仓的清单查找 <code>plugin.py</code>。每个工厂创建一个模块，启用状态决定哪些能力可用。</p>
+          <ul class="platform-list">
+            <li><strong><a href="src/hakimi/modules/platforms/qq/qq_social.py">QQ 社交</a></strong><code>qq_social</code><small class="action">对话与投递 · <code>qq.speak</code></small></li>
+            <li><strong><a href="src/hakimi/modules/platforms/bilibili/bilibili_surf.py">B 站冲浪</a></strong><code>bilibili_surf</code><small class="action">巡逻与学习 · <code>bili.patrol</code></small></li>
+            <li><strong><a href="src/hakimi/modules/platforms/minecraft/minecraft_slot.py">Minecraft</a></strong><code>minecraft</code><small class="action">游戏目标 · <code>mc.*</code></small></li>
+            <li><strong><a href="src/hakimi/modules/platforms/weather/weather.py">天气观测</a></strong><code>weather</code><small class="action">查询设定地点 · <code>weather.read</code></small></li>
+          </ul>
+          <i class="pin" aria-hidden="true"></i>
+        </section>
+        <section class="bank resident" aria-labelledby="resident-title">
+          <header><h3 id="resident-title">常驻系统模块 × 9</h3><code>SystemModule</code></header>
+          <p>启动时按 <code>requires</code> 排列依赖顺序。箭头从前置服务指向使用它的模块，各功能的授权和连接条件分别生效。</p>
+          <dl class="deps" aria-label="前置服务与依赖该服务的模块">
+            <div>
+              <dt><a href="src/hakimi/system_modules/drive_sync.py">Drive 同步</a><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/patrol_diary.py">巡逻日记</a><a href="src/hakimi/system_modules/database_backup.py">数据库备份</a><a href="src/hakimi/system_modules/group_memory_mirror.py">群记忆镜像</a><a href="src/hakimi/system_modules/surf_mirror.py">冲浪镜像</a></dd>
+            </div>
+            <div>
+              <dt><span><a href="src/hakimi/system_modules/event_ledger.py">待办账本</a> ＋ <a href="src/hakimi/system_modules/owner_notebook.py">Owner 只读记忆</a></span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/screen_watch.py">屏幕伴看</a></dd>
+            </div>
+            <div>
+              <dt><span>待办账本 ＋ Owner 只读记忆 ＋ 屏幕伴看</span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/voice_companion.py">语音伴随</a></dd>
+            </div>
           </dl>
-          <p class="ref"><a href="src/hakimi/prefix_runtime.py">前缀与链缓存</a><a href="src/hakimi/bot_server.py">上下文装配与裁剪</a></p>
-        </article>
-        <article class="tile plum" id="provider-routing"><span class="step">MODEL / PRIVACY</span><h3>谁可以看到什么材料</h3>
-          <p>门卫是 <code>gemini-decision-1</code>。私聊默认高隐私，走付费门卫；低隐私会话可走已配置的免费门卫，回退按策略决定。生成统一选择 Hydrogen、Neon 或 Carbon。平台和常驻系统模块各自声明思考场景。开发者 API 与 Vertex 使用选定模型，记忆 Flex 和视频 Files 按实际模型计量。</p>
-          <p id="interaction-chain">允许云端短续链的聊天，按会话、模型、前缀和历史版本复用已确认标识；清空、裁剪、失效后重建。生活引擎的临场发言使用当前上下文，不串接现有聊天链。</p>
-          <p class="ref"><a href="src/hakimi/provider_routing.py">供应方策略</a><a href="src/hakimi/gemini.py">模型请求</a><a href="src/hakimi/persona.py">人设边界</a></p>
-        </article>
+          <i class="pin" aria-hidden="true"></i>
+        </section>
       </div>
-      <details><summary>展开：群内准入、图片与出站约束</summary><div>
-        <div class="row" id="bot-routing"><h4>外部 Bot 有三条路径</h4><p>本地硬拦截、按配置阈值评估、或真实 Owner 邀请的限次窗口。不能靠聊天文本伪造邀约或权限。普通群成员按群白名单进入，私聊好友名单只决定私聊准入。</p></div>
-        <div class="row" id="affection"><h4>好感度与身份不是同一件事</h4><p id="conversation-style">七级能力表限制普通成员可触发的功能；Owner 私聊依赖协议身份和私聊场景，不由好感度或昵称解锁。公开群用简短的群聊语气；真实 Owner 在群里也不会带入私聊笔记。</p></div>
-        <div class="row" id="image-context"><h4>图片与文件</h4><p>从当前批次、引用或邻近群消息选择有关图片；通过 OneBot 或受限网络路径取图，检查大小和像素，必要时切片。单轮最多两个模型图片槽；读取的图片、文件与卡片都要经过来源筛查。跨容器发送表情用本地白名单和 <code>base64://</code>。</p></div>
-        <div class="row" id="delivery-audit"><h4>逐气泡投递</h4><p>群内提及目标与本地允许集合匹配；被拦、主动弃答、生成后未发、已送达和结果不确定分别记录。已知不确定的发送不盲目重试。</p></div>
-        <p class="ref"><a href="src/hakimi/bot_guard.py">Bot 分流</a><a href="src/hakimi/affection.py">能力表</a><a href="src/hakimi/media.py">处理图片</a><a href="src/hakimi/outbound_actions.py">动作与回执协议</a></p>
-      </div></details>
-    </section>
+      <div class="merge" aria-hidden="true"></div>
+      <div class="hub">
+        <div><span class="label">引擎内的模块注册表</span><h3>ModuleRegistry</h3></div>
+        <p>系统模块登记服务与观察器。平台插件登记动作、定时任务、事件规则和协议。两类模块都可以声明自己的思考场景。</p>
+      </div>
+      <div class="outlets">
+        <article class="outlet" id="life"><h4>世界引擎 <code>LifeEngine</code></h4><p>读取世界状态、模块观测与动作目录。规划器安排日程，本地门控检查作息、目标与额度，再交给动作处理器。</p></article>
+        <article class="outlet"><h4>消息管道 <code>Service</code></h4><p>按平台注册的协议识别会话，复用防抖、模型网关、记忆和出站回执。社交模块负责本平台的准入与发送。</p></article>
+        <article class="outlet" id="controls"><h4>管理台 <code>hakimi-admin</code></h4><p>通过引擎 API 展示模块状态、调度选项、思考场景和动作回执。引擎将保存的运行策略应用到对应模块。</p></article>
+      </div>
+      <figcaption class="refs"><a href="src/hakimi/service.py">Service 装配入口</a><a href="src/hakimi/system_modules/__init__.py">常驻模块的依赖排序</a><a href="src/hakimi/modules/__init__.py">平台发现与装载</a><a href="src/hakimi/modules/base.py">注册表与模块接口</a></figcaption>
+    </figure>
 
-    <section class="chapter" id="memory" aria-labelledby="memory-title">
-      <div class="heading"><span class="num">05</span><h2 id="memory-title">会话库、只读记忆和备份的边界</h2></div>
-      <p class="intro">境外持有权威数据。游戏快照是运行背景，聊天热史属于单一会话，Owner 镜像是给本人阅读的导出。这三种材料不会因为都存于境外就变成群聊的共享记忆。</p>
-      <div class="grid two">
-        <article class="tile sea"><span class="step">SQLite / hakimi.sqlite3</span><h3>全局调度与账本</h3>
-          <dl class="kv"><div><dt><code>world_state</code></dt><dd>单行快照与最近主动活动时间。</dd></div>
-            <div><dt><code>scheduled_intents</code></dt><dd>目标模块、投递范围、到期时间、门控条件、状态；保存意图而非预写聊天台词。</dd></div>
-            <div><dt><code>life_plan_runs / life_agenda_items</code></dt><dd>按本地日期唯一登记晨间规划。行程项关联执行队列，日内调整和事件消费在同一笔事务提交。</dd></div>
-            <div><dt><code>global_events</code></dt><dd>模块里程碑、重要性和消费状态；规划器读取未消费事件。</dd></div>
-            <div><dt><code>group_proactive_cooldown</code></dt><dd>各群最近主动发言时间。配置、预算、出站回执与 Owner 私信队列也由主库存储。</dd></div></dl>
-        </article>
-        <article class="tile blue" id="memory-batching"><span class="step">SQLite / sessions/{group,private}/</span><h3>每个群、每个私聊各自一本</h3>
-          <p>按平台、机器人与会话身份派生文件键，敏感载荷加密。入站收件、热消息、折叠版本、确认回执与续链都有各自的记录。</p>
-          <p>热史裁剪先封存冷分片；后台按同一会话和 epoch 合批，筛查后提炼为画像与编年史，再入对应会话库。清空或版本变化会使过期的归档结果失效。</p>
-          <p><strong>允许的方向：</strong>Owner 私聊可回顾已参与的公开群互动；群聊不能反查 Owner 的私聊库或桌面笔记。</p>
-          <p class="ref"><a href="src/hakimi/session_manager.py">物理分库</a><a href="src/hakimi/dual_memory.py">画像与编年史</a><a href="src/hakimi/memory_compressor.py">冷史合批</a><a href="src/hakimi/public_memory.py">单向公开索引</a></p>
-        </article>
+    <section class="chapter" id="fieldwork" aria-labelledby="contracts-title">
+      <div class="section-head"><h2 id="contracts-title">动作、事件与跨日待办</h2></div>
+      <div class="contracts">
+        <article><span class="contract-name">ActionCatalog</span><h3>现在能执行什么？</h3><p>动作名对应一个处理器，声明参数、可用来源和执行限制。规划可以选择动作，对话也能按需查询已开放的 <code>weather.read</code>。</p><a class="mono" href="src/hakimi/modules/actions.py">actions.py</a></article>
+        <article><span class="contract-name">global_events</span><h3>刚刚发生了什么？</h3><p>模块发布事实。<code>RuleDispatcher</code> 按每条规则独立的游标读取，命中后把回执与新意图票据写入同一事务。</p><a class="mono" href="src/hakimi/life_rules.py">life_rules.py</a></article>
+        <article><span class="contract-name">event_ledger</span><h3>以后还要跟进什么？</h3><p>用去重键更新待办，到期时间可提前唤醒规划器。读取后仍保留，履约后显式核销，未完成项可按有效期过期。平台查询只返回公开待办。</p><a class="mono" href="src/hakimi/event_ledger.py">event_ledger.py</a></article>
       </div>
-      <figure class="sheet" style="margin-top:.85rem" aria-label="模块文件同步与 Owner 只读输入">
-        <dl class="kv">
-          <div><dt>模块 → Google Drive</dt><dd>平台和常驻模块声明 <code>drive_usage</code>，通过 <code>service.drive_sync.sync_file</code> 提交获准外发的文本或二进制文件。同名文件按调用模块隔离。<code>drive_module_sync</code> 保存每个模块的最近尝试、成功时间和错误状态，供管理后台读取。</dd></div>
-          <div id="owner-memory"><dt>桌面 → Owner 私聊</dt><dd><code>owner_memory_bridge.py</code> 同步限定的源文件；拉取比较本地 SHA-256。<code>OwnerCloudMemory</code> 在境外只读索引挂载目录，按需把片段送入 Owner 的 C 区。单文件 <code>NotebookSnapshot</code> 是另一项独立开关。</dd></div>
-          <div><dt>分身 → Owner 镜像</dt><dd><code>SurfMirror</code> 不调用模型。读取 Owner 私聊的限定记录、双轨条目、世界事件、巡逻记录，脱敏后原子写入 <code>surf_mirror/latest.md</code> 和 <code>daily/YYYY-MM-DD.md</code>。默认半小时检查一次，按摘要指纹推送变化至指定 Drive 文件夹。导出可能含私聊内容，只供 Owner 阅读。</dd></div>
-          <div><dt>巡逻日记与群镜像</dt><dd><code>PatrolDiary</code> 独立整理本地日记及每日总结。<code>DiaryDriveSync</code> 按时从本地读取并向隔离目录同步，失败后重试。<code>MemoryMirror</code> 则仅为显式开启的公开群同步 Markdown。两者都与上面的 Owner 专用导出分别管理。</dd></div>
-          <div><dt>主库 → 加密备份</dt><dd><code>DatabaseBackup</code> 对 <code>hakimi.sqlite3</code> 执行 <code>VACUUM INTO</code>，压缩、使用专用派生密钥加密，在本地保存并可上传指定 Drive 文件夹，默认保留 7 天。它不覆盖 <code>sessions/</code> 下的独立会话库，恢复主库不能代替恢复所有聊天记录。</dd></div>
-        </dl>
-        <figcaption class="caption">公开日记、加密备份、Owner 分身镜像和已授权群记忆共用隔离目录。群的同步资格由来源插件核验。备份通过专用接口轮换本命名空间的加密文件。每条链路保留自己的数据授权和远端文件标记。Owner 小本本使用单独的只读来源。</figcaption>
-        <p class="ref"><b>源码</b><a href="src/hakimi/world_state.py">全局表</a><a href="scripts/owner_memory_bridge.py">桌面桥</a><a href="src/hakimi/owner_cloud_memory.py">只读召回</a><a href="src/hakimi/surf_mirror.py">分身镜像</a><a href="src/hakimi/roaming_logger.py">巡逻日记</a><a href="src/hakimi/memory_mirror.py">群镜像</a><a href="src/hakimi/db_backup.py">备份范围</a><a href="src/hakimi/system_modules/drive_sync.py">模块同步接口</a></p>
+
+      <figure class="trace" aria-labelledby="trace-title">
+        <h3 id="trace-title">一个 B 站视频怎样变成 Minecraft 建造计划</h3>
+        <ol class="route">
+          <li><strong>B 站记录观看事实</strong><code>bili_video_watched</code><small>视频学习完成，发布带标题与摘要的事件。</small></li>
+          <li><strong>规则识别建造主题</strong><code>bili.build_inspiration</code><small>Minecraft 注册的规则匹配公开素材，生成一张有截止时间的建造计划票据。</small></li>
+          <li><strong>引擎领取票据</strong><code>mc.build_plan</code><small>GatekeeperWorker 检查执行条件，JITExecutor 在 SQLite 中领取票据，再调用已登记的处理器。</small></li>
+          <li><strong>境内节点确认计划</strong><code>NodeTransport → mc_agent</code><small>目标经 node_agent 的私网桥交给游戏端。节点的确认表示建造计划已登记。</small></li>
+        </ol>
+        <figcaption>
+          后续游戏进展可产生新的里程碑。QQ 的分享规则可据此生成 <code>qq.speak</code> 票据，送出前再次核对接收范围与免打扰时段。
+          <span class="refs"><a href="src/hakimi/modules/platforms/minecraft/inspiration.py">视频匹配规则</a><a href="src/hakimi/life_engine.py">门控与执行</a><a href="node_agent/mc_bridge_slot.py">境内游戏桥</a><a href="src/hakimi/modules/platforms/qq/milestones.py">里程碑分享</a></span>
+        </figcaption>
       </figure>
+
+      <article class="companion" aria-labelledby="voice-title">
+        <h3 id="voice-title">屏幕伴看怎样接入 Owner 语音会话</h3>
+        <div class="speech-flow"><b>桌面关键帧</b><span aria-hidden="true">→</span><code>screen_watch</code><span aria-hidden="true">→</span><code>voice_companion</code><span aria-hidden="true">→</span><b>适配端分句播报</b></div>
+        <p>屏幕帧在内存中短暂缓存。开启联动的 Owner 私有语音会话可取最近帧，结合本轮发言生成口播。独立看屏也可把评论发回桌面端。私有通话结束时，可按配置将会话摘要写为 <code>owner_private</code> 待办。</p>
+        <div class="refs"><a href="src/hakimi/screen_watch.py">屏幕帧与独立评论</a><a href="src/hakimi/voice_companion.py">语音会话与分句输出</a></div>
+      </article>
     </section>
 
-    <section class="chapter" id="controls" aria-labelledby="controls-title">
-      <div class="heading"><span class="num">06</span><h2 id="controls-title">从后台判断系统正在做什么</h2></div>
-      <p class="intro">管理请求经 SSH 隧道到回环端口；API 校验 <code>ADMIN_TOKEN</code>、Host 和浏览器来源。下面列的是面板读数的依据，不能从这张离线图推断线上健康状态。</p>
-      <div class="grid two">
-        <article class="tile blue"><span class="step">/admin/api/life</span><h3>生活引擎与模块调度</h3>
-          <div class="row"><p>分开看 NapCat、境内节点（含心跳、RPC 错误与 B 站委派）、MC 桥与游戏连接。后台按登记动作显示执行模块、接收范围、就绪原因与路由模式。票据列出来源、关联事件、结果及旧路由对照。可热调共用规划参数。各模块面板提供本模块登记的执行设置，配置由引擎保存并通知调度器。后台还可取消待执行意图或提交受限的 MC 目标。手动触发规划、门控和游戏动作受频控与操作锁约束。</p></div>
-          <div class="row"><h4>“今日主动”怎样计数？</h4><p>按机器人当地自然日统计世界引擎完成或结果不确定的自主聊天与 B 站小号巡逻。每日报告有独立的一次机会，游戏目标另行统计。</p></div>
-          <div class="row"><h4>“上次主动”来自哪里？</h4><p>JIT 发送和常规 Owner 主动私信确认后会更新世界状态。若旧库没有该时间戳，面板取已发 Owner 私信与已完成社交意图中的最近记录作为回退。</p></div>
-        </article>
-        <article class="tile sea"><span class="step">/admin/api/sessions · /admin/api/notebook</span><h3>会话与 Owner 桌面桥</h3>
-          <div class="row"><p>会话面板分列热窗口条数、旧滚动摘要字数、双轨是否就绪，以及未删除的双轨条目数和正文总字数。旧摘要为零，不能据此判断记忆库为空。</p></div>
-          <div class="row"><h4>“小本本关闭”不等于桌面桥关闭</h4><p>Notebook 与 Antigravity 只读挂载分别报告。桌面桥启用时，受保护的接口返回脱敏常驻备忘预览、索引片段数和最近活动；私人备忘正文不进入普通群聊和境内节点的状态数据。</p></div>
-          <div class="row" id="rest-hours"><h4>世界引擎统一安排巡逻与主动私信</h4><p>世界引擎用 bili.patrol 安排小号巡逻，用 qq.speak 发起聊天。qq.owner_digest 在当日可发送时段结束前安排一次日报，与手动汇报共用 SQLite 回执。QQ 负责向 Owner 投递、离线暂存和零 Token 运维告警。</p></div>
-        </article>
+    <section class="chapter" id="deployment" aria-labelledby="deployment-title">
+      <div class="section-head"><h2 id="deployment-title">模块在哪里运行</h2><p>引擎、管理台与外部适配端的连接方向</p></div>
+      <div class="lanes">
+        <div class="lane"><h3>境内 · QQ / NapCat</h3><span class="link-label">反向 WSS</span><div><strong>境外 Nginx → hakimi-bot</strong><p>QQ 事件进入 OneBot 接入层，回复与回执复用已认证的连接。</p></div></div>
+        <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集，游戏任务经私网桥交给运行 Mineflayer 的 mc_agent。</p></div></div>
+        <div class="lane"><h3>桌面 · 语音与看屏适配端</h3><span class="link-label">两条可选 WS</span><div><strong>境外 FastAPI → 对应常驻服务</strong><p>语音与看屏分别配置入口、校验适配端身份。屏幕隐私开关与会话模式控制帧的使用范围。</p></div></div>
+        <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
       </div>
-      <div class="note" id="billing"><h3>一笔模型费用，从预留到核对</h3>
-        <p id="thinking-accounting">SQLite 事务预留 → 发起请求 → 按供应方用量结算或标注估算 → 按日期、模型、来源与实际思考档汇总。输入、缓存、输出和思考 Token 分开记录；自主聊天与巡逻的次数单独统计。</p>
-        <p id="search-routing">可选外部检索独立取证并筛查来源，再把材料放入 C 区；搜索次数单独计量。GCP 账单与用量同步也是可选的核对途径，不能把本地未知模型费用直接归作 Drive 费用。</p>
-      </div>
-      <p class="ref" id="sources"><b>源码</b><a href="src/hakimi/life_admin.py">生活面板与操作</a><a href="src/hakimi/admin_routes.py">会话与快照</a><a href="admin/admin_page.html">后台展示</a><a href="admin/nginx.conf">管理代理</a><a href="admin/csp.py">页面安全策略</a><a href="scripts/deploy_prod.sh">按服务发布</a><a href="src/hakimi/admin_auth.py">鉴权</a><a href="src/hakimi/proactive_dm.py">Owner 私信</a><a href="src/hakimi/model_accounting.py">分档账本</a><a href="src/hakimi/gcp_billing.py">账单核对</a></p>
+      <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="node_agent/compose.cn.yaml">境内执行节点</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
     </section>
-    <footer class="end"><span>hakimi-surf · v2.1.0 · 离线源码图，不读取生产数据</span><a href="#top">返回图首 ↑</a></footer>
+
+    <section class="chapter" id="pipeline" aria-labelledby="conversation-title">
+      <div class="section-head"><h2 id="conversation-title">一次对话共享哪些服务</h2></div>
+      <ol class="pipeline" aria-label="QQ 来信到确认回复的先后顺序">
+        <li id="bot-routing"><h3>协议准入</h3><p>按真实身份、会话名单、Bot 策略与作息处理来信。同会话的合资格消息去重、防抖并串行处理。</p></li>
+        <li id="context"><h3>门卫与上下文</h3><p>门卫评估接话和安全。A 放静态人设，B 放会话热史，C 放当轮发言、图片、获准召回的记忆与工具资料。</p></li>
+        <li id="provider-routing"><h3>模型与输出审核</h3><p>模型网关按场景、隐私策略及预算路由请求。生成结果经审核并转换为气泡、引用或本地表情等动作。</p></li>
+        <li id="delivery-audit"><h3>Outbox 与 ACK</h3><p>投递前复核权限和时效。助手正文按已确认的发送回执入史，审计记录丢弃、拦截、成功或待确认结果。</p></li>
+      </ol>
+      <dl class="notes" id="memory">
+        <div id="memory-batching"><dt>会话记忆</dt><dd>热史按会话隔离。裁剪的历史进入冷存档，后台按批提炼画像与编年史，再由当前会话按需召回。</dd></div>
+        <div id="interaction-chain"><dt>模型续链</dt><dd>符合条件的主对话按模型与历史版本复用已确认的交互标识。收到发送回执后才提交新的本地续链。</dd></div>
+        <div id="image-context"><dt>图片与文件</dt><dd>从当轮、引用和邻近消息选择媒体。图片经过大小、像素与来源检查，文本附件受文件类型和体积限制。</dd></div>
+        <div id="owner-memory"><dt>Owner 私有背景</dt><dd id="affection">协议身份与会话场景决定私有数据的可见范围。<span id="conversation-style">群聊使用公开人设，好感度只影响可用互动。</span></dd></div>
+        <div id="rest-hours"><dt>作息与主动行动</dt><dd>世界状态记录清醒、休息与精力。LifeBlockPlanner 读取日程和待办，执行时再核对模块就绪状态与发送窗口。</dd></div>
+        <div id="billing"><dt>预算与用量</dt><dd id="thinking-accounting">付费请求先在 SQLite 中预留，再按返回用量结算。模型、思考档位和动作标识用于归账。</dd></div>
+        <div id="search-routing"><dt>联网取证</dt><dd>独立搜索请求获取外部材料，筛查来源后将相关信息交给本轮对话。</dd></div>
+        <div><dt>模块归档</dt><dd>具备归档授权的模块通过 Drive 同步服务使用指定目录。同步结果按调用模块记录。</dd></div>
+      </dl>
+      <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a></div>
+    </section>
   </main>
+  <footer><span>Hakimi Surf · v2.1.0 · 源码快照 <a href="https://github.com/FireOpalus/hakimi-surf/tree/220043c4deda1e8f397ddabbc7fd4b8102714f57"><code>220043c</code></a> · 2026-11-20</span><a href="#top">回到图首 ↑</a></footer>
 </body>
 </html>
