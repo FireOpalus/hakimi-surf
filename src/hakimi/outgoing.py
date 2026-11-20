@@ -28,6 +28,12 @@ PRE_DISPATCH_REJECTED = frozenset(
 )
 
 
+def _pacing_delay(service, seconds: float) -> float:
+    if float(getattr(service.s, "send_delay_max", 0.0) or 0.0) <= 0.0:
+        return 0.0
+    return seconds
+
+
 def safe_delivery_detail(exc: Rejected) -> str:
     code = str(exc).strip()
     return code if re.fullmatch(r"[a-z0-9_]{1,64}", code) else "delivery_uncertain"
@@ -352,7 +358,7 @@ async def deliver_actions(service, reply):
                 if actions["sticker"].get("timing") == "before_text":
                     await sticker()
                     if sticker_choice and has_text_bubbles:
-                        await asyncio.sleep(0.6)
+                        await asyncio.sleep(_pacing_delay(service, 0.6))
                 if message.kind != "group" or (
                     service.bot_guard.known_bot(message)
                     and not service.bot_guard.is_owner_invited(message)
@@ -403,7 +409,10 @@ async def deliver_actions(service, reply):
                             if hasattr(service.sender, "typing"):
                                 await service.sender.typing(message)
                             await asyncio.sleep(
-                                min(2.2, 0.8 + len(text) * 0.025 + random.uniform(0, 0.2))
+                                _pacing_delay(
+                                    service,
+                                    min(2.2, 0.8 + len(text) * 0.025 + random.uniform(0, 0.2)),
+                                )
                             )
                         if not await valid():
                             raise Rejected("reply_invalidated")
@@ -423,7 +432,7 @@ async def deliver_actions(service, reply):
                         await acknowledge(text, receipt)
                 if actions["sticker"].get("timing") != "before_text" and sticker_choice:
                     if has_text_bubbles:
-                        await asyncio.sleep(0.6)
+                        await asyncio.sleep(_pacing_delay(service, 0.6))
                     await sticker()
                 did_reaction = await _try_react_and_poke()
                 if not confirmed and not did_reaction:
@@ -629,7 +638,12 @@ async def deliver_proactive_jit(
             if index:
                 if hasattr(service.sender, "typing"):
                     await service.sender.typing(message)
-                await asyncio.sleep(min(2.2, 0.8 + len(text) * 0.025 + random.uniform(0, 0.2)))
+                await asyncio.sleep(
+                    _pacing_delay(
+                        service,
+                        min(2.2, 0.8 + len(text) * 0.025 + random.uniform(0, 0.2)),
+                    )
+                )
             if not await valid():
                 if not confirmed:
                     return {"status": "cancelled", "bubbles_sent": 0}

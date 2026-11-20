@@ -577,3 +577,18 @@ async def test_preview_links_follows_safe_redirects_gzip_and_opengraph(monkeypat
     )
     assert res == [{"title": "OpenGraph 标题", "description": "OpenGraph 摘要内容"}]
     assert "http://127.0.0.1/admin" not in seen_urls
+
+
+def test_outgoing_pacing_delay_respects_send_delay_max(settings):
+    from types import SimpleNamespace
+
+    from hakimi.outgoing import _pacing_delay
+
+    svc_zero = SimpleNamespace(
+        s=settings.model_copy(update={"send_delay_min": 0, "send_delay_max": 0})
+    )
+    svc_live = SimpleNamespace(
+        s=settings.model_copy(update={"send_delay_min": 0.8, "send_delay_max": 2.0})
+    )
+    assert _pacing_delay(svc_zero, 1.5) == 0.0
+    assert _pacing_delay(svc_live, 1.5) == pytest.approx(1.5)
