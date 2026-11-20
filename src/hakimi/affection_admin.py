@@ -102,12 +102,7 @@ async def affection_set_user(request: Request):
         return await mgr.status()
 
 
-@router.delete("/users/{user_id}")
-async def affection_delete_user(
-    request: Request,
-    user_id: str,
-    platform: str = "onebot",
-):
+def _resolve_platform_user(user_id: str, platform: str = "onebot") -> tuple[str, str]:
     if not PLATFORM_ID_RE.fullmatch(platform):
         raise HTTPException(400, "invalid_admin_input")
     resolved_platform = platform
@@ -126,6 +121,40 @@ async def affection_delete_user(
         _validate_platform_user(resolved_platform, resolved_uid)
     except Rejected:
         raise HTTPException(400, "invalid_admin_input") from None
+    return resolved_platform, resolved_uid
+
+
+@router.get("/history")
+async def affection_recent_history(request: Request, limit: int = 50):
+    clamped_limit = max(1, min(200, limit))
+    mgr = await _manager(request)
+    return {"items": await mgr.recent_history(limit=clamped_limit)}
+
+
+@router.get("/users/{user_id}/history")
+async def affection_user_history(
+    request: Request,
+    user_id: str,
+    platform: str = "onebot",
+    limit: int = 30,
+):
+    resolved_platform, resolved_uid = _resolve_platform_user(user_id, platform)
+    clamped_limit = max(1, min(200, limit))
+    mgr = await _manager(request)
+    return {
+        "platform": resolved_platform,
+        "user_id": resolved_uid,
+        "items": await mgr.user_history(resolved_platform, resolved_uid, limit=clamped_limit),
+    }
+
+
+@router.delete("/users/{user_id}")
+async def affection_delete_user(
+    request: Request,
+    user_id: str,
+    platform: str = "onebot",
+):
+    resolved_platform, resolved_uid = _resolve_platform_user(user_id, platform)
     svc = service(request)
     async with request.app.state.admin_config_lock:
         mgr = await _manager(request)

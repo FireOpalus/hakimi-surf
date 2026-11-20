@@ -125,6 +125,10 @@ async def test_gateway_5m_liveliness_cooldown_and_affection_fusion(settings, sto
 
     aff.config = aff.config.model_copy(update={"enabled": True})
     await aff.initialize()
+    owner_probe = _group_msg(message, event_id="owner-probe", user_id="20000", created_at=now)
+    assert aff.adjust_reply_threshold(owner_probe, 0.42) == 0.22  # Lv.6 owner_bond: -0.20
+    assert filters.thresholds(owner_probe, owner=True, now=now)["reply"] == 0.18
+
     await aff.set_user_score("30000", 75)  # Lv.4 familiar -> base 0.34 -> 0.22
     assert filters.thresholds(probe, now=now)["reply"] == 0.22
     await aff.set_user_score("30000", 95)  # Lv.5 bestie -> base 0.28 -> floored at 0.18
@@ -146,6 +150,7 @@ async def test_gateway_5m_liveliness_cooldown_and_affection_fusion(settings, sto
     filters.note_proactive_spoke(probe, now=now)
     assert filters.thresholds(probe, now=now + 600)["reply"] == 0.54
     assert filters.thresholds(probe, owner=True, now=now + 600)["reply"] == 0.40
+    assert filters.thresholds(owner_probe, owner=True, now=now + 600)["reply"] == 0.34
     # After 1500s cooldown expires, fresh 5m liveliness bonus applies again
     for idx in range(15):
         hot.observe(

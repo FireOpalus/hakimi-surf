@@ -168,6 +168,7 @@ class Service:
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
         self._lurk_react_at: dict[str, float] = {}
+        self._last_aff_recovery_at: float = 0.0
         self.modules = ModuleRegistry(owner_delivery=self.proactive)
         settings._chat_registry = weakref.ref(self.modules)
         self.kernel = PluginKernel()
@@ -484,6 +485,7 @@ class Service:
         if (
             result == "limited"
             and self.store.runtime.affection.config.enabled
+            and getattr(self.store.runtime.affection.config, "penalize_rate_limit", False) is True
             and not self.bot_guard.known_bot(message)
             and not self.store.runtime.affection.is_owner_id(message.platform, message.user_id)
             and (
@@ -716,12 +718,19 @@ class Service:
             return "用法：/affection [QQ] [0..120]，目标账号格式不正确。"
         if len(args) == 1:
             prof = await aff.profile(target_platform, target_uid)
-            return (
+            reply = (
                 f"{prof['nickname']}（{prof['platform']}:{prof['user_id']}）：{prof['score']} 分｜"
                 f"{prof['lv']} {prof['tier_label']}｜"
                 f"今日正向 +{prof['today_positive_gain']}/{prof['daily_positive_cap']}"
                 f"{'｜已拉黑静音' if prof['muted'] else ''}"
             )
+            if hasattr(aff, "user_history"):
+                recent = await aff.user_history(target_platform, target_uid, limit=3)
+                if recent:
+                    reply += "\n最近变动：" + "、".join(
+                        f"{int(h['delta']):+d}({h['reason']})" for h in recent
+                    )
+            return reply
         if not re.fullmatch(r"-?[0-9]{1,4}", args[1]):
             return "分数需为 0～120 之间的整数（Owner 下限 100，普通成员上限 100）。"
         target_score = int(args[1])
@@ -1184,7 +1193,26 @@ class Service:
                 target = non_owners[-1]
             else:
                 delta = 0
-        reason = "attack_owner" if delta <= -10 else "chat"
+        target_text = target.text or ""
+        lowered = target_text.lower()
+        owner_qq = str(getattr(self.s, "owner_qq_id", "") or "").strip()
+        mentions_owner = (
+            ("boiser" in lowered)
+            or ("主人" in target_text)
+            or (bool(owner_qq) and owner_qq in target_text)
+        )
+        if delta <= -10 and mentions_owner:
+            reason = "attack_owner"
+        elif delta <= -20:
+            reason = "severe_offense"
+        elif delta <= -10:
+            reason = "boundary_or_hostility"
+        elif delta < 0:
+            reason = "chat_negative"
+        elif delta > 0:
+            reason = "chat_positive"
+        else:
+            reason = "chat"
         return target, delta, reason
 
     async def _alert_affection_blacklisted(self, message: Message, update) -> None:
@@ -1274,12 +1302,16 @@ class Service:
         if not await self.bot_guard.may_process(message, job["id"]):
             return
         aff = self.store.runtime.affection
-        caps = await aff.capabilities_for(message)
+        caps, caps_msg = (
+            await aff.capabilities_for_batch(message, members)
+            if hasattr(aff, "capabilities_for_batch")
+            else (await aff.capabilities_for(message), message)
+        )
         aff_active = (
             aff.config.enabled
-            and not self.bot_guard.known_bot(message)
+            and not self.bot_guard.known_bot(caps_msg)
             and (
-                message.platform in {"onebot", "qq"} or getattr(self, "identity", None) is not None
+                caps_msg.platform in {"onebot", "qq"} or getattr(self, "identity", None) is not None
             )
         )
         if aff_active and caps.level == 0:
@@ -1305,16 +1337,17 @@ class Service:
             and not caps.allow_poke_inbound
             and message.text.strip().startswith("[协议事件：戳了戳你]")
         ):
-            update = await aff.record_annoyance(message, "poke_ignored")
-            if update.blacklisted_now:
-                await self._enqueue_affection_farewell(
-                    job, message, members, None, watermark, None, update
-                )
-                await self._alert_affection_blacklisted(message, update)
+            if getattr(aff.config, "penalize_poke_ignored", False) is True:
+                update = await aff.record_annoyance(message, "poke_ignored")
+                if update.blacklisted_now:
+                    await self._enqueue_affection_farewell(
+                        job, message, members, None, watermark, None, update
+                    )
+                    await self._alert_affection_blacklisted(message, update)
             return
         if (
             aff_active
-            and not aff.is_owner_id(message.platform, message.user_id)
+            and not aff.is_owner_id(caps_msg.platform, caps_msg.user_id)
             and caps.direct_reply_prob < 1.0
         ):
             if random.random() > caps.direct_reply_prob:
@@ -1784,12 +1817,15 @@ class Service:
                 sender_prof = await aff.profile(
                     message.platform, message.user_id, message.sender_nickname
                 )
-                payload["sender_affection"] = {
+                sender_aff_payload = {
                     "score": sender_prof["score"],
                     "lv": sender_prof["lv"],
                     "tier": sender_prof["tier"],
                     "attitude": sender_prof["attitude"],
                 }
+                if sender_prof.get("is_owner"):
+                    sender_aff_payload["unique_owner"] = True
+                payload["sender_affection"] = sender_aff_payload
                 batch_aff: dict[str, dict] = {}
                 for m in members:
                     if m.user_id in batch_aff or self.bot_guard.known_bot(m):
@@ -2127,13 +2163,30 @@ class Service:
                 aff_target, aff_delta, aff_reason = self._select_affection_target(
                     message, members, actions
                 )
-                update = (
-                    await aff.apply_turn_delta(
-                        aff_target, aff_delta, sandbox_mode=sandbox, reason=aff_reason
-                    )
-                    if aff_active
-                    else None
+                has_social_response = (not actions.abstain) or bool(
+                    actions.emoji_like or actions.poke_qq
                 )
+                if aff_active:
+                    if has_social_response:
+                        update = await aff.apply_turn_delta(
+                            aff_target,
+                            aff_delta,
+                            sandbox_mode=sandbox,
+                            daily_first_bonus=True,
+                            reason=aff_reason,
+                        )
+                    elif aff_delta < 0:
+                        update = await aff.apply_turn_delta(
+                            aff_target,
+                            aff_delta,
+                            sandbox_mode=sandbox,
+                            daily_first_bonus=False,
+                            reason=aff_reason,
+                        )
+                    else:
+                        update = None
+                else:
+                    update = None
                 farewell_bypass = bool(update and update.blacklisted_now)
                 if farewell_bypass:
                     await self._alert_affection_blacklisted(aff_target, update)
@@ -2876,4 +2929,18 @@ class Service:
                     await self.ai.cleanup_video_files()
                 except Exception:
                     self.record("video_file_cleanup_pending")
+            now = time.time()
+            aff = getattr(self.store.runtime, "affection", None)
+            if (
+                aff is not None
+                and hasattr(aff, "run_cooldown_recovery")
+                and now - self._last_aff_recovery_at >= 600
+            ):
+                self._last_aff_recovery_at = now
+                try:
+                    await aff.run_cooldown_recovery()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.record("affection_recovery_error", emit_audit=False)
             await asyncio.sleep(60)

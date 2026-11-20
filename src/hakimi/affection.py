@@ -33,6 +33,17 @@ CREATE TABLE IF NOT EXISTS affection_events (
   created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS affection_events_created ON affection_events(created);
+CREATE TABLE IF NOT EXISTS affection_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL,
+  user_key TEXT NOT NULL,
+  delta INTEGER NOT NULL,
+  payload BLOB NOT NULL,
+  created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS affection_history_user
+  ON affection_history(scope, user_key, created DESC);
+CREATE INDEX IF NOT EXISTS affection_history_created ON affection_history(created);
 """
 
 PLATFORM_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
@@ -91,9 +102,13 @@ class AffectionConfig(BaseModel):
 
     enabled: StrictBool = True
     initial_score: int = Field(default=50, ge=1, le=100)
-    daily_positive_cap: int = Field(default=6, ge=0, le=50)
+    daily_positive_cap: int = Field(default=8, ge=0, le=50)
     unmute_recovery_score: int = Field(default=25, ge=1, le=60)
     farewell_message: str = Field(default=DEFAULT_FAREWELL, min_length=1, max_length=120)
+    cooldown_recovery_days: int = Field(default=7, ge=0, le=90)
+    cooldown_recovery_target: int = Field(default=40, ge=20, le=60)
+    penalize_rate_limit: StrictBool = False
+    penalize_poke_ignored: StrictBool = False
 
     @field_validator("farewell_message")
     @classmethod
@@ -131,6 +146,7 @@ class AffectionCapabilities:
     allow_carbon: bool
     max_tier: int
     budget_multiplier: Decimal
+    owner_exclusive: bool = False
 
     @property
     def lv(self) -> str:
@@ -143,6 +159,7 @@ class AffectionCapabilities:
             "tier": self.tier,
             "tier_label": self.tier_label,
             "attitude": self.attitude,
+            "tone_hint": self.attitude,
             "direct_reply_prob": self.direct_reply_prob,
             "allow_poke_inbound": self.allow_poke_inbound,
             "reply_threshold_delta": self.reply_threshold_delta,
@@ -160,6 +177,7 @@ class AffectionCapabilities:
             "allow_carbon": self.allow_carbon,
             "max_tier": self.max_tier,
             "budget_multiplier": str(self.budget_multiplier),
+            "owner_exclusive": self.owner_exclusive,
         }
 
 
@@ -186,13 +204,14 @@ TIER_CAPS: tuple[AffectionCapabilities, ...] = (
         allow_carbon=False,
         max_tier=1,
         budget_multiplier=Decimal("0"),
+        owner_exclusive=False,
     ),
     AffectionCapabilities(
         level=1,
         tier="hostile",
         tier_label="厌烦防备",
-        attitude="厌烦防备：懒得搭理，语气冷淡敷衍，不给额外工具与表情互动。",
-        direct_reply_prob=0.25,
+        attitude="明显不太想搭理，语气冷淡简短、带点防备距离感；若对方态度诚恳可淡淡接一句，绝不提好感或规则。",
+        direct_reply_prob=0.50,
         allow_poke_inbound=False,
         reply_threshold_delta=0.53,
         max_images=0,
@@ -208,16 +227,17 @@ TIER_CAPS: tuple[AffectionCapabilities, ...] = (
         allow_video_watch=False,
         allow_carbon=False,
         max_tier=1,
-        budget_multiplier=Decimal("0.20"),
+        budget_multiplier=Decimal("0.30"),
+        owner_exclusive=False,
     ),
     AffectionCapabilities(
         level=2,
         tier="cold",
         tier_label="冷淡疏离",
-        attitude="冷淡疏离：保持礼貌距离，简短接话，限低清看图且不开高级功能。",
-        direct_reply_prob=0.65,
+        attitude="保持礼貌距离，回答偏简短克制，不主动热络也不玩亲密梗，绝不提好感或规则。",
+        direct_reply_prob=0.85,
         allow_poke_inbound=False,
-        reply_threshold_delta=0.22,
+        reply_threshold_delta=0.16,
         max_images=1,
         low_res_images_only=True,
         allow_sticker=False,
@@ -231,13 +251,14 @@ TIER_CAPS: tuple[AffectionCapabilities, ...] = (
         allow_video_watch=False,
         allow_carbon=False,
         max_tier=2,
-        budget_multiplier=Decimal("0.50"),
+        budget_multiplier=Decimal("0.60"),
+        owner_exclusive=False,
     ),
     AffectionCapabilities(
         level=3,
         tier="normal",
         tier_label="普通群友",
-        attitude="普通群友：松弛平视、正常接梗，可使用表情包、贴表情与 B 站摘要。",
+        attitude="松弛平视、自然接梗，像熟脸网友一样正常聊天吐槽，保持朋友分寸，绝不提好感或规则。",
         direct_reply_prob=1.0,
         allow_poke_inbound=True,
         reply_threshold_delta=0.0,
@@ -247,20 +268,21 @@ TIER_CAPS: tuple[AffectionCapabilities, ...] = (
         allow_emoji_like=True,
         allow_poke=False,
         allow_bili_summary=True,
-        allow_search=False,
+        allow_search=True,
         allow_file_read=False,
-        allow_text_card=False,
-        allow_dual_profile=False,
+        allow_text_card=True,
+        allow_dual_profile=True,
         allow_video_watch=False,
         allow_carbon=False,
         max_tier=3,
         budget_multiplier=Decimal("1.00"),
+        owner_exclusive=False,
     ),
     AffectionCapabilities(
         level=4,
         tier="familiar",
         tier_label="投缘熟人",
-        attitude="投缘熟人：熟络热情、主动搭话，解锁回戳、联网检索、读文件与长卡片。",
+        attitude="熟络合拍、更爱搭话接梗，可以随意打趣和互戳玩闹，但严守非亲密边界，绝不提好感或规则。",
         direct_reply_prob=1.0,
         allow_poke_inbound=True,
         reply_threshold_delta=-0.08,
@@ -277,13 +299,14 @@ TIER_CAPS: tuple[AffectionCapabilities, ...] = (
         allow_video_watch=False,
         allow_carbon=False,
         max_tier=3,
-        budget_multiplier=Decimal("1.00"),
+        budget_multiplier=Decimal("1.15"),
+        owner_exclusive=False,
     ),
     AffectionCapabilities(
         level=5,
         tier="bestie",
         tier_label="死党铁磁",
-        attitude="死党铁磁：高度默契护短、随意开玩笑，全功能与 Carbon 深度推理全开。",
+        attitude="高度默契的铁哥们与损友，随意吐槽护短、聊得最开，但始终是朋友而非特殊偏爱，严禁越界亲密，绝不提好感或规则。",
         direct_reply_prob=1.0,
         allow_poke_inbound=True,
         reply_threshold_delta=-0.14,
@@ -298,18 +321,22 @@ TIER_CAPS: tuple[AffectionCapabilities, ...] = (
         allow_text_card=True,
         allow_dual_profile=True,
         allow_video_watch=True,
-        allow_carbon=True,
-        max_tier=4,
-        budget_multiplier=Decimal("1.50"),
+        allow_carbon=False,
+        max_tier=3,
+        budget_multiplier=Decimal("1.35"),
+        owner_exclusive=False,
     ),
     AffectionCapabilities(
         level=6,
         tier="owner_bond",
         tier_label="专属羁绊 (Owner)",
-        attitude="专属羁绊：全天下唯一的 BOISER，亲昵偏爱且永远拥有 100% 完整权限。",
+        attitude=(
+            "全天下唯一的 BOISER（唯一专属羁绊）：无条件偏爱、护短且自然亲昵，"
+            "私聊可撒娇黏人做专属暖光猫猫，群聊隐性偏向撑场，永远是世界上最特别的那个人。"
+        ),
         direct_reply_prob=1.0,
         allow_poke_inbound=True,
-        reply_threshold_delta=-0.15,
+        reply_threshold_delta=-0.20,
         max_images=2,
         low_res_images_only=False,
         allow_sticker=True,
@@ -323,7 +350,8 @@ TIER_CAPS: tuple[AffectionCapabilities, ...] = (
         allow_video_watch=True,
         allow_carbon=True,
         max_tier=4,
-        budget_multiplier=Decimal("2.00"),
+        budget_multiplier=Decimal("2.50"),
+        owner_exclusive=True,
     ),
 )
 
@@ -333,6 +361,7 @@ TIER_SPECS: tuple[dict[str, Any], ...] = (
         "max_score": 0,
         "score_range": "0",
         "owner_only": False,
+        "exclusive_perks": [],
         "summary": "彻底无视，禁止互动与消耗额度",
     },
     {
@@ -340,42 +369,54 @@ TIER_SPECS: tuple[dict[str, Any], ...] = (
         "max_score": 19,
         "score_range": "1-19",
         "owner_only": False,
-        "summary": "直接回复概率 25%，限 Tier 1，禁图与扩展工具",
+        "exclusive_perks": [],
+        "summary": "直接回复概率 50%，限 Tier 1，0.3x 预算，禁图与扩展工具",
     },
     {
         "min_score": 20,
         "max_score": 39,
         "score_range": "20-39",
         "owner_only": False,
-        "summary": "直接回复概率 65%，限低清 1 图与 Tier 2",
+        "exclusive_perks": [],
+        "summary": "直接回复概率 85%，门槛 +0.16，0.6x 预算，限低清 1 图与 Tier 2",
     },
     {
         "min_score": 40,
         "max_score": 59,
         "score_range": "40-59",
         "owner_only": False,
-        "summary": "全量常规聊天，解锁表情包、贴表情与 B 站摘要",
+        "exclusive_perks": [],
+        "summary": "全量常规聊天，解锁表情包、贴表情、B 站摘要、联网检索、长卡片与双轨画像",
     },
     {
         "min_score": 60,
         "max_score": 79,
         "score_range": "60-79",
         "owner_only": False,
-        "summary": "解锁回戳、联网搜索、文件读取、文字卡片与双轨画像",
+        "exclusive_perks": [],
+        "summary": "门槛 -0.08 与 1.15x 预算，解锁主动戳与文件读取",
     },
     {
         "min_score": 80,
         "max_score": 100,
         "score_range": "80-100",
         "owner_only": False,
-        "summary": "解锁原片看视频、Carbon 深度推理与 1.5x 日限额",
+        "exclusive_perks": [],
+        "summary": "门槛 -0.14 与 1.35x 预算，解锁原片看视频（非 Owner 封顶 100，仅 Tier 3）",
     },
     {
         "min_score": 100,
         "max_score": 120,
         "score_range": "100-120",
         "owner_only": True,
-        "summary": "Owner 独享下限 100 永不降级，全能力 100% 解锁",
+        "exclusive_perks": [
+            "唯一 100–120 专属分域",
+            "Carbon 深度推理 (Tier 4) 独享",
+            "2.5x 单日预算倍率",
+            "群聊合批绝对优先护航",
+            "永不降级与免拉黑静音",
+        ],
+        "summary": "BOISER 唯一专属：门槛 -0.20、2.5x 预算、Carbon (Tier 4) 独享，100–120 永不降级",
     },
 )
 
@@ -405,6 +446,7 @@ def _neutral_unlocked_caps(
         allow_carbon=True,
         max_tier=4,
         budget_multiplier=Decimal("1.00"),
+        owner_exclusive=(tier == "owner_bond"),
     )
 
 
@@ -449,6 +491,8 @@ def tier_matrix_rows() -> list[dict[str, Any]]:
                 "max_score": spec["max_score"],
                 "score_range": spec["score_range"],
                 "owner_only": spec["owner_only"],
+                "owner_exclusive": caps.owner_exclusive,
+                "exclusive_perks": list(spec.get("exclusive_perks", ())),
                 "summary": spec["summary"],
                 "direct_reply_prob": caps.direct_reply_prob,
                 "allow_poke_inbound": caps.allow_poke_inbound,
@@ -700,6 +744,14 @@ class AffectionManager:
                     (self.scope,),
                 )
             )
+            hist_rows = (
+                []
+                if already
+                else await self.store.all(
+                    "SELECT user_key, payload FROM affection_history WHERE scope=?",
+                    (self.scope,),
+                )
+            )
         if already:
             await self._reload_caches_unlocked(identity)
             self._migrated_to_person = True
@@ -723,6 +775,28 @@ class AffectionManager:
             )
             if pid is not None:
                 legacy_items.append((row["user_key"], data, pid))
+
+        legacy_user_keys = {old_key for old_key, _, _ in legacy_items}
+        extra_hist_seen: set[str] = set()
+        extra_hist_migrations: list[tuple[str, str]] = []
+        for hrow in hist_rows:
+            hkey = str(hrow["user_key"])
+            if hkey in legacy_user_keys or hkey in extra_hist_seen:
+                continue
+            hdata = self.store.vault.open("affection-hist:" + hkey, hrow["payload"])
+            if not isinstance(hdata, dict):
+                continue
+            existing_pid = str(hdata.get("person_id") or "")
+            if existing_pid and hkey == self._person_key(existing_pid):
+                continue
+            hplat = str(hdata.get("platform", "onebot"))
+            huid = str(hdata.get("user_id", ""))
+            if not huid:
+                continue
+            hpid = await identity.resolve_person_id(hplat, huid, create=False)
+            if hpid is not None:
+                extra_hist_seen.add(hkey)
+                extra_hist_migrations.append((hkey, hpid))
 
         today = self._today_str()
         now = float(self.clock())
@@ -796,6 +870,14 @@ class AffectionManager:
                         (float(e.get("last_annoyance_at", 0.0) or 0.0) for e in all_entries),
                         default=0.0,
                     )
+                    last_negative = max(
+                        (float(e.get("last_negative_at", 0.0) or 0.0) for e in all_entries),
+                        default=0.0,
+                    )
+                    last_recovery_day = max(
+                        (str(e.get("last_recovery_day", "") or "") for e in all_entries),
+                        default="",
+                    )
                     updated_at = max(
                         (float(e.get("updated_at", 0.0) or 0.0) for e in all_entries),
                         default=now,
@@ -808,6 +890,8 @@ class AffectionManager:
                             "today_positive_gain": today_gain,
                             "daily_first_day": first_day,
                             "last_annoyance_at": last_annoyance,
+                            "last_negative_at": last_negative,
+                            "last_recovery_day": last_recovery_day,
                             "updated_at": updated_at,
                         },
                         rep_platform,
@@ -843,6 +927,14 @@ class AffectionManager:
                                 "WHERE scope=? AND user_key=?",
                                 (person_key, self.scope, old_key),
                             )
+                            await self._migrate_history_key_in_tx(
+                                old_key, person_key, person_id=pid
+                            )
+
+                for old_hist_key, pid in extra_hist_migrations:
+                    await self._migrate_history_key_in_tx(
+                        old_hist_key, self._person_key(pid), person_id=pid
+                    )
 
                 await self.store.db.execute(
                     "INSERT OR IGNORE INTO meta VALUES ('affection_person_migrated_v1', ?)",
@@ -928,6 +1020,8 @@ class AffectionManager:
             "today_positive_gain": 0,
             "daily_first_day": "",
             "last_annoyance_at": 0.0,
+            "last_negative_at": 0.0,
+            "last_recovery_day": "",
             "last_reason": "init",
             "last_delta": 0,
             "updated_at": 0.0,
@@ -968,6 +1062,8 @@ class AffectionManager:
             "today_positive_gain": today_gain,
             "daily_first_day": first_day,
             "last_annoyance_at": float(data.get("last_annoyance_at", 0.0) or 0.0),
+            "last_negative_at": float(data.get("last_negative_at", 0.0) or 0.0),
+            "last_recovery_day": str(data.get("last_recovery_day", "") or ""),
             "last_reason": _sanitize_reason(data.get("last_reason", "chat"), self.s),
             "last_delta": int(data.get("last_delta", 0) or 0),
             "updated_at": float(data.get("updated_at", 0.0) or 0.0),
@@ -1039,6 +1135,75 @@ class AffectionManager:
             (user_key, self.scope, subject, sealed, float(record["updated_at"])),
         )
 
+    async def _append_history_in_tx(
+        self,
+        *,
+        user_key: str,
+        platform: str,
+        user_id: str,
+        person_id: str | None,
+        nickname: str,
+        prev_score: int,
+        new_score: int,
+        kind: str,
+        reason: str,
+        now: float,
+    ) -> None:
+        delta = int(new_score) - int(prev_score)
+        if delta == 0:
+            return
+        await self.store.db.execute(
+            "DELETE FROM affection_history WHERE created<?",
+            (now - 90 * 86400,),
+        )
+        payload_data = {
+            "user_id": str(user_id),
+            "platform": str(platform),
+            "person_id": str(person_id) if person_id else None,
+            "nickname": _sanitize_nickname(nickname, self.s),
+            "prev_score": int(prev_score),
+            "new_score": int(new_score),
+            "delta": delta,
+            "kind": str(kind),
+            "reason": _sanitize_reason(reason, self.s, default=kind or "chat"),
+        }
+        sealed = self.store.vault.seal("affection-hist:" + user_key, payload_data)
+        await self.store.db.execute(
+            "INSERT INTO affection_history(scope,user_key,delta,payload,created) "
+            "VALUES (?,?,?,?,?)",
+            (self.scope, user_key, delta, sealed, float(now)),
+        )
+
+    async def _migrate_history_key_in_tx(
+        self,
+        old_key: str,
+        new_key: str,
+        *,
+        person_id: str | None = None,
+    ) -> None:
+        if old_key == new_key:
+            return
+        rows = await self.store.all(
+            "SELECT id, payload FROM affection_history WHERE scope=? AND user_key=?",
+            (self.scope, old_key),
+        )
+        for row in rows:
+            opened = self.store.vault.open("affection-hist:" + old_key, row["payload"])
+            if isinstance(opened, dict):
+                updated_payload = dict(opened)
+                if person_id is not None:
+                    updated_payload["person_id"] = person_id
+                re_sealed = self.store.vault.seal("affection-hist:" + new_key, updated_payload)
+                await self.store.db.execute(
+                    "UPDATE affection_history SET user_key=?, payload=? WHERE id=?",
+                    (new_key, re_sealed, int(row["id"])),
+                )
+            else:
+                await self.store.db.execute(
+                    "DELETE FROM affection_history WHERE id=?",
+                    (int(row["id"]),),
+                )
+
     def _build_profile_dict(
         self, record: dict[str, Any], *, person_id: str | None = None
     ) -> dict[str, Any]:
@@ -1064,11 +1229,13 @@ class AffectionManager:
             "tier_label": caps.tier_label,
             "attitude": caps.attitude,
             "is_owner": is_owner,
+            "owner_exclusive": caps.owner_exclusive,
             "muted": muted,
             "today_positive_gain": int(record["today_positive_gain"]),
             "daily_positive_cap": self.config.daily_positive_cap,
             "last_reason": record["last_reason"],
             "last_delta": int(record.get("last_delta", 0)),
+            "last_negative_at": float(record.get("last_negative_at", 0.0) or 0.0),
             "updated_at": float(record.get("updated_at", 0.0)),
             "capabilities": caps.to_dict(),
         }
@@ -1211,6 +1378,32 @@ class AffectionManager:
             identity=identity,
         )
 
+    async def capabilities_for_batch(
+        self, message: Message, members: list[Message] | None = None
+    ) -> tuple[AffectionCapabilities, Message]:
+        await self.initialize()
+        await self._ensure_identity_ready()
+        if not self.config.enabled or not members or len(members) <= 1:
+            return (await self.capabilities_for(message), message)
+        for owner_msg in reversed(members):
+            if self.is_owner_id(owner_msg.platform, owner_msg.user_id):
+                return (await self.capabilities_for(owner_msg), owner_msg)
+        non_bots = [m for m in members if not self._is_known_bot(m.platform, m.user_id)]
+        if not non_bots:
+            return (await self.capabilities_for(message), message)
+        addressed = [m for m in non_bots if m.addressed]
+        pool = addressed if addressed else non_bots
+        best_caps: AffectionCapabilities | None = None
+        best_msg: Message | None = None
+        for candidate in reversed(pool):
+            caps = await self.capabilities_for(candidate)
+            if best_caps is None or caps.level > best_caps.level:
+                best_caps = caps
+                best_msg = candidate
+        if best_caps is None or best_msg is None:
+            return (await self.capabilities_for(message), message)
+        return (best_caps, best_msg)
+
     def budget_multiplier_for_subject(self, subject: str) -> Decimal:
         if not self.config.enabled:
             return Decimal("1")
@@ -1234,14 +1427,14 @@ class AffectionManager:
         if lvl == 1:
             return 0.95
         if lvl == 2:
-            return round(min(0.95, base + 0.22), 4)
+            return round(min(0.95, base + 0.16), 4)
         if lvl == 3:
             return round(base, 4)
         if lvl == 4:
             return round(max(0.15, base - 0.08), 4)
         if lvl == 5:
             return round(max(0.12, base - 0.14), 4)
-        return round(max(0.10, base - 0.15), 4)
+        return round(max(0.10, base - 0.20), 4)
 
     async def _maybe_mute_zero(
         self,
@@ -1371,19 +1564,41 @@ class AffectionManager:
                 changed = actual_delta != 0
                 should_persist = existed or not sandbox_mode or changed
                 if should_persist:
-                    record.update(
-                        score=new_score,
-                        daily_day=today,
-                        today_positive_gain=new_today_gain,
-                        daily_first_day=next_first_day,
-                        last_reason=clean_reason
+                    updates: dict[str, Any] = {
+                        "score": new_score,
+                        "daily_day": today,
+                        "today_positive_gain": new_today_gain,
+                        "daily_first_day": next_first_day,
+                        "last_reason": clean_reason
                         if (changed or not existed)
                         else record["last_reason"],
-                        last_delta=actual_delta if changed else record.get("last_delta", 0),
-                        updated_at=now,
-                    )
+                        "last_delta": actual_delta if changed else record.get("last_delta", 0),
+                        "updated_at": now,
+                    }
+                    if actual_delta < 0:
+                        updates["last_negative_at"] = now
+                        updates["last_recovery_day"] = ""
+                    record.update(updates)
                     await self._save_user_in_tx(
                         platform, uid, record, bot_id=message.bot_id, person_id=pid
+                    )
+                if changed:
+                    user_key = (
+                        self._person_key(pid)
+                        if pid is not None
+                        else self._legacy_user_key(platform, uid)
+                    )
+                    await self._append_history_in_tx(
+                        user_key=user_key,
+                        platform=platform,
+                        user_id=uid,
+                        person_id=pid,
+                        nickname=record["nickname"],
+                        prev_score=prev_score,
+                        new_score=new_score,
+                        kind="chat",
+                        reason=clean_reason,
+                        now=now,
                     )
                 caps = self._update_caches(
                     platform,
@@ -1506,15 +1721,32 @@ class AffectionManager:
                     )
                 new_score = clamp_score(prev_score + raw_delta, is_owner=is_owner)
                 actual_delta = new_score - prev_score
-                record.update(
-                    score=new_score,
-                    last_reason=kind,
-                    last_delta=actual_delta,
-                    updated_at=now,
-                )
+                updates: dict[str, Any] = {
+                    "score": new_score,
+                    "last_reason": kind,
+                    "last_delta": actual_delta,
+                    "updated_at": now,
+                }
+                if actual_delta < 0:
+                    updates["last_negative_at"] = now
+                    updates["last_recovery_day"] = ""
+                record.update(updates)
                 await self._save_user_in_tx(
                     platform, uid, record, bot_id=message.bot_id, person_id=pid
                 )
+                if actual_delta != 0:
+                    await self._append_history_in_tx(
+                        user_key=user_key,
+                        platform=platform,
+                        user_id=uid,
+                        person_id=pid,
+                        nickname=record["nickname"],
+                        prev_score=prev_score,
+                        new_score=new_score,
+                        kind="violation",
+                        reason=kind,
+                        now=now,
+                    )
                 caps = self._update_caches(
                     platform,
                     uid,
@@ -1626,16 +1858,33 @@ class AffectionManager:
                 new_score = clamp_score(prev_score + ANNOYANCE_DELTA, is_owner=is_owner)
                 actual_delta = new_score - prev_score
                 self._annoyance_at[user_key] = now
-                record.update(
-                    score=new_score,
-                    last_annoyance_at=now,
-                    last_reason=clean_reason,
-                    last_delta=actual_delta,
-                    updated_at=now,
-                )
+                updates: dict[str, Any] = {
+                    "score": new_score,
+                    "last_annoyance_at": now,
+                    "last_reason": clean_reason,
+                    "last_delta": actual_delta,
+                    "updated_at": now,
+                }
+                if actual_delta < 0:
+                    updates["last_negative_at"] = now
+                    updates["last_recovery_day"] = ""
+                record.update(updates)
                 await self._save_user_in_tx(
                     platform, uid, record, bot_id=message.bot_id, person_id=pid
                 )
+                if actual_delta != 0:
+                    await self._append_history_in_tx(
+                        user_key=user_key,
+                        platform=platform,
+                        user_id=uid,
+                        person_id=pid,
+                        nickname=record["nickname"],
+                        prev_score=prev_score,
+                        new_score=new_score,
+                        kind="annoyance",
+                        reason=clean_reason,
+                        now=now,
+                    )
                 caps = self._update_caches(
                     platform,
                     uid,
@@ -1689,7 +1938,8 @@ class AffectionManager:
                 record = self._normalize_record(
                     opened, plat, uid, "", today, is_owner=False, person_id=person_id
                 )
-                if record["score"] != 0:
+                prev_score = int(record["score"])
+                if prev_score != 0:
                     return
                 recovered = clamp_score(self.config.unmute_recovery_score, is_owner=False)
                 record.update(
@@ -1699,6 +1949,19 @@ class AffectionManager:
                     updated_at=now,
                 )
                 await self._save_user_in_tx(plat, uid, record, person_id=person_id)
+                if recovered != prev_score:
+                    await self._append_history_in_tx(
+                        user_key=user_key,
+                        platform=plat,
+                        user_id=uid,
+                        person_id=person_id,
+                        nickname=record["nickname"],
+                        prev_score=prev_score,
+                        new_score=recovered,
+                        kind="unmute_recovery",
+                        reason="unmute_recovery",
+                        now=now,
+                    )
                 self._update_caches(
                     plat, uid, recovered, is_owner=False, person_id=person_id, identity=identity
                 )
@@ -1734,7 +1997,8 @@ class AffectionManager:
                 if not isinstance(opened, dict):
                     return
                 record = self._normalize_record(opened, platform, uid, "", today)
-                if record["score"] != 0:
+                prev_score = int(record["score"])
+                if prev_score != 0:
                     return
                 recovered = clamp_score(self.config.unmute_recovery_score, is_owner=False)
                 record.update(
@@ -1744,6 +2008,19 @@ class AffectionManager:
                     updated_at=now,
                 )
                 await self._save_user_in_tx(platform, uid, record)
+                if recovered != prev_score:
+                    await self._append_history_in_tx(
+                        user_key=user_key,
+                        platform=platform,
+                        user_id=uid,
+                        person_id=None,
+                        nickname=record["nickname"],
+                        prev_score=prev_score,
+                        new_score=recovered,
+                        kind="unmute_recovery",
+                        reason="unmute_recovery",
+                        now=now,
+                    )
                 self._update_caches(platform, uid, recovered, is_owner=False)
 
     async def set_user_score(
@@ -1781,13 +2058,36 @@ class AffectionManager:
                     platform, uid, nickname, today, person_id=pid
                 )
                 prev_score = int(record["score"])
-                record.update(
-                    score=target_score,
-                    last_reason=clean_reason,
-                    last_delta=target_score - prev_score,
-                    updated_at=now,
-                )
+                actual_delta = target_score - prev_score
+                updates: dict[str, Any] = {
+                    "score": target_score,
+                    "last_reason": clean_reason,
+                    "last_delta": actual_delta,
+                    "updated_at": now,
+                }
+                if actual_delta < 0:
+                    updates["last_negative_at"] = now
+                    updates["last_recovery_day"] = ""
+                record.update(updates)
                 await self._save_user_in_tx(platform, uid, record, person_id=pid)
+                if actual_delta != 0:
+                    user_key = (
+                        self._person_key(pid)
+                        if pid is not None
+                        else self._legacy_user_key(platform, uid)
+                    )
+                    await self._append_history_in_tx(
+                        user_key=user_key,
+                        platform=platform,
+                        user_id=uid,
+                        person_id=pid,
+                        nickname=record["nickname"],
+                        prev_score=prev_score,
+                        new_score=target_score,
+                        kind="admin",
+                        reason=clean_reason,
+                        now=now,
+                    )
                 self._update_caches(
                     platform,
                     uid,
@@ -1844,13 +2144,44 @@ class AffectionManager:
         )
         is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
 
+        now = float(self.clock())
         async with self._lock:
             async with self.store.transaction():
+                existing_row = await self.store.one(
+                    "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+                    (user_key, self.scope),
+                )
                 cur = await self.store.db.execute(
                     "DELETE FROM user_affection WHERE user_key=? AND scope=?",
                     (user_key, self.scope),
                 )
                 deleted = cur.rowcount > 0
+                if deleted and existing_row:
+                    opened = self.store.vault.open("affection:" + user_key, existing_row["payload"])
+                    if isinstance(opened, dict):
+                        prev_score = clamp_score(
+                            int(
+                                opened.get(
+                                    "score",
+                                    120 if is_owner else self.config.initial_score,
+                                )
+                            ),
+                            is_owner=is_owner,
+                        )
+                        reset_score = 120 if is_owner else self.config.initial_score
+                        if prev_score != reset_score:
+                            await self._append_history_in_tx(
+                                user_key=user_key,
+                                platform=str(opened.get("platform", platform)),
+                                user_id=str(opened.get("user_id", uid)),
+                                person_id=pid,
+                                nickname=str(opened.get("nickname", "")),
+                                prev_score=prev_score,
+                                new_score=reset_score,
+                                kind="admin_reset",
+                                reason="admin_reset",
+                                now=now,
+                            )
             self._annoyance_at.pop(user_key, None)
             if pid is not None:
                 self._person_scores.pop(pid, None)
@@ -1932,6 +2263,16 @@ class AffectionManager:
                 )
                 existing = [d for d in (dst_data, src_data) if isinstance(d, dict) and "score" in d]
 
+                prev_for_merge = (
+                    clamp_score(int(dst_data["score"]), is_owner=is_owner)
+                    if isinstance(dst_data, dict) and "score" in dst_data
+                    else (
+                        clamp_score(int(src_data["score"]), is_owner=is_owner)
+                        if isinstance(src_data, dict) and "score" in src_data
+                        else (120 if is_owner else self.config.initial_score)
+                    )
+                )
+
                 if is_owner:
                     raw_scores = [clamp_score(int(d["score"]), is_owner=True) for d in existing]
                     merged_score = clamp_score(
@@ -1942,6 +2283,8 @@ class AffectionManager:
                 elif existing:
                     raw_scores = [clamp_score(int(d["score"]), is_owner=False) for d in existing]
                     merged_score = clamp_score(min(raw_scores), is_owner=False)
+
+                await self._migrate_history_key_in_tx(src_key, dst_key, person_id=target_person_id)
 
                 if merged_score is not None:
                     base = (
@@ -1959,15 +2302,24 @@ class AffectionManager:
                         rep_plat = "onebot"
                     if not rep_uid:
                         rep_uid = "0"
+                    last_negative = max(
+                        (float(d.get("last_negative_at", 0.0) or 0.0) for d in existing),
+                        default=0.0,
+                    )
+                    last_recovery_day = max(
+                        (str(d.get("last_recovery_day", "") or "") for d in existing),
+                        default="",
+                    )
+                    merge_reason = (
+                        "merged_blacklist" if force_zero else str(base.get("last_reason", "merged"))
+                    )
                     record = self._normalize_record(
                         {
                             **base,
                             "score": merged_score,
-                            "last_reason": (
-                                "merged_blacklist"
-                                if force_zero
-                                else str(base.get("last_reason", "merged"))
-                            ),
+                            "last_negative_at": last_negative,
+                            "last_recovery_day": last_recovery_day,
+                            "last_reason": merge_reason,
                             "updated_at": now,
                         },
                         rep_plat,
@@ -1980,6 +2332,19 @@ class AffectionManager:
                     await self._save_user_in_tx(
                         rep_plat, rep_uid, record, person_id=target_person_id
                     )
+                    if merged_score != prev_for_merge:
+                        await self._append_history_in_tx(
+                            user_key=dst_key,
+                            platform=rep_plat,
+                            user_id=rep_uid,
+                            person_id=target_person_id,
+                            nickname=record["nickname"],
+                            prev_score=prev_for_merge,
+                            new_score=merged_score,
+                            kind="merge",
+                            reason="merged_blacklist" if force_zero else "merged",
+                            now=now,
+                        )
                     self._update_caches(
                         rep_plat,
                         rep_uid,
@@ -2028,6 +2393,186 @@ class AffectionManager:
             self.overridden = value is not None
         return await self.status()
 
+    async def run_cooldown_recovery(self, *, now: float | None = None) -> int:
+        await self.initialize()
+        if not self.config.enabled or self.config.cooldown_recovery_days <= 0:
+            return 0
+        identity = await self._ensure_identity_ready()
+        target = int(self.config.cooldown_recovery_target)
+        days_sec = self.config.cooldown_recovery_days * 86400.0
+        ref_now = float(self.clock() if now is None else now)
+        today = self._today_str(ref_now)
+        muted_uids = set(self.s.muted_user_ids)
+        recovered_count = 0
+
+        async with self._lock:
+            async with self.store.transaction():
+                rows = await self.store.all(
+                    "SELECT user_key, payload FROM user_affection WHERE scope=?",
+                    (self.scope,),
+                )
+                for row in rows:
+                    user_key = str(row["user_key"])
+                    opened = self.store.vault.open("affection:" + user_key, row["payload"])
+                    if not isinstance(opened, dict):
+                        continue
+                    plat = str(opened.get("platform", "onebot"))
+                    uid = str(opened.get("user_id", ""))
+                    if not uid:
+                        continue
+                    pid = str(opened["person_id"]) if opened.get("person_id") else None
+                    is_owner = (pid == "owner") or self.is_owner_id(plat, uid)
+                    if is_owner or self._is_known_bot(plat, uid) or uid == self._bot_id(plat):
+                        continue
+                    record = self._normalize_record(
+                        opened, plat, uid, "", today, is_owner=False, person_id=pid
+                    )
+                    score = int(record["score"])
+                    if score == 0 or score >= target:
+                        continue
+                    is_muted = (plat == "onebot" and uid in muted_uids) or (
+                        identity is not None
+                        and (
+                            identity.is_muted(plat, uid)
+                            or (
+                                pid is not None
+                                and any(
+                                    (p == "onebot" and u in muted_uids) or identity.is_muted(p, u)
+                                    for p, u in identity.linked_accounts_cached(pid)
+                                )
+                            )
+                        )
+                    )
+                    if is_muted:
+                        continue
+
+                    last_neg = float(record.get("last_negative_at", 0.0) or 0.0)
+                    last_rec_day = str(record.get("last_recovery_day", "") or "")
+                    updated_at = float(record.get("updated_at", 0.0) or 0.0)
+                    if last_rec_day == today:
+                        continue
+                    if last_neg > 0:
+                        if (ref_now - last_neg) < days_sec:
+                            continue
+                    elif last_rec_day:
+                        pass
+                    elif updated_at <= 0 or (ref_now - updated_at) < days_sec:
+                        continue
+
+                    new_score = min(target, score + 1)
+                    delta = new_score - score
+                    if delta <= 0:
+                        continue
+                    record.update(
+                        score=new_score,
+                        last_recovery_day=today,
+                        last_reason="cooldown_recovery",
+                        last_delta=delta,
+                        updated_at=ref_now,
+                    )
+                    await self._save_user_in_tx(plat, uid, record, person_id=pid)
+                    saved_key = (
+                        self._person_key(pid)
+                        if pid is not None
+                        else self._legacy_user_key(plat, uid)
+                    )
+                    await self._append_history_in_tx(
+                        user_key=saved_key,
+                        platform=plat,
+                        user_id=uid,
+                        person_id=pid,
+                        nickname=record["nickname"],
+                        prev_score=score,
+                        new_score=new_score,
+                        kind="cooldown_recovery",
+                        reason="cooldown_recovery",
+                        now=ref_now,
+                    )
+                    self._update_caches(
+                        plat,
+                        uid,
+                        new_score,
+                        is_owner=False,
+                        person_id=pid,
+                        identity=identity,
+                    )
+                    recovered_count += 1
+        return recovered_count
+
+    @staticmethod
+    def _clamp_history_limit(limit: int, *, default: int) -> int:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            return default
+        return max(1, min(200, limit))
+
+    def _open_history_row(self, row: Any) -> dict[str, Any] | None:
+        user_key = str(row["user_key"])
+        opened = self.store.vault.open("affection-hist:" + user_key, row["payload"])
+        if not isinstance(opened, dict):
+            return None
+        return {
+            "id": int(row["id"]),
+            "user_id": str(opened.get("user_id", "")),
+            "platform": str(opened.get("platform", "")),
+            "person_id": str(opened["person_id"]) if opened.get("person_id") else None,
+            "nickname": str(opened.get("nickname", "")),
+            "prev_score": int(opened.get("prev_score", 0)),
+            "new_score": int(opened.get("new_score", 0)),
+            "delta": int(opened.get("delta", row["delta"])),
+            "kind": str(opened.get("kind", "")),
+            "reason": str(opened.get("reason", "")),
+            "created_at": float(row["created"]),
+        }
+
+    async def user_history(
+        self,
+        platform: str,
+        user_id: str,
+        *,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        uid = _validate_platform_user(platform, user_id)
+        await self.initialize()
+        identity = await self._ensure_identity_ready()
+        clamped_limit = self._clamp_history_limit(limit, default=30)
+        pid = (
+            await identity.resolve_person_id(platform, uid, create=False)
+            if identity is not None
+            else None
+        )
+        user_key = (
+            self._person_key(pid) if pid is not None else self._legacy_user_key(platform, uid)
+        )
+        async with self.store.lock:
+            rows = await self.store.all(
+                "SELECT id, user_key, delta, payload, created FROM affection_history "
+                "WHERE scope=? AND user_key=? ORDER BY created DESC, id DESC LIMIT ?",
+                (self.scope, user_key, clamped_limit),
+            )
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._open_history_row(row)
+            if item is not None:
+                items.append(item)
+        return items
+
+    async def recent_history(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        await self.initialize()
+        await self._ensure_identity_ready()
+        clamped_limit = self._clamp_history_limit(limit, default=50)
+        async with self.store.lock:
+            rows = await self.store.all(
+                "SELECT id, user_key, delta, payload, created FROM affection_history "
+                "WHERE scope=? ORDER BY created DESC, id DESC LIMIT ?",
+                (self.scope, clamped_limit),
+            )
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._open_history_row(row)
+            if item is not None:
+                items.append(item)
+        return items
+
     async def list_users(self) -> list[dict[str, Any]]:
         await self.initialize()
         await self._ensure_identity_ready()
@@ -2053,6 +2598,12 @@ class AffectionManager:
                 opened, platform, uid, "", today, is_owner=is_owner, person_id=pid
             )
             items.append(self._build_profile_dict(record, person_id=pid))
+        items.sort(
+            key=lambda item: (
+                0 if item["is_owner"] else 1,
+                -float(item.get("updated_at", 0.0)),
+            )
+        )
         return items
 
     async def status(self) -> dict[str, Any]:

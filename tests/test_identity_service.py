@@ -253,8 +253,9 @@ async def test_cross_platform_shared_score_capabilities_and_validation(id_env, m
     )
     caps = await aff.capabilities_for(dc_msg)
     assert caps.level == 5 and caps.tier == "bestie"
-    assert caps.allow_carbon is True and caps.allow_video_watch is True
-    assert aff.budget_multiplier_for_subject(ident.store.subject(dc_msg)) == Decimal("1.50")
+    assert caps.allow_carbon is False and caps.allow_video_watch is True
+    assert caps.max_tier == 3 and caps.owner_exclusive is False
+    assert aff.budget_multiplier_for_subject(ident.store.subject(dc_msg)) == Decimal("1.35")
     assert aff.adjust_reply_threshold(dc_msg, 0.42) == pytest.approx(0.28)
 
     # Turn delta on discord modifies the shared person score visible on onebot and qq.

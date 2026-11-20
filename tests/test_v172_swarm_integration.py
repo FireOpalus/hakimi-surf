@@ -15,6 +15,7 @@ from PIL import Image
 from pydantic import SecretStr
 
 from hakimi.adapters import Sender
+from hakimi.affection import AffectionConfig
 from hakimi.app import create_app
 from hakimi.bot_server import assemble_chat_input, prompt_context
 from hakimi.context_budget import estimate_tokens
@@ -402,12 +403,10 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
 
     monkeypatch.setattr(svc.sessions.dual, "prefetch", fake_prefetch)
 
-    # Lv.3 (score=50): search, file, poke, text_card, dual_profile, video, Carbon are gated.
+    # Lv.3 (score=50): search, card, dual_profile, sticker, emoji_like, bili_summary unlocked;
+    # file_read, poke, video_watch, Carbon remain gated (max_tier=3).
     rich_reply = "```python\n" + "x = 12345678901234567890\n" * 6 + "```"
-    ai.next_route = RouteDecision(
-        "chat", tier=4, need_external_lookup=True, need_memory_recall=True
-    )
-    ai.next_reply = json.dumps(
+    lv3_reply = json.dumps(
         {
             "abstain": False,
             "bubbles": [rich_reply],
@@ -420,6 +419,10 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
         },
         ensure_ascii=False,
     )
+    ai.next_route = RouteDecision(
+        "chat", tier=4, need_external_lookup=True, need_memory_recall=True
+    )
+    ai.next_reply = lv3_reply
     lv3_msg = _member_msg(
         message,
         event_id="10020",
@@ -429,14 +432,15 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
     )
     await run_msg(lv3_msg)
     gen_call = [c for c in ai.calls if c[0] == "generate"][-1]
-    assert ai.search_calls == []  # search gated
-    assert "file_attachments" not in gen_call[1]  # file read gated
-    assert "speaker_profile" not in gen_call[1]["dual_memory_data"]
-    assert "member_profiles" not in gen_call[1]["dual_memory_data"]
+    assert ai.search_calls == ["测试"]  # search enabled at Lv.3
+    assert "file_attachments" not in gen_call[1]  # file read gated at Lv.3
+    assert "speaker_profile" in gen_call[1]["dual_memory_data"]  # dual_profile enabled at Lv.3
+    assert "member_profiles" in gen_call[1]["dual_memory_data"]
     assert gen_call[1]["sender_affection"]["score"] == 50
+    assert "unique_owner" not in gen_call[1]["sender_affection"]
     assert gen_call[3]["route"].tier == 3  # Carbon clamped to 3
     assert sender.pokes == []  # poke gated at Lv.3
-    assert sender.cards == []  # text card gated at Lv.3
+    assert len(sender.cards) == 1  # text card enabled at Lv.3
     assert len(sender.memes) == 1  # sticker allowed at Lv.3
     assert len(sender.emojis) == 1  # emoji_like allowed at Lv.3
 
@@ -450,7 +454,9 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
     assert bili_video_calls == ["BV1xx411c7mD"]
     assert watch_calls == []  # regular Bili summary did NOT invoke video_watch.analyze
     bili_video_calls.clear()
+    ai.search_calls.clear()
 
+    ai.next_route = RouteDecision("chat", tier=1)
     ai.next_reply = None
     await run_msg(
         _member_msg(
@@ -458,8 +464,9 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
         )
     )
     assert watch_calls == []  # /watch-video gated off at Lv.3
+    ai.search_calls.clear()
 
-    # 4. Drop to Lv.2 (score=30): direct_reply_prob=0.65, low-res 1 image, no Bili/poke
+    # 4. Drop to Lv.2 (score=30): direct_reply_prob=0.85, low-res 1 image, no search/card/dual/Bili
     await store.runtime.affection.set_user_score("30000", 30, moderation=svc.moderation)
     monkeypatch.setattr("hakimi.service.random.random", lambda: 0.9)
     ai.fail_on_call = True
@@ -467,39 +474,70 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
     assert svc.counters["affection_prob_ignored"] >= 1
     ai.fail_on_call = False
 
-    # Poke at Lv.2 -> 0 Token & -3 annoyance
+    # Poke at Lv.2 under default config -> 0-Token ignore WITHOUT penalty
     ai.fail_on_call = True
     await run_msg(
         _member_msg(
             message,
-            event_id="lv2-poke",
+            event_id="lv2-poke-default",
             text="[协议事件：戳了戳你]",
             command_text="",
             created_at=now + 31,
         )
     )
     ai.fail_on_call = False
-    assert (await store.runtime.affection.profile("onebot", "30000"))["score"] == 27
+    assert (await store.runtime.affection.profile("onebot", "30000"))["score"] == 30
 
-    # Allow reply roll at Lv.2: 1 low-res image max, plain Bili link does NOT fetch Bili
+    # Enable penalize_poke_ignored via set_config -> 0-Token ignore AND -3 penalty
+    await store.runtime.affection.set_config(
+        AffectionConfig(enabled=True, penalize_poke_ignored=True)
+    )
+    ai.fail_on_call = True
+    await run_msg(
+        _member_msg(
+            message,
+            event_id="lv2-poke-penalized",
+            text="[协议事件：戳了戳你]",
+            command_text="",
+            created_at=now + 31.5,
+        )
+    )
+    ai.fail_on_call = False
+    assert (await store.runtime.affection.profile("onebot", "30000"))["score"] == 27
+    await store.runtime.affection.set_config(AffectionConfig(enabled=True))
+
+    # Allow reply roll at Lv.2: 1 low-res image max, search/card/dual_profile/Bili disabled
     monkeypatch.setattr("hakimi.service.random.random", lambda: 0.1)
-    ai.next_route = RouteDecision("chat", tier=3)
+    cards_before_lv2 = len(sender.cards)
+    memes_before_lv2 = len(sender.memes)
+    emojis_before_lv2 = len(sender.emojis)
+    ai.next_route = RouteDecision(
+        "chat", tier=3, need_external_lookup=True, need_memory_recall=True
+    )
+    ai.next_reply = lv3_reply
     await run_msg(
         _member_msg(
             message,
             event_id="lv2-img-bili",
-            text="看图和视频 BV1xx411c7mD",
+            text="/搜索 看图和视频 BV1xx411c7mD",
             images=[ImageRef(file="img1"), ImageRef(file="img2")],
             created_at=now + 32,
         )
     )
     assert bili_video_calls == []  # Lv.2 treats Bili link as normal chat text
+    assert ai.search_calls == []  # Lv.2 disables search
+    assert len(sender.cards) == cards_before_lv2  # Lv.2 disables text_card
+    assert len(sender.memes) == memes_before_lv2  # Lv.2 disables sticker
+    assert len(sender.emojis) == emojis_before_lv2  # Lv.2 disables emoji_like
     gen_lv2 = [c for c in ai.calls if c[0] == "generate"][-1]
+    assert "speaker_profile" not in gen_lv2[1]["dual_memory_data"]  # Lv.2 disables dual_profile
+    assert "member_profiles" not in gen_lv2[1]["dual_memory_data"]
     assert len(gen_lv2[3]["images"]) == 1 and gen_lv2[3]["images"][0].resolution == "low"
     assert gen_lv2[3]["route"].tier == 2  # clamped to max_tier=2
 
-    # 5. Lv.5 (score=85): unlocks search, file read, poke, card, dual_profile, /watch-video, Carbon
+    # 5. Lv.5 (score=85): unlocks file read, poke, /watch-video, but clamps Carbon (route.tier == 3)
     await store.runtime.affection.set_user_score("30000", 85, moderation=svc.moderation)
+    cards_before_lv5 = len(sender.cards)
     ai.next_route = RouteDecision(
         "chat", tier=4, need_external_lookup=True, need_memory_recall=True
     )
@@ -526,12 +564,12 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
         )
     )
     gen_lv5 = [c for c in ai.calls if c[0] == "generate"][-1]
-    assert len(ai.search_calls) == 1
+    assert ai.search_calls == ["开源"]
     assert "file_attachments" in gen_lv5[1]
     assert "speaker_profile" in gen_lv5[1]["dual_memory_data"]
-    assert gen_lv5[3]["route"].tier == 4  # Carbon unlocked
+    assert gen_lv5[3]["route"].tier == 3  # Non-Owner Lv.5 clamped to tier 3 (no Carbon)
     assert sender.pokes == ["30000"]
-    assert len(sender.cards) == 1
+    assert len(sender.cards) == cards_before_lv5 + 1
 
     await run_msg(
         _member_msg(
@@ -539,6 +577,18 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
         )
     )
     assert watch_calls == ["BV1xx411c7mD"]
+
+    # Owner Lv.6 is the ONLY tier with Carbon (route.tier == 4) and unique_owner=True
+    ai.next_route = RouteDecision("chat", tier=4, need_external_lookup=False)
+    ai.next_reply = None
+    await run_msg(
+        message.model_copy(
+            update={"event_id": "own-lv6-carbon", "text": "深入聊聊", "created_at": now + 42}
+        )
+    )
+    gen_own = [c for c in ai.calls if c[0] == "generate"][-1]
+    assert gen_own[3]["route"].tier == 4
+    assert gen_own[1]["sender_affection"]["unique_owner"] is True
 
     # 6. Drop to 0 -> farewell + muted (ai_affection_zero) + alert -> 0-Token -> /unmute 25
     await store.runtime.affection.set_user_score("30000", 20, moderation=svc.moderation)
@@ -634,7 +684,7 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
         assert len(wire.calls) == calls_before_manual
         await svc_real.moderation.set_muted("30000", False)
 
-    # 8. Rate-limit annoyance on Service.accept
+    # 8. Rate-limit on Service.accept: 0-Token ignore without penalty by default, -3 when enabled
     async with store.transaction():
         await store.db.execute("DELETE FROM counters")
     settings.user_requests_per_minute = 1
@@ -642,10 +692,20 @@ async def test_affection_service_lifecycle_commands_gating_farewell_and_unmute(
     m_rl1 = _member_msg(message, event_id="rl-1", text="你好1", created_at=now + 80)
     m_rl2 = _member_msg(message, event_id="rl-2", text="你好2", created_at=now + 81)
     assert await svc.accept(m_rl1) == "accepted"
+    ai.fail_on_call = True
+    assert await svc.accept(m_rl2) == "limited"
+    assert (await store.runtime.affection.profile("onebot", "30000"))["score"] == 50
+
+    await store.runtime.affection.set_config(
+        AffectionConfig(enabled=True, penalize_rate_limit=True)
+    )
     future_clock = time.time() + 120.0
     store.runtime.affection.clock = lambda: future_clock
-    assert await svc.accept(m_rl2) == "limited"
+    m_rl3 = _member_msg(message, event_id="rl-3", text="你好3", created_at=now + 82)
+    assert await svc.accept(m_rl3) == "limited"
     assert (await store.runtime.affection.profile("onebot", "30000"))["score"] == 47
+    ai.fail_on_call = False
+    await store.runtime.affection.set_config(AffectionConfig(enabled=True))
 
     # 9. assemble_chat_input non-mutation, sandbox stripping, and StaticPrefixes isolation
     caller_sender = {"nickname": "小明", "qq": "30000"}
