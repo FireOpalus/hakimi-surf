@@ -353,9 +353,20 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
     assert tabs["core"] | tabs["modules"] == set(panels)
     assert html.count('id="module-heading-switch"') == 1
     assert "module-detail-state" not in html
-    assert {"overview", "ledger", "life", "api-routing", "memory"} <= tabs["core"]
+    assert {
+        "overview",
+        "ledger",
+        "life",
+        "proactive",
+        "identity-center",
+        "community",
+        "memes",
+        "api-routing",
+        "memory",
+    } <= tabs["core"]
     assert {
         "modules",
+        "plugin-bus",
         "qq",
         "bili",
         "minecraft",
@@ -369,14 +380,18 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         "drive-sync",
         "journal",
     } <= tabs["modules"]
+    assert "plugin-bus" in tabs["modules"]
     for key in tabs["core"]:
         shortcuts = set(re.findall(r'data-open-tab="([^"]+)"', panels[key]))
-        assert shortcuts <= tabs["core"] | {"modules"}, (key, shortcuts)
+        assert shortcuts <= tabs["core"] | {"modules", "plugin-bus"}, (key, shortcuts)
     for marker, owner in (
         ('id="module-catalog"', "modules"),
         ('id="weather-editor"', "weather"),
         ('id="ws-heartbeat"', "qq"),
         ('id="qq-privacy-card"', "qq"),
+        ('id="sign-form"', "qq"),
+        ('id="identity-persons-list"', "identity-center"),
+        ('id="pb-plugins-list"', "plugin-bus"),
         ('id="groups"', "group-policy"),
         ('id="sessions"', "memory"),
         ('id="life-mc-form"', "minecraft"),

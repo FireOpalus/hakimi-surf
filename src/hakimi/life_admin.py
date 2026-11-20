@@ -6,7 +6,7 @@ import inspect
 import json
 import re
 from collections import Counter
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import (
@@ -22,8 +22,15 @@ from . import world_observations
 from .admin_routes import body, service
 from .life_engine import LifeEngineConfig
 from .modules.actions import ActionCall, HourlyAction, Mode, reject_reason
+from .modules.weather_location import (
+    LocationLookupUnavailable,
+    WeatherLocation,
+    find_cities,
+    locate_server,
+)
 from .rest_policy import RestHoursConfig
 from .screen_watch import ScreenWatchConfig
+from .security import Rejected
 from .voice_companion import VoiceCompanionConfig
 
 router = APIRouter(prefix="/admin/api/life")
@@ -892,9 +899,18 @@ async def life_mc_goal(request: Request):
         except ValueError as exc:
             raise HTTPException(400, reject_reason(exc)) from None
         result = await spec.run(ActionCall(ticket, validated, svc.life_engine.clock()))
+        goal_result = result.details.get("result")
+        if not isinstance(goal_result, dict):
+            goal_result = {
+                "ok": result.status == "done",
+                "module_id": "minecraft",
+                "summary": "",
+                "artifacts": {},
+                "reason": result.reason,
+            }
         response = {
             "status": "ok" if result.status == "done" else "unavailable",
-            "result": result.details["result"],
+            "result": goal_result,
         }
         if value.view == "module":
             response["mc_status"] = _collect_mc_agent_status(svc)
@@ -988,3 +1004,121 @@ async def life_screen_watch_disconnect(request: Request):
     if sw is None:
         raise HTTPException(503, "screen_watch_unavailable")
     return await sw.disconnect_active()
+
+
+class WeatherCityQuery(BaseModel):
+    """Strict city geocoding lookup input."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    query: str = Field(min_length=2, max_length=80)
+
+
+def _weather_module(svc: Any) -> Any:
+    registry = getattr(svc, "modules", None)
+    if registry is not None:
+        return registry.get("weather")
+    return getattr(svc, "weather", None)
+
+
+def _raise_weather_rpc_http_error(exc: Rejected) -> NoReturn:
+    code = str(exc)
+    if code in {
+        "invalid_admin_input",
+        "plugin_invalid_params",
+        "plugin_invalid_schema",
+        "invalid_state_value",
+    }:
+        raise HTTPException(400, code) from None
+    if code in {
+        "weather_unavailable",
+        "weather_stale",
+        "weather_city_lookup_unavailable",
+        "weather_ip_lookup_unavailable",
+        "plugin_disconnected",
+        "plugin_rpc_timeout",
+        "plugin_rpc_queue_full",
+        "plugin_rpc_failed",
+        "plugin_internal_error",
+        "rpc_method_not_found",
+    }:
+        raise HTTPException(503, code) from None
+    raise HTTPException(409, code) from None
+
+
+@router.get("/modules/weather/current")
+async def current_weather(request: Request):
+    svc = service(request)
+    if _weather_module(svc) is None:
+        raise HTTPException(503, "weather_module_unavailable")
+    engine = getattr(svc, "life_engine", None)
+    if engine is None:
+        raise HTTPException(503, "life_engine_unavailable")
+    result = await engine.query("weather.read")
+    if result.status != "done":
+        status = (
+            503
+            if result.reason
+            in {"weather_unavailable", "weather_stale", "plugin_disconnected", "plugin_rpc_timeout"}
+            else 409
+        )
+        raise HTTPException(status, result.reason)
+    return result.details
+
+
+@router.post("/modules/weather/location/cities")
+async def weather_cities(request: Request):
+    query = await body(request, WeatherCityQuery)
+    svc = service(request)
+    mod = _weather_module(svc)
+    if mod is None:
+        raise HTTPException(503, "weather_module_unavailable")
+    if hasattr(mod, "call_custom_rpc"):
+        try:
+            return await mod.call_custom_rpc("weather.location.cities", {"query": query.query})
+        except Rejected as exc:
+            _raise_weather_rpc_http_error(exc)
+    try:
+        return {"places": await find_cities(mod.http, query.query)}
+    except LocationLookupUnavailable:
+        raise HTTPException(503, "weather_city_lookup_unavailable") from None
+
+
+@router.post("/modules/weather/location/detect")
+async def weather_detect_location(request: Request):
+    svc = service(request)
+    mod = _weather_module(svc)
+    if mod is None:
+        raise HTTPException(503, "weather_module_unavailable")
+    if hasattr(mod, "call_custom_rpc"):
+        try:
+            return await mod.call_custom_rpc("weather.location.detect", {})
+        except Rejected as exc:
+            _raise_weather_rpc_http_error(exc)
+    try:
+        return await locate_server(mod.http)
+    except LocationLookupUnavailable:
+        raise HTTPException(503, "weather_ip_lookup_unavailable") from None
+
+
+@router.put("/modules/weather/location")
+@router.delete("/modules/weather/location")
+async def weather_set_location(request: Request):
+    svc = service(request)
+    place = await body(request, WeatherLocation) if request.method == "PUT" else None
+    async with request.app.state.admin_config_lock:
+        mod = _weather_module(svc)
+        if mod is None:
+            raise HTTPException(503, "weather_module_unavailable")
+        if hasattr(mod, "call_custom_rpc"):
+            try:
+                if place is not None:
+                    await mod.call_custom_rpc("weather.location.set", place.model_dump())
+                else:
+                    await mod.call_custom_rpc("weather.location.reset", {})
+            except Rejected as exc:
+                _raise_weather_rpc_http_error(exc)
+        else:
+            await mod.set_location(place)
+        if (engine := getattr(svc, "life_engine", None)) is not None:
+            engine.wakeup.set()
+        return await module_detail(request, "weather")

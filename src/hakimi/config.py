@@ -1,15 +1,16 @@
 import ipaddress
+import json
 import math
 import re
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal, Self
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet
-from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .compression_policy import CompressionConfig
 from .models import PlatformId
@@ -290,6 +291,30 @@ class Settings(BaseSettings):
             "PLUGIN_BUS_WS_MAX_FRAME_BYTES", "HAKIMI_PLUGIN_BUS_WS_MAX_FRAME_BYTES"
         ),
     )
+    external_plugins: Annotated[set[str], NoDecode] = Field(
+        default_factory=set,
+        validation_alias=AliasChoices("EXTERNAL_PLUGINS", "HAKIMI_EXTERNAL_PLUGINS"),
+    )
+
+    @field_validator("external_plugins", mode="before")
+    @classmethod
+    def _parse_external_plugins(cls, value: Any) -> set[str]:
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return set()
+            if raw.startswith("["):
+                parsed = json.loads(raw)
+                if not isinstance(parsed, list):
+                    raise ValueError("external_plugins JSON must be an array")
+                return {str(item).strip() for item in parsed if str(item).strip()}
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        if isinstance(value, set | frozenset | list | tuple):
+            return {str(item).strip() for item in value if str(item).strip()}
+        raise ValueError("invalid external_plugins")
+
     group_policies: dict[str, Literal["at_only", "smart_reply", "muted"]] = Field(
         default_factory=dict
     )

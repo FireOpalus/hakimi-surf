@@ -9,6 +9,7 @@ import uuid
 import weakref
 from collections import Counter
 from contextlib import AsyncExitStack, nullcontext
+from typing import Any
 
 import httpx
 
@@ -199,7 +200,13 @@ class Service:
         self.kernel.provide_core("voice_companion", self.voice_companion)
         self.kernel.provide_core("plugin_bus", self.plugin_bus)
         self.world_state = WorldStateManager(settings, store, self.modules)
+        self.world_state.subscribe(self._broadcast_world_event)
         install_modules(self)
+        if "minecraft" in self.s.external_plugins or self.modules.get("minecraft") is None:
+            if getattr(self.node_transport, "on_event", None) is None:
+                self.node_transport.on_event = self._relay_node_event
+            if getattr(self.node_transport, "on_state", None) is None:
+                self.node_transport.on_state = self._relay_node_state
         settings._thinking_scenes = self.modules.thinking_scenes
         self.life_engine = LifeEngine(self)
 
@@ -207,6 +214,46 @@ class Service:
     def weather(self):
         """Compatibility accessor for existing weather integrations."""
         return self.modules.get("weather")
+
+    async def _broadcast_world_event(self, event: Any) -> None:
+        payload = (
+            event.get("payload") if isinstance(event, dict) else getattr(event, "payload", None)
+        )
+        if isinstance(payload, dict) and (
+            payload.get("private_first") or payload.get("owner_private")
+        ):
+            return
+        if pb := getattr(self, "plugin_bus", None):
+            await pb.broadcast_world_event(event)
+
+    async def _relay_node_event(self, frame: dict[str, Any]) -> str:
+        if not isinstance(frame, dict):
+            return "ignored"
+        event_name = frame.get("event")
+        if not isinstance(event_name, str) or not event_name.startswith("mc."):
+            return "ignored"
+        pb = getattr(self, "plugin_bus", None)
+        if pb is None:
+            return "ignored"
+        mc_mod = self.modules.get("minecraft")
+        if mc_mod is None or not mc_mod.enabled:
+            return "ignored"
+        sessions = getattr(pb, "_sessions", None)
+        if isinstance(sessions, dict):
+            mc_sess = sessions.get("minecraft")
+            if (
+                mc_sess is None
+                or not mc_sess.ready
+                or mc_sess.closed
+                or "node_bridge" not in mc_sess.scopes
+            ):
+                return "ignored"
+        await pb.relay_node_event(frame)
+        return "accepted"
+
+    async def _relay_node_state(self, connected: bool) -> None:
+        if pb := getattr(self, "plugin_bus", None):
+            await pb.relay_node_state(connected)
 
     def refresh_secrets(self):
         self.secrets = configured_secrets(self.s)

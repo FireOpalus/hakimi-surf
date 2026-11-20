@@ -1,0 +1,60 @@
+services:
+  hakimi-plugin-weather:
+    build:
+      context: .
+      dockerfile: plugins/Dockerfile
+    command: ["python", "-m", "plugins.weather.plugin_main"]
+    env_file:
+      - path: ./secrets/plugins.env
+        required: false
+    environment:
+      HAKIMI_PLUGIN_WS_URL: "ws://hakimi-bot:12141/ws/plugin"
+      TZ: "Asia/Shanghai"
+    depends_on:
+      hakimi-bot:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 128m
+    pids_limit: 32
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  hakimi-plugin-minecraft:
+    build:
+      context: .
+      dockerfile: plugins/Dockerfile
+    command: ["python", "-m", "plugins.minecraft.plugin_main"]
+    env_file:
+      - path: ./secrets/plugins.env
+        required: false
+    environment:
+      HAKIMI_PLUGIN_WS_URL: "ws://hakimi-bot:12141/ws/plugin"
+      TZ: "Asia/Shanghai"
+    depends_on:
+      hakimi-bot:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 128m
+    pids_limit: 32
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

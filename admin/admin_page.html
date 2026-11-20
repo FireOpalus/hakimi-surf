@@ -1281,6 +1281,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-overview" type="button" role="tab" data-tab="overview" data-description="查看本日调用、预算和消息处理状态。" aria-controls="overview" aria-selected="true" tabindex="0"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg><span>运行概览</span></button>
         <button id="nav-ledger" type="button" role="tab" data-tab="ledger" data-description="查看调用明细、账户余额及 GCP 赠金对账。" aria-controls="ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span>账本与预算</span></button>
         <button id="nav-life" type="button" role="tab" data-tab="life" data-description="管理作息、精力、跨节点动作和执行回执。" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
+        <button id="nav-proactive" type="button" role="tab" data-tab="proactive" data-description="查看 Owner 投递、运维告警和当日汇报。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信与投递</span></button>
         <button id="nav-logs" type="button" role="tab" data-tab="logs" data-description="查看最近的脱敏拦截记录与系统告警。" aria-controls="logs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span>安全日志</span></button>
       </div>
       <div class="nav-group" role="presentation">
@@ -1295,20 +1296,24 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <div class="nav-group-label">记忆管理</div>
         <button id="nav-memory" type="button" role="tab" data-tab="memory" data-description="管理隔离会话、历史压缩与长期记忆。" aria-controls="memory" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span>会话与记忆</span></button>
       </div>
+      <div class="nav-group" role="presentation">
+        <div class="nav-group-label">关系与内容</div>
+        <button id="nav-identity-center" type="button" role="tab" data-tab="identity-center" data-description="管理跨平台统一身份档案（Person）、Owner 认证、账号绑定合并、L2 画像标签与跨平台屏蔽。" aria-controls="identity-center" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M17 11l2 2 4-4"/></svg><span>统一身份与绑定</span></button>
+        <button id="nav-community" type="button" role="tab" data-tab="community" data-description="管理跨平台好感度档案、全局策略与小黑屋屏蔽。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
+        <button id="nav-memes" type="button" role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包库</span></button>
+      </div>
     </nav>
     <nav id="modules-nav" data-workspace="modules" role="tablist" aria-label="功能模块" aria-orientation="vertical" hidden>
       <div class="nav-group" role="presentation">
         <button id="nav-modules" type="button" role="tab" data-tab="modules" data-description="选择模块，查看它的运行状态、设置和可执行动作。" aria-controls="modules" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5-9 5-9-5z M3 12l9 5 9-5 M3 17l9 5 9-5"/></svg><span>模块目录</span></button>
+        <button id="nav-plugin-bus" type="button" role="tab" data-tab="plugin-bus" data-description="签发与管理远程模块插件凭据、Scope 权限、WebSocket 会话状态与令牌轮换。" aria-controls="plugin-bus" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5 M9 8V2 M15 8V2 M18 8v5a6 6 0 0 1-12 0V8z"/></svg><span>远程插件总线</span></button>
       </div>
       <div id="platform-nav-group" class="nav-group" role="group" aria-labelledby="platform-nav-label">
         <div id="platform-nav-label" class="nav-group-label">平台模块</div>
         <div data-module="qq_social">
-          <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接，管理会话隐私、群聊互动、社区和 Owner 私信。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
+          <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接、每日心情个签，管理会话隐私、群聊互动和准入。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
           <button id="nav-group-policy" type="button" data-subpage hidden role="tab" data-tab="group-policy" data-description="设置白名单群的互动方式、外部 Bot 回复阈值与冷却。" aria-controls="group-policy" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18 M3 12h18 M3 18h18 M8 3v6 M16 9v6 M8 15v6"/></svg><span>群聊互动策略</span></button>
           <button id="nav-admission" type="button" data-subpage hidden role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
-          <button id="nav-community" type="button" data-subpage hidden role="tab" data-tab="community" data-description="管理好感度、小黑屋和心情个签。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
-          <button id="nav-memes" type="button" data-subpage hidden role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包</span></button>
-          <button id="nav-proactive" type="button" data-subpage hidden role="tab" data-tab="proactive" data-description="查看 Owner 投递、运维告警和当日汇报。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信</span></button>
         </div>
         <div data-module="bilibili_surf">
           <button id="nav-bili" type="button" role="tab" data-tab="bili" data-description="管理账号、视频订阅和巡逻任务。" aria-controls="bili" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v13H3z M8 3l3 4 M16 3l-3 4 M7 12v3 M17 12v3 M10 15l2 1 2-1"/></svg><span>B 站巡逻</span></button>
@@ -1330,8 +1335,6 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-event-ledger" type="button" role="tab" data-tab="event-ledger" data-description="查看并管理各模块、私聊约定与规划器写入的跨日待办事件。" aria-controls="event-ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h5 M3 8h2 M3 12h2 M3 16h2"/></svg><span>跨日待办账本</span></button>
         <button id="nav-voice-companion" type="button" role="tab" data-tab="voice-companion" data-description="管理实时语音伴随中枢状态、口播风格与陪玩会话记录（可联动屏幕伴看）。" aria-controls="voice-companion" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z M19 10v1a7 7 0 0 1-14 0v-1 M12 18v3 M8 21h8"/></svg><span>语音伴随</span></button>
         <button id="nav-screen-watch" type="button" role="tab" data-tab="screen-watch" data-description="管理 Owner 私有看屏连接、内存短 TTL 画面缓存、隐私开关与主动吐槽策略。" aria-controls="screen-watch" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v12H3z M8 21h8 M12 17v4 M9 11l3-3 3 3"/></svg><span>屏幕伴看</span></button>
-        <button id="nav-identity-center" type="button" role="tab" data-tab="identity-center" data-description="管理跨平台统一身份档案（Person）、Owner 认证、账号绑定合并、L2 画像标签与跨平台屏蔽。" aria-controls="identity-center" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M17 11l2 2 4-4"/></svg><span>统一身份与绑定</span></button>
-        <button id="nav-plugin-bus" type="button" role="tab" data-tab="plugin-bus" data-description="签发与管理远程模块插件凭据、Scope 权限、WebSocket 会话状态与令牌轮换。" aria-controls="plugin-bus" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5 M9 8V2 M15 8V2 M18 8v5a6 6 0 0 1-12 0V8z"/></svg><span>远程插件总线</span></button>
       </div>
     </nav>
     <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
@@ -1385,6 +1388,8 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
       <div class="quick-actions">
         <button type="button" class="quick-action" data-open-tab="reply-settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span><strong>回复与联网</strong><small>调整防抖和检索</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
         <button type="button" class="quick-action" data-open-tab="memory"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span><strong>会话与记忆</strong><small>查看隔离会话和滚动摘要</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="identity-center"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M17 11l2 2 4-4"/></svg><span><strong>统一身份与绑定</strong><small>跨平台账号合并与 L2 画像</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="plugin-bus"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5 M9 8V2 M15 8V2 M18 8v5a6 6 0 0 1-12 0V8z"/></svg><span><strong>远程插件总线</strong><small>签发插件凭据与管理连接</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
         <button type="button" class="quick-action" data-open-tab="logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span><strong>安全日志</strong><small>排查拦截和服务告警</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
       </div>
     </article>
@@ -1407,7 +1412,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   <template id="catalog-icon-database_backup"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6c0-4 16-4 16 0s-16 4-16 0 M4 6v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0"/></svg></template>
   <template id="catalog-icon-surf_mirror"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h12v14H8z M4 7v14h12 M11 8h6 M11 12h4"/></svg></template>
   <template id="catalog-icon-group_memory_mirror"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h16v11H8l-5 4z M7 8h8 M7 11h4 M12 19h5l4 3V9"/></svg></template>
-  <div class="directory-heading"><h2>平台模块</h2><button class="secondary" id="reload-modules" type="button">刷新目录</button></div>
+  <div class="directory-heading"><h2>平台模块</h2><div class="row"><button class="secondary" type="button" data-open-tab="plugin-bus">管理远程插件总线 →</button><button class="secondary" id="reload-modules" type="button">刷新目录</button></div></div>
   <div id="module-catalog" class="module-catalog" aria-live="polite"></div>
   <div class="directory-heading system-heading"><h2>常驻系统模块</h2></div>
   <div id="system-catalog" class="module-catalog" aria-live="polite"></div>
@@ -1425,9 +1430,13 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <div class="module-shortcuts">
       <button type="button" class="secondary" data-open-tab="group-policy">群聊互动策略 <span aria-hidden="true">→</span></button>
       <button type="button" class="secondary" data-open-tab="admission">准入与防互刷 <span aria-hidden="true">→</span></button>
+    </div>
+    <h3>跨平台主控入口</h3>
+    <div class="module-shortcuts">
+      <button type="button" class="secondary" data-open-tab="identity-center">统一身份与绑定 <span aria-hidden="true">→</span></button>
       <button type="button" class="secondary" data-open-tab="community">好感度与小黑屋 <span aria-hidden="true">→</span></button>
-      <button type="button" class="secondary" data-open-tab="memes">表情包 <span aria-hidden="true">→</span></button>
-      <button type="button" class="secondary" data-open-tab="proactive">主动私信 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="memes">表情包库 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="proactive">主动私信与投递 <span aria-hidden="true">→</span></button>
     </div>
   </div>
   <div class="card" id="qq-privacy-card">
@@ -1447,6 +1456,12 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="prov-add-session-policy" disabled>保存等级</button>
       </form>
     </details>
+  </div>
+  <div class="card"><h2>每日心情个签</h2>
+    <p class="muted">每日自动换签默认关闭。开启后与日报共用一次模型生成，LifeEngine 心情联动换签同样受此开关与冷却保护；失败不影响汇报。手动改签不调用模型。</p>
+    <p id="sign-state"></p>
+    <form id="sign-config-form"><div class="row"><label><input id="sign-enabled" type="checkbox"> 每日日报联动换签</label><label>自动冷却小时 <input id="sign-cooldown" type="number" min="20" max="168" required></label><button type="submit">保存换签设置</button><button type="button" id="sign-reset" class="secondary">恢复 .env</button></div></form>
+    <form id="sign-form"><label for="sign-text">纯文本签名（最多 50 字）</label><input id="sign-text" maxlength="50" required autocomplete="off"><button type="submit">立即更新签名</button></form>
   </div>
   <div class="card"><h2>模块动作</h2>
     <div id="qq-actions" class="module-tools"></div>
@@ -1964,17 +1979,24 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   <div class="card">
     <div class="row between">
       <h2>用户好感度档案与调分台</h2>
-      <span id="aff-users-count" class="muted"></span>
+      <div class="row">
+        <span id="aff-users-count" class="muted"></span>
+        <button type="button" class="secondary" data-open-tab="identity-center">管理跨平台账号绑定 →</button>
+      </div>
     </div>
     <p class="muted">可直接按平台与 ID 设定用户好感度（0～120），或对已有档案快速调分（-10 / +10 / 拉黑(0) / 自定义修改 / 重置）。将非 Owner 设为 0 分或重置档案时，将自动同步「讨厌鬼小黑屋」屏蔽列表。</p>
     <form id="aff-user-form" class="quick-bar">
+      <datalist id="aff-platform-options">
+        <option value="onebot"></option>
+        <option value="qq"></option>
+        <option value="discord"></option>
+        <option value="oopz"></option>
+        <option value="telegram"></option>
+      </datalist>
       <label for="aff-set-platform">平台
-        <select id="aff-set-platform">
-          <option value="onebot">onebot (QQ)</option>
-          <option value="qq">qq (官方)</option>
-        </select>
+        <input id="aff-set-platform" list="aff-platform-options" type="text" maxlength="48" value="onebot" required>
       </label>
-      <label for="aff-set-uid">用户 ID（QQ / OpenID）<input id="aff-set-uid" type="text" maxlength="128" required placeholder="输入 QQ 号或 OpenID"></label>
+      <label for="aff-set-uid">用户 ID（QQ / OpenID）<input id="aff-set-uid" type="text" maxlength="128" required placeholder="输入 QQ 号、OpenID 或平台 user_id"></label>
       <label for="aff-set-score">目标好感度（0–120）<input id="aff-set-score" type="number" min="0" max="120" step="1" value="50" required></label>
       <label for="aff-set-nickname">昵称（可选）<input id="aff-set-nickname" type="text" maxlength="80" placeholder="备注昵称"></label>
       <label for="aff-set-reason">调整原因<input id="aff-set-reason" type="text" maxlength="64" value="admin_set" placeholder="admin_set"></label>
@@ -1994,17 +2016,11 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     <p class="muted">同一群友 24 小时内多次触发安全检测后申请，未审批前不会自动屏蔽。昵称仅供辨认，身份以 QQ 号为准。</p>
     <div id="mute-proposals" class="table"></div>
   </div>
-  <div class="card"><h2>每日心情个签</h2>
-    <p class="muted">每日自动换签默认关闭。开启后与日报共用一次模型生成，LifeEngine 心情联动换签同样受此开关与冷却保护；失败不影响汇报。手动改签不调用模型。</p>
-    <p id="sign-state"></p>
-    <form id="sign-config-form"><div class="row"><label><input id="sign-enabled" type="checkbox"> 每日日报联动换签</label><label>自动冷却小时 <input id="sign-cooldown" type="number" min="20" max="168" required></label><button type="submit">保存换签设置</button><button type="button" id="sign-reset" class="secondary">恢复 .env</button></div></form>
-    <form id="sign-form"><label for="sign-text">纯文本签名（最多 50 字）</label><input id="sign-text" maxlength="50" required autocomplete="off"><button type="submit">立即更新签名</button></form>
-  </div>
 </section>
 
 <section id="proactive" class="tab" role="tabpanel" aria-labelledby="nav-proactive" hidden>
   <div class="card"><div class="row between"><h2>Owner 投递与告警</h2><button id="refresh-proactive" class="secondary">刷新状态</button></div>
-    <p class="muted">接收人固定为 Owner。<button class="secondary" type="button" data-open-tab="qq">打开 QQ 模块调度</button></p>
+    <p class="muted">接收人固定为 Owner。<button class="secondary" type="button" data-open-tab="modules">打开平台模块调度</button></p>
     <div id="proactive-stats" class="stats"></div>
     <p id="proactive-state" class="muted"></p>
     <p id="proactive-budget" class="muted"></p>
@@ -2443,7 +2459,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 (()=>{
 let token='',tab='overview',session=null,timer=null;
 let identityState=null,pluginBusState=null,currentPluginToken='',currentPluginTokenId='';
-const DEFAULT_PLUGIN_SCOPES=['actions','sensors','thinking_scenes','chat','media','owner_notify'];
+const DEFAULT_PLUGIN_SCOPES=['actions','sensors','thinking_scenes','chat','media','owner_notify','node_bridge'];
 let sessionRequests=new AbortController();
 let displayZone='Asia/Shanghai';
 const zoneLabel=zone=>zone==='Asia/Shanghai'?'北京时间':zone;
@@ -2522,7 +2538,7 @@ function logout(){
   for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','id-link-submit','id-merge-submit','pb-create-submit'])$(id).disabled=true;
   $('world-observation-card').hidden=true;
   ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-changes','life-batteries','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
-  ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
+  ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','sign-state','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
   text('gcp-bq-sql','配置 billing_table 后可预览查询 SQL。');
   thinkingReady=false;thinkingDirty=false;scenePolicy=null;sceneEdits.clear();
   $('thinking-fields').replaceChildren();$('primary-model').replaceChildren();
@@ -2534,9 +2550,9 @@ function logout(){
   if(timer)clearInterval(timer);
   $('session-dialog').close();session=null;
   $('token').focus();
-  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search','life-mc-topic','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
+  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search','sign-text','sign-cooldown','life-mc-topic','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
   $('pb-create-region').value='KR';
-  $('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;
+  $('aff-set-platform').value='onebot';$('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;$('sign-enabled').checked=false;
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
   ['memory-entries','decision-audit','token-ledger','work-ledger','provider-ledger','cost-ledger','budget-periods','model-ledger','thinking-ledger','effective-cache','prov-sessions-table','gcp-credits-table','gcp-mon-compare-table','gcp-mon-models-table'].forEach(id=>$(id).replaceChildren());
 }
@@ -3948,7 +3964,8 @@ const PLUGIN_SCOPE_LABELS={
   thinking_scenes:'thinking_scenes · 思考场景与生成',
   chat:'chat · 聊天平台收发',
   media:'media · 媒体资源能力',
-  owner_notify:'owner_notify · Owner 主动提醒'
+  owner_notify:'owner_notify · Owner 主动提醒',
+  node_bridge:'节点桥接 (node_bridge)'
 };
 function clearPluginTokenBanner(){
   currentPluginToken='';
@@ -4441,13 +4458,15 @@ $('aff-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
 $('aff-user-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('aff-set-submit'),async()=>{
-    const platform=$('aff-set-platform').value;
+    const platform=$('aff-set-platform').value.trim().toLowerCase();
     const uid=$('aff-set-uid').value.trim();
     const score=Number($('aff-set-score').value);
     const nickname=$('aff-set-nickname').value.trim();
     const reason=$('aff-set-reason').value.trim()||'admin_set';
+    if(!/^[a-z][a-z0-9_]{0,47}$/.test(platform))throw Error('平台标识须以小写字母开头，仅含小写字母、数字和下划线');
     if(platform==='onebot'&&!/^[1-9][0-9]{0,19}$/.test(uid))throw Error('OneBot QQ 号须为不含前导零的纯数字');
-    if(platform==='qq'&&!/^[A-Za-z0-9_-]{1,128}$/.test(uid))throw Error('QQ 官方 ID 仅支持字母、数字、下划线或短横线');
+    else if(platform==='qq'&&!/^[A-Za-z0-9_-]{1,128}$/.test(uid))throw Error('QQ 官方 ID 仅支持字母、数字、下划线或短横线');
+    else if(platform!=='onebot'&&platform!=='qq'&&!/^[A-Za-z0-9_.:@-]{1,128}$/.test(uid))throw Error('用户 ID 须为 1–128 位字母、数字或 _ . : @ -');
     if(!Number.isInteger(score)||score<0||score>120)throw Error('目标好感度须为 0–120 的整数');
     await saveAffectionUser(uid,platform,score,nickname,reason);
     $('aff-set-uid').value='';
@@ -4461,12 +4480,13 @@ const muteDeleteLabels={none:'仅屏蔽',deleted:'已删好友',not_friend:'非�
 const proposalStatusLabels={pending:'待审批',approved:'已批准',rejected:'已驳回'};
 const cfgSourceLabels={admin:'SQLite 热配置',sqlite:'SQLite 热配置',env:'.env 默认值',none:'未配置'};
 const signStatusLabels={never:'尚未自动换签',ok:'更新成功',updated:'更新成功',skipped:'冷却跳过',disabled:'未启用',failed:'更新失败'};
-async function community(){const [m,n]=await Promise.all([api('moderation'),api('longnick')]);table('mute-list',['QQ 号','加入时间','好友操作','操作'],m.muted_users.map(x=>[x.user_id,dateTime(x.created),muteDeleteLabels[x.delete_status]||x.delete_status,button('解除屏蔽',async()=>{await api('moderation/users','PUT',{user_id:x.user_id,muted:false});await syncCommunityAndAffection();})]));table('mute-proposals',['编号 / QQ / 昵称','原因','状态','操作'],m.proposals.map(x=>{const actions=el('div',undefined,'row');if(x.status==='pending'){actions.append(button('批准屏蔽',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:true});await syncCommunityAndAffection();}),button('批准并移除好友',async()=>{if(!confirm('将屏蔽 QQ '+x.user_id+'，并在其为好友时移除好友。确定？'))return;await api('moderation/proposals/'+x.id,'POST',{approve:true,delete_friend:true});await syncCommunityAndAffection();},'danger'),button('驳回',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:false});await community();}));}return[x.id+' / '+x.user_id+' / '+x.nickname,x.reason,proposalStatusLabels[x.status]||x.status,actions];}));$('sign-enabled').checked=n.config.enabled;$('sign-cooldown').value=n.config.cooldown_hours;const nextAutoText=n.next_auto_after>Date.now()/1000?dateTime(n.next_auto_after):'随时可更新';text('sign-state','设置来源：'+(cfgSourceLabels[n.source]||n.source)+' · 最近状态 '+(signStatusLabels[n.status]||n.status)+' · 成功时间 '+(n.last_success?dateTime(n.last_success):'尚无记录')+(n.last_error?' · '+n.last_error:'')+' · 下次自动可更新 '+nextAutoText);}
+async function longnick(){const n=await api('longnick');if(!token)return;$('sign-enabled').checked=n.config.enabled;$('sign-cooldown').value=n.config.cooldown_hours;const nextAutoText=n.next_auto_after>Date.now()/1000?dateTime(n.next_auto_after):'随时可更新';text('sign-state','设置来源：'+(cfgSourceLabels[n.source]||n.source)+' · 最近状态 '+(signStatusLabels[n.status]||n.status)+' · 成功时间 '+(n.last_success?dateTime(n.last_success):'尚无记录')+(n.last_error?' · '+n.last_error:'')+' · 下次自动可更新 '+nextAutoText);}
+async function community(){const m=await api('moderation');if(!token)return;table('mute-list',['QQ 号','加入时间','好友操作','操作'],m.muted_users.map(x=>[x.user_id,dateTime(x.created),muteDeleteLabels[x.delete_status]||x.delete_status,button('解除屏蔽',async()=>{await api('moderation/users','PUT',{user_id:x.user_id,muted:false});await syncCommunityAndAffection();})]));table('mute-proposals',['编号 / QQ / 昵称','原因','状态','操作'],m.proposals.map(x=>{const actions=el('div',undefined,'row');if(x.status==='pending'){actions.append(button('批准屏蔽',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:true});await syncCommunityAndAffection();}),button('批准并移除好友',async()=>{if(!confirm('将屏蔽 QQ '+x.user_id+'，并在其为好友时移除好友。确定？'))return;await api('moderation/proposals/'+x.id,'POST',{approve:true,delete_friend:true});await syncCommunityAndAffection();},'danger'),button('驳回',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:false});await community();}));}return[x.id+' / '+x.user_id+' / '+x.nickname,x.reason,proposalStatusLabels[x.status]||x.status,actions];}));}
 $('refresh-community').addEventListener('click',e=>busy(e.target,syncCommunityAndAffection));
 $('mute-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{const uid=communityQQ($('mute-qq').value),remove=$('mute-delete').checked;if(remove&&!confirm('确认屏蔽并移除 QQ '+uid+' 的好友关系（若存在）？'))return;const r=await api('moderation/users','PUT',{user_id:uid,muted:true,delete_friend:remove});notice('屏蔽已生效 · 好友操作 '+r.delete_status);$('mute-qq').value='';$('mute-delete').checked=false;await syncCommunityAndAffection();});});
-$('sign-config-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('longnick/config','PUT',{enabled:$('sign-enabled').checked,cooldown_hours:Number($('sign-cooldown').value)});notice('换签设置已保存');await community();});});
-$('sign-reset').addEventListener('click',e=>busy(e.target,async()=>{await api('longnick/config','DELETE');await community();}));
-$('sign-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{const r=await api('longnick','POST',{text:$('sign-text').value});notice('签名更新：'+r.status+(r.error?' · '+r.error:''));await community();});});
+$('sign-config-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('longnick/config','PUT',{enabled:$('sign-enabled').checked,cooldown_hours:Number($('sign-cooldown').value)});notice('换签设置已保存');await longnick();});});
+$('sign-reset').addEventListener('click',e=>busy(e.target,async()=>{await api('longnick/config','DELETE');await longnick();}));
+$('sign-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{const r=await api('longnick','POST',{text:$('sign-text').value});notice('签名更新：'+r.status+(r.error?' · '+r.error:''));await longnick();});});
 
 const biliRunStatusLabels={ok:'完成',done:'完成',completed:'完成',skipped:'跳过',cooldown:'风控冷却',failed:'失败',uncertain:'结果不确定'};
 const videoStatusLabels={succeeded:'成功',ok:'成功',done:'成功',failed:'失败',uncertain:'结果不确定',working:'处理中'};
@@ -4948,7 +4968,7 @@ async function moduleDirectory(){
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, 'event-ledger':eventLedger, 'voice-companion':voiceCompanion, 'screen-watch':screenWatch, 'identity-center':identityCenter, 'plugin-bus':pluginBus, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
+  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, 'event-ledger':eventLedger, 'voice-companion':voiceCompanion, 'screen-watch':screenWatch, 'identity-center':identityCenter, 'plugin-bus':pluginBus, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy(),longnick()]), bili:()=>loadModule('bilibili_surf'),
   weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{

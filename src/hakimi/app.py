@@ -197,6 +197,8 @@ def create_app(
     app.include_router(plugin_router)
     app.include_router(life_router)
     for platform, entry in platform_entries():
+        if platform.name == "weather":
+            continue
         if (router := getattr(entry, "admin_router", None)) is not None:
             if any(not isinstance(route, APIRoute) for route in router.routes):
                 raise ValueError(
