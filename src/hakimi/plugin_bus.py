@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import inspect
@@ -21,8 +22,10 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, field_validator
 
-from .budget_policy import PROACTIVE_LANE, paid_lane_available
+from .bot_server import untrusted_input
+from .budget_policy import PATROL_LANE, PROACTIVE_LANE, paid_lane_available
 from .config import Settings
+from .generation_policy import Scenario
 from .media import ModelImage
 from .models import FileRef, ImageRef, Message
 from .modules.actions import Action, ActionCall, NoArgs, Outcome, reject_reason
@@ -34,11 +37,14 @@ from .modules.base import (
     NodeRegion,
     sanitize_sensor_text,
 )
+from .modules.bili_schedule import BiliScheduleOptions
+from .modules.scheduling import ActivityQuota, LocalActivity
 from .plugin_kernel import PluginContext, PluginFiber, PluginKernel
+from .roaming_logger import redact_public_summary
 from .screen_watch import decode_b64_frames, decode_ws_json_frame
 from .security import Rejected, clean_text, configured_secrets, safe_output
-from .social import confirmed_message_id
-from .thinking_policy import CORE_THINKING_SCENES, THINKING_LEVELS, ThinkingScene
+from .social import confirmed_message_id, owner_target
+from .thinking_policy import CORE_THINKING_SCENES, THINKING_LEVELS, OutputCap, ThinkingScene
 from .world_state import IntentTicketCreate
 
 log = logging.getLogger("hakimi")
@@ -57,7 +63,6 @@ _VALID_SCOPES_SET = frozenset(VALID_SCOPES)
 RESERVED_PLUGIN_IDS = frozenset(
     {
         "qq_social",
-        "bilibili_surf",
         "identity",
         "plugin_bus",
         "event_ledger",
@@ -74,13 +79,16 @@ RESERVED_PLUGIN_IDS = frozenset(
         "core",
     }
 )
-HOTPLUG_PILOT_PLUGIN_IDS = frozenset({"weather", "minecraft"})
+HOTPLUG_PILOT_PLUGIN_IDS = frozenset({"weather", "minecraft", "bilibili_surf"})
+_HOTPLUG_ADMIN_PANELS: dict[str, str] = {
+    "weather": "weather",
+    "minecraft": "minecraft",
+    "bilibili_surf": "bili",
+}
 RESERVED_CHAT_PLATFORMS = frozenset({"onebot", "qq"})
 _RESERVED_ACTION_PREFIXES = frozenset(
     {
         "qq",
-        "bili",
-        "bilibili",
         "social",
         "system",
         "admin",
@@ -94,15 +102,34 @@ _SCOPED_ACTION_PREFIX_OWNERS: dict[str, str] = {
     "weather": "weather",
     "mc": "minecraft",
     "minecraft": "minecraft",
+    "bili": "bilibili_surf",
+    "bilibili": "bilibili_surf",
 }
-_NODE_BRIDGE_ALLOWED_ACTIONS = frozenset(
-    {
-        "mc.status",
-        "mc.dispatch_goal",
-        "mc.pause",
-        "mc.resume",
-    }
-)
+_SCOPED_SCENE_OWNERS: dict[str, str] = {
+    "bilibili_summary": "bilibili_surf",
+    "bili_selection": "bilibili_surf",
+    "bili_learning": "bilibili_surf",
+}
+_NODE_BRIDGE_PLUGIN_ACTIONS: dict[str, frozenset[str]] = {
+    "minecraft": frozenset(
+        {
+            "mc.status",
+            "mc.dispatch_goal",
+            "mc.pause",
+            "mc.resume",
+        }
+    ),
+    "bilibili_surf": frozenset(
+        {
+            "bili.public_get",
+            "bili.resolve_short",
+            "bili.request",
+            "bili.cover_thumb",
+            "bili.video_storyboard",
+        }
+    ),
+}
+_NODE_BRIDGE_ALLOWED_ACTIONS = frozenset().union(*_NODE_BRIDGE_PLUGIN_ACTIONS.values())
 _CORE_ADMIN_PANELS = frozenset(
     {
         "login",
@@ -145,18 +172,16 @@ _RESERVED_SCENE_KEYS = frozenset(
     {
         "fast_chat",
         "owner_private",
-        "bilibili_summary",
         "daily_diary",
         "memory_compression",
         "owner_digest",
         "owner_companion",
-        "bili_selection",
-        "bili_learning",
         "voice.companion",
         "screen.watch",
         *(scene.key for scene in CORE_THINKING_SCENES),
     }
 )
+_BVID_RE = re.compile(r"^BV[1-9A-HJ-NP-Za-km-z]{10}\Z")
 
 PLUGIN_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,47}\Z")
 PLATFORM_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}\Z")
@@ -190,8 +215,10 @@ CREATE TABLE IF NOT EXISTS plugin_kv_state (
 
 _VAULT_CRED_PREFIX = "plugin-cred:"
 _VAULT_KV_PREFIX = "plugin-kv:"
-_MAX_KV_VALUE_BYTES = 16_384
+_LEGACY_KV_VALUE_BYTES = 16_384
+_MAX_KV_VALUE_BYTES = 65_536
 _MAX_NODE_BRIDGE_INFLIGHT = 16
+_MAX_AI_CALLS_INFLIGHT = 4
 _DEFAULT_MAX_FRAME_BYTES = 262_144
 _DEFAULT_HEARTBEAT_SECONDS = 20.0
 _DEFAULT_IDLE_TIMEOUT_SECONDS = 60.0
@@ -243,6 +270,132 @@ def _sanitize_payload(
             for item in list(value)[:24]
         ]
     return sanitize_sensor_text(str(value), settings, max_tokens=val_limit)
+
+
+def _secret_candidates(secrets_list: list[str]) -> list[str]:
+    cands: set[str] = set()
+    for raw in secrets_list:
+        if not raw:
+            continue
+        for val in (raw, clean_text(raw)):
+            if len(val) >= 6:
+                cands.add(val)
+    return sorted(cands, key=len, reverse=True)
+
+
+def _scrub_text_secrets(text: str, candidates: list[str]) -> str:
+    if not text or not candidates:
+        return text
+    out = text
+    for secret in candidates:
+        if secret in out:
+            out = out.replace(secret, "[REDACTED]")
+    return out
+
+
+def _scrub_json_secrets(
+    value: Any,
+    secrets_list: list[str],
+    *,
+    _candidates: list[str] | None = None,
+    depth: int = 0,
+) -> Any:
+    if depth > 32:
+        return "[truncated]"
+    cands = _secret_candidates(secrets_list) if _candidates is None else _candidates
+    if isinstance(value, str):
+        return _scrub_text_secrets(value, cands)
+    if value is None or isinstance(value, bool | int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            ck = _scrub_text_secrets(str(k), cands)
+            out[ck] = _scrub_json_secrets(v, secrets_list, _candidates=cands, depth=depth + 1)
+        return out
+    if isinstance(value, list | tuple):
+        return [
+            _scrub_json_secrets(item, secrets_list, _candidates=cands, depth=depth + 1)
+            for item in value
+        ]
+    return _scrub_text_secrets(str(value), cands)
+
+
+def _bound_ai_payload(
+    payload: dict[str, Any], secrets_list: list[str], max_bytes: int
+) -> dict[str, Any]:
+    cleaned = _scrub_json_secrets(payload, secrets_list)
+    if not isinstance(cleaned, dict):
+        raise Rejected("plugin_invalid_schema")
+    if len(untrusted_input(cleaned).encode("utf-8")) <= max_bytes:
+        return cleaned
+
+    bounded = copy.deepcopy(cleaned)
+
+    def _find_longest_str(node: Any) -> tuple[int, Any, Any] | None:
+        best: tuple[int, Any, Any] | None = None
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str):
+                    cand = (len(v), node, k)
+                    if best is None or cand[0] > best[0]:
+                        best = cand
+                elif isinstance(v, dict | list):
+                    sub = _find_longest_str(v)
+                    if sub is not None and (best is None or sub[0] > best[0]):
+                        best = sub
+        elif isinstance(node, list):
+            for idx, item in enumerate(node):
+                if isinstance(item, str):
+                    cand = (len(item), node, idx)
+                    if best is None or cand[0] > best[0]:
+                        best = cand
+                elif isinstance(item, dict | list):
+                    sub = _find_longest_str(item)
+                    if sub is not None and (best is None or sub[0] > best[0]):
+                        best = sub
+        return best
+
+    def _find_longest_list(node: Any) -> list[Any] | None:
+        best: list[Any] | None = None
+        if isinstance(node, dict):
+            for v in node.values():
+                if isinstance(v, list):
+                    if best is None or len(v) > len(best):
+                        best = v
+                    sub = _find_longest_list(v)
+                    if sub is not None and len(sub) > len(best):
+                        best = sub
+                elif isinstance(v, dict):
+                    sub = _find_longest_list(v)
+                    if sub is not None and (best is None or len(sub) > len(best)):
+                        best = sub
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, dict | list):
+                    sub = _find_longest_list(item)
+                    if sub is not None and (best is None or len(sub) > len(best)):
+                        best = sub
+        return best
+
+    while len(untrusted_input(bounded).encode("utf-8")) > max_bytes:
+        longest = _find_longest_str(bounded)
+        if longest is not None and longest[0] > 32:
+            length, container, key = longest
+            container[key] = container[key][: max(16, length // 2)]
+            if container is bounded and key == "subtitle_excerpt":
+                bounded["subtitle_complete"] = False
+                bounded["subtitle_status"] = "truncated"
+                bounded["material_scope"] = "partial_subtitle" if bounded[key] else "metadata_only"
+            continue
+        longest_list = _find_longest_list(bounded)
+        if longest_list is not None and len(longest_list) > 0:
+            longest_list.pop()
+            continue
+        raise Rejected("context_too_large")
+    return bounded
 
 
 def _validate_plugin_id(plugin_id: str) -> str:
@@ -299,6 +452,9 @@ class _PluginActionDecl(BaseModel):
     social: bool = False
     owner_only: bool = False
     aliases: list[list[Any]] = Field(default_factory=list, max_length=4)
+    budget_lane: Literal["patrol", "proactive"] | None = None
+    quotas: list[dict[str, str]] | None = Field(default=None, max_length=4)
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=300.0)
 
     @field_validator("name")
     @classmethod
@@ -321,6 +477,7 @@ class _PluginThinkingSceneDecl(BaseModel):
         default_factory=lambda: list(THINKING_LEVELS), min_length=1, max_length=4
     )
     output_tokens: int = Field(default=2048, ge=128, le=16384)
+    output_cap: OutputCap | None = None
 
 
 class _PluginHelloFrame(BaseModel):
@@ -545,6 +702,7 @@ class _PluginSession:
     pending: dict[str, _PendingRpc] = field(default_factory=dict)
     uncertain_deliveries: set[str] = field(default_factory=set)
     inflight_node_calls: int = 0
+    inflight_ai_calls: int = 0
     ready: bool = False
     closed: bool = False
     close_code: int = 1012
@@ -573,6 +731,7 @@ class RemoteModuleProxy(BaseModule):
         admin_panel: str | None = None,
         configuration_issue: str | None = None,
         initial_status: dict[str, Any] | None = None,
+        action_timeouts: dict[str, float] | None = None,
     ) -> None:
         super().__init__(settings)
         self.module_id = plugin_id
@@ -581,6 +740,8 @@ class RemoteModuleProxy(BaseModule):
         self.node_region = node_region
         self.attention_level = attention_level
         self.admin_panel = admin_panel
+        if plugin_id == "bilibili_surf":
+            self.schedule_options = BiliScheduleOptions
         self._bus = bus
         self._session = session
         self._scopes = scopes
@@ -600,6 +761,9 @@ class RemoteModuleProxy(BaseModule):
             _sanitize_payload(initial_status, settings) if isinstance(initial_status, dict) else {}
         )
         self._last_sensor_summary: str = ""
+        self._action_unavailable: dict[str, str] = {}
+        self._current_activity: str | None = None
+        self._action_timeouts: dict[str, float] = dict(action_timeouts or {})
 
     @property
     def configuration_issue(self) -> str | None:
@@ -761,6 +925,104 @@ class RemoteModuleProxy(BaseModule):
             return _sanitize_payload(raw_res, self.settings)
         return {"value": _sanitize_payload(raw_res, self.settings)}
 
+    async def call_raw_rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,  # noqa: ASYNC109
+    ) -> Any:
+        if (
+            not isinstance(method, str)
+            or not _CUSTOM_RPC_RE.fullmatch(method)
+            or method == "delivery.send"
+        ):
+            raise Rejected("plugin_invalid_method")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise Rejected("plugin_invalid_params")
+        resp = await self._bus._rpc(self._session, method, params, timeout=timeout)
+        if not resp.get("ok", False):
+            raw_err = str(resp.get("error") or "")
+            code = raw_err if _CODE_RE.fullmatch(raw_err) else "plugin_rpc_failed"
+            raise Rejected(code)
+        raw_res = resp.get("result") if "result" in resp else resp.get("data")
+        return _scrub_json_secrets(raw_res, self._bus._all_secrets())
+
+    def local_activity(
+        self, context: dict, available: set[str], unfunded: bool
+    ) -> LocalActivity | None:
+        if self.module_id == "bilibili_surf" and unfunded and "bili.patrol" in available:
+            return LocalActivity(
+                30,
+                {
+                    "action_name": "bili.patrol",
+                    "delay_minutes": 1,
+                    "ttl_minutes": 60,
+                    "intent_note": "用可用的巡逻额度去看看首页和关注动态",
+                },
+                one_outstanding=True,
+                focus=(self.attention_level, "curious"),
+            )
+        return None
+
+    def local_focus(self, context: dict, hour: int) -> tuple[AttentionLevel, str] | None:
+        if self.module_id == "bilibili_surf" and (
+            context.get("recent_bili_surfed") or hour in {13, 14, 20, 21}
+        ):
+            return (self.attention_level, "curious")
+        return None
+
+    async def current_activity(self) -> str | None:
+        return self._current_activity
+
+    async def context_data(self, *, limit: int, now: float, message: Message | None = None) -> dict:
+        if self.module_id == "bilibili_surf":
+            bw = getattr(self._bus.service, "bili_watcher", None)
+            if bw is not None and hasattr(bw, "recent_surfed"):
+                return {
+                    "recent_bili_surfed": await bw.recent_surfed(
+                        limit=limit, now=now, message=message
+                    )
+                }
+            return {}
+        if "context_data" in self.capabilities and self._session.ready and not self._session.closed:
+            try:
+                resp = await self._bus._rpc(
+                    self._session,
+                    "context.read",
+                    {"limit": int(limit), "now": float(now)},
+                    timeout=min(self._bus.rpc_timeout, _SENSOR_RPC_TIMEOUT_SECONDS),
+                )
+                if resp.get("ok", True):
+                    raw = resp.get("result") if "result" in resp else resp.get("data")
+                    if isinstance(raw, dict):
+                        return _sanitize_payload(raw, self.settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return {}
+        return {}
+
+    async def public_patrol_entry(self, event: Any) -> tuple[str, str] | None:
+        if self.module_id != "bilibili_surf":
+            return None
+        if getattr(event, "event_type", None) not in {
+            "bili_video_watched",
+            "bili_mc_inspiration",
+        }:
+            return None
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            payload = {}
+        bvid = str(payload.get("bvid") or "")
+        entry = None
+        bw = getattr(self._bus.service, "bili_watcher", None)
+        if bw is not None and hasattr(bw, "lookup_watched") and not payload.get("private_first"):
+            entry = await bw.lookup_watched(bvid, limit=1200)
+        return "bili-account:" + bvid, entry["prior_patrol_notes"] if entry else ""
+
     async def dispatch_goal(self, ticket: dict[str, Any]) -> GoalResult:
         if not self.enabled:
             return GoalResult(ok=False, module_id=self.module_id, reason="module_disabled")
@@ -846,6 +1108,7 @@ class RemoteModuleProxy(BaseModule):
                     "target_scope": str(ticket.get("target_scope") or ""),
                     "now": float(ticket.get("now") or self._bus.clock()),
                 },
+                timeout=self._action_timeouts.get(action_name),
             )
         except Rejected as exc:
             return GoalResult(
@@ -982,6 +1245,17 @@ class RemoteModuleProxy(BaseModule):
                 if not getattr(exp, "ready", True) and hasattr(world, "initialize"):
                     await world.initialize()
                 await exp.mc_snapshot("", world.clock(), disconnected=True)
+        if not self.enabled and self.module_id == "bilibili_surf":
+            bw = getattr(service, "bili_watcher", None)
+            if bw is not None and hasattr(bw, "policy_epoch"):
+                bw.policy_epoch += 1
+            world = getattr(service, "world_state", None)
+            if world is not None and hasattr(world, "experience"):
+                exp = world.experience
+                if not getattr(exp, "ready", True) and hasattr(world, "initialize"):
+                    await world.initialize()
+                ts = world.clock() if hasattr(world, "clock") else self._bus.clock()
+                await exp.bili_reading(False, ts)
         if self._session.ready and not self._session.closed:
             await self._bus._send_frame(
                 self._session,
@@ -1061,6 +1335,16 @@ class PluginBus:
     def _kernel(self) -> PluginKernel:
         k = getattr(self.service, "kernel", None)
         return k if isinstance(k, PluginKernel) else self._fallback_kernel
+
+    def _all_secrets(self) -> list[str]:
+        seen: dict[str, None] = {}
+        for raw in configured_secrets(self.s):
+            if raw:
+                seen[raw] = None
+        for raw in getattr(self.service, "secrets", ()) or ():
+            if isinstance(raw, str) and raw:
+                seen[raw] = None
+        return list(seen)
 
     def _ensure_plugin_not_reserved(self, pid: str) -> None:
         if pid in RESERVED_PLUGIN_IDS:
@@ -1469,19 +1753,22 @@ class PluginBus:
         self,
         session: _PluginSession,
         decls: list[_PluginActionDecl],
-    ) -> tuple[Action, ...]:
+    ) -> tuple[tuple[Action, ...], dict[str, float]]:
         registry = getattr(self.service, "modules", None)
         existing_actions = set(registry.catalog.actions) if registry is not None else set()
         existing_aliases = set(registry.catalog.aliases) if registry is not None else set()
         seen_names: set[str] = set()
         seen_aliases: set[tuple[str, str, bool]] = set()
         actions: list[Action] = []
+        action_timeouts: dict[str, float] = {}
         for decl in decls:
             prefix = decl.name.split(".", 1)[0]
             required_owner = _SCOPED_ACTION_PREFIX_OWNERS.get(prefix)
             if prefix in _RESERVED_ACTION_PREFIXES or (
                 required_owner is not None and session.plugin_id != required_owner
             ):
+                raise Rejected("plugin_scope_rejected")
+            if decl.budget_lane == PATROL_LANE and session.plugin_id != "bilibili_surf":
                 raise Rejected("plugin_scope_rejected")
             if decl.name in seen_names or decl.name in existing_actions:
                 raise Rejected("plugin_duplicate_action")
@@ -1496,8 +1783,40 @@ class PluginBus:
             )
             if not origins:
                 raise Rejected("plugin_invalid_schema")
-            if "query" in origins and (decl.social or decl.owner_only or args_model is not NoArgs):
+            if "query" in origins and (
+                decl.social
+                or decl.owner_only
+                or decl.budget_lane is not None
+                or bool(decl.quotas)
+                or args_model is not NoArgs
+            ):
                 raise Rejected("plugin_invalid_schema")
+            parsed_quotas: tuple[ActivityQuota, ...] | None
+            if decl.quotas is None:
+                parsed_quotas = () if "query" in origins else None
+            else:
+                if len(decl.quotas) > 4:
+                    raise Rejected("plugin_invalid_schema")
+                q_list: list[ActivityQuota] = []
+                for q_item in decl.quotas:
+                    if not isinstance(q_item, dict):
+                        raise Rejected("plugin_invalid_schema")
+                    if set(q_item) - {"name", "unlimited_flag"} or "name" not in q_item:
+                        raise Rejected("plugin_invalid_schema")
+                    q_name = q_item["name"]
+                    if (
+                        not isinstance(q_name, str)
+                        or not _FIELD_NAME_RE.fullmatch(q_name)
+                        or q_name in {"total", "counted"}
+                    ):
+                        raise Rejected("plugin_invalid_schema")
+                    q_flag = q_item.get("unlimited_flag", "")
+                    if not isinstance(q_flag, str) or (
+                        q_flag and not _FIELD_NAME_RE.fullmatch(q_flag)
+                    ):
+                        raise Rejected("plugin_invalid_schema")
+                    q_list.append(ActivityQuota(counter=q_name, unlimited_option=q_flag))
+                parsed_quotas = tuple(q_list)
             parsed_aliases: list[tuple[str, str, bool]] = []
             for raw_alias in decl.aliases:
                 if not isinstance(raw_alias, list) or len(raw_alias) != 3:
@@ -1521,8 +1840,14 @@ class PluginBus:
             desc = sanitize_sensor_text(clean_text(decl.description), self.s, max_tokens=80)
             if not desc:
                 raise Rejected("plugin_invalid_schema")
+            if decl.timeout_seconds is not None:
+                action_timeouts[decl.name] = float(decl.timeout_seconds)
 
-            async def _run(call: ActionCall, action_name: str = decl.name) -> Outcome:
+            async def _run(
+                call: ActionCall,
+                action_name: str = decl.name,
+                action_timeout: float | None = decl.timeout_seconds,
+            ) -> Outcome:
                 proxy = session.proxy
                 if proxy is None or not proxy.enabled:
                     return Outcome("gated_skip", "module_disabled")
@@ -1540,6 +1865,7 @@ class PluginBus:
                             "target_scope": str(call.ticket.get("target_scope") or ""),
                             "now": call.now,
                         },
+                        timeout=action_timeout,
                     )
                 except Rejected as exc:
                     code = str(exc)
@@ -1590,18 +1916,21 @@ class PluginBus:
                     arguments=args_model,
                     social=decl.social,
                     owner_only=decl.owner_only,
+                    budget_lane=decl.budget_lane,
                     effortful=decl.effortful,
                     interrupts_focus=decl.interrupts_focus,
                     window=decl.window,
-                    quotas=() if "query" in origins else None,
+                    quotas=parsed_quotas,
                     origins=origins,
                     aliases=tuple(parsed_aliases),
-                    unavailable=lambda s=session: (
-                        None if s.ready and not s.closed else "plugin_offline"
+                    unavailable=lambda s=session, n=decl.name: (
+                        "plugin_offline"
+                        if not (s.ready and not s.closed)
+                        else (s.proxy._action_unavailable.get(n) if s.proxy is not None else None)
                     ),
                 )
             )
-        return tuple(actions)
+        return tuple(actions), action_timeouts
 
     def _build_thinking_scenes(
         self,
@@ -1613,16 +1942,24 @@ class PluginBus:
         seen: set[str] = set()
         scenes: list[ThinkingScene] = []
         for decl in decls:
-            prefix = decl.key.split(".", 1)[0]
-            required_owner = _SCOPED_ACTION_PREFIX_OWNERS.get(prefix)
-            if (
-                decl.key in _RESERVED_SCENE_KEYS
-                or decl.key in seen
-                or decl.key in existing_keys
-                or prefix in _RESERVED_ACTION_PREFIXES
-                or (required_owner is not None and plugin_id != required_owner)
-            ):
-                raise Rejected("plugin_scope_rejected")
+            if decl.key in _SCOPED_SCENE_OWNERS:
+                if (
+                    plugin_id != _SCOPED_SCENE_OWNERS[decl.key]
+                    or decl.key in seen
+                    or decl.key in existing_keys
+                ):
+                    raise Rejected("plugin_scope_rejected")
+            else:
+                prefix = decl.key.split(".", 1)[0]
+                required_owner = _SCOPED_ACTION_PREFIX_OWNERS.get(prefix)
+                if (
+                    decl.key in _RESERVED_SCENE_KEYS
+                    or decl.key in seen
+                    or decl.key in existing_keys
+                    or prefix in _RESERVED_ACTION_PREFIXES
+                    or (required_owner is not None and plugin_id != required_owner)
+                ):
+                    raise Rejected("plugin_scope_rejected")
             seen.add(decl.key)
             clean_label = sanitize_sensor_text(clean_text(decl.label), self.s, max_tokens=32)[:80]
             if not clean_label:
@@ -1634,6 +1971,7 @@ class PluginBus:
                     default=decl.default,
                     levels=tuple(decl.levels),
                     output_tokens=decl.output_tokens,
+                    output_cap=decl.output_cap,
                 )
             except ValueError:
                 raise Rejected("plugin_invalid_schema") from None
@@ -1694,7 +2032,7 @@ class PluginBus:
                 clean_caps.append(cap)
 
         if hello.admin_panel is not None:
-            if plugin_id in HOTPLUG_PILOT_PLUGIN_IDS and hello.admin_panel == plugin_id:
+            if _HOTPLUG_ADMIN_PANELS.get(plugin_id) == hello.admin_panel:
                 pass
             elif hello.admin_panel in _CORE_ADMIN_PANELS:
                 raise Rejected("plugin_scope_rejected")
@@ -1712,6 +2050,12 @@ class PluginBus:
             raise Rejected("plugin_invalid_schema")
         raw_payload = frame.get("payload", {})
         if not isinstance(raw_payload, dict) or len(raw_payload) > 32:
+            raise Rejected("plugin_invalid_schema")
+        raw_report = frame.get("report_text")
+        if raw_report is not None and not isinstance(raw_report, str):
+            raise Rejected("plugin_invalid_schema")
+        raw_longnick = frame.get("mood_longnick")
+        if raw_longnick is not None and not isinstance(raw_longnick, str):
             raise Rejected("plugin_invalid_schema")
         clean_payload = _sanitize_payload(raw_payload, self.s)
         clean_type = sanitize_sensor_text(raw_type, self.s, max_tokens=24)[:48]
@@ -1764,6 +2108,37 @@ class PluginBus:
                     )
                 except ValueError:
                     pass
+
+        if session.plugin_id == "bilibili_surf" and clean_type == "bili_video_watched":
+            if isinstance(raw_report, str) and raw_report.strip():
+                if not raw_payload.get("private_first") or raw_payload.get("owner_private"):
+                    report_target = owner_target(
+                        self.s,
+                        getattr(self.s, "owner_delivery_platform", "onebot"),
+                        self.clock(),
+                        "patrol-report",
+                    )
+                    if report_target is not None and hasattr(self.store, "save_report"):
+                        try:
+                            redacted_report = redact_public_summary(
+                                safe_output(raw_report, self._all_secrets(), limit=1100)
+                            )
+                        except Rejected:
+                            redacted_report = ""
+                        if redacted_report:
+                            await self.store.save_report(
+                                self.store.subject(report_target),
+                                redacted_report,
+                                public=not bool(raw_payload.get("private_first")),
+                            )
+            if (
+                isinstance(raw_longnick, str)
+                and raw_longnick.strip()
+                and not raw_payload.get("private_first")
+                and (longnick := getattr(self.service, "longnick", None)) is not None
+                and hasattr(longnick, "apply_patrol")
+            ):
+                await longnick.apply_patrol(raw_longnick[:80])
 
         if isinstance(frame.get("id"), str) and frame["id"]:
             await self._send_frame(
@@ -1907,11 +2282,208 @@ class PluginBus:
                 },
             )
 
+    def _validate_ai_lane(
+        self, session: _PluginSession, raw_lane: Any, *, default: str = PROACTIVE_LANE
+    ) -> str:
+        lane = default if raw_lane is None else raw_lane
+        if not isinstance(lane, str):
+            raise Rejected("plugin_invalid_schema")
+        if lane == PROACTIVE_LANE or (lane == PATROL_LANE and session.plugin_id == "bilibili_surf"):
+            return lane
+        raise Rejected("plugin_scope_rejected")
+
+    async def _check_ai_budget(self, lane: str) -> tuple[bool, bool]:
+        if not hasattr(self.store, "budget_status"):
+            return True, False
+        budget = await self.store.budget_status()
+        hard_stop = bool(budget.get("hard_stop"))
+        available = (not hard_stop) and bool(paid_lane_available(budget, lane))
+        return available, hard_stop
+
+    async def _spawn_ai_call(
+        self,
+        session: _PluginSession,
+        req_id: str,
+        *,
+        result_type: str,
+        task_name: str,
+        worker: Callable[[], Awaitable[None]],
+    ) -> None:
+        if session.proxy is None or not session.proxy.enabled:
+            await self._send_frame(
+                session,
+                {"type": result_type, "id": req_id, "ok": False, "error": "module_disabled"},
+            )
+            return
+        if session.inflight_ai_calls >= _MAX_AI_CALLS_INFLIGHT:
+            await self._send_frame(
+                session,
+                {"type": result_type, "id": req_id, "ok": False, "error": "ai_backpressure"},
+            )
+            return
+        if session.closed or session.fiber.state != "active":
+            return
+        session.inflight_ai_calls += 1
+
+        async def _runner() -> None:
+            try:
+                await worker()
+            finally:
+                session.inflight_ai_calls = max(0, session.inflight_ai_calls - 1)
+
+        try:
+            session.ctx.spawn(_runner(), name=task_name)
+        except RuntimeError:
+            session.inflight_ai_calls = max(0, session.inflight_ai_calls - 1)
+
+    async def _handle_ai_budget_check(self, session: _PluginSession, frame: dict[str, Any]) -> None:
+        if "thinking_scenes" not in session.scopes or session.proxy is None:
+            raise Rejected("plugin_scope_rejected")
+        req_id = frame.get("id")
+        if not isinstance(req_id, str) or not req_id.strip() or len(req_id) > 128:
+            raise Rejected("plugin_invalid_schema")
+        lane = self._validate_ai_lane(session, frame.get("budget_lane"), default=PROACTIVE_LANE)
+
+        async def _run_budget_check() -> None:
+            try:
+                available, hard_stop = await self._check_ai_budget(lane)
+                await self._send_frame(
+                    session,
+                    {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": True,
+                        "result": {"available": available, "hard_stop": hard_stop},
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self._send_frame(
+                    session,
+                    {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": False,
+                        "error": "budget_check_failed",
+                    },
+                )
+
+        await self._spawn_ai_call(
+            session,
+            req_id,
+            result_type="kernel.result",
+            task_name=f"plugin-ai-budget:{session.plugin_id}:{req_id[:16]}",
+            worker=_run_budget_check,
+        )
+
+    async def _handle_ai_screen(self, session: _PluginSession, frame: dict[str, Any]) -> None:
+        if "thinking_scenes" not in session.scopes or session.proxy is None:
+            raise Rejected("plugin_scope_rejected")
+        req_id = frame.get("id")
+        if not isinstance(req_id, str) or not req_id.strip() or len(req_id) > 128:
+            raise Rejected("plugin_invalid_schema")
+        lane = self._validate_ai_lane(session, frame.get("budget_lane"), default=PROACTIVE_LANE)
+        raw_purpose = frame.get("purpose", "source")
+        if raw_purpose is not None and raw_purpose != "source":
+            raise Rejected("plugin_scope_rejected")
+        raw_images = frame.get("images")
+        if raw_images is not None and not isinstance(raw_images, list):
+            raise Rejected("plugin_invalid_schema")
+        if raw_images and "media" not in session.scopes:
+            raise Rejected("plugin_scope_rejected")
+        raw_payload = frame.get("payload")
+        if not isinstance(raw_payload, dict):
+            raise Rejected("plugin_invalid_schema")
+        if not raw_payload:
+            await self._send_frame(
+                session,
+                {"type": "kernel.result", "id": req_id, "ok": False, "error": "empty_payload"},
+            )
+            return
+
+        async def _run_screen() -> None:
+            try:
+                images: list[ModelImage] = (
+                    decode_b64_frames(raw_images, 2, self.s, error_prefix="plugin")
+                    if raw_images
+                    else []
+                )
+                available, _ = await self._check_ai_budget(lane)
+                if not available:
+                    await self._send_frame(
+                        session,
+                        {
+                            "type": "kernel.result",
+                            "id": req_id,
+                            "ok": False,
+                            "error": "budget_exhausted",
+                        },
+                    )
+                    return
+                ai = getattr(self.service, "ai", None)
+                if ai is None or not hasattr(ai, "screen"):
+                    await self._send_frame(
+                        session,
+                        {
+                            "type": "kernel.result",
+                            "id": req_id,
+                            "ok": False,
+                            "error": "ai_unavailable",
+                        },
+                    )
+                    return
+                max_bytes = int(getattr(self.s, "max_context_bytes", 48_000))
+                bounded_payload = _bound_ai_payload(raw_payload, self._all_secrets(), max_bytes)
+                await ai.screen(
+                    bounded_payload,
+                    f"plugin:{session.plugin_id}",
+                    purpose="source",
+                    budget_lane=lane,
+                    images=images or None,
+                )
+                await self._send_frame(
+                    session,
+                    {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": True,
+                        "result": {"passed": True},
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Rejected as exc:
+                raw_err = str(exc).strip()
+                code = raw_err if _CODE_RE.fullmatch(raw_err) else "ai_screen_rejected"
+                await self._send_frame(
+                    session,
+                    {"type": "kernel.result", "id": req_id, "ok": False, "error": code},
+                )
+            except Exception:
+                await self._send_frame(
+                    session,
+                    {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": False,
+                        "error": "ai_screen_failed",
+                    },
+                )
+
+        await self._spawn_ai_call(
+            session,
+            req_id,
+            result_type="kernel.result",
+            task_name=f"plugin-ai-screen:{session.plugin_id}:{req_id[:16]}",
+            worker=_run_screen,
+        )
+
     async def _handle_ai_generate(self, session: _PluginSession, frame: dict[str, Any]) -> None:
         if "thinking_scenes" not in session.scopes or session.proxy is None:
             raise Rejected("plugin_scope_rejected")
         req_id = frame.get("id")
-        if not isinstance(req_id, str) or not req_id:
+        if not isinstance(req_id, str) or not req_id.strip() or len(req_id) > 128:
             raise Rejected("plugin_invalid_schema")
         scenario = frame.get("scenario") or frame.get("scene")
         if not isinstance(scenario, str) or scenario not in session.proxy.thinking_scene_keys:
@@ -1927,6 +2499,8 @@ class PluginBus:
             raise Rejected("plugin_scope_rejected")
 
         raw_images = frame.get("images")
+        if raw_images is not None and not isinstance(raw_images, list):
+            raise Rejected("plugin_invalid_schema")
         if raw_images and "media" not in session.scopes:
             await self._send_frame(
                 session,
@@ -1939,12 +2513,7 @@ class PluginBus:
             )
             raise Rejected("plugin_scope_rejected")
 
-        if not session.proxy.enabled:
-            await self._send_frame(
-                session,
-                {"type": "ai.result", "id": req_id, "ok": False, "error": "module_disabled"},
-            )
-            return
+        lane = self._validate_ai_lane(session, frame.get("budget_lane"), default=PROACTIVE_LANE)
 
         raw_payload = frame.get("payload")
         raw_prompt = frame.get("prompt")
@@ -1953,68 +2522,224 @@ class PluginBus:
         if raw_prompt is not None and not isinstance(raw_prompt, str):
             raise Rejected("plugin_invalid_schema")
 
-        sanitized_payload = _sanitize_payload(raw_payload or {}, self.s)
+        payload_in: dict[str, Any] = dict(raw_payload or {})
         if isinstance(raw_prompt, str) and raw_prompt.strip():
-            sanitized_payload["prompt"] = sanitize_sensor_text(raw_prompt, self.s, max_tokens=400)
-        if not sanitized_payload:
+            payload_in["prompt"] = raw_prompt.strip()
+        if not payload_in:
             await self._send_frame(
                 session,
                 {"type": "ai.result", "id": req_id, "ok": False, "error": "empty_payload"},
             )
             return
-        sanitized_payload["plugin_id"] = session.plugin_id
 
-        images: list[ModelImage] = []
-        if raw_images:
-            images = decode_b64_frames(raw_images, 2, self.s, error_prefix="plugin")
+        try:
+            resolved_scenario: Scenario | str = Scenario(scenario)
+        except ValueError:
+            resolved_scenario = scenario
+        is_bili_scene = scenario in _SCOPED_SCENE_OWNERS or scenario.startswith(
+            ("bili_", "bilibili_")
+        )
+        out_limit = 4000 if is_bili_scene else 1800
 
-        if hasattr(self.store, "budget_status"):
-            budget = await self.store.budget_status()
-            if budget.get("hard_stop") or not paid_lane_available(budget, PROACTIVE_LANE):
+        async def _run_generate() -> None:
+            try:
+                images: list[ModelImage] = (
+                    decode_b64_frames(raw_images, 2, self.s, error_prefix="plugin")
+                    if raw_images
+                    else []
+                )
+                available, _ = await self._check_ai_budget(lane)
+                if not available:
+                    await self._send_frame(
+                        session,
+                        {
+                            "type": "ai.result",
+                            "id": req_id,
+                            "ok": False,
+                            "error": "budget_exhausted",
+                        },
+                    )
+                    return
+
+                ai = getattr(self.service, "ai", None)
+                if ai is None or not hasattr(ai, "generate"):
+                    await self._send_frame(
+                        session,
+                        {"type": "ai.result", "id": req_id, "ok": False, "error": "ai_unavailable"},
+                    )
+                    return
+
+                secrets_list = self._all_secrets()
+                max_bytes = int(getattr(self.s, "max_context_bytes", 48_000))
+                bounded_payload = _bound_ai_payload(payload_in, secrets_list, max_bytes)
+                bounded_payload["plugin_id"] = session.plugin_id
+
+                raw_text = await ai.generate(
+                    bounded_payload,
+                    f"plugin:{session.plugin_id}",
+                    scenario=resolved_scenario,
+                    budget_lane=lane,
+                    images=images or None,
+                    audit_source="production",
+                )
+                clean_reply = safe_output(str(raw_text or ""), secrets_list, limit=out_limit)
                 await self._send_frame(
                     session,
-                    {"type": "ai.result", "id": req_id, "ok": False, "error": "budget_exhausted"},
+                    {"type": "ai.result", "id": req_id, "ok": True, "text": clean_reply},
                 )
-                return
+            except asyncio.CancelledError:
+                raise
+            except Rejected as exc:
+                raw_err = str(exc).strip()
+                code = raw_err if _CODE_RE.fullmatch(raw_err) else "ai_generate_rejected"
+                await self._send_frame(
+                    session, {"type": "ai.result", "id": req_id, "ok": False, "error": code}
+                )
+            except Exception:
+                await self._send_frame(
+                    session,
+                    {"type": "ai.result", "id": req_id, "ok": False, "error": "ai_generate_failed"},
+                )
 
-        ai = getattr(self.service, "ai", None)
-        if ai is None or not hasattr(ai, "generate"):
+        await self._spawn_ai_call(
+            session,
+            req_id,
+            result_type="ai.result",
+            task_name=f"plugin-ai-generate:{session.plugin_id}:{req_id[:16]}",
+            worker=_run_generate,
+        )
+
+    async def _handle_ai_video_analyze(
+        self, session: _PluginSession, frame: dict[str, Any]
+    ) -> None:
+        if (
+            "thinking_scenes" not in session.scopes
+            or session.proxy is None
+            or session.plugin_id != "bilibili_surf"
+        ):
+            raise Rejected("plugin_scope_rejected")
+        req_id = frame.get("id")
+        if not isinstance(req_id, str) or not req_id.strip() or len(req_id) > 128:
+            raise Rejected("plugin_invalid_schema")
+        bvid = frame.get("bvid")
+        material = frame.get("material")
+        if not isinstance(bvid, str) or not isinstance(material, dict):
+            raise Rejected("plugin_invalid_schema")
+        if not _BVID_RE.fullmatch(bvid):
             await self._send_frame(
                 session,
-                {"type": "ai.result", "id": req_id, "ok": False, "error": "ai_unavailable"},
+                {"type": "kernel.result", "id": req_id, "ok": False, "error": "invalid_bvid"},
             )
             return
+        self._validate_ai_lane(session, frame.get("budget_lane"), default=PATROL_LANE)
 
-        secrets_list = (
-            list(self.service.secrets)
-            if getattr(self.service, "secrets", None)
-            else configured_secrets(self.s)
+        async def _run_video_analyze() -> None:
+            try:
+                available, _ = await self._check_ai_budget(PATROL_LANE)
+                if not available:
+                    await self._send_frame(
+                        session,
+                        {
+                            "type": "kernel.result",
+                            "id": req_id,
+                            "ok": False,
+                            "error": "budget_exhausted",
+                        },
+                    )
+                    return
+
+                secrets_list = self._all_secrets()
+                subject = f"plugin:{session.plugin_id}"
+                clean_material = _scrub_json_secrets(material, secrets_list)
+                if not isinstance(clean_material, dict):
+                    raise Rejected("plugin_invalid_schema")
+
+                video_watch = getattr(self.service, "video_watch", None)
+                if video_watch is not None and hasattr(video_watch, "analyze"):
+                    res = await video_watch.analyze(bvid, clean_material, subject, PATROL_LANE)
+                    out_text = redact_public_summary(
+                        safe_output(str(res.text or ""), secrets_list, limit=1000)
+                    )
+                    result_obj = {
+                        "text": out_text,
+                        "mode": str(res.mode),
+                        "material_scope": str(res.material_scope),
+                        "reason": res.reason,
+                    }
+                else:
+                    ai = getattr(self.service, "ai", None)
+                    if ai is None or not hasattr(ai, "screen") or not hasattr(ai, "generate"):
+                        await self._send_frame(
+                            session,
+                            {
+                                "type": "kernel.result",
+                                "id": req_id,
+                                "ok": False,
+                                "error": "ai_unavailable",
+                            },
+                        )
+                        return
+                    max_bytes = int(getattr(self.s, "max_context_bytes", 48_000))
+                    bounded_mat = _bound_ai_payload(clean_material, secrets_list, max_bytes)
+                    await ai.screen(
+                        bounded_mat,
+                        subject,
+                        purpose="source",
+                        budget_lane=PATROL_LANE,
+                    )
+                    raw_text = await ai.generate(
+                        bounded_mat,
+                        subject,
+                        scenario=Scenario.BILI_LEARNING,
+                        budget_lane=PATROL_LANE,
+                        audit_source="production",
+                    )
+                    out_text = redact_public_summary(
+                        safe_output(str(raw_text or ""), secrets_list, limit=1000)
+                    )
+                    result_obj = {
+                        "text": out_text,
+                        "mode": "text",
+                        "material_scope": str(bounded_mat.get("material_scope") or "metadata_only"),
+                        "reason": None,
+                    }
+
+                await self._send_frame(
+                    session,
+                    {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": True,
+                        "result": result_obj,
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Rejected as exc:
+                raw_err = str(exc).strip()
+                code = raw_err if _CODE_RE.fullmatch(raw_err) else "ai_video_analyze_rejected"
+                await self._send_frame(
+                    session,
+                    {"type": "kernel.result", "id": req_id, "ok": False, "error": code},
+                )
+            except Exception:
+                await self._send_frame(
+                    session,
+                    {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": False,
+                        "error": "ai_video_analyze_failed",
+                    },
+                )
+
+        await self._spawn_ai_call(
+            session,
+            req_id,
+            result_type="kernel.result",
+            task_name=f"plugin-ai-video:{session.plugin_id}:{req_id[:16]}",
+            worker=_run_video_analyze,
         )
-        try:
-            raw_text = await ai.generate(
-                sanitized_payload,
-                f"plugin:{session.plugin_id}",
-                scenario=scenario,
-                budget_lane=PROACTIVE_LANE,
-                images=images or None,
-                audit_source="production",
-            )
-            clean_reply = safe_output(str(raw_text or ""), secrets_list, limit=1800)
-            await self._send_frame(
-                session,
-                {"type": "ai.result", "id": req_id, "ok": True, "text": clean_reply},
-            )
-        except Rejected as exc:
-            raw_err = str(exc).strip()
-            code = raw_err if _CODE_RE.fullmatch(raw_err) else "ai_generate_rejected"
-            await self._send_frame(
-                session, {"type": "ai.result", "id": req_id, "ok": False, "error": code}
-            )
-        except Exception:
-            await self._send_frame(
-                session,
-                {"type": "ai.result", "id": req_id, "ok": False, "error": "ai_generate_failed"},
-            )
 
     async def _handle_state_get(self, session: _PluginSession, frame: dict[str, Any]) -> None:
         req_id = frame.get("id")
@@ -2076,6 +2801,22 @@ class PluginBus:
                     )
                     return
 
+        if session.plugin_id == "bilibili_surf":
+            fallback = await self._load_bili_state_fallback(session, req_id, state_key)
+            if fallback is not None:
+                found, val = fallback
+                await self._send_frame(
+                    session,
+                    {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": True,
+                        "result": {"found": found, "value": val},
+                    },
+                )
+                return
+            return
+
         await self._send_frame(
             session,
             {
@@ -2085,6 +2826,244 @@ class PluginBus:
                 "result": {"found": False, "value": None},
             },
         )
+
+    async def _table_exists(self, table_name: str) -> bool:
+        row = await self.store.one(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        )
+        return row is not None
+
+    async def _load_bili_state_fallback(
+        self, session: _PluginSession, req_id: str, state_key: str
+    ) -> tuple[bool, Any] | None:
+        if state_key == "env_defaults":
+            return True, {
+                "enabled": bool(getattr(self.s, "bili_autonomous_enabled", False)),
+                "allow_like": False,
+                "allow_favorite": False,
+                "favorite_folder_id": "",
+                "daily_action_limit": 1,
+                "bot_timezone": str(getattr(self.s, "bot_timezone", "Asia/Shanghai")),
+                "bilibili_enabled": bool(getattr(self.s, "bilibili_enabled", True)),
+                "bilibili_min_interval_seconds": float(
+                    getattr(self.s, "bilibili_min_interval_seconds", 3.0)
+                ),
+                "node_bili_delegate_enabled": bool(
+                    getattr(self.s, "node_bili_delegate_enabled", True)
+                ),
+                "node_bili_fallback_local": bool(getattr(self.s, "node_bili_fallback_local", True)),
+            }
+
+        if state_key == "policy":
+            async with self.store.lock:
+                has_admin = await self._table_exists("admin_config")
+                row = (
+                    await self.store.one(
+                        "SELECT payload FROM admin_config WHERE key='bili_account'"
+                    )
+                    if has_admin
+                    else None
+                )
+            if row is None:
+                return False, None
+            try:
+                saved = self.store.vault.open("admin:bili_account", row[0])
+            except Exception:
+                await self._send_frame(
+                    session,
+                    {"type": "kernel.result", "id": req_id, "ok": False, "error": "state_corrupt"},
+                )
+                return None
+            if not isinstance(saved, dict):
+                return False, None
+            cleaned = {k: v for k, v in saved.items() if k not in {"times", "jitter_minutes"}}
+            return True, cleaned
+
+        if state_key == "credentials":
+            cred_keys = ("sessdata", "bili_jct", "buvid3", "buvid4")
+            async with self.store.lock:
+                has_creds = await self._table_exists("bili_credentials")
+                row = (
+                    await self.store.one("SELECT payload FROM bili_credentials WHERE id=1")
+                    if has_creds
+                    else None
+                )
+            if row is not None:
+                try:
+                    saved = self.store.vault.open("bili-credentials", row[0])
+                except Exception:
+                    await self._send_frame(
+                        session,
+                        {
+                            "type": "kernel.result",
+                            "id": req_id,
+                            "ok": False,
+                            "error": "state_corrupt",
+                        },
+                    )
+                    return None
+                if isinstance(saved, dict):
+                    creds = {k: str(saved.get(k) or "") for k in cred_keys}
+                    return True, {"creds": creds, "source": "sqlite"}
+                return False, None
+
+            def _secret_str(attr: str) -> str:
+                raw = getattr(self.s, attr, "")
+                return (
+                    raw.get_secret_value() if hasattr(raw, "get_secret_value") else str(raw or "")
+                )
+
+            env_creds = {
+                "sessdata": _secret_str("bili_sessdata"),
+                "bili_jct": _secret_str("bili_bili_jct"),
+                "buvid3": _secret_str("bili_buvid3"),
+                "buvid4": _secret_str("bili_buvid4"),
+            }
+            if any(env_creds.values()):
+                return True, {"creds": env_creds, "source": "env"}
+            return False, None
+
+        if state_key == "account_state":
+            async with self.store.lock:
+                has_acc = await self._table_exists("bili_account_state")
+                has_dev = await self._table_exists("bili_device_state")
+                acc_row = (
+                    await self.store.one(
+                        "SELECT blocked_until, last_error, checked_at, account "
+                        "FROM bili_account_state WHERE id=1"
+                    )
+                    if has_acc
+                    else None
+                )
+                dev_row = (
+                    await self.store.one(
+                        "SELECT fingerprint, attempted_at, status FROM bili_device_state WHERE id=1"
+                    )
+                    if has_dev
+                    else None
+                )
+            if acc_row is None and dev_row is None:
+                return False, None
+            opened_account: Any = None
+            if acc_row is not None and acc_row["account"] is not None:
+                try:
+                    opened_account = self.store.vault.open("bili-account", acc_row["account"])
+                except Exception:
+                    opened_account = None
+            return True, {
+                "blocked_until": float(acc_row["blocked_until"]) if acc_row else 0.0,
+                "last_error": acc_row["last_error"] if acc_row else None,
+                "checked_at": (
+                    float(acc_row["checked_at"])
+                    if acc_row and acc_row["checked_at"] is not None
+                    else None
+                ),
+                "account": opened_account,
+                "buvid4_device": (
+                    {
+                        "fingerprint": str(dev_row["fingerprint"]),
+                        "attempted_at": float(dev_row["attempted_at"]),
+                        "status": str(dev_row["status"]),
+                    }
+                    if dev_row is not None
+                    else None
+                ),
+            }
+
+        if state_key == "watched_seed":
+            secrets_list = self._all_secrets()
+            async with self.store.lock:
+                has_watched = await self._table_exists("bili_watched_history")
+                has_actions = await self._table_exists("bili_actions")
+                has_runs = await self._table_exists("bili_patrol_runs")
+                watched_rows = (
+                    await self.store.all(
+                        "SELECT bvid, run_id, status, created, summary "
+                        "FROM bili_watched_history "
+                        "WHERE status='done' AND summary IS NOT NULL "
+                        "ORDER BY created DESC LIMIT 50"
+                    )
+                    if has_watched
+                    else []
+                )
+                action_rows = (
+                    await self.store.all(
+                        "SELECT day, bvid, kind, status, created "
+                        "FROM bili_actions ORDER BY created DESC LIMIT 100"
+                    )
+                    if has_actions
+                    else []
+                )
+                run_rows = (
+                    await self.store.all(
+                        "SELECT id, day, slot, status, created, reason "
+                        "FROM bili_patrol_runs ORDER BY created DESC LIMIT 10"
+                    )
+                    if has_runs
+                    else []
+                )
+                done_actions: dict[str, list[str]] = {}
+                if has_actions and watched_rows:
+                    bvids = [str(r["bvid"]) for r in watched_rows]
+                    slots = ",".join("?" for _ in bvids)
+                    done_rows = await self.store.all(
+                        "SELECT bvid, kind FROM bili_actions "
+                        f"WHERE status='done' AND bvid IN ({slots})",
+                        tuple(bvids),
+                    )
+                    for dr in done_rows:
+                        done_actions.setdefault(str(dr["bvid"]), []).append(str(dr["kind"]))
+            watched_items: list[dict[str, Any]] = []
+            for r in watched_rows:
+                bvid_val = str(r["bvid"])
+                try:
+                    raw_summary = self.store.vault.open("bili-learn:" + bvid_val, r["summary"])
+                    redacted = redact_public_summary(
+                        safe_output(str(raw_summary), secrets_list, limit=1200)
+                    )
+                except Exception:
+                    continue
+                watched_items.append(
+                    {
+                        "bvid": bvid_val,
+                        "run_id": str(r["run_id"]),
+                        "status": str(r["status"]),
+                        "created": float(r["created"]),
+                        "summary": redacted,
+                        "actions": sorted(set(done_actions.get(bvid_val, []))),
+                    }
+                )
+            actions_list = [
+                {
+                    "day": str(r["day"]),
+                    "bvid": str(r["bvid"]),
+                    "kind": str(r["kind"]),
+                    "status": str(r["status"]),
+                    "created": float(r["created"]),
+                }
+                for r in action_rows
+            ]
+            runs_list = [
+                {
+                    "id": str(r["id"]),
+                    "day": str(r["day"]),
+                    "slot": str(r["slot"]),
+                    "status": str(r["status"]),
+                    "created": float(r["created"]),
+                    "reason": r["reason"],
+                }
+                for r in run_rows
+            ]
+            if not watched_items and not actions_list and not runs_list:
+                return False, None
+            return True, {
+                "watched": watched_items,
+                "actions": actions_list,
+                "runs": runs_list,
+            }
+
+        return False, None
 
     async def _handle_state_set(self, session: _PluginSession, frame: dict[str, Any]) -> None:
         req_id = frame.get("id")
@@ -2122,7 +3101,10 @@ class PluginBus:
                 },
             )
             return
-        if len(encoded) > _MAX_KV_VALUE_BYTES:
+        kv_limit = (
+            _MAX_KV_VALUE_BYTES if session.plugin_id == "bilibili_surf" else _LEGACY_KV_VALUE_BYTES
+        )
+        if len(encoded) > kv_limit:
             await self._send_frame(
                 session,
                 {
@@ -2144,6 +3126,30 @@ class PluginBus:
                 "payload=excluded.payload, updated=excluded.updated",
                 (session.plugin_id, state_key, blob, now),
             )
+        if (
+            session.plugin_id == "bilibili_surf"
+            and state_key == "credentials"
+            and isinstance(value, dict)
+        ):
+            creds_obj = value.get("creds") if isinstance(value.get("creds"), dict) else value
+            cookie_vals = [
+                str(creds_obj.get(k) or "")
+                for k in ("sessdata", "bili_jct", "buvid3", "buvid4")
+                if isinstance(creds_obj.get(k), str) and creds_obj.get(k)
+            ]
+            if cookie_vals:
+                existing_extra = tuple(getattr(self.s, "_runtime_extra_secrets", ()) or ())
+                self.s._runtime_extra_secrets = tuple(
+                    dict.fromkeys([*existing_extra, *cookie_vals])
+                )
+                svc_secrets = getattr(self.service, "secrets", None)
+                if isinstance(svc_secrets, list):
+                    for val in cookie_vals:
+                        if val not in svc_secrets:
+                            svc_secrets.append(val)
+            bw = getattr(self.service, "bili_watcher", None)
+            if bw is not None and hasattr(bw, "credentials_epoch"):
+                bw.credentials_epoch += 1
         await self._send_frame(
             session,
             {"type": "kernel.result", "id": req_id, "ok": True, "result": {"saved": True}},
@@ -2171,6 +3177,12 @@ class PluginBus:
                     "DELETE FROM admin_config WHERE key='weather_location'"
                 )
                 deleted = deleted or (cur_legacy.rowcount > 0)
+            elif session.plugin_id == "bilibili_surf" and state_key == "policy":
+                if await self._table_exists("admin_config"):
+                    cur_legacy = await self.store.db.execute(
+                        "DELETE FROM admin_config WHERE key='bili_account'"
+                    )
+                    deleted = deleted or (cur_legacy.rowcount > 0)
         await self._send_frame(
             session,
             {
@@ -2202,7 +3214,8 @@ class PluginBus:
             return
         action = frame.get("action")
         params = frame.get("params", {})
-        if not isinstance(action, str) or action not in _NODE_BRIDGE_ALLOWED_ACTIONS:
+        allowed_actions = _NODE_BRIDGE_PLUGIN_ACTIONS.get(session.plugin_id, frozenset())
+        if not isinstance(action, str) or action not in allowed_actions:
             log.warning(
                 "event=plugin_node_bridge_rejected plugin=%s action=%s",
                 session.plugin_id,
@@ -2263,15 +3276,16 @@ class PluginBus:
                 except Rejected as exc:
                     raw_err = str(exc).strip()
                     code = raw_err if _CODE_RE.fullmatch(raw_err) else "node_rpc_failed"
-                    await self._send_frame(
-                        session,
-                        {
-                            "type": "kernel.result",
-                            "id": req_id,
-                            "ok": False,
-                            "error": code,
-                        },
-                    )
+                    err_frame: dict[str, Any] = {
+                        "type": "kernel.result",
+                        "id": req_id,
+                        "ok": False,
+                        "error": code,
+                    }
+                    detail = getattr(exc, "detail", "")
+                    if isinstance(detail, str) and detail and _CODE_RE.fullmatch(detail):
+                        err_frame["message"] = detail
+                    await self._send_frame(session, err_frame)
                     return
                 except Exception:
                     await self._send_frame(
@@ -2284,18 +3298,44 @@ class PluginBus:
                         },
                     )
                     return
-                sanitized = _sanitize_payload(
-                    data if isinstance(data, dict) else {"data": data}, self.s
-                )
-                await self._send_frame(
-                    session,
-                    {
-                        "type": "kernel.result",
-                        "id": req_id,
-                        "ok": True,
-                        "result": sanitized,
-                    },
-                )
+                raw_obj = data if isinstance(data, dict) else {"data": data}
+                if session.plugin_id == "bilibili_surf" and action.startswith("bili."):
+                    sanitized = _scrub_json_secrets(raw_obj, self._all_secrets())
+                else:
+                    sanitized = _sanitize_payload(raw_obj, self.s)
+                res_frame: dict[str, Any] = {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": True,
+                    "result": sanitized,
+                }
+                try:
+                    encoded = json.dumps(res_frame, ensure_ascii=False, allow_nan=False).encode(
+                        "utf-8"
+                    )
+                except (TypeError, ValueError):
+                    await self._send_frame(
+                        session,
+                        {
+                            "type": "kernel.result",
+                            "id": req_id,
+                            "ok": False,
+                            "error": "node_invalid_response",
+                        },
+                    )
+                    return
+                if len(encoded) > self._max_frame_bytes():
+                    await self._send_frame(
+                        session,
+                        {
+                            "type": "kernel.result",
+                            "id": req_id,
+                            "ok": False,
+                            "error": "node_frame_too_large",
+                        },
+                    )
+                    return
+                await self._send_frame(session, res_frame)
             finally:
                 session.inflight_node_calls = max(0, session.inflight_node_calls - 1)
 
@@ -2383,6 +3423,33 @@ class PluginBus:
                 proxy._configuration_issue = raw_issue
             else:
                 raise Rejected("plugin_invalid_schema")
+        if "unavailable_actions" in frame and frame["unavailable_actions"] is not None:
+            raw_unavail = frame["unavailable_actions"]
+            if not isinstance(raw_unavail, dict) or len(raw_unavail) > 32:
+                raise Rejected("plugin_invalid_schema")
+            declared = {a.name for a in proxy.actions()}
+            if not raw_unavail:
+                proxy._action_unavailable.clear()
+            else:
+                for act_name, reason in raw_unavail.items():
+                    if not isinstance(act_name, str) or not _ACTION_NAME_RE.fullmatch(act_name):
+                        raise Rejected("plugin_invalid_schema")
+                    if act_name not in declared:
+                        raise Rejected("plugin_scope_rejected")
+                    if reason is None or reason == "":
+                        proxy._action_unavailable.pop(act_name, None)
+                    elif isinstance(reason, str) and _CODE_RE.fullmatch(reason):
+                        proxy._action_unavailable[act_name] = reason
+                    else:
+                        raise Rejected("plugin_invalid_schema")
+        if "current_activity" in frame:
+            raw_act = frame["current_activity"]
+            if raw_act is None or raw_act == "":
+                proxy._current_activity = None
+            elif isinstance(raw_act, str) and _CODE_RE.fullmatch(raw_act):
+                proxy._current_activity = raw_act
+            else:
+                raise Rejected("plugin_invalid_schema")
         if isinstance(frame.get("id"), str) and frame["id"]:
             await self._send_frame(
                 session,
@@ -2414,19 +3481,35 @@ class PluginBus:
         else:
             raise Rejected("plugin_invalid_schema")
 
-        ws = getattr(self.service, "world_state", None)
-        if (
-            ws is not None
-            and hasattr(ws, "experience")
-            and (
-                session.plugin_id == "minecraft"
-                or (session.proxy is not None and session.proxy.attention_level == "HIGH")
-            )
-        ):
-            exp = ws.experience
-            if not getattr(exp, "ready", True) and hasattr(ws, "initialize"):
-                await ws.initialize()
-            await exp.mc_snapshot(active_task, updated_at, disconnected=disconnected)
+        kind = frame.get("kind")
+        if kind == "bili_reading":
+            if session.plugin_id != "bilibili_surf":
+                raise Rejected("plugin_scope_rejected")
+            active = frame.get("active")
+            if not isinstance(active, bool):
+                raise Rejected("plugin_invalid_schema")
+            ws = getattr(self.service, "world_state", None)
+            if ws is not None and hasattr(ws, "experience"):
+                exp = ws.experience
+                if not getattr(exp, "ready", True) and hasattr(ws, "initialize"):
+                    await ws.initialize()
+                await exp.bili_reading(active, updated_at)
+        else:
+            if kind is not None and (not isinstance(kind, str) or not _CODE_RE.fullmatch(kind)):
+                raise Rejected("plugin_invalid_schema")
+            ws = getattr(self.service, "world_state", None)
+            if (
+                ws is not None
+                and hasattr(ws, "experience")
+                and (
+                    session.plugin_id == "minecraft"
+                    or (session.proxy is not None and session.proxy.attention_level == "HIGH")
+                )
+            ):
+                exp = ws.experience
+                if not getattr(exp, "ready", True) and hasattr(ws, "initialize"):
+                    await ws.initialize()
+                await exp.mc_snapshot(active_task, updated_at, disconnected=disconnected)
         if isinstance(frame.get("id"), str) and frame["id"]:
             await self._send_frame(
                 session,
@@ -2786,7 +3869,7 @@ class PluginBus:
             ctx.effect(_cancel_pending_rpcs)
 
             try:
-                actions = self._build_actions(session, hello.actions)
+                actions, action_timeouts = self._build_actions(session, hello.actions)
                 scenes = self._build_thinking_scenes(pid, hello.thinking_scenes)
                 saved_enabled = await self._load_module_switch(pid)
                 clean_disp = sanitize_sensor_text(
@@ -2813,6 +3896,7 @@ class PluginBus:
                     admin_panel=hello.admin_panel,
                     configuration_issue=hello.configuration_issue,
                     initial_status=hello.initial_status,
+                    action_timeouts=action_timeouts,
                 )
                 session.proxy = proxy
                 modules = getattr(self.service, "modules", None)
@@ -2854,6 +3938,16 @@ class PluginBus:
                 "node_region": session.node_region,
             },
         )
+        nt = getattr(self.service, "node_transport", None)
+        if (
+            nt is not None
+            and "node_bridge" in session.scopes
+            and callable(getattr(nt, "connected", None))
+        ):
+            await self._send_frame(
+                session,
+                {"type": "node.state", "connected": bool(nt.connected())},
+            )
 
         # Phase 3: Active message loop, 20s heartbeat, and 60s idle timeout on tracked fiber tasks.
         async def _reader() -> None:
@@ -2890,8 +3984,14 @@ class PluginBus:
                     await self._handle_chat_inbound(session, frame)
                 elif ftype == "owner.notify":
                     await self._handle_owner_notify(session, frame)
+                elif ftype == "ai.budget_check":
+                    await self._handle_ai_budget_check(session, frame)
+                elif ftype == "ai.screen":
+                    await self._handle_ai_screen(session, frame)
                 elif ftype == "ai.generate":
                     await self._handle_ai_generate(session, frame)
+                elif ftype == "ai.video_analyze":
+                    await self._handle_ai_video_analyze(session, frame)
                 elif ftype == "state.get":
                     await self._handle_state_get(session, frame)
                 elif ftype == "state.set":

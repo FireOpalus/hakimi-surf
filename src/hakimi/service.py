@@ -15,8 +15,9 @@ import httpx
 
 from .affection import _validate_platform_user
 from .attention import can_watch_video
+from .bili_bridge import RemoteBiliClient, RemoteBiliWatcher
 from .bot_server import is_persona_owner, untrusted_input
-from .config import Settings
+from .config import Settings, is_external_plugin
 from .drive_client import FolderDrive
 from .file_reader import FileReader
 from .gateway import redact_excerpt
@@ -116,14 +117,18 @@ class Service:
         http: httpx.AsyncClient | None = None,
         node_transport: NodeTransport | None = None,
     ):
-        self.s, self.store, self.ai, self.bili, self.sender = settings, store, gateway, bili, sender
+        self.s, self.store, self.ai, self.sender = settings, store, gateway, sender
         # Older composition roots supplied their shared HTTP client on the sender.
         self.http = http if http is not None else getattr(sender, "http", None)
         self.node_transport = (
             node_transport if node_transport is not None else NodeTransport(settings)
         )
-        if node_transport is not None or getattr(self.bili, "node_transport", None) is None:
-            self.bili.node_transport = self.node_transport
+        if is_external_plugin(settings, "bilibili_surf"):
+            self.bili = RemoteBiliClient(self)
+        else:
+            self.bili = bili
+            if node_transport is not None or getattr(self.bili, "node_transport", None) is None:
+                self.bili.node_transport = self.node_transport
         self.sessions = SessionManager(settings, store)
         self.hot = HotRing()
         store.runtime.hot_ring = self.hot
@@ -154,7 +159,11 @@ class Service:
         self.moderation = Moderation(self)
         store.runtime.moderation = self.moderation
         self.longnick = Longnick(self)
-        self.bili_watcher = BiliWatcher(self)
+        self.bili_watcher = (
+            RemoteBiliWatcher(self)
+            if is_external_plugin(settings, "bilibili_surf")
+            else BiliWatcher(self)
+        )
         self.video_watch = VideoWatch(self)
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
@@ -202,7 +211,12 @@ class Service:
         self.world_state = WorldStateManager(settings, store, self.modules)
         self.world_state.subscribe(self._broadcast_world_event)
         install_modules(self)
-        if "minecraft" in self.s.external_plugins or self.modules.get("minecraft") is None:
+        if (
+            is_external_plugin(self.s, "minecraft")
+            or is_external_plugin(self.s, "bilibili_surf")
+            or self.modules.get("minecraft") is None
+            or self.modules.get("bilibili_surf") is None
+        ):
             if getattr(self.node_transport, "on_event", None) is None:
                 self.node_transport.on_event = self._relay_node_event
             if getattr(self.node_transport, "on_state", None) is None:

@@ -25,8 +25,23 @@ _ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}\.[a-z][a-z0-9_]{0,30}\Z")
 _CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 _VALID_WINDOWS = frozenset({"any", "active", "closing"})
 _DEFAULT_MAX_FRAME_BYTES = 262_144
+_UNSET: Any = object()
 
 ThinkingLevel = Literal["low", "medium", "high", "xhigh"]
+OutputCapKey = Literal[
+    "chat_output_tokens",
+    "owner_output_tokens",
+    "summary_output_tokens",
+    "diary_output_tokens",
+]
+
+
+def _as_result_dict(res: Any) -> dict[str, Any]:
+    if res is None:
+        return {}
+    if isinstance(res, dict):
+        return res
+    return {"result": res}
 
 
 class PluginRpcError(Exception):
@@ -190,6 +205,7 @@ class ThinkingSceneSpec(BaseModel):
     default: ThinkingLevel = "medium"
     levels: tuple[ThinkingLevel, ...] = ("low", "medium", "high", "xhigh")
     output_tokens: int = Field(default=2048, ge=128, le=16384)
+    output_cap: OutputCapKey | None = None
 
     @field_validator("levels")
     @classmethod
@@ -203,13 +219,16 @@ class ThinkingSceneSpec(BaseModel):
             raise ValueError("default level must be present in levels")
 
     def to_hello_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "key": self.key,
             "label": self.label,
             "default": self.default,
             "levels": list(self.levels),
             "output_tokens": self.output_tokens,
         }
+        if self.output_cap is not None:
+            data["output_cap"] = self.output_cap
+        return data
 
 
 class ActionSpec(BaseModel):
@@ -231,6 +250,9 @@ class ActionSpec(BaseModel):
     social: bool = False
     owner_only: bool = False
     aliases: list[list[Any]] = Field(default_factory=list)
+    budget_lane: Literal["patrol", "proactive"] | None = None
+    quotas: list[dict[str, str]] | None = None
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=300.0)
     handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
     @field_validator("name")
@@ -247,8 +269,15 @@ class ActionSpec(BaseModel):
             raise ValueError("invalid action window")
         return value
 
+    @field_validator("timeout_seconds", mode="before")
+    @classmethod
+    def _reject_bool_timeout(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("timeout_seconds must not be a boolean")
+        return value
+
     def to_hello_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "arguments": self.arguments,
@@ -260,6 +289,13 @@ class ActionSpec(BaseModel):
             "owner_only": self.owner_only,
             "aliases": [list(alias) for alias in self.aliases],
         }
+        if self.budget_lane is not None:
+            data["budget_lane"] = self.budget_lane
+        if self.quotas is not None:
+            data["quotas"] = [dict(item) for item in self.quotas]
+        if self.timeout_seconds is not None:
+            data["timeout_seconds"] = self.timeout_seconds
+        return data
 
 
 class HakimiPluginClient:
@@ -302,6 +338,7 @@ class HakimiPluginClient:
         )
         self._last_status: dict[str, Any] = dict(initial_status or {})
         self._configuration_issue: str | None = configuration_issue
+        self._unavailable_actions: dict[str, str | None] = {}
 
         self._sensor_handler: Callable[..., Any] | None = None
         self._rpc_handlers: dict[str, Callable[..., Any]] = {}
@@ -352,6 +389,9 @@ class HakimiPluginClient:
         social: bool = False,
         owner_only: bool = False,
         aliases: Sequence[Sequence[Any]] = (),
+        budget_lane: Literal["patrol", "proactive"] | None = None,
+        quotas: Sequence[dict[str, str]] | None = None,
+        timeout_seconds: float | None = None,
     ) -> Callable[[Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]], Callable[..., Any]]:
         """Decorator registering an ActionSpec handler."""
 
@@ -368,6 +408,9 @@ class HakimiPluginClient:
                     social=social,
                     owner_only=owner_only,
                     aliases=[list(item) for item in aliases],
+                    budget_lane=budget_lane,
+                    quotas=[dict(item) for item in quotas] if quotas is not None else None,
+                    timeout_seconds=timeout_seconds,
                     handler=fn,
                 )
             )
@@ -448,11 +491,17 @@ class HakimiPluginClient:
         return _decorator(fn) if fn is not None else _decorator
 
     def set_status_cache(
-        self, status: dict[str, Any], *, configuration_issue: str | None = None
+        self,
+        status: dict[str, Any],
+        *,
+        configuration_issue: str | None = None,
+        unavailable_actions: dict[str, str | None] | None = None,
     ) -> None:
         """Update cached initial status and configuration issue sent on next handshake."""
         self._last_status = dict(status)
         self._configuration_issue = configuration_issue
+        if unavailable_actions is not None:
+            self._unavailable_actions = dict(unavailable_actions)
 
     def _auth_headers(self) -> dict[str, str]:
         return {
@@ -546,7 +595,7 @@ class HakimiPluginClient:
                 return await future
         except TimeoutError:
             raise PluginRpcError(
-                "plugin_rpc_timeout", f"timed out waiting for {frame.get(type)}"
+                "plugin_rpc_timeout", f"timed out waiting for {frame.get('type')}"
             ) from None
         finally:
             self._pending_kernel_rpcs.pop(req_id, None)
@@ -580,24 +629,116 @@ class HakimiPluginClient:
             {"type": "node.call", "action": action, "params": dict(params or {})},
             timeout=timeout,
         )
-        if res is None:
-            return {}
+        return _as_result_dict(res)
+
+    async def ai_budget_check(
+        self,
+        lane: str = "patrol",
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        """Check whether the requested paid AI budget lane is currently available."""
+        res = await self._kernel_request(
+            {"type": "ai.budget_check", "budget_lane": lane},
+            timeout=timeout,
+        )
+        return _as_result_dict(res)
+
+    async def ai_screen(
+        self,
+        payload: dict[str, Any],
+        *,
+        budget_lane: str = "patrol",
+        purpose: str = "source",
+        images: list[dict[str, Any]] | None = None,
+        timeout: float = 45.0,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        """Run the kernel AI safety gate on external content (`thinking_scenes` scope)."""
+        frame: dict[str, Any] = {
+            "type": "ai.screen",
+            "payload": dict(payload),
+            "budget_lane": budget_lane,
+            "purpose": purpose,
+        }
+        if images:
+            frame["images"] = [dict(item) if isinstance(item, dict) else item for item in images]
+        res = await self._kernel_request(frame, timeout=timeout)
+        return _as_result_dict(res)
+
+    async def ai_generate(
+        self,
+        scenario: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        prompt: str | None = None,
+        budget_lane: str = "proactive",
+        images: list[dict[str, Any]] | None = None,
+        timeout: float = 95.0,  # noqa: ASYNC109
+    ) -> str:
+        """Request model generation via a declared thinking scene (`thinking_scenes` scope)."""
+        frame: dict[str, Any] = {
+            "type": "ai.generate",
+            "scenario": scenario,
+            "payload": dict(payload or {}),
+            "budget_lane": budget_lane,
+        }
+        if prompt is not None:
+            frame["prompt"] = prompt
+        if images:
+            frame["images"] = [dict(item) if isinstance(item, dict) else item for item in images]
+        res = await self._kernel_request(frame, timeout=timeout)
         if isinstance(res, dict):
-            return res
-        return {"result": res}
+            return str(res.get("text") or "")
+        return str(res or "")
+
+    async def ai_video_analyze(
+        self,
+        bvid: str,
+        material: dict[str, Any],
+        *,
+        budget_lane: str = "patrol",
+        timeout: float = 180.0,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        """Run kernel video analysis for a Bilibili video (`thinking_scenes` scope)."""
+        res = await self._kernel_request(
+            {
+                "type": "ai.video_analyze",
+                "bvid": bvid,
+                "material": dict(material),
+                "budget_lane": budget_lane,
+            },
+            timeout=timeout,
+        )
+        return _as_result_dict(res)
+
+    async def notify_owner(self, text: str, *, code: str = "notify") -> None:
+        """Send an owner notification alert through the kernel (`owner_notify` scope)."""
+        await self._send_live_frame({"type": "owner.notify", "text": text, "code": code})
 
     async def push_status(
-        self, status: dict[str, Any], *, configuration_issue: str | None = None
+        self,
+        status: dict[str, Any],
+        *,
+        configuration_issue: str | None = None,
+        unavailable_actions: dict[str, str | None] | None = None,
+        current_activity: str | None = _UNSET,
     ) -> None:
-        """Push updated admin/runtime status and optional configuration issue."""
-        self.set_status_cache(status, configuration_issue=configuration_issue)
-        await self._send_live_frame(
-            {
-                "type": "plugin.status",
-                "status": dict(status),
-                "configuration_issue": configuration_issue,
-            }
+        """Push updated admin/runtime status and optional configuration metadata."""
+        self.set_status_cache(
+            status,
+            configuration_issue=configuration_issue,
+            unavailable_actions=unavailable_actions,
         )
+        frame: dict[str, Any] = {
+            "type": "plugin.status",
+            "status": dict(status),
+            "configuration_issue": configuration_issue,
+        }
+        if unavailable_actions is not None:
+            frame["unavailable_actions"] = dict(unavailable_actions)
+        if current_activity is not _UNSET:
+            frame["current_activity"] = current_activity
+        await self._send_live_frame(frame)
 
     async def emit_world_event(
         self,
@@ -607,6 +748,8 @@ class HakimiPluginClient:
         importance: str = "normal",
         business_key: str | None = None,
         summary: str | None = None,
+        report_text: str | None = None,
+        mood_longnick: str | None = None,
     ) -> None:
         """Emit a one-way `world.event` frame (`sensors` scope)."""
         frame: dict[str, Any] = {
@@ -619,24 +762,33 @@ class HakimiPluginClient:
             frame["business_key"] = business_key
         if summary is not None:
             frame["summary"] = summary
+        if report_text is not None:
+            frame["report_text"] = report_text
+        if mood_longnick is not None:
+            frame["mood_longnick"] = mood_longnick
         await self._send_live_frame(frame)
 
     async def report_activity(
         self,
-        active_task: str,
+        active_task: str = "",
         *,
         disconnected: bool = False,
         updated_at: float | None = None,
+        kind: str | None = None,
+        active: bool | None = None,
     ) -> None:
         """Report current world activity snapshot (`sensors` scope)."""
-        await self._send_live_frame(
-            {
-                "type": "world.activity",
-                "active_task": active_task,
-                "disconnected": bool(disconnected),
-                "updated_at": time.time() if updated_at is None else float(updated_at),
-            }
-        )
+        frame: dict[str, Any] = {
+            "type": "world.activity",
+            "active_task": active_task,
+            "disconnected": bool(disconnected),
+            "updated_at": time.time() if updated_at is None else float(updated_at),
+        }
+        if kind is not None:
+            frame["kind"] = kind
+        if active is not None:
+            frame["active"] = bool(active)
+        await self._send_live_frame(frame)
 
     async def enqueue_reaction(
         self,
@@ -668,6 +820,27 @@ class HakimiPluginClient:
             if not future.done():
                 future.set_exception(PluginRpcError(code))
         self._pending_kernel_rpcs.clear()
+
+    def _resolve_pending_rpc(
+        self,
+        frame: dict[str, Any],
+        *,
+        default_error: str,
+        result_extractor: Callable[[dict[str, Any]], Any],
+    ) -> None:
+        req_id = frame.get("id")
+        fut = self._pending_kernel_rpcs.get(req_id) if isinstance(req_id, str) else None
+        if fut is None or fut.done():
+            return
+        if frame.get("ok", False):
+            fut.set_result(result_extractor(frame))
+        else:
+            fut.set_exception(
+                PluginRpcError(
+                    str(frame.get("error") or default_error),
+                    str(frame.get("message") or ""),
+                )
+            )
 
     async def _send_rpc_result(
         self,
@@ -859,18 +1032,17 @@ class HakimiPluginClient:
                     self._rpc_tasks.add(task)
                     task.add_done_callback(self._rpc_tasks.discard)
                 elif ftype == "kernel.result":
-                    req_id = frame.get("id")
-                    fut = self._pending_kernel_rpcs.get(req_id) if isinstance(req_id, str) else None
-                    if fut is not None and not fut.done():
-                        if frame.get("ok", False):
-                            fut.set_result(frame.get("result"))
-                        else:
-                            fut.set_exception(
-                                PluginRpcError(
-                                    str(frame.get("error") or "kernel_rpc_failed"),
-                                    str(frame.get("message") or ""),
-                                )
-                            )
+                    self._resolve_pending_rpc(
+                        frame,
+                        default_error="kernel_rpc_failed",
+                        result_extractor=lambda item: item.get("result"),
+                    )
+                elif ftype == "ai.result":
+                    self._resolve_pending_rpc(
+                        frame,
+                        default_error="ai_generate_failed",
+                        result_extractor=lambda item: {"text": str(item.get("text") or "")},
+                    )
                 elif ftype == "world.event.broadcast":
                     raw_ev = frame.get("event")
                     ev = (
@@ -894,7 +1066,10 @@ class HakimiPluginClient:
                 elif ftype in {
                     "plugin.welcome",
                     "plugin.ready",
+                    "plugin.status.ack",
                     "world.event.ack",
+                    "world.activity.ack",
+                    "world.reaction.ack",
                     "chat.inbound.ack",
                     "owner.notify.ack",
                 }:

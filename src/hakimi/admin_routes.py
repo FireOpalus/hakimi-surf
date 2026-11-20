@@ -1190,7 +1190,18 @@ async def _sandbox(request: Request, audit_id: str):
                     else None
                 )
                 if bvid:
-                    video = await svc.bili.video(bvid)
+                    try:
+                        video = await svc.bili.video(bvid)
+                    except Rejected as exc:
+                        if str(exc) in {
+                            "bilibili_module_unavailable",
+                            "bilibili_unavailable",
+                            "plugin_disconnected",
+                            "plugin_rpc_timeout",
+                        }:
+                            rejection = exc
+                            raise HTTPException(503, "bilibili_module_unavailable") from None
+                        raise
                     payload = {
                         "task": "summarize_public_metadata",
                         "material_scope": "metadata_only",

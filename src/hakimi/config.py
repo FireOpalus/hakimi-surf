@@ -657,3 +657,17 @@ class Settings(BaseSettings):
                 "remote OneBot APIs require HTTPS; 'onebot' is a private Docker service"
             )
         return self
+
+
+_BILI_EXTERNAL_ALIASES = frozenset({"bilibili", "bilibili_surf"})
+
+
+def is_external_plugin(settings: Settings | None, module_id: str) -> bool:
+    """Return True when `module_id` matches `settings.external_plugins` (with Bili alias)."""
+    if settings is None or not isinstance(module_id, str) or not module_id:
+        return False
+    raw = getattr(settings, "external_plugins", ()) or ()
+    configured = {raw} if isinstance(raw, str) else set(raw)
+    if module_id in _BILI_EXTERNAL_ALIASES:
+        return bool(configured & _BILI_EXTERNAL_ALIASES)
+    return module_id in configured

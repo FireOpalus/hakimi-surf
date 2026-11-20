@@ -721,8 +721,10 @@ def test_packaging_and_deploy_script_conventions():
     for required in (
         "hakimi-plugin-weather:",
         "hakimi-plugin-minecraft:",
+        "hakimi-plugin-bilibili:",
         "plugins.weather.plugin_main",
         "plugins.minecraft.plugin_main",
+        "plugins.bilibili.plugin_main",
         "secrets/plugins.env",
         "ws://hakimi-bot:12141/ws/plugin",
         "condition: service_healthy",
@@ -738,3 +740,327 @@ def test_packaging_and_deploy_script_conventions():
     deploy_text = deploy_sh.read_text(encoding="utf-8")
     assert "compose.plugins.yaml" in deploy_text
     assert "--no-deps" in deploy_text
+    assert "hakimi-plugin-bilibili" in deploy_text
+    assert "bilibili|bilibili_surf|hakimi-plugin-bilibili" in deploy_text
+
+
+def test_phase3_extended_specs_and_validation():
+    default_scene = ThinkingSceneSpec(key="bili.default", label="Default Scene")
+    assert "output_cap" not in default_scene.to_hello_dict()
+
+    capped_scene = ThinkingSceneSpec(
+        key="bilibili_summary",
+        label="B站视频总结",
+        default="medium",
+        levels=("low", "medium", "high"),
+        output_tokens=2048,
+        output_cap="summary_output_tokens",
+    )
+    assert capped_scene.to_hello_dict()["output_cap"] == "summary_output_tokens"
+
+    with pytest.raises(ValidationError):
+        ThinkingSceneSpec(key="bad.cap", label="Bad", output_cap="unknown_cap")  # type: ignore[arg-type]
+
+    async def noop(params: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "done"}
+
+    plain_action = ActionSpec(name="bili.plain", description="Plain", handler=noop)
+    plain_hello = plain_action.to_hello_dict()
+    assert "budget_lane" not in plain_hello
+    assert "quotas" not in plain_hello
+    assert "timeout_seconds" not in plain_hello
+
+    patrol_action = ActionSpec(
+        name="bili.patrol",
+        description="Run patrol",
+        budget_lane="patrol",
+        quotas=[{"name": "bili_patrols", "unlimited_flag": "bili_patrols_unlimited"}],
+        timeout_seconds=180.0,
+        handler=noop,
+    )
+    assert patrol_action.to_hello_dict()["budget_lane"] == "patrol"
+    assert patrol_action.to_hello_dict()["quotas"] == [
+        {"name": "bili_patrols", "unlimited_flag": "bili_patrols_unlimited"}
+    ]
+    assert patrol_action.to_hello_dict()["timeout_seconds"] == 180.0
+
+    for bad_timeout in (0.5, 301.0, True, float("nan")):
+        with pytest.raises(ValidationError):
+            ActionSpec(
+                name="bili.bad",
+                description="Bad timeout",
+                timeout_seconds=bad_timeout,  # type: ignore[arg-type]
+                handler=noop,
+            )
+
+    with pytest.raises(ValidationError):
+        ActionSpec(
+            name="bili.bad_lane",
+            description="Bad lane",
+            budget_lane="invalid",  # type: ignore[arg-type]
+            handler=noop,
+        )
+
+    client = HakimiPluginClient(_make_config(), thinking_scenes=[capped_scene])
+
+    @client.action(
+        "bili.patrol",
+        "Patrol Bilibili",
+        budget_lane="patrol",
+        quotas=[{"name": "bili_patrols", "unlimited_flag": "bili_patrols_unlimited"}],
+        timeout_seconds=180.0,
+    )
+    async def patrol_handler(params: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "done"}
+
+    hello = client.hello_payload()
+    assert hello["thinking_scenes"][0]["output_cap"] == "summary_output_tokens"
+    assert hello["actions"][0]["budget_lane"] == "patrol"
+    assert hello["actions"][0]["quotas"] == [
+        {"name": "bili_patrols", "unlimited_flag": "bili_patrols_unlimited"}
+    ]
+    assert hello["actions"][0]["timeout_seconds"] == 180.0
+
+
+async def test_phase3_ai_helpers_notify_telemetry_and_acks():
+    sock = _FakeSocket()
+    client = HakimiPluginClient(
+        _make_config(
+            plugin_id="bilibili_surf",
+            scopes=("actions", "sensors", "thinking_scenes", "owner_notify"),
+        ),
+        initial_status={"ready": False},
+        connect_factory=lambda *_: sock,
+    )
+    await client.start()
+    try:
+        await sock.wait_sent(lambda m: m.get("type") == "plugin.hello")
+        await sock.push({"type": "plugin.welcome"})
+        assert await client.wait_connected(timeout=2.0)
+
+        # 1. ai_budget_check
+        budget_task = asyncio.create_task(client.ai_budget_check("patrol"))
+        budget_req = await sock.wait_sent(lambda m: m.get("type") == "ai.budget_check")
+        assert budget_req["budget_lane"] == "patrol"
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": budget_req["id"],
+                "ok": True,
+                "result": {"available": True, "hard_stop": False},
+            }
+        )
+        assert await budget_task == {"available": True, "hard_stop": False}
+
+        # 2. ai_screen (without and with images)
+        screen_task = asyncio.create_task(
+            client.ai_screen({"title": "Hello"}, budget_lane="patrol", purpose="source")
+        )
+        screen_req = await sock.wait_sent(
+            lambda m: m.get("type") == "ai.screen" and m.get("payload") == {"title": "Hello"}
+        )
+        assert screen_req["budget_lane"] == "patrol"
+        assert screen_req["purpose"] == "source"
+        assert "images" not in screen_req
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": screen_req["id"],
+                "ok": True,
+                "result": {"passed": True},
+            }
+        )
+        assert await screen_task == {"passed": True}
+
+        img_screen_task = asyncio.create_task(
+            client.ai_screen(
+                {"title": "With Image"},
+                images=[{"mime_type": "image/jpeg", "data": "Zm9v"}],
+            )
+        )
+        img_screen_req = await sock.wait_sent(
+            lambda m: m.get("type") == "ai.screen" and m.get("payload") == {"title": "With Image"}
+        )
+        assert img_screen_req["images"] == [{"mime_type": "image/jpeg", "data": "Zm9v"}]
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": img_screen_req["id"],
+                "ok": False,
+                "error": "ai_screen_blocked",
+                "message": "unsafe content",
+            }
+        )
+        with pytest.raises(PluginRpcError) as screen_err:
+            await img_screen_task
+        assert screen_err.value.code == "ai_screen_blocked"
+
+        # 3. ai_generate (ai.result ok & error)
+        gen_task = asyncio.create_task(
+            client.ai_generate(
+                "bili_selection",
+                {"candidates": [{"bvid": "BV1xx411c7mD"}]},
+                prompt="select picks",
+                budget_lane="patrol",
+                images=[{"mime_type": "image/png", "data": "YmFy"}],
+            )
+        )
+        gen_req = await sock.wait_sent(
+            lambda m: m.get("type") == "ai.generate" and m.get("scenario") == "bili_selection"
+        )
+        assert gen_req["payload"] == {"candidates": [{"bvid": "BV1xx411c7mD"}]}
+        assert gen_req["prompt"] == "select picks"
+        assert gen_req["budget_lane"] == "patrol"
+        assert gen_req["images"] == [{"mime_type": "image/png", "data": "YmFy"}]
+        await sock.push(
+            {"type": "ai.result", "id": gen_req["id"], "ok": True, "text": '{"picks": []}'}
+        )
+        assert await gen_task == '{"picks": []}'
+
+        gen_err_task = asyncio.create_task(
+            client.ai_generate("bili_learning", {"bvid": "BV1xx411c7mD"})
+        )
+        gen_err_req = await sock.wait_sent(
+            lambda m: m.get("type") == "ai.generate" and m.get("scenario") == "bili_learning"
+        )
+        assert gen_err_req["budget_lane"] == "proactive"
+        assert "prompt" not in gen_err_req
+        assert "images" not in gen_err_req
+        await sock.push(
+            {
+                "type": "ai.result",
+                "id": gen_err_req["id"],
+                "ok": False,
+                "error": "budget_exhausted",
+                "message": "no quota",
+            }
+        )
+        with pytest.raises(PluginRpcError) as gen_err:
+            await gen_err_task
+        assert gen_err.value.code == "budget_exhausted"
+
+        # 4. ai_video_analyze
+        va_task = asyncio.create_task(
+            client.ai_video_analyze("BV1xx411c7mD", {"title": "Test Video"})
+        )
+        va_req = await sock.wait_sent(lambda m: m.get("type") == "ai.video_analyze")
+        assert va_req["bvid"] == "BV1xx411c7mD"
+        assert va_req["material"] == {"title": "Test Video"}
+        assert va_req["budget_lane"] == "patrol"
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": va_req["id"],
+                "ok": True,
+                "result": {"text": "总结内容", "mode": "subtitle", "material_scope": "subtitles"},
+            }
+        )
+        assert await va_task == {
+            "text": "总结内容",
+            "mode": "subtitle",
+            "material_scope": "subtitles",
+        }
+
+        # 5. notify_owner
+        await client.notify_owner("风控触发", code="bili_risk")
+        notify = await sock.wait_sent(lambda m: m.get("type") == "owner.notify")
+        assert notify == {"type": "owner.notify", "text": "风控触发", "code": "bili_risk"}
+
+        # 6. push_status with unavailable_actions & current_activity (including explicit None clear)
+        await client.push_status(
+            {"ready": True},
+            unavailable_actions={"bili.patrol": "risk_cooldown"},
+            current_activity="bili_patrol",
+        )
+        st1 = await sock.wait_sent(
+            lambda m: (
+                m.get("type") == "plugin.status" and m.get("current_activity") == "bili_patrol"
+            )
+        )
+        assert st1 == {
+            "type": "plugin.status",
+            "status": {"ready": True},
+            "configuration_issue": None,
+            "unavailable_actions": {"bili.patrol": "risk_cooldown"},
+            "current_activity": "bili_patrol",
+        }
+        assert "unavailable_actions" not in client.hello_payload()["initial_status"]
+
+        await client.push_status(
+            {"ready": True},
+            unavailable_actions={"bili.patrol": None},
+            current_activity=None,
+        )
+        st2 = await sock.wait_sent(
+            lambda m: (
+                m.get("type") == "plugin.status"
+                and "current_activity" in m
+                and m["current_activity"] is None
+            )
+        )
+        assert st2 == {
+            "type": "plugin.status",
+            "status": {"ready": True},
+            "configuration_issue": None,
+            "unavailable_actions": {"bili.patrol": None},
+            "current_activity": None,
+        }
+
+        # 7. report_activity(kind="bili_reading", active=True)
+        await client.report_activity(updated_at=1234.0, kind="bili_reading", active=True)
+        act = await sock.wait_sent(
+            lambda m: m.get("type") == "world.activity" and m.get("kind") == "bili_reading"
+        )
+        assert act == {
+            "type": "world.activity",
+            "active_task": "",
+            "disconnected": False,
+            "updated_at": 1234.0,
+            "kind": "bili_reading",
+            "active": True,
+        }
+
+        # 8. emit_world_event(..., report_text=..., mood_longnick=...)
+        await client.emit_world_event(
+            "bili_video_watched",
+            {"bvid": "BV1xx411c7mD"},
+            report_text="今日看了红石教程",
+            mood_longnick="沉迷红石电路",
+        )
+        ev = await sock.wait_sent(
+            lambda m: m.get("type") == "world.event" and m.get("event_type") == "bili_video_watched"
+        )
+        assert ev == {
+            "type": "world.event",
+            "event_type": "bili_video_watched",
+            "payload": {"bvid": "BV1xx411c7mD"},
+            "importance": "normal",
+            "report_text": "今日看了红石教程",
+            "mood_longnick": "沉迷红石电路",
+        }
+
+        # 9. Silently ignored ack frames do not break session or pending RPCs
+        for ack_type in (
+            "plugin.status.ack",
+            "world.event.ack",
+            "world.activity.ack",
+            "world.reaction.ack",
+            "chat.inbound.ack",
+            "owner.notify.ack",
+        ):
+            await sock.push({"type": ack_type, "id": "ack-1", "ok": True})
+        ping_task = asyncio.create_task(client.ai_budget_check("patrol"))
+        ping_req = await sock.wait_sent(
+            lambda m: m.get("type") == "ai.budget_check" and m.get("id") != budget_req["id"]
+        )
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": ping_req["id"],
+                "ok": True,
+                "result": {"available": False, "hard_stop": True},
+            }
+        )
+        assert await ping_task == {"available": False, "hard_stop": True}
+    finally:
+        await client.stop()

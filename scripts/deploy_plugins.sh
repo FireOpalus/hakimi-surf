@@ -8,20 +8,23 @@ target=${2:-}
 compose=(docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml -f compose.plugins.yaml)
 
 usage() {
-    echo "Usage: $0 {up [weather|minecraft]|restart [weather|minecraft]|down [weather|minecraft]|status [weather|minecraft]}" >&2
+    echo "Usage: $0 {up [weather|minecraft|bilibili]|restart [weather|minecraft|bilibili]|down [weather|minecraft|bilibili]|status [weather|minecraft|bilibili]}" >&2
     exit 2
 }
 
 resolve_services() {
     case "${1:-}" in
         "")
-            echo "hakimi-plugin-weather hakimi-plugin-minecraft"
+            echo "hakimi-plugin-weather hakimi-plugin-minecraft hakimi-plugin-bilibili"
             ;;
         weather|hakimi-plugin-weather)
             echo "hakimi-plugin-weather"
             ;;
         minecraft|hakimi-plugin-minecraft)
             echo "hakimi-plugin-minecraft"
+            ;;
+        bilibili|bilibili_surf|hakimi-plugin-bilibili)
+            echo "hakimi-plugin-bilibili"
             ;;
         *)
             usage
