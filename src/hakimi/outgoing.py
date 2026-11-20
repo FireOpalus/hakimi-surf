@@ -187,6 +187,13 @@ async def deliver_actions(service, reply):
     farewell_bypass_mute = bool(actions.get("farewell_bypass_mute")) and (
         await is_affection_muted_only(service, message)
     )
+    raw_bypass_ids = {
+        str(u).strip()
+        for u in (actions.get("farewell_bypass_user_ids") or [])
+        if isinstance(u, str) and str(u).strip()
+    }
+    if actions.get("farewell_bypass_mute"):
+        raw_bypass_ids.add(message.user_id)
     status, detail, confirmed, position = "sent", "", [], 0
     sticker_choice = None
 
@@ -200,20 +207,26 @@ async def deliver_actions(service, reply):
             for m in members
         ):
             return False
-        bypass_uid = None
-        if farewell_bypass_mute and await is_affection_muted_only(service, message):
-            bypass_uid = message.user_id
+        verified_bypass_pairs: set[tuple[str, str]] = set()
+        verified_bypass_uids: set[str] = set()
+        if raw_bypass_ids:
+            for m in [message, *members]:
+                if (
+                    m.user_id in raw_bypass_ids
+                    and (m.platform, m.user_id) not in verified_bypass_pairs
+                    and await is_affection_muted_only(service, m)
+                ):
+                    verified_bypass_pairs.add((m.platform, m.user_id))
+                    verified_bypass_uids.add(m.user_id)
         if identity is not None and any(
             identity.is_muted(m.platform, m.user_id)
-            and not (
-                bypass_uid is not None
-                and m.platform == message.platform
-                and m.user_id == bypass_uid
-            )
+            and (m.platform, m.user_id) not in verified_bypass_pairs
             for m in members
         ):
             return False
-        if not service.batch_authorized(message, members, bypass_mute_user_id=bypass_uid):
+        if not service.batch_authorized(
+            message, members, bypass_mute_user_ids=verified_bypass_uids
+        ):
             return False
         if not await service.bot_guard.may_process(message, reply["id"]):
             return False

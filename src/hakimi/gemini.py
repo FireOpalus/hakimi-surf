@@ -2544,6 +2544,8 @@ class GeminiGateway:
                         image_digest=None,
                         emoji_like=parsed_actions.emoji_like,
                         poke_qq=parsed_actions.poke_qq,
+                        affection_delta=parsed_actions.affection_delta,
+                        affection_deltas=parsed_actions.affection_deltas,
                     ).model_dump_json()
             abstained_voice = is_voice_companion and text.strip().upper() == "[SILENT]"
             abstained_screen = is_screen_watch and text.strip().upper() == "[SILENT]"

@@ -9,7 +9,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from hakimi.affection import AffectionManager, _validate_platform_user
+from hakimi.affection import AffectionConfig, AffectionManager, _validate_platform_user
 from hakimi.affection_admin import router as affection_router
 from hakimi.app import create_app
 from hakimi.context_budget import estimate_tokens
@@ -217,15 +217,18 @@ async def test_legacy_affection_migration_idempotent(settings, store, message):
     prof_qq = await legacy_aff.profile("qq", "qq-user-1")
     prof_own = await legacy_aff.profile("onebot", "20000")
     assert prof_ob["score"] == 74 and prof_ob["level"] == 4 and prof_ob["today_positive_gain"] == 2
-    assert prof_qq["score"] == 10 and prof_qq["level"] == 1
+    assert prof_qq["score"] == 27 and prof_qq["level"] == 2
+    assert prof_qq["violations_30d"] == 1 and prof_qq["safety_strikes_total"] == 1
+    assert prof_qq["safety_status"] == "watch"
     assert prof_own["score"] == 115 and prof_own["level"] == 6
+    assert prof_own["safety_status"] == "owner_immune" and prof_own["violations_30d"] == 0
 
     # Restart / second initialize is strictly idempotent.
     restarted = AffectionManager(store)
     restarted.bind_identity(ident)
     await restarted.initialize()
     assert (await restarted.profile("onebot", "30000"))["score"] == 74
-    assert (await restarted.profile("qq", "qq-user-1"))["score"] == 10
+    assert (await restarted.profile("qq", "qq-user-1"))["score"] == 27
 
 
 async def test_cross_platform_shared_score_capabilities_and_validation(id_env, message):
@@ -610,3 +613,44 @@ async def test_identity_admin_routes_system_module_and_widened_affection_admin(i
     del_resp = await client.delete("/admin/api/affection/users/discord:dc_user:42")
     assert del_resp.status_code == 200
     assert not gateway.calls
+
+
+async def test_identity_cross_platform_violation_decoupled_floor_and_coupled_recovery(
+    id_env, message
+):
+    ident, aff, mod, _ = id_env
+    pid = await ident.resolve_person_id("onebot", "30010", "跨端测试", create=True)
+    await ident.link_account(pid, "qq", "qq-30010", nickname="QQ跨端")
+    await aff.set_user_score("30010", 20, platform="onebot", moderation=mod)
+
+    # Decoupled default stops at floor=15, sets watch, and does NOT mute across platforms.
+    u_dec = await aff.record_violation(
+        _mk_message(message, platform="qq", user_id="qq-30010", event_id="id-dec-1"),
+        "prompt_injection",
+    )
+    assert u_dec.previous_score == 20 and u_dec.new_score == 15 and u_dec.delta == -5
+    assert u_dec.blacklisted_now is False and u_dec.farewell_message is None
+    assert ident.is_muted("onebot", "30010") is False and ident.is_muted("qq", "qq-30010") is False
+    prof_dec = await aff.profile("onebot", "30010")
+    assert prof_dec["score"] == 15 and prof_dec["violations_30d"] == 1
+    assert prof_dec["safety_status"] == "watch"
+
+    # Coupled mode triggers legacy -25 -> 0 -> farewell + ai_affection_zero + /unmute 25.
+    await aff.set_config(AffectionConfig(decouple_safety_violations=False))
+    u_cpl = await aff.record_violation(
+        _mk_message(message, platform="onebot", user_id="30010", event_id="id-cpl-1"),
+        "prompt_injection",
+    )
+    assert u_cpl.previous_score == 15 and u_cpl.new_score == 0
+    assert u_cpl.blacklisted_now is True
+    assert u_cpl.farewell_message == aff.config.farewell_message
+    assert ident.is_muted("onebot", "30010") is True and ident.is_muted("qq", "qq-30010") is True
+    assert "30010" in ident.s.muted_user_ids
+    muted_row = await ident.store.one(
+        "SELECT source FROM muted_users WHERE user_key=?", (mod.key("30010"),)
+    )
+    assert muted_row is not None and muted_row["source"] == "ai_affection_zero"
+
+    await mod.set_muted("30010", False)
+    assert ident.is_muted("onebot", "30010") is False and ident.is_muted("qq", "qq-30010") is False
+    assert (await aff.profile("qq", "qq-30010"))["score"] == 25

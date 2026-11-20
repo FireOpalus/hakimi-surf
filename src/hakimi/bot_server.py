@@ -362,6 +362,18 @@ def assemble_chat_input(
                 metadata["jit_proactive_intent"] = (
                     dict(raw_jit) if isinstance(raw_jit, dict) else raw_jit
                 )
+    if not sandbox_mode and isinstance(current_batch, list) and isinstance(batch_affection, dict):
+        distinct_speakers = {
+            sid
+            for entry in current_batch
+            if isinstance(entry, dict) and (sid := str(entry.get("sender_id", "")).strip())
+        }
+        if len(distinct_speakers) >= 2:
+            metadata["multi_speaker_affection_hint"] = (
+                "本批含多名发言者，如需分别打分请填 affection_deltas"
+                "（每项 target_id 须取自 current_batch.sender_id，delta 限 -35~2，reason 可选），"
+                "否则填 null。"
+            )
     if not sandbox_mode and payload.get("module_context"):
         metadata["module_context"] = payload["module_context"]
     if not sandbox_mode and payload.get("unshared_world_news"):

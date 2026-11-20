@@ -718,11 +718,21 @@ class Service:
             return "用法：/affection [QQ] [0..120]，目标账号格式不正确。"
         if len(args) == 1:
             prof = await aff.profile(target_platform, target_uid)
+            safety_tag = ""
+            if prof.get("is_owner") or prof.get("safety_status") == "owner_immune":
+                safety_tag = "｜风控免疫"
+            else:
+                viol_30d = int(prof.get("violations_30d", 0) or 0)
+                if viol_30d > 0:
+                    safety_tag = (
+                        f"｜30天安全拦截 {viol_30d}次({prof.get('safety_status') or 'watch'})"
+                    )
             reply = (
                 f"{prof['nickname']}（{prof['platform']}:{prof['user_id']}）：{prof['score']} 分｜"
                 f"{prof['lv']} {prof['tier_label']}｜"
                 f"今日正向 +{prof['today_positive_gain']}/{prof['daily_positive_cap']}"
                 f"{'｜已拉黑静音' if prof['muted'] else ''}"
+                f"{safety_tag}"
             )
             if hasattr(aff, "user_history"):
                 recent = await aff.user_history(target_platform, target_uid, limit=3)
@@ -840,32 +850,38 @@ class Service:
         return None
 
     def _authorize_for_batch(
-        self, candidate: Message, *, bypass_mute_user_id: str | None = None
+        self,
+        candidate: Message,
+        *,
+        bypass_mute_user_id: str | None = None,
+        bypass_mute_user_ids: set[str] | frozenset[str] | None = None,
     ) -> bool:
+        bypass_ids: set[str] = {
+            str(u).strip() for u in (bypass_mute_user_ids or ()) if str(u).strip()
+        }
+        if bypass_mute_user_id and str(bypass_mute_user_id).strip():
+            bypass_ids.add(str(bypass_mute_user_id).strip())
+        can_bypass = candidate.user_id in bypass_ids and not self.bot_guard.known_bot(candidate)
         identity = getattr(self, "identity", None)
         if (
             identity is not None
             and identity.is_muted(candidate.platform, candidate.user_id)
-            and not (
-                bypass_mute_user_id
-                and candidate.user_id == bypass_mute_user_id
-                and not self.bot_guard.known_bot(candidate)
-            )
+            and not can_bypass
         ):
             return False
-        if (
-            bypass_mute_user_id
-            and candidate.user_id == bypass_mute_user_id
-            and candidate.user_id in self.s.muted_user_ids
-            and not self.bot_guard.known_bot(candidate)
-        ):
-            cfg = self.s.model_copy(
-                update={"muted_user_ids": self.s.muted_user_ids - {bypass_mute_user_id}}
-            )
+        if can_bypass and candidate.user_id in self.s.muted_user_ids:
+            cfg = self.s.model_copy(update={"muted_user_ids": self.s.muted_user_ids - bypass_ids})
             return authorize(candidate, cfg)
         return authorize(candidate, self.s)
 
-    def batch_authorized(self, message, members, *, bypass_mute_user_id: str | None = None):
+    def batch_authorized(
+        self,
+        message,
+        members,
+        *,
+        bypass_mute_user_id: str | None = None,
+        bypass_mute_user_ids: set[str] | frozenset[str] | None = None,
+    ):
         if not chat_module(self.s, message.platform):
             return False
         # Followers inherit admission to the batch. The merged message retains the
@@ -875,10 +891,15 @@ class Service:
             and len(members) > 1
             and any(m.invites_group_review for m in members)
         )
-        return self._authorize_for_batch(message, bypass_mute_user_id=bypass_mute_user_id) and all(
+        return self._authorize_for_batch(
+            message,
+            bypass_mute_user_id=bypass_mute_user_id,
+            bypass_mute_user_ids=bypass_mute_user_ids,
+        ) and all(
             self._authorize_for_batch(
                 m.model_copy(update={"addressed": True}) if invited_batch else m,
                 bypass_mute_user_id=bypass_mute_user_id,
+                bypass_mute_user_ids=bypass_mute_user_ids,
             )
             and not other_mentions(m)
             for m in members
@@ -1168,11 +1189,59 @@ class Service:
             finally:
                 self.store.groups.active.pop(job["scope"], None)
 
+    _ALLOWED_AFFECTION_REASONS = frozenset(
+        {
+            "attack_owner",
+            "severe_offense",
+            "boundary_or_hostility",
+            "chat_negative",
+            "chat_positive",
+            "chat",
+        }
+    )
+
+    def _classify_affection_reason(
+        self, target: Message, delta: int, model_reason: str | None = None
+    ) -> str:
+        tag = model_reason.strip() if isinstance(model_reason, str) else ""
+        if tag in self._ALLOWED_AFFECTION_REASONS:
+            if delta <= -10 and tag in {
+                "attack_owner",
+                "severe_offense",
+                "boundary_or_hostility",
+                "chat_negative",
+            }:
+                return tag
+            if -9 <= delta < 0 and tag == "chat_negative":
+                return tag
+            if delta > 0 and tag in {"chat_positive", "chat"}:
+                return tag
+        target_text = target.text or ""
+        lowered = target_text.lower()
+        owner_qq = str(getattr(self.s, "owner_qq_id", "") or "").strip()
+        mentions_owner = (
+            ("boiser" in lowered)
+            or ("主人" in target_text)
+            or (bool(owner_qq) and owner_qq in target_text)
+        )
+        if delta <= -10 and mentions_owner:
+            return "attack_owner"
+        if delta <= -20:
+            return "severe_offense"
+        if delta <= -10:
+            return "boundary_or_hostility"
+        if delta < 0:
+            return "chat_negative"
+        if delta > 0:
+            return "chat_positive"
+        return "chat"
+
     def _select_affection_target(
         self, message: Message, members: list[Message], actions
     ) -> tuple[Message, int, str]:
         target = message
-        delta = int(actions.affection_delta or 0)
+        raw_delta = getattr(actions, "affection_delta", 0)
+        delta = 0 if isinstance(raw_delta, bool) else int(raw_delta or 0)
         if len(members) > 1:
             if actions.anchor.reply_id:
                 matched = next((m for m in members if m.event_id == actions.anchor.reply_id), None)
@@ -1193,27 +1262,64 @@ class Service:
                 target = non_owners[-1]
             else:
                 delta = 0
-        target_text = target.text or ""
-        lowered = target_text.lower()
-        owner_qq = str(getattr(self.s, "owner_qq_id", "") or "").strip()
-        mentions_owner = (
-            ("boiser" in lowered)
-            or ("主人" in target_text)
-            or (bool(owner_qq) and owner_qq in target_text)
-        )
-        if delta <= -10 and mentions_owner:
-            reason = "attack_owner"
-        elif delta <= -20:
-            reason = "severe_offense"
-        elif delta <= -10:
-            reason = "boundary_or_hostility"
-        elif delta < 0:
-            reason = "chat_negative"
-        elif delta > 0:
-            reason = "chat_positive"
-        else:
-            reason = "chat"
+        reason = self._classify_affection_reason(target, delta)
         return target, delta, reason
+
+    def _select_affection_targets(
+        self, message: Message, members: list[Message], actions
+    ) -> list[tuple[Message, int, str]]:
+        raw_deltas = getattr(actions, "affection_deltas", None)
+        if raw_deltas:
+            member_by_uid: dict[str, Message] = {}
+            for m in members:
+                if not self.bot_guard.known_bot(m):
+                    member_by_uid[m.user_id] = m
+            if not self.bot_guard.known_bot(message) and message.user_id not in member_by_uid:
+                member_by_uid[message.user_id] = message
+            has_non_owner = any(
+                not is_persona_owner(m, self.s)
+                for m in (members or [message])
+                if not self.bot_guard.known_bot(m)
+            )
+            results: list[tuple[Message, int, str]] = []
+            for item in raw_deltas:
+                if isinstance(item, dict):
+                    tid = str(item.get("target_id") or "").strip()
+                    raw_d = item.get("delta", 0)
+                    raw_reason = item.get("reason")
+                else:
+                    tid = str(getattr(item, "target_id", "") or "").strip()
+                    raw_d = getattr(item, "delta", 0)
+                    raw_reason = getattr(item, "reason", None)
+                t = member_by_uid.get(tid)
+                if t is None:
+                    continue
+                d = 0 if isinstance(raw_d, bool) else int(raw_d or 0)
+                if d == 0:
+                    continue
+                if is_persona_owner(t, self.s) and d < 0 and has_non_owner:
+                    continue
+                results.append((t, d, self._classify_affection_reason(t, d, raw_reason)))
+            if results:
+                return results
+        non_owner_uids = {
+            m.user_id
+            for m in members
+            if not is_persona_owner(m, self.s) and not self.bot_guard.known_bot(m)
+        }
+        raw_single_delta = getattr(actions, "affection_delta", 0)
+        single_delta = 0 if isinstance(raw_single_delta, bool) else int(raw_single_delta or 0)
+        if (
+            len(members) > 1
+            and len(non_owner_uids) >= 2
+            and not actions.anchor.reply_id
+            and not actions.anchor.mentions
+            and single_delta <= -10
+        ):
+            self.counters["affection_ambiguous_penalty_skipped"] += 1
+            return []
+        target, delta, reason = self._select_affection_target(message, members, actions)
+        return [(target, delta, reason)]
 
     async def _alert_affection_blacklisted(self, message: Message, update) -> None:
         self.record("affection_blacklisted")
@@ -2144,6 +2250,16 @@ class Service:
                     if message.kind == "group"
                     else {message.user_id}
                 )
+                allowed_aff_targets = {
+                    m.user_id for m in (members or [message]) if not self.bot_guard.known_bot(m)
+                }
+                parse_params = inspect.signature(parse_actions).parameters
+                extra_parse_kwargs = (
+                    {"allowed_affection_targets": allowed_aff_targets}
+                    if "allowed_affection_targets" in parse_params
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parse_params.values())
+                    else {}
+                )
                 actions, folded = parse_actions(
                     generated,
                     public=public,
@@ -2159,42 +2275,50 @@ class Service:
                     allow_poke_action=(
                         not aff_active or (caps.allow_poke and caps.allow_poke_inbound)
                     ),
+                    **extra_parse_kwargs,
                 )
-                aff_target, aff_delta, aff_reason = self._select_affection_target(
-                    message, members, actions
-                )
+                aff_targets = self._select_affection_targets(message, members, actions)
                 has_social_response = (not actions.abstain) or bool(
                     actions.emoji_like or actions.poke_qq
                 )
+                blacklisted_hits: list[tuple[Message, Any]] = []
                 if aff_active:
-                    if has_social_response:
-                        update = await aff.apply_turn_delta(
-                            aff_target,
-                            aff_delta,
-                            sandbox_mode=sandbox,
-                            daily_first_bonus=True,
-                            reason=aff_reason,
-                        )
-                    elif aff_delta < 0:
-                        update = await aff.apply_turn_delta(
-                            aff_target,
-                            aff_delta,
-                            sandbox_mode=sandbox,
-                            daily_first_bonus=False,
-                            reason=aff_reason,
-                        )
-                    else:
-                        update = None
-                else:
-                    update = None
-                farewell_bypass = bool(update and update.blacklisted_now)
-                if farewell_bypass:
-                    await self._alert_affection_blacklisted(aff_target, update)
-                    if not actions.anchor.reply_id and aff_target.event_id in allowed_reply:
-                        actions.anchor.reply_id = aff_target.event_id
+                    for aff_target, aff_delta, aff_reason in aff_targets:
+                        if has_social_response:
+                            upd = await aff.apply_turn_delta(
+                                aff_target,
+                                aff_delta,
+                                sandbox_mode=sandbox,
+                                daily_first_bonus=True,
+                                reason=aff_reason,
+                            )
+                        elif aff_delta < 0:
+                            upd = await aff.apply_turn_delta(
+                                aff_target,
+                                aff_delta,
+                                sandbox_mode=sandbox,
+                                daily_first_bonus=False,
+                                reason=aff_reason,
+                            )
+                        else:
+                            upd = None
+                        if upd and upd.blacklisted_now:
+                            await self._alert_affection_blacklisted(aff_target, upd)
+                            blacklisted_hits.append((aff_target, upd))
+                farewell_bypass = any(
+                    t.user_id == message.user_id and t.platform == message.platform
+                    for t, _ in blacklisted_hits
+                )
+                farewell_bypass_user_ids = sorted({t.user_id for t, _ in blacklisted_hits})
+                if blacklisted_hits:
+                    first_bl_target, first_bl_upd = blacklisted_hits[0]
+                    if not actions.anchor.reply_id and first_bl_target.event_id in allowed_reply:
+                        actions.anchor.reply_id = first_bl_target.event_id
                     if actions.abstain or not any(b.strip() for b in actions.bubbles):
                         actions.abstain = False
-                        actions.bubbles = [update.farewell_message or aff.config.farewell_message]
+                        actions.bubbles = [
+                            first_bl_upd.farewell_message or aff.config.farewell_message
+                        ]
                         actions.sticker.label = None
                         actions.emoji_like = None
                         actions.poke_qq = None
@@ -2239,6 +2363,11 @@ class Service:
                                 "public": public,
                                 "allow_text_card": allow_text_card,
                                 **({"farewell_bypass_mute": True} if farewell_bypass else {}),
+                                **(
+                                    {"farewell_bypass_user_ids": farewell_bypass_user_ids}
+                                    if farewell_bypass_user_ids
+                                    else {}
+                                ),
                             },
                             consumed_image_events=neighbour_image_events,
                             consumed_file_events=consumed_file_events,
@@ -2279,6 +2408,11 @@ class Service:
                         "public": public,
                         "allow_text_card": allow_text_card,
                         **({"farewell_bypass_mute": True} if farewell_bypass else {}),
+                        **(
+                            {"farewell_bypass_user_ids": farewell_bypass_user_ids}
+                            if farewell_bypass_user_ids
+                            else {}
+                        ),
                         **(
                             {
                                 "chain_commit": {
@@ -2520,6 +2654,13 @@ class Service:
         farewell_bypass = bool(reply_actions.get("farewell_bypass_mute")) and (
             await is_affection_muted_only(self, message)
         )
+        raw_bypass_ids = {
+            str(u).strip()
+            for u in (reply_actions.get("farewell_bypass_user_ids") or [])
+            if isinstance(u, str) and str(u).strip()
+        }
+        if reply_actions.get("farewell_bypass_mute"):
+            raw_bypass_ids.add(message.user_id)
         if (
             message.platform in {"onebot", "qq"}
             and reply_actions
@@ -2575,13 +2716,21 @@ class Service:
                         return False
                     if not await self.bot_guard.may_process(message, reply["id"]):
                         return False
-                    bypass_uid = None
-                    if farewell_bypass and await is_affection_muted_only(self, message):
-                        bypass_uid = message.user_id
+                    bypass_uids: set[str] = set()
+                    if raw_bypass_ids:
+                        for candidate in [message, *(participants or [message])]:
+                            if (
+                                candidate.user_id in raw_bypass_ids
+                                and candidate.user_id not in bypass_uids
+                                and await is_affection_muted_only(self, candidate)
+                            ):
+                                bypass_uids.add(candidate.user_id)
                     return (
                         (await self.sessions.snapshot(message))["epoch"] == delivery_epoch
                     ) and self.batch_authorized(
-                        message, participants or [message], bypass_mute_user_id=bypass_uid
+                        message,
+                        participants or [message],
+                        bypass_mute_user_ids=bypass_uids,
                     )
 
                 receipt = None

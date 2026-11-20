@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -102,6 +103,13 @@ class Sticker(BaseModel):
     timing: Literal["before_text", "after_text"] = "after_text"
 
 
+class AffectionTargetDelta(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    target_id: str
+    delta: int
+    reason: str | None = None
+
+
 class ChatActions(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     abstain: bool
@@ -114,6 +122,7 @@ class ChatActions(BaseModel):
     save_meme_label: str | None = None
     set_longnick: str | None = None
     affection_delta: int | None = 0
+    affection_deltas: list[AffectionTargetDelta] | None = None
 
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
@@ -158,6 +167,60 @@ ACTION_INSTRUCTION = """\n【固定回复协议，优先于旧文本标签示例
 """
 
 
+def _sanitize_affection_deltas(
+    raw_list,
+    *,
+    blocked_ids,
+    allowed_targets,
+    settings,
+) -> list[AffectionTargetDelta] | None:
+    if not raw_list:
+        return None
+    allowed_set = set(allowed_targets) if allowed_targets is not None else None
+    secrets = configured_secrets(settings) if settings else []
+    by_target: dict[str, AffectionTargetDelta] = {}
+    for item in raw_list[:16]:
+        raw_tid = getattr(item, "target_id", None)
+        if not isinstance(raw_tid, str):
+            continue
+        tid = raw_tid.strip()
+        if not tid or len(tid) > 128 or tid in blocked_ids:
+            continue
+        if allowed_set is not None and tid not in allowed_set:
+            continue
+        raw_d = getattr(item, "delta", 0)
+        if isinstance(raw_d, bool) or not isinstance(raw_d, int):
+            d = 0
+        else:
+            d = max(-35, min(2, raw_d))
+        if d == 0:
+            continue
+        raw_reason = getattr(item, "reason", None)
+        r: str | None = None
+        if isinstance(raw_reason, str):
+            cleaned = (
+                clean_text(raw_reason)
+                .replace("\n", " ")
+                .replace("\r", " ")
+                .replace("\t", " ")
+                .strip()
+            )
+            if cleaned and not any(
+                s and len(s) >= 8 and (s in raw_reason or s in cleaned) for s in secrets
+            ):
+                r = cleaned[:32].strip() or None
+        candidate = AffectionTargetDelta(target_id=tid, delta=d, reason=r)
+        prev = by_target.get(tid)
+        if prev is None:
+            by_target[tid] = candidate
+        elif (d < 0 and (prev.delta >= 0 or d < prev.delta)) or (
+            prev.delta >= 0 and d >= 0 and abs(d) > abs(prev.delta)
+        ):
+            by_target[tid] = candidate
+    result = list(by_target.values())[:8]
+    return result or None
+
+
 def parse_actions(
     raw,
     *,
@@ -172,6 +235,7 @@ def parse_actions(
     allow_sticker: bool = True,
     allow_emoji_like: bool = True,
     allow_poke_action: bool = True,
+    allowed_affection_targets: Iterable[str] | None = None,
 ):
     try:
         value = json.loads(raw)
@@ -215,6 +279,12 @@ def parse_actions(
         actions.affection_delta = 0
     else:
         actions.affection_delta = max(-35, min(2, raw_delta))
+    actions.affection_deltas = _sanitize_affection_deltas(
+        actions.affection_deltas,
+        blocked_ids=blocked_ids,
+        allowed_targets=allowed_affection_targets,
+        settings=settings,
+    )
     if actions.save_meme_label:
         try:
             actions.save_meme_label = validate_meme_label(actions.save_meme_label.strip())

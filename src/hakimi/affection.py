@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS affection_events (
   created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS affection_events_created ON affection_events(created);
+CREATE INDEX IF NOT EXISTS affection_events_user ON affection_events(scope, user_key, created);
 CREATE TABLE IF NOT EXISTS affection_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   scope TEXT NOT NULL,
@@ -109,6 +110,10 @@ class AffectionConfig(BaseModel):
     cooldown_recovery_target: int = Field(default=40, ge=20, le=60)
     penalize_rate_limit: StrictBool = False
     penalize_poke_ignored: StrictBool = False
+    decouple_safety_violations: StrictBool = True
+    violation_injection_delta: int = Field(default=-8, ge=-50, le=0)
+    violation_content_delta: int = Field(default=-10, ge=-50, le=0)
+    violation_affection_floor: int = Field(default=15, ge=0, le=50)
 
     @field_validator("farewell_message")
     @classmethod
@@ -878,6 +883,13 @@ class AffectionManager:
                         (str(e.get("last_recovery_day", "") or "") for e in all_entries),
                         default="",
                     )
+                    safety_strikes_total = sum(
+                        max(0, int(e.get("safety_strikes_total", 0) or 0)) for e in all_entries
+                    )
+                    last_violation_at = max(
+                        (float(e.get("last_violation_at", 0.0) or 0.0) for e in all_entries),
+                        default=0.0,
+                    )
                     updated_at = max(
                         (float(e.get("updated_at", 0.0) or 0.0) for e in all_entries),
                         default=now,
@@ -892,6 +904,8 @@ class AffectionManager:
                             "last_annoyance_at": last_annoyance,
                             "last_negative_at": last_negative,
                             "last_recovery_day": last_recovery_day,
+                            "safety_strikes_total": safety_strikes_total,
+                            "last_violation_at": last_violation_at,
                             "updated_at": updated_at,
                         },
                         rep_platform,
@@ -1022,6 +1036,8 @@ class AffectionManager:
             "last_annoyance_at": 0.0,
             "last_negative_at": 0.0,
             "last_recovery_day": "",
+            "safety_strikes_total": 0,
+            "last_violation_at": 0.0,
             "last_reason": "init",
             "last_delta": 0,
             "updated_at": 0.0,
@@ -1064,6 +1080,8 @@ class AffectionManager:
             "last_annoyance_at": float(data.get("last_annoyance_at", 0.0) or 0.0),
             "last_negative_at": float(data.get("last_negative_at", 0.0) or 0.0),
             "last_recovery_day": str(data.get("last_recovery_day", "") or ""),
+            "safety_strikes_total": max(0, int(data.get("safety_strikes_total", 0) or 0)),
+            "last_violation_at": max(0.0, float(data.get("last_violation_at", 0.0) or 0.0)),
             "last_reason": _sanitize_reason(data.get("last_reason", "chat"), self.s),
             "last_delta": int(data.get("last_delta", 0) or 0),
             "updated_at": float(data.get("updated_at", 0.0) or 0.0),
@@ -1148,9 +1166,10 @@ class AffectionManager:
         kind: str,
         reason: str,
         now: float,
+        allow_zero: bool = False,
     ) -> None:
         delta = int(new_score) - int(prev_score)
-        if delta == 0:
+        if delta == 0 and not allow_zero:
             return
         await self.store.db.execute(
             "DELETE FROM affection_history WHERE created<?",
@@ -1204,8 +1223,22 @@ class AffectionManager:
                     (int(row["id"]),),
                 )
 
+    @staticmethod
+    def _safety_status(is_owner: bool, violations_30d: int) -> str:
+        if is_owner:
+            return "owner_immune"
+        if violations_30d >= 3:
+            return "risk"
+        if violations_30d >= 1:
+            return "watch"
+        return "clean"
+
     def _build_profile_dict(
-        self, record: dict[str, Any], *, person_id: str | None = None
+        self,
+        record: dict[str, Any],
+        *,
+        person_id: str | None = None,
+        violations_30d: int = 0,
     ) -> dict[str, Any]:
         platform = str(record["platform"])
         uid = str(record["user_id"])
@@ -1218,6 +1251,7 @@ class AffectionManager:
             (platform == "onebot" and uid in set(self.s.muted_user_ids))
             or (identity is not None and identity.is_muted(platform, uid))
         )
+        clean_violations_30d = 0 if is_owner else max(0, int(violations_30d))
         out: dict[str, Any] = {
             "user_id": uid,
             "platform": platform,
@@ -1236,6 +1270,14 @@ class AffectionManager:
             "last_reason": record["last_reason"],
             "last_delta": int(record.get("last_delta", 0)),
             "last_negative_at": float(record.get("last_negative_at", 0.0) or 0.0),
+            "violations_30d": clean_violations_30d,
+            "safety_strikes_total": (
+                0 if is_owner else max(0, int(record.get("safety_strikes_total", 0) or 0))
+            ),
+            "last_violation_at": (
+                0.0 if is_owner else float(record.get("last_violation_at", 0.0) or 0.0)
+            ),
+            "safety_status": self._safety_status(is_owner, clean_violations_30d),
             "updated_at": float(record.get("updated_at", 0.0)),
             "capabilities": caps.to_dict(),
         }
@@ -1302,12 +1344,24 @@ class AffectionManager:
             if identity is not None
             else None
         )
-        today = self._today_str()
+        now = float(self.clock())
+        today = self._today_str(now)
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
+        user_key = (
+            self._person_key(pid) if pid is not None else self._legacy_user_key(platform, uid)
+        )
+        violations_30d = 0
         async with self.store.lock:
             record, _ = await self._load_user_unlocked(
                 platform, uid, nickname, today, person_id=pid
             )
-        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
+            if not is_owner:
+                row = await self.store.one(
+                    "SELECT COUNT(*) AS cnt FROM affection_events "
+                    "WHERE scope=? AND user_key=? AND created>=?",
+                    (self.scope, user_key, now - 30 * 86400),
+                )
+                violations_30d = int(row["cnt"]) if row else 0
         if pid is not None and identity is not None:
             self._update_caches(
                 platform,
@@ -1319,7 +1373,7 @@ class AffectionManager:
             )
         elif identity is None:
             self._update_caches(platform, uid, record["score"], is_owner=is_owner)
-        return self._build_profile_dict(record, person_id=pid)
+        return self._build_profile_dict(record, person_id=pid, violations_30d=violations_30d)
 
     async def capabilities_for(self, message: Message) -> AffectionCapabilities:
         await self.initialize()
@@ -1672,9 +1726,49 @@ class AffectionManager:
                 today_positive_gain=0,
             )
 
+        if is_owner and self.config.decouple_safety_violations:
+            now = float(self.clock())
+            today = self._today_str(now)
+            async with self.store.lock:
+                record, _ = await self._load_user_unlocked(
+                    platform, uid, message.sender_nickname, today, person_id=pid
+                )
+            prev_score = int(record["score"])
+            caps = self._update_caches(
+                platform,
+                uid,
+                prev_score,
+                is_owner=True,
+                bot_id=message.bot_id,
+                person_id=pid,
+                identity=identity,
+            )
+            return AffectionUpdate(
+                user_id=uid,
+                platform=platform,
+                previous_score=prev_score,
+                new_score=prev_score,
+                delta=0,
+                tier=caps.tier,
+                tier_label=caps.tier_label,
+                level=caps.level,
+                is_owner=True,
+                changed=False,
+                blacklisted_now=False,
+                reason=f"{kind}_owner_immune",
+                today_positive_gain=int(record["today_positive_gain"]),
+            )
+
         now = float(self.clock())
         today = self._today_str(now)
-        raw_delta = VIOLATION_DELTAS[kind]
+        if self.config.decouple_safety_violations:
+            raw_delta = (
+                self.config.violation_injection_delta
+                if kind == "prompt_injection"
+                else self.config.violation_content_delta
+            )
+        else:
+            raw_delta = VIOLATION_DELTAS[kind]
         user_key = (
             self._person_key(pid) if pid is not None else self._legacy_user_key(platform, uid)
         )
@@ -1719,17 +1813,28 @@ class AffectionManager:
                         reason=f"{kind}_duplicate",
                         today_positive_gain=int(record["today_positive_gain"]),
                     )
-                new_score = clamp_score(prev_score + raw_delta, is_owner=is_owner)
+                if is_owner:
+                    new_score = clamp_score(prev_score + raw_delta, is_owner=True)
+                elif self.config.decouple_safety_violations:
+                    floor = int(self.config.violation_affection_floor)
+                    if prev_score <= floor:
+                        new_score = prev_score
+                    else:
+                        new_score = max(floor, clamp_score(prev_score + raw_delta, is_owner=False))
+                else:
+                    new_score = clamp_score(prev_score + raw_delta, is_owner=False)
                 actual_delta = new_score - prev_score
                 updates: dict[str, Any] = {
                     "score": new_score,
-                    "last_reason": kind,
-                    "last_delta": actual_delta,
+                    "safety_strikes_total": int(record.get("safety_strikes_total", 0) or 0) + 1,
+                    "last_violation_at": now,
+                    "last_negative_at": now,
+                    "last_recovery_day": "",
                     "updated_at": now,
                 }
-                if actual_delta < 0:
-                    updates["last_negative_at"] = now
-                    updates["last_recovery_day"] = ""
+                if actual_delta != 0:
+                    updates["last_reason"] = kind
+                    updates["last_delta"] = actual_delta
                 record.update(updates)
                 await self._save_user_in_tx(
                     platform, uid, record, bot_id=message.bot_id, person_id=pid
@@ -1746,6 +1851,20 @@ class AffectionManager:
                         kind="violation",
                         reason=kind,
                         now=now,
+                    )
+                elif self.config.decouple_safety_violations and not is_owner:
+                    await self._append_history_in_tx(
+                        user_key=user_key,
+                        platform=platform,
+                        user_id=uid,
+                        person_id=pid,
+                        nickname=record["nickname"],
+                        prev_score=prev_score,
+                        new_score=new_score,
+                        kind="violation",
+                        reason=f"{kind}_floored",
+                        now=now,
+                        allow_zero=True,
                     )
                 caps = self._update_caches(
                     platform,
@@ -2052,6 +2171,10 @@ class AffectionManager:
         today = self._today_str(now)
         clean_reason = _sanitize_reason(reason, self.s, default="admin_set")
 
+        violations_30d = 0
+        user_key = (
+            self._person_key(pid) if pid is not None else self._legacy_user_key(platform, uid)
+        )
         async with self._lock:
             async with self.store.transaction():
                 record, _ = await self._load_user_unlocked(
@@ -2071,11 +2194,6 @@ class AffectionManager:
                 record.update(updates)
                 await self._save_user_in_tx(platform, uid, record, person_id=pid)
                 if actual_delta != 0:
-                    user_key = (
-                        self._person_key(pid)
-                        if pid is not None
-                        else self._legacy_user_key(platform, uid)
-                    )
                     await self._append_history_in_tx(
                         user_key=user_key,
                         platform=platform,
@@ -2088,6 +2206,13 @@ class AffectionManager:
                         reason=clean_reason,
                         now=now,
                     )
+                if not is_owner:
+                    ev_row = await self.store.one(
+                        "SELECT COUNT(*) AS cnt FROM affection_events "
+                        "WHERE scope=? AND user_key=? AND created>=?",
+                        (self.scope, user_key, now - 30 * 86400),
+                    )
+                    violations_30d = int(ev_row["cnt"]) if ev_row else 0
                 self._update_caches(
                     platform,
                     uid,
@@ -2120,7 +2245,7 @@ class AffectionManager:
                     if hasattr(mod, "set_muted"):
                         await mod.set_muted(uid, False)
 
-        return self._build_profile_dict(record, person_id=pid)
+        return self._build_profile_dict(record, person_id=pid, violations_30d=violations_30d)
 
     async def delete_user_score(
         self,
@@ -2310,6 +2435,13 @@ class AffectionManager:
                         (str(d.get("last_recovery_day", "") or "") for d in existing),
                         default="",
                     )
+                    safety_strikes_total = sum(
+                        max(0, int(d.get("safety_strikes_total", 0) or 0)) for d in existing
+                    )
+                    last_violation_at = max(
+                        (float(d.get("last_violation_at", 0.0) or 0.0) for d in existing),
+                        default=0.0,
+                    )
                     merge_reason = (
                         "merged_blacklist" if force_zero else str(base.get("last_reason", "merged"))
                     )
@@ -2319,6 +2451,8 @@ class AffectionManager:
                             "score": merged_score,
                             "last_negative_at": last_negative,
                             "last_recovery_day": last_recovery_day,
+                            "safety_strikes_total": safety_strikes_total,
+                            "last_violation_at": last_violation_at,
                             "last_reason": merge_reason,
                             "updated_at": now,
                         },
@@ -2576,13 +2710,20 @@ class AffectionManager:
     async def list_users(self) -> list[dict[str, Any]]:
         await self.initialize()
         await self._ensure_identity_ready()
-        today = self._today_str()
+        now = float(self.clock())
+        today = self._today_str(now)
         async with self.store.lock:
             rows = await self.store.all(
                 "SELECT user_key, payload FROM user_affection WHERE scope=? "
                 "ORDER BY updated DESC LIMIT 500",
                 (self.scope,),
             )
+            event_rows = await self.store.all(
+                "SELECT user_key, COUNT(*) AS cnt FROM affection_events "
+                "WHERE scope=? AND created>=? GROUP BY user_key",
+                (self.scope, now - 30 * 86400),
+            )
+        violations_by_key = {str(er["user_key"]): int(er["cnt"]) for er in event_rows}
         items: list[dict[str, Any]] = []
         for row in rows:
             opened = self.store.vault.open("affection:" + row["user_key"], row["payload"])
@@ -2597,7 +2738,8 @@ class AffectionManager:
             record = self._normalize_record(
                 opened, platform, uid, "", today, is_owner=is_owner, person_id=pid
             )
-            items.append(self._build_profile_dict(record, person_id=pid))
+            v30 = 0 if is_owner else violations_by_key.get(str(row["user_key"]), 0)
+            items.append(self._build_profile_dict(record, person_id=pid, violations_30d=v30))
         items.sort(
             key=lambda item: (
                 0 if item["is_owner"] else 1,

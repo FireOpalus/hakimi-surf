@@ -2359,10 +2359,14 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <label for="aff-farewell">归零绝交告别语（farewell_message，1–120 字）<input id="aff-farewell" type="text" maxlength="120" required placeholder="话不投机，以后不想再理你了，再见。"></label>
         <label for="aff-cooldown-days">冷静期自动回暖天数（cooldown_recovery_days，0=关闭）<input id="aff-cooldown-days" type="number" min="0" max="90" step="1" required></label>
         <label for="aff-cooldown-target">冷静期回暖目标分（cooldown_recovery_target，20–60）<input id="aff-cooldown-target" type="number" min="20" max="60" step="1" required></label>
+        <label for="aff-viol-inj">注入拦截好感扣分（violation_injection_delta，-50..0）<input id="aff-viol-inj" type="number" min="-50" max="0" step="1" required></label>
+        <label for="aff-viol-blk">内容拦截好感扣分（violation_content_delta，-50..0）<input id="aff-viol-blk" type="number" min="-50" max="0" step="1" required></label>
+        <label for="aff-viol-floor">安全拦截好感保底分（violation_affection_floor，0..50）<input id="aff-viol-floor" type="number" min="0" max="50" step="1" required></label>
       </div>
       <div class="row aff-checks">
         <label><input id="aff-penalize-rl" type="checkbox"> 触发限流时扣好感度（-3）</label>
         <label><input id="aff-penalize-poke" type="checkbox"> Lv.1/Lv.2 被戳一戳忽略时扣好感度（-3）</label>
+        <label><input id="aff-decouple-safety" type="checkbox"> 安全拦截与好感度轻度解耦（decouple_safety_violations，避免误拦截越权拉黑，Owner 始终风控免疫）</label>
       </div>
       <div class="row">
         <button id="aff-save-config" type="submit" disabled>保存好感度策略</button>
@@ -2958,9 +2962,9 @@ function logout(){
   if(timer)clearInterval(timer);
   $('session-dialog').close();session=null;
   $('token').focus();
-  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-cooldown-days','aff-cooldown-target','aff-set-uid','aff-set-nickname','aff-search','sign-text','sign-cooldown','life-mc-topic','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
+  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-cooldown-days','aff-cooldown-target','aff-viol-inj','aff-viol-blk','aff-viol-floor','aff-set-uid','aff-set-nickname','aff-search','sign-text','sign-cooldown','life-mc-topic','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
   $('pb-create-region').value='KR';
-  $('aff-set-platform').value='onebot';$('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;$('aff-penalize-rl').checked=false;$('aff-penalize-poke').checked=false;$('sign-enabled').checked=false;text('aff-history-scope','最近全局 50 条加密审计流水');
+  $('aff-set-platform').value='onebot';$('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;$('aff-penalize-rl').checked=false;$('aff-penalize-poke').checked=false;$('aff-decouple-safety').checked=false;$('sign-enabled').checked=false;text('aff-history-scope','最近全局 50 条加密审计流水');
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
   ['memory-entries','decision-audit','token-ledger','work-ledger','provider-ledger','cost-ledger','budget-periods','model-ledger','thinking-ledger','effective-cache','prov-sessions-table','gcp-credits-table','gcp-mon-compare-table','gcp-mon-models-table'].forEach(id=>$(id).replaceChildren());
 }
@@ -4767,7 +4771,9 @@ function renderAffectionUsers(){
   const cfg=affectionState?.config||{};
   const q=($('aff-search').value||'').trim().toLowerCase();
   const filtered=q?users.filter(u=>{
-    const hay=[u.user_id,u.platform,u.nickname,u.lv,'lv.'+(u.level??''),u.tier,u.tier_label,u.last_reason,u.is_owner?'owner boiser 唯一专属':'',u.muted?'muted 小黑屋':''].join(' ').toLowerCase();
+    const isImmune=u.safety_status==='owner_immune'||Boolean(u.is_owner);
+    const safetyTag=isImmune?'owner_immune 风控免疫':u.safety_status==='risk'?'risk 风控高危':u.safety_status==='watch'?'watch 风控观察':(u.safety_status||'');
+    const hay=[u.user_id,u.platform,u.nickname,u.lv,'lv.'+(u.level??''),u.tier,u.tier_label,u.last_reason,u.safety_status||'',safetyTag,u.is_owner?'owner boiser 唯一专属':'',u.muted?'muted 小黑屋':''].join(' ').toLowerCase();
     return hay.includes(q);
   }):users;
   text('aff-users-count',q?('筛选匹配 '+filtered.length+' / '+users.length+' 条档案'):('共 '+users.length+' 条用户好感度档案'));
@@ -4777,9 +4783,14 @@ function renderAffectionUsers(){
     const idLine=el('div',undefined,'row');
     idLine.append(el('span',u.user_id,'code-mono'),pill(plat,plat==='qq'?'vertex':'muted'));
     userBox.append(idLine);
-    if(u.is_owner||u.muted){
+    const isOwnerImmune=u.safety_status==='owner_immune'||Boolean(u.is_owner);
+    const isRisk=!isOwnerImmune&&u.safety_status==='risk';
+    const isWatch=!isOwnerImmune&&u.safety_status==='watch';
+    if(isOwnerImmune||u.muted||isRisk||isWatch){
       const tagLine=el('div',undefined,'row');
-      if(u.is_owner)tagLine.append(pill('✦ 唯一专属 · 100~120','paid'));
+      if(isOwnerImmune)tagLine.append(pill('✦ 唯一专属 · 100~120','paid'),pill('风控免疫','ok'));
+      if(isRisk)tagLine.append(pill('风控高危 · '+(u.violations_30d??0)+'次/30d','err'));
+      else if(isWatch)tagLine.append(pill('风控观察 · '+(u.violations_30d??0)+'次/30d','warn'));
       if(u.muted)tagLine.append(pill('小黑屋屏蔽中','err'));
       userBox.append(tagLine);
     }
@@ -4888,6 +4899,10 @@ function renderAffection(d){
   $('aff-cooldown-target').value=c.cooldown_recovery_target??40;
   $('aff-penalize-rl').checked=Boolean(c.penalize_rate_limit);
   $('aff-penalize-poke').checked=Boolean(c.penalize_poke_ignored);
+  $('aff-decouple-safety').checked=Boolean(c.decouple_safety_violations??true);
+  $('aff-viol-inj').value=c.violation_injection_delta??-8;
+  $('aff-viol-blk').value=c.violation_content_delta??-10;
+  $('aff-viol-floor').value=c.violation_affection_floor??15;
   const srcLabel=(d.source==='admin'||d.source==='sqlite')?'后台 SQLite（重启保留）':'.env 初始值';
   text('affection-source','配置来源：'+srcLabel+' · 当前状态：'+(c.enabled?'已启用':'已停用')+' · 全天下唯一 BOISER 恒定 Lv.6（100～120）· 非 Owner 严禁查询/泄露分值');
   for(const id of ['aff-save-config','aff-reset-config','aff-set-submit'])$(id).disabled=false;
@@ -4946,14 +4961,23 @@ $('aff-config-form').addEventListener('submit',e=>{
     const unmuteScore=Number($('aff-unmute-score').value);
     const cooldownDaysRaw=$('aff-cooldown-days').value.trim();
     const cooldownTargetRaw=$('aff-cooldown-target').value.trim();
+    const violInjRaw=$('aff-viol-inj').value.trim();
+    const violBlkRaw=$('aff-viol-blk').value.trim();
+    const violFloorRaw=$('aff-viol-floor').value.trim();
     const cooldownDays=Number(cooldownDaysRaw);
     const cooldownTarget=Number(cooldownTargetRaw);
+    const violInj=Number(violInjRaw);
+    const violBlk=Number(violBlkRaw);
+    const violFloor=Number(violFloorRaw);
     const farewell=$('aff-farewell').value.trim();
     if(!Number.isInteger(initScore)||initScore<1||initScore>100)throw Error('非 Owner 初始分须为 1–100 的整数');
     if(!Number.isInteger(dailyCap)||dailyCap<0||dailyCap>50)throw Error('每日正向加分上限须为 0–50 的整数');
     if(!Number.isInteger(unmuteScore)||unmuteScore<1||unmuteScore>60)throw Error('解封恢复分须为 1–60 的整数');
     if(!cooldownDaysRaw||!Number.isInteger(cooldownDays)||cooldownDays<0||cooldownDays>90)throw Error('冷静期自动回暖天数须为 0–90 的整数');
     if(!cooldownTargetRaw||!Number.isInteger(cooldownTarget)||cooldownTarget<20||cooldownTarget>60)throw Error('冷静期回暖目标分须为 20–60 的整数');
+    if(!violInjRaw||!Number.isInteger(violInj)||violInj<-50||violInj>0)throw Error('注入拦截好感扣分须为 -50–0 的整数');
+    if(!violBlkRaw||!Number.isInteger(violBlk)||violBlk<-50||violBlk>0)throw Error('内容拦截好感扣分须为 -50–0 的整数');
+    if(!violFloorRaw||!Number.isInteger(violFloor)||violFloor<0||violFloor>50)throw Error('安全拦截好感保底分须为 0–50 的整数');
     if(!farewell||farewell.length>120)throw Error('归零绝交告别语须为 1–120 字');
     const next=await api('affection','PUT',{
       enabled:$('aff-enabled').checked,
@@ -4964,7 +4988,11 @@ $('aff-config-form').addEventListener('submit',e=>{
       cooldown_recovery_days:cooldownDays,
       cooldown_recovery_target:cooldownTarget,
       penalize_rate_limit:$('aff-penalize-rl').checked,
-      penalize_poke_ignored:$('aff-penalize-poke').checked
+      penalize_poke_ignored:$('aff-penalize-poke').checked,
+      decouple_safety_violations:$('aff-decouple-safety').checked,
+      violation_injection_delta:violInj,
+      violation_content_delta:violBlk,
+      violation_affection_floor:violFloor
     });
     renderAffection(next);
     notice('好感度全局策略已保存并立即生效');
