@@ -33,6 +33,23 @@ def safe_delivery_detail(exc: Rejected) -> str:
     return code if re.fullmatch(r"[a-z0-9_]{1,64}", code) else "delivery_uncertain"
 
 
+async def is_affection_muted_only(service, message: Message) -> bool:
+    """Return True only if the message sender is muted due to zero affection (never manual mute)."""
+    if message.platform == "onebot":
+        return await service.moderation.is_affection_muted(message.user_id)
+    identity = getattr(service, "identity", None)
+    if identity is not None:
+        if not identity.is_muted(message.platform, message.user_id):
+            return False
+        pid = identity.cached_person_id(message.platform, message.user_id)
+        if pid is None:
+            pid = await identity.resolve_person_id(message.platform, message.user_id, create=False)
+        if pid is None:
+            return False
+        return (await identity.person_mute_source(pid)) == "ai_affection_zero"
+    return True
+
+
 async def persist_ack(service, reply, position, text, receipt, epoch, digest=None):
     if not valid_receipt(receipt, platform=reply["message"]["platform"]):
         raise Rejected("onebot_send_unconfirmed")
@@ -166,8 +183,9 @@ async def deliver_actions(service, reply):
     members = [Message.model_validate(m) for m in reply.get("participants", [])] or [message]
     actions = reply["actions"]
     epoch = reply.get("session_epoch", -1)
+    identity = getattr(service, "identity", None)
     farewell_bypass_mute = bool(actions.get("farewell_bypass_mute")) and (
-        message.platform != "onebot" or await service.moderation.is_affection_muted(message.user_id)
+        await is_affection_muted_only(service, message)
     )
     status, detail, confirmed, position = "sent", "", [], 0
     sticker_choice = None
@@ -183,11 +201,18 @@ async def deliver_actions(service, reply):
         ):
             return False
         bypass_uid = None
-        if farewell_bypass_mute and (
-            message.platform != "onebot"
-            or await service.moderation.is_affection_muted(message.user_id)
-        ):
+        if farewell_bypass_mute and await is_affection_muted_only(service, message):
             bypass_uid = message.user_id
+        if identity is not None and any(
+            identity.is_muted(m.platform, m.user_id)
+            and not (
+                bypass_uid is not None
+                and m.platform == message.platform
+                and m.user_id == bypass_uid
+            )
+            for m in members
+        ):
+            return False
         if not service.batch_authorized(message, members, bypass_mute_user_id=bypass_uid):
             return False
         if not await service.bot_guard.may_process(message, reply["id"]):
@@ -531,11 +556,14 @@ async def deliver_proactive_jit(
     if (abstain or not bubbles) and not can_emoji and not can_poke:
         return {"status": "abstained", "bubbles_sent": 0}
 
+    identity = getattr(service, "identity", None)
+
     def permitted() -> bool:
         return (
             still_allowed()
             and allowed_proactive_message(message, service.s)
             and authorize(message, service.s)
+            and (identity is None or not identity.is_muted(message.platform, message.user_id))
         )
 
     if not permitted():

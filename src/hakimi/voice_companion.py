@@ -777,10 +777,22 @@ class VoiceCompanion:
                     entry["user"] = speech_text[:120]
                 entry["assistant"] = clean_reply
                 session.recent_turns.append(entry)
+                recap = ""
                 if event_kind == "speech" and speech_text:
-                    session.highlights.append(f"{speech_text[:40]} -> {clean_reply[:60]}")
+                    recap = f"{speech_text[:40]} -> {clean_reply[:60]}"
+                    session.highlights.append(recap)
                 elif clean_reply:
-                    session.highlights.append(clean_reply[:70])
+                    recap = clean_reply[:70]
+                    session.highlights.append(recap)
+                if is_owner and recap:
+                    ident = getattr(self.service, "identity", None)
+                    if ident is not None:
+                        ident.record_owner_recap(
+                            "voice_companion",
+                            recap,
+                            now=now,
+                            private_owner=True,
+                        )
                 await self._send_frame(
                     peer, {"type": "turn.end", "turn_id": turn_id, "status": "spoken"}
                 )

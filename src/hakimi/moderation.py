@@ -90,6 +90,9 @@ class Moderation:
                     await self.store.db.execute(
                         "DELETE FROM muted_users WHERE user_key=?", (row["user_key"],)
                     )
+        identity = getattr(self.store.runtime, "identity", None)
+        if identity is not None and getattr(identity, "initialized", False):
+            ids = ids | identity.muted_onebot_user_ids()
         self.s.muted_user_ids = ids
         async with self.store.transaction():
             await self.store.db.execute(
@@ -97,6 +100,9 @@ class Moderation:
                 "WHERE scope=? AND delete_status='attempted'",
                 (self.scope,),
             )
+        if identity is not None and getattr(identity, "initialized", False):
+            for uid in sorted(ids):
+                await identity.sync_account_muted("onebot", uid, True, moderation=self)
 
     async def record_strike(self, message, reason, nickname=""):
         # Only evidence about this CURRENT authenticated group message belongs here.
@@ -204,6 +210,16 @@ class Moderation:
                     ),
                 )
             self.s.muted_user_ids = set(self.s.muted_user_ids) | {uid}
+        identity = getattr(self.store.runtime, "identity", None)
+        if identity is not None:
+            await identity.sync_account_muted(
+                "onebot",
+                uid,
+                True,
+                source="ai_affection_zero",
+                nickname=clean_nick,
+                moderation=self,
+            )
         return cur.rowcount == 1
 
     async def is_affection_muted(self, uid: str) -> bool:
@@ -236,6 +252,11 @@ class Moderation:
             ids.add(uid) if muted else ids.discard(uid)
             self.s.muted_user_ids = ids
             deletion = await self._delete_friend(uid) if delete_friend else "not_requested"
+        identity = getattr(self.store.runtime, "identity", None)
+        if identity is not None:
+            await identity.sync_account_muted(
+                "onebot", uid, bool(muted), source="manual", moderation=self
+            )
         if not muted:
             aff = getattr(self.store.runtime, "affection", None)
             if aff is not None:
@@ -269,6 +290,12 @@ class Moderation:
             if approve:
                 self.s.muted_user_ids = set(self.s.muted_user_ids) | {uid}
             deletion = await self._delete_friend(uid) if delete_friend else "not_requested"
+        if approve:
+            identity = getattr(self.store.runtime, "identity", None)
+            if identity is not None:
+                await identity.sync_account_muted(
+                    "onebot", uid, True, source="proposal", moderation=self
+                )
         return {
             "id": proposal,
             "status": "approved" if approve else "rejected",

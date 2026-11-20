@@ -273,6 +273,23 @@ class Settings(BaseSettings):
             "SCREEN_WS_MAX_FRAME_BYTES", "HAKIMI_SCREEN_WS_MAX_FRAME_BYTES"
         ),
     )
+    plugin_bus_ws_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("PLUGIN_BUS_WS_ENABLED", "HAKIMI_PLUGIN_BUS_WS_ENABLED"),
+    )
+    plugin_bus_ws_path: str = Field(
+        default="/ws/plugin",
+        validation_alias=AliasChoices("PLUGIN_BUS_WS_PATH", "HAKIMI_PLUGIN_BUS_WS_PATH"),
+        pattern=r"^/ws/plugin(?:/[A-Za-z0-9_-]{24,128})?$",
+    )
+    plugin_bus_ws_max_frame_bytes: int = Field(
+        default=262_144,
+        ge=16_384,
+        le=1_048_576,
+        validation_alias=AliasChoices(
+            "PLUGIN_BUS_WS_MAX_FRAME_BYTES", "HAKIMI_PLUGIN_BUS_WS_MAX_FRAME_BYTES"
+        ),
+    )
     group_policies: dict[str, Literal["at_only", "smart_reply", "muted"]] = Field(
         default_factory=dict
     )

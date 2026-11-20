@@ -19,6 +19,7 @@ from .community_admin import router as community_router
 from .config import Settings
 from .gcp_admin import router as gcp_billing_router
 from .gemini import GeminiGateway
+from .identity_admin import router as identity_router
 from .life_admin import router as life_router
 from .meme_admin import router as meme_router
 from .modules import platform_entries
@@ -26,6 +27,7 @@ from .modules.adapters import Sender, qq_message
 from .modules.bilibili import Bilibili
 from .modules.onebot_transport import HTTPTransport, WebSocketTransport, websocket_source_ip
 from .node_transport import NodeTransport
+from .plugin_admin import router as plugin_router
 from .provider_admin import router as provider_router
 from .security import Rejected, check_fresh, qq_signing_key, verify_onebot, verify_qq
 from .service import Service
@@ -191,6 +193,8 @@ def create_app(
     app.include_router(provider_router)
     app.include_router(gcp_billing_router)
     app.include_router(affection_router)
+    app.include_router(identity_router)
+    app.include_router(plugin_router)
     app.include_router(life_router)
     for platform, entry in platform_entries():
         if (router := getattr(entry, "admin_router", None)) is not None:
@@ -392,6 +396,40 @@ def create_app(
             source_ip=source_ip,
             adapter_id=adapter_id,
             client_id=client_id,
+        )
+
+    @app.websocket("/ws/plugin{suffix:path}")
+    async def plugin_reverse(websocket: WebSocket, suffix: str = ""):
+        s = websocket.app.state.settings
+        source_ip = websocket_source_ip(websocket, s)
+        plugin_id = websocket.headers.get("x-plugin-id", "")
+        auth_header = websocket.headers.get("authorization", "")
+        token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+        service = getattr(websocket.app.state, "service", None)
+        bus = getattr(service, "plugin_bus", None) if service is not None else None
+        cred = None
+        if (
+            s.plugin_bus_ws_enabled
+            and websocket.url.path == s.plugin_bus_ws_path
+            and not websocket.query_params
+            and bus is not None
+            and plugin_id
+            and token
+        ):
+            cred = await bus.authenticate(plugin_id, token)
+        if cred is None:
+            logging.getLogger("hakimi").warning(
+                "event=plugin_auth_rejected source_ip=%s", source_ip
+            )
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        await bus.serve(
+            websocket.receive_text,
+            websocket.send_text,
+            websocket.close,
+            source_ip=source_ip,
+            plugin_id=plugin_id,
         )
 
     @app.post("/webhooks/qq")

@@ -1,18 +1,19 @@
 """Authenticated control plane for the user affection scoring system."""
 
 import asyncio
-from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .admin_routes import body, service
 from .affection import (
-    ONEBOT_USER_RE,
-    QQ_USER_RE,
+    PLATFORM_ID_RE,
     AffectionConfig,
     AffectionManager,
+    _validate_platform_user,
 )
+from .models import PlatformId
+from .security import Rejected
 
 router = APIRouter(prefix="/admin/api/affection")
 
@@ -21,16 +22,19 @@ class UserAffectionInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     user_id: str = Field(min_length=1, max_length=128)
-    platform: Literal["onebot", "qq"] = "onebot"
+    platform: PlatformId = "onebot"
     score: int = Field(ge=0, le=120)
     nickname: str = Field(default="", max_length=80)
     reason: str = Field(default="admin_set", min_length=1, max_length=64)
 
     @model_validator(mode="after")
     def _validate_user_id(self) -> "UserAffectionInput":
-        pattern = ONEBOT_USER_RE if self.platform == "onebot" else QQ_USER_RE
-        if not pattern.fullmatch(self.user_id):
+        if self.user_id != self.user_id.strip():
             raise ValueError("Invalid user_id for platform")
+        try:
+            _validate_platform_user(self.platform, self.user_id)
+        except Rejected:
+            raise ValueError("Invalid user_id for platform") from None
         return self
 
 
@@ -102,15 +106,26 @@ async def affection_set_user(request: Request):
 async def affection_delete_user(
     request: Request,
     user_id: str,
-    platform: Literal["onebot", "qq"] = "onebot",
+    platform: str = "onebot",
 ):
+    if not PLATFORM_ID_RE.fullmatch(platform):
+        raise HTTPException(400, "invalid_admin_input")
     resolved_platform = platform
     resolved_uid = user_id
-    if user_id.startswith(("onebot:", "qq:")):
-        resolved_platform, resolved_uid = user_id.split(":", 1)
-    pattern = ONEBOT_USER_RE if resolved_platform == "onebot" else QQ_USER_RE
-    if not pattern.fullmatch(resolved_uid):
+    if platform != "onebot":
+        if user_id.startswith(platform + ":"):
+            resolved_uid = user_id[len(platform) + 1 :]
+    elif ":" in user_id:
+        maybe_plat, maybe_uid = user_id.split(":", 1)
+        if not PLATFORM_ID_RE.fullmatch(maybe_plat):
+            raise HTTPException(400, "invalid_admin_input")
+        resolved_platform, resolved_uid = maybe_plat, maybe_uid
+    if resolved_uid != resolved_uid.strip():
         raise HTTPException(400, "invalid_admin_input")
+    try:
+        _validate_platform_user(resolved_platform, resolved_uid)
+    except Rejected:
+        raise HTTPException(400, "invalid_admin_input") from None
     svc = service(request)
     async with request.app.state.admin_config_lock:
         mgr = await _manager(request)

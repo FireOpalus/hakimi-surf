@@ -114,6 +114,15 @@ CODES = frozenset(
         "screen_watch_connected",
         "screen_watch_disconnected",
         "screen_watch_pulse_failed",
+        "plugin_connected",
+        "plugin_disconnected",
+        "plugin_auth_rejected",
+        "plugin_scope_rejected",
+        "plugin_rpc_failed",
+        "identity_bound",
+        "identity_merged",
+        "identity_unlinked",
+        "identity_muted",
     }
 )
 

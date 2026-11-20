@@ -45,8 +45,9 @@ from .modules.longnick import Longnick
 from .modules.proactive_dm import OwnerProactive
 from .node_transport import NodeTransport
 from .outbound_actions import normalize_emoji_like, parse_actions
-from .outgoing import PRE_DISPATCH_REJECTED, safe_delivery_detail
+from .outgoing import PRE_DISPATCH_REJECTED, is_affection_muted_only, safe_delivery_detail
 from .output_links import filter_reply_links
+from .plugin_kernel import PluginKernel
 from .public_memory import PublicMemory
 from .rich_message_parser import parse_forward
 from .roaming_logger import PatrolDiary, redact_public_summary
@@ -159,6 +160,7 @@ class Service:
         self._lurk_react_at: dict[str, float] = {}
         self.modules = ModuleRegistry(owner_delivery=self.proactive)
         settings._chat_registry = weakref.ref(self.modules)
+        self.kernel = PluginKernel()
         install_system_modules(
             self.modules,
             SystemResources(
@@ -187,6 +189,15 @@ class Service:
         self.sessions.event_ledger = self.event_ledger
         self.screen_watch = self.modules.systems["screen_watch"].screen_watch
         self.voice_companion = self.modules.systems["voice_companion"].companion
+        self.identity = self.modules.systems["identity"].identity
+        self.plugin_bus = self.modules.systems["plugin_bus"].plugin_bus
+        store.runtime.identity = self.identity
+        store.runtime.affection.bind_identity(self.identity)
+        self.kernel.provide_core("identity", self.identity)
+        self.kernel.provide_core("event_ledger", self.event_ledger)
+        self.kernel.provide_core("screen_watch", self.screen_watch)
+        self.kernel.provide_core("voice_companion", self.voice_companion)
+        self.kernel.provide_core("plugin_bus", self.plugin_bus)
         self.world_state = WorldStateManager(settings, store, self.modules)
         install_modules(self)
         settings._thinking_scenes = self.modules.thinking_scenes
@@ -324,6 +335,13 @@ class Service:
         if message is not None and self.bot_guard.known_bot(message):
             if not await self.bot_guard.prepare(message):
                 return "ignored"
+        if (
+            message is not None
+            and getattr(self, "identity", None) is not None
+            and self.identity.is_muted(message.platform, message.user_id)
+        ):
+            self.counters["ignored"] += 1
+            return "ignored"
         eligible_context = bool(
             message is not None
             and message.kind == "group"
@@ -404,10 +422,12 @@ class Service:
             self.store.groups.interrupt(message)
         if (
             result == "limited"
-            and message.platform in {"onebot", "qq"}
             and self.store.runtime.affection.config.enabled
             and not self.bot_guard.known_bot(message)
-            and not owner(message, self.s)
+            and not self.store.runtime.affection.is_owner_id(message.platform, message.user_id)
+            and (
+                message.platform in {"onebot", "qq"} or getattr(self, "identity", None) is not None
+            )
         ):
             update = await self.store.runtime.affection.record_annoyance(message, "rate_limit")
             if update.blacklisted_now:
@@ -459,6 +479,10 @@ class Service:
             res = close_nt()
             if inspect.isawaitable(res):
                 await res
+        if kernel := getattr(self, "kernel", None):
+            await kernel.dispose_all()
+        if pb := getattr(self, "plugin_bus", None):
+            await pb.close()
         if sw := getattr(self, "screen_watch", None):
             await sw.close()
         if vc := getattr(self, "voice_companion", None):
@@ -496,6 +520,9 @@ class Service:
         )
         if aff_match:
             return await self._affection_command(message, aff_match[1] or "")
+        bind_match = re.match(r"^/bind(?:\s+(.*))?$", direct.strip())
+        if bind_match:
+            return await self._bind_command(message, bind_match[1] or "")
         if not direct.startswith(prefix):
             return None
         command = direct[len(prefix) :].strip()
@@ -547,6 +574,46 @@ class Service:
             else "新摘要会保存在 /哈基米 报告 中。"
         )
         return "已订阅；首次巡逻仅建立基线。" + tip
+
+    async def _bind_command(self, message: Message, raw_args: str) -> str:
+        identity = getattr(self, "identity", None)
+        if identity is None:
+            return "跨平台账号绑定服务暂未就绪，请稍后再试。"
+        arg = raw_args.strip()
+        try:
+            if not arg:
+                code = await identity.create_bind_code(message)
+                return (
+                    f"已生成一次性跨平台绑定码：{code}\n"
+                    f"请在 5 分钟内使用另一个平台的账号私聊发送：/bind {code}\n"
+                    "绑定完成后好感度与权限将自动合并同步（绑定码仅限单次使用）。"
+                )
+            await identity.redeem_bind_code(
+                message,
+                arg,
+                affection=self.store.runtime.affection,
+                moderation=self.moderation,
+            )
+            self.record("identity_bound")
+            return "跨平台账号绑定成功！已合并同步好感度与账号状态~"
+        except Rejected as exc:
+            code = str(exc).strip()
+            messages = {
+                "bind_private_only": "为了安全，跨平台账号绑定仅支持在私聊中使用哦~",
+                "bind_bot_forbidden": "Bot 账号不支持使用 /bind 绑定。",
+                "protected_identity": "主人账号由系统配置受保护绑定，不支持通过 /bind 合并或修改。",
+                "bind_muted_forbidden": "当前账号状态受限，暂无法使用 /bind 绑定。",
+                "bind_rate_limited": "生成绑定码太频繁啦，请过几分钟再试~",
+                "bind_code_generation_failed": "暂时未能生成绑定码，请稍后再试~",
+                "bind_cooldown": "绑定码错误次数过多，已触发冷却保护，请 15 分钟后再试~",
+                "invalid_bind_code": "绑定码无效或已过期，请核对后再试，或发送 /bind 重新生成。",
+                "bind_same_account": (
+                    "不能绑定当前同一个账号哦，请用另一个平台或账号私聊发送绑定码。"
+                ),
+                "bind_already_linked": "这两个账号已经绑定在同一个身份档案下啦，无需重复绑定~",
+                "person_not_found": "未找到对应的身份档案，请重新发送 /bind 获取新绑定码。",
+            }
+            return messages.get(code, "绑定操作未完成，请稍后重试或联系管理员处理。")
 
     async def _affection_command(self, message: Message, raw_args: str) -> str:
         if message.kind != "private" or not owner(message, self.s):
@@ -705,6 +772,17 @@ class Service:
     def _authorize_for_batch(
         self, candidate: Message, *, bypass_mute_user_id: str | None = None
     ) -> bool:
+        identity = getattr(self, "identity", None)
+        if (
+            identity is not None
+            and identity.is_muted(candidate.platform, candidate.user_id)
+            and not (
+                bypass_mute_user_id
+                and candidate.user_id == bypass_mute_user_id
+                and not self.bot_guard.known_bot(candidate)
+            )
+        ):
+            return False
         if (
             bypass_mute_user_id
             and candidate.user_id == bypass_mute_user_id
@@ -1137,9 +1215,11 @@ class Service:
         aff = self.store.runtime.affection
         caps = await aff.capabilities_for(message)
         aff_active = (
-            message.platform in {"onebot", "qq"}
-            and aff.config.enabled
+            aff.config.enabled
             and not self.bot_guard.known_bot(message)
+            and (
+                message.platform in {"onebot", "qq"} or getattr(self, "identity", None) is not None
+            )
         )
         if aff_active and caps.level == 0:
             return
@@ -1666,6 +1746,27 @@ class Service:
                     }
                 if batch_aff:
                     payload["batch_affection"] = batch_aff
+            identity = getattr(self, "identity", None)
+            if (
+                identity is not None
+                and not self.bot_guard.known_bot(message)
+                and not identity.is_muted(message.platform, message.user_id)
+            ):
+                l2_tags = await identity.get_l2_tags(message.platform, message.user_id)
+                if l2_tags:
+                    sender_aff = dict(payload.get("sender_affection") or {})
+                    sender_aff["known_preferences"] = l2_tags
+                    payload["sender_affection"] = sender_aff
+            if (
+                identity is not None
+                and message.kind == "private"
+                and is_persona_owner(message, self.s)
+            ):
+                other_recent = identity.owner_other_surface_recent(
+                    message.platform, message=message
+                )
+                if other_recent:
+                    payload["owner_other_surface_recent"] = other_recent
             if not self.bot_guard.known_bot(message):
                 material = await self.modules.context_data(
                     limit=4, now=time.time(), message=message
@@ -2078,6 +2179,11 @@ class Service:
                     consumed_image_events=neighbour_image_events,
                     consumed_file_events=consumed_file_events,
                 )
+                if not sandbox and not actions.abstain and not farewell_bypass:
+                    self._record_owner_turn_recap(
+                        message,
+                        " ".join(b.strip() for b in actions.bubbles if b.strip()) or (folded or ""),
+                    )
                 await self.store.runtime.filters.update_audit(audit_id, "queued")
                 return
             # Read compatibility for integrations returning the old single-text contract.
@@ -2117,7 +2223,22 @@ class Service:
             consumed_image_events=neighbour_image_events,
             consumed_file_events=consumed_file_events,
         )
+        if not sandbox and result:
+            self._record_owner_turn_recap(message, result)
         await self.store.runtime.filters.update_audit(audit_id, "queued")
+
+    def _record_owner_turn_recap(self, message: Message, reply_text: str) -> None:
+        identity = getattr(self, "identity", None)
+        if identity is None or message.kind != "private" or not is_persona_owner(message, self.s):
+            return
+        user_part = " ".join(str(message.text or "").split())[:35]
+        reply_part = " ".join(str(reply_text or "").split())[:38]
+        if user_part and reply_part:
+            summary = f"{user_part} -> {reply_part}"
+        else:
+            summary = reply_part or user_part
+        if summary:
+            identity.record_owner_recap(message.platform, summary, message=message)
 
     async def handle_patrol(self, job: dict):
         if self.modules.inactive_reason("bilibili_surf"):
@@ -2283,8 +2404,7 @@ class Service:
         reply_actions = reply.get("actions") or {}
         message = Message.model_validate(reply["message"])
         farewell_bypass = bool(reply_actions.get("farewell_bypass_mute")) and (
-            message.platform != "onebot"
-            or await self.moderation.is_affection_muted(message.user_id)
+            await is_affection_muted_only(self, message)
         )
         if (
             message.platform in {"onebot", "qq"}
@@ -2342,10 +2462,7 @@ class Service:
                     if not await self.bot_guard.may_process(message, reply["id"]):
                         return False
                     bypass_uid = None
-                    if farewell_bypass and (
-                        message.platform != "onebot"
-                        or await self.moderation.is_affection_muted(message.user_id)
-                    ):
+                    if farewell_bypass and await is_affection_muted_only(self, message):
                         bypass_uid = message.user_id
                     return (
                         (await self.sessions.snapshot(message))["epoch"] == delivery_epoch

@@ -35,8 +35,10 @@ CREATE TABLE IF NOT EXISTS affection_events (
 CREATE INDEX IF NOT EXISTS affection_events_created ON affection_events(created);
 """
 
+PLATFORM_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 ONEBOT_USER_RE = re.compile(r"^[1-9][0-9]{0,19}$")
 QQ_USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+GENERIC_USER_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 DEFAULT_FAREWELL = "话不投机，以后不想再理你了，再见。"
 VIOLATION_DELTAS = {
     "prompt_injection": -25,
@@ -68,12 +70,17 @@ def _sanitize_reason(value: Any, settings: Settings, default: str = "chat") -> s
 
 
 def _validate_platform_user(platform: str, user_id: str) -> str:
-    if platform not in {"onebot", "qq"}:
+    if not isinstance(platform, str) or not PLATFORM_ID_RE.fullmatch(platform):
         raise Rejected("invalid_platform")
     if isinstance(user_id, bool) or not isinstance(user_id, str):
         raise Rejected("invalid_user_id")
     uid = user_id.strip()
-    pattern = ONEBOT_USER_RE if platform == "onebot" else QQ_USER_RE
+    if platform == "onebot":
+        pattern = ONEBOT_USER_RE
+    elif platform == "qq":
+        pattern = QQ_USER_RE
+    else:
+        pattern = GENERIC_USER_RE
     if not pattern.fullmatch(uid):
         raise Rejected("invalid_user_id")
     return uid
@@ -475,7 +482,7 @@ class AffectionUpdate:
 
 
 class AffectionManager:
-    """Manages encrypted per-user affection scores, capabilities, and moderation sync."""
+    """Manages encrypted per-user/person affection scores, capabilities, and moderation sync."""
 
     def __init__(self, store: Any, *, clock: Any = time.time):
         self.store = store
@@ -487,9 +494,22 @@ class AffectionManager:
         self.initialized = False
         self.init_lock = asyncio.Lock()
         self._lock = asyncio.Lock()
+        self._identity: Any = None
+        self._migrated_to_person = False
         self._user_scores: dict[str, tuple[int, bool]] = {}
+        self._person_scores: dict[str, int] = {}
         self._subject_multipliers: dict[str, Decimal] = {}
         self._annoyance_at: dict[str, float] = {}
+
+    def bind_identity(self, identity: Any) -> None:
+        """Bind an IdentityService so affection tracks unified cross-platform person_ids."""
+        self._identity = identity
+
+    def _get_identity(self) -> Any:
+        if self._identity is not None:
+            return self._identity
+        runtime = getattr(self.store, "runtime", None)
+        return getattr(runtime, "identity", None) if runtime is not None else None
 
     @property
     def scope(self) -> str:
@@ -498,10 +518,26 @@ class AffectionManager:
         )
 
     def _bot_id(self, platform: str) -> str:
-        return self.s.onebot_self_id if platform == "onebot" else self.s.qq_app_id
+        if platform == "onebot":
+            return self.s.onebot_self_id
+        if platform == "qq":
+            return self.s.qq_app_id
+        binding = self.s.social_owner_bindings.get(platform)
+        return binding.bot_id if binding is not None else ""
+
+    def _legacy_user_key(self, platform: str, user_id: str) -> str:
+        return self.store.vault.digest("affection-user", self.scope, platform, user_id)
+
+    def _person_key(self, person_id: str) -> str:
+        return self.store.vault.digest("affection-person", self.scope, person_id)
 
     def _user_key(self, platform: str, user_id: str) -> str:
-        return self.store.vault.digest("affection-user", self.scope, platform, user_id)
+        identity = self._get_identity()
+        if identity is not None:
+            pid = identity.cached_person_id(platform, user_id)
+            if pid is not None:
+                return self._person_key(pid)
+        return self._legacy_user_key(platform, user_id)
 
     def _subject(self, platform: str, user_id: str, bot_id: str | None = None) -> str:
         resolved_bot = bot_id if bot_id is not None else self._bot_id(platform)
@@ -521,15 +557,24 @@ class AffectionManager:
             return False
         if platform == "onebot":
             owners = {self.s.owner_qq_id, *self.s.onebot_owner_ids} - {""}
-            return uid in owners
-        if platform == "qq":
-            return uid in (set(self.s.qq_owner_ids) - {""})
+            if uid in owners:
+                return True
+        elif platform == "qq":
+            if uid in (set(self.s.qq_owner_ids) - {""}):
+                return True
+        else:
+            binding = self.s.social_owner_bindings.get(platform)
+            if binding is not None and uid == binding.user_id:
+                return True
+        identity = self._get_identity()
+        if identity is not None and identity.is_owner_account(platform, uid):
+            return True
         return False
 
     def _is_known_bot(self, platform: str, user_id: str) -> bool:
         return platform == "onebot" and user_id in self.s.bot_qq_ids
 
-    def _seed_owner_caches(self) -> None:
+    def _seed_owner_caches(self, identity: Any = None) -> None:
         owner_caps = TIER_CAPS[6]
         for uid in {self.s.owner_qq_id, *self.s.onebot_owner_ids} - {""}:
             uk = self._user_key("onebot", uid)
@@ -545,6 +590,25 @@ class AffectionManager:
             self._subject_multipliers.setdefault(
                 self._subject("qq", uid), owner_caps.budget_multiplier
             )
+        for plat, binding in self.s.social_owner_bindings.items():
+            uk = self._user_key(plat, binding.user_id)
+            if uk not in self._user_scores:
+                self._user_scores[uk] = (120, True)
+            self._subject_multipliers.setdefault(
+                self._subject(plat, binding.user_id, binding.bot_id), owner_caps.budget_multiplier
+            )
+            self._subject_multipliers.setdefault(
+                self._subject(plat, binding.user_id), owner_caps.budget_multiplier
+            )
+        if identity is not None and getattr(identity, "initialized", False):
+            ok = self._person_key("owner")
+            if ok not in self._user_scores:
+                self._user_scores[ok] = (120, True)
+            self._person_scores.setdefault("owner", self._user_scores[ok][0])
+            for plat, uid in identity.linked_accounts_cached("owner"):
+                self._subject_multipliers.setdefault(
+                    self._subject(plat, uid), owner_caps.budget_multiplier
+                )
 
     def _update_caches(
         self,
@@ -554,19 +618,271 @@ class AffectionManager:
         *,
         is_owner: bool,
         bot_id: str | None = None,
+        person_id: str | None = None,
+        identity: Any = None,
     ) -> AffectionCapabilities:
         bounded = clamp_score(score, is_owner=is_owner)
         caps = capabilities_for_score(bounded, is_owner=is_owner)
-        uk = self._user_key(platform, user_id)
+        if person_id is not None and identity is not None:
+            pk = self._person_key(person_id)
+            self._user_scores[pk] = (bounded, is_owner)
+            self._person_scores[person_id] = bounded
+            accounts = list(identity.linked_accounts_cached(person_id))
+            if platform and user_id and (platform, user_id) not in accounts:
+                accounts.append((platform, user_id))
+            for plat, uid in accounts:
+                self._subject_multipliers[self._subject(plat, uid)] = caps.budget_multiplier
+                if (
+                    bot_id is not None
+                    and plat == platform
+                    and uid == user_id
+                    and bot_id != self._bot_id(plat)
+                ):
+                    self._subject_multipliers[self._subject(plat, uid, bot_id)] = (
+                        caps.budget_multiplier
+                    )
+            return caps
+        uk = self._legacy_user_key(platform, user_id)
         self._user_scores[uk] = (bounded, is_owner)
         self._subject_multipliers[self._subject(platform, user_id, bot_id)] = caps.budget_multiplier
         if bot_id is not None and bot_id != self._bot_id(platform):
             self._subject_multipliers[self._subject(platform, user_id)] = caps.budget_multiplier
         return caps
 
+    async def _reload_caches_unlocked(self, identity: Any = None) -> None:
+        async with self.store.lock:
+            user_rows = await self.store.all(
+                "SELECT user_key, subject, payload FROM user_affection WHERE scope=?",
+                (self.scope,),
+            )
+        next_scores: dict[str, tuple[int, bool]] = {}
+        next_person_scores: dict[str, int] = {}
+        next_mults: dict[str, Decimal] = {}
+        for row in user_rows:
+            data = self.store.vault.open("affection:" + row["user_key"], row["payload"])
+            if not isinstance(data, dict):
+                continue
+            platform = str(data.get("platform", "onebot"))
+            uid = str(data.get("user_id", ""))
+            pid = str(data.get("person_id", "")) if data.get("person_id") else ""
+            is_owner = (pid == "owner") or (bool(uid) and self.is_owner_id(platform, uid))
+            default_score = 120 if is_owner else self.config.initial_score
+            score = clamp_score(int(data.get("score", default_score)), is_owner=is_owner)
+            caps = capabilities_for_score(score, is_owner=is_owner)
+            next_scores[row["user_key"]] = (score, is_owner)
+            if pid:
+                next_person_scores[pid] = score
+            if uid:
+                next_mults[row["subject"]] = caps.budget_multiplier
+                next_mults[self._subject(platform, uid)] = caps.budget_multiplier
+            if pid and identity is not None and getattr(identity, "initialized", False):
+                for plat, acc_uid in identity.linked_accounts_cached(pid):
+                    next_mults[self._subject(plat, acc_uid)] = caps.budget_multiplier
+        self._user_scores = next_scores
+        self._person_scores = next_person_scores
+        self._subject_multipliers = next_mults
+        self._seed_owner_caches(identity)
+
+    async def _migrate_to_identity_unlocked(self, identity: Any) -> None:
+        if identity is None or not getattr(identity, "initialized", False):
+            return
+        if self._migrated_to_person:
+            return
+        async with self.store.lock:
+            already = await self.store.one(
+                "SELECT 1 FROM meta WHERE key='affection_person_migrated_v1'"
+            )
+            user_rows = (
+                []
+                if already
+                else await self.store.all(
+                    "SELECT user_key, subject, payload, updated FROM user_affection WHERE scope=?",
+                    (self.scope,),
+                )
+            )
+        if already:
+            await self._reload_caches_unlocked(identity)
+            self._migrated_to_person = True
+            return
+
+        legacy_items: list[tuple[str, dict[str, Any], str]] = []
+        for row in user_rows:
+            data = self.store.vault.open("affection:" + row["user_key"], row["payload"])
+            if not isinstance(data, dict):
+                continue
+            existing_pid = str(data.get("person_id", ""))
+            if existing_pid and row["user_key"] == self._person_key(existing_pid):
+                continue
+            platform = str(data.get("platform", "onebot"))
+            uid = str(data.get("user_id", ""))
+            if not uid:
+                continue
+            nickname = str(data.get("nickname", ""))
+            pid = await identity.resolve_person_id(
+                platform, uid, nickname, create=True, source="auto"
+            )
+            if pid is not None:
+                legacy_items.append((row["user_key"], data, pid))
+
+        today = self._today_str()
+        now = float(self.clock())
+        zero_person_ids: list[str] = []
+
+        async with self._lock:
+            async with self.store.transaction():
+                if await self.store.one(
+                    "SELECT 1 FROM meta WHERE key='affection_person_migrated_v1'"
+                ):
+                    self._migrated_to_person = True
+                    return
+
+                grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+                for old_key, data, pid in legacy_items:
+                    grouped.setdefault(pid, []).append((old_key, data))
+
+                for pid, items in grouped.items():
+                    person_key = self._person_key(pid)
+                    existing_prow = await self.store.one(
+                        "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+                        (person_key, self.scope),
+                    )
+                    existing_pdata = (
+                        self.store.vault.open("affection:" + person_key, existing_prow["payload"])
+                        if existing_prow
+                        else None
+                    )
+                    all_entries: list[dict[str, Any]] = [
+                        *([existing_pdata] if isinstance(existing_pdata, dict) else []),
+                        *(d for _, d in items),
+                    ]
+                    is_owner = (pid == "owner") or any(
+                        self.is_owner_id(
+                            str(e.get("platform", "onebot")), str(e.get("user_id", ""))
+                        )
+                        for e in all_entries
+                    )
+                    raw_scores = [
+                        clamp_score(
+                            int(e.get("score", 120 if is_owner else self.config.initial_score)),
+                            is_owner=is_owner,
+                        )
+                        for e in all_entries
+                    ]
+                    if is_owner:
+                        merged_score = clamp_score(max(raw_scores), is_owner=True)
+                    elif 0 in raw_scores:
+                        merged_score = 0
+                        zero_person_ids.append(pid)
+                    else:
+                        merged_score = clamp_score(min(raw_scores), is_owner=False)
+
+                    latest = max(all_entries, key=lambda e: float(e.get("updated_at", 0.0) or 0.0))
+                    rep_platform = str(latest.get("platform", "onebot"))
+                    rep_uid = str(latest.get("user_id", ""))
+                    same_day_entries = [e for e in all_entries if e.get("daily_day") == today]
+                    today_gain = max(
+                        (max(0, int(e.get("today_positive_gain", 0))) for e in same_day_entries),
+                        default=0,
+                    )
+                    first_day = next(
+                        (
+                            str(e.get("daily_first_day", ""))
+                            for e in same_day_entries
+                            if str(e.get("daily_first_day", ""))
+                        ),
+                        "",
+                    )
+                    last_annoyance = max(
+                        (float(e.get("last_annoyance_at", 0.0) or 0.0) for e in all_entries),
+                        default=0.0,
+                    )
+                    updated_at = max(
+                        (float(e.get("updated_at", 0.0) or 0.0) for e in all_entries),
+                        default=now,
+                    )
+                    merged_record = self._normalize_record(
+                        {
+                            **latest,
+                            "score": merged_score,
+                            "daily_day": today,
+                            "today_positive_gain": today_gain,
+                            "daily_first_day": first_day,
+                            "last_annoyance_at": last_annoyance,
+                            "updated_at": updated_at,
+                        },
+                        rep_platform,
+                        rep_uid,
+                        "",
+                        today,
+                        is_owner=is_owner,
+                        person_id=pid,
+                    )
+                    sealed = self.store.vault.seal("affection:" + person_key, merged_record)
+                    subject = self._subject(rep_platform, rep_uid)
+                    await self.store.db.execute(
+                        "INSERT INTO user_affection(user_key,scope,subject,payload,updated) "
+                        "VALUES (?,?,?,?,?) "
+                        "ON CONFLICT(user_key) DO UPDATE SET scope=excluded.scope,"
+                        "subject=excluded.subject,payload=excluded.payload,updated=excluded.updated",
+                        (
+                            person_key,
+                            self.scope,
+                            subject,
+                            sealed,
+                            float(merged_record["updated_at"]),
+                        ),
+                    )
+                    for old_key, _ in items:
+                        if old_key != person_key:
+                            await self.store.db.execute(
+                                "DELETE FROM user_affection WHERE user_key=? AND scope=?",
+                                (old_key, self.scope),
+                            )
+                            await self.store.db.execute(
+                                "UPDATE affection_events SET user_key=? "
+                                "WHERE scope=? AND user_key=?",
+                                (person_key, self.scope, old_key),
+                            )
+
+                await self.store.db.execute(
+                    "INSERT OR IGNORE INTO meta VALUES ('affection_person_migrated_v1', ?)",
+                    (self.store.vault.seal("meta:affection_person_migrated_v1", {"v": 1}),),
+                )
+
+        for pid in zero_person_ids:
+            if pid != "owner":
+                await identity.set_person_muted(pid, True, source="ai_affection_zero")
+
+        await self._reload_caches_unlocked(identity)
+        self._migrated_to_person = True
+
+    async def migrate_to_identity(self) -> None:
+        identity = self._get_identity()
+        if identity is None or not getattr(identity, "initialized", False):
+            return
+        async with self.init_lock:
+            await self._migrate_to_identity_unlocked(identity)
+
+    async def _ensure_identity_ready(self) -> Any:
+        identity = self._get_identity()
+        if identity is None:
+            return None
+        if not getattr(identity, "initialized", False):
+            await identity.initialize()
+        if not self._migrated_to_person:
+            await self.migrate_to_identity()
+        return identity
+
     async def initialize(self) -> None:
+        identity = self._get_identity()
         async with self.init_lock:
             if self.initialized:
+                if (
+                    identity is not None
+                    and getattr(identity, "initialized", False)
+                    and not self._migrated_to_person
+                ):
+                    await self._migrate_to_identity_unlocked(identity)
                 return
             self.env_config = AffectionConfig.from_settings(self.s)
             async with self.store.transaction():
@@ -574,10 +890,6 @@ class AffectionManager:
             async with self.store.lock:
                 cfg_row = await self.store.one(
                     "SELECT payload FROM admin_config WHERE key='affection'"
-                )
-                user_rows = await self.store.all(
-                    "SELECT user_key, subject, payload FROM user_affection WHERE scope=?",
-                    (self.scope,),
                 )
             if cfg_row:
                 saved = self.store.vault.open("admin:affection", cfg_row[0])
@@ -590,32 +902,24 @@ class AffectionManager:
                 self.config = self.env_config
                 self.overridden = False
 
-            next_scores: dict[str, tuple[int, bool]] = {}
-            next_mults: dict[str, Decimal] = {}
-            for row in user_rows:
-                data = self.store.vault.open("affection:" + row["user_key"], row["payload"])
-                if not isinstance(data, dict):
-                    continue
-                platform = str(data.get("platform", "onebot"))
-                uid = str(data.get("user_id", ""))
-                is_owner = self.is_owner_id(platform, uid)
-                default_score = 120 if is_owner else self.config.initial_score
-                score = clamp_score(int(data.get("score", default_score)), is_owner=is_owner)
-                caps = capabilities_for_score(score, is_owner=is_owner)
-                next_scores[row["user_key"]] = (score, is_owner)
-                next_mults[row["subject"]] = caps.budget_multiplier
-                next_mults[self._subject(platform, uid)] = caps.budget_multiplier
-            self._user_scores = next_scores
-            self._subject_multipliers = next_mults
-            self._seed_owner_caches()
+            await self._reload_caches_unlocked(identity)
+            if identity is not None and getattr(identity, "initialized", False):
+                await self._migrate_to_identity_unlocked(identity)
             self.initialized = True
 
     def _default_record(
-        self, platform: str, user_id: str, nickname: str, today: str
+        self,
+        platform: str,
+        user_id: str,
+        nickname: str,
+        today: str,
+        *,
+        is_owner: bool | None = None,
+        person_id: str | None = None,
     ) -> dict[str, Any]:
-        is_owner = self.is_owner_id(platform, user_id)
-        score = 120 if is_owner else self.config.initial_score
-        return {
+        owner_flag = self.is_owner_id(platform, user_id) if is_owner is None else bool(is_owner)
+        score = 120 if owner_flag else self.config.initial_score
+        record: dict[str, Any] = {
             "user_id": user_id,
             "platform": platform,
             "nickname": _sanitize_nickname(nickname, self.s),
@@ -628,6 +932,9 @@ class AffectionManager:
             "last_delta": 0,
             "updated_at": 0.0,
         }
+        if person_id:
+            record["person_id"] = person_id
+        return record
 
     def _normalize_record(
         self,
@@ -636,10 +943,13 @@ class AffectionManager:
         user_id: str,
         nickname: str,
         today: str,
+        *,
+        is_owner: bool | None = None,
+        person_id: str | None = None,
     ) -> dict[str, Any]:
-        is_owner = self.is_owner_id(platform, user_id)
-        default_score = 120 if is_owner else self.config.initial_score
-        score = clamp_score(int(data.get("score", default_score)), is_owner=is_owner)
+        owner_flag = self.is_owner_id(platform, user_id) if is_owner is None else bool(is_owner)
+        default_score = 120 if owner_flag else self.config.initial_score
+        score = clamp_score(int(data.get("score", default_score)), is_owner=owner_flag)
         same_day = data.get("daily_day") == today
         today_gain = max(0, int(data.get("today_positive_gain", 0))) if same_day else 0
         first_day = str(data.get("daily_first_day", "")) if same_day else ""
@@ -648,7 +958,8 @@ class AffectionManager:
             if nickname
             else _sanitize_nickname(data.get("nickname", ""), self.s)
         )
-        return {
+        resolved_pid = person_id or (str(data["person_id"]) if data.get("person_id") else None)
+        record: dict[str, Any] = {
             "user_id": user_id,
             "platform": platform,
             "nickname": clean_nick,
@@ -661,6 +972,9 @@ class AffectionManager:
             "last_delta": int(data.get("last_delta", 0) or 0),
             "updated_at": float(data.get("updated_at", 0.0) or 0.0),
         }
+        if resolved_pid:
+            record["person_id"] = resolved_pid
+        return record
 
     async def _load_user_unlocked(
         self,
@@ -668,17 +982,39 @@ class AffectionManager:
         user_id: str,
         nickname: str,
         today: str,
+        *,
+        person_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        user_key = self._user_key(platform, user_id)
+        is_owner = (person_id == "owner") or self.is_owner_id(platform, user_id)
+        user_key = (
+            self._person_key(person_id)
+            if person_id is not None
+            else self._legacy_user_key(platform, user_id)
+        )
         row = await self.store.one(
             "SELECT payload FROM user_affection WHERE user_key=?", (user_key,)
         )
         if not row:
-            return self._default_record(platform, user_id, nickname, today), False
+            return (
+                self._default_record(
+                    platform, user_id, nickname, today, is_owner=is_owner, person_id=person_id
+                ),
+                False,
+            )
         opened = self.store.vault.open("affection:" + user_key, row["payload"])
         if not isinstance(opened, dict):
-            return self._default_record(platform, user_id, nickname, today), False
-        return self._normalize_record(opened, platform, user_id, nickname, today), True
+            return (
+                self._default_record(
+                    platform, user_id, nickname, today, is_owner=is_owner, person_id=person_id
+                ),
+                False,
+            )
+        return (
+            self._normalize_record(
+                opened, platform, user_id, nickname, today, is_owner=is_owner, person_id=person_id
+            ),
+            True,
+        )
 
     async def _save_user_in_tx(
         self,
@@ -687,8 +1023,13 @@ class AffectionManager:
         record: dict[str, Any],
         *,
         bot_id: str | None = None,
+        person_id: str | None = None,
     ) -> None:
-        user_key = self._user_key(platform, user_id)
+        if person_id is not None:
+            record = {**record, "person_id": person_id}
+            user_key = self._person_key(person_id)
+        else:
+            user_key = self._legacy_user_key(platform, user_id)
         subject = self._subject(platform, user_id, bot_id)
         sealed = self.store.vault.seal("affection:" + user_key, record)
         await self.store.db.execute(
@@ -698,14 +1039,21 @@ class AffectionManager:
             (user_key, self.scope, subject, sealed, float(record["updated_at"])),
         )
 
-    def _build_profile_dict(self, record: dict[str, Any]) -> dict[str, Any]:
+    def _build_profile_dict(
+        self, record: dict[str, Any], *, person_id: str | None = None
+    ) -> dict[str, Any]:
         platform = str(record["platform"])
         uid = str(record["user_id"])
-        is_owner = self.is_owner_id(platform, uid)
+        pid = person_id or (str(record["person_id"]) if record.get("person_id") else None)
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
         score = clamp_score(int(record["score"]), is_owner=is_owner)
         caps = capabilities_for_score(score, is_owner=is_owner)
-        muted = (not is_owner) and platform == "onebot" and uid in set(self.s.muted_user_ids)
-        return {
+        identity = self._get_identity()
+        muted = (not is_owner) and (
+            (platform == "onebot" and uid in set(self.s.muted_user_ids))
+            or (identity is not None and identity.is_muted(platform, uid))
+        )
+        out: dict[str, Any] = {
             "user_id": uid,
             "platform": platform,
             "nickname": record["nickname"],
@@ -724,6 +1072,51 @@ class AffectionManager:
             "updated_at": float(record.get("updated_at", 0.0)),
             "capabilities": caps.to_dict(),
         }
+        if pid is not None:
+            out["person_id"] = pid
+        return out
+
+    async def person_scores_snapshot(self) -> dict[str, int]:
+        await self.initialize()
+        await self._ensure_identity_ready()
+        snapshot = dict(self._person_scores)
+        snapshot.setdefault("owner", 120)
+        return snapshot
+
+    async def refresh_person_caches(self, person_id: str) -> None:
+        await self.initialize()
+        identity = await self._ensure_identity_ready()
+        if identity is None:
+            return
+        is_owner = person_id == "owner"
+        pk = self._person_key(person_id)
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+                (pk, self.scope),
+            )
+        if row:
+            opened = self.store.vault.open("affection:" + pk, row["payload"])
+            if isinstance(opened, dict):
+                score = clamp_score(
+                    int(opened.get("score", 120 if is_owner else self.config.initial_score)),
+                    is_owner=is_owner,
+                )
+                self._update_caches(
+                    str(opened.get("platform", "onebot")),
+                    str(opened.get("user_id", "")),
+                    score,
+                    is_owner=is_owner,
+                    person_id=person_id,
+                    identity=identity,
+                )
+                return
+        accounts = identity.linked_accounts_cached(person_id)
+        default_score = 120 if is_owner else self.config.initial_score
+        caps = capabilities_for_score(default_score, is_owner=is_owner)
+        self._user_scores[pk] = (default_score, is_owner)
+        for plat, uid in accounts:
+            self._subject_multipliers[self._subject(plat, uid)] = caps.budget_multiplier
 
     async def profile(
         self,
@@ -736,16 +1129,37 @@ class AffectionManager:
         del subject
         await self.initialize()
         uid = _validate_platform_user(platform, user_id)
+        identity = await self._ensure_identity_ready()
+        pid = (
+            await identity.resolve_person_id(platform, uid, nickname, create=False)
+            if identity is not None
+            else None
+        )
         today = self._today_str()
         async with self.store.lock:
-            record, _ = await self._load_user_unlocked(platform, uid, nickname, today)
-        is_owner = self.is_owner_id(platform, uid)
-        self._update_caches(platform, uid, record["score"], is_owner=is_owner)
-        return self._build_profile_dict(record)
+            record, _ = await self._load_user_unlocked(
+                platform, uid, nickname, today, person_id=pid
+            )
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
+        if pid is not None and identity is not None:
+            self._update_caches(
+                platform,
+                uid,
+                record["score"],
+                is_owner=is_owner,
+                person_id=pid,
+                identity=identity,
+            )
+        elif identity is None:
+            self._update_caches(platform, uid, record["score"], is_owner=is_owner)
+        return self._build_profile_dict(record, person_id=pid)
 
     async def capabilities_for(self, message: Message) -> AffectionCapabilities:
         await self.initialize()
-        if not self.config.enabled or message.platform not in {"onebot", "qq"}:
+        identity = await self._ensure_identity_ready()
+        if not self.config.enabled or (
+            identity is None and message.platform not in {"onebot", "qq"}
+        ):
             is_owner = self.is_owner_id(message.platform, message.user_id)
             return _neutral_unlocked_caps(
                 tier="owner_bond" if is_owner else "disabled",
@@ -753,15 +1167,39 @@ class AffectionManager:
             )
         if self._is_known_bot(message.platform, message.user_id):
             return _neutral_unlocked_caps(tier="bot_bypass", tier_label="Bot 豁免")
-        is_owner = self.is_owner_id(message.platform, message.user_id)
-        uk = self._user_key(message.platform, message.user_id)
+
+        pid = (
+            await identity.resolve_person_id(
+                message.platform,
+                message.user_id,
+                message.sender_nickname,
+                create=True,
+                source="auto",
+            )
+            if identity is not None
+            else None
+        )
+        is_owner = (pid == "owner") or self.is_owner_id(message.platform, message.user_id)
+        uk = (
+            self._person_key(pid)
+            if pid is not None
+            else self._legacy_user_key(message.platform, message.user_id)
+        )
         cached = self._user_scores.get(uk)
         if cached is not None:
-            return capabilities_for_score(cached[0], is_owner=is_owner)
+            caps = capabilities_for_score(cached[0], is_owner=is_owner)
+            self._subject_multipliers[
+                self._subject(message.platform, message.user_id, message.bot_id)
+            ] = caps.budget_multiplier
+            return caps
         today = self._today_str()
         async with self.store.lock:
             record, _ = await self._load_user_unlocked(
-                message.platform, message.user_id, message.sender_nickname, today
+                message.platform,
+                message.user_id,
+                message.sender_nickname,
+                today,
+                person_id=pid,
             )
         return self._update_caches(
             message.platform,
@@ -769,6 +1207,8 @@ class AffectionManager:
             record["score"],
             is_owner=is_owner,
             bot_id=message.bot_id,
+            person_id=pid,
+            identity=identity,
         )
 
     def budget_multiplier_for_subject(self, subject: str) -> Decimal:
@@ -804,15 +1244,29 @@ class AffectionManager:
         return round(max(0.10, base - 0.15), 4)
 
     async def _maybe_mute_zero(
-        self, platform: str, user_id: str, nickname: str, moderation: Any = None
+        self,
+        platform: str,
+        user_id: str,
+        nickname: str,
+        moderation: Any = None,
+        *,
+        person_id: str | None = None,
     ) -> None:
-        if platform != "onebot" or self.is_owner_id(platform, user_id):
+        if person_id == "owner" or self.is_owner_id(platform, user_id):
             return
         mod = (
             moderation
             if moderation is not None
             else getattr(self.store.runtime, "moderation", None)
         )
+        identity = self._get_identity()
+        if identity is not None and person_id is not None:
+            await identity.set_person_muted(
+                person_id, True, moderation=mod, source="ai_affection_zero"
+            )
+            return
+        if platform != "onebot":
+            return
         if mod is None:
             return
         if hasattr(mod, "mute_by_affection"):
@@ -830,8 +1284,18 @@ class AffectionManager:
         reason: str = "chat",
     ) -> AffectionUpdate:
         await self.initialize()
+        identity = await self._ensure_identity_ready()
         platform, uid = message.platform, message.user_id
-        is_owner = self.is_owner_id(platform, uid)
+        pid = (
+            await identity.resolve_person_id(
+                platform, uid, message.sender_nickname, create=True, source="auto"
+            )
+            if identity is not None
+            and not self._is_known_bot(platform, uid)
+            and uid != self._bot_id(platform)
+            else None
+        )
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
         if (
             not self.config.enabled
             or self._is_known_bot(platform, uid)
@@ -867,7 +1331,7 @@ class AffectionManager:
         async with self._lock:
             async with self.store.transaction():
                 record, existed = await self._load_user_unlocked(
-                    platform, uid, message.sender_nickname, today
+                    platform, uid, message.sender_nickname, today, person_id=pid
                 )
                 prev_score = int(record["score"])
                 today_gain = int(record["today_positive_gain"])
@@ -918,14 +1382,22 @@ class AffectionManager:
                         last_delta=actual_delta if changed else record.get("last_delta", 0),
                         updated_at=now,
                     )
-                    await self._save_user_in_tx(platform, uid, record, bot_id=message.bot_id)
+                    await self._save_user_in_tx(
+                        platform, uid, record, bot_id=message.bot_id, person_id=pid
+                    )
                 caps = self._update_caches(
-                    platform, uid, new_score, is_owner=is_owner, bot_id=message.bot_id
+                    platform,
+                    uid,
+                    new_score,
+                    is_owner=is_owner,
+                    bot_id=message.bot_id,
+                    person_id=pid,
+                    identity=identity,
                 )
 
         blacklisted_now = (not is_owner) and prev_score > 0 and new_score == 0
         if blacklisted_now:
-            await self._maybe_mute_zero(platform, uid, record["nickname"])
+            await self._maybe_mute_zero(platform, uid, record["nickname"], person_id=pid)
         return AffectionUpdate(
             user_id=uid,
             platform=platform,
@@ -951,8 +1423,18 @@ class AffectionManager:
         if kind not in VIOLATION_DELTAS:
             raise Rejected("invalid_affection_violation")
         await self.initialize()
+        identity = await self._ensure_identity_ready()
         platform, uid = message.platform, message.user_id
-        is_owner = self.is_owner_id(platform, uid)
+        pid = (
+            await identity.resolve_person_id(
+                platform, uid, message.sender_nickname, create=True, source="auto"
+            )
+            if identity is not None
+            and not self._is_known_bot(platform, uid)
+            and uid != self._bot_id(platform)
+            else None
+        )
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
         if (
             not self.config.enabled
             or self._is_known_bot(platform, uid)
@@ -978,7 +1460,9 @@ class AffectionManager:
         now = float(self.clock())
         today = self._today_str(now)
         raw_delta = VIOLATION_DELTAS[kind]
-        user_key = self._user_key(platform, uid)
+        user_key = (
+            self._person_key(pid) if pid is not None else self._legacy_user_key(platform, uid)
+        )
         event_key = self.store.vault.digest("affection-violation", self.store.event_key(message))
         blacklisted_now = False
 
@@ -993,12 +1477,18 @@ class AffectionManager:
                     (event_key, self.scope, user_key, kind, raw_delta, now),
                 )
                 record, _ = await self._load_user_unlocked(
-                    platform, uid, message.sender_nickname, today
+                    platform, uid, message.sender_nickname, today, person_id=pid
                 )
                 prev_score = int(record["score"])
                 if cur.rowcount != 1:
                     caps = self._update_caches(
-                        platform, uid, prev_score, is_owner=is_owner, bot_id=message.bot_id
+                        platform,
+                        uid,
+                        prev_score,
+                        is_owner=is_owner,
+                        bot_id=message.bot_id,
+                        person_id=pid,
+                        identity=identity,
                     )
                     return AffectionUpdate(
                         user_id=uid,
@@ -1022,14 +1512,22 @@ class AffectionManager:
                     last_delta=actual_delta,
                     updated_at=now,
                 )
-                await self._save_user_in_tx(platform, uid, record, bot_id=message.bot_id)
+                await self._save_user_in_tx(
+                    platform, uid, record, bot_id=message.bot_id, person_id=pid
+                )
                 caps = self._update_caches(
-                    platform, uid, new_score, is_owner=is_owner, bot_id=message.bot_id
+                    platform,
+                    uid,
+                    new_score,
+                    is_owner=is_owner,
+                    bot_id=message.bot_id,
+                    person_id=pid,
+                    identity=identity,
                 )
 
         blacklisted_now = (not is_owner) and prev_score > 0 and new_score == 0
         if blacklisted_now:
-            await self._maybe_mute_zero(platform, uid, record["nickname"])
+            await self._maybe_mute_zero(platform, uid, record["nickname"], person_id=pid)
         return AffectionUpdate(
             user_id=uid,
             platform=platform,
@@ -1049,8 +1547,18 @@ class AffectionManager:
 
     async def record_annoyance(self, message: Message, reason: str = "spam") -> AffectionUpdate:
         await self.initialize()
+        identity = await self._ensure_identity_ready()
         platform, uid = message.platform, message.user_id
-        is_owner = self.is_owner_id(platform, uid)
+        pid = (
+            await identity.resolve_person_id(
+                platform, uid, message.sender_nickname, create=True, source="auto"
+            )
+            if identity is not None
+            and not self._is_known_bot(platform, uid)
+            and uid != self._bot_id(platform)
+            else None
+        )
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
         clean_reason = _sanitize_reason(reason, self.s, default="spam")
         if (
             not self.config.enabled
@@ -1076,13 +1584,15 @@ class AffectionManager:
 
         now = float(self.clock())
         today = self._today_str(now)
-        user_key = self._user_key(platform, uid)
+        user_key = (
+            self._person_key(pid) if pid is not None else self._legacy_user_key(platform, uid)
+        )
         blacklisted_now = False
 
         async with self._lock:
             async with self.store.transaction():
                 record, _ = await self._load_user_unlocked(
-                    platform, uid, message.sender_nickname, today
+                    platform, uid, message.sender_nickname, today, person_id=pid
                 )
                 prev_score = int(record["score"])
                 last_at = max(
@@ -1091,7 +1601,13 @@ class AffectionManager:
                 )
                 if now - last_at < ANNOYANCE_COOLDOWN_SECONDS:
                     caps = self._update_caches(
-                        platform, uid, prev_score, is_owner=is_owner, bot_id=message.bot_id
+                        platform,
+                        uid,
+                        prev_score,
+                        is_owner=is_owner,
+                        bot_id=message.bot_id,
+                        person_id=pid,
+                        identity=identity,
                     )
                     return AffectionUpdate(
                         user_id=uid,
@@ -1117,14 +1633,22 @@ class AffectionManager:
                     last_delta=actual_delta,
                     updated_at=now,
                 )
-                await self._save_user_in_tx(platform, uid, record, bot_id=message.bot_id)
+                await self._save_user_in_tx(
+                    platform, uid, record, bot_id=message.bot_id, person_id=pid
+                )
                 caps = self._update_caches(
-                    platform, uid, new_score, is_owner=is_owner, bot_id=message.bot_id
+                    platform,
+                    uid,
+                    new_score,
+                    is_owner=is_owner,
+                    bot_id=message.bot_id,
+                    person_id=pid,
+                    identity=identity,
                 )
 
         blacklisted_now = (not is_owner) and prev_score > 0 and new_score == 0
         if blacklisted_now:
-            await self._maybe_mute_zero(platform, uid, record["nickname"])
+            await self._maybe_mute_zero(platform, uid, record["nickname"], person_id=pid)
         return AffectionUpdate(
             user_id=uid,
             platform=platform,
@@ -1142,8 +1666,46 @@ class AffectionManager:
             today_positive_gain=int(record["today_positive_gain"]),
         )
 
+    async def on_unmute_person(self, person_id: str) -> None:
+        await self.initialize()
+        identity = await self._ensure_identity_ready()
+        if identity is None or person_id == "owner":
+            return
+        now = float(self.clock())
+        today = self._today_str(now)
+        user_key = self._person_key(person_id)
+        async with self._lock:
+            async with self.store.transaction():
+                row = await self.store.one(
+                    "SELECT payload FROM user_affection WHERE user_key=?", (user_key,)
+                )
+                if not row:
+                    return
+                opened = self.store.vault.open("affection:" + user_key, row["payload"])
+                if not isinstance(opened, dict):
+                    return
+                plat = str(opened.get("platform", "onebot"))
+                uid = str(opened.get("user_id", ""))
+                record = self._normalize_record(
+                    opened, plat, uid, "", today, is_owner=False, person_id=person_id
+                )
+                if record["score"] != 0:
+                    return
+                recovered = clamp_score(self.config.unmute_recovery_score, is_owner=False)
+                record.update(
+                    score=recovered,
+                    last_reason="unmute_recovery",
+                    last_delta=recovered,
+                    updated_at=now,
+                )
+                await self._save_user_in_tx(plat, uid, record, person_id=person_id)
+                self._update_caches(
+                    plat, uid, recovered, is_owner=False, person_id=person_id, identity=identity
+                )
+
     async def on_unmute(self, user_id: str, platform: str = "onebot") -> None:
         await self.initialize()
+        identity = await self._ensure_identity_ready()
         uid = str(user_id or "").strip()
         if not uid or self.is_owner_id(platform, uid) or self._is_known_bot(platform, uid):
             return
@@ -1151,9 +1713,16 @@ class AffectionManager:
             uid = _validate_platform_user(platform, uid)
         except Rejected:
             return
+        if identity is not None:
+            pid = await identity.resolve_person_id(platform, uid, create=False)
+            if pid is None:
+                return
+            await self.on_unmute_person(pid)
+            return
+
         now = float(self.clock())
         today = self._today_str(now)
-        user_key = self._user_key(platform, uid)
+        user_key = self._legacy_user_key(platform, uid)
         async with self._lock:
             async with self.store.transaction():
                 row = await self.store.one(
@@ -1188,12 +1757,19 @@ class AffectionManager:
         moderation: Any = None,
     ) -> dict[str, Any]:
         await self.initialize()
+        identity = await self._ensure_identity_ready()
         uid = _validate_platform_user(platform, user_id)
         if uid == self._bot_id(platform):
             raise Rejected("protected_identity")
         if isinstance(score, bool) or not isinstance(score, int):
             raise Rejected("invalid_affection_score")
-        is_owner = self.is_owner_id(platform, uid)
+
+        pid = (
+            await identity.resolve_person_id(platform, uid, nickname, create=True, source="auto")
+            if identity is not None
+            else None
+        )
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
         target_score = clamp_score(score, is_owner=is_owner)
         now = float(self.clock())
         today = self._today_str(now)
@@ -1201,7 +1777,9 @@ class AffectionManager:
 
         async with self._lock:
             async with self.store.transaction():
-                record, _ = await self._load_user_unlocked(platform, uid, nickname, today)
+                record, _ = await self._load_user_unlocked(
+                    platform, uid, nickname, today, person_id=pid
+                )
                 prev_score = int(record["score"])
                 record.update(
                     score=target_score,
@@ -1209,22 +1787,40 @@ class AffectionManager:
                     last_delta=target_score - prev_score,
                     updated_at=now,
                 )
-                await self._save_user_in_tx(platform, uid, record)
-                self._update_caches(platform, uid, target_score, is_owner=is_owner)
+                await self._save_user_in_tx(platform, uid, record, person_id=pid)
+                self._update_caches(
+                    platform,
+                    uid,
+                    target_score,
+                    is_owner=is_owner,
+                    person_id=pid,
+                    identity=identity,
+                )
 
         mod = (
             moderation
             if moderation is not None
             else getattr(self.store.runtime, "moderation", None)
         )
-        if not is_owner and platform == "onebot" and mod is not None:
-            if target_score == 0:
-                await self._maybe_mute_zero(platform, uid, record["nickname"], moderation=mod)
-            elif target_score > 0 and uid in set(self.s.muted_user_ids):
-                if hasattr(mod, "set_muted"):
-                    await mod.set_muted(uid, False)
+        if not is_owner:
+            if identity is not None and pid is not None:
+                if target_score == 0:
+                    await identity.set_person_muted(
+                        pid, True, moderation=mod, source="ai_affection_zero"
+                    )
+                elif target_score > 0 and (
+                    identity.is_muted(platform, uid)
+                    or (platform == "onebot" and uid in set(self.s.muted_user_ids))
+                ):
+                    await identity.set_person_muted(pid, False, moderation=mod)
+            elif platform == "onebot" and mod is not None:
+                if target_score == 0:
+                    await self._maybe_mute_zero(platform, uid, record["nickname"], moderation=mod)
+                elif target_score > 0 and uid in set(self.s.muted_user_ids):
+                    if hasattr(mod, "set_muted"):
+                        await mod.set_muted(uid, False)
 
-        return self._build_profile_dict(record)
+        return self._build_profile_dict(record, person_id=pid)
 
     async def delete_user_score(
         self,
@@ -1234,9 +1830,19 @@ class AffectionManager:
         moderation: Any = None,
     ) -> bool:
         await self.initialize()
+        identity = await self._ensure_identity_ready()
         uid = _validate_platform_user(platform, user_id)
-        user_key = self._user_key(platform, uid)
-        is_owner = self.is_owner_id(platform, uid)
+        pid = (
+            await identity.resolve_person_id(platform, uid, create=False)
+            if identity is not None
+            else None
+        )
+        if identity is not None and pid is None:
+            return False
+        user_key = (
+            self._person_key(pid) if pid is not None else self._legacy_user_key(platform, uid)
+        )
+        is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
 
         async with self._lock:
             async with self.store.transaction():
@@ -1246,22 +1852,162 @@ class AffectionManager:
                 )
                 deleted = cur.rowcount > 0
             self._annoyance_at.pop(user_key, None)
+            if pid is not None:
+                self._person_scores.pop(pid, None)
             if is_owner:
-                self._update_caches(platform, uid, 120, is_owner=True)
+                self._update_caches(
+                    platform,
+                    uid,
+                    120,
+                    is_owner=True,
+                    person_id=pid,
+                    identity=identity,
+                )
             else:
                 self._user_scores.pop(user_key, None)
-                self._subject_multipliers.pop(self._subject(platform, uid), None)
+                if pid is not None and identity is not None:
+                    for plat, acc_uid in identity.linked_accounts_cached(pid):
+                        self._subject_multipliers.pop(self._subject(plat, acc_uid), None)
+                else:
+                    self._subject_multipliers.pop(self._subject(platform, uid), None)
 
         mod = (
             moderation
             if moderation is not None
             else getattr(self.store.runtime, "moderation", None)
         )
-        if not is_owner and platform == "onebot" and mod is not None:
-            is_aff_muted = getattr(mod, "is_affection_muted", None)
-            if callable(is_aff_muted) and await is_aff_muted(uid):
-                await mod.set_muted(uid, False)
+        if not is_owner:
+            if identity is not None and pid is not None:
+                aff_muted = False
+                if mod is not None and callable(getattr(mod, "is_affection_muted", None)):
+                    for plat, acc_uid in identity.linked_accounts_cached(pid):
+                        if plat == "onebot" and await mod.is_affection_muted(acc_uid):
+                            aff_muted = True
+                            break
+                if not aff_muted and hasattr(identity, "person_mute_source"):
+                    aff_muted = (await identity.person_mute_source(pid)) == "ai_affection_zero"
+                if aff_muted:
+                    await identity.set_person_muted(pid, False, moderation=mod)
+            elif platform == "onebot" and mod is not None:
+                is_aff_muted = getattr(mod, "is_affection_muted", None)
+                if callable(is_aff_muted) and await is_aff_muted(uid):
+                    await mod.set_muted(uid, False)
         return deleted
+
+    async def merge_person_scores(
+        self,
+        source_person_id: str,
+        target_person_id: str,
+        *,
+        force_zero: bool = False,
+    ) -> int:
+        await self.initialize()
+        identity = self._get_identity()
+        is_owner = target_person_id == "owner"
+        src_key = self._person_key(source_person_id)
+        dst_key = self._person_key(target_person_id)
+        now = float(self.clock())
+        today = self._today_str(now)
+        merged_score: int | None = None
+
+        async with self._lock:
+            async with self.store.transaction():
+                src_row = await self.store.one(
+                    "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+                    (src_key, self.scope),
+                )
+                dst_row = await self.store.one(
+                    "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+                    (dst_key, self.scope),
+                )
+                src_data = (
+                    self.store.vault.open("affection:" + src_key, src_row["payload"])
+                    if src_row
+                    else None
+                )
+                dst_data = (
+                    self.store.vault.open("affection:" + dst_key, dst_row["payload"])
+                    if dst_row
+                    else None
+                )
+                existing = [d for d in (dst_data, src_data) if isinstance(d, dict) and "score" in d]
+
+                if is_owner:
+                    raw_scores = [clamp_score(int(d["score"]), is_owner=True) for d in existing]
+                    merged_score = clamp_score(
+                        max(raw_scores) if raw_scores else 120, is_owner=True
+                    )
+                elif force_zero:
+                    merged_score = 0
+                elif existing:
+                    raw_scores = [clamp_score(int(d["score"]), is_owner=False) for d in existing]
+                    merged_score = clamp_score(min(raw_scores), is_owner=False)
+
+                if merged_score is not None:
+                    base = (
+                        dst_data
+                        if isinstance(dst_data, dict)
+                        else (src_data if isinstance(src_data, dict) else {})
+                    )
+                    rep_plat = str(base.get("platform", ""))
+                    rep_uid = str(base.get("user_id", ""))
+                    if (not rep_plat or not rep_uid) and identity is not None:
+                        linked = identity.linked_accounts_cached(target_person_id)
+                        if linked:
+                            rep_plat, rep_uid = linked[0]
+                    if not rep_plat:
+                        rep_plat = "onebot"
+                    if not rep_uid:
+                        rep_uid = "0"
+                    record = self._normalize_record(
+                        {
+                            **base,
+                            "score": merged_score,
+                            "last_reason": (
+                                "merged_blacklist"
+                                if force_zero
+                                else str(base.get("last_reason", "merged"))
+                            ),
+                            "updated_at": now,
+                        },
+                        rep_plat,
+                        rep_uid,
+                        "",
+                        today,
+                        is_owner=is_owner,
+                        person_id=target_person_id,
+                    )
+                    await self._save_user_in_tx(
+                        rep_plat, rep_uid, record, person_id=target_person_id
+                    )
+                    self._update_caches(
+                        rep_plat,
+                        rep_uid,
+                        merged_score,
+                        is_owner=is_owner,
+                        person_id=target_person_id,
+                        identity=identity,
+                    )
+
+                if src_row:
+                    await self.store.db.execute(
+                        "DELETE FROM user_affection WHERE user_key=? AND scope=?",
+                        (src_key, self.scope),
+                    )
+                await self.store.db.execute(
+                    "UPDATE affection_events SET user_key=? WHERE scope=? AND user_key=?",
+                    (dst_key, self.scope, src_key),
+                )
+
+            self._user_scores.pop(src_key, None)
+            self._person_scores.pop(source_person_id, None)
+            self._annoyance_at.pop(src_key, None)
+
+        return (
+            merged_score
+            if merged_score is not None
+            else (120 if is_owner else self.config.initial_score)
+        )
 
     async def set_config(self, value: AffectionConfig | None) -> dict[str, Any]:
         await self.initialize()
@@ -1284,6 +2030,7 @@ class AffectionManager:
 
     async def list_users(self) -> list[dict[str, Any]]:
         await self.initialize()
+        await self._ensure_identity_ready()
         today = self._today_str()
         async with self.store.lock:
             rows = await self.store.all(
@@ -1298,10 +2045,14 @@ class AffectionManager:
                 continue
             platform = str(opened.get("platform", "onebot"))
             uid = str(opened.get("user_id", ""))
+            pid = str(opened["person_id"]) if opened.get("person_id") else None
             if not uid:
                 continue
-            record = self._normalize_record(opened, platform, uid, "", today)
-            items.append(self._build_profile_dict(record))
+            is_owner = (pid == "owner") or self.is_owner_id(platform, uid)
+            record = self._normalize_record(
+                opened, platform, uid, "", today, is_owner=is_owner, person_id=pid
+            )
+            items.append(self._build_profile_dict(record, person_id=pid))
         return items
 
     async def status(self) -> dict[str, Any]:

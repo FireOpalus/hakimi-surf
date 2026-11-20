@@ -1219,6 +1219,18 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 .scene-fields select { width: 100%; margin: 0; }
 .rhythm-preview { border-left: 3px solid var(--accent); padding-left: 10px; }
 @media (max-width: 600px) { .model-choice { grid-template-columns: 1fr; gap: 0; } }
+.stack-cards { display: grid; gap: 14px; margin-top: 12px; }
+.sub-card { border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: var(--card-2); min-width: 0; }
+.sub-card-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
+.sub-card-head h3 { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
+.scope-checks { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 4px 0 2px; }
+.scope-checks label { display: inline-flex; align-items: center; gap: 5px; margin: 0; color: var(--ink); font-size: 12px; cursor: pointer; }
+.token-banner { border: 1px solid var(--warn-line); border-left: 4px solid var(--warn); border-radius: 12px; padding: 14px 16px; background: var(--warn-bg); margin: 14px 0 0; }
+.token-banner-title { margin: 0 0 4px; font-weight: 700; color: var(--warn); font-size: 13px; }
+.token-secret-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 8px; }
+.token-secret { display: inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); font-family: var(--mono); font-size: 12px; word-break: break-all; user-select: all; }
+.inline-edit-form { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line); }
+.inline-edit-form textarea { min-height: 62px; }
 </style>
 </head>
 <body>
@@ -1318,6 +1330,8 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-event-ledger" type="button" role="tab" data-tab="event-ledger" data-description="查看并管理各模块、私聊约定与规划器写入的跨日待办事件。" aria-controls="event-ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h5 M3 8h2 M3 12h2 M3 16h2"/></svg><span>跨日待办账本</span></button>
         <button id="nav-voice-companion" type="button" role="tab" data-tab="voice-companion" data-description="管理实时语音伴随中枢状态、口播风格与陪玩会话记录（可联动屏幕伴看）。" aria-controls="voice-companion" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z M19 10v1a7 7 0 0 1-14 0v-1 M12 18v3 M8 21h8"/></svg><span>语音伴随</span></button>
         <button id="nav-screen-watch" type="button" role="tab" data-tab="screen-watch" data-description="管理 Owner 私有看屏连接、内存短 TTL 画面缓存、隐私开关与主动吐槽策略。" aria-controls="screen-watch" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v12H3z M8 21h8 M12 17v4 M9 11l3-3 3 3"/></svg><span>屏幕伴看</span></button>
+        <button id="nav-identity-center" type="button" role="tab" data-tab="identity-center" data-description="管理跨平台统一身份档案（Person）、Owner 认证、账号绑定合并、L2 画像标签与跨平台屏蔽。" aria-controls="identity-center" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M17 11l2 2 4-4"/></svg><span>统一身份与绑定</span></button>
+        <button id="nav-plugin-bus" type="button" role="tab" data-tab="plugin-bus" data-description="签发与管理远程模块插件凭据、Scope 权限、WebSocket 会话状态与令牌轮换。" aria-controls="plugin-bus" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5 M9 8V2 M15 8V2 M18 8v5a6 6 0 0 1-12 0V8z"/></svg><span>远程插件总线</span></button>
       </div>
     </nav>
     <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
@@ -2286,6 +2300,109 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   </div>
 </section>
 
+<section id="identity-center" class="tab" role="tabpanel" aria-labelledby="nav-identity-center" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>统一身份与绑定中枢（Identity Center）</h2>
+      <button id="refresh-identity" class="secondary" type="button">刷新档案</button>
+    </div>
+    <p class="muted">将跨平台账号（QQ / OneBot / 远程插件平台等）归并至统一自然人身份（Person），共享 L1 好感度、L2 轻量画像标签（上限 8 条）与全平台小黑屋屏蔽；Owner 身份受系统强保护且跨端私聊保留 12 小时内脱敏近期摘要。</p>
+    <div id="identity-kpis" class="kpi-strip"></div>
+    <p id="identity-state" class="muted" aria-live="polite"></p>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <h2>绑定外部账号</h2>
+      <p class="muted">将指定平台的账号手工关联至现有身份（若该账号原属其他独立档案，请先确认归属或改用合并操作）。</p>
+      <form id="id-link-form">
+        <datalist id="id-person-options"></datalist>
+        <datalist id="id-platform-options">
+          <option value="onebot"></option>
+          <option value="qq"></option>
+          <option value="discord"></option>
+          <option value="oopz"></option>
+          <option value="telegram"></option>
+        </datalist>
+        <label for="id-link-person">目标身份 person_id<input id="id-link-person" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入 owner / p_..."></label>
+        <div class="grid">
+          <label for="id-link-platform">平台 platform<input id="id-link-platform" list="id-platform-options" type="text" maxlength="48" required placeholder="onebot / qq / discord"></label>
+          <label for="id-link-uid">账号 user_id<input id="id-link-uid" type="text" maxlength="128" required placeholder="平台用户 ID"></label>
+        </div>
+        <label for="id-link-nickname">账号昵称（可选）<input id="id-link-nickname" type="text" maxlength="80" placeholder="用于后台展示的昵称"></label>
+        <div class="row">
+          <button id="id-link-submit" type="submit" disabled>绑定账号</button>
+        </div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>合并身份档案</h2>
+      <p class="muted">将源身份的所有账号与画像并入目标身份（管理员可合并至 Owner）。防小号规则：任一方被屏蔽或好感归零时，合并结果将强制全平台屏蔽并归零；否则取两方最低好感，L2 标签去重后最多保留 8 个。</p>
+      <form id="id-merge-form">
+        <label for="id-merge-source">源身份 source_person_id（将被并入并移除）<input id="id-merge-source" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入源 person_id"></label>
+        <label for="id-merge-target">目标身份 target_person_id（保留）<input id="id-merge-target" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入目标 person_id"></label>
+        <div class="row">
+          <button id="id-merge-submit" type="submit" class="danger" disabled>合并身份</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="card">
+    <h2>统一身份档案列表</h2>
+    <div class="row between">
+      <label for="identity-search" class="aff-search-label">筛选身份、账号或标签<input id="identity-search" class="aff-search-input" type="search" maxlength="120" placeholder="输入 person_id、显示名称、标签、平台或 user_id"></label>
+    </div>
+    <div id="identity-persons-list" class="stack-cards"></div>
+  </div>
+</section>
+
+<section id="plugin-bus" class="tab" role="tabpanel" aria-labelledby="nav-plugin-bus" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>远程插件总线（Remote Plugin Bus）</h2>
+      <button id="refresh-plugin-bus" class="secondary" type="button">刷新总线</button>
+    </div>
+    <p class="muted">通过独立签发的高熵令牌与最小权限 Scope 接入远程能力插件（/ws/plugin）；会话断开或吊销时经 PluginKernel 严格按 LIFO 逆序自动卸载其注册动作、思考场景与聊天平台。</p>
+    <div id="pb-pills" class="pill-row"></div>
+    <p id="pb-state" class="muted" aria-live="polite"></p>
+    <div id="pb-token-banner" class="token-banner" role="region" aria-label="一次性插件令牌" hidden>
+      <p class="token-banner-title">此 Token 仅展示一次，请立即保存</p>
+      <p id="pb-token-meta" class="muted"></p>
+      <div class="token-secret-row">
+        <code id="pb-token-value" class="token-secret"></code>
+        <button id="pb-token-copy" type="button">复制 Token</button>
+        <button id="pb-token-dismiss" type="button" class="secondary">我已保存，关闭</button>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>签发远程插件凭据</h2>
+    <form id="pb-create-form">
+      <div class="grid">
+        <label for="pb-create-id">插件 ID（plugin_id）<input id="pb-create-id" type="text" maxlength="48" pattern="^[a-z][a-z0-9_]{1,47}$" required placeholder="如 discord_bridge（小写字母开头，2–48位）"></label>
+        <label for="pb-create-name">显示名称（display_name）<input id="pb-create-name" type="text" maxlength="64" required placeholder="如 Discord 语音与频道桥"></label>
+        <label for="pb-create-region">节点区域（node_region）
+          <select id="pb-create-region">
+            <option value="KR">KR · 境外节点</option>
+            <option value="CN">CN · 境内节点</option>
+          </select>
+        </label>
+      </div>
+      <fieldset class="panel-group">
+        <legend>授权权限范围（Scopes）</legend>
+        <div id="pb-create-scopes" class="scope-checks"></div>
+      </fieldset>
+      <div class="row">
+        <button id="pb-create-submit" type="submit" disabled>签发插件凭据</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>已注册远程插件</h2>
+    <p class="muted">支持在线启停、修改展示名/区域/Scope、轮换密钥、主动断开当前 WebSocket 会话以及吊销凭据；轮换、禁用或收窄权限会自动触发在途连接清理。</p>
+    <div id="pb-plugins-list" class="stack-cards"></div>
+  </div>
+</section>
+
 <section id="logs" class="tab" role="tabpanel" aria-labelledby="nav-logs" hidden>
   <div class="card"><div class="row between"><h2>最近 50 条脱敏事件</h2><button id="refresh-logs" class="secondary">刷新</button></div>
     <p class="muted">模型异常可展开查看调用阶段、通道、耗时和上游错误码。页面每 15 秒更新。</p>
@@ -2325,6 +2442,8 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 'use strict';
 (()=>{
 let token='',tab='overview',session=null,timer=null;
+let identityState=null,pluginBusState=null,currentPluginToken='',currentPluginTokenId='';
+const DEFAULT_PLUGIN_SCOPES=['actions','sensors','thinking_scenes','chat','media','owner_notify'];
 let sessionRequests=new AbortController();
 let displayZone='Asia/Shanghai';
 const zoneLabel=zone=>zone==='Asia/Shanghai'?'北京时间':zone;
@@ -2346,7 +2465,7 @@ async function api(path,method='GET',data){
   if(signal.aborted)throw new DOMException('请求已取消','AbortError');
   if(!r.ok){
     if(r.status===401||r.status===403)logout();
-    const hints={module_disabled:'模块已关闭，可在模块详情中开启。',weather_location_missing:'请先保存观测地点。',weather_unavailable:'天气服务暂时不可用，请稍后再查。',weather_stale:'天气数据已过期，请稍后再查。',weather_location_changed:'地点已更改，请重新查询。',weather_city_lookup_unavailable:'城市查询暂时不可用，可重试或输入经纬度。',weather_ip_lookup_unavailable:'暂时无法识别服务器地点，可重试或搜索城市。',module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。'};
+    const hints={module_disabled:'模块已关闭，可在模块详情中开启。',weather_location_missing:'请先保存观测地点。',weather_unavailable:'天气服务暂时不可用，请稍后再查。',weather_stale:'天气数据已过期，请稍后再查。',weather_location_changed:'地点已更改，请重新查询。',weather_city_lookup_unavailable:'城市查询暂时不可用，可重试或输入经纬度。',weather_ip_lookup_unavailable:'暂时无法识别服务器地点，可重试或搜索城市。',module_sensor_unavailable:'暂时无法读取传感器，可稍后重试。',module_not_registered:'模块当前未注册，请刷新目录。',authentication_required:'管理口令无效，请重新输入。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',admin_disabled:'管理入口已关闭。',protected_identity:'受保护的身份或唯一 Owner 账号不允许此操作。',person_not_found:'未找到对应的统一身份档案。',account_not_found:'未找到对应的平台账号。',identity_unavailable:'统一身份服务暂未就绪。'};
     throw Error(hints[value.detail]||value.detail||('HTTP '+r.status));
   }
   return value;
@@ -2389,6 +2508,8 @@ function logout(){
   gcpBillingState=null;
   accountBalanceState=null;
   affectionState=null;
+  identityState=null;
+  pluginBusState=null;
   resetWorkspaces();
   text('life-node-status','');
   text('life-mc-status','');
@@ -2398,7 +2519,7 @@ function logout(){
   $('overview-gcp-strip').replaceChildren();
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
-  for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=true;
+  for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','id-link-submit','id-merge-submit','pb-create-submit'])$(id).disabled=true;
   $('world-observation-card').hidden=true;
   ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','life-stats','life-changes','life-batteries','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
@@ -2413,7 +2534,8 @@ function logout(){
   if(timer)clearInterval(timer);
   $('session-dialog').close();session=null;
   $('token').focus();
-  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search','life-mc-topic'].forEach(id=>{$(id).value='';});
+  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-set-uid','aff-set-nickname','aff-search','life-mc-topic','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
+  $('pb-create-region').value='KR';
   $('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
   ['memory-entries','decision-audit','token-ledger','work-ledger','provider-ledger','cost-ledger','budget-periods','model-ledger','thinking-ledger','effective-cache','prov-sessions-table','gcp-credits-table','gcp-mon-compare-table','gcp-mon-models-table'].forEach(id=>$(id).replaceChildren());
@@ -3623,6 +3745,410 @@ $('sw-reset').addEventListener('click',e=>busy(e.target,async()=>{
   const next=await api('life/screen-watch','DELETE');
   renderScreenWatch(next);notice('已恢复屏幕伴看默认配置');
 }));
+
+const idAccSourceLabels={auto:'自动建档',admin:'后台手工绑定',bind_code:'/bind 验证码',owner_config:'Owner 配置'};
+function isSoleOwnerAccount(person,account){
+  if(!person.is_owner)return false;
+  const accounts=person.accounts||[];
+  if(accounts.length<=1)return true;
+  if(account.source==='owner_config'){
+    return accounts.filter(a=>a.source==='owner_config').length<=1;
+  }
+  return false;
+}
+function formatPersonLv(p){
+  const parts=[];
+  if(p.lv!==undefined&&p.lv!==null&&p.lv!==''){
+    const raw=String(p.lv);
+    parts.push(raw.startsWith('Lv')?raw:('Lv.'+raw));
+  }
+  if(p.tier_label)parts.push(String(p.tier_label));
+  if(p.score!==undefined&&p.score!==null&&p.score!=='')parts.push(String(p.score)+' 分');
+  return parts.join(' · ');
+}
+function renderIdentityPersonsList(){
+  const host=$('identity-persons-list');
+  const persons=identityState?.persons||[];
+  const q=($('identity-search').value||'').trim().toLowerCase();
+  const filtered=q?persons.filter(p=>{
+    const hay=[
+      p.person_id,p.display_name,p.tier_label,
+      ...(p.l2_tags||[]),
+      ...((p.accounts||[]).flatMap(a=>[a.platform,a.user_id,a.nickname,a.source]))
+    ].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
+  }):persons;
+  if(!filtered.length){
+    host.replaceChildren(el('p',persons.length?'没有匹配的身份档案，请调整筛选条件。':'暂无统一身份档案。','empty-state'));
+    return;
+  }
+  host.replaceChildren(...filtered.map(p=>{
+    const card=el('article',undefined,'sub-card');
+    const head=el('div',undefined,'sub-card-head');
+    const titleRow=el('div',undefined,'row');
+    titleRow.append(el('h3',p.display_name||p.person_id),el('code',p.person_id,'code-mono'));
+    const pills=el('div',undefined,'row');
+    if(p.is_owner)pills.append(pill('Owner · 受保护','paid'));
+    else if(p.muted)pills.append(pill('小黑屋屏蔽中','err'));
+    else pills.append(pill('正常互动','ok'));
+    const lvDesc=formatPersonLv(p);
+    if(lvDesc)pills.append(pill(lvDesc,p.is_owner?'paid':p.muted?'err':'vertex'));
+    pills.append(pill('更新 '+dateTime(p.updated_at),'muted'));
+    head.append(titleRow,pills);
+    card.append(head);
+
+    const tags=(p.l2_tags||[]).filter(Boolean);
+    const tagRow=el('div',undefined,'pill-row');
+    if(tags.length){
+      tagRow.append(el('small','L2 标签：','muted'),...tags.map(t=>pill(t,'muted')));
+    }else{
+      tagRow.append(el('small','L2 标签：暂无','muted'));
+    }
+    card.append(tagRow);
+
+    const accWrap=el('div',undefined,'table');
+    const accList=p.accounts||[];
+    table(accWrap,['平台','账号 ID','昵称','来源','绑定时间','操作'],accList.map(acc=>{
+      const plat=acc.platform||'—';
+      const platPill=pill(plat,plat==='qq'?'vertex':plat==='onebot'?'paid':'muted');
+      const srcPill=pill(idAccSourceLabels[acc.source]||acc.source||'—',acc.source==='owner_config'?'paid':'muted');
+      const op=isSoleOwnerAccount(p,acc)?pill('唯一 Owner 账号','paid'):button('解绑',async()=>{
+        if(!confirm('确认解绑 '+plat+':'+acc.user_id+'？解绑后该账号将拆分为独立 Person 档案。'))return;
+        const next=await api('identity/unlink','POST',{platform:plat,user_id:acc.user_id});
+        await applyIdentityResponse(next);
+        notice('已解绑 '+plat+':'+acc.user_id);
+      },'secondary');
+      return[platPill,el('span',acc.user_id||'—','code-mono'),acc.nickname||'—',srcPill,dateTime(acc.linked_at),op];
+    }));
+    card.append(accWrap);
+
+    const form=el('form',undefined,'inline-edit-form');
+    const grid=el('div',undefined,'grid');
+    const nameLabel=el('label','显示名称（display_name）');
+    const nameInput=el('input');nameInput.type='text';nameInput.maxLength=64;
+    nameInput.value=p.display_name||'';nameInput.placeholder='用于后台展示的名称';
+    nameLabel.append(nameInput);
+
+    const tagsLabel=el('label','L2 画像标签（逗号或换行分隔，最多 8 个）');
+    const tagsInput=el('textarea');tagsInput.rows=2;tagsInput.maxLength=400;
+    tagsInput.value=tags.join(', ');tagsInput.placeholder='例如：喜欢猫猫, 深夜党（最多 8 条，单条 ≤ 32 字）';
+    tagsLabel.append(tagsInput);
+    grid.append(nameLabel,tagsLabel);
+    form.append(grid);
+
+    const footerRow=el('div',undefined,'row');
+    const mutedInput=el('input');mutedInput.type='checkbox';mutedInput.checked=Boolean(p.muted);
+    if(p.is_owner){
+      mutedInput.disabled=true;
+    }else{
+      const muteLabel=el('label');
+      muteLabel.append(mutedInput,' 跨平台小黑屋屏蔽（muted）');
+      footerRow.append(muteLabel);
+    }
+    const saveBtn=el('button','保存档案');saveBtn.type='submit';
+    footerRow.append(saveBtn);
+    form.append(footerRow);
+
+    form.addEventListener('submit',e=>{
+      e.preventDefault();
+      busy(saveBtn,async()=>{
+        const rawTags=tagsInput.value.trim();
+        const parsed=rawTags?rawTags.split(/[\n,，]+/).map(s=>s.trim()).filter(Boolean):[];
+        const deduped=[...new Set(parsed)];
+        if(deduped.length>8)throw Error('L2 标签最多 8 个（当前 '+deduped.length+' 个）');
+        for(const item of deduped){
+          if(item.length>32)throw Error('单个 L2 标签不能超过 32 个字符');
+        }
+        const trimmedName=nameInput.value.trim();
+        if(!trimmedName&&p.display_name)throw Error('显示名称不能为空');
+        const payload={l2_tags:deduped};
+        if(trimmedName)payload.display_name=trimmedName;
+        if(!p.is_owner)payload.muted=mutedInput.checked;
+        const next=await api('identity/persons/'+encodeURIComponent(p.person_id),'PUT',payload);
+        await applyIdentityResponse(next);
+        notice('已更新身份档案：'+(payload.display_name||p.person_id));
+      });
+    });
+    card.append(form);
+    return card;
+  }));
+}
+function renderIdentityCenter(d){
+  if(!d||!Array.isArray(d.persons))return;
+  identityState=d;
+  const persons=d.persons;
+  const totalAccounts=persons.reduce((sum,p)=>sum+((p.accounts||[]).length),0);
+  const mutedCount=persons.filter(p=>p.muted).length;
+  const recapCount=Number(d.owner_recap_count??0);
+  const bindCount=Number(d.pending_bind_codes??0);
+  $('identity-kpis').replaceChildren(
+    kpiCard('统一身份总数',String(persons.length),'已绑定账号 '+totalAccounts+' 个'+(mutedCount?' · 已屏蔽 '+mutedCount+' 人':''),'accent'),
+    kpiCard('Owner 跨端摘要缓存',String(recapCount),'RAM 环形缓存（12h TTL，上限 6 条）',recapCount>0?'ok':''),
+    kpiCard('活跃 /bind 绑定码',String(bindCount),'一次性 8 位验证码（300s TTL）',bindCount>0?'warn':'')
+  );
+  text('identity-state','共 '+persons.length+' 个统一身份 · '+totalAccounts+' 个关联账号 · Owner 跨端近期摘要 '+recapCount+' 条 · 待兑换 /bind 码 '+bindCount+' 个');
+  $('id-person-options').replaceChildren(...persons.map(p=>{
+    const opt=el('option');opt.value=p.person_id;
+    opt.label=(p.display_name||p.person_id)+(p.is_owner?' [Owner]':'')+' ('+(p.accounts||[]).length+' 账号)';
+    return opt;
+  }));
+  const seenPlatforms=new Set(['onebot','qq','discord','oopz','telegram']);
+  for(const p of persons)for(const a of (p.accounts||[]))if(a.platform)seenPlatforms.add(a.platform);
+  $('id-platform-options').replaceChildren(...[...seenPlatforms].map(plat=>{
+    const opt=el('option');opt.value=plat;return opt;
+  }));
+  for(const id of ['id-link-submit','id-merge-submit'])$(id).disabled=false;
+  renderIdentityPersonsList();
+}
+async function applyIdentityResponse(next){
+  if(next&&Array.isArray(next.persons))renderIdentityCenter(next);
+  else await identityCenter();
+}
+async function identityCenter(){
+  const d=await api('identity/persons');
+  if(!token)return;
+  renderIdentityCenter(d);
+}
+$('refresh-identity').addEventListener('click',e=>busy(e.target,identityCenter));
+$('identity-search').addEventListener('input',()=>{if(identityState)renderIdentityPersonsList();});
+$('id-link-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('id-link-submit'),async()=>{
+    const personId=$('id-link-person').value.trim();
+    const platform=$('id-link-platform').value.trim().toLowerCase();
+    const userId=$('id-link-uid').value.trim();
+    const nickname=$('id-link-nickname').value.trim();
+    if(!personId)throw Error('请填写目标 person_id');
+    if(!/^[a-z][a-z0-9_]{0,47}$/.test(platform))throw Error('平台标识须以小写字母开头，仅含小写字母、数字和下划线');
+    if(!userId)throw Error('请填写账号 user_id');
+    const next=await api('identity/link','POST',{person_id:personId,platform,user_id:userId,nickname});
+    $('id-link-uid').value='';$('id-link-nickname').value='';
+    await applyIdentityResponse(next);
+    notice('已将 '+platform+':'+userId+' 绑定到 '+personId);
+  });
+});
+$('id-merge-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('id-merge-submit'),async()=>{
+    const src=$('id-merge-source').value.trim();
+    const dst=$('id-merge-target').value.trim();
+    if(!src||!dst)throw Error('请选择源身份与目标身份');
+    if(src===dst)throw Error('源身份与目标身份不能相同');
+    if(!confirm('确认将 '+src+' 合并至 '+dst+'？源身份的账号将全部转入目标身份，若任一方存在屏蔽或好感为 0 则合并后强制全平台屏蔽并归零。'))return;
+    const next=await api('identity/merge','POST',{source_person_id:src,target_person_id:dst});
+    $('id-merge-source').value='';$('id-merge-target').value='';
+    await applyIdentityResponse(next);
+    notice('已将 '+src+' 合并至 '+dst);
+  });
+});
+
+const PLUGIN_SCOPE_LABELS={
+  actions:'actions · 动作注册与执行',
+  sensors:'sensors · 传感器与世界事件',
+  thinking_scenes:'thinking_scenes · 思考场景与生成',
+  chat:'chat · 聊天平台收发',
+  media:'media · 媒体资源能力',
+  owner_notify:'owner_notify · Owner 主动提醒'
+};
+function clearPluginTokenBanner(){
+  currentPluginToken='';
+  currentPluginTokenId='';
+  text('pb-token-meta','');
+  text('pb-token-value','');
+  $('pb-token-banner').hidden=true;
+}
+function showPluginTokenBanner(res,fallbackId=''){
+  if(!res||!res.token)return;
+  currentPluginToken=String(res.token);
+  currentPluginTokenId=String(res.plugin_id||fallbackId||'');
+  text('pb-token-meta','插件 ID：'+(currentPluginTokenId||'—')+(res.ws_path?' · WS 路径：'+res.ws_path:''));
+  text('pb-token-value',currentPluginToken);
+  $('pb-token-banner').hidden=false;
+}
+function renderScopeCheckboxes(container,catalog,selected){
+  const list=Array.isArray(catalog)&&catalog.length?catalog:DEFAULT_PLUGIN_SCOPES;
+  const chosen=new Set(selected||[]);
+  container.replaceChildren(...list.map(scope=>{
+    const label=el('label');
+    const cb=el('input');cb.type='checkbox';cb.value=scope;cb.checked=chosen.has(scope);
+    label.append(cb,el('span',PLUGIN_SCOPE_LABELS[scope]||scope));
+    return label;
+  }));
+}
+renderScopeCheckboxes($('pb-create-scopes'),DEFAULT_PLUGIN_SCOPES,[]);
+function renderPluginBus(d){
+  if(!d)return;
+  pluginBusState=d;
+  const catalog=Array.isArray(d.allowed_scopes_catalog)&&d.allowed_scopes_catalog.length?d.allowed_scopes_catalog:DEFAULT_PLUGIN_SCOPES;
+  const plugins=Array.isArray(d.plugins)?d.plugins:[];
+  const connectedCount=plugins.filter(p=>p.online).length;
+  $('pb-pills').replaceChildren(
+    d.ws_enabled?pill('WS 总线已启用','ok'):pill('WS 总线未启用','warn'),
+    pill('接入路径 '+(d.ws_path||'/ws/plugin'),'paid'),
+    pill('在线 '+connectedCount+' / 已签发 '+plugins.length,connectedCount>0?'ok':'muted')
+  );
+  text('pb-state','WS 路径：'+(d.ws_path||'/ws/plugin')+' · 已注册插件 '+plugins.length+' 个（在线 '+connectedCount+' 个）· 可选权限 '+catalog.join(', '));
+  const createChecked=[...$('pb-create-scopes').querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);
+  renderScopeCheckboxes($('pb-create-scopes'),catalog,createChecked);
+  $('pb-create-submit').disabled=false;
+
+  const host=$('pb-plugins-list');
+  if(!plugins.length){
+    host.replaceChildren(el('p','暂未签发远程插件凭据，可在上方表单创建。','empty-state'));
+    return;
+  }
+  host.replaceChildren(...plugins.map(p=>{
+    const card=el('article',undefined,'sub-card');
+    const head=el('div',undefined,'sub-card-head');
+    const titleRow=el('div',undefined,'row');
+    titleRow.append(el('h3',p.display_name||p.plugin_id),el('code',p.plugin_id,'code-mono'));
+    const pills=el('div',undefined,'row');
+    pills.append(
+      p.online?pill('在线','ok'):pill('离线','muted'),
+      p.enabled?pill('凭据已启用','paid'):pill('凭据已禁用','err'),
+      pill(regionName(p.node_region||'KR'),p.node_region==='CN'?'vertex':'muted')
+    );
+    head.append(titleRow,pills);
+    card.append(head);
+
+    const chatPlats=(p.chat_platforms||[]).filter(Boolean);
+    const scenes=(p.thinking_scenes||[]).map(s=>typeof s==='string'?s:(s?.scene||s?.name||String(s))).filter(Boolean);
+    const metaParts=[
+      '来源 IP：'+(p.remote_ip||'—'),
+      '建连：'+dateTime(p.connected_at),
+      '最近活跃：'+dateTime(p.last_seen_at),
+      '动作数：'+(p.actions_count??0)
+    ];
+    if(chatPlats.length)metaParts.push('聊天平台：'+chatPlats.join(', '));
+    if(scenes.length)metaParts.push('思考场景：'+scenes.join(', '));
+    card.append(el('p',metaParts.join(' · '),'muted'));
+
+    const scopeRow=el('div',undefined,'pill-row');
+    const scopes=Array.isArray(p.scopes)?p.scopes:[];
+    if(scopes.length)scopeRow.append(el('small','已授权 Scope：','muted'),...scopes.map(s=>pill(s,'paid')));
+    else scopeRow.append(el('small','已授权 Scope：无（仅心跳）','muted'));
+    card.append(scopeRow);
+
+    const opRow=el('div',undefined,'row');
+    const toggleBtn=button(p.enabled?'禁用凭据':'启用凭据',async()=>{
+      const next=await api('plugins/'+encodeURIComponent(p.plugin_id),'PUT',{enabled:!p.enabled});
+      await applyPluginBusResponse(next);
+      notice((p.enabled?'已禁用插件 ':'已启用插件 ')+p.plugin_id);
+    },'secondary');
+    const rotateBtn=button('轮换 Token',async()=>{
+      if(!confirm('确认轮换 '+p.plugin_id+' 的连接 Token？旧 Token 将立即失效，当前在线连接也会被断开。'))return;
+      const res=await api('plugins/'+encodeURIComponent(p.plugin_id)+'/rotate','POST');
+      await applyPluginBusResponse(res?.state||null);
+      showPluginTokenBanner(res,p.plugin_id);
+      notice('已轮换 '+p.plugin_id+' 的 Token，请立即保存新 Token');
+    },'secondary');
+    const discBtn=button('断开会话',async()=>{
+      const next=await api('plugins/'+encodeURIComponent(p.plugin_id)+'/disconnect','POST');
+      await applyPluginBusResponse(next);
+      notice('已断开 '+p.plugin_id+' 的当前会话');
+    },'secondary');
+    discBtn.disabled=!p.online;
+    const delBtn=button('吊销删除',async()=>{
+      if(!confirm('确认永久吊销并删除远程插件 '+p.plugin_id+'？当前在线连接将立即终止。'))return;
+      const next=await api('plugins/'+encodeURIComponent(p.plugin_id),'DELETE');
+      if(currentPluginTokenId===p.plugin_id)clearPluginTokenBanner();
+      await applyPluginBusResponse(next);
+      notice('已吊销插件 '+p.plugin_id);
+    },'danger');
+    opRow.append(toggleBtn,rotateBtn,discBtn,delBtn);
+    card.append(opRow);
+
+    const form=el('form',undefined,'inline-edit-form');
+    const grid=el('div',undefined,'grid');
+    const nameLabel=el('label','展示名称（display_name）');
+    const nameInput=el('input');nameInput.type='text';nameInput.maxLength=64;nameInput.required=true;
+    nameInput.value=p.display_name||'';
+    nameLabel.append(nameInput);
+
+    const regionLabel=el('label','节点区域（node_region）');
+    const regionSel=el('select');
+    for(const [val,lbl] of [['KR','KR · 境外节点'],['CN','CN · 境内节点']]){
+      const o=el('option',lbl);o.value=val;regionSel.append(o);
+    }
+    regionSel.value=p.node_region==='CN'?'CN':'KR';
+    regionLabel.append(regionSel);
+    grid.append(nameLabel,regionLabel);
+    form.append(grid);
+
+    const scopesWrap=el('div',undefined,'scope-checks');
+    renderScopeCheckboxes(scopesWrap,catalog,scopes);
+    form.append(scopesWrap);
+
+    const editFoot=el('div',undefined,'row');
+    const enabledCb=el('input');enabledCb.type='checkbox';enabledCb.checked=Boolean(p.enabled);
+    const enabledLabel=el('label');enabledLabel.append(enabledCb,' 启用该插件凭据');
+    const saveBtn=el('button','保存配置');saveBtn.type='submit';
+    editFoot.append(enabledLabel,saveBtn);
+    form.append(editFoot);
+
+    form.addEventListener('submit',e=>{
+      e.preventDefault();
+      busy(saveBtn,async()=>{
+        const displayName=nameInput.value.trim();
+        if(!displayName)throw Error('展示名称不能为空');
+        const nextScopes=[...scopesWrap.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);
+        const payload={
+          display_name:displayName,
+          scopes:nextScopes,
+          node_region:regionSel.value==='CN'?'CN':'KR',
+          enabled:enabledCb.checked
+        };
+        const next=await api('plugins/'+encodeURIComponent(p.plugin_id),'PUT',payload);
+        await applyPluginBusResponse(next);
+        notice('已保存插件配置：'+p.plugin_id);
+      });
+    });
+    card.append(form);
+    return card;
+  }));
+}
+async function applyPluginBusResponse(next){
+  if(next&&Array.isArray(next.plugins)){
+    renderPluginBus(next);
+  }else{
+    const fresh=await api('plugins');
+    if(!token)return;
+    renderPluginBus(fresh);
+  }
+}
+async function pluginBus(){
+  clearPluginTokenBanner();
+  const d=await api('plugins');
+  if(!token)return;
+  renderPluginBus(d);
+}
+$('refresh-plugin-bus').addEventListener('click',e=>busy(e.target,pluginBus));
+$('pb-token-copy').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!currentPluginToken)throw Error('当前没有可复制的一次性 Token');
+  if(!navigator.clipboard||!navigator.clipboard.writeText)throw Error('当前浏览器环境不支持一键复制，请手动全选 Token 复制');
+  await navigator.clipboard.writeText(currentPluginToken);
+  notice('已复制插件 Token 到剪贴板');
+}));
+$('pb-token-dismiss').addEventListener('click',clearPluginTokenBanner);
+$('pb-create-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('pb-create-submit'),async()=>{
+    const pluginId=$('pb-create-id').value.trim();
+    const displayName=$('pb-create-name').value.trim();
+    const nodeRegion=$('pb-create-region').value==='CN'?'CN':'KR';
+    const scopes=[...$('pb-create-scopes').querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);
+    if(!/^[a-z][a-z0-9_]{1,47}$/.test(pluginId))throw Error('插件 ID 须为 2～48 位，以小写字母开头，仅含小写字母、数字和下划线');
+    if(!displayName)throw Error('显示名称不能为空');
+    const res=await api('plugins','POST',{plugin_id:pluginId,display_name:displayName,scopes,node_region:nodeRegion});
+    $('pb-create-id').value='';
+    $('pb-create-name').value='';
+    $('pb-create-region').value='KR';
+    renderScopeCheckboxes($('pb-create-scopes'),pluginBusState?.allowed_scopes_catalog||DEFAULT_PLUGIN_SCOPES,[]);
+    await applyPluginBusResponse(res?.state||null);
+    showPluginTokenBanner(res,pluginId);
+    notice('已签发远程插件凭据：'+pluginId+'（请立即保存一次性 Token）');
+  });
+});
 $('refresh-life').addEventListener('click',e=>busy(e.target,life));
 $('life-world-form').addEventListener('submit',e=>{
   e.preventDefault();
@@ -4386,9 +4912,10 @@ function registerPluginPage(m){
   });
 }
 function systemCard(m){
-  const status=m.status;
+  const status=m.status||{};
+  const page=m.panel&&sections.has(m.panel)?m.panel:null;
   const note=[status.last_error,status.last_success&&'上次同步 '+dateTime(status.last_success)].filter(Boolean).join(' · ');
-  const card=catalogCard(m,{page:sections.has(m.panel)?m.panel:null,indicator:el('span','常驻','module-resident'),
+  const card=catalogCard(m,{page,indicator:el('span','常驻','module-resident'),
     meta:status.detail,note});
   card.dataset.systemModule=m.id;
   return card;
@@ -4421,7 +4948,7 @@ async function moduleDirectory(){
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, 'event-ledger':eventLedger, 'voice-companion':voiceCompanion, 'screen-watch':screenWatch, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
+  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, 'event-ledger':eventLedger, 'voice-companion':voiceCompanion, 'screen-watch':screenWatch, 'identity-center':identityCenter, 'plugin-bus':pluginBus, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
   weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{
@@ -4476,8 +5003,10 @@ function resetWorkspaces(){
   for(const remove of pluginPages.values())remove();
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
-  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');text('event-ledger-state','');text('vc-state','');text('sw-state','');
-  for(const id of ['module-catalog','system-catalog','drive-consumers','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table','sw-pills','sw-commentary-table'])$(id).replaceChildren();
+  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');text('event-ledger-state','');text('vc-state','');text('sw-state','');text('identity-state','');text('pb-state','');
+  clearPluginTokenBanner();
+  for(const id of ['module-catalog','system-catalog','drive-consumers','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table','sw-pills','sw-commentary-table','identity-kpis','identity-persons-list','id-person-options','pb-pills','pb-plugins-list'])$(id).replaceChildren();
+  renderScopeCheckboxes($('pb-create-scopes'),DEFAULT_PLUGIN_SCOPES,[]);
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;

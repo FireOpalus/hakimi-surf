@@ -370,7 +370,7 @@ def assemble_chat_input(
     dual = payload.get("dual_memory_data", {}) if not sandbox_mode else {}
     background = {}
     if context.private_owner and not sandbox_mode:
-        for key in ("owner_core_memory", "owner_recalled_memories"):
+        for key in ("owner_core_memory", "owner_recalled_memories", "owner_other_surface_recent"):
             if payload.get(key):
                 background[key] = payload[key]
         if recall:
@@ -458,7 +458,11 @@ def assemble_chat_input(
         dual = {}
     # Trim optional background first; never move a dynamic fragment ahead of B.
     if estimate_tokens(tail()) > settings.chat_tail_tokens and background:
-        for drop_key in ("近期群聊巡逻记忆（只读背景）", "owner_recalled_memories"):
+        for drop_key in (
+            "近期群聊巡逻记忆（只读背景）",
+            "owner_other_surface_recent",
+            "owner_recalled_memories",
+        ):
             if drop_key in background and estimate_tokens(tail()) > settings.chat_tail_tokens:
                 background.pop(drop_key, None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
