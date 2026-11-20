@@ -61,6 +61,7 @@ def configured_secrets(settings: Settings) -> list[str]:
                 settings.onebot_access_token,
                 settings.onebot_ws_token,
                 settings.node_ws_token,
+                settings.companion_ws_token,
                 settings.qq_app_secret,
                 settings.admin_token,
                 settings.bili_sessdata,

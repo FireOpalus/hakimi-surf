@@ -231,6 +231,27 @@ class Settings(BaseSettings):
             "NODE_BILI_FALLBACK_LOCAL", "HAKIMI_NODE_BILI_FALLBACK_LOCAL"
         ),
     )
+    companion_ws_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COMPANION_WS_ENABLED", "HAKIMI_COMPANION_WS_ENABLED"),
+    )
+    companion_ws_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("COMPANION_WS_TOKEN", "HAKIMI_COMPANION_WS_TOKEN"),
+    )
+    companion_ws_path: str = Field(
+        default="/ws/companion",
+        validation_alias=AliasChoices("COMPANION_WS_PATH", "HAKIMI_COMPANION_WS_PATH"),
+        pattern=r"^/ws/companion(?:/[A-Za-z0-9_-]{24,128})?$",
+    )
+    companion_ws_max_frame_bytes: int = Field(
+        default=4_194_304,
+        ge=65536,
+        le=8_388_608,
+        validation_alias=AliasChoices(
+            "COMPANION_WS_MAX_FRAME_BYTES", "HAKIMI_COMPANION_WS_MAX_FRAME_BYTES"
+        ),
+    )
     group_policies: dict[str, Literal["at_only", "smart_reply", "muted"]] = Field(
         default_factory=dict
     )

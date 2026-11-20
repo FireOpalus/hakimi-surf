@@ -85,6 +85,8 @@ def create_app(
             raise RuntimeError("OneBot WebSocket requires a >=32-character access token")
         if s.node_ws_enabled and len(s.node_ws_token.get_secret_value()) < 32:
             raise RuntimeError("Node WebSocket requires a >=32-character access token")
+        if s.companion_ws_enabled and len(s.companion_ws_token.get_secret_value()) < 32:
+            raise RuntimeError("Companion WebSocket requires a >=32-character access token")
         # HTTP debug logs may contain tokens, IDs and request metadata.
         for name in ("httpx", "httpcore", "google.genai", "websockets", "aiohttp"):
             logging.getLogger(name).setLevel(logging.CRITICAL)
@@ -324,6 +326,38 @@ def create_app(
             source_ip=source_ip,
             node_id=node_id,
             region=region,
+        )
+
+    @app.websocket("/ws/companion{suffix:path}")
+    async def companion_reverse(websocket: WebSocket, suffix: str = ""):
+        s = websocket.app.state.settings
+        expected = "Bearer " + s.companion_ws_token.get_secret_value()
+        source_ip = websocket_source_ip(websocket, s)
+        adapter_id = websocket.headers.get("x-companion-adapter", "")
+        client_id = websocket.headers.get("x-companion-client-id", "")
+        if (
+            not s.companion_ws_enabled
+            or websocket.url.path != s.companion_ws_path
+            or not hmac.compare_digest(
+                websocket.headers.get("authorization", "").encode(), expected.encode()
+            )
+            or bool(websocket.query_params)
+            or not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", adapter_id)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", client_id)
+        ):
+            logging.getLogger("hakimi").warning(
+                "event=companion_auth_rejected source_ip=%s", source_ip
+            )
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        await websocket.app.state.service.voice_companion.serve(
+            websocket.receive_text,
+            websocket.send_text,
+            websocket.close,
+            source_ip=source_ip,
+            adapter_id=adapter_id,
+            client_id=client_id,
         )
 
     @app.post("/webhooks/qq")

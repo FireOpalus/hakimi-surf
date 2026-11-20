@@ -9,7 +9,7 @@ def recorded_kwargs(kwargs):
     return {
         k: v.model_dump() if isinstance(v, Message) else copy.deepcopy(v)
         for k, v in kwargs.items()
-        if k not in {"before_call", "cancel_event", "audit_id", "audit_job_id"}
+        if k not in {"before_call", "cancel_event", "audit_id", "audit_job_id", "on_text"}
     }
 
 
@@ -39,7 +39,12 @@ class FakeGateway:
     async def generate(self, payload, subject, **kwargs):
         await call_guard(kwargs)
         self.calls.append(("generate", copy.deepcopy(payload), subject, recorded_kwargs(kwargs)))
-        return "这是基于已有信息的简短回复。"
+        reply = "这是基于已有信息的简短回复。"
+        if (on_text := kwargs.get("on_text")) is not None:
+            res = on_text(reply)
+            if inspect.isawaitable(res):
+                await res
+        return reply
 
     async def close(self):
         pass

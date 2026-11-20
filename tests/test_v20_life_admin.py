@@ -106,6 +106,10 @@ LIFE_ROUTES = [
     ("GET", "/admin/api/life/ledger"),
     ("POST", "/admin/api/life/ledger"),
     ("DELETE", "/admin/api/life/ledger/0123456789abcdef0123456789abcdef"),
+    ("GET", "/admin/api/life/voice-companion"),
+    ("PUT", "/admin/api/life/voice-companion"),
+    ("DELETE", "/admin/api/life/voice-companion"),
+    ("POST", "/admin/api/life/voice-companion/disconnect"),
 ]
 
 
@@ -355,6 +359,7 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         "patrol",
         "notebook",
         "event-ledger",
+        "voice-companion",
         "drive-sync",
         "journal",
     } <= tabs["modules"]
@@ -375,6 +380,8 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         ('data-action="notebook"', "notebook"),
         ('id="life-ledger-form"', "event-ledger"),
         ('id="life-ledger-table"', "event-ledger"),
+        ('id="vc-config-form"', "voice-companion"),
+        ('id="vc-sessions-table"', "voice-companion"),
     ):
         assert [key for key, content in panels.items() if marker in content] == [owner]
 

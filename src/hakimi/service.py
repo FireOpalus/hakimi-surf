@@ -185,6 +185,7 @@ class Service:
         self.event_ledger = self.modules.systems["event_ledger"].ledger
         self.modules.event_ledger = self.event_ledger
         self.sessions.event_ledger = self.event_ledger
+        self.voice_companion = self.modules.systems["voice_companion"].companion
         self.world_state = WorldStateManager(settings, store, self.modules)
         install_modules(self)
         settings._thinking_scenes = self.modules.thinking_scenes
@@ -457,6 +458,8 @@ class Service:
             res = close_nt()
             if inspect.isawaitable(res):
                 await res
+        if vc := getattr(self, "voice_companion", None):
+            await vc.close()
 
     async def command(self, message: Message) -> str | None:
         if self.bot_guard.known_bot(message):

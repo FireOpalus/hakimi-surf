@@ -23,6 +23,7 @@ from .admin_routes import body, service
 from .life_engine import LifeEngineConfig
 from .modules.actions import ActionCall, HourlyAction, Mode, reject_reason
 from .rest_policy import RestHoursConfig
+from .voice_companion import VoiceCompanionConfig
 
 router = APIRouter(prefix="/admin/api/life")
 
@@ -899,3 +900,42 @@ async def life_mc_goal(request: Request):
         else:
             response["life"] = await _build_life_status(svc)
         return response
+
+
+@router.get("/voice-companion")
+async def life_voice_companion_status(request: Request):
+    svc = service(request)
+    vc = getattr(svc, "voice_companion", None)
+    if vc is None:
+        raise HTTPException(503, "voice_companion_unavailable")
+    return await vc.admin_status()
+
+
+@router.put("/voice-companion")
+async def life_voice_companion_update(request: Request):
+    value = await body(request, VoiceCompanionConfig)
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        vc = getattr(svc, "voice_companion", None)
+        if vc is None:
+            raise HTTPException(503, "voice_companion_unavailable")
+        return await vc.set_config(value)
+
+
+@router.delete("/voice-companion")
+async def life_voice_companion_reset(request: Request):
+    svc = service(request)
+    async with request.app.state.admin_config_lock:
+        vc = getattr(svc, "voice_companion", None)
+        if vc is None:
+            raise HTTPException(503, "voice_companion_unavailable")
+        return await vc.set_config(None)
+
+
+@router.post("/voice-companion/disconnect")
+async def life_voice_companion_disconnect(request: Request):
+    svc = service(request)
+    vc = getattr(svc, "voice_companion", None)
+    if vc is None:
+        raise HTTPException(503, "voice_companion_unavailable")
+    return await vc.disconnect_active()

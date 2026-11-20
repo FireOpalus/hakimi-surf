@@ -36,12 +36,22 @@ def upstream_http_status(code: str | None) -> int | None:
 class StreamProgress:
     """Tracks stream execution state and assembled output for interrupted billing fallback."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_text=None) -> None:
         self.dispatched = False
         self.started = False
         self.text_parts: list[str] = []
         self.thought_steps = 0
         self.error_code: str | None = None
+        self._on_text = on_text
+
+    async def emit_text(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self.text_parts.append(chunk)
+        if self._on_text is not None:
+            res = self._on_text(chunk)
+            if inspect.isawaitable(res):
+                await res
 
     @property
     def output_text(self) -> str:
@@ -71,7 +81,7 @@ async def consume_stream(stream, progress: StreamProgress | None = None):
                             raise Rejected("unexpected_model_content")
                         pieces.append(part.text or "")
                     if progress is not None and pieces:
-                        progress.text_parts.extend(pieces)
+                        await progress.emit_text("".join(pieces))
                 steps[event.index] = (step.type, pieces)
             elif kind == "step.delta":
                 if event.index not in steps:
@@ -86,7 +96,7 @@ async def consume_stream(stream, progress: StreamProgress | None = None):
                         raise Rejected("invalid_output")
                     pieces.append(text)
                     if progress is not None and text:
-                        progress.text_parts.append(text)
+                        await progress.emit_text(text)
             elif kind == "error":
                 code = upstream_error_code(getattr(event.error, "code", None))
                 if progress is not None:

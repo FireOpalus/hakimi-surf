@@ -108,6 +108,9 @@ CODES = frozenset(
         "gcp_bigquery_sync_failed",
         "gcp_monitoring_sync_failed",
         "affection_blacklisted",
+        "companion_connected",
+        "companion_disconnected",
+        "companion_turn_failed",
     }
 )
 
