@@ -1,4 +1,4 @@
-"""Resident system module for real-time voice & gameplay companion hub."""
+"""Resident system module for real-time voice companion hub."""
 
 from __future__ import annotations
 
@@ -10,8 +10,11 @@ from . import SystemModule
 class Module(SystemModule):
     module_id = "voice_companion"
     display_name = "语音伴随"
-    description = "为桌面端与第三方语音软件提供统一的实时语音对话、低频看屏吐槽与记忆沉淀中枢。"
-    requires = ("event_ledger", "owner_notebook")
+    description = (
+        "为桌面端与第三方语音软件提供统一的实时语音对话、流式口播分句与记忆沉淀中枢；"
+        "Owner 连麦时自动联动屏幕伴看。"
+    )
+    requires = ("event_ledger", "owner_notebook", "screen_watch")
     admin_panel = "voice-companion"
     thinking_scenes = (
         ThinkingScene(

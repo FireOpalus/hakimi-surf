@@ -347,7 +347,7 @@ class OwnerProactive:
 
     async def enqueue(self, kind, text, *, key=None, expires=None):
         now = self.clock()
-        if kind not in {"test", "patrol"}:
+        if kind not in {"test", "patrol", "screen_watch"}:
             raise Rejected("invalid_owner_dm_kind")
         maximum = now + 43200
         expires = min(expires, maximum) if expires is not None else maximum

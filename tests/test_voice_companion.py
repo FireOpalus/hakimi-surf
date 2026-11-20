@@ -12,6 +12,7 @@ from pydantic import SecretStr
 from starlette.websockets import WebSocketDisconnect
 
 from hakimi.app import create_app
+from hakimi.media import ModelImage
 from hakimi.security import Rejected, configured_secrets
 from hakimi.voice_companion import SentenceStreamBuffer
 from tests.test_admin import TOKEN
@@ -237,23 +238,21 @@ async def test_owner_private_lifecycle_memory_barge_in_and_recap(settings, tmp_p
             it["summary"] == "西边地里草莓明天熟了" for it in gen_payload["pending_ledger_events"]
         )
 
-        # 2. Screen pulse hits cooldown immediately (0 LLM calls)
-        await sock.push({"type": "screen.pulse", "turn_id": "p-cool", "frames": [TINY_PNG_B64]})
-        ev_cool = await sock.recv_until(
-            lambda m: m.get("type") == "turn.end" and m["turn_id"] == "p-cool"
-        )
-        assert ev_cool[-1] == {
-            "type": "turn.end",
-            "turn_id": "p-cool",
-            "status": "skipped",
-            "reason": "cooldown",
-        }
+        # 2. Legacy screen.pulse on /ws/companion is rejected cleanly (moved to screen_watch)
+        await sock.push({"type": "screen.pulse", "turn_id": "legacy", "frames": [TINY_PNG_B64]})
+        ev_unk = await sock.recv_until(lambda m: m.get("type") == "error")
+        assert ev_unk[-1]["reason"] == "companion_unknown_frame"
         assert len(gw.calls) == 1
 
-        # 3. Screen pulse after cooldown with [SILENT] produces zero speak.chunks
+        # 3. Screen commentary dispatched from screen_watch with [SILENT] emits zero speak.chunks
         now[0] += 30.0
         gw.deltas = ["[SIL", "ENT]"]
-        await sock.push({"type": "screen.pulse", "turn_id": "p-silent", "frames": [TINY_PNG_B64]})
+        outcome = await svc.voice_companion.trigger_screen_commentary(
+            [ModelImage(data=TINY_PNG_B64, mime_type="image/png")],
+            game_title="终末地",
+            turn_id="p-silent",
+        )
+        assert outcome == "dispatched"
         ev_sil = await sock.recv_until(
             lambda m: m.get("type") == "turn.end" and m["turn_id"] == "p-silent"
         )
@@ -432,9 +431,7 @@ async def test_voice_companion_admin_api_models_and_live_disconnect(settings):
                 "/admin/api/life/voice-companion",
                 json={
                     "enabled": True,
-                    "proactive_watch_enabled": True,
-                    "min_pulse_interval_seconds": 5,
-                    "max_frames_per_turn": 1,
+                    "use_screen_watch": "yes",
                     "save_recap_to_ledger": True,
                     "tts_style_hint": "fast",
                 },
@@ -458,9 +455,7 @@ async def test_voice_companion_admin_api_models_and_live_disconnect(settings):
                 "/admin/api/life/voice-companion",
                 json={
                     "enabled": True,
-                    "proactive_watch_enabled": False,
-                    "min_pulse_interval_seconds": 45,
-                    "max_frames_per_turn": 1,
+                    "use_screen_watch": False,
                     "save_recap_to_ledger": True,
                     "tts_style_hint": "轻快简洁",
                 },
@@ -469,11 +464,11 @@ async def test_voice_companion_admin_api_models_and_live_disconnect(settings):
             up_data = updated.json()
             assert up_data["online"] is True
             assert up_data["source"] == "sqlite"
-            assert up_data["config"]["min_pulse_interval_seconds"] == 45
+            assert up_data["config"]["use_screen_watch"] is False
             assert COMPANION_TOKEN not in json.dumps(up_data)
 
             synced = (await sock.recv_until(lambda m: m.get("type") == "config.sync"))[-1]
-            assert synced["config"]["proactive_watch_enabled"] is False
+            assert synced["config"]["use_screen_watch"] is False
 
             disc = await client.post("/admin/api/life/voice-companion/disconnect")
             assert disc.status_code == 200
@@ -483,4 +478,4 @@ async def test_voice_companion_admin_api_models_and_live_disconnect(settings):
             reset = await client.delete("/admin/api/life/voice-companion")
             assert reset.status_code == 200
             assert reset.json()["source"] == "default"
-            assert reset.json()["config"]["min_pulse_interval_seconds"] == 25
+            assert reset.json()["config"]["use_screen_watch"] is True

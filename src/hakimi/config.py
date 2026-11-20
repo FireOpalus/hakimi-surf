@@ -252,6 +252,27 @@ class Settings(BaseSettings):
             "COMPANION_WS_MAX_FRAME_BYTES", "HAKIMI_COMPANION_WS_MAX_FRAME_BYTES"
         ),
     )
+    screen_ws_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("SCREEN_WS_ENABLED", "HAKIMI_SCREEN_WS_ENABLED"),
+    )
+    screen_ws_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("SCREEN_WS_TOKEN", "HAKIMI_SCREEN_WS_TOKEN"),
+    )
+    screen_ws_path: str = Field(
+        default="/ws/screen",
+        validation_alias=AliasChoices("SCREEN_WS_PATH", "HAKIMI_SCREEN_WS_PATH"),
+        pattern=r"^/ws/screen(?:/[A-Za-z0-9_-]{24,128})?$",
+    )
+    screen_ws_max_frame_bytes: int = Field(
+        default=4_194_304,
+        ge=65536,
+        le=8_388_608,
+        validation_alias=AliasChoices(
+            "SCREEN_WS_MAX_FRAME_BYTES", "HAKIMI_SCREEN_WS_MAX_FRAME_BYTES"
+        ),
+    )
     group_policies: dict[str, Literal["at_only", "smart_reply", "muted"]] = Field(
         default_factory=dict
     )

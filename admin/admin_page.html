@@ -1316,7 +1316,8 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-drive-sync" type="button" role="tab" data-tab="drive-sync" data-description="查看已接入模块的同步状态和最近回执。" aria-controls="drive-sync" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18H6a4 4 0 0 1-.5-8 6.5 6.5 0 0 1 12.5-2 5 5 0 0 1 0 10h-1 M12 20v-9 M8.5 14.5 12 11l3.5 3.5"/></svg><span>Google Drive 同步</span></button>
         <button id="nav-notebook" type="button" role="tab" data-tab="notebook" data-description="管理仅供 Owner 私聊使用的脱敏快照。" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
         <button id="nav-event-ledger" type="button" role="tab" data-tab="event-ledger" data-description="查看并管理各模块、私聊约定与规划器写入的跨日待办事件。" aria-controls="event-ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h5 M3 8h2 M3 12h2 M3 16h2"/></svg><span>跨日待办账本</span></button>
-        <button id="nav-voice-companion" type="button" role="tab" data-tab="voice-companion" data-description="管理实时语音与看屏伴随中枢状态、主动吐槽节流与陪玩会话记录。" aria-controls="voice-companion" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z M19 10v1a7 7 0 0 1-14 0v-1 M12 18v3 M8 21h8"/></svg><span>语音伴随</span></button>
+        <button id="nav-voice-companion" type="button" role="tab" data-tab="voice-companion" data-description="管理实时语音伴随中枢状态、口播风格与陪玩会话记录（可联动屏幕伴看）。" aria-controls="voice-companion" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z M19 10v1a7 7 0 0 1-14 0v-1 M12 18v3 M8 21h8"/></svg><span>语音伴随</span></button>
+        <button id="nav-screen-watch" type="button" role="tab" data-tab="screen-watch" data-description="管理 Owner 私有看屏连接、内存短 TTL 画面缓存、隐私开关与主动吐槽策略。" aria-controls="screen-watch" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v12H3z M8 21h8 M12 17v4 M9 11l3-3 3 3"/></svg><span>屏幕伴看</span></button>
       </div>
     </nav>
     <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
@@ -2221,21 +2222,17 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="vc-disconnect" class="danger" type="button" disabled>断开当前连接</button>
       </div>
     </div>
-    <p class="muted">桌面专属伴随客户端与 Discord / OOPZ 等外部语音桥统一接入本中枢，共享主脑人设、私聊记忆与世界引擎状态。</p>
+    <p class="muted">桌面专属伴随客户端与 Discord / OOPZ 等外部语音桥统一接入本中枢；Owner 私有连麦时自动读取「屏幕伴看」内存近期画面，多人语音房（room_public）严格隔离一切私有记忆与画面。</p>
     <div id="vc-pills" class="pill-row"></div>
     <p id="vc-state" class="muted" aria-live="polite"></p>
   </div>
   <div class="card">
-    <h2>伴随行为与节流设置</h2>
+    <h2>语音伴随设置</h2>
     <form id="vc-config-form">
       <div class="row">
         <label><input id="vc-enabled" type="checkbox"> 启用语音伴随服务</label>
-        <label><input id="vc-proactive-watch" type="checkbox"> 允许低频看屏主动吐槽（screen.pulse）</label>
+        <label><input id="vc-use-screen-watch" type="checkbox"> Owner 私有连麦时自动联动「屏幕伴看」近期画面</label>
         <label><input id="vc-save-recap" type="checkbox"> 下播自动写入摘要到跨日待办</label>
-      </div>
-      <div class="grid">
-        <label for="vc-pulse-interval">看屏吐槽最小间隔（秒，10–300）<input id="vc-pulse-interval" type="number" min="10" max="300" step="1" required></label>
-        <label for="vc-max-frames">单轮最多附带截图（张，1–2）<input id="vc-max-frames" type="number" min="1" max="2" step="1" required></label>
       </div>
       <label for="vc-style-hint">口播风格提示（传给主脑）<input id="vc-style-hint" type="text" maxlength="80" placeholder="活泼软萌、口语短句"></label>
       <div class="row">
@@ -2247,6 +2244,45 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   <div class="card">
     <h2>最近伴随会话（最近 20 场）</h2>
     <div id="vc-sessions-table" class="table"></div>
+  </div>
+</section>
+
+<section id="screen-watch" class="tab" role="tabpanel" aria-labelledby="nav-screen-watch" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>屏幕伴看感知中枢（Screen Watch）</h2>
+      <div class="row">
+        <button id="refresh-sw" class="secondary" type="button">刷新状态</button>
+        <button id="sw-clear" class="secondary" type="button" disabled>立即清空画面缓存</button>
+        <button id="sw-disconnect" class="danger" type="button" disabled>断开看屏连接</button>
+      </div>
+    </div>
+    <p class="muted">严格限定 Owner 私有；桌面端推送的关键帧仅在服务端内存中以超短 TTL 环形缓存、到期或暂停/断连即刻销毁，绝不写入磁盘或数据库，也绝不暴露给多人语音房或群聊。</p>
+    <div id="sw-pills" class="pill-row"></div>
+    <p id="sw-state" class="muted" aria-live="polite"></p>
+  </div>
+  <div class="card">
+    <h2>看屏隐私与主动吐槽策略</h2>
+    <form id="sw-config-form">
+      <div class="row">
+        <label><input id="sw-enabled" type="checkbox"> 启用屏幕伴看接收（关闭立即销毁缓存并拒收新帧）</label>
+        <label><input id="sw-proactive" type="checkbox"> 允许低频主动看屏吐槽（优先走在线语音伴随口播）</label>
+        <label><input id="sw-qq-fallback" type="checkbox"> 未开语音连麦时将主动吐槽同步私聊至 Owner QQ</label>
+      </div>
+      <div class="grid">
+        <label for="sw-pulse-interval">主动吐槽最小间隔（秒，10–300）<input id="sw-pulse-interval" type="number" min="10" max="300" step="1" required></label>
+        <label for="sw-max-frames">单次最多提供截图（张，1–2）<input id="sw-max-frames" type="number" min="1" max="2" step="1" required></label>
+        <label for="sw-frame-ttl">内存帧保质期 TTL（秒，5–60）<input id="sw-frame-ttl" type="number" min="5" max="60" step="1" required></label>
+      </div>
+      <div class="row">
+        <button id="sw-save" type="submit" disabled>保存配置</button>
+        <button id="sw-reset" type="button" class="secondary" disabled>恢复默认</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>最近看屏吐槽动态（仅内存记录，重启清空）</h2>
+    <div id="sw-commentary-table" class="table"></div>
   </div>
 </section>
 
@@ -3468,18 +3504,16 @@ function renderVoiceCompanion(d){
     ' · 客户端 '+(d.client_id||'—')+
     ' · 来源 IP '+(d.source_ip||'—')+
     (d.connected_at?' · 建连 '+lifeFmt(d.connected_at,tz):'')+
-    (active?' · 正在游玩 '+(active.game_title||'未命名游戏')+'（已对话 '+active.spoken_turns+'/'+active.turns+' 轮 · 截屏 '+active.frames_analyzed+' 帧）':'')
+    (active?' · 正在游玩 '+(active.game_title||'未命名游戏')+'（已对话 '+active.spoken_turns+'/'+active.turns+' 轮 · 看图 '+active.frames_analyzed+' 帧）':'')
   );
   $('vc-disconnect').disabled=!d.online;
   $('vc-enabled').checked=Boolean(c.enabled);
-  $('vc-proactive-watch').checked=Boolean(c.proactive_watch_enabled);
+  $('vc-use-screen-watch').checked=Boolean(c.use_screen_watch);
   $('vc-save-recap').checked=Boolean(c.save_recap_to_ledger);
-  $('vc-pulse-interval').value=c.min_pulse_interval_seconds??25;
-  $('vc-max-frames').value=c.max_frames_per_turn??2;
   $('vc-style-hint').value=c.tts_style_hint||'';
   for(const id of ['vc-save','vc-reset'])$(id).disabled=false;
   const stLabels={active:'进行中',ended:'正常下播',disconnected:'连接断开',restarted:'切换重开',superseded:'被新连接接管',admin_disconnect:'后台断开',service_stop:'服务停机'};
-  table('vc-sessions-table',['时间','适配器 / 模式','游戏','对话 / 截屏','状态','摘要'],(d.sessions||[]).map(s=>[
+  table('vc-sessions-table',['时间','适配器 / 模式','游戏','对话 / 看图','状态','摘要'],(d.sessions||[]).map(s=>[
     lifeFmt(s.started_at,tz),
     (s.adapter_id||'—')+' · '+modeLabel(s.mode),
     s.game_title||'—',
@@ -3501,15 +3535,9 @@ $('vc-disconnect').addEventListener('click',e=>busy(e.target,async()=>{
 $('vc-config-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('vc-save'),async()=>{
-    const pulse=Number($('vc-pulse-interval').value);
-    const frames=Number($('vc-max-frames').value);
-    if(!Number.isInteger(pulse)||pulse<10||pulse>300)throw Error('看屏吐槽最小间隔须为 10～300 秒的整数');
-    if(!Number.isInteger(frames)||frames<1||frames>2)throw Error('单轮截图上限须为 1 或 2');
     const payload={
       enabled:$('vc-enabled').checked,
-      proactive_watch_enabled:$('vc-proactive-watch').checked,
-      min_pulse_interval_seconds:pulse,
-      max_frames_per_turn:frames,
+      use_screen_watch:$('vc-use-screen-watch').checked,
       save_recap_to_ledger:$('vc-save-recap').checked,
       tts_style_hint:$('vc-style-hint').value.trim()
     };
@@ -3521,6 +3549,79 @@ $('vc-reset').addEventListener('click',e=>busy(e.target,async()=>{
   if(!confirm('恢复语音伴随默认配置？'))return;
   const next=await api('life/voice-companion','DELETE');
   renderVoiceCompanion(next);notice('已恢复语音伴随默认配置');
+}));
+
+function renderScreenWatch(d){
+  const tz=d.timezone||'Asia/Shanghai', c=d.config||{};
+  const swPills=[
+    d.online?(d.paused?pill('看屏端在线 · 已暂停采集','warn'):pill('看屏端在线 · '+(d.adapter_id||'adapter'),'ok')):d.ws_configured?pill('等待看屏端接入','warn'):pill('WS 接入未启用','muted'),
+    c.enabled?pill('内存缓存 '+d.buffered_frames+' 帧','ok'):pill('隐私开关已关闭','err')
+  ];
+  $('sw-pills').replaceChildren(...swPills);
+  text('sw-state',
+    '配置来源：'+(d.source==='sqlite'?'后台 SQLite':'默认配置')+
+    ' · 客户端 '+(d.client_id||'—')+
+    ' · 来源 IP '+(d.source_ip||'—')+
+    (d.connected_at?' · 建连 '+lifeFmt(d.connected_at,tz):'')+
+    (d.game_title?' · 当前窗口 '+(d.game_title+(d.window_title?' / '+d.window_title:'')):'')+
+    ' · 累计收帧 '+d.frames_received+' · 语音口播 '+d.routed_voice_count+' · 独立吐槽 '+d.standalone_commentary_count
+  );
+  $('sw-clear').disabled=false;
+  $('sw-disconnect').disabled=!d.online;
+  $('sw-enabled').checked=Boolean(c.enabled);
+  $('sw-proactive').checked=Boolean(c.proactive_commentary_enabled);
+  $('sw-qq-fallback').checked=Boolean(c.deliver_to_qq_when_no_voice);
+  $('sw-pulse-interval').value=c.min_pulse_interval_seconds??25;
+  $('sw-max-frames').value=c.max_frames_per_query??2;
+  $('sw-frame-ttl').value=c.frame_ttl_seconds??15;
+  for(const id of ['sw-save','sw-reset'])$(id).disabled=false;
+  const chLabels={voice_companion:'语音伴随口播',qq_dm:'Owner QQ 私聊 + 气泡',overlay:'桌面悬浮气泡'};
+  table('sw-commentary-table',['时间','投递渠道','画面主题','内容摘要'],(d.recent_commentaries||[]).map(item=>[
+    lifeFmt(item.at,tz),
+    chLabels[item.channel]||item.channel,
+    item.game_title||'—',
+    item.text||'—'
+  ]));
+}
+async function screenWatch(){
+  const d=await api('life/screen-watch');
+  if(!token)return;
+  renderScreenWatch(d);
+}
+$('refresh-sw').addEventListener('click',e=>busy(e.target,screenWatch));
+$('sw-clear').addEventListener('click',e=>busy(e.target,async()=>{
+  const next=await api('life/screen-watch/clear','POST');
+  renderScreenWatch(next);notice('已立即销毁内存画面缓存');
+}));
+$('sw-disconnect').addEventListener('click',e=>busy(e.target,async()=>{
+  const next=await api('life/screen-watch/disconnect','POST');
+  renderScreenWatch(next);notice('已断开当前看屏连接并销毁缓存');
+}));
+$('sw-config-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('sw-save'),async()=>{
+    const pulse=Number($('sw-pulse-interval').value);
+    const frames=Number($('sw-max-frames').value);
+    const ttl=Number($('sw-frame-ttl').value);
+    if(!Number.isInteger(pulse)||pulse<10||pulse>300)throw Error('主动吐槽最小间隔须为 10～300 秒的整数');
+    if(!Number.isInteger(frames)||frames<1||frames>2)throw Error('单次最多提供截图须为 1 或 2');
+    if(!Number.isInteger(ttl)||ttl<5||ttl>60)throw Error('内存帧保质期 TTL 须为 5～60 秒的整数');
+    const payload={
+      enabled:$('sw-enabled').checked,
+      proactive_commentary_enabled:$('sw-proactive').checked,
+      min_pulse_interval_seconds:pulse,
+      max_frames_per_query:frames,
+      frame_ttl_seconds:ttl,
+      deliver_to_qq_when_no_voice:$('sw-qq-fallback').checked
+    };
+    const next=await api('life/screen-watch','PUT',payload);
+    renderScreenWatch(next);notice('屏幕伴看配置已保存');
+  });
+});
+$('sw-reset').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!confirm('恢复屏幕伴看默认配置？'))return;
+  const next=await api('life/screen-watch','DELETE');
+  renderScreenWatch(next);notice('已恢复屏幕伴看默认配置');
 }));
 $('refresh-life').addEventListener('click',e=>busy(e.target,life));
 $('life-world-form').addEventListener('submit',e=>{
@@ -4320,7 +4421,7 @@ async function moduleDirectory(){
 const tabLoaders={
   overview:dashboard,ledger, 'api-routing':providers, 'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]), filter:filters, admission,
-  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, 'event-ledger':eventLedger, 'voice-companion':voiceCompanion, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
+  modules:()=>Promise.all([moduleDirectory(),systemDirectory()]), journal:diaries, 'drive-sync':driveSync, 'event-ledger':eventLedger, 'voice-companion':voiceCompanion, 'screen-watch':screenWatch, qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy()]), bili:()=>loadModule('bilibili_surf'),
   weather:()=>loadModule('weather'), minecraft:()=>loadModule('minecraft'), 'group-policy':()=>Promise.all([groups(),bots()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount, community:async()=>{
@@ -4375,8 +4476,8 @@ function resetWorkspaces(){
   for(const remove of pluginPages.values())remove();
   lastTab.core='overview';lastTab.modules='modules';
   $('workspace-switch').hidden=true;
-  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');text('event-ledger-state','');text('vc-state','');
-  for(const id of ['module-catalog','system-catalog','drive-consumers','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table'])$(id).replaceChildren();
+  text('diary-preview','选择日期即可阅读日记。');text('journal-drive-status','');text('drive-connection','');text('event-ledger-state','');text('vc-state','');text('sw-state','');
+  for(const id of ['module-catalog','system-catalog','drive-consumers','diaries','qq-actions','bili-actions','minecraft-actions','weather-actions','mc-overview','module-heading-switch','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table','sw-pills','sw-commentary-table'])$(id).replaceChildren();
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;

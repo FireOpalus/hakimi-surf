@@ -1,10 +1,8 @@
-"""Adapter-agnostic real-time voice & gameplay screen companion core."""
+"""Adapter-agnostic real-time voice companion hub."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import logging
 import re
@@ -18,9 +16,10 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, ConfigDict, Field
 
-from .media import ModelImage, normalize_image
+from .media import ModelImage
 from .models import Message
 from .modules.base import sanitize_sensor_text
+from .screen_watch import decode_b64_frames, decode_ws_json_frame, strip_markdown_noise
 from .security import Rejected, clean_text, configured_secrets, safe_output
 
 log = logging.getLogger("hakimi")
@@ -50,7 +49,6 @@ _STRONG_ENDS = frozenset("。！？!?~～\n")
 _SOFT_ENDS = frozenset("，,；;、")
 _MAX_CHUNK_CHARS = 60
 _SOFT_SPLIT_MIN_CHARS = 14
-_MAX_BASE64_FRAME_CHARS = 2_800_000
 _SILENT_TOKEN = "[SILENT]"
 
 
@@ -60,18 +58,9 @@ class VoiceCompanionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     enabled: bool = True
-    proactive_watch_enabled: bool = True
-    min_pulse_interval_seconds: int = Field(default=25, ge=10, le=300)
-    max_frames_per_turn: int = Field(default=2, ge=1, le=2)
+    use_screen_watch: bool = True
     save_recap_to_ledger: bool = True
     tts_style_hint: str = Field(default="活泼软萌、口语短句", max_length=80)
-
-
-def _strip_markdown_noise(text: str) -> str:
-    cleaned = text.replace("**", "").replace("__", "").replace("`", "")
-    cleaned = re.sub(r"(?m)^[ 	]*#{1,6}[ 	]*", "", cleaned)
-    cleaned = re.sub(r"(?m)^[ 	]*[-*+][ 	]+", "", cleaned)
-    return cleaned
 
 
 class SentenceStreamBuffer:
@@ -89,7 +78,7 @@ class SentenceStreamBuffer:
         return self._silent
 
     def _emit_clean(self, raw: str) -> list[str]:
-        normalized = " ".join(clean_text(_strip_markdown_noise(raw)).split()).strip()
+        normalized = " ".join(clean_text(strip_markdown_noise(raw)).split()).strip()
         if not normalized:
             return []
         scrubbed = safe_output(normalized, self._secrets, limit=300).strip()
@@ -123,7 +112,7 @@ class SentenceStreamBuffer:
         """Accept one streamed text delta and return zero or more complete spoken chunks."""
         if not delta or self._silent:
             return []
-        self._buf += _strip_markdown_noise(delta)
+        self._buf += strip_markdown_noise(delta)
         if self._allow_silent and not self._started_speaking:
             probe = self._buf.strip()
             if not probe:
@@ -160,68 +149,11 @@ class SentenceStreamBuffer:
 
 def decode_companion_frame(raw: str | bytes, limit: int) -> dict[str, Any]:
     """Decode and validate one incoming companion WS JSON object frame."""
-    try:
-        size = len(raw.encode("utf-8")) if isinstance(raw, str) else len(raw)
-    except UnicodeError:
-        raise Rejected("companion_invalid_json") from None
-    if size > limit:
-        raise Rejected("companion_frame_too_large")
-
-    def _pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
-        obj: dict[str, Any] = {}
-        for k, v in items:
-            if k in obj:
-                raise Rejected("companion_invalid_json")
-            obj[k] = v
-        return obj
-
-    try:
-        val = json.loads(
-            raw,
-            object_pairs_hook=_pairs,
-            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
-        )
-        if not isinstance(val, dict):
-            raise ValueError
-        return val
-    except (ValueError, TypeError, RecursionError, UnicodeError):
-        raise Rejected("companion_invalid_json") from None
+    return decode_ws_json_frame(raw, limit, error_prefix="companion")
 
 
 def _decode_frames(raw_frames: Any, max_frames: int, settings: Any) -> list[ModelImage]:
-    if not raw_frames:
-        return []
-    if not isinstance(raw_frames, list):
-        raise Rejected("companion_invalid_frames")
-    if len(raw_frames) > 2:
-        raise Rejected("companion_too_many_frames")
-    out: list[ModelImage] = []
-    for item in raw_frames[: max(1, min(int(max_frames), 2))]:
-        raw_b64 = item.get("data") if isinstance(item, dict) else item
-        if not isinstance(raw_b64, str) or not raw_b64.strip():
-            raise Rejected("companion_invalid_frames")
-        b64 = raw_b64.strip()
-        if b64.startswith("data:"):
-            _, _, b64 = b64.partition(",")
-        elif b64.startswith("base64://"):
-            b64 = b64[9:]
-        if not b64 or len(b64) > _MAX_BASE64_FRAME_CHARS:
-            raise Rejected("companion_frame_too_large")
-        try:
-            decoded = base64.b64decode(b64, validate=True)
-        except (ValueError, binascii.Error):
-            raise Rejected("companion_invalid_frames") from None
-        if not decoded or len(decoded) > settings.image_max_bytes:
-            raise Rejected("companion_frame_too_large")
-        out.append(
-            normalize_image(
-                decoded,
-                settings.image_max_pixels,
-                standard_max_edge=1024,
-                tall_max_edge=1024,
-            )
-        )
-    return out
+    return decode_b64_frames(raw_frames, max_frames, settings, error_prefix="companion")
 
 
 @dataclass
@@ -235,7 +167,6 @@ class _CompanionSession:
     turns: int = 0
     spoken_turns: int = 0
     frames_analyzed: int = 0
-    last_pulse_at: float = 0.0
     finalized: bool = False
     recent_turns: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=16))
     highlights: deque[str] = field(default_factory=lambda: deque(maxlen=8))
@@ -295,12 +226,91 @@ class VoiceCompanion:
             if row and row[0]:
                 try:
                     data = self.store.vault.open(_VAULT_CTX_CFG, row[0])
-                    self.config = VoiceCompanionConfig.model_validate(data)
+                    filtered = (
+                        {k: v for k, v in data.items() if k in VoiceCompanionConfig.model_fields}
+                        if isinstance(data, dict)
+                        else data
+                    )
+                    self.config = VoiceCompanionConfig.model_validate(filtered)
                     self.overridden = True
                 except Exception:
                     self.config = VoiceCompanionConfig()
                     self.overridden = False
         self.initialized = True
+
+    def has_active_owner_session(self) -> bool:
+        """Whether an authenticated owner_private voice session is ready and allows screen_watch."""
+        peer = self._peer
+        return bool(
+            peer is not None
+            and peer.ready.is_set()
+            and not peer.closed
+            and self.config.enabled
+            and self.config.use_screen_watch
+            and bool(self.s.owner_qq_id)
+            and peer.session is not None
+            and not peer.session.finalized
+            and peer.session.mode == "owner_private"
+        )
+
+    async def trigger_screen_commentary(
+        self,
+        frames: list[ModelImage],
+        *,
+        game_title: str = "",
+        turn_id: str = "",
+    ) -> Literal["dispatched", "busy", "unavailable"]:
+        """Trigger a proactive spoken commentary turn using frames supplied by screen_watch."""
+        async with self.peer_lock:
+            peer = self._peer
+        if (
+            peer is None
+            or not peer.ready.is_set()
+            or peer.closed
+            or not self.config.enabled
+            or not self.config.use_screen_watch
+            or not self.s.owner_qq_id
+            or peer.session is None
+            or peer.session.finalized
+            or peer.session.mode != "owner_private"
+        ):
+            return "unavailable"
+        raw_tid = turn_id.strip()
+        tid = (
+            raw_tid
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw_tid)
+            else "sw-" + uuid.uuid4().hex[:12]
+        )
+        async with peer.turn_lock:
+            if (
+                peer.closed
+                or not peer.ready.is_set()
+                or peer.session is None
+                or peer.session.finalized
+                or peer.session.mode != "owner_private"
+            ):
+                return "unavailable"
+            if peer.active_turn_task is not None and not peer.active_turn_task.done():
+                return "busy"
+            cancel_event = asyncio.Event()
+            task = asyncio.create_task(
+                self._run_turn(
+                    peer,
+                    peer.session,
+                    turn_id=tid,
+                    event_kind="screen_pulse",
+                    speech_text="",
+                    speaker_id=self.s.owner_qq_id,
+                    speaker_name="BOISER",
+                    frames=list(frames[:2]),
+                    cancel_event=cancel_event,
+                    game_title_override=game_title,
+                )
+            )
+            peer.active_turn_task = task
+            peer.active_turn_cancel = cancel_event
+            peer.active_turn_id = tid
+        return "dispatched"
 
     def status_summary(self) -> dict[str, Any]:
         peer = self._peer
@@ -639,7 +649,7 @@ class VoiceCompanion:
             user_id=safe_speaker,
             kind="group",
             conversation_id=f"{session.adapter_id}:{session.id}",
-            text=text or "[看屏观察]",
+            text=text or "[语音发言]",
             addressed=True,
             created_at=now,
             sender_nickname=sanitize_sensor_text(speaker_name, self.s, max_tokens=16),
@@ -657,6 +667,7 @@ class VoiceCompanion:
         speaker_name: str,
         frames: list[ModelImage],
         cancel_event: asyncio.Event,
+        game_title_override: str = "",
     ) -> None:
         secrets = (
             list(self.service.secrets)
@@ -669,10 +680,13 @@ class VoiceCompanion:
         session.turns += 1
         session.frames_analyzed += len(frames)
 
+        effective_game = session.game_title or (
+            sanitize_sensor_text(game_title_override, self.s, max_tokens=16) if is_owner else ""
+        )
         msg = self._make_turn_message(session, speaker_id, speaker_name, speech_text, now)
         payload: dict[str, Any] = {
             "event_kind": event_kind,
-            "game_title": session.game_title,
+            "game_title": effective_game,
             "allow_silent": allow_silent,
             "tts_style_hint": self.config.tts_style_hint,
             "recent_voice_turns": list(session.recent_turns),
@@ -749,9 +763,12 @@ class VoiceCompanion:
             spoken = not buffer.silent and full_text.strip().upper() != _SILENT_TOKEN and seq > 0
             if spoken:
                 session.spoken_turns += 1
-                session.last_pulse_at = max(session.last_pulse_at, now)
+                if is_owner:
+                    sw = getattr(self.service, "screen_watch", None)
+                    if sw is not None and hasattr(sw, "note_spoken"):
+                        sw.note_spoken(self.clock())
                 clean_reply = safe_output(
-                    " ".join(clean_text(_strip_markdown_noise(full_text)).split()),
+                    " ".join(clean_text(strip_markdown_noise(full_text)).split()),
                     secrets,
                     limit=240,
                 )
@@ -837,6 +854,7 @@ class VoiceCompanion:
         speaker_id: str,
         speaker_name: str,
         frames: list[ModelImage],
+        game_title_override: str = "",
     ) -> None:
         async with peer.turn_lock:
             if event_kind == "speech":
@@ -859,6 +877,7 @@ class VoiceCompanion:
                     speaker_name=speaker_name,
                     frames=frames,
                     cancel_event=cancel_event,
+                    game_title_override=game_title_override,
                 )
             )
             peer.active_turn_task = task
@@ -928,7 +947,6 @@ class VoiceCompanion:
                         mode=mode,
                         game_title=game_title,
                         started_at=now,
-                        last_pulse_at=now,
                     )
                     peer.session = sess
                     ws = getattr(self.service, "world_state", None)
@@ -961,7 +979,7 @@ class VoiceCompanion:
                     target_id = str(frame.get("turn_id") or "").strip()
                     if not target_id or target_id == peer.active_turn_id:
                         await self._cancel_active_turn(peer)
-                elif typ in {"speech.turn", "screen.pulse"}:
+                elif typ == "speech.turn":
                     sess = peer.session
                     if sess is None or sess.finalized:
                         await self._send_frame(
@@ -986,54 +1004,22 @@ class VoiceCompanion:
                             },
                         )
                         continue
-                    event_kind: Literal["speech", "screen_pulse"] = (
-                        "speech" if typ == "speech.turn" else "screen_pulse"
-                    )
-                    if event_kind == "screen_pulse":
-                        if not self.config.proactive_watch_enabled:
-                            await self._send_frame(
-                                peer,
-                                {
-                                    "type": "turn.end",
-                                    "turn_id": tid,
-                                    "status": "skipped",
-                                    "reason": "proactive_disabled",
-                                },
-                            )
-                            continue
-                        now = self.clock()
-                        if now - sess.last_pulse_at < self.config.min_pulse_interval_seconds:
-                            await self._send_frame(
-                                peer,
-                                {
-                                    "type": "turn.end",
-                                    "turn_id": tid,
-                                    "status": "skipped",
-                                    "reason": "cooldown",
-                                },
-                            )
-                            continue
-                        sess.last_pulse_at = now
-                    speech_text = ""
-                    if event_kind == "speech":
-                        speech_text = clean_text(str(frame.get("text") or ""))[:1000]
-                        if not speech_text:
-                            await self._send_frame(
-                                peer,
-                                {
-                                    "type": "turn.end",
-                                    "turn_id": tid,
-                                    "status": "skipped",
-                                    "reason": "empty_speech",
-                                },
-                            )
-                            continue
+                    speech_text = clean_text(str(frame.get("text") or ""))[:1000]
+                    if not speech_text:
+                        await self._send_frame(
+                            peer,
+                            {
+                                "type": "turn.end",
+                                "turn_id": tid,
+                                "status": "skipped",
+                                "reason": "empty_speech",
+                            },
+                        )
+                        continue
                     speaker_id = str(frame.get("speaker_id") or "speaker").strip()[:64]
                     speaker_name = str(frame.get("speaker_name") or "").strip()[:48]
                     try:
-                        frames = _decode_frames(
-                            frame.get("frames"), self.config.max_frames_per_turn, self.s
-                        )
+                        frames = _decode_frames(frame.get("frames"), 2, self.s)
                     except Rejected as exc:
                         await self._send_frame(
                             peer,
@@ -1045,15 +1031,23 @@ class VoiceCompanion:
                             },
                         )
                         continue
+                    game_override = ""
+                    if not frames and sess.mode == "owner_private" and self.config.use_screen_watch:
+                        sw = getattr(self.service, "screen_watch", None)
+                        if sw is not None and hasattr(sw, "latest_frames"):
+                            frames, game_override = sw.latest_frames(
+                                owner_only=True, now=self.clock()
+                            )
                     await self._start_turn(
                         peer,
                         sess,
                         turn_id=tid,
-                        event_kind=event_kind,
+                        event_kind="speech",
                         speech_text=speech_text,
                         speaker_id=speaker_id,
                         speaker_name=speaker_name,
                         frames=frames,
+                        game_title_override=game_override,
                     )
                 elif typ == "session.stop":
                     await self._cancel_active_turn(peer)

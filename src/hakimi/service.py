@@ -185,6 +185,7 @@ class Service:
         self.event_ledger = self.modules.systems["event_ledger"].ledger
         self.modules.event_ledger = self.event_ledger
         self.sessions.event_ledger = self.event_ledger
+        self.screen_watch = self.modules.systems["screen_watch"].screen_watch
         self.voice_companion = self.modules.systems["voice_companion"].companion
         self.world_state = WorldStateManager(settings, store, self.modules)
         install_modules(self)
@@ -458,6 +459,8 @@ class Service:
             res = close_nt()
             if inspect.isawaitable(res):
                 await res
+        if sw := getattr(self, "screen_watch", None):
+            await sw.close()
         if vc := getattr(self, "voice_companion", None):
             await vc.close()
 

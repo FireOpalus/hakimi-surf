@@ -111,6 +111,9 @@ CODES = frozenset(
         "companion_connected",
         "companion_disconnected",
         "companion_turn_failed",
+        "screen_watch_connected",
+        "screen_watch_disconnected",
+        "screen_watch_pulse_failed",
     }
 )
 
