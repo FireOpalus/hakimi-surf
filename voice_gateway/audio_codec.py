@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
+import math
+import os
+import tempfile
+import wave
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
+from pathlib import Path
 
 from voice_client.audio import pcm16_to_wav_bytes
 
-OUTPUT_FORMATS: tuple[str, ...] = ("mp3", "wav", "pcm_16k", "pcm_48k_stereo")
+OUTPUT_FORMATS: tuple[str, ...] = ("mp3", "wav", "ogg_opus", "pcm_16k", "pcm_48k_stereo")
 
 _OUTPUT_FORMAT_META: dict[str, tuple[str, int, int]] = {
     "mp3": ("audio/mpeg", 44100, 1),
     "wav": ("audio/wav", 32000, 1),
+    "ogg_opus": ("audio/ogg", 48000, 1),
     "pcm_16k": ("audio/L16;rate=16000;channels=1", 16000, 1),
     "pcm_48k_stereo": ("audio/L16;rate=48000;channels=2", 48000, 2),
 }
@@ -30,6 +37,24 @@ _FFMPEG_INPUT_ARGS: dict[str, list[str]] = {
 _FFMPEG_OUTPUT_ARGS: dict[str, list[str]] = {
     "mp3": ["-vn", "-ac", "1", "-ar", "44100", "-f", "mp3", "pipe:1"],
     "wav": ["-vn", "-ac", "1", "-ar", "32000", "-f", "wav", "pipe:1"],
+    "ogg_opus": [
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "32k",
+        "-vbr",
+        "on",
+        "-application",
+        "voip",
+        "-f",
+        "ogg",
+        "pipe:1",
+    ],
     "pcm_16k": ["-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"],
     "pcm_48k_stereo": ["-vn", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1"],
 }
@@ -302,3 +327,99 @@ async def transcode_audio_stream(
             await _terminate_process(proc)
         with contextlib.suppress(Exception):
             await chunks.aclose()
+
+
+def _derive_ffprobe_bin(ffmpeg_bin: str) -> str:
+    raw = str(ffmpeg_bin or "").strip()
+    if not raw or raw == "ffmpeg":
+        return "ffprobe"
+    path = Path(raw)
+    if path.name.startswith("ffmpeg"):
+        return str(path.with_name("ffprobe" + path.name[6:]))
+    return str(path.with_name("ffprobe"))
+
+
+def _write_temp_audio(audio_bytes: bytes, suffix: str) -> str:
+    fd, temp_path = tempfile.mkstemp(prefix="vg-dur-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(audio_bytes)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_path)
+        raise
+    return temp_path
+
+
+async def probe_audio_duration_ms(
+    audio_bytes: bytes,
+    fmt: str,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    timeout: float = 5.0,  # noqa: ASYNC109
+) -> int | None:
+    """Return positive audio duration in milliseconds, or None when unavailable."""
+    if not audio_bytes:
+        return None
+    fmt_norm = fmt.strip().lower().lstrip(".")
+    if fmt_norm == "wav":
+        try:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+        except (wave.Error, EOFError, ValueError):
+            return None
+        if frames <= 0 or rate <= 0:
+            return None
+        return max(1, round(frames / rate * 1000.0))
+    if fmt_norm == "pcm_16k":
+        if len(audio_bytes) < 2:
+            return None
+        return max(1, round(len(audio_bytes) / (16000 * 2) * 1000.0))
+    if fmt_norm == "pcm_48k_stereo":
+        if len(audio_bytes) < 4:
+            return None
+        return max(1, round(len(audio_bytes) / (48000 * 2 * 2) * 1000.0))
+
+    ffprobe_bin = _derive_ffprobe_bin(ffmpeg_bin)
+    suffix = ".ogg" if fmt_norm == "ogg_opus" else f".{fmt_norm}" if fmt_norm.isalnum() else ".bin"
+    temp_path: str | None = None
+    try:
+        temp_path = await asyncio.to_thread(_write_temp_audio, audio_bytes, suffix)
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            temp_path,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            async with asyncio.timeout(timeout):
+                stdout, _ = await proc.communicate()
+        except TimeoutError:
+            await _terminate_process(proc)
+            return None
+        except asyncio.CancelledError:
+            await _terminate_process(proc)
+            raise
+        if proc.returncode != 0:
+            return None
+        raw_val = stdout.decode("utf-8", errors="replace").strip().splitlines()
+        if not raw_val:
+            return None
+        seconds = float(raw_val[0].strip())
+        if not math.isfinite(seconds) or seconds <= 0:
+            return None
+        return max(1, round(seconds * 1000.0))
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    finally:
+        if temp_path is not None:
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(os.unlink, temp_path)

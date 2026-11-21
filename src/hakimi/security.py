@@ -71,6 +71,7 @@ def configured_secrets(settings: Settings) -> list[str]:
                 settings.bili_buvid4,
                 settings.bili_proxy,
                 settings.deepseek_api_key,
+                settings.voice_gateway_token,
             )
         ),
         *(getattr(settings, "_runtime_extra_secrets", ()) or ()),

@@ -22,7 +22,12 @@ from voice_client.providers import (
     build_tts_provider,
 )
 
-from .audio_codec import normalize_input_to_wav, output_format_meta, transcode_audio_stream
+from .audio_codec import (
+    normalize_input_to_wav,
+    output_format_meta,
+    probe_audio_duration_ms,
+    transcode_audio_stream,
+)
 from .config import VoiceGatewayConfig, load_gateway_config
 from .protocol import (
     ProtocolError,
@@ -236,7 +241,13 @@ def create_gateway_app(
             with contextlib.suppress(Exception):
                 await transcoded.aclose()
 
-        return Response(content=bytes(buf), media_type=mime_type, headers=headers)
+        audio_bytes = bytes(buf)
+        duration_ms = await probe_audio_duration_ms(
+            audio_bytes, output_fmt, ffmpeg_bin=cfg.ffmpeg_bin
+        )
+        if duration_ms is not None and duration_ms > 0:
+            headers["X-Audio-Duration-Ms"] = str(duration_ms)
+        return Response(content=audio_bytes, media_type=mime_type, headers=headers)
 
     @app.websocket("/{full_path:path}")
     async def voice_ws(websocket: WebSocket, full_path: str = "") -> None:

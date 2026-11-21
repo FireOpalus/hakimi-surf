@@ -174,6 +174,7 @@ class PluginRuntimeConfig(BaseModel):
     capabilities: tuple[str, ...] = ()
     event_subscriptions: tuple[str, ...] = ()
     chat_platforms: tuple[str, ...] = ()
+    voice_format: str | None = None
     session_exit_action: str | None = None
     reconnect_min: float = Field(default=1.0, gt=0.0)
     reconnect_max: float = Field(default=30.0, gt=0.0)
@@ -204,6 +205,15 @@ class PluginRuntimeConfig(BaseModel):
             return None
         if not _ACTION_NAME_RE.fullmatch(value):
             raise ValueError("invalid session_exit_action")
+        return value
+
+    @field_validator("voice_format")
+    @classmethod
+    def _validate_voice_format(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if value not in {"ogg_opus", "mp3", "wav"}:
+            raise ValueError("invalid voice_format")
         return value
 
 
@@ -473,6 +483,15 @@ class HakimiPluginClient:
 
         return _decorator(fn) if fn is not None else _decorator
 
+    def on_voice_delivery(self, fn: Callable[..., Any] | None = None) -> Any:
+        """Decorator registering the `delivery.send_voice` RPC handler."""
+
+        def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_rpc("delivery.send_voice", target)
+            return target
+
+        return _decorator(fn) if fn is not None else _decorator
+
     def on_switch(self, fn: Callable[..., Any] | None = None) -> Any:
         """Decorator registering a handler for `module.switch` (`enabled: bool`)."""
 
@@ -538,6 +557,8 @@ class HakimiPluginClient:
         }
         if self.config.session_exit_action is not None:
             payload["session_exit_action"] = self.config.session_exit_action
+        if self.config.voice_format is not None:
+            payload["voice_format"] = self.config.voice_format
         return payload
 
     async def _ws_send(self, ws: Any, frame: dict[str, Any]) -> None:

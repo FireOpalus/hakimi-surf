@@ -27,6 +27,24 @@ from .thinking_policy import (
 from .video_policy import MAX_VIDEO_SECONDS, VideoDailyLimit
 
 
+def _parse_string_set(value: Any, *, field_name: str) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return set()
+        if raw.startswith("["):
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                raise ValueError(f"{field_name} JSON must be an array")
+            return {str(item).strip() for item in parsed if str(item).strip()}
+        return {part.strip() for part in raw.split(",") if part.strip()}
+    if isinstance(value, set | frozenset | list | tuple):
+        return {str(item).strip() for item in value if str(item).strip()}
+    raise ValueError(f"invalid {field_name}")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="HAKIMI_",
@@ -295,25 +313,96 @@ class Settings(BaseSettings):
         default_factory=set,
         validation_alias=AliasChoices("EXTERNAL_PLUGINS", "HAKIMI_EXTERNAL_PLUGINS"),
     )
+    voice_reply_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("VOICE_REPLY_ENABLED", "HAKIMI_VOICE_REPLY_ENABLED"),
+    )
+    voice_reply_mode: Literal["owner_only", "allowlist", "all"] = Field(
+        default="owner_only",
+        validation_alias=AliasChoices("VOICE_REPLY_MODE", "HAKIMI_VOICE_REPLY_MODE"),
+    )
+    voice_reply_allowed_groups: Annotated[set[str], NoDecode] = Field(
+        default_factory=set,
+        validation_alias=AliasChoices(
+            "VOICE_REPLY_ALLOWED_GROUPS", "HAKIMI_VOICE_REPLY_ALLOWED_GROUPS"
+        ),
+    )
+    voice_gateway_url: str = Field(
+        default="",
+        max_length=256,
+        validation_alias=AliasChoices("VOICE_GATEWAY_URL", "HAKIMI_VOICE_GATEWAY_URL"),
+    )
+    voice_gateway_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("VOICE_GATEWAY_TOKEN", "HAKIMI_VOICE_GATEWAY_TOKEN"),
+    )
+    voice_reply_timeout_seconds: float = Field(
+        default=12.0,
+        ge=2.0,
+        le=30.0,
+        validation_alias=AliasChoices(
+            "VOICE_REPLY_TIMEOUT_SECONDS", "HAKIMI_VOICE_REPLY_TIMEOUT_SECONDS"
+        ),
+    )
+    voice_reply_max_chars: int = Field(
+        default=120,
+        ge=20,
+        le=300,
+        validation_alias=AliasChoices("VOICE_REPLY_MAX_CHARS", "HAKIMI_VOICE_REPLY_MAX_CHARS"),
+    )
+    voice_reply_cooldown_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=3600.0,
+        validation_alias=AliasChoices(
+            "VOICE_REPLY_COOLDOWN_SECONDS", "HAKIMI_VOICE_REPLY_COOLDOWN_SECONDS"
+        ),
+    )
+    voice_reply_daily_limit: int = Field(
+        default=40,
+        ge=1,
+        le=500,
+        validation_alias=AliasChoices("VOICE_REPLY_DAILY_LIMIT", "HAKIMI_VOICE_REPLY_DAILY_LIMIT"),
+    )
 
     @field_validator("external_plugins", mode="before")
     @classmethod
     def _parse_external_plugins(cls, value: Any) -> set[str]:
+        return _parse_string_set(value, field_name="external_plugins")
+
+    @field_validator("voice_reply_allowed_groups", mode="before")
+    @classmethod
+    def _parse_voice_reply_allowed_groups(cls, value: Any) -> set[str]:
+        return _parse_string_set(value, field_name="voice_reply_allowed_groups")
+
+    @field_validator("voice_gateway_url", mode="before")
+    @classmethod
+    def _validate_voice_gateway_url(cls, value: Any) -> str:
         if value is None:
-            return set()
-        if isinstance(value, str):
-            raw = value.strip()
-            if not raw:
-                return set()
-            if raw.startswith("["):
-                parsed = json.loads(raw)
-                if not isinstance(parsed, list):
-                    raise ValueError("external_plugins JSON must be an array")
-                return {str(item).strip() for item in parsed if str(item).strip()}
-            return {part.strip() for part in raw.split(",") if part.strip()}
-        if isinstance(value, set | frozenset | list | tuple):
-            return {str(item).strip() for item in value if str(item).strip()}
-        raise ValueError("invalid external_plugins")
+            return ""
+        raw = str(value).strip()
+        if not raw:
+            return ""
+        if len(raw) > 256:
+            raise ValueError("voice_gateway_url too long")
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("invalid voice_gateway_url")
+        if parsed.scheme == "http" and not (
+            host in {"127.0.0.1", "::1", "localhost"}
+            or bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host))
+        ):
+            raise ValueError("remote voice_gateway_url requires HTTPS")
+        return raw.rstrip("/")
 
     group_policies: dict[str, Literal["at_only", "smart_reply", "muted"]] = Field(
         default_factory=dict

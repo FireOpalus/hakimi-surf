@@ -392,6 +392,13 @@ def assemble_chat_input(
             '（无参数时 arguments_json 填 "{}" 或 null），'
             "否则必须填 null。"
         )
+    if not sandbox_mode and payload.get("voice_reply_available"):
+        metadata["voice_reply_hint"] = (
+            "当前对话支持发送语音条：当你希望用声音回复（如对方要求发语音、早晚安、安慰撒娇或轻松吐槽）时，"
+            "可在 voice_text 填一段简短纯口播文案（<=100字，勿含链接/代码/颜文字）；"
+            '纯发语音时 bubbles 可填 [""]，文字+语音可同时填；'
+            "平时普通文字回复 voice_text 填 null，不要每句都发语音。"
+        )
     if not sandbox_mode and payload.get("module_context"):
         metadata["module_context"] = payload["module_context"]
     if not sandbox_mode and payload.get("unshared_world_news"):
@@ -534,6 +541,8 @@ def assemble_chat_input(
             metadata["allowed_at_qqs"] = metadata["allowed_at_qqs"][:20]
     if estimate_tokens(tail()) > settings.chat_tail_tokens and "jit_proactive_intent" in metadata:
         metadata.pop("jit_proactive_intent", None)
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and "voice_reply_hint" in metadata:
+        metadata.pop("voice_reply_hint", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and "owner_chat_actions" in metadata:
         metadata.pop("owner_chat_actions", None)
         metadata.pop("owner_chat_action_hint", None)

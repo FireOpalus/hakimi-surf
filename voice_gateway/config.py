@@ -22,9 +22,11 @@ from voice_client.config import (
     load_dotenv_file,
 )
 
-OutputFormat = Literal["mp3", "wav", "pcm_16k", "pcm_48k_stereo"]
+OutputFormat = Literal["mp3", "wav", "ogg_opus", "pcm_16k", "pcm_48k_stereo"]
 
-_VALID_OUTPUT_FORMATS: frozenset[str] = frozenset({"mp3", "wav", "pcm_16k", "pcm_48k_stereo"})
+_VALID_OUTPUT_FORMATS: frozenset[str] = frozenset(
+    {"mp3", "wav", "ogg_opus", "pcm_16k", "pcm_48k_stereo"}
+)
 _WS_PATH_RE = re.compile(r"^/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")

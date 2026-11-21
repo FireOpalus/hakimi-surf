@@ -64,6 +64,7 @@ from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
 from .video_watch import VideoWatch
+from .voice_reply import VoiceReplyClient, explicit_voice_request
 from .web_search import explicit_search, search_query
 from .work_usage import model_work
 from .world_experience import SOCIAL_LOW
@@ -122,6 +123,7 @@ class Service:
         self.s, self.store, self.ai, self.sender = settings, store, gateway, sender
         # Older composition roots supplied their shared HTTP client on the sender.
         self.http = http if http is not None else getattr(sender, "http", None)
+        self.voice_reply = VoiceReplyClient(settings, http=self.http)
         self.node_transport = (
             node_transport if node_transport is not None else NodeTransport(settings)
         )
@@ -1018,6 +1020,17 @@ class Service:
 
     def output(self, text: str) -> str:
         return safe_output(text, self.secrets, limit=self.s.send_max_chars)
+
+    def platform_voice_capability(self, message: Message) -> tuple[bool, str]:
+        if message.platform == "onebot":
+            return (hasattr(self.sender, "send_voice"), "mp3")
+        if message.platform == "qq":
+            return (False, "")
+        module = chat_module(self.s, message.platform)
+        return (
+            bool(module and getattr(module, "supports_voice", False)),
+            str(getattr(module, "preferred_voice_format", "ogg_opus") or "ogg_opus"),
+        )
 
     @staticmethod
     def _pick_lurk_emoji(members: list[Message]) -> str | None:
@@ -2085,6 +2098,8 @@ class Service:
                 )
                 payload["file_attachments"] = file_attachments
         owner_chat_actions: list[dict[str, Any]] = []
+        allow_voice = False
+        explicit_voice = False
         verified_owner_turn = owner(message, self.s) and all(owner(m, self.s) for m in members)
         if not sandbox:
             related_user_ids = [
@@ -2173,6 +2188,18 @@ class Service:
                 owner_chat_actions = self._collect_owner_chat_actions()
                 if owner_chat_actions:
                     payload["owner_chat_actions"] = owner_chat_actions
+            voice_supported, _ = self.platform_voice_capability(message)
+            explicit_voice = explicit_voice_request(*(m.text for m in members), message.text)
+            allow_voice = (
+                voice_supported
+                and not self.bot_guard.known_bot(message)
+                and self.voice_reply.allowed_for_message(message, sandbox=sandbox)
+                and self.voice_reply.can_send_now(
+                    self.store.session_scope(message), explicit=explicit_voice
+                )[0]
+            )
+            if allow_voice:
+                payload["voice_reply_available"] = True
         context_members = list(members)
         if message.kind == "group":
             context_members.extend(neighbour_members if images else [])
@@ -2459,6 +2486,8 @@ class Service:
                     extra_parse_kwargs["allow_owner_chat_actions"] = allow_owner_actions
                 if has_varkw or "allowed_owner_chat_actions" in parse_params:
                     extra_parse_kwargs["allowed_owner_chat_actions"] = allowed_owner_action_names
+                if has_varkw or "allow_voice" in parse_params:
+                    extra_parse_kwargs["allow_voice"] = allow_voice
                 actions, folded = parse_actions(
                     generated,
                     public=public,
@@ -2521,6 +2550,7 @@ class Service:
                         actions.sticker.label = None
                         actions.emoji_like = None
                         actions.poke_qq = None
+                        actions.voice_text = None
                         folded = None
                 if not sandbox and not actions.abstain and not farewell_bypass:
                     if (
@@ -2608,6 +2638,7 @@ class Service:
                         "source_ids": [m.event_id for m in members],
                         "public": public,
                         "allow_text_card": allow_text_card,
+                        **({"explicit_voice": explicit_voice} if actions.voice_text else {}),
                         **({"farewell_bypass_mute": True} if farewell_bypass else {}),
                         **(
                             {"farewell_bypass_user_ids": farewell_bypass_user_ids}
@@ -2631,7 +2662,9 @@ class Service:
                 if not sandbox and not actions.abstain and not farewell_bypass:
                     self._record_owner_turn_recap(
                         message,
-                        " ".join(b.strip() for b in actions.bubbles if b.strip()) or (folded or ""),
+                        " ".join(b.strip() for b in actions.bubbles if b.strip())
+                        or (folded or "")
+                        or (actions.voice_text or ""),
                     )
                 await self.store.runtime.filters.update_audit(audit_id, "queued")
                 return
@@ -2862,14 +2895,10 @@ class Service:
         }
         if reply_actions.get("farewell_bypass_mute"):
             raw_bypass_ids.add(message.user_id)
-        if (
-            message.platform in {"onebot", "qq"}
-            and reply_actions
-            and not (
-                bool(reply_actions.get("farewell_bypass_mute"))
-                and "bubbles" not in reply_actions
-                and reply.get("text")
-            )
+        if reply_actions and not (
+            bool(reply_actions.get("farewell_bypass_mute"))
+            and "bubbles" not in reply_actions
+            and reply.get("text")
         ):
             from .outgoing import deliver_actions
 

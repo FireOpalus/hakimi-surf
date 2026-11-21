@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import hashlib
 import hmac
@@ -571,6 +572,10 @@ class _PluginThinkingSceneDecl(BaseModel):
     output_cap: OutputCap | None = None
 
 
+_VALID_VOICE_FORMATS = frozenset({"ogg_opus", "mp3", "wav"})
+_MAX_VOICE_AUDIO_BYTES = 2 * 1024 * 1024
+
+
 class _PluginHelloFrame(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
@@ -589,6 +594,7 @@ class _PluginHelloFrame(BaseModel):
     initial_status: dict[str, Any] = Field(default_factory=dict)
     event_subscriptions: list[str] = Field(default_factory=list, max_length=16)
     session_exit_action: str | None = None
+    voice_format: str | None = None
 
     @field_validator("protocol_version")
     @classmethod
@@ -642,6 +648,15 @@ class _PluginHelloFrame(BaseModel):
             return None
         if not _ACTION_NAME_RE.fullmatch(val):
             raise ValueError("invalid session_exit_action")
+        return val
+
+    @field_validator("voice_format")
+    @classmethod
+    def _check_voice_format(cls, val: str | None) -> str | None:
+        if val is None or val == "":
+            return None
+        if val not in _VALID_VOICE_FORMATS:
+            raise ValueError("invalid voice_format")
         return val
 
 
@@ -834,6 +849,7 @@ class RemoteModuleProxy(BaseModule):
         initial_status: dict[str, Any] | None = None,
         action_timeouts: dict[str, float] | None = None,
         session_exit_action: str | None = None,
+        voice_format: str | None = None,
     ) -> None:
         super().__init__(settings)
         self.module_id = plugin_id
@@ -857,6 +873,8 @@ class RemoteModuleProxy(BaseModule):
         self.supports_emoji_like = bool({"emoji_like", "supports_emoji_like"} & cap_set)
         self.supports_poke = bool({"poke", "supports_poke"} & cap_set)
         self.supports_reply_anchor = bool({"reply_anchor", "supports_reply_anchor"} & cap_set)
+        self.supports_voice = bool({"voice", "supports_voice"} & cap_set)
+        self.preferred_voice_format = voice_format or "ogg_opus"
         self.enabled = enabled
         self._configuration_issue: str | None = configuration_issue
         self._remote_status: dict[str, Any] = (
@@ -947,11 +965,13 @@ class RemoteModuleProxy(BaseModule):
             and not self._session.closed
         )
 
-    async def send_chat(self, message: Message, text: str, *, before_send=None) -> str:
-        if "chat" not in self._scopes or message.platform not in self.chat_platforms:
-            raise Rejected("delivery_not_authorized")
-        if not self.enabled:
-            raise Rejected("module_disabled")
+    async def _deliver_rpc(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        before_send=None,
+    ) -> str:
         delivery_id = uuid.uuid4().hex
         if before_send is not None:
             allowed = await _call_before_send(before_send, delivery_id)
@@ -959,20 +979,11 @@ class RemoteModuleProxy(BaseModule):
                 raise Rejected("reply_invalidated")
         if not self._session.ready or self._session.closed:
             raise Rejected("plugin_disconnected")
-        params = {
-            "delivery_id": delivery_id,
-            "platform": message.platform,
-            "bot_id": message.bot_id,
-            "kind": message.kind,
-            "conversation_id": message.conversation_id,
-            "user_id": message.user_id,
-            "text": text,
-            "reply_to": message.reply_ids[0] if message.reply_ids else None,
-        }
+        params = {"delivery_id": delivery_id, **payload}
         try:
             resp = await self._bus._rpc(
                 self._session,
-                "delivery.send",
+                method,
                 params,
                 delivery_id=delivery_id,
             )
@@ -1000,6 +1011,78 @@ class RemoteModuleProxy(BaseModule):
         msg_id = res.get("message_id") if isinstance(res, dict) else res
         return confirmed_message_id(msg_id)
 
+    async def send_chat(self, message: Message, text: str, *, before_send=None) -> str:
+        if "chat" not in self._scopes or message.platform not in self.chat_platforms:
+            raise Rejected("delivery_not_authorized")
+        if not self.enabled:
+            raise Rejected("module_disabled")
+        return await self._deliver_rpc(
+            "delivery.send",
+            {
+                "platform": message.platform,
+                "bot_id": message.bot_id,
+                "kind": message.kind,
+                "conversation_id": message.conversation_id,
+                "user_id": message.user_id,
+                "text": text,
+                "reply_to": message.reply_ids[0] if message.reply_ids else None,
+            },
+            before_send=before_send,
+        )
+
+    async def send_voice(
+        self,
+        message: Message,
+        audio_bytes: bytes,
+        *,
+        fmt: str,
+        mime_type: str,
+        duration_ms: int | None = None,
+        before_send=None,
+    ) -> str:
+        if "chat" not in self._scopes or message.platform not in self.chat_platforms:
+            raise Rejected("delivery_not_authorized")
+        if not self.supports_voice:
+            raise Rejected("voice_not_supported")
+        if not self.enabled:
+            raise Rejected("module_disabled")
+        if (
+            fmt not in _VALID_VOICE_FORMATS
+            or not isinstance(audio_bytes, (bytes, bytearray))
+            or not (0 < len(audio_bytes) <= _MAX_VOICE_AUDIO_BYTES)
+        ):
+            raise Rejected("invalid_voice_audio")
+        audio_b64 = base64.b64encode(bytes(audio_bytes)).decode("ascii")
+        payload = {
+            "platform": message.platform,
+            "bot_id": message.bot_id,
+            "kind": message.kind,
+            "conversation_id": message.conversation_id,
+            "user_id": message.user_id,
+            "audio_b64": audio_b64,
+            "format": fmt,
+            "mime_type": mime_type,
+            "duration_ms": duration_ms,
+            "reply_to": message.reply_ids[0] if message.reply_ids else None,
+        }
+        probe = json.dumps(
+            {
+                "type": "rpc.request",
+                "id": "0" * 32,
+                "method": "delivery.send_voice",
+                "params": {"delivery_id": "0" * 32, **payload},
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if len(probe.encode("utf-8")) > self._bus._max_frame_bytes():
+            raise Rejected("voice_payload_too_large")
+        return await self._deliver_rpc(
+            "delivery.send_voice",
+            payload,
+            before_send=before_send,
+        )
+
     async def call_custom_rpc(
         self,
         method: str,
@@ -1009,7 +1092,7 @@ class RemoteModuleProxy(BaseModule):
         if (
             not isinstance(method, str)
             or not _CUSTOM_RPC_RE.fullmatch(method)
-            or method == "delivery.send"
+            or method in {"delivery.send", "delivery.send_voice"}
         ):
             raise Rejected("plugin_invalid_method")
         if params is None:
@@ -1038,7 +1121,7 @@ class RemoteModuleProxy(BaseModule):
         if (
             not isinstance(method, str)
             or not _CUSTOM_RPC_RE.fullmatch(method)
-            or method == "delivery.send"
+            or method in {"delivery.send", "delivery.send_voice"}
         ):
             raise Rejected("plugin_invalid_method")
         if params is None:
@@ -1385,6 +1468,8 @@ class RemoteModuleProxy(BaseModule):
             "supports_emoji_like": self.supports_emoji_like,
             "supports_poke": self.supports_poke,
             "supports_reply_anchor": self.supports_reply_anchor,
+            "supports_voice": self.supports_voice,
+            "preferred_voice_format": self.preferred_voice_format,
         }
         return {**self.status_dict(), **base}
 
@@ -4151,6 +4236,7 @@ class PluginBus:
                     initial_status=hello.initial_status,
                     action_timeouts=action_timeouts,
                     session_exit_action=hello.session_exit_action,
+                    voice_format=hello.voice_format,
                 )
                 session.proxy = proxy
                 modules = getattr(self.service, "modules", None)

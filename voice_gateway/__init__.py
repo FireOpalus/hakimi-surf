@@ -8,6 +8,7 @@ from .audio_codec import (
     OUTPUT_FORMATS,
     normalize_input_to_wav,
     output_format_meta,
+    probe_audio_duration_ms,
     transcode_audio_stream,
 )
 from .config import VoiceGatewayConfig, load_gateway_config, redact_secrets
@@ -48,6 +49,7 @@ __all__ = [
     "load_gateway_config",
     "normalize_input_to_wav",
     "output_format_meta",
+    "probe_audio_duration_ms",
     "redact_secrets",
     "transcode_audio_stream",
     "validate_adapter_id",

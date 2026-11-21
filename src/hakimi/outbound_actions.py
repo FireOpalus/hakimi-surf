@@ -11,6 +11,7 @@ from .memes import extract_meme, validate_meme_label
 from .output_links import filter_reply_links
 from .reply_style import casual_reply, clean_chinese_punctuation, public_reply
 from .security import Rejected, clean_text, configured_secrets, safe_output
+from .voice_reply import sanitize_voice_text
 
 ALLOWED_EMOJI_IDS = frozenset(
     {
@@ -130,6 +131,7 @@ class ChatActions(BaseModel):
     affection_delta: int | None = 0
     affection_deltas: list[AffectionTargetDelta] | None = None
     trigger_action: ChatActionTrigger | None = None
+    voice_text: str | None = None
 
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
@@ -289,6 +291,7 @@ def parse_actions(
     allowed_affection_targets: Iterable[str] | None = None,
     allow_owner_chat_actions: bool = False,
     allowed_owner_chat_actions: Iterable[str] | None = None,
+    allow_voice: bool = False,
 ):
     try:
         value = json.loads(raw)
@@ -355,6 +358,15 @@ def parse_actions(
         allowed_actions=allowed_owner_chat_actions,
         settings=settings,
     )
+    if allow_voice and not actions.abstain and actions.voice_text:
+        max_voice_chars = (
+            int(getattr(settings, "voice_reply_max_chars", 120)) if settings is not None else 120
+        )
+        actions.voice_text = sanitize_voice_text(
+            actions.voice_text, settings=settings, max_chars=max_voice_chars
+        )
+    else:
+        actions.voice_text = None
     clean = []
     for text in actions.bubbles:
         text, _ = extract_meme(text)
