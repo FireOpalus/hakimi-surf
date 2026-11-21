@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import math
 import os
 import re
 import signal
 import time
-import unicodedata
 from typing import Any, Literal
 
 import httpx
@@ -21,7 +19,10 @@ from hakimi_plugin_sdk import (
     HakimiPluginClient,
     PluginRpcError,
     PluginRuntimeConfig,
+    ThinkingSceneSpec,
 )
+
+from .play_brain import McBrainConfig, McPlayBrain, _sanitize_text
 
 log = logging.getLogger("hakimi_plugin_minecraft")
 
@@ -70,9 +71,13 @@ _SNAPSHOT_FIELD_KEYS = frozenset(
         "activity",
         "active_task",
         "nearby_entities",
+        "nearby_players",
         "recent_chat_or_sign",
         "updated_at",
     }
+)
+_BRAIN_MILESTONE_EVENTS = frozenset(
+    {"mc_player_chat", "mc_health_alert", "mc_death", "mc_rare_find", "mc_player_spotted"}
 )
 _UNCERTAIN_REASONS = frozenset(
     {
@@ -100,69 +105,6 @@ _STATUS_SYNC_KEYS = (
     "activity",
     "phase",
 )
-
-_AUTH_HEADER_RE = re.compile(r"(?i)\bauthorization\b\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]{4,}")
-_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
-_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}")
-_AIZA_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{8,}")
-_CREDENTIAL_KEY_RE = re.compile(
-    r"(?i)(?:[\"']?)"
-    r"(?:api[_-]?key|apikey|password|passwd|pwd|secret|token|"
-    r"sessdata|bili_jct|buvid3|buvid4|access[_-]?token|refresh[_-]?token|authorization)"
-    r"(?:[\"']?)\s*[:=]\s*(?:[\"']?)[^\s,;}\"'\]]+(?:[\"']?)"
-)
-_ROLE_RE = re.compile(r"\[role=", re.IGNORECASE)
-_CQ_RE = re.compile(r"\[cq:", re.IGNORECASE)
-_AT_BROADCAST_RE = re.compile(r"@(everyone|all|全体成员)", re.IGNORECASE)
-_COLLAPSE_WS_RE = re.compile(r"[\r\n\t ]+")
-
-
-def _clean_text(text: str) -> str:
-    return "".join(
-        c
-        for c in unicodedata.normalize("NFKC", text)
-        if c in "\n\t" or not unicodedata.category(c).startswith("C")
-    ).strip()
-
-
-def _estimate_tokens(text: str) -> int:
-    wide = sum(ord(c) > 127 for c in text)
-    ascii_text = "".join(c if ord(c) < 128 else " " for c in text)
-    return math.ceil(wide * 0.68) + sum(
-        max(1, math.ceil(len(t) / 4)) for t in re.findall(r"\w+|[^\w\s]", ascii_text)
-    )
-
-
-def _truncate_tokens(text: str, limit: int) -> str:
-    if _estimate_tokens(text) <= limit:
-        return text
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _estimate_tokens(text[:mid] + "…[节选]") <= limit:
-            lo = mid
-        else:
-            hi = mid - 1
-    return text[:lo] + "…[节选]"
-
-
-def _sanitize_text(text: str, *, max_tokens: int = 90) -> str:
-    if max_tokens <= 0:
-        return ""
-    cleaned = _clean_text(str(text or ""))
-    if not cleaned:
-        return ""
-    cleaned = _AUTH_HEADER_RE.sub("[REDACTED]", cleaned)
-    cleaned = _BEARER_RE.sub("[REDACTED]", cleaned)
-    cleaned = _SK_RE.sub("[REDACTED]", cleaned)
-    cleaned = _AIZA_RE.sub("[REDACTED]", cleaned)
-    cleaned = _CREDENTIAL_KEY_RE.sub("[REDACTED]", cleaned)
-    cleaned = _ROLE_RE.sub("[untrusted_role=", cleaned)
-    cleaned = _CQ_RE.sub("［CQ:", cleaned)
-    cleaned = _AT_BROADCAST_RE.sub(r"＠\1", cleaned)
-    cleaned = html.escape(cleaned, quote=False)
-    cleaned = _COLLAPSE_WS_RE.sub(" ", cleaned).strip()
-    return _truncate_tokens(cleaned, max_tokens)
 
 
 def _fmt_num(val: int | float) -> str:
@@ -207,12 +149,17 @@ class MinecraftSnapshot(BaseModel):
     active_task: str = ""
     activity: str = ""
     nearby_entities: list[str] = Field(default_factory=list)
+    nearby_players: tuple[str, ...] = ()
     recent_chat_or_sign: str = ""
     updated_at: float = 0.0
 
 
 class NoArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+
+class ConnectArgs(NoArgs):
+    intent: str = Field(default="", max_length=80)
 
 
 class BuildArgs(NoArgs):
@@ -251,6 +198,14 @@ class DisconnectArgs(NoArgs):
     sleep_server: bool = False
 
 
+_CONNECT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "maxLength": 80, "default": ""},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
 _BUILD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -303,7 +258,11 @@ _DISCONNECT_SCHEMA: dict[str, Any] = {
 }
 
 _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
-    "connect": ("登录进入 Minecraft 服务器上线游玩（如服务端休眠会自动唤醒）", {}, NoArgs),
+    "connect": (
+        "登录进入 Minecraft 服务器上线游玩（如服务端休眠会自动唤醒）",
+        _CONNECT_SCHEMA,
+        ConnectArgs,
+    ),
     "disconnect": ("主动退出 Minecraft 服务器下线待机休息", _DISCONNECT_SCHEMA, DisconnectArgs),
     "build_plan": ("在记事本里记下接下来想在 Minecraft 里搭的建筑点子", _BUILD_SCHEMA, BuildArgs),
     "explore": ("在 Minecraft 世界里四处探索地形与新发现", {}, NoArgs),
@@ -320,10 +279,27 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "pause": ("暂停游戏自主动作", {}, NoArgs),
     "resume": ("恢复游戏自主动作", {}, NoArgs),
 }
-_ADMIN_ONLY_VERBS = frozenset({"status", "pause", "resume"})
 _OWNER_CHAT_VERBS = frozenset({"connect", "disconnect"})
+_MACRO_PLANNER_VERBS = frozenset({"build_plan"})
+_MICRO_GAME_VERBS = frozenset(
+    {
+        "explore",
+        "mine",
+        "gather",
+        "goto",
+        "follow",
+        "chat",
+        "observe",
+        "look_signs",
+        "stop",
+        "idle",
+    }
+)
+_ADMIN_ONLY_VERBS = frozenset({"status", "pause", "resume"})
 _EFFORTFUL_VERBS = frozenset({"explore", "goto", "mine", "gather", "follow"})
-_AUTONOMOUS_AND_ADMIN_ORIGINS = ["planner", "rule", "timer", "legacy", "admin"]
+_OWNER_CHAT_ORIGINS = ["planner", "owner_chat", "rule", "timer", "legacy", "admin"]
+_MACRO_PLANNER_ORIGINS = ["planner", "rule", "timer", "legacy", "admin"]
+_MICRO_GAME_ORIGINS = ["rule", "legacy", "admin"]
 
 
 class MinecraftPlugin:
@@ -340,6 +316,8 @@ class MinecraftPlugin:
         connect_factory: Any = None,
         reconnect_min: float = 1.0,
         reconnect_max: float = 30.0,
+        enable_brain: bool = False,
+        brain_config: McBrainConfig | None = None,
     ) -> None:
         self.mc_bridge_url = mc_bridge_url.strip()
         self._owns_http = http is None
@@ -354,6 +332,26 @@ class MinecraftPlugin:
         self.mc_enabled: bool = False
         self.mc_configured: bool = False
         self.paused: bool = False
+        self.enable_brain: bool = bool(enable_brain)
+        self.session_intent: str = ""
+        self._sync_lock = asyncio.Lock()
+        self._snapshot_seq: int = 0
+        self.brain = McPlayBrain(self, config=brain_config)
+
+        if self.enable_brain:
+            scopes: tuple[str, ...] = ("actions", "sensors", "node_bridge", "thinking_scenes")
+            thinking_scenes: tuple[ThinkingSceneSpec, ...] = (
+                ThinkingSceneSpec(
+                    key="mc.play",
+                    label="MC 实时游玩",
+                    default="low",
+                    levels=("low", "medium", "high"),
+                    output_tokens=512,
+                ),
+            )
+        else:
+            scopes = ("actions", "sensors", "node_bridge")
+            thinking_scenes = ()
 
         config = PluginRuntimeConfig(
             ws_url=ws_url,
@@ -361,7 +359,7 @@ class MinecraftPlugin:
             token=token,
             display_name="Minecraft",
             description="游戏连接、活动目标与建造计划",
-            scopes=("actions", "sensors", "node_bridge"),
+            scopes=scopes,
             node_region="CN",
             admin_panel="minecraft",
             attention_level="HIGH",
@@ -376,6 +374,7 @@ class MinecraftPlugin:
         self.client = HakimiPluginClient(
             config,
             actions=action_specs,
+            thinking_scenes=thinking_scenes,
             initial_status=self.status_dict(),
             connect_factory=connect_factory,
         )
@@ -386,9 +385,13 @@ class MinecraftPlugin:
         if admin_only:
             origins = ["admin"]
         elif verb in _OWNER_CHAT_VERBS:
-            origins = [*_AUTONOMOUS_AND_ADMIN_ORIGINS, "owner_chat"]
+            origins = list(_OWNER_CHAT_ORIGINS)
+        elif verb in _MACRO_PLANNER_VERBS:
+            origins = list(_MACRO_PLANNER_ORIGINS)
+        elif verb in _MICRO_GAME_VERBS:
+            origins = list(_MICRO_GAME_ORIGINS)
         else:
-            origins = list(_AUTONOMOUS_AND_ADMIN_ORIGINS)
+            raise ValueError(f"unclassified_mc_verb:{verb}")
 
         async def _run(params: dict[str, Any]) -> dict[str, Any]:
             return await self._handle_action(verb, params)
@@ -415,6 +418,7 @@ class MinecraftPlugin:
         self.client.on_world_event(self._on_world_event)
 
     async def close(self) -> None:
+        await self.brain.stop()
         await self.client.stop()
         if self._owns_http:
             await self.http.aclose()
@@ -491,6 +495,18 @@ class MinecraftPlugin:
             and math.isfinite(float(raw_ts))
             else float(self.clock())
         )
+        raw_players = data.get("nearby_players") or []
+        players: list[str] = []
+        if isinstance(raw_players, (list, tuple)):
+            for item in raw_players[:6]:
+                clean_player = _sanitize_text(str(item), max_tokens=10)
+                if clean_player and clean_player not in players:
+                    players.append(clean_player)
+        elif isinstance(raw_players, str) and raw_players.strip():
+            clean_player = _sanitize_text(raw_players, max_tokens=10)
+            if clean_player:
+                players.append(clean_player)
+
         return MinecraftSnapshot(
             connected=connected,
             dimension=dimension,
@@ -500,6 +516,7 @@ class MinecraftPlugin:
             activity=activity,
             active_task=str(data.get("active_task") or "")[:16],
             nearby_entities=entities,
+            nearby_players=tuple(players),
             recent_chat_or_sign=recent_chat_or_sign,
             updated_at=updated_at,
         )
@@ -510,6 +527,7 @@ class MinecraftPlugin:
         sanitized = self._sanitize_snapshot(raw)
         self.snapshot = sanitized
         self._has_snapshot = True
+        self._snapshot_seq += 1
         return sanitized
 
     def apply_status(self, raw: dict[str, Any]) -> MinecraftSnapshot:
@@ -522,6 +540,7 @@ class MinecraftPlugin:
             sanitized = self._sanitize_snapshot(nested)
             self.snapshot = sanitized
             self._has_snapshot = True
+            self._snapshot_seq += 1
             return sanitized
         stripped = {k: v for k, v in raw.items() if k not in _NON_SNAPSHOT_KEYS}
         snapshot_fields = {k: v for k, v in stripped.items() if k in _SNAPSHOT_FIELD_KEYS}
@@ -529,6 +548,7 @@ class MinecraftPlugin:
             merged = {**self.snapshot.model_dump(), **snapshot_fields}
             sanitized = self._sanitize_snapshot(merged)
             self.snapshot = sanitized
+            self._snapshot_seq += 1
             if sanitized.connected:
                 self._has_snapshot = True
         return self.snapshot
@@ -560,6 +580,8 @@ class MinecraftPlugin:
         prev = self.snapshot
         was_initialized = self._has_snapshot
         curr = self.apply_snapshot(raw)
+        if was_initialized and prev.connected and not curr.connected:
+            self.session_intent = ""
 
         explicit = milestone or (raw.get("milestone") if isinstance(raw, dict) else None)
         if isinstance(explicit, dict) and explicit.get("event_type"):
@@ -567,12 +589,16 @@ class MinecraftPlugin:
             imp: Literal["low", "normal", "high"] = (
                 imp_raw if imp_raw in ("low", "normal", "high") else "normal"
             )
+            exp_type = _sanitize_text(str(explicit["event_type"]), max_tokens=16)
+            exp_payload = dict(explicit.get("payload") or {})
             await self._emit_milestone(
-                str(explicit["event_type"]),
-                dict(explicit.get("payload") or {}),
+                exp_type or str(explicit["event_type"]),
+                exp_payload,
                 importance=imp,
                 business_key=explicit.get("event_id"),
             )
+            if exp_type in _BRAIN_MILESTONE_EVENTS:
+                self.brain.on_milestone(exp_type, exp_payload)
         elif not prev.connected and curr.connected:
             await self._emit_milestone(
                 "mc_connected",
@@ -604,11 +630,14 @@ class MinecraftPlugin:
             and prev.health is not None
             and ((prev.health > 0 and curr.health <= 0) or (prev.health > 4 and curr.health <= 4))
         ):
+            alert_payload = {"health": curr.health, "dimension": curr.dimension}
             await self._emit_milestone(
                 "mc_health_alert",
-                {"health": curr.health, "dimension": curr.dimension},
+                alert_payload,
                 importance="high",
             )
+            self.brain.on_milestone("mc_health_alert", alert_payload)
+        self.brain.on_snapshot(curr)
         return curr
 
     def status_dict(self) -> dict[str, Any]:
@@ -636,8 +665,14 @@ class MinecraftPlugin:
                 for item in snap.nearby_entities[:5]
                 if (clean := _sanitize_text(item, max_tokens=10))
             ],
+            "nearby_players": [
+                clean
+                for item in snap.nearby_players[:6]
+                if (clean := _sanitize_text(item, max_tokens=10))
+            ],
             "recent_chat_or_sign": _sanitize_text(snap.recent_chat_or_sign, max_tokens=20),
             "updated_at": float(snap.updated_at),
+            **self.brain.telemetry(),
         }
 
     def format_sensor_summary(self) -> str:
@@ -691,14 +726,20 @@ class MinecraftPlugin:
             task, updated_at=snap.updated_at, disconnected=disconnected
         )
 
-    async def _apply_status_data(self, data: dict[str, Any]) -> None:
-        if isinstance(data.get("snapshot"), dict):
-            snap = dict(data["snapshot"])
-            for flag in _BRIDGE_FLAG_KEYS:
-                if flag in data:
-                    snap[flag] = data[flag]
-            await self.update_snapshot(snap)
-        self.apply_status(data)
+    async def _apply_status_data(
+        self, data: dict[str, Any], *, allow_snapshot: bool = True
+    ) -> None:
+        if allow_snapshot:
+            if isinstance(data.get("snapshot"), dict):
+                snap = dict(data["snapshot"])
+                for flag in _BRIDGE_FLAG_KEYS:
+                    if flag in data:
+                        snap[flag] = data[flag]
+                await self.update_snapshot(snap)
+            self.apply_status(data)
+        else:
+            self._update_bridge_flags(data)
+        self.brain.on_state_change()
         await self._push_status_and_activity()
 
     async def _call_bridge(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -733,18 +774,28 @@ class MinecraftPlugin:
         """Best-effort sync of mc.status from CN bridge or local HTTP bridge."""
         if not self.enabled:
             return
-        try:
-            data = await self._call_bridge("mc.status", {})
-        except PluginRpcError as exc:
-            if exc.code in {"node_disconnected", "node_not_dispatched"}:
-                self.node_online = False
-            return
-        if isinstance(data, dict) and self.enabled:
-            await self._apply_status_data(data)
+        seq = self._snapshot_seq
+        async with self._sync_lock:
+            if not self.enabled:
+                return
+            try:
+                data = await self._call_bridge("mc.status", {})
+            except PluginRpcError as exc:
+                if exc.code in {"node_disconnected", "node_not_dispatched"}:
+                    self.node_online = False
+                return
+            if isinstance(data, dict) and self.enabled:
+                bare_stale = (
+                    self._has_snapshot and "snapshot" not in data and "updated_at" not in data
+                )
+                allow_snapshot = (self._snapshot_seq == seq) and not bare_stale
+                await self._apply_status_data(data, allow_snapshot=allow_snapshot)
 
     async def _on_connect(self, welcome: dict[str, Any]) -> None:
         if "enabled" in welcome:
             self.enabled = bool(welcome["enabled"])
+        if self.enable_brain:
+            self.brain.start()
         await self.client.push_status(self.status_dict())
         await self.sync_status()
 
@@ -780,6 +831,8 @@ class MinecraftPlugin:
                 importance=importance,
                 business_key=str(business_key) if business_key else None,
             )
+            if clean_type in _BRAIN_MILESTONE_EVENTS:
+                self.brain.on_milestone(clean_type, event_data)
 
     async def _on_node_state(self, connected: bool) -> None:
         if connected:
@@ -795,6 +848,7 @@ class MinecraftPlugin:
             await self.update_snapshot(
                 {"connected": False, "bridge_ready": False, "activity": "节点连接断开"}
             )
+        self.brain.on_state_change()
         if self.client.connected:
             await self.client.push_status(self.status_dict())
             await self.client.report_activity("", disconnected=True)
@@ -809,6 +863,7 @@ class MinecraftPlugin:
 
     async def _on_switch(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
+        self.brain.on_state_change()
         if not self.enabled:
             if self.client.connected:
                 await self.client.report_activity("", disconnected=True)
@@ -886,6 +941,8 @@ class MinecraftPlugin:
         try:
             if verb in _ADMIN_ONLY_VERBS:
                 data = await self._call_bridge(f"mc.{verb}", {})
+            elif verb == "connect":
+                data = await self._call_bridge("mc.dispatch_goal", {"action_type": "connect"})
             else:
                 params = {
                     key: clean_ticket[key]
@@ -912,15 +969,26 @@ class MinecraftPlugin:
         if not isinstance(data, dict):
             return self._goal_result(ok=False, reason="mc_invalid_receipt")
 
-        if any(k in data for k in _STATUS_SYNC_KEYS):
-            await self._apply_status_data(data)
-
         if "ok" in data:
             ok = data["ok"] is True and data.get("accepted", True) is True
         elif verb == "status":
             ok = data.get("bridge_ready") is True
         else:
             ok = data.get("accepted") is True
+
+        if verb == "connect" and ok:
+            self.session_intent = _sanitize_text(validated.intent, max_tokens=40)[:80]
+        elif verb == "disconnect":
+            self.session_intent = ""
+            self.brain.on_disconnect()
+
+        if any(k in data for k in _STATUS_SYNC_KEYS):
+            await self._apply_status_data(data)
+        elif verb in ("connect", "disconnect") and self.client.connected:
+            await self.client.push_status(self.status_dict())
+
+        if verb in ("pause", "resume"):
+            self.brain.on_state_change()
 
         artifacts: dict[str, Any] = {k: getattr(self, k) for k in _BRIDGE_FLAG_KEYS}
         artifacts["connected"] = self.snapshot.connected
@@ -981,10 +1049,13 @@ def build_minecraft_plugin_from_env(**overrides: Any) -> MinecraftPlugin:
     ).strip()
     if not token and "token" not in overrides:
         raise RuntimeError("HAKIMI_PLUGIN_MINECRAFT_TOKEN (or HAKIMI_PLUGIN_TOKEN) is required")
+    raw_brain = (os.getenv("MC_BRAIN_ENABLED") or "true").strip().lower()
+    enable_brain = raw_brain not in {"0", "false", "no", "off"}
     kwargs: dict[str, Any] = {
         "ws_url": ws_url,
         "token": token,
         "mc_bridge_url": os.getenv("MC_BRIDGE_URL") or "",
+        "enable_brain": enable_brain,
     }
     kwargs.update(overrides)
     return MinecraftPlugin(**kwargs)

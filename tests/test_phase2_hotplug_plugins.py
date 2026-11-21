@@ -690,11 +690,32 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         assert rare.importance == "high"
         assert rare.payload["block"] == "diamond_ore"
 
+        # Macro-only planner origins: planner owns connect/disconnect/build_plan, NOT micro verbs
+        for macro_verb in ("connect", "disconnect", "build_plan"):
+            macro_spec = svc.modules.catalog.actions[f"mc.{macro_verb}"]
+            assert "planner" in macro_spec.origins
+            assert "admin" in macro_spec.origins
+        for micro_verb in (
+            "chat",
+            "mine",
+            "explore",
+            "follow",
+            "gather",
+            "goto",
+            "observe",
+            "look_signs",
+            "stop",
+            "idle",
+        ):
+            micro_spec = svc.modules.catalog.actions[f"mc.{micro_verb}"]
+            assert "planner" not in micro_spec.origins
+            assert "admin" in micro_spec.origins
+
         # Action dispatch via ActionCatalog + SSRF key stripping + mc.goal RPC
         goto_spec = svc.modules.catalog.actions["mc.goto"]
         goto_args = goto_spec.arguments.model_validate({"x": 10, "y": 64, "z": -5})
         goto_outcome = await goto_spec.run(
-            ActionCall({"origin": "planner", "target_scope": ""}, goto_args, NOW)
+            ActionCall({"origin": "admin", "target_scope": ""}, goto_args, NOW)
         )
         assert goto_outcome.status == "done"
         assert goto_outcome.details["result"]["ok"] is True
@@ -719,11 +740,11 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         # mc.chat action dispatch, non-effortful origins, and slash/empty validation guards
         chat_spec = svc.modules.catalog.actions["mc.chat"]
         assert chat_spec.effortful is False
-        assert "planner" in chat_spec.origins
+        assert "planner" not in chat_spec.origins
         assert "admin" in chat_spec.origins
         chat_args = chat_spec.arguments.model_validate({"message": "大家好，我是哈基米！"})
         chat_outcome = await chat_spec.run(
-            ActionCall({"origin": "planner", "target_scope": ""}, chat_args, NOW)
+            ActionCall({"origin": "admin", "target_scope": ""}, chat_args, NOW)
         )
         assert chat_outcome.status == "done"
         assert nt.calls[-1] == (

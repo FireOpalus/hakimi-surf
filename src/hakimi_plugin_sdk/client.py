@@ -671,6 +671,8 @@ class HakimiPluginClient:
         payload: dict[str, Any] | None = None,
         *,
         prompt: str | None = None,
+        task_instruction: str | None = None,
+        response_schema: dict[str, Any] | None = None,
         budget_lane: str = "proactive",
         images: list[dict[str, Any]] | None = None,
         timeout: float = 95.0,  # noqa: ASYNC109
@@ -684,6 +686,10 @@ class HakimiPluginClient:
         }
         if prompt is not None:
             frame["prompt"] = prompt
+        if isinstance(task_instruction, str) and task_instruction.strip():
+            frame["task_instruction"] = task_instruction
+        if response_schema is not None:
+            frame["response_schema"] = dict(response_schema)
         if images:
             frame["images"] = [dict(item) if isinstance(item, dict) else item for item in images]
         res = await self._kernel_request(frame, timeout=timeout)

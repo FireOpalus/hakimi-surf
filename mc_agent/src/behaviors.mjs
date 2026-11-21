@@ -280,6 +280,7 @@ export class McRuntime {
       active_task: this._activeGoalCancel && this.connected && !this.paused ? this.activeTask : "",
       activity: sanitizeMcText(this.activity, 64) || (this.connected ? "原地待命" : "待机"),
       nearby_entities: [...this.nearbyEntities],
+      nearby_players: this._collectNearbyPlayers(),
       recent_chat_or_sign: this.chatBuffer.format(),
       updated_at: this.updatedAt,
     };
@@ -373,6 +374,24 @@ export class McRuntime {
       }
     }
     return false;
+  }
+
+  _collectNearbyPlayers() {
+    const bot = this.bot;
+    if (!this.connected || !bot || !bot.players || typeof bot.players !== "object") {
+      return [];
+    }
+    const selfName = typeof bot.username === "string" ? bot.username.toLowerCase() : "";
+    const names = new Set();
+    for (const p of Object.values(bot.players)) {
+      if (!p || typeof p.username !== "string" || !p.username) continue;
+      if (selfName && p.username.toLowerCase() === selfName) continue;
+      const cleanName = sanitizeMcText(p.username, 24);
+      if (cleanName) {
+        names.add(cleanName);
+      }
+    }
+    return Array.from(names).sort().slice(0, 6);
   }
 
   _collectNearbyEntities(bot) {
@@ -670,6 +689,9 @@ export class McRuntime {
     );
     if (matched?.entity) {
       this._lookAtEntity(this.bot, matched.entity);
+    }
+    if (this.config.mcCompanionLocalChatReply === false) {
+      return;
     }
     if (STAY_CMD_RE.test(cleanMsg)) {
       this._stayPut = true;
@@ -1753,6 +1775,7 @@ export class McRuntime {
         };
       }
       this._stayPut = false;
+      this._followingPlayer = matched.username;
       this.activity = `跟随:${sanitizeMcText(matched.username, 24)}`;
       this._emitSnapshot();
       const followTimeout = Math.min(15_000, timeoutMs);

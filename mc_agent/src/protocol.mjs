@@ -121,6 +121,7 @@ export function loadConfig(env = process.env) {
     "invalid_mc_idle_disconnect_minutes",
   );
   const mcCompanionMode = parseBoolEnv(env.MC_COMPANION_MODE, false);
+  const mcCompanionLocalChatReply = parseBoolEnv(env.MC_COMPANION_LOCAL_CHAT_REPLY, true);
 
   return Object.freeze({
     bridgeHost,
@@ -142,6 +143,7 @@ export function loadConfig(env = process.env) {
     mcPowerdToken,
     mcIdleDisconnectMinutes,
     mcCompanionMode,
+    mcCompanionLocalChatReply,
   });
 }
 

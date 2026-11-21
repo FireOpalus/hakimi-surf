@@ -39,6 +39,7 @@ from .modules.base import (
 )
 from .modules.bili_schedule import BiliScheduleOptions
 from .modules.scheduling import ActivityQuota, LocalActivity
+from .outbound_actions import require_all_schema_fields
 from .plugin_kernel import PluginContext, PluginFiber, PluginKernel
 from .roaming_logger import redact_public_summary
 from .screen_watch import decode_b64_frames, decode_ws_json_frame
@@ -396,6 +397,94 @@ def _bound_ai_payload(
             continue
         raise Rejected("context_too_large")
     return bounded
+
+
+_MAX_PLUGIN_TASK_INSTRUCTION_CHARS = 2400
+_MAX_PLUGIN_RESPONSE_SCHEMA_BYTES = 8192
+_MAX_PLUGIN_RESPONSE_SCHEMA_DEPTH = 8
+
+
+def _json_nesting_depth(node: Any, depth: int = 1) -> int:
+    if depth > _MAX_PLUGIN_RESPONSE_SCHEMA_DEPTH:
+        return depth
+    if isinstance(node, dict):
+        nested = [
+            _json_nesting_depth(v, depth + 1) for v in node.values() if isinstance(v, dict | list)
+        ]
+        return max(nested, default=depth)
+    if isinstance(node, list):
+        nested = [
+            _json_nesting_depth(item, depth + 1) for item in node if isinstance(item, dict | list)
+        ]
+        return max(nested, default=depth)
+    return depth
+
+
+def _normalize_plugin_schema_node(node: Any, *, is_mapping_container: bool = False) -> Any:
+    if isinstance(node, dict):
+        if not all(isinstance(k, str) for k in node):
+            raise Rejected("plugin_invalid_schema")
+        if not is_mapping_container:
+            if "properties" in node and not isinstance(node["properties"], dict):
+                raise Rejected("plugin_invalid_schema")
+            if "required" in node and (
+                not isinstance(node["required"], list)
+                or not all(isinstance(item, str) for item in node["required"])
+            ):
+                raise Rejected("plugin_invalid_schema")
+            if "additionalProperties" in node and node["additionalProperties"] is not False:
+                raise Rejected("plugin_invalid_schema")
+        out: dict[str, Any] = {}
+        for k, v in node.items():
+            child_is_map = (not is_mapping_container) and k in {
+                "properties",
+                "$defs",
+                "definitions",
+            }
+            out[k] = _normalize_plugin_schema_node(v, is_mapping_container=child_is_map)
+        if not is_mapping_container and out.get("type") == "object":
+            out.setdefault("additionalProperties", False)
+        return out
+    if isinstance(node, list):
+        return [_normalize_plugin_schema_node(item, is_mapping_container=False) for item in node]
+    return node
+
+
+def _validate_plugin_task_instruction(raw: Any, secrets_list: list[str]) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise Rejected("plugin_invalid_schema")
+    cleaned = clean_text(raw)
+    if not cleaned:
+        return None
+    if len(cleaned) > _MAX_PLUGIN_TASK_INSTRUCTION_CHARS:
+        raise Rejected("plugin_invalid_schema")
+    if any(secret in cleaned for secret in _secret_candidates(secrets_list)):
+        raise Rejected("plugin_invalid_schema")
+    return cleaned
+
+
+def _validate_plugin_response_schema(raw: Any, secrets_list: list[str]) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or raw.get("type") != "object":
+        raise Rejected("plugin_invalid_schema")
+    try:
+        serialized = json.dumps(raw, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        raise Rejected("plugin_invalid_schema") from None
+    if len(serialized.encode("utf-8")) > _MAX_PLUGIN_RESPONSE_SCHEMA_BYTES:
+        raise Rejected("plugin_invalid_schema")
+    if any(secret in serialized for secret in _secret_candidates(secrets_list)):
+        raise Rejected("plugin_invalid_schema")
+    if _json_nesting_depth(raw) > _MAX_PLUGIN_RESPONSE_SCHEMA_DEPTH:
+        raise Rejected("plugin_invalid_schema")
+    normalized = _normalize_plugin_schema_node(raw)
+    result = require_all_schema_fields(normalized)
+    if not isinstance(result, dict):
+        raise Rejected("plugin_invalid_schema")
+    return result
 
 
 def _validate_plugin_id(plugin_id: str) -> str:
@@ -2548,6 +2637,40 @@ class PluginBus:
             resolved_scenario: Scenario | str = Scenario(scenario)
         except ValueError:
             resolved_scenario = scenario
+
+        raw_task_instruction = frame.get("task_instruction")
+        raw_response_schema = frame.get("response_schema")
+        if isinstance(raw_task_instruction, str) and not clean_text(raw_task_instruction):
+            raw_task_instruction = None
+        if isinstance(resolved_scenario, Scenario) and (
+            raw_task_instruction is not None or raw_response_schema is not None
+        ):
+            await self._send_frame(
+                session,
+                {
+                    "type": "ai.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": "plugin_scope_rejected",
+                },
+            )
+            raise Rejected("plugin_scope_rejected")
+
+        precheck_secrets = self._all_secrets()
+        try:
+            plugin_instruction = _validate_plugin_task_instruction(
+                raw_task_instruction, precheck_secrets
+            )
+            validated_schema = _validate_plugin_response_schema(
+                raw_response_schema, precheck_secrets
+            )
+        except Rejected as exc:
+            await self._send_frame(
+                session,
+                {"type": "ai.result", "id": req_id, "ok": False, "error": str(exc)},
+            )
+            return
+
         is_bili_scene = scenario in _SCOPED_SCENE_OWNERS or scenario.startswith(
             ("bili_", "bilibili_")
         )
@@ -2586,6 +2709,12 @@ class PluginBus:
                 bounded_payload = _bound_ai_payload(payload_in, secrets_list, max_bytes)
                 bounded_payload["plugin_id"] = session.plugin_id
 
+                extra_kwargs: dict[str, Any] = {}
+                if plugin_instruction is not None:
+                    extra_kwargs["plugin_instruction"] = plugin_instruction
+                if validated_schema is not None:
+                    extra_kwargs["response_schema"] = validated_schema
+
                 raw_text = await ai.generate(
                     bounded_payload,
                     f"plugin:{session.plugin_id}",
@@ -2593,6 +2722,7 @@ class PluginBus:
                     budget_lane=lane,
                     images=images or None,
                     audit_source="production",
+                    **extra_kwargs,
                 )
                 clean_reply = safe_output(str(raw_text or ""), secrets_list, limit=out_limit)
                 await self._send_frame(

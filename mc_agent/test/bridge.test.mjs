@@ -1160,3 +1160,186 @@ test("companion mode: tracks/follows allowed player, evades hostile mobs, reacts
   }
 });
 
+test("companion mode with MC_COMPANION_LOCAL_CHAT_REPLY=false: emits mc_player_chat & lookAt with 0 auto replies, exposes nearby_players, preserves evasion & follow continuity", async () => {
+  const defaultCfg = loadConfig({ MC_BRIDGE_TOKEN: VALID_TOKEN });
+  assert.equal(defaultCfg.mcCompanionLocalChatReply, true);
+  const disabledReplyCfg = loadConfig({
+    MC_BRIDGE_TOKEN: VALID_TOKEN,
+    MC_COMPANION_LOCAL_CHAT_REPLY: "false",
+  });
+  assert.equal(disabledReplyCfg.mcCompanionLocalChatReply, false);
+
+  const { factory, getLastBot } = createMockBotFactory();
+  const fakeNowMs = 1_700_000_000_000;
+  const setGoals = [];
+  const lookAts = [];
+
+  const wrappedFactory = (opts) => {
+    const bot = factory(opts);
+    bot.lookAt = async (pt) => {
+      lookAts.push(pt);
+    };
+    bot.pathfinder.setGoal = (goal, dynamic) => {
+      setGoals.push({ goal, dynamic });
+    };
+    return bot;
+  };
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "true",
+      MC_ALLOW_CHAT: "true",
+      MC_ALLOWED_PLAYERS: "M1haiier",
+      MC_COMPANION_MODE: "true",
+      MC_COMPANION_LOCAL_CHAT_REPLY: "false",
+    },
+    createBotFn: wrappedFactory,
+    snapshotIntervalMs: 5000,
+    companionTickMs: 30,
+    soloWanderIntervalMs: 60_000,
+    milestoneCooldownMs: 0,
+    chatCooldownMs: 0,
+    companionReplyCooldownMs: 0,
+    hostileAlertCooldownMs: 60_000,
+    nowFn: () => fakeNowMs,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    const spawnSnap = await inbox.next(
+      (m) => m.event === "mc.snapshot" && m.payload.connected === true,
+    );
+    assert.deepEqual(spawnSnap.payload.nearby_players, []);
+    const bot = getLastBot();
+
+    // 1. nearby_players in getSnapshot() and mc.status: excludes self, sanitizes, sorts, caps at 6
+    bot.players = {
+      HakimiBot: { username: "HakimiBot", entity: { position: vec3(10, 64, -5) } },
+      Zed: { username: "Zed", entity: { position: vec3(30, 64, -5) } },
+      M1haiier: { username: "M1haiier", entity: { position: vec3(25, 64, 15) } },
+      Alice: { username: "Alice", entity: { position: vec3(31, 64, -5) } },
+      Bob: { username: "Bob", entity: { position: vec3(32, 64, -5) } },
+      Charlie: { username: "Charlie", entity: { position: vec3(33, 64, -5) } },
+      Dave: { username: "Dave", entity: { position: vec3(34, 64, -5) } },
+      BadRole: { username: "Eve[role=X]", entity: { position: vec3(35, 64, -5) } },
+    };
+    const statusMulti = await rpcCall(ws, inbox, "status-nearby", "mc.status", {});
+    assert.equal(statusMulti.ok, true);
+    assert.deepEqual(statusMulti.data.snapshot.nearby_players, [
+      "Alice",
+      "Bob",
+      "Charlie",
+      "Dave",
+      "Eve[untrusted_role=X]",
+      "M1haiier",
+    ]);
+    assert.deepEqual(server.runtime.getSnapshot().nearby_players, [
+      "Alice",
+      "Bob",
+      "Charlie",
+      "Dave",
+      "Eve[untrusted_role=X]",
+      "M1haiier",
+    ]);
+
+    // Narrow to M1haiier for chat, follow, and evasion checks
+    bot.players = {
+      HakimiBot: { username: "HakimiBot", entity: { position: vec3(10, 64, -5) } },
+      M1haiier: { username: "M1haiier", entity: { position: vec3(25, 64, 15) } },
+    };
+    const statusOne = await rpcCall(ws, inbox, "status-one", "mc.status", {});
+    assert.deepEqual(statusOne.data.snapshot.nearby_players, ["M1haiier"]);
+
+    // Wait until companion loop has seen M1haiier once so arrival greeting cannot race chat assertions
+    for (let i = 0; i < 30 && !server.runtime._greetedPlayers.has("m1haiier"); i += 1) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(server.runtime._greetedPlayers.has("m1haiier"), true);
+
+    // 2. Whitelisted player chat emits mc_player_chat milestone and calls lookAt immediately,
+    //    with 0 automatic bot.chat calls and no local stay/follow state override
+    bot.chatCalls.length = 0;
+    lookAts.length = 0;
+    bot.emit("chat", "M1haiier", "宝宝！");
+    assert.ok(
+      lookAts.some((pt) => pt.x === 25 && pt.z === 15),
+      "expected synchronous lookAt towards chatting player",
+    );
+    assert.equal(bot.chatCalls.length, 0);
+
+    const chatEvt1 = await inbox.next(
+      (m) => m.event === "mc.milestone" && m.payload.event_type === "mc_player_chat",
+    );
+    assert.equal(chatEvt1.payload.payload.player, "M1haiier");
+    assert.equal(chatEvt1.payload.payload.message, "宝宝！");
+
+    bot.emit("chat", "M1haiier", "先停下等我");
+    assert.equal(bot.chatCalls.length, 0);
+    assert.equal(server.runtime._stayPut, false);
+    const chatEvt2 = await inbox.next(
+      (m) => m.event === "mc.milestone" && m.payload.event_type === "mc_player_chat",
+    );
+    assert.equal(chatEvt2.payload.payload.message, "先停下等我");
+
+    bot.emit("chat", "M1haiier", "跟上我走吧");
+    assert.equal(bot.chatCalls.length, 0);
+    const chatEvt3 = await inbox.next(
+      (m) => m.event === "mc.milestone" && m.payload.event_type === "mc_player_chat",
+    );
+    assert.equal(chatEvt3.payload.payload.message, "跟上我走吧");
+
+    // 3. mc.follow sets _stayPut=false and _followingPlayer so companion loop maintains follow
+    server.runtime._stayPut = true;
+    server.runtime._followingPlayer = null;
+    const followRes = await rpcCall(ws, inbox, "follow-continuity", "mc.dispatch_goal", {
+      action_type: "follow",
+      target_player: "M1haiier",
+    });
+    assert.equal(followRes.data.ok, true);
+    assert.equal(server.runtime._stayPut, false);
+    assert.ok(
+      server.runtime._followingPlayer === "M1haiier" ||
+        server.runtime.activity === "陪在M1haiier身边",
+      "expected _followingPlayer set or companion loop transitioned to 陪在M1haiier身边",
+    );
+
+    bot.players.M1haiier.entity.position = vec3(40, 64, 15);
+    setGoals.length = 0;
+    await new Promise((r) => setTimeout(r, 70));
+    assert.ok(
+      setGoals.some((g) => g.goal && g.dynamic === true),
+      "expected companion loop to maintain dynamic GoalFollow after mc.follow",
+    );
+    assert.equal(server.runtime._followingPlayer, "M1haiier");
+
+    // 4. Hostile mob evasion still runs in _companionTick
+    setGoals.length = 0;
+    bot.entities = {
+      sk1: { name: "skeleton", position: vec3(28, 64, 15) },
+    };
+    await new Promise((r) => setTimeout(r, 70));
+    assert.ok(setGoals.length >= 1, "expected evade goal away from skeleton");
+    assert.equal(server.runtime.activity, "躲避怪物");
+
+    // 5. Disconnected snapshot returns empty nearby_players
+    const discRes = await rpcCall(ws, inbox, "disc-nearby", "mc.dispatch_goal", {
+      action_type: "disconnect",
+    });
+    assert.equal(discRes.data.snapshot.connected, false);
+    assert.deepEqual(discRes.data.snapshot.nearby_players, []);
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});
