@@ -1129,3 +1129,99 @@ async def test_cli_test_tts_stt_upload_and_vad_barge_in(monkeypatch, capsys, tmp
     assert barge_player.cancelled >= 1
     assert any(f["type"] == "turn.cancel" for f in ws_seen)
     assert any(f["type"] == "speech.turn" and f["text"] == "识别成功喵" for f in ws_seen)
+
+
+async def test_resolve_ws_proxy_and_connect_passes_proxy(monkeypatch):
+    import importlib.util
+    import urllib.request
+
+    from voice_client.companion_ws import _resolve_ws_proxy
+
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+
+    # 1. macOS Clash/Surge proxy dict with http + https + socks -> picks https, skips socks
+    monkeypatch.setattr(
+        urllib.request,
+        "getproxies",
+        lambda: {
+            "http": "http://127.0.0.1:7897",
+            "https": "http://127.0.0.1:7898",
+            "socks": "http://127.0.0.1:7897",
+        },
+    )
+    assert _resolve_ws_proxy("wss://qq.example.com/ws/companion/x") == "http://127.0.0.1:7898"
+
+    # 2. socks-only or socks scheme URLs without python_socks -> None (direct)
+    monkeypatch.setattr(
+        urllib.request,
+        "getproxies",
+        lambda: {"socks": "http://127.0.0.1:7897", "https": "socks5://127.0.0.1:7898"},
+    )
+    assert _resolve_ws_proxy("wss://qq.example.com/ws/companion/x") is None
+
+    # 3. proxy_bypass -> None
+    monkeypatch.setattr(
+        urllib.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:7898"},
+    )
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+    assert _resolve_ws_proxy("wss://qq.example.com/ws/companion/x") is None
+
+    # 4. python_socks installed -> True (let websockets use default auto-detection)
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name: object() if name == "python_socks" else None
+    )
+    assert _resolve_ws_proxy("wss://qq.example.com/ws/companion/x") is True
+
+    # 5. Default CompanionWsClient.connect() passes proxy=_resolve_ws_proxy(...) to ws_connect
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    monkeypatch.setattr(
+        urllib.request,
+        "getproxies",
+        lambda: {
+            "http": "http://127.0.0.1:7897",
+            "https": "http://127.0.0.1:7897",
+            "socks": "http://127.0.0.1:7897",
+        },
+    )
+
+    connect_calls: list[dict[str, Any]] = []
+
+    class DummyWs:
+        def __init__(self) -> None:
+            self._q: asyncio.Queue[str] = asyncio.Queue()
+
+        async def send(self, raw: str) -> None:
+            return None
+
+        async def recv(self) -> str:
+            item = await self._q.get()
+            if item == "__EOF__":
+                raise RuntimeError("eof")
+            return item
+
+        async def close(self) -> None:
+            await self._q.put("__EOF__")
+
+    async def fake_ws_connect(url: str, **kwargs: Any) -> DummyWs:
+        connect_calls.append({"url": url, **kwargs})
+        return DummyWs()
+
+    monkeypatch.setattr("websockets.asyncio.client.connect", fake_ws_connect)
+    cfg = VoiceClientConfig(
+        ws_url="wss://qq.example.com/ws/companion/secret-path",
+        ws_token="companion-secret-token-32-chars-min",
+        ping_interval_seconds=0.0,
+    )
+    client = CompanionWsClient(cfg)
+    await client.connect()
+    try:
+        assert len(connect_calls) == 1
+        assert connect_calls[0]["proxy"] == "http://127.0.0.1:7897"
+        assert connect_calls[0]["ping_interval"] is None
+        assert connect_calls[0]["max_size"] == 4_194_304
+    finally:
+        await client.close()

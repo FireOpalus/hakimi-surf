@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 import json
 import logging
 import re
 import time
+import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -49,6 +51,30 @@ def _safe_endpoint_label(ws_url: str) -> str:
     if parsed.scheme and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}"
     return "(configured-ws)"
+
+
+def _resolve_ws_proxy(ws_url: str) -> str | bool | None:
+    """Resolve system/env proxy without failing on macOS SOCKS entries lacking python-socks."""
+    if importlib.util.find_spec("python_socks") is not None:
+        return True
+    parsed = urlparse(ws_url)
+    host = parsed.hostname or ""
+    if host:
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        if urllib.request.proxy_bypass(f"{host}:{port}") or urllib.request.proxy_bypass(host):
+            return None
+    proxies = urllib.request.getproxies()
+    keys = ("wss", "https", "http") if parsed.scheme == "wss" else ("ws", "https", "http")
+    for key in keys:
+        proxy_url = str(proxies.get(key) or "").strip()
+        if not proxy_url:
+            continue
+        proxy_scheme = urlparse(proxy_url).scheme.lower()
+        if proxy_scheme.startswith("socks"):
+            continue
+        if proxy_scheme in {"http", "https"}:
+            return proxy_url
+    return None
 
 
 class CompanionWsClient:
@@ -152,6 +178,7 @@ class CompanionWsClient:
                     additional_headers=headers,
                     max_size=4_194_304,
                     ping_interval=None,
+                    proxy=_resolve_ws_proxy(self._config.ws_url),
                 )
             except Exception as exc:
                 raise CompanionWsError(
