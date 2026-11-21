@@ -1,0 +1,146 @@
+/* ==================== 02 · Base, Starry Background & Animations ==================== */
+* {
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+html {
+  background: var(--bg);
+  scroll-padding-top: calc(var(--bar) + 20px);
+  scrollbar-gutter: stable;
+}
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: transparent;
+  color: var(--ink);
+  font: 14px/1.55 var(--sans);
+  letter-spacing: .005em;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select, textarea { font: inherit; }
+button, a, input, textarea, select { touch-action: manipulation; }
+button { cursor: pointer; }
+a { color: var(--accent); }
+hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
+svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+.hidden, [hidden] { display: none !important; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+::selection { background: color-mix(in srgb, var(--accent) 26%, transparent); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 10px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+.skip {
+  position: fixed;
+  left: 20px;
+  top: -80px;
+  z-index: 100;
+  background: var(--card);
+  border: 1px solid var(--line);
+  padding: 12px 18px;
+  border-radius: 10px;
+}
+.skip:focus { top: 10px; }
+
+/* 固定星夜极光与双层星点（固定伪元素分层，避免滚动主线程重绘） */
+html::before,
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+html::before {
+  z-index: -2;
+  background:
+    radial-gradient(1200px 680px at 96% -18%, var(--glow-2), transparent 62%),
+    radial-gradient(1000px 640px at 0% -10%, var(--glow-1), transparent 60%),
+    radial-gradient(900px 600px at 50% 120%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 65%);
+}
+body::before,
+body::after {
+  z-index: -1;
+}
+body::before {
+  background-image:
+    radial-gradient(1.2px 1.2px at 6% 14%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 18% 62%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.6px 1.6px at 31% 28%, var(--star-2) 50%, transparent 54%),
+    radial-gradient(1px 1px at 44% 82%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.3px 1.3px at 57% 9%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 69% 47%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.5px 1.5px at 81% 73%, var(--star-2) 50%, transparent 54%),
+    radial-gradient(1px 1px at 93% 33%, var(--star) 50%, transparent 54%);
+  background-size: 560px 560px;
+  opacity: .55;
+}
+:root[data-theme=dark] body::before { opacity: .8; }
+body::after {
+  background-image:
+    radial-gradient(1.4px 1.4px at 12% 38%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 26% 88%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.8px 1.8px at 49% 54%, var(--star-2) 50%, transparent 54%),
+    radial-gradient(1px 1px at 63% 21%, var(--star) 50%, transparent 54%),
+    radial-gradient(1.3px 1.3px at 77% 92%, var(--star) 50%, transparent 54%),
+    radial-gradient(1px 1px at 89% 6%, var(--star) 50%, transparent 54%);
+  background-size: 760px 760px;
+  animation: star-twinkle 7s ease-in-out infinite alternate;
+}
+
+/* 后台标签页暂停全部装饰动画 */
+body.page-hidden::before,
+body.page-hidden::after,
+body.page-hidden *,
+body.page-hidden *::before,
+body.page-hidden *::after {
+  animation-play-state: paused !important;
+}
+
+/* 纯 GPU 合成动画（仅使用 transform / opacity） */
+@keyframes star-twinkle {
+  from { opacity: .25; }
+  to { opacity: .9; }
+}
+@keyframes star-breathe {
+  0%, 100% { opacity: .28; transform: scale(.96); }
+  50% { opacity: 1; transform: scale(1.04); }
+}
+@keyframes sky-pulse {
+  0%, 100% { transform: translate(-50%, -50%) rotate(12deg) scale(1); }
+  50% { transform: translate(-50%, -50%) rotate(12deg) scale(1.06); }
+}
+@keyframes tab-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes dialog-pop {
+  from { opacity: 0; transform: translateY(10px) scale(.98); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes notice-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes dot-pulse {
+  0% { transform: scale(1); opacity: .65; }
+  100% { transform: scale(2.8); opacity: 0; }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

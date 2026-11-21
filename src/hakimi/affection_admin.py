@@ -3,9 +3,9 @@
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .admin_routes import body, service
+from .admin_common import body, domain_lock, partial_body, service
 from .affection import (
     PLATFORM_ID_RE,
     AffectionConfig,
@@ -16,6 +16,9 @@ from .models import PlatformId
 from .security import Rejected
 
 router = APIRouter(prefix="/admin/api/affection")
+
+_DEFAULT_RECENT_HISTORY_LIMIT = 50
+_DEFAULT_USER_HISTORY_LIMIT = 30
 
 
 class UserAffectionInput(BaseModel):
@@ -63,24 +66,16 @@ async def affection_status(request: Request):
 
 @router.put("")
 async def affection_save(request: Request):
-    from .app import json_object, read_body
-
-    raw = json_object(await read_body(request, request.app.state.settings))
-    if not raw:
-        raise HTTPException(400, "invalid_admin_input")
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "affection"):
         mgr = await _manager(request)
         current = mgr.config.model_dump(mode="json")
-        try:
-            value = AffectionConfig.model_validate({**current, **raw})
-        except ValidationError:
-            raise HTTPException(400, "invalid_admin_input") from None
+        value = await partial_body(request, current, AffectionConfig)
         return await mgr.set_config(value)
 
 
 @router.delete("")
 async def affection_reset(request: Request):
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "affection"):
         mgr = await _manager(request)
         return await mgr.set_config(None)
 
@@ -89,7 +84,7 @@ async def affection_reset(request: Request):
 async def affection_set_user(request: Request):
     value = await body(request, UserAffectionInput)
     svc = service(request)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "affection"):
         mgr = await _manager(request)
         await mgr.set_user_score(
             value.user_id,
@@ -125,38 +120,29 @@ def _resolve_platform_user(user_id: str, platform: str = "onebot") -> tuple[str,
 
 
 @router.get("/history")
-async def affection_recent_history(request: Request, limit: int = 50):
-    clamped_limit = max(1, min(200, limit))
+async def affection_recent_history(request: Request):
     mgr = await _manager(request)
-    return {"items": await mgr.recent_history(limit=clamped_limit)}
+    return {"items": await mgr.recent_history(limit=_DEFAULT_RECENT_HISTORY_LIMIT)}
 
 
 @router.get("/users/{user_id}/history")
-async def affection_user_history(
-    request: Request,
-    user_id: str,
-    platform: str = "onebot",
-    limit: int = 30,
-):
-    resolved_platform, resolved_uid = _resolve_platform_user(user_id, platform)
-    clamped_limit = max(1, min(200, limit))
+async def affection_user_history(request: Request, user_id: str):
+    resolved_platform, resolved_uid = _resolve_platform_user(user_id)
     mgr = await _manager(request)
     return {
         "platform": resolved_platform,
         "user_id": resolved_uid,
-        "items": await mgr.user_history(resolved_platform, resolved_uid, limit=clamped_limit),
+        "items": await mgr.user_history(
+            resolved_platform, resolved_uid, limit=_DEFAULT_USER_HISTORY_LIMIT
+        ),
     }
 
 
 @router.delete("/users/{user_id}")
-async def affection_delete_user(
-    request: Request,
-    user_id: str,
-    platform: str = "onebot",
-):
-    resolved_platform, resolved_uid = _resolve_platform_user(user_id, platform)
+async def affection_delete_user(request: Request, user_id: str):
+    resolved_platform, resolved_uid = _resolve_platform_user(user_id)
     svc = service(request)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "affection"):
         mgr = await _manager(request)
         await mgr.delete_user_score(
             resolved_uid,

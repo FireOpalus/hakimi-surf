@@ -1,0 +1,109 @@
+<section id="identity-center" class="tab" role="tabpanel" aria-labelledby="nav-identity-center" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>统一身份与绑定中枢（Identity Center）</h2>
+      <button id="refresh-identity" class="secondary" type="button">刷新档案</button>
+    </div>
+    <p class="muted">将跨平台账号（QQ / OneBot / 远程插件平台等）归并至统一自然人身份（Person），共享 L1 好感度、L2 轻量画像标签（上限 8 条）与全平台小黑屋屏蔽；Owner 身份受系统强保护且跨端私聊保留 12 小时内脱敏近期摘要。</p>
+    <div id="identity-kpis" class="kpi-strip"></div>
+    <p id="identity-state" class="muted" aria-live="polite"></p>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <h2>绑定外部账号</h2>
+      <p class="muted">将指定平台的账号手工关联至现有身份（若该账号原属其他独立档案，请先确认归属或改用合并操作）。</p>
+      <form id="id-link-form">
+        <datalist id="id-person-options"></datalist>
+        <datalist id="id-platform-options">
+          <option value="onebot"></option>
+          <option value="qq"></option>
+          <option value="discord"></option>
+          <option value="oopz"></option>
+          <option value="telegram"></option>
+        </datalist>
+        <label for="id-link-person">目标身份 person_id<input id="id-link-person" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入 owner / p_..."></label>
+        <div class="grid">
+          <label for="id-link-platform">平台 platform<input id="id-link-platform" list="id-platform-options" type="text" maxlength="48" required placeholder="onebot / qq / discord"></label>
+          <label for="id-link-uid">账号 user_id<input id="id-link-uid" type="text" maxlength="128" required placeholder="平台用户 ID"></label>
+        </div>
+        <label for="id-link-nickname">账号昵称（可选）<input id="id-link-nickname" type="text" maxlength="80" placeholder="用于后台展示的昵称"></label>
+        <div class="row">
+          <button id="id-link-submit" type="submit" class="primary" disabled>绑定账号</button>
+        </div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>合并身份档案</h2>
+      <p class="muted">将源身份的所有账号与画像并入目标身份（管理员可合并至 Owner）。防小号规则：任一方被屏蔽或好感归零时，合并结果将强制全平台屏蔽并归零；否则取两方最低好感，L2 标签去重后最多保留 8 个。</p>
+      <form id="id-merge-form">
+        <label for="id-merge-source">源身份 source_person_id（将被并入并移除）<input id="id-merge-source" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入源 person_id"></label>
+        <label for="id-merge-target">目标身份 target_person_id（保留）<input id="id-merge-target" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入目标 person_id"></label>
+        <div class="row">
+          <button id="id-merge-submit" type="submit" class="danger" disabled>合并身份</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="card">
+    <h2>统一身份档案列表</h2>
+    <div class="row between">
+      <label for="identity-search" class="aff-search-label">筛选身份、账号或标签<input id="identity-search" class="aff-search-input" type="search" maxlength="120" placeholder="输入 person_id、显示名称、标签、平台或 user_id"></label>
+    </div>
+    <div id="identity-persons-list" class="stack-cards"></div>
+  </div>
+</section>
+
+<section id="plugin-bus" class="tab" role="tabpanel" aria-labelledby="nav-plugin-bus" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>远程插件总线（Remote Plugin Bus）</h2>
+      <button id="refresh-plugin-bus" class="secondary" type="button">刷新总线</button>
+    </div>
+    <p class="muted">通过独立签发的高熵令牌与最小权限 Scope 接入远程能力插件（/ws/plugin）；会话断开或吊销时经 PluginKernel 严格按 LIFO 逆序自动卸载其注册动作、思考场景与聊天平台。</p>
+    <div id="pb-pills" class="pill-row"></div>
+    <p id="pb-state" class="muted" aria-live="polite"></p>
+    <div id="pb-token-banner" class="token-banner" role="region" aria-label="一次性插件令牌" hidden>
+      <p class="token-banner-title">此 Token 仅展示一次，请立即保存</p>
+      <p id="pb-token-meta" class="muted"></p>
+      <div class="token-secret-row">
+        <code id="pb-token-value" class="token-secret"></code>
+        <button id="pb-token-copy" type="button" class="primary">复制 Token</button>
+        <button id="pb-token-dismiss" type="button" class="secondary">我已保存，关闭</button>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>签发远程插件凭据</h2>
+    <form id="pb-create-form">
+      <div class="grid">
+        <label for="pb-create-id">插件 ID（plugin_id）<input id="pb-create-id" type="text" maxlength="48" pattern="^[a-z][a-z0-9_]{1,47}$" required placeholder="如 discord_bridge（小写字母开头，2–48位）"></label>
+        <label for="pb-create-name">显示名称（display_name）<input id="pb-create-name" type="text" maxlength="64" required placeholder="如 Discord 语音与频道桥"></label>
+        <label for="pb-create-region">节点区域（node_region）
+          <select id="pb-create-region">
+            <option value="KR">KR · 境外节点</option>
+            <option value="CN">CN · 境内节点</option>
+          </select>
+        </label>
+      </div>
+      <fieldset class="panel-group">
+        <legend>授权权限范围（Scopes）</legend>
+        <div id="pb-create-scopes" class="scope-checks"></div>
+      </fieldset>
+      <div class="row">
+        <button id="pb-create-submit" type="submit" class="primary" disabled>签发插件凭据</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>已注册远程插件</h2>
+    <p class="muted">支持在线启停、修改展示名/区域/Scope、轮换密钥、主动断开当前 WebSocket 会话以及吊销凭据；轮换、禁用或收窄权限会自动触发在途连接清理。</p>
+    <div id="pb-plugins-list" class="stack-cards"></div>
+  </div>
+</section>
+
+<section id="logs" class="tab" role="tabpanel" aria-labelledby="nav-logs" hidden>
+  <div class="card"><div class="row between"><h2>最近 50 条脱敏事件</h2><button id="refresh-logs" type="button" class="secondary">刷新</button></div>
+    <p class="muted">模型异常可展开查看调用阶段、通道、耗时和上游错误码。页面每 15 秒更新。</p>
+    <div id="log-list" class="table"></div>
+  </div>
+</section>

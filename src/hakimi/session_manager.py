@@ -284,6 +284,37 @@ class SessionManager:
                 "enabled": enabled,
             }
 
+    async def admin_list_summary(self, message: Message) -> dict:
+        """Return lightweight session list metadata in a single DB open without decrypting logs."""
+        async with self.database(message) as (db, key):
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                enabled = bool((await cur.fetchone())[0])
+            await self._fold_history(db, key, message)
+            async with db.execute("SELECT summary,epoch,version FROM rolling_state") as cur:
+                summary_blob, epoch, version = await cur.fetchone()
+            async with db.execute("SELECT ready FROM memory_control") as cur:
+                dual_ready = bool((await cur.fetchone())[0])
+            if enabled:
+                async with db.execute("SELECT COUNT(*) FROM recent_messages") as cur:
+                    recent_count = (await cur.fetchone())[0]
+                summary_chars = (
+                    len(self.vault.open(key, summary_blob))
+                    if summary_blob and not dual_ready
+                    else 0
+                )
+                dual_stats = await self.dual.stats_in_db(db, key, epoch, version)
+            else:
+                recent_count = 0
+                summary_chars = 0
+                dual_stats = {"dual_entries_count": 0, "dual_chars": 0}
+        return {
+            "enabled": enabled,
+            "dual_ready": dual_ready,
+            "summary_chars": summary_chars,
+            "recent_count": recent_count,
+            **dual_stats,
+        }
+
     async def remember(self, message: Message, user: str, assistant: str, *, expected_epoch=None):
         async with self.database(message) as (db, key):
             async with db.execute("SELECT epoch FROM rolling_state") as cur:
@@ -573,7 +604,9 @@ class SessionManager:
                 "UPDATE memory_control SET "
                 "ready=0,mirror_enabled=0,mirror_payload=NULL,last_nightly=NULL"
             )
-            self.dual.index.discard(self.key(message))
+            session_key = self.key(message)
+            self.dual.index.discard(session_key)
+            self.dual._stats_cache.pop(session_key, None)
             await db.execute("DELETE FROM turns")
             await db.execute("DELETE FROM recent_messages")
             await db.execute("DELETE FROM received_messages")

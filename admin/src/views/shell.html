@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>洁米奈星夜</title>
+<style>
+{{STYLE}}
+</style>
+</head>
+<body>
+<a href="#workspace" class="skip">跳到主要内容</a>
+<header class="topbar">
+  <div class="brand">
+    <button id="menu-toggle" class="icon-button" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16"/></svg></button>
+    <span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></svg></span>
+    <div class="brand-copy"><strong>洁米奈星夜</strong><small>STARRY NIGHT</small></div>
+  </div>
+  <div id="workspace-switch" class="workspace-switch" role="group" aria-label="选择工作区" hidden>
+    <button type="button" data-workspace-target="core" aria-controls="core-nav" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg>主控台</button>
+    <button type="button" data-workspace-target="modules" aria-controls="modules-nav" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5-9 5-9-5z M3 12l9 5 9-5 M3 17l9 5 9-5"/></svg>功能模块</button>
+  </div>
+  <div class="page-meta">
+    <time id="last-updated">尚未刷新</time>
+  </div>
+  <div class="topbar-actions">
+    <button id="open-finder" type="button" class="finder-button" aria-label="查找模块或设置" aria-haspopup="dialog" aria-controls="module-finder" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg><span>查找设置</span><kbd id="finder-shortcut">Ctrl K</kbd></button>
+    <span class="version">v{{VERSION}}</span>
+    <button id="theme-toggle" type="button" class="icon-button" aria-label="切换深色主题" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14a8 8 0 0 1-10-10 8 8 0 1 0 10 10"/></svg></button>
+    <button id="logout" type="button" class="secondary" hidden>退出</button>
+  </div>
+</header>
+<main id="workspace" tabindex="-1">
+<div id="notice" role="status" aria-live="polite" hidden><span id="notice-text"></span><button id="notice-close" type="button" class="notice-close" aria-label="关闭通知">×</button></div>
+<section id="login" class="login" aria-labelledby="login-title">
+  <div class="login-sky">
+    <div class="sky-map" aria-hidden="true"><i class="orbit outer"></i><i class="orbit"></i><i class="sky-star"></i></div>
+    <div class="sky-copy"><h1 id="login-title">洁米奈星夜</h1><p>Starry Night Console</p></div>
+  </div>
+  <div class="login-fields">
+    <h2>管理员登录</h2>
+    <p>输入管理口令进入控制台。口令只保存在当前页面内存中，刷新或关闭即失效。</p>
+    <form id="login-form">
+      <label for="token">管理口令</label>
+      <input id="token" type="password" autocomplete="off" placeholder="ADMIN_TOKEN" aria-describedby="login-error" required>
+      <p id="login-error" role="alert" hidden></p>
+      <button type="submit" class="primary">进入控制台</button>
+    </form>
+  </div>
+</section>
+<div id="app" hidden>
+  <aside id="sidebar" class="sidebar" aria-label="控制台导航">
+    <div class="drawer-head"><strong id="drawer-title">主控台</strong><button id="drawer-close" class="icon-button" type="button" aria-label="关闭导航"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <nav id="core-nav" data-workspace="core" role="tablist" aria-label="主控台" aria-orientation="vertical">
+      <div class="nav-group" role="presentation">
+        <div class="nav-group-label">运行管理</div>
+        <button id="nav-overview" type="button" role="tab" data-tab="overview" data-description="查看本日调用、预算和消息处理状态。" aria-controls="overview" aria-selected="true" tabindex="0"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg><span>运行概览</span></button>
+        <button id="nav-ledger" type="button" role="tab" data-tab="ledger" data-description="查看调用明细、账户余额及 GCP 赠金对账。" aria-controls="ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h8 M8 18h4"/></svg><span>账本与预算</span></button>
+        <button id="nav-life" type="button" role="tab" data-tab="life" data-description="管理作息、精力、跨节点动作和执行回执。" aria-controls="life" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M2 12h20 M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10"/></svg><span>世界与主动引擎</span></button>
+        <button id="nav-proactive" type="button" role="tab" data-tab="proactive" data-description="查看 Owner 投递、运维告警和当日汇报。" aria-controls="proactive" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z M3 5l9 8 9-8"/></svg><span>主动私信与投递</span></button>
+        <button id="nav-logs" type="button" role="tab" data-tab="logs" data-description="查看最近的脱敏拦截记录与系统告警。" aria-controls="logs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span>安全日志</span></button>
+      </div>
+      <div class="nav-group" role="presentation">
+        <div class="nav-group-label">模型与对话</div>
+        <button id="nav-api-routing" type="button" role="tab" data-tab="api-routing" data-description="管理模型凭据、安全审核和全局模型通道。" aria-controls="api-routing" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z M9 12h6 M12 9v6"/></svg><span>全局模型通道</span></button>
+        <button id="nav-thinking" type="button" role="tab" data-tab="thinking" data-description="选择全局主模型，管理已安装模块的思考强度。" aria-controls="thinking" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6 M10 21h4 M8 14a6 6 0 1 1 8 0l-1 2H9z"/></svg><span>模型与思考</span></button>
+        <button id="nav-reply-settings" type="button" role="tab" data-tab="reply-settings" data-description="调整防抖、请求限流和联网检索。" aria-controls="reply-settings" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span>回复与联网</span></button>
+        <button id="nav-filter" type="button" role="tab" data-tab="filter" data-description="调整 Decisions 阈值，核对消息判定和投递结果。" aria-controls="filter" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6z M8 12l3 3 5-6"/></svg><span>网关与审计</span></button>
+        <button id="nav-sandbox" type="button" role="tab" data-tab="sandbox" data-description="用模拟身份测试门卫判定与回复。" aria-controls="sandbox" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6 M10 3v7L4 20h16l-6-10V3 M7 15h10"/></svg><span>沙盒测试</span></button>
+      </div>
+      <div class="nav-group" role="presentation">
+        <div class="nav-group-label">记忆管理</div>
+        <button id="nav-memory" type="button" role="tab" data-tab="memory" data-description="管理隔离会话、历史压缩与长期记忆。" aria-controls="memory" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span>会话与记忆</span></button>
+      </div>
+      <div class="nav-group" role="presentation">
+        <div class="nav-group-label">关系与内容</div>
+        <button id="nav-identity-center" type="button" role="tab" data-tab="identity-center" data-description="管理跨平台统一身份档案（Person）、Owner 认证、账号绑定合并、L2 画像标签与跨平台屏蔽。" aria-controls="identity-center" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M17 11l2 2 4-4"/></svg><span>统一身份与绑定</span></button>
+        <button id="nav-community" type="button" role="tab" data-tab="community" data-description="管理跨平台好感度档案、全局策略与小黑屋屏蔽。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
+        <button id="nav-memes" type="button" role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包库</span></button>
+        <button id="nav-songs" type="button" role="tab" data-tab="songs" data-description="管理猫猫的专属翻唱歌单与音频切片。" aria-controls="songs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13 M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0 M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0"/></svg><span>猫猫歌单</span></button>
+      </div>
+    </nav>
+    <nav id="modules-nav" data-workspace="modules" role="tablist" aria-label="功能模块" aria-orientation="vertical" hidden>
+      <div class="nav-group" role="presentation">
+        <button id="nav-modules" type="button" role="tab" data-tab="modules" data-description="选择模块，查看它的运行状态、设置和可执行动作。" aria-controls="modules" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5-9 5-9-5z M3 12l9 5 9-5 M3 17l9 5 9-5"/></svg><span>模块目录</span></button>
+        <button id="nav-plugin-bus" type="button" role="tab" data-tab="plugin-bus" data-description="签发与管理远程模块插件凭据、Scope 权限、WebSocket 会话状态与令牌轮换。" aria-controls="plugin-bus" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5 M9 8V2 M15 8V2 M18 8v5a6 6 0 0 1-12 0V8z"/></svg><span>远程插件总线</span></button>
+      </div>
+      <div id="platform-nav-group" class="nav-group" role="group" aria-labelledby="platform-nav-label">
+        <div id="platform-nav-label" class="nav-group-label">平台模块</div>
+        <div data-module="qq_social">
+          <button id="nav-qq" type="button" role="tab" data-tab="qq" data-description="查看 OneBot 连接、每日心情个签，管理会话隐私、群聊互动和准入。" aria-controls="qq" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H8l-5 3 1-6a8 8 0 0 1 7-13h2a8 8 0 0 1 8 8z M8 11h.1 M12 11h.1 M16 11h.1"/></svg><span>QQ 社交</span></button>
+          <button id="nav-group-policy" type="button" data-subpage hidden role="tab" data-tab="group-policy" data-description="设置白名单群的互动方式、外部 Bot 回复阈值与冷却。" aria-controls="group-policy" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18 M3 12h18 M3 18h18 M8 3v6 M16 9v6 M8 15v6"/></svg><span>群聊互动策略</span></button>
+          <button id="nav-admission" type="button" data-subpage hidden role="tab" data-tab="admission" data-description="管理允许接入的群、私聊好友和外部机器人。" aria-controls="admission" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-2a6 6 0 0 1 12 0v2 M17 11h5 M19.5 8.5v5"/></svg><span>准入与防互刷</span></button>
+        </div>
+        <div data-module="bilibili_surf">
+          <button id="nav-bili" type="button" role="tab" data-tab="bili" data-description="管理账号、视频订阅和巡逻任务。" aria-controls="bili" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v13H3z M8 3l3 4 M16 3l-3 4 M7 12v3 M17 12v3 M10 15l2 1 2-1"/></svg><span>B 站巡逻</span></button>
+          <button id="nav-bili-account" type="button" data-subpage hidden role="tab" data-tab="bili-account" data-description="管理小号凭据、互动权限与看片额度。" aria-controls="bili-account" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v14H4z M8 3l3 4 M16 3l-3 4 M8 12v3 M16 12v3"/></svg><span>账号与看片设置</span></button>
+          <button id="nav-patrol" type="button" data-subpage hidden role="tab" data-tab="patrol" data-description="管理 B 站订阅与巡逻配额。" aria-controls="patrol" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span>巡逻订阅</span></button>
+        </div>
+        <div data-module="minecraft">
+          <button id="nav-minecraft" type="button" role="tab" data-tab="minecraft" data-description="查看游戏连接和角色状态，下达活动目标。" aria-controls="minecraft" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l9 5v10l-9 5-9-5V7z M3 7l9 5 9-5 M12 12v10"/></svg><span>Minecraft</span></button>
+        </div>
+        <div data-module="weather">
+          <button id="nav-weather" type="button" role="tab" data-tab="weather" data-description="设置观测地点，按需查询当前天气。" aria-controls="weather" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4 4 0 1 1 .4-8 6 6 0 0 1 11.5 1.3A3.5 3.5 0 0 1 18 18z M16 3V1 M21 5l1-1"/></svg><span>天气观测</span></button>
+        </div>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="system-nav-label">
+        <div id="system-nav-label" class="nav-group-label">常驻系统模块</div>
+        <button id="nav-journal" type="button" role="tab" data-tab="journal" data-description="查看本地巡逻日记与隔离文件夹的同步回执。" aria-controls="journal" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M8 10h8 M8 14h5"/></svg><span>巡逻日记</span></button>
+        <button id="nav-drive-sync" type="button" role="tab" data-tab="drive-sync" data-description="查看已接入模块的同步状态和最近回执。" aria-controls="drive-sync" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18H6a4 4 0 0 1-.5-8 6.5 6.5 0 0 1 12.5-2 5 5 0 0 1 0 10h-1 M12 20v-9 M8.5 14.5 12 11l3.5 3.5"/></svg><span>Google Drive 同步</span></button>
+        <button id="nav-notebook" type="button" role="tab" data-tab="notebook" data-description="管理仅供 Owner 私聊使用的脱敏快照。" aria-controls="notebook" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v16 M12 5C8 2 4 3 2 4v15c3-2 7-1 10 2 3-3 7-4 10-2V4c-2-1-6-2-10 1"/></svg><span>只读小本本</span></button>
+        <button id="nav-event-ledger" type="button" role="tab" data-tab="event-ledger" data-description="查看并管理各模块、私聊约定与规划器写入的跨日待办事件。" aria-controls="event-ledger" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h5 M3 8h2 M3 12h2 M3 16h2"/></svg><span>跨日待办账本</span></button>
+        <button id="nav-voice-companion" type="button" role="tab" data-tab="voice-companion" data-description="管理实时语音伴随中枢状态、口播风格与陪玩会话记录（可联动屏幕伴看）。" aria-controls="voice-companion" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z M19 10v1a7 7 0 0 1-14 0v-1 M12 18v3 M8 21h8"/></svg><span>语音伴随</span></button>
+        <button id="nav-screen-watch" type="button" role="tab" data-tab="screen-watch" data-description="管理 Owner 私有看屏连接、内存短 TTL 画面缓存、隐私开关与主动吐槽策略。" aria-controls="screen-watch" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v12H3z M8 21h8 M12 17v4 M9 11l3-3 3 3"/></svg><span>屏幕伴看</span></button>
+      </div>
+    </nav>
+    <div class="sidebar-foot">统计时区 · <span id="sidebar-zone">北京时间</span></div>
+  </aside>
+  <button id="nav-scrim" type="button" class="nav-scrim" aria-label="关闭导航" tabindex="-1" hidden></button>
+  <div class="page-content">
+    <div class="page-heading">
+      <div>
+        <div id="page-kicker" class="eyebrow">主控台 / 运行管理</div>
+        <div class="module-name-row"><h1 id="page-title" tabindex="-1">运行概览</h1><span id="module-heading-switch" hidden></span><span id="page-dirty-badge" class="dirty-badge" hidden>有未保存修改</span></div>
+        <p id="page-description" hidden></p><time id="overview-day"></time>
+      </div>
+      <button type="button" class="secondary" id="refresh-module" hidden>刷新模块状态</button>
+      <div id="overview-tools">
+        <button id="refresh" type="button" class="secondary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M5.5 8a7 7 0 0 1 12-2l2.5 4M18.5 16a7 7 0 0 1-12 2L4 14"/></svg>刷新概览</button>
+      </div>
+    </div>
+
+{{VIEWS}}
+  </div>
+</div>
+
+<dialog id="session-dialog">
+  <h2 id="session-title">会话摘要</h2>
+  <p id="session-info" class="muted"></p>
+  <textarea id="summary-text" maxlength="800" rows="9" aria-label="滚动摘要"></textarea>
+  <div class="row"><button id="save-summary" type="button" class="primary">筛查并保存摘要</button><button id="compress-session" type="button" class="secondary">立即压缩</button><button id="reset-session" type="button" class="danger">彻底重置</button><button id="close-dialog" type="button" class="secondary">关闭</button></div>
+  <hr>
+  <h3>双轨记忆治理</h3>
+  <p class="muted">编辑会经 source 安全筛查并锁定；删除保留保护墓碑，解锁后允许后续提炼更新。默认不展开原始聊天。Flex 手动提炼可能等待数分钟；双轨提炼固定 medium，不受通用思考档位覆盖。</p>
+  <div class="row"><input id="memory-query" maxlength="200" placeholder="搜索账号、称呼或群梗"><button id="memory-search" type="button" class="primary">检索</button></div>
+  <p id="memory-state" class="muted"></p>
+  <div id="memory-entries" class="table"></div>
+  <div id="memory-mirror">
+    <label><input type="checkbox" id="memory-mirror-enabled"> 将本白名单群同步到隔离 Drive 目录</label>
+    <div class="row"><button id="memory-mirror-save" type="button" class="primary">保存镜像开关</button><button id="memory-push" type="button" class="secondary">推送群档案</button><button id="memory-pull" type="button" class="secondary">拉取人工修订</button></div>
+    <p id="memory-mirror-state" class="muted"></p>
+  </div>
+</dialog>
+
+<dialog id="module-finder" class="finder" aria-labelledby="finder-title">
+  <div class="finder-head"><h2 id="finder-title">查找模块或设置</h2><button id="finder-close" type="button" class="icon-button" aria-label="关闭搜索"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+  <label class="finder-field"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg><input id="finder-query" type="search" autocomplete="off" maxlength="100" placeholder="输入名称，例如「防抖」" aria-label="搜索模块和设置" role="combobox" aria-autocomplete="list" aria-controls="finder-results" aria-expanded="true"></label>
+  <div id="finder-results" class="finder-results" role="listbox" aria-label="匹配的模块和设置"></div>
+  <p id="finder-empty" class="finder-empty" role="status" hidden>没有匹配的设置，试试模块名称。</p>
+</dialog>
+
+<dialog id="modal-dialog" class="modal-dialog" aria-labelledby="modal-title">
+  <form id="modal-form">
+    <div class="modal-head">
+      <h2 id="modal-title">确认操作</h2>
+      <button id="modal-close" type="button" class="icon-button" aria-label="关闭弹窗"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p id="modal-message" class="modal-message"></p>
+      <p id="modal-hint" class="modal-hint muted" hidden></p>
+      <input id="modal-input" class="modal-input" type="text" autocomplete="off" hidden>
+      <textarea id="modal-textarea" class="modal-textarea" rows="5" hidden></textarea>
+    </div>
+    <div class="modal-actions row">
+      <button id="modal-cancel" type="button" class="secondary">取消</button>
+      <button id="modal-confirm" type="submit" class="primary">确认</button>
+    </div>
+  </form>
+</dialog>
+
+<footer>洁米奈星夜 &nbsp; / &nbsp; v{{VERSION}}</footer>
+</main>
+<script>
+{{SCRIPT}}
+</script>
+</body>
+</html>

@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from .admin_routes import body, service
+from .admin_common import body, domain_lock, service
 from .modules.longnick import LongnickConfig
 
 router = APIRouter(prefix="/admin/api")
@@ -59,12 +59,15 @@ async def longnick_status(request: Request):
 
 @router.put("/longnick/config")
 async def longnick_config(request: Request):
-    return await service(request).longnick.set_config(await body(request, LongnickConfig))
+    value = await body(request, LongnickConfig)
+    async with domain_lock(request, "community"):
+        return await service(request).longnick.set_config(value)
 
 
 @router.delete("/longnick/config")
 async def longnick_reset(request: Request):
-    return await service(request).longnick.set_config(None)
+    async with domain_lock(request, "community"):
+        return await service(request).longnick.set_config(None)
 
 
 @router.post("/longnick")

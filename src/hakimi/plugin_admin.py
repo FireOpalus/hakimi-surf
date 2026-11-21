@@ -7,7 +7,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .admin_routes import body, service
+from .admin_common import body, domain_lock, service
 from .plugin_bus import (
     PLUGIN_ID_RE,
     RESERVED_PLUGIN_IDS,
@@ -137,7 +137,7 @@ async def plugins_overview(request: Request):
 async def plugins_create(request: Request):
     value = await body(request, PluginCreateBody)
     bus = _bus(request)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "plugins"):
         try:
             token, state = await bus.create_plugin(
                 value.plugin_id,
@@ -160,7 +160,7 @@ async def plugins_update(request: Request, plugin_id: str):
     pid = _validate_path_plugin_id(plugin_id)
     value = await body(request, PluginUpdateBody)
     bus = _bus(request)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "plugins"):
         try:
             return await bus.update_plugin(
                 pid,
@@ -177,7 +177,7 @@ async def plugins_update(request: Request, plugin_id: str):
 async def plugins_rotate_token(request: Request, plugin_id: str):
     pid = _validate_path_plugin_id(plugin_id)
     bus = _bus(request)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "plugins"):
         try:
             token, state = await bus.rotate_token(pid)
         except Rejected as exc:
@@ -193,7 +193,7 @@ async def plugins_rotate_token(request: Request, plugin_id: str):
 async def plugins_disconnect(request: Request, plugin_id: str):
     pid = _validate_path_plugin_id(plugin_id)
     bus = _bus(request)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "plugins"):
         try:
             return await bus.disconnect_plugin(pid)
         except Rejected as exc:
@@ -204,7 +204,7 @@ async def plugins_disconnect(request: Request, plugin_id: str):
 async def plugins_delete(request: Request, plugin_id: str):
     pid = _validate_path_plugin_id(plugin_id)
     bus = _bus(request)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "plugins"):
         try:
             return await bus.delete_plugin(pid)
         except Rejected as exc:

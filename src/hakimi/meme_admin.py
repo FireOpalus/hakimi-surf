@@ -1,13 +1,22 @@
 """Authenticated bounded binary uploads; the admin middleware protects every route."""
 
-import asyncio
-
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from .admin_common import read_binary_upload
 from .memes import MAX_UPLOAD_BYTES, label_from_filename
 from .security import Rejected
 
 router = APIRouter(prefix="/admin/api/memes")
+
+_ALLOWED_MEME_MIMES = frozenset(
+    {
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "application/octet-stream",
+    }
+)
 
 
 def library(request):
@@ -27,32 +36,17 @@ async def memes(request: Request):
 @router.post("/upload/{filename}")
 async def upload(request: Request, filename: str):
     label_from_filename(filename)
-    if request.headers.get("content-encoding", "identity") != "identity":
-        raise HTTPException(415, "compressed_meme_upload_forbidden")
-    if request.headers.get("content-type", "").split(";")[0] not in {
-        "image/jpeg",
-        "image/png",
-        "image/gif",
-        "image/webp",
-        "application/octet-stream",
-    }:
-        raise HTTPException(415, "meme_image_required")
-    try:
-        declared = int(request.headers.get("content-length", "0"))
-    except ValueError:
-        raise HTTPException(400, "invalid_content_length") from None
-    if declared > MAX_UPLOAD_BYTES or declared < 0:
-        raise HTTPException(413, "meme_upload_too_large")
-    raw = bytearray()
-    try:
-        async with asyncio.timeout(10):
-            async for chunk in request.stream():
-                raw.extend(chunk)
-                if len(raw) > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "meme_upload_too_large")
-    except TimeoutError:
-        raise HTTPException(408, "meme_upload_timeout") from None
-    return await library(request).upload(filename, bytes(raw))
+    raw = await read_binary_upload(
+        request,
+        allowed_mimes=_ALLOWED_MEME_MIMES,
+        max_bytes=MAX_UPLOAD_BYTES,
+        timeout_seconds=10,
+        compressed_error="compressed_meme_upload_forbidden",
+        mime_error="meme_image_required",
+        size_error="meme_upload_too_large",
+        timeout_error="meme_upload_timeout",
+    )
+    return await library(request).upload(filename, raw)
 
 
 @router.get("/{key}/image")

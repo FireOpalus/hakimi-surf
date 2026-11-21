@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 from typing import Any, Literal
 
@@ -167,13 +168,14 @@ class VoiceGatewayAdminManager:
 
     async def sync_to_gateway(self) -> bool:
         await self.initialize()
-        if not self.configured() or not isinstance(self._override, dict):
-            return False
-        try:
-            resp = await self._request("POST", "/v1/admin/config", json_body=self._override)
-            return resp.status_code == 200
-        except (httpx.HTTPError, TimeoutError, ValueError):
-            return False
+        async with self._op_lock:
+            if not self.configured() or not isinstance(self._override, dict):
+                return False
+            try:
+                resp = await self._request("POST", "/v1/admin/config", json_body=self._override)
+                return resp.status_code == 200
+            except (httpx.HTTPError, TimeoutError, ValueError):
+                return False
 
     async def status(self) -> dict[str, Any]:
         await self.initialize()
@@ -301,15 +303,43 @@ class VoiceGatewayAdminManager:
                     pass
         return await self.status()
 
+    async def _needs_gateway_resync(self) -> bool:
+        if not isinstance(self._override, dict):
+            return False
+        try:
+            cfg_resp = await self._request("GET", "/v1/admin/config")
+            if cfg_resp.status_code == 200:
+                gw = cfg_resp.json()
+                if isinstance(gw, dict):
+                    return not bool(gw.get("overridden"))
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            return False
+        return False
+
     async def list_breezeblue_voices(self) -> dict[str, Any]:
         await self.initialize()
         if not self.configured():
             raise Rejected("voice_gateway_not_configured")
-        await self.sync_to_gateway()
         try:
             resp = await self._request("GET", "/v1/admin/voices", timeout_sec=10.0)
         except (httpx.HTTPError, TimeoutError, ValueError):
             raise HTTPException(503, "voice_gateway_unreachable") from None
+
+        has_override_key = isinstance(self._override, dict) and bool(
+            str(self._override.get("breezeblue_api_key") or "").strip()
+        )
+        should_resync = False
+        if has_override_key and resp.status_code == 400:
+            should_resync = True
+        elif has_override_key and resp.status_code == 502:
+            should_resync = await self._needs_gateway_resync()
+
+        if should_resync and await self.sync_to_gateway():
+            try:
+                resp = await self._request("GET", "/v1/admin/voices", timeout_sec=10.0)
+            except (httpx.HTTPError, TimeoutError, ValueError):
+                raise HTTPException(503, "voice_gateway_unreachable") from None
+
         if resp.status_code == 400:
             detail = ""
             try:
@@ -336,10 +366,14 @@ class VoiceGatewayAdminManager:
         except Rejected:
             raise HTTPException(502, "voice_gateway_tts_test_failed") from None
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        fallback_mime = "audio/wav" if getattr(synth, "fmt", "") == "wav" else "audio/mpeg"
+        mime_type = str(getattr(synth, "mime_type", None) or "").strip() or fallback_mime
         return {
             "ok": True,
             "bytes": len(synth.audio_bytes),
             "duration_ms": synth.duration_ms,
             "latency_ms": latency_ms,
             "fmt": synth.fmt,
+            "mime_type": mime_type,
+            "audio_b64": base64.b64encode(synth.audio_bytes).decode("ascii"),
         }

@@ -15,7 +15,7 @@ from pydantic import (
     model_validator,
 )
 
-from .admin_routes import body, service
+from .admin_common import body, domain_lock, service
 from .identity import IdentityService, validate_platform_user
 from .models import PlatformId
 from .security import Rejected
@@ -128,7 +128,7 @@ async def identity_update_person(request: Request, person_id: str):
     if not ADMIN_PERSON_ID_RE.fullmatch(person_id):
         raise HTTPException(400, "invalid_admin_input")
     value = await body(request, PersonUpdateInput)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "identity"):
         ident, aff, mod = await _identity(request)
         try:
             await ident.update_person(
@@ -146,7 +146,7 @@ async def identity_update_person(request: Request, person_id: str):
 @router.post("/merge")
 async def identity_merge_persons(request: Request):
     value = await body(request, MergePersonsInput)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "identity"):
         ident, aff, mod = await _identity(request)
         try:
             await ident.merge_persons(
@@ -164,7 +164,7 @@ async def identity_merge_persons(request: Request):
 @router.post("/link")
 async def identity_link_account(request: Request):
     value = await body(request, LinkAccountInput)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "identity"):
         ident, aff, mod = await _identity(request)
         try:
             await ident.link_account(
@@ -184,7 +184,7 @@ async def identity_link_account(request: Request):
 @router.post("/unlink")
 async def identity_unlink_account(request: Request):
     value = await body(request, UnlinkAccountInput)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "identity"):
         ident, aff, mod = await _identity(request)
         try:
             await ident.unlink_account(value.platform, value.user_id, moderation=mod)

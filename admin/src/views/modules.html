@@ -1,0 +1,150 @@
+<section id="modules" class="tab" role="tabpanel" aria-labelledby="nav-modules" hidden>
+  <template id="catalog-icon-database_backup"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6c0-4 16-4 16 0s-16 4-16 0 M4 6v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0"/></svg></template>
+  <template id="catalog-icon-surf_mirror"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h12v14H8z M4 7v14h12 M11 8h6 M11 12h4"/></svg></template>
+  <template id="catalog-icon-group_memory_mirror"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h16v11H8l-5 4z M7 8h8 M7 11h4 M12 19h5l4 3V9"/></svg></template>
+  <div class="directory-heading"><h2>平台模块</h2><div class="row"><button class="secondary" type="button" data-open-tab="plugin-bus">管理远程插件总线 →</button><button class="secondary" id="reload-modules" type="button">刷新目录</button></div></div>
+  <div id="module-catalog" class="module-catalog" aria-live="polite"></div>
+  <div class="directory-heading system-heading"><h2>常驻系统模块</h2></div>
+  <div id="system-catalog" class="module-catalog" aria-live="polite"></div>
+</section>
+
+<section id="qq" class="tab" role="tabpanel" aria-labelledby="nav-qq" hidden>
+  <div class="card"><h2>OneBot 连接</h2>
+    <span class="connection-state"><span id="connection-dot" class="status-dot" aria-hidden="true"></span><span id="connection-label">等待连接状态</span></span>
+    <dl id="ws-details" class="node-details">
+        <div><dt>最近心跳</dt><dd id="ws-heartbeat">—</dd></div>
+        <div><dt>连接来源</dt><dd id="ws-source">—</dd></div>
+    </dl>
+  </div>
+  <div class="card"><h2>社交设置</h2>
+    <div class="module-shortcuts">
+      <button type="button" class="secondary" data-open-tab="group-policy">群聊互动策略 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="admission">准入与防互刷 <span aria-hidden="true">→</span></button>
+    </div>
+    <h3>跨平台主控入口</h3>
+    <div class="module-shortcuts">
+      <button type="button" class="secondary" data-open-tab="identity-center">统一身份与绑定 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="community">好感度与小黑屋 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="memes">表情包库 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="proactive">主动私信与投递 <span aria-hidden="true">→</span></button>
+    </div>
+  </div>
+  <div class="card" id="qq-privacy-card">
+    <h2>群聊与私聊隐私</h2>
+    <p class="muted">高隐私使用付费安全审核。低隐私可使用已配置的免费审核。所有会话的主模型通道跟随全局。Owner 私聊默认使用高隐私。</p>
+    <form id="qq-privacy-defaults" class="quick-bar">
+      <label>群聊默认等级<select id="prov-default-group-privacy"><option value="low">低隐私</option><option value="high">高隐私</option></select></label>
+      <label>普通私聊默认等级<select id="prov-default-private-privacy"><option value="high">高隐私</option><option value="low">低隐私</option></select></label>
+      <button id="qq-privacy-default-save" type="submit" class="primary" disabled>保存默认等级</button>
+    </form>
+    <div id="prov-sessions-table" class="table"></div>
+    <details><summary>为其他会话指定隐私等级</summary>
+      <form id="prov-custom-session-form" class="quick-bar">
+        <label>会话类型<select id="prov-custom-kind"><option value="group">群聊</option><option value="private">私聊</option></select></label>
+        <label>群号或用户 ID<input id="prov-custom-id" maxlength="131" placeholder="QQ 号码或 qq:OpenID" required></label>
+        <label>隐私等级<select id="prov-custom-privacy"><option value="default">跟随默认</option><option value="high">高隐私</option><option value="low">低隐私</option></select></label>
+        <button id="prov-add-session-policy" type="submit" class="primary" disabled>保存等级</button>
+      </form>
+    </details>
+  </div>
+  <div class="card"><h2>每日心情个签</h2>
+    <p class="muted">每日自动换签默认关闭。开启后与日报共用一次模型生成，LifeEngine 心情联动换签同样受此开关与冷却保护；失败不影响汇报。手动改签不调用模型。</p>
+    <p id="sign-state"></p>
+    <form id="sign-config-form"><div class="row"><label><input id="sign-enabled" type="checkbox"> 每日日报联动换签</label><label>自动冷却小时 <input id="sign-cooldown" type="number" min="20" max="168" required></label><button type="submit" class="primary">保存换签设置</button><button type="button" id="sign-reset" class="secondary">恢复 .env</button></div></form>
+    <form id="sign-form"><label for="sign-text">纯文本签名（最多 50 字）</label><input id="sign-text" maxlength="50" required autocomplete="off"><button type="submit" class="primary">立即更新签名</button></form>
+  </div>
+  <div class="card"><h2>模块动作</h2>
+    <div id="qq-actions" class="module-tools"></div>
+  </div>
+</section>
+
+<section id="group-policy" class="tab" role="tabpanel" aria-labelledby="nav-group-policy" hidden>
+  <div class="card"><h2>群聊互动策略</h2>
+    <p class="muted">仅管理已有白名单群；保存后立即生效，重启保留。at_only 接收真实 @、对机器人的已验证回复和顶层昵称点名（群内看视频需真实 @）；muted 始终静默。活跃度只调整 smart_reply 的自由插话门槛。</p>
+    <div id="groups" class="table"></div>
+  </div>
+  <div class="card"><h2>Bot 回复阈值与冷却</h2>
+    <p class="muted">此处与「准入与防互刷」共用外部 Bot 名单与回复阈值（0.01–1.00，1.00=完全屏蔽）。显式 /bot-interact 窗口内允许 2 轮对话及点名，不改变日常阈值。</p>
+    <form id="bot-default-threshold-form" class="row"><label for="bot-default-threshold">全局默认 Bot 阈值 <input id="bot-default-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" required></label><button type="submit" class="primary">保存默认阈值</button></form>
+    <div class="row"><input id="bot-id" inputmode="numeric" placeholder="其他机器人 QQ 号" aria-label="机器人 QQ"><input id="bot-custom-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" placeholder="专属阈值（可留空）" aria-label="机器人专属回复阈值"><button id="add-bot" type="button" class="primary">加入管理</button></div>
+    <div id="bots" class="table"></div>
+  </div>
+</section>
+
+<section id="bili" class="tab" role="tabpanel" aria-labelledby="nav-bili" hidden>
+  <div class="card"><h2>巡逻设置</h2>
+    <dl class="node-details"><div><dt>执行节点</dt><dd id="bili-module-backend">—</dd></div><div><dt>小号自主巡逻</dt><dd id="bili-module-autonomous">—</dd></div></dl>
+    <div class="module-shortcuts">
+      <button type="button" class="secondary" data-open-tab="bili-account">账号与看片设置 <span aria-hidden="true">→</span></button>
+      <button type="button" class="secondary" data-open-tab="patrol">巡逻订阅 <span aria-hidden="true">→</span></button>
+    </div>
+  </div>
+  <div class="card"><h2>手动巡逻</h2>
+      <div class="quick-actions">
+        <button type="button" class="quick-action" data-action="patrol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M15 9l-2 4-4 2 2-4z"/></svg><span><strong>执行 B 站巡逻</strong><small>拉取订阅更新</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+      </div>
+    <p class="overview-footnote">手动巡逻使用现有 API 额度。</p>
+  </div>
+  <div class="card"><h2>模块动作</h2>
+    <div id="bili-actions" class="module-tools"></div>
+  </div>
+</section>
+
+<section id="weather" class="tab" role="tabpanel" aria-labelledby="nav-weather" hidden>
+  <div class="card"><h2>观测地点</h2>
+    <p id="weather-current" aria-live="polite">正在读取地点…</p>
+    <fieldset id="weather-editor" class="weather-editor" aria-label="设置观测地点" disabled>
+      <fieldset id="weather-methods" class="weather-methods"><legend>设置方式</legend>
+        <label><input type="radio" name="weather-method" value="city" checked><span>搜索城市</span></label>
+        <label><input type="radio" name="weather-method" value="coordinates"><span>输入经纬度</span></label>
+        <label><input type="radio" name="weather-method" value="server_ip"><span>IP 自动定位</span></label>
+      </fieldset>
+      <div id="weather-mode-city">
+        <form id="weather-city-form">
+          <label for="weather-query">城市名</label>
+          <div class="row"><input id="weather-query" type="search" minlength="2" maxlength="80" placeholder="例如 上海、首尔" required><button type="submit" class="secondary">查找城市</button></div>
+        </form>
+        <label id="weather-results" hidden>匹配地点<select id="weather-city-select"></select></label>
+      </div>
+      <div id="weather-mode-coordinates" class="grid" hidden>
+        <label>纬度<input id="weather-lat" type="number" min="-90" max="90" step="any" placeholder="−90 至 90" required></label>
+        <label>经度<input id="weather-lon" type="number" min="-180" max="180" step="any" placeholder="−180 至 180" required></label>
+      </div>
+      <div id="weather-mode-server_ip" hidden>
+        <p class="muted">通过天气服务所在服务器的出口 IP 估算城市。若要查看你所在城市的天气，请使用城市搜索。</p>
+        <button id="weather-detect" type="button" class="secondary">识别服务器地点</button>
+      </div>
+      <p id="weather-preview" role="status"></p>
+      <div class="row"><button id="weather-save" type="button" class="primary" disabled>保存地点</button><button id="weather-reset" type="button" class="secondary" hidden>恢复环境默认</button></div>
+    </fieldset>
+  </div>
+  <div class="card"><h2>当前天气</h2><div id="weather-actions" class="module-tools"></div></div>
+</section>
+
+<section id="minecraft" class="tab" role="tabpanel" aria-labelledby="nav-minecraft" hidden>
+  <div class="card"><h2>Minecraft 控制</h2>
+    <dl id="mc-overview" class="node-details"></dl>
+    <p id="life-mc-status" class="muted"></p>
+    <form id="life-mc-form" class="quick-bar">
+      <label for="life-mc-topic">Mineflayer 建造 / 活动目标
+        <input id="life-mc-topic" type="text" maxlength="80" placeholder="例如：红石自动门、探索雪原">
+      </label>
+      <button id="life-mc-build" type="submit" class="primary" disabled>筹备建造 (build_plan)</button>
+      <button id="life-mc-connect" type="button" class="secondary" disabled>上线进服 (connect)</button>
+      <button id="life-mc-disconnect" type="button" class="secondary" disabled>下线待机 (disconnect)</button>
+      <button id="life-mc-status-btn" type="button" class="secondary" disabled>刷新 MC 状态</button>
+      <button id="life-mc-idle" type="button" class="secondary" disabled>MC 待命 (idle)</button>
+      <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
+      <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
+    </form>
+    <form id="life-mc-chat-form" class="quick-bar">
+      <label for="life-mc-chat-msg">MC 公屏喊话 (chat)
+        <input id="life-mc-chat-msg" type="text" maxlength="120" placeholder="例如：大家好，我上线啦（不可发 / 指令）">
+      </label>
+      <button id="life-mc-chat-btn" type="submit" class="primary" disabled>公屏喊话 (chat)</button>
+    </form>
+  </div>
+  <div class="card"><h2>模块动作</h2>
+    <div id="minecraft-actions" class="module-tools"></div>
+  </div>
+</section>

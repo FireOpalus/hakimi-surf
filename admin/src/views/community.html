@@ -1,0 +1,87 @@
+<section id="community" class="tab" role="tabpanel" aria-labelledby="nav-community" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>好感度系统全局策略与阶梯一览</h2>
+      <button id="refresh-affection" type="button" class="secondary">刷新好感度</button>
+    </div>
+    <p class="muted">按用户动态追踪好感度并门控回复概率、功能解锁与单用户预算倍率。全天下唯一 BOISER（Owner，Lv.6）初始 120、硬下限 100、上限 120，独享 Carbon Tier 4、2.50x 预算与群聊合批绝对优先护航，永不降级或被拉黑；非 Owner 区间 0～100（最高 Lv.5 / Tier 3）且严禁向非 Owner 查询或泄露好感度分值与机制。</p>
+    <p id="affection-source" class="muted"></p>
+    <form id="aff-config-form">
+      <div class="row">
+        <label><input id="aff-enabled" type="checkbox"> 启用好感度动态门控与关系档案（enabled）</label>
+      </div>
+      <div class="grid">
+        <label for="aff-initial-score">非 Owner 初始分（initial_score，1–100）<input id="aff-initial-score" type="number" min="1" max="100" step="1" required></label>
+        <label for="aff-daily-cap">每日正向加分上限（daily_positive_cap，0–50）<input id="aff-daily-cap" type="number" min="0" max="50" step="1" required></label>
+        <label for="aff-unmute-score">解除小黑屋恢复分（unmute_recovery_score，1–60）<input id="aff-unmute-score" type="number" min="1" max="60" step="1" required></label>
+        <label for="aff-farewell">归零绝交告别语（farewell_message，1–120 字）<input id="aff-farewell" type="text" maxlength="120" required placeholder="话不投机，以后不想再理你了，再见。"></label>
+        <label for="aff-cooldown-days">冷静期自动回暖天数（cooldown_recovery_days，0=关闭）<input id="aff-cooldown-days" type="number" min="0" max="90" step="1" required></label>
+        <label for="aff-cooldown-target">冷静期回暖目标分（cooldown_recovery_target，20–60）<input id="aff-cooldown-target" type="number" min="20" max="60" step="1" required></label>
+        <label for="aff-viol-inj">注入拦截好感扣分（violation_injection_delta，-50..0）<input id="aff-viol-inj" type="number" min="-50" max="0" step="1" required></label>
+        <label for="aff-viol-blk">内容拦截好感扣分（violation_content_delta，-50..0）<input id="aff-viol-blk" type="number" min="-50" max="0" step="1" required></label>
+        <label for="aff-viol-floor">安全拦截好感保底分（violation_affection_floor，0..50）<input id="aff-viol-floor" type="number" min="0" max="50" step="1" required></label>
+      </div>
+      <div class="row aff-checks">
+        <label><input id="aff-penalize-rl" type="checkbox"> 触发限流时扣好感度（-3）</label>
+        <label><input id="aff-penalize-poke" type="checkbox"> Lv.1/Lv.2 被戳一戳忽略时扣好感度（-3）</label>
+        <label><input id="aff-decouple-safety" type="checkbox"> 安全拦截与好感度轻度解耦（decouple_safety_violations，避免误拦截越权拉黑，Owner 始终风控免疫）</label>
+      </div>
+      <div class="row">
+        <button id="aff-save-config" type="submit" class="primary" disabled>保存好感度策略</button>
+        <button id="aff-reset-config" type="button" class="secondary" disabled>恢复默认策略</button>
+      </div>
+    </form>
+    <h3>7 阶好感度能力阶梯一览（Lv.0～Lv.6）</h3>
+    <p class="muted">全天下唯一 BOISER（Owner）最低保底 100 / 最高 120，Lv.6 独享 Carbon 深度推理（Tier 4）、2.50x 单日预算与群聊合批绝对优先护航；非 Owner 封顶 100（Lv.5 仅解锁至 Tier 3 与看原片），且禁止非 Owner 在对话中查询自己或他人的好感度分值与阶梯。</p>
+    <div id="aff-tiers-table" class="table"></div>
+  </div>
+  <div class="card">
+    <div class="row between">
+      <h2>用户好感度档案与调分台</h2>
+      <div class="row">
+        <span id="aff-users-count" class="muted"></span>
+        <button type="button" class="secondary" data-open-tab="identity-center">管理跨平台账号绑定 →</button>
+      </div>
+    </div>
+    <p class="muted">可直接按平台与 ID 设定用户好感度（0～120），或对已有档案快速调分（-10 / +10 / 拉黑(0) / 自定义修改 / 查看流水 / 重置）。Owner 档案固定置顶；将非 Owner 设为 0 分或重置档案时，将自动同步「讨厌鬼小黑屋」屏蔽列表。</p>
+    <form id="aff-user-form" class="quick-bar">
+      <datalist id="aff-platform-options">
+        <option value="onebot"></option>
+        <option value="qq"></option>
+        <option value="discord"></option>
+        <option value="oopz"></option>
+        <option value="telegram"></option>
+      </datalist>
+      <label for="aff-set-platform">平台
+        <input id="aff-set-platform" list="aff-platform-options" type="text" maxlength="48" value="onebot" required>
+      </label>
+      <label for="aff-set-uid">用户 ID（QQ / OpenID）<input id="aff-set-uid" type="text" maxlength="128" required placeholder="输入 QQ 号、OpenID 或平台 user_id"></label>
+      <label for="aff-set-score">目标好感度（0–120）<input id="aff-set-score" type="number" min="0" max="120" step="1" value="50" required></label>
+      <label for="aff-set-nickname">昵称（可选）<input id="aff-set-nickname" type="text" maxlength="80" placeholder="备注昵称"></label>
+      <label for="aff-set-reason">调整原因<input id="aff-set-reason" type="text" maxlength="64" value="admin_set" placeholder="admin_set"></label>
+      <button id="aff-set-submit" type="submit" class="primary" disabled>设置好感度</button>
+    </form>
+    <div class="row between">
+      <label for="aff-search" class="aff-search-label">筛选档案 <input id="aff-search" class="aff-search-input" type="search" maxlength="128" placeholder="搜索 user_id / 昵称 / 阶梯 / 原因…"></label>
+    </div>
+    <div id="aff-users-table" class="table"></div>
+    <div class="row between aff-history-head">
+      <h3>好感度变动审计流水</h3>
+      <div class="row">
+        <span id="aff-history-scope" class="muted">最近全局 50 条加密审计流水</span>
+        <button id="aff-history-all" type="button" class="secondary">查看全部流水</button>
+        <button id="aff-history-refresh" type="button" class="secondary">刷新流水</button>
+      </div>
+    </div>
+    <div id="aff-history-table" class="table"></div>
+  </div>
+  <div class="card"><div class="row between"><h2>讨厌鬼小黑屋</h2><button id="refresh-community" type="button" class="secondary">刷新</button></div>
+    <p class="muted">应用层屏蔽，群聊与私聊都直接忽略。Owner 与机器人自身受保护。只有明确勾选并确认，才会顺带从好友列表移除。</p>
+    <form id="mute-form"><div class="row"><input id="mute-qq" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" placeholder="QQ 号" aria-label="屏蔽目标 QQ" required><label><input id="mute-delete" type="checkbox"> 同时移除 QQ 好友（若存在）</label><button type="submit" class="primary">加入小黑屋</button></div></form>
+    <div id="mute-list" class="table"></div>
+  </div>
+  <div class="card"><h2>待审批告状</h2>
+    <p class="muted">同一群友 24 小时内多次触发安全检测后申请，未审批前不会自动屏蔽。昵称仅供辨认，身份以 QQ 号为准。</p>
+    <div id="mute-proposals" class="table"></div>
+  </div>
+</section>

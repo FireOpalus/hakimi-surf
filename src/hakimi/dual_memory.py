@@ -220,6 +220,7 @@ class DualMemory:
         self.sessions = sessions
         self.s, self.vault = sessions.s, sessions.vault
         self.index = RecallIndex()
+        self._stats_cache: OrderedDict[str, tuple[int, int, int, int]] = OrderedDict()
 
     async def migrate(self, db, key):
         # Runs within the session transaction; preserves every legacy payload byte.
@@ -509,6 +510,69 @@ class DualMemory:
             )
             return changed.rowcount > 0
 
+    async def stats_in_db(self, db, key: str, epoch: int, version: int) -> dict:
+        async with db.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM member_profiles WHERE deleted=0 LIMIT ?)",
+            (MAX_ENTRIES,),
+        ) as cur:
+            prof_count = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM chronicle_events WHERE deleted=0 LIMIT ?)",
+            (MAX_ENTRIES,),
+        ) as cur:
+            chron_count = (await cur.fetchone())[0]
+        active_count = prof_count + chron_count
+        if active_count == 0:
+            active_chars = 0
+        else:
+            cached = self._stats_cache.get(key)
+            if cached is not None and cached[:3] == (epoch, version, active_count):
+                self._stats_cache.move_to_end(key)
+                active_chars = cached[3]
+            else:
+                active_chars = 0
+                if prof_count:
+                    async with db.execute(
+                        "SELECT member_id,slot,payload FROM member_profiles "
+                        "WHERE deleted=0 LIMIT ?",
+                        (MAX_ENTRIES,),
+                    ) as cur:
+                        for uid, slot, blob in await cur.fetchall():
+                            data = self.vault.open(key + f":p:{uid}:{slot}", blob)
+                            active_chars += len(str(data.get("text", "")))
+                if chron_count:
+                    async with db.execute(
+                        "SELECT id,payload FROM chronicle_events WHERE deleted=0 LIMIT ?",
+                        (MAX_ENTRIES,),
+                    ) as cur:
+                        for ident, blob in await cur.fetchall():
+                            data = self.vault.open(key + ":e:" + ident, blob)
+                            active_chars += len(str(data.get("text", "")))
+                self._stats_cache[key] = (epoch, version, active_count, active_chars)
+                self._stats_cache.move_to_end(key)
+                while len(self._stats_cache) > MAX_ENTRIES:
+                    self._stats_cache.popitem(last=False)
+        async with db.execute(
+            "SELECT CASE WHEN status='attempted' AND COALESCE(attempted_at,0)<? "
+            "THEN 'unconfirmed' ELSE status END,COUNT(*) FROM memory_slice_jobs GROUP BY 1",
+            (_PROCESS_STARTED_AT,),
+        ) as cur:
+            jobs = dict(await cur.fetchall())
+        retry = await self._capacity_retry(db, epoch)
+        return {
+            "dual_entries_count": active_count,
+            "dual_chars": active_chars,
+            "flex_retry": {k: v for k, v in retry.items() if k != "batch_id"} if retry else None,
+            "archive_failed_slices": jobs.get("failed", 0),
+            "archive_unconfirmed_slices": jobs.get("unconfirmed", 0),
+        }
+
+    async def stats(self, message) -> dict:
+        async with self.sessions.database(message, preserve_history=True) as (db, key):
+            async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
+                epoch, version = await cur.fetchone()
+            return await self.stats_in_db(db, key, epoch, version)
+
     async def view(self, message, query=""):
         async with self.sessions.database(message, preserve_history=True) as (db, key):
             async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
@@ -714,6 +778,7 @@ class DualMemory:
                 [(ident,) for ident in ids],
             )
         self.index.discard(key)
+        self._stats_cache.pop(key, None)
         ledger = getattr(self.sessions, "event_ledger", None)
         if owner_commitments and ledger is not None:
             for ident, summary, created_ts in owner_commitments:
@@ -832,6 +897,7 @@ class DualMemory:
             await db.execute("UPDATE memory_control SET ready=1")
             await db.execute("UPDATE rolling_state SET version=version+1")
         self.index.discard(key)
+        self._stats_cache.pop(key, None)
         return True
 
     async def edit(self, message, ident, *, version, action, text="", expires=0):
@@ -907,6 +973,7 @@ class DualMemory:
                     )
             await db.execute("UPDATE rolling_state SET version=version+1")
         self.index.discard(key)
+        self._stats_cache.pop(key, None)
         return {"status": "saved", "version": version + 1}
 
     async def prefetch(self, message, query, *, recall=False, related_user_ids=()):

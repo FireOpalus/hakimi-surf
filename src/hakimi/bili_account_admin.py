@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .admin_routes import body, service
+from .admin_common import body, domain_lock, service
 from .modules.bili_watcher import BiliPolicy, CredentialUpdate
 from .security import Rejected
 from .video_policy import VideoWatchConfig
@@ -36,18 +36,21 @@ async def status(request: Request):
 @router.put("")
 async def policy(request: Request):
     value = await body(request, BiliPolicy)
-    return await _call_bili(service(request).bili_watcher.set_policy(value))
+    async with domain_lock(request, "bili_account"):
+        return await _call_bili(service(request).bili_watcher.set_policy(value))
 
 
 @router.delete("")
 async def reset(request: Request):
-    return await _call_bili(service(request).bili_watcher.set_policy(None))
+    async with domain_lock(request, "bili_account"):
+        return await _call_bili(service(request).bili_watcher.set_policy(None))
 
 
 @router.post("/credentials")
 async def credentials(request: Request):
     value = await body(request, CredentialUpdate)
-    return await _call_bili(service(request).bili_watcher.update_credentials(value))
+    async with domain_lock(request, "bili_account"):
+        return await _call_bili(service(request).bili_watcher.update_credentials(value))
 
 
 @router.get("/video-watch")
@@ -58,12 +61,14 @@ async def video_watch_status(request: Request):
 @router.put("/video-watch")
 async def video_watch_config(request: Request):
     value = await body(request, VideoWatchConfig)
-    return await service(request).video_watch.set_config(value)
+    async with domain_lock(request, "bili_account"):
+        return await service(request).video_watch.set_config(value)
 
 
 @router.delete("/video-watch")
 async def video_watch_reset(request: Request):
-    return await service(request).video_watch.set_config(None)
+    async with domain_lock(request, "bili_account"):
+        return await service(request).video_watch.set_config(None)
 
 
 @router.post("/{action}")

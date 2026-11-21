@@ -1,0 +1,54 @@
+<section id="overview" class="tab" role="tabpanel" aria-labelledby="nav-overview">
+  <dl id="stats" class="stats">
+    <div class="stat"><dt>今日 API 尝试<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h5l2-8 4 14 3-9 1 3h3"/></svg></dt><dd id="stat-calls">—</dd></div>
+    <div class="stat"><dt>注入拦截<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6zM9 12l2 2 4-5"/></svg></dt><dd id="stat-injection">—</dd></div>
+    <div class="stat"><dt>噪音忽略<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg></dt><dd id="stat-noise">—</dd></div>
+    <div class="stat"><dt>运行时长<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg></dt><dd id="stat-uptime">—</dd></div>
+  </dl>
+  <div class="overview-grid">
+    <article class="card budget-card">
+      <h2>今日预算</h2>
+      <div class="budget-numbers"><strong id="budget-spend">—</strong><span id="budget-limit"></span></div>
+      <div id="budget-meter" class="budget-meter"><progress id="budget" max="100" value="0" aria-label="今日预算使用比例"></progress><output id="budget-percent" for="budget">—</output></div>
+      <p id="budget-label" hidden></p>
+      <div class="budget-foot">
+        <div><span>日预算余量</span><strong id="budget-left">—</strong></div>
+        <div><span>本分钟入队</span><strong id="rate-label">—</strong></div>
+      </div>
+    </article>
+    <article class="card">
+      <h2>消息处理</h2>
+      <dl class="node-details">
+        <div><dt>处理中</dt><dd id="pipeline-state">—</dd></div>
+        <div><dt>图片缓存</dt><dd id="image-cache">—</dd></div>
+      </dl>
+      <div class="row between rest-row"><span id="rest-overview-badge" class="badge">作息读取中</span><button data-open-tab="life" type="button" class="secondary">管理作息</button></div>
+    </article>
+    <article class="card">
+      <h2>费用分布</h2><dl id="lane-stats" class="lanes"></dl>
+      <p id="lanes-empty" class="muted" hidden>今天还没有 API 调用。</p>
+      <p class="overview-footnote">按用途统计当日费用，包含预留额度，联网检索费除外。</p>
+    </article>
+    <article class="card"><h2>常用设置</h2>
+      <div class="quick-actions">
+        <button type="button" class="quick-action" data-open-tab="reply-settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16 M8 3v6 M16 9v6 M10 15v6"/></svg><span><strong>回复与联网</strong><small>调整防抖和检索</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="memory"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z M8 8h8 M8 12h8 M8 16h4 M2 7h3 M2 13h3"/></svg><span><strong>会话与记忆</strong><small>查看隔离会话和滚动摘要</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="identity-center"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M17 11l2 2 4-4"/></svg><span><strong>统一身份与绑定</strong><small>跨平台账号合并与 L2 画像</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="plugin-bus"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5 M9 8V2 M15 8V2 M18 8v5a6 6 0 0 1-12 0V8z"/></svg><span><strong>远程插件总线</strong><small>签发插件凭据与管理连接</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+        <button type="button" class="quick-action" data-open-tab="logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"/></svg><span><strong>安全日志</strong><small>排查拦截和服务告警</small></span><span class="action-arrow" aria-hidden="true">→</span></button>
+      </div>
+    </article>
+  </div>
+  <div id="overview-routing-gcp" class="card" hidden>
+    <div class="row between">
+      <h2>路由策略与统一余额概览</h2>
+      <div class="row">
+        <button id="overview-go-routing" type="button" class="secondary" data-open-tab="api-routing">全局模型通道</button>
+        <button id="overview-go-ledger" type="button" class="secondary" data-open-tab="ledger">账本与统一余额</button>
+      </div>
+    </div>
+    <div id="overview-routing-pills" class="pill-row"></div>
+    <div id="overview-gcp-strip" class="kpi-strip" hidden></div>
+    <p id="overview-gcp-note" class="muted"></p>
+  </div>
+</section>

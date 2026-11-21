@@ -1,0 +1,116 @@
+<section id="memes" class="tab" role="tabpanel" aria-labelledby="nav-memes" hidden>
+  <div class="card"><div class="row between"><h2>本地白名单表情包</h2><button id="meme-refresh" type="button" class="secondary">刷新列表</button></div>
+    <p class="muted">只有本页或 Owner 用 /存表情 收录的图片可用于公开聊天；模型只能选标签。标签支持 1～24 个汉字、英文字母、数字、下划线或短横线；同名标签可上传多张并在发送时轮换；相同图片不会重复入库。</p>
+    <form id="meme-upload">
+      <div class="row"><label for="meme-file">选择或拖拽上传 jpg / png / gif / webp（单张 ≤ 5 MiB，支持多选）</label><input id="meme-file" type="file" accept=".jpg,.jpeg,.png,.gif,.webp" multiple></div>
+      <div id="meme-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把多张表情拖到这里（支持从文件名自动识别标签，也可加入队列后逐张改名）</div>
+      <div class="row"><input id="meme-batch-label" maxlength="24" placeholder="统一标签（可选，适合同情绪多图轮换）" aria-label="统一标签"><button id="meme-apply-batch" type="button" class="secondary">应用到全部待传项</button><button id="meme-clear-queue" type="button" class="secondary">清空待传</button><button type="submit" class="primary">批量上传并立即生效</button></div>
+      <div id="meme-pending" class="meme-queue"></div>
+    </form>
+    <p class="muted">最多 100 张、合计 50 MiB。上传自动清除元数据：GIF / 动态 WebP 保留重编码动图（≤60 帧、512px），透明底 PNG / WebP 保留透明 PNG，普通静图转 JPEG（≤1024px）。以 OneBot 动画表情子类型（sub_type=1）跨容器 base64 发送；公开会话每 4 次回复最多附一张（Owner 私聊不限频），同名多图优先轮换不重复。</p>
+    <p id="meme-prompt-count" class="badge">当前已加载到 Prompt 的有效表情数量：0</p>
+    <p id="meme-state" role="status"></p>
+    <div id="meme-list" class="meme-grid"></div>
+  </div>
+</section>
+
+<section id="songs" class="tab" role="tabpanel" aria-labelledby="nav-songs" hidden>
+  <div class="card"><div class="row between"><h2>猫猫专属翻唱歌单</h2><button id="song-refresh" type="button" class="secondary">刷新歌单</button></div>
+    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 12 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台；模型仅从歌单标题白名单里挑选。</p>
+    <form id="song-upload">
+      <div class="row"><label for="song-file">选择音频文件</label><input id="song-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac"><small id="song-file-name" class="muted">未选择音频文件</small></div>
+      <div id="song-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把翻唱音频拖到这里（自动识别文件名作为歌名）</div>
+      <div class="song-meta">
+        <label for="song-title">歌名（必填，1～40字）<input id="song-title" maxlength="40" required placeholder="例如：小星星"></label>
+        <label for="song-artist">原唱（可选）<input id="song-artist" maxlength="40" placeholder="例如：传统儿歌"></label>
+        <label for="song-tags">风格标签（可选）<input id="song-tags" maxlength="80" placeholder="例如：温柔 晚安"></label>
+        <label for="song-start">起始秒数（0～600）<input id="song-start" type="number" min="0" max="600" step="0.5" value="0"></label>
+        <label for="song-duration">截取时长秒（5～58）<input id="song-duration" type="number" min="5" max="58" step="1" value="50"></label>
+      </div>
+      <div class="row"><button type="submit" class="primary">上传并切片转码</button><button id="song-clear-file" type="button" class="secondary">清空文件</button></div>
+    </form>
+    <p id="song-prompt-count" class="badge">当前已加载到 Prompt 的有效曲目：0</p>
+    <p id="song-state" role="status"></p>
+    <div id="song-list" class="song-grid"></div>
+  </div>
+</section>
+
+<section id="bili-account" class="tab" role="tabpanel" aria-labelledby="nav-bili-account" hidden>
+  <div class="card"><div class="row between"><h2>B 站小号巡逻配置</h2><button id="bili-refresh" type="button" class="secondary">刷新状态</button></div>
+    <p class="muted">仅使用独立小号。优先读取推荐、关注动态、简介、字幕和热评；可单独启用受限原片分析。不伪造播放心跳，不发评论、弹幕、私信或自动关注。遇到凭证过期或验证码风控立即暂停 12 小时。</p>
+    <p id="bili-state"></p>
+    <p id="bili-watch-history"></p>
+    <form id="bili-credentials">
+      <div class="grid">
+        <div><label for="bili-sessdata">SESSDATA（仅粘贴值）</label><input id="bili-sessdata" type="password" autocomplete="off" maxlength="4096"></div>
+        <div><label for="bili-jct">bili_jct（互动需要）</label><input id="bili-jct" type="password" autocomplete="off" maxlength="4096"></div>
+        <div><label for="bili-buvid3">buvid3（可选）</label><input id="bili-buvid3" type="password" autocomplete="off" maxlength="4096"></div>
+        <div><label for="bili-buvid4">buvid4（可选，缺失自动补全）</label><input id="bili-buvid4" type="password" autocomplete="off" maxlength="4096"></div>
+      </div>
+      <p id="bili-credential-state" class="muted"></p>
+      <p class="muted">后台不回显 Cookie；留空表示保持原值，单独粘贴值，不粘贴完整 Cookie 请求头。</p>
+      <div class="row"><button type="submit" class="primary">加密保存凭证</button><button type="button" id="bili-clear" class="danger">清除保存的凭证</button><button type="button" id="bili-test" class="secondary">测试凭证有效性（nav）</button></div>
+    </form>
+  </div>
+  <div class="card"><h2>低频自主巡逻与互动</h2>
+    <p class="muted">开启后，世界引擎按计划安排小号逛首页和关注动态。 <button type="button" class="secondary" data-open-tab="bili">打开 B 站模块调度</button></p>
+    <form id="bili-policy">
+      <label><input id="bili-enabled" type="checkbox"> 启用小号自主巡逻</label>
+      <div class="row"><label><input id="bili-like" type="checkbox"> 允许低频点赞</label><label><input id="bili-favorite" type="checkbox"> 允许低频收藏</label><label>指定本账号收藏夹 ID <input id="bili-folder" pattern="[1-9][0-9]{0,19}|" maxlength="20" inputmode="numeric"></label><label>每日点赞与收藏合计上限 <select id="bili-limit"><option value="1">1 次</option><option value="2">2 次</option></select></label></div>
+      <p class="muted">所有互动默认关闭。收藏前验证收藏夹归属；超时结果不确定时不自动重试。每轮巡逻都会检查预算和账号冷却状态。</p>
+      <div class="row"><button type="submit" class="primary">保存并立即生效</button><button type="button" id="bili-reset" class="secondary">恢复 .env 设置</button><button type="button" id="bili-run" class="primary">立即执行一轮巡逻</button></div>
+    </form>
+  </div>
+  <div class="card"><h2>双轨看片：字幕优先 / 原片兜底</h2>
+    <p class="muted">完整字幕优先走文本快读。没有可用字幕，或明确要求“看画面细节 / 听声音”时，才按下列开关和额度尝试原片分析；群聊 @ 看片、私聊链接与自主巡逻共享每日上限，本开关独立于小号自主巡逻。</p>
+    <p id="video-watch-state" role="status"></p>
+    <form id="video-watch-policy">
+      <label><input id="video-watch-enabled" type="checkbox"> 启用受限原片分析（默认关闭）</label>
+      <div class="row"><label for="video-watch-seconds">最长视频时长（秒） <input id="video-watch-seconds" type="number" min="30" max="900" step="1" required></label><label for="video-watch-limit">每日原片次数 <select id="video-watch-limit" required><option value="unlimited">不限次数</option><option value="0">0 次（暂停）</option></select></label></div>
+      <p class="muted">兼容横屏与竖屏（短边 ≤ 540px、长边 ≤ 1280px）MP4，单文件 ≤ 80 MiB；本地格式／体积前置校验失败不扣减每日次数，无论成功失败均清理本地缓存并请求删除 Gemini 文件。视频输入 token 计入现有账本。关闭、超时长、无额度或遇风控时降级为已有文本，不绕过验证码；每日上限设为 0 可暂停尝试。</p>
+      <div class="row"><button type="submit" class="primary">保存看片设置</button><button type="button" id="video-watch-reset" class="secondary">恢复 .env 看片设置</button></div>
+    </form>
+    <h3>最近原片尝试</h3>
+    <div id="video-watch-attempts" class="table"></div>
+  </div>
+  <div class="card"><h2>最近巡逻结果</h2><div id="bili-runs" class="table"></div></div>
+</section>
+
+<section id="patrol" class="tab" role="tabpanel" aria-labelledby="nav-patrol" hidden>
+  <div class="card"><div class="row between"><h2>订阅配额与轮询间隔</h2><button id="refresh-patrol-limits" type="button" class="secondary">刷新配额</button></div>
+    <p class="muted">订阅总数为 UP 主与直播间合计上限（1–50）；轮询间隔范围 900–86400 秒。调短间隔时，既有订阅的下次巡逻时间会同步收紧。</p>
+    <p id="patrol-limits-source" class="muted"></p>
+    <form id="patrol-limits-form"><div class="row"><label for="patrol-max-subs">订阅总数上限 <input id="patrol-max-subs" type="number" min="1" max="50" step="1" required></label><label for="patrol-interval">轮询间隔（秒） <input id="patrol-interval" type="number" min="900" max="86400" step="1" required></label></div><div class="row"><button id="save-patrol-limits" type="submit" class="primary" disabled>保存配额并立即生效</button><button id="reset-patrol-limits" type="button" class="secondary" disabled>恢复 .env 初始值</button></div></form>
+  </div>
+  <div class="card"><h2>B 站只读巡逻订阅</h2>
+    <div class="row"><select id="sub-kind" aria-label="订阅类型"><option value="up">UP 主 UID</option><option value="live">直播间 ID（状态巡逻）</option></select><input id="sub-uid" inputmode="numeric" placeholder="数字 ID" aria-label="订阅 ID"><button id="add-sub" type="button" class="primary">添加订阅</button></div>
+    <p class="muted">UP 更新报告与直播间开播通知均投递给已配置 Owner；直播间只读公开状态，不拉流、不发弹幕。</p>
+    <div id="subs" class="table"></div>
+  </div>
+</section>
+
+<section id="drive-sync" class="tab" role="tabpanel" aria-labelledby="nav-drive-sync" hidden>
+  <div class="card">
+    <div class="row between"><h2>模块同步回执</h2><button id="refresh-drive-sync" class="secondary" type="button">刷新回执</button></div>
+    <p id="drive-connection" class="muted" aria-live="polite"></p>
+    <div id="drive-consumers" class="table" aria-live="polite"></div>
+  </div>
+</section>
+
+<section id="journal" class="tab" role="tabpanel" aria-labelledby="nav-journal" hidden>
+  <div class="card"><div class="row between"><h2>每日巡逻记录</h2><button type="button" class="primary" data-action="diary">汇总今日日记</button></div>
+    <p id="journal-drive-status" class="muted" aria-live="polite"></p>
+    <div id="diaries" class="table"></div>
+    <pre id="diary-preview">选择日期即可阅读日记。</pre>
+  </div>
+</section>
+
+<section id="notebook" class="tab" role="tabpanel" aria-labelledby="nav-notebook" hidden>
+  <div class="card"><h2>Owner 只读《小本本》快照</h2>
+    <p class="muted">当「Antigravity_Memory 双端记忆桥」已启用时，Owner 私聊实时挂载只读《小本本》与云端长期记忆；此处的单文件快照（Drive 6 小时刷新或本地兜底）仅作可选兼容模式。只用于真实 Owner 私聊，不用于沙盒、群聊或日记。</p>
+    <p id="notebook-state"></p>
+    <p id="notebook-action-note" class="muted"></p>
+    <textarea id="notebook-text" maxlength="4000" rows="12" aria-label="小本本快照"></textarea>
+    <div class="row"><button type="button" class="secondary" data-action="notebook" disabled>刷新快照</button><button id="save-notebook" type="button" class="primary">筛查并更新本地快照</button></div>
+  </div>
+</section>

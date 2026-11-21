@@ -1243,6 +1243,27 @@ class Store:
                     (period, lane, usage.cached_tokens, max(1, usage.input_tokens - 2050)),
                 )
 
+    async def usage_overview(self) -> dict:
+        day = self.local_now().date().isoformat()
+        async with self.lock:
+            rows = await self.all(
+                "SELECT lane,SUM(amount) AS amount,COUNT(*) AS calls "
+                "FROM ledger WHERE day=? AND lane<>'search' GROUP BY lane",
+                (day,),
+            )
+            statuses = await self.all("SELECT status,COUNT(*) AS n FROM jobs GROUP BY status")
+        return {
+            "day": day,
+            "day_local": day,
+            "month_local": day[:7],
+            "timezone": self.budget_zone.key,
+            "budget_timezone": self.budget_zone.key,
+            # Deprecated alias for existing clients; the bucket is now explicitly local.
+            "day_utc": day,
+            "lanes": [dict(r) for r in rows],
+            "jobs": [dict(r) for r in statuses],
+        }
+
     async def usage(self) -> dict:
         day = self.local_now().date().isoformat()
         async with self.lock:

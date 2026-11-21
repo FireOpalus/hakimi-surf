@@ -7,8 +7,10 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi.exception_handlers import http_exception_handler as default_http_exception_handler
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .admin_auth import AdminAuth
@@ -210,6 +212,17 @@ def create_app(
                     f"{platform.path}: admin_router supports authenticated HTTP routes only"
                 )
             app.include_router(router, prefix=f"/admin/api/life/modules/{platform.name}")
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(request: Request, exc: StarletteHTTPException):
+        headers = getattr(exc, "headers", None)
+        if headers and "X-Invalid-Field" in headers:
+            return JSONResponse(
+                {"detail": exc.detail, "invalid_field": headers["X-Invalid-Field"]},
+                status_code=exc.status_code,
+                headers=headers,
+            )
+        return await default_http_exception_handler(request, exc)
 
     @app.middleware("http")
     async def protect_admin(request: Request, call_next):

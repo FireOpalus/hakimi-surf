@@ -1,0 +1,158 @@
+<section id="ledger" class="tab" role="tabpanel" aria-labelledby="nav-ledger" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>Token 与费用账本</h2>
+      <button id="refresh-ledger" type="button" class="secondary">刷新账本</button>
+    </div>
+    <p id="ledger-coverage" class="muted"></p>
+    <div id="token-ledger" class="table"></div>
+    <details class="table-details"><summary>今日按动作查账</summary>
+      <div id="work-ledger" class="table"></div>
+    </details>
+    <details class="table-details">
+      <summary><h3>按 API 通道统计</h3></summary>
+      <div id="provider-ledger" class="table"></div>
+    </details>
+    <details class="table-details">
+      <summary><h3>费用估算与熔断</h3></summary>
+      <div id="cost-ledger" class="table"></div>
+    </details>
+    <details class="table-details">
+      <summary><h3>按模型统计</h3></summary>
+      <div id="model-ledger" class="table"></div>
+    </details>
+    <details class="table-details">
+      <summary><h3>按思考档位统计</h3></summary>
+      <div id="thinking-ledger" class="table"></div>
+    </details>
+    <details class="table-details">
+      <summary><h3>有效缓存覆盖率</h3></summary>
+      <div id="effective-cache" class="table"></div>
+      <p id="cache-alert" role="status"></p>
+    </details>
+  </div>
+
+  <div class="card">
+    <div class="row between">
+      <h2>统一账户余额与 GCP BigQuery 账单中心</h2>
+      <div class="row">
+        <button id="gcp-sync-bq" type="button" class="primary">立即查询 BigQuery 账单</button>
+        <button id="refresh-gcp-billing" type="button" class="secondary">刷新账单状态</button>
+      </div>
+    </div>
+    <p class="muted">统一汇聚手动校准 / 额外现金补充与 GCP Cloud Billing BigQuery 赠金导出（UNNEST(credits)）；合并模式下本地未结算消费增量仅在 GCP 实时余额中扣除一次，绝不重复扣减。</p>
+    <div id="unified-balance-pills" class="pill-row"></div>
+    <div id="unified-balance-strip" class="kpi-strip"></div>
+    <p id="unified-balance-note" class="muted"></p>
+    <fieldset class="panel-group">
+      <legend>手动余额校准 / 额外现金补充</legend>
+      <p class="muted">未启用 BigQuery 账单同步时，按手动校准余额实时扣减非联网付费消耗；若已同步 GCP BigQuery 赠金，此处金额作为额外现金补充与 GCP 实时余额合并（不重复扣减本地增量），赠金耗尽时无缝接管。联网搜索费用不计入扣减。</p>
+      <p id="balance-status" class="muted"></p>
+      <form id="balance-form">
+        <div class="row">
+          <label for="balance-input">设置手动校准 / 补充余额（USD） <input id="balance-input" type="number" min="0" max="100000" step="0.01" required placeholder="例如 45.00"></label>
+          <button id="save-balance" type="submit" class="primary" disabled>保存校准余额</button>
+          <button id="clear-balance" type="button" class="secondary" disabled>清除余额记录</button>
+        </div>
+      </form>
+    </fieldset>
+    <hr>
+    <h3>GCP Cloud Billing Export · BigQuery 精确余额核算</h3>
+    <div id="gcp-bq-pills" class="pill-row"></div>
+    <p id="gcp-bq-status" class="muted"></p>
+    <div id="gcp-kpi-strip" class="kpi-strip"></div>
+    <p id="gcp-bq-lag-info" class="muted"></p>
+    <h3>赠金项目抵扣明细 · UNNEST(credits)</h3>
+    <div id="gcp-credits-table" class="table"></div>
+    <details>
+      <summary>查看 BigQuery UNNEST(credits) 核对 SQL 预览</summary>
+      <pre id="gcp-bq-sql">配置 billing_table 后可预览查询 SQL。</pre>
+    </details>
+    <form id="gcp-bq-form">
+      <fieldset class="panel-group">
+        <legend>BigQuery 账单同步配置</legend>
+        <div class="row">
+          <label><input id="gcp-bq-enabled" type="checkbox"> 启用 BigQuery 账单自动同步</label>
+          <label><input id="gcp-hard-stop" type="checkbox"> 赠金耗尽时触发全局付费硬熔断（enforce_credit_hard_stop）</label>
+        </div>
+        <div class="grid">
+          <label for="gcp-billing-project">BigQuery 账单项目 ID（billing_project）<input id="gcp-billing-project" type="text" maxlength="128" placeholder="例如 my-gcp-billing-project"></label>
+          <label for="gcp-billing-table">导出明细表全路径（billing_table）<input id="gcp-billing-table" type="text" maxlength="256" placeholder="project.dataset.gcp_billing_export_v1_XXXXXX"></label>
+          <label for="gcp-bq-location">BigQuery 数据区域（bigquery_location）<input id="gcp-bq-location" type="text" maxlength="64" placeholder="US"></label>
+          <label for="gcp-initial-credits">初始赠金总额 USD（initial_credits_usd）<input id="gcp-initial-credits" type="number" min="0" max="1000000" step="0.01" required></label>
+          <label for="gcp-bq-interval">自动同步间隔秒数（bigquery_sync_interval_seconds）<input id="gcp-bq-interval" type="number" min="60" max="86400" step="1" required></label>
+        </div>
+      </fieldset>
+      <fieldset class="panel-group">
+        <legend>分项赠金规则（credit_grants · 匹配 UNNEST(credits) 名称）</legend>
+        <p class="muted">按 credit_name 关键字匹配各笔赠金的初始总额，用于分项计算剩余额度。</p>
+        <div id="gcp-grants-list"></div>
+        <div class="row"><button id="gcp-add-grant" type="button" class="secondary">+ 添加赠金规则</button></div>
+      </fieldset>
+      <div class="row">
+        <button id="gcp-save-config" type="submit" class="primary">保存 BigQuery 与对账配置</button>
+        <button id="gcp-reset-config" type="button" class="secondary">恢复 .env 默认配置</button>
+      </div>
+    </form>
+    <details>
+      <summary>GCP Service Account 凭据状态与独立覆盖（默认共享「全局模型通道」已存 JSON）</summary>
+      <p id="gcp-sa-status" class="muted"></p>
+      <form id="gcp-sa-form">
+        <label for="gcp-sa-file">从本地 .json 文件加载 Service Account 密钥<input id="gcp-sa-file" type="file" accept=".json,application/json"></label>
+        <label for="gcp-sa-json">独立 Service Account JSON（留空则继续共享「全局模型通道」凭据）<textarea id="gcp-sa-json" maxlength="65536" placeholder='粘贴 Service Account JSON（包含 "type": "service_account"）...'></textarea></label>
+        <div class="row">
+          <button id="gcp-save-sa" type="submit" class="primary">加密保存独立 Service Account</button>
+          <button id="gcp-clear-sa" type="button" class="danger">清除独立覆盖（回退共享凭据）</button>
+        </div>
+      </form>
+    </details>
+  </div>
+
+  <div class="card">
+    <div class="row between">
+      <h2>准实时本地 usage_metadata + Cloud Monitoring API 对账校准</h2>
+      <button id="gcp-sync-monitoring" type="button" class="primary">立即拉取 Monitoring 对账</button>
+    </div>
+    <p class="muted">拉取 GCP 官方指标 aiplatform.googleapis.com/publisher/online_serving/token_count，与本地 SQLite 记录的 vertex_paid（及全通道）Token 明细进行差额对账，实时监测 1～3 分钟指标延迟或用量漂移。</p>
+    <div id="gcp-mon-pills" class="pill-row"></div>
+    <p id="gcp-mon-status" class="muted"></p>
+    <div id="gcp-mon-compare-table" class="table"></div>
+    <h3>按模型维度 Token 对账</h3>
+    <div id="gcp-mon-models-table" class="table"></div>
+    <form id="gcp-mon-form">
+      <fieldset class="panel-group">
+        <legend>Cloud Monitoring 对账配置</legend>
+        <div class="row">
+          <label><input id="gcp-mon-enabled" type="checkbox"> 启用 Cloud Monitoring 定期对账</label>
+        </div>
+        <div class="grid">
+          <label for="gcp-mon-project">GCP Monitoring 项目 ID（monitoring_project）<input id="gcp-mon-project" type="text" maxlength="128" placeholder="留空则回退 Vertex / Billing 项目"></label>
+          <label for="gcp-mon-interval">对账间隔秒数（monitoring_sync_interval_seconds）<input id="gcp-mon-interval" type="number" min="60" max="86400" step="1" required></label>
+        </div>
+      </fieldset>
+      <div class="row">
+        <button id="gcp-save-mon" type="submit" class="primary">保存 Monitoring 配置</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>全局与分项预算</h2>
+    <p class="muted">按 BOT_TIMEZONE 自然日和自然月统计，默认北京时间。单用户与各分项日预算同样按本地自然日生效；设置任一上限为 0 会暂停对应付费调用，0 Token 本地指令和告警不受影响。既有累计总上限（total_usd）仅由 .env 独立生效。</p>
+    <p id="budget-source" class="muted"></p>
+    <form id="budget-policy">
+      <div class="grid">
+        <label for="budget-daily">全局每日上限（USD） <input id="budget-daily" type="number" min="0" max="1000" step="0.01" required></label>
+        <label for="budget-monthly">全局每月上限（USD） <input id="budget-monthly" type="number" min="0" max="10000" step="0.01" required></label>
+        <label for="budget-user">单用户每日上限（USD） <input id="budget-user" type="number" min="0" max="1000" step="0.01" required></label>
+        <label for="budget-patrol">B 站巡逻每日上限（USD） <input id="budget-patrol" type="number" min="0" max="1000" step="0.01" required></label>
+        <label for="budget-memory">记忆提炼／压缩每日上限（USD） <input id="budget-memory" type="number" min="0" max="100" step="0.01" required></label>
+        <label for="budget-proactive">世界引擎与主动生成每日预算（USD） <input id="budget-proactive" type="number" min="0" max="100" step="0.01" required></label>
+        <label for="budget-admin">管理沙盒／筛查每日上限（USD） <input id="budget-admin" type="number" min="0" max="100" step="0.01" required></label>
+      </div>
+      <div class="row"><button type="submit" class="primary">保存预算并立即生效</button><button id="reset-budget" type="button" class="secondary">恢复 .env 预算</button></div>
+    </form>
+    <h3>当前账单扣账用量</h3>
+    <div id="budget-periods" class="table"></div>
+  </div>
+</section>

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from .admin_common import read_binary_upload
 from .security import Rejected
 from .songs import (
     ALLOWED_SONG_MIMES,
@@ -71,29 +71,19 @@ async def upload(request: Request):
         _float_header(request, "x-song-start", default=0.0),
         _float_header(request, "x-song-duration", default=MAX_SONG_DURATION_SECONDS),
     )
-    if request.headers.get("content-encoding", "identity") != "identity":
-        raise HTTPException(415, "compressed_song_upload_forbidden")
-    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
-    if content_type not in ALLOWED_SONG_MIMES:
-        raise HTTPException(415, "song_audio_required")
-    try:
-        declared = int(request.headers.get("content-length", "0"))
-    except ValueError:
-        raise HTTPException(400, "invalid_content_length") from None
-    if declared > MAX_SONG_UPLOAD_BYTES or declared < 0:
-        raise HTTPException(413, "song_upload_too_large")
-    raw = bytearray()
-    try:
-        async with asyncio.timeout(30):
-            async for chunk in request.stream():
-                raw.extend(chunk)
-                if len(raw) > MAX_SONG_UPLOAD_BYTES:
-                    raise HTTPException(413, "song_upload_too_large")
-    except TimeoutError:
-        raise HTTPException(408, "song_upload_timeout") from None
+    raw = await read_binary_upload(
+        request,
+        allowed_mimes=ALLOWED_SONG_MIMES,
+        max_bytes=MAX_SONG_UPLOAD_BYTES,
+        timeout_seconds=30,
+        compressed_error="compressed_song_upload_forbidden",
+        mime_error="song_audio_required",
+        size_error="song_upload_too_large",
+        timeout_error="song_upload_timeout",
+    )
     return await library(request).upload(
         title,
-        bytes(raw),
+        raw,
         artist=artist,
         tags=tags,
         filename=filename,

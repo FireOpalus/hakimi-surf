@@ -6,7 +6,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from .admin_routes import body, service
+from .admin_common import body, domain_lock, service
 from .provider_routing import (
     QQ_PRIVACY_FIELDS,
     PrivacyDefaults,
@@ -68,7 +68,7 @@ async def _save_policy(request: Request, view: ProviderView):
         raise HTTPException(400, "invalid_admin_input")
     svc = service(request)
     routing = _routing_manager(svc)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "providers"):
         await routing.initialize()
         preserved = routing.config.model_dump(
             include=(set(QQ_PRIVACY_FIELDS) | {"vertex_hydrogen_model"}) - value.model_fields_set
@@ -93,7 +93,7 @@ async def global_provider_reset(request: Request):
 async def _reset_policy(request: Request, view: ProviderView):
     svc = service(request)
     routing = _routing_manager(svc)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "providers"):
         await routing.initialize()
         privacy = routing.config.model_dump(include=set(QQ_PRIVACY_FIELDS))
         reset = routing.env_config.model_copy(update=privacy)
@@ -116,7 +116,7 @@ async def _save_credentials(request: Request, view: ProviderView):
     value = await body(request, ProviderCredentialsUpdate)
     svc = service(request)
     routing = _routing_manager(svc)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "providers"):
         result = await routing.update_credentials(value, view=view)
         svc.secrets = configured_secrets(svc.s)
         await _reload_ai_clients(svc)
@@ -132,7 +132,7 @@ async def qq_privacy(request: Request):
 async def qq_privacy_defaults(request: Request):
     value = await body(request, PrivacyDefaults)
     routing = _routing_manager(service(request))
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "providers"):
         await routing.set_privacy_defaults(value)
         return await routing.privacy_status()
 
@@ -142,7 +142,7 @@ async def provider_session_policy(request: Request):
     legacy = await body(request, LegacySessionPrivacyUpdate)
     value = SessionPrivacyUpdate.model_validate(legacy.model_dump(exclude={"hydrogen_provider"}))
     routing = _routing_manager(service(request))
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "providers"):
         await routing.set_session_policy(value)
         return await routing.status()
 
@@ -152,7 +152,7 @@ async def qq_session_privacy(request: Request):
     value = await body(request, SessionPrivacyUpdate)
     svc = service(request)
     routing = _routing_manager(svc)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "providers"):
         await routing.set_session_policy(value)
         return await routing.privacy_status()
 
@@ -182,8 +182,9 @@ async def update_module_privacy(request: Request, module_id: str):
     protocols = plugin_protocols(svc, module_id)
     value = await body(request, PluginPrivacyEdit)
     routing = _routing_manager(svc)
-    try:
-        await routing.set_chat_privacy(value.key, value.privacy, protocols)
-    except Rejected as exc:
-        raise HTTPException(404, "session_not_found") from exc
-    return await routing.chat_privacy(protocols)
+    async with domain_lock(request, "providers"):
+        try:
+            await routing.set_chat_privacy(value.key, value.privacy, protocols)
+        except Rejected as exc:
+            raise HTTPException(404, "session_not_found") from exc
+        return await routing.chat_privacy(protocols)

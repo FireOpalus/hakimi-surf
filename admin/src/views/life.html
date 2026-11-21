@@ -1,0 +1,320 @@
+<section id="proactive" class="tab" role="tabpanel" aria-labelledby="nav-proactive" hidden>
+  <div class="card"><div class="row between"><h2>Owner 投递与告警</h2><button id="refresh-proactive" type="button" class="secondary">刷新状态</button></div>
+    <p class="muted">接收人固定为 Owner。<button class="secondary" type="button" data-open-tab="modules">打开平台模块调度</button></p>
+    <div id="proactive-stats" class="stats"></div>
+    <p id="proactive-state" class="muted"></p>
+    <p id="proactive-budget" class="muted"></p>
+    <div id="proactive-queue" class="table"></div>
+  </div>
+  <div class="card"><h2>手动验收</h2>
+    <p class="muted">测试消息会直接发给 Owner，消耗 0 Token。手动与定时汇报每天共用一份。预算熔断会暂停新生成，已通过审核的日报仍可在有效时段投递。QQ 断线时排队，回执待核实的消息不会自动重发。</p>
+    <div class="row"><button id="dm-test" type="button" class="primary">发送测试私信（0 Token）</button><button id="dm-now" type="button" class="primary">立即生成并发送今日汇报</button></div>
+  </div>
+  <div class="card"><h2>最近运维告警</h2><div id="proactive-alerts" class="table"></div></div>
+</section>
+
+<section id="life" class="tab" role="tabpanel" aria-labelledby="nav-life" hidden>
+  <div class="card"><div class="row between"><h2>世界状态与节点连接</h2><button id="refresh-life" type="button" class="secondary">刷新状态</button></div>
+    <div id="life-stats" class="stats"></div>
+    <details class="table-details">
+      <summary><h3>最近的状态变化</h3></summary>
+      <div id="life-changes" class="table"></div>
+    </details>
+    <details><summary>精力与无聊度怎样结算</summary>
+      <p class="muted">定时睡眠每 4 分钟恢复 1 点精力，小憩每 6 分钟恢复 1 点。清醒空闲时精力持平。MC 任务每小时消耗 8 点精力。</p>
+      <p class="muted">每轮成功回复消耗 0.1 点精力。完成视频学习消耗 2 点，每学习 5 分钟再扣 1 点。MC 完成任务或发现稀有资源各扣 1 点。</p>
+    </details>
+    <details><summary>社交电量与待分享见闻</summary>
+      <p class="muted">群聊与私聊共享 100 点电量。每轮成功回复扣 0.25 点，多个气泡合计一次。聊天期间暂停恢复。没在聊天时，清醒每 5 分钟回 1 点，睡眠或小憩每 2 分钟回 1 点。</p>
+      <p id="life-battery-status" class="muted"></p><div id="life-news" class="table"></div>
+    </details>
+    <div id="life-node-pills" class="pill-row"></div>
+    <details class="table-details">
+      <summary><h3>Owner 日报送达记录</h3></summary>
+      <div id="life-digests" class="table"></div>
+    </details>
+    <p id="life-world-status" class="muted"></p>
+    <p id="life-node-status" class="muted"></p>
+    <p id="life-desktop-status" class="muted"></p>
+    <form id="life-world-form" class="quick-bar">
+      <label for="life-world-module">当前模块（current_module）
+        <input id="life-world-module" list="life-module-options" type="text" maxlength="64" required placeholder="选择模块或输入模块 ID">
+      </label>
+      <datalist id="life-module-options">
+        <option value="idle"></option>
+      </datalist>
+      <label for="life-world-focus">专注等级（focus_level）
+        <select id="life-world-focus">
+          <option value="LOW">LOW · 低专注（开放主动）</option>
+          <option value="MEDIUM">MEDIUM · 中等专注</option>
+          <option value="HIGH">HIGH · 高专注（触发 Attention Lock）</option>
+        </select>
+      </label>
+      <label for="life-world-mood">心情（mood）<input id="life-world-mood" type="text" maxlength="64" required placeholder="calm / focused / sleeping"></label>
+      <label for="life-world-energy">精力（0–100）<input id="life-world-energy" type="number" min="0" max="100" step="0.1" required></label>
+      <label for="life-world-boredom">无聊度（0–100）<input id="life-world-boredom" type="number" min="0" max="100" step="1" required></label>
+      <button id="life-world-save" type="submit" class="primary" disabled>更新世界状态</button>
+    </form>
+  </div>
+
+  <div class="card" id="world-observation-card" hidden>
+    <h2>今天的行动与规划</h2>
+    <div id="world-day-stats" class="stats"></div>
+    <h3>今日行程</h3>
+    <p id="world-morning" class="muted"></p>
+    <div id="world-agenda" class="table"></div>
+    <p id="world-next"></p>
+    <p id="world-quiet" class="muted"></p>
+    <div id="world-daily-actions" class="pill-row"></div>
+    <details><summary>最近 30 轮规划</summary><div id="world-plans" class="table"></div></details>
+    <details><summary>七日规划基线与定时送达</summary>
+      <p id="world-day-coverage"></p><div id="world-days" class="table"></div>
+      <p id="world-evening-coverage"></p><div id="world-evenings" class="table"></div>
+    </details>
+  </div>
+  <div class="card" id="world-rhythm"><div class="row between"><h2>世界作息与调度</h2><button id="refresh-rest-hours" type="button" class="secondary">刷新作息</button></div>
+    <p id="rest-hours-status" class="muted" role="status"></p>
+    <form id="life-config-form">
+      <div class="row"><label><input id="life-enabled" type="checkbox"> 启用世界引擎</label><label><input id="rest-enabled" type="checkbox"> 定时睡眠</label><label><input id="rest-day-enabled" type="checkbox"> 自主小憩</label><label><input id="rest-owner-private" type="checkbox"> 休息时响应 Owner 私聊</label></div>
+      <div class="grid"><label>入睡时间<input id="rest-start" type="time" required></label><label>起床时间<input id="rest-end" type="time" required></label></div>
+      <p id="wake-window" class="rhythm-preview" aria-live="polite"></p>
+      <div class="grid"><label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label></div>
+      <p class="muted">白天由哈基米结合精力、无聊度与挂念值自行安排活动或小憩。入睡–起床时段统一作为睡眠与主动消息免打扰时间；清醒每小时消耗 3 点精力并累积 12 点无聊度，睡眠每 4 分钟恢复 1 点，小憩每 6 分钟恢复 1 点。</p>
+      <details>
+        <summary>规划与休眠间隔</summary>
+        <div class="grid">
+          <label for="life-planner-min">活跃规划最小间隔（分钟，30–720）<input id="life-planner-min" type="number" min="30" max="720" step="1" required></label>
+          <label for="life-planner-max">活跃规划最大间隔（分钟，60–720）<input id="life-planner-max" type="number" min="60" max="720" step="1" required></label>
+          <label for="life-sleep-min">夜间休眠最小间隔（分钟，120–960）<input id="life-sleep-min" type="number" min="120" max="960" step="1" required></label>
+          <label for="life-sleep-max">夜间休眠最大间隔（分钟，180–960）<input id="life-sleep-max" type="number" min="180" max="960" step="1" required></label>
+        </div>
+      </details>
+      <div class="row"><button id="life-save-config" type="submit" class="primary" disabled>保存作息与调度</button><button id="life-reset-config" type="button" class="secondary" disabled>恢复默认作息与调度</button></div>
+    </form>
+    <p id="life-source" class="muted"></p>
+    <div class="row"><button id="life-plan-now" type="button" class="secondary" disabled>立即规划或调整行程</button><button id="life-gatekeeper-now" type="button" class="secondary" disabled>执行零 Token 门控扫描</button></div>
+  </div>
+  <div class="card"><h2>意图队列（最近 40 条）</h2>
+    <p class="muted">只记录触发时间窗、门控条件与模糊动机，绝不预写台词；状态为 pending 时可手动取消。</p>
+    <div id="life-intents-table" class="table"></div>
+  </div>
+  <div class="card"><h2>跨模块事件（最近 30 条）</h2>
+    <p class="muted">能力模块发布的脱敏里程碑事件（明文 JSON 存储，供规划器与镜像消费）。</p>
+    <div id="life-events-table" class="table"></div>
+    <h3>规则处理记录</h3><div id="life-rules-table" class="table"></div>
+  </div>
+</section>
+
+<section id="event-ledger" class="tab" role="tabpanel" aria-labelledby="nav-event-ledger" hidden>
+  <div class="card">
+    <div class="row between"><h2>跨日待办账本（Event Ledger）</h2><button id="refresh-event-ledger" class="secondary" type="button">刷新账本</button></div>
+    <p class="muted">各能力模块、私聊约定与规划器写入的跨时段待办事项（Fernet 加密落盘，显式核销或到期前持续保留）。</p>
+    <p id="event-ledger-state" class="muted" aria-live="polite"></p>
+    <form id="life-ledger-form" class="quick-bar">
+      <label for="life-ledger-summary">待办摘要<input id="life-ledger-summary" type="text" maxlength="160" required placeholder="如：明天下午收农场西边草莓 / 约好两点进MC挖铁矿"></label>
+      <label for="life-ledger-target">目标模块（可选）<input id="life-ledger-target" list="ledger-module-options" type="text" maxlength="32" placeholder="minecraft / 留空"></label>
+      <datalist id="ledger-module-options"></datalist>
+      <label for="life-ledger-due">延后生效（分钟）<input id="life-ledger-due" type="number" min="0" max="43200" step="1" value="0" required></label>
+      <label for="life-ledger-vis">可见域
+        <select id="life-ledger-vis">
+          <option value="owner_private">owner_private · 仅私密排程</option>
+          <option value="public">public · 模块与群聊可见</option>
+        </select>
+      </label>
+      <button id="life-ledger-submit" type="submit" class="primary">送入待办事件</button>
+    </form>
+    <div id="life-ledger-table" class="table"></div>
+  </div>
+</section>
+
+<section id="voice-companion" class="tab" role="tabpanel" aria-labelledby="nav-voice-companion" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>语音伴随中枢（Voice Companion）</h2>
+      <div class="row">
+        <button id="refresh-vc" class="secondary" type="button">刷新状态</button>
+        <button id="vc-disconnect" class="danger" type="button" disabled>断开当前连接</button>
+      </div>
+    </div>
+    <p class="muted">桌面专属伴随客户端与 Discord / OOPZ 等外部语音桥统一接入本中枢；Owner 私有连麦时自动读取「屏幕伴看」内存近期画面，多人语音房（room_public）严格隔离一切私有记忆与画面。</p>
+    <div id="vc-pills" class="pill-row"></div>
+    <p id="vc-state" class="muted" aria-live="polite"></p>
+  </div>
+  <div class="card">
+    <h2>语音伴随设置</h2>
+    <form id="vc-config-form">
+      <div class="row">
+        <label><input id="vc-enabled" type="checkbox"> 启用语音伴随服务</label>
+        <label><input id="vc-use-screen-watch" type="checkbox"> Owner 私有连麦时自动联动「屏幕伴看」近期画面</label>
+        <label><input id="vc-save-recap" type="checkbox"> 下播自动写入摘要到跨日待办</label>
+      </div>
+      <label for="vc-style-hint">口播风格提示（传给主脑）<input id="vc-style-hint" type="text" maxlength="80" placeholder="活泼软萌、口语短句"></label>
+      <div class="row">
+        <button id="vc-save" type="submit" class="primary" disabled>保存配置</button>
+        <button id="vc-reset" type="button" class="secondary" disabled>恢复默认</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <div class="row between">
+      <h2>语音网关 API 配置（STT / TTS 热切换）</h2>
+      <div class="row">
+        <button id="vc-gw-refresh" type="button" class="secondary">刷新网关配置</button>
+        <button id="vc-gw-test" type="button" class="secondary" disabled>实测合成一条 TTS</button>
+      </div>
+    </div>
+    <p class="muted">统一管理 KR 语音网关的 STT 识别与 TTS 合成引擎（同时作用于 QQ 语音条与实时连麦）。修改后加密保存在主脑 SQLite 并在不重启容器的情况下实时热切换；留空 API Key 表示保留已存密钥。</p>
+    <div id="vc-gw-pills" class="pill-row"></div>
+    <p id="vc-gw-state" class="muted" aria-live="polite"></p>
+    <div id="vc-gw-tts-preview" class="tts-preview" hidden></div>
+    <form id="vc-gw-form">
+      <div class="grid">
+        <label for="vc-gw-stt-provider">STT 语音识别引擎
+          <select id="vc-gw-stt-provider">
+            <option value="fish">Fish Audio STT</option>
+            <option value="siliconflow">SiliconFlow (SenseVoiceSmall)</option>
+            <option value="openai">OpenAI / Groq Whisper 兼容</option>
+          </select>
+        </label>
+        <label for="vc-gw-tts-provider">TTS 语音合成引擎
+          <select id="vc-gw-tts-provider">
+            <option value="breezeblue">BreezeBlue (Breeze TTS 2)</option>
+            <option value="fish">Fish Audio TTS</option>
+            <option value="siliconflow">SiliconFlow (CosyVoice2)</option>
+            <option value="edge">Edge TTS 兜底</option>
+          </select>
+        </label>
+        <label for="vc-gw-tts-speed">语速倍率（0.25–4.0）<input id="vc-gw-tts-speed" type="number" min="0.25" max="4" step="0.05" value="1.05" required></label>
+        <label for="vc-gw-tts-buffer-mode">连麦播报缓冲模式
+          <select id="vc-gw-tts-buffer-mode">
+            <option value="turn">turn（整轮完整合成，停顿更自然）</option>
+            <option value="chunk">chunk（按句分片实时合成）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row"><label><input id="vc-gw-tts-streaming" type="checkbox"> 启用流式音频合成与边下边转码（TTS_STREAMING）</label></div>
+
+      <details class="provider-fold" data-provider-group="breezeblue">
+        <summary>BreezeBlue（TTS）</summary>
+        <div class="provider-fold-body">
+          <div class="grid">
+            <div>
+              <label for="vc-gw-brz-key">API Key（留空保留原值）<input id="vc-gw-brz-key" type="password" autocomplete="off" maxlength="512" placeholder="brz_..."></label>
+              <div class="row"><span id="vc-gw-brz-key-state" class="badge">未读取</span><label><input id="vc-gw-brz-clear" type="checkbox"> 清除已存 Key</label></div>
+            </div>
+            <label for="vc-gw-brz-url">Base URL<input id="vc-gw-brz-url" type="url" maxlength="256" placeholder="https://api.breeze.blue"></label>
+            <div>
+              <label for="vc-gw-brz-voice">Voice ID<input id="vc-gw-brz-voice" type="text" maxlength="128" placeholder="voc_psm85weeq82a"></label>
+              <div class="row"><button id="vc-gw-brz-fetch-voices" type="button" class="secondary" disabled>拉取账号音色</button><select id="vc-gw-brz-voice-select" hidden aria-label="选择 BreezeBlue 音色"></select></div>
+            </div>
+            <label for="vc-gw-brz-model">模型 ID<input id="vc-gw-brz-model" type="text" maxlength="128" placeholder="breeze-tts-2"></label>
+            <label for="vc-gw-brz-lang">语言代码（留空自动识别）<input id="vc-gw-brz-lang" type="text" maxlength="32" placeholder="zh"></label>
+            <label for="vc-gw-brz-guidance">Guidance Scale（可选，1.0–10.0）<input id="vc-gw-brz-guidance" type="number" min="1" max="10" step="0.1" placeholder="留空默认"></label>
+          </div>
+          <label for="vc-gw-brz-instructions">声音导演指令（可选，BREEZEBLUE_INSTRUCTIONS）<input id="vc-gw-brz-instructions" type="text" maxlength="500" placeholder="例如：用轻快温柔、稍微贴耳聊天的语气"></label>
+        </div>
+      </details>
+
+      <details class="provider-fold" data-provider-group="fish">
+        <summary>Fish Audio（STT / TTS）</summary>
+        <div class="provider-fold-body">
+          <div class="grid">
+            <div>
+              <label for="vc-gw-fish-key">API Key（留空保留原值）<input id="vc-gw-fish-key" type="password" autocomplete="off" maxlength="512" placeholder="Fish API Key"></label>
+              <div class="row"><span id="vc-gw-fish-key-state" class="badge">未读取</span><label><input id="vc-gw-fish-clear" type="checkbox"> 清除已存 Key</label></div>
+            </div>
+            <label for="vc-gw-fish-url">Base URL<input id="vc-gw-fish-url" type="url" maxlength="256" placeholder="https://api.fish.audio"></label>
+            <label for="vc-gw-fish-ref">音色 Reference ID<input id="vc-gw-fish-ref" type="text" maxlength="128" placeholder="32位音色UUID"></label>
+            <label for="vc-gw-fish-model">TTS 模型（留空走默认）<input id="vc-gw-fish-model" type="text" maxlength="128" placeholder="s2-pro / drama-3"></label>
+            <label for="vc-gw-fish-latency">延迟模式
+              <select id="vc-gw-fish-latency">
+                <option value="balanced">balanced（低延迟推荐）</option>
+                <option value="normal">normal</option>
+              </select>
+            </label>
+            <label for="vc-gw-fish-asr-lang">ASR 语言代码<input id="vc-gw-fish-asr-lang" type="text" maxlength="32" placeholder="zh"></label>
+          </div>
+        </div>
+      </details>
+
+      <details class="provider-fold" data-provider-group="siliconflow">
+        <summary>SiliconFlow 硅基流动（STT / TTS）</summary>
+        <div class="provider-fold-body">
+          <div class="grid">
+            <div>
+              <label for="vc-gw-sf-key">API Key（留空保留原值）<input id="vc-gw-sf-key" type="password" autocomplete="off" maxlength="512" placeholder="sk-..."></label>
+              <div class="row"><span id="vc-gw-sf-key-state" class="badge">未读取</span><label><input id="vc-gw-sf-clear" type="checkbox"> 清除已存 Key</label></div>
+            </div>
+            <label for="vc-gw-sf-url">Base URL<input id="vc-gw-sf-url" type="url" maxlength="256" placeholder="https://api.siliconflow.cn/v1"></label>
+            <label for="vc-gw-sf-stt-model">STT 模型<input id="vc-gw-sf-stt-model" type="text" maxlength="128" placeholder="FunAudioLLM/SenseVoiceSmall"></label>
+            <label for="vc-gw-sf-tts-model">TTS 模型<input id="vc-gw-sf-tts-model" type="text" maxlength="128" placeholder="FunAudioLLM/CosyVoice2-0.5B"></label>
+            <label for="vc-gw-sf-tts-voice">TTS 音色<input id="vc-gw-sf-tts-voice" type="text" maxlength="128" placeholder="FunAudioLLM/CosyVoice2-0.5B:diana"></label>
+          </div>
+        </div>
+      </details>
+
+      <details class="provider-fold" data-provider-group="openai,edge">
+        <summary>OpenAI / Groq 兼容 STT &amp; Edge TTS</summary>
+        <div class="provider-fold-body">
+          <div class="grid">
+            <div>
+              <label for="vc-gw-oai-key">OpenAI STT Key（留空保留原值）<input id="vc-gw-oai-key" type="password" autocomplete="off" maxlength="512" placeholder="sk-... / gsk_..."></label>
+              <div class="row"><span id="vc-gw-oai-key-state" class="badge">未读取</span><label><input id="vc-gw-oai-clear" type="checkbox"> 清除已存 Key</label></div>
+            </div>
+            <label for="vc-gw-oai-url">OpenAI STT Base URL<input id="vc-gw-oai-url" type="url" maxlength="256" placeholder="https://api.groq.com/openai/v1"></label>
+            <label for="vc-gw-oai-model">OpenAI STT 模型<input id="vc-gw-oai-model" type="text" maxlength="128" placeholder="whisper-large-v3-turbo"></label>
+            <label for="vc-gw-edge-voice">Edge TTS 音色<input id="vc-gw-edge-voice" type="text" maxlength="128" placeholder="zh-CN-XiaoyiNeural"></label>
+          </div>
+        </div>
+      </details>
+
+      <div class="row">
+        <button id="vc-gw-save" type="submit" class="primary" disabled>保存并热切换生效</button>
+        <button id="vc-gw-reset" type="button" class="secondary" disabled>恢复网关 .env 默认</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>最近伴随会话（最近 20 场）</h2>
+    <div id="vc-sessions-table" class="table"></div>
+  </div>
+</section>
+
+<section id="screen-watch" class="tab" role="tabpanel" aria-labelledby="nav-screen-watch" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>屏幕伴看感知中枢（Screen Watch）</h2>
+      <div class="row">
+        <button id="refresh-sw" class="secondary" type="button">刷新状态</button>
+        <button id="sw-clear" class="secondary" type="button" disabled>立即清空画面缓存</button>
+        <button id="sw-disconnect" class="danger" type="button" disabled>断开看屏连接</button>
+      </div>
+    </div>
+    <p class="muted">严格限定 Owner 私有；桌面端推送的关键帧仅在服务端内存中以超短 TTL 环形缓存、到期或暂停/断连即刻销毁，绝不写入磁盘或数据库，也绝不暴露给多人语音房或群聊。</p>
+    <div id="sw-pills" class="pill-row"></div>
+    <p id="sw-state" class="muted" aria-live="polite"></p>
+  </div>
+  <div class="card">
+    <h2>看屏隐私与主动吐槽策略</h2>
+    <form id="sw-config-form">
+      <div class="row">
+        <label><input id="sw-enabled" type="checkbox"> 启用屏幕伴看接收（关闭立即销毁缓存并拒收新帧）</label>
+        <label><input id="sw-proactive" type="checkbox"> 允许低频主动看屏吐槽（优先走在线语音伴随口播）</label>
+        <label><input id="sw-qq-fallback" type="checkbox"> 未开语音连麦时将主动吐槽同步私聊至 Owner QQ</label>
+      </div>
+      <div class="grid">
+        <label for="sw-pulse-interval">主动吐槽最小间隔（秒，10–300）<input id="sw-pulse-interval" type="number" min="10" max="300" step="1" required></label>
+        <label for="sw-max-frames">单次最多提供截图（张，1–2）<input id="sw-max-frames" type="number" min="1" max="2" step="1" required></label>
+        <label for="sw-frame-ttl">内存帧保质期 TTL（秒，5–60）<input id="sw-frame-ttl" type="number" min="5" max="60" step="1" required></label>
+      </div>
+      <div class="row">
+        <button id="sw-save" type="submit" class="primary" disabled>保存配置</button>
+        <button id="sw-reset" type="button" class="secondary" disabled>恢复默认</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>最近看屏吐槽动态（仅内存记录，重启清空）</h2>
+    <div id="sw-commentary-table" class="table"></div>
+  </div>
+</section>

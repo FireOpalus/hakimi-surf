@@ -2,10 +2,9 @@
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import ValidationError
+from fastapi import APIRouter, Request
 
-from .admin_routes import body, service
+from .admin_common import body, domain_lock, partial_body, service
 from .gcp_billing import (
     GcpBillingConfig,
     GcpBillingCredentialsUpdate,
@@ -41,24 +40,16 @@ async def gcp_billing_status(request: Request):
 
 @router.put("")
 async def gcp_billing_save(request: Request):
-    from .app import json_object, read_body
-
-    raw = json_object(await read_body(request, request.app.state.settings))
-    if not raw:
-        raise HTTPException(400, "invalid_admin_input")
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "gcp_billing"):
         mgr = await _manager(request)
         current = mgr.config.model_dump(mode="json")
-        try:
-            value = GcpBillingConfig.model_validate({**current, **raw})
-        except ValidationError:
-            raise HTTPException(400, "invalid_admin_input") from None
+        value = await partial_body(request, current, GcpBillingConfig)
         return await mgr.set_config(value)
 
 
 @router.delete("")
 async def gcp_billing_reset(request: Request):
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "gcp_billing"):
         mgr = await _manager(request)
         return await mgr.set_config(None)
 
@@ -66,7 +57,7 @@ async def gcp_billing_reset(request: Request):
 @router.post("/credentials")
 async def gcp_billing_credentials(request: Request):
     value = await body(request, GcpBillingCredentialsUpdate)
-    async with request.app.state.admin_config_lock:
+    async with domain_lock(request, "gcp_billing"):
         mgr = await _manager(request)
         return await mgr.update_credentials(value)
 

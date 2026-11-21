@@ -1,0 +1,217 @@
+<section id="api-routing" class="tab" role="tabpanel" aria-labelledby="nav-api-routing" hidden>
+  <div class="card">
+    <div class="row between">
+      <h2>API 密钥与 GCP 服务账号凭据中心</h2>
+      <button id="refresh-providers" type="button" class="secondary">刷新路由与凭据</button>
+    </div>
+    <p class="muted">Paid Gemini 使用环境主密钥，可用于安全审核和主模型。Free Tier 密钥可用于低隐私审核。GCP 服务账号也可供 BigQuery 账单和 Cloud Monitoring 对账使用。</p>
+    <div id="prov-cred-pills" class="pill-row"></div>
+    <p id="prov-cred-status" class="muted"></p>
+    <form id="prov-cred-form">
+      <fieldset class="panel-group">
+        <legend>API Key 凭据（仅写不回显）</legend>
+        <div class="grid">
+          <div>
+            <label for="prov-free-key">Free Tier Gemini API Key（低隐私 Decisions 门卫）<input id="prov-free-key" type="password" autocomplete="off" maxlength="512" placeholder="AIza... 留空保持已存密钥"></label>
+            <label><input id="prov-clear-free" type="checkbox"> 清除后台保存的 Free Tier Gemini Key</label>
+          </div>
+          <div>
+            <label for="prov-vertex-key">Vertex AI API Key（api_key 认证模式）<input id="prov-vertex-key" type="password" autocomplete="off" maxlength="512" placeholder="AQ... / AIza... 留空保持已存密钥"></label>
+            <label><input id="prov-clear-vertex" type="checkbox"> 清除后台保存的 Vertex AI API Key</label>
+          </div>
+        </div>
+      </fieldset>
+      <fieldset class="panel-group">
+        <legend>GCP Service Account JSON（与 BigQuery 账单 &amp; Cloud Monitoring 共享）</legend>
+        <label for="prov-sa-file">选择本地 .json 密钥文件自动填充<input id="prov-sa-file" type="file" accept=".json,application/json"></label>
+        <label for="prov-sa-json">Service Account JSON 原文（仅写不回显，留空保持已存凭据）<textarea id="prov-sa-json" maxlength="65536" placeholder='粘贴包含 "type": "service_account"、"client_email"、"private_key" 的 JSON；也可通过上方文件选择导入'></textarea></label>
+        <label><input id="prov-clear-sa" type="checkbox"> 清除后台保存的 GCP Service Account JSON</label>
+      </fieldset>
+      <div class="row">
+        <button id="prov-save-creds" type="submit" class="primary">加密保存凭据</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>全局模型通道</h2>
+    <p id="prov-policy-source" class="muted"></p>
+    <form id="prov-policy-form">
+      <fieldset class="panel-group">
+        <legend>Decisions 上下文预算与回退</legend>
+        <div class="grid">
+          <label for="prov-decision-tokens">Decisions 上下文 Token 上限（600–4200，默认 2500）<input id="prov-decision-tokens" type="number" min="600" max="4200" step="50" required></label>
+        </div>
+        <label><input id="prov-free-fallback" type="checkbox"> Free Tier 门卫遇到 429 限流 / 超时 / 5xx 时自动回退至 Paid Tier（且不触发全局熔断）</label>
+      </fieldset>
+      <fieldset class="panel-group">
+        <legend>Vertex AI 主模型通道</legend>
+        <div class="row">
+          <label><input id="prov-vertex-enabled" type="checkbox"> 通过 Vertex AI 调用全局主模型</label>
+          <label><input id="prov-vertex-fallback" type="checkbox"> Vertex 异常或凭据未就绪时自动回退至 Gemini Developer API</label>
+        </div>
+        <div class="grid">
+          <label for="prov-vertex-auth-mode">Vertex 认证方式（vertex_auth_mode）
+            <select id="prov-vertex-auth-mode">
+              <option value="api_key">api_key · Vertex AI API Key</option>
+              <option value="service_account">service_account · GCP Service Account OAuth2</option>
+            </select>
+          </label>
+          <label for="prov-vertex-protocol">Vertex 调用协议（vertex_protocol）
+            <select id="prov-vertex-protocol">
+              <option value="auto">auto · 自动选择（gemini-4* 优先 Interactions）</option>
+              <option value="interactions">interactions · 强制 Interactions API</option>
+              <option value="generate_content">generate_content · 标准 GenerateContent</option>
+            </select>
+          </label>
+          <label for="prov-vertex-project">GCP Vertex 项目 ID（vertex_project）<input id="prov-vertex-project" type="text" maxlength="128" placeholder="Service Account 模式必填，API Key 模式可留空"></label>
+          <label for="prov-vertex-location">Vertex 区域（vertex_location）<input id="prov-vertex-location" type="text" maxlength="64" placeholder="global"></label>
+        </div>
+      </fieldset>
+      <div class="row">
+        <button id="prov-save-policy" type="submit" class="primary">保存路由策略并立即生效</button>
+        <button id="prov-reset-policy" type="button" class="secondary">恢复 .env 默认策略</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section id="reply-settings" class="tab" role="tabpanel" aria-labelledby="nav-reply-settings" hidden>
+  <div class="card"><div class="row between"><h2>回复防抖时间</h2><button id="refresh-reply-settings" type="button" class="secondary">刷新配置</button></div>
+    <p class="muted">单位为秒，范围 0–30。消息连续到达时重新计时，但不超过最长等待；当前已开始生成的回复不受影响。普通群聊等待或最长等待设为 0 时，全场景关闭合并等待。命令仍即时处理。</p>
+    <p id="debounce-source" class="muted"></p>
+    <form id="debounce-form"><div id="debounce-fields" class="grid"></div><div class="row"><button id="save-debounce" type="submit" class="primary" disabled>保存并立即生效</button><button id="reset-debounce" type="button" class="secondary" disabled>恢复 .env 初始值</button></div></form>
+  </div>
+  <div class="card"><div class="row between"><h2>请求限流与发送节奏</h2><button id="refresh-rate-limits" type="button" class="secondary">刷新限流</button></div>
+    <p class="muted">单用户与全局每分钟限流及待处理队列容量立即生效；超出限流的消息在入队前静默忽略。拟人发送延迟范围 0–10 秒，且最长延迟不得小于最短延迟。</p>
+    <p id="rate-limits-source" class="muted"></p>
+    <form id="rate-limits-form"><div id="rate-limits-fields" class="grid"></div><div class="row"><button id="save-rate-limits" type="submit" class="primary" disabled>保存限流与延迟</button><button id="reset-rate-limits" type="button" class="secondary" disabled>恢复 .env 初始值</button></div></form>
+  </div>
+  <div class="card"><div class="row between"><h2>图片尺寸与智能压缩</h2><button id="refresh-image-limits" type="button" class="secondary">刷新配置</button></div>
+    <p class="muted">先按原图大小和总像素上限放宽接收，再在本地按 Lanczos 缩放为高清 JPEG 发给模型，编码目标 ≤800 KiB，复杂图片仍可能超过；常规／16:9 截图默认长边 ≤1600px、长截图默认 ≤2560px，长宽比 ＞4.5 的超长图在空余槽位充足时沿长轴自动切为两张带重叠的高清切片。</p>
+    <p id="image-limits-source" class="muted"></p>
+    <form id="image-limits-form">
+      <div class="grid">
+        <label for="img-max-mib">原图大小上限（1–20 MiB，超限直接略过）<input id="img-max-mib" type="number" min="1" max="20" step="0.5" required></label>
+        <label for="img-max-mp">原图总像素上限（1–80 MP 百万像素）<input id="img-max-mp" type="number" min="1" max="80" step="1" required></label>
+        <label for="img-std-edge">常规图 / 16:9 截图缩放长边（512–2560 px）<input id="img-std-edge" type="number" min="512" max="2560" step="1" required></label>
+        <label for="img-tall-edge">长截图 / 切片缩放长边（1024–4096 px）<input id="img-tall-edge" type="number" min="1024" max="4096" step="1" required></label>
+      </div>
+      <div class="row"><button id="save-image-limits" type="submit" class="primary" disabled>保存图片限制</button><button id="reset-image-limits" type="button" class="secondary" disabled>恢复 .env 初始值</button></div>
+    </form>
+  </div>
+  <div class="card"><h2>联网搜索（Google 免费额度 + DeepSeek 自动切换）</h2>
+    <p class="muted">开启后，可发 /搜索 问题 或 /search question，门卫也会在私聊及群聊自然接话时自主触发核实。联网搜索不计入本地账单扣账与日/月/余额预算；按自然月统计 Google 搜索查询次数，未满上限前走原生 Google Search，满阈值自动切换至 DeepSeek API。</p>
+    <p id="search-status" class="muted"></p>
+    <form id="search-form">
+      <label><input id="search-enabled" type="checkbox"> 允许模型联网搜索</label>
+      <div class="grid"><label for="search-limit">每日最多检索请求（0–500，失败尝试也计数）<input id="search-limit" type="number" min="0" max="500" step="1" required></label><label for="search-monthly-limit">每月 Google 免费次数上限（满额自动切 DeepSeek）<input id="search-monthly-limit" type="number" min="0" max="100000" step="1" required></label></div>
+      <div class="row"><button id="save-search" type="submit" class="primary" disabled>保存联网配置</button><button id="reset-search" type="button" class="secondary" disabled>恢复 .env 初始值</button></div>
+    </form>
+    <hr>
+    <h3>DeepSeek 搜索备用配置（满额自动切换）</h3>
+    <p id="deepseek-status" class="muted"></p>
+    <form id="deepseek-form">
+      <div class="grid"><label for="deepseek-key">DeepSeek API Key（留空保持已存密钥）<input id="deepseek-key" type="password" autocomplete="off" maxlength="512" placeholder="sk-..."></label><label for="deepseek-base-url">Base URL（HTTPS 公网地址）<input id="deepseek-base-url" type="url" maxlength="256" placeholder="https://api.deepseek.com"></label><label for="deepseek-model">备选对话搜索模型<input id="deepseek-model" maxlength="80" placeholder="deepseek-flash"></label></div>
+      <div class="row"><button id="save-deepseek" type="submit" class="primary" disabled>加密保存 DeepSeek 配置</button><button id="clear-deepseek" type="button" class="danger" disabled>清除密钥</button></div>
+    </form>
+  </div>
+  <div class="card"><div class="row between"><h2>文本文件阅读与代码表格卡片</h2><button id="refresh-content-tools" type="button" class="secondary">刷新配置</button></div>
+    <p class="muted">开放给白名单群与获准私聊：安全读取群聊或私聊分享的小体积纯文本 / 代码 / 报错日志（严格白名单扩展名，拒绝二进制与含敏感凭据文件）；以及群聊回复含多行代码块或 Markdown 表格时自动渲染高清排版卡片图。</p>
+    <p id="content-tools-source" class="muted"></p>
+    <form id="content-tools-form">
+      <div class="grid">
+        <label><input id="file-read-enabled" type="checkbox"> 启用纯文本／报错日志文件阅读</label>
+        <label for="text-card-mode">群聊代码与表格卡片模式 <select id="text-card-mode"><option value="rich_auto">rich_auto · 检测到代码块/表格自动发卡片图</option><option value="fallback_only">fallback_only · 仅超长折叠兜底时发图</option></select></label>
+        <label for="file-max-kib">单文件大小上限（16–256 KiB）<input id="file-max-kib" type="number" min="16" max="256" step="1" required></label>
+        <label for="file-daily-limit">单用户每日文件读取上限（0–100 次）<input id="file-daily-limit" type="number" min="0" max="100" step="1" required></label>
+      </div>
+      <div class="row"><button id="save-content-tools" type="submit" class="primary" disabled>保存配置并立即生效</button><button id="reset-content-tools" type="button" class="secondary" disabled>恢复 .env 初始值</button></div>
+    </form>
+  </div>
+</section>
+
+<section id="thinking" class="tab" role="tabpanel" aria-labelledby="nav-thinking" hidden>
+  <form id="thinking-policy" class="card">
+    <div class="row between"><h2>全局主模型</h2><button id="refresh-thinking" type="button" class="secondary">刷新设置</button></div>
+    <div class="model-choice"><label for="primary-model">生成模型<select id="primary-model" required disabled></select></label>
+      <p class="muted">对话、规划和后台生成共用此模型。安全审核继续使用 Decisions。</p></div>
+    <div class="row between scene-heading"><h3>场景思考强度</h3><span id="thinking-source" class="muted" role="status"></span></div>
+    <div id="thinking-fields" class="scene-groups"></div>
+    <details><summary>批量调整档位</summary><div class="row"><label for="thinking-all">思考强度<select id="thinking-all" disabled><option value="low">low · 轻量</option><option value="medium" selected>medium · 均衡</option><option value="high">high · 深入</option><option value="xhigh">xhigh · 最高</option></select></label><button id="apply-thinking-all" type="button" class="secondary" disabled>填入支持此档位的场景</button></div></details>
+    <div class="row"><button id="save-thinking" type="submit" class="primary" disabled>保存模型与思考设置</button><button id="reset-thinking" type="button" class="secondary" disabled>恢复默认设置</button><span id="thinking-edit-state" class="muted" aria-live="polite"></span></div>
+  </form>
+  <details class="card"><summary>单次生成的输出 Token 上限</summary><p id="gen-caps-source" class="muted"></p>
+    <form id="gen-caps-form"><div id="gen-caps-fields" class="grid"></div><div class="row"><button id="save-gen-caps" type="submit" class="primary" disabled>保存输出上限</button><button id="reset-gen-caps" type="button" class="secondary" disabled>恢复默认上限</button><button id="refresh-gen-caps" type="button" class="secondary">刷新上限</button></div></form>
+  </details>
+</section>
+
+<section id="filter" class="tab" role="tabpanel" aria-labelledby="nav-filter" hidden>
+  <div class="card"><div class="row between"><h2>Decisions 来信阈值</h2><button id="refresh-filter" type="button" class="secondary">刷新配置与审计</button></div>
+    <p class="muted">提高注入／违规阈值会减少拦截，降低回应阈值会增加自由插话。外部来源与模型输出继续独立执行严格筛查；这些设置不改变白名单、身份或工具权限。</p>
+    <p id="filter-source" class="muted"></p>
+    <form id="filter-policy">
+      <div class="grid">
+        <label for="filter-injection">来信注入拦截阈值 <input id="filter-injection" type="number" min="0.01" max="0.99" step="0.01" required></label>
+        <label for="filter-unsafe">来信违规拦截阈值 <input id="filter-unsafe" type="number" min="0.01" max="0.99" step="0.01" required></label>
+        <label for="filter-reply">默认自由插话门槛 <input id="filter-reply" type="number" min="0.01" max="0.99" step="0.01" required></label>
+        <label for="filter-bot-reply">外部 Bot 默认回复门槛（0.01–1.00，1.00=完全屏蔽） <input id="filter-bot-reply" type="number" min="0.01" max="1" step="0.01" required></label>
+        <label for="filter-owner-injection">真实 Owner 来信注入阈值 <input id="filter-owner-injection" type="number" min="0.01" max="0.99" step="0.01" required></label>
+        <label for="filter-owner-unsafe">真实 Owner 来信违规阈值 <input id="filter-owner-unsafe" type="number" min="0.01" max="0.99" step="0.01" required></label>
+      </div>
+      <p class="muted">私聊与明确点名、回复机器人通过安全检查后可直接回应（群聊仅在明确 @ 机器人时解析视频）；外部 Bot 即使主动 @ 或引用回复也不会跳过门槛（默认 0.85，设为 1.00 为 0 Token 完全屏蔽；仅 Owner 发起 /bot-interact 时临时豁免 2 轮）。群内自由插话仍看 should_reply，每个群可在 QQ 的「群聊互动策略」中选择安静、自然或活跃预设；Owner 普通群聊的插话门槛最高为 0.28。</p>
+      <div class="row"><button type="submit" class="primary">保存网关阈值</button><button id="reset-filter" type="button" class="secondary">恢复 .env 阈值与群预设</button></div>
+    </form>
+  </div>
+  <div class="card"><h2>最近 30 条 Decisions 审计</h2>
+    <p class="muted">仅显示当前来信的脱敏摘录、隐私与门卫路由层级、判定概率和置信度，不读取会话历史或私人快照；审计加密保存，仅此鉴权后台可见。每 15 秒刷新判定记录。</p>
+    <div id="decision-audit" class="table"></div>
+  </div>
+</section>
+
+<section id="sandbox" class="tab" role="tabpanel" aria-labelledby="nav-sandbox" hidden>
+  <div class="card"><h2>沙盒模拟测试台</h2>
+    <p class="muted">调用真实模型并计入管理预算。不会发送 QQ、读取真实记忆或写入生产 Session。Bot 处于 1.00 完全屏蔽、私聊或群策略不放行时不调用模型；阈值低于 1.00 时按 Bot 回复门槛实测。</p>
+    <div class="row">
+      <select id="sim-identity" aria-label="身份"><option value="OWNER">OWNER</option><option value="MEMBER">普通群友</option><option value="BOT">已知 Bot</option></select>
+      <select id="sim-scene" aria-label="场景"><option value="group_at">群聊 @</option><option value="group_plain">群聊普通发言</option><option value="private">私聊</option></select>
+      <select id="sim-group" aria-label="模拟群策略"></select>
+    </div>
+    <label for="sim-text">测试文本</label>
+    <textarea id="sim-text" maxlength="2000" placeholder="试着问一个问题，或输入提示词注入试探。"></textarea>
+    <button id="simulate" type="button" class="primary">运行一次测试</button>
+  </div>
+  <div class="grid">
+    <div class="card"><h2>Decisions 网关</h2><div id="scores"></div><pre id="decision-result">尚未运行</pre><details><summary>原始概率与置信度</summary><pre id="decision-raw"></pre></details></div>
+    <div class="card"><h2>Interactions 预览</h2><p id="preview-meta" class="muted"></p><pre id="preview-text">尚未运行</pre></div>
+  </div>
+</section>
+
+<section id="admission" class="tab" role="tabpanel" aria-labelledby="nav-admission" hidden>
+  <div class="card"><div class="row between"><h2>准入与防互刷名单管理</h2><button id="refresh-admission" type="button" class="secondary">刷新名单</button></div>
+    <p id="admission-source" class="muted"></p>
+    <p id="admission-owner" class="muted"></p>
+    <p class="muted">变更立即生效，无需重启；SQLite 保存的名单与阈值优先于启动时的 .env。非准入消息和设为 1.00 的 Bot 在模型调用前直接忽略。</p>
+    <button id="reset-admission" type="button" class="secondary">重置回 .env 初始值</button>
+    <details><summary>查看启动时的初始名单</summary><pre id="admission-environment"></pre></details>
+  </div>
+  <div class="card"><h2>群聊白名单</h2>
+    <p class="muted">空名单拒绝全部群聊。新增群默认由点名或回复触发（群内看视频需明确 @），并立即加入 QQ 的「群聊互动策略」列表。</p>
+    <p id="admission-group-scope" class="muted"></p>
+    <form id="admission-groups-form" class="row"><input id="admission-group-id" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" required placeholder="QQ 群号（纯数字）" aria-label="添加群白名单"><button type="submit" class="primary">添加群</button></form>
+    <div id="admission-groups" class="table"></div>
+  </div>
+  <div class="card"><h2>私聊准入</h2>
+    <label for="admission-private-mode">允许谁私聊</label>
+    <select id="admission-private-mode"><option value="owner_only">仅允许 Owner 私聊</option><option value="owner_and_allowlist">Owner + 指定白名单好友私聊</option></select>
+    <p class="muted">Owner 永远保留私聊权限，不能从页面移除。其他获准好友只使用公开人设、各自独立会话，不读取 Owner 快照或私人记忆。仅 Owner 模式下，下面保留的好友名单暂不生效。</p>
+    <form id="admission-users-form" class="row"><input id="admission-user-id" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" required placeholder="好友 QQ 号（纯数字）" aria-label="添加好友白名单"><button type="submit" class="primary">添加好友</button></form>
+    <div id="admission-users" class="table"></div>
+  </div>
+  <div class="card"><h2>外部 Bot 防互刷与回复阈值</h2>
+    <p class="muted">已知 Bot 在群聊按 should_reply 回复阈值控制触发（默认 0.85，设为 1.00 即 0 Token 完全屏蔽），即使外部 Bot 主动 @ 或引用哈基米也不跳过阈值；未邀请的 Bot 回复不会带出 @ 或引用锚点。私聊始终忽略；Owner 和机器人自身不能加入。此名单与「讨厌鬼小黑屋」分别维护。</p>
+    <form id="admission-bot-threshold-form" class="row"><label for="admission-bot-threshold">默认 Bot 回复阈值（0.01–1.00，1.00=完全屏蔽） <input id="admission-bot-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" required></label><button type="submit" class="primary">保存默认阈值</button><button id="admission-bot-hardblock" type="button" class="secondary">设为 1.00 完全屏蔽</button></form>
+    <form id="admission-bots-form" class="row"><input id="admission-bot-id" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" required placeholder="外部 Bot QQ 号" aria-label="添加外部 Bot"><input id="admission-bot-custom-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" placeholder="专属阈值（可留空）" aria-label="外部 Bot 专属回复阈值"><button type="submit" class="primary">加入名单</button></form>
+    <div id="admission-bots" class="table"></div>
+  </div>
+</section>
