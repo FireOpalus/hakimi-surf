@@ -513,9 +513,12 @@ async def test_event_consumer_backpressure_and_forbidden_event(settings: Setting
         await wire.close()
 
 
-async def test_heartbeat_updates_timestamp_and_disconnects_on_failure(settings: Settings) -> None:
+async def test_heartbeat_updates_timestamp_and_disconnects_on_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
     wire = NodeTransport(node_settings(settings, ws_ping_interval=1.0))
     # Speed up heartbeat loop for test without hitting Settings ge=1 constraint.
+    monkeypatch.setattr(wire.s, "ws_ping_interval", 0.05)
     peer = FakeNodePeer()
     try:
         await peer.connect(wire)

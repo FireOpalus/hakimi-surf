@@ -2,12 +2,11 @@ import json
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from google.auth import jwt
 
 from hakimi.drive_client import API, SCOPE, TOKEN_URI, UPLOAD, FolderDrive
 from hakimi.security import Rejected
+from tests.conftest import cached_rsa_private_key_pem
 
 FOLDER = "dedicated-folder-123456"
 FILE = "diary-file-123456"
@@ -175,10 +174,7 @@ async def test_ambiguous_listing_never_creates_another_diary(settings, listing):
 async def test_service_account_jwt_uses_only_drive_file_scope_and_fixed_token_uri(
     settings, tmp_path
 ):
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-    ).decode()
+    pem = cached_rsa_private_key_pem()
     path = tmp_path / "test-service-account.json"
     info = {
         "type": "service_account",

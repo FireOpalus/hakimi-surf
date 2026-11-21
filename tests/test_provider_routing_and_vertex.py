@@ -8,8 +8,6 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from google import genai
 from google.genai import types
 from pydantic import SecretStr
@@ -31,6 +29,7 @@ from hakimi.provider_routing import (
 )
 from hakimi.security import Rejected, configured_secrets
 from hakimi.store import Store
+from tests.conftest import cached_rsa_private_key_pem
 from tests.test_admin import TOKEN
 from tests.test_admin import admin_api as admin_api
 from tests.test_gateway import group
@@ -46,12 +45,7 @@ def _make_sa_json(
     private_key: str | None = None,
 ) -> str:
     if private_key is None:
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        private_key = key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ).decode("ascii")
+        private_key = cached_rsa_private_key_pem()
     return json.dumps(
         {
             "type": sa_type,

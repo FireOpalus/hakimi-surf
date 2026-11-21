@@ -387,11 +387,14 @@ async def test_world_patrol_share_intent_and_mood_longnick(settings, store, mess
             await svc.stop()
 
 
-async def test_live_watch_open_notification_and_up_patrol_persona(settings, store, message):
+async def test_live_watch_open_notification_and_up_patrol_persona(
+    settings, store, message, monkeypatch
+):
     settings.owner_qq_id = "20000"
     settings.onebot_mode = "ws_reverse"
     settings.bilibili_enabled = True
     settings.patrol_interval_seconds = 0
+    monkeypatch.setattr(settings, "bilibili_min_interval_seconds", 0.0)
 
     live_payload = {"live_status": 0, "title": "夜聊修猫编程", "area_name": "科技"}
 

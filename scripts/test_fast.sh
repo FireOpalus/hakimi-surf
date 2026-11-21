@@ -29,7 +29,7 @@ if [[ $has_basetemp -eq 0 && -d /dev/shm && -w /dev/shm ]]; then
 fi
 
 if [[ $has_numprocs -eq 0 ]] && .venv/bin/python -c "import xdist" >/dev/null 2>&1; then
-    extra_args+=("-n" "auto" "--dist=loadfile")
+    extra_args+=("-n" "auto" "--dist=worksteal")
 fi
 
 .venv/bin/pytest "${extra_args[@]}" "$@"

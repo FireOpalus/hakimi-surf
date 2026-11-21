@@ -33,10 +33,12 @@ from relay import (  # noqa: E402
 
 def _settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = {
+        "_env_file": None,
         "gemini_api_key": "test-gemini-key",
         "encryption_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "onebot_enabled": True,
         "onebot_mode": "ws_reverse",
+        "onebot_secret": "test-onebot-signing-secret",
         "onebot_ws_token": "x" * 32,
         "onebot_self_id": "3554766829",
         "owner_qq_id": "10001",

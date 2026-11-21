@@ -33,6 +33,7 @@ packages = ["src/hakimi", "src/hakimi_plugin_sdk"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = ["sqlite_durable: keep SQLite synchronous=FULL and secure_delete=ON"]
 
 [tool.ruff]
 target-version = "py312"

@@ -8,7 +8,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from google.auth import jwt
 from pydantic import SecretStr
 
@@ -29,6 +29,7 @@ from hakimi.gcp_billing import (
 from hakimi.security import Rejected
 from hakimi.store import Store
 from hakimi.usage_accounting import TokenUsage
+from tests.conftest import cached_rsa_private_key_pem
 from tests.fakes import FakeGateway
 from tests.test_admin import TOKEN
 
@@ -42,12 +43,7 @@ def make_sa_info(
     private_key: str | None = None,
 ) -> dict:
     if private_key is None:
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        private_key = key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ).decode("utf-8")
+        private_key = cached_rsa_private_key_pem()
     return {
         "type": account_type,
         "project_id": project_id,

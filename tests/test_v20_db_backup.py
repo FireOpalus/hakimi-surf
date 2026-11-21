@@ -448,6 +448,7 @@ def _run_cli_subprocess(
     )
 
 
+@pytest.mark.sqlite_durable
 async def test_cli_backup_db_script(settings, store, tmp_path):
     env_file = tmp_path / "test.env"
     key = settings.encryption_key.get_secret_value()

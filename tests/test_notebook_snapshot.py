@@ -3,13 +3,12 @@ import time
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from google.auth import jwt
 
 from hakimi.drive_client import TOKEN_URI
 from hakimi.notebook_snapshot import NotebookSnapshot, SnapshotDrive
 from hakimi.security import Rejected
+from tests.conftest import cached_rsa_private_key_pem
 from tests.fakes import FakeGateway
 
 FILE = "single-sanitized-snapshot-id"
@@ -156,10 +155,7 @@ async def test_cloud_failure_does_not_fall_back_or_allow_local_write(settings, s
 
 
 async def test_snapshot_token_scope_is_readonly_without_delegation(settings, tmp_path):
-    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = private.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-    ).decode()
+    pem = cached_rsa_private_key_pem()
     credentials = {
         "type": "service_account",
         "project_id": "test",

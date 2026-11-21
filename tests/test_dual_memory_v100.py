@@ -90,6 +90,7 @@ async def populate(sessions, msg):
     return job
 
 
+@pytest.mark.sqlite_durable
 async def test_old_database_migrates_twice_without_changing_ciphertext(settings, store, message):
     sessions = SessionManager(settings, store)
     msg = group(message)
