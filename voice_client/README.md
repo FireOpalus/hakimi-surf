@@ -1,0 +1,90 @@
+# Hakimi Mac 实时语音客户端 (`voice_client`)
+
+面向 macOS（Python 3.12+ / 3.15 + `ffmpeg` + `afplay`）的轻量纯 Python 实时语音客户端，直连服务端 `/ws/companion`，默认采用硅基流动（SiliconFlow）`SenseVoiceSmall` STT + `CosyVoice2-0.5B` TTS，零 C 扩展依赖。
+
+## 1. 环境准备（macOS）
+
+```bash
+# 确保已安装 ffmpeg（用于 AVFoundation 麦克风采集与设备枚举）
+brew install ffmpeg
+
+# 创建虚拟环境并安装仅有的两个外部依赖 (httpx / websockets)
+/opt/homebrew/bin/python3 -m venv ~/.local/share/hakimi-voice/venv
+~/.local/share/hakimi-voice/venv/bin/pip install -r voice_client/requirements.txt
+```
+
+## 2. 配置文件 (`~/.config/hakimi-voice/.env`)
+
+建议目录权限 `0700`，文件权限 `0600`：
+
+```ini
+# WebSocket 连接信息（与服务端 /ws/companion 配置一致）
+COMPANION_WS_URL=wss://example.com/ws/companion-secret
+COMPANION_WS_TOKEN=your-companion-ws-token
+COMPANION_ADAPTER_ID=mac-voice
+COMPANION_CLIENT_ID=boiser-m4
+COMPANION_MODE=owner_private
+
+# 语音方案 A：硅基流动 SiliconFlow
+STT_PROVIDER=siliconflow
+TTS_PROVIDER=siliconflow
+SILICONFLOW_API_KEY=your-siliconflow-api-key
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+SILICONFLOW_STT_MODEL=FunAudioLLM/SenseVoiceSmall
+SILICONFLOW_TTS_MODEL=FunAudioLLM/CosyVoice2-0.5B
+SILICONFLOW_TTS_VOICE=FunAudioLLM/CosyVoice2-0.5B:diana
+TTS_SPEED=1.05
+TTS_GAIN=0.0
+TTS_FORMAT=mp3
+
+# 音频与 VAD / PTT 参数
+VOICE_MODE=vad
+AUDIO_INPUT_DEVICE=0
+VAD_THRESHOLD=0.018
+VAD_SILENCE_MS=750
+VAD_MIN_SPEECH_MS=320
+VAD_MAX_SPEECH_MS=20000
+VAD_BARGE_IN_MULTIPLIER=2.2
+BARGE_IN_ENABLED=true
+```
+
+> 可选备用 Provider：`STT_PROVIDER=openai`（搭配 `OPENAI_STT_API_KEY` / `OPENAI_STT_BASE_URL` / `OPENAI_STT_MODEL`）；`TTS_PROVIDER=fish`（搭配 `FISH_API_KEY` / `FISH_REFERENCE_ID`）或 `TTS_PROVIDER=edge`（本地 `edge-tts` 命令）。
+
+## 3. 自检与工具命令
+
+```bash
+# 1) 列出 macOS 麦克风设备编号（确认 AUDIO_INPUT_DEVICE）
+python3 -m voice_client --list-devices
+
+# 2) 验证 WebSocket 握手与心跳 RTT（不触发 LLM 消耗）
+python3 -m voice_client --check-ws
+
+# 3) 测试 TTS 合成与 afplay 播报
+python3 -m voice_client --test-tts "哈基米收到啦，测试语音播报喵~"
+
+# 4) 测试 4 秒麦克风录音 + STT 转写
+python3 -m voice_client --test-stt
+
+# 5) 上传自定义参考音色，打印可直接写入 SILICONFLOW_TTS_VOICE 的 speech:... URI
+python3 -m voice_client --upload-voice ./ref.wav --voice-name my-voice --ref-text "参考音频对应的准确台词"
+```
+
+## 4. 启动实时对话与快捷键
+
+```bash
+python3 -m voice_client --mode vad
+# 或按键说话模式 / 指定游戏标题 / 指定麦克风设备
+python3 -m voice_client --mode ptt --game "Minecraft" --device 0
+```
+
+交互模式快捷键：
+
+| 按键 | 功能说明 |
+| :--- | :--- |
+| `[Space]` | PTT 模式下切换开始录音 / 停止并发送识别 |
+| `[m]` | 实时切换 `VAD`（自动语音检测）↔ `PTT`（按键说话） |
+| `[x]` | 立即打断当前播报与服务端本轮生成（`turn.cancel`） |
+| `[t]` | 暂停单键模式，输入一行文字直接发送 |
+| `[q]` | 干净结束会话并退出 |
+
+- **VAD 打断（Barge-in）**：当 `BARGE_IN_ENABLED=true` 且播放器正在播报时，检测阈值自动提高至 `VAD_THRESHOLD * VAD_BARGE_IN_MULTIPLIER` 以减少回声误触发；检测到真实插话后立即终止 `afplay` 并向服务端发送 `turn.cancel`。
