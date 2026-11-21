@@ -31,6 +31,7 @@ from .plugin_admin import router as plugin_router
 from .provider_admin import router as provider_router
 from .security import Rejected, check_fresh, qq_signing_key, verify_onebot, verify_qq
 from .service import Service
+from .song_admin import router as song_router
 from .store import Store
 
 
@@ -130,6 +131,7 @@ def create_app(
                     await service.bili_watcher.initialize()
                     await service.video_watch.initialize()
                     await service.memes.initialize()
+                    await service.songs.initialize()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
                     for module in service.modules.all():
@@ -190,6 +192,7 @@ def create_app(
     app.include_router(community_router)
     app.include_router(bili_account_router)
     app.include_router(meme_router)
+    app.include_router(song_router)
     app.include_router(provider_router)
     app.include_router(gcp_billing_router)
     app.include_router(affection_router)
@@ -232,7 +235,7 @@ def create_app(
         )
         response.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'none'; img-src blob:; base-uri 'none'; "
+            "default-src 'none'; img-src blob:; media-src blob:; base-uri 'none'; "
             "frame-ancestors 'none'; form-action 'none'",
         )
         return response

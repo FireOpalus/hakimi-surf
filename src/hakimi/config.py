@@ -358,6 +358,15 @@ class Settings(BaseSettings):
             "VOICE_REPLY_COOLDOWN_SECONDS", "HAKIMI_VOICE_REPLY_COOLDOWN_SECONDS"
         ),
     )
+    voice_reply_group_cooldown_seconds: float = Field(
+        default=60.0,
+        ge=0.0,
+        le=3600.0,
+        validation_alias=AliasChoices(
+            "VOICE_REPLY_GROUP_COOLDOWN_SECONDS",
+            "HAKIMI_VOICE_REPLY_GROUP_COOLDOWN_SECONDS",
+        ),
+    )
     voice_reply_daily_limit: int = Field(
         default=40,
         ge=1,

@@ -114,9 +114,7 @@ class VoiceReplyClient:
             self._daily_day = day
             self._daily_count = 0
 
-    def allowed_for_message(self, message: Message, *, sandbox: bool = False) -> bool:
-        if sandbox or not self.configured():
-            return False
+    def _mode_allows(self, message: Message) -> bool:
         mode = self.s.voice_reply_mode
         if mode == "owner_only":
             return message.kind == "private" and is_persona_owner(message, self.s)
@@ -132,18 +130,34 @@ class VoiceReplyClient:
             )
         return mode == "all"
 
+    def allowed_for_message(self, message: Message, *, sandbox: bool = False) -> bool:
+        if sandbox or not self.configured():
+            return False
+        return self._mode_allows(message)
+
+    def allowed_for_song(self, message: Message, *, sandbox: bool = False) -> bool:
+        if sandbox or not self.s.voice_reply_enabled:
+            return False
+        return self._mode_allows(message)
+
     def can_send_now(
         self,
         scope: str,
         *,
         explicit: bool = False,
+        is_group: bool = False,
         now: float | None = None,
     ) -> tuple[bool, str]:
         ts = self.clock() if now is None else now
         self._roll_day(ts)
         if self._daily_count >= self.s.voice_reply_daily_limit:
             return (False, "daily_limit")
-        cooldown = float(self.s.voice_reply_cooldown_seconds or 0.0)
+        raw_cooldown = (
+            self.s.voice_reply_group_cooldown_seconds
+            if is_group
+            else self.s.voice_reply_cooldown_seconds
+        )
+        cooldown = float(raw_cooldown or 0.0)
         if not explicit and cooldown > 0.0:
             prev = self._last_sent.get(scope)
             if prev is not None and (ts - prev) < cooldown:

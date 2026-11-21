@@ -393,11 +393,29 @@ def assemble_chat_input(
             "否则必须填 null。"
         )
     if not sandbox_mode and payload.get("voice_reply_available"):
-        metadata["voice_reply_hint"] = (
-            "当前对话支持发送语音条：当你希望用声音回复（如对方要求发语音、早晚安、安慰撒娇或轻松吐槽）时，"
-            "可在 voice_text 填一段简短纯口播文案（<=100字，勿含链接/代码/颜文字）；"
-            '纯发语音时 bubbles 可填 [""]，文字+语音可同时填；'
-            "平时普通文字回复 voice_text 填 null，不要每句都发语音。"
+        if context.private_owner:
+            metadata["voice_reply_hint"] = (
+                "当前对话支持发送语音条：当你希望用声音回复（如对方要求发语音、早晚安、安慰撒娇或轻松吐槽）时，"
+                "可在 voice_text 填一段简短纯口播文案（<=100字，勿含链接/代码/颜文字）；"
+                '纯发语音时 bubbles 可填 [""]，文字+语音可同时填；'
+                "平时普通文字回复 voice_text 填 null，不要每句都发语音。"
+            )
+        else:
+            metadata["voice_reply_hint"] = (
+                "当前群聊支持发送语音条：当群友点名要听语音、气氛好玩或轻松吐槽时，"
+                "可偶尔在 voice_text 填一段简短纯口播文案（<=100字，勿含链接/代码/颜文字）；"
+                '纯发语音时 bubbles 可填 [""]，文字+语音可同时填；'
+                "平时普通聊天 voice_text 填 null，克制使用不要刷屏。"
+            )
+    if not sandbox_mode and payload.get("song_catalog"):
+        metadata["song_catalog"] = list(payload["song_catalog"])
+        metadata["sing_song_hint"] = (
+            "你有一个专属翻唱歌单（song_catalog）。仅当对方点歌、让你唱歌，或"
+            "在特别开心/适合献唱的时刻，可在 sing_song 填歌单里完全一致的 title"
+            "（只能选 song_catalog 中已有的歌，绝不编造歌名；"
+            "可配 1 条简短报幕文字气泡，填了 sing_song 时 voice_text 填 null）；"
+            "平时不唱歌时 sing_song 必须填 null。若对方点的歌不在歌单里，"
+            "自然说明还没学会/还没录这首，可顺便推荐歌单里会唱的歌。"
         )
     if not sandbox_mode and payload.get("module_context"):
         metadata["module_context"] = payload["module_context"]
@@ -543,6 +561,11 @@ def assemble_chat_input(
         metadata.pop("jit_proactive_intent", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and "voice_reply_hint" in metadata:
         metadata.pop("voice_reply_hint", None)
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and (
+        "sing_song_hint" in metadata or "song_catalog" in metadata
+    ):
+        metadata.pop("sing_song_hint", None)
+        metadata.pop("song_catalog", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and "owner_chat_actions" in metadata:
         metadata.pop("owner_chat_actions", None)
         metadata.pop("owner_chat_action_hint", None)

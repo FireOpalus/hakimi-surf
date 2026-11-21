@@ -1621,6 +1621,15 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
 .aff-history-head { margin-top: 22px; }
 .aff-history-head h3 { margin: 0; }
 .aff-exclusive-note { color: var(--paid-ink); font-weight: 600; }
+.song-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
+.song-item { border: 1px solid var(--line); border-radius: 14px; padding: 14px; min-width: 0; overflow-wrap: anywhere; background: var(--card-2); transition: border-color .18s ease, transform .18s var(--ease), box-shadow .2s ease; }
+.song-item:hover { border-color: var(--line-strong); transform: translateY(-2px); box-shadow: var(--lift); }
+.song-item h3 { margin: 0 0 6px; font-size: 15px; }
+.song-item small { display: block; margin: 4px 0; font-size: 11px; }
+.song-item audio { width: 100%; margin: 8px 0; }
+.song-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 10px 0; }
+.song-meta label { display: block; font-size: 12px; color: var(--muted); }
+.song-meta input { display: block; width: 100%; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -1692,6 +1701,7 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <button id="nav-identity-center" type="button" role="tab" data-tab="identity-center" data-description="管理跨平台统一身份档案（Person）、Owner 认证、账号绑定合并、L2 画像标签与跨平台屏蔽。" aria-controls="identity-center" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M17 11l2 2 4-4"/></svg><span>统一身份与绑定</span></button>
         <button id="nav-community" type="button" role="tab" data-tab="community" data-description="管理跨平台好感度档案、全局策略与小黑屋屏蔽。" aria-controls="community" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v5l-6 4-6-4z M6 16h12 M8 20h8"/></svg><span>好感度与小黑屋</span></button>
         <button id="nav-memes" type="button" role="tab" data-tab="memes" data-description="管理可发送的本地图片和情绪标签。" aria-controls="memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 8h.01"/></svg><span>表情包库</span></button>
+        <button id="nav-songs" type="button" role="tab" data-tab="songs" data-description="管理猫猫的专属翻唱歌单与音频切片。" aria-controls="songs" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13 M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0 M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0"/></svg><span>猫猫歌单</span></button>
       </div>
     </nav>
     <nav id="modules-nav" data-workspace="modules" role="tablist" aria-label="功能模块" aria-orientation="vertical" hidden>
@@ -2559,6 +2569,27 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
   </div>
 </section>
 
+<section id="songs" class="tab" role="tabpanel" aria-labelledby="nav-songs" hidden>
+  <div class="card"><div class="row between"><h2>猫猫专属翻唱歌单</h2><button id="song-refresh" class="secondary">刷新歌单</button></div>
+    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 12 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台；模型仅从歌单标题白名单里挑选。</p>
+    <form id="song-upload">
+      <div class="row"><label for="song-file">选择音频文件</label><input id="song-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac"><small id="song-file-name" class="muted">未选择音频文件</small></div>
+      <div id="song-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把翻唱音频拖到这里（自动识别文件名作为歌名）</div>
+      <div class="song-meta">
+        <label for="song-title">歌名（必填，1～40字）<input id="song-title" maxlength="40" required placeholder="例如：小星星"></label>
+        <label for="song-artist">原唱（可选）<input id="song-artist" maxlength="40" placeholder="例如：传统儿歌"></label>
+        <label for="song-tags">风格标签（可选）<input id="song-tags" maxlength="80" placeholder="例如：温柔 晚安"></label>
+        <label for="song-start">起始秒数（0～600）<input id="song-start" type="number" min="0" max="600" step="0.5" value="0"></label>
+        <label for="song-duration">截取时长秒（5～58）<input id="song-duration" type="number" min="5" max="58" step="1" value="50"></label>
+      </div>
+      <div class="row"><button type="submit">上传并切片转码</button><button id="song-clear-file" type="button" class="secondary">清空文件</button></div>
+    </form>
+    <p id="song-prompt-count" class="badge">当前已加载到 Prompt 的有效曲目：0</p>
+    <p id="song-state" role="status"></p>
+    <div id="song-list" class="song-grid"></div>
+  </div>
+</section>
+
 <section id="bili-account" class="tab" role="tabpanel" aria-labelledby="nav-bili-account" hidden>
   <div class="card"><div class="row between"><h2>B 站小号巡逻配置</h2><button id="bili-refresh" class="secondary">刷新状态</button></div>
     <p class="muted">仅使用独立小号。优先读取推荐、关注动态、简介、字幕和热评；可单独启用受限原片分析。不伪造播放心跳，不发评论、弹幕、私信或自动关注。遇到凭证过期或验证码风控立即暂停 12 小时。</p>
@@ -2965,6 +2996,7 @@ function logout(){
   text('thinking-source','');text('thinking-edit-state','');
   for(const id of ['primary-model','thinking-all','apply-thinking-all','save-thinking','reset-thinking'])$(id).disabled=true;
   clearMemePreviews();clearMemeQueue();$('meme-file').value='';$('meme-batch-label').value='';
+  clearSongPreviews();selectedSongFile=null;text('song-file-name','未选择音频文件');$('song-file').value='';$('song-title').value='';$('song-artist').value='';$('song-tags').value='';$('song-start').value='0';$('song-duration').value='50';
   token='';$('token').value='';
   $('login').hidden=false;$('app').hidden=true;$('logout').hidden=true;
   if(timer)clearInterval(timer);
@@ -5130,6 +5162,96 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
+let songGeneration=0,selectedSongFile=null;
+const songObjectURLs=new Set();
+function clearSongPreviews(){songGeneration++;for(const url of songObjectURLs)URL.revokeObjectURL(url);songObjectURLs.clear();$('song-list').replaceChildren();text('song-state','');}
+async function songRequest(path,method='GET',body,extraHeaders={}){
+  const signal=sessionRequests.signal;
+  const r=await fetch('/admin/api/songs'+path,{method,signal,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':body.type||'application/octet-stream'}:{}),...extraHeaders},body,cache:'no-store',credentials:'omit',redirect:'error'});
+  if(!r.ok){
+    let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}
+    if(!signal.aborted&&(r.status===401||r.status===403))logout();
+    throw Error(detail);
+  }
+  return r;
+}
+function setSelectedSongFile(file){
+  if(!file){selectedSongFile=null;text('song-file-name','未选择音频文件');return;}
+  if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name)||file.size>12*1024*1024){
+    selectedSongFile=null;text('song-file-name','未选择音频文件');
+    throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac，且单文件不超过 12 MiB');
+  }
+  selectedSongFile=file;
+  text('song-file-name',file.name+'（'+(file.size/1048576).toFixed(2)+' MiB）');
+  if(!$('song-title').value.trim()){
+    const stem=file.name.replace(/\.[^.]+$/,'').replace(/\s+/g,' ').trim().slice(0,40);
+    if(stem)$('song-title').value=stem;
+  }
+}
+async function songs(){
+  clearSongPreviews();
+  const generation=songGeneration,d=await api('songs');
+  if(!token||generation!==songGeneration)return;
+  text('song-prompt-count','当前已加载到 Prompt 的有效曲目：'+(d.loaded_prompt_count??0));
+  text('song-state',d.items.length+' / '+(d.max_songs??100)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??104857600)/1048576).toFixed(0)+' MiB');
+  if(!d.items.length){$('song-list').append(el('p','还没有录入翻唱曲目。上传一段音频切片即可让猫猫学会唱它。','muted'));return;}
+  const queue=d.items.map(item=>{
+    const card=el('article',undefined,'song-item');
+    const audio=document.createElement('audio');
+    audio.controls=true;audio.preload='none';
+    const meta=[item.artist?('原唱：'+item.artist):'',item.tags?('标签：'+item.tags):''].filter(Boolean).join(' · ');
+    const spec=((item.duration_ms||0)/1000).toFixed(1)+' 秒 · '+Math.ceil((item.byte_size||0)/1024)+' KiB';
+    card.append(el('h3',item.title));
+    if(meta)card.append(el('small',meta));
+    card.append(el('small',spec),audio,button('删除',async()=>{await api('songs/'+encodeURIComponent(item.id),'DELETE');notice('曲目已移除，歌单立即更新');await songs();},'danger'));
+    $('song-list').append(card);
+    return{item,audio,card};
+  });
+  await Promise.all(Array.from({length:Math.min(4,queue.length)},async()=>{
+    while(queue.length&&token&&generation===songGeneration){
+      const{item,audio,card}=queue.shift();
+      try{
+        const response=await songRequest('/'+encodeURIComponent(item.id)+'/audio'),blob=await response.blob();
+        if(!token||generation!==songGeneration)return;
+        const url=URL.createObjectURL(blob);songObjectURLs.add(url);audio.src=url;
+      }catch{if(token&&generation===songGeneration)card.append(el('small','音频试听暂不可用'));}
+    }
+  }));
+}
+$('song-refresh').addEventListener('click',e=>busy(e.target,songs));
+$('song-file').addEventListener('change',e=>{try{setSelectedSongFile(e.target.files?.[0]||null);}catch(err){e.target.value='';notice(err.message,true);}});
+$('song-clear-file').addEventListener('click',()=>{$('song-file').value='';setSelectedSongFile(null);});
+$('song-dropzone').addEventListener('click',()=>$('song-file').click());
+$('song-dropzone').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('song-file').click();}});
+$('song-dropzone').addEventListener('dragover',e=>{e.preventDefault();$('song-dropzone').classList.add('drag');});
+$('song-dropzone').addEventListener('dragleave',()=>$('song-dropzone').classList.remove('drag'));
+$('song-dropzone').addEventListener('drop',e=>{e.preventDefault();$('song-dropzone').classList.remove('drag');try{setSelectedSongFile(e.dataTransfer?.files?.[0]||null);}catch(err){notice(err.message,true);}});
+$('song-upload').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy(e.submitter,async()=>{
+    const file=selectedSongFile||$('song-file').files?.[0];
+    if(!file)throw Error('请先选择或拖入音频文件');
+    const title=$('song-title').value.trim();
+    if(!title)throw Error('请填写歌名（1～40字）');
+    const startSec=Number($('song-start').value||'0');
+    const durSec=Number($('song-duration').value||'50');
+    if(!Number.isFinite(startSec)||startSec<0||startSec>600)throw Error('起始秒数须在 0～600 之间');
+    if(!Number.isFinite(durSec)||durSec<5||durSec>58)throw Error('截取时长须在 5～58 秒之间');
+    await songRequest('/upload','POST',file,{
+      'X-Song-Title':encodeURIComponent(title),
+      'X-Song-Artist':encodeURIComponent($('song-artist').value.trim()),
+      'X-Song-Tags':encodeURIComponent($('song-tags').value.trim()),
+      'X-Song-Filename':encodeURIComponent(file.name),
+      'X-Song-Start':String(startSec),
+      'X-Song-Duration':String(durSec),
+    });
+    $('song-file').value='';setSelectedSongFile(null);
+    $('song-title').value='';$('song-artist').value='';$('song-tags').value='';
+    notice('已上传并切片入库：'+title);
+    await songs();
+  });
+});
+
 const modulePage=new Map([...$('platform-nav-group').querySelectorAll('[data-module]')].map(group=>[
   group.dataset.module,group.querySelector('[role=tab]').dataset.tab
 ]));
@@ -5546,7 +5668,7 @@ const tabLoaders={
     if(moderation.status==='rejected')throw moderation.reason;
     if(profiles.status==='rejected'&&profiles.reason.name!=='AbortError')notice('好感度接口暂不可用：'+profiles.reason.message,true);
   },
-  memes, proactive, life, patrol:()=>Promise.all([patrolLimits(),subscriptions()]),
+  memes, songs, proactive, life, patrol:()=>Promise.all([patrolLimits(),subscriptions()]),
   notebook, logs, sandbox:groups
 };
 function refreshTab(key=tab){return tabLoaders[key]();}

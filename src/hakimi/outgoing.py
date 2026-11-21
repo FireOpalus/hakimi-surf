@@ -114,7 +114,9 @@ async def _deliver_voice_or_fallback(
         voice_client is not None
         and supported
         and voice_client.allowed_for_message(message)
-        and voice_client.can_send_now(scope, explicit=explicit_voice)[0]
+        and voice_client.can_send_now(
+            scope, explicit=explicit_voice, is_group=(message.kind == "group")
+        )[0]
     )
 
     fallback_to_text = not eligible
@@ -179,6 +181,117 @@ async def _deliver_voice_or_fallback(
         apply_output=apply_output,
     )
     await acknowledge(voice_text, receipt)
+
+
+async def _deliver_song(
+    service,
+    message: Message,
+    song_title: str,
+    *,
+    anchor: dict,
+    include_anchor: bool,
+    targets,
+    valid: Callable[[], Awaitable[bool]],
+    acknowledge: Callable[[str, dict], Awaitable[None]],
+    before_dispatch: Callable[[], Awaitable[bool]] | None = None,
+    proactive: bool = False,
+    explicit_voice: bool = False,
+    delay_before: bool = False,
+    has_confirmed_before: bool = False,
+    apply_output: bool = True,
+) -> None:
+    if delay_before:
+        if hasattr(service.sender, "typing"):
+            await service.sender.typing(message)
+        await asyncio.sleep(_pacing_delay(service, 1.0))
+
+    song_lib = getattr(service, "songs", None)
+    voice_client = getattr(service, "voice_reply", None)
+    supported, preferred_fmt = _resolve_platform_voice_capability(service, message)
+    scope = service.store.session_scope(message)
+    is_group = message.kind == "group"
+    eligible = (
+        song_lib is not None
+        and voice_client is not None
+        and supported
+        and voice_client.allowed_for_song(message)
+        and voice_client.can_send_now(scope, explicit=explicit_voice, is_group=is_group)[0]
+    )
+
+    fallback_needed = not eligible
+    receipt: dict | None = None
+    if eligible:
+        assert song_lib is not None and voice_client is not None
+        try:
+            (
+                audio_bytes,
+                fmt,
+                mime_type,
+                duration_ms,
+                canonical_title,
+            ) = await song_lib.load_for_delivery(song_title, preferred_fmt=preferred_fmt)
+        except Rejected as exc:
+            if str(exc) in {"song_unavailable", "song_not_found", "song_transcode_failed"}:
+                fallback_needed = True
+            else:
+                raise
+        else:
+            if not await valid():
+                raise Rejected("reply_invalidated")
+            voice_gate = before_dispatch if before_dispatch is not None else valid
+            try:
+                if message.platform == "onebot" and hasattr(service.sender, "send_voice"):
+                    receipt = await service.sender.send_voice(
+                        message,
+                        audio_bytes,
+                        fmt=fmt,
+                        duration_ms=duration_ms,
+                        proactive=proactive,
+                        before_send=voice_gate,
+                    )
+                else:
+                    module = chat_module(service.s, message.platform)
+                    if module is None or not getattr(module, "supports_voice", False):
+                        fallback_needed = True
+                    else:
+                        ident = await module.send_voice(
+                            message,
+                            audio_bytes,
+                            fmt=fmt,
+                            mime_type=mime_type,
+                            duration_ms=duration_ms,
+                            before_send=voice_gate,
+                        )
+                        receipt = {"message_id": confirmed_message_id(ident)}
+            except Rejected as exc:
+                if str(exc) in _VOICE_PRE_DISPATCH_FALLBACK:
+                    fallback_needed = True
+                    receipt = None
+                else:
+                    raise
+
+            if not fallback_needed and receipt is not None:
+                await acknowledge(f"[唱歌：《{canonical_title}》]", receipt)
+                voice_client.note_sent(scope)
+                return
+
+    if has_confirmed_before:
+        return
+    if not await valid():
+        raise Rejected("reply_invalidated")
+    text_gate = before_dispatch if before_dispatch is not None else valid
+    fallback_text = f"刚想给你唱《{song_title}》，结果翻半天没找到伴奏…"
+    receipt = await _send_text_bubble(
+        service,
+        message,
+        fallback_text,
+        anchor=anchor,
+        include_anchor=include_anchor,
+        targets=targets,
+        before_send=text_gate,
+        apply_output=apply_output,
+    )
+    await acknowledge(fallback_text, receipt)
 
 
 def _pacing_delay(service, seconds: float) -> float:
@@ -495,7 +608,8 @@ async def deliver_actions(service, reply):
                 is_public = bool(actions.get("public", message.kind == "group"))
                 has_text_bubbles = any(b.strip() for b in actions.get("bubbles", [])[:3])
                 voice_text = str(actions.get("voice_text") or "").strip()
-                has_reply_body = has_text_bubbles or bool(voice_text)
+                sing_song = str(actions.get("sing_song") or "").strip()
+                has_reply_body = has_text_bubbles or bool(voice_text) or bool(sing_song)
                 if message.platform == "onebot":
                     force_sticker = (not has_reply_body and bool(label)) or explicit_meme_request(
                         *(m.text for m in members), message.text
@@ -581,7 +695,23 @@ async def deliver_actions(service, reply):
                             before_send=valid,
                         )
                         await acknowledge(text, receipt)
-                if voice_text:
+                if sing_song:
+                    had_confirmed = bool(confirmed)
+                    await _deliver_song(
+                        service,
+                        message,
+                        sing_song,
+                        anchor=anchor,
+                        include_anchor=not had_confirmed,
+                        targets=targets,
+                        valid=valid,
+                        acknowledge=acknowledge,
+                        proactive=bool(reply.get("proactive")),
+                        explicit_voice=bool(actions.get("explicit_voice")),
+                        delay_before=had_confirmed,
+                        has_confirmed_before=had_confirmed,
+                    )
+                elif voice_text:
                     await _deliver_voice_or_fallback(
                         service,
                         message,
@@ -690,14 +820,24 @@ async def deliver_proactive_jit(
     anchor_dict: dict = {"reply_id": None, "mentions": []}
     bubbles: list[str] = []
     voice_text: str | None = None
+    sing_song: str | None = None
 
+    song_lib = getattr(service, "songs", None)
     voice_client = getattr(service, "voice_reply", None)
     voice_supported, _ = _resolve_platform_voice_capability(service, message)
-    allow_voice_proactive = (
+    proactive_cooldown_ok = (
         voice_client is not None
         and voice_supported
-        and voice_client.allowed_for_message(message)
-        and voice_client.can_send_now(service.store.session_scope(message), explicit=False)[0]
+        and voice_client.can_send_now(
+            service.store.session_scope(message), explicit=False, is_group=is_group
+        )[0]
+    )
+    allow_voice_proactive = proactive_cooldown_ok and voice_client.allowed_for_message(message)
+    allow_sing_song_proactive = (
+        proactive_cooldown_ok
+        and song_lib is not None
+        and bool(song_lib.titles)
+        and voice_client.allowed_for_song(message)
     )
 
     if raw.lstrip().startswith("{"):
@@ -714,11 +854,14 @@ async def deliver_proactive_jit(
             allow_longnick=False,
             allow_sticker=False,
             allow_voice=allow_voice_proactive,
+            allow_sing_song=allow_sing_song_proactive,
+            song_titles=song_lib.titles if song_lib is not None else (),
         )
         abstain = bool(actions.abstain)
         emoji_like = actions.emoji_like
         poke_qq = actions.poke_qq
         voice_text = actions.voice_text if not abstain else None
+        sing_song = actions.sing_song if not abstain else None
         anchor_dict = {"reply_id": None, "mentions": list(actions.anchor.mentions)}
         if not abstain:
             for item in actions.bubbles[:3]:
@@ -752,7 +895,11 @@ async def deliver_proactive_jit(
         and hasattr(service.sender, "send_poke")
     )
 
-    if (abstain or (not bubbles and not voice_text)) and not can_emoji and not can_poke:
+    if (
+        (abstain or (not bubbles and not voice_text and not sing_song))
+        and not can_emoji
+        and not can_poke
+    ):
         return {"status": "abstained", "bubbles_sent": 0}
 
     identity = getattr(service, "identity", None)
@@ -778,7 +925,9 @@ async def deliver_proactive_jit(
     if intent_id is not None:
         # Only an entirely text-based dispatch can be recovered from bubble ACKs alone.
         expected = (
-            (len(bubbles) + (1 if voice_text else 0)) if not (can_emoji or can_poke) else None
+            (len(bubbles) + (1 if (sing_song or voice_text) else 0))
+            if not (can_emoji or can_poke)
+            else None
         )
         async with service.store.transaction():
             cur = await service.store.db.execute(
@@ -853,7 +1002,7 @@ async def deliver_proactive_jit(
             confirmed.append(data)
             position += 1
 
-        if voice_text:
+        if sing_song or voice_text:
 
             async def ack_voice(ack_text: str, ack_receipt: dict) -> None:
                 nonlocal position, dispatched
@@ -866,21 +1015,40 @@ async def deliver_proactive_jit(
                 confirmed.append(data)
                 position += 1
 
-            await _deliver_voice_or_fallback(
-                service,
-                message,
-                voice_text,
-                anchor=anchor_dict,
-                include_anchor=not confirmed,
-                targets=targets,
-                valid=valid,
-                acknowledge=ack_voice,
-                before_dispatch=before_bubble_send,
-                proactive=True,
-                explicit_voice=False,
-                delay_before=bool(confirmed),
-                apply_output=False,
-            )
+            if sing_song:
+                had_confirmed = bool(confirmed)
+                await _deliver_song(
+                    service,
+                    message,
+                    sing_song,
+                    anchor=anchor_dict,
+                    include_anchor=not had_confirmed,
+                    targets=targets,
+                    valid=valid,
+                    acknowledge=ack_voice,
+                    before_dispatch=before_bubble_send,
+                    proactive=True,
+                    explicit_voice=False,
+                    delay_before=had_confirmed,
+                    has_confirmed_before=had_confirmed,
+                    apply_output=False,
+                )
+            elif voice_text:
+                await _deliver_voice_or_fallback(
+                    service,
+                    message,
+                    voice_text,
+                    anchor=anchor_dict,
+                    include_anchor=not confirmed,
+                    targets=targets,
+                    valid=valid,
+                    acknowledge=ack_voice,
+                    before_dispatch=before_bubble_send,
+                    proactive=True,
+                    explicit_voice=False,
+                    delay_before=bool(confirmed),
+                    apply_output=False,
+                )
 
         if can_emoji:
             try:

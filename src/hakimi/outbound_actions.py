@@ -132,6 +132,7 @@ class ChatActions(BaseModel):
     affection_deltas: list[AffectionTargetDelta] | None = None
     trigger_action: ChatActionTrigger | None = None
     voice_text: str | None = None
+    sing_song: str | None = None
 
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
@@ -292,6 +293,8 @@ def parse_actions(
     allow_owner_chat_actions: bool = False,
     allowed_owner_chat_actions: Iterable[str] | None = None,
     allow_voice: bool = False,
+    allow_sing_song: bool = False,
+    song_titles: Iterable[str] = (),
 ):
     try:
         value = json.loads(raw)
@@ -358,7 +361,20 @@ def parse_actions(
         allowed_actions=allowed_owner_chat_actions,
         settings=settings,
     )
-    if allow_voice and not actions.abstain and actions.voice_text:
+    normalized_song: str | None = None
+    if allow_sing_song and not actions.abstain and isinstance(actions.sing_song, str):
+        raw_song = " ".join(clean_text(actions.sing_song).split()).strip()
+        if raw_song:
+            title_lookup: dict[str, str] = {}
+            for title in song_titles:
+                if isinstance(title, str) and title:
+                    title_lookup.setdefault(title.casefold(), title)
+            normalized_song = next(
+                (t for t in song_titles if t == raw_song), None
+            ) or title_lookup.get(raw_song.casefold())
+    actions.sing_song = normalized_song
+
+    if allow_voice and not actions.abstain and actions.voice_text and actions.sing_song is None:
         max_voice_chars = (
             int(getattr(settings, "voice_reply_max_chars", 120)) if settings is not None else 120
         )

@@ -17,6 +17,7 @@ def content_security_policy(html: str) -> str:
     directives += [
         "connect-src 'self'",
         "img-src blob:",
+        "media-src blob:",
         "base-uri 'none'",
         "frame-ancestors 'none'",
         "form-action 'none'",

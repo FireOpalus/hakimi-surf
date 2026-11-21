@@ -60,6 +60,7 @@ from .security import Rejected, authorize, configured_secrets, owner, safe_outpu
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
 from .social import chat_module, confirmed_message_id
+from .songs import SongLibrary, explicit_song_request
 from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
@@ -171,6 +172,8 @@ class Service:
         self.video_watch = VideoWatch(self)
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
+        self.songs = SongLibrary(store)
+        store.runtime.songs = self.songs
         self._lurk_react_at: dict[str, float] = {}
         self._last_aff_recovery_at: float = 0.0
         self.modules = ModuleRegistry(owner_delivery=self.proactive)
@@ -2079,7 +2082,9 @@ class Service:
                 payload["file_attachments"] = file_attachments
         owner_chat_actions: list[dict[str, Any]] = []
         allow_voice = False
+        allow_sing_song = False
         explicit_voice = False
+        explicit_voice_bypass = False
         verified_owner_turn = owner(message, self.s) and all(owner(m, self.s) for m in members)
         if not sandbox:
             related_user_ids = [
@@ -2156,17 +2161,36 @@ class Service:
                 if owner_chat_actions:
                     payload["owner_chat_actions"] = owner_chat_actions
             voice_supported, _ = self.platform_voice_capability(message)
+            voice_aff_ok = (not aff_active) or caps.allow_sticker
             explicit_voice = explicit_voice_request(*(m.text for m in members), message.text)
+            explicit_song = explicit_song_request(*(m.text for m in members), message.text)
+            explicit_voice_bypass = (explicit_voice or explicit_song) and (
+                message.kind == "private" or verified_owner_turn
+            )
+            is_group_msg = message.kind == "group"
+            scope = self.store.session_scope(message)
+            cooldown_ok = self.voice_reply.can_send_now(
+                scope, explicit=explicit_voice_bypass, is_group=is_group_msg
+            )[0]
             allow_voice = (
                 voice_supported
                 and not self.bot_guard.known_bot(message)
+                and voice_aff_ok
                 and self.voice_reply.allowed_for_message(message, sandbox=sandbox)
-                and self.voice_reply.can_send_now(
-                    self.store.session_scope(message), explicit=explicit_voice
-                )[0]
+                and cooldown_ok
+            )
+            allow_sing_song = (
+                voice_supported
+                and not self.bot_guard.known_bot(message)
+                and voice_aff_ok
+                and bool(self.songs.titles)
+                and self.voice_reply.allowed_for_song(message, sandbox=sandbox)
+                and cooldown_ok
             )
             if allow_voice:
                 payload["voice_reply_available"] = True
+            if allow_sing_song:
+                payload["song_catalog"] = self.songs.catalog_entries()
         context_members = list(members)
         if message.kind == "group":
             context_members.extend(neighbour_members if images else [])
@@ -2455,6 +2479,10 @@ class Service:
                     extra_parse_kwargs["allowed_owner_chat_actions"] = allowed_owner_action_names
                 if has_varkw or "allow_voice" in parse_params:
                     extra_parse_kwargs["allow_voice"] = allow_voice
+                if has_varkw or "allow_sing_song" in parse_params:
+                    extra_parse_kwargs["allow_sing_song"] = allow_sing_song
+                if has_varkw or "song_titles" in parse_params:
+                    extra_parse_kwargs["song_titles"] = self.songs.titles
                 actions, folded = parse_actions(
                     generated,
                     public=public,
@@ -2518,6 +2546,7 @@ class Service:
                         actions.emoji_like = None
                         actions.poke_qq = None
                         actions.voice_text = None
+                        actions.sing_song = None
                         folded = None
                 if not sandbox and not actions.abstain and not farewell_bypass:
                     if (
@@ -2605,7 +2634,11 @@ class Service:
                         "source_ids": [m.event_id for m in members],
                         "public": public,
                         "allow_text_card": allow_text_card,
-                        **({"explicit_voice": explicit_voice} if actions.voice_text else {}),
+                        **(
+                            {"explicit_voice": explicit_voice_bypass}
+                            if (actions.voice_text or actions.sing_song)
+                            else {}
+                        ),
                         **({"farewell_bypass_mute": True} if farewell_bypass else {}),
                         **(
                             {"farewell_bypass_user_ids": farewell_bypass_user_ids}
@@ -2631,7 +2664,8 @@ class Service:
                         message,
                         " ".join(b.strip() for b in actions.bubbles if b.strip())
                         or (folded or "")
-                        or (actions.voice_text or ""),
+                        or (actions.voice_text or "")
+                        or (f"[唱歌] {actions.sing_song}" if actions.sing_song else ""),
                     )
                 await self.store.runtime.filters.update_audit(audit_id, "queued")
                 return
