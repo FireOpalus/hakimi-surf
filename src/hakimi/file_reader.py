@@ -19,8 +19,10 @@ from .models import FileRef, Message
 from .security import Rejected, authorize, clean_text, configured_secrets
 
 MAX_FILE_HARD_BYTES = 262_144
+MAX_AUDIO_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_EXCERPT_CHARS = 3200
 HTTP_TIMEOUT = 12
+ALLOWED_AUDIO_EXTENSIONS = frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"})
 ALLOWED_TEXT_EXTENSIONS = frozenset(
     {
         ".txt",
@@ -90,6 +92,16 @@ def _allowed_filename(name: str) -> bool:
         return True
     suffix = PurePosixPath(clean).suffix.lower()
     return suffix in ALLOWED_TEXT_EXTENSIONS
+
+
+def _sanitize_audio_filename(name: str) -> str | None:
+    clean = PurePosixPath(str(name or "").replace("\\", "/")).name.strip()
+    if not clean or clean in {".", ".."} or any(ord(ch) < 32 for ch in clean):
+        return None
+    suffix = PurePosixPath(clean.lower()).suffix
+    if suffix not in ALLOWED_AUDIO_EXTENSIONS:
+        return None
+    return clean[:120]
 
 
 def _public_download_url(url: str) -> str | None:
@@ -386,3 +398,39 @@ class FileReader:
             if selected_members is not None:
                 selected_members.append(owner_msg)
         return attachments, sources
+
+    async def read_audio_attachment(
+        self,
+        ref: FileRef,
+        context_msg: Message,
+        *,
+        max_bytes: int = MAX_AUDIO_ATTACHMENT_BYTES,
+    ) -> tuple[bytes, str]:
+        """Download a bounded audio attachment using strict extension & SSRF checks."""
+        if not isinstance(ref, FileRef):
+            raise Rejected("invalid_song_audio")
+        filename = _sanitize_audio_filename(self._display_name(ref))
+        if not filename:
+            raise Rejected("invalid_song_audio")
+        if isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise Rejected("oversized")
+        maximum = min(int(max_bytes), MAX_AUDIO_ATTACHMENT_BYTES * 2)
+        if ref.file_size is not None and ref.file_size > maximum:
+            raise Rejected("oversized")
+
+        raw, urls = await self._via_transport(ref, context_msg, maximum)
+        if raw is None:
+            url = next(iter(urls), _public_download_url(ref.url) if ref.url else None)
+            if not url:
+                raise Rejected("unavailable")
+            try:
+                raw = await self._download_http(url, maximum)
+            except Rejected:
+                raise
+            except (TimeoutError, aiohttp.ClientError, OSError, ValueError):
+                raise Rejected("unavailable") from None
+        if not raw:
+            raise Rejected("unavailable")
+        if len(raw) > maximum:
+            raise Rejected("oversized")
+        return raw, filename

@@ -14,7 +14,7 @@ class Module(SystemModule):
         "为桌面端与第三方语音软件提供统一的实时语音对话、流式口播分句与记忆沉淀中枢；"
         "Owner 连麦时自动联动屏幕伴看。"
     )
-    requires = ("event_ledger", "owner_notebook", "screen_watch")
+    requires = ("event_ledger", "owner_notebook", "screen_watch", "voice_gateway")
     admin_panel = "voice-companion"
     thinking_scenes = (
         ThinkingScene(

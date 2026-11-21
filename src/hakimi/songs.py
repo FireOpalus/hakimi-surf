@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 import os
 import re
@@ -18,17 +19,32 @@ from typing import Any
 
 from .security import Rejected, clean_text
 
+log = logging.getLogger("hakimi")
+
 MAX_SONG_UPLOAD_BYTES = 12 * 1024 * 1024
+MAX_LEARN_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_STORED_SONG_BYTES = 1_800_000
 MAX_SONG_DURATION_SECONDS = 58.0
 MIN_SONG_DURATION_MS = 1000
 MAX_SONGS = 100
 MAX_SONG_LIBRARY_BYTES = 100 * 1024 * 1024
 MAX_PROMPT_SONGS = 40
+DEFAULT_SONG_CACHE_MAX_BYTES = 30 * 1024 * 1024
+CACHE_EVICT_INTERVAL_SECONDS = 1800.0
+MIN_SONG_PITCH = -24
+MAX_SONG_PITCH = 24
 
 SONG_TITLE_RE = re.compile(r"^[A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff（）()·\s]{1,40}\Z")
 SONG_ID_RE = re.compile(r"^[a-f0-9]{32}\Z")
 ALLOWED_SONG_EXTENSIONS = frozenset({"mp3", "wav", "ogg", "opus", "m4a", "flac"})
+MIME_BY_SONG_EXTENSION = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "opus": "audio/opus",
+    "m4a": "audio/mp4",
+    "flac": "audio/flac",
+}
 ALLOWED_SONG_MIMES = frozenset(
     {
         "audio/mpeg",
@@ -61,9 +77,20 @@ CREATE TABLE IF NOT EXISTS song_library (
   digest TEXT UNIQUE NOT NULL,
   byte_size INTEGER NOT NULL,
   duration_ms INTEGER NOT NULL,
-  created REAL NOT NULL
+  created REAL NOT NULL,
+  drive_chorus_id TEXT NOT NULL DEFAULT '',
+  drive_full_id TEXT NOT NULL DEFAULT '',
+  source_origin TEXT NOT NULL DEFAULT 'local',
+  last_used_at REAL NOT NULL DEFAULT 0
 );
 """
+
+_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("drive_chorus_id", "TEXT NOT NULL DEFAULT ''"),
+    ("drive_full_id", "TEXT NOT NULL DEFAULT ''"),
+    ("source_origin", "TEXT NOT NULL DEFAULT 'local'"),
+    ("last_used_at", "REAL NOT NULL DEFAULT 0"),
+)
 
 
 def explicit_song_request(*texts: str) -> bool:
@@ -87,6 +114,67 @@ def validate_song_meta(raw: str | None, *, max_len: int) -> str:
         return ""
     cleaned = " ".join(clean_text(raw).split()).strip()
     return cleaned[:max_len].strip()
+
+
+def validate_song_pitch(pitch: Any) -> int:
+    """Validate RVC semitone pitch shift within [-24, 24]."""
+    if isinstance(pitch, bool) or not isinstance(pitch, int):
+        raise Rejected("invalid_song_pitch")
+    if pitch < MIN_SONG_PITCH or pitch > MAX_SONG_PITCH:
+        raise Rejected("invalid_song_pitch")
+    return pitch
+
+
+def _sanitize_drive_id(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise Rejected("invalid_drive_file_id")
+    cleaned = clean_text(raw).strip()
+    if not cleaned:
+        return ""
+    if (
+        len(cleaned) > 256
+        or any(ch.isspace() for ch in cleaned)
+        or "/" in cleaned
+        or "\\" in cleaned
+        or ".." in cleaned
+    ):
+        raise Rejected("invalid_drive_file_id")
+    return cleaned
+
+
+def _sanitize_inbox_filename(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise Rejected("invalid_song_audio")
+    cleaned = clean_text(raw).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) > 200 or "/" in cleaned or "\\" in cleaned or ".." in cleaned:
+        raise Rejected("invalid_song_audio")
+    return cleaned
+
+
+def _safe_learn_upload_name(audio_filename: str, fallback_title: str) -> tuple[str, str]:
+    raw_name = clean_text(audio_filename).strip() if isinstance(audio_filename, str) else ""
+    base = Path(raw_name).name if raw_name else ""
+    ext = "mp3"
+    stem_raw = fallback_title
+    if base:
+        stem_part, dot, ext_part = base.rpartition(".")
+        if dot:
+            lowered = ext_part.lower()
+            if lowered not in ALLOWED_SONG_EXTENSIONS:
+                raise Rejected("invalid_song_audio")
+            ext = lowered
+            stem_raw = stem_part or fallback_title
+        else:
+            stem_raw = base
+    safe_stem = re.sub(r"[^A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff]+", "_", stem_raw).strip("_")
+    safe_stem = (safe_stem or "track")[:60]
+    return f"{safe_stem}.{ext}", MIME_BY_SONG_EXTENSION.get(ext, "application/octet-stream")
 
 
 def validate_clip_window(start_sec: float, duration_sec: float) -> tuple[float, float]:
@@ -300,7 +388,7 @@ async def transcode_mp3_to_ogg_opus(
 
 
 class SongLibrary:
-    """Locally administered pre-recorded cover songbook stored under data_dir/songs."""
+    """Cover songbook backed by SQLite metadata, Google Drive storage, and a bounded local cache."""
 
     def __init__(
         self,
@@ -308,16 +396,22 @@ class SongLibrary:
         *,
         ffmpeg_bin: str = "ffmpeg",
         ffprobe_bin: str = "ffprobe",
+        compute: Any | None = None,
+        settings: Any | None = None,
     ) -> None:
         self.store = store
-        self.root = store.s.data_dir / "songs"
+        self.settings = settings if settings is not None else getattr(store, "s", None)
+        data_dir = Path(getattr(self.settings, "data_dir", None) or store.s.data_dir)
+        self.root = data_dir / "songs"
         self.ffmpeg_bin = ffmpeg_bin
         self.ffprobe_bin = ffprobe_bin
+        self.compute = compute
         self.lock = asyncio.Lock()
         self.init_lock = asyncio.Lock()
         self.decode_slots = asyncio.Semaphore(1)
         self.initialized = False
         self._entries: dict[str, dict[str, Any]] = {}
+        self._download_locks: dict[str, asyncio.Lock] = {}
         self.titles: tuple[str, ...] = ()
 
     @contextmanager
@@ -330,8 +424,24 @@ class SongLibrary:
         finally:
             os.close(fd)
 
+    def _compute_configured(self) -> bool:
+        if self.compute is None:
+            return False
+        fn = getattr(self.compute, "configured", None)
+        return bool(fn()) if callable(fn) else True
+
+    def _cache_max_bytes(self) -> int:
+        raw = getattr(self.settings, "song_cache_max_bytes", None)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            return raw
+        return DEFAULT_SONG_CACHE_MAX_BYTES
+
     @staticmethod
     def _valid_entry(row: dict[str, Any]) -> bool:
+        drive_chorus_id = row.get("drive_chorus_id", "")
+        drive_full_id = row.get("drive_full_id", "")
+        source_origin = row.get("source_origin", "local")
+        last_used_at = row.get("last_used_at", 0.0)
         return (
             isinstance(row.get("id"), str)
             and bool(SONG_ID_RE.fullmatch(row["id"]))
@@ -342,9 +452,17 @@ class SongLibrary:
             and isinstance(row.get("digest"), str)
             and bool(re.fullmatch(r"[a-f0-9]{64}", row["digest"]))
             and isinstance(row.get("byte_size"), int)
+            and not isinstance(row.get("byte_size"), bool)
             and 0 < row["byte_size"] <= MAX_STORED_SONG_BYTES
             and isinstance(row.get("duration_ms"), int)
+            and not isinstance(row.get("duration_ms"), bool)
             and MIN_SONG_DURATION_MS <= row["duration_ms"] <= 60_000
+            and isinstance(drive_chorus_id, str)
+            and isinstance(drive_full_id, str)
+            and isinstance(source_origin, str)
+            and isinstance(last_used_at, (int, float))
+            and not isinstance(last_used_at, bool)
+            and math.isfinite(float(last_used_at))
         )
 
     def _read(self, entry: dict[str, Any]) -> bytes:
@@ -388,13 +506,37 @@ class SongLibrary:
                 os.unlink(filename, dir_fd=directory)
                 raise
 
-    def _unlink(self, filename: str) -> None:
+    def _write_atomic(self, filename: str, raw: bytes) -> None:
+        tmp_name = f".tmp-{uuid.uuid4().hex}"
+        with self._directory() as directory:
+            fd = os.open(
+                tmp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory,
+            )
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    output.write(raw)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(tmp_name, filename, src_dir_fd=directory, dst_dir_fd=directory)
+                os.fsync(directory)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+                raise
+
+    def _unlink(self, filename: str) -> bool:
         with self._directory() as directory:
             try:
                 os.unlink(filename, dir_fd=directory)
                 os.fsync(directory)
+                return True
             except FileNotFoundError:
-                pass
+                return False
 
     def _refresh_titles(self) -> None:
         self.titles = tuple(sorted(e["title"] for e in self._entries.values()))
@@ -402,9 +544,99 @@ class SongLibrary:
     @staticmethod
     def _public(entry: dict[str, Any]) -> dict[str, Any]:
         return {
-            key: entry[key]
-            for key in ("id", "title", "artist", "tags", "byte_size", "duration_ms", "created")
+            "id": entry["id"],
+            "title": entry["title"],
+            "artist": entry["artist"],
+            "tags": entry["tags"],
+            "byte_size": entry["byte_size"],
+            "duration_ms": entry["duration_ms"],
+            "created": entry["created"],
+            "cached_local": bool(entry.get("cached_local", False)),
+            "drive_backed": bool(entry.get("drive_chorus_id")),
+            "drive_full_backed": bool(entry.get("drive_full_id")),
+            "source_origin": str(entry.get("source_origin") or "local"),
         }
+
+    def cache_stats(self) -> dict[str, Any]:
+        """Return non-blocking in-memory statistics for Drive backup and local LRU cache."""
+        drive_entries = [e for e in self._entries.values() if e.get("drive_chorus_id")]
+        cached_drive = [e for e in drive_entries if e.get("cached_local")]
+        return {
+            "cache_bytes": sum(int(e["byte_size"]) for e in cached_drive),
+            "cache_max_bytes": self._cache_max_bytes(),
+            "cached_count": len(cached_drive),
+            "drive_backed_count": len(drive_entries),
+            "colab_configured": self._compute_configured(),
+        }
+
+    async def _evict_cache_locked(
+        self,
+        *,
+        target_bytes: int | None = None,
+        keep_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        limit = self._cache_max_bytes() if target_bytes is None else max(0, int(target_bytes))
+        drive_cached = [
+            e for e in self._entries.values() if e.get("drive_chorus_id") and e.get("cached_local")
+        ]
+        cache_bytes = sum(int(e["byte_size"]) for e in drive_cached)
+        evicted_count = 0
+        freed_bytes = 0
+
+        if cache_bytes > limit:
+            candidates = sorted(
+                (e for e in drive_cached if not keep_ids or e["id"] not in keep_ids),
+                key=lambda e: (
+                    float(e.get("last_used_at") or 0.0),
+                    float(e.get("created") or 0.0),
+                    e["id"],
+                ),
+            )
+            for entry in candidates:
+                if cache_bytes <= limit:
+                    break
+                removed = await asyncio.to_thread(self._unlink, entry["filename"])
+                entry["cached_local"] = False
+                size = int(entry["byte_size"])
+                cache_bytes -= size
+                evicted_count += 1
+                if removed:
+                    freed_bytes += size
+
+        cached_count = sum(
+            1 for e in self._entries.values() if e.get("drive_chorus_id") and e.get("cached_local")
+        )
+        return {
+            "evicted_count": evicted_count,
+            "freed_bytes": freed_bytes,
+            "cache_bytes": cache_bytes,
+            "cache_max_bytes": self._cache_max_bytes(),
+            "cached_count": cached_count,
+        }
+
+    async def evict_cache(self, *, target_bytes: int | None = None) -> dict[str, Any]:
+        """Evict least-recently-used local cache files for Drive-backed songs only."""
+        if target_bytes is not None and (
+            isinstance(target_bytes, bool) or not isinstance(target_bytes, int) or target_bytes < 0
+        ):
+            raise Rejected("invalid_admin_input")
+        await self.initialize()
+        async with self.lock:
+            return await self._evict_cache_locked(target_bytes=target_bytes)
+
+    async def run_cache_evictor(
+        self, *, interval_seconds: float = CACHE_EVICT_INTERVAL_SECONDS
+    ) -> None:
+        """Periodically enforce the bounded local LRU cache without removing Drive songs."""
+        while True:
+            try:
+                await self.evict_cache()
+                await asyncio.sleep(interval_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("event=song_cache_evict_failed")
+                await asyncio.sleep(interval_seconds)
 
     async def initialize(self) -> None:
         async with self.init_lock:
@@ -414,6 +646,13 @@ class SongLibrary:
                 pass
             async with self.store.lock:
                 await self.store.db.executescript(SCHEMA)
+            async with self.store.transaction():
+                cols = {r["name"] for r in await self.store.all("PRAGMA table_info(song_library)")}
+                for col_name, col_def in _MIGRATION_COLUMNS:
+                    if col_name not in cols:
+                        await self.store.db.execute(
+                            f"ALTER TABLE song_library ADD COLUMN {col_name} {col_def}"
+                        )
                 rows = await self.store.all(
                     "SELECT * FROM song_library ORDER BY created ASC, title ASC LIMIT 105"
                 )
@@ -421,6 +660,13 @@ class SongLibrary:
             stale_ids: list[str] = []
             for row in rows:
                 item = dict(row)
+                item["drive_chorus_id"] = str(item.get("drive_chorus_id") or "").strip()
+                item["drive_full_id"] = str(item.get("drive_full_id") or "").strip()
+                item["source_origin"] = str(item.get("source_origin") or "local").strip() or "local"
+                try:
+                    item["last_used_at"] = float(item.get("last_used_at") or 0.0)
+                except (TypeError, ValueError):
+                    item["last_used_at"] = 0.0
                 if not self._valid_entry(item):
                     if isinstance(item.get("id"), str):
                         stale_ids.append(item["id"])
@@ -428,8 +674,15 @@ class SongLibrary:
                 try:
                     await asyncio.to_thread(self._read, item)
                 except (OSError, Rejected):
-                    stale_ids.append(item["id"])
+                    if item["drive_chorus_id"]:
+                        # Keep Drive-backed entries indexed even when local cache is absent/evicted.
+                        await asyncio.to_thread(self._unlink, item["filename"])
+                        item["cached_local"] = False
+                        valid[item["id"]] = item
+                    else:
+                        stale_ids.append(item["id"])
                     continue
+                item["cached_local"] = True
                 valid[item["id"]] = item
             if stale_ids:
                 async with self.store.transaction():
@@ -482,6 +735,31 @@ class SongLibrary:
                 )
             ]
 
+    async def _insert_entry_tx(self, entry: dict[str, Any]) -> None:
+        await self.store.db.execute(
+            "INSERT INTO song_library ("
+            "id, title, artist, tags, filename, mime_type, digest, byte_size, "
+            "duration_ms, created, drive_chorus_id, drive_full_id, "
+            "source_origin, last_used_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                entry["id"],
+                entry["title"],
+                entry["artist"],
+                entry["tags"],
+                entry["filename"],
+                entry["mime_type"],
+                entry["digest"],
+                entry["byte_size"],
+                entry["duration_ms"],
+                entry["created"],
+                entry["drive_chorus_id"],
+                entry["drive_full_id"],
+                entry["source_origin"],
+                entry["last_used_at"],
+            ),
+        )
+
     async def upload(
         self,
         title: str,
@@ -530,6 +808,7 @@ class SongLibrary:
 
             song_id = uuid.uuid4().hex
             stored_filename = f"{song_id}.mp3"
+            now = time.time()
             entry: dict[str, Any] = {
                 "id": song_id,
                 "title": clean_title,
@@ -540,29 +819,17 @@ class SongLibrary:
                 "digest": normalized.digest,
                 "byte_size": len(normalized.data),
                 "duration_ms": normalized.duration_ms,
-                "created": time.time(),
+                "created": now,
+                "drive_chorus_id": "",
+                "drive_full_id": "",
+                "source_origin": "local",
+                "last_used_at": now,
+                "cached_local": True,
             }
             self._write(stored_filename, normalized.data)
             try:
                 async with self.store.transaction():
-                    await self.store.db.execute(
-                        "INSERT INTO song_library ("
-                        "id, title, artist, tags, filename, mime_type, digest, byte_size, "
-                        "duration_ms, created"
-                        ") VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            entry["id"],
-                            entry["title"],
-                            entry["artist"],
-                            entry["tags"],
-                            entry["filename"],
-                            entry["mime_type"],
-                            entry["digest"],
-                            entry["byte_size"],
-                            entry["duration_ms"],
-                            entry["created"],
-                        ),
-                    )
+                    await self._insert_entry_tx(entry)
             except BaseException:
                 self._unlink(stored_filename)
                 raise
@@ -570,19 +837,259 @@ class SongLibrary:
             self._refresh_titles()
             return self._public(entry)
 
+    async def register_colab_cover(
+        self,
+        *,
+        title: str,
+        artist: str = "",
+        tags: str = "",
+        digest: str,
+        byte_size: int,
+        duration_ms: int,
+        drive_chorus_id: str,
+        drive_full_id: str = "",
+        chorus_bytes: bytes | None = None,
+        replace: bool = True,
+    ) -> dict[str, Any]:
+        """Register or replace a Drive-backed Colab RVC cover in the songbook."""
+        clean_title = validate_song_title(title)
+        clean_artist = validate_song_meta(artist, max_len=40)
+        clean_tags = validate_song_meta(tags, max_len=80)
+        clean_digest = str(digest).strip().lower() if isinstance(digest, str) else ""
+        if not re.fullmatch(r"[a-f0-9]{64}", clean_digest):
+            raise Rejected("invalid_song_audio")
+        if (
+            isinstance(byte_size, bool)
+            or not isinstance(byte_size, int)
+            or byte_size <= 0
+            or byte_size > MAX_STORED_SONG_BYTES
+        ):
+            raise Rejected("invalid_song_audio")
+        if (
+            isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, int)
+            or duration_ms < MIN_SONG_DURATION_MS
+            or duration_ms > 60_000
+        ):
+            raise Rejected("invalid_song_duration")
+        clean_chorus_id = _sanitize_drive_id(drive_chorus_id)
+        if not clean_chorus_id:
+            raise Rejected("invalid_drive_file_id")
+        clean_full_id = _sanitize_drive_id(drive_full_id)
+
+        validated_bytes: bytes | None = None
+        if chorus_bytes is not None:
+            if not isinstance(chorus_bytes, (bytes, bytearray)) or not chorus_bytes:
+                raise Rejected("invalid_song_audio")
+            validated_bytes = bytes(chorus_bytes)
+            if (
+                len(validated_bytes) != byte_size
+                or len(validated_bytes) > MAX_STORED_SONG_BYTES
+                or not _is_valid_mp3_bytes(validated_bytes)
+                or hashlib.sha256(validated_bytes).hexdigest() != clean_digest
+            ):
+                raise Rejected("invalid_song_audio")
+
+        await self.initialize()
+        async with self.lock:
+            folded = clean_title.casefold()
+            existing = next(
+                (e for e in self._entries.values() if e["title"].casefold() == folded),
+                None,
+            )
+            if existing is not None and not replace:
+                raise Rejected("song_title_exists")
+            if any(
+                e["digest"] == clean_digest and e is not existing for e in self._entries.values()
+            ):
+                raise Rejected("song_already_exists")
+            if existing is None and len(self._entries) >= MAX_SONGS:
+                raise Rejected("song_library_full")
+
+            song_id = uuid.uuid4().hex
+            stored_filename = f"{song_id}.mp3"
+            now = time.time()
+            entry: dict[str, Any] = {
+                "id": song_id,
+                "title": clean_title,
+                "artist": clean_artist,
+                "tags": clean_tags,
+                "filename": stored_filename,
+                "mime_type": "audio/mpeg",
+                "digest": clean_digest,
+                "byte_size": byte_size,
+                "duration_ms": duration_ms,
+                "created": now,
+                "drive_chorus_id": clean_chorus_id,
+                "drive_full_id": clean_full_id,
+                "source_origin": "colab",
+                "last_used_at": now if validated_bytes is not None else 0.0,
+                "cached_local": validated_bytes is not None,
+            }
+
+            if validated_bytes is not None:
+                await asyncio.to_thread(self._write_atomic, stored_filename, validated_bytes)
+
+            try:
+                async with self.store.transaction():
+                    if existing is not None:
+                        await self.store.db.execute(
+                            "DELETE FROM song_library WHERE id=?", (existing["id"],)
+                        )
+                    await self._insert_entry_tx(entry)
+            except BaseException:
+                if validated_bytes is not None:
+                    await asyncio.to_thread(self._unlink, stored_filename)
+                raise
+
+            if existing is not None:
+                self._entries.pop(existing["id"], None)
+                self._download_locks.pop(existing["id"], None)
+                await asyncio.to_thread(self._unlink, existing["filename"])
+
+            self._entries[song_id] = entry
+            self._refresh_titles()
+            if validated_bytes is not None:
+                await self._evict_cache_locked(keep_ids={song_id})
+            return self._public(entry)
+
+    async def request_learn_song(
+        self,
+        title: str,
+        *,
+        artist: str = "",
+        tags: str = "",
+        pitch: int = 0,
+        audio_bytes: bytes | None = None,
+        audio_filename: str = "",
+        inbox_filename: str = "",
+        inbox_file_id: str = "",
+        auto_search: bool = True,
+        requester: str = "owner",
+    ) -> dict[str, Any]:
+        """Submit an asynchronous Colab RVC cover job via upload, Drive inbox, or auto-search."""
+        clean_title = validate_song_title(title)
+        clean_artist = validate_song_meta(artist, max_len=40)
+        clean_tags = validate_song_meta(tags, max_len=80)
+        clean_pitch = validate_song_pitch(pitch)
+        if not self._compute_configured():
+            raise Rejected("colab_unconfigured")
+        await self.initialize()
+
+        payload: dict[str, Any] = {
+            "title": clean_title,
+            "artist": clean_artist,
+            "tags": clean_tags,
+            "pitch": clean_pitch,
+        }
+
+        if audio_bytes is not None:
+            if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
+                raise Rejected("invalid_song_audio")
+            raw = bytes(audio_bytes)
+            if len(raw) > MAX_LEARN_UPLOAD_BYTES:
+                raise Rejected("song_upload_too_large")
+            safe_name, mime_type = _safe_learn_upload_name(audio_filename, clean_title)
+            uploaded = await self.compute.upload_drive_inbox(safe_name, raw, mime_type=mime_type)
+            raw_file_id = uploaded.get("file_id") if isinstance(uploaded, dict) else ""
+            file_id = _sanitize_drive_id(raw_file_id)
+            if not file_id:
+                raise Rejected("colab_drive_invalid_file")
+            payload["inbox_file_id"] = file_id
+            payload["inbox_filename"] = str(uploaded.get("name") or safe_name)
+            payload["auto_search"] = False
+        else:
+            clean_inbox_name = _sanitize_inbox_filename(inbox_filename)
+            clean_inbox_id = _sanitize_drive_id(inbox_file_id)
+            if clean_inbox_name or clean_inbox_id:
+                if clean_inbox_name:
+                    payload["inbox_filename"] = clean_inbox_name
+                if clean_inbox_id:
+                    payload["inbox_file_id"] = clean_inbox_id
+                payload["auto_search"] = False
+            elif auto_search:
+                payload["query"] = clean_title
+                payload["auto_search"] = True
+            else:
+                raise Rejected("song_source_required")
+
+        return await self.compute.submit_job("rvc_cover", payload, requester=requester)
+
+    async def _touch_last_used(self, entry: dict[str, Any], now: float) -> None:
+        entry["cached_local"] = True
+        entry["last_used_at"] = now
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "UPDATE song_library SET last_used_at=? WHERE id=?",
+                (now, entry["id"]),
+            )
+
+    async def _try_read_cached_locked(self, entry_id: str) -> tuple[bytes | None, dict[str, Any]]:
+        entry = self._entries.get(entry_id)
+        if entry is None:
+            raise Rejected("song_unavailable")
+        try:
+            raw = await asyncio.to_thread(self._read, entry)
+        except (OSError, Rejected):
+            entry["cached_local"] = False
+            if not entry["drive_chorus_id"] or not self._compute_configured():
+                raise Rejected("song_unavailable") from None
+            return None, dict(entry)
+        await self._touch_last_used(entry, time.time())
+        return raw, dict(entry)
+
+    async def _load_entry_audio(self, entry_id: str) -> tuple[bytes, dict[str, Any]]:
+        async with self.lock:
+            raw, snapshot = await self._try_read_cached_locked(entry_id)
+            if raw is not None:
+                return raw, snapshot
+
+        dl_lock = self._download_locks.setdefault(entry_id, asyncio.Lock())
+        async with dl_lock:
+            async with self.lock:
+                raw, snapshot = await self._try_read_cached_locked(entry_id)
+                if raw is not None:
+                    return raw, snapshot
+                drive_chorus_id = snapshot["drive_chorus_id"]
+                expected_digest = snapshot["digest"]
+                expected_size = int(snapshot["byte_size"])
+                filename = snapshot["filename"]
+
+            # Download from Google Drive outside self.lock.
+            try:
+                downloaded = await self.compute.download_drive_song(drive_chorus_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise Rejected("song_unavailable") from None
+
+            if not isinstance(downloaded, (bytes, bytearray)):
+                raise Rejected("song_unavailable")
+            raw = bytes(downloaded)
+            if (
+                not raw
+                or len(raw) > MAX_STORED_SONG_BYTES
+                or len(raw) != expected_size
+                or not _is_valid_mp3_bytes(raw)
+                or hashlib.sha256(raw).hexdigest() != expected_digest
+            ):
+                raise Rejected("song_unavailable")
+
+            async with self.lock:
+                entry = self._entries.get(entry_id)
+                if entry is None or entry["digest"] != expected_digest:
+                    raise Rejected("song_unavailable")
+                await asyncio.to_thread(self._write_atomic, filename, raw)
+                await self._touch_last_used(entry, time.time())
+                await self._evict_cache_locked(keep_ids={entry_id})
+                return raw, dict(entry)
+
     async def audio_bytes(self, song_id: str) -> tuple[bytes, str]:
         await self.initialize()
         if not isinstance(song_id, str) or not SONG_ID_RE.fullmatch(song_id):
             raise Rejected("song_unavailable")
-        async with self.lock:
-            entry = self._entries.get(song_id)
-            if entry is None:
-                raise Rejected("song_unavailable")
-            try:
-                raw = await asyncio.to_thread(self._read, entry)
-            except (OSError, Rejected):
-                raise Rejected("song_unavailable") from None
-            return raw, entry["mime_type"]
+        raw, loaded = await self._load_entry_audio(song_id)
+        return raw, loaded["mime_type"]
 
     async def load_for_delivery(
         self,
@@ -602,18 +1109,18 @@ class SongLibrary:
             )
             if entry is None:
                 raise Rejected("song_unavailable")
-            try:
-                mp3_raw = await asyncio.to_thread(self._read, entry)
-            except (OSError, Rejected):
-                raise Rejected("song_unavailable") from None
-            duration_ms = int(entry["duration_ms"])
+            entry_id = entry["id"]
+
+        mp3_raw, loaded = await self._load_entry_audio(entry_id)
+        duration_ms = int(loaded["duration_ms"])
+        canonical_title = str(loaded["title"])
 
         fmt = (preferred_fmt or "mp3").strip().lower()
         if fmt == "ogg_opus":
             async with self.decode_slots:
                 ogg = await transcode_mp3_to_ogg_opus(mp3_raw, ffmpeg_bin=self.ffmpeg_bin)
-            return ogg, "ogg_opus", "audio/ogg", duration_ms, canonical
-        return mp3_raw, "mp3", "audio/mpeg", duration_ms, canonical
+            return ogg, "ogg_opus", "audio/ogg", duration_ms, canonical_title
+        return mp3_raw, "mp3", "audio/mpeg", duration_ms, canonical_title
 
     async def delete(self, song_id: str) -> None:
         await self.initialize()
@@ -626,5 +1133,6 @@ class SongLibrary:
             async with self.store.transaction():
                 await self.store.db.execute("DELETE FROM song_library WHERE id=?", (song_id,))
             del self._entries[song_id]
+            self._download_locks.pop(song_id, None)
             self._refresh_titles()
             self._unlink(entry["filename"])

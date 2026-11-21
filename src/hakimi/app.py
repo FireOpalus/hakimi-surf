@@ -17,6 +17,7 @@ from .admin_auth import AdminAuth
 from .admin_routes import router as admin_router
 from .affection_admin import router as affection_router
 from .bili_account_admin import router as bili_account_router
+from .colab_admin import router as colab_router
 from .community_admin import router as community_router
 from .config import Settings
 from .gcp_admin import router as gcp_billing_router
@@ -127,15 +128,21 @@ def create_app(
                     )
                     for module in service.modules.systems.values():
                         await module.initialize()
+                    if "song_studio" not in service.modules.systems and hasattr(service, "songs"):
+                        await service.songs.initialize()
+                    if "voice_gateway" not in service.modules.systems and hasattr(
+                        service, "voice_gateway_admin"
+                    ):
+                        await service.voice_gateway_admin.initialize()
+                        await service.voice_gateway_admin.sync_to_gateway()
+                    if (cc := getattr(service, "colab_compute", None)) is not None:
+                        resources.push_async_callback(cc.close)
                     await service.sessions.index_existing()
                     await service.moderation.initialize()
                     await service.longnick.initialize()
                     await service.bili_watcher.initialize()
                     await service.video_watch.initialize()
                     await service.memes.initialize()
-                    await service.songs.initialize()
-                    await service.voice_gateway_admin.initialize()
-                    await service.voice_gateway_admin.sync_to_gateway()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
                     for module in service.modules.all():
@@ -197,6 +204,7 @@ def create_app(
     app.include_router(bili_account_router)
     app.include_router(meme_router)
     app.include_router(song_router)
+    app.include_router(colab_router)
     app.include_router(provider_router)
     app.include_router(gcp_billing_router)
     app.include_router(affection_router)

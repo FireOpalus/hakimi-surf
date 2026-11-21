@@ -8,14 +8,21 @@ Designed to be self-contained (stdlib-only) and runnable both via:
 from __future__ import annotations
 
 import argparse
+import array
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -306,14 +313,123 @@ def normalize_zh_text(text: str) -> str:
     return re.sub(r"[\s\W_]+", "", translated).lower()
 
 
+def compute_wav_rms_envelope(
+    wav_path: Path,
+    *,
+    bin_sec: float = 1.0,
+) -> tuple[list[float], float]:
+    """Compute per-bin RMS vocal energy envelope from a PCM WAV without external deps."""
+    with wave.open(str(wav_path), "rb") as wf:
+        channels = max(1, wf.getnchannels())
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        nframes = wf.getnframes()
+        if framerate <= 0 or nframes <= 0:
+            return [], 0.0
+        total_sec = nframes / float(framerate)
+        frames_per_bin = max(1, int(round(framerate * max(0.25, bin_sec))))
+        rms_bins: list[float] = []
+        # Stride keeps pure-Python RMS fast even on long 44.1 kHz stereo stems.
+        stride = max(1, (framerate * channels) // 1000)
+
+        while True:
+            raw = wf.readframes(frames_per_bin)
+            if not raw:
+                break
+            if sampwidth == 2:
+                samples = array.array("h")
+                samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+                if sys.byteorder == "big":
+                    samples.byteswap()
+                sampled = samples[::stride]
+                if not sampled:
+                    rms_bins.append(0.0)
+                    continue
+                sq_sum = sum(float(s) * float(s) for s in sampled)
+                rms_bins.append(math.sqrt(sq_sum / len(sampled)))
+            elif sampwidth == 1:
+                sampled_u8 = raw[::stride]
+                if not sampled_u8:
+                    rms_bins.append(0.0)
+                    continue
+                sq_sum = sum(float(b - 128) * float(b - 128) * 65536.0 for b in sampled_u8)
+                rms_bins.append(math.sqrt(sq_sum / len(sampled_u8)))
+            else:
+                step = sampwidth * stride
+                total_samples = 0
+                sq_sum = 0.0
+                for idx in range(0, len(raw) - sampwidth + 1, step):
+                    val = int.from_bytes(raw[idx : idx + sampwidth], "little", signed=True)
+                    norm = float(val) / float(1 << max(0, (sampwidth - 2) * 8))
+                    sq_sum += norm * norm
+                    total_samples += 1
+                rms_bins.append(math.sqrt(sq_sum / total_samples) if total_samples else 0.0)
+    return rms_bins, total_sec
+
+
+def detect_vocal_energy_chorus_start(
+    vocals_wav: Path,
+    total_duration_sec: float,
+    clip_duration_sec: float,
+    *,
+    intro_skip_ratio: float = 0.12,
+) -> float | None:
+    """Locate the highest sustained vocal RMS energy window as a DSP chorus fallback."""
+    try:
+        bins, wav_dur = compute_wav_rms_envelope(vocals_wav, bin_sec=1.0)
+    except Exception as exc:
+        log(f"DSP vocal RMS envelope unavailable ({type(exc).__name__}: {exc})")
+        return None
+    if not bins:
+        return None
+    peak_rms = max(bins)
+    if peak_rms <= 10.0:
+        return None
+
+    effective_total = total_duration_sec if total_duration_sec > 0 else wav_dur
+    win_bins = max(8, min(len(bins), int(round(min(clip_duration_sec, effective_total)))))
+    if len(bins) <= win_bins:
+        return 0.0
+
+    max_idx = len(bins) - win_bins
+    min_idx = min(max_idx, int(round(min(15.0, len(bins) * intro_skip_ratio))))
+    if max_idx <= 4:
+        min_idx = 0
+
+    prefix = [0.0] * (len(bins) + 1)
+    for idx, val in enumerate(bins):
+        prefix[idx + 1] = prefix[idx] + val
+
+    best_idx = min_idx
+    best_score = -1.0
+    for start_idx in range(min_idx, max_idx + 1):
+        score = prefix[start_idx + win_bins] - prefix[start_idx]
+        if score > best_score:
+            best_score = score
+            best_idx = start_idx
+
+    # Trim leading near-silence inside the selected window up to 5 seconds forward.
+    win_peak = max(bins[best_idx : best_idx + win_bins])
+    onset_thresh = win_peak * 0.35
+    chosen_idx = best_idx
+    for offset in range(min(5, max_idx - best_idx + 1)):
+        if bins[best_idx + offset] >= onset_thresh:
+            chosen_idx = best_idx + offset
+            break
+
+    return _clamp_start(float(chosen_idx), effective_total, clip_duration_sec)
+
+
 def find_chorus_start_sec(
     segments: list[dict[str, Any]],
     anchor: str,
     fallback_start_sec: float,
     total_duration_sec: float,
     clip_duration_sec: float,
+    *,
+    vocal_wav: Path | None = None,
 ) -> tuple[float, str]:
-    """Resolve chorus trim start timestamp from ASR segments or safe fallback."""
+    """Resolve chorus trim start timestamp from ASR segments, DSP vocal RMS, or safe fallback."""
     clean_anchor = normalize_zh_text(anchor)
     if clean_anchor and segments:
         for seg in segments:
@@ -333,6 +449,15 @@ def find_chorus_start_sec(
                     return _clamp_start(raw_start, total_duration_sec, clip_duration_sec), (
                         f"fuzzy_anchor:{seg.get('text', '')}"
                     )
+
+    if vocal_wav is not None and vocal_wav.is_file():
+        dsp_start = detect_vocal_energy_chorus_start(
+            vocal_wav,
+            total_duration_sec,
+            clip_duration_sec,
+        )
+        if dsp_start is not None:
+            return dsp_start, "dsp_vocal_rms"
 
     return _clamp_start(fallback_start_sec, total_duration_sec, clip_duration_sec), "fallback"
 
@@ -742,24 +867,53 @@ raise RuntimeError(f"All separation models failed: {last_err}")
 def _transcribe_for_chorus(sep_py: str, dry_vocals_wav: Path) -> list[dict[str, Any]]:
     script = """import json, sys
 from faster_whisper import WhisperModel
+
+def _run_model(device, compute_type):
+    model = WhisperModel("small", device=device, compute_type=compute_type)
+    try:
+        segments, _ = model.transcribe(sys.argv[1], language="zh", vad_filter=True)
+        return list(segments)
+    except Exception as vad_exc:
+        print(
+            f"[whisper] vad_filter=True failed on {device} "
+            f"({type(vad_exc).__name__}: {vad_exc}); retrying without VAD.",
+            file=sys.stderr,
+        )
+        segments, _ = model.transcribe(sys.argv[1], language="zh", vad_filter=False)
+        return list(segments)
+
+seg_list = None
+used_device = "cuda"
 try:
-    model = WhisperModel("small", device="cuda", compute_type="float16")
-    segments, _ = model.transcribe(sys.argv[1], language="zh", vad_filter=True)
-    seg_list = list(segments)
-except Exception:
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(sys.argv[1], language="zh", vad_filter=True)
-    seg_list = list(segments)
+    seg_list = _run_model("cuda", "float16")
+except Exception as cuda_exc:
+    print(
+        f"[whisper] CUDA transcribe failed ({type(cuda_exc).__name__}: {cuda_exc}); "
+        "falling back to CPU int8.",
+        file=sys.stderr,
+    )
+    used_device = "cpu"
+    seg_list = _run_model("cpu", "int8")
+
 out = [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in seg_list]
+print(f"[whisper] transcribed {len(out)} segment(s) on {used_device}.", file=sys.stderr)
 print("__WHISPER_SEGS__=" + json.dumps(out, ensure_ascii=False))
 """
     proc = _run([sep_py, "-c", script, str(dry_vocals_wav)], check=False, capture=True)
+    if proc.stderr:
+        for line in proc.stderr.strip().splitlines():
+            log(f"whisper stderr: {line}")
     if proc.returncode != 0:
-        log(f"faster-whisper skipped/failed ({proc.returncode}); using fallback chorus start.")
+        tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        log(
+            f"faster-whisper skipped/failed (exit={proc.returncode}); "
+            f"proceeding to DSP vocal RMS / fallback. detail={tail}"
+        )
         return []
     for line in proc.stdout.splitlines():
         if line.startswith("__WHISPER_SEGS__="):
             return json.loads(line.split("=", 1)[1])
+    log("faster-whisper produced no __WHISPER_SEGS__ marker; proceeding to DSP / fallback.")
     return []
 
 
@@ -926,6 +1080,7 @@ def action_cover(
             fallback_start_sec,
             total_duration,
             clamped_dur,
+            vocal_wav=dry_vocals_wav,
         )
     else:
         chosen_start = _clamp_start(float(start_sec), total_duration, clamped_dur)
@@ -1015,7 +1170,120 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+DRIVE_OUTPUTS_PREFIX = "__HAKIMI_DRIVE_OUTPUTS__="
+
+
+def _drive_download_to_path(access_token: str, file_id: str, dest_path: Path) -> Path:
+    """Download a Drive file directly from Colab using a short-lived Bearer token."""
+    clean_id = re.sub(r"[^A-Za-z0-9_-]", "", file_id.strip())
+    if not clean_id or clean_id != file_id.strip():
+        raise ValueError("Invalid Drive file ID")
+    url = f"https://www.googleapis.com/drive/v3/files/{clean_id}?alt=media&supportsAllDrives=true"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+    with urllib.request.urlopen(req, timeout=120) as resp, tmp_path.open("wb") as handle:
+        while chunk := resp.read(1024 * 1024):
+            handle.write(chunk)
+    tmp_path.replace(dest_path)
+    log(f"Direct Drive download complete -> {dest_path} ({dest_path.stat().st_size} B)")
+    return dest_path
+
+
+def _drive_upload_from_path(
+    access_token: str,
+    folder_id: str,
+    local_path: Path,
+    drive_name: str,
+    mime_type: str,
+) -> dict[str, Any]:
+    """Upload a local output artifact directly from Colab to Google Drive."""
+    clean_folder = re.sub(r"[^A-Za-z0-9_-]", "", folder_id.strip())
+    if not clean_folder or clean_folder != folder_id.strip():
+        raise ValueError("Invalid Drive folder ID")
+    data = local_path.read_bytes()
+    if len(data) <= 4 * 1024 * 1024:
+        boundary = f"hakimi_{uuid.uuid4().hex}"
+        meta = json.dumps(
+            {"name": drive_name, "parents": [clean_folder]}, ensure_ascii=False
+        ).encode("utf-8")
+        body = b"".join(
+            [
+                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode(),
+                meta,
+                f"\r\n--{boundary}\r\nContent-Type: {mime_type}\r\n\r\n".encode(),
+                data,
+                f"\r\n--{boundary}--\r\n".encode(),
+            ]
+        )
+        req = urllib.request.Request(
+            "https://www.googleapis.com/upload/drive/v3/files"
+            "?uploadType=multipart&supportsAllDrives=true&fields=id,name,size",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": f"multipart/related; boundary={boundary}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        log(f"Direct Drive upload complete: {drive_name} ({len(data)} B)")
+        return {"file_id": str(result["id"]), "name": str(result.get("name") or drive_name)}
+
+    init_req = urllib.request.Request(
+        "https://www.googleapis.com/upload/drive/v3/files"
+        "?uploadType=resumable&supportsAllDrives=true&fields=id,name,size",
+        data=json.dumps({"name": drive_name, "parents": [clean_folder]}, ensure_ascii=False).encode(
+            "utf-8"
+        ),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": mime_type,
+            "X-Upload-Content-Length": str(len(data)),
+        },
+    )
+    with urllib.request.urlopen(init_req, timeout=60) as resp:
+        upload_url = resp.headers.get("Location", "")
+    if not upload_url.startswith("https://www.googleapis.com/"):
+        raise RuntimeError("Drive resumable upload init returned invalid Location")
+
+    chunk_size = 4 * 1024 * 1024
+    offset = 0
+    total = len(data)
+    while offset < total:
+        end = min(total, offset + chunk_size)
+        chunk = data[offset:end]
+        put_req = urllib.request.Request(
+            upload_url,
+            data=chunk,
+            method="PUT",
+            headers={
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {offset}-{end - 1}/{total}",
+                "Content-Type": mime_type,
+            },
+        )
+        try:
+            with urllib.request.urlopen(put_req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                log(f"Direct Drive upload complete: {drive_name} ({total} B)")
+                return {
+                    "file_id": str(result["id"]),
+                    "name": str(result.get("name") or drive_name),
+                }
+        except urllib.error.HTTPError as exc:
+            if exc.code == 308:
+                offset = end
+                continue
+            raise
+    raise RuntimeError("Direct Drive resumable upload ended without completion")
+
+
 def _dispatch_env(action: str) -> None:
+    drive_token = os.environ.get("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
     if action == "reassemble":
         reassemble_chunks(
             Path(os.environ["HAKIMI_CHUNK_DIR"]),
@@ -1034,8 +1302,9 @@ def _dispatch_env(action: str) -> None:
             mode=os.environ.get("HAKIMI_SETUP_MODE", "all").strip().lower() or "all",
         )
     elif action == "train":
-        action_train(
-            model_name=os.environ.get("HAKIMI_MODEL_NAME", "hakimi"),
+        model_name = os.environ.get("HAKIMI_MODEL_NAME", "hakimi")
+        final_pth, final_idx = action_train(
+            model_name=model_name,
             dataset_tar=Path(os.environ.get("HAKIMI_DATASET_TAR", "/content/work/dataset.tar.gz")),
             epochs=_env_int("HAKIMI_EPOCHS", 250),
             save_every=_env_int("HAKIMI_SAVE_EVERY", 50),
@@ -1043,11 +1312,34 @@ def _dispatch_env(action: str) -> None:
             sample_rate=_env_int("HAKIMI_SAMPLE_RATE", 40000),
             chunk_mb=_env_int("HAKIMI_CHUNK_MB", 6),
         )
+        models_folder = os.environ.get("HAKIMI_DRIVE_MODELS_FOLDER_ID", "").strip()
+        if drive_token and models_folder:
+            pth_up = _drive_upload_from_path(
+                drive_token, models_folder, final_pth, final_pth.name, "application/octet-stream"
+            )
+            idx_up = _drive_upload_from_path(
+                drive_token, models_folder, final_idx, final_idx.name, "application/octet-stream"
+            )
+            print(
+                DRIVE_OUTPUTS_PREFIX
+                + json.dumps({"pth": pth_up, "index": idx_up}, ensure_ascii=False),
+                flush=True,
+            )
     elif action == "cover":
-        action_cover(
-            source_audio=Path(os.environ.get("HAKIMI_SOURCE_AUDIO", "/content/work/source_song")),
-            pth_path=Path(os.environ.get("HAKIMI_PTH_PATH", "/content/out/hakimi.pth")),
-            index_path=Path(os.environ.get("HAKIMI_INDEX_PATH", "/content/out/hakimi.index")),
+        source_path = Path(os.environ.get("HAKIMI_SOURCE_AUDIO", "/content/work/source_song"))
+        pth_path = Path(os.environ.get("HAKIMI_PTH_PATH", "/content/out/hakimi.pth"))
+        index_path = Path(os.environ.get("HAKIMI_INDEX_PATH", "/content/out/hakimi.index"))
+        if drive_token:
+            if src_fid := os.environ.get("HAKIMI_DRIVE_SOURCE_FILE_ID", "").strip():
+                _drive_download_to_path(drive_token, src_fid, source_path)
+            if pth_fid := os.environ.get("HAKIMI_DRIVE_PTH_FILE_ID", "").strip():
+                _drive_download_to_path(drive_token, pth_fid, pth_path)
+            if idx_fid := os.environ.get("HAKIMI_DRIVE_INDEX_FILE_ID", "").strip():
+                _drive_download_to_path(drive_token, idx_fid, index_path)
+        meta = action_cover(
+            source_audio=source_path,
+            pth_path=pth_path,
+            index_path=index_path,
             pitch=_env_int("HAKIMI_PITCH", 0),
             index_rate=_env_float("HAKIMI_INDEX_RATE", 0.55),
             protect=_env_float("HAKIMI_PROTECT", 0.33),
@@ -1058,6 +1350,29 @@ def _dispatch_env(action: str) -> None:
             fallback_start_sec=_env_float("HAKIMI_FALLBACK_START_SEC", 60.0),
             chunk_mb=_env_int("HAKIMI_CHUNK_MB", 6),
         )
+        songs_folder = os.environ.get("HAKIMI_DRIVE_SONGS_FOLDER_ID", "").strip()
+        if drive_token and songs_folder:
+            raw_prefix = os.environ.get("HAKIMI_COVER_PREFIX", "cover").strip()
+            prefix = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", raw_prefix).strip("_") or "cover"
+            full_up = _drive_upload_from_path(
+                drive_token,
+                songs_folder,
+                DEFAULT_OUT_DIR / "cover_full.mp3",
+                f"{prefix}_full.mp3",
+                "audio/mpeg",
+            )
+            chorus_up = _drive_upload_from_path(
+                drive_token,
+                songs_folder,
+                DEFAULT_OUT_DIR / "cover_chorus.mp3",
+                f"{prefix}_chorus.mp3",
+                "audio/mpeg",
+            )
+            payload_json = json.dumps(
+                {"full": full_up, "chorus": chorus_up, "meta": meta},
+                ensure_ascii=False,
+            )
+            print(DRIVE_OUTPUTS_PREFIX + payload_json, flush=True)
     else:
         raise ValueError(f"Unsupported HAKIMI_COLAB_ACTION: {action!r}")
 

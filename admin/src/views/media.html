@@ -15,8 +15,61 @@
 </section>
 
 <section id="songs" class="tab" role="tabpanel" aria-labelledby="nav-songs" hidden>
-  <div class="card"><div class="row between"><h2>猫猫专属翻唱歌单</h2><button id="song-refresh" type="button" class="secondary">刷新歌单</button></div>
-    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 12 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台；模型仅从歌单标题白名单里挑选。</p>
+  <div class="card">
+    <div class="row between">
+      <h2>猫猫专属翻唱歌单</h2>
+      <div class="row">
+        <button id="song-cache-evict" type="button" class="secondary">清理本地 LRU 热缓存</button>
+        <button type="button" class="secondary" data-open-tab="colab-compute">算力与作业队列 →</button>
+        <button id="song-refresh" type="button" class="secondary">刷新歌单</button>
+      </div>
+    </div>
+    <p class="muted">Google Drive 主存持久保存翻唱成品与完整版备份，本地保留有界 LRU 热缓存用于秒级发送（纯本地上传曲目永不被淘汰）。模型仅从歌单标题白名单里挑选。</p>
+    <div id="song-storage-pills" class="pill-row"></div>
+    <p id="song-cache-state" class="muted" role="status" aria-live="polite"></p>
+    <div class="row">
+      <p id="song-prompt-count" class="badge">当前已加载到 Prompt 的有效曲目：0</p>
+      <p id="song-state" role="status"></p>
+    </div>
+    <div id="song-list" class="song-grid"></div>
+  </div>
+  <div class="card">
+    <div class="row between">
+      <h2 id="song-learn-heading">Colab 学一首新歌</h2>
+      <div class="row">
+        <button id="song-learn-refresh-inbox" type="button" class="secondary">刷新 Drive 收件箱</button>
+        <button type="button" class="secondary" data-open-tab="colab-compute">查看作业队列 →</button>
+      </div>
+    </div>
+    <p class="muted">提交到 Colab GPU Worker 自动执行人声分离、RVC 翻唱推理与高潮切片，成品将自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。若未选择 Drive <code>inbox/</code> 原曲且启用自动检索，Worker 会尝试搜索干净官方原版。</p>
+    <p id="song-learn-colab-hint" class="muted"></p>
+    <form id="song-learn-form">
+      <div class="song-meta">
+        <label for="song-learn-title">歌名（必填，1～40字）<input id="song-learn-title" maxlength="40" required placeholder="例如：晴天"></label>
+        <label for="song-learn-artist">原唱（可选）<input id="song-learn-artist" maxlength="40" placeholder="例如：周杰伦"></label>
+        <label for="song-learn-tags">风格标签（可选）<input id="song-learn-tags" maxlength="80" placeholder="例如：抒情 怀旧"></label>
+        <label for="song-learn-pitch">升降调 Pitch（-24～24，默认 0）<input id="song-learn-pitch" type="number" min="-24" max="24" step="1" value="0" required></label>
+      </div>
+      <div class="grid">
+        <label for="song-learn-inbox">Drive <code>Hakimi_Songs/inbox/</code> 已有原曲（可选）
+          <select id="song-learn-inbox">
+            <option value="">不指定文件（使用下方自动检索）</option>
+          </select>
+        </label>
+        <div class="row">
+          <label><input id="song-learn-auto-search" type="checkbox" checked> 未指定文件时自动检索官方原版</label>
+        </div>
+      </div>
+      <div class="row">
+        <button id="song-learn-submit" type="submit" class="primary">发起 Colab 学歌</button>
+        <button id="song-learn-clear" type="button" class="secondary">清空表单</button>
+      </div>
+    </form>
+    <div id="song-learn-result" class="sub-card" hidden></div>
+  </div>
+  <div class="card">
+    <h2>手动上传本地翻唱成品</h2>
+    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 12 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台。</p>
     <form id="song-upload">
       <div class="row"><label for="song-file">选择音频文件</label><input id="song-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac"><small id="song-file-name" class="muted">未选择音频文件</small></div>
       <div id="song-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把翻唱音频拖到这里（自动识别文件名作为歌名）</div>
@@ -29,9 +82,6 @@
       </div>
       <div class="row"><button type="submit" class="primary">上传并切片转码</button><button id="song-clear-file" type="button" class="secondary">清空文件</button></div>
     </form>
-    <p id="song-prompt-count" class="badge">当前已加载到 Prompt 的有效曲目：0</p>
-    <p id="song-state" role="status"></p>
-    <div id="song-list" class="song-grid"></div>
   </div>
 </section>
 

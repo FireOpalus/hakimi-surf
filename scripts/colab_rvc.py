@@ -956,6 +956,412 @@ def stop_session(session: str) -> None:
         log(f"Warning: colab stop failed ({exc})")
 
 
+def _load_colab_drive_module():
+    import importlib.util
+
+    if "colab_drive" in sys.modules:
+        return sys.modules["colab_drive"]
+    mod_path = Path(__file__).with_name("colab_drive.py")
+    spec = importlib.util.spec_from_file_location("colab_drive", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load colab_drive module from {mod_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["colab_drive"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class SourceNotFoundError(RuntimeError):
+    """Raised when auto-search cannot locate a clean official source track."""
+
+    def __init__(self, code: str = "source_not_found", detail: str = "") -> None:
+        self.code = code
+        super().__init__(detail or code)
+
+
+_NOISY_SOURCE_KEYWORDS = (
+    "cover",
+    "翻唱",
+    "remix",
+    "nightcore",
+    "8d",
+    "karaoke",
+    "ktv",
+    "伴奏",
+    "消音",
+    "纯音乐",
+    "instrumental",
+    "acapella",
+    "live",
+    "现场",
+    "演唱会",
+    "concert",
+    "reaction",
+    "反应",
+    "shorts",
+    "#shorts",
+    "slowed",
+    "reverb",
+    "speed up",
+    "sped up",
+    "升调",
+    "降调",
+    "教学",
+    "tutorial",
+    "吉他弹唱",
+    "钢琴版",
+    "piano ver",
+    "翻自",
+    "合唱版",
+)
+
+
+def is_clean_source_candidate(info: dict[str, Any]) -> bool:
+    """Filter yt-dlp metadata entries to exclude covers, live clips, shorts, and remixes."""
+    if not isinstance(info, dict):
+        return False
+    if info.get("is_live") or info.get("was_live"):
+        return False
+    age_limit = info.get("age_limit")
+    if isinstance(age_limit, (int, float)) and age_limit >= 18:
+        return False
+    dur = info.get("duration")
+    if not isinstance(dur, (int, float)) or dur < 60 or dur > 600:
+        return False
+    title = str(info.get("title") or "").strip().lower()
+    if not title:
+        return False
+    webpage_url = str(info.get("webpage_url") or info.get("url") or "").lower()
+    if "/shorts/" in webpage_url:
+        return False
+    for bad in _NOISY_SOURCE_KEYWORDS:
+        if bad in title:
+            return False
+    return True
+
+
+def _yt_dlp_bin() -> str:
+    yt_dlp = REPO_ROOT / ".venv" / "bin" / "yt-dlp"
+    return str(yt_dlp) if yt_dlp.is_file() else shutil.which("yt-dlp") or "yt-dlp"
+
+
+def search_and_download_clean_source(
+    query: str,
+    out_dir: Path,
+    *,
+    artist: str = "",
+    yt_dlp_bin: str = "",
+) -> Path:
+    """Search YouTube via yt-dlp for a clean original track, or raise SourceNotFoundError."""
+    clean_query = " ".join(f"{artist} {query}".split()).strip()
+    if not clean_query:
+        raise SourceNotFoundError("source_not_found", "Empty source search query")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    yt_bin = yt_dlp_bin or _yt_dlp_bin()
+    search_expr = f"ytsearch8:{clean_query}"
+    probe_cmd = [
+        yt_bin,
+        "--dump-json",
+        "--no-playlist",
+        "--skip-download",
+        "--ignore-errors",
+        "--no-warnings",
+        search_expr,
+    ]
+    proc = subprocess.run(probe_cmd, capture_output=True, text=True, errors="replace", check=False)
+    candidates: list[dict[str, Any]] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if is_clean_source_candidate(item):
+            candidates.append(item)
+
+    if not candidates:
+        raise SourceNotFoundError(
+            "source_not_found", f"No clean original audio found for query: {clean_query}"
+        )
+
+    for cand in candidates[:3]:
+        target_url = str(cand.get("webpage_url") or cand.get("url") or "").strip()
+        if not target_url.startswith(("https://", "http://")):
+            continue
+        vid_id = re.sub(r"[^A-Za-z0-9_-]", "", str(cand.get("id") or "src"))[:24] or "src"
+        out_path = out_dir / f"source_{vid_id}.m4a"
+        out_path.unlink(missing_ok=True)
+        dl_cmd = [
+            yt_bin,
+            "-f",
+            "bestaudio[ext=m4a]/bestaudio",
+            "--no-playlist",
+            "--no-warnings",
+            "-o",
+            str(out_path),
+            target_url,
+        ]
+        dl_proc = subprocess.run(
+            dl_cmd, capture_output=True, text=True, errors="replace", check=False
+        )
+        if dl_proc.returncode == 0 and out_path.is_file() and out_path.stat().st_size > 8192:
+            return out_path
+        out_path.unlink(missing_ok=True)
+
+    raise SourceNotFoundError(
+        "source_not_found", f"All clean candidate downloads failed for: {clean_query}"
+    )
+
+
+def parse_colab_usage() -> dict[str, Any]:
+    """Query Colab ADC account CU balance and active sessions safely (never returns tokens)."""
+    try:
+        _ensure_colab_installed()
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "compute_units": None,
+            "usage_rate": None,
+            "active_sessions": 0,
+            "sessions": [],
+            "error": str(exc)[:160],
+        }
+    if not COLAB_ADC_PATH.is_file():
+        return {
+            "reachable": False,
+            "compute_units": None,
+            "usage_rate": None,
+            "active_sessions": 0,
+            "sessions": [],
+            "error": "colab_adc_missing",
+        }
+    try:
+        rc_u, out_u = _run_colab(["usage"], check=False, stream=False, idle_timeout=30.0)
+        rc_s, out_s = _run_colab(["sessions"], check=False, stream=False, idle_timeout=30.0)
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "compute_units": None,
+            "usage_rate": None,
+            "active_sessions": 0,
+            "sessions": [],
+            "error": f"colab_cli_error:{type(exc).__name__}",
+        }
+
+    cu_balance: float | None = None
+    usage_rate: float | None = None
+    active_assignments = 0
+    if m_cu := re.search(r"Current balance:\s*([0-9]+(?:\.[0-9]+)?)", out_u):
+        cu_balance = float(m_cu.group(1))
+    if m_rate := re.search(r"Usage rate:\s*([0-9]+(?:\.[0-9]+)?)", out_u):
+        usage_rate = float(m_rate.group(1))
+    if m_act := re.search(r"Active assignments:\s*([0-9]+)", out_u):
+        active_assignments = int(m_act.group(1))
+
+    sessions: list[str] = []
+    if rc_s == 0:
+        for line in out_s.splitlines():
+            clean = line.strip()
+            if not clean or clean.startswith(("[colab]", "Name", "-", "=")):
+                continue
+            token = clean.split()[0]
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", token) and token.lower() not in {
+                "no",
+                "active",
+                "session",
+            }:
+                sessions.append(token)
+
+    return {
+        "reachable": rc_u == 0,
+        "compute_units": cu_balance,
+        "usage_rate": usage_rate,
+        "active_sessions": max(active_assignments, len(sessions)),
+        "sessions": sessions,
+        "error": None if rc_u == 0 else "colab_usage_failed",
+    }
+
+
+def stop_all_sessions(extra_sessions: list[str] | None = None) -> dict[str, Any]:
+    """Terminate all active Colab sessions reported by `colab sessions` plus known targets."""
+    usage = parse_colab_usage()
+    targets: list[str] = []
+    for name in [*(usage.get("sessions") or []), *(extra_sessions or []), "hakimi-rvc"]:
+        clean = str(name or "").strip()
+        if clean and clean not in targets:
+            targets.append(clean)
+    stopped: list[str] = []
+    for sess in targets:
+        try:
+            rc, _ = _run_colab(["stop", "-s", sess], check=False, stream=False, idle_timeout=60.0)
+            if rc == 0:
+                stopped.append(sess)
+        except Exception:
+            pass
+    return {"terminated_sessions": len(stopped), "sessions": stopped}
+
+
+def run_cover_pipeline(
+    *,
+    session: str,
+    gpu_spec: str,
+    source_path: Path,
+    pth_path: Path,
+    index_path: Path,
+    cover_dir: Path,
+    model_name: str = "hakimi",
+    pitch: int = 0,
+    index_rate: float = 0.55,
+    protect: float = 0.33,
+    volume_envelope: float = 0.85,
+    start_sec: str = "auto",
+    duration_sec: float = 50.0,
+    chorus_anchor: str = "",
+    fallback_start_sec: float = 60.0,
+) -> dict[str, Any]:
+    """Provision Colab GPU, run setup + RVC cover, download outputs, and always stop session."""
+    assigned_gpu = provision_gpu(session, gpu=gpu_spec)
+    try:
+        exec_remote_worker(session, "setup", {"HAKIMI_SETUP_MODE": "cover"})
+        remote_pth = f"/content/out/{model_name}.pth"
+        remote_idx = f"/content/out/{model_name}.index"
+        upload_file_chunked(session, pth_path, remote_pth, tag=f"{model_name}_pth")
+        upload_file_chunked(session, index_path, remote_idx, tag=f"{model_name}_idx")
+        full_mp3, chorus_mp3, meta = _run_remote_cover(
+            session,
+            source_path=source_path,
+            remote_pth=remote_pth,
+            remote_idx=remote_idx,
+            cover_dir=cover_dir,
+            pitch=pitch,
+            index_rate=index_rate,
+            protect=protect,
+            volume_envelope=volume_envelope,
+            start_sec=start_sec,
+            duration_sec=duration_sec,
+            chorus_anchor=chorus_anchor,
+            fallback_start_sec=fallback_start_sec,
+        )
+        return {
+            "assigned_gpu": assigned_gpu,
+            "full_mp3": full_mp3,
+            "chorus_mp3": chorus_mp3,
+            "meta": meta,
+        }
+    finally:
+        stop_session(session)
+
+
+def run_train_pipeline(
+    *,
+    session: str,
+    gpu_spec: str,
+    dataset_tar: Path,
+    model_name: str = "hakimi",
+    epochs: int = 250,
+    save_every: int = 50,
+    batch_size: int = 8,
+    sample_rate: int = 40000,
+    model_dir: Path = MODEL_DIR,
+) -> dict[str, Any]:
+    """Provision Colab GPU, run setup + RVC training, download weights, and always stop session."""
+    assigned_gpu = provision_gpu(session, gpu=gpu_spec)
+    try:
+        exec_remote_worker(session, "setup")
+        pth_out, idx_out = _run_remote_train(
+            session,
+            dataset_tar=dataset_tar,
+            model_name=model_name,
+            epochs=epochs,
+            save_every=save_every,
+            batch_size=batch_size,
+            sample_rate=sample_rate,
+            model_dir=model_dir,
+        )
+        return {
+            "assigned_gpu": assigned_gpu,
+            "pth_path": pth_out,
+            "index_path": idx_out,
+        }
+    finally:
+        stop_session(session)
+
+
+def migrate_drive_assets(
+    *,
+    cred_path: Path | None = None,
+    root_folder_id: str = "",
+    model_dir: Path = MODEL_DIR,
+    covers_dir: Path = COVERS_DIR,
+    sources_dir: Path = SOURCES_DIR,
+    include_sources: bool = False,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    drive_client: Any = None,
+) -> dict[str, Any]:
+    """Idempotently initialize Hakimi_Songs/ on Drive and migrate existing local assets."""
+    drive_mod = _load_colab_drive_module()
+    if drive_client is None:
+        resolved = drive_mod.resolve_drive_credentials_path(cred_path, repo_root=REPO_ROOT)
+        drive_client = drive_mod.ColabDriveClient(resolved, root_folder_id=root_folder_id)
+
+    tree = drive_client.ensure_folder_tree(root_folder_id)
+    summary: dict[str, Any] = {
+        "folders": tree.as_dict(),
+        "uploaded": [],
+        "skipped": [],
+        "dry_run": dry_run,
+    }
+
+    existing_by_role = {
+        role: {item["name"]: item for item in drive_client.list_folder(role)}
+        for role in ("models", "songs", "inbox")
+    }
+
+    def _sync_file(role: str, local_path: Path, drive_name: str) -> None:
+        if not overwrite and drive_name in existing_by_role[role]:
+            summary["skipped"].append({"role": role, "name": drive_name, "reason": "exists"})
+            return
+        if dry_run:
+            summary["uploaded"].append(
+                {
+                    "role": role,
+                    "name": drive_name,
+                    "size": local_path.stat().st_size,
+                    "dry_run": True,
+                }
+            )
+            return
+        res = drive_client.upload_file(
+            role, local_path, drive_name=drive_name, replace_existing=True
+        )
+        summary["uploaded"].append({"role": role, **res})
+
+    if model_dir.is_dir():
+        for ext in (".pth", ".index"):
+            for path in sorted(model_dir.rglob(f"*{ext}")):
+                if path.is_file():
+                    _sync_file("models", path, path.name)
+
+    if covers_dir.is_dir():
+        for cover_sub in sorted(p for p in covers_dir.iterdir() if p.is_dir()):
+            slug = _slugify(cover_sub.name)
+            chorus = cover_sub / "cover_chorus.mp3"
+            full = cover_sub / "cover_full.mp3"
+            if chorus.is_file():
+                _sync_file("songs", chorus, f"{slug}_chorus.mp3")
+            if full.is_file():
+                _sync_file("songs", full, f"{slug}_full.mp3")
+
+    if include_sources and sources_dir.is_dir():
+        for src in sorted(p for p in sources_dir.iterdir() if p.is_file()):
+            _sync_file("inbox", src, src.name)
+
+    return summary
+
+
 def upload_song_to_admin(
     *,
     audio_path: Path,
@@ -1317,6 +1723,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_up.add_argument("--start", type=float, default=0.0)
     p_up.add_argument("--duration", type=float, default=58.0)
     p_up.add_argument("--admin-url", default=DEFAULT_ADMIN_BASE_URL)
+
+    p_mig = sub.add_parser(
+        "migrate-drive",
+        help="Initialize Hakimi_Songs/ on Drive and migrate existing local models/covers.",
+    )
+    p_mig.add_argument("--cred-path", type=Path, default=None)
+    p_mig.add_argument("--root-folder-id", default="")
+    p_mig.add_argument("--model-dir", type=Path, default=MODEL_DIR)
+    p_mig.add_argument("--covers-dir", type=Path, default=COVERS_DIR)
+    p_mig.add_argument("--sources-dir", type=Path, default=SOURCES_DIR)
+    p_mig.add_argument("--include-sources", action="store_true")
+    p_mig.add_argument("--overwrite", action="store_true")
+    p_mig.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -1355,6 +1774,19 @@ def main(argv: list[str] | None = None) -> int:
             admin_base_url=args.admin_url,
         )
         log(f"Uploaded to SongLibrary: {json.dumps(res, ensure_ascii=False)}")
+        return 0
+    if args.command == "migrate-drive":
+        res = migrate_drive_assets(
+            cred_path=args.cred_path,
+            root_folder_id=args.root_folder_id,
+            model_dir=args.model_dir,
+            covers_dir=args.covers_dir,
+            sources_dir=args.sources_dir,
+            include_sources=args.include_sources,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2), flush=True)
         return 0
     raise ValueError(f"Unknown command: {args.command}")
 

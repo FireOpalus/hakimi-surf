@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import re
+import shlex
 import time
 import uuid
 import weakref
@@ -13,6 +14,7 @@ from contextlib import AsyncExitStack, nullcontext
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .affection import _validate_platform_user
 from .attention import can_watch_video
@@ -60,13 +62,12 @@ from .security import Rejected, authorize, configured_secrets, owner, safe_outpu
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
 from .social import chat_module, confirmed_message_id
-from .songs import SongLibrary, explicit_song_request
+from .songs import explicit_song_request
 from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
 from .video_watch import VideoWatch
-from .voice_gateway_admin import VoiceGatewayAdminManager
-from .voice_reply import VoiceReplyClient, explicit_voice_request
+from .voice_reply import explicit_voice_request
 from .web_search import explicit_search, search_query
 from .work_usage import model_work
 from .world_experience import SOCIAL_LOW
@@ -101,9 +102,22 @@ HELP = """哈基米在这里。私聊可直接提问或发 B 站视频；群聊�
 /mute-approve <编号> 或 /mute-reject <编号>：批准或驳回屏蔽申请
 （如需同时删除好友，须在 /mute 或 /mute-approve 末尾加 --delete-friend）
 /affection [QQ] [分数]（或 /好感度）：查看或调整指定用户好感度档案（仅主人私聊）
+/学歌 <歌名> [pitch=-24..24]（或 /learn-song）：提交 Colab 学歌任务（可附带音频）
 /哈基米 订阅 <UP主UID> / /哈基米 退订 <UP主UID>：UP 更新私聊提醒（直播开播监控可在 /admin 添加）
 /哈基米 订阅列表 / /哈基米 报告 / /哈基米 状态：查看订阅、近 7 天巡逻报告与今日额度
 链接与小号巡逻优先阅读公开字幕与热评资料；原片分析受后台开关、时长、体积和每日次数限制。"""
+
+_LEARN_SONG_ACTION_NAME = "song_studio.learn_song"
+
+
+class _LearnSongArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    title: str = Field(min_length=1, max_length=40, description="歌曲名称")
+    artist: str = Field(default="", max_length=40, description="原唱歌手（可选）")
+    tags: str = Field(default="", max_length=80, description="风格标签（可选）")
+    pitch: int = Field(default=0, ge=-24, le=24, description="升降调半音数（-24..24，默认0）")
+    auto_search: bool = Field(default=True, description="未附带音频时是否自动检索原版伴奏/原唱")
 
 
 class Service:
@@ -125,8 +139,6 @@ class Service:
         self.s, self.store, self.ai, self.sender = settings, store, gateway, sender
         # Older composition roots supplied their shared HTTP client on the sender.
         self.http = http if http is not None else getattr(sender, "http", None)
-        self.voice_reply = VoiceReplyClient(settings, http=self.http)
-        self.voice_gateway_admin = VoiceGatewayAdminManager(settings, store, http=self.http)
         self.node_transport = (
             node_transport if node_transport is not None else NodeTransport(settings)
         )
@@ -174,8 +186,6 @@ class Service:
         self.video_watch = VideoWatch(self)
         self.memes = MemeLibrary(store)
         store.runtime.memes = self.memes
-        self.songs = SongLibrary(store)
-        store.runtime.songs = self.songs
         self._lurk_react_at: dict[str, float] = {}
         self._last_aff_recovery_at: float = 0.0
         self.modules = ModuleRegistry(owner_delivery=self.proactive)
@@ -187,7 +197,7 @@ class Service:
                 settings,
                 store,
                 gateway,
-                http,
+                self.http,
                 self,
                 notebook=notebook,
                 diary=diary,
@@ -209,6 +219,12 @@ class Service:
         self.sessions.event_ledger = self.event_ledger
         self.screen_watch = self.modules.systems["screen_watch"].screen_watch
         self.voice_companion = self.modules.systems["voice_companion"].companion
+        self.voice_reply = self.modules.systems["voice_gateway"].reply
+        self.voice_gateway_admin = self.modules.systems["voice_gateway"].admin
+        self.colab_compute = self.modules.systems["colab_compute"].compute
+        self.songs = self.modules.systems["song_studio"].songs
+        store.runtime.songs = self.songs
+        self.gcp_billing = self.modules.systems["gcp_billing"].manager
         self.identity = self.modules.systems["identity"].identity
         self.memory_hub = self.modules.systems["memory_hub"].hub
         self.plugin_bus = self.modules.systems["plugin_bus"].plugin_bus
@@ -355,12 +371,173 @@ class Service:
             items.append(entry)
             if len(items) >= 12:
                 break
+        if (
+            len(items) < 12
+            and action_modes.get(_LEARN_SONG_ACTION_NAME, "active") != "off"
+            and getattr(self, "songs", None) is not None
+            and getattr(self, "colab_compute", None) is not None
+            and self.colab_compute.configured()
+            and not any(item["action_name"] == _LEARN_SONG_ACTION_NAME for item in items)
+        ):
+            schema = _LearnSongArgs.model_json_schema()
+            items.append(
+                {
+                    "action_name": _LEARN_SONG_ACTION_NAME,
+                    "description": (
+                        "用 Colab 学唱一首新歌并加入歌单（支持附带音频文件或自动检索原曲）"
+                    ),
+                    "arguments": schema.get("properties", {}),
+                    "required": list(schema.get("required", ())),
+                }
+            )
+            items.sort(key=lambda item: item["action_name"])
         return items
 
-    def _spawn_owner_chat_action(self, trigger: ChatActionTrigger) -> asyncio.Task[None]:
-        return self.background(self._run_owner_chat_action(trigger))
+    @staticmethod
+    def _safe_action_reason(raw: Any, *, fallback: str = "rejected") -> str:
+        text = str(raw or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", text):
+            return text
+        return fallback
 
-    async def _run_owner_chat_action(self, trigger: ChatActionTrigger) -> None:
+    def _spawn_owner_chat_action(
+        self, trigger: ChatActionTrigger, *, context_message: Message | None = None
+    ) -> asyncio.Task[None]:
+        return self.background(
+            self._run_owner_chat_action(trigger, context_message=context_message)
+        )
+
+    async def _run_learn_song_owner_action(
+        self,
+        trigger: ChatActionTrigger,
+        engine: Any,
+        cfg: Any,
+        *,
+        context_message: Message | None = None,
+    ) -> None:
+        if context_message is not None and not owner(context_message, self.s):
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=owner_only",
+                _LEARN_SONG_ACTION_NAME,
+            )
+            return
+        if cfg.action_modes.get(_LEARN_SONG_ACTION_NAME, "active") == "off":
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=action_disabled",
+                _LEARN_SONG_ACTION_NAME,
+            )
+            return
+        colab = getattr(self, "colab_compute", None)
+        songs = getattr(self, "songs", None)
+        if colab is None or not colab.configured() or songs is None:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip "
+                "reason=colab_unconfigured",
+                _LEARN_SONG_ACTION_NAME,
+            )
+            return
+        parsed_args: dict[str, Any] = {}
+        raw_args_json = trigger.arguments_json
+        if isinstance(raw_args_json, str) and raw_args_json.strip():
+            try:
+                loaded = json.loads(raw_args_json)
+            except (ValueError, TypeError):
+                log.info(
+                    "event=owner_chat_action_done action=%s status=not_dispatched "
+                    "reason=invalid_action_arguments",
+                    _LEARN_SONG_ACTION_NAME,
+                )
+                return
+            if not isinstance(loaded, dict):
+                log.info(
+                    "event=owner_chat_action_done action=%s status=not_dispatched "
+                    "reason=invalid_action_arguments",
+                    _LEARN_SONG_ACTION_NAME,
+                )
+                return
+            parsed_args = loaded
+        try:
+            args = _LearnSongArgs.model_validate(parsed_args)
+        except ValidationError:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip "
+                "reason=invalid_action_arguments",
+                _LEARN_SONG_ACTION_NAME,
+            )
+            return
+        title = args.title.strip().strip("《》").strip()
+        if not title:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip "
+                "reason=invalid_song_title",
+                _LEARN_SONG_ACTION_NAME,
+            )
+            return
+
+        audio_bytes: bytes | None = None
+        audio_filename = ""
+        if context_message is not None and context_message.files:
+            for ref in context_message.files:
+                try:
+                    audio_bytes, audio_filename = await self.files.read_audio_attachment(
+                        ref, context_message
+                    )
+                    break
+                except Rejected as exc:
+                    if str(exc) == "invalid_song_audio":
+                        continue
+                    log.info(
+                        "event=owner_chat_action_done action=%s status=not_dispatched reason=%s",
+                        _LEARN_SONG_ACTION_NAME,
+                        self._safe_action_reason(exc, fallback="unavailable"),
+                    )
+                    return
+
+        try:
+            await songs.request_learn_song(
+                title,
+                artist=args.artist.strip(),
+                tags=args.tags.strip(),
+                pitch=args.pitch,
+                audio_bytes=audio_bytes,
+                audio_filename=audio_filename,
+                auto_search=args.auto_search,
+                requester="owner_chat",
+            )
+        except Rejected as exc:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=%s",
+                _LEARN_SONG_ACTION_NAME,
+                self._safe_action_reason(exc),
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "event=owner_chat_action_done action=%s status=not_dispatched reason=%s",
+                _LEARN_SONG_ACTION_NAME,
+                type(exc).__name__,
+            )
+            return
+
+        log.info(
+            "event=owner_chat_action_done action=%s status=done reason=queued",
+            _LEARN_SONG_ACTION_NAME,
+        )
+        planner = getattr(engine, "planner", None)
+        replan = getattr(planner, "request_replan", None)
+        if callable(replan):
+            try:
+                await replan(delay_seconds=35.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+    async def _run_owner_chat_action(
+        self, trigger: ChatActionTrigger, context_message: Message | None = None
+    ) -> None:
         raw_name = (trigger.action_name or "").strip()
         engine = getattr(self, "life_engine", None)
         catalog = getattr(engine, "catalog", None)
@@ -369,6 +546,11 @@ class Service:
             log.info(
                 "event=owner_chat_action_done action=unknown status=gated_skip "
                 "reason=engine_disabled"
+            )
+            return
+        if raw_name == _LEARN_SONG_ACTION_NAME:
+            await self._run_learn_song_owner_action(
+                trigger, engine, cfg, context_message=context_message
             )
             return
         spec = catalog.actions.get(raw_name)
@@ -706,7 +888,6 @@ class Service:
             asyncio.create_task(self.janitor(), name="janitor"),
             asyncio.create_task(self.proactive.run(), name="owner-operational-alerts"),
             asyncio.create_task(self.proactive.delivery(), name="owner-dm-delivery"),
-            asyncio.create_task(self.gcp_billing_worker(), name="gcp-billing-sync"),
             asyncio.create_task(self.life_engine.run(), name="life-engine"),
         ]
         for module in self.modules.systems.values():
@@ -744,6 +925,8 @@ class Service:
             await sw.close()
         if vc := getattr(self, "voice_companion", None):
             await vc.close()
+        if cc := getattr(self, "colab_compute", None):
+            await cc.close()
 
     async def command(self, message: Message) -> str | None:
         if self.bot_guard.known_bot(message):
@@ -780,6 +963,13 @@ class Service:
         bind_match = re.match(r"^/bind(?:\s+(.*))?$", direct.strip())
         if bind_match:
             return await self._bind_command(message, bind_match[1] or "")
+        learn_match = re.match(
+            r"^(?:/(?:学歌|learn-song)|" + re.escape(prefix) + r"\s*学歌)(?:\s+(.*))?$",
+            direct.strip(),
+            re.DOTALL,
+        )
+        if learn_match:
+            return await self._learn_song_command(message, learn_match[1] or "")
         if not direct.startswith(prefix):
             return None
         command = direct[len(prefix) :].strip()
@@ -998,6 +1188,163 @@ class Service:
             return f"保存表情失败（{code}）。"
         extra = "（动画已取第一帧）" if saved.get("first_frame_only") else ""
         return f"表情已存好啦：标签「{saved['label']}」，随时可以用~{extra}"
+
+    async def _learn_song_command(self, message: Message, raw_args: str) -> str:
+        if message.kind != "private" or not owner(message, self.s):
+            raise Rejected("owner_private_only")
+        stripped = raw_args.strip()
+        if not stripped:
+            return (
+                "用法：/学歌 <歌名> [pitch=-24..24] [artist=原唱] [tags=标签] "
+                "[inbox=文件名] [--no-search]；可附带音频文件"
+                "（.mp3/.wav/.flac/.m4a/.ogg/.opus）。"
+            )
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            tokens = stripped.split()
+
+        title_parts: list[str] = []
+        artist = ""
+        tags = ""
+        inbox_filename = ""
+        pitch = 0
+        auto_search = True
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx]
+            low = tok.lower()
+            if low in {"--no-search", "--nosearch"}:
+                auto_search = False
+            elif low.startswith("auto_search="):
+                val = tok.split("=", 1)[1].strip().lower()
+                if val in {"0", "false", "no", "off"}:
+                    auto_search = False
+                elif val in {"1", "true", "yes", "on"}:
+                    auto_search = True
+                else:
+                    return "auto_search 参数需为 true 或 false。"
+            elif low in {"--pitch", "-p"}:
+                if idx + 1 >= len(tokens):
+                    return "用法：--pitch <整数 -24..24>"
+                idx += 1
+                raw_pitch = tokens[idx].strip()
+                if not re.fullmatch(r"[+-]?[0-9]{1,3}", raw_pitch):
+                    return "pitch 必须是整数（范围 -24 到 24）。"
+                pitch = int(raw_pitch)
+            elif low.startswith(("pitch=", "--pitch=", "pitch:", "变调=")):
+                sep = ":" if low.startswith("pitch:") else "="
+                raw_pitch = tok.split(sep, 1)[1].strip()
+                if not re.fullmatch(r"[+-]?[0-9]{1,3}", raw_pitch):
+                    return "pitch 必须是整数（范围 -24 到 24）。"
+                pitch = int(raw_pitch)
+            elif low in {"--artist", "-a"}:
+                if idx + 1 >= len(tokens):
+                    return "用法：--artist <原唱歌手>"
+                idx += 1
+                artist = tokens[idx].strip()
+            elif low.startswith(("artist=", "--artist=")):
+                artist = tok.split("=", 1)[1].strip()
+            elif low in {"--tags", "-t"}:
+                if idx + 1 >= len(tokens):
+                    return "用法：--tags <标签>"
+                idx += 1
+                tags = tokens[idx].strip()
+            elif low.startswith(("tags=", "--tags=")):
+                tags = tok.split("=", 1)[1].strip()
+            elif low in {"--inbox", "-i"}:
+                if idx + 1 >= len(tokens):
+                    return "用法：--inbox <云盘inbox文件名>"
+                idx += 1
+                inbox_filename = tokens[idx].strip()
+            elif low.startswith(("inbox=", "--inbox=")):
+                inbox_filename = tok.split("=", 1)[1].strip()
+            else:
+                title_parts.append(tok)
+            idx += 1
+
+        if not -24 <= pitch <= 24:
+            return "pitch 范围需在 -24 到 24 之间。"
+        raw_title = " ".join(title_parts).strip().strip("《》\"'").strip()
+        if not raw_title:
+            return "请提供歌名，例如：/学歌 晴天 pitch=-2"
+
+        if not message.files and message.forward_ids and not message.context_expanded:
+            try:
+                message = await self.expand_forwards(message)
+            except Rejected:
+                return "转发内容展开失败，无法读取音频附件。"
+
+        audio_bytes: bytes | None = None
+        audio_filename = ""
+        if message.files:
+            try:
+                audio_bytes, audio_filename = await self.files.read_audio_attachment(
+                    message.files[0], message
+                )
+            except Rejected as exc:
+                code = str(exc)
+                if code == "invalid_song_audio":
+                    return "音频附件格式不支持，仅支持 .mp3 / .wav / .flac / .m4a / .ogg / .opus。"
+                if code == "oversized":
+                    return "音频附件太大啦（最大支持 25 MiB），请剪辑或压缩后再发。"
+                if code == "unavailable":
+                    return "音频附件下载失败，请重新发送或上传到云盘 Hakimi_Songs/inbox/。"
+                return f"读取音频附件失败（{code}）。"
+
+        songs = getattr(self, "songs", None)
+        if songs is None or not hasattr(songs, "request_learn_song"):
+            return "歌单工坊模块尚未就绪，请稍后再试。"
+        try:
+            job = await songs.request_learn_song(
+                raw_title,
+                artist=artist,
+                tags=tags,
+                pitch=pitch,
+                audio_bytes=audio_bytes,
+                audio_filename=audio_filename,
+                inbox_filename=inbox_filename,
+                auto_search=auto_search,
+                requester="owner",
+            )
+        except Rejected as exc:
+            code = str(exc)
+            err_map = {
+                "colab_unconfigured": "Colab 云端算力未配置，请先在后台或环境变量配置 Worker。",
+                "colab_disabled": "Colab 云端算力当前已停用，请先在后台启用。",
+                "colab_worker_unavailable": "Colab Worker 暂时离线或不可达，请检查后台状态。",
+                "colab_daily_job_limit": "今日 Colab 学歌作业次数已达上限啦。",
+                "colab_daily_limit": "今日 Colab 学歌作业次数已达上限啦。",
+                "colab_daily_cu_budget": "今日 Colab CU 预算已用完啦。",
+                "colab_budget_exceeded": "今日 Colab CU 预算已用完啦。",
+                "colab_job_limit_reached": "Colab 任务队列已满，请稍等当前任务跑完再试。",
+                "colab_drive_not_configured": "Drive 歌单目录未配置，暂时无法上传/检索云盘。",
+                "colab_drive_invalid_file": "指定的云盘 inbox 文件无效，请核对文件名。",
+                "colab_invalid_job": "提交学歌参数无效，请检查歌名或选项。",
+                "invalid_song_title": "歌名格式不太对，请用 1～40 字常见字符、数字或中英文。",
+                "invalid_song_meta": "歌手或标签格式过长或包含非法字符。",
+                "invalid_song_pitch": "pitch 范围需在 -24 到 24 之间。",
+                "invalid_song_audio": "音频格式不支持或文件已损坏。",
+                "invalid_drive_file_id": "云盘文件标识无效，请重试。",
+                "song_upload_too_large": "音频超过体积上限，请先压缩或截取后再试。",
+                "song_source_required": "未附音频且已关闭自动搜歌，请附带音频或开启自动搜索。",
+                "song_title_exists": f"歌单里已经有《{raw_title}》啦，换一首或先在后台删除旧版吧。",
+                "song_library_full": "歌单已满（最多 100 首），去后台清理几首再来学吧。",
+            }
+            return err_map.get(code, f"提交学歌任务失败（{code}）。")
+
+        job_id = str(job.get("id") or job.get("job_id") or "")
+        pitch_note = f"，变调 {pitch:+d}" if pitch else ""
+        if audio_bytes is not None:
+            source_note = "（已使用附带音频）"
+        elif inbox_filename:
+            source_note = "（云盘原曲）"
+        else:
+            source_note = "（自动检索原曲）"
+        return (
+            f"收到！已开始练习《{raw_title}》{source_note}（任务 {job_id}{pitch_note}），"
+            "学好后会来叫你~"
+        )
 
     async def _auto_save_meme(
         self, message: Message, candidates: list[Message], label: str
@@ -2567,7 +2914,9 @@ class Service:
                         except Exception:
                             pass
                     if actions.trigger_action and verified_owner_turn:
-                        self._spawn_owner_chat_action(actions.trigger_action)
+                        self._spawn_owner_chat_action(
+                            actions.trigger_action, context_message=message
+                        )
                 allow_text_card = not aff_active or caps.allow_text_card
                 if actions.abstain:
                     if (

@@ -373,6 +373,28 @@ class Settings(BaseSettings):
         le=500,
         validation_alias=AliasChoices("VOICE_REPLY_DAILY_LIMIT", "HAKIMI_VOICE_REPLY_DAILY_LIMIT"),
     )
+    colab_worker_url: str = Field(
+        default="",
+        max_length=256,
+        validation_alias=AliasChoices("COLAB_WORKER_URL", "HAKIMI_COLAB_WORKER_URL"),
+    )
+    colab_worker_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices("COLAB_WORKER_TOKEN", "HAKIMI_COLAB_WORKER_TOKEN"),
+    )
+    colab_drive_songs_folder_id: str = Field(
+        default="",
+        pattern=r"^[A-Za-z0-9_-]{0,128}$",
+        validation_alias=AliasChoices(
+            "COLAB_DRIVE_SONGS_FOLDER_ID", "HAKIMI_COLAB_DRIVE_SONGS_FOLDER_ID"
+        ),
+    )
+    song_cache_max_bytes: int = Field(
+        default=30 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=500 * 1024 * 1024,
+        validation_alias=AliasChoices("SONG_CACHE_MAX_BYTES", "HAKIMI_SONG_CACHE_MAX_BYTES"),
+    )
 
     @field_validator("external_plugins", mode="before")
     @classmethod
@@ -411,6 +433,51 @@ class Settings(BaseSettings):
             or bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host))
         ):
             raise ValueError("remote voice_gateway_url requires HTTPS")
+        return raw.rstrip("/")
+
+    @field_validator("colab_worker_url", mode="before")
+    @classmethod
+    def _validate_colab_worker_url(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        raw = str(value).strip()
+        if not raw:
+            return ""
+        if len(raw) > 256:
+            raise ValueError("colab_worker_url too long")
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("invalid colab_worker_url")
+        if host in {"127.0.0.1", "::1", "localhost", "host.docker.internal"}:
+            return raw.rstrip("/")
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            if ip.version == 6 and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            if not (
+                ip.is_loopback
+                or (
+                    ip.is_private
+                    and not ip.is_link_local
+                    and not ip.is_unspecified
+                    and not ip.is_multicast
+                )
+            ):
+                raise ValueError("colab_worker_url must target loopback or internal host")
+        elif not re.fullmatch(r"(?=.*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host):
+            raise ValueError("colab_worker_url must target loopback or internal host")
         return raw.rstrip("/")
 
     group_policies: dict[str, Literal["at_only", "smart_reply", "muted"]] = Field(

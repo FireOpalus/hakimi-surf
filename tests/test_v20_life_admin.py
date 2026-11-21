@@ -377,13 +377,15 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         "event-ledger",
         "voice-companion",
         "screen-watch",
+        "colab-compute",
         "drive-sync",
         "journal",
     } <= tabs["modules"]
     assert "plugin-bus" in tabs["modules"]
+    allowed_core_shortcuts = tabs["core"] | {"modules", "plugin-bus", "colab-compute"}
     for key in tabs["core"]:
         shortcuts = set(re.findall(r'data-open-tab="([^"]+)"', panels[key]))
-        assert shortcuts <= tabs["core"] | {"modules", "plugin-bus"}, (key, shortcuts)
+        assert shortcuts <= allowed_core_shortcuts, (key, shortcuts)
     for marker, owner in (
         ('id="module-catalog"', "modules"),
         ('id="weather-editor"', "weather"),
@@ -405,6 +407,8 @@ async def test_admin_workspace_navigation_owns_each_panel_and_control_once(
         ('id="vc-sessions-table"', "voice-companion"),
         ('id="sw-config-form"', "screen-watch"),
         ('id="sw-commentary-table"', "screen-watch"),
+        ('id="colab-config-form"', "colab-compute"),
+        ('id="colab-jobs-table"', "colab-compute"),
     ):
         assert [key for key, content in panels.items() if marker in content] == [owner]
 

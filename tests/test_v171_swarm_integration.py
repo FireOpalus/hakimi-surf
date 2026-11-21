@@ -124,7 +124,7 @@ async def test_mounted_routes_dashboard_and_worker_liveness(settings):
     async with app.router.lifespan_context(app):
         app.state.gcp_transport = httpx.MockTransport(gcp_handler)
         svc = app.state.service
-        assert any(t.get_name() == "gcp-billing-sync" and not t.done() for t in svc.tasks)
+        assert any(t.get_name() == "gcp_billing" and not t.done() for t in svc.tasks)
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
