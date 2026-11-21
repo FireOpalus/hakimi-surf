@@ -143,6 +143,7 @@ class VoiceClientConfig:
     tts_gain: float = 0.0
     tts_format: Literal["mp3", "wav"] = "mp3"
     tts_buffer_mode: Literal["turn", "chunk"] = "turn"
+    tts_streaming: bool = True
 
     # Optional alternate providers
     fish_api_key: str = ""
@@ -150,6 +151,8 @@ class VoiceClientConfig:
     fish_reference_id: str = ""
     fish_model: str = ""
     fish_latency: Literal["balanced", "normal"] = "balanced"
+    fish_asr_language: str = "zh"
+    fish_asr_model: str = ""
     openai_stt_api_key: str = ""
     openai_stt_base_url: str = "https://api.groq.com/openai/v1"
     openai_stt_model: str = "whisper-large-v3-turbo"
@@ -160,7 +163,7 @@ class VoiceClientConfig:
     audio_input_device: str = "0"
     sample_rate: int = 16000
     vad_threshold: float = 0.018
-    vad_silence_ms: int = 750
+    vad_silence_ms: int = 480
     vad_min_speech_ms: int = 320
     vad_max_speech_ms: int = 20000
     vad_barge_in_multiplier: float = 2.2
@@ -195,6 +198,12 @@ class VoiceClientConfig:
                     "请配置硅基流动 API Key。"
                 )
             return
+        if provider in {"fish", "fish_audio"}:
+            if not self.fish_api_key.strip():
+                raise ValueError(
+                    "缺少 FISH_API_KEY：当前 STT_PROVIDER=fish，请配置 Fish Audio API Key。"
+                )
+            return
         if provider in {"openai", "openai_compatible", "groq"}:
             if not self.openai_stt_api_key.strip():
                 raise ValueError(
@@ -203,7 +212,7 @@ class VoiceClientConfig:
                 )
             return
         raise ValueError(
-            f"不支持的 STT_PROVIDER={self.stt_provider!r}（支持: siliconflow, openai）。"
+            f"不支持的 STT_PROVIDER={self.stt_provider!r}（支持: siliconflow, fish, openai）。"
         )
 
     def require_tts(self) -> None:
@@ -291,11 +300,12 @@ def load_config(
 
     tts_speed = _clamp(_parse_float(merged.get("TTS_SPEED"), 1.05, "TTS_SPEED"), 0.25, 4.0)
     tts_gain = _clamp(_parse_float(merged.get("TTS_GAIN"), 0.0, "TTS_GAIN"), -10.0, 10.0)
+    tts_streaming = _parse_bool(merged.get("TTS_STREAMING"), True, "TTS_STREAMING")
 
     vad_threshold = _clamp(
         _parse_float(merged.get("VAD_THRESHOLD"), 0.018, "VAD_THRESHOLD"), 0.0005, 1.0
     )
-    vad_silence_ms = max(60, _parse_int(merged.get("VAD_SILENCE_MS"), 750, "VAD_SILENCE_MS"))
+    vad_silence_ms = max(60, _parse_int(merged.get("VAD_SILENCE_MS"), 480, "VAD_SILENCE_MS"))
     vad_min_speech_ms = max(
         30, _parse_int(merged.get("VAD_MIN_SPEECH_MS"), 320, "VAD_MIN_SPEECH_MS")
     )
@@ -336,6 +346,7 @@ def load_config(
         tts_gain=tts_gain,
         tts_format=tts_format,
         tts_buffer_mode=tts_buffer_mode,
+        tts_streaming=tts_streaming,
         fish_api_key=merged.get("FISH_API_KEY", "").strip(),
         fish_base_url=_non_empty_or_default(
             merged, "FISH_BASE_URL", "https://api.fish.audio"
@@ -343,6 +354,10 @@ def load_config(
         fish_reference_id=merged.get("FISH_REFERENCE_ID", "").strip(),
         fish_model=merged.get("FISH_MODEL", "").strip(),
         fish_latency=fish_latency,
+        fish_asr_language=(
+            merged["FISH_ASR_LANGUAGE"].strip() if "FISH_ASR_LANGUAGE" in merged else "zh"
+        ),
+        fish_asr_model=merged.get("FISH_ASR_MODEL", "").strip(),
         openai_stt_api_key=merged.get("OPENAI_STT_API_KEY", "").strip(),
         openai_stt_base_url=_non_empty_or_default(
             merged, "OPENAI_STT_BASE_URL", "https://api.groq.com/openai/v1"

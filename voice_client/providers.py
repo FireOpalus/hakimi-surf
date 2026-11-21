@@ -6,7 +6,7 @@ import asyncio
 import mimetypes
 import re
 import tempfile
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -120,6 +120,55 @@ async def _post_transcription(
     if not isinstance(payload, dict) or "text" not in payload:
         raise ProviderError(f"{provider_label} 响应缺少 text 字段")
     return str(payload.get("text") or "")
+
+
+class FishAudioSTT:
+    """Fish Audio /v1/asr client."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str = "https://api.fish.audio",
+        language: str = "zh",
+        model: str = "",
+        http: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.language = language.strip()
+        self.model = model.strip()
+        self._owns_http = http is None
+        self._http = http or _make_default_http_client()
+
+    async def transcribe(self, wav_bytes: bytes, *, filename: str = "utterance.wav") -> str:
+        if not wav_bytes:
+            return ""
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if self.model:
+            headers["model"] = self.model
+        data = {"language": self.language} if self.language else {}
+        try:
+            resp = await self._http.post(
+                f"{self.base_url}/v1/asr",
+                headers=headers,
+                files={"audio": (filename, wav_bytes, "audio/wav")},
+                data=data,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"Fish Audio STT 网络请求失败 ({type(exc).__name__})") from None
+        _raise_for_bad_status("Fish Audio STT", resp, secrets=(self.api_key,))
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise ProviderError("Fish Audio STT 返回了无效 JSON 响应") from None
+        if not isinstance(payload, dict) or "text" not in payload:
+            raise ProviderError("Fish Audio STT 响应缺少 text 字段")
+        return strip_stt_markup(str(payload.get("text") or ""))
+
+    async def aclose(self) -> None:
+        if self._owns_http:
+            await self._http.aclose()
 
 
 class SiliconFlowSTT:
@@ -241,6 +290,39 @@ class SiliconFlowTTS:
             raise ProviderError("SiliconFlow TTS 返回了空音频数据")
         return resp.content, fmt
 
+    async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
+        if not text.strip():
+            raise ProviderError("SiliconFlow TTS 输入文本为空")
+        fmt = self.response_format
+        sample_rate = 44100 if fmt == "mp3" else 32000
+        try:
+            async with self._http.stream(
+                "POST",
+                f"{self.base_url}/audio/speech",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "model": self.model,
+                    "input": text,
+                    "voice": self.voice,
+                    "response_format": fmt,
+                    "sample_rate": sample_rate,
+                    "speed": self.speed,
+                    "gain": self.gain,
+                },
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    _raise_for_bad_status("SiliconFlow TTS", resp, secrets=(self.api_key,))
+                emitted = False
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    if chunk:
+                        emitted = True
+                        yield chunk
+                if not emitted:
+                    raise ProviderError("SiliconFlow TTS 返回了空音频数据")
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"SiliconFlow TTS 流式请求失败 ({type(exc).__name__})") from None
+
     async def upload_custom_voice(
         self,
         audio_path: Path,
@@ -345,6 +427,46 @@ class FishAudioTTS:
             raise ProviderError("Fish Audio TTS 返回了空音频数据")
         return resp.content, self.response_format
 
+    async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
+        if not text.strip():
+            raise ProviderError("Fish Audio TTS 输入文本为空")
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if self.model:
+            headers["model"] = self.model
+        body: dict[str, Any] = {
+            "text": text,
+            "format": self.response_format,
+            "latency": self.latency,
+            "normalize": True,
+            "prosody": {
+                "speed": self.speed,
+                "volume": self.volume,
+            },
+        }
+        if self.reference_id:
+            body["reference_id"] = self.reference_id
+        if self.response_format == "mp3":
+            body["mp3_bitrate"] = 128
+        try:
+            async with self._http.stream(
+                "POST",
+                f"{self.base_url}/v1/tts",
+                headers=headers,
+                json=body,
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    _raise_for_bad_status("Fish Audio TTS", resp, secrets=(self.api_key,))
+                emitted = False
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    if chunk:
+                        emitted = True
+                        yield chunk
+                if not emitted:
+                    raise ProviderError("Fish Audio TTS 返回了空音频数据")
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"Fish Audio TTS 流式请求失败 ({type(exc).__name__})") from None
+
     async def aclose(self) -> None:
         if self._owns_http:
             await self._http.aclose()
@@ -413,6 +535,14 @@ def build_stt_provider(
             api_key=config.siliconflow_api_key,
             base_url=config.siliconflow_base_url,
             model=config.siliconflow_stt_model,
+            http=http,
+        )
+    if provider in {"fish", "fish_audio"}:
+        return FishAudioSTT(
+            api_key=config.fish_api_key,
+            base_url=config.fish_base_url,
+            language=config.fish_asr_language,
+            model=config.fish_asr_model,
             http=http,
         )
     return OpenAICompatibleSTT(

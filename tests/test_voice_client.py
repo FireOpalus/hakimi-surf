@@ -23,6 +23,7 @@ from tests.test_voice_companion import COMPANION_PATH, COMPANION_TOKEN
 from voice_client import (
     AfplayAudioPlayer,
     EnergyVadDetector,
+    FishAudioSTT,
     FishAudioTTS,
     OpenAICompatibleSTT,
     ProviderError,
@@ -133,7 +134,12 @@ def test_load_dotenv_file_and_config_validation_clamping(tmp_path):
     ).require_ws()
     VoiceClientConfig(siliconflow_api_key="sk-secret").require_stt()
     VoiceClientConfig(siliconflow_api_key="sk-secret").require_tts()
+    VoiceClientConfig(stt_provider="fish", fish_api_key="fish-secret").require_stt()
+    with pytest.raises(ValueError, match="FISH_API_KEY"):
+        VoiceClientConfig(stt_provider="fish").require_stt()
     VoiceClientConfig(stt_provider="openai", openai_stt_api_key="sk-oai").require_stt()
+    assert VoiceClientConfig().vad_silence_ms == 480
+    assert VoiceClientConfig().tts_streaming is True
     VoiceClientConfig(tts_provider="fish", fish_api_key="f").require_tts()
     VoiceClientConfig(tts_provider="fish", fish_api_key="f", fish_reference_id="r").require_tts()
     with pytest.raises(ValueError, match="FISH_API_KEY"):
@@ -1400,3 +1406,126 @@ async def test_full_turn_tts_buffer_mode_and_chunk_mode(monkeypatch):
     # Chunk mode still enqueues each slice immediately
     res_chunk = await _run_case("chunk", "spoken")
     assert [txt for _, _, txt in res_chunk] == ["哇，", "苦力怕来了！", "快跑喵~"]
+
+
+async def test_fish_asr_and_tts_streaming_chunks(monkeypatch):
+    from voice_client.providers import build_stt_provider
+
+    seen: list[tuple[str, dict[str, str], bytes]] = []
+    fish_key = "fish-secret-token-never-leak"
+    sf_key = "sf-secret-token-never-leak"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), dict(request.headers), await request.aread()))
+        if str(request.url) == "https://api.fish.audio/v1/asr":
+            if request.headers.get("authorization") != f"Bearer {fish_key}":
+                return httpx.Response(401, text=f"bad auth {request.headers.get('authorization')}")
+            return httpx.Response(200, json={"text": "<|zh|> 你好呀，哈基米！"})
+        if str(request.url) == "https://api.fish.audio/v1/tts":
+            return httpx.Response(200, content=b"ID3" + b"A" * 2048 + b"B" * 2048)
+        if str(request.url) == "https://api.siliconflow.cn/v1/audio/speech":
+            return httpx.Response(403, text="quota_exceeded")
+        raise AssertionError(f"unexpected url: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        cfg = VoiceClientConfig(
+            stt_provider="fish",
+            fish_api_key=fish_key,
+            fish_asr_language="zh",
+            fish_asr_model="transcribe-1-pro",
+        )
+        stt = build_stt_provider(cfg, http=http)
+        assert isinstance(stt, FishAudioSTT)
+        assert await stt.transcribe(b"RIFF-WAV") == "你好呀，哈基米！"
+        url, hdrs, body = seen[-1]
+        assert url == "https://api.fish.audio/v1/asr"
+        assert hdrs["authorization"] == f"Bearer {fish_key}"
+        assert hdrs["model"] == "transcribe-1-pro"
+        assert b'name="audio"' in body
+        assert b'name="language"' in body
+
+        bad_stt = FishAudioSTT(api_key="bad-key-xyz", http=http)
+        with pytest.raises(ProviderError) as exc_info:
+            await bad_stt.transcribe(b"RIFF-WAV")
+        assert "HTTP 401" in str(exc_info.value)
+        assert "bad-key-xyz" not in str(exc_info.value)
+
+        fish_tts = FishAudioTTS(api_key=fish_key, reference_id="ref-1", http=http)
+        chunks = [c async for c in fish_tts.synthesize_stream("测试流式")]
+        assert b"".join(chunks).startswith(b"ID3")
+
+        sf_tts = SiliconFlowTTS(api_key=sf_key, http=http)
+        with pytest.raises(ProviderError, match="HTTP 403"):
+            async for _ in sf_tts.synthesize_stream("失败测试"):
+                pass
+
+
+async def test_streaming_player_pipes_chunks_and_cancels_immediately(tmp_path):
+    chunk1_emitted = asyncio.Event()
+    allow_chunk2 = asyncio.Event()
+    allow_cancel = asyncio.Event()
+    first_audio_times: list[tuple[str, float]] = []
+
+    class StreamTTS:
+        response_format = "mp3"
+
+        async def synthesize(self, text: str) -> tuple[bytes, str]:
+            return text.encode("utf-8"), "mp3"
+
+        async def synthesize_stream(self, text: str):
+            if text == "cancel-me":
+                yield b"HEAD-"
+                allow_cancel.set()
+                await asyncio.sleep(5.0)
+                yield b"TAIL"
+                return
+            yield b"FIRST-"
+            chunk1_emitted.set()
+            await allow_chunk2.wait()
+            yield b"SECOND"
+
+        async def aclose(self) -> None:
+            return None
+
+    sink_file = tmp_path / "streamed.bin"
+
+    def stream_cmd_factory(fmt: str) -> list[str]:
+        assert fmt == "mp3"
+        script = (
+            "import pathlib, sys; "
+            "data = sys.stdin.buffer.read(); "
+            "pathlib.Path(sys.argv[1]).write_bytes(data)"
+        )
+        return [sys.executable, "-c", script, str(sink_file)]
+
+    player = AfplayAudioPlayer(
+        StreamTTS(),
+        stream_cmd_factory=stream_cmd_factory,
+        enable_streaming=True,
+        on_first_audio=lambda tid, ms: first_audio_times.append((tid, ms)),
+    )
+    assert player.streaming_active is True
+    await player.start()
+    try:
+        player.enqueue_chunk("turn-1", 1, "hello-stream")
+        await asyncio.wait_for(chunk1_emitted.wait(), timeout=2.0)
+        for _ in range(50):
+            if first_audio_times:
+                break
+            await asyncio.sleep(0.01)
+        assert len(first_audio_times) == 1
+        assert first_audio_times[0][0] == "turn-1"
+        allow_chunk2.set()
+        await player.wait_idle()
+        assert sink_file.read_bytes() == b"FIRST-SECOND"
+
+        player.enqueue_chunk("turn-cancel", 1, "cancel-me")
+        await asyncio.wait_for(allow_cancel.wait(), timeout=2.0)
+        for _ in range(50):
+            if player.is_playing:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.wait_for(player.cancel_turn("turn-cancel"), timeout=1.5)
+        await asyncio.wait_for(player.wait_idle(), timeout=1.5)
+    finally:
+        await player.stop()

@@ -13,6 +13,7 @@ from .audio import (
 from .config import DEFAULT_ENV_FILE, VoiceClientConfig, load_config, load_dotenv_file
 from .providers import (
     EdgeFallbackTTS,
+    FishAudioSTT,
     FishAudioTTS,
     OpenAICompatibleSTT,
     ProviderError,
@@ -33,6 +34,7 @@ __all__ = [
     "EdgeFallbackTTS",
     "EnergyVadDetector",
     "FfmpegMicCapture",
+    "FishAudioSTT",
     "FishAudioTTS",
     "OpenAICompatibleSTT",
     "ProviderError",

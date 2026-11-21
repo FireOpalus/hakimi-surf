@@ -10,7 +10,9 @@ import os
 import signal
 import sys
 import termios
+import time
 import tty
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -146,11 +148,22 @@ async def test_tts(config: VoiceClientConfig, text: str) -> int:
     """Synthesize and play one test phrase via the configured TTS provider."""
     config.require_tts()
     tts = build_tts_provider(config)
-    player = AfplayAudioPlayer(tts)
     try:
-        audio_bytes, fmt = await tts.synthesize(text)
-        await player.play_once(audio_bytes, fmt)
-        print(f"✅ TTS 合成并播放完成 ({len(audio_bytes)} bytes, {fmt})")
+        player = AfplayAudioPlayer(tts, enable_streaming=config.tts_streaming)
+    except TypeError:
+        player = AfplayAudioPlayer(tts)
+    try:
+        if callable(getattr(player, "play_stream_once", None)):
+            ttfb_ms, total_ms, total_bytes, fmt = await player.play_stream_once(text)
+            mode = "流式ffplay" if getattr(player, "streaming_active", False) else "afplay"
+            print(
+                f"✅ TTS 播放完成 ({mode}, 首字节={ttfb_ms:.0f}ms, "
+                f"总计={total_ms:.0f}ms, {total_bytes} bytes, {fmt})"
+            )
+        else:
+            audio_bytes, fmt = await tts.synthesize(text)
+            await player.play_once(audio_bytes, fmt)
+            print(f"✅ TTS 合成并播放完成 ({len(audio_bytes)} bytes, {fmt})")
         return 0
     finally:
         await player.stop()
@@ -183,8 +196,10 @@ async def test_stt(config: VoiceClientConfig, *, duration_seconds: float = 4.0) 
             print("⚠️ 未采集到麦克风音频。")
             return 1
         wav = pcm16_to_wav_bytes(pcm, sample_rate=config.sample_rate)
+        t0 = time.perf_counter()
         text = (await stt.transcribe(wav)).strip()
-        print(f"📝 识别文本: {text or '(未识别到有效语音)'}")
+        stt_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"📝 识别文本 ({stt_ms:.0f}ms): {text or '(未识别到有效语音)'}")
         return 0
     finally:
         await mic.stop()
@@ -234,11 +249,12 @@ def _print_banner(config: VoiceClientConfig, ready: dict[str, Any], voice_mode: 
     mode_label = ready.get("mode", config.session_mode)
     game_label = config.game_title or "日常连麦"
     buf_label = "整轮合播(不切片)" if config.tts_buffer_mode == "turn" else "逐句流式"
+    stream_label = "流式ffplay" if config.tts_streaming else "afplay"
     print("=" * 64)
     print("🐱 哈基米实时语音伴随客户端已连接")
     print(
         f"会话模式: {mode_label} | 拾音: {voice_mode.upper()} | "
-        f"TTS: {config.tts_provider}/{buf_label} | "
+        f"STT: {config.stt_provider} | TTS: {config.tts_provider}/{buf_label}/{stream_label} | "
         f"设备: [{config.audio_input_device}] | 场景: {game_label}"
     )
     print("操作说明:")
@@ -272,7 +288,37 @@ async def run_interactive_session(
     owns_stt = stt_provider is None
     owns_tts = tts_provider is None
 
-    player = audio_player or AfplayAudioPlayer(tts)
+    turn_metrics: dict[str, dict[str, float]] = {}
+
+    def _on_first_audio(turn_id: str, tts_ttfa_ms: float) -> None:
+        info = turn_metrics.pop(turn_id, None)
+        if not info:
+            return
+        llm_ms = info.get("llm_ms")
+        if llm_ms is None and "sent_at" in info:
+            llm_ms = (time.perf_counter() - info["sent_at"]) * 1000.0
+        parts: list[str] = []
+        if "stt_ms" in info:
+            parts.append(f"STT={info['stt_ms']:.0f}ms")
+        if llm_ms is not None:
+            parts.append(f"LLM={llm_ms:.0f}ms")
+        parts.append(f"TTS首音={tts_ttfa_ms:.0f}ms")
+        print(f"⏱️ 耗时: {' | '.join(parts)}", flush=True)
+
+    def _record_turn_metric(turn_id: str, *, stt_ms: float | None = None) -> None:
+        if len(turn_metrics) >= 32:
+            oldest = next(iter(turn_metrics))
+            turn_metrics.pop(oldest, None)
+        entry: dict[str, float] = {"sent_at": time.perf_counter()}
+        if stt_ms is not None:
+            entry["stt_ms"] = stt_ms
+        turn_metrics[turn_id] = entry
+
+    player = audio_player or AfplayAudioPlayer(
+        tts,
+        enable_streaming=config.tts_streaming,
+        on_first_audio=_on_first_audio,
+    )
     mic = mic_capture or FfmpegMicCapture(
         device=config.audio_input_device,
         sample_rate=config.sample_rate,
@@ -332,16 +378,24 @@ async def run_interactive_session(
         turn_id = str(frame.get("turn_id") or "")
         parts = turn_buffers.pop(turn_id, [])
         if status == "cancelled":
+            turn_metrics.pop(turn_id, None)
             await player.cancel_turn(turn_id or None)
         elif status == "error":
+            turn_metrics.pop(turn_id, None)
             reason = str(frame.get("reason") or "unknown")
             print(f"⚠️ 本轮回复异常: {reason}", flush=True)
-        elif config.tts_buffer_mode == "turn" and parts and status not in {"silent", "skipped"}:
-            full_text = _join_turn_chunks(parts)
-            if full_text:
-                res = player.enqueue_chunk(turn_id, 1, full_text)
-                if asyncio.iscoroutine(res):
-                    await res
+        elif status in {"silent", "skipped"}:
+            turn_metrics.pop(turn_id, None)
+        else:
+            metric = turn_metrics.get(turn_id)
+            if metric is not None and "sent_at" in metric:
+                metric["llm_ms"] = (time.perf_counter() - metric["sent_at"]) * 1000.0
+            if config.tts_buffer_mode == "turn" and parts:
+                full_text = _join_turn_chunks(parts)
+                if full_text:
+                    res = player.enqueue_chunk(turn_id, 1, full_text)
+                    if asyncio.iscoroutine(res):
+                        await res
 
     async def on_error(frame: dict[str, Any]) -> None:
         reason = str(frame.get("reason") or "unknown")
@@ -362,8 +416,14 @@ async def run_interactive_session(
         on_disconnect=on_disconnect,
     )
 
+    async def send_text_turn(text: str, *, stt_ms: float | None = None) -> None:
+        tid = f"t-{uuid.uuid4().hex[:12]}"
+        _record_turn_metric(tid, stt_ms=stt_ms)
+        await ws.send_speech_turn(text, turn_id=tid)
+
     async def interrupt_now() -> None:
         turn_buffers.clear()
+        turn_metrics.clear()
         await player.cancel_turn()
         await ws.cancel_turn()
 
@@ -371,15 +431,17 @@ async def run_interactive_session(
         if not pcm_bytes:
             return
         wav = pcm16_to_wav_bytes(pcm_bytes, sample_rate=config.sample_rate)
+        t0 = time.perf_counter()
         try:
             text = (await stt.transcribe(wav)).strip()
         except ProviderError as exc:
             print(f"⚠️ 语音识别失败: {exc}", flush=True)
             return
+        stt_ms = (time.perf_counter() - t0) * 1000.0
         if not text:
             return
-        print(f"🎤 你: {text}", flush=True)
-        await ws.send_speech_turn(text)
+        print(f"🎤 你: {text}  (STT {stt_ms:.0f}ms)", flush=True)
+        await send_text_turn(text, stt_ms=stt_ms)
 
     def toggle_mode() -> None:
         nonlocal voice_mode, ptt_recording
@@ -470,7 +532,7 @@ async def run_interactive_session(
             clean = line.strip()
             if clean and not stop_event.is_set():
                 print(f"💬 你: {clean}", flush=True)
-                await ws.send_speech_turn(clean)
+                await send_text_turn(clean)
 
     def on_tty_stdin_ready() -> None:
         try:
@@ -535,12 +597,12 @@ async def run_interactive_session(
                     msg = next_line.strip()
                     if msg:
                         print(f"💬 你: {msg}", flush=True)
-                        await ws.send_speech_turn(msg)
+                        await send_text_turn(msg)
                 else:
                     msg = stripped[2:].strip() if stripped.startswith("t ") else stripped
                     if msg:
                         print(f"💬 你: {msg}", flush=True)
-                        await ws.send_speech_turn(msg)
+                        await send_text_turn(msg)
         except asyncio.CancelledError:
             raise
 

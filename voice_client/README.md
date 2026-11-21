@@ -41,7 +41,7 @@ TTS_FORMAT=mp3
 VOICE_MODE=vad
 AUDIO_INPUT_DEVICE=0
 VAD_THRESHOLD=0.018
-VAD_SILENCE_MS=750
+VAD_SILENCE_MS=480
 VAD_MIN_SPEECH_MS=320
 VAD_MAX_SPEECH_MS=20000
 VAD_BARGE_IN_MULTIPLIER=2.2
@@ -50,7 +50,8 @@ BARGE_IN_ENABLED=true
 
 - `TTS_BUFFER_MODE=turn`（默认）：流式收到文本后先在终端实时显示，等整轮说完后**一次性整段合成播报**（消除逗号逐句切片导致的机械停顿）；设为 `chunk` 或传 `--tts-buffer-mode chunk` 可切回逐句流式播报。
 - 可选 Provider：
-  - **Fish Audio TTS（`TTS_PROVIDER=fish`）**：配置 `FISH_API_KEY`，可选填 `FISH_REFERENCE_ID`（音色 UUID，留空使用默认）、`FISH_MODEL`（如 `s2.1-pro`、`s2.1-pro-free`、`s2-pro`，留空走 Fish Audio 最新默认）、`FISH_LATENCY`（`balanced` / `normal`）；支持 `TTS_SPEED` 与 `TTS_GAIN` 语速音量控制。
+  - **Fish Audio STT + TTS（`STT_PROVIDER=fish`, `TTS_PROVIDER=fish`）**：低延迟约 200ms 识别（按净音频秒数计费，向上取整到整秒，挂机不收费），可设 `FISH_ASR_LANGUAGE=zh` 与 `TTS_STREAMING=true`（通过 `ffplay` 管道边下边播，不切片也能 ~300ms 开口）；
+  - **Fish Audio TTS 细节**：配置 `FISH_API_KEY`，可选填 `FISH_REFERENCE_ID`（音色 UUID，留空使用默认）、`FISH_MODEL`（如 `s2.1-pro`、`s2.1-pro-free`、`s2-pro`，留空走 Fish Audio 最新默认）、`FISH_LATENCY`（`balanced` / `normal`）；支持 `TTS_SPEED` 与 `TTS_GAIN` 语速音量控制。
   - **OpenAI/Groq 兼容 STT（`STT_PROVIDER=openai`）**：搭配 `OPENAI_STT_API_KEY` / `OPENAI_STT_BASE_URL` / `OPENAI_STT_MODEL`。
   - **本地 Edge TTS 兜底（`TTS_PROVIDER=edge`）**：依赖本地 `edge-tts` 命令。
 
