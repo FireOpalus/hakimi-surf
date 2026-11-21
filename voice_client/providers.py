@@ -9,6 +9,7 @@ import tempfile
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
+from urllib.parse import quote
 
 import httpx
 
@@ -17,6 +18,7 @@ from .config import VoiceClientConfig
 _STT_MARKUP_RE = re.compile(r"<\|[^|>]{1,32}\|>")
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
+_BRZ_TOKEN_RE = re.compile(r"brz_[A-Za-z0-9_-]{8,}")
 
 
 def _read_existing_file(path: Path) -> bytes | None:
@@ -43,6 +45,7 @@ def _sanitize_error_detail(detail: str, secrets: Sequence[str] = ()) -> str:
             out = out.replace(secret, "[REDACTED]")
     out = _BEARER_RE.sub("Bearer [REDACTED]", out)
     out = _SK_TOKEN_RE.sub("sk-[REDACTED]", out)
+    out = _BRZ_TOKEN_RE.sub("brz_[REDACTED]", out)
     out = " ".join(out.split())
     if len(out) > 220:
         out = out[:217] + "..."
@@ -472,6 +475,138 @@ class FishAudioTTS:
             await self._http.aclose()
 
 
+class BreezeBlueTTS:
+    """BreezeBlue (Breeze TTS 2) /v1/text-to-speech/{voice_id} client."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        voice_id: str,
+        base_url: str = "https://api.breeze.blue",
+        model_id: str = "breeze-tts-2",
+        language_code: str = "zh",
+        instructions: str = "",
+        response_format: Literal["mp3", "wav"] = "mp3",
+        speed: float = 1.0,
+        guidance_scale: float | None = None,
+        use_speaker_boost: bool | None = None,
+        http: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.api_key = api_key
+        self.voice_id = voice_id.strip()
+        cleaned_url = base_url.strip().rstrip("/") or "https://api.breeze.blue"
+        if cleaned_url.endswith("/v1"):
+            cleaned_url = cleaned_url[:-3].rstrip("/")
+        self.base_url = cleaned_url
+        self.model_id = model_id.strip()
+        self.language_code = language_code.strip()
+        self.instructions = instructions.strip()
+        self.response_format = response_format if response_format in {"mp3", "wav"} else "mp3"
+        self.speed = max(0.5, min(2.0, float(speed)))
+        self.guidance_scale = (
+            max(1.0, min(10.0, float(guidance_scale))) if guidance_scale is not None else None
+        )
+        self.use_speaker_boost = use_speaker_boost
+        self._owns_http = http is None
+        self._http = http or _make_default_http_client()
+
+    def _output_format_param(self) -> str:
+        return "mp3" if self.response_format == "mp3" else "wav_24000"
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def _body(self, text: str) -> dict[str, Any]:
+        body: dict[str, Any] = {"text": text}
+        if self.model_id:
+            body["model_id"] = self.model_id
+        if self.language_code:
+            body["language_code"] = self.language_code
+        if self.instructions:
+            body["instructions"] = self.instructions
+        voice_settings: dict[str, Any] = {}
+        if abs(self.speed - 1.0) > 1e-6:
+            voice_settings["speed"] = self.speed
+        if self.guidance_scale is not None:
+            voice_settings["guidance_scale"] = self.guidance_scale
+        if self.use_speaker_boost is not None:
+            voice_settings["use_speaker_boost"] = self.use_speaker_boost
+        if voice_settings:
+            body["voice_settings"] = voice_settings
+        return body
+
+    async def synthesize(self, text: str) -> tuple[bytes, str]:
+        if not text.strip():
+            raise ProviderError("BreezeBlue TTS 输入文本为空")
+        if not self.voice_id:
+            raise ProviderError("BreezeBlue TTS 未配置 voice_id")
+        voice_seg = quote(self.voice_id, safe="")
+        try:
+            resp = await self._http.post(
+                f"{self.base_url}/v1/text-to-speech/{voice_seg}",
+                params={"output_format": self._output_format_param()},
+                headers=self._headers(),
+                json=self._body(text),
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"BreezeBlue TTS 网络请求失败 ({type(exc).__name__})") from None
+        _raise_for_bad_status("BreezeBlue TTS", resp, secrets=(self.api_key,))
+        if not resp.content:
+            raise ProviderError("BreezeBlue TTS 返回了空音频数据")
+        return resp.content, self.response_format
+
+    async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
+        if not text.strip():
+            raise ProviderError("BreezeBlue TTS 输入文本为空")
+        if not self.voice_id:
+            raise ProviderError("BreezeBlue TTS 未配置 voice_id")
+        voice_seg = quote(self.voice_id, safe="")
+        try:
+            async with self._http.stream(
+                "POST",
+                f"{self.base_url}/v1/text-to-speech/{voice_seg}/stream",
+                params={"output_format": self._output_format_param()},
+                headers=self._headers(),
+                json=self._body(text),
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    _raise_for_bad_status("BreezeBlue TTS", resp, secrets=(self.api_key,))
+                emitted = False
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    if chunk:
+                        emitted = True
+                        yield chunk
+                if not emitted:
+                    raise ProviderError("BreezeBlue TTS 返回了空音频数据")
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"BreezeBlue TTS 流式请求失败 ({type(exc).__name__})") from None
+
+    async def list_voices(self) -> list[dict[str, Any]]:
+        try:
+            resp = await self._http.get(
+                f"{self.base_url}/v1/voices",
+                headers=self._headers(),
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"BreezeBlue 音色列表请求失败 ({type(exc).__name__})") from None
+        _raise_for_bad_status("BreezeBlue 音色列表", resp, secrets=(self.api_key,))
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise ProviderError("BreezeBlue 音色列表返回了无效 JSON 响应") from None
+        if isinstance(payload, dict) and isinstance(payload.get("voices"), list):
+            return [v for v in payload["voices"] if isinstance(v, dict)]
+        if isinstance(payload, list):
+            return [v for v in payload if isinstance(v, dict)]
+        raise ProviderError("BreezeBlue 音色列表响应格式无效")
+
+    async def aclose(self) -> None:
+        if self._owns_http:
+            await self._http.aclose()
+
+
 class EdgeFallbackTTS:
     """Fallback TTS invoking the local edge-tts CLI into a temporary MP3 file."""
 
@@ -582,6 +717,20 @@ def build_tts_provider(
             latency=config.fish_latency,
             speed=config.tts_speed,
             volume=config.tts_gain,
+            http=http,
+        )
+    if provider in {"breezeblue", "breeze_blue", "breeze"}:
+        return BreezeBlueTTS(
+            api_key=config.breezeblue_api_key,
+            voice_id=config.breezeblue_voice_id,
+            base_url=config.breezeblue_base_url,
+            model_id=config.breezeblue_model_id,
+            language_code=config.breezeblue_language_code,
+            instructions=config.breezeblue_instructions,
+            response_format=config.tts_format,
+            speed=config.tts_speed,
+            guidance_scale=config.breezeblue_guidance_scale,
+            use_speaker_boost=config.breezeblue_speaker_boost,
             http=http,
         )
     return EdgeFallbackTTS(voice=config.edge_tts_voice)

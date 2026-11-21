@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from hakimi.app import create_app
 from tests.test_voice_companion import COMPANION_PATH, COMPANION_TOKEN, _StreamMockGateway
+from voice_client import BreezeBlueTTS
 from voice_client.audio import pcm16_to_wav_bytes
 from voice_client.config import VoiceClientConfig
 from voice_client.gateway_ws import VoiceGatewayWsClient
@@ -1214,3 +1215,62 @@ async def test_e2e_voice_gateway_ws_client_asgi_to_real_voice_companion(settings
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(server_task, timeout=5.0)
             await asyncio.gather(*bridge.serve_tasks, return_exceptions=True)
+
+
+def test_gateway_breezeblue_config_redaction_and_http_tts(tmp_path):
+    fake_ffmpeg = _write_fake_ffmpeg_script(tmp_path / "fake_ffmpeg.py")
+    brz_key = "brz_gw_secret_token_987654"
+    gw_cfg = load_gateway_config(
+        env={
+            "VOICE_GATEWAY_TOKEN": GATEWAY_TOKEN,
+            "VOICE_GATEWAY_WS_PATH": GATEWAY_PATH,
+            "FFMPEG_BIN": fake_ffmpeg,
+            "STT_PROVIDER": "fish",
+            "FISH_API_KEY": "fish-stt-key-123",
+            "TTS_PROVIDER": "breezeblue",
+            "BREEZEBLUE_API_KEY": brz_key,
+            "BREEZEBLUE_VOICE_ID": "voc_gw_001",
+            "BREEZEBLUE_MODEL_ID": "breeze-tts-2",
+            "BREEZEBLUE_GUIDANCE_SCALE": "2.5",
+            "BREEZEBLUE_SPEAKER_BOOST": "false",
+        }
+    )
+    assert gw_cfg.resolved_tts_model() == "breeze-tts-2"
+    client_cfg = gw_cfg.to_client_config()
+    assert client_cfg.breezeblue_api_key == brz_key
+    assert client_cfg.breezeblue_voice_id == "voc_gw_001"
+    assert client_cfg.breezeblue_guidance_scale == 2.5
+    assert client_cfg.breezeblue_speaker_boost is False
+
+    scrubbed = redact_secrets(
+        f"Authorization: Bearer {brz_key} and stray brz_other_secret_key_99", gw_cfg
+    )
+    assert brz_key not in scrubbed
+    assert "brz_other_secret_key_99" not in scrubbed
+
+    import httpx
+
+    def brz_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/text-to-speech/voc_gw_001/stream"
+        return httpx.Response(200, content=b"ID3\x03\x00\x00BRZ-GW")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(brz_handler))
+    tts = BreezeBlueTTS(
+        api_key=gw_cfg.breezeblue_api_key,
+        voice_id=gw_cfg.breezeblue_voice_id,
+        model_id=gw_cfg.breezeblue_model_id,
+        http=http,
+    )
+    app = create_gateway_app(gw_cfg, stt_provider=_FakeSTT(), tts_provider=tts)
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.json()["tts_provider"] == "breezeblue"
+
+        resp = client.post(
+            "/v1/tts",
+            headers={"Authorization": f"Bearer {GATEWAY_TOKEN}"},
+            json={"text": "BreezeBlue 测试喵", "output_format": "pcm_16k", "stream": False},
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"PCM:ID3\x03\x00\x00BRZ-GW"

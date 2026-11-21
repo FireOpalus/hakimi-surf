@@ -22,6 +22,7 @@ from hakimi.app import create_app
 from tests.test_voice_companion import COMPANION_PATH, COMPANION_TOKEN
 from voice_client import (
     AfplayAudioPlayer,
+    BreezeBlueTTS,
     EnergyVadDetector,
     FishAudioSTT,
     FishAudioTTS,
@@ -30,6 +31,7 @@ from voice_client import (
     SiliconFlowSTT,
     SiliconFlowTTS,
     VoiceClientConfig,
+    build_tts_provider,
     list_avfoundation_audio_devices,
     load_config,
     load_dotenv_file,
@@ -2442,3 +2444,106 @@ async def test_cli_gateway_tts_stt_and_interactive_session(monkeypatch, capsys, 
     assert any(f["type"] == "audio.turn" for f in sess_sent)
     assert any(f["type"] == "turn.cancel" for f in sess_sent)
     assert vad_player.cancelled >= 1
+
+
+async def test_breezeblue_config_provider_streaming_and_redaction(tmp_path):
+    missing = tmp_path / "none.env"
+    with pytest.raises(ValueError, match="BREEZEBLUE_API_KEY"):
+        VoiceClientConfig(tts_provider="breezeblue", breezeblue_voice_id="voc_123").require_tts()
+    with pytest.raises(ValueError, match="BREEZEBLUE_VOICE_ID"):
+        VoiceClientConfig(
+            tts_provider="breeze", breezeblue_api_key="brz_secret_123456"
+        ).require_tts()
+
+    cfg = load_config(
+        env={
+            "TTS_PROVIDER": "breezeblue",
+            "BREEZEBLUE_API_KEY": "brz_secret_key_abcdef12",
+            "BREEZEBLUE_BASE_URL": "https://api.breeze.blue/v1/",
+            "BREEZEBLUE_VOICE_ID": "voc_hakimi_001",
+            "BREEZEBLUE_MODEL_ID": "breeze-tts-2-multilingual",
+            "BREEZEBLUE_LANGUAGE_CODE": "",
+            "BREEZEBLUE_INSTRUCTIONS": "温柔娇俏地说话",
+            "BREEZEBLUE_GUIDANCE_SCALE": "15.0",
+            "BREEZEBLUE_SPEAKER_BOOST": "true",
+            "TTS_SPEED": "1.1",
+            "TTS_FORMAT": "wav",
+        },
+        env_file=missing,
+    )
+    cfg.require_tts()
+    assert cfg.breezeblue_guidance_scale == 10.0
+    assert cfg.breezeblue_speaker_boost is True
+    assert cfg.breezeblue_language_code == ""
+
+    seen: list[tuple[str, str, dict[str, str], bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, str(request.url), dict(request.headers), request.content))
+        if request.url.path == "/v1/voices":
+            return httpx.Response(
+                200, json={"voices": [{"voice_id": "voc_hakimi_001", "name": "哈基米"}]}
+            )
+        if request.url.path == "/v1/text-to-speech/voc_bad/stream":
+            return httpx.Response(
+                401,
+                text="bad key brz_secret_key_abcdef12 and brz_another_leaked_key",
+            )
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, content=b"BRZ-STREAM-1BRZ-STREAM-2")
+        return httpx.Response(200, content=b"RIFF-BRZ-WAV")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        provider = build_tts_provider(cfg, http=http)
+        assert isinstance(provider, BreezeBlueTTS)
+        audio, fmt = await provider.synthesize("早安喵~")
+        assert audio == b"RIFF-BRZ-WAV"
+        assert fmt == "wav"
+        method, url, hdrs, body = seen[-1]
+        assert method == "POST"
+        assert (
+            url
+            == "https://api.breeze.blue/v1/text-to-speech/voc_hakimi_001?output_format=wav_24000"
+        )
+        assert hdrs["authorization"] == "Bearer brz_secret_key_abcdef12"
+        assert json.loads(body.decode("utf-8")) == {
+            "text": "早安喵~",
+            "model_id": "breeze-tts-2-multilingual",
+            "instructions": "温柔娇俏地说话",
+            "voice_settings": {
+                "speed": 1.1,
+                "guidance_scale": 10.0,
+                "use_speaker_boost": True,
+            },
+        }
+
+        mp3_provider = BreezeBlueTTS(
+            api_key="brz_secret_key_abcdef12",
+            voice_id="voc_hakimi_001",
+            response_format="mp3",
+            speed=1.0,
+            http=http,
+        )
+        streamed = [c async for c in mp3_provider.synthesize_stream("测试流式")]
+        assert b"".join(streamed) == b"BRZ-STREAM-1BRZ-STREAM-2"
+        _, surl, _, sbody = seen[-1]
+        assert (
+            surl
+            == "https://api.breeze.blue/v1/text-to-speech/voc_hakimi_001/stream?output_format=mp3"
+        )
+        assert "voice_settings" not in json.loads(sbody.decode("utf-8"))
+
+        voices = await mp3_provider.list_voices()
+        assert voices == [{"voice_id": "voc_hakimi_001", "name": "哈基米"}]
+
+        bad_provider = BreezeBlueTTS(
+            api_key="brz_secret_key_abcdef12",
+            voice_id="voc_bad",
+            http=http,
+        )
+        with pytest.raises(ProviderError) as exc_info:
+            await anext(bad_provider.synthesize_stream("fail"))
+        err_msg = str(exc_info.value)
+        assert "brz_secret_key_abcdef12" not in err_msg
+        assert "brz_another_leaked_key" not in err_msg
+        assert "brz_[REDACTED]" in err_msg or "[REDACTED]" in err_msg

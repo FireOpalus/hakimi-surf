@@ -12,6 +12,7 @@ from .audio import (
 )
 from .config import DEFAULT_ENV_FILE, VoiceClientConfig, load_config, load_dotenv_file
 from .providers import (
+    BreezeBlueTTS,
     EdgeFallbackTTS,
     FishAudioSTT,
     FishAudioTTS,
@@ -31,6 +32,7 @@ __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_ENV_FILE",
     "AfplayAudioPlayer",
+    "BreezeBlueTTS",
     "EdgeFallbackTTS",
     "EnergyVadDetector",
     "FfmpegMicCapture",

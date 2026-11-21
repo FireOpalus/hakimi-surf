@@ -30,6 +30,7 @@ _VALID_OUTPUT_FORMATS: frozenset[str] = frozenset(
 _WS_PATH_RE = re.compile(r"^/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
+_BRZ_TOKEN_RE = re.compile(r"brz_[A-Za-z0-9_-]{8,}")
 
 
 def redact_secrets(text: str, config: VoiceGatewayConfig | None = None) -> str:
@@ -53,6 +54,7 @@ def redact_secrets(text: str, config: VoiceGatewayConfig | None = None) -> str:
             config.siliconflow_api_key.strip(),
             config.fish_api_key.strip(),
             config.openai_stt_api_key.strip(),
+            config.breezeblue_api_key.strip(),
         ]
         # Replace longer secret values before shorter ones to prevent partial leakage.
         for secret in sorted({s for s in raw_secrets if s}, key=len, reverse=True):
@@ -60,6 +62,7 @@ def redact_secrets(text: str, config: VoiceGatewayConfig | None = None) -> str:
 
     out = _BEARER_RE.sub("Bearer [REDACTED]", out)
     out = _SK_TOKEN_RE.sub("sk-[REDACTED]", out)
+    out = _BRZ_TOKEN_RE.sub("brz_[REDACTED]", out)
     return out
 
 
@@ -115,6 +118,14 @@ class VoiceGatewayConfig:
     openai_stt_base_url: str = "https://api.groq.com/openai/v1"
     openai_stt_model: str = "whisper-large-v3-turbo"
     edge_tts_voice: str = "zh-CN-XiaoyiNeural"
+    breezeblue_api_key: str = ""
+    breezeblue_base_url: str = "https://api.breeze.blue"
+    breezeblue_voice_id: str = ""
+    breezeblue_model_id: str = "breeze-tts-2"
+    breezeblue_language_code: str = "zh"
+    breezeblue_instructions: str = ""
+    breezeblue_guidance_scale: float | None = None
+    breezeblue_speaker_boost: bool | None = None
 
     def require_gateway_auth(self) -> None:
         """Enforce >=32-character gateway Bearer token and valid WS path."""
@@ -177,6 +188,14 @@ class VoiceGatewayConfig:
             openai_stt_base_url=self.openai_stt_base_url,
             openai_stt_model=self.openai_stt_model,
             edge_tts_voice=self.edge_tts_voice,
+            breezeblue_api_key=self.breezeblue_api_key,
+            breezeblue_base_url=self.breezeblue_base_url,
+            breezeblue_voice_id=self.breezeblue_voice_id,
+            breezeblue_model_id=self.breezeblue_model_id,
+            breezeblue_language_code=self.breezeblue_language_code,
+            breezeblue_instructions=self.breezeblue_instructions,
+            breezeblue_guidance_scale=self.breezeblue_guidance_scale,
+            breezeblue_speaker_boost=self.breezeblue_speaker_boost,
             ping_interval_seconds=self.ping_interval_seconds,
         )
 
@@ -187,6 +206,8 @@ class VoiceGatewayConfig:
             return self.siliconflow_tts_model
         if provider in {"fish", "fish_audio"}:
             return self.fish_model or self.fish_reference_id or "default"
+        if provider in {"breezeblue", "breeze_blue", "breeze"}:
+            return self.breezeblue_model_id or self.breezeblue_voice_id or "breeze-tts-2"
         if provider in {"edge", "edge_tts"}:
             return self.edge_tts_voice
         return ""
@@ -282,6 +303,18 @@ def load_gateway_config(
     tts_speed = _clamp(_parse_float(merged.get("TTS_SPEED"), 1.05, "TTS_SPEED"), 0.25, 4.0)
     tts_gain = _clamp(_parse_float(merged.get("TTS_GAIN"), 0.0, "TTS_GAIN"), -10.0, 10.0)
     tts_streaming = _parse_bool(merged.get("TTS_STREAMING"), True, "TTS_STREAMING")
+    raw_breeze_guidance = merged.get("BREEZEBLUE_GUIDANCE_SCALE", "").strip()
+    breezeblue_guidance_scale = (
+        _clamp(_parse_float(raw_breeze_guidance, 1.0, "BREEZEBLUE_GUIDANCE_SCALE"), 1.0, 10.0)
+        if raw_breeze_guidance
+        else None
+    )
+    raw_breeze_boost = merged.get("BREEZEBLUE_SPEAKER_BOOST", "").strip()
+    breezeblue_speaker_boost = (
+        _parse_bool(raw_breeze_boost, True, "BREEZEBLUE_SPEAKER_BOOST")
+        if raw_breeze_boost
+        else None
+    )
     ping_interval_seconds = max(
         0.0,
         _parse_float(merged.get("PING_INTERVAL_SECONDS"), 20.0, "PING_INTERVAL_SECONDS"),
@@ -344,4 +377,18 @@ def load_gateway_config(
             merged, "OPENAI_STT_MODEL", "whisper-large-v3-turbo"
         ),
         edge_tts_voice=_non_empty_or_default(merged, "EDGE_TTS_VOICE", "zh-CN-XiaoyiNeural"),
+        breezeblue_api_key=merged.get("BREEZEBLUE_API_KEY", "").strip(),
+        breezeblue_base_url=_non_empty_or_default(
+            merged, "BREEZEBLUE_BASE_URL", "https://api.breeze.blue"
+        ).rstrip("/"),
+        breezeblue_voice_id=merged.get("BREEZEBLUE_VOICE_ID", "").strip(),
+        breezeblue_model_id=_non_empty_or_default(merged, "BREEZEBLUE_MODEL_ID", "breeze-tts-2"),
+        breezeblue_language_code=(
+            merged["BREEZEBLUE_LANGUAGE_CODE"].strip()
+            if "BREEZEBLUE_LANGUAGE_CODE" in merged
+            else "zh"
+        ),
+        breezeblue_instructions=merged.get("BREEZEBLUE_INSTRUCTIONS", "").strip(),
+        breezeblue_guidance_scale=breezeblue_guidance_scale,
+        breezeblue_speaker_boost=breezeblue_speaker_boost,
     )

@@ -160,6 +160,14 @@ class VoiceClientConfig:
     openai_stt_base_url: str = "https://api.groq.com/openai/v1"
     openai_stt_model: str = "whisper-large-v3-turbo"
     edge_tts_voice: str = "zh-CN-XiaoyiNeural"
+    breezeblue_api_key: str = ""
+    breezeblue_base_url: str = "https://api.breeze.blue"
+    breezeblue_voice_id: str = ""
+    breezeblue_model_id: str = "breeze-tts-2"
+    breezeblue_language_code: str = "zh"
+    breezeblue_instructions: str = ""
+    breezeblue_guidance_scale: float | None = None
+    breezeblue_speaker_boost: bool | None = None
 
     # Audio capture, VAD, PTT, and keepalive
     voice_mode: Literal["vad", "ptt"] = "vad"
@@ -258,6 +266,18 @@ class VoiceClientConfig:
                     "缺少 FISH_API_KEY：当前 TTS_PROVIDER=fish，请配置 Fish Audio API Key。"
                 )
             return
+        if provider in {"breezeblue", "breeze_blue", "breeze"}:
+            if not self.breezeblue_api_key.strip():
+                raise ValueError(
+                    "缺少 BREEZEBLUE_API_KEY：当前 TTS_PROVIDER=breezeblue，"
+                    "请配置 BreezeBlue API Key。"
+                )
+            if not self.breezeblue_voice_id.strip():
+                raise ValueError(
+                    "缺少 BREEZEBLUE_VOICE_ID：当前 TTS_PROVIDER=breezeblue，"
+                    "请配置 BreezeBlue Voice ID。"
+                )
+            return
         if provider in {"edge", "edge_tts"}:
             if not self.edge_tts_voice.strip():
                 raise ValueError(
@@ -265,7 +285,8 @@ class VoiceClientConfig:
                 )
             return
         raise ValueError(
-            f"不支持的 TTS_PROVIDER={self.tts_provider!r}（支持: siliconflow, fish, edge）。"
+            f"不支持的 TTS_PROVIDER={self.tts_provider!r}（支持: siliconflow, fish, "
+            "breezeblue, edge）。"
         )
 
 
@@ -328,6 +349,18 @@ def load_config(
     tts_speed = _clamp(_parse_float(merged.get("TTS_SPEED"), 1.05, "TTS_SPEED"), 0.25, 4.0)
     tts_gain = _clamp(_parse_float(merged.get("TTS_GAIN"), 0.0, "TTS_GAIN"), -10.0, 10.0)
     tts_streaming = _parse_bool(merged.get("TTS_STREAMING"), True, "TTS_STREAMING")
+    raw_breeze_guidance = merged.get("BREEZEBLUE_GUIDANCE_SCALE", "").strip()
+    breezeblue_guidance_scale = (
+        _clamp(_parse_float(raw_breeze_guidance, 1.0, "BREEZEBLUE_GUIDANCE_SCALE"), 1.0, 10.0)
+        if raw_breeze_guidance
+        else None
+    )
+    raw_breeze_boost = merged.get("BREEZEBLUE_SPEAKER_BOOST", "").strip()
+    breezeblue_speaker_boost = (
+        _parse_bool(raw_breeze_boost, True, "BREEZEBLUE_SPEAKER_BOOST")
+        if raw_breeze_boost
+        else None
+    )
 
     vad_threshold = _clamp(
         _parse_float(merged.get("VAD_THRESHOLD"), 0.018, "VAD_THRESHOLD"), 0.0005, 1.0
@@ -407,6 +440,20 @@ def load_config(
             merged, "OPENAI_STT_MODEL", "whisper-large-v3-turbo"
         ),
         edge_tts_voice=_non_empty_or_default(merged, "EDGE_TTS_VOICE", "zh-CN-XiaoyiNeural"),
+        breezeblue_api_key=merged.get("BREEZEBLUE_API_KEY", "").strip(),
+        breezeblue_base_url=_non_empty_or_default(
+            merged, "BREEZEBLUE_BASE_URL", "https://api.breeze.blue"
+        ).rstrip("/"),
+        breezeblue_voice_id=merged.get("BREEZEBLUE_VOICE_ID", "").strip(),
+        breezeblue_model_id=_non_empty_or_default(merged, "BREEZEBLUE_MODEL_ID", "breeze-tts-2"),
+        breezeblue_language_code=(
+            merged["BREEZEBLUE_LANGUAGE_CODE"].strip()
+            if "BREEZEBLUE_LANGUAGE_CODE" in merged
+            else "zh"
+        ),
+        breezeblue_instructions=merged.get("BREEZEBLUE_INSTRUCTIONS", "").strip(),
+        breezeblue_guidance_scale=breezeblue_guidance_scale,
+        breezeblue_speaker_boost=breezeblue_speaker_boost,
         voice_mode=voice_mode,
         audio_input_device=_non_empty_or_default(merged, "AUDIO_INPUT_DEVICE", "0"),
         vad_threshold=vad_threshold,
