@@ -51,7 +51,7 @@ _MARKDOWN_SAFE = str.maketrans({"<": "＜", ">": "＞", "[": "［", "]": "］", 
 
 def redact_public_summary(text: str) -> str:
     # Defense in depth; callers may supply only already-screened public metadata summaries.
-    text = clean_text(text)[:3000]
+    text = clean_text(text)[:6000]
     text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[联系方式已隐去]", text)
     text = re.sub(r"(?<!\w)\d{5,}(?!\w)", "[号码已隐去]", text)
     text = re.sub(r"@[\w\u4e00-\u9fff-]+", "[称呼已隐去]", text)
@@ -61,7 +61,7 @@ def redact_public_summary(text: str) -> str:
 
 
 def format_chat_entry(
-    text: str, secrets: list[str], *, limit: int = 1200, scrub_secrets: bool = False
+    text: str, secrets: list[str], *, limit: int = 4000, scrub_secrets: bool = False
 ) -> str:
     """Sanitize chat/summary text for Drive Markdown without stripping speakers."""
     cleaned = clean_text(text)
@@ -386,6 +386,11 @@ class PatrolDiary:
         await self.initialize()
         async with self.store.lock:
             counts, rows = await self._source_rows(day, archive_chats=self.s.roaming_enabled)
+            summary = await self.store.one(
+                "SELECT * FROM roaming_summaries WHERE day=? AND (? OR day IN "
+                "(SELECT day FROM roaming_public_summaries))",
+                (day, self.s.roaming_enabled),
+            )
         patrol_rows = [r for r in rows if (r["event_kind"] or "patrol") == "patrol"]
         world_rows = [r for r in rows if (r["event_kind"] or "patrol") == "world_life"]
         chat_rows = [
@@ -393,11 +398,24 @@ class PatrolDiary:
             for r in rows
             if self.s.roaming_enabled and r["event_kind"] in {"chat_private", "chat_group"}
         ]
+        max_bytes = self.s.roaming_max_bytes
         lines = [
             f"# 分身巡逻日记 · {day}",
             "",
             f"时区：{self.s.roaming_timezone}",
             "",
+        ]
+        if summary:
+            lines += ["## 每日总结", ""]
+            if summary["status"] == "done":
+                key = self.store.vault.digest("daily-summary", self.s.namespace, day)
+                text = self.store.vault.open(key, summary["payload"])
+                lines += ["> " + line for line in text.splitlines()]
+                snapshot = self.local(summary["created"]).strftime("%Y-%m-%d %H:%M")
+                lines += ["", f"基于 {snapshot} 的日志快照；详细记录见下方明细。", ""]
+            else:
+                lines += ["当日模型总结未完成；以下保留已记录的日志明细。", ""]
+        lines += [
             "## B 站公开内容巡逻",
             "",
             "仅基于公开标题和简介，未观看全片。",
@@ -407,10 +425,10 @@ class PatrolDiary:
         used_bytes = 0
         if patrol_rows:
             for index, row in enumerate(patrol_rows):
-                summary = self.store.vault.open(row["id"], row["payload"])
-                quoted = ["> " + line for line in summary.splitlines()]
+                entry = self.store.vault.open(row["id"], row["payload"])
+                quoted = ["> " + line for line in entry.splitlines()]
                 used_bytes += len("\n".join(quoted).encode()) + 2
-                if used_bytes > 196608:
+                if used_bytes > max_bytes:
                     omitted += len(patrol_rows) - index
                     break
                 lines += quoted
@@ -431,7 +449,7 @@ class PatrolDiary:
                 entry = self.store.vault.open(row["id"], row["payload"])
                 quoted = ["> " + line for line in entry.splitlines()]
                 used_bytes += len("\n".join(quoted).encode()) + 2
-                if used_bytes > 196608:
+                if used_bytes > max_bytes:
                     omitted += len(chat_rows) - index
                     break
                 lines += quoted
@@ -444,7 +462,7 @@ class PatrolDiary:
                 entry = self.store.vault.open(row["id"], row["payload"])
                 quoted = ["> " + line for line in entry.splitlines()]
                 used_bytes += len("\n".join(quoted).encode()) + 2
-                if used_bytes > 196608:
+                if used_bytes > max_bytes:
                     omitted += len(world_rows) - index
                     break
                 lines += quoted
@@ -457,22 +475,6 @@ class PatrolDiary:
             f"检测到的提示词注入试探：{counts.get('injection', 0)} 次。",
             "",
         ]
-        async with self.store.lock:
-            summary = await self.store.one(
-                "SELECT * FROM roaming_summaries WHERE day=? AND (? OR day IN "
-                "(SELECT day FROM roaming_public_summaries))",
-                (day, self.s.roaming_enabled),
-            )
-        if summary:
-            lines += ["## 每日总结", ""]
-            if summary["status"] == "done":
-                key = self.store.vault.digest("daily-summary", self.s.namespace, day)
-                text = self.store.vault.open(key, summary["payload"])
-                lines += ["> " + line for line in text.splitlines()]
-                snapshot = self.local(summary["created"]).strftime("%Y-%m-%d %H:%M")
-                lines += ["", f"基于 {snapshot} 的日志快照；后续记录见上方明细。", ""]
-            else:
-                lines += ["当日模型总结未完成；以上保留已记录的日志明细。", ""]
         return "\n".join(lines)
 
     async def prepare_due(self, *, now=None, force=False):

@@ -22,6 +22,7 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 API = "https://www.googleapis.com/drive/v3/files"
 UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 FILE_FIELDS = "id,name,parents,mimeType,trashed,appProperties"
+MAX_DIARY_UPLOAD_BYTES = 4_500_000
 
 
 class DriveAuth:
@@ -171,7 +172,10 @@ class FolderDrive(DriveAuth):
             raise Rejected("drive_oauth_folder_mismatch")
 
     async def sync_day(self, day: str, markdown: str) -> str:
-        if date.fromisoformat(day).isoformat() != day or len(markdown.encode()) > 262144:
+        if (
+            date.fromisoformat(day).isoformat() != day
+            or len(markdown.encode()) > MAX_DIARY_UPLOAD_BYTES
+        ):
             raise Rejected("drive_invalid_diary")
         return await self.upsert(
             day + ".md", markdown.encode(), "text/markdown", "hakimi_roaming", self.marker

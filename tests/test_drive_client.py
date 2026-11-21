@@ -278,3 +278,20 @@ async def test_group_memory_no_unconditional_update_or_out_of_scope_download(set
             await drive.read_memory(
                 scope, {"id": FILE, "etag": '"v2"' if mode == "too_big" else '"v1"'}
             )
+
+
+async def test_sync_day_allows_large_diary_up_to_4_5mb_and_rejects_excess(settings):
+    from hakimi.drive_client import MAX_DIARY_UPLOAD_BYTES
+
+    def handler(request):
+        if request.url.path == "/drive/v3/files/" + FOLDER:
+            return httpx.Response(200, json=folder_info())
+        if request.method == "POST":
+            return httpx.Response(200, json=file_info())
+        return httpx.Response(200, json={"files": []})
+
+    drive, client = await drive_for(settings, handler)
+    async with client:
+        assert await drive.sync_day(DAY, "x" * 400_000) == FILE
+        with pytest.raises(Rejected, match="drive_invalid_diary"):
+            await drive.sync_day(DAY, "x" * (MAX_DIARY_UPLOAD_BYTES + 1))

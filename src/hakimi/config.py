@@ -492,7 +492,8 @@ class Settings(BaseSettings):
     roaming_timezone: str = "Asia/Shanghai"
     roaming_interval_seconds: int = Field(default=7200, ge=3600, le=86400)
     roaming_group_ids: set[str] = Field(default_factory=set)
-    roaming_max_events_per_day: int = Field(default=200, ge=10, le=1000)
+    roaming_max_events_per_day: int = Field(default=2000, ge=10, le=10000)
+    roaming_max_bytes: int = Field(default=2_097_152, ge=32_768, le=4_194_304)
     qq_enabled: bool = False
     qq_app_id: str = Field(default="", pattern=r"^[0-9]{0,32}$")
     qq_app_secret: SecretStr = SecretStr("")

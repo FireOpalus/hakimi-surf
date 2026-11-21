@@ -284,3 +284,24 @@ async def test_manual_today_flush_ignores_slot_and_backoff_without_repeating_mod
     assert row[0] is None and row[1] == now + 1
     await diary.sync_due(now=now + 2, force=True)
     assert len(diary.drive.calls) == 2
+
+
+async def test_diary_summary_placed_above_details_and_large_body_cap_supported(diary, message):
+    diary.gateway = FakeGateway()
+    now = timestamp("2026-11-14T23:55:00")
+    chunk = "细节记录" * 500
+    for idx in range(55):
+        await diary.patrol(f"big-{idx}", f"条目{idx:02d}-{chunk}", now=now)
+    await diary.group("chat-big", message.model_copy(update={"text": "长聊记录" * 600}), now=now)
+    await diary.sync_due(now=now)
+    rendered = diary.drive.calls[-1][1]
+    assert len(rendered.encode()) > 262_144
+    assert "另有" not in rendered
+    assert "条目00-" in rendered and "条目54-" in rendered
+    assert "长聊记录" in rendered
+    assert rendered.index("## 每日总结") < rendered.index("## B 站公开内容巡逻")
+    assert rendered.index("## B 站公开内容巡逻") < rendered.index("## 白名单聊天记录（群聊与私聊）")
+
+    diary.s = diary.s.model_copy(update={"roaming_max_bytes": 32_768})
+    capped = await diary.render("2026-11-14")
+    assert "因日记长度限制省略" in capped
