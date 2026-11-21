@@ -13,6 +13,7 @@ import struct
 import sys
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -728,6 +729,109 @@ class DualMemory:
                     )
                 except Exception:
                     continue
+        return True
+
+    async def record_chronicle(
+        self,
+        message,
+        *,
+        topic: str,
+        text: str,
+        category: Literal["event", "slang", "consensus", "open_question"] = "event",
+        tags: Sequence[str] = (),
+        source_id: str = "",
+        created_at: float | None = None,
+    ) -> bool:
+        """Record or update an encrypted chronicle entry directly without LLM extraction."""
+        if not isinstance(topic, str) or not isinstance(text, str):
+            return False
+        clean_topic = topic.strip()
+        clean_text = text.strip()
+        if (
+            not clean_topic
+            or len(clean_topic) > 80
+            or not clean_text
+            or len(clean_text) > 500
+            or category not in {"event", "slang", "consensus", "open_question"}
+        ):
+            return False
+        if isinstance(tags, str | bytes) or not isinstance(tags, Sequence):
+            return False
+        clean_tags: list[str] = []
+        for raw_tag in tags:
+            if not isinstance(raw_tag, str):
+                return False
+            tag = raw_tag.strip()
+            if not tag:
+                continue
+            if len(tag) > 40:
+                return False
+            if tag not in clean_tags:
+                clean_tags.append(tag)
+                if len(clean_tags) >= 8:
+                    break
+        if created_at is not None and (
+            isinstance(created_at, bool)
+            or not isinstance(created_at, int | float)
+            or not math.isfinite(float(created_at))
+        ):
+            return False
+        ts = float(time.time() if created_at is None else created_at)
+        clean_source = source_id[:80] if isinstance(source_id, str) else ""
+
+        async with self.sessions.database(message, preserve_history=True) as (db, key):
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                row = await cur.fetchone()
+                if not row or not row[0]:
+                    return False
+            ident = self.vault.digest("chronicle-topic", key, category, clean_topic.lower())[:24]
+            async with db.execute(
+                "SELECT id,payload,locked,deleted,vector FROM chronicle_events"
+            ) as cur:
+                existing = await cur.fetchall()
+            existing_ids = {r[0] for r in existing}
+            text_vec = vector(clean_text)
+            for old_id, _blob, locked, deleted, old_vector in existing:
+                if locked and (
+                    old_id == ident
+                    or (
+                        deleted
+                        and similarity(
+                            base64.b64decode(self.vault.open(key + ":v:" + old_id, old_vector)),
+                            text_vec,
+                        )
+                        >= 0.78
+                    )
+                ):
+                    return False
+            if len(existing) >= MAX_ENTRIES and ident not in existing_ids:
+                return False
+            data = {
+                "topic": clean_topic,
+                "category": category,
+                "text": clean_text,
+                "tags": clean_tags,
+                "evidence_seqs": [],
+            }
+            packed = vector(clean_text + " " + " ".join(clean_tags))
+            await db.execute(
+                "INSERT INTO chronicle_events VALUES (?,?,?,1,?,?,0,0,?) ON "
+                "CONFLICT(id) DO UPDATE SET "
+                "payload=excluded.payload,vector=excluded.vector,heat=MIN(heat+1,100),"
+                "updated=excluded.updated,source_id=excluded.source_id "
+                "WHERE locked=0 AND updated<=excluded.updated",
+                (
+                    ident,
+                    self.vault.seal(key + ":e:" + ident, data),
+                    self.vault.seal(key + ":v:" + ident, base64.b64encode(packed).decode()),
+                    ts,
+                    ts,
+                    clean_source,
+                ),
+            )
+            await db.execute("UPDATE memory_control SET ready=1")
+            await db.execute("UPDATE rolling_state SET version=version+1")
+        self.index.discard(key)
         return True
 
     async def edit(self, message, ident, *, version, action, text="", expires=0):

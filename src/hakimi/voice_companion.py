@@ -11,7 +11,9 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 import anyio
 from pydantic import BaseModel, ConfigDict, Field
@@ -60,6 +62,7 @@ class VoiceCompanionConfig(BaseModel):
     enabled: bool = True
     use_screen_watch: bool = True
     save_recap_to_ledger: bool = True
+    save_recap_to_dual_memory: bool = True
     tts_style_hint: str = Field(default="活泼软萌、口语短句", max_length=80)
 
 
@@ -505,6 +508,32 @@ class VoiceCompanion:
         cleaned = " ".join(clean_text(raw).split())
         return safe_output(cleaned, secrets, limit=180)
 
+    def _build_dual_memory_recap(
+        self, session: _CompanionSession, ended_at: float
+    ) -> tuple[str, str, list[str]]:
+        secrets = (
+            list(self.service.secrets)
+            if getattr(self.service, "secrets", None)
+            else configured_secrets(self.s)
+        )
+        tz = ZoneInfo(getattr(self.s, "bot_timezone", "Asia/Shanghai") or "Asia/Shanghai")
+        local_date = datetime.fromtimestamp(ended_at, tz=tz).strftime("%Y-%m-%d")
+        mins = max(1, round(max(0.0, ended_at - session.started_at) / 60.0))
+        title = session.game_title or "日常连麦"
+        topic = f"语音伴随:{title}:{local_date}"[:80]
+        head = f"「{title}」语音连麦 {mins} 分钟（对话 {session.spoken_turns} 轮"
+        if session.frames_analyzed:
+            head += f"，看屏 {session.frames_analyzed} 帧"
+        head += "）"
+        if session.highlights:
+            tail = "；".join(list(session.highlights)[-6:])
+            raw = f"{head}：{tail}"
+        else:
+            raw = head
+        recap_text = safe_output(" ".join(clean_text(raw).split()), secrets, limit=420)
+        tags = list(dict.fromkeys([t for t in ("语音伴随", "连麦", session.game_title) if t]))[:6]
+        return topic, recap_text, tags
+
     async def _finalize_session(self, session: _CompanionSession, *, status: str = "ended") -> None:
         if session.finalized:
             return
@@ -547,6 +576,26 @@ class VoiceCompanion:
                     )
                 except Exception:
                     pass
+            if self.config.save_recap_to_dual_memory and self.s.owner_qq_id:
+                sessions = getattr(self.service, "sessions", None)
+                dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
+                if dual_mem is not None and hasattr(dual_mem, "record_chronicle"):
+                    try:
+                        topic, recap_text, tags = self._build_dual_memory_recap(session, now)
+                        owner_msg = self._make_turn_message(
+                            session, self.s.owner_qq_id, "BOISER", "", now
+                        )
+                        await dual_mem.record_chronicle(
+                            owner_msg,
+                            topic=topic,
+                            text=recap_text,
+                            category="event",
+                            tags=tags,
+                            source_id=f"voice:{session.id}",
+                            created_at=now,
+                        )
+                    except Exception:
+                        pass
         elif ws is not None and hasattr(ws, "publish_event"):
             try:
                 await ws.publish_event(
@@ -606,6 +655,20 @@ class VoiceCompanion:
                         turns.append(prefix + clean_text(txt)[:140])
                     if turns:
                         ctx["recent_qq_turns"] = turns[-6:]
+                except Exception:
+                    pass
+        dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
+        if dual_mem is not None and hasattr(dual_mem, "prefetch"):
+            path_fn = getattr(sessions, "path", None)
+            if not callable(path_fn) or path_fn(owner_msg).exists():
+                try:
+                    dual = await dual_mem.prefetch(
+                        owner_msg, speech_text or "语音伴随", recall=True
+                    )
+                    if isinstance(dual, dict) and (
+                        dual.get("speaker_profile") or dual.get("chronicle_recall")
+                    ):
+                        ctx["owner_dual_memory"] = dual
                 except Exception:
                     pass
         ledger = getattr(self.service, "event_ledger", None)

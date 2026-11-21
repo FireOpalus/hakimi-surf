@@ -580,6 +580,9 @@ class MinecraftPlugin:
         prev = self.snapshot
         was_initialized = self._has_snapshot
         curr = self.apply_snapshot(raw)
+        if curr.connected:
+            self.brain.note_session_connected()
+            self.brain.note_players(curr.nearby_players)
         if was_initialized and prev.connected and not curr.connected:
             self.session_intent = ""
 
@@ -637,6 +640,8 @@ class MinecraftPlugin:
                 importance="high",
             )
             self.brain.on_milestone("mc_health_alert", alert_payload)
+        if was_initialized and prev.connected and not curr.connected:
+            await self.brain.flush_session_recap(reason="disconnected")
         self.brain.on_snapshot(curr)
         return curr
 
@@ -730,13 +735,22 @@ class MinecraftPlugin:
         self, data: dict[str, Any], *, allow_snapshot: bool = True
     ) -> None:
         if allow_snapshot:
-            if isinstance(data.get("snapshot"), dict):
+            prev_connected = self.snapshot.connected
+            has_nested = isinstance(data.get("snapshot"), dict)
+            if has_nested:
                 snap = dict(data["snapshot"])
                 for flag in _BRIDGE_FLAG_KEYS:
                     if flag in data:
                         snap[flag] = data[flag]
                 await self.update_snapshot(snap)
             self.apply_status(data)
+            if not has_nested:
+                if self.snapshot.connected:
+                    self.brain.note_session_connected()
+                    self.brain.note_players(self.snapshot.nearby_players)
+                elif prev_connected and not self.snapshot.connected:
+                    await self.brain.flush_session_recap(reason="disconnected")
+                    self.brain.on_snapshot(self.snapshot)
         else:
             self._update_bridge_flags(data)
         self.brain.on_state_change()
@@ -978,7 +992,11 @@ class MinecraftPlugin:
 
         if verb == "connect" and ok:
             self.session_intent = _sanitize_text(validated.intent, max_tokens=40)[:80]
+            self.brain.note_session_connected()
+        elif verb == "chat" and ok and isinstance(validated, ChatArgs):
+            self.brain.record_direct_chat(validated.message)
         elif verb == "disconnect":
+            await self.brain.flush_session_recap(reason="disconnect")
             self.session_intent = ""
             self.brain.on_disconnect()
 

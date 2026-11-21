@@ -2185,6 +2185,7 @@ class PluginBus:
 
         raw_summary = frame.get("summary")
         if isinstance(raw_summary, str) and raw_summary.strip():
+            safe_summary = _scrub_text_secrets(raw_summary, _secret_candidates(self._all_secrets()))
             ledger = getattr(self.service, "event_ledger", None)
             if ledger is not None and hasattr(ledger, "post"):
                 visibility = frame.get("visibility", "public")
@@ -2197,18 +2198,98 @@ class PluginBus:
                     or not math.isfinite(float(due_at))
                 ):
                     due_at = None
+                raw_ttl = frame.get("ttl_seconds")
+                ttl_seconds: float | None = None
+                if (
+                    raw_ttl is not None
+                    and not isinstance(raw_ttl, bool)
+                    and isinstance(raw_ttl, int | float)
+                    and math.isfinite(float(raw_ttl))
+                ):
+                    ttl_seconds = max(300.0, min(float(raw_ttl), 7 * 86400.0))
+                post_kwargs: dict[str, Any] = {
+                    "payload": clean_payload,
+                    "dedupe_key": clean_key,
+                    "due_at": float(due_at) if due_at is not None else None,
+                    "visibility": visibility,
+                }
+                if ttl_seconds is not None:
+                    post_kwargs["ttl_seconds"] = ttl_seconds
                 try:
                     await ledger.post(
                         session.plugin_id,
                         clean_type,
-                        raw_summary,
-                        payload=clean_payload,
-                        dedupe_key=clean_key,
-                        due_at=float(due_at) if due_at is not None else None,
-                        visibility=visibility,
+                        safe_summary,
+                        **post_kwargs,
                     )
                 except ValueError:
                     pass
+
+            if frame.get("owner_recap") is True and self.s.owner_qq_id:
+                now = self.clock()
+                try:
+                    scrubbed = safe_output(clean_text(raw_summary), self._all_secrets(), limit=260)
+                except Rejected:
+                    scrubbed = ""
+                clean_recap = (
+                    sanitize_sensor_text(scrubbed, self.s, max_tokens=90) if scrubbed else ""
+                )
+                if clean_recap:
+                    identity = getattr(self.service, "identity", None)
+                    if identity is not None and hasattr(identity, "record_owner_recap"):
+                        identity.record_owner_recap(
+                            session.plugin_id,
+                            clean_recap,
+                            now=now,
+                            private_owner=True,
+                        )
+                    raw_topic = frame.get("chronicle_topic")
+                    if isinstance(raw_topic, str) and raw_topic.strip():
+                        clean_topic = sanitize_sensor_text(
+                            clean_text(raw_topic), self.s, max_tokens=24
+                        )[:80].strip()
+                        raw_tags = frame.get("chronicle_tags")
+                        clean_tags: list[str] = []
+                        if isinstance(raw_tags, list | tuple):
+                            for raw_tag in raw_tags:
+                                if not isinstance(raw_tag, str):
+                                    continue
+                                clean_tag = sanitize_sensor_text(
+                                    clean_text(raw_tag), self.s, max_tokens=10
+                                )[:24].strip()
+                                if clean_tag and clean_tag not in clean_tags:
+                                    clean_tags.append(clean_tag)
+                                    if len(clean_tags) >= 6:
+                                        break
+                        if session.plugin_id not in clean_tags:
+                            clean_tags = clean_tags[:5] + [session.plugin_id]
+                        owner_msg = owner_target(
+                            self.s,
+                            getattr(self.s, "owner_delivery_platform", "onebot"),
+                            now,
+                            f"plugin-recap:{session.plugin_id}",
+                        )
+                        sessions = getattr(self.service, "sessions", None)
+                        dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
+                        if (
+                            owner_msg is not None
+                            and dual_mem is not None
+                            and hasattr(dual_mem, "record_chronicle")
+                            and clean_topic
+                        ):
+                            try:
+                                source_id = f"plugin:{session.plugin_id}:{clean_key or clean_type}"
+                                await dual_mem.record_chronicle(
+                                    owner_msg,
+                                    topic=clean_topic,
+                                    text=clean_recap,
+                                    category="event",
+                                    tags=clean_tags,
+                                    source_id=source_id,
+                                    created_at=now,
+                                )
+                            except Exception:
+                                pass
 
         if session.plugin_id == "bilibili_surf" and clean_type == "bili_video_watched":
             if isinstance(raw_report, str) and raw_report.strip():

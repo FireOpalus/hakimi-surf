@@ -756,6 +756,11 @@ class HakimiPluginClient:
         summary: str | None = None,
         report_text: str | None = None,
         mood_longnick: str | None = None,
+        visibility: str | None = None,
+        ttl_seconds: float | None = None,
+        owner_recap: bool = False,
+        chronicle_topic: str | None = None,
+        chronicle_tags: Sequence[str] | None = None,
     ) -> None:
         """Emit a one-way `world.event` frame (`sensors` scope)."""
         frame: dict[str, Any] = {
@@ -772,6 +777,16 @@ class HakimiPluginClient:
             frame["report_text"] = report_text
         if mood_longnick is not None:
             frame["mood_longnick"] = mood_longnick
+        if visibility is not None:
+            frame["visibility"] = visibility
+        if ttl_seconds is not None:
+            frame["ttl_seconds"] = float(ttl_seconds)
+        if owner_recap:
+            frame["owner_recap"] = True
+        if chronicle_topic is not None:
+            frame["chronicle_topic"] = chronicle_topic
+        if chronicle_tags is not None:
+            frame["chronicle_tags"] = list(chronicle_tags)
         await self._send_live_frame(frame)
 
     async def report_activity(

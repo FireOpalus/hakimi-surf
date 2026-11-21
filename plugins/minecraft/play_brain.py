@@ -12,8 +12,11 @@ import re
 import time
 import unicodedata
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -23,6 +26,7 @@ if TYPE_CHECKING:
     from .plugin_main import MinecraftPlugin
 
 log = logging.getLogger("hakimi_plugin_minecraft")
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 _AUTH_HEADER_RE = re.compile(r"(?i)\bauthorization\b\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]{4,}")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
@@ -313,6 +317,12 @@ class McPlayBrain:
         self._last_clk: float = float(plugin.clock())
         self._virtual_now: float = 0.0
 
+        self._session_started_at: float | None = None
+        self._session_players: list[str] = []
+        self._session_chat_highlights: list[str] = []
+        self._session_milestones: list[str] = []
+        self._session_recap_flushed: bool = False
+
     def _now(self) -> float:
         cur_mono = time.monotonic()
         cur_clk = float(self.plugin.clock())
@@ -390,9 +400,193 @@ class McPlayBrain:
         self._pending_events.clear()
         self._chat_first_at = None
         self._chat_ready_at = None
+        self._session_started_at = None
+        self._session_players.clear()
+        self._session_chat_highlights.clear()
+        self._session_milestones.clear()
+        self._session_recap_flushed = False
         self._prev_connected = False
         self._prev_ready = False
         self._wake()
+
+    def note_session_connected(self, now: float | None = None) -> None:
+        """Record active Minecraft session start timestamp if not already set."""
+        if self._session_started_at is None:
+            self._session_started_at = self._now() if now is None else float(now)
+        self._session_recap_flushed = False
+
+    def note_players(self, players: Sequence[str]) -> None:
+        """Record sanitized, deduplicated player names seen during this session."""
+        if not players:
+            return
+        for raw in players:
+            if len(self._session_players) >= 8:
+                break
+            raw_clean = _clean_text(str(raw or ""))
+            if not raw_clean:
+                continue
+            scrubbed = _scrub_patterns(raw_clean)
+            if _PLAYER_NAME_RE.fullmatch(scrubbed):
+                clean = scrubbed
+            else:
+                clean = _sanitize_text(scrubbed, max_tokens=8)[:16].strip()
+            if clean and clean not in self._session_players:
+                self._session_players.append(clean)
+
+    def _append_chat_highlight(self, entry: str) -> None:
+        if not entry:
+            return
+        self._session_chat_highlights.append(entry)
+        if len(self._session_chat_highlights) > 8:
+            self._session_chat_highlights = self._session_chat_highlights[-8:]
+
+    def _append_milestone(self, text: str) -> None:
+        if not text:
+            return
+        if self._session_milestones and self._session_milestones[-1] == text:
+            return
+        self._session_milestones.append(text)
+        if len(self._session_milestones) > 6:
+            self._session_milestones = self._session_milestones[-6:]
+
+    def record_direct_chat(self, text: str) -> None:
+        """Record an outbound direct MC chat line into session recap highlights."""
+        if not (self.plugin.snapshot.connected or self._session_started_at is not None):
+            return
+        clean = _sanitize_text(text, max_tokens=40)
+        if not clean:
+            return
+        self._append_chat_highlight(f"我:{clean[:44]}")
+
+    def _record_turn_recap(
+        self,
+        *,
+        chat_batch: list[tuple[str, str]] | None = None,
+        event_batch: list[dict[str, Any]] | None = None,
+        clean_say: str = "",
+    ) -> None:
+        say_safe = _sanitize_text(clean_say, max_tokens=40) if clean_say else ""
+        chats = list(chat_batch or ())
+        if chats:
+            last_idx = len(chats) - 1
+            for idx, (player, msg) in enumerate(chats):
+                speaker = _scrub_patterns(_clean_text(player))[:16] or "玩家"
+                msg_clean = _scrub_patterns(_clean_text(msg))
+                if not msg_clean:
+                    continue
+                if idx == last_idx and say_safe:
+                    self._append_chat_highlight(f"{speaker}:{msg_clean[:34]}->{say_safe[:40]}")
+                else:
+                    self._append_chat_highlight(f"{speaker}:{msg_clean[:40]}")
+        elif say_safe:
+            self._append_chat_highlight(f"我:{say_safe[:44]}")
+
+        for ev in event_batch or ():
+            etype = str(ev.get("event_type") or "")
+            if etype == "mc_rare_find":
+                block = _scrub_patterns(_clean_text(str(ev.get("block") or "")))[:32]
+                note = f"发现{block}" if block else "发现稀有方块"
+            elif etype == "mc_death":
+                note = "意外阵亡"
+            elif etype == "mc_health_alert":
+                note = "血量告急"
+            else:
+                note = ""
+            if note:
+                self._append_milestone(note)
+
+    def build_session_recap(
+        self, *, now: float | None = None, reason: str = "disconnect"
+    ) -> dict[str, Any] | None:
+        """Build a bounded, sanitized MC session recap payload or return None if trivial."""
+        if self._session_recap_flushed:
+            return None
+        now_ts = self._now() if now is None else float(now)
+        started_at = now_ts if self._session_started_at is None else float(self._session_started_at)
+        elapsed = max(0.0, now_ts - started_at)
+        if (
+            not self._session_chat_highlights
+            and not self._session_milestones
+            and (not self._session_players or elapsed < 60.0)
+        ):
+            return None
+
+        mins = max(1, round(elapsed / 60.0))
+
+        def _format_summary(players: Sequence[str], chats: Sequence[str]) -> str:
+            if players:
+                header = f"MC游玩小记（{mins}分钟，同服: {'、'.join(players)}）"
+            else:
+                header = f"MC游玩小记（{mins}分钟）"
+            body_parts: list[str] = []
+            if chats:
+                body_parts.append(f"聊了「{' / '.join(chats)}」")
+            if self._session_milestones:
+                body_parts.append(f"见闻: {'、'.join(self._session_milestones)}")
+            raw = f"{header}：{'；'.join(body_parts)}" if body_parts else header
+            cleaned = _COLLAPSE_WS_RE.sub(" ", _scrub_patterns(_clean_text(raw))).strip()
+            return cleaned
+
+        summary = _format_summary(self._session_players, self._session_chat_highlights)
+        if len(summary) > 240:
+            summary = _format_summary(self._session_players[:4], self._session_chat_highlights[-4:])
+        if len(summary) > 240:
+            summary = summary[:239].rstrip() + "…"
+
+        clock_ts = float(self.plugin.clock())
+        date_ts = started_at if started_at >= 1_000_000_000 else clock_ts
+        if not math.isfinite(date_ts) or date_ts < 0:
+            date_ts = time.time()
+        local_date = datetime.fromtimestamp(date_ts, tz=_SHANGHAI_TZ).strftime("%Y-%m-%d")
+        started_int = int(started_at)
+        business_key = f"mc-recap:{started_int}"
+        topic = f"MC游玩:{local_date}:{started_int}"[:80]
+        tags = list(
+            dict.fromkeys(t for t in ("minecraft", "MC游玩", *self._session_players[:2]) if t)
+        )
+        clean_reason = _sanitize_text(reason, max_tokens=16)[:32] or "disconnect"
+        payload = {
+            "duration_minutes": mins,
+            "players": list(self._session_players),
+            "chat_count": len(self._session_chat_highlights),
+            "milestone_count": len(self._session_milestones),
+            "reason": clean_reason,
+        }
+        return {
+            "summary": summary,
+            "business_key": business_key,
+            "topic": topic,
+            "tags": tags,
+            "payload": payload,
+        }
+
+    async def flush_session_recap(self, *, reason: str = "disconnect") -> bool:
+        """Emit session recap world event once and clear session recap buffers."""
+        recap = self.build_session_recap(reason=reason)
+        self._session_recap_flushed = True
+        self._session_started_at = None
+        self._session_players.clear()
+        self._session_chat_highlights.clear()
+        self._session_milestones.clear()
+        if recap is None or not self.plugin.client.connected:
+            return False
+        try:
+            await self.plugin.client.emit_world_event(
+                "mc_session_recap",
+                recap["payload"],
+                importance="normal",
+                business_key=recap["business_key"],
+                summary=recap["summary"],
+                visibility="public",
+                ttl_seconds=48 * 3600.0,
+                owner_recap=True,
+                chronicle_topic=recap["topic"],
+                chronicle_tags=recap["tags"],
+            )
+            return True
+        except Exception as exc:
+            log.warning("event=mc_session_recap_emit_failed reason=%s err=%s", reason, exc)
+            return False
 
     def on_state_change(self) -> None:
         """Notify the loop of enabled/paused/bridge state transitions."""
@@ -734,6 +928,8 @@ class McPlayBrain:
                 speaking_player=speaking_player,
                 trigger=trigger,
                 input_summary=input_summary,
+                chat_batch=chat_batch,
+                event_batch=event_batch,
             )
 
     async def _dispatch_goal_safe(self, params: dict[str, Any]) -> bool:
@@ -756,6 +952,8 @@ class McPlayBrain:
         speaking_player: str,
         trigger: str,
         input_summary: str,
+        chat_batch: list[tuple[str, str]] | None = None,
+        event_batch: list[dict[str, Any]] | None = None,
     ) -> None:
         clean_say = _sanitize_chat_say(decision.say, max_len=120)
         if clean_say:
@@ -828,6 +1026,11 @@ class McPlayBrain:
         )
         if len(self.recent_turns) > max_turns:
             self.recent_turns = self.recent_turns[-max_turns:]
+        self._record_turn_recap(
+            chat_batch=chat_batch,
+            event_batch=event_batch,
+            clean_say=clean_say,
+        )
         await self._push_status_safe()
 
     async def _run_local_fallback(
@@ -839,30 +1042,29 @@ class McPlayBrain:
         reason: str,
     ) -> None:
         combined = " ".join(msg for _, msg in chat_batch)
+        clean_say = ""
         if any(kw in combined for kw in _LOCAL_STOP_KEYWORDS):
             await self._dispatch_goal_safe({"action_type": "stop"})
-            await self._dispatch_goal_safe(
-                {"action_type": "chat", "message": "好哒，我乖乖站在这里等你喵~"}
-            )
+            clean_say = "好哒，我乖乖站在这里等你喵~"
+            await self._dispatch_goal_safe({"action_type": "chat", "message": clean_say})
             self._last_reason = f"fallback_stop:{reason}"[:60]
         elif any(kw in combined for kw in _LOCAL_FOLLOW_KEYWORDS):
             target = speaking_player.strip()
             if not _PLAYER_NAME_RE.fullmatch(target):
                 nearby = getattr(snap, "nearby_players", ()) or ()
                 target = next((p for p in nearby if _PLAYER_NAME_RE.fullmatch(str(p))), "")
-            await self._dispatch_goal_safe(
-                {"action_type": "chat", "message": "来啦来啦！这就跟上你喵~"}
-            )
+            clean_say = "来啦来啦！这就跟上你喵~"
+            await self._dispatch_goal_safe({"action_type": "chat", "message": clean_say})
             if _PLAYER_NAME_RE.fullmatch(target):
                 await self._dispatch_goal_safe({"action_type": "follow", "target_player": target})
             self._last_reason = f"fallback_follow:{reason}"[:60]
         elif any(kw in combined for kw in _LOCAL_GREETING_KEYWORDS):
-            await self._dispatch_goal_safe(
-                {"action_type": "chat", "message": "在呢！猫猫看到你啦喵~"}
-            )
+            clean_say = "在呢！猫猫看到你啦喵~"
+            await self._dispatch_goal_safe({"action_type": "chat", "message": clean_say})
             self._last_reason = f"fallback_chat:{reason}"[:60]
         else:
             self._last_reason = f"fallback_noop:{reason}"[:60]
+        self._record_turn_recap(chat_batch=chat_batch, clean_say=clean_say)
         await self._push_status_safe()
 
     async def _push_status_safe(self) -> None:

@@ -14,9 +14,11 @@ from starlette.websockets import WebSocketDisconnect
 from hakimi.app import create_app
 from hakimi.media import ModelImage
 from hakimi.security import Rejected, configured_secrets
-from hakimi.voice_companion import SentenceStreamBuffer
+from hakimi.social import owner_target
+from hakimi.voice_companion import SentenceStreamBuffer, VoiceCompanionConfig
 from tests.test_admin import TOKEN
 from tests.test_delivery_resilience import TINY_PNG_B64
+from tests.test_owner_cloud_memory import _populate_memory
 
 COMPANION_TOKEN = "companion-test-secret-token-32-chars-min"
 COMPANION_PATH = "/ws/companion/abcdef0123456789abcdef0123456789"
@@ -479,3 +481,213 @@ async def test_voice_companion_admin_api_models_and_live_disconnect(settings):
             assert reset.status_code == 200
             assert reset.json()["source"] == "default"
             assert reset.json()["config"]["use_screen_watch"] is True
+
+
+def _snapshot_dir(root):
+    return {
+        str(p.relative_to(root)): (p.stat().st_mtime_ns, p.read_bytes())
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+async def test_voice_companion_dual_memory_roundtrip_and_cloud_memory_readonly(settings, tmp_path):
+    now = [1_795_200_000.0]
+    mem_dir = _populate_memory(tmp_path, settings.gemini_api_key.get_secret_value())
+    before_mem = _snapshot_dir(mem_dir)
+    s = _companion_settings(
+        settings,
+        enable_antigravity_memory=True,
+        antigravity_memory_dir=mem_dir,
+    )
+    gw = _StreamMockGateway(deltas=["莱万汀的基建可以先放电力站！"])
+    app = create_app(s, gateway_factory=lambda *_: gw, start_workers=False)
+
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        svc.voice_companion.clock = lambda: now[0]
+        owner_msg = owner_target(svc.s, "onebot", now[0], "vc-dual-check")
+        assert owner_msg is not None
+
+        # Session 1: owner_private spoken turn -> session.stop persists DualMemory, ledger, identity
+        sock1 = _SocketDouble()
+        runner1 = asyncio.create_task(
+            svc.voice_companion.serve(
+                sock1.receive,
+                sock1.send,
+                sock1.close,
+                source_ip="127.0.0.1",
+                adapter_id="windows_desktop",
+                client_id="pc-dual-1",
+            )
+        )
+        await sock1.push({"type": "session.start", "mode": "owner_private", "game_title": "终末地"})
+        await sock1.recv_until(lambda m: m["type"] == "session.ready")
+        await sock1.push(
+            {
+                "type": "speech.turn",
+                "turn_id": "t-dual-1",
+                "text": "帮我看下莱万汀的基建排版",
+            }
+        )
+        ev1 = await sock1.recv_until(
+            lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-dual-1"
+        )
+        assert ev1[-1]["status"] == "spoken"
+        await sock1.push({"type": "session.stop"})
+        await sock1.recv_until(lambda m: m.get("type") == "session.ended")
+        await sock1.close()
+        await asyncio.wait_for(runner1, 2.0)
+
+        ledger_items = await svc.event_ledger.read(include_owner_private=True, now=now[0])
+        vc_ledger = [it for it in ledger_items if it.source_module == "voice_companion"]
+        assert len(vc_ledger) == 1
+        assert vc_ledger[0].visibility == "owner_private"
+
+        id_recaps = svc.identity.owner_other_surface_recent("onebot", now=now[0])
+        assert len(id_recaps) == 1
+        assert id_recaps[0]["platform"] == "voice_companion"
+        assert "莱万汀" in id_recaps[0]["summary"]
+
+        view = await svc.sessions.dual.view(owner_msg)
+        assert len(view["entries"]) == 1
+        entry = view["entries"][0]
+        assert entry["kind"] == "chronicle"
+        assert entry["topic"].startswith("语音伴随:终末地:")
+        assert "莱万汀" in entry["text"]
+        assert entry["tags"] == ["语音伴随", "连麦", "终末地"]
+        assert "莱万汀".encode() not in svc.sessions.path(owner_msg).read_bytes()
+        assert _snapshot_dir(mem_dir) == before_mem
+
+        # Session 2: next owner_private session receives owner_dual_memory in prompt payload
+        now[0] += 120.0
+        sock2 = _SocketDouble()
+        runner2 = asyncio.create_task(
+            svc.voice_companion.serve(
+                sock2.receive,
+                sock2.send,
+                sock2.close,
+                source_ip="127.0.0.1",
+                adapter_id="windows_desktop",
+                client_id="pc-dual-2",
+            )
+        )
+        await sock2.push({"type": "session.start", "mode": "owner_private", "game_title": "终末地"})
+        await sock2.recv_until(lambda m: m["type"] == "session.ready")
+        await sock2.push(
+            {
+                "type": "speech.turn",
+                "turn_id": "t-dual-2",
+                "text": "刚才我们聊的莱万汀怎么样",
+            }
+        )
+        ev2 = await sock2.recv_until(
+            lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-dual-2"
+        )
+        assert ev2[-1]["status"] == "spoken"
+        gen_payload = gw.calls[-1][0]
+        assert "owner_dual_memory" in gen_payload
+        assert any(
+            "莱万汀" in item for item in gen_payload["owner_dual_memory"]["chronicle_recall"]
+        )
+
+        await sock2.push({"type": "session.stop"})
+        await sock2.recv_until(lambda m: m.get("type") == "session.ended")
+        await sock2.close()
+        await asyncio.wait_for(runner2, 2.0)
+        assert _snapshot_dir(mem_dir) == before_mem
+
+
+async def test_voice_companion_room_public_and_save_recap_to_dual_memory_disabled(settings):
+    now = [1_795_300_000.0]
+    s = _companion_settings(settings)
+    gw = _StreamMockGateway(deltas=["好的呢！"])
+    app = create_app(s, gateway_factory=lambda *_: gw, start_workers=False)
+
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        svc.voice_companion.clock = lambda: now[0]
+        owner_msg = owner_target(svc.s, "onebot", now[0], "vc-iso-check")
+        assert owner_msg is not None
+
+        # 1. room_public must NOT write to Owner DualMemory or owner_recaps
+        sock_pub = _SocketDouble()
+        runner_pub = asyncio.create_task(
+            svc.voice_companion.serve(
+                sock_pub.receive,
+                sock_pub.send,
+                sock_pub.close,
+                source_ip="127.0.0.1",
+                adapter_id="discord_voice",
+                client_id="guild-pub",
+            )
+        )
+        await sock_pub.push({"type": "session.start", "mode": "room_public", "game_title": "Apex"})
+        await sock_pub.recv_until(lambda m: m["type"] == "session.ready")
+        await sock_pub.push(
+            {
+                "type": "speech.turn",
+                "turn_id": "t-pub-iso",
+                "speaker_id": "888",
+                "speaker_name": "队友",
+                "text": "这把跳哪",
+            }
+        )
+        await sock_pub.recv_until(
+            lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-pub-iso"
+        )
+        await sock_pub.push({"type": "session.stop"})
+        await sock_pub.recv_until(lambda m: m.get("type") == "session.ended")
+        await sock_pub.close()
+        await asyncio.wait_for(runner_pub, 2.0)
+
+        assert not svc.sessions.path(owner_msg).exists()
+        assert svc.identity.owner_other_surface_recent("onebot", now=now[0]) == []
+        assert not [
+            it
+            for it in await svc.event_ledger.read(include_owner_private=True, now=now[0])
+            if it.source_module == "voice_companion"
+        ]
+
+        # 2. save_recap_to_dual_memory=False skips DualMemory write while keeping ledger/recaps
+        await svc.voice_companion.set_config(VoiceCompanionConfig(save_recap_to_dual_memory=False))
+        assert svc.voice_companion.config.save_recap_to_dual_memory is False
+
+        sock_priv = _SocketDouble()
+        runner_priv = asyncio.create_task(
+            svc.voice_companion.serve(
+                sock_priv.receive,
+                sock_priv.send,
+                sock_priv.close,
+                source_ip="127.0.0.1",
+                adapter_id="windows_desktop",
+                client_id="pc-no-dual",
+            )
+        )
+        await sock_priv.push(
+            {"type": "session.start", "mode": "owner_private", "game_title": "星铁"}
+        )
+        await sock_priv.recv_until(lambda m: m["type"] == "session.ready")
+        await sock_priv.push(
+            {
+                "type": "speech.turn",
+                "turn_id": "t-priv-nodual",
+                "text": "帮我看下忘却之庭配队",
+            }
+        )
+        await sock_priv.recv_until(
+            lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-priv-nodual"
+        )
+        await sock_priv.push({"type": "session.stop"})
+        await sock_priv.recv_until(lambda m: m.get("type") == "session.ended")
+        await sock_priv.close()
+        await asyncio.wait_for(runner_priv, 2.0)
+
+        ledger_after = [
+            it
+            for it in await svc.event_ledger.read(include_owner_private=True, now=now[0])
+            if it.source_module == "voice_companion"
+        ]
+        assert len(ledger_after) == 1 and "星铁" in ledger_after[0].summary
+        assert len(svc.identity.owner_other_surface_recent("onebot", now=now[0])) == 1
+        assert not svc.sessions.path(owner_msg).exists()
