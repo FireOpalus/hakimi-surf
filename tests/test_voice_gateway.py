@@ -1274,3 +1274,128 @@ def test_gateway_breezeblue_config_redaction_and_http_tts(tmp_path):
         )
         assert resp.status_code == 200
         assert resp.content == b"PCM:ID3\x03\x00\x00BRZ-GW"
+
+
+def test_gateway_admin_config_hot_swap_reset_and_voices(monkeypatch):
+    import httpx
+
+    brz_secret = "brz_admin_secret_key_555555"
+    fish_secret = "fish_admin_secret_key_666666"
+
+    def external_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/voices":
+            return httpx.Response(
+                200,
+                json={
+                    "voices": [
+                        {"voice_id": "voc_def", "name": "Z官方", "voice_type": "default"},
+                        {"voice_id": "voc_mine", "name": "A猫猫", "voice_type": "personal"},
+                    ]
+                },
+            )
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, content=b"ID3\x03\x00\x00HOTSWAP")
+        return httpx.Response(200, content=b"ID3\x03\x00\x00OK")
+
+    monkeypatch.setattr(
+        "voice_client.providers._make_default_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(external_handler)),
+    )
+
+    cfg = _gateway_config()
+    app = create_gateway_app(cfg, stt_provider=_FakeSTT(), tts_provider=_FakeTTS())
+    auth = {"Authorization": f"Bearer {GATEWAY_TOKEN}"}
+
+    with TestClient(app) as client:
+        # 1. Auth required
+        assert client.get("/v1/admin/config").status_code == 401
+        assert (
+            client.get("/v1/admin/config", headers={"Authorization": "Bearer wrong"}).status_code
+            == 403
+        )
+        r0 = client.get("/v1/admin/config", headers=auth)
+        assert r0.status_code == 200
+        d0 = r0.json()
+        assert d0["overridden"] is False
+        assert d0["tts_provider"] == "siliconflow"
+        assert cfg.siliconflow_api_key not in r0.text
+
+        # Missing BreezeBlue key rejects /v1/admin/voices
+        assert client.get("/v1/admin/voices", headers=auth).status_code == 400
+
+        # 2. Invalid hot-swap rejected 400 without corrupting live config or leaking secret
+        bad = client.post(
+            "/v1/admin/config",
+            headers=auth,
+            json={
+                "stt_provider": "siliconflow",
+                "tts_provider": "breezeblue",
+                "breezeblue_api_key": brz_secret,
+                "breezeblue_voice_id": "voc_mine",
+                "breezeblue_base_url": "http://public.invalid",
+            },
+        )
+        assert bad.status_code == 400
+        assert brz_secret not in bad.text
+        assert client.get("/v1/admin/config", headers=auth).json()["tts_provider"] == "siliconflow"
+
+        # 3. Valid hot-swap to BreezeBlue + Fish STT
+        sw = client.post(
+            "/v1/admin/config",
+            headers=auth,
+            json={
+                "stt_provider": "fish",
+                "tts_provider": "breezeblue",
+                "fish_api_key": fish_secret,
+                "breezeblue_api_key": brz_secret,
+                "breezeblue_voice_id": "voc_mine",
+                "breezeblue_model_id": "breeze-tts-2",
+                "breezeblue_guidance_scale": 2.0,
+            },
+        )
+        assert sw.status_code == 200
+        sw_d = sw.json()
+        assert sw_d["overridden"] is True
+        assert sw_d["stt_provider"] == "fish"
+        assert sw_d["tts_provider"] == "breezeblue"
+        assert sw_d["breezeblue"]["configured"] is True
+        assert brz_secret not in sw.text and fish_secret not in sw.text
+
+        assert client.get("/healthz").json()["tts_provider"] == "breezeblue"
+
+        # /v1/admin/voices sorts personal voices first
+        vr = client.get("/v1/admin/voices", headers=auth)
+        assert vr.status_code == 200
+        assert [v["voice_id"] for v in vr.json()["voices"]] == ["voc_mine", "voc_def"]
+
+        # Re-saving without key retains key; clear_breezeblue_api_key removes it
+        kept = client.post(
+            "/v1/admin/config",
+            headers=auth,
+            json={
+                "stt_provider": "siliconflow",
+                "tts_provider": "fish",
+                "fish_api_key": fish_secret,
+                "breezeblue_api_key": brz_secret,
+            },
+        )
+        assert kept.status_code == 200 and kept.json()["breezeblue"]["configured"] is True
+
+        cleared = client.post(
+            "/v1/admin/config",
+            headers=auth,
+            json={
+                "stt_provider": "siliconflow",
+                "tts_provider": "fish",
+                "fish_api_key": fish_secret,
+                "clear_breezeblue_api_key": True,
+            },
+        )
+        assert cleared.status_code == 200 and cleared.json()["breezeblue"]["configured"] is False
+
+        # 4. DELETE /v1/admin/config restores base env config
+        rst = client.delete("/v1/admin/config", headers=auth)
+        assert rst.status_code == 200
+        assert rst.json()["overridden"] is False
+        assert rst.json()["tts_provider"] == "siliconflow"
+        assert client.get("/healthz").json()["tts_provider"] == "siliconflow"

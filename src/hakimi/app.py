@@ -132,6 +132,8 @@ def create_app(
                     await service.video_watch.initialize()
                     await service.memes.initialize()
                     await service.songs.initialize()
+                    await service.voice_gateway_admin.initialize()
+                    await service.voice_gateway_admin.sync_to_gateway()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
                     for module in service.modules.all():

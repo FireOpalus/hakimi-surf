@@ -1041,6 +1041,13 @@ class VoiceCompanion:
                             "config": self.config.model_dump(),
                         },
                     )
+                    gw_admin = getattr(self.service, "voice_gateway_admin", None)
+                    if gw_admin is not None:
+                        sync_task = asyncio.create_task(gw_admin.sync_to_gateway())
+                        bg = getattr(self.service, "background_tasks", None)
+                        if isinstance(bg, set):
+                            bg.add(sync_task)
+                            sync_task.add_done_callback(bg.discard)
                 elif typ == "turn.cancel":
                     target_id = str(frame.get("turn_id") or "").strip()
                     if not target_id or target_id == peer.active_turn_id:

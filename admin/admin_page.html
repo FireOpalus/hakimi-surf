@@ -2721,6 +2721,116 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
     </form>
   </div>
   <div class="card">
+    <div class="row between">
+      <h2>语音网关 API 配置（STT / TTS 热切换）</h2>
+      <div class="row">
+        <button id="vc-gw-refresh" type="button" class="secondary">刷新网关配置</button>
+        <button id="vc-gw-test" type="button" class="secondary" disabled>实测合成一条 TTS</button>
+      </div>
+    </div>
+    <p class="muted">统一管理 KR 语音网关的 STT 识别与 TTS 合成引擎（同时作用于 QQ 语音条与实时连麦）。修改后加密保存在主脑 SQLite 并在不重启容器的情况下实时热切换；留空 API Key 表示保留已存密钥。</p>
+    <div id="vc-gw-pills" class="pill-row"></div>
+    <p id="vc-gw-state" class="muted" aria-live="polite"></p>
+    <form id="vc-gw-form">
+      <div class="grid">
+        <label for="vc-gw-stt-provider">STT 语音识别引擎
+          <select id="vc-gw-stt-provider">
+            <option value="fish">Fish Audio STT</option>
+            <option value="siliconflow">SiliconFlow (SenseVoiceSmall)</option>
+            <option value="openai">OpenAI / Groq Whisper 兼容</option>
+          </select>
+        </label>
+        <label for="vc-gw-tts-provider">TTS 语音合成引擎
+          <select id="vc-gw-tts-provider">
+            <option value="breezeblue">BreezeBlue (Breeze TTS 2)</option>
+            <option value="fish">Fish Audio TTS</option>
+            <option value="siliconflow">SiliconFlow (CosyVoice2)</option>
+            <option value="edge">Edge TTS 兜底</option>
+          </select>
+        </label>
+        <label for="vc-gw-tts-speed">语速倍率（0.25–4.0）<input id="vc-gw-tts-speed" type="number" min="0.25" max="4" step="0.05" value="1.05" required></label>
+        <label for="vc-gw-tts-buffer-mode">连麦播报缓冲模式
+          <select id="vc-gw-tts-buffer-mode">
+            <option value="turn">turn（整轮完整合成，停顿更自然）</option>
+            <option value="chunk">chunk（按句分片实时合成）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row"><label><input id="vc-gw-tts-streaming" type="checkbox"> 启用流式音频合成与边下边转码（TTS_STREAMING）</label></div>
+
+      <fieldset class="panel-group">
+        <legend>BreezeBlue（TTS）</legend>
+        <div class="grid">
+          <div>
+            <label for="vc-gw-brz-key">API Key（留空保留原值）<input id="vc-gw-brz-key" type="password" autocomplete="off" maxlength="512" placeholder="brz_..."></label>
+            <div class="row"><span id="vc-gw-brz-key-state" class="badge">未读取</span><label><input id="vc-gw-brz-clear" type="checkbox"> 清除已存 Key</label></div>
+          </div>
+          <label for="vc-gw-brz-url">Base URL<input id="vc-gw-brz-url" type="url" maxlength="256" placeholder="https://api.breeze.blue"></label>
+          <div>
+            <label for="vc-gw-brz-voice">Voice ID<input id="vc-gw-brz-voice" type="text" maxlength="128" placeholder="voc_psm85weeq82a"></label>
+            <div class="row"><button id="vc-gw-brz-fetch-voices" type="button" class="secondary" disabled>拉取账号音色</button><select id="vc-gw-brz-voice-select" hidden aria-label="选择 BreezeBlue 音色"></select></div>
+          </div>
+          <label for="vc-gw-brz-model">模型 ID<input id="vc-gw-brz-model" type="text" maxlength="128" placeholder="breeze-tts-2"></label>
+          <label for="vc-gw-brz-lang">语言代码（留空自动识别）<input id="vc-gw-brz-lang" type="text" maxlength="32" placeholder="zh"></label>
+          <label for="vc-gw-brz-guidance">Guidance Scale（可选，1.0–10.0）<input id="vc-gw-brz-guidance" type="number" min="1" max="10" step="0.1" placeholder="留空默认"></label>
+        </div>
+        <label for="vc-gw-brz-instructions">声音导演指令（可选，BREEZEBLUE_INSTRUCTIONS）<input id="vc-gw-brz-instructions" type="text" maxlength="500" placeholder="例如：用轻快温柔、稍微贴耳聊天的语气"></label>
+      </fieldset>
+
+      <fieldset class="panel-group">
+        <legend>Fish Audio（STT / TTS）</legend>
+        <div class="grid">
+          <div>
+            <label for="vc-gw-fish-key">API Key（留空保留原值）<input id="vc-gw-fish-key" type="password" autocomplete="off" maxlength="512" placeholder="Fish API Key"></label>
+            <div class="row"><span id="vc-gw-fish-key-state" class="badge">未读取</span><label><input id="vc-gw-fish-clear" type="checkbox"> 清除已存 Key</label></div>
+          </div>
+          <label for="vc-gw-fish-url">Base URL<input id="vc-gw-fish-url" type="url" maxlength="256" placeholder="https://api.fish.audio"></label>
+          <label for="vc-gw-fish-ref">音色 Reference ID<input id="vc-gw-fish-ref" type="text" maxlength="128" placeholder="32位音色UUID"></label>
+          <label for="vc-gw-fish-model">TTS 模型（留空走默认）<input id="vc-gw-fish-model" type="text" maxlength="128" placeholder="s2-pro / drama-3"></label>
+          <label for="vc-gw-fish-latency">延迟模式
+            <select id="vc-gw-fish-latency">
+              <option value="balanced">balanced（低延迟推荐）</option>
+              <option value="normal">normal</option>
+            </select>
+          </label>
+          <label for="vc-gw-fish-asr-lang">ASR 语言代码<input id="vc-gw-fish-asr-lang" type="text" maxlength="32" placeholder="zh"></label>
+        </div>
+      </fieldset>
+
+      <fieldset class="panel-group">
+        <legend>SiliconFlow 硅基流动（STT / TTS）</legend>
+        <div class="grid">
+          <div>
+            <label for="vc-gw-sf-key">API Key（留空保留原值）<input id="vc-gw-sf-key" type="password" autocomplete="off" maxlength="512" placeholder="sk-..."></label>
+            <div class="row"><span id="vc-gw-sf-key-state" class="badge">未读取</span><label><input id="vc-gw-sf-clear" type="checkbox"> 清除已存 Key</label></div>
+          </div>
+          <label for="vc-gw-sf-url">Base URL<input id="vc-gw-sf-url" type="url" maxlength="256" placeholder="https://api.siliconflow.cn/v1"></label>
+          <label for="vc-gw-sf-stt-model">STT 模型<input id="vc-gw-sf-stt-model" type="text" maxlength="128" placeholder="FunAudioLLM/SenseVoiceSmall"></label>
+          <label for="vc-gw-sf-tts-model">TTS 模型<input id="vc-gw-sf-tts-model" type="text" maxlength="128" placeholder="FunAudioLLM/CosyVoice2-0.5B"></label>
+          <label for="vc-gw-sf-tts-voice">TTS 音色<input id="vc-gw-sf-tts-voice" type="text" maxlength="128" placeholder="FunAudioLLM/CosyVoice2-0.5B:diana"></label>
+        </div>
+      </fieldset>
+
+      <fieldset class="panel-group">
+        <legend>OpenAI / Groq 兼容 STT &amp; Edge TTS</legend>
+        <div class="grid">
+          <div>
+            <label for="vc-gw-oai-key">OpenAI STT Key（留空保留原值）<input id="vc-gw-oai-key" type="password" autocomplete="off" maxlength="512" placeholder="sk-... / gsk_..."></label>
+            <div class="row"><span id="vc-gw-oai-key-state" class="badge">未读取</span><label><input id="vc-gw-oai-clear" type="checkbox"> 清除已存 Key</label></div>
+          </div>
+          <label for="vc-gw-oai-url">OpenAI STT Base URL<input id="vc-gw-oai-url" type="url" maxlength="256" placeholder="https://api.groq.com/openai/v1"></label>
+          <label for="vc-gw-oai-model">OpenAI STT 模型<input id="vc-gw-oai-model" type="text" maxlength="128" placeholder="whisper-large-v3-turbo"></label>
+          <label for="vc-gw-edge-voice">Edge TTS 音色<input id="vc-gw-edge-voice" type="text" maxlength="128" placeholder="zh-CN-XiaoyiNeural"></label>
+        </div>
+      </fieldset>
+
+      <div class="row">
+        <button id="vc-gw-save" type="submit" disabled>保存并热切换生效</button>
+        <button id="vc-gw-reset" type="button" class="secondary" disabled>恢复网关 .env 默认</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
     <h2>最近伴随会话（最近 20 场）</h2>
     <div id="vc-sessions-table" class="table"></div>
   </div>
@@ -2986,6 +3096,11 @@ function logout(){
   $('overview-gcp-strip').replaceChildren();
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
+  for(const id of ['vc-gw-save','vc-gw-reset','vc-gw-test','vc-gw-brz-fetch-voices'])$(id).disabled=true;
+  $('vc-gw-pills').replaceChildren();text('vc-gw-state','');
+  $('vc-gw-brz-voice-select').replaceChildren();$('vc-gw-brz-voice-select').hidden=true;
+  ['vc-gw-brz-key-state','vc-gw-fish-key-state','vc-gw-sf-key-state','vc-gw-oai-key-state'].forEach(id=>text(id,'未读取'));
+  ['vc-gw-brz-clear','vc-gw-fish-clear','vc-gw-sf-clear','vc-gw-oai-clear'].forEach(id=>{$(id).checked=false;});
   for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','id-link-submit','id-merge-submit','pb-create-submit'])$(id).disabled=true;
   $('world-observation-card').hidden=true;
   ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','aff-history-table','life-stats','life-changes','life-batteries','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
@@ -3002,7 +3117,7 @@ function logout(){
   if(timer)clearInterval(timer);
   $('session-dialog').close();session=null;
   $('token').focus();
-  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-cooldown-days','aff-cooldown-target','aff-viol-inj','aff-viol-blk','aff-viol-floor','aff-set-uid','aff-set-nickname','aff-search','sign-text','sign-cooldown','life-mc-topic','life-mc-chat-msg','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name'].forEach(id=>{$(id).value='';});
+  ['notebook-text','summary-text','bili-sessdata','bili-jct','bili-buvid3','bili-buvid4','deepseek-key','balance-input','prov-free-key','prov-vertex-key','prov-sa-json','prov-sa-file','prov-custom-id','gcp-sa-json','gcp-sa-file','gcp-billing-project','gcp-billing-table','gcp-bq-location','gcp-mon-project','aff-farewell','aff-cooldown-days','aff-cooldown-target','aff-viol-inj','aff-viol-blk','aff-viol-floor','aff-set-uid','aff-set-nickname','aff-search','sign-text','sign-cooldown','life-mc-topic','life-mc-chat-msg','id-link-person','id-link-platform','id-link-uid','id-link-nickname','id-merge-source','id-merge-target','identity-search','pb-create-id','pb-create-name','vc-gw-brz-key','vc-gw-fish-key','vc-gw-sf-key','vc-gw-oai-key'].forEach(id=>{$(id).value='';});
   $('pb-create-region').value='KR';
   $('aff-set-platform').value='onebot';$('aff-set-score').value='50';$('aff-set-reason').value='admin_set';$('aff-enabled').checked=false;$('aff-penalize-rl').checked=false;$('aff-penalize-poke').checked=false;$('aff-decouple-safety').checked=false;$('sign-enabled').checked=false;text('aff-history-scope','最近全局 50 条加密审计流水');
   ['prov-clear-free','prov-clear-vertex','prov-clear-sa'].forEach(id=>{$(id).checked=false;});
@@ -4112,10 +4227,155 @@ function renderVoiceCompanion(d){
     s.summary||'—'
   ]));
 }
-async function voiceCompanion(){
-  const d=await api('life/voice-companion');
+function _normSttProv(v){const s=String(v||'fish').toLowerCase();return s==='fish_audio'?'fish':['openai_compatible','groq'].includes(s)?'openai':s;}
+function _normTtsProv(v){const s=String(v||'breezeblue').toLowerCase();return s==='fish_audio'?'fish':['breeze_blue','breeze'].includes(s)?'breezeblue':s==='edge_tts'?'edge':s;}
+function renderVoiceGatewayConfig(d){
+  const g=d?.gateway||null,saved=d?.saved_keys||{};
+  const pills=[];
+  if(!d?.configured){pills.push(pill('未配置 VOICE_GATEWAY_URL','muted'));}
+  else if(d.reachable&&g){
+    pills.push(pill('网关在线 · STT '+g.stt_provider,'ok'));
+    pills.push(pill('TTS '+g.tts_provider+(g.tts_model?' ('+g.tts_model+')':''),'paid'));
+    pills.push(pill(d.source==='sqlite'?'SQLite 加密热覆盖':'.env 启动默认',d.source==='sqlite'?'warn':'muted'));
+  }else{pills.push(pill('网关暂不可达','err'));}
+  $('vc-gw-pills').replaceChildren(...pills);
+  text('vc-gw-state',d?.configured?(d.reachable?'热切换就绪：修改保存后立即写入 SQLite 保险库并同步网关，网关重启也会自动重放覆盖。':('无法连接语音网关：'+(d.error||'unavailable'))):'主脑尚未配置 VOICE_GATEWAY_URL / VOICE_GATEWAY_TOKEN。');
+  const usable=Boolean(d?.configured);
+  ['vc-gw-save','vc-gw-reset'].forEach(id=>{$(id).disabled=!usable;});
+  $('vc-gw-test').disabled=!Boolean(d?.configured&&d?.reachable);
+  if(g){
+    $('vc-gw-stt-provider').value=_normSttProv(g.stt_provider);
+    $('vc-gw-tts-provider').value=_normTtsProv(g.tts_provider);
+    $('vc-gw-tts-speed').value=String(g.tts_speed??1.05);
+    $('vc-gw-tts-buffer-mode').value=g.tts_buffer_mode||'turn';
+    $('vc-gw-tts-streaming').checked=Boolean(g.tts_streaming);
+    const brz=g.breezeblue||{},fish=g.fish||{},sf=g.siliconflow||{},oai=g.openai_stt||{},edge=g.edge_tts||{};
+    $('vc-gw-brz-url').value=brz.base_url||'https://api.breeze.blue';
+    $('vc-gw-brz-voice').value=brz.voice_id||'';
+    $('vc-gw-brz-model').value=brz.model_id||'breeze-tts-2';
+    $('vc-gw-brz-lang').value=brz.language_code??'zh';
+    $('vc-gw-brz-guidance').value=brz.guidance_scale??'';
+    $('vc-gw-brz-instructions').value=brz.instructions||'';
+    $('vc-gw-fish-url').value=fish.base_url||'https://api.fish.audio';
+    $('vc-gw-fish-ref').value=fish.reference_id||'';
+    $('vc-gw-fish-model').value=fish.model||'';
+    $('vc-gw-fish-latency').value=fish.latency||'balanced';
+    $('vc-gw-fish-asr-lang').value=fish.asr_language??'zh';
+    $('vc-gw-sf-url').value=sf.base_url||'https://api.siliconflow.cn/v1';
+    $('vc-gw-sf-stt-model').value=sf.stt_model||'FunAudioLLM/SenseVoiceSmall';
+    $('vc-gw-sf-tts-model').value=sf.tts_model||'FunAudioLLM/CosyVoice2-0.5B';
+    $('vc-gw-sf-tts-voice').value=sf.tts_voice||'FunAudioLLM/CosyVoice2-0.5B:diana';
+    $('vc-gw-oai-url').value=oai.base_url||'https://api.groq.com/openai/v1';
+    $('vc-gw-oai-model').value=oai.model||'whisper-large-v3-turbo';
+    $('vc-gw-edge-voice').value=edge.voice||'zh-CN-XiaoyiNeural';
+    const brzOk=Boolean(brz.configured||saved.breezeblue);
+    const fishOk=Boolean(fish.configured||saved.fish);
+    const sfOk=Boolean(sf.configured||saved.siliconflow);
+    const oaiOk=Boolean(oai.configured||saved.openai_stt);
+    text('vc-gw-brz-key-state',brz.configured?(saved.breezeblue?'已存(SQLite)':'已配置(.env)'):saved.breezeblue?'已存(SQLite)':'未配置');
+    text('vc-gw-fish-key-state',fish.configured?(saved.fish?'已存(SQLite)':'已配置(.env)'):saved.fish?'已存(SQLite)':'未配置');
+    text('vc-gw-sf-key-state',sf.configured?(saved.siliconflow?'已存(SQLite)':'已配置(.env)'):saved.siliconflow?'已存(SQLite)':'未配置');
+    text('vc-gw-oai-key-state',oai.configured?(saved.openai_stt?'已存(SQLite)':'已配置(.env)'):saved.openai_stt?'已存(SQLite)':'未配置');
+    $('vc-gw-brz-fetch-voices').disabled=!Boolean(d.reachable&&brzOk);
+    void(sfOk);void(fishOk);void(oaiOk);
+  }else{
+    text('vc-gw-brz-key-state',saved.breezeblue?'已存(SQLite)':'未读取');
+    text('vc-gw-fish-key-state',saved.fish?'已存(SQLite)':'未读取');
+    text('vc-gw-sf-key-state',saved.siliconflow?'已存(SQLite)':'未读取');
+    text('vc-gw-oai-key-state',saved.openai_stt?'已存(SQLite)':'未读取');
+    $('vc-gw-brz-fetch-voices').disabled=true;
+  }
+}
+async function voiceGatewayConfig(){
+  const d=await api('life/voice-companion/gateway');
   if(!token)return;
-  renderVoiceCompanion(d);
+  renderVoiceGatewayConfig(d);
+}
+$('vc-gw-refresh').addEventListener('click',e=>busy(e.target,voiceGatewayConfig));
+$('vc-gw-brz-fetch-voices').addEventListener('click',e=>busy(e.target,async()=>{
+  const r=await api('life/voice-companion/gateway/voices');
+  const list=r.voices||[],sel=$('vc-gw-brz-voice-select');
+  sel.replaceChildren(el('option','请选择音色（'+list.length+' 个）',''));
+  sel.firstChild.value='';
+  list.forEach(v=>{
+    const opt=document.createElement('option');
+    opt.value=v.voice_id;
+    opt.textContent=(v.voice_type==='personal'?'[我的] ':'[官方] ')+(v.name||v.voice_id)+' ('+v.voice_id+')';
+    sel.append(opt);
+  });
+  sel.hidden=list.length===0;
+  if(list.length){sel.value=$('vc-gw-brz-voice').value||'';notice('已加载 '+list.length+' 个 BreezeBlue 音色');}
+  else notice('账号下暂无可用音色',true);
+}));
+$('vc-gw-brz-voice-select').addEventListener('change',e=>{
+  if(e.target.value)$('vc-gw-brz-voice').value=e.target.value;
+});
+$('vc-gw-test').addEventListener('click',e=>busy(e.target,async()=>{
+  const r=await api('life/voice-companion/gateway/test','POST');
+  notice('TTS 实测成功：'+r.bytes+' 字节 · '+r.duration_ms+' ms（耗时 '+r.latency_ms+' ms）');
+}));
+$('vc-gw-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('vc-gw-save'),async()=>{
+    const rawGs=$('vc-gw-brz-guidance').value.trim();
+    const payload={
+      stt_provider:$('vc-gw-stt-provider').value,
+      tts_provider:$('vc-gw-tts-provider').value,
+      tts_speed:Number($('vc-gw-tts-speed').value||'1.05'),
+      tts_buffer_mode:$('vc-gw-tts-buffer-mode').value,
+      tts_streaming:$('vc-gw-tts-streaming').checked,
+      breezeblue_api_key:$('vc-gw-brz-key').value.trim(),
+      clear_breezeblue_api_key:$('vc-gw-brz-clear').checked,
+      breezeblue_base_url:$('vc-gw-brz-url').value.trim()||'https://api.breeze.blue',
+      breezeblue_voice_id:$('vc-gw-brz-voice').value.trim(),
+      breezeblue_model_id:$('vc-gw-brz-model').value.trim()||'breeze-tts-2',
+      breezeblue_language_code:$('vc-gw-brz-lang').value.trim(),
+      breezeblue_guidance_scale:rawGs?Number(rawGs):null,
+      breezeblue_instructions:$('vc-gw-brz-instructions').value.trim(),
+      fish_api_key:$('vc-gw-fish-key').value.trim(),
+      clear_fish_api_key:$('vc-gw-fish-clear').checked,
+      fish_base_url:$('vc-gw-fish-url').value.trim()||'https://api.fish.audio',
+      fish_reference_id:$('vc-gw-fish-ref').value.trim(),
+      fish_model:$('vc-gw-fish-model').value.trim(),
+      fish_latency:$('vc-gw-fish-latency').value,
+      fish_asr_language:$('vc-gw-fish-asr-lang').value.trim(),
+      siliconflow_api_key:$('vc-gw-sf-key').value.trim(),
+      clear_siliconflow_api_key:$('vc-gw-sf-clear').checked,
+      siliconflow_base_url:$('vc-gw-sf-url').value.trim()||'https://api.siliconflow.cn/v1',
+      siliconflow_stt_model:$('vc-gw-sf-stt-model').value.trim(),
+      siliconflow_tts_model:$('vc-gw-sf-tts-model').value.trim(),
+      siliconflow_tts_voice:$('vc-gw-sf-tts-voice').value.trim(),
+      openai_stt_api_key:$('vc-gw-oai-key').value.trim(),
+      clear_openai_stt_api_key:$('vc-gw-oai-clear').checked,
+      openai_stt_base_url:$('vc-gw-oai-url').value.trim()||'https://api.groq.com/openai/v1',
+      openai_stt_model:$('vc-gw-oai-model').value.trim(),
+      edge_tts_voice:$('vc-gw-edge-voice').value.trim()||'zh-CN-XiaoyiNeural',
+    };
+    const next=await api('life/voice-companion/gateway','PUT',payload);
+    ['vc-gw-brz-key','vc-gw-fish-key','vc-gw-sf-key','vc-gw-oai-key'].forEach(id=>{$(id).value='';});
+    ['vc-gw-brz-clear','vc-gw-fish-clear','vc-gw-sf-clear','vc-gw-oai-clear'].forEach(id=>{$(id).checked=false;});
+    renderVoiceGatewayConfig(next);
+    notice('语音网关 API 配置已保存并实时热切换');
+  });
+});
+$('vc-gw-reset').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!confirm('清除后台语音网关 API 覆盖，恢复网关 .env 默认配置？'))return;
+  const next=await api('life/voice-companion/gateway','DELETE');
+  ['vc-gw-brz-key','vc-gw-fish-key','vc-gw-sf-key','vc-gw-oai-key'].forEach(id=>{$(id).value='';});
+  ['vc-gw-brz-clear','vc-gw-fish-clear','vc-gw-sf-clear','vc-gw-oai-clear'].forEach(id=>{$(id).checked=false;});
+  renderVoiceGatewayConfig(next);
+  notice('已恢复网关 .env 默认配置');
+}));
+async function voiceCompanion(){
+  const [vcRes,gwRes]=await Promise.allSettled([
+    api('life/voice-companion'),
+    api('life/voice-companion/gateway')
+  ]);
+  if(vcRes.status==='rejected')throw vcRes.reason;
+  if(!token)return;
+  renderVoiceCompanion(vcRes.value);
+  if(gwRes.status==='fulfilled'){renderVoiceGatewayConfig(gwRes.value);}
+  else if(gwRes.reason?.name!=='AbortError'){renderVoiceGatewayConfig({configured:false,reachable:false,error:gwRes.reason?.message||'unavailable'});}
 }
 $('refresh-vc').addEventListener('click',e=>busy(e.target,voiceCompanion));
 $('vc-disconnect').addEventListener('click',e=>busy(e.target,async()=>{

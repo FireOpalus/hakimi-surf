@@ -32,6 +32,7 @@ from .rest_policy import RestHoursConfig
 from .screen_watch import ScreenWatchConfig
 from .security import Rejected
 from .voice_companion import VoiceCompanionConfig
+from .voice_gateway_admin import VoiceGatewayConfigUpdate
 
 router = APIRouter(prefix="/admin/api/life")
 
@@ -960,6 +961,55 @@ async def life_voice_companion_disconnect(request: Request):
     if vc is None:
         raise HTTPException(503, "voice_companion_unavailable")
     return await vc.disconnect_active()
+
+
+@router.get("/voice-companion/gateway")
+async def life_voice_companion_gateway_status(request: Request):
+    svc = service(request)
+    gw = getattr(svc, "voice_gateway_admin", None)
+    if gw is None:
+        raise HTTPException(503, "voice_gateway_admin_unavailable")
+    return await gw.status()
+
+
+@router.put("/voice-companion/gateway")
+async def life_voice_companion_gateway_update(request: Request):
+    value = await body(request, VoiceGatewayConfigUpdate)
+    svc = service(request)
+    gw = getattr(svc, "voice_gateway_admin", None)
+    if gw is None:
+        raise HTTPException(503, "voice_gateway_admin_unavailable")
+    async with request.app.state.admin_config_lock:
+        return await gw.update(value)
+
+
+@router.delete("/voice-companion/gateway")
+async def life_voice_companion_gateway_reset(request: Request):
+    svc = service(request)
+    gw = getattr(svc, "voice_gateway_admin", None)
+    if gw is None:
+        raise HTTPException(503, "voice_gateway_admin_unavailable")
+    async with request.app.state.admin_config_lock:
+        return await gw.reset()
+
+
+@router.get("/voice-companion/gateway/voices")
+async def life_voice_companion_gateway_voices(request: Request):
+    svc = service(request)
+    gw = getattr(svc, "voice_gateway_admin", None)
+    if gw is None:
+        raise HTTPException(503, "voice_gateway_admin_unavailable")
+    return await gw.list_breezeblue_voices()
+
+
+@router.post("/voice-companion/gateway/test")
+async def life_voice_companion_gateway_test(request: Request):
+    request.app.state.admin_auth.costly()
+    svc = service(request)
+    gw = getattr(svc, "voice_gateway_admin", None)
+    if gw is None:
+        raise HTTPException(503, "voice_gateway_admin_unavailable")
+    return await gw.test_tts(svc.voice_reply)
 
 
 @router.get("/screen-watch")

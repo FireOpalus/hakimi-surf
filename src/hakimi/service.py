@@ -65,6 +65,7 @@ from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
 from .video_watch import VideoWatch
+from .voice_gateway_admin import VoiceGatewayAdminManager
 from .voice_reply import VoiceReplyClient, explicit_voice_request
 from .web_search import explicit_search, search_query
 from .work_usage import model_work
@@ -125,6 +126,7 @@ class Service:
         # Older composition roots supplied their shared HTTP client on the sender.
         self.http = http if http is not None else getattr(sender, "http", None)
         self.voice_reply = VoiceReplyClient(settings, http=self.http)
+        self.voice_gateway_admin = VoiceGatewayAdminManager(settings, store, http=self.http)
         self.node_transport = (
             node_transport if node_transport is not None else NodeTransport(settings)
         )
