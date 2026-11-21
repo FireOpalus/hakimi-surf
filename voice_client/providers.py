@@ -8,7 +8,7 @@ import re
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import httpx
 
@@ -293,34 +293,57 @@ class FishAudioTTS:
         *,
         api_key: str,
         base_url: str = "https://api.fish.audio",
-        reference_id: str,
+        reference_id: str = "",
+        model: str = "",
+        response_format: Literal["mp3", "wav"] = "mp3",
+        latency: str = "balanced",
+        speed: float = 1.0,
+        volume: float = 0.0,
         http: httpx.AsyncClient | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.reference_id = reference_id
+        self.reference_id = reference_id.strip()
+        self.model = model.strip()
+        self.response_format = response_format if response_format in {"mp3", "wav"} else "mp3"
+        self.latency = latency if latency in {"balanced", "normal"} else "balanced"
+        self.speed = max(0.5, min(2.0, float(speed)))
+        self.volume = max(-20.0, min(20.0, float(volume)))
         self._owns_http = http is None
         self._http = http or _make_default_http_client()
 
     async def synthesize(self, text: str) -> tuple[bytes, str]:
         if not text.strip():
             raise ProviderError("Fish Audio TTS 输入文本为空")
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if self.model:
+            headers["model"] = self.model
+        body: dict[str, Any] = {
+            "text": text,
+            "format": self.response_format,
+            "latency": self.latency,
+            "normalize": True,
+            "prosody": {
+                "speed": self.speed,
+                "volume": self.volume,
+            },
+        }
+        if self.reference_id:
+            body["reference_id"] = self.reference_id
+        if self.response_format == "mp3":
+            body["mp3_bitrate"] = 128
         try:
             resp = await self._http.post(
                 f"{self.base_url}/v1/tts",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "text": text,
-                    "reference_id": self.reference_id,
-                    "format": "mp3",
-                },
+                headers=headers,
+                json=body,
             )
         except httpx.HTTPError as exc:
             raise ProviderError(f"Fish Audio TTS 网络请求失败 ({type(exc).__name__})") from None
         _raise_for_bad_status("Fish Audio TTS", resp, secrets=(self.api_key,))
         if not resp.content:
             raise ProviderError("Fish Audio TTS 返回了空音频数据")
-        return resp.content, "mp3"
+        return resp.content, self.response_format
 
     async def aclose(self) -> None:
         if self._owns_http:
@@ -424,6 +447,11 @@ def build_tts_provider(
             api_key=config.fish_api_key,
             base_url=config.fish_base_url,
             reference_id=config.fish_reference_id,
+            model=config.fish_model,
+            response_format=config.tts_format,
+            latency=config.fish_latency,
+            speed=config.tts_speed,
+            volume=config.tts_gain,
             http=http,
         )
     return EdgeFallbackTTS(voice=config.edge_tts_voice)

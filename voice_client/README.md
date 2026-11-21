@@ -48,7 +48,11 @@ VAD_BARGE_IN_MULTIPLIER=2.2
 BARGE_IN_ENABLED=true
 ```
 
-> 可选备用 Provider：`STT_PROVIDER=openai`（搭配 `OPENAI_STT_API_KEY` / `OPENAI_STT_BASE_URL` / `OPENAI_STT_MODEL`）；`TTS_PROVIDER=fish`（搭配 `FISH_API_KEY` / `FISH_REFERENCE_ID`）或 `TTS_PROVIDER=edge`（本地 `edge-tts` 命令）。
+- `TTS_BUFFER_MODE=turn`（默认）：流式收到文本后先在终端实时显示，等整轮说完后**一次性整段合成播报**（消除逗号逐句切片导致的机械停顿）；设为 `chunk` 或传 `--tts-buffer-mode chunk` 可切回逐句流式播报。
+- 可选 Provider：
+  - **Fish Audio TTS（`TTS_PROVIDER=fish`）**：配置 `FISH_API_KEY`，可选填 `FISH_REFERENCE_ID`（音色 UUID，留空使用默认）、`FISH_MODEL`（如 `s2.1-pro`、`s2.1-pro-free`、`s2-pro`，留空走 Fish Audio 最新默认）、`FISH_LATENCY`（`balanced` / `normal`）；支持 `TTS_SPEED` 与 `TTS_GAIN` 语速音量控制。
+  - **OpenAI/Groq 兼容 STT（`STT_PROVIDER=openai`）**：搭配 `OPENAI_STT_API_KEY` / `OPENAI_STT_BASE_URL` / `OPENAI_STT_MODEL`。
+  - **本地 Edge TTS 兜底（`TTS_PROVIDER=edge`）**：依赖本地 `edge-tts` 命令。
 
 ## 3. 自检与工具命令
 

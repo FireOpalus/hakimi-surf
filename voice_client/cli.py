@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="覆盖 AVFoundation 音频输入设备序号或名称",
     )
+    parser.add_argument(
+        "--tts-buffer-mode",
+        choices=("turn", "chunk"),
+        default=None,
+        help="覆盖 TTS 缓冲策略: turn (整轮说完一次合成, 默认) 或 chunk (逐句切片合成)",
+    )
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -208,13 +214,31 @@ async def upload_voice(
         await tts.aclose()
 
 
+def _join_turn_chunks(parts: list[str]) -> str:
+    """Join streamed chunks cleanly while avoiding extra spaces between Chinese chars."""
+    out: list[str] = []
+    for raw in parts:
+        piece = str(raw or "").strip()
+        if not piece:
+            continue
+        if out:
+            prev = out[-1][-1]
+            curr = piece[0]
+            if prev.isascii() and prev.isalnum() and curr.isascii() and curr.isalnum():
+                out.append(" ")
+        out.append(piece)
+    return "".join(out)
+
+
 def _print_banner(config: VoiceClientConfig, ready: dict[str, Any], voice_mode: str) -> None:
     mode_label = ready.get("mode", config.session_mode)
     game_label = config.game_title or "日常连麦"
+    buf_label = "整轮合播(不切片)" if config.tts_buffer_mode == "turn" else "逐句流式"
     print("=" * 64)
     print("🐱 哈基米实时语音伴随客户端已连接")
     print(
-        f"会话模式: {mode_label} | 拾音模式: {voice_mode.upper()} | "
+        f"会话模式: {mode_label} | 拾音: {voice_mode.upper()} | "
+        f"TTS: {config.tts_provider}/{buf_label} | "
         f"设备: [{config.audio_input_device}] | 场景: {game_label}"
     )
     print("操作说明:")
@@ -268,6 +292,7 @@ async def run_interactive_session(
     ptt_buffer = bytearray()
     max_ptt_bytes = max(1, config.sample_rate * 2 * 60)
     bg_tasks: set[asyncio.Task[None]] = set()
+    turn_buffers: dict[str, list[str]] = {}
     loop = asyncio.get_running_loop()
 
     def spawn_task(coro: Any) -> asyncio.Task[None]:
@@ -285,26 +310,38 @@ async def run_interactive_session(
         return task
 
     async def on_turn_start(frame: dict[str, Any]) -> None:
-        _ = frame
+        if config.tts_buffer_mode == "turn":
+            turn_buffers[str(frame.get("turn_id") or "")] = []
 
     async def on_speak_chunk(frame: dict[str, Any]) -> None:
         turn_id = str(frame.get("turn_id") or "")
         seq = int(frame.get("seq") or 0)
         text = str(frame.get("text") or "").strip()
-        if text:
-            print(f"🐱 哈基米: {text}", flush=True)
-            res = player.enqueue_chunk(turn_id, seq, text)
-            if asyncio.iscoroutine(res):
-                await res
+        if not text:
+            return
+        print(f"🐱 哈基米: {text}", flush=True)
+        if config.tts_buffer_mode == "turn":
+            turn_buffers.setdefault(turn_id, []).append(text)
+            return
+        res = player.enqueue_chunk(turn_id, seq, text)
+        if asyncio.iscoroutine(res):
+            await res
 
     async def on_turn_end(frame: dict[str, Any]) -> None:
-        status = str(frame.get("status") or "")
+        status = str(frame.get("status") or "").lower()
         turn_id = str(frame.get("turn_id") or "")
+        parts = turn_buffers.pop(turn_id, [])
         if status == "cancelled":
             await player.cancel_turn(turn_id or None)
         elif status == "error":
             reason = str(frame.get("reason") or "unknown")
             print(f"⚠️ 本轮回复异常: {reason}", flush=True)
+        elif config.tts_buffer_mode == "turn" and parts and status not in {"silent", "skipped"}:
+            full_text = _join_turn_chunks(parts)
+            if full_text:
+                res = player.enqueue_chunk(turn_id, 1, full_text)
+                if asyncio.iscoroutine(res):
+                    await res
 
     async def on_error(frame: dict[str, Any]) -> None:
         reason = str(frame.get("reason") or "unknown")
@@ -326,6 +363,7 @@ async def run_interactive_session(
     )
 
     async def interrupt_now() -> None:
+        turn_buffers.clear()
         await player.cancel_turn()
         await ws.cancel_turn()
 
@@ -594,6 +632,8 @@ def main(argv: list[str] | None = None) -> int:
             updates["game_title"] = args.game
         if args.device is not None:
             updates["audio_input_device"] = args.device
+        if args.tts_buffer_mode is not None:
+            updates["tts_buffer_mode"] = args.tts_buffer_mode
         if updates:
             config = dataclasses.replace(config, **updates)
 

@@ -142,11 +142,14 @@ class VoiceClientConfig:
     tts_speed: float = 1.05
     tts_gain: float = 0.0
     tts_format: Literal["mp3", "wav"] = "mp3"
+    tts_buffer_mode: Literal["turn", "chunk"] = "turn"
 
     # Optional alternate providers
     fish_api_key: str = ""
     fish_base_url: str = "https://api.fish.audio"
     fish_reference_id: str = ""
+    fish_model: str = ""
+    fish_latency: Literal["balanced", "normal"] = "balanced"
     openai_stt_api_key: str = ""
     openai_stt_base_url: str = "https://api.groq.com/openai/v1"
     openai_stt_model: str = "whisper-large-v3-turbo"
@@ -218,10 +221,6 @@ class VoiceClientConfig:
                 raise ValueError(
                     "缺少 FISH_API_KEY：当前 TTS_PROVIDER=fish，请配置 Fish Audio API Key。"
                 )
-            if not self.fish_reference_id.strip():
-                raise ValueError(
-                    "缺少 FISH_REFERENCE_ID：当前 TTS_PROVIDER=fish，请配置音色 reference_id。"
-                )
             return
         if provider in {"edge", "edge_tts"}:
             if not self.edge_tts_voice.strip():
@@ -275,6 +274,16 @@ def load_config(
         raise ValueError(f"TTS_FORMAT 无效 ({raw_tts_fmt!r})：必须为 mp3 或 wav。")
     tts_format: Literal["mp3", "wav"] = raw_tts_fmt  # type: ignore[assignment]
 
+    raw_tts_buf = _non_empty_or_default(merged, "TTS_BUFFER_MODE", "turn").lower()
+    if raw_tts_buf not in {"turn", "chunk"}:
+        raise ValueError(f"TTS_BUFFER_MODE 无效 ({raw_tts_buf!r})：必须为 turn 或 chunk。")
+    tts_buffer_mode: Literal["turn", "chunk"] = raw_tts_buf  # type: ignore[assignment]
+
+    raw_fish_latency = _non_empty_or_default(merged, "FISH_LATENCY", "balanced").lower()
+    if raw_fish_latency not in {"balanced", "normal"}:
+        raise ValueError(f"FISH_LATENCY 无效 ({raw_fish_latency!r})：必须为 balanced 或 normal。")
+    fish_latency: Literal["balanced", "normal"] = raw_fish_latency  # type: ignore[assignment]
+
     raw_voice_mode = _non_empty_or_default(merged, "VOICE_MODE", "vad").lower()
     if raw_voice_mode not in {"vad", "ptt"}:
         raise ValueError(f"VOICE_MODE 无效 ({raw_voice_mode!r})：必须为 vad 或 ptt。")
@@ -326,11 +335,14 @@ def load_config(
         tts_speed=tts_speed,
         tts_gain=tts_gain,
         tts_format=tts_format,
+        tts_buffer_mode=tts_buffer_mode,
         fish_api_key=merged.get("FISH_API_KEY", "").strip(),
         fish_base_url=_non_empty_or_default(
             merged, "FISH_BASE_URL", "https://api.fish.audio"
         ).rstrip("/"),
         fish_reference_id=merged.get("FISH_REFERENCE_ID", "").strip(),
+        fish_model=merged.get("FISH_MODEL", "").strip(),
+        fish_latency=fish_latency,
         openai_stt_api_key=merged.get("OPENAI_STT_API_KEY", "").strip(),
         openai_stt_base_url=_non_empty_or_default(
             merged, "OPENAI_STT_BASE_URL", "https://api.groq.com/openai/v1"

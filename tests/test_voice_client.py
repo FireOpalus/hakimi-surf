@@ -134,7 +134,14 @@ def test_load_dotenv_file_and_config_validation_clamping(tmp_path):
     VoiceClientConfig(siliconflow_api_key="sk-secret").require_stt()
     VoiceClientConfig(siliconflow_api_key="sk-secret").require_tts()
     VoiceClientConfig(stt_provider="openai", openai_stt_api_key="sk-oai").require_stt()
+    VoiceClientConfig(tts_provider="fish", fish_api_key="f").require_tts()
     VoiceClientConfig(tts_provider="fish", fish_api_key="f", fish_reference_id="r").require_tts()
+    with pytest.raises(ValueError, match="FISH_API_KEY"):
+        VoiceClientConfig(tts_provider="fish").require_tts()
+    with pytest.raises(ValueError, match="TTS_BUFFER_MODE"):
+        load_config(env={"TTS_BUFFER_MODE": "bad"}, env_file=missing)
+    with pytest.raises(ValueError, match="FISH_LATENCY"):
+        load_config(env={"FISH_LATENCY": "turbo"}, env_file=missing)
     VoiceClientConfig(tts_provider="edge", edge_tts_voice="zh-CN-XiaoyiNeural").require_tts()
 
     # Regex validation for adapter_id and client_id
@@ -265,11 +272,16 @@ async def test_providers_siliconflow_fish_openai_and_secret_redaction(tmp_path):
         assert "主人好呀喵".encode() in body
         assert b"ref.wav" in body
 
-        # Fish Audio TTS
+        # Fish Audio TTS (with model header, prosody, latency, and optional reference_id)
         fish_tts = FishAudioTTS(
             api_key=fish_key,
             base_url="https://api.fish.audio",
             reference_id="ref-id-001",
+            model="s2.1-pro",
+            response_format="mp3",
+            latency="balanced",
+            speed=1.1,
+            volume=1.5,
             http=http,
         )
         fish_bytes, fish_fmt = await fish_tts.synthesize("小鱼干")
@@ -278,11 +290,23 @@ async def test_providers_siliconflow_fish_openai_and_secret_redaction(tmp_path):
         _, url, hdrs, body = seen_requests[-1]
         assert url == "https://api.fish.audio/v1/tts"
         assert hdrs["authorization"] == f"Bearer {fish_key}"
+        assert hdrs["model"] == "s2.1-pro"
         assert json.loads(body.decode("utf-8")) == {
             "text": "小鱼干",
             "reference_id": "ref-id-001",
             "format": "mp3",
+            "mp3_bitrate": 128,
+            "latency": "balanced",
+            "normalize": True,
+            "prosody": {"speed": 1.1, "volume": 1.5},
         }
+
+        # Fish Audio TTS without model / reference_id uses defaults cleanly
+        fish_min = FishAudioTTS(api_key=fish_key, base_url="https://api.fish.audio", http=http)
+        await fish_min.synthesize("测试默认")
+        _, _, hdrs2, body2 = seen_requests[-1]
+        assert "model" not in hdrs2
+        assert "reference_id" not in json.loads(body2.decode("utf-8"))
 
         # OpenAI-compatible STT
         oai_stt = OpenAICompatibleSTT(
@@ -1225,3 +1249,154 @@ async def test_resolve_ws_proxy_and_connect_passes_proxy(monkeypatch):
         assert connect_calls[0]["max_size"] == 4_194_304
     finally:
         await client.close()
+
+
+async def test_full_turn_tts_buffer_mode_and_chunk_mode(monkeypatch):
+    import sys
+
+    from voice_client.cli import _join_turn_chunks, run_interactive_session
+
+    assert (
+        _join_turn_chunks(["哇，刚才吓死我了", "，", "还好没事！"])
+        == "哇，刚才吓死我了，还好没事！"
+    )
+    assert _join_turn_chunks(["Hello", "World", "，走吧"]) == "Hello World，走吧"
+    assert _join_turn_chunks(["Go ", "MC"]) == "Go MC"
+
+    async def _run_case(mode: str, status: str) -> list[tuple[str, int, str]]:
+        monkeypatch.setattr(sys, "stdin", io.StringIO("t\n第一句话\nq\n"))
+        enqueued: list[tuple[str, int, str]] = []
+
+        class IdleMic:
+            async def start(self) -> None:
+                return None
+
+            async def read_frame(self) -> bytes:
+                await asyncio.sleep(0.04)
+                return _silence_frame()
+
+            async def stop(self) -> None:
+                return None
+
+        class DummySTT:
+            async def transcribe(self, wav_bytes: bytes, *, filename: str = "utterance.wav") -> str:
+                return ""
+
+            async def aclose(self) -> None:
+                return None
+
+        class DummyTTS:
+            async def synthesize(self, text: str) -> tuple[bytes, str]:
+                return b"MP3", "mp3"
+
+            async def aclose(self) -> None:
+                return None
+
+        class CapturePlayer:
+            is_playing = False
+
+            async def start(self) -> None:
+                return None
+
+            def enqueue_chunk(self, turn_id: str, seq: int, text: str) -> None:
+                enqueued.append((turn_id, seq, text))
+
+            async def cancel_turn(self, turn_id: str | None = None) -> None:
+                return None
+
+            async def stop(self) -> None:
+                return None
+
+        class MultiChunkWs:
+            def __init__(self) -> None:
+                self.incoming: asyncio.Queue[str] = asyncio.Queue()
+
+            async def send(self, raw: str) -> None:
+                frame = json.loads(raw)
+                if frame["type"] == "session.start":
+                    await self.incoming.put(
+                        json.dumps(
+                            {
+                                "type": "session.ready",
+                                "session_id": "buf-s1",
+                                "mode": "owner_private",
+                                "config": {},
+                            }
+                        )
+                    )
+                elif frame["type"] == "speech.turn":
+                    tid = frame["turn_id"]
+                    await self.incoming.put(
+                        json.dumps({"type": "turn.start", "turn_id": tid, "kind": "speech"})
+                    )
+                    for idx, piece in enumerate(("哇，", "苦力怕来了！", "快跑喵~"), start=1):
+                        await self.incoming.put(
+                            json.dumps(
+                                {
+                                    "type": "speak.chunk",
+                                    "turn_id": tid,
+                                    "seq": idx,
+                                    "text": piece,
+                                    "final": False,
+                                }
+                            )
+                        )
+                    # Wait briefly mid-turn before turn.end
+                    await asyncio.sleep(0.02)
+                    if mode == "turn":
+                        assert enqueued == []
+                    await self.incoming.put(
+                        json.dumps({"type": "turn.end", "turn_id": tid, "status": status})
+                    )
+                elif frame["type"] == "session.stop":
+                    await self.incoming.put(
+                        json.dumps({"type": "session.ended", "session_id": "buf-s1"})
+                    )
+
+            async def recv(self) -> str:
+                item = await self.incoming.get()
+                if item == "__EOF__":
+                    raise RuntimeError("eof")
+                return item
+
+            async def close(self) -> None:
+                await self.incoming.put("__EOF__")
+
+        cfg = VoiceClientConfig(
+            ws_url="wss://example.invalid/ws/companion/secret-path-xyz",
+            ws_token="companion-secret-token-32-chars-min",
+            tts_provider="fish",
+            fish_api_key="fish-dummy-key",
+            tts_buffer_mode=mode,  # type: ignore[arg-type]
+            ping_interval_seconds=0.0,
+        )
+        assert (
+            await run_interactive_session(
+                cfg,
+                connect_factory=MultiChunkWs,
+                stt_provider=DummySTT(),
+                tts_provider=DummyTTS(),
+                mic_capture=IdleMic(),
+                audio_player=CapturePlayer(),
+            )
+            == 0
+        )
+        return enqueued
+
+    # Full-turn mode merges chunks on turn.end(status="spoken") or "ok"
+    res_spoken = await _run_case("turn", "spoken")
+    assert len(res_spoken) == 1
+    assert res_spoken[0][1] == 1
+    assert res_spoken[0][2] == "哇，苦力怕来了！快跑喵~"
+
+    res_ok = await _run_case("turn", "ok")
+    assert len(res_ok) == 1
+    assert res_ok[0][2] == "哇，苦力怕来了！快跑喵~"
+
+    # Cancelled turn discards buffered text with 0 TTS synthesis calls
+    res_cancelled = await _run_case("turn", "cancelled")
+    assert res_cancelled == []
+
+    # Chunk mode still enqueues each slice immediately
+    res_chunk = await _run_case("chunk", "spoken")
+    assert [txt for _, _, txt in res_chunk] == ["哇，", "苦力怕来了！", "快跑喵~"]
