@@ -979,6 +979,16 @@ class RemoteModuleProxy(BaseModule):
     async def current_activity(self) -> str | None:
         return self._current_activity
 
+    def planning_fingerprint(self) -> str:
+        st = self.status_dict()
+        if not isinstance(st, dict):
+            return ""
+        parts: list[str] = []
+        for key in ("connected", "paused", "bridge_ready"):
+            if key in st and isinstance(st[key], bool):
+                parts.append(f"{key}={int(st[key])}")
+        return ",".join(parts)
+
     async def context_data(self, *, limit: int, now: float, message: Message | None = None) -> dict:
         if self.module_id == "bilibili_surf":
             bw = getattr(self._bus.service, "bili_watcher", None)

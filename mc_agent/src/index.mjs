@@ -39,6 +39,7 @@ export function createMcBridgeServer(options = {}) {
     onEvent: broadcastEvent,
     snapshotIntervalMs: options.snapshotIntervalMs,
     milestoneCooldownMs: options.milestoneCooldownMs,
+    chatCooldownMs: options.chatCooldownMs,
     actionTimeoutMs: options.actionTimeoutMs,
     profilesFolder: options.profilesFolder,
     nowFn: options.nowFn,
@@ -46,6 +47,10 @@ export function createMcBridgeServer(options = {}) {
     powerPollIntervalMs: options.powerPollIntervalMs,
     powerWakeTimeoutMs: options.powerWakeTimeoutMs,
     idleDisconnectMs: options.idleDisconnectMs,
+    companionTickMs: options.companionTickMs,
+    soloWanderIntervalMs: options.soloWanderIntervalMs,
+    companionReplyCooldownMs: options.companionReplyCooldownMs,
+    hostileAlertCooldownMs: options.hostileAlertCooldownMs,
   });
 
   const httpServer = http.createServer((req, res) => {

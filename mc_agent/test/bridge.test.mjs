@@ -1059,3 +1059,104 @@ test("autonomous idle auto-disconnect skips when another player is online and di
     await server.close();
   }
 });
+
+test("companion mode: tracks/follows allowed player, evades hostile mobs, reacts to whitelisted chat, and wanders solo", async () => {
+  const { factory, getLastBot } = createMockBotFactory();
+  let fakeNowMs = 1_700_000_000_000;
+  const setGoals = [];
+  const lookAts = [];
+  const swings = [];
+
+  const wrappedFactory = (opts) => {
+    const bot = factory(opts);
+    bot.lookAt = async (pt) => {
+      lookAts.push(pt);
+    };
+    bot.swingArm = (hand) => {
+      swings.push(hand);
+    };
+    bot.pathfinder.setGoal = (goal, dynamic) => {
+      setGoals.push({ goal, dynamic });
+    };
+    return bot;
+  };
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "true",
+      MC_ALLOW_CHAT: "true",
+      MC_ALLOWED_PLAYERS: "M1haiier",
+      MC_COMPANION_MODE: "true",
+    },
+    createBotFn: wrappedFactory,
+    snapshotIntervalMs: 5000,
+    companionTickMs: 30,
+    soloWanderIntervalMs: 80,
+    chatCooldownMs: 0,
+    companionReplyCooldownMs: 0,
+    hostileAlertCooldownMs: 60_000,
+    nowFn: () => fakeNowMs,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
+    const bot = getLastBot();
+
+    // 1. Solo wander when alone
+    fakeNowMs += 100;
+    await new Promise((r) => setTimeout(r, 70));
+    assert.ok(setGoals.length >= 1, "expected solo wander goal when alone");
+
+    // 2. Allowed player M1haiier arrives 10 blocks away -> looks, greets, follows
+    setGoals.length = 0;
+    bot.players = {
+      M1haiier: { username: "M1haiier", entity: { position: vec3(20, 64, -5) } },
+    };
+    await new Promise((r) => setTimeout(r, 70));
+    assert.ok(lookAts.length >= 1, "expected lookAt towards allowed player");
+    assert.ok(swings.length >= 1, "expected wave greeting");
+    assert.ok(setGoals.some((g) => g.goal && g.dynamic === true), "expected dynamic GoalFollow");
+
+    // 3. Whitelisted player chat reflexes (greet, stay, follow); stranger & slash ignored
+    bot.chatCalls.length = 0;
+    bot.emit("chat", "Stranger", "宝宝！");
+    bot.emit("chat", "M1haiier", "/op Geminy");
+    assert.equal(bot.chatCalls.length, 0);
+
+    bot.emit("chat", "M1haiier", "宝宝！");
+    assert.ok(bot.chatCalls.some((m) => m.includes("在呢")));
+
+    bot.emit("chat", "M1haiier", "先停下等我");
+    assert.ok(bot.chatCalls.some((m) => m.includes("乖乖站在这里")));
+    assert.equal(server.runtime._stayPut, true);
+
+    bot.emit("chat", "M1haiier", "跟上我走吧");
+    assert.ok(bot.chatCalls.some((m) => m.includes("跟上")));
+    assert.equal(server.runtime._stayPut, false);
+
+    // 4. Hostile skeleton within 8 blocks -> evades and alerts
+    setGoals.length = 0;
+    bot.entities = {
+      sk1: { name: "skeleton", position: vec3(13, 64, -5) },
+    };
+    await new Promise((r) => setTimeout(r, 70));
+    assert.ok(setGoals.length >= 1, "expected evade goal away from skeleton");
+    assert.ok(bot.chatCalls.some((m) => m.includes("怪物")));
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});
+

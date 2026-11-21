@@ -705,3 +705,44 @@ async def test_plugin_bus_accepts_owner_chat_origin(settings):
         finally:
             await sock.push("__EOF__")
             await asyncio.wait_for(serve_task, timeout=2.0)
+
+
+async def test_owner_chat_action_requests_planner_replan(settings, store):
+    dummy = _DummyArcadeModule(settings)
+    svc = Service(settings, store, FakeGateway(), FakeBili(), FakeSender())
+    try:
+        svc.modules.register(dummy)
+        await svc.world_state.initialize()
+        assert any(
+            item["action_name"] == "arcade.launch" for item in svc._collect_owner_chat_actions()
+        )
+        called: list[float] = []
+        orig_replan = svc.life_engine.planner.request_replan
+
+        async def fake_replan(*, delay_seconds: float = 35.0) -> bool:
+            called.append(delay_seconds)
+            return True
+
+        svc.life_engine.planner.request_replan = fake_replan  # type: ignore[method-assign]
+        await svc._run_owner_chat_action(
+            ChatActionTrigger(action_name="arcade.launch", arguments_json='{"mode":"turbo"}')
+        )
+        assert len(dummy.calls) == 1
+        assert dummy.calls[0].args.mode == "turbo"
+        assert called == [35.0]
+
+        # Also verify real LifeBlockPlanner.request_replan schedules an early wake.
+        svc.life_engine.planner.request_replan = orig_replan  # type: ignore[method-assign]
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        midday = datetime(2026, 11, 18, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+        svc.life_engine.planner.clock = lambda: midday  # type: ignore[method-assign]
+        svc.life_engine.wakeup.clear()
+        now = midday
+        svc.life_engine.planner.next_plan_at = now + 7200
+        assert await svc.life_engine.planner.request_replan(delay_seconds=35.0) is True
+        assert now < svc.life_engine.planner.next_plan_at <= now + 36.0
+        assert svc.life_engine.wakeup.is_set()
+    finally:
+        await svc.stop()

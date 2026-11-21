@@ -53,6 +53,35 @@ const DEFAULT_GATHER_BLOCKS = [
   "cobblestone",
 ];
 
+export const HOSTILE_MOBS = new Set([
+  "zombie",
+  "skeleton",
+  "creeper",
+  "spider",
+  "cave_spider",
+  "enderman",
+  "witch",
+  "pillager",
+  "drowned",
+  "husk",
+  "stray",
+  "slime",
+  "phantom",
+  "bogged",
+  "breeze",
+  "blaze",
+  "piglin_brute",
+  "vindicator",
+  "evoker",
+  "ravager",
+  "warden",
+  "zombified_piglin",
+]);
+
+const STAY_CMD_RE = /停下|别动|原地|等我|待着|\bstay\b|\bstop\b/i;
+const FOLLOW_CMD_RE = /跟上|过来|跟我走|跟我来|陪我|走吧|\bfollow\b|\bcome\b/i;
+const GREET_CMD_RE = /宝宝|哈基米|猫猫|geminy|吉米奈|大小姐|在吗|你好|\bhi\b|\bhello\b/i;
+
 function roundCoord(v) {
   const num = Number(v);
   if (!Number.isFinite(num)) return 0;
@@ -113,6 +142,10 @@ export class McRuntime {
     powerPollIntervalMs = 2_000,
     powerWakeTimeoutMs = 90_000,
     idleDisconnectMs = undefined,
+    companionTickMs = 1_500,
+    soloWanderIntervalMs = 25_000,
+    companionReplyCooldownMs = 5_000,
+    hostileAlertCooldownMs = 60_000,
   }) {
     this.config = config;
     this.createBotFn = createBotFn;
@@ -170,6 +203,29 @@ export class McRuntime {
     this._prevHealth = null;
     this._lastChatAtMs = -Infinity;
     this._milestoneCooldowns = new Map();
+    this.companionTickMs =
+      typeof companionTickMs === "number" && Number.isFinite(companionTickMs)
+        ? Math.max(25, companionTickMs)
+        : 1_500;
+    this.soloWanderIntervalMs =
+      typeof soloWanderIntervalMs === "number" && Number.isFinite(soloWanderIntervalMs)
+        ? Math.max(50, soloWanderIntervalMs)
+        : 25_000;
+    this.companionReplyCooldownMs =
+      typeof companionReplyCooldownMs === "number" && Number.isFinite(companionReplyCooldownMs)
+        ? Math.max(0, companionReplyCooldownMs)
+        : 5_000;
+    this.hostileAlertCooldownMs =
+      typeof hostileAlertCooldownMs === "number" && Number.isFinite(hostileAlertCooldownMs)
+        ? Math.max(0, hostileAlertCooldownMs)
+        : 60_000;
+    this._companionTimer = null;
+    this._stayPut = false;
+    this._followingPlayer = null;
+    this._greetedPlayers = new Set();
+    this._lastSoloWanderAtMs = 0;
+    this._lastAutoReplyAtMs = -Infinity;
+    this._lastHostileAlertAtMs = -Infinity;
   }
 
   start() {
@@ -193,6 +249,7 @@ export class McRuntime {
     this._manualDisconnect = true;
     this._cancelWakePoll();
     this._clearReconnectTimer();
+    this._stopCompanionLoop();
     this._stopSnapshotTimer();
     this._cancelActiveGoal();
     this._teardownBot(true);
@@ -384,6 +441,279 @@ export class McRuntime {
     if (this._snapshotTimer) {
       clearInterval(this._snapshotTimer);
       this._snapshotTimer = null;
+    }
+  }
+
+  _startCompanionLoop() {
+    this._stopCompanionLoop();
+    if (!this.connected || !this.config.mcCompanionMode) return;
+    this._lastSoloWanderAtMs = this.nowFn() - Math.floor(this.soloWanderIntervalMs * 0.6);
+    this._companionTimer = setInterval(() => {
+      if (!this.connected || this._stopped) {
+        this._stopCompanionLoop();
+        return;
+      }
+      this._companionTick();
+    }, this.companionTickMs);
+    if (typeof this._companionTimer.unref === "function") {
+      this._companionTimer.unref();
+    }
+  }
+
+  _stopCompanionLoop() {
+    if (this._companionTimer) {
+      clearInterval(this._companionTimer);
+      this._companionTimer = null;
+    }
+  }
+
+  _distanceBetween(a, b) {
+    if (!a || !b) return Infinity;
+    if (typeof a.distanceTo === "function") {
+      const d = a.distanceTo(b);
+      return Number.isFinite(d) ? d : Infinity;
+    }
+    return Math.hypot((b.x ?? 0) - (a.x ?? 0), (b.y ?? 0) - (a.y ?? 0), (b.z ?? 0) - (a.z ?? 0));
+  }
+
+  _lookAtEntity(bot, entity) {
+    if (!bot || typeof bot.lookAt !== "function" || !entity?.position) return;
+    const pos = entity.position;
+    const eyeTarget =
+      typeof pos.offset === "function"
+        ? pos.offset(0, 1.62, 0)
+        : { x: pos.x ?? 0, y: (pos.y ?? 0) + 1.62, z: pos.z ?? 0 };
+    try {
+      const res = bot.lookAt(eyeTarget, true);
+      if (res && typeof res.catch === "function") {
+        res.catch(() => {});
+      }
+    } catch {
+      // Ignore lookAt errors
+    }
+  }
+
+  _tryCompanionChat(rawMsg) {
+    const bot = this.bot;
+    if (!this.config.mcAllowChat || !this.connected || !bot || typeof bot.chat !== "function") {
+      return false;
+    }
+    const clean = sanitizeMcText(rawMsg, 100);
+    if (!clean || clean.startsWith("/")) return false;
+    const nowMs = this.nowFn();
+    if (this.chatCooldownMs > 0 && nowMs - this._lastChatAtMs < this.chatCooldownMs) {
+      return false;
+    }
+    if (
+      this.companionReplyCooldownMs > 0 &&
+      nowMs - this._lastAutoReplyAtMs < this.companionReplyCooldownMs
+    ) {
+      return false;
+    }
+    try {
+      bot.chat(clean);
+      this._lastChatAtMs = nowMs;
+      this._lastAutoReplyAtMs = nowMs;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _findNearestAllowedPlayer(bot) {
+    if (!bot?.entity?.position || this.config.mcAllowedPlayers.size === 0) return null;
+    const origin = bot.entity.position;
+    let best = null;
+    for (const p of Object.values(bot.players || {})) {
+      if (!p || !p.username || p.username === bot.username || !p.entity?.position) continue;
+      if (!this.config.mcAllowedPlayers.has(p.username.toLowerCase())) continue;
+      const dist = this._distanceBetween(origin, p.entity.position);
+      if (!best || dist < best.dist) {
+        best = { player: p, dist };
+      }
+    }
+    return best;
+  }
+
+  _findNearestHostile(bot, maxDist = 8) {
+    if (!bot?.entity?.position) return null;
+    const origin = bot.entity.position;
+    let best = null;
+    for (const ent of Object.values(bot.entities || {})) {
+      if (!ent || ent === bot.entity || !ent.position) continue;
+      const name = String(ent.name || "").toLowerCase();
+      if (!HOSTILE_MOBS.has(name)) continue;
+      const dist = this._distanceBetween(origin, ent.position);
+      if (dist <= maxDist && (!best || dist < best.dist)) {
+        best = { entity: ent, name, dist };
+      }
+    }
+    return best;
+  }
+
+  _companionTick() {
+    const bot = this.bot;
+    if (
+      !this.config.mcCompanionMode ||
+      !this.connected ||
+      !bot ||
+      this.paused ||
+      this._stopped ||
+      this._activeGoalCancel
+    ) {
+      return;
+    }
+    const origin = bot.entity?.position;
+    if (!origin) return;
+    const nowMs = this.nowFn();
+    const allowed = this._findNearestAllowedPlayer(bot);
+    const hostile = this._findNearestHostile(bot, 8);
+
+    // 1. Self-preservation: evade nearby hostile mob
+    if (hostile) {
+      const dx = (origin.x ?? 0) - (hostile.entity.position.x ?? 0);
+      const dz = (origin.z ?? 0) - (hostile.entity.position.z ?? 0);
+      const len = Math.hypot(dx, dz) || 1;
+      let tx = Math.round((origin.x ?? 0) + (dx / len) * 10);
+      let tz = Math.round((origin.z ?? 0) + (dz / len) * 10);
+      if (
+        allowed &&
+        allowed.dist <= 24 &&
+        this._distanceBetween(allowed.player.entity.position, hostile.entity.position) > hostile.dist + 2
+      ) {
+        tx = Math.round(allowed.player.entity.position.x ?? tx);
+        tz = Math.round(allowed.player.entity.position.z ?? tz);
+      }
+      this._ensurePathfinder(bot);
+      try {
+        bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
+      } catch {
+        // Ignore pathfinder errors
+      }
+      this._followingPlayer = null;
+      this.activity = "躲避怪物";
+      if (allowed && nowMs - this._lastHostileAlertAtMs >= this.hostileAlertCooldownMs) {
+        if (this._tryCompanionChat("呀！旁边有怪物靠近我，快救救猫猫喵~")) {
+          this._lastHostileAlertAtMs = nowMs;
+        }
+      }
+      return;
+    }
+
+    // 2. Accompany nearest whitelisted player (look + continuous follow)
+    if (allowed) {
+      const uname = sanitizeMcText(allowed.player.username, 20);
+      const key = allowed.player.username.toLowerCase();
+      this._lookAtEntity(bot, allowed.player.entity);
+      if (!this._greetedPlayers.has(key)) {
+        this._greetedPlayers.add(key);
+        try {
+          bot.swingArm?.("right");
+        } catch {
+          // Ignore swing errors
+        }
+        this._tryCompanionChat("来啦！看到你上线了喵~");
+      }
+      if (!this._stayPut && allowed.dist > 4.2) {
+        this._ensurePathfinder(bot);
+        try {
+          bot.pathfinder?.setGoal?.(new GoalFollow(allowed.player.entity, 3), true);
+          this._followingPlayer = allowed.player.username;
+          this.activity = `陪伴:${uname}`;
+        } catch {
+          // Ignore pathfinder errors
+        }
+      } else if (allowed.dist <= 3.6 && this._followingPlayer) {
+        try {
+          bot.pathfinder?.setGoal?.(null);
+        } catch {
+          // Ignore stop errors
+        }
+        this._followingPlayer = null;
+        this.activity = this._stayPut ? `原地等${uname}` : `陪在${uname}身边`;
+      }
+      return;
+    }
+
+    // 3. Gentle solo stroll when alone (does NOT reset idle auto-disconnect clock)
+    if (!this._stayPut && nowMs - this._lastSoloWanderAtMs >= this.soloWanderIntervalMs) {
+      this._lastSoloWanderAtMs = nowMs;
+      const dx = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
+      const dz = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
+      const wx = Math.round((origin.x ?? 0) + dx);
+      const wz = Math.round((origin.z ?? 0) + dz);
+      this._ensurePathfinder(bot);
+      try {
+        bot.pathfinder?.setGoal?.(new GoalNearXZ(wx, wz, 2), false);
+        this.activity = "四周闲逛";
+      } catch {
+        // Ignore wander errors
+      }
+    }
+  }
+
+  _handleCompanionChat(username, rawMessage) {
+    if (!this.config.mcCompanionMode || this.paused || !this.connected || !this.bot) return;
+    if (!username || !this.config.mcAllowedPlayers.has(username.toLowerCase())) return;
+    const trimmed = String(rawMessage || "").trim();
+    if (!trimmed || trimmed.startsWith("/")) return;
+    const cleanUser = sanitizeMcText(username, 20);
+    const cleanMsg = sanitizeMcText(trimmed, 80);
+    if (!cleanMsg) return;
+    this._lastActivityOrHumanAtMs = this.nowFn();
+    this._emitMilestone("mc_player_chat", "normal", {
+      player: cleanUser,
+      message: cleanMsg,
+    });
+    const matched = Object.values(this.bot.players || {}).find(
+      (p) => p && typeof p.username === "string" && p.username.toLowerCase() === username.toLowerCase(),
+    );
+    if (matched?.entity) {
+      this._lookAtEntity(this.bot, matched.entity);
+    }
+    if (STAY_CMD_RE.test(cleanMsg)) {
+      this._stayPut = true;
+      this._followingPlayer = null;
+      try {
+        this.bot.pathfinder?.stop?.();
+        this.bot.pathfinder?.setGoal?.(null);
+      } catch {
+        // Ignore stop errors
+      }
+      this.activity = `原地等${cleanUser}`;
+      this._tryCompanionChat("好哒，我乖乖站在这里等你喵~");
+      this._emitSnapshot();
+      return;
+    }
+    if (FOLLOW_CMD_RE.test(cleanMsg)) {
+      this._stayPut = false;
+      if (matched?.entity) {
+        this._ensurePathfinder(this.bot);
+        try {
+          this.bot.pathfinder?.setGoal?.(new GoalFollow(matched.entity, 3), true);
+          this._followingPlayer = matched.username;
+        } catch {
+          // Ignore follow errors
+        }
+      }
+      this.activity = `陪伴:${cleanUser}`;
+      this._tryCompanionChat("来啦来啦！这就跟上你喵~");
+      this._emitSnapshot();
+      return;
+    }
+    if (GREET_CMD_RE.test(cleanMsg)) {
+      try {
+        this.bot.swingArm?.("right");
+      } catch {
+        // Ignore swing errors
+      }
+      const hostile = this._findNearestHostile(this.bot, 12);
+      const reply =
+        hostile || (this.health !== null && this.health <= 16)
+          ? "在呢在呢！刚才旁边有怪欺负我，快保护猫猫喵~"
+          : "在呢！我看到你啦，这就陪着你一起玩喵~";
+      this._tryCompanionChat(reply);
+      this._emitSnapshot();
     }
   }
 
@@ -631,6 +961,7 @@ export class McRuntime {
         this.activity = this.paused ? "已暂停" : "原地待命";
       }
       this._startSnapshotTimer();
+      this._startCompanionLoop();
       this._emitSnapshot();
     });
 
@@ -697,6 +1028,7 @@ export class McRuntime {
       const cleanMsg = sanitizeMcText(message, 80);
       if (!cleanUser && !cleanMsg) return;
       this.chatBuffer.push(cleanUser ? `${cleanUser}: ${cleanMsg}` : cleanMsg);
+      this._handleCompanionChat(username, message);
     });
 
     bot.on("entitySpawn", (entity) => {
@@ -739,8 +1071,11 @@ export class McRuntime {
   _handleBotEnd(bot) {
     if (this.bot !== bot) return;
     const wasConnected = this.connected;
+    this._stopCompanionLoop();
     this._stopSnapshotTimer();
     this._cancelActiveGoal();
+    this._followingPlayer = null;
+    this._greetedPlayers.clear();
     this.bot = null;
     this.connected = false;
     this.dimension = "";
@@ -762,8 +1097,11 @@ export class McRuntime {
     const bot = this.bot;
     if (!bot) return;
     this.bot = null;
+    this._stopCompanionLoop();
     this._stopSnapshotTimer();
     this._cancelActiveGoal();
+    this._followingPlayer = null;
+    this._greetedPlayers.clear();
     const wasConnected = this.connected;
     this.connected = false;
     this.dimension = "";
@@ -1013,7 +1351,15 @@ export class McRuntime {
     }
 
     if (actionType === "idle" || actionType === "stop") {
+      this._stayPut = true;
+      this._followingPlayer = null;
       this._cancelActiveGoal();
+      try {
+        this.bot?.pathfinder?.stop?.();
+        this.bot?.pathfinder?.setGoal?.(null);
+      } catch {
+        // Ignore stop errors
+      }
       this.activity = this.connected ? "原地待命" : "待机";
       this._emitSnapshot();
       return {
@@ -1141,6 +1487,7 @@ export class McRuntime {
     if (actionType === "disconnect") {
       this._desiredConnected = false;
       this._manualDisconnect = true;
+      this._stayPut = false;
       this._cancelWakePoll();
       this._clearReconnectTimer();
       this._teardownBot(true);
@@ -1405,6 +1752,7 @@ export class McRuntime {
           snapshot: this.getSnapshot(),
         };
       }
+      this._stayPut = false;
       this.activity = `跟随:${sanitizeMcText(matched.username, 24)}`;
       this._emitSnapshot();
       const followTimeout = Math.min(15_000, timeoutMs);

@@ -655,6 +655,7 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         )
         await _wait_until(lambda: svc.world_state.current.focus_level == "HIGH")
         assert svc.world_state.current.current_module == "minecraft"
+        assert "connected=1" in proxy.planning_fingerprint()
         summary = await proxy.get_sensor_summary()
         assert "MC在线" in summary
         assert "维度:overworld" in summary

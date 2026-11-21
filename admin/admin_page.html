@@ -3914,7 +3914,7 @@ function renderLife(d){
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
   renderWorldObservation(d.observation,eng,tz);
   const exp=ws.experience||{},plan=exp.plan,actual=exp.actual||{};
-  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',chatting:'正在聊天',chat_delivered:'聊天回复已送达',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',sleepy:'困倦',playful:'活泼',cozy:'惬意',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
+  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',mc_play:'MC 游玩',online:'在线游玩',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',chatting:'正在聊天',chat_delivered:'聊天回复已送达',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',sleepy:'困倦',playful:'活泼',cozy:'惬意',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
   const circadianLabels={just_woke_up:'刚醒迷糊',bedtime_drowsy:'睡前犯困',late_night_catch:'深夜值守'};
   const name=k=>labels[k]||k||'—';
   const battery=exp.social_battery;

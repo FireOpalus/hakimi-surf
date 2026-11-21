@@ -471,6 +471,16 @@ class Service:
                 status_code,
                 reason_code,
             )
+            if status_code == "done":
+                planner = getattr(engine, "planner", None)
+                replan = getattr(planner, "request_replan", None)
+                if callable(replan):
+                    try:
+                        await replan(delay_seconds=35.0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:

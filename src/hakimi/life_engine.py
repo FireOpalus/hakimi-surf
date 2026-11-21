@@ -186,6 +186,23 @@ class LifeBlockPlanner:
             self.next_plan_at = wake
         self.engine.wakeup.set()
 
+    async def request_replan(self, *, delay_seconds: float = 35.0) -> bool:
+        """Schedule an early revision plan after an explicit external/owner trigger."""
+        now = self.clock()
+        if not self.planning_enabled or self.store.runtime.is_resting(now):
+            return False
+        delay = max(1.0, min(300.0, float(delay_seconds)))
+        wake = now + delay
+        if not self.journal.ready:
+            await self.journal.initialize(
+                now, initial_interval=self.config.planner_min_minutes * 60
+            )
+        await self.journal.signal(wake)
+        if self.next_plan_at <= 0 or wake < self.next_plan_at:
+            self.next_plan_at = wake
+        self.engine.wakeup.set()
+        return True
+
     async def _collect_owner_planning_context(self, ts: float) -> dict[str, Any]:
         owner_msg = owner_target(self.s, "onebot", ts, "planner-owner-ctx")
         sessions = getattr(self.service, "sessions", None)

@@ -681,8 +681,15 @@ class MinecraftPlugin:
             return
         await self.client.push_status(self.status_dict())
         snap = self.snapshot
-        task = snap.active_task if snap.connected and not self.paused and self.bridge_ready else ""
-        await self.client.report_activity(task, updated_at=snap.updated_at)
+        if snap.connected and not self.paused and self.bridge_ready:
+            task = snap.active_task or "online"
+            disconnected = False
+        else:
+            task = ""
+            disconnected = not snap.connected
+        await self.client.report_activity(
+            task, updated_at=snap.updated_at, disconnected=disconnected
+        )
 
     async def _apply_status_data(self, data: dict[str, Any]) -> None:
         if isinstance(data.get("snapshot"), dict):

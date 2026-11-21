@@ -11,6 +11,7 @@ from .modules.base import sanitize_sensor_text
 from .proactive_policy import hours_bounds
 
 MC_TASKS = frozenset({"goto", "explore", "mine", "gather", "follow"})
+MC_ONLINE_TASKS = frozenset({"online", "companion"})
 NEWS_TTL = 48 * 3600
 INTEREST_TTL = 9000
 SOCIAL_LOW = 30
@@ -21,7 +22,13 @@ CHAT_BOREDOM_DELTA = -4
 OWNER_CHAT_BOREDOM_DELTA = -6
 AWAKE_SECONDS_PER_POINT = 600
 REST_SECONDS_PER_POINT = 120
-HOURLY_RATES = {"sleep": (15, -4), "day_rest": (10, -4), "idle": (-3, 12), "mc_work": (-8, -6)}
+HOURLY_RATES = {
+    "sleep": (15, -4),
+    "day_rest": (10, -4),
+    "idle": (-3, 12),
+    "mc_work": (-8, -6),
+    "mc_play": (-4, -10),
+}
 MAX_DAY_REST_MINUTES = 90
 
 SCHEMA = """
@@ -195,7 +202,7 @@ class WorldExperience:
         points = sorted(cuts)
         for left, right in zip(points, points[1:], strict=False):
             kind = (
-                "mc_work"
+                ("mc_play" if row["mc_task"] in MC_ONLINE_TASKS else "mc_work")
                 if left < row["mc_until"]
                 else "bili_read"
                 if left < row["bili_until"]
@@ -350,7 +357,8 @@ class WorldExperience:
         await self.store.db.execute("UPDATE world_rhythm SET mc_task='',mc_until=0 WHERE id=1")
         await self.store.db.execute(
             "UPDATE world_state SET current_module='idle',focus_level='LOW',mood='calm' "
-            "WHERE singleton=1 AND current_module='minecraft' AND focus_level='HIGH'"
+            "WHERE singleton=1 AND current_module='minecraft' "
+            "AND focus_level IN ('HIGH','MEDIUM')"
         )
 
     async def mc_snapshot(self, task, observed, *, disconnected=False):
@@ -372,6 +380,17 @@ class WorldExperience:
                 await self.store.db.execute(
                     "UPDATE world_state SET "
                     "current_module='minecraft',focus_level='HIGH',mood='focused',"
+                    "updated_at=? WHERE singleton=1",
+                    (now,),
+                )
+            elif task in MC_ONLINE_TASKS and observed + 40 > now and not disconnected:
+                await self.end_day_rest_tx(now)
+                await self.store.db.execute(
+                    "UPDATE world_rhythm SET mc_task=?,mc_until=? WHERE id=1", (task, observed + 40)
+                )
+                await self.store.db.execute(
+                    "UPDATE world_state SET "
+                    "current_module='minecraft',focus_level='MEDIUM',mood='playful',"
                     "updated_at=? WHERE singleton=1",
                     (now,),
                 )
@@ -697,7 +716,7 @@ class WorldExperience:
             # Keep confirmed activity once by its durable source ID. Time samples are disposable.
             await self.store.db.execute(
                 "DELETE FROM world_changes WHERE reason IN "
-                "('rest','sleep','day_rest','idle','mc_work') AND at<?",
+                "('rest','sleep','day_rest','idle','mc_work','mc_play') AND at<?",
                 (now - 14 * 86400,),
             )
             await self.store.db.execute("DELETE FROM world_social WHERE at<?", (now - 30 * 86400,))
@@ -743,7 +762,7 @@ class WorldExperience:
         return {
             "plan": dict(plan) if plan else None,
             "actual": {
-                "state": "mc_work"
+                "state": ("mc_play" if mc in MC_ONLINE_TASKS else "mc_work")
                 if mc
                 else "bili_read"
                 if row["bili_until"] > now

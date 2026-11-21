@@ -360,3 +360,32 @@ async def test_living_states_longing_interest_circadian_and_owner_zero_social_co
     assert x.circadian_tag(stamp(23, 30), energy=80.0) == "late_night_catch"
     assert x.circadian_tag(stamp(15, 0), energy=30.0) == "bedtime_drowsy"
     assert x.circadian_tag(stamp(15, 0), energy=80.0) == ""
+
+
+async def test_mc_online_companion_sets_medium_focus_and_releases(settings, store):
+    now = stamp(14)
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    await PlannerJournal(store).initialize(now)
+    x = world.experience
+
+    await x.mc_snapshot("online", now)
+    assert world.current.current_module == "minecraft"
+    assert world.current.focus_level == "MEDIUM"
+    assert world.current.mood == "playful"
+    assert not world.proactive_suspended()
+    assert (await x.view(now))["actual"]["state"] == "mc_play"
+
+    now += 1
+    await x.mc_snapshot("mine", now)
+    assert world.current.focus_level == "HIGH"
+    assert world.current.mood == "focused"
+    assert world.proactive_suspended()
+    assert (await x.view(now))["actual"]["state"] == "mc_work"
+
+    now += 1
+    await x.mc_snapshot("", now, disconnected=True)
+    assert world.current.current_module == "idle"
+    assert world.current.focus_level == "LOW"
+    assert world.current.mood == "calm"
+    assert (await x.view(now))["actual"]["state"] == "idle"
