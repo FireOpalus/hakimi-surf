@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import inspect
+import json
 import logging
 import random
 import re
@@ -40,13 +41,14 @@ from .message_context import MessageContextResolver
 from .models import Message, Video
 from .moderation import Moderation
 from .modules import ModuleRegistry, install_modules
+from .modules.actions import ActionCall, reject_reason
 from .modules.adapters import Sender, farewell_send_bypass, identifier, onebot_message
 from .modules.bili_watcher import BiliWatcher
 from .modules.bilibili import Bilibili, extract_bvid
 from .modules.longnick import Longnick
 from .modules.proactive_dm import OwnerProactive
 from .node_transport import NodeTransport
-from .outbound_actions import normalize_emoji_like, parse_actions
+from .outbound_actions import ChatActionTrigger, normalize_emoji_like, parse_actions
 from .outgoing import PRE_DISPATCH_REJECTED, is_affection_muted_only, safe_delivery_detail
 from .output_links import filter_reply_links
 from .plugin_kernel import PluginKernel
@@ -304,6 +306,179 @@ class Service:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
         return task
+
+    def _collect_owner_chat_actions(self) -> list[dict[str, Any]]:
+        engine = getattr(self, "life_engine", None)
+        catalog = getattr(engine, "catalog", None)
+        cfg = getattr(engine, "config", None)
+        if engine is None or catalog is None or cfg is None or not cfg.enabled:
+            return []
+        action_modes = getattr(cfg, "action_modes", {}) or {}
+        items: list[dict[str, Any]] = []
+        for spec in sorted(catalog.actions.values(), key=lambda s: s.name):
+            if "owner_chat" not in spec.origins or spec.social:
+                continue
+            owner_mod = catalog.owners.get(spec.name, "")
+            if not owner_mod or catalog.inactive_reason(owner_mod):
+                continue
+            if action_modes.get(spec.name, "active") == "off":
+                continue
+            if spec.unavailable():
+                continue
+            model_json_schema = getattr(spec.arguments, "model_json_schema", None)
+            if callable(model_json_schema):
+                schema = model_json_schema()
+                args_props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                required_args = schema.get("required", []) if isinstance(schema, dict) else []
+            elif isinstance(spec.arguments, dict):
+                args_props = dict(spec.arguments)
+                required_args = []
+            else:
+                args_props = {}
+                required_args = []
+            entry: dict[str, Any] = {
+                "action_name": spec.name,
+                "description": spec.description,
+                "arguments": args_props,
+            }
+            if required_args:
+                entry["required"] = list(required_args)
+            items.append(entry)
+            if len(items) >= 12:
+                break
+        return items
+
+    def _spawn_owner_chat_action(self, trigger: ChatActionTrigger) -> asyncio.Task[None]:
+        return self.background(self._run_owner_chat_action(trigger))
+
+    async def _run_owner_chat_action(self, trigger: ChatActionTrigger) -> None:
+        raw_name = (trigger.action_name or "").strip()
+        engine = getattr(self, "life_engine", None)
+        catalog = getattr(engine, "catalog", None)
+        cfg = getattr(engine, "config", None)
+        if engine is None or catalog is None or cfg is None or not cfg.enabled:
+            log.info(
+                "event=owner_chat_action_done action=unknown status=gated_skip "
+                "reason=engine_disabled"
+            )
+            return
+        spec = catalog.actions.get(raw_name)
+        if spec is None or "owner_chat" not in spec.origins:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip "
+                "reason=action_origin_forbidden",
+                spec.name if spec is not None else "unknown",
+            )
+            return
+        owner_mod = catalog.owners.get(spec.name, "")
+        if not owner_mod or (inactive := catalog.inactive_reason(owner_mod)):
+            reason_code = (
+                str(inactive)
+                if isinstance(inactive, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", inactive)
+                else "module_disabled"
+            )
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=%s",
+                spec.name,
+                reason_code,
+            )
+            return
+        if cfg.action_modes.get(spec.name, "active") == "off":
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=action_disabled",
+                spec.name,
+            )
+            return
+        if unavail := spec.unavailable():
+            reason_code = (
+                str(unavail)
+                if isinstance(unavail, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", unavail)
+                else "action_unavailable"
+            )
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=%s",
+                spec.name,
+                reason_code,
+            )
+            return
+        parsed_args: dict[str, Any] = {}
+        raw_args_json = trigger.arguments_json
+        if isinstance(raw_args_json, str) and raw_args_json.strip():
+            try:
+                loaded = json.loads(raw_args_json)
+            except (ValueError, TypeError):
+                log.info(
+                    "event=owner_chat_action_done action=%s status=not_dispatched "
+                    "reason=invalid_action_arguments",
+                    spec.name,
+                )
+                return
+            if not isinstance(loaded, dict):
+                log.info(
+                    "event=owner_chat_action_done action=%s status=not_dispatched "
+                    "reason=invalid_action_arguments",
+                    spec.name,
+                )
+                return
+            parsed_args = loaded
+        alias = next((a for a in spec.aliases if a[0] == owner_mod), None)
+        ticket = {
+            "action_name": spec.name,
+            "target_module": owner_mod,
+            "action_type": alias[1] if alias else spec.name,
+            "origin": "owner_chat",
+            "target_scope": "",
+            "arguments": parsed_args,
+        }
+        try:
+            resolved_spec, validated = engine.resolve(ticket)
+        except ValueError as exc:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=%s",
+                spec.name,
+                reject_reason(exc),
+            )
+            return
+        except Exception as exc:
+            log.warning(
+                "event=owner_chat_action_done action=%s status=not_dispatched reason=%s",
+                spec.name,
+                type(exc).__name__,
+            )
+            return
+        try:
+            call = ActionCall(
+                ticket,
+                validated,
+                engine.clock(),
+                still_allowed=lambda: (
+                    bool(engine.config.enabled)
+                    and not catalog.inactive_reason(owner_mod)
+                    and engine.config.action_modes.get(resolved_spec.name, "active") != "off"
+                    and not resolved_spec.unavailable()
+                ),
+            )
+            outcome = await resolved_spec.run(call)
+            raw_status = str(getattr(outcome, "status", "done") or "done")
+            raw_reason = str(getattr(outcome, "reason", "ok") or "ok")
+            status_code = (
+                raw_status if re.fullmatch(r"[A-Za-z0-9_.:-]{1,32}", raw_status) else "done"
+            )
+            reason_code = raw_reason if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", raw_reason) else "ok"
+            log.info(
+                "event=owner_chat_action_done action=%s status=%s reason=%s",
+                resolved_spec.name,
+                status_code,
+                reason_code,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "event=owner_chat_action_done action=%s status=not_dispatched reason=%s",
+                resolved_spec.name,
+                type(exc).__name__,
+            )
 
     async def enrich(self, message):
         try:
@@ -1899,6 +2074,8 @@ class Service:
                     before_call=message_guard,
                 )
                 payload["file_attachments"] = file_attachments
+        owner_chat_actions: list[dict[str, Any]] = []
+        verified_owner_turn = owner(message, self.s) and all(owner(m, self.s) for m in members)
         if not sandbox:
             related_user_ids = [
                 *(m.user_id for m in members),
@@ -1982,6 +2159,10 @@ class Service:
                 ws_summary = await self.world_state.chat_sensor_payload(message)
                 if ws_summary:
                     payload["world_state_summary"] = ws_summary
+            if verified_owner_turn:
+                owner_chat_actions = self._collect_owner_chat_actions()
+                if owner_chat_actions:
+                    payload["owner_chat_actions"] = owner_chat_actions
         context_members = list(members)
         if message.kind == "group":
             context_members.extend(neighbour_members if images else [])
@@ -2253,13 +2434,21 @@ class Service:
                 allowed_aff_targets = {
                     m.user_id for m in (members or [message]) if not self.bot_guard.known_bot(m)
                 }
-                parse_params = inspect.signature(parse_actions).parameters
-                extra_parse_kwargs = (
-                    {"allowed_affection_targets": allowed_aff_targets}
-                    if "allowed_affection_targets" in parse_params
-                    or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parse_params.values())
-                    else {}
+                allow_owner_actions = not sandbox and verified_owner_turn
+                allowed_owner_action_names = (
+                    {a["action_name"] for a in owner_chat_actions} if allow_owner_actions else ()
                 )
+                parse_params = inspect.signature(parse_actions).parameters
+                has_varkw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in parse_params.values()
+                )
+                extra_parse_kwargs: dict[str, Any] = {}
+                if has_varkw or "allowed_affection_targets" in parse_params:
+                    extra_parse_kwargs["allowed_affection_targets"] = allowed_aff_targets
+                if has_varkw or "allow_owner_chat_actions" in parse_params:
+                    extra_parse_kwargs["allow_owner_chat_actions"] = allow_owner_actions
+                if has_varkw or "allowed_owner_chat_actions" in parse_params:
+                    extra_parse_kwargs["allowed_owner_chat_actions"] = allowed_owner_action_names
                 actions, folded = parse_actions(
                     generated,
                     public=public,
@@ -2339,6 +2528,8 @@ class Service:
                             raise
                         except Exception:
                             pass
+                    if actions.trigger_action and verified_owner_turn:
+                        self._spawn_owner_chat_action(actions.trigger_action)
                 allow_text_card = not aff_active or caps.allow_text_card
                 if actions.abstain:
                     if (

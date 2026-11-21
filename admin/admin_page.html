@@ -1931,6 +1931,8 @@ footer::before { content: "\2726"; color: #d99a2b; margin-right: 8px; }
         <input id="life-mc-topic" type="text" maxlength="80" placeholder="例如：红石自动门、探索雪原">
       </label>
       <button id="life-mc-build" type="submit" disabled>筹备建造 (build_plan)</button>
+      <button id="life-mc-connect" type="button" class="secondary" disabled>上线进服 (connect)</button>
+      <button id="life-mc-disconnect" type="button" class="secondary" disabled>下线待机 (disconnect)</button>
       <button id="life-mc-status-btn" type="button" class="secondary" disabled>刷新 MC 状态</button>
       <button id="life-mc-idle" type="button" class="secondary" disabled>MC 待命 (idle)</button>
       <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
@@ -2953,7 +2955,7 @@ function logout(){
   $('overview-gcp-strip').replaceChildren();
   $('overview-gcp-strip').hidden=true;
   text('overview-gcp-note','');
-  for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','id-link-submit','id-merge-submit','pb-create-submit'])$(id).disabled=true;
+  for(const id of ['save-debounce','reset-debounce','save-rate-limits','reset-rate-limits','save-image-limits','reset-image-limits','save-content-tools','reset-content-tools','save-search','reset-search','save-deepseek','clear-deepseek','save-balance','clear-balance','save-gen-caps','reset-gen-caps','save-patrol-limits','reset-patrol-limits','prov-save-creds','prov-save-policy','prov-reset-policy','prov-add-session-policy','qq-privacy-default-save','gcp-sync-bq','gcp-sync-monitoring','gcp-save-config','gcp-reset-config','gcp-save-mon','gcp-save-sa','gcp-clear-sa','aff-save-config','aff-reset-config','aff-set-submit','life-world-save','life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','id-link-submit','id-merge-submit','pb-create-submit'])$(id).disabled=true;
   $('world-observation-card').hidden=true;
   ['world-day-stats','world-next','world-quiet','world-daily-actions','world-plans','world-days','world-evenings','world-day-coverage','world-evening-coverage','life-digests','debounce-fields','rate-limits-fields','gen-caps-fields','prov-cred-pills','unified-balance-pills','unified-balance-strip','gcp-bq-pills','gcp-kpi-strip','gcp-mon-pills','aff-tiers-table','aff-users-table','aff-history-table','life-stats','life-changes','life-batteries','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table'].forEach(id=>$(id).replaceChildren());
   ['rest-hours-status','debounce-source','rate-limits-source','image-limits-source','content-tools-source','gen-caps-source','patrol-limits-source','search-status','deepseek-status','unified-balance-note','balance-status','prov-cred-status','prov-policy-source','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','affection-source','aff-users-count','sign-state','life-source','life-world-status','life-desktop-status'].forEach(id=>text(id,''));
@@ -4660,6 +4662,8 @@ $('life-mc-chat-form').addEventListener('submit',e=>{
     $('life-mc-chat-msg').value='';
   });
 });
+$('life-mc-connect').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('connect')));
+$('life-mc-disconnect').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('disconnect')));
 $('life-mc-status-btn').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('status')));
 $('life-mc-idle').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('idle')));
 $('life-mc-pause').addEventListener('click',e=>busy(e.target,()=>sendMcGoal('pause')));
@@ -5214,7 +5218,7 @@ $('weather-detect').addEventListener('click',e=>busy(e.currentTarget,()=>lookupW
 for(const id of ['weather-lat','weather-lon'])$(id).addEventListener('input',previewCoordinates);
 $('weather-save').addEventListener('click',()=>persistWeatherPlace(false));
 $('weather-reset').addEventListener('click',()=>persistWeatherPlace(true));
-const mcControls=['life-mc-build','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
+const mcControls=['life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
 function renderMinecraft(mc){
   const fields=[
     ['境内连接',mc.bridge_ready?'桥接就绪':'未就绪'],['游戏连接',mc.connected?'游戏在线':'未进入游戏'],

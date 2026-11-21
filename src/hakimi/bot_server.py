@@ -34,6 +34,10 @@ class PromptContext:
     surface: Literal["private", "group", "public_task"]
 
     @property
+    def verified_owner(self) -> bool:
+        return self.role == "OWNER" and self.surface in {"private", "group"}
+
+    @property
     def private_owner(self) -> bool:
         return self.role == "OWNER" and self.surface == "private"
 
@@ -374,6 +378,20 @@ def assemble_chat_input(
                 "（每项 target_id 须取自 current_batch.sender_id，delta 限 -35~2，reason 可选），"
                 "否则填 null。"
             )
+    raw_owner_actions = payload.get("owner_chat_actions")
+    if (
+        not sandbox_mode
+        and context.verified_owner
+        and isinstance(raw_owner_actions, list)
+        and raw_owner_actions
+    ):
+        metadata["owner_chat_actions"] = list(raw_owner_actions)
+        metadata["owner_chat_action_hint"] = (
+            "仅当 BOISER 本轮明确要求或约你立刻执行上述模块动作时，"
+            "填 trigger_action={action_name, arguments_json}"
+            '（无参数时 arguments_json 填 "{}" 或 null），'
+            "否则必须填 null。"
+        )
     if not sandbox_mode and payload.get("module_context"):
         metadata["module_context"] = payload["module_context"]
     if not sandbox_mode and payload.get("unshared_world_news"):
@@ -516,6 +534,9 @@ def assemble_chat_input(
             metadata["allowed_at_qqs"] = metadata["allowed_at_qqs"][:20]
     if estimate_tokens(tail()) > settings.chat_tail_tokens and "jit_proactive_intent" in metadata:
         metadata.pop("jit_proactive_intent", None)
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and "owner_chat_actions" in metadata:
+        metadata.pop("owner_chat_actions", None)
+        metadata.pop("owner_chat_action_hint", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens:
         raise Rejected("transient_context_too_large")
     return "<conversation_history_log>\n" + b + "</conversation_history_log>\n" + tail()

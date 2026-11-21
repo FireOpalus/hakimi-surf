@@ -109,6 +109,10 @@ export class McRuntime {
     chatCooldownMs = 3_000,
     profilesFolder = "/tmp/mc_cache",
     nowFn = () => Date.now(),
+    fetchFn = globalThis.fetch,
+    powerPollIntervalMs = 2_000,
+    powerWakeTimeoutMs = 90_000,
+    idleDisconnectMs = undefined,
   }) {
     this.config = config;
     this.createBotFn = createBotFn;
@@ -122,6 +126,24 @@ export class McRuntime {
         : 3_000;
     this.profilesFolder = profilesFolder;
     this.nowFn = nowFn;
+    this.fetchFn = fetchFn;
+    this.powerPollIntervalMs =
+      typeof powerPollIntervalMs === "number" && Number.isFinite(powerPollIntervalMs)
+        ? Math.max(10, powerPollIntervalMs)
+        : 2_000;
+    this.powerWakeTimeoutMs =
+      typeof powerWakeTimeoutMs === "number" && Number.isFinite(powerWakeTimeoutMs)
+        ? Math.max(50, powerWakeTimeoutMs)
+        : 90_000;
+    const defaultIdleMinutes =
+      typeof config.mcIdleDisconnectMinutes === "number" &&
+      Number.isFinite(config.mcIdleDisconnectMinutes)
+        ? config.mcIdleDisconnectMinutes
+        : 20;
+    this.idleDisconnectMs =
+      typeof idleDisconnectMs === "number" && Number.isFinite(idleDisconnectMs)
+        ? Math.max(0, idleDisconnectMs)
+        : defaultIdleMinutes * 60_000;
 
     this.connected = false;
     this.paused = false;
@@ -140,6 +162,10 @@ export class McRuntime {
     this._reconnectAttempts = 0;
     this._manualDisconnect = false;
     this._stopped = false;
+    this._desiredConnected = false;
+    this._wakeController = null;
+    this._lastActivityOrHumanAtMs = this.nowFn();
+    this._consecutiveReconnectFails = 0;
     this._activeGoalCancel = null;
     this._prevHealth = null;
     this._lastChatAtMs = -Infinity;
@@ -148,14 +174,24 @@ export class McRuntime {
 
   start() {
     this._stopped = false;
-    if (this.config.mcEnabled && this.config.mcConfigured && !this.paused) {
+    const autoConnect = this.config.mcAutoConnect !== false;
+    if (autoConnect && this.config.mcEnabled && this.config.mcConfigured && !this.paused) {
+      this._desiredConnected = true;
+      this._consecutiveReconnectFails = 0;
       this.connectBot();
+    } else {
+      this._desiredConnected = false;
+      if (!this.activity.startsWith("筹备建造:")) {
+        this.activity = this.paused ? "已暂停" : "待机";
+      }
     }
   }
 
   stop() {
     this._stopped = true;
+    this._desiredConnected = false;
     this._manualDisconnect = true;
+    this._cancelWakePoll();
     this._clearReconnectTimer();
     this._stopSnapshotTimer();
     this._cancelActiveGoal();
@@ -264,9 +300,22 @@ export class McRuntime {
       this.food = nextFood;
     }
     this.nearbyEntities = this._collectNearbyEntities(bot);
+    if (this._hasOtherPlayer(bot)) {
+      this._lastActivityOrHumanAtMs = this.nowFn();
+    }
     if (dimChanged) {
       this._emitSnapshot();
     }
+  }
+
+  _hasOtherPlayer(bot) {
+    if (!bot || !bot.players || typeof bot.players !== "object") return false;
+    for (const p of Object.values(bot.players)) {
+      if (p && typeof p.username === "string" && p.username && p.username !== bot.username) {
+        return true;
+      }
+    }
+    return false;
   }
 
   _collectNearbyEntities(bot) {
@@ -308,6 +357,22 @@ export class McRuntime {
         return;
       }
       this._refreshFromBot();
+      if (
+        this.connected &&
+        !this._activeGoalCancel &&
+        this.idleDisconnectMs > 0 &&
+        !this._hasOtherPlayer(this.bot) &&
+        this.nowFn() - this._lastActivityOrHumanAtMs >= this.idleDisconnectMs
+      ) {
+        this._desiredConnected = false;
+        this._manualDisconnect = true;
+        this._clearReconnectTimer();
+        this._teardownBot(true);
+        this.activity = "待机";
+        this._emitMilestone("mc_idle_disconnected", "normal", { reason: "idle_alone" });
+        this._emitSnapshot();
+        return;
+      }
       this._emitSnapshot();
     }, this.snapshotIntervalMs);
     if (typeof this._snapshotTimer.unref === "function") {
@@ -329,22 +394,147 @@ export class McRuntime {
     }
   }
 
+  _powerdHeaders(hasJsonBody = false) {
+    const headers = {};
+    if (this.config.mcPowerdToken) {
+      headers.Authorization = `Bearer ${this.config.mcPowerdToken}`;
+    }
+    if (hasJsonBody) {
+      headers["Content-Type"] = "application/json";
+    }
+    return headers;
+  }
+
+  _cancelWakePoll() {
+    if (this._wakeController) {
+      const ctrl = this._wakeController;
+      this._wakeController = null;
+      if (!ctrl.signal.aborted) {
+        ctrl.abort();
+      }
+    }
+  }
+
+  _sleepAbortable(ms, signal) {
+    if (signal.aborted) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(true);
+      }, ms);
+      if (typeof timer.unref === "function") {
+        timer.unref();
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  _startWakePoll() {
+    this._cancelWakePoll();
+    const controller = new AbortController();
+    this._wakeController = controller;
+    const signal = controller.signal;
+    const wallStart = Date.now();
+    const logicalStart = this.nowFn();
+
+    (async () => {
+      try {
+        while (!signal.aborted && !this._stopped && this._desiredConnected && !this.paused) {
+          const waited = await this._sleepAbortable(this.powerPollIntervalMs, signal);
+          if (!waited || signal.aborted || this._stopped || !this._desiredConnected || this.paused) {
+            return;
+          }
+          if (this.connected || this.bot) {
+            return;
+          }
+          try {
+            const reqSignal =
+              typeof AbortSignal.any === "function"
+                ? AbortSignal.any([signal, AbortSignal.timeout(4_000)])
+                : AbortSignal.timeout(4_000);
+            const resp = await this.fetchFn(`${this.config.mcPowerdUrl}/status`, {
+              method: "GET",
+              headers: this._powerdHeaders(false),
+              signal: reqSignal,
+            });
+            if (signal.aborted || this._stopped || !this._desiredConnected || this.paused) {
+              return;
+            }
+            if (resp && resp.ok) {
+              const body = await resp.json().catch(() => ({}));
+              if (body && body.ready === true) {
+                if (this._wakeController === controller) {
+                  this._wakeController = null;
+                }
+                if (!signal.aborted && !this._stopped && this._desiredConnected && !this.paused) {
+                  this.connectBot();
+                }
+                return;
+              }
+              if (body && body.state === "stopped") {
+                break;
+              }
+            }
+          } catch {
+            // Transient poll error; keep retrying until timeout or cancellation
+          }
+          const elapsed = Math.max(Date.now() - wallStart, this.nowFn() - logicalStart);
+          if (elapsed >= this.powerWakeTimeoutMs) {
+            break;
+          }
+        }
+        if (
+          this._wakeController === controller &&
+          !signal.aborted &&
+          !this._stopped &&
+          !this.connected
+        ) {
+          this._wakeController = null;
+          this._desiredConnected = false;
+          if (!this.activity.startsWith("筹备建造:")) {
+            this.activity = this.paused ? "已暂停" : "待机";
+          }
+          this._emitSnapshot();
+        }
+      } finally {
+        if (this._wakeController === controller) {
+          this._wakeController = null;
+        }
+      }
+    })();
+  }
+
   _scheduleReconnect() {
     this._clearReconnectTimer();
     if (
       this._stopped ||
       this._manualDisconnect ||
+      !this._desiredConnected ||
       this.paused ||
       !this.config.mcEnabled ||
       !this.config.mcConfigured
     ) {
       return;
     }
+    this._consecutiveReconnectFails += 1;
+    if (this.config.mcAutoConnect === false && this._consecutiveReconnectFails >= 3) {
+      this._desiredConnected = false;
+      this._reconnectAttempts = 0;
+      if (!this.activity.startsWith("筹备建造:")) {
+        this.activity = "待机";
+      }
+      this._emitSnapshot();
+      return;
+    }
     const baseMs = Math.min(60_000, 5000 * 2 ** Math.min(this._reconnectAttempts, 4));
     this._reconnectAttempts += 1;
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
-      if (!this._stopped && !this._manualDisconnect && !this.paused) {
+      if (!this._stopped && !this._manualDisconnect && this._desiredConnected && !this.paused) {
         this.connectBot();
       }
     }, baseMs);
@@ -422,6 +612,8 @@ export class McRuntime {
       this._ensurePathfinder(bot);
       this.connected = true;
       this._reconnectAttempts = 0;
+      this._consecutiveReconnectFails = 0;
+      this._lastActivityOrHumanAtMs = this.nowFn();
       this.dimension = sanitizeMcText(bot.game?.dimension || "overworld", 24) || "overworld";
       this.pos = this._vecToTuple(bot.entity?.position);
       this.health = readNonNegativeFinite(bot.health);
@@ -432,6 +624,7 @@ export class McRuntime {
         !this.activity ||
         this.activity === "待机" ||
         this.activity === "连接中" ||
+        this.activity === "唤醒MC服务端中" ||
         this.activity === "连接已断开" ||
         this.activity === "等待复活"
       ) {
@@ -640,6 +833,7 @@ export class McRuntime {
       throw err;
     } finally {
       if (timer) clearTimeout(timer);
+      this._lastActivityOrHumanAtMs = this.nowFn();
       if (this._activeGoalCancel === cancel) {
         this._activeGoalCancel = null;
         this._emitSnapshot();
@@ -713,6 +907,7 @@ export class McRuntime {
   }
 
   async pause() {
+    this._cancelWakePoll();
     this._cancelActiveGoal();
     this.paused = true;
     this.activity = "已暂停";
@@ -776,7 +971,13 @@ export class McRuntime {
       throw new ProtocolError("unsupported_mc_action");
     }
 
-    if (this.paused && actionType !== "status" && actionType !== "stop" && actionType !== "idle") {
+    if (
+      this.paused &&
+      actionType !== "status" &&
+      actionType !== "stop" &&
+      actionType !== "idle" &&
+      actionType !== "disconnect"
+    ) {
       return {
         ok: false,
         accepted: false,
@@ -838,6 +1039,7 @@ export class McRuntime {
         };
       }
       if (this.connected) {
+        this._lastActivityOrHumanAtMs = this.nowFn();
         return {
           ok: true,
           accepted: true,
@@ -847,6 +1049,84 @@ export class McRuntime {
           snapshot: this.getSnapshot(),
         };
       }
+      this._desiredConnected = true;
+      this._manualDisconnect = false;
+      this._consecutiveReconnectFails = 0;
+      this._reconnectAttempts = 0;
+      this._lastActivityOrHumanAtMs = this.nowFn();
+
+      if (this.config.mcPowerdUrl) {
+        try {
+          const resp = await this.fetchFn(`${this.config.mcPowerdUrl}/start`, {
+            method: "POST",
+            headers: this._powerdHeaders(false),
+            signal: AbortSignal.timeout(4_000),
+          });
+          const body = await resp.json().catch(() => ({}));
+          if (resp.status === 503 || body?.reason === "low_memory") {
+            this._desiredConnected = false;
+            this._cancelWakePoll();
+            return {
+              ok: false,
+              accepted: false,
+              bridge_ready: true,
+              paused: false,
+              reason: "mc_host_low_memory",
+              summary: "境内节点内存不足，暂不唤醒MC服务端",
+              snapshot: this.getSnapshot(),
+            };
+          }
+          if (!resp.ok || body?.ok === false) {
+            this._desiredConnected = false;
+            this._cancelWakePoll();
+            return {
+              ok: false,
+              accepted: false,
+              bridge_ready: true,
+              paused: false,
+              reason: "mc_powerd_unavailable",
+              summary: "MC唤醒服务暂不可用",
+              snapshot: this.getSnapshot(),
+            };
+          }
+          if (body?.ready === true) {
+            this._cancelWakePoll();
+            this.connectBot();
+            return {
+              ok: true,
+              accepted: true,
+              bridge_ready: true,
+              paused: false,
+              summary: "正在连接MC服务端",
+              snapshot: this.getSnapshot(),
+            };
+          }
+          this.activity = "唤醒MC服务端中";
+          this._startWakePoll();
+          this._emitSnapshot();
+          return {
+            ok: true,
+            accepted: true,
+            bridge_ready: true,
+            paused: false,
+            summary: "正在唤醒MC服务端并准备上号",
+            snapshot: this.getSnapshot(),
+          };
+        } catch {
+          this._desiredConnected = false;
+          this._cancelWakePoll();
+          return {
+            ok: false,
+            accepted: false,
+            bridge_ready: true,
+            paused: false,
+            reason: "mc_powerd_unavailable",
+            summary: "MC唤醒服务暂不可用",
+            snapshot: this.getSnapshot(),
+          };
+        }
+      }
+
       this.connectBot();
       return {
         ok: true,
@@ -859,11 +1139,25 @@ export class McRuntime {
     }
 
     if (actionType === "disconnect") {
+      this._desiredConnected = false;
       this._manualDisconnect = true;
+      this._cancelWakePoll();
       this._clearReconnectTimer();
       this._teardownBot(true);
       this.activity = "待机";
       this._emitSnapshot();
+      if (params.sleep_server === true && this.config.mcPowerdUrl) {
+        try {
+          await this.fetchFn(`${this.config.mcPowerdUrl}/stop`, {
+            method: "POST",
+            headers: this._powerdHeaders(true),
+            body: JSON.stringify({ force: false }),
+            signal: AbortSignal.timeout(3_000),
+          });
+        } catch {
+          // Best-effort server sleep request; disconnect already succeeded
+        }
+      }
       return {
         ok: true,
         accepted: true,
@@ -891,6 +1185,7 @@ export class McRuntime {
 
   async _executeInGameGoal(actionType, params) {
     const bot = this.bot;
+    this._lastActivityOrHumanAtMs = this.nowFn();
     const timeoutMs =
       typeof params.timeout_ms === "number" && Number.isFinite(params.timeout_ms)
         ? Math.min(30_000, Math.max(100, params.timeout_ms))

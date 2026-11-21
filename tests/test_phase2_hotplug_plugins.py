@@ -590,6 +590,8 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         expected_actions = {
             f"mc.{verb}"
             for verb in (
+                "connect",
+                "disconnect",
                 "build_plan",
                 "explore",
                 "mine",
@@ -608,6 +610,8 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         }
         assert expected_actions <= set(svc.modules.catalog.actions)
         for verb in (
+            "connect",
+            "disconnect",
             "build_plan",
             "explore",
             "mine",
@@ -745,6 +749,47 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         assert rpc_slash["artifacts"]["not_dispatched"] is True
         assert len(nt.calls) == calls_before_reject
 
+        # mc.connect & mc.disconnect expose planner + admin + owner_chat origins (non-effortful)
+        conn_spec = svc.modules.catalog.actions["mc.connect"]
+        disc_spec = svc.modules.catalog.actions["mc.disconnect"]
+        assert conn_spec.effortful is False
+        assert disc_spec.effortful is False
+        assert {"planner", "admin", "owner_chat"} <= set(conn_spec.origins)
+        assert {"planner", "admin", "owner_chat"} <= set(disc_spec.origins)
+        assert "owner_chat" not in chat_spec.origins
+
+        conn_out = await conn_spec.run(
+            ActionCall({"origin": "owner_chat", "target_scope": ""}, conn_spec.arguments(), NOW)
+        )
+        assert conn_out.status == "done"
+        assert nt.calls[-1] == ("mc.dispatch_goal", {"action_type": "connect"})
+
+        disc_default_out = await disc_spec.run(
+            ActionCall({"origin": "owner_chat", "target_scope": ""}, disc_spec.arguments(), NOW)
+        )
+        assert disc_default_out.status == "done"
+        assert nt.calls[-1] == (
+            "mc.dispatch_goal",
+            {"action_type": "disconnect", "sleep_server": False},
+        )
+
+        disc_sleep_args = disc_spec.arguments.model_validate({"sleep_server": True})
+        disc_sleep_out = await disc_spec.run(
+            ActionCall({"origin": "owner_chat", "target_scope": ""}, disc_sleep_args, NOW)
+        )
+        assert disc_sleep_out.status == "done"
+        assert nt.calls[-1] == (
+            "mc.dispatch_goal",
+            {"action_type": "disconnect", "sleep_server": True},
+        )
+
+        calls_before_bad_disc = len(nt.calls)
+        bad_disc = await plugin.dispatch_goal({"action_type": "disconnect", "sleep_server": "yes"})
+        assert bad_disc["ok"] is False
+        assert bad_disc["reason"] == "invalid_action_arguments"
+        assert bad_disc["artifacts"]["not_dispatched"] is True
+        assert len(nt.calls) == calls_before_bad_disc
+
         # Admin pause & resume keep active_task=explore intact when resumed
         pause_spec = svc.modules.catalog.actions["mc.pause"]
         pause_out = await pause_spec.run(
@@ -825,7 +870,7 @@ async def test_minecraft_plugin_e2e_actions_node_events_inspiration_and_reconnec
         await plugin.client.stop()
         await pipe.shutdown()
 
-    # Hot disconnect cleanup removes proxy, all 14 actions, and aliases cleanly
+    # Hot disconnect cleanup removes proxy, all 16 actions, and aliases cleanly
     await _wait_until(lambda: svc.modules.get("minecraft") is None)
     assert not any(name.startswith("mc.") for name in svc.modules.catalog.actions)
     assert not any(

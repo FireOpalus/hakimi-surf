@@ -445,7 +445,9 @@ class _PluginActionDecl(BaseModel):
     name: str = Field(min_length=3, max_length=63)
     description: str = Field(min_length=1, max_length=240)
     arguments: dict[str, Any] = Field(default_factory=dict)
-    origins: list[Literal["planner", "admin", "query", "rule", "legacy", "timer"]] | None = None
+    origins: (
+        list[Literal["planner", "admin", "query", "rule", "legacy", "timer", "owner_chat"]] | None
+    ) = None
     effortful: bool = False
     interrupts_focus: bool = False
     window: Literal["any", "active", "closing"] = "any"

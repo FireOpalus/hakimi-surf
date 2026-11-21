@@ -864,6 +864,8 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(admin_fro
                 'id="life-mc-form"',
                 'id="life-mc-topic"',
                 'id="life-mc-build"',
+                'id="life-mc-connect"',
+                'id="life-mc-disconnect"',
                 'id="life-mc-chat-form"',
                 'id="life-mc-chat-msg"',
                 'id="life-mc-chat-btn"',
@@ -882,7 +884,7 @@ async def test_service_dispatch_mc_goal_ssrf_filter_and_admin_mc_panel(admin_fro
             )
             assert unauth.status_code == 401
             for bad in (
-                {"action_type": "connect"},
+                {"action_type": "shell_exec"},
                 {"action_type": "goto", "host": "127.0.0.1"},
                 {"action_type": "goto", "x": True},
                 {"action_type": "build_plan", "topic": "x" * 81},
@@ -1097,6 +1099,26 @@ async def test_admin_mc_goal_chat_via_external_plugin(settings):
                 )
                 assert empty_res.status_code == 400
                 assert len(nt.calls) == calls_before
+
+                # Admin connect & disconnect dispatch cleanly to external MinecraftPlugin
+                conn_res = await client.post(
+                    "/admin/api/life/mc/goal",
+                    json={"action_type": "connect", "view": "module"},
+                )
+                assert conn_res.status_code == 200
+                assert conn_res.json()["status"] == "ok"
+                assert nt.calls[-1] == ("mc.dispatch_goal", {"action_type": "connect"})
+
+                disc_res = await client.post(
+                    "/admin/api/life/mc/goal",
+                    json={"action_type": "disconnect", "view": "module"},
+                )
+                assert disc_res.status_code == 200
+                assert disc_res.json()["status"] == "ok"
+                assert nt.calls[-1] == (
+                    "mc.dispatch_goal",
+                    {"action_type": "disconnect", "sleep_server": False},
+                )
         finally:
             await plugin.client.stop()
             await _close_both(1000)

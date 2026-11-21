@@ -751,3 +751,311 @@ test("mc.chat enforces MC_ALLOW_CHAT=true, sanitization, slash-command guard, an
     await server.close();
   }
 });
+test("config parses MC_AUTO_CONNECT, MC_POWERD_URL/TOKEN, and MC_IDLE_DISCONNECT_MINUTES", () => {
+  const defaults = loadConfig({ MC_BRIDGE_TOKEN: VALID_TOKEN });
+  assert.equal(defaults.mcAutoConnect, true);
+  assert.equal(defaults.mcPowerdUrl, "");
+  assert.equal(defaults.mcPowerdToken, "");
+  assert.equal(defaults.mcIdleDisconnectMinutes, 20);
+
+  const custom = loadConfig({
+    MC_BRIDGE_TOKEN: VALID_TOKEN,
+    MC_AUTO_CONNECT: "false",
+    MC_POWERD_URL: "http://172.22.0.1:8792///",
+    MC_POWERD_TOKEN: "powerd-secret-token-for-test",
+    MC_IDLE_DISCONNECT_MINUTES: "0",
+  });
+  assert.equal(custom.mcAutoConnect, false);
+  assert.equal(custom.mcPowerdUrl, "http://172.22.0.1:8792");
+  assert.equal(custom.mcPowerdToken, "powerd-secret-token-for-test");
+  assert.equal(custom.mcIdleDisconnectMinutes, 0);
+
+  assert.throws(
+    () => loadConfig({ MC_BRIDGE_TOKEN: VALID_TOKEN, MC_IDLE_DISCONNECT_MINUTES: "241" }),
+    (err) => err instanceof ProtocolError && err.code === "invalid_mc_idle_disconnect_minutes",
+  );
+  assert.throws(
+    () => loadConfig({ MC_BRIDGE_TOKEN: VALID_TOKEN, MC_IDLE_DISCONNECT_MINUTES: "-1" }),
+    (err) => err instanceof ProtocolError && err.code === "invalid_mc_idle_disconnect_minutes",
+  );
+});
+
+test("MC_AUTO_CONNECT=false stays standby on start; connect wakes mc-powerd non-blocking and spawns when ready", async () => {
+  let createCalls = 0;
+  const { factory } = createMockBotFactory();
+  const countingFactory = (opts) => {
+    createCalls += 1;
+    return factory(opts);
+  };
+
+  let statusPollCount = 0;
+  const fetchCalls = [];
+  const powerdToken = "test-powerd-token-xyz-123456";
+  const mockFetch = async (url, init = {}) => {
+    fetchCalls.push({ url, method: init.method || "GET", headers: init.headers || {}, body: init.body });
+    assert.equal(init.headers?.Authorization, `Bearer ${powerdToken}`);
+    if (url.endsWith("/start") && init.method === "POST") {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, state: "starting", ready: false };
+        },
+      };
+    }
+    if (url.endsWith("/status") && init.method === "GET") {
+      statusPollCount += 1;
+      const ready = statusPollCount >= 2;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, state: ready ? "running" : "starting", ready };
+        },
+      };
+    }
+    throw new Error(`unexpected_fetch_${url}`);
+  };
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "false",
+      MC_POWERD_URL: "http://172.22.0.1:8792/",
+      MC_POWERD_TOKEN: powerdToken,
+    },
+    createBotFn: countingFactory,
+    fetchFn: mockFetch,
+    powerPollIntervalMs: 20,
+    powerWakeTimeoutMs: 2000,
+    snapshotIntervalMs: 5000,
+  });
+
+  const addr = await server.start();
+  const baseHttp = `http://127.0.0.1:${addr.port}`;
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    const snap0 = await inbox.next((m) => m.event === "mc.snapshot");
+    assert.equal(snap0.payload.connected, false);
+    assert.equal(snap0.payload.activity, "待机");
+    assert.equal(createCalls, 0);
+
+    const health = await fetchJson(`${baseHttp}/healthz`);
+    assert.equal(health.body.mc_enabled, true);
+    assert.equal(health.body.mc_configured, true);
+    assert.equal(health.body.mc_connected, false);
+
+    // connect returns immediately while waking
+    const connRes = await rpcCall(ws, inbox, "wake-1", "mc.dispatch_goal", {
+      action_type: "connect",
+    });
+    assert.equal(connRes.ok, true);
+    assert.equal(connRes.data.ok, true);
+    assert.equal(connRes.data.accepted, true);
+    assert.equal(connRes.data.summary, "正在唤醒MC服务端并准备上号");
+    assert.equal(connRes.data.snapshot.connected, false);
+    assert.equal(connRes.data.snapshot.activity, "唤醒MC服务端中");
+    assert.equal(createCalls, 0);
+
+    // Once /status reports ready:true, bot spawns automatically
+    const connectedSnap = await inbox.next(
+      (m) => m.event === "mc.snapshot" && m.payload.connected === true,
+      2000,
+    );
+    assert.equal(connectedSnap.payload.connected, true);
+    assert.equal(connectedSnap.payload.activity, "原地待命");
+    assert.equal(createCalls, 1);
+    assert.ok(statusPollCount >= 2);
+    assert.equal(fetchCalls[0].url, "http://172.22.0.1:8792/start");
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("connect returns mc_host_low_memory on mc-powerd 503 and disconnect cancels in-flight wake poll", async () => {
+  let createCalls = 0;
+  const { factory } = createMockBotFactory();
+  const countingFactory = (opts) => {
+    createCalls += 1;
+    return factory(opts);
+  };
+
+  let mode = "low_mem";
+  let stopCalled = false;
+  const mockFetch = async (url, init = {}) => {
+    if (url.endsWith("/start") && init.method === "POST") {
+      if (mode === "low_mem") {
+        return {
+          ok: false,
+          status: 503,
+          async json() {
+            return { ok: false, reason: "low_memory", avail_mem_mib: 900 };
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, state: "starting", ready: false };
+        },
+      };
+    }
+    if (url.endsWith("/status") && init.method === "GET") {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, state: mode === "ready" ? "running" : "starting", ready: mode === "ready" };
+        },
+      };
+    }
+    if (url.endsWith("/stop") && init.method === "POST") {
+      stopCalled = true;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, state: "stopping" };
+        },
+      };
+    }
+    throw new Error(`unexpected_fetch_${url}`);
+  };
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "false",
+      MC_POWERD_URL: "http://172.22.0.1:8792",
+      MC_POWERD_TOKEN: "tok-cancel-test",
+    },
+    createBotFn: countingFactory,
+    fetchFn: mockFetch,
+    powerPollIntervalMs: 25,
+    powerWakeTimeoutMs: 2000,
+    snapshotIntervalMs: 5000,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    await inbox.next((m) => m.event === "mc.snapshot");
+
+    // 503 low_memory returns mc_host_low_memory
+    const lowMemRes = await rpcCall(ws, inbox, "low-mem", "mc.dispatch_goal", {
+      action_type: "connect",
+    });
+    assert.equal(lowMemRes.ok, true);
+    assert.equal(lowMemRes.data.ok, false);
+    assert.equal(lowMemRes.data.accepted, false);
+    assert.equal(lowMemRes.data.reason, "mc_host_low_memory");
+    assert.equal(createCalls, 0);
+
+    // Start waking, then disconnect cancels wake poll and forwards optional sleep_server
+    mode = "starting";
+    const startWake = await rpcCall(ws, inbox, "wake-cancel", "mc.dispatch_goal", {
+      action_type: "connect",
+    });
+    assert.equal(startWake.data.ok, true);
+    assert.equal(startWake.data.summary, "正在唤醒MC服务端并准备上号");
+
+    const discRes = await rpcCall(ws, inbox, "disc-cancel", "mc.dispatch_goal", {
+      action_type: "disconnect",
+      sleep_server: true,
+    });
+    assert.equal(discRes.ok, true);
+    assert.equal(discRes.data.ok, true);
+    assert.equal(discRes.data.snapshot.activity, "待机");
+    assert.equal(stopCalled, true);
+
+    // Even if server later becomes ready, cancelled wake poll must NOT connect
+    mode = "ready";
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(createCalls, 0);
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("autonomous idle auto-disconnect skips when another player is online and disconnects when alone", async () => {
+  const { factory, getLastBot } = createMockBotFactory();
+  let fakeNowMs = 1_700_000_000_000;
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "true",
+    },
+    createBotFn: factory,
+    snapshotIntervalMs: 25,
+    idleDisconnectMs: 120,
+    nowFn: () => fakeNowMs,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
+    const bot = getLastBot();
+
+    // Another human player present -> keeps resetting idle timer and does NOT disconnect
+    bot.players = {
+      HakimiBot: { username: "HakimiBot" },
+      M1haiier: { username: "M1haiier" },
+    };
+    fakeNowMs += 500;
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(server.runtime.connected, true);
+
+    // Human leaves -> once idleDisconnectMs elapses, bot auto-disconnects cleanly
+    bot.players = {
+      HakimiBot: { username: "HakimiBot" },
+    };
+    fakeNowMs += 200;
+    const idleMilestone = await inbox.next(
+      (m) => m.event === "mc.milestone" && m.payload.event_type === "mc_idle_disconnected",
+      2000,
+    );
+    assert.equal(idleMilestone.payload.importance, "normal");
+    assert.equal(idleMilestone.payload.payload.reason, "idle_alone");
+    const discSnap = await inbox.next(
+      (m) => m.event === "mc.snapshot" && m.payload.connected === false && m.payload.activity === "待机",
+      2000,
+    );
+    assert.equal(discSnap.payload.connected, false);
+    assert.equal(server.runtime.connected, false);
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});

@@ -118,6 +118,8 @@ class MinecraftAdminGoalRequest(BaseModel):
     view: Literal["life", "module"] = "life"
     action_type: Literal[
         "status",
+        "connect",
+        "disconnect",
         "explore",
         "mine",
         "goto",

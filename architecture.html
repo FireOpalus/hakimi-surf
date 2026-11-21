@@ -322,7 +322,7 @@
     <section class="chapter" id="fieldwork" aria-labelledby="contracts-title">
       <div class="section-head"><h2 id="contracts-title">动作、事件与跨日待办</h2></div>
       <div class="contracts">
-        <article><span class="contract-name">ActionCatalog</span><h3>现在能执行什么？</h3><p>动作名对应一个处理器，声明参数、可用来源和执行限制。规划可以选择动作，对话也能按需查询已开放的 <code>weather.read</code>。</p><a class="mono" href="src/hakimi/modules/actions.py">actions.py</a></article>
+        <article><span class="contract-name">ActionCatalog</span><h3>现在能执行什么？</h3><p>动作名对应一个处理器，声明参数、可用来源和执行限制。规划可以选择动作，对话也能按需查询已开放的 <code>weather.read</code>，或在 Owner 明确要求时异步触发声明了 <code>owner_chat</code> 来源的模块动作。</p><a class="mono" href="src/hakimi/modules/actions.py">actions.py</a></article>
         <article><span class="contract-name">global_events</span><h3>刚刚发生了什么？</h3><p>模块发布事实。<code>RuleDispatcher</code> 按每条规则独立的游标读取，命中后把回执与新意图票据写入同一事务。</p><a class="mono" href="src/hakimi/life_rules.py">life_rules.py</a></article>
         <article><span class="contract-name">event_ledger</span><h3>以后还要跟进什么？</h3><p>用去重键更新待办，到期时间可提前唤醒规划器。读取后仍保留，履约后显式核销，未完成项可按有效期过期。平台查询只返回公开待办。</p><a class="mono" href="src/hakimi/event_ledger.py">event_ledger.py</a></article>
       </div>
@@ -333,7 +333,7 @@
           <li><strong>B 站记录观看事实</strong><code>bili_video_watched</code><small>视频学习完成，发布带标题与摘要的事件。</small></li>
           <li><strong>规则识别建造主题</strong><code>bili.build_inspiration</code><small>Minecraft 注册的规则匹配公开素材，生成一张有截止时间的建造计划票据。</small></li>
           <li><strong>引擎领取票据</strong><code>mc.build_plan</code><small>GatekeeperWorker 检查执行条件，JITExecutor 在 SQLite 中领取票据，再调用已登记的处理器。</small></li>
-          <li><strong>境内节点确认计划</strong><code>NodeTransport → mc_agent</code><small>目标经 node_agent 的私网桥交给游戏端。节点的确认表示建造计划已登记。</small></li>
+          <li><strong>境内节点确认计划</strong><code>NodeTransport → mc_agent</code><small>目标经 node_agent 的私网桥交给游戏端；需要上号时由 <code>mc-powerd</code> 按需唤醒境内服务端并在无人闲置后自动休眠。</small></li>
         </ol>
         <figcaption>
           后续游戏进展可产生新的里程碑。QQ 的分享规则可据此生成 <code>qq.speak</code> 票据，送出前再次核对接收范围与免打扰时段。
@@ -353,7 +353,7 @@
       <div class="section-head"><h2 id="deployment-title">模块在哪里运行</h2><p>引擎、管理台与外部适配端的连接方向</p></div>
       <div class="lanes">
         <div class="lane"><h3>境内 · QQ / NapCat</h3><span class="link-label">反向 WSS</span><div><strong>境外 Nginx → hakimi-bot</strong><p>QQ 事件进入 OneBot 接入层，回复与回执复用已认证的连接。</p></div></div>
-        <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集，游戏任务经私网桥交给运行 Mineflayer 的 mc_agent。</p></div></div>
+        <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集；游戏端由 <code>mc_agent</code> 常驻待机，配合境内回环守护进程 <code>mc-powerd</code> 按需唤醒与闲置自动休眠 Minecraft 服务端，支持管理台、自主规划及通用 <code>owner_chat</code> 即时触发。</p></div></div>
         <div class="lane"><h3>桌面 · 语音与看屏适配端</h3><span class="link-label">两条可选 WS</span><div><strong>境外 FastAPI → 对应常驻服务</strong><p>语音与看屏分别配置入口、校验适配端身份。屏幕隐私开关与会话模式控制帧的使用范围。</p></div></div>
         <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
       </div>

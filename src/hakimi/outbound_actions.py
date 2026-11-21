@@ -110,6 +110,12 @@ class AffectionTargetDelta(BaseModel):
     reason: str | None = None
 
 
+class ChatActionTrigger(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    action_name: str
+    arguments_json: str | None = None
+
+
 class ChatActions(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     abstain: bool
@@ -123,6 +129,7 @@ class ChatActions(BaseModel):
     set_longnick: str | None = None
     affection_delta: int | None = 0
     affection_deltas: list[AffectionTargetDelta] | None = None
+    trigger_action: ChatActionTrigger | None = None
 
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
@@ -221,6 +228,50 @@ def _sanitize_affection_deltas(
     return result or None
 
 
+def _sanitize_trigger_action(
+    raw: ChatActionTrigger | None,
+    *,
+    allow: bool,
+    abstain: bool,
+    allowed_actions: Iterable[str] | None,
+    settings,
+) -> ChatActionTrigger | None:
+    if not allow or abstain or raw is None:
+        return None
+    allowed_set = set(allowed_actions or ())
+    if not allowed_set:
+        return None
+    raw_name = getattr(raw, "action_name", None)
+    if not isinstance(raw_name, str):
+        return None
+    action_name = raw_name.strip()
+    if not action_name or action_name not in allowed_set:
+        return None
+    secrets = configured_secrets(settings) if settings else []
+    raw_args = getattr(raw, "arguments_json", None)
+    if raw_args is None:
+        return ChatActionTrigger(action_name=action_name, arguments_json=None)
+    if not isinstance(raw_args, str) or len(raw_args) > 512:
+        return None
+    if any(s and len(s) >= 8 and s in raw_args for s in secrets):
+        return None
+    trimmed = raw_args.strip()
+    if not trimmed:
+        return ChatActionTrigger(action_name=action_name, arguments_json=None)
+    try:
+        parsed = json.loads(trimmed)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    canonical = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    if len(canonical) > 512:
+        return None
+    if any(s and len(s) >= 8 and s in canonical for s in secrets):
+        return None
+    return ChatActionTrigger(action_name=action_name, arguments_json=canonical)
+
+
 def parse_actions(
     raw,
     *,
@@ -236,6 +287,8 @@ def parse_actions(
     allow_emoji_like: bool = True,
     allow_poke_action: bool = True,
     allowed_affection_targets: Iterable[str] | None = None,
+    allow_owner_chat_actions: bool = False,
+    allowed_owner_chat_actions: Iterable[str] | None = None,
 ):
     try:
         value = json.loads(raw)
@@ -294,6 +347,13 @@ def parse_actions(
         actions.save_meme_label = None
     actions.set_longnick = (
         _normalize_longnick(actions.set_longnick, settings) if allow_longnick else None
+    )
+    actions.trigger_action = _sanitize_trigger_action(
+        actions.trigger_action,
+        allow=allow_owner_chat_actions,
+        abstain=actions.abstain,
+        allowed_actions=allowed_owner_chat_actions,
+        settings=settings,
     )
     clean = []
     for text in actions.bubbles:

@@ -39,6 +39,7 @@ _MC_ALLOWED_DISPATCH_FIELDS = (
     "z",
     "target_player",
     "message",
+    "sleep_server",
     "intent_note",
     "mood",
     "gate_condition",
@@ -246,6 +247,10 @@ class ChatArgs(NoArgs):
         return cleaned
 
 
+class DisconnectArgs(NoArgs):
+    sleep_server: bool = False
+
+
 _BUILD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -288,8 +293,18 @@ _CHAT_SCHEMA: dict[str, Any] = {
     "required": ["message"],
     "additionalProperties": False,
 }
+_DISCONNECT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "sleep_server": {"type": "boolean", "default": False},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
 
 _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
+    "connect": ("登录进入 Minecraft 服务器上线游玩（如服务端休眠会自动唤醒）", {}, NoArgs),
+    "disconnect": ("主动退出 Minecraft 服务器下线待机休息", _DISCONNECT_SCHEMA, DisconnectArgs),
     "build_plan": ("在记事本里记下接下来想在 Minecraft 里搭的建筑点子", _BUILD_SCHEMA, BuildArgs),
     "explore": ("在 Minecraft 世界里四处探索地形与新发现", {}, NoArgs),
     "mine": ("在游戏里挖掘指定矿石或方块", _BLOCK_SCHEMA, BlockArgs),
@@ -306,6 +321,7 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "resume": ("恢复游戏自主动作", {}, NoArgs),
 }
 _ADMIN_ONLY_VERBS = frozenset({"status", "pause", "resume"})
+_OWNER_CHAT_VERBS = frozenset({"connect", "disconnect"})
 _EFFORTFUL_VERBS = frozenset({"explore", "goto", "mine", "gather", "follow"})
 _AUTONOMOUS_AND_ADMIN_ORIGINS = ["planner", "rule", "timer", "legacy", "admin"]
 
@@ -367,6 +383,12 @@ class MinecraftPlugin:
 
     def _build_action_spec(self, verb: str, description: str, schema: dict[str, Any]) -> ActionSpec:
         admin_only = verb in _ADMIN_ONLY_VERBS
+        if admin_only:
+            origins = ["admin"]
+        elif verb in _OWNER_CHAT_VERBS:
+            origins = [*_AUTONOMOUS_AND_ADMIN_ORIGINS, "owner_chat"]
+        else:
+            origins = list(_AUTONOMOUS_AND_ADMIN_ORIGINS)
 
         async def _run(params: dict[str, Any]) -> dict[str, Any]:
             return await self._handle_action(verb, params)
@@ -375,7 +397,7 @@ class MinecraftPlugin:
             name=f"mc.{verb}",
             description=description,
             arguments=schema,
-            origins=["admin"] if admin_only else list(_AUTONOMOUS_AND_ADMIN_ORIGINS),
+            origins=origins,
             effortful=verb in _EFFORTFUL_VERBS,
             interrupts_focus=False,
             window="any",

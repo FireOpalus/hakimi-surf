@@ -42,6 +42,10 @@ export function createMcBridgeServer(options = {}) {
     actionTimeoutMs: options.actionTimeoutMs,
     profilesFolder: options.profilesFolder,
     nowFn: options.nowFn,
+    fetchFn: options.fetchFn,
+    powerPollIntervalMs: options.powerPollIntervalMs,
+    powerWakeTimeoutMs: options.powerWakeTimeoutMs,
+    idleDisconnectMs: options.idleDisconnectMs,
   });
 
   const httpServer = http.createServer((req, res) => {

@@ -110,6 +110,16 @@ export function loadConfig(env = process.env) {
     : [];
   const mcAllowedPlayers = new Set(mcAllowedPlayerList.map((s) => s.toLowerCase()));
   const mcAllowChat = parseBoolEnv(env.MC_ALLOW_CHAT, false);
+  const mcAutoConnect = parseBoolEnv(env.MC_AUTO_CONNECT, true);
+  const mcPowerdUrl = unquoteEnvValue(env.MC_POWERD_URL ?? "").replace(/\/+$/, "");
+  const mcPowerdToken = unquoteEnvValue(env.MC_POWERD_TOKEN ?? "");
+  const mcIdleDisconnectMinutes = parseIntEnv(
+    env.MC_IDLE_DISCONNECT_MINUTES,
+    20,
+    0,
+    240,
+    "invalid_mc_idle_disconnect_minutes",
+  );
 
   return Object.freeze({
     bridgeHost,
@@ -126,6 +136,10 @@ export function loadConfig(env = process.env) {
     mcAllowedPlayerList,
     mcAllowedPlayers,
     mcAllowChat,
+    mcAutoConnect,
+    mcPowerdUrl,
+    mcPowerdToken,
+    mcIdleDisconnectMinutes,
   });
 }
 
