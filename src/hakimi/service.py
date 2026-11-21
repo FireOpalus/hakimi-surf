@@ -205,10 +205,12 @@ class Service:
         self.screen_watch = self.modules.systems["screen_watch"].screen_watch
         self.voice_companion = self.modules.systems["voice_companion"].companion
         self.identity = self.modules.systems["identity"].identity
+        self.memory_hub = self.modules.systems["memory_hub"].hub
         self.plugin_bus = self.modules.systems["plugin_bus"].plugin_bus
         store.runtime.identity = self.identity
         store.runtime.affection.bind_identity(self.identity)
         self.kernel.provide_core("identity", self.identity)
+        self.kernel.provide_core("memory_hub", self.memory_hub)
         self.kernel.provide_core("event_ledger", self.event_ledger)
         self.kernel.provide_core("screen_watch", self.screen_watch)
         self.kernel.provide_core("voice_companion", self.voice_companion)
@@ -1738,19 +1740,6 @@ class Service:
             payload["web_preview_untrusted"] = previews[:2]
         if image_sources:
             payload["image_sources"] = image_sources
-        if self.notebook:
-            snapshot = self.notebook.for_message(message)
-            if snapshot:
-                payload["owner_notebook_snapshot"] = snapshot
-        public_history = await self.public_memory.recent_for(message)
-        while (
-            public_history
-            and len(untrusted_input({"background": public_history}).encode())
-            > self.s.max_context_bytes // 2
-        ):
-            public_history.pop()
-        if public_history:
-            payload["近期群聊巡逻记忆（只读背景）"] = public_history
         # Attribute strikes to this incoming content, never to another member's history.
         # Stored history, summaries and model outputs were screened on entry/creation.
         current = {
@@ -1854,15 +1843,6 @@ class Service:
                 session_enabled=fresh.get("enabled", False),
                 interaction_chains=fresh.get("interaction_chains", {}),
             )
-            if self.cloud_memory:
-                cloud_mem = await asyncio.to_thread(
-                    self.cloud_memory.for_message,
-                    message,
-                    message.text,
-                    recall=getattr(intent, "need_memory_recall", False),
-                )
-                if cloud_mem:
-                    payload.update(cloud_mem)
         else:
             payload.update(
                 recent_messages=[],
@@ -2108,19 +2088,16 @@ class Service:
                 *(m.user_id for m in filtered_nearby),
                 *(str(item.get("user_id", "")) for item in history[-8:]),
             ]
-            dual_data = await self.sessions.dual.prefetch(
+            recalled_ctx = await self.memory_hub.recall_context(
                 message,
                 message.text,
+                mode="chat",
                 recall=getattr(intent, "need_memory_recall", False),
+                sandbox=sandbox,
                 related_user_ids=related_user_ids,
+                allow_dual_profile=(not aff_active or caps.allow_dual_profile),
             )
-            if aff_active and not caps.allow_dual_profile and isinstance(dual_data, dict):
-                dual_data = {
-                    k: v
-                    for k, v in dual_data.items()
-                    if k not in {"speaker_profile", "member_profiles"}
-                }
-            payload["dual_memory_data"] = dual_data
+            payload.update(recalled_ctx)
             if aff_active:
                 sender_prof = await aff.profile(
                     message.platform, message.user_id, message.sender_nickname
@@ -2162,16 +2139,6 @@ class Service:
                     sender_aff = dict(payload.get("sender_affection") or {})
                     sender_aff["known_preferences"] = l2_tags
                     payload["sender_affection"] = sender_aff
-            if (
-                identity is not None
-                and message.kind == "private"
-                and is_persona_owner(message, self.s)
-            ):
-                other_recent = identity.owner_other_surface_recent(
-                    message.platform, message=message
-                )
-                if other_recent:
-                    payload["owner_other_surface_recent"] = other_recent
             if not self.bot_guard.known_bot(message):
                 material = await self.modules.context_data(
                     limit=4, now=time.time(), message=message
@@ -2710,17 +2677,9 @@ class Service:
         await self.store.runtime.filters.update_audit(audit_id, "queued")
 
     def _record_owner_turn_recap(self, message: Message, reply_text: str) -> None:
-        identity = getattr(self, "identity", None)
-        if identity is None or message.kind != "private" or not is_persona_owner(message, self.s):
-            return
-        user_part = " ".join(str(message.text or "").split())[:35]
-        reply_part = " ".join(str(reply_text or "").split())[:38]
-        if user_part and reply_part:
-            summary = f"{user_part} -> {reply_part}"
-        else:
-            summary = reply_part or user_part
-        if summary:
-            identity.record_owner_recap(message.platform, summary, message=message)
+        memory_hub = getattr(self, "memory_hub", None)
+        if memory_hub is not None and hasattr(memory_hub, "record_turn_recap"):
+            memory_hub.record_turn_recap(message, reply_text)
 
     async def handle_patrol(self, job: dict):
         if self.modules.inactive_reason("bilibili_surf"):

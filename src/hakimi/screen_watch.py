@@ -387,22 +387,12 @@ class ScreenWatch:
 
     async def _gather_owner_context(self, owner_msg: Message, now: float) -> dict[str, Any]:
         ctx: dict[str, Any] = {}
-        notebook = getattr(self.service, "notebook", None)
-        if notebook is not None and hasattr(notebook, "for_message"):
+        hub = getattr(self.service, "memory_hub", None)
+        if hub is not None and hasattr(hub, "recall_context"):
             try:
-                snap = notebook.for_message(owner_msg)
-                if snap:
-                    ctx["owner_notebook_snapshot"] = str(snap)[:600]
-            except Exception:
-                pass
-        ledger = getattr(self.service, "event_ledger", None)
-        if ledger is not None and hasattr(ledger, "read"):
-            try:
-                items = await ledger.read(include_owner_private=True, limit=4, now=now)
-                if items:
-                    ctx["pending_ledger_events"] = [
-                        {"key": it.dedupe_key, "summary": it.summary} for it in items[:4]
-                    ]
+                recalled = await hub.recall_context(owner_msg, "", mode="screen", now=now)
+                if isinstance(recalled, dict):
+                    ctx.update(recalled)
             except Exception:
                 pass
         ws = getattr(self.service, "world_state", None)

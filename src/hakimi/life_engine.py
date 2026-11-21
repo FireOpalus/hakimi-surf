@@ -36,7 +36,6 @@ from .modules.qq_policy import DESKTOP_CONTEXT_HINT as DESKTOP_CONTEXT_HINT
 from .planning_journal import PlannerJournal
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
-from .social import owner_target
 from .thinking_policy import preferences as model_preferences
 from .thinking_policy import supported_level
 from .work_usage import model_work
@@ -207,62 +206,14 @@ class LifeBlockPlanner:
         return True
 
     async def _collect_owner_planning_context(self, ts: float) -> dict[str, Any]:
-        owner_msg = owner_target(self.s, "onebot", ts, "planner-owner-ctx")
-        sessions = getattr(self.service, "sessions", None)
-        if owner_msg is None or sessions is None:
+        hub = getattr(self.service, "memory_hub", None)
+        if hub is None or not hasattr(hub, "recall_context"):
             return {}
-        path_fn = getattr(sessions, "path", None)
-        if callable(path_fn) and not path_fn(owner_msg).exists():
-            return {}
-        snap: dict[str, Any] = {}
         try:
-            if hasattr(sessions, "database") and hasattr(sessions, "vault"):
-                async with sessions.database(owner_msg, preserve_history=True) as (db, key):
-                    async with db.execute("SELECT enabled FROM session_meta") as cur:
-                        row_en = await cur.fetchone()
-                    if not row_en or not row_en[0]:
-                        return {}
-                    async with db.execute("SELECT summary FROM rolling_state") as cur:
-                        sum_row = await cur.fetchone()
-                    summary_raw = (
-                        sessions.vault.open(key, sum_row[0]) if sum_row and sum_row[0] else ""
-                    )
-                    async with db.execute(
-                        "SELECT payload FROM recent_messages ORDER BY id DESC LIMIT 8"
-                    ) as cur:
-                        msg_rows = await cur.fetchall()
-                    recent_msgs = [sessions.vault.open(key, r[0]) for r in reversed(msg_rows)]
-                snap = {"rolling_summary": summary_raw, "recent_messages": recent_msgs}
-            else:
-                snap = await sessions.snapshot(owner_msg)
+            ctx = await hub.recall_context(None, "", mode="planner", now=ts)
+            return dict(ctx) if isinstance(ctx, dict) else {}
         except Exception:
             return {}
-        turns: list[str] = []
-        for item in snap.get("recent_messages", [])[-8:]:
-            created = item.get("created_at")
-            if (
-                isinstance(created, int | float)
-                and not isinstance(created, bool)
-                and created > 0
-                and created < ts - 129600.0
-            ):
-                continue
-            raw_text = str(item.get("text") or "").strip()
-            if not raw_text or raw_text.startswith(("[协议事件", "/")):
-                continue
-            prefix = "BOISER: " if item.get("role") == "user" else "我: "
-            cleaned = sanitize_sensor_text(raw_text, self.s, max_tokens=45)
-            if cleaned:
-                turns.append(prefix + cleaned)
-        out: dict[str, Any] = {}
-        if turns:
-            out["recent_turns"] = turns[-5:]
-        summary_clean = sanitize_sensor_text(
-            str(snap.get("rolling_summary") or ""), self.s, max_tokens=80
-        )
-        if summary_clean:
-            out["rolling_summary"] = summary_clean
-        return out
 
     async def _recent_completed_intents(self, ts: float) -> list[dict[str, str]]:
         async with self.store.lock:

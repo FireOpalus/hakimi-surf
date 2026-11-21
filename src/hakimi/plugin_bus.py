@@ -66,6 +66,7 @@ RESERVED_PLUGIN_IDS = frozenset(
     {
         "qq_social",
         "identity",
+        "memory_hub",
         "plugin_bus",
         "event_ledger",
         "patrol_diary",
@@ -2331,69 +2332,93 @@ class PluginBus:
 
             if frame.get("owner_recap") is True and self.s.owner_qq_id:
                 now = self.clock()
-                try:
-                    scrubbed = safe_output(clean_text(raw_summary), self._all_secrets(), limit=260)
-                except Rejected:
-                    scrubbed = ""
-                clean_recap = (
-                    sanitize_sensor_text(scrubbed, self.s, max_tokens=90) if scrubbed else ""
-                )
-                if clean_recap:
-                    identity = getattr(self.service, "identity", None)
-                    if identity is not None and hasattr(identity, "record_owner_recap"):
-                        identity.record_owner_recap(
-                            session.plugin_id,
-                            clean_recap,
-                            now=now,
-                            private_owner=True,
+                raw_topic = frame.get("chronicle_topic")
+                topic_arg = raw_topic if isinstance(raw_topic, str) and raw_topic.strip() else None
+                raw_tags = frame.get("chronicle_tags")
+                clean_tags: list[str] = []
+                if isinstance(raw_tags, list | tuple):
+                    for raw_tag in raw_tags:
+                        if not isinstance(raw_tag, str):
+                            continue
+                        clean_tag = sanitize_sensor_text(
+                            clean_text(raw_tag), self.s, max_tokens=10
+                        )[:24].strip()
+                        if clean_tag and clean_tag not in clean_tags:
+                            clean_tags.append(clean_tag)
+                            if len(clean_tags) >= 6:
+                                break
+                if session.plugin_id not in clean_tags:
+                    clean_tags = clean_tags[:5] + [session.plugin_id]
+                memory_hub = getattr(self.service, "memory_hub", None)
+                if memory_hub is not None and hasattr(memory_hub, "record_experience"):
+                    await memory_hub.record_experience(
+                        session.plugin_id,
+                        raw_summary,
+                        visibility="owner_private",
+                        event_type=clean_type,
+                        dedupe_key=clean_key,
+                        write_recap=True,
+                        recap_platform=session.plugin_id,
+                        write_ledger=False,
+                        chronicle_topic=topic_arg,
+                        chronicle_tags=clean_tags,
+                        chronicle_source_id=f"plugin:{session.plugin_id}:{clean_key or clean_type}",
+                        now=now,
+                    )
+                else:
+                    try:
+                        scrubbed = safe_output(
+                            clean_text(raw_summary), self._all_secrets(), limit=260
                         )
-                    raw_topic = frame.get("chronicle_topic")
-                    if isinstance(raw_topic, str) and raw_topic.strip():
-                        clean_topic = sanitize_sensor_text(
-                            clean_text(raw_topic), self.s, max_tokens=24
-                        )[:80].strip()
-                        raw_tags = frame.get("chronicle_tags")
-                        clean_tags: list[str] = []
-                        if isinstance(raw_tags, list | tuple):
-                            for raw_tag in raw_tags:
-                                if not isinstance(raw_tag, str):
-                                    continue
-                                clean_tag = sanitize_sensor_text(
-                                    clean_text(raw_tag), self.s, max_tokens=10
-                                )[:24].strip()
-                                if clean_tag and clean_tag not in clean_tags:
-                                    clean_tags.append(clean_tag)
-                                    if len(clean_tags) >= 6:
-                                        break
-                        if session.plugin_id not in clean_tags:
-                            clean_tags = clean_tags[:5] + [session.plugin_id]
-                        owner_msg = owner_target(
-                            self.s,
-                            getattr(self.s, "owner_delivery_platform", "onebot"),
-                            now,
-                            f"plugin-recap:{session.plugin_id}",
-                        )
-                        sessions = getattr(self.service, "sessions", None)
-                        dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
-                        if (
-                            owner_msg is not None
-                            and dual_mem is not None
-                            and hasattr(dual_mem, "record_chronicle")
-                            and clean_topic
-                        ):
-                            try:
-                                source_id = f"plugin:{session.plugin_id}:{clean_key or clean_type}"
-                                await dual_mem.record_chronicle(
-                                    owner_msg,
-                                    topic=clean_topic,
-                                    text=clean_recap,
-                                    category="event",
-                                    tags=clean_tags,
-                                    source_id=source_id,
-                                    created_at=now,
-                                )
-                            except Exception:
-                                pass
+                    except Rejected:
+                        scrubbed = ""
+                    clean_recap = (
+                        sanitize_sensor_text(scrubbed, self.s, max_tokens=90) if scrubbed else ""
+                    )
+                    if clean_recap:
+                        identity = getattr(self.service, "identity", None)
+                        if identity is not None and hasattr(identity, "record_owner_recap"):
+                            identity.record_owner_recap(
+                                session.plugin_id,
+                                clean_recap,
+                                now=now,
+                                private_owner=True,
+                            )
+                        if topic_arg is not None:
+                            clean_topic = sanitize_sensor_text(
+                                clean_text(topic_arg), self.s, max_tokens=24
+                            )[:80].strip()
+                            owner_msg = owner_target(
+                                self.s,
+                                getattr(self.s, "owner_delivery_platform", "onebot"),
+                                now,
+                                f"plugin-recap:{session.plugin_id}",
+                            )
+                            sessions = getattr(self.service, "sessions", None)
+                            dual_mem = (
+                                getattr(sessions, "dual", None) if sessions is not None else None
+                            )
+                            if (
+                                owner_msg is not None
+                                and dual_mem is not None
+                                and hasattr(dual_mem, "record_chronicle")
+                                and clean_topic
+                            ):
+                                try:
+                                    source_id = (
+                                        f"plugin:{session.plugin_id}:{clean_key or clean_type}"
+                                    )
+                                    await dual_mem.record_chronicle(
+                                        owner_msg,
+                                        topic=clean_topic,
+                                        text=clean_recap,
+                                        category="event",
+                                        tags=clean_tags,
+                                        source_id=source_id,
+                                        created_at=now,
+                                    )
+                                except Exception:
+                                    pass
 
         if session.plugin_id == "bilibili_surf" and clean_type == "bili_video_watched":
             if isinstance(raw_report, str) and raw_report.strip():

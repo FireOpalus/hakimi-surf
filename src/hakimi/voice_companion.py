@@ -561,41 +561,83 @@ class VoiceCompanion:
         if session.spoken_turns < 1:
             return
         if session.mode == "owner_private":
-            ledger = getattr(self.service, "event_ledger", None)
-            if self.config.save_recap_to_ledger and ledger is not None:
-                try:
-                    await ledger.post(
-                        "voice_companion",
-                        "companion_recap",
-                        summary,
-                        dedupe_key=f"recap:{session.id}",
-                        visibility="owner_private",
-                        due_at=now,
-                        ttl_seconds=48 * 3600.0,
-                        now=now,
-                    )
-                except Exception:
-                    pass
-            if self.config.save_recap_to_dual_memory and self.s.owner_qq_id:
-                sessions = getattr(self.service, "sessions", None)
-                dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
-                if dual_mem is not None and hasattr(dual_mem, "record_chronicle"):
-                    try:
-                        topic, recap_text, tags = self._build_dual_memory_recap(session, now)
-                        owner_msg = self._make_turn_message(
-                            session, self.s.owner_qq_id, "BOISER", "", now
-                        )
-                        await dual_mem.record_chronicle(
-                            owner_msg,
-                            topic=topic,
-                            text=recap_text,
-                            category="event",
-                            tags=tags,
-                            source_id=f"voice:{session.id}",
-                            created_at=now,
-                        )
-                    except Exception:
-                        pass
+            want_ledger = bool(self.config.save_recap_to_ledger)
+            want_dual = bool(self.config.save_recap_to_dual_memory and self.s.owner_qq_id)
+            if want_ledger or want_dual:
+                hub = getattr(self.service, "memory_hub", None)
+                if hub is not None and hasattr(hub, "record_experience"):
+                    topic = ""
+                    recap_text = ""
+                    tags: list[str] = []
+                    owner_msg: Message | None = None
+                    if want_dual:
+                        try:
+                            topic, recap_text, tags = self._build_dual_memory_recap(session, now)
+                            owner_msg = self._make_turn_message(
+                                session, self.s.owner_qq_id, "BOISER", "", now
+                            )
+                        except Exception:
+                            want_dual = False
+                    if want_ledger or want_dual:
+                        try:
+                            await hub.record_experience(
+                                "voice_companion",
+                                summary,
+                                visibility="owner_private",
+                                event_type="companion_recap",
+                                dedupe_key=f"recap:{session.id}",
+                                due_at=now,
+                                ttl_seconds=48 * 3600.0,
+                                write_recap=False,
+                                write_ledger=want_ledger,
+                                chronicle_topic=topic if want_dual else None,
+                                chronicle_text=recap_text if want_dual else None,
+                                chronicle_tags=tags if want_dual else (),
+                                chronicle_source_id=f"voice:{session.id}",
+                                chronicle_category="event",
+                                owner_message=owner_msg,
+                                now=now,
+                            )
+                        except Exception:
+                            pass
+                else:
+                    ledger = getattr(self.service, "event_ledger", None)
+                    if want_ledger and ledger is not None:
+                        try:
+                            await ledger.post(
+                                "voice_companion",
+                                "companion_recap",
+                                summary,
+                                dedupe_key=f"recap:{session.id}",
+                                visibility="owner_private",
+                                due_at=now,
+                                ttl_seconds=48 * 3600.0,
+                                now=now,
+                            )
+                        except Exception:
+                            pass
+                    if want_dual:
+                        sessions = getattr(self.service, "sessions", None)
+                        dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
+                        if dual_mem is not None and hasattr(dual_mem, "record_chronicle"):
+                            try:
+                                topic, recap_text, tags = self._build_dual_memory_recap(
+                                    session, now
+                                )
+                                owner_msg = self._make_turn_message(
+                                    session, self.s.owner_qq_id, "BOISER", "", now
+                                )
+                                await dual_mem.record_chronicle(
+                                    owner_msg,
+                                    topic=topic,
+                                    text=recap_text,
+                                    category="event",
+                                    tags=tags,
+                                    source_id=f"voice:{session.id}",
+                                    created_at=now,
+                                )
+                            except Exception:
+                                pass
         elif ws is not None and hasattr(ws, "publish_event"):
             try:
                 await ws.publish_event(
@@ -614,74 +656,14 @@ class VoiceCompanion:
     async def _gather_owner_context(
         self, owner_msg: Message, speech_text: str, now: float
     ) -> dict[str, Any]:
-        ctx: dict[str, Any] = {}
-        notebook = getattr(self.service, "notebook", None)
-        if notebook is not None and hasattr(notebook, "for_message"):
-            try:
-                snap = notebook.for_message(owner_msg)
-                if snap:
-                    ctx["owner_notebook_snapshot"] = str(snap)[:800]
-            except Exception:
-                pass
-        cloud_mem = getattr(self.service, "cloud_memory", None)
-        if cloud_mem is not None and hasattr(cloud_mem, "for_message"):
-            try:
-                mem = await asyncio.to_thread(
-                    cloud_mem.for_message, owner_msg, speech_text, recall=False
-                )
-                if isinstance(mem, dict) and mem:
-                    for key in ("owner_core_memory", "owner_recalled_memories"):
-                        if val := mem.get(key):
-                            ctx[key] = val
-            except Exception:
-                pass
-        sessions = getattr(self.service, "sessions", None)
-        if sessions is not None and hasattr(sessions, "database") and hasattr(sessions, "vault"):
-            path_fn = getattr(sessions, "path", None)
-            if not callable(path_fn) or path_fn(owner_msg).exists():
-                try:
-                    async with sessions.database(owner_msg, preserve_history=True) as (db, key):
-                        async with db.execute(
-                            "SELECT payload FROM recent_messages ORDER BY id DESC LIMIT 6"
-                        ) as cur:
-                            rows = await cur.fetchall()
-                    turns: list[str] = []
-                    for row in reversed(rows):
-                        item = sessions.vault.open(key, row[0])
-                        txt = str(item.get("text") or "").strip()
-                        if not txt or txt.startswith(("[协议事件", "/")):
-                            continue
-                        prefix = "BOISER: " if item.get("role") == "user" else "我: "
-                        turns.append(prefix + clean_text(txt)[:140])
-                    if turns:
-                        ctx["recent_qq_turns"] = turns[-6:]
-                except Exception:
-                    pass
-        dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
-        if dual_mem is not None and hasattr(dual_mem, "prefetch"):
-            path_fn = getattr(sessions, "path", None)
-            if not callable(path_fn) or path_fn(owner_msg).exists():
-                try:
-                    dual = await dual_mem.prefetch(
-                        owner_msg, speech_text or "语音伴随", recall=True
-                    )
-                    if isinstance(dual, dict) and (
-                        dual.get("speaker_profile") or dual.get("chronicle_recall")
-                    ):
-                        ctx["owner_dual_memory"] = dual
-                except Exception:
-                    pass
-        ledger = getattr(self.service, "event_ledger", None)
-        if ledger is not None and hasattr(ledger, "read"):
-            try:
-                items = await ledger.read(include_owner_private=True, limit=6, now=now)
-                if items:
-                    ctx["pending_ledger_events"] = [
-                        {"key": it.dedupe_key, "summary": it.summary} for it in items[:6]
-                    ]
-            except Exception:
-                pass
-        return ctx
+        hub = getattr(self.service, "memory_hub", None)
+        if hub is None or not hasattr(hub, "recall_context"):
+            return {}
+        try:
+            ctx = await hub.recall_context(owner_msg, speech_text, mode="voice", now=now)
+            return dict(ctx) if isinstance(ctx, dict) else {}
+        except Exception:
+            return {}
 
     def _make_turn_message(
         self,
@@ -848,14 +830,23 @@ class VoiceCompanion:
                     recap = clean_reply[:70]
                     session.highlights.append(recap)
                 if is_owner and recap:
-                    ident = getattr(self.service, "identity", None)
-                    if ident is not None:
-                        ident.record_owner_recap(
+                    hub = getattr(self.service, "memory_hub", None)
+                    if hub is not None and hasattr(hub, "record_quick_recap"):
+                        hub.record_quick_recap(
                             "voice_companion",
                             recap,
                             now=now,
                             private_owner=True,
                         )
+                    else:
+                        ident = getattr(self.service, "identity", None)
+                        if ident is not None:
+                            ident.record_owner_recap(
+                                "voice_companion",
+                                recap,
+                                now=now,
+                                private_owner=True,
+                            )
                 await self._send_frame(
                     peer, {"type": "turn.end", "turn_id": turn_id, "status": "spoken"}
                 )
