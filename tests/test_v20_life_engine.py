@@ -580,7 +580,9 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
         view = await svc.world_state.experience.view(day_now)
         assert view["plan"]["plan_module"] == "minecraft" and view["actual"]["state"] == "idle"
         assert await svc.world_state.unconsumed_events() == []
-        assert 2 * 3600 <= (plan_res["next_plan_at"] - day_now) <= 4 * 3600
+        assert LifeEngineConfig().planner_min_minutes == 60
+        assert LifeEngineConfig().planner_max_minutes == 120
+        assert 1 * 3600 <= (plan_res["next_plan_at"] - day_now) <= 2 * 3600
         assert len(diary.world_events) == 1
 
         # Milestone high-importance impulse subscriber (0 LLM calls + 10m per-source dedup)
@@ -933,3 +935,230 @@ async def test_jit_executor_bili_dispatch_not_dispatched_and_run_loop(settings, 
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await run_task
+
+
+def test_life_plan_instruction_is_module_agnostic():
+    forbidden = [
+        "bili.patrol",
+        "weather.read",
+        "mc.build_plan",
+        "mc.connect",
+        "mc.disconnect",
+        "qq.speak",
+        "bilibili_surf",
+        "qq_social",
+        "weather",
+        "minecraft",
+        "B 站",
+        "B站",
+        "MC",
+    ]
+    for word in forbidden:
+        assert word not in LIFE_PLAN_INSTRUCTION
+    for required in [
+        "available_actions",
+        "near_horizon",
+        "pending_count",
+        "awake_minutes_left",
+        "active_session_exit_action",
+        "<内部活动动作名>",
+        "<社交动作名>",
+    ]:
+        assert required in LIFE_PLAN_INSTRUCTION
+
+
+async def test_active_session_exit_protocol_cooldown_and_triggers(settings, store):
+    from pydantic import BaseModel
+
+    from hakimi.life_engine import (
+        ACTIVE_SESSION_REVIEW_SECONDS,
+        SESSION_EXIT_COOLDOWN_SECONDS,
+    )
+    from hakimi.modules.actions import Action, Outcome
+    from hakimi.modules.base import BaseModule
+    from hakimi.rest_policy import RestHoursConfig
+
+    class _NeedArg(BaseModel):
+        target: str
+
+    exit_calls: list[dict] = []
+    next_status = ["done"]
+    clear_on_exit = [True]
+
+    async def _run_exit(call):
+        exit_calls.append({"ticket": dict(call.ticket), "now": call.now})
+        if clear_on_exit[0]:
+            await svc.world_state.update_state(current_module="idle", focus_level="LOW")
+        return Outcome(next_status[0], "left")
+
+    async def _noop(call):
+        return Outcome("done", "ok")
+
+    class _SandboxModule(BaseModule):
+        module_id = "sandbox_game"
+        display_name = "Sandbox"
+        session_exit_action: str | None = "sandbox.leave"
+
+        async def _raw_sensor_summary(self) -> str:
+            return ""
+
+        def actions(self) -> tuple[Action, ...]:
+            return (
+                Action(name="sandbox.leave", description="leave session", run=_run_exit),
+                Action(name="sandbox.wave", description="social wave", run=_noop, social=True),
+                Action(
+                    name="sandbox.need_arg",
+                    description="needs arg",
+                    run=_noop,
+                    arguments=_NeedArg,
+                ),
+            )
+
+    class _OtherModule(BaseModule):
+        module_id = "other_mod"
+        display_name = "Other"
+        session_exit_action: str | None = "other.exit"
+
+        async def _raw_sensor_summary(self) -> str:
+            return ""
+
+        def actions(self) -> tuple[Action, ...]:
+            return (Action(name="other.exit", description="exit other", run=_noop),)
+
+    now = [_stamp("2026-11-17T14:00:00")]
+    async with httpx.AsyncClient() as http:
+        svc = Service(
+            settings,
+            store,
+            LifeGateway(),
+            FakeBili(),
+            Sender(settings, http, Wire()),
+        )
+        sandbox = _SandboxModule(settings)
+        other = _OtherModule(settings)
+        svc.modules.register(sandbox)
+        svc.modules.register(other)
+        svc.world_state.clock = lambda: now[0]
+        await svc.world_state.initialize()
+        engine = LifeEngine(svc, clock=lambda: now[0], rng=random.Random(1))
+        await engine.initialize()
+        await engine.set_rest_policy(RestHoursConfig(rest_hours="23:30-08:30"))
+
+        # 1. Idle clears attempts and returns None
+        engine._session_exit_attempts["sandbox_game"] = now[0]
+        assert engine.active_session_exit() is None
+        assert engine._session_exit_attempts == {}
+
+        # 2. Active session validation checks
+        await svc.world_state.update_state(current_module="sandbox_game", focus_level="MEDIUM")
+        resolved = engine.active_session_exit()
+        assert resolved is not None and resolved[1].name == "sandbox.leave"
+
+        sandbox.enabled = False
+        assert engine.active_session_exit() is None
+        sandbox.enabled = True
+
+        sandbox.session_exit_action = "sandbox.wave"  # social rejected
+        assert engine.active_session_exit() is None
+        sandbox.session_exit_action = "other.exit"  # cross-module rejected
+        assert engine.active_session_exit() is None
+        sandbox.session_exit_action = "sandbox.missing"
+        assert engine.active_session_exit() is None
+        sandbox.session_exit_action = "sandbox.leave"
+
+        await engine.set_config({"action_modes": {"sandbox.leave": "off"}})
+        assert engine.active_session_exit() is None
+        await engine.set_config({"action_modes": {}})
+
+        # Required-arg action safely returns False
+        sandbox.session_exit_action = "sandbox.need_arg"
+        assert await engine.exit_active_session(now[0], reason="sleeping") is False
+        sandbox.session_exit_action = "sandbox.leave"
+
+        # 3. Cooldown prevents rapid repeated attempts while active; idle clears cooldown
+        clear_on_exit[0] = False
+        assert await engine.exit_active_session(now[0], reason="day_rest") is True
+        assert exit_calls[-1]["ticket"]["origin"] == "timer"
+        assert exit_calls[-1]["ticket"]["target_module"] == "sandbox_game"
+        assert exit_calls[-1]["ticket"]["target_scope"] == ""
+        assert exit_calls[-1]["ticket"]["exit_reason"] == "day_rest"
+
+        assert await engine.exit_active_session(now[0] + 60, reason="day_rest") is False
+        assert len(exit_calls) == 1
+        assert (
+            await engine.exit_active_session(
+                now[0] + SESSION_EXIT_COOLDOWN_SECONDS, reason="day_rest"
+            )
+            is True
+        )
+        assert len(exit_calls) == 2
+
+        await svc.world_state.update_state(current_module="idle", focus_level="LOW")
+        assert engine.active_session_exit() is None
+        await svc.world_state.update_state(current_module="sandbox_game", focus_level="MEDIUM")
+        assert (
+            await engine.exit_active_session(
+                now[0] + SESSION_EXIT_COOLDOWN_SECONDS + 1, reason="sleeping"
+            )
+            is True
+        )
+        assert len(exit_calls) == 3
+
+        # 4. Planner active_session_review exposes exit action, clamps next_at, bypasses quiet
+        svc.ai.plan_json = json.dumps(
+            {
+                "current_module": "sandbox_game",
+                "focus_level": "MEDIUM",
+                "mood": "playful",
+                "intents": [],
+            }
+        )
+        res1 = await engine.trigger_plan_once(now=now[0])
+        assert res1["next_plan_at"] <= now[0] + ACTIVE_SESSION_REVIEW_SECONDS
+        assert (
+            svc.ai.calls[0][1]["current_world_state"]["active_session_exit_action"]
+            == "sandbox.leave"
+        )
+        now[0] = res1["next_plan_at"]
+        res2 = await engine.trigger_plan_once(now=now[0], automatic=True)
+        assert res2["status"] == "planned" and len(svc.ai.calls) == 2
+        latest_run = await store.one(
+            "SELECT trigger FROM life_plan_runs ORDER BY started DESC LIMIT 1"
+        )
+        assert latest_run[0] == "active_session_review"
+
+        # 5. Planner day_rest choice triggers exit_active_session(applied_at, reason="day_rest")
+        clear_on_exit[0] = True
+        now[0] += 300
+        await svc.world_state.update_state(energy=25)
+        svc.ai.plan_json = json.dumps(
+            {
+                "current_module": "idle",
+                "focus_level": "LOW",
+                "mood": "sleepy",
+                "rest_minutes": 30,
+                "intents": [],
+            }
+        )
+        await engine.trigger_plan_once(now=now[0])
+        assert exit_calls[-1]["ticket"]["exit_reason"] == "day_rest"
+        assert svc.world_state.current.current_module == "idle"
+
+        # 6. tick_gatekeeper_once triggers exit for day_rest and sleeping
+        clear_on_exit[0] = False
+        await svc.world_state.update_state(current_module="sandbox_game", focus_level="MEDIUM")
+        now[0] += 600
+        await engine.tick_gatekeeper_once(now=now[0])
+        assert exit_calls[-1]["ticket"]["exit_reason"] == "day_rest"
+
+        sleep_ts = _stamp("2026-11-17T23:45:00")
+        now[0] = sleep_ts
+        await engine.tick_gatekeeper_once(now=sleep_ts)
+        assert exit_calls[-1]["ticket"]["exit_reason"] == "sleeping"
+
+        # 7. Planner sleep branch triggers exit_active_session(ts, reason="sleeping")
+        now[0] = sleep_ts + 300
+        sleep_plan = await engine.trigger_plan_once(now=now[0])
+        assert sleep_plan["status"] == "sleeping"
+        assert exit_calls[-1]["ticket"]["exit_reason"] == "sleeping"
+        assert exit_calls[-1]["now"] == now[0]

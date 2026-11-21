@@ -142,6 +142,7 @@ export class McRuntime {
     powerPollIntervalMs = 2_000,
     powerWakeTimeoutMs = 90_000,
     idleDisconnectMs = undefined,
+    soloMaxSessionMs = undefined,
     companionTickMs = 1_500,
     soloWanderIntervalMs = 25_000,
     companionReplyCooldownMs = 5_000,
@@ -177,6 +178,15 @@ export class McRuntime {
       typeof idleDisconnectMs === "number" && Number.isFinite(idleDisconnectMs)
         ? Math.max(0, idleDisconnectMs)
         : defaultIdleMinutes * 60_000;
+    const defaultSoloMaxMinutes =
+      typeof config.mcSoloMaxMinutes === "number" &&
+      Number.isFinite(config.mcSoloMaxMinutes)
+        ? config.mcSoloMaxMinutes
+        : 90;
+    this.soloMaxSessionMs =
+      typeof soloMaxSessionMs === "number" && Number.isFinite(soloMaxSessionMs)
+        ? Math.max(0, soloMaxSessionMs)
+        : defaultSoloMaxMinutes * 60_000;
 
     this.connected = false;
     this.paused = false;
@@ -198,6 +208,7 @@ export class McRuntime {
     this._desiredConnected = false;
     this._wakeController = null;
     this._lastActivityOrHumanAtMs = this.nowFn();
+    this._soloSinceMs = null;
     this._consecutiveReconnectFails = 0;
     this._activeGoalCancel = null;
     this._prevHealth = null;
@@ -247,6 +258,7 @@ export class McRuntime {
     this._stopped = true;
     this._desiredConnected = false;
     this._manualDisconnect = true;
+    this._soloSinceMs = null;
     this._cancelWakePoll();
     this._clearReconnectTimer();
     this._stopCompanionLoop();
@@ -361,8 +373,21 @@ export class McRuntime {
     if (this._hasOtherPlayer(bot)) {
       this._lastActivityOrHumanAtMs = this.nowFn();
     }
+    this._syncSoloClock(bot);
     if (dimChanged) {
       this._emitSnapshot();
+    }
+  }
+
+  _syncSoloClock(bot = this.bot) {
+    if (!bot || !this.connected) {
+      this._soloSinceMs = null;
+      return;
+    }
+    if (this._hasOtherPlayer(bot)) {
+      this._soloSinceMs = null;
+    } else if (this._soloSinceMs === null) {
+      this._soloSinceMs = this.nowFn();
     }
   }
 
@@ -433,6 +458,23 @@ export class McRuntime {
         return;
       }
       this._refreshFromBot();
+      if (
+        this.connected &&
+        this.soloMaxSessionMs > 0 &&
+        !this._hasOtherPlayer(this.bot) &&
+        this._soloSinceMs !== null &&
+        this.nowFn() - this._soloSinceMs >= this.soloMaxSessionMs
+      ) {
+        this._cancelActiveGoal();
+        this._desiredConnected = false;
+        this._manualDisconnect = true;
+        this._clearReconnectTimer();
+        this._teardownBot(true);
+        this.activity = "待机";
+        this._emitMilestone("mc_idle_disconnected", "normal", { reason: "solo_session_limit" });
+        this._emitSnapshot();
+        return;
+      }
       if (
         this.connected &&
         !this._activeGoalCancel &&
@@ -966,6 +1008,7 @@ export class McRuntime {
       this._reconnectAttempts = 0;
       this._consecutiveReconnectFails = 0;
       this._lastActivityOrHumanAtMs = this.nowFn();
+      this._syncSoloClock(bot);
       this.dimension = sanitizeMcText(bot.game?.dimension || "overworld", 24) || "overworld";
       this.pos = this._vecToTuple(bot.entity?.position);
       this.health = readNonNegativeFinite(bot.health);
@@ -1043,9 +1086,27 @@ export class McRuntime {
       this._emitSnapshot();
     });
 
+    bot.on("playerJoined", (player) => {
+      if (this.bot !== bot || !this.connected) return;
+      if (
+        this._hasOtherPlayer(this.bot) ||
+        (player && typeof player.username === "string" && player.username && player.username !== bot.username)
+      ) {
+        this._soloSinceMs = null;
+      }
+    });
+
+    bot.on("playerLeft", () => {
+      if (this.bot !== bot || !this.connected) return;
+      this._syncSoloClock(bot);
+    });
+
     bot.on("chat", (username, message) => {
       if (this.bot !== bot) return;
       if (username === bot.username) return;
+      if (this._hasOtherPlayer(this.bot)) {
+        this._soloSinceMs = null;
+      }
       const cleanUser = sanitizeMcText(username, 40);
       const cleanMsg = sanitizeMcText(message, 80);
       if (!cleanUser && !cleanMsg) return;
@@ -1100,6 +1161,7 @@ export class McRuntime {
     this._greetedPlayers.clear();
     this.bot = null;
     this.connected = false;
+    this._soloSinceMs = null;
     this.dimension = "";
     this.pos = null;
     this.health = null;
@@ -1117,6 +1179,7 @@ export class McRuntime {
 
   _teardownBot(intentional) {
     const bot = this.bot;
+    this._soloSinceMs = null;
     if (!bot) return;
     this.bot = null;
     this._stopCompanionLoop();
@@ -1510,6 +1573,7 @@ export class McRuntime {
       this._desiredConnected = false;
       this._manualDisconnect = true;
       this._stayPut = false;
+      this._soloSinceMs = null;
       this._cancelWakePoll();
       this._clearReconnectTimer();
       this._teardownBot(true);
@@ -1581,8 +1645,8 @@ export class McRuntime {
       });
       this._refreshFromBot();
       if (outcome?.timedOut || outcome?.aborted) {
-        this.activity = this.paused ? "已暂停" : "原地待命";
-        this._emitSnapshot();
+        this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+        if (this.connected) this._emitSnapshot();
         return {
           ok: false,
           accepted: true,
@@ -1620,10 +1684,10 @@ export class McRuntime {
         return { ok: true };
       });
       this._refreshFromBot();
-      const rare = this._scanRareBlocks(bot, 24);
-      const signs = this._scanSigns(bot, 24);
-      this.activity = this.paused ? "已暂停" : "原地待命";
-      this._emitSnapshot();
+      const rare = this.connected ? this._scanRareBlocks(bot, 24) : [];
+      const signs = this.connected ? this._scanSigns(bot, 24) : [];
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -1709,8 +1773,8 @@ export class McRuntime {
       });
 
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : "原地待命";
-      this._emitSnapshot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -1784,8 +1848,8 @@ export class McRuntime {
         return { ok: true };
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : "原地待命";
-      this._emitSnapshot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
       if (outcome?.aborted && !outcome?.timedOut) {
         return {
           ok: false,

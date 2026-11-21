@@ -120,6 +120,13 @@ export function loadConfig(env = process.env) {
     240,
     "invalid_mc_idle_disconnect_minutes",
   );
+  const mcSoloMaxMinutes = parseIntEnv(
+    env.MC_SOLO_MAX_MINUTES,
+    90,
+    0,
+    480,
+    "invalid_mc_solo_max_minutes",
+  );
   const mcCompanionMode = parseBoolEnv(env.MC_COMPANION_MODE, false);
   const mcCompanionLocalChatReply = parseBoolEnv(env.MC_COMPANION_LOCAL_CHAT_REPLY, true);
 
@@ -142,6 +149,7 @@ export function loadConfig(env = process.env) {
     mcPowerdUrl,
     mcPowerdToken,
     mcIdleDisconnectMinutes,
+    mcSoloMaxMinutes,
     mcCompanionMode,
     mcCompanionLocalChatReply,
   });

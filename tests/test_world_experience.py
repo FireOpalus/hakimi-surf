@@ -7,7 +7,13 @@ import pytest
 
 from hakimi.planning_journal import PlannerJournal
 from hakimi.rest_policy import RestHoursConfig
-from hakimi.world_experience import NEWS_TTL
+from hakimi.world_experience import (
+    CHAT_BOREDOM_DELTA,
+    HOURLY_RATES,
+    NEWS_TTL,
+    OWNER_CHAT_BOREDOM_DELTA,
+    WorldExperience,
+)
 from hakimi.world_state import SCHEMA, WorldStateManager, private_event_audience
 from tests.test_social_integration import group
 
@@ -39,7 +45,7 @@ async def test_migration_elapsed_rest_and_restart(settings, store):
     restarted = WorldStateManager(settings, store, clock=lambda: end)
     await restarted.initialize()
     await asyncio.gather(*(restarted.experience.advance(end) for _ in range(4)))
-    assert (restarted.current.energy, restarted.current.boredom) == (80.5, 46)
+    assert (restarted.current.energy, restarted.current.boredom) == (80.5, 52)
     assert restarted.current.mood == "sleeping"
     rows = await store.all("SELECT reason,energy_after-energy_before AS d FROM world_changes")
     assert sum(r["d"] for r in rows if r["reason"] == "sleep") == 30
@@ -351,7 +357,7 @@ async def test_living_states_longing_interest_circadian_and_owner_zero_social_co
     # 4. Elapsed 10 hours without Owner raises owner_longing; touching Owner resets it to 0
     later = now + 10 * 3600
     prefs_later = await x.preferences(later)
-    assert prefs_later["owner_longing"] == 48
+    assert prefs_later["owner_longing"] == 80
     await x.touch_owner(later)
     assert (await x.preferences(later))["owner_longing"] == 0
 
@@ -389,3 +395,27 @@ async def test_mc_online_companion_sets_medium_focus_and_releases(settings, stor
     assert world.current.focus_level == "LOW"
     assert world.current.mood == "calm"
     assert (await x.view(now))["actual"]["state"] == "idle"
+
+
+async def test_boredom_deltas_idle_rate_and_owner_longing_slope(settings, store, message):
+    assert CHAT_BOREDOM_DELTA == -2
+    assert OWNER_CHAT_BOREDOM_DELTA == -3
+    assert HOURLY_RATES["idle"] == (-3, 24)
+    now = stamp(14)
+    assert WorldExperience._owner_longing(now - 7200, now) == 0
+    assert WorldExperience._owner_longing(now - 5 * 3600, now) == 30
+    assert WorldExperience._owner_longing(now - 10 * 3600, now) == 80
+    assert WorldExperience._owner_longing(now - 15 * 3600, now) == 100
+
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    x = world.experience
+    async with store.transaction():
+        await x.confirmed_tx(group(message), "grp-1", now, ["嗨"])
+    await world.refresh()
+    assert world.current.boredom == 18
+
+    async with store.transaction():
+        await x.confirmed_tx(message, "owner-1", now, ["在呢"])
+    await world.refresh()
+    assert world.current.boredom == 15

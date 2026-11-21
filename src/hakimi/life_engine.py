@@ -52,6 +52,9 @@ from .world_state import (
 log = logging.getLogger("hakimi")
 
 GROUP_SCRUBBED_INTENT_NOTE = "去群里看看大家在聊什么，顺势自然接话或结合公开见闻互动"
+NEAR_HORIZON_SECONDS = 3 * 3600
+ACTIVE_SESSION_REVIEW_SECONDS = 60 * 60
+SESSION_EXIT_COOLDOWN_SECONDS = 120.0
 
 
 def _parse_local_due(raw: str, local_now: datetime, zone: ZoneInfo) -> float:
@@ -85,8 +88,8 @@ class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
     quiet_hours: str = "23:30-08:30"
     active_hours: str = Field(default="09:00-01:00", exclude=True)
     morning_thinking_level: Literal["medium", "high"] = Field(default="medium", exclude=True)
-    planner_min_minutes: int = Field(default=120, ge=30, le=720)
-    planner_max_minutes: int = Field(default=240, ge=60, le=720)
+    planner_min_minutes: int = Field(default=60, ge=30, le=720)
+    planner_max_minutes: int = Field(default=120, ge=60, le=720)
     sleep_min_minutes: int = Field(default=360, ge=120, le=960)
     sleep_max_minutes: int = Field(default=480, ge=180, le=960)
     max_proactive_per_day: int = Field(default=6, ge=0, le=30)
@@ -390,6 +393,7 @@ class LifeBlockPlanner:
         calendar = self.calendar(local_dt.date())
         checkpoint = await self.journal.prepared() if state["prepared"] else None
         if self.store.runtime.is_resting(ts):
+            await self.engine.exit_active_session(ts, reason="sleeping")
             wake_at = self._schedule_sleep_wakeup(ts, cfg)
             self.last_plan_at = ts
             self.last_plan_source = "sleeping"
@@ -431,18 +435,23 @@ class LifeBlockPlanner:
             if not action["budget_lane"] or paid_lane_available(budget, action["budget_lane"])
         ]
         offered = {action["name"] for action in available_actions}
+        active_session = self.engine.active_session_exit()
+        near_horizon = await self._near_horizon_summary(calendar, ts)
         zone = _zone(self.s.bot_timezone)
+        current_world_state: dict[str, Any] = {
+            "current_module": current.current_module,
+            "focus_level": current.focus_level,
+            "mood": current.mood,
+            **preferences,
+            "energy": current.energy,
+            "boredom": current.boredom,
+        }
+        if active_session is not None:
+            current_world_state["active_session_exit_action"] = active_session[1].name
         planner_payload: dict[str, Any] = {
             "local_time": local_dt.strftime("%Y-%m-%d %H:%M"),
             "weekday": ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[local_dt.weekday()],
-            "current_world_state": {
-                "current_module": current.current_module,
-                "focus_level": current.focus_level,
-                "mood": current.mood,
-                **preferences,
-                "energy": current.energy,
-                "boredom": current.boredom,
-            },
+            "current_world_state": current_world_state,
             "module_sensors": sensors,
             "unconsumed_events": [
                 {
@@ -471,23 +480,27 @@ class LifeBlockPlanner:
             if recent_done:
                 planner_payload["recent_completed_intents"] = recent_done
 
-        signature = self.store.vault.digest(
-            "planner-opportunities",
-            json.dumps(
-                {
-                    "actions": sorted(offered),
-                    "day_rest_available": preferences["day_rest_available"],
-                    "modules": sorted(known_modules),
-                    "audiences": planning_context.get("available_groups", []),
-                    "owner_available": planning_context.get("owner_dm_available", False),
-                    "focus_lock": current.current_module if ws.proactive_suspended() else None,
-                    "funded": paid_lane_available(budget, PROACTIVE_LANE),
-                    "ledger_due": ledger_due_digest,
-                    "module_fp": module_fingerprints,
-                },
-                sort_keys=True,
-            ),
-        )
+        def _make_signature(near_has_pending: bool) -> str:
+            return self.store.vault.digest(
+                "planner-opportunities",
+                json.dumps(
+                    {
+                        "actions": sorted(offered),
+                        "day_rest_available": preferences["day_rest_available"],
+                        "modules": sorted(known_modules),
+                        "audiences": planning_context.get("available_groups", []),
+                        "owner_available": planning_context.get("owner_dm_available", False),
+                        "focus_lock": current.current_module if ws.proactive_suspended() else None,
+                        "funded": paid_lane_available(budget, PROACTIVE_LANE),
+                        "ledger_due": ledger_due_digest,
+                        "module_fp": module_fingerprints,
+                        "near_horizon_has_pending": near_has_pending,
+                    },
+                    sort_keys=True,
+                ),
+            )
+
+        signature = _make_signature(near_horizon["has_pending"])
         public_events = planner_payload["unconsumed_events"]
         if checkpoint:
             row, body = checkpoint
@@ -508,6 +521,8 @@ class LifeBlockPlanner:
                 and not self.store.runtime.is_resting(next_ledger_due)
             ):
                 next_at = max(ts + 5.0, next_ledger_due)
+            if active_session is not None:
+                next_at = min(next_at, ts + ACTIVE_SESSION_REVIEW_SECONDS)
             planner_funded = paid_lane_available(budget, PROACTIVE_LANE)
             restless_bored = current.boredom >= 70
             owner_longing_wake = preferences.get("owner_longing", 0) >= 65 and bool(
@@ -519,6 +534,7 @@ class LifeBlockPlanner:
                 and not public_events
                 and not restless_bored
                 and not owner_longing_wake
+                and active_session is None
                 and state["signature"] == signature
                 and ts < state["explore_at"]
                 and planner_funded
@@ -530,6 +546,8 @@ class LifeBlockPlanner:
                 if not automatic
                 else "milestone"
                 if public_events
+                else "active_session_review"
+                if active_session is not None
                 else "opportunities_changed"
                 if state["signature"] != signature
                 else "unchanged"
@@ -593,7 +611,9 @@ class LifeBlockPlanner:
             if planner_funded:
                 subject = self.store.vault.digest("life-planner", self.s.namespace)
                 try:
-                    planner_payload.update(await self.agenda_context(calendar, ts, morning))
+                    planner_payload.update(
+                        await self.agenda_context(calendar, ts, morning, near_horizon=near_horizon)
+                    )
                     with model_work("world.plan", run_id):
                         raw_plan = await self.service.ai.generate(
                             {
@@ -746,9 +766,11 @@ class LifeBlockPlanner:
             tickets.append(ticket)
 
         changes = []
+        agenda_snapshot: list[dict] | None = None
         if plan.agenda_changes and not morning and plan_source == "llm":
             async with self.store.lock:
                 items = await agenda_items(self.store, calendar.day.isoformat())
+            agenda_snapshot = items
             pending = {
                 i["id"]: i
                 for i in items
@@ -801,6 +823,24 @@ class LifeBlockPlanner:
                 self.engine.day_rest_limit(decision_at), scheduled_at + plan.rest_minutes * 60
             )
             day_rest = (decision_at, end)
+        if agenda_snapshot is None:
+            async with self.store.lock:
+                agenda_snapshot = await agenda_items(self.store, calendar.day.isoformat())
+        horizon_end = ts + NEAR_HORIZON_SECONDS
+        change_map = dict(changes)
+        post_near_has_pending = any(
+            ticket.expire_at > ts and ticket.execute_after <= horizon_end for ticket in tickets
+        ) or any(
+            (
+                change_map[item["id"]] is not None
+                and change_map[item["id"]][1] > ts
+                and change_map[item["id"]][0] <= horizon_end
+            )
+            if item["id"] in change_map
+            else (item["expire_at"] > ts and item["execute_after"] <= horizon_end)
+            for item in agenda_snapshot
+            if item["status"] in ("pending", "executing")
+        )
         enqueued_ids = await self.journal.commit(
             ws,
             run_id,
@@ -814,9 +854,11 @@ class LifeBlockPlanner:
             day_rest=day_rest,
             agenda_changes=changes,
             applied_at=applied_at,
+            final_signature=_make_signature(post_near_has_pending),
         )
         if day_rest:
             await ws.refresh()
+            await self.engine.exit_active_session(applied_at, reason="day_rest")
         if plan_source == "llm" and self.ledger is not None:
             for post_item in plan.ledger_posts[:4]:
                 if not str(post_item.summary or "").strip():
@@ -886,7 +928,41 @@ class LifeBlockPlanner:
             "next_plan_at": self.next_plan_at,
         }
 
-    async def agenda_context(self, calendar, now, morning):
+    async def _near_horizon_summary(
+        self, calendar, now: float, *, rows: list[dict] | None = None
+    ) -> dict[str, Any]:
+        horizon_end = now + NEAR_HORIZON_SECONDS
+        if rows is None:
+            async with self.store.lock:
+                rows = await agenda_items(self.store, calendar.day.isoformat())
+        pending_count = sum(
+            1
+            for r in rows
+            if r["status"] in ("pending", "executing")
+            and r["expire_at"] > now
+            and r["execute_after"] <= horizon_end
+        )
+        awake_sec = sum(
+            max(0.0, min(b, horizon_end) - max(a, now))
+            for a, b in calendar.windows
+            if b > now and a < horizon_end
+        )
+        return {
+            "window_hours": 3,
+            "window_end": self._local(horizon_end).strftime("%H:%M"),
+            "pending_count": pending_count,
+            "has_pending": pending_count > 0,
+            "awake_minutes_left": round(awake_sec / 60),
+        }
+
+    async def agenda_context(
+        self,
+        calendar,
+        now,
+        morning,
+        *,
+        near_horizon: dict[str, Any] | None = None,
+    ):
         async with self.store.lock:
             rows = await agenda_items(self.store, calendar.day.isoformat())
         remaining = [r for r in rows if r["status"] in ("pending", "executing")]
@@ -912,6 +988,11 @@ class LifeBlockPlanner:
                 for a, b in calendar.windows
                 if b > now
             ],
+            "near_horizon": (
+                near_horizon
+                if near_horizon is not None
+                else await self._near_horizon_summary(calendar, now, rows=rows)
+            ),
             "today_agenda": [
                 {
                     "id": r["id"],
@@ -1327,12 +1408,71 @@ class LifeEngine:
         self._config_lock = asyncio.Lock()
         self._gate_lock = asyncio.Lock()
         self._background: dict[str, asyncio.Task] = {}
+        self._session_exit_attempts: dict[str, float] = {}
         self.wakeup = asyncio.Event()
         self.planner = LifeBlockPlanner(service, self, clock=self.clock, rng=self.rng)
         self.gatekeeper = GatekeeperWorker(service, self, clock=self.clock)
         self.jit = JITExecutor(service, self, clock=self.clock)
         self.catalog = service.modules.catalog
         self.rules = RuleDispatcher(self, service.modules)
+
+    def active_session_exit(self) -> tuple[Any, Any] | None:
+        active_id = self.service.world_state.current.current_module
+        if not active_id or active_id == "idle":
+            self._session_exit_attempts.clear()
+            return None
+        module = self.service.modules.get(active_id)
+        exit_action = getattr(module, "session_exit_action", None) if module is not None else None
+        if not isinstance(exit_action, str) or not exit_action or module.inactive_reason:
+            return None
+        spec = self.catalog.actions.get(exit_action)
+        if (
+            spec is None
+            or self.catalog.owners.get(exit_action) != active_id
+            or spec.social
+            or self.config.action_modes.get(exit_action) == "off"
+        ):
+            return None
+        return (module, spec)
+
+    async def exit_active_session(self, now: float, *, reason: str) -> bool:
+        resolved = self.active_session_exit()
+        if resolved is None:
+            return False
+        module, spec = resolved
+        last_attempt = self._session_exit_attempts.get(module.module_id)
+        if last_attempt is not None and now - last_attempt < SESSION_EXIT_COOLDOWN_SECONDS:
+            return False
+        try:
+            args = spec.arguments()
+        except (ValidationError, TypeError):
+            return False
+        self._session_exit_attempts[module.module_id] = now
+        call = ActionCall(
+            {
+                "origin": "timer",
+                "action_name": spec.name,
+                "target_module": module.module_id,
+                "target_scope": "",
+                "arguments": args.model_dump(),
+                "exit_reason": reason,
+            },
+            args,
+            now,
+            still_allowed=lambda: True,
+        )
+        try:
+            outcome = await spec.run(call)
+        except Exception:
+            log.warning(
+                "event=session_exit_failed module=%s action=%s reason=%s",
+                module.module_id,
+                spec.name,
+                reason,
+                exc_info=True,
+            )
+            return False
+        return outcome.status == "done"
 
     async def set_module_enabled(self, module, enabled: bool) -> None:
         await self.initialize()
@@ -1637,6 +1777,10 @@ class LifeEngine:
         ts = self.clock() if now is None else now
         await self.service.world_state.experience.advance(ts)
         if self.config.enabled:
+            if self.store.runtime.is_resting(ts):
+                await self.exit_active_session(ts, reason="sleeping")
+            elif self.store.runtime.day_rest_end(ts):
+                await self.exit_active_session(ts, reason="day_rest")
             async with self._gate_lock:
                 await self.schedule_due(ts)
         rules = self._start_background("rules", self.rules.catch_up, ts)

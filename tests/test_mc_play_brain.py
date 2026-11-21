@@ -319,8 +319,12 @@ async def test_mc_play_brain_chat_screen_generate_and_dispatch_e2e(brain_bus_env
         )
 
         await _wait_until(
-            lambda: any(
-                a == "mc.dispatch_goal" and p.get("action_type") == "gather" for a, p in nt.calls
+            lambda: (
+                any(
+                    a == "mc.dispatch_goal" and p.get("action_type") == "gather"
+                    for a, p in nt.calls
+                )
+                and len(plugin.brain.recent_turns) == 1
             )
         )
         assert any(
@@ -1090,3 +1094,7 @@ async def test_mc_session_recap_unit_filters_trivial_and_blocked_sessions(
         assert await plugin.brain.flush_session_recap(reason="disconnect") is False
     finally:
         await plugin.close()
+
+
+def test_mc_brain_config_default_solo_cruise_interval() -> None:
+    assert McBrainConfig().solo_cruise_interval_seconds == 150.0

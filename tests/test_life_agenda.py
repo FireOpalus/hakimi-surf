@@ -263,3 +263,153 @@ async def test_upgrade_and_backup_keep_old_queue_identity_without_adopting_rule_
             ("2026-11-15", keep)
         ]
         assert await copy.execute_fetchall("SELECT COUNT(*) FROM scheduled_intents") == [(2,)]
+
+
+async def test_near_horizon_summary_avoids_double_query_and_wakes_when_near_window_empties(
+    dm, monkeypatch
+):
+    import hakimi.life_engine as life_engine_mod
+
+    engine = await waking_day(dm)
+    dm.time[0] = at("09:00")
+    await dm.service.world_state.experience.touch_owner(dm.clock())
+    await dm.service.world_state.update_state(energy=80, boredom=20)
+    fake = setup_model(dm, intents=[activity("09:30"), activity("18:00")])
+
+    morning = await engine.trigger_plan_once(now=dm.clock())
+    assert morning["intents_enqueued"] == 2
+    assert fake.calls[0][1]["near_horizon"] == {
+        "window_hours": 3,
+        "window_end": "12:00",
+        "pending_count": 0,
+        "has_pending": False,
+        "awake_minutes_left": 180,
+    }
+    near_id, far_id = morning["intent_ids"]
+
+    # Agenda context reuses precomputed near_horizon without a second agenda_items query
+    query_calls = 0
+    orig_agenda_items = life_engine_mod.agenda_items
+
+    async def spy_agenda_items(*args, **kwargs):
+        nonlocal query_calls
+        query_calls += 1
+        return await orig_agenda_items(*args, **kwargs)
+
+    monkeypatch.setattr(life_engine_mod, "agenda_items", spy_agenda_items)
+    cal = engine.planner.calendar(engine.planner._local(dm.clock()).date())
+    ctx_standalone = await engine.planner.agenda_context(cal, dm.clock(), False)
+    assert query_calls == 1
+    assert ctx_standalone["near_horizon"]["pending_count"] == 1
+    assert ctx_standalone["near_horizon"]["has_pending"] is True
+
+    query_calls = 0
+    pre = await engine.planner._near_horizon_summary(cal, dm.clock())
+    assert query_calls == 1
+    ctx_pre = await engine.planner.agenda_context(cal, dm.clock(), False, near_horizon=pre)
+    assert query_calls == 2  # 1 in _near_horizon_summary + 1 in agenda_context, never 3
+    assert ctx_pre["near_horizon"] == pre
+    monkeypatch.setattr(life_engine_mod, "agenda_items", orig_agenda_items)
+
+    # Automatic tick while near-horizon 09:30 item is still pending hits unchanged_state
+    dm.time[0] = at("09:20")
+    async with dm.store.transaction():
+        await dm.store.db.execute("UPDATE life_planner_clock SET next_at=?", (dm.time[0],))
+    await engine.planner.sync_wake(dm.clock())
+    skip_res = await engine.trigger_plan_once(now=dm.clock(), automatic=True)
+    assert skip_res["reason"] == "unchanged_state"
+    assert len(fake.calls) == 1
+
+    # Once 09:30 finishes, 18:00 is still pending later, but 3h near_horizon is empty -> wakes!
+    assert await dm.service.world_state.mark_intent(near_id, "done", now=at("09:35"))
+    dm.time[0] = at("10:30")
+    async with dm.store.transaction():
+        await dm.store.db.execute("UPDATE life_planner_clock SET next_at=?", (dm.time[0],))
+    await engine.planner.sync_wake(dm.clock())
+    wake_res = await engine.trigger_plan_once(now=dm.clock(), automatic=True)
+    assert wake_res["status"] == "planned" and len(fake.calls) == 2
+    assert fake.calls[1][1]["near_horizon"] == {
+        "window_hours": 3,
+        "window_end": "13:30",
+        "pending_count": 0,
+        "has_pending": False,
+        "awake_minutes_left": 180,
+    }
+    latest = (await overview(dm.store, dm.clock(), "Asia/Shanghai"))["recent_plans"][0]
+    assert latest["trigger"] == "opportunities_changed"
+    assert far_id in {i["id"] for i in fake.calls[1][1]["today_agenda"]}
+
+
+async def test_near_horizon_post_signature_tracks_cancellations_moves_and_bedtime_cap(dm):
+    engine = await waking_day(dm)
+    dm.time[0] = at("09:00")
+    await dm.service.world_state.experience.touch_owner(dm.clock())
+    await dm.service.world_state.update_state(energy=80, boredom=20)
+    fake = setup_model(dm, intents=[activity("10:30"), activity("18:00")])
+    morning = await engine.trigger_plan_once(now=dm.clock())
+    near_id, far_id = morning["intent_ids"]
+
+    # 1. Cancelling near_id via agenda_changes commits post_near_has_pending=False
+    dm.time[0] = at("10:00")
+    fake.plan_json = json.dumps(
+        {
+            **json.loads(fake.plan_json),
+            "intents": [],
+            "agenda_changes": [{"intent_id": near_id, "operation": "cancel"}],
+        }
+    )
+    await engine.trigger_plan_once(now=dm.clock())
+    dm.time[0] = at("11:05")
+    await dm.service.world_state.update_state(boredom=20)
+    async with dm.store.transaction():
+        await dm.store.db.execute("UPDATE life_planner_clock SET next_at=?", (dm.time[0],))
+    await engine.planner.sync_wake(dm.clock())
+    # Should stay unchanged_state since final_signature recorded has_pending=False
+    res_quiet = await engine.trigger_plan_once(now=dm.clock(), automatic=True)
+    assert res_quiet["reason"] == "unchanged_state"
+
+    # 2. Moving far_id (18:00) INTO near horizon (12:00 at 11:10) sets post_near_has_pending=True
+    dm.time[0] = at("11:10")
+    fake.plan_json = json.dumps(
+        {
+            **json.loads(fake.plan_json),
+            "intents": [],
+            "agenda_changes": [
+                {"intent_id": far_id, "operation": "move", "at_local_time": "12:00"}
+            ],
+        }
+    )
+    await engine.trigger_plan_once(now=dm.clock())
+    dm.time[0] = at("11:45")
+    await dm.service.world_state.update_state(boredom=20)
+    async with dm.store.transaction():
+        await dm.store.db.execute("UPDATE life_planner_clock SET next_at=?", (dm.time[0],))
+    await engine.planner.sync_wake(dm.clock())
+    res_quiet_in = await engine.trigger_plan_once(now=dm.clock(), automatic=True)
+    assert res_quiet_in["reason"] == "unchanged_state"
+
+    # 3. Moving far_id OUT of near horizon (12:00 -> 19:00) sets post_near_has_pending=False
+    dm.time[0] = at("11:50")
+    fake.plan_json = json.dumps(
+        {
+            **json.loads(fake.plan_json),
+            "intents": [],
+            "agenda_changes": [
+                {"intent_id": far_id, "operation": "move", "at_local_time": "19:00"}
+            ],
+        }
+    )
+    await engine.trigger_plan_once(now=dm.clock())
+    dm.time[0] = at("12:55")
+    await dm.service.world_state.update_state(boredom=20)
+    async with dm.store.transaction():
+        await dm.store.db.execute("UPDATE life_planner_clock SET next_at=?", (dm.time[0],))
+    await engine.planner.sync_wake(dm.clock())
+    res_quiet_out = await engine.trigger_plan_once(now=dm.clock(), automatic=True)
+    assert res_quiet_out["reason"] == "unchanged_state"
+
+    # 4. Near bedtime (22:00, rest_hours 23:20-07:30) awake_minutes_left is 80
+    cal = engine.planner.calendar(engine.planner._local(at("22:00")).date())
+    bedtime_near = await engine.planner._near_horizon_summary(cal, at("22:00"))
+    assert bedtime_near["awake_minutes_left"] == 80
+    assert bedtime_near["window_end"] == "01:00"

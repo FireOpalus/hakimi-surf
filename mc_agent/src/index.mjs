@@ -47,6 +47,7 @@ export function createMcBridgeServer(options = {}) {
     powerPollIntervalMs: options.powerPollIntervalMs,
     powerWakeTimeoutMs: options.powerWakeTimeoutMs,
     idleDisconnectMs: options.idleDisconnectMs,
+    soloMaxSessionMs: options.soloMaxSessionMs,
     companionTickMs: options.companionTickMs,
     soloWanderIntervalMs: options.soloWanderIntervalMs,
     companionReplyCooldownMs: options.companionReplyCooldownMs,

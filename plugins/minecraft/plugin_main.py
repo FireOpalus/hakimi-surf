@@ -259,11 +259,16 @@ _DISCONNECT_SCHEMA: dict[str, Any] = {
 
 _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "connect": (
-        "登录进入 Minecraft 服务器上线游玩（如服务端休眠会自动唤醒）",
+        "登录进入 Minecraft 服务器上线游玩（白天精力充沛、想自己挖矿盖房探索或"
+        "陪玩家玩时均可安排；如服务端休眠会自动唤醒）",
         _CONNECT_SCHEMA,
         ConnectArgs,
     ),
-    "disconnect": ("主动退出 Minecraft 服务器下线待机休息", _DISCONNECT_SCHEMA, DisconnectArgs),
+    "disconnect": (
+        "主动退出 Minecraft 服务器下线待机休息（玩够了、精力偏低或准备换其他活动时使用）",
+        _DISCONNECT_SCHEMA,
+        DisconnectArgs,
+    ),
     "build_plan": ("在记事本里记下接下来想在 Minecraft 里搭的建筑点子", _BUILD_SCHEMA, BuildArgs),
     "explore": ("在 Minecraft 世界里四处探索地形与新发现", {}, NoArgs),
     "mine": ("在游戏里挖掘指定矿石或方块", _BLOCK_SCHEMA, BlockArgs),
@@ -364,6 +369,7 @@ class MinecraftPlugin:
             admin_panel="minecraft",
             attention_level="HIGH",
             event_subscriptions=("bili_video_watched", "bili_mc_inspiration"),
+            session_exit_action="mc.disconnect",
             reconnect_min=reconnect_min,
             reconnect_max=reconnect_max,
         )
@@ -950,7 +956,9 @@ class MinecraftPlugin:
                 artifacts={"not_dispatched": True},
             )
 
+        recap_reason = str(ticket.get("recap_reason") or "").strip() or "disconnect"
         clean_ticket = {**ticket, **validated.model_dump()}
+        clean_ticket.pop("recap_reason", None)
         was_node_online = self.node_online
         try:
             if verb in _ADMIN_ONLY_VERBS:
@@ -996,7 +1004,7 @@ class MinecraftPlugin:
         elif verb == "chat" and ok and isinstance(validated, ChatArgs):
             self.brain.record_direct_chat(validated.message)
         elif verb == "disconnect":
-            await self.brain.flush_session_recap(reason="disconnect")
+            await self.brain.flush_session_recap(reason=recap_reason)
             self.session_intent = ""
             self.brain.on_disconnect()
 
@@ -1034,7 +1042,33 @@ class MinecraftPlugin:
         ):
             args["topic"] = _sanitize_text(str(evidence["payload"].get("title", "")), max_tokens=20)
 
-        res = await self.dispatch_goal({"action_type": verb, **args})
+        exit_reason = str(params.get("exit_reason") or "").strip()
+        if (
+            verb == "disconnect"
+            and self.snapshot.connected
+            and exit_reason in {"sleeping", "day_rest"}
+            and self.snapshot.nearby_players
+        ):
+            goodbye_msg = (
+                "时间不早啦，猫猫困了先下线睡觉去咯，晚安喵~"
+                if exit_reason == "sleeping"
+                else "猫猫有点累了，先下线小憩一会儿，待会儿见喵~"
+            )
+            try:
+                chat_res = await self._call_bridge(
+                    "mc.dispatch_goal",
+                    {"action_type": "chat", "message": goodbye_msg},
+                )
+                if isinstance(chat_res, dict) and chat_res.get("ok"):
+                    self.brain.record_direct_chat(goodbye_msg)
+            except PluginRpcError:
+                pass
+
+        recap_reason = exit_reason if (verb == "disconnect" and exit_reason) else "disconnect"
+        goal_ticket: dict[str, Any] = {"action_type": verb, **args}
+        if verb == "disconnect":
+            goal_ticket["recap_reason"] = recap_reason
+        res = await self.dispatch_goal(goal_ticket)
         reason = res.get("reason")
         artifacts = res.get("artifacts") if isinstance(res.get("artifacts"), dict) else {}
         if res.get("ok"):

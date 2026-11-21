@@ -174,6 +174,7 @@ class PluginRuntimeConfig(BaseModel):
     capabilities: tuple[str, ...] = ()
     event_subscriptions: tuple[str, ...] = ()
     chat_platforms: tuple[str, ...] = ()
+    session_exit_action: str | None = None
     reconnect_min: float = Field(default=1.0, gt=0.0)
     reconnect_max: float = Field(default=30.0, gt=0.0)
     heartbeat_seconds: float = Field(default=20.0, gt=0.0)
@@ -194,6 +195,15 @@ class PluginRuntimeConfig(BaseModel):
     def _validate_plugin_id(cls, value: str) -> str:
         if not _PLUGIN_ID_RE.fullmatch(value):
             raise ValueError("invalid plugin_id")
+        return value
+
+    @field_validator("session_exit_action")
+    @classmethod
+    def _validate_session_exit_action(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not _ACTION_NAME_RE.fullmatch(value):
+            raise ValueError("invalid session_exit_action")
         return value
 
 
@@ -510,7 +520,7 @@ class HakimiPluginClient:
         }
 
     def hello_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "type": "plugin.hello",
             "protocol_version": 1,
             "display_name": self.config.display_name,
@@ -526,6 +536,9 @@ class HakimiPluginClient:
             "initial_status": dict(self._last_status),
             "event_subscriptions": list(self.config.event_subscriptions),
         }
+        if self.config.session_exit_action is not None:
+            payload["session_exit_action"] = self.config.session_exit_action
+        return payload
 
     async def _ws_send(self, ws: Any, frame: dict[str, Any]) -> None:
         raw = json.dumps(frame, ensure_ascii=False, allow_nan=False)

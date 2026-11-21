@@ -588,6 +588,7 @@ class _PluginHelloFrame(BaseModel):
     configuration_issue: str | None = None
     initial_status: dict[str, Any] = Field(default_factory=dict)
     event_subscriptions: list[str] = Field(default_factory=list, max_length=16)
+    session_exit_action: str | None = None
 
     @field_validator("protocol_version")
     @classmethod
@@ -633,6 +634,15 @@ class _PluginHelloFrame(BaseModel):
                 seen.add(item)
                 deduped.append(item)
         return deduped
+
+    @field_validator("session_exit_action")
+    @classmethod
+    def _check_session_exit_action(cls, val: str | None) -> str | None:
+        if val is None or val == "":
+            return None
+        if not _ACTION_NAME_RE.fullmatch(val):
+            raise ValueError("invalid session_exit_action")
+        return val
 
 
 def _build_action_args_model(action_name: str, raw_args: dict[str, Any]) -> type[BaseModel]:
@@ -823,6 +833,7 @@ class RemoteModuleProxy(BaseModule):
         configuration_issue: str | None = None,
         initial_status: dict[str, Any] | None = None,
         action_timeouts: dict[str, float] | None = None,
+        session_exit_action: str | None = None,
     ) -> None:
         super().__init__(settings)
         self.module_id = plugin_id
@@ -855,6 +866,7 @@ class RemoteModuleProxy(BaseModule):
         self._action_unavailable: dict[str, str] = {}
         self._current_activity: str | None = None
         self._action_timeouts: dict[str, float] = dict(action_timeouts or {})
+        self.session_exit_action: str | None = session_exit_action
 
     @property
     def configuration_issue(self) -> str | None:
@@ -1955,17 +1967,24 @@ class PluginBus:
                 if not call.still_allowed():
                     return Outcome("gated_skip", "action_no_longer_eligible")
                 args_dict = call.args.model_dump(mode="json")
+                rpc_params: dict[str, Any] = {
+                    "action": action_name,
+                    "arguments": args_dict,
+                    "origin": str(call.ticket.get("origin") or "planner"),
+                    "target_scope": str(call.ticket.get("target_scope") or ""),
+                    "now": call.now,
+                }
+                if exit_reason := str(call.ticket.get("exit_reason") or "").strip():
+                    clean_exit_reason = sanitize_sensor_text(exit_reason, self.s, max_tokens=12)[
+                        :32
+                    ]
+                    if clean_exit_reason:
+                        rpc_params["exit_reason"] = clean_exit_reason
                 try:
                     resp = await self._rpc(
                         session,
                         "action.run",
-                        {
-                            "action": action_name,
-                            "arguments": args_dict,
-                            "origin": str(call.ticket.get("origin") or "planner"),
-                            "target_scope": str(call.ticket.get("target_scope") or ""),
-                            "now": call.now,
-                        },
+                        rpc_params,
                         timeout=action_timeout,
                     )
                 except Rejected as exc:
@@ -4093,6 +4112,17 @@ class PluginBus:
 
             try:
                 actions, action_timeouts = self._build_actions(session, hello.actions)
+                if hello.session_exit_action is not None:
+                    exit_spec = next(
+                        (spec for spec in actions if spec.name == hello.session_exit_action),
+                        None,
+                    )
+                    if exit_spec is None or exit_spec.social:
+                        raise Rejected("plugin_invalid_schema")
+                    try:
+                        exit_spec.arguments()
+                    except (ValidationError, TypeError, ValueError):
+                        raise Rejected("plugin_invalid_schema") from None
                 scenes = self._build_thinking_scenes(pid, hello.thinking_scenes)
                 saved_enabled = await self._load_module_switch(pid)
                 clean_disp = sanitize_sensor_text(
@@ -4120,6 +4150,7 @@ class PluginBus:
                     configuration_issue=hello.configuration_issue,
                     initial_status=hello.initial_status,
                     action_timeouts=action_timeouts,
+                    session_exit_action=hello.session_exit_action,
                 )
                 session.proxy = proxy
                 modules = getattr(self.service, "modules", None)

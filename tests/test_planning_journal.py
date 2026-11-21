@@ -136,3 +136,61 @@ async def test_first_upgrade_honors_observed_recent_plan_without_counting_an_uns
     journal = PlannerJournal(dm.store)
     assert (await journal.initialize(dm.clock(), initial_interval=7200))["next_at"] == then + 7200
     assert not await dm.store.one("SELECT 1 FROM life_plan_runs")
+
+
+async def test_journal_commit_persists_optional_final_signature(dm):
+    from hakimi.planning_journal import PlannerJournal
+
+    journal = PlannerJournal(dm.store)
+    now = dm.clock()
+    await journal.initialize(now, initial_interval=3600)
+    ws = dm.service.world_state
+
+    run1 = await journal.start(
+        "2026-11-14",
+        now,
+        trigger="revision",
+        next_at=now + 3600,
+        signature="pre-sig",
+        explore_at=now + 7200,
+        events=[],
+    )
+    assert run1 is not None
+    await journal.commit(
+        ws,
+        run1,
+        tickets=[],
+        candidates=0,
+        source="llm",
+        outcome="model_chose_idle",
+        reasons={},
+        avoided=False,
+        final_signature="post-sig",
+    )
+    clock_row = await dm.store.one("SELECT signature FROM life_planner_clock WHERE id=1")
+    run_row = await dm.store.one("SELECT signature FROM life_plan_runs WHERE id=?", (run1,))
+    assert clock_row[0] == "post-sig"
+    assert run_row[0] == "pre-sig"
+
+    run2 = await journal.start(
+        "2026-11-14",
+        now + 10,
+        trigger="revision",
+        next_at=now + 3610,
+        signature="keep-sig",
+        explore_at=now + 7210,
+        events=[],
+    )
+    assert run2 is not None
+    await journal.commit(
+        ws,
+        run2,
+        tickets=[],
+        candidates=0,
+        source="llm",
+        outcome="model_chose_idle",
+        reasons={},
+        avoided=False,
+    )
+    clock_row2 = await dm.store.one("SELECT signature FROM life_planner_clock WHERE id=1")
+    assert clock_row2[0] == "keep-sig"

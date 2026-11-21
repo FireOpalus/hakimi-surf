@@ -1343,3 +1343,221 @@ test("companion mode with MC_COMPANION_LOCAL_CHAT_REPLY=false: emits mc_player_c
     await server.close();
   }
 });
+test("config parses MC_SOLO_MAX_MINUTES default 90, 0 disable, and rejects invalid bounds", () => {
+  const defaults = loadConfig({ MC_BRIDGE_TOKEN: VALID_TOKEN });
+  assert.equal(defaults.mcSoloMaxMinutes, 90);
+
+  const disabled = loadConfig({
+    MC_BRIDGE_TOKEN: VALID_TOKEN,
+    MC_SOLO_MAX_MINUTES: "0",
+  });
+  assert.equal(disabled.mcSoloMaxMinutes, 0);
+
+  const maxValid = loadConfig({
+    MC_BRIDGE_TOKEN: VALID_TOKEN,
+    MC_SOLO_MAX_MINUTES: "480",
+  });
+  assert.equal(maxValid.mcSoloMaxMinutes, 480);
+
+  for (const bad of ["481", "-1", "abc"]) {
+    assert.throws(
+      () => loadConfig({ MC_BRIDGE_TOKEN: VALID_TOKEN, MC_SOLO_MAX_MINUTES: bad }),
+      (err) => err instanceof ProtocolError && err.code === "invalid_mc_solo_max_minutes",
+    );
+  }
+});
+
+test("solo session hard cap disconnects active solo bot with solo_session_limit even when goals reset idle timer", async () => {
+  const { factory } = createMockBotFactory();
+  let fakeNowMs = 1_700_000_000_000;
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "true",
+    },
+    createBotFn: factory,
+    snapshotIntervalMs: 25,
+    idleDisconnectMs: 120,
+    soloMaxSessionMs: 300,
+    nowFn: () => fakeNowMs,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
+    assert.equal(server.runtime._soloSinceMs, 1_700_000_000_000);
+
+    // Repeated in-game goals keep resetting idleDisconnectMs (120ms), but MUST NOT reset _soloSinceMs
+    for (let i = 1; i <= 3; i += 1) {
+      fakeNowMs += 80;
+      const res = await rpcCall(ws, inbox, `solo-goal-${i}`, "mc.dispatch_goal", {
+        action_type: i % 2 === 1 ? "goto" : "observe",
+        x: 10 + i,
+        y: 64,
+        z: -5 + i,
+      });
+      assert.equal(res.ok, true);
+      assert.equal(res.data.ok, true);
+      await new Promise((r) => setTimeout(r, 45));
+      assert.equal(server.runtime.connected, true);
+      assert.equal(server.runtime._soloSinceMs, 1_700_000_000_000);
+    }
+
+    // Total solo duration reaches 320ms >= 300ms while time since last goal is 80ms < 120ms
+    fakeNowMs += 80;
+    const soloMilestone = await inbox.next(
+      (m) => m.event === "mc.milestone" && m.payload.event_type === "mc_idle_disconnected",
+      2000,
+    );
+    assert.equal(soloMilestone.payload.importance, "normal");
+    assert.equal(soloMilestone.payload.payload.reason, "solo_session_limit");
+
+    const discSnap = await inbox.next(
+      (m) => m.event === "mc.snapshot" && m.payload.connected === false && m.payload.activity === "待机",
+      2000,
+    );
+    assert.equal(discSnap.payload.connected, false);
+    assert.equal(server.runtime.connected, false);
+    assert.equal(server.runtime._soloSinceMs, null);
+    assert.equal(server.runtime.activity, "待机");
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("human player joining before soloMaxSessionMs clears _soloSinceMs and prevents disconnect while present", async () => {
+  const { factory, getLastBot } = createMockBotFactory();
+  let fakeNowMs = 1_700_000_000_000;
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "true",
+    },
+    createBotFn: factory,
+    snapshotIntervalMs: 25,
+    idleDisconnectMs: 150,
+    soloMaxSessionMs: 250,
+    nowFn: () => fakeNowMs,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
+    const bot = getLastBot();
+    assert.equal(server.runtime._soloSinceMs, 1_700_000_000_000);
+
+    fakeNowMs += 100;
+    bot.players = {
+      HakimiBot: { username: "HakimiBot" },
+      M1haiier: { username: "M1haiier" },
+    };
+    bot.emit("playerJoined", { username: "M1haiier" });
+    assert.equal(server.runtime._soloSinceMs, null);
+
+    // Advance far past soloMaxSessionMs while human stays online -> must not disconnect
+    fakeNowMs += 1_000;
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(server.runtime.connected, true);
+    assert.equal(server.runtime._soloSinceMs, null);
+
+    // Human chat also preserves cleared _soloSinceMs
+    bot.emit("chat", "M1haiier", "hi hakimi");
+    assert.equal(server.runtime._soloSinceMs, null);
+
+    // Human leaves -> fresh solo clock starts from leave time, does not immediately disconnect
+    bot.players = {
+      HakimiBot: { username: "HakimiBot" },
+    };
+    bot.emit("playerLeft", { username: "M1haiier" });
+    assert.equal(server.runtime._soloSinceMs, fakeNowMs);
+
+    fakeNowMs += 100;
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(server.runtime.connected, true);
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("solo_session_limit cancels in-flight slow goal cleanly and remains in 待机", async () => {
+  const { factory, getLastBot } = createMockBotFactory({ slowGoto: true, slowGotoMs: 2000 });
+  let fakeNowMs = 1_700_000_000_000;
+
+  const server = createMcBridgeServer({
+    env: {
+      MC_BRIDGE_HOST: "127.0.0.1",
+      MC_BRIDGE_PORT: "0",
+      MC_BRIDGE_TOKEN: VALID_TOKEN,
+      MC_ENABLED: "true",
+      MC_HOST: "mock.mc.internal",
+      MC_AUTO_CONNECT: "true",
+    },
+    createBotFn: factory,
+    snapshotIntervalMs: 25,
+    idleDisconnectMs: 0,
+    soloMaxSessionMs: 150,
+    nowFn: () => fakeNowMs,
+  });
+
+  const addr = await server.start();
+  const { ws, inbox } = await connectWs(`ws://127.0.0.1:${addr.port}/ws`, {
+    Authorization: `Bearer ${VALID_TOKEN}`,
+  });
+
+  try {
+    await inbox.next((m) => m.event === "mc.hello");
+    await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
+    const bot = getLastBot();
+
+    const goalPromise = rpcCall(ws, inbox, "slow-solo-goal", "mc.dispatch_goal", {
+      action_type: "goto",
+      x: 50,
+      y: 64,
+      z: 50,
+    });
+    await inbox.next((m) => m.event === "mc.snapshot" && m.payload.active_task === "goto");
+
+    fakeNowMs += 200;
+    const soloMilestone = await inbox.next(
+      (m) => m.event === "mc.milestone" && m.payload.event_type === "mc_idle_disconnected",
+      2000,
+    );
+    assert.equal(soloMilestone.payload.payload.reason, "solo_session_limit");
+
+    const goalRes = await goalPromise;
+    assert.equal(goalRes.ok, true);
+    assert.equal(goalRes.data.ok, false);
+    assert.equal(goalRes.data.reason, "mc_goal_cancelled");
+    assert.equal(server.runtime.connected, false);
+    assert.equal(server.runtime.activity, "待机");
+    assert.ok(bot.stoppedCalls >= 1);
+
+    ws.close();
+  } finally {
+    await server.close();
+  }
+});

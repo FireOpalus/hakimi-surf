@@ -224,6 +224,7 @@ class PlannerJournal:
         day_rest=None,
         agenda_changes=(),
         applied_at=None,
+        final_signature: str | None = None,
     ):
         async with self.store.transaction():
             row = await self.store.one(
@@ -309,7 +310,11 @@ class PlannerJournal:
             )
             await self.store.db.execute(
                 "UPDATE life_planner_clock SET next_at=?,signature=?,explore_at=? WHERE id=1",
-                (row["next_at"], row["signature"], row["explore_at"]),
+                (
+                    row["next_at"],
+                    final_signature if final_signature is not None else row["signature"],
+                    row["explore_at"],
+                ),
             )
             if await world.remaining_milestone_tx():
                 # A high event can arrive after reading the batch or beyond its 20-row limit.

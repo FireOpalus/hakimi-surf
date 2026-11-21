@@ -18,14 +18,14 @@ SOCIAL_LOW = 30
 CHAT_SOCIAL_COST = 1.25
 OWNER_CHAT_SOCIAL_COST = 0.0
 CHAT_ENERGY_COST = 0.4
-CHAT_BOREDOM_DELTA = -4
-OWNER_CHAT_BOREDOM_DELTA = -6
+CHAT_BOREDOM_DELTA = -2
+OWNER_CHAT_BOREDOM_DELTA = -3
 AWAKE_SECONDS_PER_POINT = 600
 REST_SECONDS_PER_POINT = 120
 HOURLY_RATES = {
     "sleep": (15, -4),
     "day_rest": (10, -4),
-    "idle": (-3, 12),
+    "idle": (-3, 24),
     "mc_work": (-8, -6),
     "mc_play": (-4, -10),
 }
@@ -523,7 +523,7 @@ class WorldExperience:
         if not last_owner_at or last_owner_at <= 0 or now - last_owner_at <= 7200:
             return 0
         hours_apart = (now - last_owner_at) / 3600.0
-        return min(100, round((hours_apart - 2.0) * 6))
+        return min(100, round((hours_apart - 2.0) * 10))
 
     def circadian_tag(self, now: float, *, energy: float = 80.0) -> str:
         local_dt = datetime.fromtimestamp(now, self.zone)

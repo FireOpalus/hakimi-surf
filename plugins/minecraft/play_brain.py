@@ -230,7 +230,7 @@ class McBrainConfig:
     chat_cooldown_seconds: float = 2.5
     event_cooldown_seconds: float = 8.0
     cruise_interval_seconds: float = 45.0
-    solo_cruise_interval_seconds: float = 60.0
+    solo_cruise_interval_seconds: float = 150.0
     max_calls_per_10m: int = 12
     max_goto_distance: float = 128.0
     max_history_turns: int = 5

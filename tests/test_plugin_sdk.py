@@ -1064,3 +1064,29 @@ async def test_phase3_ai_helpers_notify_telemetry_and_acks():
         assert await ping_task == {"available": False, "hard_stop": True}
     finally:
         await client.stop()
+
+
+def test_session_exit_action_config_and_hello_payload():
+    async def noop(params: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "done"}
+
+    action = ActionSpec(name="weather_pilot.stop", description="Stop pilot", handler=noop)
+
+    cfg_default = _make_config()
+    assert cfg_default.session_exit_action is None
+    hello_default = HakimiPluginClient(cfg_default, actions=[action]).hello_payload()
+    assert "session_exit_action" not in hello_default
+
+    cfg_empty = _make_config(session_exit_action="")
+    assert cfg_empty.session_exit_action is None
+    hello_empty = HakimiPluginClient(cfg_empty, actions=[action]).hello_payload()
+    assert "session_exit_action" not in hello_empty
+
+    cfg_set = _make_config(session_exit_action="weather_pilot.stop")
+    assert cfg_set.session_exit_action == "weather_pilot.stop"
+    hello_set = HakimiPluginClient(cfg_set, actions=[action]).hello_payload()
+    assert hello_set["session_exit_action"] == "weather_pilot.stop"
+
+    for bad_action in ("stop", "Bad.Action", "weather_pilot.stop!", "   ", "1bad.stop"):
+        with pytest.raises(ValidationError):
+            _make_config(session_exit_action=bad_action)
