@@ -20,11 +20,13 @@ from .audio import (
     AfplayAudioPlayer,
     EnergyVadDetector,
     FfmpegMicCapture,
+    RawStreamAudioPlayer,
     list_avfoundation_audio_devices,
     pcm16_to_wav_bytes,
 )
 from .companion_ws import CompanionWsClient
 from .config import DEFAULT_ENV_FILE, VoiceClientConfig, load_config
+from .gateway_ws import VoiceGatewayError, VoiceGatewayWsClient
 from .providers import (
     ProviderError,
     SiliconFlowTTS,
@@ -37,13 +39,18 @@ def build_parser() -> argparse.ArgumentParser:
     """Create the argument parser for `python -m voice_client`."""
     parser = argparse.ArgumentParser(
         prog="hakimi-voice",
-        description="哈基米 Mac 实时语音伴随客户端 (/ws/companion + SiliconFlow STT/TTS)",
+        description="哈基米 Mac 实时语音伴随客户端 (Voice Gateway / /ws/companion)",
     )
     parser.add_argument(
         "--env-file",
         type=Path,
         default=None,
         help=f".env 配置文件路径 (默认: {DEFAULT_ENV_FILE})",
+    )
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="忽略 VOICE_GATEWAY_URL，强制直连 /ws/companion 与本地 STT/TTS",
     )
     parser.add_argument(
         "--mode",
@@ -127,7 +134,33 @@ async def check_ws(
     *,
     connect_factory: Any = None,
 ) -> int:
-    """Verify /ws/companion handshake, ping RTT, and clean session teardown."""
+    """Verify gateway or /ws/companion handshake, ping RTT, and clean teardown."""
+    if config.use_gateway:
+        if connect_factory is None:
+            config.require_gateway()
+        gw_client = VoiceGatewayWsClient(config, connect_factory=connect_factory)
+        await gw_client.connect()
+        try:
+            ready = await gw_client.start_session()
+            pong = await gw_client.ping_info(timeout=10.0)
+            ended = await gw_client.stop_session(timeout=5.0)
+            mode = ready.get("mode", config.session_mode)
+            sid = str(ready.get("session_id") or ended.get("session_id") or "")[:8]
+            rtt_ms = float(pong.get("rtt_ms") or 0.0)
+            upstream_val = pong.get("upstream_ms")
+            upstream_str = f"{float(upstream_val):.1f}" if upstream_val is not None else "-"
+            stt_name = str(ready.get("stt_provider") or config.stt_provider or "-")
+            tts_name = str(ready.get("tts_provider") or config.tts_provider or "-")
+            tts_model = str(ready.get("tts_model") or ready.get("output_format") or "-")
+            print(
+                f"✅ 语音网关握手正常: mode={mode} session={sid or '-'} "
+                f"rtt={rtt_ms:.1f}ms (upstream={upstream_str}ms, "
+                f"stt={stt_name}, tts={tts_name}/{tts_model})"
+            )
+            return 0
+        finally:
+            await gw_client.close()
+
     if connect_factory is None:
         config.require_ws()
     client = CompanionWsClient(config, connect_factory=connect_factory)
@@ -144,8 +177,40 @@ async def check_ws(
         await client.close()
 
 
-async def test_tts(config: VoiceClientConfig, text: str) -> int:
-    """Synthesize and play one test phrase via the configured TTS provider."""
+async def test_tts(
+    config: VoiceClientConfig,
+    text: str,
+    *,
+    connect_factory: Any = None,
+) -> int:
+    """Synthesize and play one test phrase via gateway or local TTS provider."""
+    if config.use_gateway:
+        if connect_factory is None:
+            config.require_gateway()
+        gw_client = VoiceGatewayWsClient(config, connect_factory=connect_factory)
+        try:
+            player = RawStreamAudioPlayer(enable_streaming=config.tts_streaming)
+        except TypeError:
+            player = RawStreamAudioPlayer()
+        await gw_client.connect()
+        try:
+            ttfb_ms, total_ms, total_bytes, fmt = await player.play_stream_once(
+                lambda on_chunk: gw_client.synthesize_once(
+                    text,
+                    output_format=config.gateway_output_format or None,
+                    on_chunk=on_chunk,
+                )
+            )
+            mode = "流式ffplay" if getattr(player, "streaming_active", False) else "afplay"
+            print(
+                f"✅ TTS 播放完成 ({mode}, 首字节={ttfb_ms:.0f}ms, "
+                f"总计={total_ms:.0f}ms, {total_bytes} bytes, {fmt})"
+            )
+            return 0
+        finally:
+            await player.stop()
+            await gw_client.close()
+
     config.require_tts()
     tts = build_tts_provider(config)
     try:
@@ -170,10 +235,7 @@ async def test_tts(config: VoiceClientConfig, text: str) -> int:
         await tts.aclose()
 
 
-async def test_stt(config: VoiceClientConfig, *, duration_seconds: float = 4.0) -> int:
-    """Capture a short microphone clip and print STT transcription."""
-    config.require_stt()
-    stt = build_stt_provider(config)
+async def _capture_mic_wav(config: VoiceClientConfig, duration_seconds: float) -> bytes | None:
     mic = FfmpegMicCapture(
         device=config.audio_input_device,
         sample_rate=config.sample_rate,
@@ -194,15 +256,55 @@ async def test_stt(config: VoiceClientConfig, *, duration_seconds: float = 4.0) 
         pcm = b"".join(chunks)[:target_bytes]
         if not pcm:
             print("⚠️ 未采集到麦克风音频。")
+            return None
+        return pcm16_to_wav_bytes(pcm, sample_rate=config.sample_rate)
+    finally:
+        await mic.stop()
+
+
+async def test_stt(
+    config: VoiceClientConfig,
+    *,
+    duration_seconds: float = 4.0,
+    connect_factory: Any = None,
+) -> int:
+    """Capture a short microphone clip and print STT transcription."""
+    if config.use_gateway:
+        if connect_factory is None:
+            config.require_gateway()
+        wav = await _capture_mic_wav(config, duration_seconds)
+        if wav is None:
             return 1
-        wav = pcm16_to_wav_bytes(pcm, sample_rate=config.sample_rate)
+        gw_client = VoiceGatewayWsClient(config, connect_factory=connect_factory)
+        await gw_client.connect()
+        try:
+            t0 = time.perf_counter()
+            text = (
+                await gw_client.transcribe_once(
+                    wav,
+                    fmt="wav",
+                    sample_rate=config.sample_rate,
+                    channels=1,
+                )
+            ).strip()
+            stt_ms = (time.perf_counter() - t0) * 1000.0
+            print(f"📝 识别文本 ({stt_ms:.0f}ms): {text or '(未识别到有效语音)'}")
+            return 0
+        finally:
+            await gw_client.close()
+
+    config.require_stt()
+    stt = build_stt_provider(config)
+    try:
+        wav = await _capture_mic_wav(config, duration_seconds)
+        if wav is None:
+            return 1
         t0 = time.perf_counter()
         text = (await stt.transcribe(wav)).strip()
         stt_ms = (time.perf_counter() - t0) * 1000.0
         print(f"📝 识别文本 ({stt_ms:.0f}ms): {text or '(未识别到有效语音)'}")
         return 0
     finally:
-        await mic.stop()
         await stt.aclose()
 
 
@@ -245,16 +347,26 @@ def _join_turn_chunks(parts: list[str]) -> str:
     return "".join(out)
 
 
-def _print_banner(config: VoiceClientConfig, ready: dict[str, Any], voice_mode: str) -> None:
+def _print_banner(
+    config: VoiceClientConfig,
+    ready: dict[str, Any],
+    voice_mode: str,
+    *,
+    gateway_mode: bool = False,
+) -> None:
     mode_label = ready.get("mode", config.session_mode)
     game_label = config.game_title or "日常连麦"
-    buf_label = "整轮合播(不切片)" if config.tts_buffer_mode == "turn" else "逐句流式"
+    buf_mode = str(ready.get("tts_buffer_mode") or config.tts_buffer_mode)
+    buf_label = "整轮合播(不切片)" if buf_mode == "turn" else "逐句流式"
     stream_label = "流式ffplay" if config.tts_streaming else "afplay"
+    stt_label = str(ready.get("stt_provider") or config.stt_provider)
+    tts_label = str(ready.get("tts_provider") or config.tts_provider)
+    conn_label = "Voice Gateway" if gateway_mode else "直连 /ws/companion"
     print("=" * 64)
-    print("🐱 哈基米实时语音伴随客户端已连接")
+    print(f"🐱 哈基米实时语音伴随客户端已连接 ({conn_label})")
     print(
         f"会话模式: {mode_label} | 拾音: {voice_mode.upper()} | "
-        f"STT: {config.stt_provider} | TTS: {config.tts_provider}/{buf_label}/{stream_label} | "
+        f"STT: {stt_label} | TTS: {tts_label}/{buf_label}/{stream_label} | "
         f"设备: [{config.audio_input_device}] | 场景: {game_label}"
     )
     print("操作说明:")
@@ -276,34 +388,63 @@ async def run_interactive_session(
     audio_player: Any = None,
 ) -> int:
     """Run the interactive dual-mode (VAD/PTT) voice companion session."""
-    if connect_factory is None:
-        config.require_ws()
-    if stt_provider is None:
-        config.require_stt()
-    if tts_provider is None:
-        config.require_tts()
-
-    stt = stt_provider or build_stt_provider(config)
-    tts = tts_provider or build_tts_provider(config)
-    owns_stt = stt_provider is None
-    owns_tts = tts_provider is None
+    use_gateway = config.use_gateway and stt_provider is None and tts_provider is None
+    if use_gateway:
+        if connect_factory is None:
+            config.require_gateway()
+        stt = None
+        tts = None
+        owns_stt = False
+        owns_tts = False
+    else:
+        if connect_factory is None:
+            config.require_ws()
+        if stt_provider is None:
+            config.require_stt()
+        if tts_provider is None:
+            config.require_tts()
+        stt = stt_provider or build_stt_provider(config)
+        tts = tts_provider or build_tts_provider(config)
+        owns_stt = stt_provider is None
+        owns_tts = tts_provider is None
 
     turn_metrics: dict[str, dict[str, float]] = {}
 
+    def _format_timing_line(
+        *,
+        stt_ms: float | None = None,
+        llm_ms: float | None = None,
+        tts_ms: float | None = None,
+    ) -> str:
+        parts: list[str] = []
+        if stt_ms is not None:
+            parts.append(f"STT={stt_ms:.0f}ms")
+        if llm_ms is not None:
+            parts.append(f"LLM={llm_ms:.0f}ms")
+        if tts_ms is not None:
+            parts.append(f"TTS首音={tts_ms:.0f}ms")
+        return f"⏱️ 耗时: {' | '.join(parts)}"
+
     def _on_first_audio(turn_id: str, tts_ttfa_ms: float) -> None:
+        if use_gateway:
+            entry = turn_metrics.get(turn_id)
+            if entry is not None:
+                entry["tts_ttfa_ms"] = tts_ttfa_ms
+            return
         info = turn_metrics.pop(turn_id, None)
         if not info:
             return
         llm_ms = info.get("llm_ms")
         if llm_ms is None and "sent_at" in info:
             llm_ms = (time.perf_counter() - info["sent_at"]) * 1000.0
-        parts: list[str] = []
-        if "stt_ms" in info:
-            parts.append(f"STT={info['stt_ms']:.0f}ms")
-        if llm_ms is not None:
-            parts.append(f"LLM={llm_ms:.0f}ms")
-        parts.append(f"TTS首音={tts_ttfa_ms:.0f}ms")
-        print(f"⏱️ 耗时: {' | '.join(parts)}", flush=True)
+        print(
+            _format_timing_line(
+                stt_ms=info.get("stt_ms"),
+                llm_ms=llm_ms,
+                tts_ms=tts_ttfa_ms,
+            ),
+            flush=True,
+        )
 
     def _record_turn_metric(turn_id: str, *, stt_ms: float | None = None) -> None:
         if len(turn_metrics) >= 32:
@@ -314,11 +455,17 @@ async def run_interactive_session(
             entry["stt_ms"] = stt_ms
         turn_metrics[turn_id] = entry
 
-    player = audio_player or AfplayAudioPlayer(
-        tts,
-        enable_streaming=config.tts_streaming,
-        on_first_audio=_on_first_audio,
-    )
+    if use_gateway:
+        player: Any = audio_player or RawStreamAudioPlayer(
+            enable_streaming=config.tts_streaming,
+            on_first_audio=_on_first_audio,
+        )
+    else:
+        player = audio_player or AfplayAudioPlayer(
+            tts,
+            enable_streaming=config.tts_streaming,
+            on_first_audio=_on_first_audio,
+        )
     mic = mic_capture or FfmpegMicCapture(
         device=config.audio_input_device,
         sample_rate=config.sample_rate,
@@ -355,93 +502,208 @@ async def run_interactive_session(
         task.add_done_callback(_done)
         return task
 
-    async def on_turn_start(frame: dict[str, Any]) -> None:
-        if config.tts_buffer_mode == "turn":
-            turn_buffers[str(frame.get("turn_id") or "")] = []
-
-    async def on_speak_chunk(frame: dict[str, Any]) -> None:
-        turn_id = str(frame.get("turn_id") or "")
-        seq = int(frame.get("seq") or 0)
-        text = str(frame.get("text") or "").strip()
-        if not text:
-            return
-        print(f"🐱 哈基米: {text}", flush=True)
-        if config.tts_buffer_mode == "turn":
-            turn_buffers.setdefault(turn_id, []).append(text)
-            return
-        res = player.enqueue_chunk(turn_id, seq, text)
-        if asyncio.iscoroutine(res):
-            await res
-
-    async def on_turn_end(frame: dict[str, Any]) -> None:
-        status = str(frame.get("status") or "").lower()
-        turn_id = str(frame.get("turn_id") or "")
-        parts = turn_buffers.pop(turn_id, [])
-        if status == "cancelled":
-            turn_metrics.pop(turn_id, None)
-            await player.cancel_turn(turn_id or None)
-        elif status == "error":
-            turn_metrics.pop(turn_id, None)
-            reason = str(frame.get("reason") or "unknown")
-            print(f"⚠️ 本轮回复异常: {reason}", flush=True)
-        elif status in {"silent", "skipped"}:
-            turn_metrics.pop(turn_id, None)
-        else:
-            metric = turn_metrics.get(turn_id)
-            if metric is not None and "sent_at" in metric:
-                metric["llm_ms"] = (time.perf_counter() - metric["sent_at"]) * 1000.0
-            if config.tts_buffer_mode == "turn" and parts:
-                full_text = _join_turn_chunks(parts)
-                if full_text:
-                    res = player.enqueue_chunk(turn_id, 1, full_text)
-                    if asyncio.iscoroutine(res):
-                        await res
-
-    async def on_error(frame: dict[str, Any]) -> None:
-        reason = str(frame.get("reason") or "unknown")
-        print(f"⚠️ 服务端错误: {reason}", flush=True)
-
     async def on_disconnect() -> None:
         if not stop_event.is_set():
             print("\n🔌 与哈基米服务端连接已断开。", flush=True)
             stop_event.set()
 
-    ws = CompanionWsClient(
-        config,
-        connect_factory=connect_factory,
-        on_turn_start=on_turn_start,
-        on_speak_chunk=on_speak_chunk,
-        on_turn_end=on_turn_end,
-        on_error=on_error,
-        on_disconnect=on_disconnect,
-    )
+    async def on_error(frame: dict[str, Any]) -> None:
+        reason = str(frame.get("detail") or frame.get("reason") or "unknown")
+        print(f"⚠️ 服务端错误: {reason}", flush=True)
 
-    async def send_text_turn(text: str, *, stt_ms: float | None = None) -> None:
-        tid = f"t-{uuid.uuid4().hex[:12]}"
-        _record_turn_metric(tid, stt_ms=stt_ms)
-        await ws.send_speech_turn(text, turn_id=tid)
+    ws: Any
+    if use_gateway:
+
+        async def gw_on_stt_final(frame: dict[str, Any]) -> None:
+            tid = str(frame.get("turn_id") or "")
+            text = str(frame.get("text") or "").strip()
+            if not text:
+                return
+            raw_stt_ms = frame.get("stt_ms")
+            if raw_stt_ms is not None:
+                stt_val = float(raw_stt_ms)
+                if tid in turn_metrics:
+                    turn_metrics[tid]["stt_ms"] = stt_val
+                print(f"🎤 你: {text}  (STT {stt_val:.0f}ms)", flush=True)
+            else:
+                print(f"🎤 你: {text}", flush=True)
+
+        async def gw_on_text_chunk(frame: dict[str, Any]) -> None:
+            text = str(frame.get("text") or "").strip()
+            if text:
+                print(f"🐱 哈基米: {text}", flush=True)
+
+        async def gw_on_tts_start(frame: dict[str, Any]) -> None:
+            tid = str(frame.get("turn_id") or "")
+            seq = int(frame.get("seq") or 0)
+            fmt = str(frame.get("format") or config.gateway_output_format or "mp3")
+            res = player.begin_stream(tid, seq, fmt)
+            if asyncio.iscoroutine(res):
+                await res
+
+        async def gw_on_tts_chunk(turn_id: str, seq: int, fmt: str, chunk: bytes) -> None:
+            _ = seq, fmt
+            res = player.push_chunk(turn_id, chunk)
+            if asyncio.iscoroutine(res):
+                await res
+
+        async def gw_on_tts_end(frame: dict[str, Any]) -> None:
+            tid = str(frame.get("turn_id") or "")
+            seq = int(frame.get("seq") or 0)
+            res = player.end_stream(tid, seq)
+            if asyncio.iscoroutine(res):
+                await res
+
+        async def gw_on_turn_end(frame: dict[str, Any]) -> None:
+            status = str(frame.get("status") or "").lower()
+            tid = str(frame.get("turn_id") or "")
+            if status == "cancelled":
+                turn_metrics.pop(tid, None)
+                await player.cancel_turn(tid or None)
+                return
+            if status == "error":
+                turn_metrics.pop(tid, None)
+                reason = str(frame.get("reason") or "unknown")
+                print(f"⚠️ 本轮回复异常: {reason}", flush=True)
+                return
+            if status in {"silent", "skipped"}:
+                turn_metrics.pop(tid, None)
+                return
+            info = turn_metrics.pop(tid, {})
+            metrics = frame.get("metrics") if isinstance(frame.get("metrics"), dict) else {}
+            stt_ms = metrics.get("stt_ms") if "stt_ms" in metrics else info.get("stt_ms")
+            llm_ms = metrics.get("llm_ms") if "llm_ms" in metrics else info.get("llm_ms")
+            tts_ms = info.get("tts_ttfa_ms")
+            if tts_ms is None and "tts_ttfb_ms" in metrics:
+                tts_ms = metrics.get("tts_ttfb_ms")
+            if stt_ms is not None or llm_ms is not None or tts_ms is not None:
+                print(
+                    _format_timing_line(
+                        stt_ms=float(stt_ms) if stt_ms is not None else None,
+                        llm_ms=float(llm_ms) if llm_ms is not None else None,
+                        tts_ms=float(tts_ms) if tts_ms is not None else None,
+                    ),
+                    flush=True,
+                )
+
+        ws = VoiceGatewayWsClient(
+            config,
+            connect_factory=connect_factory,
+            on_stt_final=gw_on_stt_final,
+            on_text_chunk=gw_on_text_chunk,
+            on_tts_start=gw_on_tts_start,
+            on_tts_chunk=gw_on_tts_chunk,
+            on_tts_end=gw_on_tts_end,
+            on_turn_end=gw_on_turn_end,
+            on_error=on_error,
+            on_disconnect=on_disconnect,
+        )
+
+        async def send_text_turn(text: str, *, stt_ms: float | None = None) -> None:
+            _ = stt_ms
+            tid = f"t-{uuid.uuid4().hex[:12]}"
+            _record_turn_metric(tid)
+            await ws.send_text_turn(text, turn_id=tid)
+
+        async def submit_pcm(pcm_bytes: bytes) -> None:
+            if not pcm_bytes:
+                return
+            wav = pcm16_to_wav_bytes(pcm_bytes, sample_rate=config.sample_rate)
+            tid = f"t-{uuid.uuid4().hex[:12]}"
+            _record_turn_metric(tid)
+            try:
+                await ws.send_audio_turn(
+                    wav,
+                    fmt="wav",
+                    sample_rate=config.sample_rate,
+                    channels=1,
+                    turn_id=tid,
+                )
+            except VoiceGatewayError as exc:
+                turn_metrics.pop(tid, None)
+                print(f"⚠️ 语音发送失败: {exc}", flush=True)
+
+    else:
+
+        async def on_turn_start(frame: dict[str, Any]) -> None:
+            if config.tts_buffer_mode == "turn":
+                turn_buffers[str(frame.get("turn_id") or "")] = []
+
+        async def on_speak_chunk(frame: dict[str, Any]) -> None:
+            turn_id = str(frame.get("turn_id") or "")
+            seq = int(frame.get("seq") or 0)
+            text = str(frame.get("text") or "").strip()
+            if not text:
+                return
+            print(f"🐱 哈基米: {text}", flush=True)
+            if config.tts_buffer_mode == "turn":
+                turn_buffers.setdefault(turn_id, []).append(text)
+                return
+            res = player.enqueue_chunk(turn_id, seq, text)
+            if asyncio.iscoroutine(res):
+                await res
+
+        async def on_turn_end(frame: dict[str, Any]) -> None:
+            status = str(frame.get("status") or "").lower()
+            turn_id = str(frame.get("turn_id") or "")
+            parts = turn_buffers.pop(turn_id, [])
+            if status == "cancelled":
+                turn_metrics.pop(turn_id, None)
+                await player.cancel_turn(turn_id or None)
+            elif status == "error":
+                turn_metrics.pop(turn_id, None)
+                reason = str(frame.get("reason") or "unknown")
+                print(f"⚠️ 本轮回复异常: {reason}", flush=True)
+            elif status in {"silent", "skipped"}:
+                turn_metrics.pop(turn_id, None)
+            else:
+                metric = turn_metrics.get(turn_id)
+                if metric is not None and "sent_at" in metric:
+                    metric["llm_ms"] = (time.perf_counter() - metric["sent_at"]) * 1000.0
+                if config.tts_buffer_mode == "turn" and parts:
+                    full_text = _join_turn_chunks(parts)
+                    if full_text:
+                        res = player.enqueue_chunk(turn_id, 1, full_text)
+                        if asyncio.iscoroutine(res):
+                            await res
+
+        ws = CompanionWsClient(
+            config,
+            connect_factory=connect_factory,
+            on_turn_start=on_turn_start,
+            on_speak_chunk=on_speak_chunk,
+            on_turn_end=on_turn_end,
+            on_error=on_error,
+            on_disconnect=on_disconnect,
+        )
+
+        async def send_text_turn(text: str, *, stt_ms: float | None = None) -> None:
+            tid = f"t-{uuid.uuid4().hex[:12]}"
+            _record_turn_metric(tid, stt_ms=stt_ms)
+            await ws.send_speech_turn(text, turn_id=tid)
+
+        async def submit_pcm(pcm_bytes: bytes) -> None:
+            if not pcm_bytes:
+                return
+            assert stt is not None
+            wav = pcm16_to_wav_bytes(pcm_bytes, sample_rate=config.sample_rate)
+            t0 = time.perf_counter()
+            try:
+                text = (await stt.transcribe(wav)).strip()
+            except ProviderError as exc:
+                print(f"⚠️ 语音识别失败: {exc}", flush=True)
+                return
+            stt_ms = (time.perf_counter() - t0) * 1000.0
+            if not text:
+                return
+            print(f"🎤 你: {text}  (STT {stt_ms:.0f}ms)", flush=True)
+            await send_text_turn(text, stt_ms=stt_ms)
 
     async def interrupt_now() -> None:
         turn_buffers.clear()
         turn_metrics.clear()
         await player.cancel_turn()
         await ws.cancel_turn()
-
-    async def submit_pcm(pcm_bytes: bytes) -> None:
-        if not pcm_bytes:
-            return
-        wav = pcm16_to_wav_bytes(pcm_bytes, sample_rate=config.sample_rate)
-        t0 = time.perf_counter()
-        try:
-            text = (await stt.transcribe(wav)).strip()
-        except ProviderError as exc:
-            print(f"⚠️ 语音识别失败: {exc}", flush=True)
-            return
-        stt_ms = (time.perf_counter() - t0) * 1000.0
-        if not text:
-            return
-        print(f"🎤 你: {text}  (STT {stt_ms:.0f}ms)", flush=True)
-        await send_text_turn(text, stt_ms=stt_ms)
 
     def toggle_mode() -> None:
         nonlocal voice_mode, ptt_recording
@@ -622,7 +884,7 @@ async def run_interactive_session(
         ready = await ws.start_session()
         await player.start()
         await mic.start()
-        _print_banner(config, ready, voice_mode)
+        _print_banner(config, ready, voice_mode, gateway_mode=use_gateway)
 
         mic_task = asyncio.create_task(mic_loop(), name="voice-mic-loop")
         if is_tty and stdin_fd >= 0:
@@ -696,6 +958,8 @@ def main(argv: list[str] | None = None) -> int:
             updates["audio_input_device"] = args.device
         if args.tts_buffer_mode is not None:
             updates["tts_buffer_mode"] = args.tts_buffer_mode
+        if args.direct:
+            updates["gateway_url"] = ""
         if updates:
             config = dataclasses.replace(config, **updates)
 
@@ -717,6 +981,6 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(run_interactive_session(config))
     except KeyboardInterrupt:
         return 0
-    except (ValueError, ProviderError, RuntimeError, OSError) as exc:
+    except (ValueError, ProviderError, VoiceGatewayError, RuntimeError, OSError) as exc:
         print(f"❌ 错误: {exc}", file=sys.stderr)
         return 1

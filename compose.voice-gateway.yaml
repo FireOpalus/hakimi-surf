@@ -1,0 +1,44 @@
+# Standalone KR universal audio gateway alongside hakimi-bot:
+# docker compose -f compose.yaml -f compose.voice-gateway.yaml up -d hakimi-voice-gateway
+services:
+  hakimi-voice-gateway:
+    build:
+      context: .
+      dockerfile: voice_gateway/Dockerfile
+    ports:
+      - '127.0.0.1:12145:12145'
+    env_file: ./secrets/voice-gateway.env
+    environment:
+      TZ: Asia/Shanghai
+    depends_on:
+      hakimi-bot:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 256m
+    cpus: "1.0"
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:12145/healthz', timeout=2)",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

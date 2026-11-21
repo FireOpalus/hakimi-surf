@@ -253,6 +253,8 @@ class CompanionWsClient:
         *,
         turn_id: str | None = None,
         frames: list[dict[str, Any]] | None = None,
+        speaker_id: str | None = None,
+        speaker_name: str | None = None,
     ) -> str:
         """Send a speech.turn frame and return the assigned turn_id."""
         if not self.connected:
@@ -268,12 +270,18 @@ class CompanionWsClient:
             if not _TURN_ID_RE.fullmatch(tid):
                 raise ValueError("turn_id must match ^[A-Za-z0-9_.-]{1,64}$")
 
+        resolved_speaker_id = (
+            self._config.speaker_id if speaker_id is None else str(speaker_id).strip()
+        )
+        resolved_speaker_name = (
+            self._config.speaker_name if speaker_name is None else str(speaker_name).strip()
+        )
         payload: dict[str, Any] = {
             "type": "speech.turn",
             "turn_id": tid,
             "text": clean,
-            "speaker_id": self._config.speaker_id,
-            "speaker_name": self._config.speaker_name,
+            "speaker_id": resolved_speaker_id,
+            "speaker_name": resolved_speaker_name,
         }
         if frames:
             payload["frames"] = frames

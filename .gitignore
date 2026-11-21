@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 !.env.napcat.example
+!.env.voice-gateway.example
 *.env
 *.env.bak
 .venv/

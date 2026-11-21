@@ -1,11 +1,11 @@
 # Hakimi Mac 实时语音客户端 (`voice_client`)
 
-面向 macOS（Python 3.12+ / 3.15 + `ffmpeg` + `afplay`）的轻量纯 Python 实时语音客户端，直连服务端 `/ws/companion`，默认采用硅基流动（SiliconFlow）`SenseVoiceSmall` STT + `CosyVoice2-0.5B` TTS，零 C 扩展依赖。
+面向 macOS（Python 3.12+ / 3.15 + `ffmpeg` + `afplay`/`ffplay`）的轻量纯 Python 实时语音客户端，支持直连 KR 通用语音网关（`VOICE_GATEWAY_URL`，推荐，云端集中管理 STT/TTS Key 与流式音频转码）或使用 `--direct` 直连 `/ws/companion` 搭配本地 STT/TTS，零 C 扩展依赖。
 
 ## 1. 环境准备（macOS）
 
 ```bash
-# 确保已安装 ffmpeg（用于 AVFoundation 麦克风采集与设备枚举）
+# 确保已安装 ffmpeg（用于 AVFoundation 麦克风采集与设备枚举；附带的 ffplay 支持流式边下边播）
 brew install ffmpeg
 
 # 创建虚拟环境并安装仅有的两个外部依赖 (httpx / websockets)
@@ -16,6 +16,25 @@ brew install ffmpeg
 ## 2. 配置文件 (`~/.config/hakimi-voice/.env`)
 
 建议目录权限 `0700`，文件权限 `0600`：
+
+### 2.1 通用语音网关模式（推荐，Mac 本地无需保存 STT/TTS API Key）
+
+```ini
+# 通用语音网关连接信息（设置 VOICE_GATEWAY_URL 后自动启用网关模式）
+VOICE_GATEWAY_URL=wss://example.com/ws/voice/secret-path
+VOICE_GATEWAY_TOKEN=your-32-char-or-longer-voice-gateway-token
+# 可选覆盖网关输出格式: 留空跟随网关默认 / mp3 / wav / pcm_16k / pcm_48k_stereo
+VOICE_GATEWAY_OUTPUT_FORMAT=mp3
+
+COMPANION_ADAPTER_ID=mac-voice
+COMPANION_CLIENT_ID=boiser-m4
+COMPANION_MODE=owner_private
+TTS_STREAMING=true
+VOICE_MODE=vad
+AUDIO_INPUT_DEVICE=0
+```
+
+### 2.2 直连 `/ws/companion` 模式（未设置 `VOICE_GATEWAY_URL` 或传 `--direct` 时启用）
 
 ```ini
 # WebSocket 连接信息（与服务端 /ws/companion 配置一致）
@@ -61,13 +80,15 @@ BARGE_IN_ENABLED=true
 # 1) 列出 macOS 麦克风设备编号（确认 AUDIO_INPUT_DEVICE）
 python3 -m voice_client --list-devices
 
-# 2) 验证 WebSocket 握手与心跳 RTT（不触发 LLM 消耗）
+# 2) 验证网关或 /ws/companion 握手与心跳 RTT（不触发 LLM 消耗）
 python3 -m voice_client --check-ws
+# 强制跳过 VOICE_GATEWAY_URL 直连 /ws/companion
+python3 -m voice_client --direct --check-ws
 
-# 3) 测试 TTS 合成与 afplay 播报
+# 3) 测试 TTS 合成与流式播放（网关模式下无需本地 API Key）
 python3 -m voice_client --test-tts "哈基米收到啦，测试语音播报喵~"
 
-# 4) 测试 4 秒麦克风录音 + STT 转写
+# 4) 测试 4 秒麦克风录音 + STT 转写（网关模式下无需本地 API Key）
 python3 -m voice_client --test-stt
 
 # 5) 上传自定义参考音色，打印可直接写入 SILICONFLOW_TTS_VOICE 的 speech:... URI
@@ -78,8 +99,8 @@ python3 -m voice_client --upload-voice ./ref.wav --voice-name my-voice --ref-tex
 
 ```bash
 python3 -m voice_client --mode vad
-# 或按键说话模式 / 指定游戏标题 / 指定麦克风设备
-python3 -m voice_client --mode ptt --game "Minecraft" --device 0
+# 或强制直连模式 / 按键说话模式 / 指定游戏标题 / 指定麦克风设备
+python3 -m voice_client --direct --mode ptt --game "Minecraft" --device 0
 ```
 
 交互模式快捷键：

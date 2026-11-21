@@ -37,8 +37,10 @@ from voice_client import (
     pcm16_to_wav_bytes,
     strip_stt_markup,
 )
+from voice_client.audio import RawStreamAudioPlayer, _default_ffplay_stream_cmd
 from voice_client.cli import check_ws, main, run_interactive_session
 from voice_client.companion_ws import CompanionWsClient, CompanionWsError
+from voice_client.gateway_ws import VoiceGatewayError, VoiceGatewayWsClient
 
 
 def _pcm_frame(amplitude: int, *, samples: int = 480) -> bytes:
@@ -1529,3 +1531,914 @@ async def test_streaming_player_pipes_chunks_and_cancels_immediately(tmp_path):
         await asyncio.wait_for(player.wait_idle(), timeout=1.5)
     finally:
         await player.stop()
+
+
+def test_voice_gateway_config_loading_and_validation(tmp_path):
+    missing = tmp_path / "missing.env"
+    env_file = tmp_path / "gw.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "VOICE_GATEWAY_URL=wss://voice.example.invalid/ws/voice/secret-gw-path-001",
+                "VOICE_GATEWAY_TOKEN=gateway-secret-token-32-chars-minimum",
+                "VOICE_GATEWAY_OUTPUT_FORMAT=PCM_48K_STEREO",
+                "PING_INTERVAL_SECONDS=12.5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(env={}, env_file=env_file)
+    assert cfg.gateway_url == "wss://voice.example.invalid/ws/voice/secret-gw-path-001"
+    assert cfg.gateway_token == "gateway-secret-token-32-chars-minimum"
+    assert cfg.gateway_output_format == "pcm_48k_stereo"
+    assert cfg.ping_interval_seconds == 12.5
+    assert cfg.use_gateway is True
+    cfg.require_gateway()
+
+    for valid_fmt in ("", "mp3", "wav", "pcm_16k", "pcm_48k_stereo"):
+        loaded = load_config(
+            env={"VOICE_GATEWAY_OUTPUT_FORMAT": valid_fmt.upper()},
+            env_file=missing,
+        )
+        assert loaded.gateway_output_format == valid_fmt
+
+    with pytest.raises(ValueError, match="VOICE_GATEWAY_OUTPUT_FORMAT"):
+        load_config(env={"VOICE_GATEWAY_OUTPUT_FORMAT": "ogg"}, env_file=missing)
+
+    empty_cfg = load_config(env={}, env_file=missing)
+    assert empty_cfg.use_gateway is False
+    with pytest.raises(ValueError, match="VOICE_GATEWAY_URL"):
+        empty_cfg.require_gateway()
+    with pytest.raises(ValueError, match="ws://"):
+        VoiceClientConfig(
+            gateway_url="https://voice.example.invalid/ws/voice",
+            gateway_token="g" * 32,
+        ).require_gateway()
+    with pytest.raises(ValueError, match="VOICE_GATEWAY_TOKEN"):
+        VoiceClientConfig(
+            gateway_url="wss://voice.example.invalid/ws/voice/secret",
+            gateway_token="   ",
+        ).require_gateway()
+
+
+async def test_companion_ws_send_speech_turn_speaker_override():
+    sent: list[dict[str, Any]] = []
+
+    class DummyWs:
+        def __init__(self) -> None:
+            self.incoming: asyncio.Queue[str] = asyncio.Queue()
+
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+        async def recv(self) -> str:
+            item = await self.incoming.get()
+            if item == "__EOF__":
+                raise RuntimeError("eof")
+            return item
+
+        async def close(self) -> None:
+            await self.incoming.put("__EOF__")
+
+    cfg = VoiceClientConfig(
+        ws_url="wss://example.invalid/ws/companion/secret-path",
+        ws_token=COMPANION_TOKEN,
+        speaker_id="default-id",
+        speaker_name="默认名",
+        ping_interval_seconds=0.0,
+    )
+    client = CompanionWsClient(cfg, connect_factory=DummyWs)
+    await client.connect()
+    try:
+        tid1 = await client.send_speech_turn("你好", turn_id="t-def")
+        tid2 = await client.send_speech_turn(
+            "这把冲",
+            turn_id="t-ovr",
+            speaker_id="guest-42",
+            speaker_name="队友乙",
+        )
+        assert tid1 == "t-def"
+        assert tid2 == "t-ovr"
+        assert sent[0]["speaker_id"] == "default-id"
+        assert sent[0]["speaker_name"] == "默认名"
+        assert sent[1]["speaker_id"] == "guest-42"
+        assert sent[1]["speaker_name"] == "队友乙"
+    finally:
+        await client.close()
+
+
+async def test_voice_gateway_ws_client_protocol_binary_and_redaction(monkeypatch):
+    import importlib.util
+    import urllib.request
+
+    gw_secret = "gateway-token-must-never-leak-32chars"
+    gw_path = "/ws/voice/0123456789abcdef0123456789abcdef"
+    gw_url = f"wss://gw.example.invalid{gw_path}"
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    monkeypatch.setattr(
+        urllib.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:7897", "socks": "http://127.0.0.1:7897"},
+    )
+
+    connect_calls: list[dict[str, Any]] = []
+
+    async def failing_ws_connect(url: str, **kwargs: Any) -> Any:
+        connect_calls.append({"url": url, **kwargs})
+        raise RuntimeError(f"boom url={url} headers={kwargs.get('additional_headers')}")
+
+    monkeypatch.setattr("websockets.asyncio.client.connect", failing_ws_connect)
+    cfg = VoiceClientConfig(
+        gateway_url=gw_url,
+        gateway_token=gw_secret,
+        gateway_output_format="pcm_16k",
+        adapter_id="mac-voice",
+        client_id="boiser-m4",
+        speaker_id="owner",
+        speaker_name="BOISER",
+        ping_interval_seconds=0.0,
+    )
+    bad_client = VoiceGatewayWsClient(cfg)
+    with pytest.raises(VoiceGatewayError) as exc_info:
+        await bad_client.connect()
+    err_str = str(exc_info.value)
+    assert gw_secret not in err_str
+    assert gw_path not in err_str
+    assert len(connect_calls) == 1
+    assert connect_calls[0]["additional_headers"] == {
+        "Authorization": f"Bearer {gw_secret}",
+        "X-Voice-Adapter": "mac-voice",
+        "X-Voice-Client-Id": "boiser-m4",
+    }
+    assert connect_calls[0]["max_size"] == 16_777_216
+    assert connect_calls[0]["ping_interval"] is None
+    assert connect_calls[0]["proxy"] == "http://127.0.0.1:7897"
+
+    sent_items: list[dict[str, Any] | bytes] = []
+
+    class ScriptedGatewayWs:
+        def __init__(self) -> None:
+            self.incoming: asyncio.Queue[str | bytes] = asyncio.Queue()
+
+        async def send(self, data: str | bytes) -> None:
+            if isinstance(data, (bytes, bytearray)):
+                sent_items.append(bytes(data))
+                return
+            frame = json.loads(data)
+            sent_items.append(frame)
+            typ = frame["type"]
+            if typ == "ping":
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "pong",
+                            "req_id": frame.get("req_id", ""),
+                            "ts": 1.0,
+                            "upstream_ms": None,
+                        }
+                    )
+                )
+            elif typ == "stt.transcribe":
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "stt.result",
+                            "req_id": frame["req_id"],
+                            "text": "单独识别测试",
+                            "stt_ms": 42.0,
+                        }
+                    )
+                )
+            elif typ == "tts.synthesize":
+                req_id = frame["req_id"]
+                if frame["text"] == "fail-me":
+                    await self.incoming.put(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "req_id": req_id,
+                                "reason": "tts_failed",
+                                "detail": f"leaked {gw_secret} at {gw_url}",
+                            }
+                        )
+                    )
+                else:
+                    await self.incoming.put(
+                        json.dumps(
+                            {
+                                "type": "tts.start",
+                                "req_id": req_id,
+                                "turn_id": "",
+                                "seq": 1,
+                                "format": frame.get("output_format", "pcm_16k"),
+                            }
+                        )
+                    )
+                    await self.incoming.put(b"PCM-PART-1-")
+                    await self.incoming.put(b"PCM-PART-2")
+                    await self.incoming.put(
+                        json.dumps(
+                            {
+                                "type": "tts.end",
+                                "req_id": req_id,
+                                "turn_id": "",
+                                "seq": 1,
+                                "bytes": 20,
+                                "status": "ok",
+                            }
+                        )
+                    )
+            elif typ == "session.start":
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "session.ready",
+                            "session_id": "gw-sess-1",
+                            "mode": frame["mode"],
+                            "output_format": "pcm_16k",
+                            "stt_provider": "fish",
+                            "tts_provider": "siliconflow",
+                            "tts_model": "CosyVoice2",
+                            "upstream_config": {"use_screen_watch": True},
+                        }
+                    )
+                )
+            elif typ == "audio.stream.end":
+                tid = frame["turn_id"]
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "stt.final",
+                            "turn_id": tid,
+                            "text": "语音流",
+                            "stt_ms": 18,
+                        }
+                    )
+                )
+                await self.incoming.put(
+                    json.dumps({"type": "turn.start", "turn_id": tid, "kind": "speech"})
+                )
+                await self.incoming.put(
+                    json.dumps({"type": "text.chunk", "turn_id": tid, "seq": 1, "text": "收到喵"})
+                )
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "tts.start",
+                            "turn_id": tid,
+                            "seq": 1,
+                            "format": "pcm_16k",
+                        }
+                    )
+                )
+                await self.incoming.put(b"STREAM-AUDIO-BYTES")
+                await self.incoming.put(
+                    json.dumps(
+                        {"type": "tts.end", "turn_id": tid, "seq": 1, "bytes": 18, "status": "ok"}
+                    )
+                )
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "turn.end",
+                            "turn_id": tid,
+                            "status": "spoken",
+                            "metrics": {"stt_ms": 18.0, "llm_ms": 50.0, "tts_ttfb_ms": 12.0},
+                        }
+                    )
+                )
+            elif typ == "session.stop":
+                await self.incoming.put(
+                    json.dumps({"type": "session.ended", "session_id": "gw-sess-1"})
+                )
+
+        async def recv(self) -> str | bytes:
+            item = await self.incoming.get()
+            if item == "__EOF__":
+                raise RuntimeError("eof")
+            return item
+
+        async def close(self) -> None:
+            await self.incoming.put("__EOF__")
+
+    events: list[tuple[str, Any]] = []
+    turn_done = asyncio.Event()
+
+    async def on_stt_final(frame: dict[str, Any]) -> None:
+        events.append(("stt.final", frame))
+
+    async def on_turn_start(frame: dict[str, Any]) -> None:
+        events.append(("turn.start", frame))
+
+    async def on_text_chunk(frame: dict[str, Any]) -> None:
+        events.append(("text.chunk", frame))
+
+    async def on_tts_start(frame: dict[str, Any]) -> None:
+        events.append(("tts.start", frame))
+
+    async def on_tts_chunk(turn_id: str, seq: int, fmt: str, chunk: bytes) -> None:
+        events.append(("tts.chunk", (turn_id, seq, fmt, chunk)))
+
+    async def on_tts_end(frame: dict[str, Any]) -> None:
+        events.append(("tts.end", frame))
+
+    async def on_turn_end(frame: dict[str, Any]) -> None:
+        events.append(("turn.end", frame))
+        turn_done.set()
+
+    client = VoiceGatewayWsClient(
+        cfg,
+        connect_factory=ScriptedGatewayWs,
+        on_stt_final=on_stt_final,
+        on_turn_start=on_turn_start,
+        on_text_chunk=on_text_chunk,
+        on_tts_start=on_tts_start,
+        on_tts_chunk=on_tts_chunk,
+        on_tts_end=on_tts_end,
+        on_turn_end=on_turn_end,
+    )
+    await client.connect()
+    try:
+        # Standalone RPCs work pre-session
+        pong = await client.ping_info(timeout=2.0)
+        assert pong["upstream_ms"] is None
+        assert pong["rtt_ms"] >= 0.0
+
+        stt_txt = await client.transcribe_once(b"RIFF-WAV-DATA", timeout=2.0)
+        assert stt_txt == "单独识别测试"
+
+        one_arg_chunks: list[bytes] = []
+        audio_out, fmt_out = await client.synthesize_once(
+            "合成测试",
+            on_chunk=lambda c: one_arg_chunks.append(c),
+            timeout=2.0,
+        )
+        assert audio_out == b"PCM-PART-1-PCM-PART-2"
+        assert fmt_out == "pcm_16k"
+        assert one_arg_chunks == [b"PCM-PART-1-", b"PCM-PART-2"]
+
+        two_arg_chunks: list[tuple[bytes, str]] = []
+        await client.synthesize_once(
+            "双参回调",
+            output_format="mp3",
+            on_chunk=lambda c, f: two_arg_chunks.append((c, f)),
+            timeout=2.0,
+        )
+        assert two_arg_chunks == [(b"PCM-PART-1-", "mp3"), (b"PCM-PART-2", "mp3")]
+
+        with pytest.raises(VoiceGatewayError) as synth_exc:
+            await client.synthesize_once("fail-me", timeout=2.0)
+        assert gw_secret not in str(synth_exc.value)
+        assert gw_path not in str(synth_exc.value)
+
+        # Session lifecycle + binary upload + text turn + cancel
+        ready = await client.start_session(timeout=2.0)
+        assert ready["session_id"] == "gw-sess-1"
+        assert client.tts_model == "CosyVoice2"
+
+        await client.send_audio_turn(
+            b"AB" * 1500,
+            fmt="pcm_16k",
+            turn_id="gw-stream-1",
+            speaker_id="spk-9",
+            speaker_name="玩家A",
+            stream=True,
+            chunk_size=1024,
+        )
+        await asyncio.wait_for(turn_done.wait(), timeout=2.0)
+        assert [name for name, _ in events] == [
+            "stt.final",
+            "turn.start",
+            "text.chunk",
+            "tts.start",
+            "tts.chunk",
+            "tts.end",
+            "turn.end",
+        ]
+        assert events[4][1] == ("gw-stream-1", 1, "pcm_16k", b"STREAM-AUDIO-BYTES")
+        assert any(isinstance(item, bytes) for item in sent_items)
+
+        await client.send_audio_turn(b"RIFF-1", turn_id="gw-b64-1")
+        await client.send_text_turn("文字发送", turn_id="gw-txt-1")
+        await client.cancel_turn("gw-txt-1")
+        assert any(
+            isinstance(item, dict)
+            and item.get("type") == "audio.turn"
+            and item.get("turn_id") == "gw-b64-1"
+            for item in sent_items
+        )
+        assert any(
+            isinstance(item, dict)
+            and item.get("type") == "text.turn"
+            and item.get("turn_id") == "gw-txt-1"
+            for item in sent_items
+        )
+        assert any(
+            isinstance(item, dict)
+            and item.get("type") == "turn.cancel"
+            and item.get("turn_id") == "gw-txt-1"
+            for item in sent_items
+        )
+
+        ended = await client.stop_session(timeout=2.0)
+        assert ended["session_id"] == "gw-sess-1"
+    finally:
+        await client.close()
+
+
+async def test_raw_stream_audio_player_streaming_fallback_and_cancel(tmp_path):
+    assert _default_ffplay_stream_cmd("pcm_16k")[-8:] == [
+        "-f",
+        "s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-i",
+        "pipe:0",
+    ]
+    assert _default_ffplay_stream_cmd("pcm_48k_stereo")[-8:] == [
+        "-f",
+        "s16le",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-i",
+        "pipe:0",
+    ]
+
+    # 1. Streaming mode (live stdin pipe + on_first_audio + immediate cancel)
+    sink_file = tmp_path / "raw_stream.bin"
+    hold_file = tmp_path / "hold.flag"
+    first_audio: list[tuple[str, float]] = []
+
+    def stream_cmd_factory(fmt: str) -> list[str]:
+        if fmt == "wav":
+            script = (
+                "import pathlib, sys, time; "
+                "pathlib.Path(sys.argv[1]).write_text('started', encoding='utf-8'); "
+                "sys.stdin.buffer.read(4); "
+                "time.sleep(5.0)"
+            )
+            return [sys.executable, "-c", script, str(hold_file)]
+        script = (
+            "import pathlib, sys; "
+            "data = sys.stdin.buffer.read(); "
+            "pathlib.Path(sys.argv[1]).write_bytes(data)"
+        )
+        return [sys.executable, "-c", script, str(sink_file)]
+
+    stream_player = RawStreamAudioPlayer(
+        stream_cmd_factory=stream_cmd_factory,
+        enable_streaming=True,
+        on_first_audio=lambda tid, ms: first_audio.append((tid, ms)),
+    )
+    assert stream_player.streaming_active is True
+    await stream_player.start()
+    try:
+        stream_player.begin_stream("raw-1", 1, "mp3")
+        stream_player.push_chunk("raw-1", b"CHUNK-A-")
+        stream_player.push_chunk("raw-1", b"CHUNK-B")
+        stream_player.end_stream("raw-1", 1)
+        await asyncio.wait_for(stream_player.wait_idle(), timeout=2.0)
+        assert sink_file.read_bytes() == b"CHUNK-A-CHUNK-B"
+        assert len(first_audio) == 1 and first_audio[0][0] == "raw-1"
+
+        # Cancel active stream kills process immediately and drops subsequent chunks
+        stream_player.begin_stream("raw-cancel", 1, "wav")
+        stream_player.push_chunk("raw-cancel", b"HOLD")
+        for _ in range(100):
+            if hold_file.is_file() and stream_player.is_playing:
+                break
+            await asyncio.sleep(0.01)
+        assert stream_player.is_playing is True
+        await asyncio.wait_for(stream_player.cancel_turn("raw-cancel"), timeout=1.5)
+        stream_player.push_chunk("raw-cancel", b"IGNORED-AFTER-CANCEL")
+        await asyncio.wait_for(stream_player.wait_idle(), timeout=1.5)
+        assert stream_player.is_playing is False
+    finally:
+        await stream_player.stop()
+
+    # 2. Buffered afplay fallback wraps pcm_16k into WAV container
+    afplay_out = tmp_path / "fallback.wav"
+
+    def play_cmd_factory(path: Path) -> list[str]:
+        script = "import pathlib, shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2])"
+        return [sys.executable, "-c", script, str(path), str(afplay_out)]
+
+    fallback_player = RawStreamAudioPlayer(
+        play_cmd_factory=play_cmd_factory,
+        enable_streaming=False,
+    )
+    assert fallback_player.streaming_active is False
+    await fallback_player.start()
+    try:
+        pcm_payload = _pcm_frame(1000, samples=160)
+        fallback_player.begin_stream("fb-1", 1, "pcm_16k")
+        fallback_player.push_chunk("fb-1", pcm_payload[:160])
+        fallback_player.push_chunk("fb-1", pcm_payload[160:])
+        fallback_player.end_stream("fb-1", 1)
+        await asyncio.wait_for(fallback_player.wait_idle(), timeout=2.0)
+        wav_bytes = afplay_out.read_bytes()
+        assert wav_bytes.startswith(b"RIFF")
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            assert wf.getnchannels() == 1
+            assert wf.getframerate() == 16000
+            assert wf.readframes(wf.getnframes()) == pcm_payload
+    finally:
+        await fallback_player.stop()
+
+
+def test_cli_direct_flag_and_gateway_check_ws(monkeypatch, capsys, tmp_path):
+    gw_token = "gateway-cli-secret-token-32-chars-min"
+    gw_path = "/ws/voice/secret-cli-gw-path"
+    env_file = tmp_path / "cli_gw.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"VOICE_GATEWAY_URL=wss://gw.example.invalid{gw_path}",
+                f"VOICE_GATEWAY_TOKEN={gw_token}",
+                "VOICE_GATEWAY_OUTPUT_FORMAT=mp3",
+                "COMPANION_WS_URL=wss://direct.example.invalid/ws/companion/direct-secret",
+                f"COMPANION_WS_TOKEN={COMPANION_TOKEN}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen_calls: list[str] = []
+
+    class FakeDirectForMain:
+        def __init__(self, config: VoiceClientConfig, **kwargs: Any) -> None:
+            _ = kwargs
+            assert config.use_gateway is False
+            seen_calls.append("direct")
+
+        async def connect(self) -> None:
+            return None
+
+        async def start_session(self) -> dict[str, Any]:
+            return {"mode": "owner_private", "session_id": "dir-sess-1"}
+
+        async def ping(self, timeout: float = 10.0) -> float:  # noqa: ASYNC109
+            _ = timeout
+            return 9.1
+
+        async def stop_session(self, timeout: float = 5.0) -> dict[str, Any]:  # noqa: ASYNC109
+            _ = timeout
+            return {"session_id": "dir-sess-1"}
+
+        async def close(self) -> None:
+            return None
+
+    class FakeGwForMain:
+        def __init__(self, config: VoiceClientConfig, **kwargs: Any) -> None:
+            _ = kwargs
+            assert config.use_gateway is True
+            seen_calls.append("gateway")
+
+        async def connect(self) -> None:
+            return None
+
+        async def start_session(self) -> dict[str, Any]:
+            return {
+                "mode": "owner_private",
+                "session_id": "gw-sess-99",
+                "stt_provider": "fish",
+                "tts_provider": "siliconflow",
+                "tts_model": "CosyVoice2",
+            }
+
+        async def ping_info(self, timeout: float = 10.0) -> dict[str, Any]:  # noqa: ASYNC109
+            _ = timeout
+            return {"rtt_ms": 14.2, "upstream_ms": 3.5}
+
+        async def stop_session(self, timeout: float = 5.0) -> dict[str, Any]:  # noqa: ASYNC109
+            _ = timeout
+            return {"session_id": "gw-sess-99"}
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("voice_client.cli.CompanionWsClient", FakeDirectForMain)
+    monkeypatch.setattr("voice_client.cli.VoiceGatewayWsClient", FakeGwForMain)
+
+    assert main(["--env-file", str(env_file), "--check-ws"]) == 0
+    gw_out = capsys.readouterr().out
+    assert "语音网关握手正常" in gw_out
+    assert "upstream=3.5ms" in gw_out
+    assert "stt=fish" in gw_out
+    assert "secret-cli-gw-path" not in gw_out
+
+    assert main(["--env-file", str(env_file), "--direct", "--check-ws"]) == 0
+    dir_out = capsys.readouterr().out
+    assert "WS 握手正常" in dir_out
+    assert seen_calls == ["gateway", "direct"]
+
+
+async def test_cli_gateway_tts_stt_and_interactive_session(monkeypatch, capsys, tmp_path):
+    gw_token = "gateway-cli-secret-token-32-chars-min"
+    gw_path = "/ws/voice/secret-cli-gw-path"
+
+    # Gateway --test-tts & --test-stt require NO local API keys
+    gw_only_cfg = VoiceClientConfig(
+        gateway_url=f"wss://gw.example.invalid{gw_path}",
+        gateway_token=gw_token,
+        gateway_output_format="mp3",
+        siliconflow_api_key="",
+        fish_api_key="",
+        openai_stt_api_key="",
+        ping_interval_seconds=0.0,
+        vad_threshold=0.05,
+        vad_silence_ms=90,
+        vad_min_speech_ms=90,
+        vad_barge_in_multiplier=2.0,
+    )
+
+    from voice_client.cli import test_stt, test_tts
+
+    tts_sink = tmp_path / "cli_tts.mp3"
+
+    class LocalRawPlayer(RawStreamAudioPlayer):
+        def __init__(self, *, enable_streaming: bool = True, **kwargs: Any) -> None:
+            _ = enable_streaming
+            script = (
+                "import pathlib, sys; "
+                "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+            )
+            super().__init__(
+                stream_cmd_factory=lambda fmt: [sys.executable, "-c", script, str(tts_sink)],
+                enable_streaming=True,
+                **kwargs,
+            )
+
+    class CliGatewayWs:
+        def __init__(self) -> None:
+            self.incoming: asyncio.Queue[str | bytes] = asyncio.Queue()
+
+        async def send(self, data: str | bytes) -> None:
+            if isinstance(data, (bytes, bytearray)):
+                return
+            frame = json.loads(data)
+            typ = frame["type"]
+            if typ == "tts.synthesize":
+                req_id = frame["req_id"]
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "tts.start",
+                            "req_id": req_id,
+                            "seq": 1,
+                            "format": "mp3",
+                        }
+                    )
+                )
+                await self.incoming.put(b"GW-CLI-MP3")
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "tts.end",
+                            "req_id": req_id,
+                            "seq": 1,
+                            "bytes": 10,
+                            "status": "ok",
+                        }
+                    )
+                )
+            elif typ == "stt.transcribe":
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "stt.result",
+                            "req_id": frame["req_id"],
+                            "text": "网关识别结果喵",
+                            "stt_ms": 21.0,
+                        }
+                    )
+                )
+
+        async def recv(self) -> str | bytes:
+            item = await self.incoming.get()
+            if item == "__EOF__":
+                raise RuntimeError("eof")
+            return item
+
+        async def close(self) -> None:
+            await self.incoming.put("__EOF__")
+
+    monkeypatch.setattr("voice_client.cli.RawStreamAudioPlayer", LocalRawPlayer)
+    assert await test_tts(gw_only_cfg, "网关测试", connect_factory=CliGatewayWs) == 0
+    assert tts_sink.read_bytes() == b"GW-CLI-MP3"
+    assert "TTS 播放完成" in capsys.readouterr().out
+
+    class FakeMicShort:
+        def __init__(self, **kwargs: Any) -> None:
+            _ = kwargs
+            self._n = 0
+
+        async def start(self) -> None:
+            return None
+
+        async def read_frame(self) -> bytes:
+            self._n += 1
+            return b"" if self._n > 5 else _pcm_frame(2000)
+
+        async def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr("voice_client.cli.FfmpegMicCapture", FakeMicShort)
+    assert await test_stt(gw_only_cfg, duration_seconds=0.1, connect_factory=CliGatewayWs) == 0
+    assert "网关识别结果喵" in capsys.readouterr().out
+
+    # Interactive gateway session A: [t] text.turn + [x] turn.cancel (EOF awaits bg_tasks)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("t\n文字问好\nx\n"))
+    sess_sent: list[dict[str, Any]] = []
+
+    class IdleGwMic:
+        async def start(self) -> None:
+            return None
+
+        async def read_frame(self) -> bytes:
+            await asyncio.sleep(0.05)
+            return _silence_frame()
+
+        async def stop(self) -> None:
+            return None
+
+    class SessPlayer:
+        def __init__(self, *, keep_playing_until_cancel: bool = False) -> None:
+            self.is_playing = False
+            self.keep_playing_until_cancel = keep_playing_until_cancel
+            self.begun: list[tuple[str, int, str]] = []
+            self.chunks: list[tuple[str, bytes]] = []
+            self.ended: list[tuple[str, int]] = []
+            self.cancelled = 0
+
+        async def start(self) -> None:
+            return None
+
+        def begin_stream(self, turn_id: str, seq: int, fmt: str) -> None:
+            self.is_playing = True
+            self.begun.append((turn_id, seq, fmt))
+
+        def push_chunk(self, turn_id: str, chunk: bytes) -> None:
+            self.chunks.append((turn_id, chunk))
+
+        def end_stream(self, turn_id: str, seq: int) -> None:
+            if not self.keep_playing_until_cancel:
+                self.is_playing = False
+            self.ended.append((turn_id, seq))
+
+        async def cancel_turn(self, turn_id: str | None = None) -> None:
+            _ = turn_id
+            self.cancelled += 1
+            self.is_playing = False
+
+        async def stop(self) -> None:
+            return None
+
+    class InteractiveGwWs:
+        def __init__(self) -> None:
+            self.incoming: asyncio.Queue[str | bytes] = asyncio.Queue()
+
+        async def send(self, data: str | bytes) -> None:
+            if isinstance(data, (bytes, bytearray)):
+                return
+            frame = json.loads(data)
+            sess_sent.append(frame)
+            typ = frame["type"]
+            if typ == "session.start":
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "session.ready",
+                            "session_id": "gw-int-1",
+                            "mode": "owner_private",
+                            "output_format": "mp3",
+                            "stt_provider": "fish",
+                            "tts_provider": "siliconflow",
+                            "tts_model": "CosyVoice2",
+                        }
+                    )
+                )
+            elif typ in ("audio.turn", "text.turn"):
+                tid = frame["turn_id"]
+                if typ == "audio.turn":
+                    await self.incoming.put(
+                        json.dumps(
+                            {
+                                "type": "stt.final",
+                                "turn_id": tid,
+                                "text": "语音提问",
+                                "stt_ms": 19.0,
+                            }
+                        )
+                    )
+                await self.incoming.put(
+                    json.dumps({"type": "turn.start", "turn_id": tid, "kind": "speech"})
+                )
+                await self.incoming.put(
+                    json.dumps({"type": "text.chunk", "turn_id": tid, "seq": 1, "text": "收到喵!"})
+                )
+                await self.incoming.put(
+                    json.dumps({"type": "tts.start", "turn_id": tid, "seq": 1, "format": "mp3"})
+                )
+                await self.incoming.put(b"MP3-FRAME")
+                await self.incoming.put(
+                    json.dumps(
+                        {"type": "tts.end", "turn_id": tid, "seq": 1, "bytes": 9, "status": "ok"}
+                    )
+                )
+                await self.incoming.put(
+                    json.dumps(
+                        {
+                            "type": "turn.end",
+                            "turn_id": tid,
+                            "status": "spoken",
+                            "metrics": {"stt_ms": 19.0, "llm_ms": 40.0, "tts_ttfb_ms": 11.0},
+                        }
+                    )
+                )
+            elif typ == "session.stop":
+                await self.incoming.put(
+                    json.dumps({"type": "session.ended", "session_id": "gw-int-1"})
+                )
+
+        async def recv(self) -> str | bytes:
+            item = await self.incoming.get()
+            if item == "__EOF__":
+                raise RuntimeError("eof")
+            return item
+
+        async def close(self) -> None:
+            await self.incoming.put("__EOF__")
+
+    sess_player = SessPlayer()
+    assert (
+        await run_interactive_session(
+            gw_only_cfg,
+            connect_factory=InteractiveGwWs,
+            mic_capture=IdleGwMic(),
+            audio_player=sess_player,
+        )
+        == 0
+    )
+    sess_out = capsys.readouterr().out
+    assert "🐱 哈基米: 收到喵!" in sess_out
+    assert "⏱️ 耗时:" in sess_out
+    assert any(f["type"] == "text.turn" and f["text"] == "文字问好" for f in sess_sent)
+    assert any(f["type"] == "turn.cancel" for f in sess_sent)
+    assert sess_player.cancelled >= 1
+    assert any(c[1] == b"MP3-FRAME" for c in sess_player.chunks)
+
+    # Interactive gateway session B: VAD audio.turn + barge-in turn.cancel
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    sess_sent.clear()
+    vad_frames = [
+        *([_pcm_frame(4000)] * 4),
+        *([_silence_frame()] * 3),
+        *([_pcm_frame(5000)] * 2),
+    ]
+
+    class VadGwMic:
+        def __init__(self) -> None:
+            self._idx = 0
+
+        async def start(self) -> None:
+            return None
+
+        async def read_frame(self) -> bytes:
+            if self._idx == 7:
+                await asyncio.sleep(0.08)
+            else:
+                await asyncio.sleep(0.01)
+            if self._idx < len(vad_frames):
+                f = vad_frames[self._idx]
+                self._idx += 1
+                return f
+            await asyncio.sleep(0.08)
+            return b""
+
+        async def stop(self) -> None:
+            return None
+
+    vad_player = SessPlayer(keep_playing_until_cancel=True)
+    assert (
+        await run_interactive_session(
+            gw_only_cfg,
+            connect_factory=InteractiveGwWs,
+            mic_capture=VadGwMic(),
+            audio_player=vad_player,
+        )
+        == 0
+    )
+    vad_out = capsys.readouterr().out
+    assert "🎤 你: 语音提问" in vad_out
+    assert "🐱 哈基米: 收到喵!" in vad_out
+    assert any(f["type"] == "audio.turn" for f in sess_sent)
+    assert any(f["type"] == "turn.cancel" for f in sess_sent)
+    assert vad_player.cancelled >= 1

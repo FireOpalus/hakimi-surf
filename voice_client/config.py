@@ -122,6 +122,9 @@ class VoiceClientConfig:
     # WebSocket connection & companion session metadata
     ws_url: str = ""
     ws_token: str = ""
+    gateway_url: str = ""
+    gateway_token: str = ""
+    gateway_output_format: str = ""
     adapter_id: str = "mac-voice"
     client_id: str = "boiser-m4"
     session_mode: Literal["owner_private", "room_public"] = "owner_private"
@@ -169,6 +172,30 @@ class VoiceClientConfig:
     vad_barge_in_multiplier: float = 2.2
     barge_in_enabled: bool = True
     ping_interval_seconds: float = 20.0
+
+    @property
+    def use_gateway(self) -> bool:
+        """Return True when VOICE_GATEWAY_URL is configured."""
+        return bool(self.gateway_url.strip())
+
+    def require_gateway(self) -> None:
+        """Validate Voice Gateway WebSocket URL and token without exposing secret values."""
+        url = self.gateway_url.strip()
+        if not url:
+            raise ValueError(
+                "缺少 VOICE_GATEWAY_URL：请在 ~/.config/hakimi-voice/.env "
+                "或环境变量中设置语音网关 WebSocket 地址。"
+            )
+        if not (url.startswith("ws://") or url.startswith("wss://")):
+            raise ValueError(
+                "VOICE_GATEWAY_URL 格式无效：必须以 ws:// 或 wss:// 开头 "
+                "(must start with ws:// or wss://)。"
+            )
+        if not self.gateway_token.strip():
+            raise ValueError(
+                "缺少 VOICE_GATEWAY_TOKEN：请在 ~/.config/hakimi-voice/.env "
+                "或环境变量中设置语音网关鉴权 Token。"
+            )
 
     def require_ws(self) -> None:
         """Validate WebSocket URL and token without exposing secret values."""
@@ -317,10 +344,24 @@ def load_config(
         _parse_float(merged.get("VAD_BARGE_IN_MULTIPLIER"), 2.2, "VAD_BARGE_IN_MULTIPLIER"),
     )
     barge_in_enabled = _parse_bool(merged.get("BARGE_IN_ENABLED"), True, "BARGE_IN_ENABLED")
+    ping_interval_seconds = max(
+        0.0,
+        _parse_float(merged.get("PING_INTERVAL_SECONDS"), 20.0, "PING_INTERVAL_SECONDS"),
+    )
+
+    raw_gw_fmt = merged.get("VOICE_GATEWAY_OUTPUT_FORMAT", "").strip().lower()
+    if raw_gw_fmt not in {"", "mp3", "wav", "pcm_16k", "pcm_48k_stereo"}:
+        raise ValueError(
+            f"VOICE_GATEWAY_OUTPUT_FORMAT 无效 ({raw_gw_fmt!r})："
+            "必须为空或 mp3 / wav / pcm_16k / pcm_48k_stereo。"
+        )
 
     return VoiceClientConfig(
         ws_url=merged.get("COMPANION_WS_URL", "").strip(),
         ws_token=merged.get("COMPANION_WS_TOKEN", "").strip(),
+        gateway_url=merged.get("VOICE_GATEWAY_URL", "").strip(),
+        gateway_token=merged.get("VOICE_GATEWAY_TOKEN", "").strip(),
+        gateway_output_format=raw_gw_fmt,
         adapter_id=adapter_id,
         client_id=client_id,
         session_mode=session_mode,
@@ -374,4 +415,5 @@ def load_config(
         vad_max_speech_ms=vad_max_speech_ms,
         vad_barge_in_multiplier=vad_barge_in_multiplier,
         barge_in_enabled=barge_in_enabled,
+        ping_interval_seconds=ping_interval_seconds,
     )

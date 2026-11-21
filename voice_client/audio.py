@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import io
 import logging
 import math
@@ -19,6 +20,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .providers import TTSProvider
 
@@ -338,6 +340,41 @@ def _consume_task_exception(task: asyncio.Task[tuple[bytes, str]]) -> None:
 
 
 def _default_ffplay_stream_cmd(fmt: str) -> list[str]:
+    lowered = fmt.strip().lower()
+    if lowered == "pcm_16k":
+        return [
+            "ffplay",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nodisp",
+            "-autoexit",
+            "-f",
+            "s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+        ]
+    if lowered == "pcm_48k_stereo":
+        return [
+            "ffplay",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nodisp",
+            "-autoexit",
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-i",
+            "pipe:0",
+        ]
     clean_fmt = _EXT_CLEAN_RE.sub("", fmt.lstrip(".")) or "mp3"
     return [
         "ffplay",
@@ -355,6 +392,17 @@ def _default_ffplay_stream_cmd(fmt: str) -> list[str]:
         "-i",
         "pipe:0",
     ]
+
+
+def _audio_bytes_for_file(audio_bytes: bytes, fmt: str) -> tuple[bytes, str]:
+    """Convert raw PCM formats to WAV for file-based playback (afplay), else return ext."""
+    lowered = (fmt or "mp3").strip().lower()
+    if lowered == "pcm_16k":
+        return pcm16_to_wav_bytes(audio_bytes, sample_rate=16000, channels=1), "wav"
+    if lowered == "pcm_48k_stereo":
+        return pcm16_to_wav_bytes(audio_bytes, sample_rate=48000, channels=2), "wav"
+    ext = _EXT_CLEAN_RE.sub("", lowered.lstrip(".")) or "mp3"
+    return audio_bytes, ext
 
 
 @dataclass
@@ -763,3 +811,511 @@ class AfplayAudioPlayer:
                         await _terminate_process(proc)
             with contextlib.suppress(Exception):
                 await gen.aclose()
+
+
+@dataclass
+class _RawStreamItem:
+    turn_id: str
+    seq: int
+    fmt: str
+    chunks: asyncio.Queue[bytes | None] = field(default_factory=asyncio.Queue)
+    enqueued_at: float = field(default_factory=time.perf_counter)
+    closed: bool = False
+
+
+class RawStreamAudioPlayer:
+    """Ordered TTS player for live binary audio chunks pushed by VoiceGatewayWsClient."""
+
+    def __init__(
+        self,
+        *,
+        play_cmd_factory: Callable[[Path], Sequence[str]] | None = None,
+        stream_cmd_factory: Callable[[str], Sequence[str]] | None = None,
+        enable_streaming: bool = True,
+        on_first_audio: Callable[[str, float], None] | None = None,
+    ) -> None:
+        self._play_cmd_factory = play_cmd_factory or (lambda path: ["afplay", str(path)])
+        if stream_cmd_factory is not None:
+            self._stream_cmd_factory: Callable[[str], Sequence[str]] | None = stream_cmd_factory
+        elif enable_streaming and play_cmd_factory is None and shutil.which("ffplay") is not None:
+            self._stream_cmd_factory = _default_ffplay_stream_cmd
+        else:
+            self._stream_cmd_factory = None
+        self._enable_streaming = bool(enable_streaming)
+        self._on_first_audio = on_first_audio
+
+        self._queue: deque[_RawStreamItem] = deque()
+        self._open_streams: dict[str, _RawStreamItem] = {}
+        self._cancelled_turns: deque[str] = deque(maxlen=64)
+        self._wake_event = asyncio.Event()
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()
+
+        self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._worker_task: asyncio.Task[None] | None = None
+        self._active_item: _RawStreamItem | None = None
+        self._active_play_task: asyncio.Task[None] | None = None
+        self._active_proc: asyncio.subprocess.Process | None = None
+        self._active_once_proc: asyncio.subprocess.Process | None = None
+        self._active_cancelled = False
+        self._is_playing = False
+        self._stop_requested = False
+        self._file_seq = 0
+
+    @property
+    def streaming_active(self) -> bool:
+        """Return True when live chunk streaming into ffplay is enabled and supported."""
+        return self._enable_streaming and self._stream_cmd_factory is not None
+
+    @property
+    def is_playing(self) -> bool:
+        """Return True while audio is actively playing out through the audio subprocess."""
+        return self._is_playing
+
+    def _fire_first_audio(self, turn_id: str, elapsed_ms: float) -> None:
+        if self._on_first_audio is None:
+            return
+        try:
+            self._on_first_audio(turn_id, elapsed_ms)
+        except Exception:
+            pass
+
+    async def start(self) -> None:
+        """Start the background playback worker and allocate temp directory."""
+        if self._worker_task is not None:
+            return
+        self._stop_requested = False
+        if self._tmpdir is None:
+            self._tmpdir = tempfile.TemporaryDirectory(prefix="hakimi_voice_raw_")
+        self._worker_task = asyncio.create_task(self._worker_loop())
+
+    def begin_stream(self, turn_id: str, seq: int = 1, fmt: str = "mp3") -> None:
+        """Open a new ordered audio chunk stream for (turn_id, seq)."""
+        if self._stop_requested or turn_id in self._cancelled_turns:
+            return
+        prev = self._open_streams.pop(turn_id, None)
+        if prev is not None and not prev.closed:
+            prev.closed = True
+            prev.chunks.put_nowait(None)
+        clean_fmt = (fmt or "mp3").strip().lower() or "mp3"
+        item = _RawStreamItem(turn_id=turn_id, seq=seq, fmt=clean_fmt)
+        self._open_streams[turn_id] = item
+        self._queue.append(item)
+        self._idle_event.clear()
+        self._wake_event.set()
+
+    def push_chunk(self, turn_id: str, chunk: bytes) -> None:
+        """Append incoming binary audio bytes to the open stream for turn_id."""
+        if self._stop_requested or not chunk or turn_id in self._cancelled_turns:
+            return
+        item = self._open_streams.get(turn_id)
+        if item is None or item.closed:
+            return
+        item.chunks.put_nowait(bytes(chunk))
+
+    def end_stream(self, turn_id: str, seq: int = 0) -> None:
+        """Close the open audio stream for turn_id so playback can finish cleanly."""
+        item = self._open_streams.get(turn_id)
+        if item is None:
+            return
+        if seq and item.seq != seq:
+            return
+        self._open_streams.pop(turn_id, None)
+        if not item.closed:
+            item.closed = True
+            item.chunks.put_nowait(None)
+
+    async def cancel_turn(self, turn_id: str | None = None) -> None:
+        """Cancel queued/open/active streams and kill active playback immediately."""
+        if turn_id is not None and turn_id not in self._cancelled_turns:
+            self._cancelled_turns.append(turn_id)
+
+        for key in list(self._open_streams):
+            if turn_id is None or key == turn_id:
+                stream_item = self._open_streams.pop(key)
+                if not stream_item.closed:
+                    stream_item.closed = True
+                    stream_item.chunks.put_nowait(None)
+
+        remaining: deque[_RawStreamItem] = deque()
+        while self._queue:
+            item = self._queue.popleft()
+            if turn_id is None or item.turn_id == turn_id:
+                if not item.closed:
+                    item.closed = True
+                    item.chunks.put_nowait(None)
+            else:
+                remaining.append(item)
+        self._queue = remaining
+
+        active = self._active_item
+        if active is not None and (turn_id is None or active.turn_id == turn_id):
+            self._active_cancelled = True
+            if not active.closed:
+                active.closed = True
+                active.chunks.put_nowait(None)
+            if self._active_play_task is not None and not self._active_play_task.done():
+                self._active_play_task.cancel()
+            proc = self._active_proc
+            if proc is not None:
+                await _terminate_process(proc)
+            self._is_playing = False
+            if self._active_play_task is not None:
+                with contextlib.suppress(BaseException):
+                    await self._active_play_task
+
+        if turn_id is None and self._active_once_proc is not None:
+            await _terminate_process(self._active_once_proc)
+            self._is_playing = False
+
+        if not self._queue and self._active_item is None:
+            self._idle_event.set()
+
+    async def wait_idle(self) -> None:
+        """Wait until all queued streams have finished playing or been cancelled."""
+        await self._idle_event.wait()
+
+    async def stop(self) -> None:
+        """Cancel pending audio, stop the playback worker, and clean up temp files."""
+        self._stop_requested = True
+        await self.cancel_turn(None)
+        self._wake_event.set()
+        worker = self._worker_task
+        self._worker_task = None
+        if worker is not None:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+        self._is_playing = False
+        self._idle_event.set()
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+
+    async def play_once(self, audio_bytes: bytes, ext: str = "mp3") -> None:
+        """Play a single complete audio buffer via play_cmd_factory (afplay)."""
+        if not audio_bytes:
+            return
+        payload, clean_ext = _audio_bytes_for_file(audio_bytes, ext)
+        with tempfile.TemporaryDirectory(prefix="hakimi_voice_raw_once_") as tmpdir:
+            out_path = Path(tmpdir) / f"once.{clean_ext}"
+            await asyncio.to_thread(out_path.write_bytes, payload)
+            cmd = [str(part) for part in self._play_cmd_factory(out_path)]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except FileNotFoundError:
+                raise RuntimeError(f"未找到播放命令 {cmd[0]!r}。") from None
+            self._active_once_proc = proc
+            try:
+                self._is_playing = True
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    err = stderr.decode("utf-8", errors="replace").strip()
+                    raise RuntimeError(f"音频播放失败 (exit={proc.returncode}): {err}")
+            except asyncio.CancelledError:
+                await _terminate_process(proc)
+                raise
+            finally:
+                self._is_playing = False
+                if self._active_once_proc is proc:
+                    self._active_once_proc = None
+
+    async def play_stream_once(
+        self,
+        stream_fn: Any,
+        *,
+        fmt: str = "mp3",
+    ) -> tuple[float, float, int, str]:
+        """Play a single incoming audio stream live via ffplay or buffered afplay."""
+        t0 = time.perf_counter()
+        active_fmt = (fmt or "mp3").strip().lower() or "mp3"
+        total_bytes = 0
+        ttfb_ms = 0.0
+        proc: asyncio.subprocess.Process | None = None
+        buffered = bytearray()
+
+        async def _consume_chunk(chunk: bytes, chunk_fmt: str | None = None) -> None:
+            nonlocal active_fmt, total_bytes, ttfb_ms, proc
+            if chunk_fmt:
+                active_fmt = chunk_fmt.strip().lower() or active_fmt
+            if not chunk:
+                return
+            if total_bytes == 0:
+                ttfb_ms = (time.perf_counter() - t0) * 1000.0
+            total_bytes += len(chunk)
+
+            if self.streaming_active:
+                assert self._stream_cmd_factory is not None
+                if proc is None:
+                    cmd = [str(part) for part in self._stream_cmd_factory(active_fmt)]
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                    except FileNotFoundError:
+                        raise RuntimeError(f"未找到流式播放命令 {cmd[0]!r}。") from None
+                    self._active_once_proc = proc
+                    self._is_playing = True
+                assert proc.stdin is not None
+                try:
+                    proc.stdin.write(chunk)
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                buffered.extend(chunk)
+
+        try:
+            if hasattr(stream_fn, "__aiter__"):
+                async for piece in stream_fn:
+                    if isinstance(piece, tuple):
+                        await _consume_chunk(piece[0], str(piece[1]))
+                    else:
+                        await _consume_chunk(piece)
+            elif callable(stream_fn):
+                sig = inspect.signature(stream_fn)
+                if len(sig.parameters) == 0:
+                    res = stream_fn()
+                    if hasattr(res, "__aiter__"):
+                        async for piece in res:
+                            if isinstance(piece, tuple):
+                                await _consume_chunk(piece[0], str(piece[1]))
+                            else:
+                                await _consume_chunk(piece)
+                    elif inspect.isawaitable(res):
+                        val = await res
+                        if isinstance(val, tuple) and len(val) >= 2:
+                            await _consume_chunk(val[0], str(val[1]))
+                        elif isinstance(val, (bytes, bytearray)):
+                            await _consume_chunk(bytes(val))
+                else:
+                    res = stream_fn(_consume_chunk)
+                    if inspect.isawaitable(res):
+                        val = await res
+                        if isinstance(val, dict) and val.get("format"):
+                            active_fmt = str(val["format"]).strip().lower() or active_fmt
+                        elif isinstance(val, tuple) and len(val) >= 2 and isinstance(val[1], str):
+                            active_fmt = val[1].strip().lower() or active_fmt
+                        elif isinstance(val, str) and val.strip():
+                            active_fmt = val.strip().lower()
+            else:
+                raise TypeError("stream_fn must be an async iterable or callable")
+
+            if proc is not None:
+                if proc.stdin is not None:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+                        await proc.stdin.wait_closed()
+                stderr_data = b""
+                if proc.stderr is not None:
+                    stderr_data = await proc.stderr.read()
+                await proc.wait()
+                if proc.returncode not in (0, None):
+                    err = stderr_data.decode("utf-8", errors="replace").strip()
+                    raise RuntimeError(f"流式音频播放失败 (exit={proc.returncode}): {err}")
+            elif buffered:
+                await self.play_once(bytes(buffered), active_fmt)
+
+            return ttfb_ms, (time.perf_counter() - t0) * 1000.0, total_bytes, active_fmt
+        except asyncio.CancelledError:
+            if proc is not None:
+                await _terminate_process(proc)
+            raise
+        finally:
+            self._is_playing = False
+            if proc is not None:
+                if self._active_once_proc is proc:
+                    self._active_once_proc = None
+                if proc.returncode is None:
+                    with contextlib.suppress(Exception):
+                        await _terminate_process(proc)
+
+    def _is_item_aborted(self, item: _RawStreamItem) -> bool:
+        if self._stop_requested or self._active_cancelled:
+            return True
+        return item.turn_id in self._cancelled_turns
+
+    async def _play_bytes_in_tmpdir(
+        self,
+        audio_bytes: bytes,
+        fmt: str,
+        item: _RawStreamItem,
+    ) -> None:
+        if not audio_bytes or self._is_item_aborted(item):
+            return
+        if self._tmpdir is None:
+            self._tmpdir = tempfile.TemporaryDirectory(prefix="hakimi_voice_raw_")
+        payload, clean_ext = _audio_bytes_for_file(audio_bytes, fmt)
+        self._file_seq += 1
+        out_path = Path(self._tmpdir.name) / f"raw_{self._file_seq}_{item.seq}.{clean_ext}"
+        await asyncio.to_thread(out_path.write_bytes, payload)
+        cmd = [str(part) for part in self._play_cmd_factory(out_path)]
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._active_proc = proc
+            if self._is_item_aborted(item):
+                await _terminate_process(proc)
+                return
+            self._is_playing = True
+            self._fire_first_audio(
+                item.turn_id,
+                (time.perf_counter() - item.enqueued_at) * 1000.0,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode not in (0, None) and not self._is_item_aborted(item):
+                err = stderr.decode("utf-8", errors="replace").strip()
+                log.warning("Playback exited non-zero (%s): %s", proc.returncode, err)
+        except FileNotFoundError:
+            log.warning("Playback command not found: %s", cmd[0])
+        except asyncio.CancelledError:
+            if proc is not None:
+                await _terminate_process(proc)
+            raise
+        finally:
+            self._is_playing = False
+            if self._active_proc is proc:
+                self._active_proc = None
+            out_path.unlink(missing_ok=True)
+
+    async def _play_raw_item(self, item: _RawStreamItem) -> None:
+        if not self.streaming_active:
+            buf = bytearray()
+            while True:
+                chunk = await item.chunks.get()
+                if chunk is None or self._is_item_aborted(item):
+                    break
+                buf.extend(chunk)
+            if not buf or self._is_item_aborted(item):
+                return
+            await self._play_bytes_in_tmpdir(bytes(buf), item.fmt, item)
+            return
+
+        assert self._stream_cmd_factory is not None
+        first_chunk = b""
+        while True:
+            chunk = await item.chunks.get()
+            if chunk is None or self._is_item_aborted(item):
+                return
+            if chunk:
+                first_chunk = chunk
+                break
+
+        ttfb_ms = (time.perf_counter() - item.enqueued_at) * 1000.0
+        cmd = [str(part) for part in self._stream_cmd_factory(item.fmt)]
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            log.warning("Streaming playback command not found: %s", cmd[0])
+            return
+
+        self._active_proc = proc
+        stderr_data = b""
+        try:
+            if self._is_item_aborted(item):
+                await _terminate_process(proc)
+                return
+            self._is_playing = True
+            self._fire_first_audio(item.turn_id, ttfb_ms)
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(first_chunk)
+                await proc.stdin.drain()
+                while True:
+                    chunk = await item.chunks.get()
+                    if chunk is None or self._is_item_aborted(item):
+                        break
+                    if chunk:
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    proc.stdin.close()
+                    await proc.stdin.wait_closed()
+
+            if self._is_item_aborted(item):
+                await _terminate_process(proc)
+                return
+            if proc.stderr is not None:
+                stderr_data = await proc.stderr.read()
+            await proc.wait()
+            if proc.returncode not in (0, None) and not self._is_item_aborted(item):
+                err = stderr_data.decode("utf-8", errors="replace").strip()
+                log.warning("Streaming playback exited non-zero (%s): %s", proc.returncode, err)
+        except asyncio.CancelledError:
+            await _terminate_process(proc)
+            raise
+        finally:
+            self._is_playing = False
+            if self._active_proc is proc:
+                self._active_proc = None
+            if proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    await _terminate_process(proc)
+
+    async def _worker_loop(self) -> None:
+        while not self._stop_requested:
+            if not self._queue:
+                if self._active_item is None:
+                    self._idle_event.set()
+                self._wake_event.clear()
+                if self._stop_requested:
+                    break
+                await self._wake_event.wait()
+                continue
+
+            item = self._queue.popleft()
+            if item.turn_id in self._cancelled_turns:
+                if not item.closed:
+                    item.closed = True
+                    item.chunks.put_nowait(None)
+                if not self._queue:
+                    self._idle_event.set()
+                continue
+
+            self._active_item = item
+            self._active_cancelled = False
+            play_task = asyncio.create_task(self._play_raw_item(item))
+            self._active_play_task = play_task
+            try:
+                await play_task
+            except asyncio.CancelledError:
+                if self._stop_requested or not self._active_cancelled:
+                    raise
+                continue
+            except Exception as exc:
+                log.warning(
+                    "Raw TTS playback failed (turn=%s seq=%s): %s",
+                    item.turn_id,
+                    item.seq,
+                    type(exc).__name__,
+                )
+            finally:
+                self._active_play_task = None
+                self._active_item = None
+                self._active_cancelled = False
+                if not self._queue:
+                    self._idle_event.set()
