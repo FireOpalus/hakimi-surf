@@ -89,3 +89,93 @@ services:
       options:
         max-size: 5m
         max-file: "2"
+
+  hakimi-plugin-web-tools:
+    build:
+      context: .
+      dockerfile: plugins/Dockerfile
+    command: ["python", "-m", "plugins.web_tools.plugin_main"]
+    env_file:
+      - path: ./secrets/plugins.env
+        required: false
+    environment:
+      HAKIMI_PLUGIN_WS_URL: "ws://hakimi-bot:12141/ws/plugin"
+      TZ: "Asia/Shanghai"
+    depends_on:
+      hakimi-bot:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 128m
+    pids_limit: 32
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  hakimi-plugin-doc-render:
+    build:
+      context: .
+      dockerfile: plugins/doc_render/Dockerfile
+    command: ["python", "-m", "plugins.doc_render.plugin_main"]
+    env_file:
+      - path: ./secrets/plugins.env
+        required: false
+    environment:
+      HAKIMI_PLUGIN_WS_URL: "ws://hakimi-bot:12141/ws/plugin"
+      TZ: "Asia/Shanghai"
+    depends_on:
+      hakimi-bot:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 384m
+    pids_limit: 48
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  hakimi-plugin-song-finder:
+    build:
+      context: .
+      dockerfile: plugins/song_finder/Dockerfile
+    command: ["python", "-m", "plugins.song_finder.plugin_main"]
+    env_file:
+      - path: ./secrets/plugins.env
+        required: false
+    environment:
+      HAKIMI_PLUGIN_WS_URL: "ws://hakimi-bot:12141/ws/plugin"
+      TZ: "Asia/Shanghai"
+    depends_on:
+      hakimi-bot:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 384m
+    pids_limit: 64
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

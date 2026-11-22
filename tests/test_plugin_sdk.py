@@ -723,9 +723,17 @@ def test_packaging_and_deploy_script_conventions():
         "hakimi-plugin-weather:",
         "hakimi-plugin-minecraft:",
         "hakimi-plugin-bilibili:",
+        "hakimi-plugin-web-tools:",
+        "hakimi-plugin-doc-render:",
+        "hakimi-plugin-song-finder:",
         "plugins.weather.plugin_main",
         "plugins.minecraft.plugin_main",
         "plugins.bilibili.plugin_main",
+        "plugins.web_tools.plugin_main",
+        "plugins.doc_render.plugin_main",
+        "plugins.song_finder.plugin_main",
+        "dockerfile: plugins/doc_render/Dockerfile",
+        "dockerfile: plugins/song_finder/Dockerfile",
         "secrets/plugins.env",
         "ws://hakimi-bot:12141/ws/plugin",
         "condition: service_healthy",
@@ -735,6 +743,39 @@ def test_packaging_and_deploy_script_conventions():
         "pids_limit: 32",
     ):
         assert required in compose_text
+    for forbidden in ("colab-adc.json", "BILI_COOKIE", "SESSDATA"):
+        assert forbidden not in compose_text
+
+    # Verify every service block in compose.plugins.yaml enforces hardened security defaults.
+    blocks: dict[str, str] = {}
+    cur_svc: str | None = None
+    for line in compose_text.splitlines():
+        if line.startswith("  ") and not line.startswith("   ") and line.rstrip().endswith(":"):
+            cur_svc = line.strip()[:-1]
+            blocks[cur_svc] = ""
+        elif cur_svc is not None:
+            blocks[cur_svc] += line + "\n"
+    assert set(blocks) == {
+        "hakimi-plugin-weather",
+        "hakimi-plugin-minecraft",
+        "hakimi-plugin-bilibili",
+        "hakimi-plugin-web-tools",
+        "hakimi-plugin-doc-render",
+        "hakimi-plugin-song-finder",
+    }
+    for svc_name, block in blocks.items():
+        assert "read_only: true" in block, svc_name
+        assert "cap_drop: [ALL]" in block, svc_name
+        assert "no-new-privileges:true" in block, svc_name
+        assert "init: true" in block, svc_name
+        assert "volumes:" not in block, svc_name
+        assert "mem_limit:" in block, svc_name
+        assert "pids_limit:" in block, svc_name
+        assert "tmpfs:" in block, svc_name
+
+    # Lightweight shared Dockerfile remains unbloated.
+    for heavy in ("pillow", "pypdf", "yt-dlp", "ffmpeg", "fonts-wqy"):
+        assert heavy not in dockerfile.lower()
 
     deploy_sh = root / "scripts" / "deploy_plugins.sh"
     assert deploy_sh.stat().st_mode & 0o111
@@ -743,6 +784,13 @@ def test_packaging_and_deploy_script_conventions():
     assert "--no-deps" in deploy_text
     assert "hakimi-plugin-bilibili" in deploy_text
     assert "bilibili|bilibili_surf|hakimi-plugin-bilibili" in deploy_text
+    for wave3_pattern in (
+        "web_tools|web-tools|hakimi-plugin-web-tools",
+        "doc_render|doc-render|hakimi-plugin-doc-render",
+        "song_finder|song-finder|hakimi-plugin-song-finder",
+        "wave3)",
+    ):
+        assert wave3_pattern in deploy_text
 
 
 def test_phase3_extended_specs_and_validation():
@@ -1166,3 +1214,235 @@ def test_session_exit_action_config_and_hello_payload():
     for bad_action in ("stop", "Bad.Action", "weather_pilot.stop!", "   ", "1bad.stop"):
         with pytest.raises(ValidationError):
             _make_config(session_exit_action=bad_action)
+
+
+def test_blob_protocol_helpers_bounds_and_sanitization():
+    from hakimi_plugin_sdk.protocol import (
+        BLOB_CHUNK_RAW_BYTES,
+        BLOB_HARD_MAX_BYTES,
+        BLOB_INLINE_MAX_BYTES,
+        compute_chunk_raw_bytes,
+        compute_inline_max_bytes,
+        decode_blob_chunk,
+        encode_blob_chunk,
+        sanitize_blob_meta_str,
+        sha256_hex,
+        validate_blob_descriptor,
+    )
+
+    assert compute_chunk_raw_bytes(262_144) == BLOB_CHUNK_RAW_BYTES
+    assert 4096 <= compute_chunk_raw_bytes(16_384) <= 10_000
+    assert compute_inline_max_bytes(262_144) == BLOB_INLINE_MAX_BYTES
+    assert compute_inline_max_bytes(16_384) == 0
+
+    assert sanitize_blob_meta_str("../../etc/passwd\n", max_len=64, is_filename=True) == "passwd"
+    assert (
+        sanitize_blob_meta_str("..", max_len=64, default="fallback", is_filename=True) == "fallback"
+    )
+    assert sanitize_blob_meta_str("audio/mpeg\x00\r\n", max_len=64) == "audio/mpeg"
+
+    sample = b"hello-blob-chunk"
+    b64 = encode_blob_chunk(sample)
+    assert decode_blob_chunk(b64, max_raw_bytes=len(sample)) == sample
+    with pytest.raises(ValueError, match="blob_too_large"):
+        decode_blob_chunk(b64, max_raw_bytes=len(sample) - 1)
+    with pytest.raises(ValueError, match="blob_invalid"):
+        decode_blob_chunk("not!valid!base64", max_raw_bytes=64)
+
+    desc = validate_blob_descriptor(
+        {
+            "encoding": "inline_b64",
+            "data_b64": b64,
+            "byte_size": len(sample),
+            "sha256": sha256_hex(sample),
+            "mime_type": "text/plain",
+            "filename": "../notes/demo.txt",
+        },
+        max_bytes=1024,
+    )
+    assert desc["filename"] == "demo.txt"
+    with pytest.raises(ValueError, match="blob_too_large"):
+        validate_blob_descriptor(
+            {
+                "encoding": "chunked",
+                "blob_id": "a" * 32,
+                "byte_size": BLOB_HARD_MAX_BYTES + 1,
+                "sha256": sha256_hex(sample),
+                "total_chunks": 2,
+            },
+            max_bytes=BLOB_HARD_MAX_BYTES + 1024,
+        )
+
+
+async def test_sdk_bidirectional_chunked_blob_and_backpressure():
+    from hakimi_plugin_sdk import BlobResult
+    from hakimi_plugin_sdk.protocol import (
+        BLOB_FIELD,
+        BLOB_RPC_GET,
+        BLOB_RPC_PUT,
+        BLOB_RPC_RELEASE,
+        encode_blob_chunk,
+        sha256_hex,
+    )
+
+    sock = _FakeSocket()
+    received_blobs: list[tuple[bytes, dict[str, Any]]] = []
+
+    async def echo_blob(params: dict[str, Any]) -> BlobResult:
+        raw = params["blob"]
+        received_blobs.append((raw, dict(params["blob_meta"])))
+        doubled = raw + raw[::-1]
+        return BlobResult(
+            data={"echoed": True, "in_size": len(raw)},
+            blob=doubled,
+            mime_type="application/octet-stream",
+            filename="../out/echo.bin",
+        )
+
+    cfg = _make_config(plugin_id="doc_render", scopes=("actions",), admin_panel=None)
+    client = HakimiPluginClient(
+        cfg,
+        actions=[ActionSpec(name="doc_render.echo", description="Echo blob", handler=echo_blob)],
+        connect_factory=lambda _url, **_kw: sock,
+        max_frame_bytes=32_768,
+        max_blob_bytes=512 * 1024,
+    )
+
+    await client.start()
+    try:
+        await sock.wait_sent(lambda m: m.get("type") == "plugin.hello")
+        await sock.push(
+            {"type": "plugin.welcome", "plugin_id": "doc_render", "scopes": ["actions"]}
+        )
+        assert await client.wait_connected(timeout=2.0)
+
+        # Upload 30 KiB in 3 x 10 KiB chunks (exceeds inline threshold for 32 KiB frame).
+        payload = bytes(range(256)) * 120  # 30,720 bytes
+        digest = sha256_hex(payload)
+        tid = "1" * 32
+        chunk_size = 10_240
+        for seq in range(3):
+            chunk = payload[seq * chunk_size : (seq + 1) * chunk_size]
+            await sock.push(
+                {
+                    "type": "rpc.request",
+                    "id": f"put-{seq}",
+                    "method": BLOB_RPC_PUT,
+                    "params": {
+                        "transfer_id": tid,
+                        "seq": seq,
+                        "total_chunks": 3,
+                        "total_bytes": len(payload),
+                        "sha256": digest,
+                        "data_b64": encode_blob_chunk(chunk),
+                        "mime_type": "application/pdf",
+                        "filename": "../../secret/sample.pdf",
+                    },
+                }
+            )
+            ack = await sock.wait_sent(lambda m, rid=f"put-{seq}": m.get("id") == rid)
+            assert ack["ok"] is True
+            assert ack["result"]["complete"] is (seq == 2)
+
+        # Invoke action referencing the uploaded chunked blob
+        await sock.push(
+            {
+                "type": "rpc.request",
+                "id": "call-echo",
+                "method": "action.run",
+                "params": {
+                    "action": "doc_render.echo",
+                    "arguments": {},
+                    BLOB_FIELD: {
+                        "encoding": "chunked",
+                        "transfer_id": tid,
+                        "byte_size": len(payload),
+                        "sha256": digest,
+                        "total_chunks": 3,
+                        "mime_type": "application/pdf",
+                        "filename": "sample.pdf",
+                    },
+                },
+            }
+        )
+        res = await sock.wait_sent(lambda m: m.get("id") == "call-echo")
+        assert res["ok"] is True
+        assert received_blobs[0][0] == payload
+        assert received_blobs[0][1]["filename"] == "sample.pdf"
+        assert not client._inbound_blobs
+
+        out_desc = res["result"][BLOB_FIELD]
+        assert out_desc["encoding"] == "chunked"
+        assert out_desc["filename"] == "echo.bin"
+        assert out_desc["byte_size"] == len(payload) * 2
+        blob_id = out_desc["blob_id"]
+
+        assembled = bytearray()
+        for seq in range(out_desc["total_chunks"]):
+            await sock.push(
+                {
+                    "type": "rpc.request",
+                    "id": f"get-{seq}",
+                    "method": BLOB_RPC_GET,
+                    "params": {"blob_id": blob_id, "seq": seq},
+                }
+            )
+            chunk_msg = await sock.wait_sent(lambda m, rid=f"get-{seq}": m.get("id") == rid)
+            assert chunk_msg["ok"] is True
+            import base64
+
+            assembled.extend(base64.b64decode(chunk_msg["result"]["data_b64"]))
+        assert bytes(assembled) == payload + payload[::-1]
+        assert not client._outbound_blobs
+
+        # Reject oversized blob.put immediately
+        await sock.push(
+            {
+                "type": "rpc.request",
+                "id": "put-huge",
+                "method": BLOB_RPC_PUT,
+                "params": {
+                    "transfer_id": "2" * 32,
+                    "seq": 0,
+                    "total_chunks": 100,
+                    "total_bytes": 1024 * 1024,
+                    "sha256": digest,
+                    "data_b64": encode_blob_chunk(b"x"),
+                },
+            }
+        )
+        huge_res = await sock.wait_sent(lambda m: m.get("id") == "put-huge")
+        assert huge_res["ok"] is False and huge_res["error"] == "plugin_blob_too_large"
+
+        # Explicit blob.release cleans up an incomplete inbound transfer
+        await sock.push(
+            {
+                "type": "rpc.request",
+                "id": "put-partial",
+                "method": BLOB_RPC_PUT,
+                "params": {
+                    "transfer_id": "3" * 32,
+                    "seq": 0,
+                    "total_chunks": 2,
+                    "total_bytes": 20,
+                    "sha256": sha256_hex(b"a" * 20),
+                    "data_b64": encode_blob_chunk(b"a" * 10),
+                },
+            }
+        )
+        await sock.wait_sent(lambda m: m.get("id") == "put-partial")
+        assert "3" * 32 in client._inbound_blobs
+
+        await sock.push(
+            {
+                "type": "rpc.request",
+                "id": "rel-partial",
+                "method": BLOB_RPC_RELEASE,
+                "params": {"transfer_id": "3" * 32},
+            }
+        )
+        rel_res = await sock.wait_sent(lambda m: m.get("id") == "rel-partial")
+        assert rel_res["ok"] is True and rel_res["result"]["released"] is True
+        assert "3" * 32 not in client._inbound_blobs
+    finally:
+        await client.stop()

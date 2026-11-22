@@ -1069,3 +1069,325 @@ async def test_e2e_bili_private_topic_patrol_cover_thumb_and_offline_filter(
         ]
         assert await svc.bili_watcher.recent_surfed(message=other_friend) == []
         assert await svc.bili_watcher.recent_surfed(message=group_msg) == []
+
+
+async def test_e2e_wave3_all_three_remote_plugins_over_real_ws_and_fallback(
+    settings: Settings,
+):
+    """Real uvicorn /ws/plugin E2E: web_tools + doc_render + song_finder simultaneously online."""
+    import io
+    import zipfile
+
+    from hakimi import text_card
+    from hakimi.models import FileRef
+    from hakimi.web_search import WebSearchConfig
+    from plugins.doc_render.plugin_main import DocRenderPlugin
+    from plugins.song_finder.plugin_main import SongFinderPlugin
+    from plugins.web_tools.plugin_main import WebToolsPlugin
+    from plugins.web_tools.search import SearchProviderConfig
+
+    s = settings.model_copy(
+        update={
+            "admin_token": SecretStr(ADMIN_TOKEN),
+            "owner_qq_id": "20000",
+            "plugin_bus_ws_enabled": True,
+            "file_read_enabled": True,
+            "web_search_enabled": True,
+        }
+    )
+    gw = FakeGateway()
+    screen_calls: list[dict[str, Any]] = []
+    orig_screen = gw.screen
+
+    async def _recording_screen(payload, subject, **kwargs):
+        screen_calls.append({"payload": payload, "subject": subject, "kwargs": kwargs})
+        return await orig_screen(payload, subject, **kwargs)
+
+    gw.screen = _recording_screen  # type: ignore[method-assign]
+    app = create_app(s, gateway_factory=lambda *_: gw, start_workers=False)
+
+    async with _running_app(app) as (port, client):
+        svc = app.state.service
+        bus = svc.plugin_bus
+        # Verify Service.__init__ wired all Wave 3 plugin_bus handles automatically.
+        assert svc.files.plugin_bus is bus
+        assert svc.songs.plugin_bus is bus
+        assert svc.store.runtime.web_search.plugin_bus is bus
+        assert text_card._get_bridge_state()[0] is bus
+
+        await svc.store.runtime.web_search.save(
+            WebSearchConfig(enabled=True, daily_limit=10, monthly_google_limit=5000)
+        )
+
+        # Fake Colab compute capturing inbox upload + rvc_cover job submission
+        inbox_uploads: list[tuple[str, bytes, str]] = []
+        submitted_jobs: list[tuple[str, dict[str, Any], str]] = []
+
+        class _StubCompute:
+            def configured(self) -> bool:
+                return True
+
+            async def upload_drive_inbox(
+                self, filename: str, raw: bytes, *, mime_type: str = "application/octet-stream"
+            ) -> dict[str, Any]:
+                inbox_uploads.append((filename, raw, mime_type))
+                return {"file_id": f"drive-inbox-{len(inbox_uploads)}", "name": filename}
+
+            async def submit_job(
+                self, job_type: str, payload: dict[str, Any], *, requester: str = "owner"
+            ) -> dict[str, Any]:
+                submitted_jobs.append((job_type, dict(payload), requester))
+                return {
+                    "id": f"job-{len(submitted_jobs)}",
+                    "job_type": job_type,
+                    "payload": payload,
+                }
+
+        svc.songs.compute = _StubCompute()
+
+        # Provision tokens for all 3 Wave 3 plugins via admin API
+        tokens: dict[str, str] = {}
+        for pid, disp in (
+            ("web_tools", "网页检索与预览"),
+            ("doc_render", "文档解析与渲染"),
+            ("song_finder", "音源检索器"),
+        ):
+            resp = await client.post(
+                "/admin/api/plugins",
+                json={
+                    "plugin_id": pid,
+                    "display_name": disp,
+                    "scopes": ["actions"],
+                    "node_region": "KR",
+                },
+            )
+            assert resp.status_code == 200
+            tokens[pid] = resp.json()["token"]
+
+        ws_url = f"ws://127.0.0.1:{port}/ws/plugin"
+
+        # 1) Build WebToolsPlugin with mocked public DNS + HTTP transport
+        async def _fake_dns(_host: str, _port: int) -> list[str]:
+            return ["93.184.216.34"]
+
+        def _web_handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/article":
+                html = (
+                    "<html><head><title>Wave3 Preview Title</title>"
+                    '<meta name="description" content="Wave3 safe summary"></head>'
+                    "<body>ok</body></html>"
+                )
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    text=html,
+                )
+            if req.url.path == "/search":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "title": "Official Spec",
+                                "content": "Wave 3 remote search verified fact.",
+                                "url": "https://example.org/spec",
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(404)
+
+        web_plugin = WebToolsPlugin(
+            ws_url=ws_url,
+            token=tokens["web_tools"],
+            search_config=SearchProviderConfig(
+                default_provider="searxng",
+                provider_order=("searxng",),
+                searxng_base_url="https://search.example.org",
+            ),
+            transport=httpx.MockTransport(_web_handler),
+            dns_resolver=_fake_dns,
+            reconnect_min=0.05,
+            reconnect_max=0.2,
+        )
+
+        # 2) Build DocRenderPlugin (real sandboxed parser + real Pillow renderer)
+        doc_plugin = DocRenderPlugin(
+            ws_url=ws_url,
+            token=tokens["doc_render"],
+            reconnect_min=0.05,
+            reconnect_max=0.2,
+        )
+
+        # 3) Build SongFinderPlugin with deterministic stub engine returning >150 KiB audio
+        chunked_audio = b"ID3" + (b"\xab\xcd" * 80_000)  # 160,003 bytes -> triggers chunked blob
+
+        class _StubSongEngine:
+            def status_snapshot(self) -> dict[str, Any]:
+                return {"provider_order": ["youtube", "bilibili_public"], "cooldowns": {}}
+
+            async def search(self, **_kw: Any) -> dict[str, Any]:
+                return {
+                    "candidates": [],
+                    "provider_used": "youtube",
+                    "skipped_providers": {},
+                }
+
+            async def fetch_source(self, *_args: Any, **_kw: Any) -> SimpleNamespace:
+                import hashlib
+
+                return SimpleNamespace(
+                    provider="youtube",
+                    title="星辰大海",
+                    uploader="Official Artist",
+                    duration_sec=210.0,
+                    audio_format="mp3",
+                    mime_type="audio/mpeg",
+                    filename="xingchen.mp3",
+                    byte_size=len(chunked_audio),
+                    data=chunked_audio,
+                    sha256=hashlib.sha256(chunked_audio).hexdigest(),
+                    skipped_providers={},
+                )
+
+        song_plugin = SongFinderPlugin(
+            ws_url=ws_url,
+            token=tokens["song_finder"],
+            engine=_StubSongEngine(),  # type: ignore[arg-type]
+            reconnect_min=0.05,
+            reconnect_max=0.2,
+        )
+
+        runners = [
+            asyncio.create_task(web_plugin.client.run_forever()),
+            asyncio.create_task(doc_plugin.client.run_forever()),
+            asyncio.create_task(song_plugin.client.run_forever()),
+        ]
+        try:
+            await _wait_until(
+                lambda: (
+                    bus.has_tool("web_tools", "web_tools.search")
+                    and bus.has_tool("web_tools", "web_tools.preview")
+                    and bus.has_tool("doc_render", "doc_render.read_file")
+                    and bus.has_tool("doc_render", "doc_render.render_card")
+                    and bus.has_tool("song_finder", "song_finder.search")
+                    and bus.has_tool("song_finder", "song_finder.fetch_source")
+                )
+            )
+
+            # Verify /admin/api/plugins overview shows all 3 online with 2 actions each
+            ov = (await client.get("/admin/api/plugins")).json()
+            by_id = {p["plugin_id"]: p for p in ov["plugins"]}
+            for pid in ("web_tools", "doc_render", "song_finder"):
+                assert by_id[pid]["online"] is True
+                assert by_id[pid]["actions_count"] == 2
+
+            # --- Test 1: web_tools.preview via Service.enrich() ---
+            probe_msg = Message(
+                platform="onebot",
+                bot_id=s.onebot_self_id,
+                event_id="e2e-w3-preview",
+                user_id="20000",
+                conversation_id="20000",
+                kind="private",
+                text="看看这个 https://example.org/article",
+                addressed=True,
+                created_at=1_700_000_000.0,
+            )
+            previews = await svc.enrich(probe_msg)
+            assert len(previews) == 1
+            assert previews[0]["title"] == "Wave3 Preview Title"
+
+            # --- Test 2: web_tools.search via WebSearch.execute_search() ---
+            findings = await svc.store.runtime.web_search.execute_search(
+                "Wave 3 architecture",
+                "owner:20000",
+                ai=svc.ai,
+                plugin_bus=bus,
+            )
+            assert "Wave 3 remote search verified fact" in findings
+            assert any(c["kwargs"].get("budget_lane") == "search" for c in screen_calls)
+            attempt_row = await svc.store.one(
+                "SELECT status, provider FROM web_search_attempts ORDER BY created DESC LIMIT 1"
+            )
+            assert attempt_row is not None and attempt_row["status"] == "completed"
+
+            # --- Test 3: doc_render.read_file (.docx) via Service.files ---
+            docx_buf = io.BytesIO()
+            with zipfile.ZipFile(docx_buf, "w") as zf:
+                zf.writestr(
+                    "word/document.xml",
+                    (
+                        '<?xml version="1.0" encoding="UTF-8"?>'
+                        '<w:document xmlns:w="'
+                        'http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                        "<w:body><w:p><w:r>"
+                        "<w:t>Wave3 DOCX Remote Parsed OK</w:t>"
+                        "</w:r></w:p></w:body>"
+                        "</w:document>"
+                    ),
+                )
+            docx_raw = docx_buf.getvalue()
+
+            class _FakeOneBotTransport:
+                async def call(self, action: str, _params: dict[str, Any]) -> dict[str, Any]:
+                    if action == "get_file":
+                        return {
+                            "file_size": len(docx_raw),
+                            "base64": base64.b64encode(docx_raw).decode("ascii"),
+                        }
+                    return {}
+
+            svc.files.transport = _FakeOneBotTransport()
+            loaded_doc = await svc.files.read_one(
+                FileRef(file_id="f-docx-1", name="spec.docx", file_size=len(docx_raw)),
+                probe_msg,
+                "owner:20000",
+            )
+            assert "Wave3 DOCX Remote Parsed OK" in loaded_doc.content
+
+            # --- Test 4: doc_render.render_card via worker-thread sync render_card() ---
+            rendered_b64 = await asyncio.to_thread(
+                text_card.render_card, "# Wave 3\n\n```python\nprint('hello')\n```"
+            )
+            assert rendered_b64.startswith("base64://")
+            rendered_bytes = base64.b64decode(rendered_b64[len("base64://") :])
+            assert rendered_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+            # --- Test 5: song_finder.fetch_source (>150 KiB chunked) -> inbox -> colab ---
+            job = await svc.songs.request_learn_song("星辰大海", auto_search=True)
+            assert job["job_type"] == "rvc_cover"
+            assert len(inbox_uploads) == 1
+            assert inbox_uploads[0][1] == chunked_audio
+            assert len(submitted_jobs) == 1
+            assert submitted_jobs[0][1]["inbox_file_id"] == "drive-inbox-1"
+            assert submitted_jobs[0][1]["auto_search"] is False
+        finally:
+            await asyncio.gather(
+                web_plugin.close(),
+                doc_plugin.close(),
+                song_plugin.close(),
+                return_exceptions=True,
+            )
+            for r in runners:
+                r.cancel()
+            await asyncio.gather(*runners, return_exceptions=True)
+
+        # --- Test 6: All 3 offline -> smooth fallback without breakage ---
+        await _wait_until(
+            lambda: (
+                not bus.is_plugin_online("web_tools")
+                and not bus.is_plugin_online("doc_render")
+                and not bus.is_plugin_online("song_finder")
+            )
+        )
+        fallback_card = await asyncio.to_thread(text_card.render_card, "离线回退卡片测试")
+        assert fallback_card.startswith("base64://")
+        assert base64.b64decode(fallback_card[len("base64://") :]).startswith(b"\xff\xd8\xff")
+
+        fallback_job = await svc.songs.request_learn_song("离线回退曲", auto_search=True)
+        assert fallback_job["payload"]["auto_search"] is True
+        assert fallback_job["payload"]["query"] == "离线回退曲"
+
+    # After app lifespan stops (Service.stop), process-wide text_card bridge is cleanly unbound.
+    assert text_card._get_bridge_state()[0] is None

@@ -23,6 +23,22 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, field_validator
 
+from hakimi_plugin_sdk.protocol import (
+    BLOB_FIELD,
+    BLOB_HARD_MAX_BYTES,
+    BLOB_RPC_GET,
+    BLOB_RPC_PUT,
+    BLOB_RPC_RELEASE,
+    ToolCallResult,
+    compute_chunk_raw_bytes,
+    compute_inline_max_bytes,
+    decode_blob_chunk,
+    encode_blob_chunk,
+    sanitize_blob_meta_str,
+    sha256_hex,
+    validate_blob_descriptor,
+)
+
 from .bot_server import is_persona_owner, untrusted_input
 from .budget_policy import PATROL_LANE, PROACTIVE_LANE, paid_lane_available
 from .config import Settings
@@ -116,6 +132,9 @@ _SCOPED_ACTION_PREFIX_OWNERS: dict[str, str] = {
     "minecraft": "minecraft",
     "bili": "bilibili_surf",
     "bilibili": "bilibili_surf",
+    "web_tools": "web_tools",
+    "doc_render": "doc_render",
+    "song_finder": "song_finder",
 }
 _SCOPED_SCENE_OWNERS: dict[str, str] = {
     "bilibili_summary": "bilibili_surf",
@@ -1537,6 +1556,16 @@ class PluginBus:
         self._fallback_kernel = PluginKernel()
         self._notify_history: dict[str, deque[float]] = {}
         self.uncertain_deliveries: deque[str] = deque(maxlen=128)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._blob_transfer_sem = asyncio.Semaphore(4)
+
+    @property
+    def event_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Return the active event loop bound to this PluginBus, if running."""
+        loop = self._loop
+        if loop is not None and not loop.is_closed() and loop.is_running():
+            return loop
+        return None
 
     def _connect_lock(self, plugin_id: str) -> asyncio.Lock:
         lock = self._connect_locks.get(plugin_id)
@@ -1580,6 +1609,7 @@ class PluginBus:
         return str(getattr(self.s, "plugin_bus_ws_path", "/ws/plugin"))
 
     async def initialize(self) -> None:
+        self._loop = asyncio.get_running_loop()
         if self.initialized:
             return
         async with self._init_lock:
@@ -1961,6 +1991,347 @@ class PluginBus:
                 future.cancel()
             elif not future.cancelled():
                 future.exception()
+
+    def is_plugin_online(self, plugin_id: str, *, require_enabled: bool = True) -> bool:
+        """Return True when `plugin_id` has an active ready session (and is enabled if required)."""
+        if not isinstance(plugin_id, str) or not plugin_id:
+            return False
+        sess = self._sessions.get(plugin_id)
+        if sess is None or not sess.ready or sess.closed:
+            return False
+        if require_enabled and (sess.proxy is None or not sess.proxy.enabled):
+            return False
+        return True
+
+    def has_tool(self, plugin_id: str, action_name: str, *, require_enabled: bool = True) -> bool:
+        """Return True when `plugin_id` is online and declares `action_name` under `actions`."""
+        if not isinstance(action_name, str) or not action_name:
+            return False
+        if not self.is_plugin_online(plugin_id, require_enabled=require_enabled):
+            return False
+        sess = self._sessions.get(plugin_id)
+        if sess is None or "actions" not in sess.scopes or sess.proxy is None:
+            return False
+        return any(spec.name == action_name for spec in sess.proxy.actions())
+
+    async def _best_effort_release_blob(
+        self,
+        session: _PluginSession,
+        *,
+        transfer_id: str | None = None,
+        blob_id: str | None = None,
+    ) -> None:
+        if session.closed or not session.ready:
+            return
+        params: dict[str, Any] = {}
+        if transfer_id:
+            params["transfer_id"] = transfer_id
+        if blob_id:
+            params["blob_id"] = blob_id
+        if not params:
+            return
+        try:
+            await self._rpc(session, BLOB_RPC_RELEASE, params, timeout=1.5)
+        except Exception:
+            pass
+
+    async def _upload_blob_chunks(
+        self,
+        session: _PluginSession,
+        raw: bytes,
+        *,
+        digest: str,
+        mime_type: str,
+        filename: str,
+        deadline: float,
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        max_frame = self._max_frame_bytes()
+        chunk_size = compute_chunk_raw_bytes(max_frame)
+        total_chunks = max(1, (len(raw) + chunk_size - 1) // chunk_size)
+        transfer_id = uuid.uuid4().hex
+        completed = False
+        async with self._blob_transfer_sem:
+            try:
+                for seq in range(total_chunks):
+                    rem = deadline - loop.time()
+                    if rem <= 0:
+                        raise Rejected("plugin_rpc_timeout")
+                    start = seq * chunk_size
+                    end = min(len(raw), start + chunk_size)
+                    put_resp = await self._rpc(
+                        session,
+                        BLOB_RPC_PUT,
+                        {
+                            "transfer_id": transfer_id,
+                            "seq": seq,
+                            "total_chunks": total_chunks,
+                            "total_bytes": len(raw),
+                            "sha256": digest,
+                            "data_b64": encode_blob_chunk(raw[start:end]),
+                            "mime_type": mime_type,
+                            "filename": filename,
+                        },
+                        timeout=min(rem, 15.0),
+                    )
+                    if not put_resp.get("ok", False):
+                        raw_err = str(put_resp.get("error") or "")
+                        code = raw_err if _CODE_RE.fullmatch(raw_err) else "plugin_blob_failed"
+                        raise Rejected(code)
+                completed = True
+            finally:
+                if not completed:
+                    await self._best_effort_release_blob(session, transfer_id=transfer_id)
+        return {
+            "encoding": "chunked",
+            "transfer_id": transfer_id,
+            "byte_size": len(raw),
+            "sha256": digest,
+            "total_chunks": total_chunks,
+            "mime_type": mime_type,
+            "filename": filename,
+        }
+
+    async def _download_blob_chunks(
+        self,
+        session: _PluginSession,
+        desc: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> bytes:
+        loop = asyncio.get_running_loop()
+        blob_id = desc["blob_id"]
+        total_chunks = int(desc["total_chunks"])
+        expected_bytes = int(desc["byte_size"])
+        expected_digest = str(desc["sha256"])
+        chunk_cap = compute_chunk_raw_bytes(self._max_frame_bytes())
+        buf = bytearray()
+        hasher = hashlib.sha256()
+        completed = False
+        async with self._blob_transfer_sem:
+            try:
+                for seq in range(total_chunks):
+                    rem = deadline - loop.time()
+                    if rem <= 0:
+                        raise Rejected("plugin_rpc_timeout")
+                    get_resp = await self._rpc(
+                        session,
+                        BLOB_RPC_GET,
+                        {"blob_id": blob_id, "seq": seq},
+                        timeout=min(rem, 15.0),
+                    )
+                    if not get_resp.get("ok", False):
+                        raw_err = str(get_resp.get("error") or "")
+                        code = raw_err if _CODE_RE.fullmatch(raw_err) else "plugin_blob_failed"
+                        raise Rejected(code)
+                    chunk_res = get_resp.get("result")
+                    if not isinstance(chunk_res, dict) or chunk_res.get("seq") != seq:
+                        raise Rejected("plugin_blob_corrupt")
+                    try:
+                        chunk_bytes = decode_blob_chunk(
+                            chunk_res.get("data_b64"), max_raw_bytes=chunk_cap
+                        )
+                    except ValueError as exc:
+                        raise Rejected(
+                            "plugin_blob_too_large"
+                            if str(exc) == "blob_too_large"
+                            else "plugin_blob_corrupt"
+                        ) from None
+                    if len(buf) + len(chunk_bytes) > expected_bytes:
+                        raise Rejected("plugin_blob_too_large")
+                    buf.extend(chunk_bytes)
+                    hasher.update(chunk_bytes)
+                if len(buf) != expected_bytes or hasher.hexdigest() != expected_digest:
+                    raise Rejected("plugin_blob_corrupt")
+                completed = True
+                return bytes(buf)
+            finally:
+                if not completed:
+                    await self._best_effort_release_blob(session, blob_id=blob_id)
+
+    async def invoke_tool(
+        self,
+        plugin_id: str,
+        action_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        blob: bytes | None = None,
+        blob_mime_type: str = "application/octet-stream",
+        blob_filename: str = "",
+        max_request_blob_bytes: int = 15 * 1024 * 1024,
+        max_response_blob_bytes: int = 0,
+        timeout: float | None = None,  # noqa: ASYNC109
+        require_enabled: bool = True,
+    ) -> ToolCallResult:
+        """Invoke a declared remote plugin tool with bounded bidirectional chunked blob transfer."""
+        if not isinstance(plugin_id, str) or not PLUGIN_ID_RE.fullmatch(plugin_id):
+            raise Rejected("invalid_plugin_id")
+        if not isinstance(action_name, str) or not _ACTION_NAME_RE.fullmatch(action_name):
+            raise Rejected("plugin_invalid_method")
+        if arguments is not None and not isinstance(arguments, dict):
+            raise Rejected("plugin_invalid_params")
+        sess = self._sessions.get(plugin_id)
+        if sess is None or not sess.ready or sess.closed:
+            raise Rejected("plugin_offline")
+        if "actions" not in sess.scopes:
+            raise Rejected("plugin_scope_rejected")
+        proxy = sess.proxy
+        if proxy is None or (require_enabled and not proxy.enabled):
+            raise Rejected("plugin_disabled")
+        if not any(spec.name == action_name for spec in proxy.actions()):
+            raise Rejected("action_not_found")
+
+        req_cap = min(max(0, int(max_request_blob_bytes)), BLOB_HARD_MAX_BYTES)
+        resp_cap = min(max(0, int(max_response_blob_bytes)), BLOB_HARD_MAX_BYTES)
+        declared_timeout = proxy._action_timeouts.get(action_name)
+        effective_timeout = float(
+            timeout
+            if timeout is not None
+            else (declared_timeout if declared_timeout is not None else self.rpc_timeout)
+        )
+        if not math.isfinite(effective_timeout) or effective_timeout <= 0:
+            effective_timeout = self.rpc_timeout
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + effective_timeout
+        rpc_params: dict[str, Any] = {
+            "action": action_name,
+            "arguments": dict(arguments or {}),
+            "origin": "kernel",
+            "target_scope": "",
+            "now": self.clock(),
+        }
+
+        uploaded_transfer_id: str | None = None
+        if blob is not None:
+            if not isinstance(blob, (bytes, bytearray)):
+                raise Rejected("plugin_invalid_params")
+            raw_req = bytes(blob)
+            if len(raw_req) > req_cap:
+                raise Rejected("plugin_blob_too_large")
+            req_digest = sha256_hex(raw_req)
+            clean_mime = sanitize_blob_meta_str(
+                blob_mime_type, max_len=96, default="application/octet-stream"
+            )
+            clean_fname = sanitize_blob_meta_str(
+                blob_filename, max_len=160, default="", is_filename=True
+            )
+            max_frame = self._max_frame_bytes()
+            inline_cap = compute_inline_max_bytes(max_frame)
+            inlined = False
+            if len(raw_req) <= inline_cap:
+                candidate_desc = {
+                    "encoding": "inline_b64",
+                    "data_b64": encode_blob_chunk(raw_req),
+                    "byte_size": len(raw_req),
+                    "sha256": req_digest,
+                    "mime_type": clean_mime,
+                    "filename": clean_fname,
+                }
+                test_params = {**rpc_params, BLOB_FIELD: candidate_desc}
+                try:
+                    encoded = json.dumps(
+                        {
+                            "type": "rpc.request",
+                            "id": "0" * 32,
+                            "method": "action.run",
+                            "params": test_params,
+                        },
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                except (TypeError, ValueError):
+                    raise Rejected("plugin_invalid_params") from None
+                if len(encoded.encode("utf-8")) <= max_frame:
+                    rpc_params[BLOB_FIELD] = candidate_desc
+                    inlined = True
+            if not inlined:
+                chunk_desc = await self._upload_blob_chunks(
+                    sess,
+                    raw_req,
+                    digest=req_digest,
+                    mime_type=clean_mime,
+                    filename=clean_fname,
+                    deadline=deadline,
+                )
+                uploaded_transfer_id = str(chunk_desc["transfer_id"])
+                rpc_params[BLOB_FIELD] = chunk_desc
+
+        try:
+            rem = deadline - loop.time()
+            if rem <= 0:
+                raise Rejected("plugin_rpc_timeout")
+            resp = await self._rpc(sess, "action.run", rpc_params, timeout=rem)
+        except Exception:
+            if uploaded_transfer_id is not None:
+                await self._best_effort_release_blob(sess, transfer_id=uploaded_transfer_id)
+            raise
+
+        if not resp.get("ok", False):
+            raw_err = str(resp.get("error") or "")
+            code = raw_err if _CODE_RE.fullmatch(raw_err) else "plugin_action_failed"
+            raise Rejected(code)
+
+        raw_res = resp.get("result") if "result" in resp else resp.get("data")
+        if raw_res is None:
+            res_dict: dict[str, Any] = {}
+        elif isinstance(raw_res, dict):
+            res_dict = dict(raw_res)
+        else:
+            res_dict = {"value": raw_res}
+
+        resp_blob: bytes | None = None
+        resp_mime = ""
+        resp_filename = ""
+        if BLOB_FIELD in res_dict:
+            raw_blob_desc = res_dict.pop(BLOB_FIELD)
+            raw_blob_id = (
+                raw_blob_desc.get("blob_id")
+                if isinstance(raw_blob_desc, dict) and isinstance(raw_blob_desc.get("blob_id"), str)
+                else None
+            )
+            if resp_cap <= 0:
+                if raw_blob_id:
+                    await self._best_effort_release_blob(sess, blob_id=raw_blob_id)
+                raise Rejected("plugin_blob_too_large")
+            try:
+                desc = validate_blob_descriptor(
+                    raw_blob_desc, max_bytes=resp_cap, id_field="blob_id"
+                )
+            except ValueError as exc:
+                if raw_blob_id:
+                    await self._best_effort_release_blob(sess, blob_id=raw_blob_id)
+                raise Rejected(
+                    "plugin_blob_too_large"
+                    if str(exc) == "blob_too_large"
+                    else "plugin_blob_invalid"
+                ) from None
+
+            resp_mime = desc["mime_type"]
+            resp_filename = desc["filename"]
+            if desc["encoding"] == "inline_b64":
+                try:
+                    resp_blob = decode_blob_chunk(desc["data_b64"], max_raw_bytes=resp_cap)
+                except ValueError as exc:
+                    raise Rejected(
+                        "plugin_blob_too_large"
+                        if str(exc) == "blob_too_large"
+                        else "plugin_blob_corrupt"
+                    ) from None
+                if len(resp_blob) != desc["byte_size"] or sha256_hex(resp_blob) != desc["sha256"]:
+                    raise Rejected("plugin_blob_corrupt")
+            else:
+                resp_blob = await self._download_blob_chunks(sess, desc, deadline=deadline)
+
+        clean_data = _scrub_json_secrets(res_dict, self._all_secrets())
+        if not isinstance(clean_data, dict):
+            clean_data = {"value": clean_data}
+        return ToolCallResult(
+            data=clean_data,
+            blob=resp_blob,
+            blob_mime_type=resp_mime,
+            blob_filename=resp_filename,
+        )
 
     def _build_actions(
         self,

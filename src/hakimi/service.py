@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from . import text_card
 from .affection import _validate_platform_user
 from .attention import can_watch_video
 from .bili_bridge import RemoteBiliClient, RemoteBiliWatcher
@@ -226,6 +227,11 @@ class Service:
         self.compressor = self.modules.systems["memory_compressor"].compressor
         self.memes = self.modules.systems["meme_library"].library
         self.plugin_bus = self.modules.systems["plugin_bus"].plugin_bus
+        self.files.plugin_bus = self.plugin_bus
+        self.songs.plugin_bus = self.plugin_bus
+        if getattr(store.runtime, "web_search", None) is not None:
+            store.runtime.web_search.plugin_bus = self.plugin_bus
+        text_card.configure_remote_bridge(self.plugin_bus)
         store.runtime.identity = self.identity
         store.runtime.affection = self.affection
         store.runtime.memes = self.memes
@@ -692,7 +698,10 @@ class Service:
             _, links = await asyncio.gather(
                 hydrate(),
                 preview_links(
-                    message.command_text or message.text, self.preview_slots, budget_seconds=1.8
+                    message.command_text or message.text,
+                    self.preview_slots,
+                    budget_seconds=1.8,
+                    plugin_bus=self.plugin_bus,
                 ),
             )
             return links
@@ -916,6 +925,8 @@ class Service:
         if kernel := getattr(self, "kernel", None):
             await kernel.dispose_all()
         if pb := getattr(self, "plugin_bus", None):
+            if text_card._get_bridge_state()[0] is pb:
+                text_card.configure_remote_bridge(None)
             await pb.close()
         if sw := getattr(self, "screen_watch", None):
             await sw.close()
@@ -2698,11 +2709,22 @@ class Service:
                         batch = self.store.groups.active.get(self.store.session_scope(message))
                         payload["web_search_status"] = "unavailable"
                         try:
-                            findings = await self.ai.search(
-                                query,
-                                job["subject"],
-                                before_call=message_guard,
-                                cancel_event=batch.cancel if batch else None,
+                            findings = (
+                                await controller.execute_search(
+                                    query,
+                                    job["subject"],
+                                    ai=self.ai,
+                                    before_call=message_guard,
+                                    cancel_event=batch.cancel if batch else None,
+                                    plugin_bus=self.plugin_bus,
+                                )
+                                if hasattr(controller, "execute_search")
+                                else await self.ai.search(
+                                    query,
+                                    job["subject"],
+                                    before_call=message_guard,
+                                    cancel_event=batch.cancel if batch else None,
+                                )
                             )
                             if findings and findings.strip() and controller.config.enabled:
                                 payload["web_search_findings"] = findings

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -12,11 +13,33 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from websockets.asyncio.client import connect as ws_connect
+
+from .protocol import (
+    BLOB_FIELD,
+    BLOB_HARD_MAX_BYTES,
+    BLOB_RPC_GET,
+    BLOB_RPC_PUT,
+    BLOB_RPC_RELEASE,
+    BLOB_TRANSFER_ID_RE,
+    BLOB_TRANSFER_TTL_SECONDS,
+    MAX_BUFFERED_BLOB_BYTES_PER_PLUGIN,
+    MAX_CONCURRENT_BLOBS_PER_PLUGIN,
+    SHA256_HEX_RE,
+    BlobResult,
+    compute_chunk_raw_bytes,
+    compute_inline_max_bytes,
+    decode_blob_chunk,
+    encode_blob_chunk,
+    sanitize_blob_meta_str,
+    sha256_hex,
+    validate_blob_descriptor,
+)
 
 log = logging.getLogger("hakimi_plugin_sdk")
 
@@ -273,7 +296,7 @@ class ActionSpec(BaseModel):
     budget_lane: Literal["patrol", "proactive"] | None = None
     quotas: list[dict[str, str]] | None = None
     timeout_seconds: float | None = Field(default=None, ge=1.0, le=1800.0)
-    handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+    handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | BlobResult]]
 
     @field_validator("name")
     @classmethod
@@ -318,6 +341,39 @@ class ActionSpec(BaseModel):
         return data
 
 
+@dataclass
+class _InboundBlobTransfer:
+    transfer_id: str
+    expected_bytes: int
+    total_chunks: int
+    sha256: str
+    mime_type: str
+    filename: str
+    updated_at: float
+    buffer: bytearray = field(default_factory=bytearray)
+    data: bytes = b""
+    next_seq: int = 0
+    complete: bool = False
+    hasher: Any = field(default_factory=hashlib.sha256)
+
+    @property
+    def buffered_bytes(self) -> int:
+        return len(self.data) if self.complete else self.expected_bytes
+
+
+@dataclass
+class _OutboundBlobEntry:
+    blob_id: str
+    data: bytes
+    sha256: str
+    chunk_size: int
+    total_chunks: int
+    mime_type: str
+    filename: str
+    updated_at: float
+    served_seqs: set[int] = field(default_factory=set)
+
+
 class HakimiPluginClient:
     """Persistent reverse-WebSocket client for an out-of-process Hakimi plugin."""
 
@@ -332,6 +388,7 @@ class HakimiPluginClient:
         configuration_issue: str | None = None,
         connect_factory: Callable[..., Any] | None = None,
         max_frame_bytes: int = _DEFAULT_MAX_FRAME_BYTES,
+        max_blob_bytes: int = BLOB_HARD_MAX_BYTES,
         handshake_timeout: float = 15.0,
         idle_timeout: float | None = None,
         rng: random.Random | None = None,
@@ -339,6 +396,7 @@ class HakimiPluginClient:
         self.config = config
         self._connect_factory = connect_factory
         self.max_frame_bytes = max(16_384, int(max_frame_bytes))
+        self.max_blob_bytes = min(max(0, int(max_blob_bytes)), BLOB_HARD_MAX_BYTES)
         self.handshake_timeout = max(0.05, float(handshake_timeout))
         self.idle_timeout = (
             float(idle_timeout)
@@ -377,6 +435,8 @@ class HakimiPluginClient:
         self._runner_task: asyncio.Task[None] | None = None
         self._rpc_tasks: set[asyncio.Task[None]] = set()
         self._pending_kernel_rpcs: dict[str, asyncio.Future[Any]] = {}
+        self._inbound_blobs: dict[str, _InboundBlobTransfer] = {}
+        self._outbound_blobs: dict[str, _OutboundBlobEntry] = {}
         self.welcome_payload: dict[str, Any] | None = None
         self.backoff_history: list[float] = []
 
@@ -412,10 +472,14 @@ class HakimiPluginClient:
         budget_lane: Literal["patrol", "proactive"] | None = None,
         quotas: Sequence[dict[str, str]] | None = None,
         timeout_seconds: float | None = None,
-    ) -> Callable[[Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]], Callable[..., Any]]:
+    ) -> Callable[
+        [Callable[[dict[str, Any]], Awaitable[dict[str, Any] | BlobResult]]], Callable[..., Any]
+    ]:
         """Decorator registering an ActionSpec handler."""
 
-        def _decorator(fn: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]) -> Any:
+        def _decorator(
+            fn: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | BlobResult]],
+        ) -> Any:
             self.register_action(
                 ActionSpec(
                     name=name,
@@ -923,6 +987,300 @@ class HakimiPluginClient:
                 )
             )
 
+    def _clear_blobs(self) -> None:
+        self._inbound_blobs.clear()
+        self._outbound_blobs.clear()
+
+    def _evict_expired_blobs(self, now: float | None = None) -> None:
+        ts = time.monotonic() if now is None else now
+        for tid in [
+            k
+            for k, entry in self._inbound_blobs.items()
+            if (ts - entry.updated_at) > BLOB_TRANSFER_TTL_SECONDS
+        ]:
+            self._inbound_blobs.pop(tid, None)
+        for bid in [
+            k
+            for k, entry in self._outbound_blobs.items()
+            if (ts - entry.updated_at) > BLOB_TRANSFER_TTL_SECONDS
+        ]:
+            self._outbound_blobs.pop(bid, None)
+
+    def _total_buffered_blob_bytes(self) -> int:
+        inbound = sum(entry.buffered_bytes for entry in self._inbound_blobs.values())
+        outbound = sum(len(entry.data) for entry in self._outbound_blobs.values())
+        return inbound + outbound
+
+    def _blob_buffer_limit(self) -> int:
+        if self.max_blob_bytes <= 0:
+            return 0
+        return max(self.max_blob_bytes, MAX_BUFFERED_BLOB_BYTES_PER_PLUGIN)
+
+    def _handle_blob_put(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self.max_blob_bytes <= 0:
+            raise PluginRpcError("plugin_blob_disabled")
+        now = time.monotonic()
+        self._evict_expired_blobs(now)
+
+        transfer_id = params.get("transfer_id")
+        if not isinstance(transfer_id, str) or not BLOB_TRANSFER_ID_RE.fullmatch(transfer_id):
+            raise PluginRpcError("plugin_blob_invalid")
+        seq = params.get("seq")
+        total_chunks = params.get("total_chunks")
+        total_bytes = params.get("total_bytes")
+        digest = params.get("sha256")
+        if (
+            isinstance(seq, bool)
+            or not isinstance(seq, int)
+            or seq < 0
+            or isinstance(total_chunks, bool)
+            or not isinstance(total_chunks, int)
+            or total_chunks < 1
+            or seq >= total_chunks
+            or isinstance(total_bytes, bool)
+            or not isinstance(total_bytes, int)
+            or total_bytes < 0
+            or not isinstance(digest, str)
+            or not SHA256_HEX_RE.fullmatch(digest)
+        ):
+            raise PluginRpcError("plugin_blob_invalid")
+        if total_bytes > self.max_blob_bytes or total_bytes > BLOB_HARD_MAX_BYTES:
+            raise PluginRpcError("plugin_blob_too_large")
+        max_allowed_chunks = max(2, (max(total_bytes, 1) + 4095) // 4096 + 2)
+        if total_chunks > max_allowed_chunks:
+            raise PluginRpcError("plugin_blob_invalid")
+
+        chunk_cap = compute_chunk_raw_bytes(self.max_frame_bytes)
+        try:
+            chunk = decode_blob_chunk(params.get("data_b64"), max_raw_bytes=chunk_cap)
+        except ValueError as exc:
+            raise PluginRpcError(
+                "plugin_blob_too_large" if str(exc) == "blob_too_large" else "plugin_blob_invalid"
+            ) from None
+
+        if seq == 0:
+            if transfer_id in self._inbound_blobs:
+                raise PluginRpcError("plugin_blob_invalid")
+            if (
+                len(self._inbound_blobs) >= MAX_CONCURRENT_BLOBS_PER_PLUGIN
+                or self._total_buffered_blob_bytes() + total_bytes > self._blob_buffer_limit()
+            ):
+                raise PluginRpcError("plugin_blob_backpressure")
+            transfer = _InboundBlobTransfer(
+                transfer_id=transfer_id,
+                expected_bytes=total_bytes,
+                total_chunks=total_chunks,
+                sha256=digest,
+                mime_type=sanitize_blob_meta_str(
+                    params.get("mime_type"), max_len=96, default="application/octet-stream"
+                ),
+                filename=sanitize_blob_meta_str(
+                    params.get("filename"), max_len=160, default="", is_filename=True
+                ),
+                updated_at=now,
+            )
+            self._inbound_blobs[transfer_id] = transfer
+        else:
+            transfer = self._inbound_blobs.get(transfer_id)
+            if (
+                transfer is None
+                or transfer.complete
+                or seq != transfer.next_seq
+                or total_chunks != transfer.total_chunks
+                or total_bytes != transfer.expected_bytes
+                or digest != transfer.sha256
+            ):
+                raise PluginRpcError("plugin_blob_invalid")
+
+        if len(transfer.buffer) + len(chunk) > transfer.expected_bytes:
+            self._inbound_blobs.pop(transfer_id, None)
+            raise PluginRpcError("plugin_blob_too_large")
+
+        transfer.buffer.extend(chunk)
+        transfer.hasher.update(chunk)
+        transfer.next_seq += 1
+        transfer.updated_at = now
+
+        if transfer.next_seq == transfer.total_chunks:
+            if (
+                len(transfer.buffer) != transfer.expected_bytes
+                or transfer.hasher.hexdigest() != transfer.sha256
+            ):
+                self._inbound_blobs.pop(transfer_id, None)
+                raise PluginRpcError("plugin_blob_corrupt")
+            transfer.data = bytes(transfer.buffer)
+            transfer.buffer.clear()
+            transfer.complete = True
+
+        return {"transfer_id": transfer_id, "seq": seq, "complete": transfer.complete}
+
+    def _handle_blob_get(self, params: dict[str, Any]) -> dict[str, Any]:
+        now = time.monotonic()
+        self._evict_expired_blobs(now)
+        blob_id = params.get("blob_id")
+        seq = params.get("seq")
+        if (
+            not isinstance(blob_id, str)
+            or not BLOB_TRANSFER_ID_RE.fullmatch(blob_id)
+            or isinstance(seq, bool)
+            or not isinstance(seq, int)
+            or seq < 0
+        ):
+            raise PluginRpcError("plugin_blob_invalid")
+        entry = self._outbound_blobs.get(blob_id)
+        if entry is None:
+            raise PluginRpcError("plugin_blob_not_found")
+        if seq >= entry.total_chunks:
+            raise PluginRpcError("plugin_blob_invalid")
+        start = seq * entry.chunk_size
+        end = min(len(entry.data), start + entry.chunk_size)
+        chunk = entry.data[start:end]
+        entry.updated_at = now
+        entry.served_seqs.add(seq)
+        done = len(entry.served_seqs) >= entry.total_chunks or seq == entry.total_chunks - 1
+        if done:
+            self._outbound_blobs.pop(blob_id, None)
+        return {
+            "blob_id": blob_id,
+            "seq": seq,
+            "total_chunks": entry.total_chunks,
+            "data_b64": encode_blob_chunk(chunk),
+            "done": done,
+        }
+
+    def _handle_blob_release(self, params: dict[str, Any]) -> dict[str, Any]:
+        released = False
+        tid = params.get("transfer_id")
+        if isinstance(tid, str) and tid in self._inbound_blobs:
+            self._inbound_blobs.pop(tid, None)
+            released = True
+        bid = params.get("blob_id")
+        if isinstance(bid, str) and bid in self._outbound_blobs:
+            self._outbound_blobs.pop(bid, None)
+            released = True
+        return {"released": released}
+
+    def _resolve_inbound_blob(self, params: dict[str, Any]) -> None:
+        if BLOB_FIELD not in params:
+            return
+        raw_desc = params.pop(BLOB_FIELD)
+        if self.max_blob_bytes <= 0:
+            raise PluginRpcError("plugin_blob_disabled")
+        self._evict_expired_blobs()
+        try:
+            desc = validate_blob_descriptor(
+                raw_desc, max_bytes=self.max_blob_bytes, id_field="transfer_id"
+            )
+        except ValueError as exc:
+            raise PluginRpcError(
+                "plugin_blob_too_large" if str(exc) == "blob_too_large" else "plugin_blob_invalid"
+            ) from None
+
+        if desc["encoding"] == "inline_b64":
+            try:
+                raw = decode_blob_chunk(desc["data_b64"], max_raw_bytes=self.max_blob_bytes)
+            except ValueError as exc:
+                raise PluginRpcError(
+                    "plugin_blob_too_large"
+                    if str(exc) == "blob_too_large"
+                    else "plugin_blob_invalid"
+                ) from None
+            if len(raw) != desc["byte_size"] or sha256_hex(raw) != desc["sha256"]:
+                raise PluginRpcError("plugin_blob_corrupt")
+        else:
+            transfer = self._inbound_blobs.pop(desc["transfer_id"], None)
+            if (
+                transfer is None
+                or not transfer.complete
+                or transfer.expected_bytes != desc["byte_size"]
+                or transfer.sha256 != desc["sha256"]
+            ):
+                raise PluginRpcError("plugin_blob_corrupt")
+            raw = transfer.data
+
+        params["blob"] = raw
+        params["blob_meta"] = {
+            "byte_size": len(raw),
+            "sha256": desc["sha256"],
+            "mime_type": desc["mime_type"],
+            "filename": desc["filename"],
+        }
+
+    def _package_outbound_result(self, req_id: str, result: Any) -> tuple[Any, str | None]:
+        if not isinstance(result, BlobResult):
+            return ({} if result is None else result), None
+        if not isinstance(result.blob, (bytes, bytearray)):
+            raise PluginRpcError("plugin_blob_invalid")
+        raw = bytes(result.blob)
+        if len(raw) > self.max_blob_bytes or len(raw) > BLOB_HARD_MAX_BYTES:
+            raise PluginRpcError("plugin_blob_too_large")
+
+        out_data = {
+            k: v
+            for k, v in (result.data.items() if isinstance(result.data, dict) else ())
+            if k != BLOB_FIELD
+        }
+        digest = sha256_hex(raw)
+        mime_type = sanitize_blob_meta_str(
+            result.mime_type, max_len=96, default="application/octet-stream"
+        )
+        filename = sanitize_blob_meta_str(
+            result.filename, max_len=160, default="", is_filename=True
+        )
+
+        inline_cap = compute_inline_max_bytes(self.max_frame_bytes)
+        if len(raw) <= inline_cap:
+            candidate = dict(out_data)
+            candidate[BLOB_FIELD] = {
+                "encoding": "inline_b64",
+                "data_b64": encode_blob_chunk(raw),
+                "byte_size": len(raw),
+                "sha256": digest,
+                "mime_type": mime_type,
+                "filename": filename,
+            }
+            encoded = json.dumps(
+                {"type": "rpc.result", "id": req_id, "ok": True, "result": candidate},
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            if len(encoded.encode("utf-8")) <= self.max_frame_bytes:
+                return candidate, None
+
+        now = time.monotonic()
+        self._evict_expired_blobs(now)
+        if (
+            self.max_blob_bytes <= 0
+            or len(self._outbound_blobs) >= MAX_CONCURRENT_BLOBS_PER_PLUGIN
+            or self._total_buffered_blob_bytes() + len(raw) > self._blob_buffer_limit()
+        ):
+            raise PluginRpcError("plugin_blob_backpressure")
+
+        chunk_size = compute_chunk_raw_bytes(self.max_frame_bytes)
+        total_chunks = max(1, (len(raw) + chunk_size - 1) // chunk_size)
+        blob_id = uuid.uuid4().hex
+        self._outbound_blobs[blob_id] = _OutboundBlobEntry(
+            blob_id=blob_id,
+            data=raw,
+            sha256=digest,
+            chunk_size=chunk_size,
+            total_chunks=total_chunks,
+            mime_type=mime_type,
+            filename=filename,
+            updated_at=now,
+        )
+        out_data[BLOB_FIELD] = {
+            "encoding": "chunked",
+            "blob_id": blob_id,
+            "byte_size": len(raw),
+            "sha256": digest,
+            "chunk_size": chunk_size,
+            "total_chunks": total_chunks,
+            "mime_type": mime_type,
+            "filename": filename,
+        }
+        return out_data, blob_id
+
     async def _send_rpc_result(
         self,
         ws: Any,
@@ -931,7 +1289,7 @@ class HakimiPluginClient:
         ok: bool,
         result: Any = None,
         error: str | None = None,
-    ) -> None:
+    ) -> bool:
         frame: dict[str, Any]
         if ok:
             frame = {"type": "rpc.result", "id": req_id, "ok": True, "result": result}
@@ -942,6 +1300,7 @@ class HakimiPluginClient:
             frame = {"type": "rpc.result", "id": req_id, "ok": False, "error": code}
         try:
             await self._ws_send(ws, frame)
+            return True
         except PluginRpcError as exc:
             if exc.code == "plugin_frame_too_large" and ok:
                 with contextlib.suppress(Exception):
@@ -954,8 +1313,9 @@ class HakimiPluginClient:
                             "error": "plugin_frame_too_large",
                         },
                     )
+            return False
         except Exception:
-            pass
+            return False
 
     async def _handle_rpc_call(self, ws: Any, frame: dict[str, Any]) -> None:
         req_id = frame.get("id")
@@ -974,7 +1334,23 @@ class HakimiPluginClient:
             await self._send_rpc_result(ws, req_id, ok=False, error="plugin_invalid_schema")
             return
 
+        outbound_blob_id: str | None = None
         try:
+            if method == BLOB_RPC_PUT:
+                res = self._handle_blob_put(params)
+                await self._send_rpc_result(ws, req_id, ok=True, result=res)
+                return
+
+            if method == BLOB_RPC_GET:
+                res = self._handle_blob_get(params)
+                await self._send_rpc_result(ws, req_id, ok=True, result=res)
+                return
+
+            if method == BLOB_RPC_RELEASE:
+                res = self._handle_blob_release(params)
+                await self._send_rpc_result(ws, req_id, ok=True, result=res)
+                return
+
             if method == "action.run":
                 action_name = params.get("action")
                 if not isinstance(action_name, str) or action_name not in self._actions:
@@ -983,10 +1359,12 @@ class HakimiPluginClient:
                 spec = self._actions[action_name]
                 if not isinstance(params.get("arguments"), dict):
                     params["arguments"] = {}
+                self._resolve_inbound_blob(params)
                 result = await _invoke_callback(spec.handler, params)
-                await self._send_rpc_result(
-                    ws, req_id, ok=True, result={} if result is None else result
-                )
+                packed, outbound_blob_id = self._package_outbound_result(req_id, result)
+                sent = await self._send_rpc_result(ws, req_id, ok=True, result=packed)
+                if not sent and outbound_blob_id is not None:
+                    self._outbound_blobs.pop(outbound_blob_id, None)
                 return
 
             if method == "sensor.read":
@@ -1007,15 +1385,23 @@ class HakimiPluginClient:
             if handler is None:
                 await self._send_rpc_result(ws, req_id, ok=False, error="rpc_method_not_found")
                 return
+            self._resolve_inbound_blob(params)
             result = await _invoke_callback(handler, params)
-            await self._send_rpc_result(
-                ws, req_id, ok=True, result={} if result is None else result
-            )
+            packed, outbound_blob_id = self._package_outbound_result(req_id, result)
+            sent = await self._send_rpc_result(ws, req_id, ok=True, result=packed)
+            if not sent and outbound_blob_id is not None:
+                self._outbound_blobs.pop(outbound_blob_id, None)
         except asyncio.CancelledError:
+            if outbound_blob_id is not None:
+                self._outbound_blobs.pop(outbound_blob_id, None)
             raise
         except PluginRpcError as exc:
+            if outbound_blob_id is not None:
+                self._outbound_blobs.pop(outbound_blob_id, None)
             await self._send_rpc_result(ws, req_id, ok=False, error=exc.code)
         except Exception as exc:
+            if outbound_blob_id is not None:
+                self._outbound_blobs.pop(outbound_blob_id, None)
             log.warning(
                 "event=plugin_rpc_handler_error plugin=%s method=%s err=%s",
                 self.config.plugin_id,
@@ -1189,6 +1575,7 @@ class HakimiPluginClient:
             self._connected_event.clear()
             self._ws = None
             self._fail_pending_kernel_rpcs("plugin_disconnected")
+            self._clear_blobs()
             for task in (reader_task, heartbeat_task, notif_task, *list(self._rpc_tasks)):
                 if not task.done():
                     task.cancel()
@@ -1345,6 +1732,7 @@ class HakimiPluginClient:
         self._connected = False
         self._connected_event.clear()
         self._fail_pending_kernel_rpcs("plugin_disconnected")
+        self._clear_blobs()
         ws = self._ws or self._connecting_ws
         if ws is not None:
             await self._ws_close(ws, 1000)

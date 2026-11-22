@@ -8,7 +8,7 @@ target=${2:-}
 compose=(docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml -f compose.plugins.yaml)
 
 usage() {
-    echo "Usage: $0 {up [weather|minecraft|bilibili]|restart [weather|minecraft|bilibili]|down [weather|minecraft|bilibili]|status [weather|minecraft|bilibili]}" >&2
+    echo "Usage: $0 {up|restart|down|status} [weather|minecraft|bilibili|web_tools|doc_render|song_finder|wave3|all]" >&2
     exit 2
 }
 
@@ -16,6 +16,12 @@ resolve_services() {
     case "${1:-}" in
         "")
             echo "hakimi-plugin-weather hakimi-plugin-minecraft hakimi-plugin-bilibili"
+            ;;
+        all)
+            echo "hakimi-plugin-weather hakimi-plugin-minecraft hakimi-plugin-bilibili hakimi-plugin-web-tools hakimi-plugin-doc-render hakimi-plugin-song-finder"
+            ;;
+        wave3)
+            echo "hakimi-plugin-web-tools hakimi-plugin-doc-render hakimi-plugin-song-finder"
             ;;
         weather|hakimi-plugin-weather)
             echo "hakimi-plugin-weather"
@@ -25,6 +31,15 @@ resolve_services() {
             ;;
         bilibili|bilibili_surf|hakimi-plugin-bilibili)
             echo "hakimi-plugin-bilibili"
+            ;;
+        web_tools|web-tools|hakimi-plugin-web-tools)
+            echo "hakimi-plugin-web-tools"
+            ;;
+        doc_render|doc-render|hakimi-plugin-doc-render)
+            echo "hakimi-plugin-doc-render"
+            ;;
+        song_finder|song-finder|hakimi-plugin-song-finder)
+            echo "hakimi-plugin-song-finder"
             ;;
         *)
             usage

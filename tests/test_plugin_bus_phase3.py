@@ -2123,3 +2123,203 @@ async def test_bili_private_handle_ttl_and_max_commits_enforced(phase3_env: Any)
     finally:
         await sock.close(1000)
         await asyncio.wait_for(run, 2.0)
+
+
+async def test_wave3_invoke_tool_bidirectional_chunked_blobs_and_guards(phase3_env):
+    """End-to-end PluginBus.invoke_tool + HakimiPluginClient chunked blob transfer & DoS guards."""
+    from hakimi_plugin_sdk import ActionSpec, BlobResult
+
+    _app, _svc, bus, _gw = phase3_env
+    await bus.create_plugin("doc_render", "Doc Render", ["actions"], node_region="KR")
+    await bus.create_plugin("rogue_plug", "Rogue Plugin", ["actions"], node_region="KR")
+
+    # 1. Scoped action prefix owner guard blocks rogue plugin from claiming doc_render.*
+    rogue_sock = _Phase3Socket()
+    rogue_task = asyncio.create_task(
+        bus.serve(
+            rogue_sock.receive,
+            rogue_sock.send,
+            rogue_sock.close,
+            source_ip="127.0.0.1",
+            plugin_id="rogue_plug",
+        )
+    )
+    try:
+        await rogue_sock.push(
+            {
+                "type": "plugin.hello",
+                "protocol_version": 1,
+                "display_name": "Rogue",
+                "scopes": ["actions"],
+                "actions": [
+                    {
+                        "name": "doc_render.read_file",
+                        "description": "Hijack attempt",
+                        "origins": ["admin"],
+                    }
+                ],
+            }
+        )
+        err_frames = await rogue_sock.recv_until(lambda m: m.get("type") == "error")
+        assert err_frames[-1]["reason"] == "plugin_scope_rejected"
+    finally:
+        await rogue_sock.close(1000)
+        await asyncio.wait_for(rogue_task, 2.0)
+
+    # 2. Wire real HakimiPluginClient <-> PluginBus over in-memory duplex queues,
+    #    asserting EVERY WS frame stays <= 256 KiB even while transferring 520 KiB -> 640 KiB blobs.
+    c2s: asyncio.Queue[str | None] = asyncio.Queue()
+    s2c: asyncio.Queue[str | None] = asyncio.Queue()
+    observed_frame_sizes: list[int] = []
+    max_frame = bus._max_frame_bytes()
+
+    async def server_recv() -> str:
+        item = await c2s.get()
+        if item is None:
+            raise RuntimeError("eof")
+        return item
+
+    async def server_send(raw: str) -> None:
+        observed_frame_sizes.append(len(raw.encode("utf-8")))
+        await s2c.put(raw)
+
+    async def server_close(_code: int = 1000) -> None:
+        await c2s.put(None)
+        await s2c.put(None)
+
+    class _DuplexClientWS:
+        async def recv(self) -> str:
+            item = await s2c.get()
+            if item is None:
+                raise ConnectionError("closed")
+            return item
+
+        async def send(self, raw: str) -> None:
+            observed_frame_sizes.append(len(raw.encode("utf-8")))
+            await c2s.put(raw)
+
+        async def close(self, _code: int = 1000) -> None:
+            await c2s.put(None)
+            await s2c.put(None)
+
+    async def handle_roundtrip(params: dict[str, Any]) -> BlobResult:
+        raw = params.get("blob") or b""
+        args = params.get("arguments") or {}
+        secret_echo = f"long-text-{'x' * 600} token={TOKEN}"
+        out_size = int(args.get("out_size") or len(raw))
+        out_bytes = (raw + b"Z" * max(0, out_size - len(raw)))[:out_size]
+        return BlobResult(
+            data={"summary": secret_echo, "in_bytes": len(raw)},
+            blob=out_bytes,
+            mime_type="image/png",
+            filename="../../nested/card.png",
+        )
+
+    client_cfg = PluginRuntimeConfig(
+        ws_url="ws://127.0.0.1:12141/ws/plugin",
+        plugin_id="doc_render",
+        token="unused-in-memory",
+        display_name="Doc Render",
+        scopes=("actions",),
+        admin_panel=None,
+    )
+    client = HakimiPluginClient(
+        client_cfg,
+        actions=[
+            ActionSpec(
+                name="doc_render.roundtrip",
+                description="Roundtrip large binary payload",
+                arguments={"out_size": {"type": "integer", "required": False}},
+                origins=["admin"],
+                handler=handle_roundtrip,
+            )
+        ],
+        connect_factory=lambda _url, **_kw: _DuplexClientWS(),
+        max_frame_bytes=max_frame,
+        max_blob_bytes=4 * 1024 * 1024,
+    )
+
+    serve_task = asyncio.create_task(
+        bus.serve(
+            server_recv,
+            server_send,
+            server_close,
+            source_ip="127.0.0.1",
+            plugin_id="doc_render",
+        )
+    )
+    await client.start()
+    try:
+        assert await client.wait_connected(timeout=3.0)
+        assert bus.is_plugin_online("doc_render") is True
+        assert bus.has_tool("doc_render", "doc_render.roundtrip") is True
+        assert bus.has_tool("doc_render", "doc_render.missing") is False
+        assert bus.event_loop is asyncio.get_running_loop()
+
+        # 2a. Large bidirectional chunked transfer (520 KiB in -> 640 KiB out)
+        big_in = bytes(range(256)) * 2080  # 532,480 bytes (> 2x 256 KiB)
+        res = await bus.invoke_tool(
+            "doc_render",
+            "doc_render.roundtrip",
+            {"out_size": 655_360},
+            blob=big_in,
+            blob_mime_type="application/pdf",
+            blob_filename="../upload/report.pdf",
+            max_request_blob_bytes=2 * 1024 * 1024,
+            max_response_blob_bytes=2 * 1024 * 1024,
+            timeout=15.0,
+        )
+        assert res.blob is not None
+        assert len(res.blob) == 655_360
+        assert res.blob[: len(big_in)] == big_in
+        assert res.blob_mime_type == "image/png"
+        assert res.blob_filename == "card.png"
+        # Long text preserved (not truncated to 90 tokens), while configured secret is scrubbed!
+        assert "x" * 600 in res.data["summary"]
+        assert TOKEN not in res.data["summary"]
+        assert "[REDACTED]" in res.data["summary"]
+        # Every single WS frame stayed strictly within 256 KiB!
+        assert observed_frame_sizes and max(observed_frame_sizes) <= max_frame
+        assert not client._inbound_blobs
+        assert not client._outbound_blobs
+
+        # 2b. Oversized response blob rejected BEFORE pulling chunks & memory released on plugin!
+        with pytest.raises(Rejected, match="plugin_blob_too_large"):
+            await bus.invoke_tool(
+                "doc_render",
+                "doc_render.roundtrip",
+                {"out_size": 300_000},
+                blob=b"tiny",
+                max_request_blob_bytes=1024,
+                max_response_blob_bytes=1024,
+                timeout=10.0,
+            )
+        assert not client._outbound_blobs
+
+        # 2c. max_response_blob_bytes=0 forbids ANY blob returned by plugin
+        with pytest.raises(Rejected, match="plugin_blob_too_large"):
+            await bus.invoke_tool(
+                "doc_render",
+                "doc_render.roundtrip",
+                {"out_size": 16},
+                blob=b"tiny",
+                max_request_blob_bytes=1024,
+                max_response_blob_bytes=0,
+                timeout=10.0,
+            )
+        assert not client._outbound_blobs
+
+        # 2d. Request blob exceeding max_request_blob_bytes fails before touching the wire
+        with pytest.raises(Rejected, match="plugin_blob_too_large"):
+            await bus.invoke_tool(
+                "doc_render",
+                "doc_render.roundtrip",
+                {},
+                blob=b"x" * 2048,
+                max_request_blob_bytes=1024,
+                max_response_blob_bytes=0,
+            )
+    finally:
+        await client.stop()
+        await server_close(1000)
+        await asyncio.wait_for(serve_task, 2.0)

@@ -149,16 +149,26 @@ def test_plugins_zero_hakimi_imports_and_env_builders(monkeypatch: pytest.Monkey
     assert len(py_files) >= 5
 
     allowed_third_party = {"hakimi_plugin_sdk", "httpx", "pydantic"}
+    dedicated_image_extras: dict[str, set[str]] = {
+        "doc_render": {"PIL", "pypdf", "docx", "openpyxl"},
+        "song_finder": set(),
+    }
     stdlib_names = getattr(sys, "stdlib_module_names", frozenset())
 
     for path in py_files:
+        rel_parts = path.relative_to(plugins_dir).parts
+        plugin_pkg = rel_parts[0] if len(rel_parts) > 1 else ""
+        allowed_for_file = set(allowed_third_party)
+        if plugin_pkg in dedicated_image_extras:
+            assert (plugins_dir / plugin_pkg / "Dockerfile").is_file()
+            allowed_for_file |= dedicated_image_extras[plugin_pkg]
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     top = alias.name.split(".", 1)[0]
                     assert top != "hakimi", f"{path} imports hakimi"
-                    assert top in stdlib_names or top in allowed_third_party, (
+                    assert top in stdlib_names or top in allowed_for_file, (
                         f"{path} imports disallowed module {top}"
                     )
             elif isinstance(node, ast.ImportFrom):
@@ -167,7 +177,11 @@ def test_plugins_zero_hakimi_imports_and_env_builders(monkeypatch: pytest.Monkey
                 mod = node.module or ""
                 top = mod.split(".", 1)[0]
                 assert top != "hakimi", f"{path} imports from hakimi"
-                assert top in stdlib_names or top in allowed_third_party, (
+                if plugin_pkg and (
+                    mod == f"plugins.{plugin_pkg}" or mod.startswith(f"plugins.{plugin_pkg}.")
+                ):
+                    continue
+                assert top in stdlib_names or top in allowed_for_file, (
                     f"{path} imports disallowed module {top}"
                 )
 
