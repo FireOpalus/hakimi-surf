@@ -34,6 +34,22 @@ DEFAULT_SONG_CACHE_MAX_BYTES = 30 * 1024 * 1024
 CACHE_EVICT_INTERVAL_SECONDS = 1800.0
 MIN_SONG_PITCH = -24
 MAX_SONG_PITCH = 24
+SONG_FINDER_PLUGIN_ID = "song_finder"
+SONG_FINDER_FETCH_ACTION = "song_finder.fetch_source"
+SONG_FINDER_MAX_AUDIO_BYTES = 40 * 1024 * 1024
+SONG_FINDER_TIMEOUT_SECONDS = 240.0
+_SONG_FINDER_UNAVAILABLE_ERRORS = frozenset(
+    {
+        "plugin_offline",
+        "plugin_disabled",
+        "plugin_disconnected",
+        "plugin_rpc_timeout",
+        "action_not_found",
+        "plugin_scope_rejected",
+        "plugin_blob_disabled",
+        "plugin_blob_backpressure",
+    }
+)
 
 MAX_SONG_TITLE_LEN = 60
 ALLOWED_SONG_TITLE_PUNCT = frozenset(
@@ -421,6 +437,8 @@ class SongLibrary:
         ffprobe_bin: str = "ffprobe",
         compute: Any | None = None,
         settings: Any | None = None,
+        plugin_bus: Any | None = None,
+        song_finder_remote_only: bool | None = None,
     ) -> None:
         self.store = store
         self.settings = settings if settings is not None else getattr(store, "s", None)
@@ -429,6 +447,8 @@ class SongLibrary:
         self.ffmpeg_bin = ffmpeg_bin
         self.ffprobe_bin = ffprobe_bin
         self.compute = compute
+        self.plugin_bus = plugin_bus
+        self._song_finder_remote_only_override = song_finder_remote_only
         self.lock = asyncio.Lock()
         self.init_lock = asyncio.Lock()
         self.decode_slots = asyncio.Semaphore(1)
@@ -452,6 +472,133 @@ class SongLibrary:
             return False
         fn = getattr(self.compute, "configured", None)
         return bool(fn()) if callable(fn) else True
+
+    def _song_finder_remote_only(self) -> bool:
+        if self._song_finder_remote_only_override is not None:
+            return bool(self._song_finder_remote_only_override)
+        from_settings = getattr(self.settings, "song_finder_remote_only", None)
+        if isinstance(from_settings, bool):
+            return from_settings
+        return (os.getenv("SONG_FINDER_REMOTE_ONLY") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _song_finder_online(self) -> bool:
+        bus = self.plugin_bus
+        if bus is None:
+            return False
+        has_tool = getattr(bus, "has_tool", None)
+        if callable(has_tool):
+            try:
+                return bool(
+                    has_tool(
+                        SONG_FINDER_PLUGIN_ID,
+                        SONG_FINDER_FETCH_ACTION,
+                        require_enabled=True,
+                    )
+                )
+            except TypeError:
+                return bool(has_tool(SONG_FINDER_PLUGIN_ID, SONG_FINDER_FETCH_ACTION))
+        is_online = getattr(bus, "is_plugin_online", None)
+        if callable(is_online):
+            try:
+                return bool(is_online(SONG_FINDER_PLUGIN_ID, require_enabled=True))
+            except TypeError:
+                return bool(is_online(SONG_FINDER_PLUGIN_ID))
+        return False
+
+    async def _fetch_remote_song_source(
+        self,
+        clean_title: str,
+        clean_artist: str,
+    ) -> tuple[bytes, str, str, str] | None:
+        """Fetch clean original audio from the isolated remote `song_finder` plugin when online."""
+        remote_only = self._song_finder_remote_only()
+        bus = self.plugin_bus
+        invoke_tool = getattr(bus, "invoke_tool", None) if bus is not None else None
+        if not self._song_finder_online() or not callable(invoke_tool):
+            if remote_only:
+                raise Rejected("song_finder_remote_unavailable")
+            return None
+
+        args: dict[str, Any] = {
+            "query": clean_title,
+            "title": clean_title,
+            "artist": clean_artist,
+            "strategy": "auto",
+            "preferred_format": "m4a",
+            "max_bytes": SONG_FINDER_MAX_AUDIO_BYTES,
+        }
+        try:
+            tool_res = await invoke_tool(
+                SONG_FINDER_PLUGIN_ID,
+                SONG_FINDER_FETCH_ACTION,
+                args,
+                max_request_blob_bytes=0,
+                max_response_blob_bytes=SONG_FINDER_MAX_AUDIO_BYTES,
+                timeout=SONG_FINDER_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Rejected as exc:
+            reason = str(exc) or "source_not_found"
+            if remote_only:
+                if reason in _SONG_FINDER_UNAVAILABLE_ERRORS:
+                    raise Rejected("song_finder_remote_unavailable") from None
+                raise Rejected(reason) from None
+            log.info("event=song_learn_source_fallback reason=%s", reason)
+            return None
+        except Exception as exc:
+            if remote_only:
+                raise Rejected("song_finder_remote_unavailable") from None
+            log.info("event=song_learn_source_fallback reason=%s", type(exc).__name__)
+            return None
+
+        raw_blob = getattr(tool_res, "blob", None)
+        meta = getattr(tool_res, "data", None)
+        meta_dict = meta if isinstance(meta, dict) else {}
+        if not isinstance(raw_blob, (bytes, bytearray)) or not raw_blob:
+            if remote_only:
+                raise Rejected("source_not_found")
+            log.info("event=song_learn_source_fallback reason=empty_blob")
+            return None
+
+        raw_bytes = bytes(raw_blob)
+        if len(raw_bytes) > SONG_FINDER_MAX_AUDIO_BYTES or len(raw_bytes) > MAX_LEARN_UPLOAD_BYTES:
+            if remote_only:
+                raise Rejected("download_too_large")
+            log.info("event=song_learn_source_fallback reason=download_too_large")
+            return None
+
+        expected_sha = str(meta_dict.get("sha256") or "").strip().lower()
+        if expected_sha and hashlib.sha256(raw_bytes).hexdigest() != expected_sha:
+            if remote_only:
+                raise Rejected("song_finder_remote_unavailable")
+            log.info("event=song_learn_source_fallback reason=sha256_mismatch")
+            return None
+
+        fname_hint = str(
+            getattr(tool_res, "blob_filename", "") or meta_dict.get("filename") or ""
+        ).strip()
+        if not fname_hint:
+            fmt_hint = str(meta_dict.get("format") or "m4a").strip().lower().lstrip(".")
+            if fmt_hint not in ALLOWED_SONG_EXTENSIONS:
+                fmt_hint = "m4a"
+            fname_hint = f"{clean_title}.{fmt_hint}"
+
+        try:
+            safe_name, mime_type = _safe_learn_upload_name(fname_hint, clean_title)
+        except Rejected as exc:
+            if remote_only:
+                raise Rejected(str(exc)) from None
+            log.info("event=song_learn_source_fallback reason=%s", str(exc))
+            return None
+
+        provider_name = str(meta_dict.get("provider") or "remote").strip()[:32] or "remote"
+        return raw_bytes, safe_name, mime_type, provider_name
 
     def _cache_max_bytes(self) -> int:
         raw = getattr(self.settings, "song_cache_max_bytes", None)
@@ -590,6 +737,7 @@ class SongLibrary:
             "cached_count": len(cached_drive),
             "drive_backed_count": len(drive_entries),
             "colab_configured": self._compute_configured(),
+            "song_finder_online": self._song_finder_online(),
         }
 
     async def _evict_cache_locked(
@@ -1032,8 +1180,27 @@ class SongLibrary:
                     payload["inbox_file_id"] = clean_inbox_id
                 payload["auto_search"] = False
             elif auto_search:
-                payload["query"] = clean_title
-                payload["auto_search"] = True
+                fetched = await self._fetch_remote_song_source(clean_title, clean_artist)
+                if fetched is not None:
+                    raw_source, safe_name, mime_type, source_provider = fetched
+                    uploaded = await self.compute.upload_drive_inbox(
+                        safe_name, raw_source, mime_type=mime_type
+                    )
+                    raw_file_id = uploaded.get("file_id") if isinstance(uploaded, dict) else ""
+                    file_id = _sanitize_drive_id(raw_file_id)
+                    if not file_id:
+                        raise Rejected("colab_drive_invalid_file")
+                    payload["inbox_file_id"] = file_id
+                    payload["inbox_filename"] = str(uploaded.get("name") or safe_name)
+                    payload["auto_search"] = False
+                    log.info(
+                        "event=song_learn_source_resolved source=song_finder provider=%s bytes=%d",
+                        source_provider,
+                        len(raw_source),
+                    )
+                else:
+                    payload["query"] = clean_title
+                    payload["auto_search"] = True
             else:
                 raise Rejected("song_source_required")
 

@@ -33,15 +33,25 @@ class Module(SystemModule):
         super().__init__(resources, registry)
         colab_module = registry.systems.get("colab_compute")
         self.compute = getattr(colab_module, "compute", None)
+        pb_module = registry.systems.get("plugin_bus")
+        plugin_bus = getattr(pb_module, "plugin_bus", None) or getattr(
+            resources.service, "plugin_bus", None
+        )
         self.songs = SongLibrary(
             resources.store,
             compute=self.compute,
             settings=resources.settings,
+            plugin_bus=plugin_bus,
         )
         resources.store.runtime.songs = self.songs
         self._hook_registered = False
 
     async def initialize(self) -> None:
+        if self.songs.plugin_bus is None:
+            svc = getattr(self.resources, "service", None)
+            pb = getattr(svc, "plugin_bus", None) if svc is not None else None
+            if pb is not None:
+                self.songs.plugin_bus = pb
         await self.songs.initialize()
         if (
             not self._hook_registered
@@ -152,9 +162,10 @@ class Module(SystemModule):
         total = len(self.songs.titles)
         cache_mb = stats["cache_bytes"] / (1024 * 1024)
         limit_mb = stats["cache_max_bytes"] / (1024 * 1024)
+        finder_tag = " · 独立找歌在线" if stats.get("song_finder_online") else ""
         detail = (
             f"曲目 {total} 首 · Drive 备份 {stats['drive_backed_count']} 首 · "
-            f"热缓存 {stats['cached_count']} 首 ({cache_mb:.1f}/{limit_mb:.0f} MiB)"
+            f"热缓存 {stats['cached_count']} 首 ({cache_mb:.1f}/{limit_mb:.0f} MiB){finder_tag}"
         )
         return {
             "state": "ready" if self.songs.initialized else "starting",
