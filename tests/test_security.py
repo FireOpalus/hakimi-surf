@@ -58,8 +58,10 @@ def test_qq_rejects_tampering_and_stale_signature():
         f"https://www.bilibili.com.evil.test/video/{BV}",
         f"https://www.bilibili.com@evil.test/video/{BV}",
         f"https://evil.test/?id={BV}",
+        f"http://evil.test/video/{BV}",
         f"https://www.bilibili.com:8443/video/{BV}",
-        f"http://www.bilibili.com/video/{BV}",
+        f"http://www.bilibili.com:443/video/{BV}",
+        f"http://www.bilibili.com:8080/video/{BV}",
         "https://b23.tv/test",
         "file:///etc/passwd",
         f"https://www.bilibili.com/video/{BV}/../../admin",
@@ -72,6 +74,7 @@ def test_no_untrusted_url_is_fetchable(url):
 def test_video_reference_canonicalization():
     assert extract_bvid(BV) == BV
     assert extract_bvid(f"帮我看看 https://www.bilibili.com/video/{BV}?share=123") == BV
+    assert extract_bvid(f"http://www.bilibili.com/video/{BV}") == BV
     assert extract_bvid(BV + " BV1Q541167Qg") == BV
     assert (
         extract_bvid(

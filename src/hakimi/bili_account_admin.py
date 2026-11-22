@@ -2,8 +2,9 @@
 
 from fastapi import APIRouter, HTTPException, Request
 
+from hakimi_plugin_sdk.bili_common import BiliPolicy, CredentialUpdate
+
 from .admin_common import body, domain_lock, service
-from .modules.bili_watcher import BiliPolicy, CredentialUpdate
 from .security import Rejected
 from .video_policy import VideoWatchConfig
 

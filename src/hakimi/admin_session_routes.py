@@ -8,6 +8,8 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import Field
 
+from hakimi_plugin_sdk.bili_common import extract_bvid
+
 from .admin_common import body, domain_lock, service
 from .admin_dashboard_routes import Input
 from .admission_policy import is_bot_hard_blocked
@@ -18,7 +20,6 @@ from .generation_policy import Scenario, generation_plan
 from .memory_compressor import check_memory_text
 from .mentions import parse_reply
 from .models import Message
-from .modules.bilibili import extract_bvid
 from .outbound_actions import parse_actions
 from .output_links import filter_reply_links
 from .rich_message_parser import parse_message

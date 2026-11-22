@@ -20,6 +20,8 @@ from google.genai._interactions import APITimeoutError
 from google.oauth2 import service_account
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from hakimi_plugin_sdk.bili_common import extract_bvid
+
 from .attention import can_watch_video
 from .bot_server import assemble_chat_input, escape_data, prompt_context, untrusted_input
 from .config import Settings
@@ -30,7 +32,6 @@ from .generation_policy import GenerationPlan, Scenario, generation_plan
 from .media import ModelImage
 from .mentions import AT_INSTRUCTION
 from .models import Message
-from .modules.bilibili import extract_bvid
 from .outbound_actions import (
     CHAT_RESPONSE_FORMAT,
     Anchor,

@@ -7,7 +7,6 @@ import base64
 import inspect
 import logging
 import math
-import re
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -16,6 +15,19 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
+from hakimi_plugin_sdk.bili_common import (
+    BVID,
+    BVID_RE,
+    COVER_URL_RE,
+    CREDENTIAL_KEYS,
+    MAX_COVER_THUMB_BYTES,
+    MID_RE,
+    PUBLIC_DEGRADE_ERRORS,
+    RISK_CODES,
+    RISK_COOLDOWN_SECONDS,
+    validate_cookie,
+)
+
 from .models import Message, Video
 from .plugin_bus import RemoteModuleProxy
 from .roaming_logger import redact_public_summary
@@ -23,32 +35,10 @@ from .security import Rejected, clean_text, configured_secrets, safe_output
 
 log = logging.getLogger("hakimi")
 
-BVID = r"BV[1-9A-HJ-NP-Za-km-z]{10}"
-BVID_RE = re.compile(rf"^{BVID}$")
-MID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
-COVER_URL_RE = re.compile(
-    r"^https://(?:i[0-2]\.hdslb\.com|archive\.biliimg\.com)/bfs/[A-Za-z0-9_./-]+$"
-)
-MAX_COVER_THUMB_BYTES = 98_304
-CREDENTIAL_KEYS = ("sessdata", "bili_jct", "buvid3", "buvid4")
-RISK_COOLDOWN_SECONDS = 43200.0
-
-_RISK_CODES = frozenset({"bili_account_risk", "bili_cookie_expired"})
+_RISK_CODES = RISK_CODES
 _RPC_TRANSPORT_ERRORS = frozenset({"plugin_disconnected", "plugin_rpc_timeout"})
-_PUBLIC_DEGRADE_ERRORS = frozenset(
-    {
-        "bilibili_unavailable",
-        "bili_account_unavailable",
-        "bili_account_upstream_error",
-        "bili_video_schema_changed",
-        "bili_video_mismatch",
-        "bili_wbi_unavailable",
-        "bili_subtitle_host_forbidden",
-        "redirect_not_allowed",
-        "upstream_body_too_large",
-        "plugin_disconnected",
-        "plugin_rpc_timeout",
-    }
+_PUBLIC_DEGRADE_ERRORS = (
+    PUBLIC_DEGRADE_ERRORS | _RPC_TRANSPORT_ERRORS | frozenset({"bilibili_unavailable"})
 )
 _REVOCATION_ERRORS = frozenset(
     {
@@ -58,16 +48,19 @@ _REVOCATION_ERRORS = frozenset(
         "video_watch_invalidated",
     }
 )
+_validate_cookie_str = validate_cookie
 
-
-def _validate_cookie_str(value: Any) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) > 4096
-        or any(ord(c) < 33 or ord(c) > 126 or c in ";\r\n" for c in value)
-    ):
-        raise ValueError("Invalid cookie value")
-    return value
+__all__ = [
+    "BVID",
+    "BVID_RE",
+    "COVER_URL_RE",
+    "CREDENTIAL_KEYS",
+    "MAX_COVER_THUMB_BYTES",
+    "MID_RE",
+    "RISK_COOLDOWN_SECONDS",
+    "RemoteBiliClient",
+    "RemoteBiliWatcher",
+]
 
 
 def _secret_str(raw: Any) -> str:

@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .modules.bilibili import BVID
+from hakimi_plugin_sdk.bili_common import BVID, COOKIE_NAMES, validate_cookie
+
 from .security import Rejected
 from .video_policy import MAX_VIDEO_SECONDS
 
@@ -70,19 +71,12 @@ def private_file(path: Path, text: str):
 
 def cookie_file(cookies: dict[str, str]) -> str:
     rows = ["# Netscape HTTP Cookie File"]
-    for source, name in (
-        ("sessdata", "SESSDATA"),
-        ("bili_jct", "bili_jct"),
-        ("buvid3", "buvid3"),
-        ("buvid4", "buvid4"),
-    ):
+    for source, name in COOKIE_NAMES.items():
         value = cookies.get(source, "")
-        if (
-            not isinstance(value, str)
-            or len(value) > 4096
-            or any(ord(c) < 33 or ord(c) > 126 or c == ";" for c in value)
-        ):
-            raise Rejected("video_download_credentials_invalid")
+        try:
+            validate_cookie(value)
+        except ValueError:
+            raise Rejected("video_download_credentials_invalid") from None
         if value:
             # Never a global Cookie header: CDN requests do not receive account credentials.
             rows.append(f".bilibili.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}")

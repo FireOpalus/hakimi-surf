@@ -6,32 +6,41 @@ import asyncio
 import json
 import logging
 import math
-import re
 import time
-import unicodedata
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from hakimi_plugin_sdk import PluginRpcError
+from hakimi_plugin_sdk.bili_common import (
+    API_ORIGIN,
+    BV_RE,
+    BVID,
+    BVID_RE,
+    CANONICAL_VIDEO_HOSTS,
+    FESTIVAL_PATH_RE,
+    LIVE_API_ORIGIN,
+    MID_RE,
+    PUBLIC_USER_AGENT,
+    SHORT_LINK_HOSTS,
+    URL_RE,
+    clean_bili_text,
+    extract_bvid,
+    extract_url_bvid,
+    extract_url_video_ref,
+    extract_video_ref,
+    validate_short_link,
+)
 
 log = logging.getLogger("hakimi_plugin_bilibili")
 
-BVID = r"BV[1-9A-HJ-NP-Za-km-z]{10}"
-_BVID_FULL_RE = re.compile(rf"^{BVID}$")
-_FESTIVAL_PATH_RE = re.compile(r"/festival(?:/[A-Za-z0-9_-]{1,80})?/?")
-BV_RE = re.compile(rf"(?<![A-Za-z0-9])({BVID})(?![A-Za-z0-9])")
-URL_RE = re.compile(r"https?://[^\s<>\"'，。！？）]+", re.IGNORECASE)
+_BVID_FULL_RE = BVID_RE
+_FESTIVAL_PATH_RE = FESTIVAL_PATH_RE
 
-API_ORIGIN = "https://api.bilibili.com"
-LIVE_API_ORIGIN = "https://api.live.bilibili.com"
 PUBLIC_API_PATHS = frozenset({"/x/web-interface/view", "/x/polymer/web-dynamic/v1/feed/space"})
 LIVE_API_PATHS = frozenset({"/room/v1/Room/get_info"})
-CANONICAL_VIDEO_HOSTS = frozenset({"www.bilibili.com", "bilibili.com", "m.bilibili.com"})
-SHORT_LINK_HOSTS = frozenset({"b23.tv", "bili2233.cn"})
 
 NODE_TRANSPORT_ERRORS = frozenset(
     {
@@ -45,7 +54,7 @@ NODE_TRANSPORT_ERRORS = frozenset(
 )
 CIRCUIT_BREAK_SECONDS = 900.0
 _DEFAULT_HEADERS = {
-    "User-Agent": "HakimiSurf/0.1 (public metadata reader)",
+    "User-Agent": PUBLIC_USER_AGENT,
     "Referer": "https://www.bilibili.com/",
 }
 
@@ -58,13 +67,10 @@ class BiliClientError(PluginRpcError):
         self.detail = detail
 
 
-def clean_text(text: str) -> str:
-    """Normalize NFKC text while stripping control characters except newline/tab."""
-    return "".join(
-        c
-        for c in unicodedata.normalize("NFKC", str(text or ""))
-        if c in "\n\t" or not unicodedata.category(c).startswith("C")
-    ).strip()
+clean_text = clean_bili_text
+_extract_url_video_ref = extract_url_video_ref
+_extract_url_bvid = extract_url_bvid
+_is_valid_short_link = validate_short_link
 
 
 async def bounded_json(
@@ -92,101 +98,28 @@ async def bounded_json(
     return obj
 
 
-def _extract_url_video_ref(raw_url: str) -> tuple[str, int] | None:
-    if not isinstance(raw_url, str) or not raw_url:
-        return None
-    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in raw_url):
-        return None
-    try:
-        u = urlsplit(raw_url)
-        port = u.port
-    except ValueError:
-        return None
-    host = (u.hostname or "").lower()
-    if (
-        u.scheme not in {"https", "http"}
-        or host not in CANONICAL_VIDEO_HOSTS
-        or u.username is not None
-        or u.password is not None
-        or (u.scheme == "https" and port not in {None, 443})
-        or (u.scheme == "http" and port not in {None, 80})
-        or ".." in u.path
-    ):
-        return None
-
-    qs = parse_qs(u.query, keep_blank_values=False)
-    bvid: str | None = None
-    match = re.fullmatch(rf"/video/({BVID})/?", u.path)
-    if match:
-        bvid = match[1]
-    elif _FESTIVAL_PATH_RE.fullmatch(u.path):
-        raw_bvids = qs.get("bvid")
-        if raw_bvids and _BVID_FULL_RE.fullmatch(raw_bvids[0]):
-            bvid = raw_bvids[0]
-    if not bvid:
-        return None
-
-    page = 1
-    raw_pages = qs.get("p")
-    if raw_pages:
-        raw_p = raw_pages[0].strip()
-        if re.fullmatch(r"[1-9][0-9]{0,2}", raw_p):
-            parsed_page = int(raw_p)
-            if 1 <= parsed_page <= 999:
-                page = parsed_page
-    return bvid, page
-
-
-def _extract_url_bvid(raw_url: str) -> str | None:
-    ref = _extract_url_video_ref(raw_url)
-    return ref[0] if ref is not None else None
-
-
-def extract_video_ref(text: str) -> tuple[str, int] | None:
-    """Extract `(bvid, page)` from canonical Bilibili URLs or bare BV text."""
-    if not isinstance(text, str) or not text:
-        return None
-    urls = URL_RE.findall(text)
-    for raw in urls:
-        ref = _extract_url_video_ref(raw)
-        if ref is not None:
-            return ref
-    bare = BV_RE.findall(URL_RE.sub(" ", text))
-    if bare:
-        return bare[0], 1
-    return None
-
-
-def extract_bvid(text: str) -> str | None:
-    """Extract a canonical Bilibili BV ID from canonical Bilibili URLs or bare text."""
-    ref = extract_video_ref(text)
-    return ref[0] if ref is not None else None
-
-
-def _is_valid_short_link(url: str) -> str | None:
-    """Validate strict HTTPS short links (`b23.tv`, `bili2233.cn`) and return hostname."""
-    if not isinstance(url, str) or not url:
-        return None
-    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
-        return None
-    try:
-        u = urlsplit(url)
-        port = u.port
-    except ValueError:
-        return None
-    host = u.hostname or ""
-    if (
-        u.scheme != "https"
-        or host not in SHORT_LINK_HOSTS
-        or u.username is not None
-        or u.password is not None
-        or port not in {None, 443}
-        or u.query
-        or u.fragment
-        or not re.fullmatch(r"/[A-Za-z0-9]{1,32}", u.path)
-    ):
-        return None
-    return host
+__all__ = [
+    "API_ORIGIN",
+    "BVID",
+    "BVID_RE",
+    "BV_RE",
+    "CANONICAL_VIDEO_HOSTS",
+    "CIRCUIT_BREAK_SECONDS",
+    "LIVE_API_ORIGIN",
+    "LIVE_API_PATHS",
+    "MID_RE",
+    "NODE_TRANSPORT_ERRORS",
+    "PUBLIC_API_PATHS",
+    "SHORT_LINK_HOSTS",
+    "URL_RE",
+    "BiliClientError",
+    "BiliPublicClient",
+    "PublicVideo",
+    "bounded_json",
+    "clean_text",
+    "extract_bvid",
+    "extract_video_ref",
+]
 
 
 def _optional_non_negative_int(value: Any) -> int | None:
@@ -481,7 +414,7 @@ class BiliPublicClient:
 
     async def video(self, bvid: str) -> dict[str, Any]:
         """Fetch and normalize public metadata for one Bilibili video."""
-        if not isinstance(bvid, str) or not re.fullmatch(BVID, bvid):
+        if not isinstance(bvid, str) or not BVID_RE.fullmatch(bvid):
             raise BiliClientError("invalid_bvid")
         data = await self._get("/x/web-interface/view", {"bvid": bvid}, bvid, 600)
         try:
@@ -510,7 +443,7 @@ class BiliPublicClient:
 
     async def updates(self, mid: str) -> list[dict[str, Any]]:
         """Fetch recent archive uploads for a creator MID."""
-        if not isinstance(mid, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", mid):
+        if not isinstance(mid, str) or not MID_RE.fullmatch(mid):
             raise BiliClientError("invalid_mid")
         data = await self._get(
             "/x/polymer/web-dynamic/v1/feed/space", {"host_mid": mid}, "up:" + mid, 600
@@ -551,7 +484,7 @@ class BiliPublicClient:
 
     async def live_info(self, room_id: str) -> dict[str, Any]:
         """Fetch sanitized live room status for one numeric room ID."""
-        if not isinstance(room_id, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", room_id):
+        if not isinstance(room_id, str) or not MID_RE.fullmatch(room_id):
             raise BiliClientError("invalid_room_id")
         data = await self._get(
             "/room/v1/Room/get_info", {"room_id": room_id}, "live:" + room_id, 60, live=True
