@@ -217,9 +217,9 @@ const songErrorLabels={
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
   colab_daily_limit_reached:'今日 Colab 作业次数或 CU 预算已达上限',
-  colab_inbox_upload_too_large:'上传原曲超过 18 MiB 上限',
+  colab_inbox_upload_too_large:'上传原曲超过 100 MiB 上限',
   colab_drive_invalid_file:'原曲文件名无效',
-  song_upload_too_large:'上传音频超过 12 MiB 上限',
+  song_upload_too_large:'上传音频超过 100 MiB 上限',
   song_audio_required:'请先选择有效的音频文件'
 };
 function mapSongError(err){
@@ -314,9 +314,9 @@ async function uploadInboxAudio(file){
 }
 function setSelectedSongFile(file){
   if(!file){selectedSongFile=null;text('song-file-name','未选择音频文件');return;}
-  if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name)||file.size>12*1024*1024){
+  if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name)||file.size>100*1024*1024){
     selectedSongFile=null;text('song-file-name','未选择音频文件');
-    throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac，且单文件不超过 12 MiB');
+    throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac，且单文件不超过 100 MiB');
   }
   selectedSongFile=file;
   text('song-file-name',file.name+'（'+(file.size/1048576).toFixed(2)+' MiB）');
@@ -408,7 +408,7 @@ async function songs(){
   }
   renderSongStorageBar(d);
   text('song-prompt-count','当前已加载到 Prompt 的有效曲目：'+(d.loaded_prompt_count??0));
-  text('song-state',d.items.length+' / '+(d.max_songs??100)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??104857600)/1048576).toFixed(0)+' MiB');
+  text('song-state',d.items.length+' / '+(d.max_songs??300)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??524288000)/1048576).toFixed(0)+' MiB');
   const listEl=$('song-list');
   listEl.replaceChildren();
   if(!d.items.length){listEl.append(el('p','还没有录入翻唱曲目。可以通过上方「Colab 学一首新歌」或下方本地上传音频切片加入歌单。','muted'));return;}
@@ -469,7 +469,7 @@ $('song-inbox-upload').addEventListener('click',e=>busy(e.target,async()=>{
   if(!file)throw Error('请先选择要上传的原曲音频文件');
   if(file.size<=0)throw Error(songErrorLabels.invalid_song_audio);
   if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name))throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac 格式的原曲音频');
-  if(file.size>18*1024*1024)throw Error(songErrorLabels.colab_inbox_upload_too_large);
+  if(file.size>100*1024*1024)throw Error(songErrorLabels.colab_inbox_upload_too_large);
   const res=await uploadInboxAudio(file);
   if(!token)return;
   $('song-inbox-file').value='';

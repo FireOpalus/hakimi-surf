@@ -459,7 +459,10 @@ async def test_lru_eviction_preserves_local_songs_and_sqlite_rows(store, fake_ff
     assert local_path.is_file()
 
 
-async def test_request_learn_song_dual_track_priority_and_validation(store):
+async def test_request_learn_song_dual_track_priority_and_validation(
+    store, monkeypatch: pytest.MonkeyPatch
+):
+    assert MAX_LEARN_UPLOAD_BYTES == 100 * 1024 * 1024
     unconfigured = SongLibrary(store, compute=_FakeColabCompute(is_configured=False))
     with pytest.raises(Rejected, match="colab_unconfigured"):
         await unconfigured.request_learn_song("晴天")
@@ -473,12 +476,14 @@ async def test_request_learn_song_dual_track_priority_and_validation(store):
     for bad_pitch in (-25, 25, True, 1.5):
         with pytest.raises(Rejected, match="invalid_song_pitch"):
             await lib.request_learn_song("晴天", pitch=bad_pitch)  # type: ignore[arg-type]
-    with pytest.raises(Rejected, match="song_upload_too_large"):
-        await lib.request_learn_song(
-            "晴天",
-            audio_bytes=b"x" * (MAX_LEARN_UPLOAD_BYTES + 1),
-            audio_filename="big.mp3",
-        )
+    with monkeypatch.context() as mp:
+        mp.setattr("hakimi.songs.MAX_LEARN_UPLOAD_BYTES", 64)
+        with pytest.raises(Rejected, match="song_upload_too_large"):
+            await lib.request_learn_song(
+                "晴天",
+                audio_bytes=b"x" * 65,
+                audio_filename="big.mp3",
+            )
     with pytest.raises(Rejected, match="song_source_required"):
         await lib.request_learn_song("晴天", auto_search=False)
 

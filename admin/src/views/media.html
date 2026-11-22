@@ -45,7 +45,7 @@
     <p id="song-learn-colab-hint" class="muted"></p>
     <div class="sub-card">
       <div class="row">
-        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 18 MiB）</label>
+        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 100 MiB）</label>
         <input id="song-inbox-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac">
         <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
       </div>
@@ -76,7 +76,7 @@
   </div>
   <div class="card">
     <h2>手动上传本地翻唱成品</h2>
-    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 12 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台。</p>
+    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 100 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台。</p>
     <form id="song-upload">
       <div class="row"><label for="song-file">选择音频文件</label><input id="song-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac"><small id="song-file-name" class="muted">未选择音频文件</small></div>
       <div id="song-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把翻唱音频拖到这里（自动识别文件名作为歌名）</div>

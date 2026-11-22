@@ -148,7 +148,7 @@ async def upload(request: Request):
         request,
         allowed_mimes=ALLOWED_SONG_MIMES,
         max_bytes=MAX_SONG_UPLOAD_BYTES,
-        timeout_seconds=30,
+        timeout_seconds=180,
         compressed_error="compressed_song_upload_forbidden",
         mime_error="song_audio_required",
         size_error="song_upload_too_large",

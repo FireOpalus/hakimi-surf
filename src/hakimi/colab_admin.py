@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal, NoReturn
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from .admin_common import body, domain_lock, partial_body, read_binary_upload, service
+from .admin_common import body, domain_lock, partial_body, service
 from .colab_compute import ColabComputeHub, ColabConfig, GpuType
 from .security import Rejected
 from .songs import ALLOWED_SONG_EXTENSIONS, ALLOWED_SONG_MIMES, _safe_learn_upload_name
 
 router = APIRouter(prefix="/admin/api/colab")
 
-MAX_ADMIN_INBOX_UPLOAD_BYTES = 18 * 1024 * 1024
+MAX_ADMIN_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 _STATUS_MAP = {
     "colab_unconfigured": 503,
@@ -155,22 +156,39 @@ async def colab_upload_drive_inbox(request: Request):
     except Rejected as exc:
         _raise_http(exc)
 
-    raw = await read_binary_upload(
-        request,
-        allowed_mimes=ALLOWED_SONG_MIMES,
-        max_bytes=MAX_ADMIN_INBOX_UPLOAD_BYTES,
-        timeout_seconds=60,
-        compressed_error="compressed_song_upload_forbidden",
-        mime_error="invalid_song_audio",
-        size_error="colab_inbox_upload_too_large",
-        timeout_error="song_upload_timeout",
-    )
-    if not raw:
-        raise HTTPException(400, "invalid_song_audio")
+    if request.headers.get("content-encoding", "identity") != "identity":
+        raise HTTPException(415, "compressed_song_upload_forbidden")
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type not in ALLOWED_SONG_MIMES:
+        raise HTTPException(415, "invalid_song_audio")
+
+    raw_len = request.headers.get("content-length")
+    declared: int | None = None
+    if raw_len is not None and raw_len.strip() != "":
+        try:
+            declared = int(raw_len.strip())
+        except ValueError:
+            raise HTTPException(400, "invalid_content_length") from None
+        if declared < 0:
+            raise HTTPException(400, "invalid_content_length")
+        if declared > MAX_ADMIN_INBOX_UPLOAD_BYTES:
+            raise HTTPException(413, "colab_inbox_upload_too_large")
+        if declared == 0:
+            raise HTTPException(400, "invalid_song_audio")
 
     compute = _compute(request)
     try:
-        res = await compute.upload_drive_inbox(safe_name, raw, mime_type=mime_type)
+        async with asyncio.timeout(300):
+            res = await compute.upload_drive_inbox_stream(
+                safe_name,
+                request.stream(),
+                mime_type=mime_type,
+                content_length=declared,
+                max_bytes=MAX_ADMIN_INBOX_UPLOAD_BYTES,
+                timeout_sec=300.0,
+            )
+    except TimeoutError:
+        raise HTTPException(408, "song_upload_timeout") from None
     except Rejected as exc:
         _raise_http(exc)
     return {"file_id": res["file_id"], "name": res["name"], "size": res["size"]}

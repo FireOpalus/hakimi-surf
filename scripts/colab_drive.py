@@ -48,7 +48,7 @@ MAX_JSON_RESPONSE_BYTES = 1_048_576
 MULTIPART_THRESHOLD_BYTES = 4 * 1024 * 1024
 RESUMABLE_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_DRIVE_UPLOAD_BYTES = 250 * 1024 * 1024
-MAX_INBOX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_SONG_DOWNLOAD_BYTES = 30 * 1024 * 1024
 
 DriveRole = Literal["root", "models", "songs", "inbox"]
@@ -239,6 +239,17 @@ def _has_drive_scope(scope_value: Any) -> bool:
     else:
         return False
     return bool(scopes & {DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE})
+
+
+def _build_app_properties(
+    role: DriveSubRole, app_properties: dict[str, str] | None
+) -> dict[str, str]:
+    props = {"hakimi_songs_role": role}
+    if app_properties:
+        for k, v in app_properties.items():
+            if isinstance(k, str) and isinstance(v, str) and k and len(v) <= 120:
+                props[k[:40]] = v
+    return props
 
 
 class ColabDriveClient:
@@ -730,12 +741,7 @@ class ColabDriveClient:
         tree = self.ensure_folder_tree()
         parent_id = tree.folder_for(role)
         existing = self.resolve_named_file(role, clean_name) if replace_existing else None
-
-        props = {"hakimi_songs_role": role}
-        if app_properties:
-            for k, v in app_properties.items():
-                if isinstance(k, str) and isinstance(v, str) and k and len(v) <= 120:
-                    props[k[:40]] = v
+        props = _build_app_properties(role, app_properties)
 
         if len(data) <= MULTIPART_THRESHOLD_BYTES:
             if existing is not None:
@@ -781,15 +787,37 @@ class ColabDriveClient:
             raise ColabDriveError("drive_file_too_large", "Local file size invalid for upload")
         name = sanitize_drive_filename(drive_name or local_path.name)
         resolved_mime = mime_type or _guess_mime(local_path.suffix.lower())
-        raw = local_path.read_bytes()
-        return self.upload_bytes(
-            role,
+        if size <= MULTIPART_THRESHOLD_BYTES:
+            raw = local_path.read_bytes()
+            return self.upload_bytes(
+                role,
+                name,
+                raw,
+                mime_type=resolved_mime,
+                replace_existing=replace_existing,
+                app_properties=app_properties,
+            )
+
+        tree = self.ensure_folder_tree()
+        parent_id = tree.folder_for(role)
+        existing = self.resolve_named_file(role, name) if replace_existing else None
+        props = _build_app_properties(role, app_properties)
+        resp = self._upload_resumable_file(
+            parent_id,
             name,
-            raw,
-            mime_type=resolved_mime,
-            replace_existing=replace_existing,
-            app_properties=app_properties,
+            local_path,
+            size,
+            resolved_mime,
+            existing_id=existing["id"] if existing else None,
+            app_properties=props,
         )
+        fid = validate_drive_id(str(resp["id"]))
+        return {
+            "file_id": fid,
+            "name": str(resp.get("name") or name),
+            "size": size,
+            "mime_type": str(resp.get("mimeType") or resolved_mime),
+        }
 
     def ensure_model_files(self, model_name: str, local_dir: Path) -> tuple[Path, Path]:
         """Return local `(pth_path, index_path)`, pulling from Hakimi_Songs/models/ if absent."""
@@ -877,17 +905,17 @@ class ColabDriveClient:
             )
         return json.loads(raw.decode("utf-8"))
 
-    def _upload_resumable(
+    def _start_resumable_session(
         self,
         parent_id: str,
         filename: str,
-        data: bytes,
+        total_bytes: int,
         mime_type: str,
         *,
         existing_id: str | None = None,
-        app_properties: dict[str, str],
-    ) -> dict[str, Any]:
-        meta: dict[str, Any] = {"name": filename, "appProperties": app_properties}
+        app_properties: dict[str, str] | None = None,
+    ) -> str:
+        meta: dict[str, Any] = {"name": filename, "appProperties": app_properties or {}}
         if existing_id is None:
             meta["parents"] = [parent_id]
         method = "PATCH" if existing_id else "POST"
@@ -903,7 +931,7 @@ class ColabDriveClient:
             headers={
                 "Content-Type": "application/json; charset=UTF-8",
                 "X-Upload-Content-Type": mime_type,
-                "X-Upload-Content-Length": str(len(data)),
+                "X-Upload-Content-Length": str(total_bytes),
             },
             body=json.dumps(meta, ensure_ascii=False).encode("utf-8"),
         )
@@ -912,12 +940,24 @@ class ColabDriveClient:
             raise ColabDriveError(
                 "drive_upload_failed", f"Drive resumable init failed (HTTP {status})"
             )
+        return upload_url
 
-        total = len(data)
+    def _put_resumable_chunks(
+        self,
+        upload_url: str,
+        total: int,
+        mime_type: str,
+        read_chunk: Callable[[int, int], bytes],
+    ) -> dict[str, Any]:
         offset = 0
         while offset < total:
             end = min(total, offset + RESUMABLE_CHUNK_BYTES)
-            chunk = data[offset:end]
+            expected_len = end - offset
+            chunk = read_chunk(offset, expected_len)
+            if len(chunk) != expected_len:
+                raise ColabDriveError(
+                    "drive_upload_failed", "Short read during Drive resumable upload"
+                )
             req_headers = {
                 "Content-Length": str(len(chunk)),
                 "Content-Range": f"bytes {offset}-{end - 1}/{total}",
@@ -937,6 +977,61 @@ class ColabDriveClient:
         raise ColabDriveError(
             "drive_upload_failed", "Drive resumable upload ended without response"
         )
+
+    def _upload_resumable(
+        self,
+        parent_id: str,
+        filename: str,
+        data: bytes,
+        mime_type: str,
+        *,
+        existing_id: str | None = None,
+        app_properties: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        total = len(data)
+        upload_url = self._start_resumable_session(
+            parent_id,
+            filename,
+            total,
+            mime_type,
+            existing_id=existing_id,
+            app_properties=app_properties,
+        )
+        return self._put_resumable_chunks(
+            upload_url,
+            total,
+            mime_type,
+            lambda offset, length: data[offset : offset + length],
+        )
+
+    def _upload_resumable_file(
+        self,
+        parent_id: str,
+        filename: str,
+        local_path: Path,
+        size: int,
+        mime_type: str,
+        *,
+        existing_id: str | None = None,
+        app_properties: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Stream a local file via Drive resumable upload in bounded chunk slices."""
+        upload_url = self._start_resumable_session(
+            parent_id,
+            filename,
+            size,
+            mime_type,
+            existing_id=existing_id,
+            app_properties=app_properties,
+        )
+        with local_path.open("rb") as handle:
+
+            def _read_slice(offset: int, length: int) -> bytes:
+                if handle.tell() != offset:
+                    handle.seek(offset)
+                return handle.read(length)
+
+            return self._put_resumable_chunks(upload_url, size, mime_type, _read_slice)
 
 
 def _guess_mime(ext: str) -> str:

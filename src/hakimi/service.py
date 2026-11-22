@@ -1287,7 +1287,7 @@ class Service:
                 if code == "invalid_song_audio":
                     return "音频附件格式不支持，仅支持 .mp3 / .wav / .flac / .m4a / .ogg / .opus。"
                 if code == "oversized":
-                    return "音频附件太大啦（最大支持 25 MiB），请剪辑或压缩后再发。"
+                    return "音频附件太大啦（最大支持 100 MiB），请剪辑或压缩后再发。"
                 if code == "unavailable":
                     return "音频附件下载失败，请重新发送或上传到云盘 Hakimi_Songs/inbox/。"
                 return f"读取音频附件失败（{code}）。"
@@ -1332,7 +1332,7 @@ class Service:
                 "song_upload_too_large": "音频超过体积上限，请先压缩或截取后再试。",
                 "song_source_required": "未附音频且已关闭自动搜歌，请附带音频或开启自动搜索。",
                 "song_title_exists": f"歌单里已经有《{raw_title}》啦，换一首或先在后台删除旧版吧。",
-                "song_library_full": "歌单已满（最多 100 首），去后台清理几首再来学吧。",
+                "song_library_full": "歌单已满（最多 300 首），去后台清理几首再来学吧。",
             }
             return err_map.get(code, f"提交学歌任务失败（{code}）。")
 

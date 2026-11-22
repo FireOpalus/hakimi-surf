@@ -129,6 +129,21 @@ def test_nginx_conf_enables_gzip_safely_and_preserves_security():
     ):
         assert required in conf
 
+    for exact_loc in (
+        "location = /admin/api/colab/drive/inbox",
+        "location = /admin/api/songs/upload",
+    ):
+        m = re.search(
+            re.escape(exact_loc) + r"\s*\{([^}]*)\}",
+            conf,
+            re.S,
+        )
+        assert m is not None, f"missing {exact_loc} block"
+        block = m.group(1)
+        assert "client_max_body_size 100m;" in block
+        assert "proxy_request_buffering off;" in block
+        assert conf.index(exact_loc) < conf.index("location /admin/api/")
+
 
 async def test_global_overview_is_lightweight_authenticated_and_rejects_query_params(settings):
     settings.admin_token = SecretStr(TOKEN)

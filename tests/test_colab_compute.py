@@ -183,6 +183,18 @@ class FakeDriveBackend:
         if parsed.path.startswith("/upload/drive/v3/files/") and method == "PATCH":
             fid = parsed.path.rsplit("/", 1)[-1]
             rec = self.files[fid]
+            if (qs.get("uploadType") or [""])[0] == "resumable":
+                meta = json.loads((body or b"{}").decode("utf-8"))
+                sess_id = self._next_id("upload_sess")
+                self.resumable_sessions[sess_id] = {
+                    "meta": meta,
+                    "existing_id": fid,
+                    "buf": bytearray(),
+                    "total": int(headers.get("X-Upload-Content-Length", "0")),
+                    "mime": headers.get("X-Upload-Content-Type", "application/octet-stream"),
+                }
+                loc = f"https://www.googleapis.com/upload/resumable/{sess_id}"
+                return 200, {"location": loc}, b""
             payload = body or b""
             rec["data"] = payload
             rec["size"] = str(len(payload))
@@ -194,13 +206,13 @@ class FakeDriveBackend:
             sess["buf"].extend(body or b"")
             if len(sess["buf"]) < sess["total"]:
                 return 308, {}, b""
-            fid = self._next_id("drv_big")
+            fid = sess.get("existing_id") or self._next_id("drv_big")
             meta = sess["meta"]
             data = bytes(sess["buf"])
             rec = {
                 "id": fid,
                 "name": meta["name"],
-                "parents": meta.get("parents", []),
+                "parents": meta.get("parents") or self.files.get(fid, {}).get("parents", []),
                 "mimeType": sess["mime"],
                 "size": str(len(data)),
                 "modifiedTime": "2026-11-21T12:00:00Z",
@@ -313,6 +325,72 @@ def test_colab_drive_folder_tree_resumable_and_scoping(tmp_path: Path) -> None:
         bad_client.ensure_folder_tree()
     assert exc_info.value.code == "drive_insufficient_scope"
     assert "invalid-secret-never-leak" not in str(exc_info.value)
+
+
+def test_colab_drive_upload_file_disk_chunked_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cred_path = tmp_path / "secrets" / "colab-drive-oauth.json"
+    _write_fake_oauth(cred_path)
+    backend = FakeDriveBackend()
+    put_sizes: list[int] = []
+
+    def tracking_transport(
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        timeout: float,
+    ) -> tuple[int, dict[str, str], bytes]:
+        if method == "PUT" and "/upload/resumable/" in url:
+            put_sizes.append(len(body or b""))
+        return backend.transport(method, url, headers, body, timeout)
+
+    client = colab_drive.ColabDriveClient(cred_path, transport=tracking_transport)
+    tree = client.ensure_folder_tree()
+
+    # 5 MiB temp file must stream from disk in 2 resumable chunks (4 MiB + 1 MiB).
+    big_path = tmp_path / "big_inbox.flac"
+    big_bytes = b"fLaC" + (b"\x5a" * (5 * 1024 * 1024 - 4))
+    big_path.write_bytes(big_bytes)
+
+    res = client.upload_file("inbox", big_path, mime_type="audio/flac")
+    assert res["name"] == "big_inbox.flac"
+    assert res["size"] == len(big_bytes)
+    assert put_sizes == [4 * 1024 * 1024, 1 * 1024 * 1024]
+    assert client.download_bytes(res["file_id"], allowed_roles=("inbox",)) == big_bytes
+
+    # Direct _upload_resumable_file with existing_id updates in place in 2 chunks as well.
+    put_sizes.clear()
+    updated_bytes = b"fLaC" + (b"\x3c" * (5 * 1024 * 1024 - 4))
+    big_path.write_bytes(updated_bytes)
+    resp2 = client._upload_resumable_file(
+        tree.inbox,
+        "big_inbox.flac",
+        big_path,
+        len(updated_bytes),
+        "audio/flac",
+        existing_id=res["file_id"],
+        app_properties={"hakimi_songs_role": "inbox"},
+    )
+    assert resp2["id"] == res["file_id"]
+    assert put_sizes == [4 * 1024 * 1024, 1 * 1024 * 1024]
+    assert client.download_bytes(res["file_id"], allowed_roles=("inbox",)) == updated_bytes
+
+    # Small file (<= 4 MiB) uses multipart/bytes without resumable chunks.
+    put_sizes.clear()
+    small_path = tmp_path / "small.mp3"
+    small_bytes = _fake_mp3_bytes(b"small-file")
+    small_path.write_bytes(small_bytes)
+    small_res = client.upload_file("inbox", small_path, mime_type="audio/mpeg")
+    assert small_res["size"] == len(small_bytes)
+    assert put_sizes == []
+
+    # Oversized file beyond MAX_INBOX_UPLOAD_BYTES fails before reading.
+    monkeypatch.setattr(colab_drive, "MAX_INBOX_UPLOAD_BYTES", 64)
+    with pytest.raises(colab_drive.ColabDriveError) as size_exc:
+        client.upload_file("inbox", small_path, mime_type="audio/mpeg")
+    assert size_exc.value.code == "drive_file_too_large"
 
 
 def test_resolve_drive_credentials_decoupled_and_symlink_rejected(
@@ -968,17 +1046,50 @@ async def test_colab_admin_drive_inbox_upload(settings, tmp_path: Path) -> None:
                 assert compressed.status_code == 415
                 assert compressed.json()["detail"] == "compressed_song_upload_forbidden"
 
+                for bad_len in ("-1", "not-an-int"):
+                    bad_cl = await client.post(
+                        "/admin/api/colab/drive/inbox",
+                        headers={
+                            "Content-Type": "audio/mpeg",
+                            "Content-Length": bad_len,
+                            "X-Drive-Filename": quote("晴天.mp3"),
+                        },
+                        content=mp3_bytes,
+                    )
+                    assert bad_cl.status_code == 400
+                    assert bad_cl.json()["detail"] == "invalid_content_length"
+
                 oversized = await client.post(
                     "/admin/api/colab/drive/inbox",
                     headers={
                         "Content-Type": "audio/mpeg",
+                        "Content-Length": str(100 * 1024 * 1024 + 1),
                         "X-Drive-Filename": quote("晴天.mp3"),
                     },
-                    content=b"0" * (18 * 1024 * 1024 + 1),
+                    content=b"x",
                 )
                 assert oversized.status_code == 413
                 assert oversized.json()["detail"] == "colab_inbox_upload_too_large"
                 assert drive_client.list_inbox() == []
+
+                # Chunked stream (no Content-Length header) succeeds end-to-end
+                async def _chunked_ok():
+                    mid = len(mp3_bytes) // 2
+                    yield mp3_bytes[:mid]
+                    yield b""
+                    yield mp3_bytes[mid:]
+
+                ok_chunked = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "audio/mpeg",
+                        "X-Drive-Filename": quote("chunked.mp3"),
+                    },
+                    content=_chunked_ok(),
+                )
+                assert ok_chunked.status_code == 200
+                assert ok_chunked.json()["name"] == "chunked.mp3"
+                assert ok_chunked.json()["size"] == len(mp3_bytes)
 
                 # Valid Unicode MP3 upload proxies to worker /v1/drive/inbox
                 ok = await client.post(
@@ -1010,9 +1121,81 @@ async def test_colab_admin_drive_inbox_upload(settings, tmp_path: Path) -> None:
                 inbox = await client.get("/admin/api/colab/drive/inbox")
                 assert inbox.status_code == 200
                 names = {item["name"]: item for item in inbox.json()["items"]}
+                assert "chunked.mp3" in names
                 assert "晴天.mp3" in names
                 assert names["晴天.mp3"]["id"] == body["file_id"]
                 assert names["晴天.mp3"]["size"] == len(mp3_bytes)
                 assert "周杰伦_晴天_Live.mp3" in names
+        finally:
+            await worker_client.aclose()
+
+
+async def test_colab_admin_drive_inbox_streaming_oversize(
+    settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    worker_tmp = tmp_path / "worker_tmp"
+    worker_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(worker_tmp))
+
+    app_w, cfg_w, drive_client, _ = _build_test_worker(tmp_path)
+    s = _worker_settings(
+        settings,
+        "http://127.0.0.1:19999",
+        cfg_w.token,
+        admin_token=SecretStr(ADMIN_TOKEN),
+    )
+    app = create_app(s, gateway_factory=FakeGateway, start_workers=False)
+    async with app.router.lifespan_context(app):
+        mod = app.state.service.modules.systems["colab_compute"]
+        worker_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_w),
+            base_url="http://127.0.0.1:19999",
+        )
+        mod.compute._injected_http = worker_client
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:12141",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            ) as client:
+
+                async def _chunked_100():
+                    for _ in range(5):
+                        yield b"a" * 20
+
+                # 1) Hub streaming limit enforced during chunked upload (max_bytes=64, stream=100B)
+                with monkeypatch.context() as mp:
+                    mp.setattr("hakimi.colab_admin.MAX_ADMIN_INBOX_UPLOAD_BYTES", 64)
+                    resp = await client.post(
+                        "/admin/api/colab/drive/inbox",
+                        headers={
+                            "Content-Type": "audio/mpeg",
+                            "X-Drive-Filename": quote("stream_big.mp3"),
+                        },
+                        content=_chunked_100(),
+                    )
+                assert resp.status_code == 413
+                assert resp.json()["detail"] == "colab_inbox_upload_too_large"
+                assert drive_client.list_inbox() == []
+                assert os.listdir(worker_tmp) == []
+
+                # 2) Worker streaming limit also maps cleanly to 413 & deletes temp file
+                with monkeypatch.context() as mp:
+                    mp.setattr("hakimi.colab_admin.MAX_ADMIN_INBOX_UPLOAD_BYTES", 256)
+                    mp.setattr(colab_worker, "MAX_INBOX_UPLOAD_BYTES", 64)
+                    resp_w = await client.post(
+                        "/admin/api/colab/drive/inbox",
+                        headers={
+                            "Content-Type": "audio/mpeg",
+                            "X-Drive-Filename": quote("worker_big.mp3"),
+                        },
+                        content=_chunked_100(),
+                    )
+                assert resp_w.status_code == 413
+                assert resp_w.json()["detail"] == "colab_inbox_upload_too_large"
+                assert drive_client.list_inbox() == []
+                assert os.listdir(worker_tmp) == []
         finally:
             await worker_client.aclose()

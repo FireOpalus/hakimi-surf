@@ -22,13 +22,13 @@ from .security import Rejected, clean_text
 
 log = logging.getLogger("hakimi")
 
-MAX_SONG_UPLOAD_BYTES = 12 * 1024 * 1024
-MAX_LEARN_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_SONG_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_LEARN_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_STORED_SONG_BYTES = 1_800_000
 MAX_SONG_DURATION_SECONDS = 58.0
 MIN_SONG_DURATION_MS = 1000
-MAX_SONGS = 100
-MAX_SONG_LIBRARY_BYTES = 100 * 1024 * 1024
+MAX_SONGS = 300
+MAX_SONG_LIBRARY_BYTES = 500 * 1024 * 1024
 MAX_PROMPT_SONGS = 40
 DEFAULT_SONG_CACHE_MAX_BYTES = 30 * 1024 * 1024
 CACHE_EVICT_INTERVAL_SECONDS = 1800.0
@@ -677,7 +677,8 @@ class SongLibrary:
                             f"ALTER TABLE song_library ADD COLUMN {col_name} {col_def}"
                         )
                 rows = await self.store.all(
-                    "SELECT * FROM song_library ORDER BY created ASC, title ASC LIMIT 105"
+                    "SELECT * FROM song_library ORDER BY created ASC, title ASC LIMIT ?",
+                    (MAX_SONGS + 5,),
                 )
             valid: dict[str, dict[str, Any]] = {}
             stale_ids: list[str] = []

@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 12146
-MAX_INBOX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_SONG_UPLOAD_BYTES = 30 * 1024 * 1024
 MAX_JOB_BODY_BYTES = 64 * 1024
 MAX_JOB_HISTORY = 100
@@ -743,25 +743,57 @@ def create_worker_app(
     @app.post("/v1/drive/inbox")
     async def v1_upload_inbox(request: Request) -> dict[str, Any]:
         _auth(request)
+        raw_len = request.headers.get("content-length")
+        if raw_len is not None and raw_len.strip() != "":
+            try:
+                declared = int(raw_len.strip())
+            except ValueError:
+                raise HTTPException(400, "invalid_content_length") from None
+            if declared < 0:
+                raise HTTPException(400, "invalid_content_length")
+            if declared > MAX_INBOX_UPLOAD_BYTES:
+                raise HTTPException(413, "payload_too_large")
+            if declared == 0:
+                raise HTTPException(400, "colab_drive_invalid_file")
+
         raw_name = unquote(request.headers.get("x-drive-filename", ""))
         mime = request.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
-        raw = await _read_bounded_bytes(request, MAX_INBOX_UPLOAD_BYTES)
-        if not raw:
-            raise HTTPException(400, "colab_drive_invalid_file")
         try:
             clean_name = sanitize_drive_filename(raw_name)
+        except ColabDriveError as exc:
+            status = 503 if "scope" in exc.code or "cred" in exc.code else 400
+            raise HTTPException(status, exc.code) from None
+
+        tmp_path: Path | None = None
+        try:
+            tmp_file = tempfile.NamedTemporaryFile(prefix="hakimi_inbox_", delete=False)
+            tmp_path = Path(tmp_file.name)
+            total = 0
+            with tmp_file:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_INBOX_UPLOAD_BYTES:
+                        raise HTTPException(413, "payload_too_large")
+                    await asyncio.to_thread(tmp_file.write, chunk)
+            if total == 0:
+                raise HTTPException(400, "colab_drive_invalid_file")
             drive = await asyncio.to_thread(state.get_drive, "")
             res = await asyncio.to_thread(
-                drive.upload_bytes,
+                drive.upload_file,
                 "inbox",
-                clean_name,
-                raw,
+                tmp_path,
+                drive_name=clean_name,
                 mime_type=mime or "application/octet-stream",
             )
             return {"file_id": res["file_id"], "name": res["name"], "size": res["size"]}
         except ColabDriveError as exc:
             status = 503 if "scope" in exc.code or "cred" in exc.code else 400
             raise HTTPException(status, exc.code) from None
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     @app.get("/v1/drive/songs/{file_id}")
     async def v1_download_song(request: Request, file_id: str) -> Response:

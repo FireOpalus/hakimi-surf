@@ -3360,7 +3360,7 @@ body:not(.authenticated) main {
     <p id="song-learn-colab-hint" class="muted"></p>
     <div class="sub-card">
       <div class="row">
-        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 18 MiB）</label>
+        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 100 MiB）</label>
         <input id="song-inbox-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac">
         <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
       </div>
@@ -3391,7 +3391,7 @@ body:not(.authenticated) main {
   </div>
   <div class="card">
     <h2>手动上传本地翻唱成品</h2>
-    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 12 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台。</p>
+    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 100 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台。</p>
     <form id="song-upload">
       <div class="row"><label for="song-file">选择音频文件</label><input id="song-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac"><small id="song-file-name" class="muted">未选择音频文件</small></div>
       <div id="song-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把翻唱音频拖到这里（自动识别文件名作为歌名）</div>
@@ -7041,9 +7041,9 @@ const songErrorLabels={
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
   colab_daily_limit_reached:'今日 Colab 作业次数或 CU 预算已达上限',
-  colab_inbox_upload_too_large:'上传原曲超过 18 MiB 上限',
+  colab_inbox_upload_too_large:'上传原曲超过 100 MiB 上限',
   colab_drive_invalid_file:'原曲文件名无效',
-  song_upload_too_large:'上传音频超过 12 MiB 上限',
+  song_upload_too_large:'上传音频超过 100 MiB 上限',
   song_audio_required:'请先选择有效的音频文件'
 };
 function mapSongError(err){
@@ -7138,9 +7138,9 @@ async function uploadInboxAudio(file){
 }
 function setSelectedSongFile(file){
   if(!file){selectedSongFile=null;text('song-file-name','未选择音频文件');return;}
-  if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name)||file.size>12*1024*1024){
+  if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name)||file.size>100*1024*1024){
     selectedSongFile=null;text('song-file-name','未选择音频文件');
-    throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac，且单文件不超过 12 MiB');
+    throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac，且单文件不超过 100 MiB');
   }
   selectedSongFile=file;
   text('song-file-name',file.name+'（'+(file.size/1048576).toFixed(2)+' MiB）');
@@ -7232,7 +7232,7 @@ async function songs(){
   }
   renderSongStorageBar(d);
   text('song-prompt-count','当前已加载到 Prompt 的有效曲目：'+(d.loaded_prompt_count??0));
-  text('song-state',d.items.length+' / '+(d.max_songs??100)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??104857600)/1048576).toFixed(0)+' MiB');
+  text('song-state',d.items.length+' / '+(d.max_songs??300)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??524288000)/1048576).toFixed(0)+' MiB');
   const listEl=$('song-list');
   listEl.replaceChildren();
   if(!d.items.length){listEl.append(el('p','还没有录入翻唱曲目。可以通过上方「Colab 学一首新歌」或下方本地上传音频切片加入歌单。','muted'));return;}
@@ -7293,7 +7293,7 @@ $('song-inbox-upload').addEventListener('click',e=>busy(e.target,async()=>{
   if(!file)throw Error('请先选择要上传的原曲音频文件');
   if(file.size<=0)throw Error(songErrorLabels.invalid_song_audio);
   if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name))throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac 格式的原曲音频');
-  if(file.size>18*1024*1024)throw Error(songErrorLabels.colab_inbox_upload_too_large);
+  if(file.size>100*1024*1024)throw Error(songErrorLabels.colab_inbox_upload_too_large);
   const res=await uploadInboxAudio(file);
   if(!token)return;
   $('song-inbox-file').value='';

@@ -19,7 +19,7 @@ from .models import FileRef, Message
 from .security import Rejected, authorize, clean_text, configured_secrets
 
 MAX_FILE_HARD_BYTES = 262_144
-MAX_AUDIO_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_AUDIO_ATTACHMENT_BYTES = 100 * 1024 * 1024
 MAX_EXCERPT_CHARS = 3200
 HTTP_TIMEOUT = 12
 ALLOWED_AUDIO_EXTENSIONS = frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"})

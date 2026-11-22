@@ -7,7 +7,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -27,7 +27,7 @@ GpuType = Literal["H100", "A100", "G4", "L4", "T4"]
 VALID_GPUS: tuple[GpuType, ...] = ("H100", "A100", "G4", "L4", "T4")
 VALID_JOB_TYPES = frozenset({"rvc_cover", "rvc_train"})
 MAX_QUEUED_JOBS = 20
-MAX_INBOX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_SONG_UPLOAD_BYTES = 30 * 1024 * 1024
 MAX_DRIVE_DOWNLOAD_BYTES = 30 * 1024 * 1024
 
@@ -794,6 +794,7 @@ class ColabComputeHub:
         raw: bytes,
         *,
         mime_type: str = "application/octet-stream",
+        timeout_sec: float = 300.0,
     ) -> dict[str, Any]:
         await self.initialize()
         clean_name = _sanitize_filename(filename)
@@ -807,7 +808,7 @@ class ColabComputeHub:
                 "Content-Type": mime_type or "application/octet-stream",
                 "X-Drive-Filename": quote(clean_name, safe=""),
             },
-            timeout_sec=60.0,
+            timeout_sec=timeout_sec,
         )
         if resp.status_code == 400 or resp.status_code == 413:
             raise Rejected("colab_drive_invalid_file")
@@ -820,6 +821,98 @@ class ColabComputeHub:
             "file_id": str(res["file_id"]),
             "name": str(res.get("name") or clean_name),
             "size": int(res.get("size") or len(raw)),
+        }
+
+    async def upload_drive_inbox_stream(
+        self,
+        filename: str,
+        stream: AsyncIterator[bytes],
+        *,
+        mime_type: str = "application/octet-stream",
+        content_length: int | None = None,
+        max_bytes: int = MAX_INBOX_UPLOAD_BYTES,
+        timeout_sec: float = 300.0,
+    ) -> dict[str, Any]:
+        """Stream an audio file directly to the host worker's /v1/drive/inbox endpoint."""
+        await self.initialize()
+        if not self.configured():
+            raise Rejected("colab_unconfigured")
+        clean_name = _sanitize_filename(filename)
+        if content_length is not None:
+            if isinstance(content_length, bool) or content_length < 0:
+                raise Rejected("colab_drive_invalid_file")
+            if content_length > max_bytes:
+                raise Rejected("colab_inbox_upload_too_large")
+            if content_length == 0:
+                raise Rejected("invalid_song_audio")
+
+        it = aiter(stream)
+        first = b""
+        while not first:
+            try:
+                chunk = await anext(it)
+            except StopAsyncIteration:
+                raise Rejected("invalid_song_audio") from None
+            if chunk:
+                first = bytes(chunk)
+        if len(first) > max_bytes:
+            raise Rejected("colab_inbox_upload_too_large")
+
+        total_bytes = 0
+
+        async def _gen() -> AsyncIterator[bytes]:
+            nonlocal total_bytes
+            total_bytes = len(first)
+            yield first
+            async for chunk in it:
+                if not chunk:
+                    continue
+                data = bytes(chunk)
+                total_bytes += len(data)
+                if total_bytes > max_bytes:
+                    raise Rejected("colab_inbox_upload_too_large")
+                yield data
+
+        client = await self._http()
+        url = f"{self._worker_url()}/v1/drive/inbox"
+        headers = {
+            "Authorization": f"Bearer {self._worker_token()}",
+            "Content-Type": mime_type or "application/octet-stream",
+            "X-Drive-Filename": quote(clean_name, safe=""),
+        }
+        try:
+            resp = await client.request(
+                "POST",
+                url,
+                headers=headers,
+                content=_gen(),
+                timeout=httpx.Timeout(timeout_sec, connect=10.0),
+            )
+        except Rejected:
+            raise
+        except (httpx.HTTPError, TimeoutError, OSError) as exc:
+            self._worker_reachable = False
+            self._last_error = self._scrub(type(exc).__name__)
+            raise Rejected("colab_worker_unavailable") from None
+
+        if resp.status_code == 413:
+            raise Rejected("colab_inbox_upload_too_large")
+        if resp.status_code == 400:
+            raise Rejected("colab_drive_invalid_file")
+        if resp.status_code == 503:
+            raise Rejected("colab_drive_not_configured")
+        if resp.status_code >= 400:
+            raise Rejected("colab_worker_unavailable")
+        try:
+            res = resp.json()
+        except ValueError:
+            raise Rejected("colab_worker_unavailable") from None
+        if not isinstance(res, dict) or not res.get("file_id"):
+            raise Rejected("colab_worker_unavailable")
+        return {
+            "file_id": str(res["file_id"]),
+            "name": str(res.get("name") or clean_name),
+            "size": int(res.get("size") or total_bytes),
         }
 
     async def download_drive_song(self, file_id: str) -> bytes:
