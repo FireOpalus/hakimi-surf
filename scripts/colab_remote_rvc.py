@@ -865,13 +865,45 @@ raise RuntimeError(f"All separation models failed: {last_err}")
 
 
 def _transcribe_for_chorus(sep_py: str, dry_vocals_wav: Path) -> list[dict[str, Any]]:
-    script = """import json, sys
+    script = """import json, subprocess, sys
+import numpy as np
 from faster_whisper import WhisperModel
+
+def _load_audio_16k(path):
+    proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "f32le",
+            "-",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        err_tail = (proc.stderr or b"").decode("utf-8", errors="replace").strip()[-240:]
+        raise RuntimeError(f"ffmpeg 16k decode failed (rc={proc.returncode}): {err_tail}")
+    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
+
+audio = _load_audio_16k(sys.argv[1])
+if audio.size == 0:
+    print("[whisper] empty audio after 16k decode.", file=sys.stderr)
+    print("__WHISPER_SEGS__=[]")
+    sys.exit(0)
 
 def _run_model(device, compute_type):
     model = WhisperModel("small", device=device, compute_type=compute_type)
     try:
-        segments, info = model.transcribe(sys.argv[1], vad_filter=True)
+        segments, info = model.transcribe(audio, vad_filter=True)
         return list(segments), info
     except Exception as vad_exc:
         print(
@@ -879,7 +911,7 @@ def _run_model(device, compute_type):
             f"({type(vad_exc).__name__}: {vad_exc}); retrying without VAD.",
             file=sys.stderr,
         )
-        segments, info = model.transcribe(sys.argv[1], vad_filter=False)
+        segments, info = model.transcribe(audio, vad_filter=False)
         return list(segments), info
 
 seg_list = None

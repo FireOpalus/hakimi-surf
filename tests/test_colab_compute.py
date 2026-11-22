@@ -7,6 +7,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -422,6 +423,31 @@ def test_resolve_drive_credentials_decoupled_and_symlink_rejected(
 # ---------------------------------------------------------------------------
 
 
+_MINIMAL_NUMPY_STUB = """import array
+
+float32 = "float32"
+
+
+class ndarray:
+    def __init__(self, data, dtype=float32):
+        self._data = list(data)
+        self.dtype = dtype
+        self.ndim = 1
+        self.size = len(self._data)
+
+    def copy(self):
+        return ndarray(self._data, dtype=self.dtype)
+
+
+def frombuffer(buf, dtype=float32):
+    if dtype != float32:
+        raise ValueError(f"unsupported dtype: {dtype}")
+    arr = array.array("f")
+    arr.frombytes(buf)
+    return ndarray(list(arr), dtype=dtype)
+"""
+
+
 def test_transcribe_for_chorus_logs_cuda_fallback_and_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -438,6 +464,9 @@ def test_transcribe_for_chorus_logs_cuda_fallback_and_stderr(
         assert "lang={detected_lang}" in cmd[2]
         assert "CUDA transcribe failed" in cmd[2]
         assert "cpu" in cmd[2]
+        assert "_load_audio_16k" in cmd[2]
+        assert "model.transcribe(audio," in cmd[2]
+        assert "model.transcribe(sys.argv[1]" not in cmd[2]
         return colab_remote.subprocess.CompletedProcess(
             cmd,
             0,
@@ -462,7 +491,9 @@ def test_transcribe_for_chorus_logs_cuda_fallback_and_stderr(
         def __init__(self, size: str, *, device: str, compute_type: str) -> None:
             self.device = device
 
-        def transcribe(self, path: str, **kwargs: Any):
+        def transcribe(self, audio: Any, **kwargs: Any):
+            assert not isinstance(audio, (str, Path))
+            assert audio.ndim == 1 and audio.size == 8
             transcribe_calls.append((self.device, dict(kwargs)))
             if self.device == "cuda":
                 raise RuntimeError("cuda unavailable")
@@ -473,10 +504,26 @@ def test_transcribe_for_chorus_logs_cuda_fallback_and_stderr(
     fake_fw = types.ModuleType("faster_whisper")
     fake_fw.WhisperModel = _FakeWhisperModel  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
+    if importlib.util.find_spec("numpy") is None:
+        fake_np = types.ModuleType("numpy")
+        exec(_MINIMAL_NUMPY_STUB, fake_np.__dict__)
+        monkeypatch.setitem(sys.modules, "numpy", fake_np)
     monkeypatch.setattr(sys, "argv", ["whisper.py", str(tmp_path / "vocals.wav")])
+
+    def fake_ffmpeg_run(cmd, **kwargs):
+        del kwargs
+        assert cmd[0] == "ffmpeg"
+        assert "-ar" in cmd and cmd[cmd.index("-ar") + 1] == "16000"
+        assert "-f" in cmd and cmd[cmd.index("-f") + 1] == "f32le"
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=struct.pack("<8f", *([0.25, -0.25] * 4)), stderr=b""
+        )
+
     stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
-        exec(compile(captured_scripts[0], "<whisper_inline>", "exec"), {})
+    with monkeypatch.context() as mp:
+        mp.setattr(subprocess, "run", fake_ffmpeg_run)
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            exec(compile(captured_scripts[0], "<whisper_inline>", "exec"), {})
     assert transcribe_calls == [
         ("cuda", {"vad_filter": True}),
         ("cuda", {"vad_filter": False}),
@@ -495,6 +542,122 @@ def test_transcribe_for_chorus_logs_cuda_fallback_and_stderr(
     logs.clear()
     assert colab_remote._transcribe_for_chorus("python", tmp_path / "vocals.wav") == []
     assert any("libcudnn missing" in msg for msg in logs)
+
+
+def test_transcribe_for_chorus_subprocess_decodes_ndarray_and_bypasses_pyav(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    py_dir = tmp_path / "pydeps"
+    bin_dir.mkdir()
+    py_dir.mkdir()
+
+    fake_ffmpeg = bin_dir / "ffmpeg"
+    fake_ffmpeg.write_text(
+        f"#!{sys.executable}\n"
+        "import os, struct, sys\n"
+        "argv = sys.argv[1:]\n"
+        "assert '-ar' in argv and argv[argv.index('-ar') + 1] == '16000'\n"
+        "assert '-ac' in argv and argv[argv.index('-ac') + 1] == '1'\n"
+        "assert '-f' in argv and argv[argv.index('-f') + 1] == 'f32le'\n"
+        "assert argv[-1] == '-'\n"
+        "if os.environ.get('FAKE_FFMPEG_FAIL') == '1':\n"
+        "    sys.stderr.write('simulated ffmpeg decode error\\n')\n"
+        "    sys.exit(1)\n"
+        "sys.stdout.buffer.write(struct.pack('<16f', *([0.1, -0.1] * 8)))\n",
+        encoding="utf-8",
+    )
+    os.chmod(fake_ffmpeg, 0o755)
+
+    if importlib.util.find_spec("numpy") is None:
+        (py_dir / "numpy.py").write_text(_MINIMAL_NUMPY_STUB, encoding="utf-8")
+
+    trace_file = tmp_path / "whisper_calls.jsonl"
+    (py_dir / "faster_whisper.py").write_text(
+        "import json, os, types\n"
+        "import numpy as np\n"
+        "\n"
+        "class WhisperModel:\n"
+        "    def __init__(self, size, *, device, compute_type):\n"
+        "        self.size = size\n"
+        "        self.device = device\n"
+        "        self.compute_type = compute_type\n"
+        "\n"
+        "    def transcribe(self, audio, **kwargs):\n"
+        "        trace_path = os.environ.get('FAKE_WHISPER_TRACE')\n"
+        "        if trace_path:\n"
+        "            rec = {\n"
+        "                'device': self.device,\n"
+        "                'compute_type': self.compute_type,\n"
+        "                'kwargs': kwargs,\n"
+        "            }\n"
+        "            with open(trace_path, 'a', encoding='utf-8') as fh:\n"
+        "                fh.write(json.dumps(rec) + '\\n')\n"
+        "        if isinstance(audio, str):\n"
+        "            raise TypeError(\n"
+        "                \"av.open() got an unexpected keyword argument 'metadata_errors'\"\n"
+        "            )\n"
+        "        assert isinstance(audio, np.ndarray), f'expected ndarray, got {type(audio)}'\n"
+        "        assert audio.ndim == 1, f'expected 1D ndarray, got ndim={audio.ndim}'\n"
+        "        assert audio.dtype == np.float32, f'expected float32, got {audio.dtype}'\n"
+        "        assert audio.size > 0, f'expected non-empty ndarray, got size={audio.size}'\n"
+        "        if self.device == 'cuda':\n"
+        "            raise RuntimeError('CUDA driver unavailable')\n"
+        "        if kwargs.get('vad_filter'):\n"
+        "            raise RuntimeError('silero VAD onnx unavailable')\n"
+        "        segs = [\n"
+        "            types.SimpleNamespace(start=58.5, end=63.25, text='桜流し'),\n"
+        "            types.SimpleNamespace(start=63.25, end=69.0, text='君のそばで'),\n"
+        "        ]\n"
+        "        info = types.SimpleNamespace(language='ja')\n"
+        "        return iter(segs), info\n",
+        encoding="utf-8",
+    )
+
+    existing_path = os.environ.get("PATH", "")
+    existing_pp = os.environ.get("PYTHONPATH", "")
+    monkeypatch.setenv(
+        "PATH", f"{bin_dir}{os.pathsep}{existing_path}" if existing_path else str(bin_dir)
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{py_dir}{os.pathsep}{existing_pp}" if existing_pp else str(py_dir)
+    )
+    monkeypatch.setenv("FAKE_WHISPER_TRACE", str(trace_file))
+
+    logs: list[str] = []
+    monkeypatch.setattr(colab_remote, "log", logs.append)
+    dummy_wav = tmp_path / "vocals.wav"
+    dummy_wav.write_bytes(b"RIFF")
+
+    segs = colab_remote._transcribe_for_chorus(sys.executable, dummy_wav)
+    assert segs == [
+        {"start": 58.5, "end": 63.25, "text": "桜流し"},
+        {"start": 63.25, "end": 69.0, "text": "君のそばで"},
+    ]
+
+    calls = [json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines()]
+    assert calls == [
+        {"device": "cuda", "compute_type": "float16", "kwargs": {"vad_filter": True}},
+        {"device": "cuda", "compute_type": "float16", "kwargs": {"vad_filter": False}},
+        {"device": "cpu", "compute_type": "int8", "kwargs": {"vad_filter": True}},
+        {"device": "cpu", "compute_type": "int8", "kwargs": {"vad_filter": False}},
+    ]
+    assert any(
+        "CUDA transcribe failed" in msg and "falling back to CPU int8." in msg for msg in logs
+    )
+    assert any(
+        "vad_filter=True failed on cpu" in msg and "retrying without VAD." in msg for msg in logs
+    )
+    assert any("transcribed 2 segment(s) on cpu (lang=ja)." in msg for msg in logs)
+    assert not any("metadata_errors" in msg for msg in logs)
+
+    logs.clear()
+    monkeypatch.setenv("FAKE_FFMPEG_FAIL", "1")
+    assert colab_remote._transcribe_for_chorus(sys.executable, dummy_wav) == []
+    assert any(
+        "ffmpeg 16k decode failed" in msg and "simulated ffmpeg decode error" in msg for msg in logs
+    )
+    assert any("faster-whisper skipped/failed" in msg for msg in logs)
 
 
 def test_dsp_vocal_rms_chorus_detection_before_60s_fallback(tmp_path: Path) -> None:
