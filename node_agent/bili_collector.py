@@ -50,6 +50,10 @@ COVER_URL_RE = re.compile(
     r"^https://(?:i[0-2]\.hdslb\.com|archive\.biliimg\.com)/bfs/[A-Za-z0-9_./-]+$"
 )
 VIDEOSHOT_HOST_RE = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.hdslb\.com$")
+VIDEOSHOT_PATH_RE = re.compile(
+    r"^/(?:bfs|videoshot[a-z0-9_-]{0,32})/[A-Za-z0-9_./@-]+\.(?:jpe?g|png|webp)$",
+    re.IGNORECASE,
+)
 BVID_RE = re.compile(r"^BV[1-9A-HJ-NP-Za-km-z]{10}$")
 
 PUBLIC_GET_MAX_BYTES = 1_048_576
@@ -291,13 +295,14 @@ def _validate_videoshot_url(raw_url: str) -> str:
     url = f"https:{raw_url}" if raw_url.startswith("//") else raw_url
     if not url.startswith("https://"):
         raise CollectorError("videoshot_host_forbidden")
-    parsed = urlsplit(url)
     try:
+        parsed = urlsplit(url)
         port = parsed.port
     except ValueError:
         raise CollectorError("videoshot_host_forbidden") from None
     host = (parsed.hostname or "").lower()
     lowered_path = parsed.path.lower()
+    segments = parsed.path.split("/")[1:] if parsed.path.startswith("/") else []
     if (
         parsed.scheme != "https"
         or not VIDEOSHOT_HOST_RE.fullmatch(host)
@@ -305,12 +310,14 @@ def _validate_videoshot_url(raw_url: str) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
-        or not parsed.path.startswith("/bfs/")
-        or len(parsed.path) <= len("/bfs/")
-        or ".." in parsed.path.split("/")
+        or not VIDEOSHOT_PATH_RE.fullmatch(parsed.path)
+        or not segments
+        or any(seg in {"", ".", ".."} for seg in segments)
+        or segments[-1].startswith(".")
         or "%2e" in lowered_path
         or "%2f" in lowered_path
         or "%5c" in lowered_path
+        or "%00" in lowered_path
     ):
         raise CollectorError("videoshot_host_forbidden")
     return url

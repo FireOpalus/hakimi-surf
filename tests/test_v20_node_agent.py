@@ -695,20 +695,45 @@ async def test_videoshot_url_ssrf_allowlist_and_cookie_isolation(
         _validate_videoshot_url("https://sub.i2.hdslb.com:443/bfs/videoshot/demo.jpg")
         == "https://sub.i2.hdslb.com:443/bfs/videoshot/demo.jpg"
     )
+    assert (
+        _validate_videoshot_url(
+            "//bimp.hdslb.com/videoshotpvhdboss/1234567890_abcdef012345-0001.jpg"
+        )
+        == "https://bimp.hdslb.com/videoshotpvhdboss/1234567890_abcdef012345-0001.jpg"
+    )
+    assert (
+        _validate_videoshot_url("//bimp.hdslb.com/videoshotpv/12345_hash-0002.webp")
+        == "https://bimp.hdslb.com/videoshotpv/12345_hash-0002.webp"
+    )
+    assert (
+        _validate_videoshot_url("https://bimp.hdslb.com/videoshot/sub/123_abc.png?auth_key=k1")
+        == "https://bimp.hdslb.com/videoshot/sub/123_abc.png?auth_key=k1"
+    )
 
     for bad_url in (
         "https://evil.com/bfs/videoshot/a.jpg",
         "//evil.com/bfs/videoshot/a.jpg",
+        "https://evil.com/videoshotpvhdboss/123_abc-0001.jpg",
         "https://hdslb.com/bfs/videoshot/a.jpg",
         "https://evil-hdslb.com/bfs/videoshot/a.jpg",
         "https://i0.hdslb.com.evil.com/bfs/videoshot/a.jpg",
         "https://127.0.0.1/bfs/videoshot/a.jpg",
         "http://i0.hdslb.com/bfs/videoshot/a.jpg",
+        "http://bimp.hdslb.com/videoshotpvhdboss/123_abc-0001.jpg",
         "https://i0.hdslb.com:8443/bfs/videoshot/a.jpg",
+        "//bimp.hdslb.com:99999/videoshotpvhdboss/123_abc-0001.jpg",
         "https://user:pass@i0.hdslb.com/bfs/videoshot/a.jpg",
         "https://i0.hdslb.com/bfs/videoshot/a.jpg#frag",
         "https://i0.hdslb.com/other/videoshot/a.jpg",
+        "https://bimp.hdslb.com/other/123_abc-0001.jpg",
         "https://i0.hdslb.com/bfs/",
+        "https://bimp.hdslb.com/videoshotpvhdboss/",
+        "https://bimp.hdslb.com/videoshotpvhdboss/secret.json",
+        "https://bimp.hdslb.com/videoshotpvhdboss/../secret.jpg",
+        "https://bimp.hdslb.com/videoshotpvhdboss/%2e%2e/secret.jpg",
+        "https://bimp.hdslb.com/videoshotpvhdboss//123_abc-0001.jpg",
+        "https://bimp.hdslb.com/videoshotpvhdboss/./123_abc-0001.jpg",
+        "https://bimp.hdslb.com/videoshotpvhdboss/.jpg",
         "https://i0.hdslb.com/bfs/videoshot/../secret.jpg",
         "https://i0.hdslb.com/bfs/%2e%2e/secret.jpg",
     ):
@@ -1032,6 +1057,65 @@ async def test_bili_collector_subtitle_invalid_port_rejected_cleanly(tmp_path: P
                 }
             )
         assert exc_info.value.code == "bili_subtitle_host_forbidden"
+    finally:
+        await collector.close()
+        await http.aclose()
+
+
+async def test_videoshot_bimp_videoshotpvhdboss_end_to_end(tmp_path: Path) -> None:
+    """Real Bilibili videoshot returns //bimp.hdslb.com/videoshotpvhdboss/<cid>_<hash>-0001.jpg."""
+    colors = [(220, 40, 40), (40, 220, 40), (40, 40, 220)] * 34
+    hd_sprite = _make_sprite_sheet_jpeg(10, 10, 480, 270, colors)
+    seen: list[tuple[str, str, dict[str, str]]] = []
+    secret_sess = "live-bimp-secret-sessdata"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.host, request.url.path, dict(request.headers)))
+        if request.url.host == "api.bilibili.com" and request.url.path == "/x/player/videoshot":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "img_x_len": 10,
+                        "img_y_len": 10,
+                        "img_x_size": 480,
+                        "img_y_size": 270,
+                        "image": [
+                            "//bimp.hdslb.com/videoshotpvhdboss/29564123456_a1b2c3d4e5-0001.jpg"
+                        ],
+                        "index": list(range(0, 400, 5)),
+                    },
+                },
+            )
+        if request.url.host == "bimp.hdslb.com":
+            return httpx.Response(200, content=hd_sprite, headers={"content-type": "image/jpeg"})
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    collector = BiliCollector(min_interval=0.0, temp_dir=tmp_path / "bimp_jobs", http_client=http)
+    try:
+        res = await collector.video_storyboard(
+            {
+                "bvid": TEST_BVID,
+                "videoshot_only": True,
+                "cookies": {"sessdata": secret_sess},
+            }
+        )
+        assert res["bvid"] == TEST_BVID
+        assert res["source"] == "videoshot"
+        assert res["grid"] == "3x3"
+        assert res["mime_type"] == "image/jpeg"
+        img_bytes = base64.b64decode(res["data_b64"])
+        assert res["bytes"] == len(img_bytes)
+        assert 1 <= len(img_bytes) <= STORYBOARD_MAX_JPEG_BYTES
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            assert img.format == "JPEG"
+            assert img.size == (960, 540)
+        cdn_reqs = [item for item in seen if item[0] == "bimp.hdslb.com"]
+        assert len(cdn_reqs) == 1
+        assert cdn_reqs[0][1] == "/videoshotpvhdboss/29564123456_a1b2c3d4e5-0001.jpg"
+        assert "cookie" not in {k.lower() for k in cdn_reqs[0][2]}
     finally:
         await collector.close()
         await http.aclose()
