@@ -472,7 +472,7 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
     ].filter(Boolean));
     kpiBox.replaceChildren(
       kpiCard('Colab CU 余额','—','Colab Worker 未配置或离线',''),
-      kpiCard('今日 / 累计作业','—','等待连接 Colab 控制面',''),
+      kpiCard('今日作业','—','等待连接 Colab 控制面',''),
       kpiCard('近 '+cloudTrendDays+' 天 CU 消耗','—','暂无趋势数据',''),
       kpiCard('热会话保活','0 活跃','仅 L4/T4 支持短时热保活','')
     );
@@ -485,8 +485,7 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
   const warm=norm.warmSessions;
   const accel=norm.accel;
   const cuAvail=w.compute_units!=null?Number(w.compute_units):null;
-  const todayJobs=Number(t.jobs_count??0);
-  const jobsLimit=Number(t.daily_job_limit??c.daily_job_limit??0);
+  const jobsCount=Number(t.jobs_count??0);
   const todayCu=Number(t.cu_used??0);
   const windowCu=cloudTrendDays===14?(sum.last_14d_cu_used??null):(sum.last_30d_cu_used??null);
   const windowJobs=cloudTrendDays===14?(sum.last_14d_jobs??null):(sum.last_30d_jobs??null);
@@ -494,13 +493,13 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
 
   pillsBox.replaceChildren(
     colab.configured?(w.reachable?pill('Worker 在线','ok'):pill('Worker 离线','err')):pill('未配置 COLAB_WORKER_URL','muted'),
-    c.enabled?pill('首选 GPU · '+(c.preferred_gpu||'L4'),'vertex'):pill('算力调度已暂停','warn'),
+    c.enabled?pill('调度开启 · 按模块自选 GPU','vertex'):pill('算力调度已暂停','warn'),
     warm.length>0?pill('热机保活中 · '+warm.length+' 会话（'+String(warmHead.gpu||'L4')+' 剩余 '+formatTtlCompact(warmHead.remaining_ttl_seconds)+'）','ok'):(accel?.warm_pool_enabled?pill('热保活待命（'+((accel.warm_allowed_gpus||['L4','T4']).join('/'))+'）','muted'):pill('热保活未启用','muted'))
   );
   const cuNote=w.reachable?'账号实时 Compute Units 余额':(w.error?('Worker 离线：'+(colabErrorLabels?.[w.error]||w.error)):'Worker 离线时暂不可查询');
   kpiBox.replaceChildren(
     kpiCard('Colab CU 余额',cuAvail!=null?cuAvail.toFixed(2)+' CU':'未知',cuNote,cuAvail!=null?(cuAvail<2?'warn':'ok'):''),
-    kpiCard('今日 / 累计作业',todayJobs+' / '+Number(sum.total_jobs??0),'日限 '+jobsLimit+' · 成功率 '+(sum.success_rate!=null?pctText(sum.success_rate):'—')+(sum.derived_legacy?'（近 30 条估算）':''),jobsLimit>0&&todayJobs>=jobsLimit?'warn':''),
+    kpiCard('今日作业',jobsCount+' 次','累计 '+Number(sum.total_jobs??0)+' 次 · 成功率 '+(sum.success_rate!=null?pctText(sum.success_rate):'—')+(sum.derived_legacy?'（近 30 条估算）':''),''),
     kpiCard('近 '+cloudTrendDays+' 天 CU 消耗',windowCu!=null?Number(windowCu).toFixed(3)+' CU':todayCu.toFixed(2)+' CU（今日）',windowCu!=null?('近 '+cloudTrendDays+' 天 '+Number(windowJobs??0)+' 次作业 · 累计 '+Number(sum.total_cu_used??0).toFixed(3)+' CU'):'旧版引擎暂未返回周期聚合','accent'),
     kpiCard('热会话保活',warm.length>0?(warm.length+' 活跃 · '+String(warmHead.gpu||'L4')):'0 活跃',warm.length>0?('剩余 TTL '+formatTtlCompact(warmHead.remaining_ttl_seconds)+' · 复用 '+Number(warmHead.reuse_count||0)+' 次'):(accel?.warm_pool_enabled?'L4/T4 完工后短时保活':'H100/A100/G4 不保活'),warm.length>0?'ok':'')
   );

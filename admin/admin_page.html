@@ -2564,19 +2564,9 @@ body:not(.authenticated) main {
         <button id="colab-terminate-sessions" type="button" class="danger" disabled>紧急清退全部 Colab 会话</button>
       </div>
     </div>
-    <p class="muted">主脑通过 loopback HTTP + Bearer 鉴权调度独立进程外 Colab 通用 GPU Worker（禁止主脑直接读取 Colab 凭据）；优先使用首选 GPU，不可用时按顺序回退，并按注册白名单分发各类异步 GPU 作业。</p>
+    <p class="muted">主脑通过 loopback HTTP + Bearer 鉴权调度独立进程外 Colab 通用 GPU Worker（禁止主脑直接读取 Colab 凭据）；GPU 选型与允许卡白名单由各业务模块按作业自主声明，不设每日次数/CU 上限，保留单作业超时、孤儿清退与队列上限 20 防失控护栏。</p>
     <div id="colab-pills" class="pill-row"></div>
     <div id="colab-kpi-strip" class="kpi-strip"></div>
-    <div class="grid">
-      <div>
-        <div class="row between"><small>今日作业次数进度</small><small id="colab-jobs-progress-label" class="muted">0 / 0</small></div>
-        <progress id="colab-jobs-progress" max="100" value="0"></progress>
-      </div>
-      <div>
-        <div class="row between"><small>今日 CU 消耗预算进度</small><small id="colab-cu-progress-label" class="muted">0.00 / 0.00 CU</small></div>
-        <progress id="colab-cu-progress" max="100" value="0"></progress>
-      </div>
-    </div>
     <p id="colab-state" class="muted" aria-live="polite"></p>
     <p id="colab-job-types" class="muted"></p>
   </div>
@@ -2617,33 +2607,20 @@ body:not(.authenticated) main {
     </div>
   </div>
   <div class="card">
-    <h2>算力调度与预算配置</h2>
+    <h2>已注册 GPU 作业策略</h2>
+    <p class="muted">各业务模块在注册作业类型时自行声明默认首选 GPU、回退顺序、允许卡型白名单与默认超时；在对应业务页发起单次任务时可在允许卡型内临时覆盖。</p>
+    <div id="colab-job-policies-table" class="table"></div>
+  </div>
+  <div class="card">
+    <h2>算力调度与防失控配置</h2>
+    <p class="muted">GPU 选型由各业务模块按作业声明，不设每日作业次数与每日 CU 上限；仅保留单作业默认超时、孤儿会话清退与队列长度上限 20 三道防失控护栏。</p>
     <p id="colab-config-source" class="muted"></p>
     <form id="colab-config-form">
       <div class="row">
         <label><input id="colab-enabled" type="checkbox"> 启用 Colab 云端算力调度</label>
       </div>
       <div class="grid">
-        <label for="colab-preferred-gpu">首选 GPU（preferred_gpu）
-          <select id="colab-preferred-gpu">
-            <option value="L4">L4（推荐均衡）</option>
-            <option value="T4">T4（经济兜底）</option>
-            <option value="G4">G4</option>
-            <option value="A100">A100（高性能）</option>
-            <option value="H100">H100（旗舰）</option>
-          </select>
-        </label>
-        <label for="colab-fallback-gpus">回退 GPU 列表（fallback_gpus，逗号分隔）
-          <input id="colab-fallback-gpus" type="text" maxlength="64" placeholder="例如：L4, T4（可选 H100 / A100 / G4 / L4 / T4）">
-          <small class="muted">按优先顺序列出备选 GPU，可选值：H100, A100, G4, L4, T4</small>
-        </label>
-        <label for="colab-daily-job-limit">每日作业上限（0–50）
-          <input id="colab-daily-job-limit" type="number" min="0" max="50" step="1" required>
-        </label>
-        <label for="colab-daily-cu-budget">每日 CU 预算（0.0–200.0）
-          <input id="colab-daily-cu-budget" type="number" min="0" max="200" step="0.1" required>
-        </label>
-        <label for="colab-job-timeout">单作业超时秒数（120–7200）
+        <label for="colab-job-timeout">默认单作业超时秒数（120–7200）
           <input id="colab-job-timeout" type="number" min="120" max="7200" step="1" required>
         </label>
         <label for="colab-orphan-minutes">孤儿会话自动清退分钟数（5–120）
@@ -3626,9 +3603,14 @@ body:not(.authenticated) main {
             <option value="">不指定文件（使用下方自动检索）</option>
           </select>
         </label>
-        <div class="row">
-          <label><input id="song-learn-auto-search" type="checkbox" checked> 未指定文件时自动检索官方原版</label>
-        </div>
+        <label for="song-learn-gpu">本次首选 GPU（可选覆盖）
+          <select id="song-learn-gpu">
+            <option value="">默认 L4（自动回退 T4）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label><input id="song-learn-auto-search" type="checkbox" checked> 未指定文件时自动检索官方原版</label>
       </div>
       <div class="row">
         <button id="song-learn-submit" type="submit" class="primary">发起 Colab 学歌</button>
@@ -4771,7 +4753,7 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
     ].filter(Boolean));
     kpiBox.replaceChildren(
       kpiCard('Colab CU 余额','—','Colab Worker 未配置或离线',''),
-      kpiCard('今日 / 累计作业','—','等待连接 Colab 控制面',''),
+      kpiCard('今日作业','—','等待连接 Colab 控制面',''),
       kpiCard('近 '+cloudTrendDays+' 天 CU 消耗','—','暂无趋势数据',''),
       kpiCard('热会话保活','0 活跃','仅 L4/T4 支持短时热保活','')
     );
@@ -4784,8 +4766,7 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
   const warm=norm.warmSessions;
   const accel=norm.accel;
   const cuAvail=w.compute_units!=null?Number(w.compute_units):null;
-  const todayJobs=Number(t.jobs_count??0);
-  const jobsLimit=Number(t.daily_job_limit??c.daily_job_limit??0);
+  const jobsCount=Number(t.jobs_count??0);
   const todayCu=Number(t.cu_used??0);
   const windowCu=cloudTrendDays===14?(sum.last_14d_cu_used??null):(sum.last_30d_cu_used??null);
   const windowJobs=cloudTrendDays===14?(sum.last_14d_jobs??null):(sum.last_30d_jobs??null);
@@ -4793,13 +4774,13 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
 
   pillsBox.replaceChildren(
     colab.configured?(w.reachable?pill('Worker 在线','ok'):pill('Worker 离线','err')):pill('未配置 COLAB_WORKER_URL','muted'),
-    c.enabled?pill('首选 GPU · '+(c.preferred_gpu||'L4'),'vertex'):pill('算力调度已暂停','warn'),
+    c.enabled?pill('调度开启 · 按模块自选 GPU','vertex'):pill('算力调度已暂停','warn'),
     warm.length>0?pill('热机保活中 · '+warm.length+' 会话（'+String(warmHead.gpu||'L4')+' 剩余 '+formatTtlCompact(warmHead.remaining_ttl_seconds)+'）','ok'):(accel?.warm_pool_enabled?pill('热保活待命（'+((accel.warm_allowed_gpus||['L4','T4']).join('/'))+'）','muted'):pill('热保活未启用','muted'))
   );
   const cuNote=w.reachable?'账号实时 Compute Units 余额':(w.error?('Worker 离线：'+(colabErrorLabels?.[w.error]||w.error)):'Worker 离线时暂不可查询');
   kpiBox.replaceChildren(
     kpiCard('Colab CU 余额',cuAvail!=null?cuAvail.toFixed(2)+' CU':'未知',cuNote,cuAvail!=null?(cuAvail<2?'warn':'ok'):''),
-    kpiCard('今日 / 累计作业',todayJobs+' / '+Number(sum.total_jobs??0),'日限 '+jobsLimit+' · 成功率 '+(sum.success_rate!=null?pctText(sum.success_rate):'—')+(sum.derived_legacy?'（近 30 条估算）':''),jobsLimit>0&&todayJobs>=jobsLimit?'warn':''),
+    kpiCard('今日作业',jobsCount+' 次','累计 '+Number(sum.total_jobs??0)+' 次 · 成功率 '+(sum.success_rate!=null?pctText(sum.success_rate):'—')+(sum.derived_legacy?'（近 30 条估算）':''),''),
     kpiCard('近 '+cloudTrendDays+' 天 CU 消耗',windowCu!=null?Number(windowCu).toFixed(3)+' CU':todayCu.toFixed(2)+' CU（今日）',windowCu!=null?('近 '+cloudTrendDays+' 天 '+Number(windowJobs??0)+' 次作业 · 累计 '+Number(sum.total_cu_used??0).toFixed(3)+' CU'):'旧版引擎暂未返回周期聚合','accent'),
     kpiCard('热会话保活',warm.length>0?(warm.length+' 活跃 · '+String(warmHead.gpu||'L4')):'0 活跃',warm.length>0?('剩余 TTL '+formatTtlCompact(warmHead.remaining_ttl_seconds)+' · 复用 '+Number(warmHead.reuse_count||0)+' 次'):(accel?.warm_pool_enabled?'L4/T4 完工后短时保活':'H100/A100/G4 不保活'),warm.length>0?'ok':'')
   );
@@ -7889,6 +7870,7 @@ const songErrorLabels={
   colab_unconfigured:'Colab 云端算力 Worker 尚未配置，请先在「Colab 云端算力」检查配置',
   colab_disabled:'Colab 云端算力调度当前已关闭，请先开启后再试',
   colab_worker_unavailable:'Colab Worker 当前离线或不可达，请稍后重试',
+  colab_gpu_not_allowed:'RVC 翻唱暂不支持该 GPU 型号（已排除不兼容卡型）',
   colab_daily_job_limit:'今日 Colab 作业次数已达上限',
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
@@ -7933,21 +7915,46 @@ function sanitizeSongTitleStem(filename){
   const cleaned=stem.replace(/[^\p{L}\p{M}\p{N}\s_\-'’‘&!?！？,，.。、~～+:：·・—–()（）\[\]【】「」『』@#%*=♡♥★☆♪♫]/gu,' ').replace(/\s+/g,' ').trim();
   return cleaned.slice(0,60).trim();
 }
+const defaultLearnGpuPolicy={default_gpu:'L4',fallback_gpus:['T4'],allowed_gpus:['L4','T4','A100','H100']};
+function renderSongLearnGpuPolicy(policy){
+  const sel=$('song-learn-gpu');
+  if(!sel)return;
+  const prev=sel.value;
+  const p=policy&&typeof policy==='object'?policy:defaultLearnGpuPolicy;
+  const defaultGpu=String(p.default_gpu||defaultLearnGpuPolicy.default_gpu).trim()||'L4';
+  const fallbacks=Array.isArray(p.fallback_gpus)?p.fallback_gpus.map(g=>String(g||'').trim()).filter(Boolean):defaultLearnGpuPolicy.fallback_gpus;
+  const rawAllowed=Array.isArray(p.allowed_gpus)&&p.allowed_gpus.length?p.allowed_gpus:defaultLearnGpuPolicy.allowed_gpus;
+  const allowed=[];
+  for(const item of rawAllowed){
+    const gpu=String(item||'').trim();
+    if(gpu&&!allowed.includes(gpu))allowed.push(gpu);
+  }
+  const defaultLabel=fallbacks.length?('默认 '+defaultGpu+'（自动回退 '+fallbacks.join(' / ')+'）'):('默认 '+defaultGpu+'（不自动回退）');
+  const opts=[selectOption('',defaultLabel),...allowed.map(gpu=>selectOption(gpu,gpu))];
+  sel.replaceChildren(...opts);
+  sel.value=prev&&allowed.includes(prev)?prev:'';
+}
 function clearSongLearnForm(){
   $('song-learn-title').value='';
   $('song-learn-artist').value='';
   $('song-learn-tags').value='';
   $('song-learn-pitch').value='0';
   $('song-learn-inbox').value='';
+  $('song-learn-gpu').value='';
   $('song-learn-auto-search').checked=true;
 }
 function showSongLearnResult(job,title,inboxFilename,pitch){
   const jobId=job?.id||job?.job_id||'—';
   const status=job?.status||'queued';
+  const prefGpu=String(job?.preferred_gpu||job?.assigned_gpu||'').trim();
   const box=$('song-learn-result');
   const head=el('div',undefined,'sub-card-head');
-  head.append(el('h3','已提交学歌作业：'+title),pill('状态：'+status,'ok'));
-  const info=el('p','作业 ID：'+jobId+(inboxFilename?' · 原曲来源：Drive inbox / '+inboxFilename:' · 自动检索官方原版')+' · 升降调：'+(pitch>0?'+'+pitch:String(pitch)),'muted');
+  head.append(...[
+    el('h3','已提交学歌作业：'+title),
+    pill('状态：'+status,'ok'),
+    prefGpu?pill('首选 GPU：'+prefGpu,'vertex'):null
+  ].filter(Boolean));
+  const info=el('p','作业 ID：'+jobId+(prefGpu?' · 首选 GPU：'+prefGpu:'')+(inboxFilename?' · 原曲来源：Drive inbox / '+inboxFilename:' · 自动检索官方原版')+' · 升降调：'+(pitch>0?'+'+pitch:String(pitch)),'muted');
   const actions=el('div',undefined,'row');
   const jumpBtn=el('button','前往 Colab 云端算力查看队列 →','secondary');
   jumpBtn.type='button';
@@ -8242,6 +8249,7 @@ async function songs(){
     if(!validIds.has(id)){URL.revokeObjectURL(url);songBlobCache.delete(id);}
   }
   renderSongStorageBar(d);
+  renderSongLearnGpuPolicy(d.learn_gpu_policy);
   text('song-prompt-count','当前已加载到 Prompt 的有效曲目：'+(d.loaded_prompt_count??0));
   text('song-state',d.items.length+' / '+(d.max_songs??300)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??524288000)/1048576).toFixed(0)+' MiB');
   const listEl=$('song-list');
@@ -8366,6 +8374,7 @@ $('song-learn-form').addEventListener('submit',e=>{
     const inboxFileId=sel.selectedOptions?.[0]?.dataset?.fileId||'';
     const autoSearch=$('song-learn-auto-search').checked;
     if(!inboxFilename&&!autoSearch)throw Error(songErrorLabels.song_source_required);
+    const chosenGpu=$('song-learn-gpu').value.trim();
     const payload={
       title,
       artist:$('song-learn-artist').value.trim(),
@@ -8373,6 +8382,7 @@ $('song-learn-form').addEventListener('submit',e=>{
       pitch,
       auto_search:autoSearch
     };
+    if(chosenGpu)payload.gpu=chosenGpu;
     if(inboxFilename){
       payload.inbox_filename=inboxFilename;
       if(inboxFileId)payload.inbox_file_id=inboxFileId;
@@ -8433,6 +8443,8 @@ onLogout(()=>{
   lastSongStorageState=null;
   clearSongLearnForm();
   $('song-learn-inbox').replaceChildren(selectOption('','不指定文件（使用下方自动检索）'));
+  $('song-learn-gpu').replaceChildren(selectOption('','默认 L4（自动回退 T4）'));
+  $('song-learn-gpu').value='';
   $('song-learn-result').hidden=true;
   $('song-learn-result').replaceChildren();
   $('song-drive-details').replaceChildren();
@@ -8844,6 +8856,7 @@ const colabErrorLabels={
   colab_unconfigured:'Colab Worker 尚未配置（请检查 COLAB_WORKER_URL / TOKEN）',
   colab_disabled:'Colab 云端算力调度当前已关闭',
   colab_worker_unavailable:'Colab Worker 离线或不可达',
+  colab_gpu_not_allowed:'该作业类型不支持所选 GPU 型号',
   colab_daily_job_limit:'今日 Colab 作业次数已达上限',
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
@@ -8851,7 +8864,6 @@ const colabErrorLabels={
   colab_job_not_found:'未找到指定作业',
   colab_job_not_cancellable:'该作业当前状态不可取消'
 };
-const colabGpuList=['H100','A100','G4','L4','T4'];
 const colabJobTypeLabels={rvc_cover:'RVC 翻唱学歌',rvc_train:'RVC 音色训练'};
 const colabJobStatusLabels={queued:'排队中',running:'运行中',succeeded:'已完成',failed:'失败',cancelled:'已取消'};
 const colabJobStatusVariant={queued:'warn',running:'paid',succeeded:'ok',failed:'err',cancelled:'muted'};
@@ -8872,36 +8884,48 @@ function renderColabOverview(d){
   $('colab-pills').replaceChildren(...[
     d.configured?pill('Worker 已配置','ok'):pill('未配置 COLAB_WORKER_URL','muted'),
     w.reachable?pill('Worker 在线','ok'):pill(d.configured?'Worker 离线':'未连接',d.configured?'err':'muted'),
-    c.enabled?pill('调度开启 · 首选 '+(c.preferred_gpu||'L4'),'vertex'):pill('调度已暂停','warn'),
+    c.enabled?pill('调度开启 · 按模块自选 GPU','vertex'):pill('调度已暂停','warn'),
     ((w.active_sessions||0)>0||w.running_job_id)?pill('活跃会话 '+(w.active_sessions||0)+(w.running_job_id?' · 作业 '+String(w.running_job_id).slice(0,8):''),'paid'):pill('当前无活跃会话','muted'),
     warmLead?pill('热机保活 '+warmSessions.length+' · '+String(warmLead.gpu||'L4')+' 剩余 '+formatTtlCompact(warmLead.remaining_ttl_seconds),'ok'):null
   ].filter(Boolean));
   const cuAvail=w.compute_units!=null?Number(w.compute_units):null;
   const jobsCount=Number(t.jobs_count??0);
-  const jobsLimit=Number(t.daily_job_limit??c.daily_job_limit??0);
   const cuUsed=Number(t.cu_used??0);
-  const cuBudget=Number(t.daily_cu_budget??c.daily_cu_budget??0);
   $('colab-kpi-strip').replaceChildren(
     kpiCard('Compute Units 余额',cuAvail!=null?cuAvail.toFixed(2)+' CU':'未知',w.reachable?'Colab 账号实时可用算力余额':'Worker 离线时暂不可查询',cuAvail!=null?(cuAvail<2?'warn':'ok'):''),
     kpiCard('运行中会话 / 作业',String(w.active_sessions??0)+' 会话',w.running_job_id?'运行作业 '+String(w.running_job_id).slice(0,12):'暂无运行中作业',(w.active_sessions||0)>0?'accent':''),
-    kpiCard('今日作业次数',jobsCount+' / '+jobsLimit,'当日累计提交/计数作业',jobsLimit>0&&jobsCount>=jobsLimit?'warn':''),
-    kpiCard('今日 CU 消耗',cuUsed.toFixed(2)+' / '+cuBudget.toFixed(2)+' CU','当日累计算力预算消耗',cuBudget>0&&cuUsed>=cuBudget?'warn':'')
+    kpiCard('今日作业次数',jobsCount+' 次','不设每日次数上限 · 排队上限 20',''),
+    kpiCard('今日 CU 消耗',cuUsed.toFixed(2)+' CU','不设每日 CU 上限 · 仅实时统计','')
   );
-  $('colab-jobs-progress').value=jobsLimit>0?Math.min(100,(jobsCount/jobsLimit)*100):0;
-  text('colab-jobs-progress-label',jobsCount+' / '+jobsLimit+' 次');
-  $('colab-cu-progress').value=cuBudget>0?Math.min(100,(cuUsed/cuBudget)*100):0;
-  text('colab-cu-progress-label',cuUsed.toFixed(2)+' / '+cuBudget.toFixed(2)+' CU');
-  text('colab-state','首选 GPU：'+(c.preferred_gpu||'L4')+' · 回退顺序：'+((c.fallback_gpus||[]).join(', ')||'无')+(w.error?' · Worker 状态提示：'+(colabErrorLabels[w.error]||w.error):''));
-  const supportedTypes=Array.isArray(d.supported_job_types)?d.supported_job_types:(Array.isArray(w.supported_job_types)?w.supported_job_types:[]);
+  const jobSpecs=Array.isArray(d.job_types)?d.job_types:[];
+  const supportedTypes=Array.isArray(d.supported_job_types)?d.supported_job_types:(jobSpecs.length?jobSpecs.map(s=>s.job_type):(Array.isArray(w.supported_job_types)?w.supported_job_types:[]));
+  const defaultTimeout=c.job_timeout_seconds??1800;
+  const orphanMins=c.auto_terminate_orphan_minutes??20;
+  const policyCount=jobSpecs.length||supportedTypes.length;
+  text('colab-state','已注册作业：'+policyCount+' 类 · 默认单作业超时：'+defaultTimeout+' 秒 · 孤儿会话清退：'+orphanMins+' 分钟 · 队列上限 20'+(w.error?' · Worker 状态提示：'+(colabErrorLabels[w.error]||w.error):''));
   text('colab-job-types','已注册作业类型：'+(supportedTypes.length?supportedTypes.map(jt=>colabJobTypeLabels[jt]?colabJobTypeLabels[jt]+'（'+jt+'）':jt).join('、'):'暂无已注册作业类型'));
 
+  table('colab-job-policies-table',['作业类型','所属模块','首选 GPU','回退顺序','允许卡型','单作业超时'],jobSpecs.map(spec=>{
+    const jt=String(spec?.job_type||'');
+    const jtLabel=colabJobTypeLabels[jt]?colabJobTypeLabels[jt]+'（'+jt+'）':(jt||'—');
+    const owner=String(spec?.owner_module||'').trim();
+    const defGpu=String(spec?.default_gpu||'').trim();
+    const fallbacks=Array.isArray(spec?.fallback_gpus)?spec.fallback_gpus.map(g=>String(g||'').trim()).filter(Boolean):[];
+    const allowed=Array.isArray(spec?.allowed_gpus)?spec.allowed_gpus.map(g=>String(g||'').trim()).filter(Boolean):[];
+    const specTimeout=spec?.timeout_seconds!=null&&Number.isFinite(Number(spec.timeout_seconds))?Number(spec.timeout_seconds):defaultTimeout;
+    return [
+      jtLabel,
+      owner?el('span',owner,'code-mono'):'—',
+      defGpu?pill(defGpu,(defGpu==='L4'||defGpu==='T4')?'ok':'vertex'):'—',
+      fallbacks.length?fallbacks.join(' → '):'不自动回退',
+      allowed.length?allowed.join(' / '):'—',
+      specTimeout+' 秒'
+    ];
+  }));
+
   $('colab-enabled').checked=Boolean(c.enabled);
-  $('colab-preferred-gpu').value=c.preferred_gpu||'L4';
-  $('colab-fallback-gpus').value=Array.isArray(c.fallback_gpus)?c.fallback_gpus.join(', '):'';
-  $('colab-daily-job-limit').value=c.daily_job_limit??5;
-  $('colab-daily-cu-budget').value=c.daily_cu_budget??10;
-  $('colab-job-timeout').value=c.job_timeout_seconds??1800;
-  $('colab-orphan-minutes').value=c.auto_terminate_orphan_minutes??20;
+  $('colab-job-timeout').value=defaultTimeout;
+  $('colab-orphan-minutes').value=orphanMins;
   text('colab-config-source',(d.source==='sqlite'||d.source==='admin')?'当前配置来源：后台 SQLite 覆盖（重启保留）':'当前配置来源：默认 / 环境变量配置');
   $('colab-save').disabled=false;
   $('colab-reset').disabled=false;
@@ -8964,30 +8988,12 @@ $('colab-terminate-sessions').addEventListener('click',e=>busy(e.target,async()=
 $('colab-config-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('colab-save'),async()=>{
-    const rawFb=$('colab-fallback-gpus').value.trim();
-    const fallback=[];
-    if(rawFb){
-      for(const part of rawFb.split(/[\s,，]+/)){
-        if(!part)continue;
-        const gpu=part.toUpperCase();
-        if(!colabGpuList.includes(gpu))throw Error('回退 GPU 仅支持：'+colabGpuList.join(', '));
-        if(!fallback.includes(gpu))fallback.push(gpu);
-      }
-    }
-    const jobLimit=Number($('colab-daily-job-limit').value);
-    const cuBudget=Number($('colab-daily-cu-budget').value);
     const timeoutSec=Number($('colab-job-timeout').value);
     const orphanMins=Number($('colab-orphan-minutes').value);
-    if(!Number.isInteger(jobLimit)||jobLimit<0||jobLimit>50)throw Error('每日作业上限须为 0～50 的整数');
-    if(!Number.isFinite(cuBudget)||cuBudget<0||cuBudget>200)throw Error('每日 CU 预算须为 0～200 之间的数字');
-    if(!Number.isInteger(timeoutSec)||timeoutSec<120||timeoutSec>7200)throw Error('单作业超时秒数须为 120～7200 的整数');
+    if(!Number.isInteger(timeoutSec)||timeoutSec<120||timeoutSec>7200)throw Error('默认单作业超时秒数须为 120～7200 的整数');
     if(!Number.isInteger(orphanMins)||orphanMins<5||orphanMins>120)throw Error('孤儿会话自动清退分钟数须为 5～120 的整数');
     const payload={
       enabled:$('colab-enabled').checked,
-      preferred_gpu:$('colab-preferred-gpu').value,
-      fallback_gpus:fallback,
-      daily_job_limit:jobLimit,
-      daily_cu_budget:cuBudget,
       job_timeout_seconds:timeoutSec,
       auto_terminate_orphan_minutes:orphanMins
     };
@@ -8999,7 +9005,7 @@ $('colab-config-form').addEventListener('submit',e=>{
   });
 });
 $('colab-reset').addEventListener('click',e=>busy(e.target,async()=>{
-  if(!(await confirmDialog('移除后台覆盖值，恢复默认 Colab 算力与预算配置？',{danger:true,confirmLabel:'恢复默认'})))return;
+  if(!(await confirmDialog('移除后台覆盖值，恢复默认 Colab 算力调度与防失控配置？',{danger:true,confirmLabel:'恢复默认'})))return;
   let next;
   try{next=await api('colab','DELETE');}
   catch(err){throwColabError(err);}
@@ -9341,7 +9347,7 @@ onLogout(()=>{
   text('connection-label','等待连接状态');
   $('connection-dot').className='status-dot';
   text('ws-heartbeat','—');text('ws-source','—');
-  for(const id of ['module-catalog','system-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','module-heading-switch','colab-pills','colab-kpi-strip','colab-jobs-table'])$(id).replaceChildren();
+  for(const id of ['module-catalog','system-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','module-heading-switch','colab-pills','colab-kpi-strip','colab-job-policies-table','colab-jobs-table'])$(id).replaceChildren();
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;
@@ -9350,10 +9356,6 @@ onLogout(()=>{
   for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=false;
   for(const id of ['bili-module-backend','bili-module-autonomous'])text(id,'—');
   for(const id of ['colab-state','colab-job-types','colab-config-source'])text(id,'');
-  text('colab-jobs-progress-label','0 / 0');
-  text('colab-cu-progress-label','0.00 / 0.00 CU');
-  $('colab-jobs-progress').value=0;
-  $('colab-cu-progress').value=0;
   for(const id of ['colab-terminate-sessions','colab-save','colab-reset'])$(id).disabled=true;
 });
 })();

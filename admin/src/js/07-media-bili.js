@@ -222,6 +222,7 @@ const songErrorLabels={
   colab_unconfigured:'Colab 云端算力 Worker 尚未配置，请先在「Colab 云端算力」检查配置',
   colab_disabled:'Colab 云端算力调度当前已关闭，请先开启后再试',
   colab_worker_unavailable:'Colab Worker 当前离线或不可达，请稍后重试',
+  colab_gpu_not_allowed:'RVC 翻唱暂不支持该 GPU 型号（已排除不兼容卡型）',
   colab_daily_job_limit:'今日 Colab 作业次数已达上限',
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
@@ -266,21 +267,46 @@ function sanitizeSongTitleStem(filename){
   const cleaned=stem.replace(/[^\p{L}\p{M}\p{N}\s_\-'’‘&!?！？,，.。、~～+:：·・—–()（）\[\]【】「」『』@#%*=♡♥★☆♪♫]/gu,' ').replace(/\s+/g,' ').trim();
   return cleaned.slice(0,60).trim();
 }
+const defaultLearnGpuPolicy={default_gpu:'L4',fallback_gpus:['T4'],allowed_gpus:['L4','T4','A100','H100']};
+function renderSongLearnGpuPolicy(policy){
+  const sel=$('song-learn-gpu');
+  if(!sel)return;
+  const prev=sel.value;
+  const p=policy&&typeof policy==='object'?policy:defaultLearnGpuPolicy;
+  const defaultGpu=String(p.default_gpu||defaultLearnGpuPolicy.default_gpu).trim()||'L4';
+  const fallbacks=Array.isArray(p.fallback_gpus)?p.fallback_gpus.map(g=>String(g||'').trim()).filter(Boolean):defaultLearnGpuPolicy.fallback_gpus;
+  const rawAllowed=Array.isArray(p.allowed_gpus)&&p.allowed_gpus.length?p.allowed_gpus:defaultLearnGpuPolicy.allowed_gpus;
+  const allowed=[];
+  for(const item of rawAllowed){
+    const gpu=String(item||'').trim();
+    if(gpu&&!allowed.includes(gpu))allowed.push(gpu);
+  }
+  const defaultLabel=fallbacks.length?('默认 '+defaultGpu+'（自动回退 '+fallbacks.join(' / ')+'）'):('默认 '+defaultGpu+'（不自动回退）');
+  const opts=[selectOption('',defaultLabel),...allowed.map(gpu=>selectOption(gpu,gpu))];
+  sel.replaceChildren(...opts);
+  sel.value=prev&&allowed.includes(prev)?prev:'';
+}
 function clearSongLearnForm(){
   $('song-learn-title').value='';
   $('song-learn-artist').value='';
   $('song-learn-tags').value='';
   $('song-learn-pitch').value='0';
   $('song-learn-inbox').value='';
+  $('song-learn-gpu').value='';
   $('song-learn-auto-search').checked=true;
 }
 function showSongLearnResult(job,title,inboxFilename,pitch){
   const jobId=job?.id||job?.job_id||'—';
   const status=job?.status||'queued';
+  const prefGpu=String(job?.preferred_gpu||job?.assigned_gpu||'').trim();
   const box=$('song-learn-result');
   const head=el('div',undefined,'sub-card-head');
-  head.append(el('h3','已提交学歌作业：'+title),pill('状态：'+status,'ok'));
-  const info=el('p','作业 ID：'+jobId+(inboxFilename?' · 原曲来源：Drive inbox / '+inboxFilename:' · 自动检索官方原版')+' · 升降调：'+(pitch>0?'+'+pitch:String(pitch)),'muted');
+  head.append(...[
+    el('h3','已提交学歌作业：'+title),
+    pill('状态：'+status,'ok'),
+    prefGpu?pill('首选 GPU：'+prefGpu,'vertex'):null
+  ].filter(Boolean));
+  const info=el('p','作业 ID：'+jobId+(prefGpu?' · 首选 GPU：'+prefGpu:'')+(inboxFilename?' · 原曲来源：Drive inbox / '+inboxFilename:' · 自动检索官方原版')+' · 升降调：'+(pitch>0?'+'+pitch:String(pitch)),'muted');
   const actions=el('div',undefined,'row');
   const jumpBtn=el('button','前往 Colab 云端算力查看队列 →','secondary');
   jumpBtn.type='button';
@@ -575,6 +601,7 @@ async function songs(){
     if(!validIds.has(id)){URL.revokeObjectURL(url);songBlobCache.delete(id);}
   }
   renderSongStorageBar(d);
+  renderSongLearnGpuPolicy(d.learn_gpu_policy);
   text('song-prompt-count','当前已加载到 Prompt 的有效曲目：'+(d.loaded_prompt_count??0));
   text('song-state',d.items.length+' / '+(d.max_songs??300)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??524288000)/1048576).toFixed(0)+' MiB');
   const listEl=$('song-list');
@@ -699,6 +726,7 @@ $('song-learn-form').addEventListener('submit',e=>{
     const inboxFileId=sel.selectedOptions?.[0]?.dataset?.fileId||'';
     const autoSearch=$('song-learn-auto-search').checked;
     if(!inboxFilename&&!autoSearch)throw Error(songErrorLabels.song_source_required);
+    const chosenGpu=$('song-learn-gpu').value.trim();
     const payload={
       title,
       artist:$('song-learn-artist').value.trim(),
@@ -706,6 +734,7 @@ $('song-learn-form').addEventListener('submit',e=>{
       pitch,
       auto_search:autoSearch
     };
+    if(chosenGpu)payload.gpu=chosenGpu;
     if(inboxFilename){
       payload.inbox_filename=inboxFilename;
       if(inboxFileId)payload.inbox_file_id=inboxFileId;
@@ -766,6 +795,8 @@ onLogout(()=>{
   lastSongStorageState=null;
   clearSongLearnForm();
   $('song-learn-inbox').replaceChildren(selectOption('','不指定文件（使用下方自动检索）'));
+  $('song-learn-gpu').replaceChildren(selectOption('','默认 L4（自动回退 T4）'));
+  $('song-learn-gpu').value='';
   $('song-learn-result').hidden=true;
   $('song-learn-result').replaceChildren();
   $('song-drive-details').replaceChildren();

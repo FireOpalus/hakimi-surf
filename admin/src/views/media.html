@@ -87,9 +87,14 @@
             <option value="">不指定文件（使用下方自动检索）</option>
           </select>
         </label>
-        <div class="row">
-          <label><input id="song-learn-auto-search" type="checkbox" checked> 未指定文件时自动检索官方原版</label>
-        </div>
+        <label for="song-learn-gpu">本次首选 GPU（可选覆盖）
+          <select id="song-learn-gpu">
+            <option value="">默认 L4（自动回退 T4）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label><input id="song-learn-auto-search" type="checkbox" checked> 未指定文件时自动检索官方原版</label>
       </div>
       <div class="row">
         <button id="song-learn-submit" type="submit" class="primary">发起 Colab 学歌</button>

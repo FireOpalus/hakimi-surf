@@ -735,11 +735,29 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
       configured: true,
       source: 'sqlite',
       config: {{
-        enabled: true, preferred_gpu: 'L4', fallback_gpus: ['T4'],
-        daily_job_limit: 5, daily_cu_budget: 10
+        enabled: true, job_timeout_seconds: 1800, auto_terminate_orphan_minutes: 20
       }},
+      supported_job_types: ['rvc_cover', 'rvc_train'],
+      job_types: [
+        {{
+          job_type: 'rvc_cover',
+          owner_module: 'song_studio',
+          default_gpu: 'L4',
+          fallback_gpus: ['T4'],
+          allowed_gpus: ['L4', 'T4', 'A100', 'H100'],
+          timeout_seconds: 1800
+        }},
+        {{
+          job_type: 'rvc_train',
+          owner_module: 'song_studio-' + xss,
+          default_gpu: 'H100',
+          fallback_gpus: ['A100'],
+          allowed_gpus: ['H100', 'A100'],
+          timeout_seconds: 3600
+        }}
+      ],
       worker: {{ reachable: true, compute_units: 42.5, active_sessions: 1, running_job_id: null }},
-      today: {{ jobs_count: 2, cu_used: 0.85, daily_job_limit: 5, daily_cu_budget: 10 }},
+      today: {{ jobs_count: 2, cu_used: 0.85 }},
       jobs: [],
       summary: {{
         total_jobs: 18, succeeded_jobs: 16, failed_jobs: 2, cancelled_jobs: 0,
@@ -777,6 +795,15 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
     cachedColabOverview = fullColab;
     renderUnifiedCloudColab(fullColab, '');
     renderColabAnalyticsOnPage(fullColab, 'colab');
+    assert(
+      $('cloud-colab-pills').textContent.includes('调度开启 · 按模块自选 GPU'),
+      'cloud-colab-pills per-module GPU pill missing'
+    );
+    assert(
+      $('cloud-colab-kpis').textContent.includes('2 次')
+        && !$('cloud-colab-kpis').textContent.includes('日限'),
+      'cloud-colab-kpis should show uncapped today job count'
+    );
 
     const chartNodes14 = walk($('cloud-cu-chart'));
     const hits14 = chartNodes14.filter(n => n.className === 'cu-hit');
@@ -898,20 +925,58 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
     renderUnifiedCloudColab(null, 'Colab Worker 尚未配置');
     assert($('cloud-colab-pills').textContent.includes('Colab Worker 尚未配置'), 'reason pill');
 
-    // renderColabOverview without warm sessions must never render literal "null" in colab-pills
+    // renderColabOverview without warm sessions: no literal "null", uncapped KPIs, policy table
     renderColabOverview({{
       configured: true,
       source: 'default',
-      config: {{ enabled: true, preferred_gpu: 'L4', fallback_gpus: ['T4'],
-        daily_job_limit: 5, daily_cu_budget: 10 }},
+      config: {{ enabled: true, job_timeout_seconds: 1800, auto_terminate_orphan_minutes: 20 }},
+      supported_job_types: ['rvc_cover', 'rvc_train'],
+      job_types: fullColab.job_types,
       worker: {{ reachable: true, compute_units: 10.0, active_sessions: 0, warm_sessions: [] }},
-      today: {{ jobs_count: 0, cu_used: 0, daily_job_limit: 5, daily_cu_budget: 10 }},
+      today: {{ jobs_count: 7, cu_used: 3.45 }},
       jobs: [],
       warm_sessions: []
     }});
     assert(
       !$('colab-pills').textContent.includes('null'),
       'colab-pills without warm sessions must not render literal null text'
+    );
+    assert(
+      $('colab-pills').textContent.includes('调度开启 · 按模块自选 GPU'),
+      'colab-pills per-module GPU pill missing'
+    );
+    assert(
+      $('colab-kpi-strip').textContent.includes('7 次')
+        && $('colab-kpi-strip').textContent.includes('不设每日次数上限 · 排队上限 20')
+        && $('colab-kpi-strip').textContent.includes('3.45 CU')
+        && $('colab-kpi-strip').textContent.includes('不设每日 CU 上限 · 仅实时统计'),
+      'colab-kpi-strip uncapped KPI cards mismatch'
+    );
+    assert(
+      $('colab-state').textContent.includes('已注册作业：2 类')
+        && $('colab-state').textContent.includes('1800 秒')
+        && $('colab-state').textContent.includes('20 分钟'),
+      'colab-state summary mismatch'
+    );
+    const policyTxt = $('colab-job-policies-table').textContent;
+    assert(
+      policyTxt.includes('RVC 翻唱学歌（rvc_cover）')
+        && policyTxt.includes('L4 / T4 / A100 / H100')
+        && policyTxt.includes('RVC 音色训练（rvc_train）')
+        && policyTxt.includes('H100 / A100')
+        && policyTxt.includes('3600 秒'),
+      'colab-job-policies-table content mismatch: ' + policyTxt
+    );
+    assert(
+      !walk($('colab-job-policies-table')).some(n => n.tagName === 'IMG'),
+      'XSS in job policy owner_module must never create IMG element'
+    );
+    assert($('colab-enabled').checked === true, 'colab-enabled not synced');
+    assert($('colab-job-timeout').value === 1800, 'colab-job-timeout not synced');
+    assert($('colab-orphan-minutes').value === 20, 'colab-orphan-minutes not synced');
+    assert(
+      colabErrorLabels.colab_gpu_not_allowed === '该作业类型不支持所选 GPU 型号',
+      'colab_gpu_not_allowed label missing'
     );
 
     // renderGcpBilling & renderUnifiedBalance without optional pills must not render literal null
@@ -964,19 +1029,31 @@ def test_colab_and_songs_ui_physical_decoupling():
     collector.feed(html)
     id_set = set(collector.ids)
 
-    # Removed Colab song/Drive coupling DOM IDs and legacy endpoints
+    # Removed Colab song/Drive coupling IDs, legacy endpoints, and removed daily limit/GPU fields
     for removed_token in (
         "colab/drive/inbox",
         "colab-drive-details",
         "colab-drive-folder-id",
         "colab-inbox-table",
         "colab-refresh-inbox",
+        "colab-preferred-gpu",
+        "colab-fallback-gpus",
+        "colab-daily-job-limit",
+        "colab-daily-cu-budget",
+        "colab-jobs-progress",
+        "colab-jobs-progress-label",
+        "colab-cu-progress",
+        "colab-cu-progress-label",
     ):
-        assert removed_token not in html, f"Residual coupled token found: {removed_token!r}"
+        assert removed_token not in html, f"Residual deprecated token found: {removed_token!r}"
 
     # Pure Colab GPU & standalone Song Studio Drive DOM IDs
     for required_id in (
         "colab-job-types",
+        "colab-job-policies-table",
+        "colab-enabled",
+        "colab-job-timeout",
+        "colab-orphan-minutes",
         "song-storage-source",
         "song-drive-details",
         "song-storage-form",
@@ -989,6 +1066,7 @@ def test_colab_and_songs_ui_physical_decoupling():
         "song-inbox-upload",
         "song-learn-heading",
         "song-learn-inbox",
+        "song-learn-gpu",
     ):
         assert required_id in id_set, f"Missing expected decoupled DOM id: {required_id}"
 
@@ -999,6 +1077,8 @@ def test_colab_and_songs_ui_physical_decoupling():
     assert "api('songs/inbox')" in script
     assert "api('songs/storage'" in script
     assert "supported_job_types" in script
+    assert "colab_gpu_not_allowed" in script
+    assert "learn_gpu_policy" in script
 
     jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
     runner: list[str] | None = None
@@ -1178,6 +1258,57 @@ def test_colab_and_songs_ui_physical_decoupling():
     assert($('song-learn-auto-search').checked === false, 'prefill unchecks auto search');
     assert($('song-learn-heading')._focused === true, 'prefill focuses learn heading');
     assert($('song-learn-heading')._scrolled === true, 'prefill scrolls learn heading');
+
+    // 4. Song learn GPU policy select rendering, result GPU badge, error map & reset
+    assert(
+      songErrorLabels.colab_gpu_not_allowed === 'RVC 翻唱暂不支持该 GPU 型号（已排除不兼容卡型）',
+      'song colab_gpu_not_allowed label missing'
+    );
+    renderSongLearnGpuPolicy(null);
+    const defOpts = $('song-learn-gpu').options;
+    assert(defOpts.length === 5, 'default GPU policy should render 5 options');
+    assert(
+      defOpts[0].value === '' && defOpts[0].textContent === '默认 L4（自动回退 T4）',
+      'default opt'
+    );
+    assert(
+      defOpts.slice(1).map(o => o.value).join(',') === 'L4,T4,A100,H100',
+      'default allowed GPUs mismatch'
+    );
+    $('song-learn-gpu').value = 'A100';
+    renderSongLearnGpuPolicy({{
+      default_gpu: 'L4',
+      fallback_gpus: ['T4'],
+      allowed_gpus: ['L4', 'T4', 'A100', 'H100']
+    }});
+    assert($('song-learn-gpu').value === 'A100', 'valid selected GPU should be preserved');
+    renderSongLearnGpuPolicy({{
+      default_gpu: 'L4',
+      fallback_gpus: [],
+      allowed_gpus: ['L4', 'T4', xss]
+    }});
+    assert($('song-learn-gpu').value === '', 'disallowed previous GPU should reset to default');
+    assert(
+      $('song-learn-gpu').options[0].textContent === '默认 L4（不自动回退）',
+      'empty fallback label mismatch'
+    );
+    assert(
+      !walk($('song-learn-gpu')).some(n => n.tagName === 'IMG'),
+      'XSS in allowed_gpus must never create IMG element'
+    );
+    showSongLearnResult(
+      {{ id: 'job_abc', status: 'queued', preferred_gpu: 'A100' }},
+      '晴天',
+      '晴天 - 周杰伦.mp3',
+      0
+    );
+    assert(
+      $('song-learn-result').textContent.includes('首选 GPU：A100'),
+      'song-learn-result must display preferred_gpu'
+    );
+    $('song-learn-gpu').value = 'T4';
+    clearSongLearnForm();
+    assert($('song-learn-gpu').value === '', 'clearSongLearnForm must reset song-learn-gpu');
     """
 
     proc = subprocess.run(
@@ -1188,3 +1319,213 @@ def test_colab_and_songs_ui_physical_decoupling():
         check=False,
     )
     assert proc.returncode == 0, f"Song decoupled JS test failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+def test_colab_config_and_song_learn_form_submit_payloads():
+    """Verify #colab-config-form and #song-learn-form submit payloads via actual JS listeners."""
+    import json
+    import shutil
+
+    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+    runner: list[str] | None = None
+    if shutil.which("node"):
+        runner = ["node", "-e"]
+    elif jsc_path.is_file():
+        runner = [str(jsc_path), "-e"]
+    if runner is None:
+        pytest.skip("No local JS engine (node/jsc) available for form submit payload test")
+
+    html = ADMIN_HTML.read_text(encoding="utf-8")
+    collector = _IdCollector()
+    collector.feed(html)
+    all_ids_json = json.dumps(sorted(set(collector.ids)))
+
+    core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
+    shell_js = (ADMIN_DIR / "src" / "js" / "08-modules-shell.js").read_text(encoding="utf-8")
+    media_js = (ADMIN_DIR / "src" / "js" / "07-media-bili.js").read_text(encoding="utf-8")
+
+    colab_cfg_start = shell_js.index("$('colab-config-form').addEventListener('submit'")
+    colab_cfg_end = shell_js.index("$('colab-reset').addEventListener('click'")
+    colab_cfg_submit_js = shell_js[colab_cfg_start:colab_cfg_end]
+
+    song_start = media_js.index("let songGeneration=0")
+    song_end = media_js.index("async function songs()")
+    song_helpers_js = media_js[song_start:song_end]
+    song_submit_start = media_js.index("$('song-learn-form').addEventListener('submit'")
+    song_submit_end = media_js.index("$('song-file').addEventListener('change'")
+    song_submit_js = media_js[song_submit_start:song_submit_end]
+
+    harness = f"""
+    const ALL_IDS = {all_ids_json};
+    const cfgSourceLabels = {{}};
+    class MockNode {{
+      constructor(tag) {{
+        this.tagName = String(tag || 'div').toUpperCase();
+        this.children = [];
+        this.attrs = {{}};
+        this.dataset = {{}};
+        this.listeners = {{}};
+        this._text = '';
+        this.hidden = false;
+        this.disabled = false;
+        this.checked = false;
+        this.value = '';
+        this.className = '';
+        this.options = [];
+        this.selectedOptions = [];
+        this.classList = {{ add(){{}}, remove(){{}}, toggle(){{}}, contains(){{ return false; }} }};
+      }}
+      get textContent() {{
+        return this.children.length
+          ? this._text + this.children.map(c => c.textContent).join('')
+          : this._text;
+      }}
+      set textContent(v) {{ this._text = String(v ?? ''); this.children = []; }}
+      setAttribute(k, v) {{
+        if (k === 'class') this.className = String(v);
+        this.attrs[k] = String(v);
+      }}
+      getAttribute(k) {{ return this.attrs[k] ?? null; }}
+      removeAttribute(k) {{ delete this.attrs[k]; }}
+      append(...nodes) {{
+        for (const n of nodes) {{
+          if (n instanceof MockNode) {{
+            this.children.push(n);
+            if (n.tagName === 'OPTION') this.options.push(n);
+          }} else {{
+            const t = new MockNode('#text'); t._text = String(n); this.children.push(t);
+          }}
+        }}
+      }}
+      replaceChildren(...nodes) {{
+        this.children = []; this.options = []; this._text = ''; this.append(...nodes);
+      }}
+      addEventListener(evt, fn) {{ (this.listeners[evt] ||= []).push(fn); }}
+      dispatch(evt) {{
+        for (const fn of (this.listeners[evt] || [])) fn({{ target: this, preventDefault(){{}} }});
+      }}
+      querySelector() {{ return null; }}
+      querySelectorAll() {{ return []; }}
+      closest() {{ return null; }}
+    }}
+    const Node = MockNode;
+    const byId = new Map();
+    for (const id of ALL_IDS) {{
+      const n = new MockNode('div');
+      n.id = id;
+      byId.set(id, n);
+    }}
+    const document = {{
+      body: new MockNode('body'),
+      documentElement: new MockNode('html'),
+      hidden: false,
+      activeElement: null,
+      title: '',
+      getElementById(id) {{ return byId.get(id) || null; }},
+      createElement(tag) {{ return new MockNode(tag); }},
+      createTextNode(t) {{ const n = new MockNode('#text'); n._text = String(t); return n; }},
+      addEventListener() {{}},
+      querySelectorAll() {{ return []; }}
+    }};
+    class AbortController {{
+      constructor() {{ this.signal = {{ aborted: false }}; }}
+      abort() {{ this.signal.aborted = true; }}
+    }}
+    function setTimeout(){{ return 0; }}
+    function clearTimeout(){{}}
+    function clearInterval(){{}}
+    const location = {{ hash: '', pathname: '/admin' }};
+    const history = {{ replaceState(){{}}, pushState(){{}} }};
+
+    {core_js}
+
+    const calls = [];
+    const pendingTasks = [];
+    const origBusy = busy;
+    busy = (btn, fn) => {{
+      const p = origBusy(btn, fn);
+      pendingTasks.push(p);
+      return p;
+    }};
+    api = async (path, method='GET', data) => {{
+      calls.push({{ path, method, data }});
+      if (path === 'colab' && method === 'PUT') return {{ config: data }};
+      if (path === 'songs/learn' && method === 'POST') {{
+        return {{ id: 'job_99', status: 'queued', preferred_gpu: data.gpu || 'L4' }};
+      }}
+      return {{}};
+    }};
+    function renderColabOverview(){{}}
+    function throwColabError(err){{ throw err; }}
+    async function songs(){{}}
+
+    {song_helpers_js}
+    {colab_cfg_submit_js}
+    {song_submit_js}
+
+    function assert(cond, msg) {{ if (!cond) throw new Error('ASSERT FAILED: ' + msg); }}
+
+    (async () => {{
+      // 1. #colab-config-form submits only enabled, job_timeout_seconds,
+      //    auto_terminate_orphan_minutes.
+      $('colab-enabled').checked = true;
+      $('colab-job-timeout').value = '2400';
+      $('colab-orphan-minutes').value = '30';
+      $('colab-config-form').dispatch('submit');
+      await Promise.all(pendingTasks.splice(0));
+      assert(calls.length === 1, 'expected 1 colab PUT call');
+      const colabKeys = Object.keys(calls[0].data).sort().join(',');
+      assert(
+        colabKeys === 'auto_terminate_orphan_minutes,enabled,job_timeout_seconds',
+        'unexpected colab PUT payload keys: ' + colabKeys
+      );
+      assert(calls[0].data.job_timeout_seconds === 2400, 'timeout mismatch');
+      assert(calls[0].data.auto_terminate_orphan_minutes === 30, 'orphan mins mismatch');
+
+      // 2. #song-learn-form without explicit GPU omits gpu field
+      $('song-learn-title').value = '晴天';
+      $('song-learn-pitch').value = '0';
+      $('song-learn-inbox').value = '';
+      $('song-learn-gpu').value = '';
+      $('song-learn-auto-search').checked = true;
+      $('song-learn-form').dispatch('submit');
+      await Promise.all(pendingTasks.splice(0));
+      assert(calls.length === 2, 'expected first song learn POST');
+      assert(!('gpu' in calls[1].data), 'default GPU selection must omit gpu field');
+      assert(
+        $('song-learn-result').textContent.includes('首选 GPU：L4'),
+        'default submit result must show preferred_gpu L4'
+      );
+
+      // 3. #song-learn-form with explicit GPU sends gpu and resets select after submit
+      $('song-learn-title').value = '夜曲';
+      $('song-learn-pitch').value = '2';
+      $('song-learn-inbox').value = '';
+      $('song-learn-gpu').value = 'A100';
+      $('song-learn-auto-search').checked = true;
+      $('song-learn-form').dispatch('submit');
+      await Promise.all(pendingTasks.splice(0));
+      assert(calls.length === 3, 'expected second song learn POST');
+      assert(calls[2].data.gpu === 'A100', 'explicit GPU selection must send gpu=A100');
+      assert(
+        $('song-learn-result').textContent.includes('首选 GPU：A100'),
+        'override submit result must show preferred_gpu A100'
+      );
+      assert($('song-learn-gpu').value === '', 'song-learn-gpu must reset after submit');
+    }})().catch(err => {{
+      if (typeof process !== 'undefined' && process.exit) {{
+        console.error(err);
+        process.exit(1);
+      }}
+      throw err;
+    }});
+    """
+
+    proc = subprocess.run(
+        [*runner, harness],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Form submit JS test failed:\n{proc.stderr}\n{proc.stdout}"

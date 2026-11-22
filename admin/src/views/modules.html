@@ -158,19 +158,9 @@
         <button id="colab-terminate-sessions" type="button" class="danger" disabled>紧急清退全部 Colab 会话</button>
       </div>
     </div>
-    <p class="muted">主脑通过 loopback HTTP + Bearer 鉴权调度独立进程外 Colab 通用 GPU Worker（禁止主脑直接读取 Colab 凭据）；优先使用首选 GPU，不可用时按顺序回退，并按注册白名单分发各类异步 GPU 作业。</p>
+    <p class="muted">主脑通过 loopback HTTP + Bearer 鉴权调度独立进程外 Colab 通用 GPU Worker（禁止主脑直接读取 Colab 凭据）；GPU 选型与允许卡白名单由各业务模块按作业自主声明，不设每日次数/CU 上限，保留单作业超时、孤儿清退与队列上限 20 防失控护栏。</p>
     <div id="colab-pills" class="pill-row"></div>
     <div id="colab-kpi-strip" class="kpi-strip"></div>
-    <div class="grid">
-      <div>
-        <div class="row between"><small>今日作业次数进度</small><small id="colab-jobs-progress-label" class="muted">0 / 0</small></div>
-        <progress id="colab-jobs-progress" max="100" value="0"></progress>
-      </div>
-      <div>
-        <div class="row between"><small>今日 CU 消耗预算进度</small><small id="colab-cu-progress-label" class="muted">0.00 / 0.00 CU</small></div>
-        <progress id="colab-cu-progress" max="100" value="0"></progress>
-      </div>
-    </div>
     <p id="colab-state" class="muted" aria-live="polite"></p>
     <p id="colab-job-types" class="muted"></p>
   </div>
@@ -211,33 +201,20 @@
     </div>
   </div>
   <div class="card">
-    <h2>算力调度与预算配置</h2>
+    <h2>已注册 GPU 作业策略</h2>
+    <p class="muted">各业务模块在注册作业类型时自行声明默认首选 GPU、回退顺序、允许卡型白名单与默认超时；在对应业务页发起单次任务时可在允许卡型内临时覆盖。</p>
+    <div id="colab-job-policies-table" class="table"></div>
+  </div>
+  <div class="card">
+    <h2>算力调度与防失控配置</h2>
+    <p class="muted">GPU 选型由各业务模块按作业声明，不设每日作业次数与每日 CU 上限；仅保留单作业默认超时、孤儿会话清退与队列长度上限 20 三道防失控护栏。</p>
     <p id="colab-config-source" class="muted"></p>
     <form id="colab-config-form">
       <div class="row">
         <label><input id="colab-enabled" type="checkbox"> 启用 Colab 云端算力调度</label>
       </div>
       <div class="grid">
-        <label for="colab-preferred-gpu">首选 GPU（preferred_gpu）
-          <select id="colab-preferred-gpu">
-            <option value="L4">L4（推荐均衡）</option>
-            <option value="T4">T4（经济兜底）</option>
-            <option value="G4">G4</option>
-            <option value="A100">A100（高性能）</option>
-            <option value="H100">H100（旗舰）</option>
-          </select>
-        </label>
-        <label for="colab-fallback-gpus">回退 GPU 列表（fallback_gpus，逗号分隔）
-          <input id="colab-fallback-gpus" type="text" maxlength="64" placeholder="例如：L4, T4（可选 H100 / A100 / G4 / L4 / T4）">
-          <small class="muted">按优先顺序列出备选 GPU，可选值：H100, A100, G4, L4, T4</small>
-        </label>
-        <label for="colab-daily-job-limit">每日作业上限（0–50）
-          <input id="colab-daily-job-limit" type="number" min="0" max="50" step="1" required>
-        </label>
-        <label for="colab-daily-cu-budget">每日 CU 预算（0.0–200.0）
-          <input id="colab-daily-cu-budget" type="number" min="0" max="200" step="0.1" required>
-        </label>
-        <label for="colab-job-timeout">单作业超时秒数（120–7200）
+        <label for="colab-job-timeout">默认单作业超时秒数（120–7200）
           <input id="colab-job-timeout" type="number" min="120" max="7200" step="1" required>
         </label>
         <label for="colab-orphan-minutes">孤儿会话自动清退分钟数（5–120）
