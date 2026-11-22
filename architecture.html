@@ -313,7 +313,7 @@
               <dd><a href="src/hakimi/system_modules/patrol_diary.py">巡逻日记</a><a href="src/hakimi/system_modules/database_backup.py">数据库备份</a><a href="src/hakimi/system_modules/group_memory_mirror.py">群记忆镜像</a><a href="src/hakimi/system_modules/surf_mirror.py">分身镜像</a></dd>
             </div>
             <div>
-              <dt><span><a href="src/hakimi/system_modules/colab_compute.py">Colab 算力</a> ＋ Drive 同步</span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dt><span><a href="src/hakimi/system_modules/colab_compute.py">Colab 通用算力</a> ＋ Drive 同步</span><span class="arrow" aria-hidden="true">→</span></dt>
               <dd><a href="src/hakimi/system_modules/song_studio.py">歌单工坊</a></dd>
             </div>
             <div>
@@ -356,7 +356,7 @@
       <div class="outlets">
         <article class="outlet" id="life"><h4>世界引擎 <code>LifeEngine</code></h4><p>读取世界状态、模块观测与动作目录。规划器安排日程，本地门控检查作息、目标与额度，再交给动作处理器。</p></article>
         <article class="outlet"><h4>消息管道 <code>Service</code></h4><p>按平台注册的协议识别会话，复用防抖、模型网关、记忆和出站回执。社交模块负责本平台的准入与发送。</p></article>
-        <article class="outlet" id="controls"><h4>管理台 <code>hakimi-admin</code></h4><p>通过引擎 API 展示模块状态、调度选项、思考场景和动作回执。引擎将保存的运行策略应用到对应模块。</p></article>
+        <article class="outlet" id="controls"><h4>管理台 <code>hakimi-admin</code></h4><p>通过引擎 API 展示模块状态、按业务维度拆细的调用统计（<code>usage.categories</code>）、调度选项、思考场景和动作回执；<code>#colab-compute</code> 与 <code>#songs</code> 前后端物理解耦。</p></article>
       </div>
       <figcaption class="refs"><a href="src/hakimi/service.py">Service 装配入口</a><a href="src/hakimi/system_modules/__init__.py">常驻模块的依赖排序</a><a href="src/hakimi/modules/__init__.py">平台发现与装载</a><a href="src/hakimi/modules/base.py">注册表与模块接口</a></figcaption>
     </figure>
@@ -400,8 +400,8 @@
         <article class="plugin-card">
           <header><h3><a href="plugins/song_finder/plugin_main.py">独立找歌音源检索器</a></h3><code>song_finder</code></header>
           <div class="plugin-meta"><a class="plugin-badge" href="plugins/song_finder/Dockerfile">独立音源镜像</a><code>song_finder.search</code> · <code>song_finder.fetch_source</code></div>
-          <p>与 <code>bilibili_surf</code> 严格物理隔离：零导入、零共用 B 站巡逻小号 Cookie 与冷却状态；独占 <code>yt-dlp</code> + <code>ffmpeg</code> 镜像（<code>-protocol_whitelist file</code>、按源独立熔断、全链路匿名），产出干净原曲经 Blob 总线交给 <code>song_studio</code> 写入 <code>Hakimi_Songs/inbox/</code>。</p>
-          <div class="plugin-links"><a href="plugins/song_finder/providers.py">providers.py</a><a href="plugins/song_finder/Dockerfile">Dockerfile</a><a href="src/hakimi/songs.py">songs.py</a><a href="src/hakimi/system_modules/song_studio.py">song_studio.py</a></div>
+          <p>与 <code>bilibili_surf</code> 严格物理隔离：零导入、零共用 B 站巡逻小号 Cookie 与冷却状态；独占 <code>yt-dlp</code> + <code>ffmpeg</code> 镜像（<code>-protocol_whitelist file</code>、按源独立熔断、全链路匿名），产出干净原曲经 Blob 总线交给 <code>song_studio</code> 通过 <code>SongDriveStore</code> 直写 <code>Hakimi_Songs/inbox/</code>。</p>
+          <div class="plugin-links"><a href="plugins/song_finder/providers.py">providers.py</a><a href="plugins/song_finder/Dockerfile">Dockerfile</a><a href="src/hakimi/songs.py">songs.py</a><a href="src/hakimi/song_drive.py">song_drive.py</a><a href="src/hakimi/system_modules/song_studio.py">song_studio.py</a></div>
         </article>
       </div>
       <div class="refs"><a href="src/hakimi/plugin_bus.py">远程插件总线</a><a href="src/hakimi_plugin_sdk/protocol.py">分块 Blob 协议</a><a href="src/hakimi_plugin_sdk/client.py">插件 SDK 客户端</a><a href="compose.plugins.yaml">6 容器编排</a><a href="scripts/deploy_plugins.sh">启停脚本</a><a href="plugins/Dockerfile">轻量公共镜像</a></div>
@@ -435,6 +435,13 @@
         <p>屏幕帧在内存中短暂缓存。开启联动的 Owner 私有语音会话可取最近帧，结合本轮发言生成口播。独立看屏也可把评论发回桌面端。私有通话结束时，可按配置将会话摘要写为 <code>owner_private</code> 待办。</p>
         <div class="refs"><a href="src/hakimi/screen_watch.py">屏幕帧与独立评论</a><a href="src/hakimi/voice_companion.py">语音会话与分句输出</a></div>
       </article>
+
+      <article class="companion" aria-labelledby="song-colab-title">
+        <h3 id="song-colab-title">歌单工坊与 Colab 通用 GPU 算力的物理解耦</h3>
+        <div class="speech-flow"><b>独立曲库 / 收件箱</b><code>SongDriveStore</code><span aria-hidden="true">→</span><code>register_job_type</code> + <code>pre_dispatch</code><span aria-hidden="true">→</span><code>colab_compute</code><span aria-hidden="true">→</span><b>纯 GPU Worker（瞬态令牌）</b></div>
+        <p><code>song_studio</code> 通过 <code>SongDriveStore</code> 复用只读 <code>/run/secrets/roaming-oauth.json</code> 直连 Google Drive <code>Hakimi_Songs/</code>（支持 2 MiB 分块 Resumable 流式上传 ≤ 100 MiB 及独立管理接口 <code>/admin/api/songs/inbox</code> 与 <code>/storage</code>），歌单播放、缓存与收件箱完全不依赖 <code>colab_compute</code> 在线。<code>colab_compute</code> 与宿主机 Worker 纯化为通用 GPU 调度与执行层：采用动态白名单作业注册制，彻底剥离歌曲/Drive OAuth 与 <code>/v1/drive/*</code> 代理，仅在派发作业时通过业务模块 <code>pre_dispatch</code> 注入内存瞬态短效 <code>dispatch_context</code> 令牌（不落 SQLite、不写日志、不回显）。</p>
+        <div class="refs"><a href="src/hakimi/song_drive.py">独立 Drive 曲库</a><a href="src/hakimi/song_admin.py">歌单管理接口</a><a href="src/hakimi/colab_compute.py">通用算力调度</a><a href="src/hakimi/colab_admin.py">算力管理接口</a><a href="scripts/colab_worker.py">纯 GPU 宿主机 Worker</a></div>
+      </article>
     </section>
 
     <section class="chapter" id="deployment" aria-labelledby="deployment-title">
@@ -443,9 +450,10 @@
         <div class="lane"><h3>境内 · QQ / NapCat</h3><span class="link-label">反向 WSS</span><div><strong>境外 Nginx → hakimi-bot</strong><p>QQ 事件进入 OneBot 接入层，回复与回执复用已认证的连接。</p></div></div>
         <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集；游戏端由 <code>mc_agent</code> 常驻待机，配合境内回环守护进程 <code>mc-powerd</code> 按需唤醒与闲置自动休眠 Minecraft 服务端，支持管理台、自主规划及通用 <code>owner_chat</code> 即时触发。</p></div></div>
         <div class="lane"><h3>桌面 · 语音与看屏适配端</h3><span class="link-label">两条可选 WS</span><div><strong>境外 FastAPI → 对应常驻服务</strong><p>语音与看屏分别配置入口、校验适配端身份。屏幕隐私开关与会话模式控制帧的使用范围。</p></div></div>
-        <div class="lane"><h3>境外宿主机 · Colab Worker</h3><span class="link-label">Docker 网桥回环</span><div><strong>境外 hakimi-bot → 172.19.0.1:12146（Bearer 隔离）</strong><p>宿主机独立守护进程承接白名单 GPU 作业与 <code>Hakimi_Songs/</code> 云盘代理，凭据与 Colab CLI 不进只读容器。</p></div></div>
+        <div class="lane"><h3>境外宿主机 · Colab Worker</h3><span class="link-label">Docker 网桥回环</span><div><strong>境外 hakimi-bot → 172.19.0.1:12146（Bearer 隔离）</strong><p>宿主机独立守护进程 <code>hakimi-colab-worker.service</code>（<code>scripts/colab_worker.py</code>）纯化为通用 GPU 作业执行层：凭据与 Colab CLI 不进只读容器，剥离全部 Drive OAuth 与 <code>/v1/drive/*</code> 代理，仅凭作业级瞬态 <code>dispatch_context</code> 短效令牌访问授权对象。</p></div></div>
+        <div class="lane"><h3>Google Drive · Hakimi_Songs/</h3><span class="link-label">主引擎直连 HTTPS</span><div><strong>境外 hakimi-bot（SongDriveStore）→ Google Drive v3 API</strong><p><code>song_studio</code> 复用只读 <code>/run/secrets/roaming-oauth.json</code> 独立管理翻唱主存、模型与原曲收件箱（2 MiB 分块 Resumable 流式上传 ≤ 100 MiB，播放与管理不依赖 Colab Worker 在线）。</p></div></div>
         <div class="lane"><h3>境外内网 · 6 个远程插件容器</h3><span class="link-label">内部 WS + 分块 Blob</span><div><strong>6 个只读隔离容器 ↔ 境外 hakimi-bot /ws/plugin</strong><p><code>weather</code>、<code>minecraft</code>、<code>bilibili_surf</code> 与 <code>web_tools</code> 复用轻量镜像；<code>doc_render</code> 独占重渲染镜像；<code>song_finder</code> 独占匿名音源镜像并与 <code>bilibili_surf</code> 严格物理隔离。</p></div></div>
-        <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
+        <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求（<code>/admin/api/songs/inbox</code> 与 <code>/upload</code> 放行 100 MiB 无缓冲直传）。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
       </div>
       <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="compose.plugins.yaml">远程插件编排</a><a href="scripts/deploy_plugins.sh">插件启停脚本</a><a href="node_agent/compose.cn.yaml">境内执行节点</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
     </section>
@@ -464,11 +472,11 @@
         <div id="image-context"><dt>图片与文件</dt><dd>从当轮、引用和邻近消息选择媒体。图片经大小、像素与来源检查；富文档解析与长文卡片渲染优先交由独立容器 <code>doc_render</code>（纯内存防炸弹），离线平滑回退内核。</dd></div>
         <div id="owner-memory"><dt>Owner 私有背景</dt><dd id="affection">协议身份与会话场景决定私有数据的可见范围。<span id="conversation-style">群聊使用公开人设，好感度只影响可用互动。</span></dd></div>
         <div id="rest-hours"><dt>作息与主动行动</dt><dd>世界状态记录清醒、休息与精力。LifeBlockPlanner 读取日程和待办，执行时再核对模块就绪状态与发送窗口。</dd></div>
-        <div id="billing"><dt>预算与用量</dt><dd id="thinking-accounting">付费请求先在 SQLite 中预留，再按返回用量结算。模型、思考档位和动作标识用于归账。</dd></div>
+        <div id="billing"><dt>预算与用量</dt><dd id="thinking-accounting">付费请求先在 SQLite 中预留，再按返回用量结算；模型、思考档位与 <code>model_work</code>（含 <code>plugin_bus</code>、伴看与语音伴随独立归属）按真实业务维度聚合为 <code>usage.categories</code>（与既有 <code>usage.lanes</code> 总额严格守恒），供运行概览与账本拆细展示。</dd></div>
         <div id="search-routing"><dt>联网取证</dt><dd>外网检索与链接预览优先委派给 <code>web_tools</code> 容器（公网 IP 钉死与逐跳 SSRF 拦截），离线回退内核；预算与安全审查仍由引擎门卫把关。</dd></div>
-        <div><dt>模块归档</dt><dd>具备归档授权的模块通过 Drive 同步服务使用指定目录。同步结果按调用模块记录。</dd></div>
+        <div><dt>模块归档</dt><dd>具备归档授权的模块通过 Drive 同步服务使用指定目录并记录回执；歌单工坊则通过独立的 <code>SongDriveStore</code> 直连 <code>Hakimi_Songs/</code>（严禁触碰 <code>Antigravity_Memory</code>）。</dd></div>
       </dl>
-      <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a></div>
+      <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/store.py">账本与用量归类</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a></div>
     </section>
   </main>
   <footer><span>Hakimi Surf · v2.1.0 · 4 个平台插件 + 21 个常驻系统模块 + 6 个远程插件容器 · 2026-11-22</span><a href="#top">回到图首 ↑</a></footer>
