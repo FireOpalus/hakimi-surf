@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from ..bot_server import untrusted_input
 from ..config import Settings
+from ..decision_templates import DecisionTemplate, resolve_decision_template
 from ..modules.actions import NoArgs
 from ..modules.base import AttentionLevel, NodeRegion, sanitize_sensor_text
 from ..outbound_actions import require_all_schema_fields
@@ -220,6 +221,18 @@ _VALID_OUTCOME_STATUSES = frozenset(
 _MAX_PLUGIN_TASK_INSTRUCTION_CHARS = 2400
 _MAX_PLUGIN_RESPONSE_SCHEMA_BYTES = 8192
 _MAX_PLUGIN_RESPONSE_SCHEMA_DEPTH = 8
+_FORBIDDEN_AI_SCREEN_KEYS = frozenset(
+    {
+        "questions",
+        "extra_questions",
+        "extra_decisions",
+        "custom_template",
+        "decision_questions",
+        "template_questions",
+        "criteria",
+        "instructions",
+    }
+)
 
 _VALID_VOICE_FORMATS = frozenset({"ogg_opus", "mp3", "wav"})
 _MAX_VOICE_AUDIO_BYTES = 2 * 1024 * 1024
@@ -449,6 +462,20 @@ def _validate_plugin_task_instruction(raw: Any, secrets_list: list[str]) -> str 
     if any(secret in cleaned for secret in _secret_candidates(secrets_list)):
         raise Rejected("plugin_invalid_schema")
     return cleaned
+
+
+def _validate_ai_screen_template(
+    plugin_id: str,
+    frame: dict[str, Any],
+    *,
+    purpose: str = "source",
+) -> DecisionTemplate | None:
+    if any(key in frame for key in _FORBIDDEN_AI_SCREEN_KEYS):
+        raise Rejected("plugin_scope_rejected")
+    raw_template = frame.get("decision_template")
+    if raw_template is None:
+        return None
+    return resolve_decision_template(raw_template, plugin_id=plugin_id, purpose=purpose)
 
 
 def _validate_plugin_response_schema(raw: Any, secrets_list: list[str]) -> dict[str, Any] | None:

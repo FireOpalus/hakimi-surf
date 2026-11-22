@@ -5,8 +5,9 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -24,6 +25,7 @@ BLOB_RPC_RELEASE = "blob.release"
 
 BLOB_TRANSFER_ID_RE = re.compile(r"^[a-f0-9]{16,64}\Z")
 SHA256_HEX_RE = re.compile(r"^[a-f0-9]{64}\Z")
+DECISION_TEMPLATE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,47}\Z")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -189,3 +191,117 @@ def validate_blob_descriptor(
             raise ValueError("blob_invalid")
         out["chunk_size"] = chunk_size
     return out
+
+
+@dataclass(frozen=True)
+class DecisionAnswer:
+    """Structured single-question decision answer returned by kernel `ai.screen`."""
+
+    kind: str
+    confidence: float
+    confident: bool = False
+    value: bool | None = None
+    noul: float | None = None
+    choice: str | None = None
+    probabilities: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ScreenDecisionResult:
+    """Parsed `ai.screen` result carrying safety pass flag and optional template decisions."""
+
+    passed: bool
+    template: str | None = None
+    decisions: dict[str, DecisionAnswer] = field(default_factory=dict)
+
+    def confidence_of(self, key: str) -> float:
+        ans = self.decisions.get(key)
+        return ans.confidence if ans is not None else 0.0
+
+    def get_noul(self, key: str, *, min_confidence: float | None = None) -> bool | None:
+        ans = self.decisions.get(key)
+        if ans is None or ans.kind != "noul" or ans.value is None:
+            return None
+        ok = ans.confident if min_confidence is None else ans.confidence >= min_confidence
+        return ans.value if ok else None
+
+    def get_choice(self, key: str, *, min_confidence: float | None = None) -> str | None:
+        ans = self.decisions.get(key)
+        if ans is None or ans.kind != "choice" or not ans.choice:
+            return None
+        ok = ans.confident if min_confidence is None else ans.confidence >= min_confidence
+        return ans.choice if ok else None
+
+
+def _parse_unit_float(raw: Any) -> float | None:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    val = float(raw)
+    if not math.isfinite(val) or not 0.0 <= val <= 1.0:
+        return None
+    return val
+
+
+def parse_screen_decision_result(raw: Any) -> ScreenDecisionResult:
+    """Parse a raw `ai.screen` dict into a validated `ScreenDecisionResult`.
+
+    Safety-first: if `passed` is not strictly `True`, any attached decisions are discarded.
+    Malformed individual decision entries are ignored so callers fail closed / conservatively.
+    """
+    if not isinstance(raw, dict) or raw.get("passed") is not True:
+        return ScreenDecisionResult(passed=False)
+
+    raw_tpl = raw.get("template")
+    template = (
+        raw_tpl if isinstance(raw_tpl, str) and DECISION_TEMPLATE_ID_RE.fullmatch(raw_tpl) else None
+    )
+    raw_decisions = raw.get("decisions")
+    if not isinstance(raw_decisions, dict):
+        return ScreenDecisionResult(passed=True, template=template)
+
+    parsed: dict[str, DecisionAnswer] = {}
+    for key, item in raw_decisions.items():
+        if not isinstance(key, str) or not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        conf = _parse_unit_float(item.get("confidence"))
+        if conf is None:
+            continue
+        confident = bool(item.get("confident", False))
+        if kind == "noul":
+            prob = _parse_unit_float(item.get("noul"))
+            raw_val = item.get("value")
+            if prob is None:
+                continue
+            val = raw_val if isinstance(raw_val, bool) else (prob >= 0.5)
+            parsed[key] = DecisionAnswer(
+                kind="noul",
+                confidence=conf,
+                confident=confident,
+                value=val,
+                noul=prob,
+            )
+        elif kind == "choice":
+            choice = item.get("choice")
+            if not isinstance(choice, str) or not choice.strip():
+                continue
+            raw_probs = item.get("probabilities")
+            probs: dict[str, float] = {}
+            if isinstance(raw_probs, dict):
+                valid_probs = True
+                for opt, p_raw in raw_probs.items():
+                    p_val = _parse_unit_float(p_raw)
+                    if not isinstance(opt, str) or p_val is None:
+                        valid_probs = False
+                        break
+                    probs[opt] = p_val
+                if not valid_probs:
+                    continue
+            parsed[key] = DecisionAnswer(
+                kind="choice",
+                confidence=conf,
+                confident=confident,
+                choice=choice,
+                probabilities=probs,
+            )
+    return ScreenDecisionResult(passed=True, template=template, decisions=parsed)

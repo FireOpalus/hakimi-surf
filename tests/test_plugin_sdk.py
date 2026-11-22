@@ -922,6 +922,7 @@ async def test_phase3_ai_helpers_notify_telemetry_and_acks():
         assert screen_req["budget_lane"] == "patrol"
         assert screen_req["purpose"] == "source"
         assert "images" not in screen_req
+        assert "decision_template" not in screen_req
         await sock.push(
             {
                 "type": "kernel.result",
@@ -931,6 +932,45 @@ async def test_phase3_ai_helpers_notify_telemetry_and_acks():
             }
         )
         assert await screen_task == {"passed": True}
+
+        tpl_screen_task = asyncio.create_task(
+            client.ai_screen(
+                {"trigger": "cruise"},
+                budget_lane="proactive",
+                purpose="source",
+                decision_template="mc_cruise_gate",
+            )
+        )
+        tpl_screen_req = await sock.wait_sent(
+            lambda m: (
+                m.get("type") == "ai.screen" and m.get("decision_template") == "mc_cruise_gate"
+            )
+        )
+        assert tpl_screen_req["budget_lane"] == "proactive"
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": tpl_screen_req["id"],
+                "ok": True,
+                "result": {
+                    "passed": True,
+                    "template": "mc_cruise_gate",
+                    "decisions": {
+                        "should_replan": {
+                            "type": "noul",
+                            "value": False,
+                            "noul": 0.1,
+                            "confidence": 0.9,
+                            "confident": True,
+                        }
+                    },
+                },
+            }
+        )
+        tpl_res = await tpl_screen_task
+        assert tpl_res["passed"] is True
+        assert tpl_res["template"] == "mc_cruise_gate"
+        assert tpl_res["decisions"]["should_replan"]["value"] is False
 
         img_screen_task = asyncio.create_task(
             client.ai_screen(

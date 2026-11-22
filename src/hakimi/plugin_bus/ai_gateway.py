@@ -21,6 +21,7 @@ from .protocol import (
     _SCOPED_SCENE_OWNERS,
     _bound_ai_payload,
     _scrub_json_secrets,
+    _validate_ai_screen_template,
     _validate_plugin_response_schema,
     _validate_plugin_task_instruction,
 )
@@ -146,6 +147,19 @@ class PluginBusAIGatewayMixin:
         raw_purpose = frame.get("purpose", "source")
         if raw_purpose is not None and raw_purpose != "source":
             raise Rejected("plugin_scope_rejected")
+        try:
+            template = _validate_ai_screen_template(session.plugin_id, frame, purpose="source")
+        except Rejected as exc:
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": str(exc),
+                },
+            )
+            raise
         raw_images = frame.get("images")
         if raw_images is not None and not isinstance(raw_images, list):
             raise Rejected("plugin_invalid_schema")
@@ -194,21 +208,39 @@ class PluginBusAIGatewayMixin:
                     return
                 max_bytes = int(getattr(self.s, "max_context_bytes", 48_000))
                 bounded_payload = _bound_ai_payload(raw_payload, self._all_secrets(), max_bytes)
+                screen_trace: dict[str, Any] = {}
+                screen_kwargs: dict[str, Any] = {
+                    "purpose": "source",
+                    "budget_lane": lane,
+                    "images": images or None,
+                }
+                if template is not None:
+                    screen_kwargs["decision_template"] = template.template_id
+                    screen_kwargs["trace"] = screen_trace
                 with model_work(f"plugin.{session.plugin_id}.screen", req_id, independent=True):
                     await ai.screen(
                         bounded_payload,
                         f"plugin:{session.plugin_id}",
-                        purpose="source",
-                        budget_lane=lane,
-                        images=images or None,
+                        **screen_kwargs,
                     )
+                result_payload: dict[str, Any] = {"passed": True}
+                if template is not None:
+                    raw_decisions = screen_trace.get("template_decisions")
+                    allowed_keys = set(template.question_keys())
+                    decisions = (
+                        {k: v for k, v in raw_decisions.items() if k in allowed_keys}
+                        if isinstance(raw_decisions, dict)
+                        else {}
+                    )
+                    result_payload["template"] = template.template_id
+                    result_payload["decisions"] = decisions
                 await self._send_frame(
                     session,
                     {
                         "type": "kernel.result",
                         "id": req_id,
                         "ok": True,
-                        "result": {"passed": True},
+                        "result": result_payload,
                     },
                 )
             except asyncio.CancelledError:

@@ -749,15 +749,25 @@ class HakimiPluginClient:
         budget_lane: str = "patrol",
         purpose: str = "source",
         images: list[dict[str, Any]] | None = None,
+        decision_template: str | None = None,
         timeout: float = 45.0,  # noqa: ASYNC109
     ) -> dict[str, Any]:
-        """Run the kernel AI safety gate on external content (`thinking_scenes` scope)."""
+        """Run the kernel AI safety gate on external content (`thinking_scenes` scope).
+
+        When `decision_template` is provided, the kernel validates it against its static
+        plugin-scoped whitelist and merges the template's questions into the same
+        `decisions.create` call, returning structured `"decisions"` only if safety passes.
+        """
         frame: dict[str, Any] = {
             "type": "ai.screen",
             "payload": dict(payload),
             "budget_lane": budget_lane,
             "purpose": purpose,
         }
+        if decision_template is not None:
+            if not isinstance(decision_template, str) or not decision_template.strip():
+                raise ValueError("decision_template must be a non-empty string")
+            frame["decision_template"] = decision_template.strip()
         if images:
             frame["images"] = [dict(item) if isinstance(item, dict) else item for item in images]
         res = await self._kernel_request(frame, timeout=timeout)

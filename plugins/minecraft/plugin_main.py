@@ -35,6 +35,8 @@ _MC_ALLOWED_DISPATCH_FIELDS = (
     "action_type",
     "topic",
     "block_type",
+    "item_name",
+    "count",
     "x",
     "y",
     "z",
@@ -45,6 +47,12 @@ _MC_ALLOWED_DISPATCH_FIELDS = (
     "mood",
     "gate_condition",
 )
+
+_ITEM_ID_RE = re.compile(r"^[a-z0-9_]{1,48}\Z")
+_INVENTORY_ENTRY_RE = re.compile(r"^[a-z0-9_]{1,48}:[1-9][0-9]{0,4}\Z")
+_PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,16}\Z")
+_EQUIPMENT_SLOTS = ("main_hand", "off_hand", "head", "chest", "legs", "feet")
+_EMPTY_EQUIPMENT: dict[str, str] = {slot: "" for slot in _EQUIPMENT_SLOTS}
 
 _BRIDGE_FLAG_KEYS = ("bridge_ready", "mc_enabled", "mc_configured", "paused")
 _NON_SNAPSHOT_KEYS = frozenset(
@@ -73,11 +81,25 @@ _SNAPSHOT_FIELD_KEYS = frozenset(
         "nearby_entities",
         "nearby_players",
         "recent_chat_or_sign",
+        "equipment",
+        "inventory_summary",
+        "free_slots",
+        "combat_mode",
+        "guard_target",
         "updated_at",
     }
 )
 _BRAIN_MILESTONE_EVENTS = frozenset(
-    {"mc_player_chat", "mc_health_alert", "mc_death", "mc_rare_find", "mc_player_spotted"}
+    {
+        "mc_player_chat",
+        "mc_health_alert",
+        "mc_death",
+        "mc_rare_find",
+        "mc_player_spotted",
+        "mc_low_food",
+        "mc_creeper_alert",
+        "mc_combat_retreat",
+    }
 )
 _UNCERTAIN_REASONS = frozenset(
     {
@@ -104,6 +126,8 @@ _STATUS_SYNC_KEYS = (
     "connected",
     "activity",
     "phase",
+    "combat_mode",
+    "guard_target",
 )
 
 
@@ -136,6 +160,69 @@ def _normalize_pos(pos: Any) -> tuple[float, float, float] | str | None:
     return _sanitize_text(str(pos), max_tokens=16) or None
 
 
+def _normalize_item_id(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip()
+    if cleaned.startswith("minecraft:"):
+        cleaned = cleaned[10:]
+    return cleaned if _ITEM_ID_RE.fullmatch(cleaned) else ""
+
+
+def _sanitize_equipment(raw: Any, *, connected: bool) -> dict[str, str]:
+    out = dict(_EMPTY_EQUIPMENT)
+    if not connected or not isinstance(raw, dict):
+        return out
+    for slot in _EQUIPMENT_SLOTS:
+        out[slot] = _normalize_item_id(raw.get(slot))
+    return out
+
+
+def _sanitize_inventory_summary(raw: Any, *, connected: bool) -> list[str]:
+    if not connected or not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        if len(out) >= 16:
+            break
+        if not isinstance(entry, str):
+            continue
+        stripped = entry.strip()
+        item_part, sep, count_part = stripped.rpartition(":")
+        if not sep:
+            continue
+        clean_item = _normalize_item_id(item_part)
+        if not clean_item:
+            continue
+        formatted = f"{clean_item}:{count_part.strip()}"
+        if _INVENTORY_ENTRY_RE.fullmatch(formatted):
+            out.append(formatted)
+    return out
+
+
+def _sanitize_missing_materials(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if len(out) >= 16:
+            break
+        if not isinstance(entry, dict):
+            continue
+        item = _normalize_item_id(entry.get("item"))
+        if not item:
+            continue
+        need = entry.get("need")
+        have = entry.get("have")
+        shortfall = entry.get("shortfall")
+        if any(
+            isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (need, have, shortfall)
+        ):
+            continue
+        out.append({"item": item, "need": need, "have": have, "shortfall": shortfall})
+    return out
+
+
 class MinecraftSnapshot(BaseModel):
     """Sanitized snapshot of the remote CN Mineflayer agent."""
 
@@ -151,7 +238,53 @@ class MinecraftSnapshot(BaseModel):
     nearby_entities: list[str] = Field(default_factory=list)
     nearby_players: tuple[str, ...] = ()
     recent_chat_or_sign: str = ""
+    equipment: dict[str, str] = Field(default_factory=lambda: dict(_EMPTY_EQUIPMENT))
+    inventory_summary: list[str] = Field(default_factory=list, max_length=16)
+    free_slots: int | None = Field(default=None, ge=0, le=36)
+    combat_mode: Literal["evade", "guard"] = "evade"
+    guard_target: str = Field(default="", max_length=16)
     updated_at: float = 0.0
+
+    @field_validator("equipment")
+    @classmethod
+    def _validate_equipment(cls, value: dict[str, str]) -> dict[str, str]:
+        if not isinstance(value, dict):
+            raise ValueError("invalid_equipment")
+        if set(value) - set(_EQUIPMENT_SLOTS):
+            raise ValueError("unknown_equipment_slot")
+        normalized: dict[str, str] = {}
+        for slot in _EQUIPMENT_SLOTS:
+            raw_item = value.get(slot, "")
+            if not isinstance(raw_item, str):
+                raise ValueError("invalid_equipment_item")
+            if raw_item and not _ITEM_ID_RE.fullmatch(raw_item):
+                raise ValueError("invalid_equipment_item")
+            normalized[slot] = raw_item
+        return normalized
+
+    @field_validator("inventory_summary")
+    @classmethod
+    def _validate_inventory_summary(cls, value: list[str]) -> list[str]:
+        if len(value) > 16:
+            raise ValueError("inventory_summary_too_long")
+        for entry in value:
+            if not isinstance(entry, str) or not _INVENTORY_ENTRY_RE.fullmatch(entry):
+                raise ValueError("invalid_inventory_entry")
+        return value
+
+    @field_validator("free_slots", mode="before")
+    @classmethod
+    def _reject_bool_free_slots(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("free_slots_bool_forbidden")
+        return value
+
+    @field_validator("guard_target")
+    @classmethod
+    def _validate_guard_target(cls, value: str) -> str:
+        if value and not _PLAYER_ID_RE.fullmatch(value):
+            raise ValueError("invalid_guard_target")
+        return value
 
 
 class NoArgs(BaseModel):
@@ -168,6 +301,31 @@ class BuildArgs(NoArgs):
 
 class BlockArgs(NoArgs):
     block_type: str = Field(default="", max_length=48, pattern=r"^[a-z0-9_:]*$")
+
+
+class CraftArgs(NoArgs):
+    item_name: str = Field(min_length=1, max_length=64)
+    count: int = Field(default=1, ge=1, le=16)
+
+    @field_validator("item_name")
+    @classmethod
+    def _validate_item_name(cls, value: str) -> str:
+        cleaned = _normalize_item_id(value)
+        if not cleaned:
+            raise ValueError("invalid_item_name")
+        return cleaned
+
+
+class GuardArgs(NoArgs):
+    target_player: str = Field(default="", max_length=16)
+
+    @field_validator("target_player")
+    @classmethod
+    def _validate_target_player(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned and not _PLAYER_ID_RE.fullmatch(cleaned):
+            raise ValueError("invalid_target_player")
+        return cleaned
 
 
 class PositionArgs(NoArgs):
@@ -218,6 +376,23 @@ _BLOCK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "block_type": {"type": "string", "maxLength": 48, "default": ""},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
+_CRAFT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "item_name": {"type": "string", "minLength": 1, "maxLength": 64},
+        "count": {"type": "integer", "minimum": 1, "maximum": 16, "default": 1},
+    },
+    "required": ["item_name"],
+    "additionalProperties": False,
+}
+_GUARD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "target_player": {"type": "string", "maxLength": 16, "default": ""},
     },
     "required": [],
     "additionalProperties": False,
@@ -273,6 +448,13 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "explore": ("在 Minecraft 世界里四处探索地形与新发现", {}, NoArgs),
     "mine": ("在游戏里挖掘指定矿石或方块", _BLOCK_SCHEMA, BlockArgs),
     "gather": ("在游戏里收集指定资源方块", _BLOCK_SCHEMA, BlockArgs),
+    "craft": (
+        "在游戏里合成指定工具、武器、护甲或物品（支持2x2和3x3工作台）",
+        _CRAFT_SCHEMA,
+        CraftArgs,
+    ),
+    "guard": ("在游戏里切换为贴身护卫模式保护玩家并击退敌对怪物", _GUARD_SCHEMA, GuardArgs),
+    "evade": ("在游戏里切换为安全躲避模式避免交战并优先保命", {}, NoArgs),
     "goto": ("在游戏里前往指定坐标位置", _POSITION_SCHEMA, PositionArgs),
     "follow": ("在游戏里跟随指定玩家一起行动", _FOLLOW_SCHEMA, FollowArgs),
     "chat": ("在游戏公屏里发一句短消息和在线玩家搭话（不可发/指令）", _CHAT_SCHEMA, ChatArgs),
@@ -291,6 +473,9 @@ _MICRO_GAME_VERBS = frozenset(
         "explore",
         "mine",
         "gather",
+        "craft",
+        "guard",
+        "evade",
         "goto",
         "follow",
         "chat",
@@ -301,7 +486,7 @@ _MICRO_GAME_VERBS = frozenset(
     }
 )
 _ADMIN_ONLY_VERBS = frozenset({"status", "pause", "resume"})
-_EFFORTFUL_VERBS = frozenset({"explore", "goto", "mine", "gather", "follow"})
+_EFFORTFUL_VERBS = frozenset({"explore", "goto", "mine", "gather", "craft", "follow"})
 _OWNER_CHAT_ORIGINS = ["planner", "owner_chat", "rule", "timer", "legacy", "admin"]
 _MACRO_PLANNER_ORIGINS = ["planner", "rule", "timer", "legacy", "admin"]
 _MICRO_GAME_ORIGINS = ["rule", "legacy", "admin"]
@@ -513,6 +698,31 @@ class MinecraftPlugin:
             if clean_player:
                 players.append(clean_player)
 
+        equipment = _sanitize_equipment(data.get("equipment"), connected=connected)
+        inventory_summary = _sanitize_inventory_summary(
+            data.get("inventory_summary"), connected=connected
+        )
+        raw_free = data.get("free_slots")
+        free_slots = (
+            raw_free
+            if connected
+            and isinstance(raw_free, int)
+            and not isinstance(raw_free, bool)
+            and 0 <= raw_free <= 36
+            else None
+        )
+        raw_mode = data.get("combat_mode")
+        combat_mode: Literal["evade", "guard"] = "guard" if raw_mode == "guard" else "evade"
+        raw_guard_target = data.get("guard_target")
+        guard_target = (
+            raw_guard_target.strip()
+            if connected
+            and combat_mode == "guard"
+            and isinstance(raw_guard_target, str)
+            and _PLAYER_ID_RE.fullmatch(raw_guard_target.strip())
+            else ""
+        )
+
         return MinecraftSnapshot(
             connected=connected,
             dimension=dimension,
@@ -524,6 +734,11 @@ class MinecraftPlugin:
             nearby_entities=entities,
             nearby_players=tuple(players),
             recent_chat_or_sign=recent_chat_or_sign,
+            equipment=equipment,
+            inventory_summary=inventory_summary,
+            free_slots=free_slots,
+            combat_mode=combat_mode,
+            guard_target=guard_target,
             updated_at=updated_at,
         )
 
@@ -682,6 +897,11 @@ class MinecraftPlugin:
                 if (clean := _sanitize_text(item, max_tokens=10))
             ],
             "recent_chat_or_sign": _sanitize_text(snap.recent_chat_or_sign, max_tokens=20),
+            "equipment": dict(snap.equipment),
+            "inventory_summary": list(snap.inventory_summary[:16]),
+            "free_slots": snap.free_slots,
+            "combat_mode": snap.combat_mode,
+            "guard_target": snap.guard_target,
             "updated_at": float(snap.updated_at),
             **self.brain.telemetry(),
         }
@@ -717,6 +937,8 @@ class MinecraftPlugin:
             parts.append(f"附近:{','.join(snap.nearby_entities)}")
         if snap.recent_chat_or_sign:
             parts.append(f"见闻:{snap.recent_chat_or_sign}")
+        if snap.combat_mode == "guard":
+            parts.append(f"模式:护卫({snap.guard_target})" if snap.guard_target else "模式:护卫")
         return _sanitize_text(" ".join(parts), max_tokens=90)
 
     async def _sensor_summary(self, _params: dict[str, Any] | None = None) -> str:
@@ -971,6 +1193,8 @@ class MinecraftPlugin:
                     for key in _MC_ALLOWED_DISPATCH_FIELDS
                     if clean_ticket.get(key) is not None
                 }
+                if verb == "guard" and not params.get("target_player"):
+                    params.pop("target_player", None)
                 for axis in ("x", "y", "z"):
                     val = params.pop(axis, None)
                     if type(val) in (int, float) and math.isfinite(val):
@@ -1022,6 +1246,28 @@ class MinecraftPlugin:
             artifacts["accepted"] = data["accepted"] is True
         if "phase" in data:
             artifacts["phase"] = _sanitize_text(str(data["phase"]), max_tokens=12)
+        if clean_item := _normalize_item_id(data.get("item_name")):
+            artifacts["item_name"] = clean_item
+        for int_key in ("crafted_count", "requested_count"):
+            raw_int = data.get(int_key)
+            if isinstance(raw_int, int) and not isinstance(raw_int, bool) and raw_int >= 0:
+                artifacts[int_key] = raw_int
+        for bool_key in ("partial", "used_table"):
+            if isinstance(data.get(bool_key), bool):
+                artifacts[bool_key] = data[bool_key]
+        if isinstance(data.get("equipped_items"), (list, tuple)):
+            artifacts["equipped_items"] = [
+                cid for raw_it in data["equipped_items"][:16] if (cid := _normalize_item_id(raw_it))
+            ]
+        if "missing_materials" in data:
+            artifacts["missing_materials"] = _sanitize_missing_materials(
+                data.get("missing_materials")
+            )
+        if data.get("combat_mode") in ("evade", "guard"):
+            artifacts["combat_mode"] = data["combat_mode"]
+        if isinstance(data.get("guard_target"), str):
+            gt = data["guard_target"].strip()
+            artifacts["guard_target"] = gt if _PLAYER_ID_RE.fullmatch(gt) else ""
 
         return self._goal_result(
             ok=ok,
