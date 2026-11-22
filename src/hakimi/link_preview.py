@@ -2,17 +2,71 @@
 
 import asyncio
 import ipaddress
+import logging
+import os
 import re
 import zlib
 from contextlib import nullcontext
 from html.parser import HTMLParser
+from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 
 from .media import PublicResolver
+from .security import Rejected
+
+log = logging.getLogger("hakimi")
 
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+WEB_TOOLS_PLUGIN_ID = "web_tools"
+WEB_TOOLS_PREVIEW_ACTION = "web_tools.preview"
+_REMOTE_CONNECTIVITY_ERRORS = frozenset(
+    {
+        "plugin_offline",
+        "plugin_disabled",
+        "action_not_found",
+        "plugin_disconnected",
+        "plugin_rpc_timeout",
+    }
+)
+
+
+def is_web_tools_remote_only(*, remote_only: bool | None = None) -> bool:
+    """Return True when strict remote-only web_tools execution is enabled."""
+    if remote_only is not None:
+        return bool(remote_only)
+    return os.getenv("WEB_TOOLS_REMOTE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _bus_has_preview_tool(plugin_bus: Any) -> bool:
+    if plugin_bus is None:
+        return False
+    has_tool = getattr(plugin_bus, "has_tool", None)
+    if callable(has_tool):
+        try:
+            return bool(has_tool(WEB_TOOLS_PLUGIN_ID, WEB_TOOLS_PREVIEW_ACTION))
+        except Exception:
+            return False
+    return False
+
+
+def _parse_remote_previews(raw_data: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_data, dict):
+        return []
+    raw_items = raw_data.get("previews")
+    if not isinstance(raw_items, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw_items[:2]:
+        if not isinstance(item, dict):
+            continue
+        title = _clean_preview_text(str(item.get("title") or ""), 120)
+        if not title:
+            continue
+        description = _clean_preview_text(str(item.get("description") or ""), 160)
+        out.append({"title": title, "description": description})
+    return out
 
 
 def _clean_preview_text(value: str, limit: int) -> str:
@@ -106,8 +160,56 @@ def _extract_urls(text: str) -> list[str]:
     return list(dict.fromkeys(u for u in cleaned if u))[:2]
 
 
-async def preview_links(text, slots=None, *, budget_seconds: float = 0.8):
+async def preview_links(
+    text,
+    slots=None,
+    *,
+    budget_seconds: float = 0.8,
+    plugin_bus: Any = None,
+    remote_only: bool | None = None,
+):
     urls = _extract_urls(text)
+    if not urls:
+        return []
+
+    strict_remote = is_web_tools_remote_only(remote_only=remote_only)
+    if _bus_has_preview_tool(plugin_bus):
+        remote_budget = min(max(float(budget_seconds), 0.2), 5.0)
+        try:
+            async with (
+                asyncio.timeout(max(float(budget_seconds), 0.2) + 0.5),
+                slots or nullcontext(),
+            ):
+                res = await plugin_bus.invoke_tool(
+                    WEB_TOOLS_PLUGIN_ID,
+                    WEB_TOOLS_PREVIEW_ACTION,
+                    {"urls": urls, "budget_seconds": remote_budget},
+                    max_request_blob_bytes=0,
+                    max_response_blob_bytes=0,
+                    timeout=remote_budget + 0.5,
+                )
+            return _parse_remote_previews(getattr(res, "data", res))
+        except TimeoutError:
+            return []
+        except Rejected as exc:
+            code = str(exc)
+            if code in {"ssrf_blocked", "preview_failed"}:
+                return []
+            if code in _REMOTE_CONNECTIVITY_ERRORS:
+                if strict_remote:
+                    raise Rejected("web_tools_remote_unavailable") from None
+                log.debug("event=link_preview_remote_fallback reason=%s", code)
+            elif strict_remote:
+                raise Rejected("web_tools_remote_unavailable") from None
+            else:
+                return []
+        except Exception as exc:
+            if strict_remote:
+                raise Rejected("web_tools_remote_unavailable") from None
+            log.debug("event=link_preview_remote_fallback type=%s", type(exc).__name__)
+    elif strict_remote:
+        raise Rejected("web_tools_remote_unavailable")
+
     headers = {
         "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
         "Accept-Encoding": "gzip, deflate, identity",

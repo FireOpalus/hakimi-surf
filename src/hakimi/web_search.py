@@ -1,13 +1,17 @@
-"""Isolated, user-initiated Google Search. Never exports conversation memory."""
+"""Isolated, user-initiated web search with optional remote plugin execution."""
 
 import asyncio
+import inspect
 import ipaddress
 import json
+import logging
+import os
 import re
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -16,6 +20,22 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from .memory_compressor import check_memory_text
 from .output_links import fact_text
 from .security import Rejected, configured_secrets, safe_output
+from .streaming import cancellable
+
+log = logging.getLogger("hakimi")
+
+WEB_TOOLS_PLUGIN_ID = "web_tools"
+WEB_TOOLS_SEARCH_ACTION = "web_tools.search"
+_REMOTE_SEARCH_PROVIDERS = frozenset({"deepseek", "searxng", "tavily", "brave", "duckduckgo"})
+_REMOTE_CONNECTIVITY_ERRORS = frozenset(
+    {
+        "plugin_offline",
+        "plugin_disabled",
+        "action_not_found",
+        "plugin_disconnected",
+        "plugin_rpc_timeout",
+    }
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS web_search_attempts (
@@ -261,6 +281,119 @@ async def _read_bounded_json(
     return value
 
 
+def is_web_tools_remote_only(settings=None, *, remote_only: bool | None = None) -> bool:
+    """Return True when strict remote-only web_tools execution is required."""
+    if remote_only is not None:
+        return bool(remote_only)
+    if settings is not None:
+        cfg_val = getattr(settings, "web_tools_remote_only", None)
+        if cfg_val is not None:
+            return bool(cfg_val)
+    return os.getenv("WEB_TOOLS_REMOTE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bus_has_web_search_tool(plugin_bus: Any) -> bool:
+    """Return True when `web_tools.search` is currently online and enabled on `plugin_bus`."""
+    if plugin_bus is None:
+        return False
+    has_tool = getattr(plugin_bus, "has_tool", None)
+    if callable(has_tool):
+        try:
+            return bool(has_tool(WEB_TOOLS_PLUGIN_ID, WEB_TOOLS_SEARCH_ACTION))
+        except Exception:
+            return False
+    return False
+
+
+def parse_remote_search_payload(raw_data: Any) -> tuple[SearchResult, str, int]:
+    """Validate and normalize the JSON payload returned by `web_tools.search`."""
+    if not isinstance(raw_data, dict):
+        raise Rejected("search_invalid_output")
+    raw_text = raw_data.get("text")
+    if not isinstance(raw_text, str):
+        raise Rejected("search_invalid_output")
+    text = raw_text.strip()
+    if not text or len(text) > 2400 or re.search(r"\[(?:AT|MEME|CQ):", text, re.I):
+        raise Rejected("search_invalid_output")
+
+    raw_sources = raw_data.get("sources")
+    sources: list[tuple[str, str]] = []
+    if raw_sources is not None:
+        if not isinstance(raw_sources, list):
+            raise Rejected("search_invalid_output")
+        for item in raw_sources:
+            if not isinstance(item, dict):
+                continue
+            url = public_url(item.get("url"))
+            if not url:
+                continue
+            title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:80]
+            sources.append((title or (urlsplit(url).hostname or ""), url))
+
+    raw_provider = str(raw_data.get("provider") or "").strip().lower()
+    provider = raw_provider if raw_provider in _REMOTE_SEARCH_PROVIDERS else "remote"
+
+    raw_count = raw_data.get("query_count", 1)
+    qcount = raw_count if type(raw_count) is int and 1 <= raw_count <= 100 else 1
+    return SearchResult(text, tuple(dict.fromkeys(sources))[:5]), provider, qcount
+
+
+async def execute_remote_web_search_detailed(
+    query: str,
+    settings,
+    *,
+    plugin_bus: Any,
+    provider: str = "auto",
+    max_results: int = 5,
+    timeout_seconds: float = 20.0,
+) -> tuple[SearchResult, str, int]:
+    """Invoke remote `web_tools.search` over `plugin_bus` and verify output in kernel."""
+    if not bus_has_web_search_tool(plugin_bus):
+        raise Rejected("web_tools_remote_unavailable")
+    bounded_results = min(max(int(max_results), 1), 10)
+    bounded_timeout = min(max(float(timeout_seconds), 1.0), 30.0)
+    res = await plugin_bus.invoke_tool(
+        WEB_TOOLS_PLUGIN_ID,
+        WEB_TOOLS_SEARCH_ACTION,
+        {
+            "query": query,
+            "provider": provider,
+            "max_results": bounded_results,
+            "timeout_seconds": bounded_timeout,
+        },
+        max_request_blob_bytes=0,
+        max_response_blob_bytes=0,
+        timeout=bounded_timeout + 5.0,
+    )
+    parsed, used_provider, qcount = parse_remote_search_payload(getattr(res, "data", res))
+    if settings is not None:
+        secrets = configured_secrets(settings)
+        if any(s and len(s) >= 8 and s in parsed.text for s in secrets):
+            raise Rejected("search_invalid_output")
+    return parsed, used_provider, qcount
+
+
+async def execute_remote_web_search(
+    query: str,
+    settings,
+    *,
+    plugin_bus: Any,
+    provider: str = "auto",
+    max_results: int = 5,
+    timeout_seconds: float = 20.0,
+) -> SearchResult:
+    """Invoke remote `web_tools.search` over `plugin_bus` and return a validated `SearchResult`."""
+    parsed, _, _ = await execute_remote_web_search_detailed(
+        query,
+        settings,
+        plugin_bus=plugin_bus,
+        provider=provider,
+        max_results=max_results,
+        timeout_seconds=timeout_seconds,
+    )
+    return parsed
+
+
 async def execute_deepseek_search(
     query: str,
     settings,
@@ -269,7 +402,38 @@ async def execute_deepseek_search(
     base_url: str,
     model: str,
     transport: httpx.AsyncBaseTransport | None = None,
+    plugin_bus: Any = None,
+    remote_only: bool | None = None,
+    provider: str = "deepseek",
+    max_results: int = 5,
+    timeout_seconds: float = 25.0,
 ) -> SearchResult:
+    strict_remote = is_web_tools_remote_only(settings, remote_only=remote_only)
+    if transport is None and bus_has_web_search_tool(plugin_bus):
+        try:
+            return await execute_remote_web_search(
+                query,
+                settings,
+                plugin_bus=plugin_bus,
+                provider=provider,
+                max_results=max_results,
+                timeout_seconds=timeout_seconds,
+            )
+        except Rejected as exc:
+            code = str(exc)
+            if code in _REMOTE_CONNECTIVITY_ERRORS or code == "search_provider_unconfigured":
+                if strict_remote:
+                    raise Rejected(
+                        "web_tools_remote_unavailable"
+                        if code in _REMOTE_CONNECTIVITY_ERRORS
+                        else code
+                    ) from None
+                log.debug("event=deepseek_search_remote_fallback reason=%s", code)
+            else:
+                raise
+    elif strict_remote:
+        raise Rejected("web_tools_remote_unavailable")
+
     clean_base = (base_url or "https://api.deepseek.com").strip().rstrip("/")
     parsed_base = urlsplit(clean_base)
     if not api_key or not public_url(clean_base) or parsed_base.query or parsed_base.fragment:
@@ -373,7 +537,17 @@ class WebSearch:
         self.override = None
         self.deepseek_override: dict | None = None
         self._attempt_providers: OrderedDict[str, str] = OrderedDict()
+        self.plugin_bus: Any = None
+        self.remote_only: bool | None = None
         self.lock = asyncio.Lock()
+
+    def remote_only_enabled(self, *, remote_only: bool | None = None) -> bool:
+        effective = self.remote_only if remote_only is None else remote_only
+        return is_web_tools_remote_only(self.store.s, remote_only=effective)
+
+    def remote_search_available(self, plugin_bus: Any = None) -> bool:
+        bus = plugin_bus if plugin_bus is not None else self.plugin_bus
+        return bus_has_web_search_tool(bus)
 
     @property
     def config(self):
@@ -468,6 +642,10 @@ class WebSearch:
             },
             "unbilled": True,
             "query_usd": "0",
+            "remote_tools": {
+                "online": self.remote_search_available(),
+                "remote_only": self.remote_only_enabled(),
+            },
         }
 
     async def save(self, value):
@@ -525,9 +703,11 @@ class WebSearch:
                 self.store.s.deepseek_api_key = SecretStr(next_key or self.env_deepseek_key)
         return (await self.status())["deepseek"]
 
-    async def claim(self):
+    async def claim(self, *, provider_override: str | None = None):
         if not self.config.enabled:
             raise Rejected("web_search_disabled")
+        if provider_override is None and self.remote_only_enabled():
+            raise Rejected("web_tools_remote_unavailable")
         now = self.store.local_now()
         day, month, key = now.date().isoformat(), now.strftime("%Y-%m"), uuid.uuid4().hex
         async with self.store.transaction():
@@ -536,19 +716,29 @@ class WebSearch:
             )
             if count[0] >= self.config.daily_limit:
                 raise Rejected("search_daily_limit")
-            google_month_queries = (
-                await self.store.one(
-                    "SELECT COALESCE(SUM(CASE WHEN query_count IS NOT NULL AND query_count > 0 "
-                    "THEN query_count ELSE 1 END),0) "
-                    "FROM web_search_attempts WHERE day LIKE ? AND provider='google'",
-                    (month + "-%",),
+            if provider_override is not None:
+                clean_override = str(provider_override).strip().lower()
+                provider = (
+                    clean_override
+                    if clean_override in _REMOTE_SEARCH_PROVIDERS or clean_override == "remote"
+                    else "remote"
                 )
-            )[0]
-            provider = (
-                "google" if google_month_queries < self.config.monthly_google_limit else "deepseek"
-            )
-            if provider == "deepseek" and not self.deepseek_settings()[0]:
-                raise Rejected("deepseek_credentials_missing")
+            else:
+                google_month_queries = (
+                    await self.store.one(
+                        "SELECT COALESCE(SUM(CASE WHEN query_count IS NOT NULL AND query_count > 0 "
+                        "THEN query_count ELSE 1 END),0) "
+                        "FROM web_search_attempts WHERE day LIKE ? AND provider='google'",
+                        (month + "-%",),
+                    )
+                )[0]
+                provider = (
+                    "google"
+                    if google_month_queries < self.config.monthly_google_limit
+                    else "deepseek"
+                )
+                if provider == "deepseek" and not self.deepseek_settings()[0]:
+                    raise Rejected("deepseek_credentials_missing")
             await self.store.db.execute(
                 "INSERT INTO web_search_attempts"
                 "(id,day,status,query_count,tool_amount,created,provider) "
@@ -563,14 +753,149 @@ class WebSearch:
             self._attempt_providers.popitem(last=False)
         return key
 
-    async def finish(self, key, result=None, *, query_count_override: int | None = None):
+    async def _release_unused_attempt(self, key: str) -> None:
+        self._attempt_providers.pop(key, None)
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "DELETE FROM web_search_attempts WHERE id=? AND status='reserved'",
+                (key,),
+            )
+
+    async def finish(
+        self,
+        key,
+        result=None,
+        *,
+        query_count_override: int | None = None,
+        provider_override: str | None = None,
+    ):
         count = (
             query_count_override
             if query_count_override is not None
             else (query_count(result) if result is not None else None)
         )
+        clean_provider = (
+            str(provider_override).strip().lower()
+            if provider_override is not None
+            and str(provider_override).strip().lower() in (_REMOTE_SEARCH_PROVIDERS | {"remote"})
+            else None
+        )
         async with self.store.transaction():
-            await self.store.db.execute(
-                "UPDATE web_search_attempts SET status=?,query_count=?,tool_amount=0 WHERE id=?",
-                ("completed" if result is not None else "unknown", count, key),
-            )
+            if clean_provider is not None:
+                await self.store.db.execute(
+                    "UPDATE web_search_attempts "
+                    "SET status=?,query_count=?,tool_amount=0,provider=? WHERE id=?",
+                    ("completed" if result is not None else "unknown", count, clean_provider, key),
+                )
+            else:
+                await self.store.db.execute(
+                    "UPDATE web_search_attempts "
+                    "SET status=?,query_count=?,tool_amount=0 WHERE id=?",
+                    ("completed" if result is not None else "unknown", count, key),
+                )
+
+    async def execute_search(
+        self,
+        query: str,
+        subject: str,
+        *,
+        ai: Any,
+        before_call=None,
+        cancel_event=None,
+        provider: str = "auto",
+        max_results: int = 5,
+        timeout_seconds: float = 20.0,
+        plugin_bus: Any = None,
+        remote_only: bool | None = None,
+    ) -> str:
+        """Run remote `web_tools.search` under kernel budget/screening gates, or fall back."""
+
+        async def guard():
+            if not self.config.enabled:
+                raise Rejected("web_search_disabled")
+            if before_call is not None:
+                res = before_call()
+                if inspect.isawaitable(res):
+                    res = await res
+                if res is False:
+                    raise Rejected("reply_invalidated")
+
+        bus = plugin_bus if plugin_bus is not None else self.plugin_bus
+        strict_remote = self.remote_only_enabled(remote_only=remote_only)
+
+        if bus_has_web_search_tool(bus):
+            await guard()
+            attempt = await self.claim(provider_override="remote")
+            remote_ok = False
+            remote_qcount: int | None = None
+            remote_provider: str | None = None
+            released_for_fallback = False
+            try:
+                try:
+                    parsed, used_provider, qcount = await cancellable(
+                        lambda: execute_remote_web_search_detailed(
+                            query,
+                            self.store.s,
+                            plugin_bus=bus,
+                            provider=provider,
+                            max_results=max_results,
+                            timeout_seconds=timeout_seconds,
+                        ),
+                        cancel_event,
+                    )
+                except Rejected as exc:
+                    code = str(exc)
+                    if (
+                        code in _REMOTE_CONNECTIVITY_ERRORS
+                        or code == "search_provider_unconfigured"
+                    ):
+                        if strict_remote:
+                            raise Rejected(
+                                "web_tools_remote_unavailable"
+                                if code in _REMOTE_CONNECTIVITY_ERRORS
+                                else code
+                            ) from None
+                        await asyncio.shield(self._release_unused_attempt(attempt))
+                        released_for_fallback = True
+                        log.debug("event=web_search_remote_fallback reason=%s", code)
+                        return await ai.search(
+                            query,
+                            subject,
+                            before_call=before_call,
+                            cancel_event=cancel_event,
+                        )
+                    raise
+                rendered = parsed.render(self.store.s)
+                await ai.screen(
+                    {"untrusted_web_search_result": rendered},
+                    subject,
+                    purpose="source",
+                    budget_lane="search",
+                    before_call=guard,
+                )
+                await guard()
+                remote_ok = True
+                remote_qcount = qcount
+                remote_provider = used_provider
+                return rendered
+            finally:
+                if not released_for_fallback:
+                    await asyncio.shield(
+                        self.finish(
+                            attempt,
+                            {"completed": True} if remote_ok else None,
+                            query_count_override=remote_qcount if remote_ok else None,
+                            provider_override=remote_provider,
+                        )
+                    )
+
+        if strict_remote:
+            await guard()
+            raise Rejected("web_tools_remote_unavailable")
+
+        return await ai.search(
+            query,
+            subject,
+            before_call=before_call,
+            cancel_event=cancel_event,
+        )
