@@ -24,7 +24,7 @@
         <button id="song-refresh" type="button" class="secondary">刷新歌单</button>
       </div>
     </div>
-    <p class="muted">Google Drive 主存持久保存翻唱成品与完整版备份，本地保留有界 LRU 热缓存用于秒级发送（纯本地上传曲目永不被淘汰）。模型仅从歌单标题白名单里挑选。</p>
+    <p class="muted">Google Drive <code>Hakimi_Songs/</code> 主存与本地有界 LRU 热缓存由歌单工坊独立管理（纯本地上传曲目永不被淘汰），歌单试听与管理不依赖 Colab GPU Worker 在线。模型仅从歌单标题白名单里挑选。</p>
     <div id="song-storage-pills" class="pill-row"></div>
     <p id="song-cache-state" class="muted" role="status" aria-live="polite"></p>
     <div class="row">
@@ -35,21 +35,45 @@
   </div>
   <div class="card">
     <div class="row between">
-      <h2 id="song-learn-heading">Colab 学一首新歌</h2>
+      <h2>Drive <code>Hakimi_Songs/</code> 云盘目录与待学原曲收件箱</h2>
       <div class="row">
-        <button id="song-learn-refresh-inbox" type="button" class="secondary">刷新 Drive 收件箱</button>
-        <button type="button" class="secondary" data-open-tab="colab-compute">查看作业队列 →</button>
+        <button id="song-refresh-inbox" type="button" class="secondary">刷新收件箱</button>
       </div>
     </div>
-    <p class="muted">提交到 Colab GPU Worker 自动执行人声分离、RVC 翻唱推理与高潮切片，成品将自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。若未选择 Drive <code>inbox/</code> 原曲且启用自动检索，Worker 会尝试搜索干净官方原版；<code>drive.file</code> 最小权限模式下也可直接在此上传本地原曲到收件箱，或在 QQ 私聊发送音频附带 <code>/学歌</code>。</p>
-    <p id="song-learn-colab-hint" class="muted"></p>
+    <p class="muted">歌单工坊独立直连 Google Drive <code>Hakimi_Songs/</code> 管理翻唱主存、音色模型与待学原曲收件箱（不依赖 Colab Worker 在线）。上传原曲至 <code>inbox/</code> 后，可在此一键填入学歌表单或直接发起学歌任务。</p>
+    <p id="song-storage-source" class="muted" aria-live="polite"></p>
+    <dl id="song-drive-details" class="node-details"></dl>
+    <form id="song-storage-form">
+      <div class="grid">
+        <label for="song-drive-folder-id">Drive 歌曲根目录 ID（drive_songs_folder_id）
+          <input id="song-drive-folder-id" type="text" maxlength="128" placeholder="Hakimi_Songs 根目录 Folder ID（留空回退默认配置）">
+        </label>
+      </div>
+      <div class="row">
+        <button id="song-storage-save" type="submit" class="primary" disabled>保存目录配置</button>
+        <button id="song-storage-reset" type="button" class="secondary" disabled>恢复默认配置</button>
+      </div>
+    </form>
     <div class="sub-card">
       <div class="row">
-        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 100 MiB）</label>
+        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 100 MiB，流式直传）</label>
         <input id="song-inbox-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac">
         <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
       </div>
     </div>
+    <h3>待学原曲收件箱（<code>inbox/</code>）</h3>
+    <div id="song-inbox-table" class="table"></div>
+  </div>
+  <div class="card">
+    <div class="row between">
+      <h2 id="song-learn-heading">Colab 学一首新歌</h2>
+      <div class="row">
+        <button id="song-learn-refresh-inbox" type="button" class="secondary">刷新收件箱列表</button>
+        <button type="button" class="secondary" data-open-tab="colab-compute">查看作业队列 →</button>
+      </div>
+    </div>
+    <p class="muted">歌单播放、Drive 主存、本地热缓存与原曲收件箱均由歌单工坊独立管理（不依赖 Colab Worker 在线）；提交异步学歌任务时会经 Colab GPU 算力执行人声分离与 RVC 翻唱推理，并支持通过独立找歌插件检索官方原版，成品自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。也可在 QQ 私聊发送音频附带 <code>/学歌</code>。</p>
+    <p id="song-learn-colab-hint" class="muted"></p>
     <form id="song-learn-form">
       <div class="song-meta">
         <label for="song-learn-title">歌名（必填，1～60字）<input id="song-learn-title" maxlength="60" required placeholder="例如：晴天"></label>

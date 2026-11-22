@@ -158,7 +158,7 @@
         <button id="colab-terminate-sessions" type="button" class="danger" disabled>紧急清退全部 Colab 会话</button>
       </div>
     </div>
-    <p class="muted">主脑通过 loopback HTTP + Bearer 鉴权调度独立进程外 Colab Worker（禁止主脑直接读取 Colab 凭据）；优先使用首选 GPU，不可用时按顺序回退，成品主存归档至 Google Drive <code>Hakimi_Songs/</code>。</p>
+    <p class="muted">主脑通过 loopback HTTP + Bearer 鉴权调度独立进程外 Colab 通用 GPU Worker（禁止主脑直接读取 Colab 凭据）；优先使用首选 GPU，不可用时按顺序回退，并按注册白名单分发各类异步 GPU 作业。</p>
     <div id="colab-pills" class="pill-row"></div>
     <div id="colab-kpi-strip" class="kpi-strip"></div>
     <div class="grid">
@@ -172,7 +172,7 @@
       </div>
     </div>
     <p id="colab-state" class="muted" aria-live="polite"></p>
-    <dl id="colab-drive-details" class="node-details"></dl>
+    <p id="colab-job-types" class="muted"></p>
   </div>
   <div id="colab-analytics-card" class="card">
     <div class="row between">
@@ -243,9 +243,6 @@
         <label for="colab-orphan-minutes">孤儿会话自动清退分钟数（5–120）
           <input id="colab-orphan-minutes" type="number" min="5" max="120" step="1" required>
         </label>
-        <label for="colab-drive-folder-id">Drive 歌曲根目录 ID（drive_songs_folder_id）
-          <input id="colab-drive-folder-id" type="text" maxlength="128" placeholder="Hakimi_Songs 根目录 Folder ID（留空回退 .env）">
-        </label>
       </div>
       <div class="row">
         <button id="colab-save" type="submit" class="primary" disabled>保存算力配置</button>
@@ -260,16 +257,5 @@
     </div>
     <p class="muted">展示排队中、执行中及历史完成的 Colab GPU 作业；等待或执行中的作业可在此取消。</p>
     <div id="colab-jobs-table" class="table"></div>
-  </div>
-  <div class="card">
-    <div class="row between">
-      <h2>Drive <code>Hakimi_Songs/inbox/</code> 待学原曲</h2>
-      <div class="row">
-        <button id="colab-refresh-inbox" type="button" class="secondary">刷新收件箱</button>
-        <button type="button" class="secondary" data-open-tab="songs">前往猫猫歌单 →</button>
-      </div>
-    </div>
-    <p class="muted">将干声或原唱音频上传到 Google Drive <code>Hakimi_Songs/inbox/</code> 后，可在此一键填入学歌表单或直接发起学歌任务。</p>
-    <div id="colab-inbox-table" class="table"></div>
   </div>
 </section>

@@ -197,7 +197,7 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
-let songGeneration=0,selectedSongFile=null,pendingSongLearn=null;
+let songGeneration=0,selectedSongFile=null,pendingSongLearn=null,lastSongStorageState=null;
 const songBlobCache=new Map();
 
 const songErrorLabels={
@@ -210,6 +210,15 @@ const songErrorLabels={
   song_title_exists:'歌名已存在，请更换歌名或先删除旧曲目',
   song_already_exists:'相同音频切片已在歌单中',
   song_library_full:'歌单曲目数或总容量已达上限',
+  song_drive_not_configured:'Google Drive Hakimi_Songs/ 云盘尚未配置（请检查凭据或目录设置）',
+  song_drive_unavailable:'Google Drive 云盘暂时不可达，请稍后重试',
+  song_drive_invalid_file:'Drive 原曲文件无效或不在 Hakimi_Songs/ 目录内',
+  song_drive_invalid_folder_id:'Drive 歌曲根目录 ID 格式无效（禁止填写 root）',
+  song_inbox_upload_too_large:'上传原曲超过 100 MiB 上限',
+  song_inbox_upload_timeout:'原曲上传超时，请稍后重试',
+  compressed_song_upload_forbidden:'原曲上传不支持压缩编码，请使用原始音频直传',
+  drive_context_required:'缺少 Drive 短期授权上下文，请先检查歌单云盘配置',
+  source_not_found:'未找到干净官方原曲，可手动上传音频到收件箱或私聊发送原曲',
   colab_unconfigured:'Colab 云端算力 Worker 尚未配置，请先在「Colab 云端算力」检查配置',
   colab_disabled:'Colab 云端算力调度当前已关闭，请先开启后再试',
   colab_worker_unavailable:'Colab Worker 当前离线或不可达，请稍后重试',
@@ -218,9 +227,20 @@ const songErrorLabels={
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
   colab_daily_limit_reached:'今日 Colab 作业次数或 CU 预算已达上限',
   colab_inbox_upload_too_large:'上传原曲超过 100 MiB 上限',
-  colab_drive_invalid_file:'原曲文件名无效',
+  colab_drive_invalid_file:'原曲文件名无效或不在 Hakimi_Songs/ 目录内',
+  colab_drive_not_configured:'Google Drive Hakimi_Songs/ 目录尚未初始化或未配置',
   song_upload_too_large:'上传音频超过 100 MiB 上限',
   song_audio_required:'请先选择有效的音频文件'
+};
+const songStorageSourceLabels={
+  sqlite:'后台 SQLite 覆盖（重启保留）',
+  admin:'后台 SQLite 覆盖（重启保留）',
+  legacy_sqlite:'旧 Colab SQLite 配置兼容迁移',
+  env:'环境变量默认配置',
+  legacy_env:'环境变量兼容配置（COLAB_DRIVE_SONGS_FOLDER_ID）',
+  default:'默认配置（My Drive 自动查找 Hakimi_Songs）',
+  auto:'默认配置（My Drive 自动查找 Hakimi_Songs）',
+  none:'未配置'
 };
 function mapSongError(err){
   const msg=String(err?.message||'操作失败');
@@ -234,6 +254,13 @@ function formatByteSize(bytes){
   if(n>=1024)return Math.ceil(n/1024)+' KiB';
   return n+' B';
 }
+function formatInboxTime(v){
+  if(!v)return '—';
+  if(typeof v==='number')return dateTime(v);
+  const parsed=Date.parse(String(v));
+  if(Number.isFinite(parsed))return new Date(parsed).toLocaleString('zh-CN',{timeZone:displayZone,hour12:false});
+  return String(v);
+}
 function sanitizeSongTitleStem(filename){
   const stem=String(filename||'').replace(/\.[^.]+$/,'');
   const cleaned=stem.replace(/[^\p{L}\p{M}\p{N}\s_\-'’‘&!?！？,，.。、~～+:：·・—–()（）\[\]【】「」『』@#%*=♡♥★☆♪♫]/gu,' ').replace(/\s+/g,' ').trim();
@@ -246,6 +273,21 @@ function clearSongLearnForm(){
   $('song-learn-pitch').value='0';
   $('song-learn-inbox').value='';
   $('song-learn-auto-search').checked=true;
+}
+function showSongLearnResult(job,title,inboxFilename,pitch){
+  const jobId=job?.id||job?.job_id||'—';
+  const status=job?.status||'queued';
+  const box=$('song-learn-result');
+  const head=el('div',undefined,'sub-card-head');
+  head.append(el('h3','已提交学歌作业：'+title),pill('状态：'+status,'ok'));
+  const info=el('p','作业 ID：'+jobId+(inboxFilename?' · 原曲来源：Drive inbox / '+inboxFilename:' · 自动检索官方原版')+' · 升降调：'+(pitch>0?'+'+pitch:String(pitch)),'muted');
+  const actions=el('div',undefined,'row');
+  const jumpBtn=el('button','前往 Colab 云端算力查看队列 →','secondary');
+  jumpBtn.type='button';
+  jumpBtn.dataset.openTab='colab-compute';
+  actions.append(jumpBtn);
+  box.replaceChildren(head,info,actions);
+  box.hidden=false;
 }
 function prefillSongLearn(item){
   const name=String(item?.name||'');
@@ -288,7 +330,7 @@ async function songRequest(path,method='GET',body,extraHeaders={}){
 async function uploadInboxAudio(file){
   const signal=sessionRequests.signal;
   const contentType=(file.type&&/^audio\/(?:mpeg|mp3|wav|x-wav|wave|ogg|opus|mp4|x-m4a|flac)$/i.test(file.type))?file.type:'application/octet-stream';
-  const r=await fetch('/admin/api/colab/drive/inbox',{
+  const r=await fetch('/admin/api/songs/inbox',{
     method:'POST',
     signal,
     headers:{
@@ -332,19 +374,46 @@ function mountSongAudio(slot,url,autoplay=false){
   audio.src=url;
   slot.replaceChildren(audio);
 }
-async function loadSongInboxSelect(strict=false){
+function renderSongStorageDetails(storage,opts={}){
+  const st=storage&&typeof storage==='object'?storage:{};
+  const configured=Boolean(st.configured);
+  const src=String(st.source||'default');
+  const folderId=String(st.drive_songs_folder_id||'');
+  const folders=st.folders&&typeof st.folders==='object'?st.folders:null;
+  const err=String(st.error||'');
+  lastSongStorageState={configured,source:src,drive_songs_folder_id:folderId,folders,error:err};
+
+  const srcLabel=songStorageSourceLabels[src]||cfgSourceLabels[src]||src;
+  const statusLabel=configured?'Google Drive 已独立接管（不依赖 Colab Worker）':'Google Drive 尚未配置';
+  text('song-storage-source',statusLabel+' · 配置来源：'+srcLabel+(err?' · 提示：'+mapSongError({message:err}):''));
+
+  const rows=[
+    ['配置来源',srcLabel],
+    ['配置歌曲根目录 ID (drive_songs_folder_id)',folderId||'未覆写（跟随默认配置）']
+  ];
+  if(folders){
+    for(const [k,label] of [['root','Hakimi_Songs/ (root)'],['models','models/'],['songs','songs/'],['inbox','inbox/']]){
+      rows.push([label,folders[k]||'未就绪']);
+    }
+  }else{
+    rows.push(['Drive Hakimi_Songs/ 目录状态',configured?(err?'目录读取异常：'+mapSongError({message:err}):'凭据已就绪，点击「刷新收件箱」探测目录 ID'):'尚未配置 Google Drive OAuth 凭据']);
+  }
+  $('song-drive-details').replaceChildren(...rows.map(([k,v])=>{
+    const row=el('div');row.append(el('dt',k),el('dd',v));return row;
+  }));
+
+  if(!opts.preserveInput){
+    $('song-drive-folder-id').value=folderId;
+    clearDirty('song-storage-form');
+  }
+  $('song-storage-save').disabled=false;
+  $('song-storage-reset').disabled=false;
+}
+function renderSongInboxSelect(items,errMsg=''){
   const sel=$('song-learn-inbox');
   const prev=pendingSongLearn?pendingSongLearn.inboxFilename:sel.value;
-  let items=[];
-  try{
-    const res=await api('colab/drive/inbox');
-    if(!token)return 0;
-    items=Array.isArray(res)?res:(Array.isArray(res?.items)?res.items:[]);
-  }catch(err){
-    if(strict)throw Error(mapSongError(err));
-    items=[];
-  }
-  const first=selectOption('',items.length?'不指定文件（使用下方自动检索）':'不指定文件（Drive inbox 暂无原曲或 Worker 离线）');
+  const emptyHint=errMsg?'不指定文件（Drive inbox 暂不可读）':'不指定文件（Drive inbox 暂无原曲）';
+  const first=selectOption('',items.length?'不指定文件（使用下方自动检索）':emptyHint);
   const opts=[first];
   for(const item of items){
     const name=String(item?.name||'').trim();
@@ -366,6 +435,94 @@ async function loadSongInboxSelect(strict=false){
     $('song-learn-auto-search').checked=Boolean(pendingSongLearn.autoSearch);
     pendingSongLearn=null;
   }
+}
+function renderSongInboxTable(items,errMsg=''){
+  if(errMsg){
+    $('song-inbox-table').replaceChildren(el('p','Drive inbox 暂不可读：'+errMsg,'empty-state'));
+    return;
+  }
+  table('song-inbox-table',['文件名','大小','修改时间','操作'],(items||[]).map(item=>{
+    const ops=el('div',undefined,'row');
+    ops.append(
+      button('填入学歌',()=>{
+        prefillSongLearn(item);
+        pendingSongLearn=null;
+        const heading=$('song-learn-heading');
+        if(heading){
+          heading.tabIndex=-1;
+          heading.focus({preventScroll:true});
+          heading.scrollIntoView({block:'start'});
+        }
+        notice('已将「'+(item.name||'')+'」填入下方学歌表单');
+      },'secondary'),
+      button('直接学歌',async()=>{
+        const title=await promptDialog('直接发起 Colab 学歌',{
+          message:'原曲文件：'+item.name+'（默认升降调 Pitch = 0）',
+          hint:'请确认或修改入库歌名（1～60字，提交后将立即提交 RVC 翻唱作业）：',
+          defaultValue:sanitizeSongTitleStem(item.name),
+          placeholder:'输入歌名（1～60字）',
+          confirmLabel:'立即提交作业'
+        });
+        if(title===null)return;
+        const clean=title.trim();
+        if(!clean)throw Error('请填写歌名（1～60字）');
+        let job;
+        try{
+          job=await api('songs/learn','POST',{
+            title:clean,
+            inbox_filename:item.name,
+            inbox_file_id:item.id||'',
+            pitch:0,
+            auto_search:false
+          });
+        }catch(err){
+          if(err?.name==='AbortError')throw err;
+          throw Error(mapSongError(err));
+        }
+        showSongLearnResult(job,clean,item.name,0);
+        notice('已发起学歌作业「'+clean+'」（'+(job?.id||job?.job_id||'queued')+'），可在「Colab 云端算力」查看进度');
+      },'primary')
+    );
+    return [
+      item.name||'—',
+      item.size!=null?formatByteSize(item.size):'—',
+      formatInboxTime(item.modified_time),
+      ops
+    ];
+  }));
+}
+async function loadSongStorage(strict=false){
+  try{
+    const st=await api('songs/storage');
+    if(!token)return null;
+    renderSongStorageDetails(st);
+    return st;
+  }catch(err){
+    if(err?.name==='AbortError')throw err;
+    if(strict)throw Error(mapSongError(err));
+    return null;
+  }
+}
+async function loadSongInbox(strict=false){
+  let items=[],errMsg='';
+  try{
+    const res=await api('songs/inbox');
+    if(!token)return 0;
+    items=Array.isArray(res)?res:(Array.isArray(res?.items)?res.items:[]);
+    if(res&&res.folders&&typeof res.folders==='object'&&lastSongStorageState&&!lastSongStorageState.folders){
+      renderSongStorageDetails({...lastSongStorageState,folders:res.folders},{preserveInput:true});
+    }
+  }catch(err){
+    if(err?.name==='AbortError')throw err;
+    errMsg=mapSongError(err);
+    if(strict){
+      renderSongInboxTable([],errMsg);
+      renderSongInboxSelect([],errMsg);
+      throw Error(errMsg);
+    }
+  }
+  renderSongInboxTable(items,errMsg);
+  renderSongInboxSelect(items,errMsg);
   return items.length;
 }
 function renderSongStorageBar(d){
@@ -373,15 +530,17 @@ function renderSongStorageBar(d){
   const cacheBytes=Number(d.cache_bytes??0);
   const cacheMax=Number(d.cache_max_bytes??30*1048576);
   const cachedCount=Number(d.cached_count??0);
+  const driveOk=Boolean(d.drive_configured);
   const colabOk=Boolean(d.colab_configured);
   const ratio=cacheMax>0?cacheBytes/cacheMax:0;
   $('song-storage-pills').replaceChildren(
+    pill(driveOk?'Drive 云盘已配置':'Drive 云盘未配置',driveOk?'ok':'muted'),
     pill('Drive 主存 '+driveCount+' 首',driveCount>0?'ok':'muted'),
     pill('本地热缓存 '+formatByteSize(cacheBytes)+' / '+formatByteSize(cacheMax)+'（'+cachedCount+' 首）',ratio>=0.9?'warn':cachedCount>0?'paid':'muted'),
-    pill(colabOk?'Colab 算力就绪':'Colab 算力未配置',colabOk?'ok':'muted')
+    pill(colabOk?'Colab GPU 算力就绪':'Colab GPU 算力未配置',colabOk?'vertex':'muted')
   );
-  text('song-cache-state','Drive 主存 '+driveCount+' 首 · 本地 LRU 热缓存占用 '+formatByteSize(cacheBytes)+' / '+formatByteSize(cacheMax)+'（共 '+cachedCount+' 首缓存；纯本地上传曲目永不淘汰）· '+(colabOk?'Colab 云端算力已配置':'Colab Worker 尚未配置'));
-  text('song-learn-colab-hint',colabOk?'Colab 算力已就绪：提交后将在后台 GPU 执行分离与 RVC 翻唱推理，完成后自动入库并通知 Owner。':'提示：当前 Colab Worker 尚未配置或未就绪，可在「Colab 云端算力」页面查看 Worker 状态与预算设置。');
+  text('song-cache-state','Drive 云盘（歌单工坊独立直连）：'+(driveOk?'已配置':'未配置')+' · Drive 主存 '+driveCount+' 首 · 本地 LRU 热缓存占用 '+formatByteSize(cacheBytes)+' / '+formatByteSize(cacheMax)+'（共 '+cachedCount+' 首缓存；纯本地上传曲目永不淘汰）· Colab GPU 算力（仅学歌推理）：'+(colabOk?'已配置':'未配置'));
+  text('song-learn-colab-hint',(driveOk?'Drive 歌单主存与原曲收件箱已独立就绪；':'提示：Drive 歌单存储尚未配置，收件箱与云盘归档暂不可用；')+(colabOk?'Colab GPU 算力已就绪，提交后将在云端执行人声分离与 RVC 翻唱推理，完成后自动入库并通知 Owner。':'当前 Colab GPU Worker 尚未配置，仍可正常播放歌单、管理 Drive 收件箱或手动上传翻唱成品；如需自动学歌请在「Colab 云端算力」配置 Worker。'));
 }
 function songStoragePills(item){
   const badges=[];
@@ -398,10 +557,19 @@ function songStoragePills(item){
 async function songs(){
   songGeneration++;
   const generation=songGeneration;
-  const [songsRes]=await Promise.allSettled([api('songs'),loadSongInboxSelect(false)]);
+  const [songsRes,storageRes]=await Promise.allSettled([api('songs'),loadSongStorage(false),loadSongInbox(false)]);
   if(songsRes.status==='rejected')throw songsRes.reason;
   const d=songsRes.value;
   if(!token||generation!==songGeneration)return;
+  if(storageRes.status!=='fulfilled'||!storageRes.value){
+    renderSongStorageDetails({
+      configured:Boolean(d.drive_configured),
+      source:d.drive_config_source||'default',
+      drive_songs_folder_id:d.drive_songs_folder_id||'',
+      folders:d.drive_folders||null,
+      error:d.drive_error||''
+    });
+  }
   const validIds=new Set(d.items.map(item=>item.id));
   for(const [id,url] of songBlobCache){
     if(!validIds.has(id)){URL.revokeObjectURL(url);songBlobCache.delete(id);}
@@ -454,27 +622,56 @@ async function songs(){
     listEl.append(card);
   }
 }
-$('song-refresh').addEventListener('click',e=>busy(e.target,songs));
+$('song-refresh').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!(await confirmDiscardTabChanges('songs','刷新歌单')))return;
+  await songs();
+}));
 $('song-cache-evict').addEventListener('click',e=>busy(e.target,async()=>{
   const res=await api('songs/cache/evict','POST');
   notice('已清理本地 LRU 热缓存：释放 '+(res.evicted_count??0)+' 首（'+formatByteSize(res.freed_bytes??0)+'），剩余缓存 '+formatByteSize(res.cache_bytes??0));
   await songs();
 }));
-$('song-learn-refresh-inbox').addEventListener('click',e=>busy(e.target,async()=>{
-  const count=await loadSongInboxSelect(true);
-  notice('已刷新 Drive inbox 收件箱（共 '+count+' 首待学原曲）');
+for(const refreshBtnId of ['song-refresh-inbox','song-learn-refresh-inbox']){
+  $(refreshBtnId).addEventListener('click',e=>busy(e.target,async()=>{
+    const count=await loadSongInbox(true);
+    notice('已刷新 Drive inbox 收件箱（共 '+count+' 首待学原曲）');
+  }));
+}
+$('song-storage-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('song-storage-save'),async()=>{
+    const folderId=$('song-drive-folder-id').value.trim();
+    if(folderId.toLowerCase()==='root')throw Error(songErrorLabels.song_drive_invalid_folder_id);
+    let next;
+    try{next=await api('songs/storage','PUT',{drive_songs_folder_id:folderId});}
+    catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
+    if(!token)return;
+    renderSongStorageDetails(next);
+    await loadSongInbox(false);
+    notice('歌单 Drive 目录配置已保存并立即生效');
+  });
+});
+$('song-storage-reset').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!(await confirmDialog('移除后台覆盖值，恢复默认 Hakimi_Songs/ 云盘目录配置？',{danger:true,confirmLabel:'恢复默认配置'})))return;
+  let next;
+  try{next=await api('songs/storage','DELETE');}
+  catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
+  if(!token)return;
+  renderSongStorageDetails(next);
+  await loadSongInbox(false);
+  notice('已恢复默认歌单 Drive 目录配置');
 }));
 $('song-inbox-upload').addEventListener('click',e=>busy(e.target,async()=>{
   const file=$('song-inbox-file').files?.[0];
   if(!file)throw Error('请先选择要上传的原曲音频文件');
   if(file.size<=0)throw Error(songErrorLabels.invalid_song_audio);
   if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name))throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac 格式的原曲音频');
-  if(file.size>100*1024*1024)throw Error(songErrorLabels.colab_inbox_upload_too_large);
+  if(file.size>100*1024*1024)throw Error(songErrorLabels.song_inbox_upload_too_large);
   const res=await uploadInboxAudio(file);
   if(!token)return;
   $('song-inbox-file').value='';
   prefillSongLearn({id:res.file_id,name:res.name,size:res.size});
-  await loadSongInboxSelect(false);
+  await loadSongInbox(false);
   notice('已上传原曲「'+res.name+'」到 Drive inbox，可直接发起 Colab 学歌');
 }));
 $('song-learn-inbox').addEventListener('change',e=>{
@@ -517,18 +714,7 @@ $('song-learn-form').addEventListener('submit',e=>{
     try{job=await api('songs/learn','POST',payload);}
     catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
     const jobId=job?.id||job?.job_id||'—';
-    const status=job?.status||'queued';
-    const box=$('song-learn-result');
-    const head=el('div',undefined,'sub-card-head');
-    head.append(el('h3','已提交学歌作业：'+title),pill('状态：'+status,'ok'));
-    const info=el('p','作业 ID：'+jobId+(inboxFilename?' · 原曲来源：Drive inbox / '+inboxFilename:' · 自动检索官方原版')+' · 升降调：'+(pitch>0?'+'+pitch:String(pitch)),'muted');
-    const actions=el('div',undefined,'row');
-    const jumpBtn=el('button','前往 Colab 云端算力查看队列 →','secondary');
-    jumpBtn.type='button';
-    jumpBtn.dataset.openTab='colab-compute';
-    actions.append(jumpBtn);
-    box.replaceChildren(head,info,actions);
-    box.hidden=false;
+    showSongLearnResult(job,title,inboxFilename,pitch);
     clearSongLearnForm();
     notice('已提交学歌任务「'+title+'」（作业 '+jobId+'），可在「Colab 云端算力」查看作业进度');
     await songs();
@@ -569,6 +755,7 @@ $('song-upload').addEventListener('submit',e=>{
 
 trackDirty('bili-policy','小号巡逻设置');
 trackDirty('video-watch-policy','原片分析设置');
+trackDirty('song-storage-form','歌单云盘目录');
 
 onLogout(()=>{
   clearMemePreviews(true);
@@ -576,10 +763,17 @@ onLogout(()=>{
   clearSongPreviews(true);
   selectedSongFile=null;
   pendingSongLearn=null;
+  lastSongStorageState=null;
   clearSongLearnForm();
   $('song-learn-inbox').replaceChildren(selectOption('','不指定文件（使用下方自动检索）'));
   $('song-learn-result').hidden=true;
   $('song-learn-result').replaceChildren();
+  $('song-drive-details').replaceChildren();
+  $('song-inbox-table').replaceChildren();
+  $('song-drive-folder-id').value='';
+  $('song-storage-save').disabled=true;
+  $('song-storage-reset').disabled=true;
+  text('song-storage-source','');
   text('song-file-name','未选择音频文件');
   text('meme-prompt-count','当前已加载到 Prompt 的有效表情数量：0');
   text('song-prompt-count','当前已加载到 Prompt 的有效曲目：0');

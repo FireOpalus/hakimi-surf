@@ -129,8 +129,9 @@ def test_nginx_conf_enables_gzip_safely_and_preserves_security():
     ):
         assert required in conf
 
+    assert "colab/drive/inbox" not in conf
     for exact_loc in (
-        "location = /admin/api/colab/drive/inbox",
+        "location = /admin/api/songs/inbox",
         "location = /admin/api/songs/upload",
     ):
         m = re.search(
@@ -603,7 +604,7 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
     ledger_js = (ADMIN_DIR / "src" / "js" / "02-overview-ledger.js").read_text(encoding="utf-8")
     shell_js = (ADMIN_DIR / "src" / "js" / "08-modules-shell.js").read_text(encoding="utf-8")
     colab_start = shell_js.index("const colabErrorLabels=")
-    colab_end = shell_js.index("function renderColabInbox(")
+    colab_end = shell_js.index("async function colabCompute(")
     colab_view_js = shell_js[colab_start:colab_end]
 
     # Collect every static HTML ID so the mock document returns a valid MockElement for all of them.
@@ -949,3 +950,241 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
         check=False,
     )
     assert proc.returncode == 0, f"JS runtime test failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+def test_colab_and_songs_ui_physical_decoupling():
+    """Verify #colab-compute and #songs are physically decoupled in HTML, JS, and runtime."""
+    import json
+    import shutil
+
+    html = ADMIN_HTML.read_text(encoding="utf-8")
+    assert audit_html(html) == []
+
+    collector = _IdCollector()
+    collector.feed(html)
+    id_set = set(collector.ids)
+
+    # Removed Colab song/Drive coupling DOM IDs and legacy endpoints
+    for removed_token in (
+        "colab/drive/inbox",
+        "colab-drive-details",
+        "colab-drive-folder-id",
+        "colab-inbox-table",
+        "colab-refresh-inbox",
+    ):
+        assert removed_token not in html, f"Residual coupled token found: {removed_token!r}"
+
+    # Pure Colab GPU & standalone Song Studio Drive DOM IDs
+    for required_id in (
+        "colab-job-types",
+        "song-storage-source",
+        "song-drive-details",
+        "song-storage-form",
+        "song-drive-folder-id",
+        "song-storage-save",
+        "song-storage-reset",
+        "song-refresh-inbox",
+        "song-inbox-table",
+        "song-inbox-file",
+        "song-inbox-upload",
+        "song-learn-heading",
+        "song-learn-inbox",
+    ):
+        assert required_id in id_set, f"Missing expected decoupled DOM id: {required_id}"
+
+    scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert len(scripts) == 1
+    script = scripts[0]
+    assert "/admin/api/songs/inbox" in script
+    assert "api('songs/inbox')" in script
+    assert "api('songs/storage'" in script
+    assert "supported_job_types" in script
+
+    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+    runner: list[str] | None = None
+    if shutil.which("node"):
+        runner = ["node", "-e"]
+    elif jsc_path.is_file():
+        runner = [str(jsc_path), "-e"]
+    if runner is None:
+        pytest.skip("No local JS engine (node/jsc) available for decoupled UI runtime test")
+
+    core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
+    media_js = (ADMIN_DIR / "src" / "js" / "07-media-bili.js").read_text(encoding="utf-8")
+    song_start = media_js.index("let songGeneration=0")
+    song_end = media_js.index("async function songs()")
+    song_helpers_js = media_js[song_start:song_end]
+    all_ids_json = json.dumps(sorted(id_set))
+
+    harness = f"""
+    const ALL_IDS = {all_ids_json};
+    const cfgSourceLabels = {{
+      admin: 'SQLite 热配置', sqlite: 'SQLite 热配置', env: '.env 默认值', none: '未配置'
+    }};
+    class MockNode {{
+      constructor(tag) {{
+        this.tagName = String(tag || 'div').toUpperCase();
+        this.children = [];
+        this.attrs = {{}};
+        this.dataset = {{}};
+        this.listeners = {{}};
+        this._text = '';
+        this.hidden = false;
+        this.disabled = false;
+        this.checked = false;
+        this.value = '';
+        this.className = '';
+        this.tabIndex = 0;
+        this.options = [];
+        this.classList = {{ add(){{}}, remove(){{}}, toggle(){{}}, contains(){{ return false; }} }};
+      }}
+      get textContent() {{
+        return this.children.length
+          ? this._text + this.children.map(c => c.textContent).join('')
+          : this._text;
+      }}
+      set textContent(v) {{ this._text = String(v ?? ''); this.children = []; }}
+      setAttribute(k, v) {{
+        if (k === 'class') this.className = String(v);
+        this.attrs[k] = String(v);
+      }}
+      getAttribute(k) {{ return this.attrs[k] ?? null; }}
+      removeAttribute(k) {{ delete this.attrs[k]; }}
+      append(...nodes) {{
+        for (const n of nodes) {{
+          if (n instanceof MockNode) {{
+            this.children.push(n);
+            if (n.tagName === 'OPTION') this.options.push(n);
+          }} else {{
+            const t = new MockNode('#text'); t._text = String(n); this.children.push(t);
+          }}
+        }}
+      }}
+      replaceChildren(...nodes) {{
+        this.children = []; this.options = []; this._text = ''; this.append(...nodes);
+      }}
+      addEventListener(evt, fn) {{ (this.listeners[evt] ||= []).push(fn); }}
+      dispatch(evt) {{
+        for (const fn of (this.listeners[evt] || [])) fn({{ target: this, preventDefault(){{}} }});
+      }}
+      querySelector() {{ return null; }}
+      querySelectorAll() {{ return []; }}
+      closest() {{ return null; }}
+      focus() {{ this._focused = true; }}
+      scrollIntoView() {{ this._scrolled = true; }}
+    }}
+    const Node = MockNode;
+    const byId = new Map();
+    for (const id of ALL_IDS) {{
+      const n = new MockNode('div');
+      n.id = id;
+      byId.set(id, n);
+    }}
+    const document = {{
+      body: new MockNode('body'),
+      documentElement: new MockNode('html'),
+      hidden: false,
+      activeElement: null,
+      title: '',
+      getElementById(id) {{ return byId.get(id) || null; }},
+      createElement(tag) {{ return new MockNode(tag); }},
+      createTextNode(t) {{ const n = new MockNode('#text'); n._text = String(t); return n; }},
+      addEventListener() {{}},
+      querySelectorAll() {{ return []; }}
+    }};
+    class AbortController {{
+      constructor() {{ this.signal = {{ aborted: false }}; }}
+      abort() {{ this.signal.aborted = true; }}
+    }}
+    function setTimeout(){{ return 0; }}
+    function clearTimeout(){{}}
+    function clearInterval(){{}}
+    const location = {{ hash: '', pathname: '/admin' }};
+    const history = {{ replaceState(){{}}, pushState(){{}} }};
+
+    {core_js}
+    {song_helpers_js}
+
+    function walk(node, acc=[]) {{
+      acc.push(node);
+      for (const c of (node.children || [])) walk(c, acc);
+      return acc;
+    }}
+    function assert(cond, msg) {{ if (!cond) throw new Error('ASSERT FAILED: ' + msg); }}
+
+    // 1. Song storage bar displays Drive & Colab independently (Drive ready while Colab offline)
+    renderSongStorageBar({{
+      drive_configured: true,
+      colab_configured: false,
+      drive_backed_count: 3,
+      cache_bytes: 1048576,
+      cache_max_bytes: 31457280,
+      cached_count: 2
+    }});
+    assert($('song-storage-pills').textContent.includes('Drive 云盘已配置'), 'Drive ready pill');
+    assert(
+      $('song-storage-pills').textContent.includes('Colab GPU 算力未配置'),
+      'Colab unconfigured pill'
+    );
+    assert(
+      $('song-learn-colab-hint').textContent.includes('仍可正常播放歌单'),
+      'independent hint'
+    );
+
+    // 2. Drive storage details + folder ID input populate safely (including XSS text escaping)
+    const xss = '<img src=x onerror=alert(1)>';
+    renderSongStorageDetails({{
+      configured: true,
+      source: 'sqlite',
+      drive_songs_folder_id: 'folder_root_123',
+      folders: {{
+        root: 'folder_root_123',
+        models: 'folder_models_456',
+        songs: 'folder_songs_789',
+        inbox: 'folder_inbox_' + xss
+      }},
+      error: ''
+    }});
+    assert($('song-drive-folder-id').value === 'folder_root_123', 'folder id populated');
+    assert(
+      $('song-drive-details').textContent.includes('folder_models_456'),
+      'models folder shown'
+    );
+    assert(!walk($('song-drive-details')).some(n => n.tagName === 'IMG'), 'no XSS IMG in details');
+    assert($('song-storage-save').disabled === false, 'save enabled');
+    assert($('song-storage-reset').disabled === false, 'reset enabled');
+
+    // 3. Inbox table renders safely and 「填入学歌」 prefills & scrolls within #songs
+    const inboxItems = [
+      {{
+        id: 'file_1', name: '晴天 - 周杰伦.mp3', size: 4194304,
+        modified_time: '2026-11-22T09:00:00Z'
+      }},
+      {{ id: 'file_xss', name: xss + '.wav', size: 1024, modified_time: '' }}
+    ];
+    renderSongInboxSelect(inboxItems, '');
+    renderSongInboxTable(inboxItems, '');
+    assert(
+      !walk($('song-inbox-table')).some(n => n.tagName === 'IMG'),
+      'no XSS IMG in inbox table'
+    );
+    const prefillBtns = walk($('song-inbox-table')).filter(
+      n => n.tagName === 'BUTTON' && n.textContent === '填入学歌'
+    );
+    assert(prefillBtns.length === 2, 'expected 2 prefill buttons');
+    prefillBtns[0].dispatch('click');
+    assert($('song-learn-title').value.includes('晴天'), 'prefill title failed');
+    assert($('song-learn-inbox').value === '晴天 - 周杰伦.mp3', 'prefill select failed');
+    assert($('song-learn-auto-search').checked === false, 'prefill unchecks auto search');
+    assert($('song-learn-heading')._focused === true, 'prefill focuses learn heading');
+    assert($('song-learn-heading')._scrolled === true, 'prefill scrolls learn heading');
+    """
+
+    proc = subprocess.run(
+        [*runner, harness],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Song decoupled JS test failed:\n{proc.stderr}\n{proc.stdout}"

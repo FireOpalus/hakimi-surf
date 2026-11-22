@@ -397,12 +397,9 @@ const colabErrorLabels={
   colab_daily_job_limit:'今日 Colab 作业次数已达上限',
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
-  colab_invalid_job:'作业参数无效',
+  colab_invalid_job:'作业类型未注册或参数无效',
   colab_job_not_found:'未找到指定作业',
-  colab_job_not_cancellable:'该作业当前状态不可取消',
-  colab_drive_invalid_file:'Drive 原曲文件无效或不在 Hakimi_Songs/ 目录内',
-  colab_drive_not_configured:'Drive Hakimi_Songs/ 目录尚未初始化或未配置',
-  source_not_found:'未找到干净官方原曲，可手动发音频或放入 Drive inbox/'
+  colab_job_not_cancellable:'该作业当前状态不可取消'
 };
 const colabGpuList=['H100','A100','G4','L4','T4'];
 const colabJobTypeLabels={rvc_cover:'RVC 翻唱学歌',rvc_train:'RVC 音色训练'};
@@ -414,13 +411,6 @@ function throwColabError(err){
   const msg=String(err?.message||'操作失败');
   const code=msg.split('（')[0].trim();
   throw Error(colabErrorLabels[code]||msg);
-}
-function formatInboxTime(v){
-  if(!v)return '—';
-  if(typeof v==='number')return dateTime(v);
-  const parsed=Date.parse(String(v));
-  if(Number.isFinite(parsed))return new Date(parsed).toLocaleString('zh-CN',{timeZone:displayZone,hour12:false});
-  return String(v);
 }
 function renderColabOverview(d){
   if(!d)return;
@@ -452,18 +442,8 @@ function renderColabOverview(d){
   $('colab-cu-progress').value=cuBudget>0?Math.min(100,(cuUsed/cuBudget)*100):0;
   text('colab-cu-progress-label',cuUsed.toFixed(2)+' / '+cuBudget.toFixed(2)+' CU');
   text('colab-state','首选 GPU：'+(c.preferred_gpu||'L4')+' · 回退顺序：'+((c.fallback_gpus||[]).join(', ')||'无')+(w.error?' · Worker 状态提示：'+(colabErrorLabels[w.error]||w.error):''));
-
-  const driveRows=[['配置歌曲根目录 ID (drive_songs_folder_id)',c.drive_songs_folder_id||'未覆写（跟随 Worker/.env 默认）']];
-  if(w.drive_folders&&typeof w.drive_folders==='object'){
-    for(const [k,label] of [['root','Hakimi_Songs/ (root)'],['models','models/'],['songs','songs/'],['inbox','inbox/']]){
-      driveRows.push([label,w.drive_folders[k]||'未就绪']);
-    }
-  }else{
-    driveRows.push(['Drive Hakimi_Songs/ 目录状态',w.reachable?'尚未初始化（请检查 Drive 凭据）':'Worker 离线，暂未读取目录 ID']);
-  }
-  $('colab-drive-details').replaceChildren(...driveRows.map(([k,v])=>{
-    const row=el('div');row.append(el('dt',k),el('dd',v));return row;
-  }));
+  const supportedTypes=Array.isArray(d.supported_job_types)?d.supported_job_types:(Array.isArray(w.supported_job_types)?w.supported_job_types:[]);
+  text('colab-job-types','已注册作业类型：'+(supportedTypes.length?supportedTypes.map(jt=>colabJobTypeLabels[jt]?colabJobTypeLabels[jt]+'（'+jt+'）':jt).join('、'):'暂无已注册作业类型'));
 
   $('colab-enabled').checked=Boolean(c.enabled);
   $('colab-preferred-gpu').value=c.preferred_gpu||'L4';
@@ -472,7 +452,6 @@ function renderColabOverview(d){
   $('colab-daily-cu-budget').value=c.daily_cu_budget??10;
   $('colab-job-timeout').value=c.job_timeout_seconds??1800;
   $('colab-orphan-minutes').value=c.auto_terminate_orphan_minutes??20;
-  $('colab-drive-folder-id').value=c.drive_songs_folder_id||'';
   text('colab-config-source',(d.source==='sqlite'||d.source==='admin')?'当前配置来源：后台 SQLite 覆盖（重启保留）':'当前配置来源：默认 / 环境变量配置');
   $('colab-save').disabled=false;
   $('colab-reset').disabled=false;
@@ -483,7 +462,7 @@ function renderColabOverview(d){
 
   table('colab-jobs-table',['作业 ID','类型','目标','状态','GPU','CU 消耗','错误信息','操作'],(d.jobs||[]).map(job=>{
     const p=job.payload||{};
-    const target=p.title||p.model_name||p.query||p.inbox_filename||'—';
+    const target=p.title||p.model_name||p.query||p.target||p.inbox_filename||'—';
     const targetDisplay=target+(p.pitch?'（Pitch '+(p.pitch>0?'+'+p.pitch:p.pitch)+'）':'');
     const gpu=job.assigned_gpu||job.preferred_gpu||'—';
     const cu=job.cu_used!=null?Number(job.cu_used).toFixed(3):'—';
@@ -508,76 +487,12 @@ function renderColabOverview(d){
     ];
   }));
 }
-function renderColabInbox(items){
-  table('colab-inbox-table',['文件名','大小','修改时间','操作'],(items||[]).map(item=>{
-    const ops=el('div',undefined,'row');
-    ops.append(
-      button('填入学歌',async()=>{
-        prefillSongLearn(item);
-        await navigate('songs',{focusContent:true,heading:$('song-learn-heading')});
-      },'secondary'),
-      button('直接学歌',async()=>{
-        const title=await promptDialog('直接发起 Colab 学歌',{
-          message:'原曲文件：'+item.name+'（默认升降调 Pitch = 0）',
-          hint:'请确认或修改入库歌名（1～60字，提交后将立即提交 RVC 翻唱作业）：',
-          defaultValue:sanitizeSongTitleStem(item.name),
-          placeholder:'输入歌名（1～60字）',
-          confirmLabel:'立即提交作业'
-        });
-        if(title===null)return;
-        const clean=title.trim();
-        if(!clean)throw Error('请填写歌名（1～60字）');
-        let job;
-        try{
-          job=await api('songs/learn','POST',{
-            title:clean,
-            inbox_filename:item.name,
-            inbox_file_id:item.id||'',
-            pitch:0,
-            auto_search:false
-          });
-        }catch(err){
-          if(err?.name==='AbortError')throw err;
-          throw Error(mapSongError(err));
-        }
-        notice('已发起学歌作业「'+clean+'」（'+(job?.id||'queued')+'）');
-        await colabCompute();
-      },'primary')
-    );
-    return [
-      item.name||'—',
-      item.size!=null?formatByteSize(item.size):'—',
-      formatInboxTime(item.modified_time),
-      ops
-    ];
-  }));
-}
-async function loadColabInboxOnly(){
-  try{
-    const res=await api('colab/drive/inbox');
-    if(!token)return;
-    const items=Array.isArray(res)?res:(Array.isArray(res?.items)?res.items:[]);
-    renderColabInbox(items);
-    return items.length;
-  }catch(err){
-    if(err?.name==='AbortError')throw err;
-    const box=$('colab-inbox-table');
-    box.replaceChildren(el('p','Drive inbox 暂不可读：'+(colabErrorLabels[err?.message]||err?.message||'Worker 未就绪'),'empty-state'));
-    return 0;
-  }
-}
 async function colabCompute(){
-  const [overviewRes,inboxRes]=await Promise.allSettled([api('colab'),api('colab/drive/inbox')]);
-  if(overviewRes.status==='rejected')throwColabError(overviewRes.reason);
+  let d;
+  try{d=await api('colab');}
+  catch(err){throwColabError(err);}
   if(!token)return;
-  renderColabOverview(overviewRes.value);
-  if(inboxRes.status==='fulfilled'){
-    const raw=inboxRes.value;
-    renderColabInbox(Array.isArray(raw)?raw:(Array.isArray(raw?.items)?raw.items:[]));
-  }else{
-    const msg=inboxRes.reason?.message||'Worker 未就绪';
-    $('colab-inbox-table').replaceChildren(el('p','Drive inbox 暂不可读：'+(colabErrorLabels[msg]||msg),'empty-state'));
-  }
+  renderColabOverview(d);
 }
 $('refresh-colab').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('colab-compute','刷新 Colab 状态')))return;
@@ -588,12 +503,8 @@ $('colab-refresh-jobs').addEventListener('click',e=>busy(e.target,async()=>{
   catch(err){throwColabError(err);}
   notice('已刷新 Colab 作业队列');
 }));
-$('colab-refresh-inbox').addEventListener('click',e=>busy(e.target,async()=>{
-  const count=await loadColabInboxOnly();
-  notice('已刷新 Drive inbox（'+count+' 个文件）');
-}));
 $('colab-terminate-sessions').addEventListener('click',e=>busy(e.target,async()=>{
-  if(!(await confirmDialog('确认紧急清退全部活跃 Colab GPU 会话？正在运行的翻唱或训练作业将被立即中止。',{danger:true,confirmLabel:'紧急清退全部会话'})))return;
+  if(!(await confirmDialog('确认紧急清退全部活跃 Colab GPU 会话？正在运行的云端 GPU 作业将被立即中止。',{danger:true,confirmLabel:'紧急清退全部会话'})))return;
   let res;
   try{res=await api('colab/terminate-sessions','POST');}
   catch(err){throwColabError(err);}
@@ -628,8 +539,7 @@ $('colab-config-form').addEventListener('submit',e=>{
       daily_job_limit:jobLimit,
       daily_cu_budget:cuBudget,
       job_timeout_seconds:timeoutSec,
-      auto_terminate_orphan_minutes:orphanMins,
-      drive_songs_folder_id:$('colab-drive-folder-id').value.trim()
+      auto_terminate_orphan_minutes:orphanMins
     };
     let next;
     try{next=await api('colab','PUT',payload);}
@@ -981,7 +891,7 @@ onLogout(()=>{
   text('connection-label','等待连接状态');
   $('connection-dot').className='status-dot';
   text('ws-heartbeat','—');text('ws-source','—');
-  for(const id of ['module-catalog','system-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','module-heading-switch','colab-pills','colab-kpi-strip','colab-drive-details','colab-jobs-table','colab-inbox-table'])$(id).replaceChildren();
+  for(const id of ['module-catalog','system-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','module-heading-switch','colab-pills','colab-kpi-strip','colab-jobs-table'])$(id).replaceChildren();
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;
@@ -989,7 +899,7 @@ onLogout(()=>{
   text('weather-current','正在读取地点…');
   for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=false;
   for(const id of ['bili-module-backend','bili-module-autonomous'])text(id,'—');
-  for(const id of ['colab-state','colab-config-source'])text(id,'');
+  for(const id of ['colab-state','colab-job-types','colab-config-source'])text(id,'');
   text('colab-jobs-progress-label','0 / 0');
   text('colab-cu-progress-label','0.00 / 0.00 CU');
   $('colab-jobs-progress').value=0;
