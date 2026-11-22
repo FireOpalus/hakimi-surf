@@ -201,7 +201,7 @@ let songGeneration=0,selectedSongFile=null,pendingSongLearn=null;
 const songBlobCache=new Map();
 
 const songErrorLabels={
-  invalid_song_title:'歌名格式无效（须为 1～40 个汉字、字母、数字、空格、括号、·、_ 或 -）',
+  invalid_song_title:'歌名格式无效（支持 1～60 字多语种文字、数字与常见标点，不可含 / \\ < > " 等特殊符号）',
   invalid_song_meta:'原唱或标签元数据格式无效',
   invalid_song_pitch:'升降调 Pitch 须为 -24～24 之间的整数',
   invalid_drive_file_id:'Drive 原曲文件 ID 格式无效',
@@ -236,8 +236,8 @@ function formatByteSize(bytes){
 }
 function sanitizeSongTitleStem(filename){
   const stem=String(filename||'').replace(/\.[^.]+$/,'');
-  const cleaned=stem.replace(/[^A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff（）()·\s]/g,' ').replace(/\s+/g,' ').trim();
-  return cleaned.slice(0,40).trim();
+  const cleaned=stem.replace(/[^\p{L}\p{M}\p{N}\s_\-'’‘&!?！？,，.。、~～+:：·・—–()（）\[\]【】「」『』@#%*=♡♥★☆♪♫]/gu,' ').replace(/\s+/g,' ').trim();
+  return cleaned.slice(0,60).trim();
 }
 function clearSongLearnForm(){
   $('song-learn-title').value='';
@@ -321,7 +321,7 @@ function setSelectedSongFile(file){
   selectedSongFile=file;
   text('song-file-name',file.name+'（'+(file.size/1048576).toFixed(2)+' MiB）');
   if(!$('song-title').value.trim()){
-    const stem=file.name.replace(/\.[^.]+$/,'').replace(/\s+/g,' ').trim().slice(0,40);
+    const stem=sanitizeSongTitleStem(file.name);
     if(stem)$('song-title').value=stem;
   }
 }
@@ -494,7 +494,7 @@ $('song-learn-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('song-learn-submit'),async()=>{
     const title=$('song-learn-title').value.trim();
-    if(!title)throw Error('请填写歌名（1～40字）');
+    if(!title)throw Error('请填写歌名（1～60字）');
     const pitch=Number($('song-learn-pitch').value||'0');
     if(!Number.isInteger(pitch)||pitch<-24||pitch>24)throw Error(songErrorLabels.invalid_song_pitch);
     const sel=$('song-learn-inbox');
@@ -547,7 +547,7 @@ $('song-upload').addEventListener('submit',e=>{
     const file=selectedSongFile||$('song-file').files?.[0];
     if(!file)throw Error('请先选择或拖入音频文件');
     const title=$('song-title').value.trim();
-    if(!title)throw Error('请填写歌名（1～40字）');
+    if(!title)throw Error('请填写歌名（1～60字）');
     const startSec=Number($('song-start').value||'0');
     const durSec=Number($('song-duration').value||'50');
     if(!Number.isFinite(startSec)||startSec<0||startSec>600)throw Error('起始秒数须在 0～600 之间');

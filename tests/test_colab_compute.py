@@ -349,23 +349,63 @@ def test_transcribe_for_chorus_logs_cuda_fallback_and_stderr(
 ) -> None:
     logs: list[str] = []
     monkeypatch.setattr(colab_remote, "log", logs.append)
+    captured_scripts: list[str] = []
 
     def fake_run(cmd, **kwargs):
         del kwargs
         assert "--" not in cmd[:1]
+        captured_scripts.append(cmd[2])
+        assert 'language="zh"' not in cmd[2]
+        assert "language=" not in cmd[2]
+        assert "lang={detected_lang}" in cmd[2]
         assert "CUDA transcribe failed" in cmd[2]
         assert "cpu" in cmd[2]
         return colab_remote.subprocess.CompletedProcess(
             cmd,
             0,
             stdout='__WHISPER_SEGS__=[{"start": 62.0, "end": 66.0, "text": "高潮歌词"}]',
-            stderr="[whisper] CUDA transcribe failed; falling back to CPU int8.\n",
+            stderr="[whisper] CUDA transcribe failed; falling back to CPU int8.\n"
+            "[whisper] transcribed 1 segment(s) on cpu (lang=ja).\n",
         )
 
     monkeypatch.setattr(colab_remote, "_run", fake_run)
     segs = colab_remote._transcribe_for_chorus("python", tmp_path / "vocals.wav")
     assert len(segs) == 1 and segs[0]["text"] == "高潮歌词"
     assert any("falling back to CPU" in msg for msg in logs)
+    assert any("lang=ja" in msg for msg in logs)
+
+    # Verify the generated inline script auto-detects language (no language kwarg) & logs lang
+    import contextlib
+    import types
+
+    transcribe_calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeWhisperModel:
+        def __init__(self, size: str, *, device: str, compute_type: str) -> None:
+            self.device = device
+
+        def transcribe(self, path: str, **kwargs: Any):
+            transcribe_calls.append((self.device, dict(kwargs)))
+            if self.device == "cuda":
+                raise RuntimeError("cuda unavailable")
+            seg = types.SimpleNamespace(start=10.0, end=14.0, text="夜に駆ける")
+            info = types.SimpleNamespace(language="ja")
+            return iter([seg]), info
+
+    fake_fw = types.ModuleType("faster_whisper")
+    fake_fw.WhisperModel = _FakeWhisperModel  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_fw)
+    monkeypatch.setattr(sys, "argv", ["whisper.py", str(tmp_path / "vocals.wav")])
+    stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+        exec(compile(captured_scripts[0], "<whisper_inline>", "exec"), {})
+    assert transcribe_calls == [
+        ("cuda", {"vad_filter": True}),
+        ("cuda", {"vad_filter": False}),
+        ("cpu", {"vad_filter": True}),
+    ]
+    assert "(lang=ja)" in stderr_buf.getvalue()
+    assert "__WHISPER_SEGS__=" in stdout_buf.getvalue()
 
     def fake_fail(cmd, **kwargs):
         del kwargs

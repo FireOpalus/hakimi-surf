@@ -11,6 +11,7 @@ import re
 import stat
 import tempfile
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,7 +35,10 @@ CACHE_EVICT_INTERVAL_SECONDS = 1800.0
 MIN_SONG_PITCH = -24
 MAX_SONG_PITCH = 24
 
-SONG_TITLE_RE = re.compile(r"^[A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff（）()·\s]{1,40}\Z")
+MAX_SONG_TITLE_LEN = 60
+ALLOWED_SONG_TITLE_PUNCT = frozenset(
+    " _-'’‘&!?！？,，.。、~～+:：·・—–()（）[]【】「」『』@#%*=♡♥★☆♪♫"
+)
 SONG_ID_RE = re.compile(r"^[a-f0-9]{32}\Z")
 ALLOWED_SONG_EXTENSIONS = frozenset({"mp3", "wav", "ogg", "opus", "m4a", "flac"})
 MIME_BY_SONG_EXTENSION = {
@@ -98,12 +102,31 @@ def explicit_song_request(*texts: str) -> bool:
     return any(isinstance(t, str) and t and EXPLICIT_SONG_REQUEST_RE.search(t) for t in texts)
 
 
+def _is_allowed_song_title_char(ch: str) -> bool:
+    return ch in ALLOWED_SONG_TITLE_PUNCT or unicodedata.category(ch).startswith(("L", "M", "N"))
+
+
+def is_valid_song_title(title: str) -> bool:
+    """Validate canonical song title across multilingual text, digits, and safe punctuation."""
+    if not isinstance(title, str):
+        return False
+    if not (1 <= len(title) <= MAX_SONG_TITLE_LEN):
+        return False
+    if title != title.strip():
+        return False
+    if "\r" in title or "\n" in title or "\t" in title:
+        return False
+    if title in {".", ".."} or "/" in title or "\\" in title:
+        return False
+    return all(_is_allowed_song_title_char(ch) for ch in title)
+
+
 def validate_song_title(title: str) -> str:
     """Normalize whitespace and validate canonical song title."""
     if not isinstance(title, str):
         raise Rejected("invalid_song_title")
     normalized = " ".join(clean_text(title).split()).strip()
-    if not normalized or not SONG_TITLE_RE.fullmatch(normalized):
+    if not is_valid_song_title(normalized):
         raise Rejected("invalid_song_title")
     return normalized
 
@@ -172,7 +195,7 @@ def _safe_learn_upload_name(audio_filename: str, fallback_title: str) -> tuple[s
             stem_raw = stem_part or fallback_title
         else:
             stem_raw = base
-    safe_stem = re.sub(r"[^A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff]+", "_", stem_raw).strip("_")
+    safe_stem = re.sub(r"[^\w\-]+", "_", stem_raw).strip("_")
     safe_stem = (safe_stem or "track")[:60]
     return f"{safe_stem}.{ext}", MIME_BY_SONG_EXTENSION.get(ext, "application/octet-stream")
 
@@ -446,7 +469,7 @@ class SongLibrary:
             isinstance(row.get("id"), str)
             and bool(SONG_ID_RE.fullmatch(row["id"]))
             and isinstance(row.get("title"), str)
-            and bool(SONG_TITLE_RE.fullmatch(row["title"]))
+            and is_valid_song_title(row["title"])
             and row.get("filename") == f"{row['id']}.mp3"
             and row.get("mime_type") == "audio/mpeg"
             and isinstance(row.get("digest"), str)

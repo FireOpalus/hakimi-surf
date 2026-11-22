@@ -23,7 +23,15 @@ from pydantic import SecretStr
 from hakimi.app import create_app
 from hakimi.modules import ModuleRegistry
 from hakimi.security import Rejected
-from hakimi.songs import MAX_LEARN_UPLOAD_BYTES, MAX_STORED_SONG_BYTES, SongLibrary
+from hakimi.songs import (
+    MAX_LEARN_UPLOAD_BYTES,
+    MAX_SONG_TITLE_LEN,
+    MAX_STORED_SONG_BYTES,
+    SongLibrary,
+    _safe_learn_upload_name,
+    is_valid_song_title,
+    validate_song_title,
+)
 from hakimi.system_modules import SystemResources
 from hakimi.system_modules.song_studio import Module as SongStudioModule
 from tests.fakes import FakeGateway
@@ -161,6 +169,9 @@ class _FakeColabCompute:
 
     def register_completion_hook(self, job_type: str, callback: Any) -> None:
         self.hooks[job_type] = callback
+
+    async def close(self) -> None:
+        return None
 
 
 class _FakeProactive:
@@ -510,6 +521,135 @@ async def test_request_learn_song_dual_track_priority_and_validation(store):
     _, p3, _ = compute.submitted_jobs[-1]
     assert p3["query"] == "夜曲"
     assert p3["auto_search"] is True
+
+
+async def test_multilingual_punctuation_song_titles_and_safe_upload_names(
+    settings, store, fake_ffmpeg_bins, tmp_path: Path
+):
+    assert MAX_SONG_TITLE_LEN == 60
+    assert _safe_learn_upload_name("夜に駆ける.mp3", "track") == ("夜に駆ける.mp3", "audio/mpeg")
+
+    multilingual_titles = (
+        "夜に駆ける",
+        "사랑을 했다 (Love Scenario)",
+        "Été d'amour",
+        "Алые паруса",
+        "พรุ่งนี้",
+    )
+    punctuation_titles = (
+        "Don't Stop Me Now!",
+        "Wait...",
+        "LOVE・DIVE",
+        "君の名は。",
+        "A & B [Remix]",
+    )
+    boundary_60 = "a" * 60
+    for good_title in (*multilingual_titles, *punctuation_titles, boundary_60):
+        assert is_valid_song_title(good_title), good_title
+        assert validate_song_title(good_title) == good_title
+
+    assert not is_valid_song_title("bad\ntitle")
+    assert not is_valid_song_title(" leading")
+
+    unsafe_titles = (
+        "",
+        "   ",
+        "../bad",
+        "..",
+        ".",
+        "a/b",
+        "a\\b",
+        "<script>",
+        '"quoted"',
+        "歌" * 61,
+    )
+    for bad_title in unsafe_titles:
+        assert not is_valid_song_title(bad_title), repr(bad_title)
+        with pytest.raises(Rejected, match="invalid_song_title"):
+            validate_song_title(bad_title)
+
+    ffm, ffp = fake_ffmpeg_bins
+    compute = _FakeColabCompute(is_configured=True)
+    lib = SongLibrary(store, ffmpeg_bin=ffm, ffprobe_bin=ffp, compute=compute)
+    await lib.initialize()
+
+    # Register & reload multilingual/punctuation songs through SQLite persistence
+    for idx, title in enumerate((*multilingual_titles, *punctuation_titles)):
+        mp3 = _make_mp3_bytes(f"i18n-song-{idx}".encode(), total_size=300)
+        compute.drive_files[f"drv-i18n-{idx}"] = mp3
+        entry = await lib.register_colab_cover(
+            title=title,
+            digest=hashlib.sha256(mp3).hexdigest(),
+            byte_size=len(mp3),
+            duration_ms=9000,
+            drive_chorus_id=f"drv-i18n-{idx}",
+        )
+        assert entry["title"] == title
+        assert lib.resolve_title(title.lower()) == title
+
+    reloaded = SongLibrary(store, ffmpeg_bin=ffm, ffprobe_bin=ffp, compute=compute)
+    await reloaded.initialize()
+    assert set(reloaded.titles) == set(multilingual_titles) | set(punctuation_titles)
+
+    # Learn requests preserve Unicode audio filenames and reject unsafe/61-char titles
+    await lib.request_learn_song(
+        "夜に駆ける (Cover)",
+        audio_bytes=b"MP3_BYTES",
+        audio_filename="夜に駆ける.mp3",
+    )
+    assert compute.inbox_uploads[-1][0] == "夜に駆ける.mp3"
+    assert compute.inbox_uploads[-1][2] == "audio/mpeg"
+
+    for bad_title in unsafe_titles:
+        with pytest.raises(Rejected, match="invalid_song_title"):
+            await lib.request_learn_song(bad_title, auto_search=True)
+
+    # /学歌 chat command & Admin API respect 60-char limit and multilingual titles
+    s = settings.model_copy(
+        update={
+            "data_dir": tmp_path / "app_data",
+            "admin_token": SecretStr(ADMIN_TOKEN),
+            "owner_qq_id": "20000",
+        }
+    )
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+    async with app.router.lifespan_context(app):
+        from hakimi.models import Message
+        from hakimi.service import _LearnSongArgs
+
+        assert _LearnSongArgs(title="夜" * 60).title == "夜" * 60
+        app.state.service.songs.compute = compute
+        app.state.service.colab_compute = compute
+        bad_cmd_reply = await app.state.service.command(
+            Message(
+                platform="onebot",
+                bot_id="10000",
+                event_id="ev-bad-title",
+                user_id="20000",
+                kind="private",
+                conversation_id="20000",
+                text="/学歌 <script>",
+                addressed=True,
+                created_at=time.time(),
+            )
+        )
+        assert bad_cmd_reply is not None and "1～60 字" in bad_cmd_reply
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        ) as client:
+            ok_60 = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "夜" * 60, "auto_search": True},
+            )
+            assert ok_60.status_code == 200
+            bad_61 = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "夜" * 61, "auto_search": True},
+            )
+            assert bad_61.status_code == 400
+            assert bad_61.json()["detail"] == "invalid_song_title"
 
 
 async def test_song_studio_module_hooks_and_owner_notifications(settings, store):

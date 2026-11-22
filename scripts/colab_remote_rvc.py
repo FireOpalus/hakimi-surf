@@ -871,21 +871,22 @@ from faster_whisper import WhisperModel
 def _run_model(device, compute_type):
     model = WhisperModel("small", device=device, compute_type=compute_type)
     try:
-        segments, _ = model.transcribe(sys.argv[1], language="zh", vad_filter=True)
-        return list(segments)
+        segments, info = model.transcribe(sys.argv[1], vad_filter=True)
+        return list(segments), info
     except Exception as vad_exc:
         print(
             f"[whisper] vad_filter=True failed on {device} "
             f"({type(vad_exc).__name__}: {vad_exc}); retrying without VAD.",
             file=sys.stderr,
         )
-        segments, _ = model.transcribe(sys.argv[1], language="zh", vad_filter=False)
-        return list(segments)
+        segments, info = model.transcribe(sys.argv[1], vad_filter=False)
+        return list(segments), info
 
 seg_list = None
+info = None
 used_device = "cuda"
 try:
-    seg_list = _run_model("cuda", "float16")
+    seg_list, info = _run_model("cuda", "float16")
 except Exception as cuda_exc:
     print(
         f"[whisper] CUDA transcribe failed ({type(cuda_exc).__name__}: {cuda_exc}); "
@@ -893,10 +894,14 @@ except Exception as cuda_exc:
         file=sys.stderr,
     )
     used_device = "cpu"
-    seg_list = _run_model("cpu", "int8")
+    seg_list, info = _run_model("cpu", "int8")
 
 out = [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in seg_list]
-print(f"[whisper] transcribed {len(out)} segment(s) on {used_device}.", file=sys.stderr)
+detected_lang = getattr(info, "language", "unknown") or "unknown"
+print(
+    f"[whisper] transcribed {len(out)} segment(s) on {used_device} (lang={detected_lang}).",
+    file=sys.stderr,
+)
 print("__WHISPER_SEGS__=" + json.dumps(out, ensure_ascii=False))
 """
     proc = _run([sep_py, "-c", script, str(dry_vocals_wav)], check=False, capture=True)

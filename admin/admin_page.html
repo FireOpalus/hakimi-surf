@@ -3367,7 +3367,7 @@ body:not(.authenticated) main {
     </div>
     <form id="song-learn-form">
       <div class="song-meta">
-        <label for="song-learn-title">歌名（必填，1～40字）<input id="song-learn-title" maxlength="40" required placeholder="例如：晴天"></label>
+        <label for="song-learn-title">歌名（必填，1～60字）<input id="song-learn-title" maxlength="60" required placeholder="例如：晴天"></label>
         <label for="song-learn-artist">原唱（可选）<input id="song-learn-artist" maxlength="40" placeholder="例如：周杰伦"></label>
         <label for="song-learn-tags">风格标签（可选）<input id="song-learn-tags" maxlength="80" placeholder="例如：抒情 怀旧"></label>
         <label for="song-learn-pitch">升降调 Pitch（-24～24，默认 0）<input id="song-learn-pitch" type="number" min="-24" max="24" step="1" value="0" required></label>
@@ -3396,7 +3396,7 @@ body:not(.authenticated) main {
       <div class="row"><label for="song-file">选择音频文件</label><input id="song-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac"><small id="song-file-name" class="muted">未选择音频文件</small></div>
       <div id="song-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把翻唱音频拖到这里（自动识别文件名作为歌名）</div>
       <div class="song-meta">
-        <label for="song-title">歌名（必填，1～40字）<input id="song-title" maxlength="40" required placeholder="例如：小星星"></label>
+        <label for="song-title">歌名（必填，1～60字）<input id="song-title" maxlength="60" required placeholder="例如：小星星"></label>
         <label for="song-artist">原唱（可选）<input id="song-artist" maxlength="40" placeholder="例如：传统儿歌"></label>
         <label for="song-tags">风格标签（可选）<input id="song-tags" maxlength="80" placeholder="例如：温柔 晚安"></label>
         <label for="song-start">起始秒数（0～600）<input id="song-start" type="number" min="0" max="600" step="0.5" value="0"></label>
@@ -7025,7 +7025,7 @@ let songGeneration=0,selectedSongFile=null,pendingSongLearn=null;
 const songBlobCache=new Map();
 
 const songErrorLabels={
-  invalid_song_title:'歌名格式无效（须为 1～40 个汉字、字母、数字、空格、括号、·、_ 或 -）',
+  invalid_song_title:'歌名格式无效（支持 1～60 字多语种文字、数字与常见标点，不可含 / \\ < > " 等特殊符号）',
   invalid_song_meta:'原唱或标签元数据格式无效',
   invalid_song_pitch:'升降调 Pitch 须为 -24～24 之间的整数',
   invalid_drive_file_id:'Drive 原曲文件 ID 格式无效',
@@ -7060,8 +7060,8 @@ function formatByteSize(bytes){
 }
 function sanitizeSongTitleStem(filename){
   const stem=String(filename||'').replace(/\.[^.]+$/,'');
-  const cleaned=stem.replace(/[^A-Za-z0-9_\-\u3400-\u4dbf\u4e00-\u9fff（）()·\s]/g,' ').replace(/\s+/g,' ').trim();
-  return cleaned.slice(0,40).trim();
+  const cleaned=stem.replace(/[^\p{L}\p{M}\p{N}\s_\-'’‘&!?！？,，.。、~～+:：·・—–()（）\[\]【】「」『』@#%*=♡♥★☆♪♫]/gu,' ').replace(/\s+/g,' ').trim();
+  return cleaned.slice(0,60).trim();
 }
 function clearSongLearnForm(){
   $('song-learn-title').value='';
@@ -7145,7 +7145,7 @@ function setSelectedSongFile(file){
   selectedSongFile=file;
   text('song-file-name',file.name+'（'+(file.size/1048576).toFixed(2)+' MiB）');
   if(!$('song-title').value.trim()){
-    const stem=file.name.replace(/\.[^.]+$/,'').replace(/\s+/g,' ').trim().slice(0,40);
+    const stem=sanitizeSongTitleStem(file.name);
     if(stem)$('song-title').value=stem;
   }
 }
@@ -7318,7 +7318,7 @@ $('song-learn-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('song-learn-submit'),async()=>{
     const title=$('song-learn-title').value.trim();
-    if(!title)throw Error('请填写歌名（1～40字）');
+    if(!title)throw Error('请填写歌名（1～60字）');
     const pitch=Number($('song-learn-pitch').value||'0');
     if(!Number.isInteger(pitch)||pitch<-24||pitch>24)throw Error(songErrorLabels.invalid_song_pitch);
     const sel=$('song-learn-inbox');
@@ -7371,7 +7371,7 @@ $('song-upload').addEventListener('submit',e=>{
     const file=selectedSongFile||$('song-file').files?.[0];
     if(!file)throw Error('请先选择或拖入音频文件');
     const title=$('song-title').value.trim();
-    if(!title)throw Error('请填写歌名（1～40字）');
+    if(!title)throw Error('请填写歌名（1～60字）');
     const startSec=Number($('song-start').value||'0');
     const durSec=Number($('song-duration').value||'50');
     if(!Number.isFinite(startSec)||startSec<0||startSec>600)throw Error('起始秒数须在 0～600 之间');
@@ -7925,14 +7925,14 @@ function renderColabInbox(items){
       button('直接学歌',async()=>{
         const title=await promptDialog('直接发起 Colab 学歌',{
           message:'原曲文件：'+item.name+'（默认升降调 Pitch = 0）',
-          hint:'请确认或修改入库歌名（1～40字，提交后将立即提交 RVC 翻唱作业）：',
+          hint:'请确认或修改入库歌名（1～60字，提交后将立即提交 RVC 翻唱作业）：',
           defaultValue:sanitizeSongTitleStem(item.name),
-          placeholder:'输入歌名（1～40字）',
+          placeholder:'输入歌名（1～60字）',
           confirmLabel:'立即提交作业'
         });
         if(title===null)return;
         const clean=title.trim();
-        if(!clean)throw Error('请填写歌名（1～40字）');
+        if(!clean)throw Error('请填写歌名（1～60字）');
         let job;
         try{
           job=await api('songs/learn','POST',{

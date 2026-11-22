@@ -113,7 +113,7 @@ _LEARN_SONG_ACTION_NAME = "song_studio.learn_song"
 class _LearnSongArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
-    title: str = Field(min_length=1, max_length=40, description="歌曲名称")
+    title: str = Field(min_length=1, max_length=60, description="歌曲名称")
     artist: str = Field(default="", max_length=40, description="原唱歌手（可选）")
     tags: str = Field(default="", max_length=80, description="风格标签（可选）")
     pitch: int = Field(default=0, ge=-24, le=24, description="升降调半音数（-24..24，默认0）")
@@ -1321,7 +1321,10 @@ class Service:
                 "colab_drive_not_configured": "Drive 歌单目录未配置，暂时无法上传/检索云盘。",
                 "colab_drive_invalid_file": "指定的云盘 inbox 文件无效，请核对文件名。",
                 "colab_invalid_job": "提交学歌参数无效，请检查歌名或选项。",
-                "invalid_song_title": "歌名格式不太对，请用 1～40 字常见字符、数字或中英文。",
+                "invalid_song_title": (
+                    "歌名格式不太对，支持 1～60 字多语种文字、数字与常见标点"
+                    '（不可含 / \\ < > " 等特殊符号）。'
+                ),
                 "invalid_song_meta": "歌手或标签格式过长或包含非法字符。",
                 "invalid_song_pitch": "pitch 范围需在 -24 到 24 之间。",
                 "invalid_song_audio": "音频格式不支持或文件已损坏。",

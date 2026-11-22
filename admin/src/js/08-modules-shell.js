@@ -512,14 +512,14 @@ function renderColabInbox(items){
       button('直接学歌',async()=>{
         const title=await promptDialog('直接发起 Colab 学歌',{
           message:'原曲文件：'+item.name+'（默认升降调 Pitch = 0）',
-          hint:'请确认或修改入库歌名（1～40字，提交后将立即提交 RVC 翻唱作业）：',
+          hint:'请确认或修改入库歌名（1～60字，提交后将立即提交 RVC 翻唱作业）：',
           defaultValue:sanitizeSongTitleStem(item.name),
-          placeholder:'输入歌名（1～40字）',
+          placeholder:'输入歌名（1～60字）',
           confirmLabel:'立即提交作业'
         });
         if(title===null)return;
         const clean=title.trim();
-        if(!clean)throw Error('请填写歌名（1～40字）');
+        if(!clean)throw Error('请填写歌名（1～60字）');
         let job;
         try{
           job=await api('songs/learn','POST',{
