@@ -1422,11 +1422,11 @@ def run_cover_pipeline(
     cover_dir: Path,
     model_name: str = "hakimi",
     pitch: int = 0,
-    index_rate: float = 0.25,
-    protect: float = 0.28,
-    volume_envelope: float = 0.25,
+    index_rate: float = 0.15,
+    protect: float = 0.42,
+    volume_envelope: float = 0.55,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
-    skip_backing: bool = False,
+    skip_backing: bool = True,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -1991,7 +1991,7 @@ def _run_remote_cover(
     chorus_anchor: str,
     fallback_start_sec: float,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
-    skip_backing: bool = False,
+    skip_backing: bool = True,
 ) -> tuple[Path, Path, dict[str, Any]]:
     if not isinstance(skip_backing, bool):
         raise ValueError("skip_backing must be a boolean")
@@ -2236,11 +2236,11 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--artist", default="")
         p.add_argument("--tags", default="")
         p.add_argument("--pitch", type=int, default=0)
-        p.add_argument("--index-rate", type=float, default=0.25)
-        p.add_argument("--protect", type=float, default=0.28)
-        p.add_argument("--volume-envelope", type=float, default=0.25)
+        p.add_argument("--index-rate", type=float, default=0.15)
+        p.add_argument("--protect", type=float, default=0.42)
+        p.add_argument("--volume-envelope", type=float, default=0.55)
         p.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
-        p.add_argument("--skip-backing", action="store_true")
+        p.add_argument("--skip-backing", action=argparse.BooleanOptionalAction, default=True)
         p.add_argument("--start", default="auto")
         p.add_argument("--duration", type=float, default=50.0)
         p.add_argument("--chorus-anchor", default="")

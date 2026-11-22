@@ -1817,8 +1817,9 @@ def _separate_clean_lead_vocals(
     work_dir: Path,
     *,
     label: str = "cover",
+    skip_backing: bool = False,
 ) -> tuple[Path, Path, Path | None]:
-    """Run primary separation -> best-effort karaoke -> best-effort dereverb.
+    """Run primary separation -> optional karaoke -> best-effort dereverb.
 
     Returns ``(dry_lead_vocals_wav, instrumental_wav, backing_vocals_wav)``.
     """
@@ -1829,15 +1830,21 @@ def _separate_clean_lead_vocals(
 
     lead_vocals_wav = vocals_wav
     backing_vocals_wav: Path | None = None
-    try:
-        log(f"Running best-effort karaoke lead/backing vocal separation ({label})...")
-        lead_vocals_wav, backing_vocals_wav = _separate_with_sep_venv(
-            sep_py, vocals_wav, work_dir / "karaoke", KARAOKE_SEP_MODELS
+    if skip_backing:
+        log(
+            f"Skipping karaoke lead/backing separation ({label}: skip_backing=True); "
+            "preserving full lead vocals."
         )
-    except Exception as exc:
-        log(f"Warning: karaoke separation skipped ({label}: {exc}); keeping full vocals stem.")
-        lead_vocals_wav = vocals_wav
-        backing_vocals_wav = None
+    else:
+        try:
+            log(f"Running best-effort karaoke lead/backing vocal separation ({label})...")
+            lead_vocals_wav, backing_vocals_wav = _separate_with_sep_venv(
+                sep_py, vocals_wav, work_dir / "karaoke", KARAOKE_SEP_MODELS
+            )
+        except Exception as exc:
+            log(f"Warning: karaoke separation skipped ({label}: {exc}); keeping full vocals stem.")
+            lead_vocals_wav = vocals_wav
+            backing_vocals_wav = None
 
     dry_vocals_wav = lead_vocals_wav
     try:
@@ -1874,7 +1881,7 @@ def build_mix_filter_complex(
     *,
     has_backing: bool = False,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
-    skip_backing: bool = False,
+    skip_backing: bool = True,
 ) -> str:
     """Build ffmpeg filter_complex graph for vocal presence, de-harshing, and mastering."""
     if isinstance(gain_db, bool):
@@ -1891,9 +1898,9 @@ def build_mix_filter_complex(
 
     vocal_bus = (
         f"[0:a]volume={clean_gain:.2f}dB,highpass=f=85,"
-        "equalizer=f=3200:t=q:w=1.4:g=1.8,"
+        "equalizer=f=3100:t=q:w=1.5:g=-1.2,"
         "equalizer=f=6800:t=q:w=2.0:g=-2.0,"
-        "acompressor=threshold=-18dB:ratio=2.2:attack=12:release=140:makeup=1dB,"
+        "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=160:makeup=2.2dB,"
         "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];"
         "[vwet]highpass=f=300,lowpass=f=3800,"
         "aecho=0.8:0.6:23|41|67:0.18|0.12|0.08,volume=0.12[vamb];"
@@ -2012,11 +2019,11 @@ def action_cover(
     pth_path: Path,
     index_path: Path,
     pitch: int = 0,
-    index_rate: float = 0.25,
-    protect: float = 0.28,
-    volume_envelope: float = 0.25,
+    index_rate: float = 0.15,
+    protect: float = 0.42,
+    volume_envelope: float = 0.55,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
-    skip_backing: bool = False,
+    skip_backing: bool = True,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -2070,7 +2077,7 @@ def action_cover(
 
     log("Separating vocals and instrumental...")
     dry_vocals_wav, inst_wav, backing_vocals_wav = _separate_clean_lead_vocals(
-        sep_py, source_wav, work_cover, label="cover"
+        sep_py, source_wav, work_cover, label="cover", skip_backing=skip_backing
     )
 
     converted_wav = work_cover / "vocals_hakimi.wav"
@@ -2701,13 +2708,13 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
             pth_path=pth_path,
             index_path=index_path,
             pitch=_env_int("HAKIMI_PITCH", 0),
-            index_rate=_env_float("HAKIMI_INDEX_RATE", 0.25),
-            protect=_env_float("HAKIMI_PROTECT", 0.28),
-            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.25),
+            index_rate=_env_float("HAKIMI_INDEX_RATE", 0.15),
+            protect=_env_float("HAKIMI_PROTECT", 0.42),
+            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.55),
             backing_gain_db=_clamp_backing_gain_db(
                 _env_float("HAKIMI_BACKING_GAIN_DB", DEFAULT_BACKING_GAIN_DB)
             ),
-            skip_backing=_env_bool("HAKIMI_SKIP_BACKING", False),
+            skip_backing=_env_bool("HAKIMI_SKIP_BACKING", True),
             start_sec=os.environ.get("HAKIMI_START_SEC", "auto"),
             duration_sec=_env_float("HAKIMI_DURATION_SEC", 50.0),
             chorus_anchor=os.environ.get("HAKIMI_CHORUS_ANCHOR", ""),
@@ -2836,11 +2843,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cover.add_argument("--pth", type=Path, required=True)
     p_cover.add_argument("--index", type=Path, required=True)
     p_cover.add_argument("--pitch", type=int, default=0)
-    p_cover.add_argument("--index-rate", type=float, default=0.25)
-    p_cover.add_argument("--protect", type=float, default=0.28)
-    p_cover.add_argument("--volume-envelope", type=float, default=0.25)
+    p_cover.add_argument("--index-rate", type=float, default=0.15)
+    p_cover.add_argument("--protect", type=float, default=0.42)
+    p_cover.add_argument("--volume-envelope", type=float, default=0.55)
     p_cover.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
-    p_cover.add_argument("--skip-backing", action="store_true")
+    p_cover.add_argument("--skip-backing", action=argparse.BooleanOptionalAction, default=True)
     p_cover.add_argument("--start", default="auto")
     p_cover.add_argument("--duration", type=float, default=50.0)
     p_cover.add_argument("--chorus-anchor", default="")

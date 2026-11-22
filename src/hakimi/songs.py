@@ -458,16 +458,16 @@ class RvcCoverJobPayload(BaseModel):
     duration_sec: float = Field(default=50.0, ge=5.0, le=56.0, allow_inf_nan=False)
     fallback_start_sec: float = Field(default=60.0, ge=0.0, le=600.0, allow_inf_nan=False)
     model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
-    index_rate: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
-    protect: float = Field(default=0.28, ge=0.0, le=0.5, allow_inf_nan=False)
-    volume_envelope: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+    index_rate: float = Field(default=0.15, ge=0.0, le=1.0, allow_inf_nan=False)
+    protect: float = Field(default=0.42, ge=0.0, le=0.5, allow_inf_nan=False)
+    volume_envelope: float = Field(default=0.55, ge=0.0, le=1.0, allow_inf_nan=False)
     backing_gain_db: float = Field(
         default=DEFAULT_BACKING_GAIN_DB,
         ge=MIN_BACKING_GAIN_DB,
         le=MAX_BACKING_GAIN_DB,
         allow_inf_nan=False,
     )
-    skip_backing: bool = False
+    skip_backing: bool = True
 
     @field_validator("title")
     @classmethod

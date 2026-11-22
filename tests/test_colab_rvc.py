@@ -313,10 +313,10 @@ def test_build_mix_filter_complex_with_and_without_backing() -> None:
     fg_no_bg = colab_remote.build_mix_filter_complex(-1.25, has_backing=False)
     assert (
         "[0:a]volume=-1.25dB,highpass=f=85,"
-        "equalizer=f=3200:t=q:w=1.4:g=1.8,"
+        "equalizer=f=3100:t=q:w=1.5:g=-1.2,"
         "equalizer=f=6800:t=q:w=2.0:g=-2.0," in fg_no_bg
     )
-    assert "acompressor=threshold=-18dB:ratio=2.2:attack=12:release=140:makeup=1dB," in fg_no_bg
+    assert "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=160:makeup=2.2dB," in fg_no_bg
     assert "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];" in fg_no_bg
     assert (
         "[vwet]highpass=f=300,lowpass=f=3800,aecho=0.8:0.6:23|41|67:0.18|0.12|0.08,volume=0.12[vamb];"
@@ -327,10 +327,15 @@ def test_build_mix_filter_complex_with_and_without_backing() -> None:
     assert "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]" in fg_no_bg
     assert "[2:a]" not in fg_no_bg
 
-    # Default backing mix: -14.0 dB + 220..3200 Hz bandpass
-    fg_with_bg = colab_remote.build_mix_filter_complex(2.5, has_backing=True)
+    # Default skip_backing=True keeps 2-input mix even when has_backing=True
+    fg_default_skip = colab_remote.build_mix_filter_complex(2.5, has_backing=True)
+    assert "[2:a]" not in fg_default_skip
+    assert "[v][inst]amix=inputs=2:duration=longest:normalize=0," in fg_default_skip
+
+    # Explicit skip_backing=False enables -14.0 dB + 220..3200 Hz bandpass backing mix
+    fg_with_bg = colab_remote.build_mix_filter_complex(2.5, has_backing=True, skip_backing=False)
     assert "[0:a]volume=2.50dB," in fg_with_bg
-    assert "equalizer=f=3200:t=q:w=1.4:g=1.8," in fg_with_bg
+    assert "equalizer=f=3100:t=q:w=1.5:g=-1.2," in fg_with_bg
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-14.0dB[bg];" in fg_with_bg
     assert "[v][inst][bg]amix=inputs=3:duration=longest:normalize=0," in fg_with_bg
     assert "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]" in fg_with_bg
@@ -343,11 +348,17 @@ def test_build_mix_filter_complex_with_and_without_backing() -> None:
     assert "[v][inst]amix=inputs=2:duration=longest:normalize=0," in fg_skip_bg
 
     # Clamping boundaries: [-24.0, -6.0]
-    fg_low = colab_remote.build_mix_filter_complex(0.0, has_backing=True, backing_gain_db=-40.0)
+    fg_low = colab_remote.build_mix_filter_complex(
+        0.0, has_backing=True, backing_gain_db=-40.0, skip_backing=False
+    )
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-24.0dB[bg];" in fg_low
-    fg_high = colab_remote.build_mix_filter_complex(0.0, has_backing=True, backing_gain_db=-1.0)
+    fg_high = colab_remote.build_mix_filter_complex(
+        0.0, has_backing=True, backing_gain_db=-1.0, skip_backing=False
+    )
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-6.0dB[bg];" in fg_high
-    fg_custom = colab_remote.build_mix_filter_complex(0.0, has_backing=True, backing_gain_db=-16.5)
+    fg_custom = colab_remote.build_mix_filter_complex(
+        0.0, has_backing=True, backing_gain_db=-16.5, skip_backing=False
+    )
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-16.5dB[bg];" in fg_custom
 
     # Strict validation: reject bool, non-finite, and injection strings
@@ -448,7 +459,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
         case_name: str,
         fail_karaoke: bool,
         backing_gain_db: float = -14.0,
-        skip_backing: bool = False,
+        skip_backing: bool = True,
     ) -> tuple[dict[str, object], list[list[str]], list[tuple[str, tuple[str, ...]]]]:
         case_dir = tmp_path / case_name
         work_dir = case_dir / "work"
@@ -534,7 +545,9 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
         )
         return meta, cmds, sep_calls
 
-    meta_ok, cmds_ok, seps_ok = _run_cover_case(case_name="karaoke", fail_karaoke=False)
+    meta_ok, cmds_ok, seps_ok = _run_cover_case(
+        case_name="karaoke", fail_karaoke=False, skip_backing=False
+    )
     assert [m for _, m in seps_ok] == [
         colab_remote.PRIMARY_SEP_MODELS,
         colab_remote.KARAOKE_SEP_MODELS,
@@ -542,9 +555,9 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     ]
     infer_cmd = next(c for c in cmds_ok if "infer" in c)
     assert "--split-audio" not in infer_cmd
-    assert infer_cmd[infer_cmd.index("--index-rate") + 1] == "0.25"
-    assert infer_cmd[infer_cmd.index("--protect") + 1] == "0.28"
-    assert infer_cmd[infer_cmd.index("--volume-envelope") + 1] == "0.25"
+    assert infer_cmd[infer_cmd.index("--index-rate") + 1] == "0.15"
+    assert infer_cmd[infer_cmd.index("--protect") + 1] == "0.42"
+    assert infer_cmd[infer_cmd.index("--volume-envelope") + 1] == "0.55"
     assert infer_cmd[infer_cmd.index("--f0-method") + 1] == "rmvpe"
     assert infer_cmd[infer_cmd.index("--embedder-model") + 1] == "contentvec"
     assert infer_cmd[infer_cmd.index("--export-format") + 1] == "WAV"
@@ -552,7 +565,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     mix_graph = mix_cmd[mix_cmd.index("-filter_complex") + 1]
     assert mix_cmd.count("-i") == 3
     assert "volume=-2.00dB" in mix_graph
-    assert "equalizer=f=3200:t=q:w=1.4:g=1.8" in mix_graph
+    assert "equalizer=f=3100:t=q:w=1.5:g=-1.2" in mix_graph
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-14.0dB[bg];" in mix_graph
     assert "[v][inst][bg]amix=inputs=3" in mix_graph
     assert meta_ok["karaoke_backing_separated"] is True
@@ -562,15 +575,19 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     assert "split_audio" not in meta_ok
     assert meta_ok["loudness_gain_db"] == -2.0
 
-    # skip_backing=True omits backing stem input from ffmpeg even when karaoke separation succeeds
-    meta_skip, cmds_skip, _ = _run_cover_case(
+    # Default skip_backing=True skips karaoke separation altogether, preserving full lead vocals
+    meta_skip, cmds_skip, seps_skip = _run_cover_case(
         case_name="skip_bg", fail_karaoke=False, backing_gain_db=-18.0, skip_backing=True
     )
+    assert [m for _, m in seps_skip] == [
+        colab_remote.PRIMARY_SEP_MODELS,
+        colab_remote.DEREVERB_MODELS,
+    ]
     mix_skip = next(c for c in cmds_skip if "-filter_complex" in c)
     assert mix_skip.count("-i") == 2
     assert "[v][inst]amix=inputs=2" in mix_skip[mix_skip.index("-filter_complex") + 1]
     assert "[2:a]" not in mix_skip[mix_skip.index("-filter_complex") + 1]
-    assert meta_skip["karaoke_backing_separated"] is True
+    assert meta_skip["karaoke_backing_separated"] is False
     assert meta_skip["skip_backing"] is True
     assert meta_skip["backing_gain_db"] == -18.0
 
@@ -582,7 +599,9 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     assert "volume=-24.0dB[bg];" in mix_clamped[mix_clamped.index("-filter_complex") + 1]
     assert meta_clamped["backing_gain_db"] == -24.0
 
-    meta_fb, cmds_fb, _ = _run_cover_case(case_name="fallback", fail_karaoke=True)
+    meta_fb, cmds_fb, _ = _run_cover_case(
+        case_name="fallback", fail_karaoke=True, skip_backing=False
+    )
     mix_fb = next(c for c in cmds_fb if "-filter_complex" in c)
     assert mix_fb.count("-i") == 2
     assert "[v][inst]amix=inputs=2" in mix_fb[mix_fb.index("-filter_complex") + 1]
@@ -1515,11 +1534,11 @@ def test_p0_remote_exception_scrubs_custom_opaque_token_in_stdout_and_traceback(
 def test_backing_mix_params_env_and_cli_passthrough(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 1) colab_rvc CLI parser exposes --backing-gain-db and --skip-backing on cover & all
+    # 1) colab_rvc CLI parser exposes --backing-gain-db and --skip-backing/--no-skip-backing
     parser = colab_rvc._build_parser()
     ns_default = parser.parse_args(["cover", "--source", "s.mp3", "--title", "枝垂桜"])
     assert ns_default.backing_gain_db == -14.0
-    assert ns_default.skip_backing is False
+    assert ns_default.skip_backing is True
     ns_custom = parser.parse_args(
         [
             "cover",
@@ -1529,11 +1548,11 @@ def test_backing_mix_params_env_and_cli_passthrough(
             "枝垂桜",
             "--backing-gain-db",
             "-16.5",
-            "--skip-backing",
+            "--no-skip-backing",
         ]
     )
     assert ns_custom.backing_gain_db == -16.5
-    assert ns_custom.skip_backing is True
+    assert ns_custom.skip_backing is False
 
     # 2) run_cover_pipeline forwards HAKIMI_BACKING_GAIN_DB & HAKIMI_SKIP_BACKING & validates inputs
     captured_envs: list[dict[str, str]] = []
@@ -1606,9 +1625,13 @@ def test_backing_mix_params_env_and_cli_passthrough(
 
     monkeypatch.setattr(colab_remote, "action_cover", fake_action_cover)
     monkeypatch.setenv("HAKIMI_BACKING_GAIN_DB", "-2.0")
-    monkeypatch.setenv("HAKIMI_SKIP_BACKING", "1")
+    monkeypatch.setenv("HAKIMI_SKIP_BACKING", "0")
     colab_remote._dispatch_env("cover", drive_token="")
     assert seen_cover_kwargs[-1]["backing_gain_db"] == -6.0
+    assert seen_cover_kwargs[-1]["skip_backing"] is False
+
+    monkeypatch.delenv("HAKIMI_SKIP_BACKING", raising=False)
+    colab_remote._dispatch_env("cover", drive_token="")
     assert seen_cover_kwargs[-1]["skip_backing"] is True
 
     monkeypatch.setenv("HAKIMI_BACKING_GAIN_DB", "nan")

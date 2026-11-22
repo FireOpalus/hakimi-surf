@@ -1112,7 +1112,8 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             norm_cover["index_rate"],
             norm_cover["protect"],
             norm_cover["volume_envelope"],
-        ) == (0.25, 0.28, 0.25)
+            norm_cover["skip_backing"],
+        ) == (0.15, 0.42, 0.55, True)
         with pytest.raises(Rejected, match="song_source_required"):
             cover_val({"title": "雨爱", "auto_search": False})
         with pytest.raises(Rejected, match="colab_invalid_job"):
@@ -1125,7 +1126,7 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             norm_train["batch_size"],
             norm_train["sample_rate"],
         ) == (150, 30, 12, 48000)
-        assert RvcCoverJobPayload(title="t").protect == 0.28
+        assert RvcCoverJobPayload(title="t").protect == 0.42
         assert RvcTrainJobPayload().sample_rate == 48000
 
         # pre_dispatch for rvc_cover returns exact transient dispatch_context contract
