@@ -5,12 +5,14 @@ import base64
 import copy
 import hashlib
 import inspect
+import logging
 import math
 import re
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from .bot_server import untrusted_input
@@ -18,6 +20,13 @@ from .media import ModelImage
 from .security import Rejected, authorize
 from .video_downloader import VideoDownloader
 from .video_policy import VideoWatchConfig
+
+log = logging.getLogger("hakimi")
+
+_BILI_URL_RE = re.compile(r"https?://[^\s<>\"'，。！？）]+", re.IGNORECASE)
+_BILI_VIDEO_HOSTS = frozenset({"www.bilibili.com", "bilibili.com", "m.bilibili.com"})
+_BILI_FESTIVAL_PATH_RE = re.compile(r"^/festival(?:/[A-Za-z0-9_-]{1,80})?/?$")
+_REASON_CODE_RE = re.compile(r"^[a-z0-9_]{1,48}$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS video_watch_attempts (
@@ -34,12 +43,30 @@ LOCAL_DOWNLOAD_REASONS = (
     "download_size",
     "download_restricted",
     "download_network",
+    "timeout",
+    "invalid_media",
+    "cdn_http_567",
+    "cdn_http_403",
+    "cdn_http_5xx",
+    "cdn_host_blocked",
+    "no_audio_track",
+    "part_not_found",
+    "storyboard_err",
 )
 DOWNLOAD_CODE_MAP = {
     "video_download_format": "download_format",
     "video_download_size": "download_size",
     "video_download_restricted": "download_restricted",
     "video_download_network_forbidden": "download_network",
+    "video_download_timeout": "timeout",
+    "video_download_invalid_media": "invalid_media",
+    "video_download_cdn_http_567": "cdn_http_567",
+    "video_download_cdn_http_403": "cdn_http_403",
+    "video_download_cdn_http_5xx": "cdn_http_5xx",
+    "video_download_cdn_host_blocked": "cdn_host_blocked",
+    "video_download_no_audio_track": "no_audio_track",
+    "video_download_part_not_found": "part_not_found",
+    "video_download_storyboard_err": "storyboard_err",
 }
 LANE2_FALLBACK_CODES = frozenset(
     {
@@ -47,6 +74,11 @@ LANE2_FALLBACK_CODES = frozenset(
         "video_download_unavailable",
         "video_download_timeout",
         "video_download_network_forbidden",
+        "video_download_cdn_http_567",
+        "video_download_cdn_http_403",
+        "video_download_cdn_http_5xx",
+        "video_download_cdn_host_blocked",
+        "video_download_no_audio_track",
     }
 )
 MAX_STORYBOARD_BYTES = 262_144
@@ -65,11 +97,63 @@ REASONS = {
     "download_size": "原片体积超过 80 MiB 上限",
     "download_restricted": "视频受限或需付费解锁",
     "download_network": "视频 CDN 地址未通过安全校验",
+    "timeout": "原片下载超时",
+    "invalid_media": "原片封装校验失败",
+    "cdn_http_567": "视频 CDN 返回 HTTP 567（边缘拦截）",
+    "cdn_http_403": "视频 CDN 返回 HTTP 403（已跳过账号风控冷却）",
+    "cdn_http_5xx": "视频 CDN 临时服务异常",
+    "cdn_host_blocked": "视频 CDN 域名未通过安全白名单校验",
+    "no_audio_track": "视频缺少可用音轨，已拒绝静默降级",
+    "part_not_found": "请求的视频分 P 不存在",
+    "storyboard_err": "境内关键帧拼图回退失败",
     "risk": "平台风控或凭证过期，已停止访问并冷却",
     "files_unavailable": "视频上传或处理暂不可用",
     "deadline": "原片处理超时",
     "interrupted": "服务重启中断，不自动重放",
 }
+
+
+def _sanitize_reason_code(raw: str, *, default: str = "storyboard_err") -> str:
+    cleaned = str(raw or "").strip().lower()
+    return cleaned if _REASON_CODE_RE.fullmatch(cleaned) else default
+
+
+def extract_video_page(text: str, bvid: str) -> int:
+    """Extract bounded 1-based `?p=N` part index for `bvid` from trusted Bilibili URLs."""
+    if not isinstance(text, str) or not text or not bvid:
+        return 1
+    for raw in _BILI_URL_RE.findall(text):
+        cleaned = raw.rstrip("。，）)")
+        try:
+            u = urlsplit(cleaned)
+            port = u.port
+        except ValueError:
+            continue
+        host = (u.hostname or "").lower()
+        if (
+            u.scheme not in {"https", "http"}
+            or host not in _BILI_VIDEO_HOSTS
+            or u.username is not None
+            or u.password is not None
+            or (u.scheme == "https" and port not in {None, 443})
+            or (u.scheme == "http" and port not in {None, 80})
+        ):
+            continue
+        qs = parse_qs(u.query, keep_blank_values=False)
+        matched_bvid = None
+        path_match = re.fullmatch(r"/video/(BV[1-9A-HJ-NP-Za-km-z]{10})/?", u.path)
+        if path_match:
+            matched_bvid = path_match[1]
+        elif _BILI_FESTIVAL_PATH_RE.fullmatch(u.path):
+            q_bvids = qs.get("bvid")
+            if q_bvids and re.fullmatch(r"BV[1-9A-HJ-NP-Za-km-z]{10}", q_bvids[0]):
+                matched_bvid = q_bvids[0]
+        if matched_bvid != bvid:
+            continue
+        raw_p = (qs.get("p") or [""])[0].strip()
+        if re.fullmatch(r"[1-9][0-9]{0,2}", raw_p):
+            return int(raw_p)
+    return 1
 
 
 @dataclass(frozen=True)
@@ -230,6 +314,14 @@ class VideoWatch:
         if check_budget and (await self.store.budget_status())["hard_stop"]:
             raise Rejected("budget_hard_stop")
 
+    def _cn_delegate_ready(self) -> bool:
+        nt = getattr(self.svc, "node_transport", None)
+        return bool(
+            nt is not None
+            and nt.connected()
+            and getattr(self.s, "node_bili_delegate_enabled", True)
+        )
+
     async def analyze(
         self,
         bvid,
@@ -253,6 +345,20 @@ class VideoWatch:
         )
         payload = self.bounded(material, direct, patrol=(lane == "patrol"))
 
+        raw_page = material.get("page") if isinstance(material, dict) else None
+        if isinstance(raw_page, int) and not isinstance(raw_page, bool) and 1 <= raw_page <= 999:
+            page = raw_page
+        elif message is not None:
+            page = extract_video_page(message.text, bvid)
+        else:
+            page = 1
+        raw_cid = material.get("cid") if isinstance(material, dict) else None
+        cid = (
+            raw_cid
+            if isinstance(raw_cid, int) and not isinstance(raw_cid, bool) and raw_cid > 0
+            else None
+        )
+
         async def valid_text():
             # Gemini reserves the budget atomically; a request's own reservation is
             # not a reason to discard its already-paid response after dispatch.
@@ -271,16 +377,17 @@ class VideoWatch:
         reason = None
         if needs_video:
             duration = payload.get("duration")
-            if not self.config.enabled:
-                reason = "disabled"
-            elif self.config.daily_limit == 0:
-                reason = "daily_limit"
-            elif (
+            is_too_long = (
                 isinstance(duration, (int, float))
                 and not isinstance(duration, bool)
                 and math.isfinite(duration)
                 and duration > self.config.max_seconds
-            ):
+            )
+            if not self.config.enabled:
+                reason = "disabled"
+            elif self.config.daily_limit == 0:
+                reason = "daily_limit"
+            elif is_too_long and not self._cn_delegate_ready():
                 reason = "too_long"
             elif self.video_lock.locked():
                 reason = "busy"
@@ -289,7 +396,16 @@ class VideoWatch:
             else:
                 try:
                     result, reason = await self._video(
-                        bvid, payload, subject, lane, message, deep, guard
+                        bvid,
+                        payload,
+                        subject,
+                        lane,
+                        message,
+                        deep,
+                        guard,
+                        page=page,
+                        cid=cid,
+                        videoshot_only=is_too_long,
                     )
                 except Rejected as exc:
                     if str(exc) != "bili_account_cooling_down":
@@ -311,38 +427,74 @@ class VideoWatch:
         return VideoAnalysis(text, payload.get("material_scope", "metadata_only"), "text", reason)
 
     async def _try_cn_storyboard(
-        self, bvid, payload, subject, lane, message, deep, config, cookies, key, valid
-    ) -> VideoAnalysis | None:
-        nt = getattr(self.svc, "node_transport", None)
-        if not (
-            nt is not None
-            and nt.connected()
-            and getattr(self.s, "node_bili_delegate_enabled", True)
-        ):
-            return None
+        self,
+        bvid,
+        payload,
+        subject,
+        lane,
+        message,
+        deep,
+        config,
+        cookies,
+        key,
+        valid,
+        *,
+        page: int = 1,
+        cid: int | None = None,
+        videoshot_only: bool = False,
+    ) -> tuple[VideoAnalysis | None, str | None]:
+        if not self._cn_delegate_ready():
+            return None, None
+        nt = self.svc.node_transport
         await valid()
         req_cookies = {k: v for k, v in cookies.items() if v} if isinstance(cookies, dict) else {}
+        call_params = {
+            "bvid": bvid,
+            "max_seconds": config.max_seconds,
+            "cookies": req_cookies,
+        }
+        if page > 1:
+            call_params["page"] = page
+        if cid is not None:
+            call_params["cid"] = cid
+        if videoshot_only:
+            call_params["videoshot_only"] = True
+            dur_val = payload.get("duration")
+            if (
+                isinstance(dur_val, (int, float))
+                and not isinstance(dur_val, bool)
+                and math.isfinite(dur_val)
+                and dur_val > 0
+            ):
+                call_params["duration"] = float(dur_val)
         try:
             sb = await nt.call(
                 "bili.video_storyboard",
-                {"bvid": bvid, "max_seconds": config.max_seconds, "cookies": req_cookies},
+                call_params,
                 timeout=120.0,
             )
-        except (Rejected, TimeoutError, ValueError):
-            return None
+        except TimeoutError:
+            return None, "timeout"
+        except Rejected as exc:
+            return None, _sanitize_reason_code(str(exc), default="storyboard_err")
+        except ValueError:
+            return None, "invalid_response"
         await valid()
         if not isinstance(sb, dict) or sb.get("mime_type") != "image/jpeg":
-            return None
+            return None, "invalid_mime"
+        is_videoshot = sb.get("source") == "videoshot"
+        if videoshot_only and not is_videoshot:
+            return None, "videoshot_required"
         data_b64 = sb.get("data_b64")
         if not isinstance(data_b64, str) or not data_b64:
-            return None
+            return None, "missing_data"
         try:
             raw_bytes = base64.b64decode(data_b64, validate=True)
         except ValueError:
-            return None
+            return None, "invalid_base64"
         if not (1 <= len(raw_bytes) <= MAX_STORYBOARD_BYTES):
-            return None
-        raw_dur = sb.get("duration", payload.get("duration"))
+            return None, "oversized"
+        raw_dur = sb.get("duration") if sb.get("duration") is not None else payload.get("duration")
         sb_duration = (
             float(raw_dur)
             if isinstance(raw_dur, (int, float))
@@ -351,8 +503,8 @@ class VideoWatch:
             and raw_dur > 0
             else None
         )
-        if sb_duration is None or sb_duration > config.max_seconds:
-            return None
+        if not is_videoshot and (sb_duration is None or sb_duration > config.max_seconds):
+            return None, "invalid_duration"
         storyboard_img = ModelImage(
             data=base64.b64encode(raw_bytes).decode("ascii"),
             mime_type="image/jpeg",
@@ -387,13 +539,29 @@ class VideoWatch:
             before_call=valid,
         )
         await valid(check_budget=False)
-        return VideoAnalysis(
-            result,
-            payload.get("material_scope", "metadata_only"),
-            "cn_storyboard",
+        return (
+            VideoAnalysis(
+                result,
+                payload.get("material_scope", "metadata_only"),
+                "cn_storyboard",
+            ),
+            None,
         )
 
-    async def _video(self, bvid, payload, subject, lane, message, deep, guard):
+    async def _video(
+        self,
+        bvid,
+        payload,
+        subject,
+        lane,
+        message,
+        deep,
+        guard,
+        *,
+        page: int = 1,
+        cid: int | None = None,
+        videoshot_only: bool = False,
+    ):
         async with self.video_lock:
             epoch, config = self.epoch, self.config
             watcher = self.svc.bili_watcher
@@ -431,14 +599,43 @@ class VideoWatch:
                         if hasattr(watcher, "download_credentials")
                         else dict(watcher.creds)
                     )
-                    try:
-                        async with self.downloader.download(
+                    if videoshot_only:
+                        analysis, sb_err = await self._try_cn_storyboard(
                             bvid,
-                            max_seconds=config.max_seconds,
-                            cookies=cookies,
-                            proxy=self.s.bili_proxy.get_secret_value(),
-                            guard=valid,
-                        ) as video:
+                            payload,
+                            subject,
+                            lane,
+                            message,
+                            deep,
+                            config,
+                            cookies,
+                            key,
+                            valid,
+                            page=page,
+                            cid=cid,
+                            videoshot_only=True,
+                        )
+                        if analysis is not None:
+                            state, reason = "done", None
+                            return analysis, None
+                        log.warning(
+                            "event=video_watch_storyboard_failed bvid=%s "
+                            "lane1_reason=too_long storyboard_reason=%s",
+                            bvid,
+                            sb_err or "node_offline",
+                        )
+                        raise Rejected("video_download_storyboard_err")
+
+                    try:
+                        dl_kwargs = {
+                            "max_seconds": config.max_seconds,
+                            "cookies": cookies,
+                            "proxy": self.s.bili_proxy.get_secret_value(),
+                            "guard": valid,
+                        }
+                        if page > 1:
+                            dl_kwargs["page"] = page
+                        async with self.downloader.download(bvid, **dl_kwargs) as video:
                             await valid()
                             async with self.store.transaction():
                                 await self.store.db.execute(
@@ -466,9 +663,17 @@ class VideoWatch:
                                 "video",
                             ), None
                     except Rejected as lane1_exc:
-                        if str(lane1_exc) not in LANE2_FALLBACK_CODES:
+                        lane1_code = str(lane1_exc)
+                        lane1_reason = DOWNLOAD_CODE_MAP.get(lane1_code, "download_failed")
+                        log.info(
+                            "event=video_watch_lane1_failed bvid=%s code=%s reason=%s",
+                            bvid,
+                            _sanitize_reason_code(lane1_code, default="unknown"),
+                            lane1_reason,
+                        )
+                        if lane1_code not in LANE2_FALLBACK_CODES:
                             raise
-                        analysis = await self._try_cn_storyboard(
+                        analysis, sb_err = await self._try_cn_storyboard(
                             bvid,
                             payload,
                             subject,
@@ -479,11 +684,23 @@ class VideoWatch:
                             cookies,
                             key,
                             valid,
+                            page=page,
+                            cid=cid,
                         )
-                        if analysis is None:
-                            raise lane1_exc from None
-                        state, reason = "done", None
-                        return analysis, None
+                        if analysis is not None:
+                            state, reason = "done", None
+                            return analysis, None
+                        if sb_err is not None:
+                            log.warning(
+                                "event=video_watch_storyboard_failed bvid=%s "
+                                "lane1_reason=%s storyboard_reason=%s",
+                                bvid,
+                                lane1_reason,
+                                sb_err,
+                            )
+                            if lane1_code == "video_download_unavailable":
+                                raise Rejected("video_download_storyboard_err") from None
+                        raise lane1_exc from None
             except asyncio.CancelledError:
                 state, reason = "uncertain", "interrupted"
                 raise

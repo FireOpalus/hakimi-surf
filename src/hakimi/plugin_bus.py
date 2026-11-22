@@ -23,7 +23,7 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, field_validator
 
-from .bot_server import untrusted_input
+from .bot_server import is_persona_owner, untrusted_input
 from .budget_policy import PATROL_LANE, PROACTIVE_LANE, paid_lane_available
 from .config import Settings
 from .generation_policy import Scenario
@@ -45,9 +45,9 @@ from .plugin_kernel import PluginContext, PluginFiber, PluginKernel
 from .roaming_logger import redact_public_summary
 from .screen_watch import decode_b64_frames, decode_ws_json_frame
 from .security import Rejected, clean_text, configured_secrets, safe_output
-from .social import confirmed_message_id, owner_target
+from .social import confirmed_message_id, owner_target, permits_chat_export
 from .thinking_policy import CORE_THINKING_SCENES, THINKING_LEVELS, OutputCap, ThinkingScene
-from .world_state import IntentTicketCreate
+from .world_state import IntentTicketCreate, private_event_audience
 
 log = logging.getLogger("hakimi")
 
@@ -235,6 +235,10 @@ _SENSOR_RPC_TIMEOUT_SECONDS = 3.5
 _MAX_PENDING_RPCS = 32
 _NOTIFY_WINDOW_SECONDS = 600.0
 _NOTIFY_MAX_PER_WINDOW = 3
+_BILI_PRIVATE_SHARE_PRIORITY_SECONDS = 24 * 3600
+_BILI_PRIVATE_HANDLE_TTL_SECONDS = 1800.0
+_BILI_PRIVATE_HANDLE_MAX_COMMITS = 2
+_MAX_BILI_PRIVATE_HANDLES = 64
 _VALID_OUTCOME_STATUSES = frozenset(
     {"done", "gated_skip", "not_dispatched", "uncertain", "executing", "expired"}
 )
@@ -551,7 +555,7 @@ class _PluginActionDecl(BaseModel):
     aliases: list[list[Any]] = Field(default_factory=list, max_length=4)
     budget_lane: Literal["patrol", "proactive"] | None = None
     quotas: list[dict[str, str]] | None = Field(default=None, max_length=4)
-    timeout_seconds: float | None = Field(default=None, ge=1.0, le=300.0)
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=1800.0)
 
     @field_validator("name")
     @classmethod
@@ -822,6 +826,7 @@ class _PluginSession:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending: dict[str, _PendingRpc] = field(default_factory=dict)
     uncertain_deliveries: set[str] = field(default_factory=set)
+    _bili_private_handles: dict[str, dict[str, Any]] = field(default_factory=dict)
     inflight_node_calls: int = 0
     inflight_ai_calls: int = 0
     ready: bool = False
@@ -3097,6 +3102,390 @@ class PluginBus:
             worker=_run_video_analyze,
         )
 
+    async def _ensure_bili_private_tables(self) -> None:
+        async with self.store.transaction():
+            await self.store.db.execute(
+                "CREATE TABLE IF NOT EXISTS bili_served_private_topics ("
+                "receipt TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+            await self.store.db.execute(
+                "CREATE TABLE IF NOT EXISTS bili_private_share_priority ("
+                "bvid TEXT PRIMARY KEY, session_scope TEXT NOT NULL, expires_at REAL NOT NULL)"
+            )
+
+    async def _next_bili_private_topic(
+        self,
+        sessions: Any,
+        session_list: list[tuple[str, Message]],
+        secrets_list: list[str],
+    ) -> dict[str, Any] | None:
+        best: dict[str, Any] | None = None
+        for _, msg in session_list:
+            if msg.kind != "private" or not permits_chat_export(msg, self.s, "bilibili_surf"):
+                continue
+            try:
+                epoch, turns = await sessions.private_request_window(msg)
+            except Exception:
+                continue
+            candidates: list[dict[str, Any]] = []
+            scope = self.store.session_scope(msg)
+            for item in turns:
+                raw = str(item.get("text", ""))
+                if item.get("role") != "user":
+                    continue
+                video = re.search(r"视频|[Bb]站|哔哩哔哩|bilibili", raw, re.I)
+                interest = re.search(r"想了解|感兴趣", raw)
+                if not video and not interest:
+                    continue
+                requested = video and re.search(r"找|想看|推荐|帮我|给我|有没有|求", raw)
+                specificity = 2 if requested else int(bool(interest))
+                try:
+                    text = redact_public_summary(safe_output(raw, secrets_list, limit=80))
+                except Rejected:
+                    continue
+                if not text:
+                    continue
+                seq = item["seq"]
+                event = item.get("event_id")
+                receipt = self.store.vault.digest(
+                    "bili-private-request-v1",
+                    scope,
+                    epoch,
+                    ("event", event) if event else ("seq", seq),
+                )
+                stamp = item.get("created_at")
+                if (
+                    isinstance(stamp, bool)
+                    or not isinstance(stamp, int | float)
+                    or not math.isfinite(stamp)
+                ):
+                    stamp = 0
+                rank = (specificity, stamp, seq)
+                candidates.append(
+                    {
+                        "source": msg,
+                        "epoch": epoch,
+                        "receipt": receipt,
+                        "text": text,
+                        "priority": rank,
+                        "scope": scope,
+                    }
+                )
+            if not candidates:
+                continue
+            keys = tuple(c["receipt"] for c in candidates)
+            async with self.store.lock:
+                if await self._table_exists("bili_served_private_topics"):
+                    rows = await self.store.all(
+                        "SELECT receipt FROM bili_served_private_topics WHERE receipt IN ("
+                        + ",".join("?" for _ in keys)
+                        + ")",
+                        keys,
+                    )
+                    served = {r[0] for r in rows}
+                else:
+                    served = set()
+            for topic in candidates:
+                if topic["receipt"] not in served and (
+                    best is None or topic["priority"] > best["priority"]
+                ):
+                    best = topic
+        return best
+
+    async def _handle_bili_memory_preferences(
+        self, session: _PluginSession, frame: dict[str, Any]
+    ) -> None:
+        if session.plugin_id != "bilibili_surf" or session.proxy is None:
+            raise Rejected("plugin_scope_rejected")
+        req_id = frame.get("id")
+        if not isinstance(req_id, str) or not req_id.strip() or len(req_id) > 128:
+            raise Rejected("plugin_invalid_schema")
+        if not session.proxy.enabled:
+            await self._send_frame(
+                session,
+                {"type": "kernel.result", "id": req_id, "ok": False, "error": "module_disabled"},
+            )
+            return
+
+        await self._ensure_bili_private_tables()
+        sessions = getattr(self.service, "sessions", None)
+        runtime = getattr(self.store, "runtime", None)
+        if sessions is None or runtime is None or not hasattr(runtime, "sessions"):
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": True,
+                    "result": {"preferences": {}, "private_topic": None},
+                },
+            )
+            return
+
+        secrets_list = self._all_secrets()
+        try:
+            session_list = await runtime.sessions()
+        except Exception:
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": True,
+                    "result": {"preferences": {}, "private_topic": None},
+                },
+            )
+            return
+
+        private = await self._next_bili_private_topic(sessions, session_list, secrets_list)
+        if private is not None:
+            preferred: Message = private["source"]
+            owner_private = bool(is_persona_owner(preferred, self.s))
+            audience = private_event_audience(
+                self.s,
+                preferred.user_id,
+                platform=preferred.platform,
+                bot_id=preferred.bot_id,
+            )
+            handle_id = uuid.uuid4().hex
+            issued_at = self.clock()
+            stale_handles = [
+                key
+                for key, item in session._bili_private_handles.items()
+                if issued_at >= float(item.get("expires_at", 0.0))
+                or int(item.get("commits", 0)) >= _BILI_PRIVATE_HANDLE_MAX_COMMITS
+            ]
+            for key in stale_handles:
+                session._bili_private_handles.pop(key, None)
+            if len(session._bili_private_handles) >= _MAX_BILI_PRIVATE_HANDLES:
+                oldest_key = next(iter(session._bili_private_handles))
+                session._bili_private_handles.pop(oldest_key, None)
+            session._bili_private_handles[handle_id] = {
+                "source": preferred,
+                "epoch": private["epoch"],
+                "receipt": private["receipt"],
+                "scope": private["scope"],
+                "audience": audience,
+                "owner_private": owner_private,
+                "issued_at": issued_at,
+                "expires_at": issued_at + _BILI_PRIVATE_HANDLE_TTL_SECONDS,
+                "commits": 0,
+            }
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": True,
+                    "result": {
+                        "preferences": {
+                            "recent_chat_topics": [private["text"]],
+                            "private_topic_refs": ["recent_chat_topics:0"],
+                        },
+                        "private_topic": {
+                            "handle": handle_id,
+                            "owner_private": owner_private,
+                            "audience": audience,
+                            "session_scope": private["scope"],
+                        },
+                    },
+                },
+            )
+            return
+
+        topics: dict[str, list[str]] = {}
+        now = self.clock()
+
+        def add_topic(field_name: str, raw_val: str, *, count: int, length: int) -> None:
+            values = topics.get(field_name, [])
+            if len(values) >= count:
+                return
+            try:
+                text = redact_public_summary(safe_output(raw_val, secrets_list, limit=length))
+            except Rejected:
+                return
+            if text and text not in values:
+                topics.setdefault(field_name, []).append(text)
+
+        for _, msg in session_list[:20]:
+            if msg.kind != "group" or not permits_chat_export(msg, self.s, "bilibili_surf"):
+                continue
+            try:
+                view = await sessions.dual.view(msg)
+                snap = await sessions.snapshot(msg)
+            except Exception:
+                continue
+            for entry in view.get("entries", []):
+                if (
+                    not entry.get("deleted")
+                    and (not entry.get("expires") or entry["expires"] > now)
+                    and (entry.get("slot") == "preferences" or entry.get("kind") == "chronicle")
+                ):
+                    add_topic("community_topics", str(entry.get("text", "")), count=10, length=120)
+            for item in reversed(snap.get("recent_messages", [])[-6:]):
+                if item.get("role") == "user":
+                    add_topic("recent_chat_topics", str(item.get("text", "")), count=5, length=80)
+
+        await self._send_frame(
+            session,
+            {
+                "type": "kernel.result",
+                "id": req_id,
+                "ok": True,
+                "result": {"preferences": topics, "private_topic": None},
+            },
+        )
+
+    async def _handle_bili_private_topic_commit(
+        self, session: _PluginSession, frame: dict[str, Any]
+    ) -> None:
+        if session.plugin_id != "bilibili_surf" or session.proxy is None:
+            raise Rejected("plugin_scope_rejected")
+        req_id = frame.get("id")
+        if not isinstance(req_id, str) or not req_id.strip() or len(req_id) > 128:
+            raise Rejected("plugin_invalid_schema")
+        if not session.proxy.enabled:
+            await self._send_frame(
+                session,
+                {"type": "kernel.result", "id": req_id, "ok": False, "error": "module_disabled"},
+            )
+            return
+
+        handle = frame.get("handle")
+        bvid = frame.get("bvid")
+        if not isinstance(handle, str) or not handle.strip() or len(handle) > 128:
+            raise Rejected("plugin_invalid_schema")
+        if not isinstance(bvid, str) or not _BVID_RE.fullmatch(bvid):
+            await self._send_frame(
+                session,
+                {"type": "kernel.result", "id": req_id, "ok": False, "error": "invalid_bvid"},
+            )
+            return
+
+        now = self.clock()
+        entry = session._bili_private_handles.get(handle)
+        if entry is None:
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": "bili_private_request_revoked",
+                },
+            )
+            return
+        if (
+            now >= float(entry.get("expires_at", 0.0))
+            or int(entry.get("commits", 0)) >= _BILI_PRIVATE_HANDLE_MAX_COMMITS
+        ):
+            session._bili_private_handles.pop(handle, None)
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": "bili_private_request_revoked",
+                },
+            )
+            return
+
+        sessions = getattr(self.service, "sessions", None)
+        preferred: Message = entry["source"]
+        try:
+            current_epoch = (
+                await sessions.current_epoch(preferred)
+                if sessions is not None and hasattr(sessions, "current_epoch")
+                else None
+            )
+        except Exception:
+            current_epoch = None
+        if (
+            not permits_chat_export(preferred, self.s, "bilibili_surf")
+            or current_epoch != entry["epoch"]
+        ):
+            session._bili_private_handles.pop(handle, None)
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": "bili_private_request_revoked",
+                },
+            )
+            return
+
+        now = self.clock()
+        if now >= float(entry.get("expires_at", 0.0)):
+            session._bili_private_handles.pop(handle, None)
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": "bili_private_request_revoked",
+                },
+            )
+            return
+        expires_at = now + _BILI_PRIVATE_SHARE_PRIORITY_SECONDS
+        try:
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "CREATE TABLE IF NOT EXISTS bili_served_private_topics ("
+                    "receipt TEXT PRIMARY KEY) WITHOUT ROWID"
+                )
+                await self.store.db.execute(
+                    "CREATE TABLE IF NOT EXISTS bili_private_share_priority ("
+                    "bvid TEXT PRIMARY KEY, session_scope TEXT NOT NULL, expires_at REAL NOT NULL)"
+                )
+                await self.store.db.execute(
+                    "INSERT OR IGNORE INTO bili_served_private_topics(receipt) VALUES (?)",
+                    (entry["receipt"],),
+                )
+                await self.store.db.execute(
+                    "DELETE FROM bili_private_share_priority WHERE expires_at<=?",
+                    (now,),
+                )
+                await self.store.db.execute(
+                    "INSERT OR REPLACE INTO bili_private_share_priority "
+                    "(bvid, session_scope, expires_at) VALUES (?,?,?)",
+                    (bvid, entry["scope"], expires_at),
+                )
+        except Exception:
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": "bili_private_commit_failed",
+                },
+            )
+            return
+
+        commits = int(entry.get("commits", 0)) + 1
+        entry["commits"] = commits
+        if commits >= _BILI_PRIVATE_HANDLE_MAX_COMMITS:
+            session._bili_private_handles.pop(handle, None)
+
+        await self._send_frame(
+            session,
+            {
+                "type": "kernel.result",
+                "id": req_id,
+                "ok": True,
+                "result": {
+                    "committed": True,
+                    "owner_private": bool(entry["owner_private"]),
+                    "audience": str(entry["audience"]),
+                    "session_scope": str(entry["scope"]),
+                },
+            },
+        )
+
     async def _handle_state_get(self, session: _PluginSession, frame: dict[str, Any]) -> None:
         req_id = frame.get("id")
         if not isinstance(req_id, str) or not req_id.strip() or len(req_id) > 128:
@@ -4185,6 +4574,7 @@ class PluginBus:
             async def _cleanup_session_and_close(sess: _PluginSession = session) -> None:
                 if self._sessions.get(sess.plugin_id) is sess:
                     self._sessions.pop(sess.plugin_id, None)
+                sess._bili_private_handles.clear()
                 sess.ready = False
                 if not sess.closed:
                     sess.closed = True
@@ -4375,6 +4765,10 @@ class PluginBus:
                     await self._handle_world_activity(session, frame)
                 elif ftype == "world.reaction":
                     await self._handle_world_reaction(session, frame)
+                elif ftype == "bili.memory_preferences":
+                    await self._handle_bili_memory_preferences(session, frame)
+                elif ftype == "bili.private_topic_commit":
+                    await self._handle_bili_private_topic_commit(session, frame)
                 else:
                     raise Rejected("plugin_unknown_frame")
 

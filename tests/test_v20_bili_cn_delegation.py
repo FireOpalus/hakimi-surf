@@ -833,3 +833,115 @@ async def test_bilibili_surf_module_cn_line_indicator(settings):
     )
     s_dis = await mod_disabled.get_sensor_summary()
     assert s_dis.startswith("B站冲浪:") and "(CN专线)" not in s_dis
+
+
+@pytest.mark.parametrize(
+    "lane1_error",
+    [
+        "video_download_cdn_http_567",
+        "video_download_cdn_http_403",
+        "video_download_cdn_host_blocked",
+        "video_download_no_audio_track",
+    ],
+)
+async def test_video_watch_lane2_rescues_cdn_errors_without_account_cooldown(
+    settings, store, tmp_path, message, lane1_error
+):
+    sb_bytes = b"\xff\xd8\xff\xe0videoshot-3x3" + b"0" * 256
+    sb_b64 = base64.b64encode(sb_bytes).decode("ascii")
+
+    def node_handler(action, params, _timeout):
+        assert action == "bili.video_storyboard"
+        assert params["page"] == 2
+        assert params["cid"] == 202
+        return {
+            "bvid": BV,
+            "duration": 60.0,
+            "mime_type": "image/jpeg",
+            "data_b64": sb_b64,
+            "bytes": len(sb_bytes),
+            "grid": "3x3",
+            "source": "videoshot",
+        }
+
+    nt = FakeNodeTransport(is_connected=True, handler=node_handler)
+    gateway = FakeGateway()
+    downloader = Downloader(tmp_path / "unused.mp4")
+    downloader.error = lane1_error
+    risks = []
+    watcher = SimpleNamespace(
+        credentials_epoch=0,
+        creds={"sessdata": "secret-cookie-must-not-log"},
+        blocked_until=0.0,
+        _ensure_current=lambda: None,
+        _risk=lambda r: risks.append(r),
+    )
+    svc = SimpleNamespace(
+        s=settings, store=store, ai=gateway, bili_watcher=watcher, secrets=[], node_transport=nt
+    )
+    watch = VideoWatch(svc, downloader=downloader, clock=lambda: 1_700_000_000.0)
+    await watch.initialize()
+    await watch.set_config(VideoWatchConfig(enabled=True))
+
+    mat = {**material(), "cid": 202, "page": 2}
+    res = await watch.analyze(BV, mat, "subject", "chat", message=message)
+    assert res.mode == "cn_storyboard" and res.reason is None
+    assert not risks and watcher.blocked_until == 0.0
+    assert downloader.calls[0][1]["page"] == 2
+
+
+async def test_video_watch_storyboard_failure_logged_and_long_video_uses_videoshot_only(
+    settings, store, tmp_path, message, caplog
+):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="hakimi")
+    nt = FakeNodeTransport(
+        is_connected=True,
+        handler=lambda *_: (_ for _ in ()).throw(Rejected("videoshot_unavailable")),
+    )
+    gateway = FakeGateway()
+    downloader = Downloader(tmp_path / "unused.mp4")
+    downloader.error = "video_download_unavailable"
+    watcher = SimpleNamespace(
+        credentials_epoch=0,
+        creds={"sessdata": "top-secret-sessdata-xyz"},
+        _ensure_current=lambda: None,
+        _risk=lambda r: None,
+    )
+    svc = SimpleNamespace(
+        s=settings, store=store, ai=gateway, bili_watcher=watcher, secrets=[], node_transport=nt
+    )
+    watch = VideoWatch(svc, downloader=downloader, clock=lambda: 1_700_000_000.0)
+    await watch.initialize()
+    await watch.set_config(VideoWatchConfig(enabled=True, max_seconds=180))
+
+    res = await watch.analyze(BV, material(), "subject", "chat", message=message)
+    assert res.mode == "text" and res.reason == "storyboard_err"
+    assert (await watch.status())["recent_attempts"][0]["reason"] == "storyboard_err"
+    assert "event=video_watch_storyboard_failed" in caplog.text
+    assert "videoshot_unavailable" in caplog.text
+    assert "top-secret-sessdata-xyz" not in caplog.text
+
+    # Long video (> max_seconds) skips Lane 1 and calls videoshot_only=True on Lane 2.
+    sb_bytes = b"\xff\xd8\xff\xe0long-videoshot" + b"1" * 128
+    sb_b64 = base64.b64encode(sb_bytes).decode("ascii")
+    nt.calls.clear()
+    downloader.calls.clear()
+    nt.handler = lambda _action, params, _timeout: (
+        {
+            "bvid": BV,
+            "duration": 1800.0,
+            "mime_type": "image/jpeg",
+            "data_b64": sb_b64,
+            "bytes": len(sb_bytes),
+            "grid": "3x3",
+            "source": "videoshot",
+        }
+        if params.get("videoshot_only") is True
+        else (_ for _ in ()).throw(AssertionError("expected videoshot_only"))
+    )
+    res_long = await watch.analyze(BV, material(duration=1800), "subject", "chat", message=message)
+    assert res_long.mode == "cn_storyboard" and res_long.reason is None
+    assert not downloader.calls
+    assert nt.calls[0][1]["videoshot_only"] is True

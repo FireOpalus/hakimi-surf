@@ -519,3 +519,63 @@ async def test_local_download_failures_keep_daily_quota_and_preserve_reasons(rig
     third = await rig.watch.analyze(BV, material(), "subject-3", "chat")
     assert third.mode == "text" and third.reason == "files_unavailable"
     assert (await rig.watch.status())["attempts_today"] == 1
+
+
+@pytest.mark.parametrize(
+    "code,expected_reason",
+    [
+        ("video_download_cdn_http_567", "cdn_http_567"),
+        ("video_download_cdn_http_403", "cdn_http_403"),
+        ("video_download_cdn_http_5xx", "cdn_http_5xx"),
+        ("video_download_cdn_host_blocked", "cdn_host_blocked"),
+        ("video_download_no_audio_track", "no_audio_track"),
+        ("video_download_timeout", "timeout"),
+        ("video_download_invalid_media", "invalid_media"),
+        ("video_download_part_not_found", "part_not_found"),
+    ],
+)
+async def test_fine_grained_download_failures_record_reason_and_never_cooldown(
+    rig, code, expected_reason
+):
+    rig.downloader.error = code
+    res = await rig.watch.analyze(BV, material(), "subject", "chat")
+    assert res.mode == "text" and res.reason == expected_reason
+    assert rig.svc.bili_watcher.blocked_until == 0
+    assert not rig.svc.bili_watcher.risks
+    status = await rig.watch.status()
+    assert status["attempts_today"] == 0
+    assert status["recent_attempts"][0]["reason"] == expected_reason
+
+
+@pytest.mark.parametrize(
+    "text,expected_page",
+    [
+        (f"看下这个 https://www.bilibili.com/video/{BV}?p=2", 2),
+        (f"旧链接 http://m.bilibili.com/video/{BV}/?p=3&from=qq", 3),
+        (f"活动页 https://www.bilibili.com/festival/2026bnj?bvid={BV}&p=4", 4),
+        (f"普通链接 https://www.bilibili.com/video/{BV}", 1),
+    ],
+)
+async def test_multipart_page_extracted_and_passed_to_downloader(rig, message, text, expected_page):
+    msg = message.model_copy(update={"text": text})
+    res = await rig.watch.analyze(BV, material(), "owner", "chat", message=msg)
+    assert res.mode == "video"
+    call_kwargs = rig.downloader.calls[-1][1]
+    if expected_page > 1:
+        assert call_kwargs.get("page") == expected_page
+    else:
+        assert "page" not in call_kwargs
+
+
+def test_extract_video_page_handles_invalid_ports_without_crashing():
+    from hakimi.video_watch import extract_video_page
+
+    assert extract_video_page(f"http://www.bilibili.com:99999/video/{BV}?p=3", BV) == 1
+    assert extract_video_page(f"https://www.bilibili.com:abc/video/{BV}?p=4", BV) == 1
+    assert (
+        extract_video_page(
+            f"http://www.bilibili.com:99999/video/{BV}?p=9 https://www.bilibili.com/video/{BV}?p=5",
+            BV,
+        )
+        == 5
+    )

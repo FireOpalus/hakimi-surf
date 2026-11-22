@@ -11,7 +11,7 @@ import time
 import unicodedata
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -21,6 +21,8 @@ from hakimi_plugin_sdk import PluginRpcError
 log = logging.getLogger("hakimi_plugin_bilibili")
 
 BVID = r"BV[1-9A-HJ-NP-Za-km-z]{10}"
+_BVID_FULL_RE = re.compile(rf"^{BVID}$")
+_FESTIVAL_PATH_RE = re.compile(r"/festival(?:/[A-Za-z0-9_-]{1,80})?/?")
 BV_RE = re.compile(rf"(?<![A-Za-z0-9])({BVID})(?![A-Za-z0-9])")
 URL_RE = re.compile(r"https?://[^\s<>\"'，。！？）]+", re.IGNORECASE)
 
@@ -90,40 +92,75 @@ async def bounded_json(
     return obj
 
 
-def _extract_url_bvid(raw_url: str) -> str | None:
+def _extract_url_video_ref(raw_url: str) -> tuple[str, int] | None:
     if not isinstance(raw_url, str) or not raw_url:
         return None
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in raw_url):
         return None
     try:
         u = urlsplit(raw_url)
+        port = u.port
     except ValueError:
         return None
+    host = (u.hostname or "").lower()
     if (
-        u.scheme != "https"
-        or u.hostname not in CANONICAL_VIDEO_HOSTS
+        u.scheme not in {"https", "http"}
+        or host not in CANONICAL_VIDEO_HOSTS
         or u.username is not None
         or u.password is not None
-        or u.port not in {None, 443}
+        or (u.scheme == "https" and port not in {None, 443})
+        or (u.scheme == "http" and port not in {None, 80})
+        or ".." in u.path
     ):
         return None
+
+    qs = parse_qs(u.query, keep_blank_values=False)
+    bvid: str | None = None
     match = re.fullmatch(rf"/video/({BVID})/?", u.path)
-    return match[1] if match else None
+    if match:
+        bvid = match[1]
+    elif _FESTIVAL_PATH_RE.fullmatch(u.path):
+        raw_bvids = qs.get("bvid")
+        if raw_bvids and _BVID_FULL_RE.fullmatch(raw_bvids[0]):
+            bvid = raw_bvids[0]
+    if not bvid:
+        return None
+
+    page = 1
+    raw_pages = qs.get("p")
+    if raw_pages:
+        raw_p = raw_pages[0].strip()
+        if re.fullmatch(r"[1-9][0-9]{0,2}", raw_p):
+            parsed_page = int(raw_p)
+            if 1 <= parsed_page <= 999:
+                page = parsed_page
+    return bvid, page
 
 
-def extract_bvid(text: str) -> str | None:
-    """Extract a canonical Bilibili BV ID from strict HTTPS Bilibili URLs or bare text."""
+def _extract_url_bvid(raw_url: str) -> str | None:
+    ref = _extract_url_video_ref(raw_url)
+    return ref[0] if ref is not None else None
+
+
+def extract_video_ref(text: str) -> tuple[str, int] | None:
+    """Extract `(bvid, page)` from canonical Bilibili URLs or bare BV text."""
     if not isinstance(text, str) or not text:
         return None
     urls = URL_RE.findall(text)
-    candidates: list[str] = []
     for raw in urls:
-        bvid = _extract_url_bvid(raw)
-        if bvid:
-            candidates.append(bvid)
-    if not candidates:
-        candidates = BV_RE.findall(URL_RE.sub(" ", text))
-    return candidates[0] if candidates else None
+        ref = _extract_url_video_ref(raw)
+        if ref is not None:
+            return ref
+    bare = BV_RE.findall(URL_RE.sub(" ", text))
+    if bare:
+        return bare[0], 1
+    return None
+
+
+def extract_bvid(text: str) -> str | None:
+    """Extract a canonical Bilibili BV ID from canonical Bilibili URLs or bare text."""
+    ref = extract_video_ref(text)
+    return ref[0] if ref is not None else None
 
 
 def _is_valid_short_link(url: str) -> str | None:
@@ -134,6 +171,7 @@ def _is_valid_short_link(url: str) -> str | None:
         return None
     try:
         u = urlsplit(url)
+        port = u.port
     except ValueError:
         return None
     host = u.hostname or ""
@@ -142,7 +180,7 @@ def _is_valid_short_link(url: str) -> str | None:
         or host not in SHORT_LINK_HOSTS
         or u.username is not None
         or u.password is not None
-        or u.port not in {None, 443}
+        or port not in {None, 443}
         or u.query
         or u.fragment
         or not re.fullmatch(r"/[A-Za-z0-9]{1,32}", u.path)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 from collections.abc import AsyncIterator
@@ -846,3 +847,225 @@ async def test_video_watch_buvid4_autofill_initialize_and_secret_scrubbing(
                 await plugin.close()
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(runner, timeout=3.0)
+
+
+async def test_e2e_bili_private_topic_patrol_cover_thumb_and_offline_filter(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hakimi.session_manager import SessionManager
+    from tests.test_v20_p4_cross_module_mc import FakeNodeTransport
+
+    class PrivatePatrolGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.selection_payloads: list[dict[str, Any]] = []
+
+        async def generate(self, payload, subject, **kwargs):
+            await super().generate(payload, subject, **kwargs)
+            if str(kwargs.get("scenario")) == "bili_selection":
+                self.selection_payloads.append(dict(payload))
+                return json.dumps(
+                    {
+                        "selected": [{"bvid": BV1, "like": True, "share_owner": True}],
+                        "mood_longnick": "不应外泄的私聊心情",
+                    },
+                    ensure_ascii=False,
+                )
+            return "这是一个很棒的极光科普视频。"
+
+    gateway = PrivatePatrolGateway()
+    s = _base_settings(
+        settings,
+        external_plugins={"bilibili_surf"},
+        onebot_enabled=True,
+        onebot_self_id="10000",
+        onebot_owner_ids={"20000"},
+        onebot_allowed_users={"20000", "30000", "40001"},
+        onebot_allowed_groups={"40000"},
+    )
+    app = create_app(s, gateway_factory=lambda *_: gateway, start_workers=False)
+    http_calls: list[httpx.Request] = []
+    responses = _default_bili_responses(with_subtitles=True)
+    responses["/x/web-interface/view"]["pic"] = "http://i0.hdslb.com/bfs/archive/aurora.jpg"
+
+    async with _running_app(app) as (port, client):
+        svc = app.state.service
+        svc.sender = FakeSender()
+        sessions = svc.sessions = SessionManager(svc.s, svc.store)
+
+        friend_msg = Message(
+            platform="onebot",
+            bot_id="10000",
+            event_id="ev-e2e-priv-1",
+            user_id="30000",
+            kind="private",
+            conversation_id="30000",
+            text="帮我找个极光视频 13800138000",
+            addressed=True,
+            created_at=svc.life_engine.clock(),
+        )
+        other_friend = Message(
+            platform="onebot",
+            bot_id="10000",
+            event_id="ev-e2e-priv-2",
+            user_id="40001",
+            kind="private",
+            conversation_id="40001",
+            text="你好",
+            addressed=True,
+            created_at=svc.life_engine.clock(),
+        )
+        group_msg = Message(
+            platform="onebot",
+            bot_id="10000",
+            event_id="ev-e2e-grp-1",
+            user_id="30000",
+            kind="group",
+            conversation_id="40000",
+            text="群聊消息",
+            addressed=True,
+            created_at=svc.life_engine.clock(),
+        )
+        await sessions.remember(friend_msg, friend_msg.text, "好")
+
+        async def _reg() -> list[tuple[str, Message]]:
+            return [
+                (svc.store.session_scope(friend_msg), friend_msg),
+                (svc.store.session_scope(group_msg), group_msg),
+            ]
+
+        monkeypatch.setattr(svc.store.runtime, "sessions", _reg)
+
+        good_jpg = b"\xff\xd8\xff\xe0" + b"j" * 64
+        nt = FakeNodeTransport(is_connected=True)
+        nt.responses["bili.cover_thumb"] = {
+            "mime_type": "image/jpeg",
+            "bytes": len(good_jpg),
+            "data_b64": base64.b64encode(good_jpg).decode("ascii"),
+        }
+        svc.node_transport = nt
+
+        created = await client.post(
+            "/admin/api/plugins",
+            json={
+                "plugin_id": "bilibili_surf",
+                "display_name": "B 站巡逻",
+                "scopes": list(BILIBILI_SCOPES),
+                "node_region": "KR",
+            },
+        )
+        assert created.status_code == 200
+        token = created.json()["token"]
+
+        async with _make_bili_http_client(responses, http_calls) as bili_http:
+            plugin = build_bilibili_plugin(
+                _bili_runtime_config(port, token),
+                http_client=bili_http,
+                sleep=_noop_sleep,
+            )
+            runner = asyncio.create_task(plugin.client.run_forever())
+            try:
+                await _wait_until(
+                    lambda: (
+                        (mod := svc.modules.get("bilibili_surf")) is not None
+                        and isinstance(mod, RemoteModuleProxy)
+                        and mod._session.ready
+                        and plugin.engine._initialized
+                    )
+                )
+                proxy = svc.modules.get("bilibili_surf")
+                assert isinstance(proxy, RemoteModuleProxy)
+                assert proxy._action_timeouts["bili.patrol"] == 1500.0
+
+                # 1) Cover thumbnail E2E via RemoteBiliWatcher -> bili.cover_thumb -> node_transport
+                plugin.engine.set_node_connected(True)
+                thumb = await svc.bili_watcher.fetch_cover_thumbnail(
+                    "https://i0.hdslb.com/bfs/archive/aurora.jpg"
+                )
+                assert thumb is not None and thumb["bytes"] == len(good_jpg)
+                # http:// and evil host rejected strictly without calling node_transport
+                nt_calls_before = len(nt.calls)
+                assert (
+                    await svc.bili_watcher.fetch_cover_thumbnail(
+                        "http://i0.hdslb.com/bfs/archive/aurora.jpg"
+                    )
+                    is None
+                )
+                assert (
+                    await svc.bili_watcher.fetch_cover_thumbnail(
+                        "https://evil.invalid/bfs/archive/aurora.jpg"
+                    )
+                    is None
+                )
+                assert len(nt.calls) == nt_calls_before
+                plugin.engine.set_node_connected(False)
+
+                # 2) Configure creds & run autonomous patrol driven by private friend request
+                assert (
+                    await client.post(
+                        "/admin/api/bili-account/credentials",
+                        json={
+                            "sessdata": "e2e-priv-sess-1234",
+                            "bili_jct": "e2e-priv-jct-1234",
+                            "buvid3": "e2e-priv-b3-1234",
+                            "buvid4": "e2e-priv-b4-1234",
+                        },
+                    )
+                ).status_code == 200
+                assert (
+                    await client.put(
+                        "/admin/api/bili-account",
+                        json={"enabled": True, "allow_like": True},
+                    )
+                ).status_code == 200
+
+                run_res = await svc.bili_watcher.run_once(slot="e2e-priv-slot")
+                assert run_res == {"status": "done", "learned": 1, "reason": None}
+                assert len(gateway.selection_payloads) == 1
+                sel_prefs = gateway.selection_payloads[0]["memory_preferences"]
+                assert sel_prefs["private_topic_refs"] == ["recent_chat_topics:0"]
+                assert "极光视频" in sel_prefs["recent_chat_topics"][0]
+                assert "13800138000" not in json.dumps(sel_prefs, ensure_ascii=False)
+                assert "30000" not in json.dumps(sel_prefs, ensure_ascii=False)
+                # No public POST interactions on private-first patrol
+                assert not any(r.method == "POST" for r in http_calls)
+
+                # Verify world event has private_first=True and NO title/summary
+                ev_row = await svc.store.one(
+                    "SELECT payload_json FROM global_events "
+                    "WHERE event_type='bili_video_watched' ORDER BY created_at DESC LIMIT 1"
+                )
+                assert ev_row is not None
+                ev_payload = json.loads(ev_row["payload_json"])
+                assert ev_payload["private_first"] is True
+                assert ev_payload["owner_private"] is False
+                assert "title" not in ev_payload and "summary" not in ev_payload
+
+                # Online lookup_watched & recent_surfed enforce 24h private scope isolation
+                lk_friend = await svc.bili_watcher.lookup_watched(BV1, message=friend_msg)
+                assert lk_friend is not None
+                assert "公开字幕学习" in lk_friend["prior_patrol_notes"]
+                assert await svc.bili_watcher.lookup_watched(BV1, message=other_friend) is None
+                assert await svc.bili_watcher.lookup_watched(BV1, message=group_msg) is None
+                assert await svc.bili_watcher.lookup_watched(BV1) is None
+
+                assert [
+                    i["bvid"] for i in await svc.bili_watcher.recent_surfed(message=friend_msg)
+                ] == [BV1]
+                assert await svc.bili_watcher.recent_surfed(message=other_friend) == []
+                assert await svc.bili_watcher.recent_surfed(message=group_msg) == []
+            finally:
+                await plugin.close()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(runner, timeout=3.0)
+
+        # Offline fallback also enforces 24h private scope isolation
+        await _wait_until(lambda: svc.modules.get("bilibili_surf") is None)
+        assert await svc.bili_watcher.lookup_watched(BV1, message=friend_msg) is not None
+        assert await svc.bili_watcher.lookup_watched(BV1, message=other_friend) is None
+        assert await svc.bili_watcher.lookup_watched(BV1, message=group_msg) is None
+        assert [i["bvid"] for i in await svc.bili_watcher.recent_surfed(message=friend_msg)] == [
+            BV1
+        ]
+        assert await svc.bili_watcher.recent_surfed(message=other_friend) == []
+        assert await svc.bili_watcher.recent_surfed(message=group_msg) == []

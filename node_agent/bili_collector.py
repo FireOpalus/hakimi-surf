@@ -49,6 +49,7 @@ SUBTITLE_HOSTS = frozenset({"aisubtitle.hdslb.com", "i0.hdslb.com", "i1.hdslb.co
 COVER_URL_RE = re.compile(
     r"^https://(?:i[0-2]\.hdslb\.com|archive\.biliimg\.com)/bfs/[A-Za-z0-9_./-]+$"
 )
+VIDEOSHOT_HOST_RE = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.hdslb\.com$")
 BVID_RE = re.compile(r"^BV[1-9A-HJ-NP-Za-km-z]{10}$")
 
 PUBLIC_GET_MAX_BYTES = 1_048_576
@@ -60,6 +61,10 @@ STORYBOARD_MAX_VIDEO_BYTES = 40 * 1024 * 1024
 STORYBOARD_MAX_JPEG_BYTES = 245_760
 STORYBOARD_CELL_W = 320
 STORYBOARD_CELL_H = 180
+STORYBOARD_YTDLP_FORMAT = "worstvideo[ext=mp4][height<=480]/worstvideo[height<=480]"
+STORYBOARD_YTDLP_MAX_SECONDS = 15 * 60
+STORYBOARD_MAX_SECONDS_CAP = 24 * 60 * 60
+VIDEOSHOT_MAX_SHEETS = 1000
 MAX_PROCESS_OUTPUT_BYTES = 32_768
 
 _COOKIE_KEY_MAP = {
@@ -274,16 +279,160 @@ def _compose_storyboard_sync(frame_paths: list[Path]) -> bytes:
     return jpeg_bytes
 
 
+def _validate_videoshot_url(raw_url: str) -> str:
+    if (
+        not isinstance(raw_url, str)
+        or not raw_url
+        or len(raw_url) > 2048
+        or "\\" in raw_url
+        or any(ord(ch) <= 32 or ord(ch) == 127 for ch in raw_url)
+    ):
+        raise CollectorError("videoshot_host_forbidden")
+    url = f"https:{raw_url}" if raw_url.startswith("//") else raw_url
+    if not url.startswith("https://"):
+        raise CollectorError("videoshot_host_forbidden")
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise CollectorError("videoshot_host_forbidden") from None
+    host = (parsed.hostname or "").lower()
+    lowered_path = parsed.path.lower()
+    if (
+        parsed.scheme != "https"
+        or not VIDEOSHOT_HOST_RE.fullmatch(host)
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or not parsed.path.startswith("/bfs/")
+        or len(parsed.path) <= len("/bfs/")
+        or ".." in parsed.path.split("/")
+        or "%2e" in lowered_path
+        or "%2f" in lowered_path
+        or "%5c" in lowered_path
+    ):
+        raise CollectorError("videoshot_host_forbidden")
+    return url
+
+
+def _compose_videoshot_sync(
+    sheet_blobs: dict[int, bytes],
+    sample_slots: list[tuple[int, int]],
+    *,
+    img_x_len: int,
+    img_y_len: int,
+    img_x_size: int,
+    img_y_size: int,
+) -> bytes:
+    if len(sample_slots) != 9:
+        raise CollectorError("videoshot_invalid_media")
+    decoded_sheets: dict[int, Image.Image] = {}
+    tiles: list[Image.Image] = []
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            for sheet_idx, raw in sheet_blobs.items():
+                if not raw:
+                    raise CollectorError("videoshot_invalid_media")
+                with Image.open(io.BytesIO(raw)) as src:
+                    if (
+                        src.format not in _ALLOWED_IMAGE_FORMATS
+                        or src.width < 1
+                        or src.height < 1
+                        or src.width * src.height > COVER_MAX_PIXELS
+                    ):
+                        raise CollectorError("videoshot_invalid_media")
+                    src.seek(0)
+                    src.load()
+                    decoded_sheets[sheet_idx] = src.convert("RGB")
+            for sheet_idx, local_idx in sample_slots:
+                sheet = decoded_sheets.get(sheet_idx)
+                if sheet is None:
+                    raise CollectorError("videoshot_invalid_media")
+                avail_cols = min(img_x_len, sheet.width // img_x_size)
+                avail_rows = min(img_y_len, sheet.height // img_y_size)
+                if avail_cols < 1 or avail_rows < 1:
+                    raise CollectorError("videoshot_invalid_media")
+                row, col = divmod(local_idx, img_x_len)
+                if row >= avail_rows:
+                    row = avail_rows - 1
+                if col >= avail_cols:
+                    col = avail_cols - 1
+                left = col * img_x_size
+                top = row * img_y_size
+                tile = sheet.crop((left, top, left + img_x_size, top + img_y_size))
+                tile.thumbnail((STORYBOARD_CELL_W, STORYBOARD_CELL_H), Image.Resampling.LANCZOS)
+                tiles.append(tile)
+    except CollectorError:
+        raise
+    except (
+        Image.DecompressionBombWarning,
+        Image.DecompressionBombError,
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+    ):
+        raise CollectorError("videoshot_invalid_media") from None
+    finally:
+        for img in decoded_sheets.values():
+            img.close()
+
+    cell_w = min(max(tile.width for tile in tiles), STORYBOARD_CELL_W)
+    cell_h = min(max(tile.height for tile in tiles), STORYBOARD_CELL_H)
+    canvas = Image.new("RGB", (cell_w * 3, cell_h * 3), (16, 16, 16))
+    for idx, tile in enumerate(tiles):
+        row, col = divmod(idx, 3)
+        offset_x = col * cell_w + (cell_w - tile.width) // 2
+        offset_y = row * cell_h + (cell_h - tile.height) // 2
+        canvas.paste(tile, (offset_x, offset_y))
+
+    jpeg_bytes, _, _ = _encode_jpeg_bounded(
+        canvas, max_bytes=STORYBOARD_MAX_JPEG_BYTES, initial_quality=78
+    )
+    return jpeg_bytes
+
+
+def _format_videoshot_reason(exc: CollectorError) -> str:
+    if exc.code == "bili_http_status" and exc.upstream_status is not None:
+        return f"videoshot_http_{exc.upstream_status}"
+    if exc.code == "videoshot_unavailable" and exc.upstream_code is not None:
+        return f"videoshot_api_{exc.upstream_code}"
+    return exc.code
+
+
 def _classify_ytdlp_error(text: str) -> str:
     lowered = text.lower()
     if re.search(r"(?<![a-z0-9])-?101(?![a-z0-9])", lowered) or "login required" in lowered:
         return "video_download_cookie_expired"
     if (
         re.search(r"(?<![a-z0-9])-?(?:352|412)(?![a-z0-9])", lowered)
+        or re.search(
+            r"(?:http(?:\s+error)?|status(?:\s+code)?)\s*:?\s*(?:412|429)(?![0-9])", lowered
+        )
+        or re.search(r"(?<![a-z0-9.])429(?![a-z0-9])", lowered)
         or any(tok in lowered for tok in ("captcha", "v_voucher", "rate limit", "验证码", "风控"))
-        or re.search(r"http(?: error)?\s+(?:403|429)", lowered)
     ):
         return "video_download_risk"
+    if re.search(r"(?:http(?:\s+error)?|status(?:\s+code)?)\s*:?\s*567(?![0-9])", lowered):
+        return "video_download_cdn_http_567"
+    if (
+        re.search(r"(?:http(?:\s+error)?|status(?:\s+code)?)\s*:?\s*403(?![0-9])", lowered)
+        or "403 forbidden" in lowered
+    ):
+        return "video_download_cdn_http_403"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "video_download_timeout"
+    if any(
+        tok in lowered
+        for tok in (
+            "requested format is not available",
+            "format is not available",
+            "format not available",
+            "no video formats found",
+        )
+    ):
+        return "video_download_format"
     if any(tok in lowered for tok in ("supporter-only", "premium-only", "drm", "preview", "试看")):
         return "video_download_restricted"
     if "file is larger than max-filesize" in lowered or "max-filesize" in lowered:
@@ -537,12 +686,16 @@ class BiliCollector:
                 raise CollectorError("bili_subtitle_host_forbidden")
             if any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
                 raise CollectorError("bili_subtitle_host_forbidden")
-            parsed = urlsplit(path)
+            try:
+                parsed = urlsplit(path)
+                port = parsed.port
+            except ValueError:
+                raise CollectorError("bili_subtitle_host_forbidden") from None
             host = (parsed.hostname or "").lower()
             if (
                 parsed.scheme != "https"
                 or host not in SUBTITLE_HOSTS
-                or parsed.port not in {None, 443}
+                or port not in {None, 443}
                 or parsed.username is not None
                 or parsed.password is not None
                 or parsed.fragment
@@ -772,20 +925,253 @@ class BiliCollector:
                 raise CollectorError("video_download_invalid_media")
         return frames
 
+    async def _resolve_page_cid_and_duration(
+        self, bvid: str, page: int, api_headers: dict[str, str]
+    ) -> tuple[int, float | None]:
+        await self._pace()
+        view_obj = await self._bounded_json(
+            "GET",
+            f"{PUBLIC_API_ORIGIN}/x/web-interface/view",
+            params={"bvid": bvid},
+            headers=api_headers,
+            max_bytes=PUBLIC_GET_MAX_BYTES,
+        )
+        code = view_obj.get("code")
+        data = view_obj.get("data")
+        if code != 0 or not isinstance(data, dict):
+            upstream_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            raise CollectorError("videoshot_unavailable", upstream_code=upstream_code)
+        pages = data.get("pages")
+        if not isinstance(pages, list) or page - 1 >= len(pages):
+            raise CollectorError("videoshot_unavailable")
+        entry = pages[page - 1]
+        if not isinstance(entry, dict):
+            raise CollectorError("videoshot_unavailable")
+        raw_cid = entry.get("cid")
+        if isinstance(raw_cid, bool) or not isinstance(raw_cid, int) or raw_cid <= 0:
+            raise CollectorError("videoshot_unavailable")
+        raw_dur = entry.get("duration")
+        page_duration = (
+            float(raw_dur)
+            if isinstance(raw_dur, (int, float))
+            and not isinstance(raw_dur, bool)
+            and math.isfinite(raw_dur)
+            and raw_dur > 0
+            else None
+        )
+        return raw_cid, page_duration
+
+    async def _video_storyboard_via_videoshot(
+        self,
+        *,
+        bvid: str,
+        page: int,
+        cid: int | None,
+        hint_duration: float | None,
+        cookies: dict[str, str],
+        resolved_view_duration: list[float | None],
+    ) -> dict[str, Any]:
+        api_headers = dict(_MINIMAL_HEADERS)
+        cookie_header = _build_cookie_header(cookies)
+        if cookie_header:
+            api_headers["Cookie"] = cookie_header
+
+        resolved_cid = cid
+        view_page_duration: float | None = None
+        if resolved_cid is None and page > 1:
+            resolved_cid, view_page_duration = await self._resolve_page_cid_and_duration(
+                bvid, page, api_headers
+            )
+            resolved_view_duration[0] = view_page_duration
+
+        vs_params: dict[str, str] = {"bvid": bvid, "index": "1"}
+        if resolved_cid is not None:
+            vs_params["cid"] = str(resolved_cid)
+
+        await self._pace()
+        vs_obj = await self._bounded_json(
+            "GET",
+            f"{PUBLIC_API_ORIGIN}/x/player/videoshot",
+            params=vs_params,
+            headers=api_headers,
+            max_bytes=PUBLIC_GET_MAX_BYTES,
+        )
+        code = vs_obj.get("code")
+        data = vs_obj.get("data")
+        if code != 0 or not isinstance(data, dict):
+            upstream_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            raise CollectorError("videoshot_unavailable", upstream_code=upstream_code)
+
+        raw_images = data.get("image")
+        if (
+            not isinstance(raw_images, list)
+            or not raw_images
+            or len(raw_images) > VIDEOSHOT_MAX_SHEETS
+        ):
+            raise CollectorError("videoshot_unavailable")
+
+        sheet_urls = [_validate_videoshot_url(item) for item in raw_images]
+
+        img_x_len = data.get("img_x_len")
+        img_y_len = data.get("img_y_len")
+        img_x_size = data.get("img_x_size")
+        img_y_size = data.get("img_y_size")
+        if (
+            any(
+                isinstance(v, bool) or not isinstance(v, int)
+                for v in (img_x_len, img_y_len, img_x_size, img_y_size)
+            )
+            or not 1 <= img_x_len <= 50
+            or not 1 <= img_y_len <= 50
+            or not 1 <= img_x_size <= 1920
+            or not 1 <= img_y_size <= 1080
+        ):
+            raise CollectorError("videoshot_invalid_media")
+
+        per_sheet = img_x_len * img_y_len
+        total_capacity = len(sheet_urls) * per_sheet
+
+        raw_index = data.get("index")
+        valid_index_count = 0
+        max_index_ts: float | None = None
+        if isinstance(raw_index, list):
+            for val in raw_index:
+                if (
+                    isinstance(val, (int, float))
+                    and not isinstance(val, bool)
+                    and math.isfinite(val)
+                    and val >= 0
+                ):
+                    valid_index_count += 1
+                    if val > 0 and (max_index_ts is None or float(val) > max_index_ts):
+                        max_index_ts = float(val)
+
+        total_frames = (
+            min(valid_index_count, total_capacity) if valid_index_count > 0 else total_capacity
+        )
+        sample_indices = [
+            min(total_frames - 1, (total_frames * (2 * i + 1)) // 18) for i in range(9)
+        ]
+        sample_slots = [divmod(frame_idx, per_sheet) for frame_idx in sample_indices]
+        needed_sheets = sorted({sheet_idx for sheet_idx, _ in sample_slots})
+
+        sheet_blobs: dict[int, bytes] = {}
+        for sheet_idx in needed_sheets:
+            sheet_blobs[sheet_idx] = await self._bounded_bytes(
+                "GET",
+                sheet_urls[sheet_idx],
+                headers=dict(_MINIMAL_HEADERS),
+                max_bytes=COVER_MAX_DOWNLOAD_BYTES,
+            )
+
+        jpeg_bytes = await asyncio.to_thread(
+            _compose_videoshot_sync,
+            sheet_blobs,
+            sample_slots,
+            img_x_len=img_x_len,
+            img_y_len=img_y_len,
+            img_x_size=img_x_size,
+            img_y_size=img_y_size,
+        )
+
+        dur = (
+            hint_duration
+            if hint_duration is not None
+            else (view_page_duration if view_page_duration is not None else max_index_ts)
+        )
+        return {
+            "bvid": bvid,
+            "duration": round(dur, 3) if dur else None,
+            "mime_type": "image/jpeg",
+            "data_b64": base64.b64encode(jpeg_bytes).decode("ascii"),
+            "bytes": len(jpeg_bytes),
+            "grid": "3x3",
+            "source": "videoshot",
+        }
+
     async def video_storyboard(self, params: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(params, dict):
             raise CollectorError("invalid_params")
         bvid = params.get("bvid", "")
         if not isinstance(bvid, str) or not BVID_RE.fullmatch(bvid):
             raise CollectorError("invalid_bvid")
-        max_seconds = params.get("max_seconds", 15 * 60)
+        raw_max = params.get("max_seconds", STORYBOARD_YTDLP_MAX_SECONDS)
+        max_seconds = STORYBOARD_YTDLP_MAX_SECONDS if raw_max is None else raw_max
         if (
             isinstance(max_seconds, bool)
             or not isinstance(max_seconds, int)
-            or not 30 <= max_seconds <= 15 * 60
+            or not 30 <= max_seconds <= STORYBOARD_MAX_SECONDS_CAP
         ):
             raise CollectorError("video_download_duration")
+
+        raw_page = params.get("page", 1)
+        page = 1 if raw_page is None else raw_page
+        if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 999:
+            raise CollectorError("invalid_params")
+
+        raw_cid = params.get("cid")
+        if raw_cid is None:
+            cid: int | None = None
+        elif isinstance(raw_cid, bool) or not isinstance(raw_cid, int) or raw_cid <= 0:
+            raise CollectorError("invalid_params")
+        else:
+            cid = raw_cid
+
+        raw_duration = params.get("duration")
+        if raw_duration is None:
+            hint_duration: float | None = None
+        elif (
+            isinstance(raw_duration, bool)
+            or not isinstance(raw_duration, (int, float))
+            or not math.isfinite(raw_duration)
+            or raw_duration <= 0
+        ):
+            raise CollectorError("invalid_params")
+        else:
+            hint_duration = float(raw_duration)
+
+        videoshot_only = params.get("videoshot_only", False)
+        if not isinstance(videoshot_only, bool):
+            raise CollectorError("invalid_params")
+
         cookies = _normalize_cookies(params.get("cookies"))
+
+        resolved_view_duration: list[float | None] = [None]
+        try:
+            return await self._video_storyboard_via_videoshot(
+                bvid=bvid,
+                page=page,
+                cid=cid,
+                hint_duration=hint_duration,
+                cookies=cookies,
+                resolved_view_duration=resolved_view_duration,
+            )
+        except CollectorError as exc:
+            videoshot_reason = _format_videoshot_reason(exc)
+            if videoshot_only:
+                log.warning(
+                    "event=bili_storyboard_failed bvid=%s videoshot_reason=%s fallback_reason=%s",
+                    bvid,
+                    videoshot_reason,
+                    "videoshot_only",
+                )
+                raise
+            log.info(
+                "event=bili_videoshot_fallback bvid=%s reason=%s",
+                bvid,
+                videoshot_reason,
+            )
+
+        ytdlp_max_seconds = min(max_seconds, STORYBOARD_YTDLP_MAX_SECONDS)
+        known_duration = hint_duration if hint_duration is not None else resolved_view_duration[0]
+        if known_duration is not None and known_duration > ytdlp_max_seconds:
+            log.warning(
+                "event=bili_storyboard_failed bvid=%s videoshot_reason=%s fallback_reason=%s",
+                bvid,
+                videoshot_reason,
+                "video_download_duration",
+            )
+            raise CollectorError("video_download_duration")
 
         async with self._storyboard_lock:
             await self.cleanup_stale()
@@ -801,7 +1187,7 @@ class BiliCollector:
                         "--max-filesize",
                         "40M",
                         "--format",
-                        "worst[ext=mp4]/mp4",
+                        STORYBOARD_YTDLP_FORMAT,
                         "--merge-output-format",
                         "mp4",
                         "--no-part",
@@ -830,14 +1216,19 @@ class BiliCollector:
                             self._write_private_file_sync, cookie_path, cookie_text
                         )
                         cmd.extend(["--cookies", str(cookie_path)])
-                    cmd.append(f"https://www.bilibili.com/video/{bvid}")
+                    video_url = (
+                        f"https://www.bilibili.com/video/{bvid}?p={page}"
+                        if page > 1
+                        else f"https://www.bilibili.com/video/{bvid}"
+                    )
+                    cmd.append(video_url)
 
                     await self._pace()
                     rc, stdout, stderr = await self._exec_bounded(
                         cmd, cwd=job_dir, env=env, wait_limit=90.0
                     )
                     if rc != 0:
-                        combined = (stderr or stdout).decode("utf-8", errors="ignore")
+                        combined = (stderr + b"\n" + stdout).decode("utf-8", errors="ignore")
                         raise CollectorError(_classify_ytdlp_error(combined))
                 finally:
                     wipe_cookie = asyncio.create_task(
@@ -851,7 +1242,7 @@ class BiliCollector:
 
                 video_path = await asyncio.to_thread(self._find_downloaded_video_sync, job_dir)
                 duration = await self._probe_duration(video_path, cwd=job_dir, env=env)
-                if duration > max_seconds:
+                if duration > ytdlp_max_seconds:
                     raise CollectorError("video_download_duration")
                 frames = await self._extract_frames(video_path, duration, cwd=job_dir, env=env)
                 jpeg_bytes = await asyncio.to_thread(_compose_storyboard_sync, frames)
@@ -862,7 +1253,16 @@ class BiliCollector:
                     "data_b64": base64.b64encode(jpeg_bytes).decode("ascii"),
                     "bytes": len(jpeg_bytes),
                     "grid": "3x3",
+                    "source": "ytdlp_fallback",
                 }
+            except CollectorError as exc:
+                log.warning(
+                    "event=bili_storyboard_failed bvid=%s videoshot_reason=%s fallback_reason=%s",
+                    bvid,
+                    videoshot_reason,
+                    exc.code,
+                )
+                raise
             finally:
                 self._active_jobs.discard(job_dir)
                 wipe_job = asyncio.create_task(asyncio.to_thread(self._rmtree_sync, job_dir))

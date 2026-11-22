@@ -135,6 +135,7 @@ COOKIE_NAMES = {
 USER_AGENT = "HakimiSurf/0.4 text patrol"
 SPI_PATH = "/x/frontend/finger/spi"
 MAX_COVER_THUMB_BYTES = 98_304
+PRIVATE_SHARE_PRIORITY_SECONDS = 24 * 3600
 MAX_READ_ATTEMPTS = 3
 READ_RETRY_SECONDS = 3600
 RISK_COOLDOWN_SECONDS = 43200
@@ -334,13 +335,14 @@ def _validate_subtitle_url(url: str) -> None:
         raise BiliClientError("bili_subtitle_host_forbidden")
     try:
         parsed = urlsplit(url)
+        port = parsed.port
     except ValueError:
         raise BiliClientError("bili_subtitle_host_forbidden") from None
     host = (parsed.hostname or "").lower()
     if (
         parsed.scheme != "https"
         or host not in SUBTITLE_HOSTS
-        or parsed.port not in {None, 443}
+        or port not in {None, 443}
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
@@ -385,6 +387,55 @@ def _resolve_timezone(tz_raw: Any) -> tuple[str, ZoneInfo]:
         return candidate, ZoneInfo(candidate)
     except ZoneInfoNotFoundError:
         return "Asia/Shanghai", ZoneInfo("Asia/Shanghai")
+
+
+def learning_source_label(mode: str, material_scope: str) -> str:
+    """Return an accurate Chinese source label for a learned Bilibili video."""
+    if mode == "video":
+        return "公开原片学习"
+    if mode == "cn_storyboard":
+        return "公开关键帧摘要"
+    if mode == "text" and material_scope in {"full_subtitle", "partial_subtitle"}:
+        return "公开字幕学习"
+    return "公开简介评论摘要"
+
+
+def _normalize_cover_url(raw_pic: Any) -> str | None:
+    """Normalize a Bilibili cover URL from `http://` or `//` to `https://` and validate it."""
+    if not isinstance(raw_pic, str):
+        return None
+    candidate = raw_pic.strip()
+    if not candidate:
+        return None
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    elif candidate[:7].lower() == "http://":
+        candidate = "https://" + candidate[7:]
+    if ".." in candidate or not COVER_URL_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _private_priority_visible(
+    meta: dict[str, Any] | None, *, session_scope: str, now: float
+) -> tuple[bool, bool]:
+    """Return `(visible, is_active_priority_for_scope)` for a watched item or document."""
+    if not isinstance(meta, dict):
+        return True, False
+    p_scope = str(meta.get("private_scope") or "")
+    raw_exp = meta.get("private_expires_at")
+    exp = (
+        float(raw_exp)
+        if isinstance(raw_exp, (int, float))
+        and not isinstance(raw_exp, bool)
+        and math.isfinite(float(raw_exp))
+        else 0.0
+    )
+    if p_scope and exp > now:
+        if session_scope and session_scope == p_scope:
+            return True, True
+        return False, False
+    return True, False
 
 
 class BiliPatrolEngine:
@@ -1058,7 +1109,7 @@ class BiliPatrolEngine:
                 raise BiliClientError("bili_account_unavailable") from None
             if code == "bili_http_status" or code.startswith("bili_http_status"):
                 combined = f"{code}:{detail}"
-                if any(s in combined for s in ("401", "403", "412", "429")):
+                if not subtitle and re.search(r"(?<!\d)(412|429)(?!\d)", combined):
                     await self._risk("bili_account_risk")
                 raise BiliClientError("bili_account_unavailable") from None
             raise BiliClientError("bili_account_unavailable") from None
@@ -1104,7 +1155,7 @@ class BiliPatrolEngine:
                     timeout=5,
                 )
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in {401, 403, 412, 429}:
+            if exc.response.status_code in {412, 429}:
                 await self._risk("bili_account_risk")
             obj = None
         except BiliClientError as exc:
@@ -1218,7 +1269,7 @@ class BiliPatrolEngine:
                         max_bytes=524288,
                     )
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in {401, 403, 412, 429}:
+                if not subtitle and exc.response.status_code in {412, 429}:
                     await self._risk("bili_account_risk")
                 raise BiliClientError("bili_account_unavailable") from None
             except BiliClientError:
@@ -1229,11 +1280,14 @@ class BiliPatrolEngine:
                 self.last_request = time.monotonic()
                 self._has_requested = True
 
+            if subtitle:
+                await self._ensure_request_current()
+                return obj
+
             anonymous_nav = False
             if (
                 public
                 and not self.creds["sessdata"]
-                and not subtitle
                 and post is None
                 and path == "/x/web-interface/nav"
                 and obj.get("code") == -101
@@ -1251,8 +1305,6 @@ class BiliPatrolEngine:
                     "bili_cookie_expired" if obj.get("code") == -101 else "bili_account_risk"
                 )
             await self._ensure_request_current()
-            if subtitle:
-                return obj
             if obj.get("code") != 0 and not anonymous_nav:
                 raise BiliClientError("bili_account_upstream_error")
             data = obj.get("data")
@@ -1398,7 +1450,9 @@ class BiliPatrolEngine:
         if any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in (aid, cid)):
             raise BiliClientError("bili_video_schema_changed")
         assert isinstance(aid, int)
+        assert isinstance(cid, int)
         duration = video_duration(info.get("duration"))
+        cover_url = _normalize_cover_url(info.get("pic"))
         transcript, complete, subtitle_status = "", False, "missing"
         subtitles: list[Any] = []
         try:
@@ -1459,8 +1513,9 @@ class BiliPatrolEngine:
             if exc.code not in {"bili_account_unavailable", "bili_account_upstream_error"}:
                 raise
 
-        return aid, {
+        result_mat: dict[str, Any] = {
             "bvid": bvid,
+            "cid": cid,
             "title": clean_text(str(info.get("title", "")))[:150],
             "description": clean_text(str(info.get("desc", "")))[:1500],
             "duration": duration,
@@ -1476,6 +1531,9 @@ class BiliPatrolEngine:
                 else "metadata_only"
             ),
         }
+        if cover_url is not None:
+            result_mat["cover_url"] = cover_url
+        return aid, result_mat
 
     async def public_material(
         self, video_dict: dict[str, Any] | Any, guard: Callable[[], Any] | None = None
@@ -1665,23 +1723,35 @@ class BiliPatrolEngine:
         limit: int = 4,
         max_age: float = 172800.0,
         now: float | None = None,
+        session_scope: str = "",
     ) -> list[dict[str, Any]]:
-        """Return up to `limit` recently watched public patrol notes."""
+        """Return up to `limit` recently watched patrol notes visible to `session_scope`."""
         current = self.clock() if now is None else float(now)
+        scope = str(session_scope or "").strip()
         items = self.watched_index.get("items", {})
-        eligible = [
-            (bv, item)
-            for bv, item in items.items()
-            if item.get("status") == "done"
-            and item.get("has_summary", True)
-            and float(item.get("created") or 0.0) >= current - max_age
-        ]
-        eligible.sort(key=lambda pair: float(pair[1].get("created") or 0.0), reverse=True)
-        selected = eligible[: max(1, int(limit))]
-        actions_map = self._actions_by_bvid([bv for bv, _ in selected])
+        eligible: list[tuple[str, dict[str, Any], bool]] = []
+        for bv, item in items.items():
+            if (
+                item.get("status") != "done"
+                or not item.get("has_summary", True)
+                or float(item.get("created") or 0.0) < current - max_age
+            ):
+                continue
+            visible, is_prio = _private_priority_visible(item, session_scope=scope, now=current)
+            if not visible:
+                continue
+            eligible.append((bv, item, is_prio))
+        eligible.sort(
+            key=lambda triple: (1 if triple[2] else 0, float(triple[1].get("created") or 0.0)),
+            reverse=True,
+        )
+        max_items = max(1, int(limit))
+        actions_map = self._actions_by_bvid([bv for bv, _, _ in eligible[: max_items * 2]])
 
         results: list[dict[str, Any]] = []
-        for bv, item in selected:
+        for bv, item, _ in eligible:
+            if len(results) >= max_items:
+                break
             doc = self._watched_cache.get(bv)
             if doc is None and self.client is not None:
                 raw_doc = await self.client.state_get(f"watched.{bv}")
@@ -1689,6 +1759,9 @@ class BiliPatrolEngine:
                     doc = raw_doc
                     self._watched_cache[bv] = doc
             if not isinstance(doc, dict):
+                continue
+            doc_visible, _ = _private_priority_visible(doc, session_scope=scope, now=current)
+            if not doc_visible:
                 continue
             raw_summary = str(doc.get("summary") or "")
             if not raw_summary:
@@ -1709,13 +1782,21 @@ class BiliPatrolEngine:
             results.append(entry)
         return results
 
-    async def lookup_watched(self, bvid: str, limit: int = 360) -> dict[str, Any] | None:
-        """Look up prior patrol notes and actions for one BV ID."""
+    async def lookup_watched(
+        self, bvid: str, limit: int = 360, session_scope: str = ""
+    ) -> dict[str, Any] | None:
+        """Look up prior patrol notes and actions for one BV ID visible to `session_scope`."""
         if not isinstance(bvid, str) or not re.fullmatch(BVID, bvid):
             return None
+        scope = str(session_scope or "").strip()
+        now = self.clock()
         item = self.watched_index.get("items", {}).get(bvid)
-        if item is not None and (item.get("status") != "done" or not item.get("has_summary", True)):
-            return None
+        if item is not None:
+            if item.get("status") != "done" or not item.get("has_summary", True):
+                return None
+            item_visible, _ = _private_priority_visible(item, session_scope=scope, now=now)
+            if not item_visible:
+                return None
 
         doc = self._watched_cache.get(bvid)
         if doc is None and self.client is not None:
@@ -1724,6 +1805,9 @@ class BiliPatrolEngine:
                 doc = raw_doc
                 self._watched_cache[bvid] = doc
         if not isinstance(doc, dict):
+            return None
+        doc_visible, _ = _private_priority_visible(doc, session_scope=scope, now=now)
+        if not doc_visible:
             return None
         raw_summary = str(doc.get("summary") or "")
         if not raw_summary:
@@ -1968,7 +2052,35 @@ class BiliPatrolEngine:
                 if not candidates:
                     return await self._finish(key, "empty", 0)
 
-                payload = self._bounded({"candidates": candidates})
+                prefs: dict[str, Any] = {}
+                private_topic: dict[str, Any] | None = None
+                fetch_prefs = getattr(self.client, "bili_memory_preferences", None)
+                if callable(fetch_prefs):
+                    try:
+                        pref_res = await fetch_prefs()
+                    except PluginRpcError as exc:
+                        if exc.code not in {"plugin_unknown_method", "plugin_unknown_frame"}:
+                            raise
+                        pref_res = {}
+                    if isinstance(pref_res, dict):
+                        raw_prefs = pref_res.get("preferences")
+                        if isinstance(raw_prefs, dict) and raw_prefs:
+                            prefs = dict(raw_prefs)
+                        raw_priv = pref_res.get("private_topic")
+                        if (
+                            isinstance(raw_priv, dict)
+                            and isinstance(raw_priv.get("handle"), str)
+                            and raw_priv["handle"].strip()
+                        ):
+                            private_topic = dict(raw_priv)
+
+                raw_payload: dict[str, Any] = {
+                    "candidates": candidates,
+                    **({"memory_preferences": prefs} if prefs else {}),
+                }
+                payload = self._bounded(raw_payload)
+                if "memory_preferences" not in payload:
+                    private_topic = None
                 self._ensure_current()
                 screen_res = await self.client.ai_screen(
                     payload, budget_lane="patrol", purpose="source"
@@ -2008,20 +2120,50 @@ class BiliPatrolEngine:
                     )
                     raw_summary = str(res.get("text") or "")
                     mode = str(res.get("mode") or "text")
-                    stop_for_risk = res.get("reason") == "risk" or self.blocked_until > self.clock()
-                    label = (
-                        "公开视频学习"
-                        if mode == "video"
-                        else "公开资料摘要"
-                        if mode == "metadata"
-                        else "公开文本学习"
+                    scope = str(
+                        res.get("material_scope")
+                        or material.get("material_scope")
+                        or "metadata_only"
                     )
+                    stop_for_risk = res.get("reason") == "risk" or self.blocked_until > self.clock()
+                    label = learning_source_label(mode, scope)
 
                     self._ensure_current(epoch=epoch, allow_cooldown=stop_for_risk)
                     summary = _sanitize_summary(raw_summary, self._secrets(), limit=1000)
                     text = f"{label} · {pick.bvid}\n{summary}"
                     learned_at = self.clock()
                     title_str = str(material.get("title", ""))
+
+                    private_first = False
+                    owner_private = False
+                    audience = ""
+                    private_scope = ""
+                    private_expires_at: float | None = None
+                    if private_topic is not None:
+                        async with self.state_lock:
+                            pre_item = self.watched_index.get("items", {}).get(pick.bvid)
+                            if (
+                                pre_item is None
+                                or pre_item.get("run_id") != key
+                                or pre_item.get("status") not in {"analyzing", "uncertain"}
+                            ):
+                                raise BiliClientError("bili_watch_claim_lost")
+                        commit_fn = getattr(self.client, "bili_commit_private_topic", None)
+                        if not callable(commit_fn):
+                            raise BiliClientError("bili_private_request_revoked")
+                        commit_res = await commit_fn(str(private_topic["handle"]), pick.bvid)
+                        if not isinstance(commit_res, dict) or not commit_res.get("committed"):
+                            raise BiliClientError("bili_private_request_revoked")
+                        owner_private = bool(commit_res.get("owner_private", False))
+                        audience = str(commit_res.get("audience") or "").strip()
+                        private_scope = str(commit_res.get("session_scope") or "").strip()
+                        if not audience or not private_scope:
+                            raise BiliClientError("bili_private_request_revoked")
+                        private_first = True
+                        private_expires_at = learned_at + PRIVATE_SHARE_PRIORITY_SECONDS
+                        share_owner = owner_private
+                    else:
+                        share_owner = bool(pick.share_owner and not pick.private_topic_ref)
 
                     async with self.state_lock:
                         item = self.watched_index.get("items", {}).get(pick.bvid)
@@ -2032,12 +2174,20 @@ class BiliPatrolEngine:
                         ):
                             raise BiliClientError("bili_watch_claim_lost")
                         existing_actions = list(item.get("actions") or [])
-                        doc = {
+                        doc: dict[str, Any] = {
                             "bvid": pick.bvid,
                             "created": learned_at,
                             "summary": text,
                             "actions": existing_actions,
                         }
+                        if private_first and private_expires_at is not None:
+                            doc["private_scope"] = private_scope
+                            doc["private_expires_at"] = private_expires_at
+                            item["private_scope"] = private_scope
+                            item["private_expires_at"] = private_expires_at
+                        else:
+                            item.pop("private_scope", None)
+                            item.pop("private_expires_at", None)
                         self._watched_cache[pick.bvid] = doc
                         await self.client.state_set(f"watched.{pick.bvid}", doc)
                         item["status"] = "done"
@@ -2045,26 +2195,40 @@ class BiliPatrolEngine:
                         item["has_summary"] = True
                         await self._save_watched_index()
 
-                    mood_nick = (
-                        selection.mood_longnick.strip()
-                        if idx == len(picks) - 1
-                        and not stop_for_risk
-                        and selection.mood_longnick.strip()
-                        else None
-                    )
+                    if private_first:
+                        event_payload: dict[str, Any] = {
+                            "bvid": pick.bvid,
+                            "learning_seconds": max(0.0, learned_at - learning_start),
+                            "activity_kind": "video_learning",
+                            "private_first": True,
+                            "owner_private": owner_private,
+                            "audience": audience,
+                        }
+                        report_text: str | None = text if owner_private else None
+                        mood_nick: str | None = None
+                    else:
+                        event_payload = {
+                            "bvid": pick.bvid,
+                            "learning_seconds": max(0.0, learned_at - learning_start),
+                            "activity_kind": "video_learning",
+                            "title": title_str[:80],
+                            "summary": summary[:140],
+                        }
+                        report_text = text
+                        mood_nick = (
+                            selection.mood_longnick.strip()
+                            if idx == len(picks) - 1
+                            and not stop_for_risk
+                            and selection.mood_longnick.strip()
+                            else None
+                        )
                     if self._client_connected():
                         await self.client.emit_world_event(
                             "bili_video_watched",
-                            {
-                                "bvid": pick.bvid,
-                                "learning_seconds": max(0.0, learned_at - learning_start),
-                                "activity_kind": "video_learning",
-                                "title": title_str[:80],
-                                "summary": summary[:140],
-                            },
-                            importance="high" if pick.share_owner else "normal",
+                            event_payload,
+                            importance="high" if share_owner else "normal",
                             business_key=pick.bvid,
-                            report_text=text,
+                            report_text=report_text,
                             mood_longnick=mood_nick,
                         )
                         await self.client.report_activity(
@@ -2074,7 +2238,8 @@ class BiliPatrolEngine:
                     if stop_for_risk:
                         reason = "bili_account_risk"
                         break
-                    await self._interaction(pick.bvid, aid, pick, epoch)
+                    if not private_first:
+                        await self._interaction(pick.bvid, aid, pick, epoch)
             except asyncio.CancelledError:
                 await self._recover_run(key)
                 await self._finish(key, "abandoned", completed, "bili_patrol_cancelled")

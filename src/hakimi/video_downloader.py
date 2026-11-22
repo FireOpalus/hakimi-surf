@@ -36,6 +36,12 @@ FAILURES = frozenset(
         "video_download_network_forbidden",
         "video_download_restricted",
         "video_download_invalid_media",
+        "video_download_cdn_http_567",
+        "video_download_cdn_http_403",
+        "video_download_cdn_http_5xx",
+        "video_download_cdn_host_blocked",
+        "video_download_no_audio_track",
+        "video_download_part_not_found",
     }
 )
 
@@ -234,7 +240,14 @@ class VideoDownloader:
 
     @asynccontextmanager
     async def download(
-        self, bvid, *, max_seconds=MAX_VIDEO_SECONDS, cookies=None, proxy="", guard=None
+        self,
+        bvid,
+        *,
+        max_seconds=MAX_VIDEO_SECONDS,
+        cookies=None,
+        proxy="",
+        guard=None,
+        page: int = 1,
     ):
         if not isinstance(bvid, str) or not re.fullmatch(BVID, bvid):
             raise Rejected("invalid_bvid")
@@ -244,6 +257,8 @@ class VideoDownloader:
             or not 1 <= max_seconds <= MAX_VIDEO_SECONDS
         ):
             raise Rejected("video_download_duration")
+        if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 999:
+            raise Rejected("video_download_part_not_found")
         valid_proxy(proxy)
         jar = cookie_file(cookies or {})
         async with self.lock:
@@ -256,7 +271,9 @@ class VideoDownloader:
                 private_file(job / "cookies.txt", jar)
                 private_file(
                     job / "request.json",
-                    json.dumps({"bvid": bvid, "max_seconds": max_seconds, "proxy": proxy}),
+                    json.dumps(
+                        {"bvid": bvid, "max_seconds": max_seconds, "proxy": proxy, "page": page}
+                    ),
                 )
                 result = await self._run(job, guard)
                 path = job / "video.mp4"

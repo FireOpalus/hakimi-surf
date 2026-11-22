@@ -5,13 +5,16 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .models import FileRef, ImageRef
 from .modules.bilibili import extract_bvid
 from .security import Rejected, clean_text
 
 BV = re.compile(r"(?<![A-Za-z0-9])BV[1-9A-HJ-NP-Za-km-z]{10}(?![A-Za-z0-9])")
+_BVID_FULL = re.compile(r"^BV[1-9A-HJ-NP-Za-km-z]{10}$")
+_BILI_VIDEO_HOSTS = frozenset({"www.bilibili.com", "bilibili.com", "m.bilibili.com"})
+_BILI_FESTIVAL_PATH = re.compile(r"^/festival(?:/[A-Za-z0-9_-]{1,80})?/?$")
 URL = re.compile(r"https?://[^\s\"'<>\\，。！？）]+")
 CQ = re.compile(r"\[CQ:([a-z_]+)((?:,[^\]]*)?)\]")
 MAX_FORWARD_NODES = 40
@@ -120,6 +123,36 @@ def cq_segments(raw: str) -> list[dict]:
     return segments
 
 
+def _extract_bili_url_bvid(raw_url: str) -> str | None:
+    if not isinstance(raw_url, str) or not raw_url:
+        return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in raw_url):
+        return None
+    try:
+        u = urlsplit(raw_url)
+        port = u.port
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower()
+    if (
+        u.scheme not in {"https", "http"}
+        or host not in _BILI_VIDEO_HOSTS
+        or u.username is not None
+        or u.password is not None
+        or (u.scheme == "https" and port not in {None, 443})
+        or (u.scheme == "http" and port not in {None, 80})
+    ):
+        return None
+    match = re.fullmatch(r"/video/(BV[1-9A-HJ-NP-Za-km-z]{10})/?", u.path)
+    if match:
+        return match[1]
+    if _BILI_FESTIVAL_PATH.fullmatch(u.path):
+        bvids = parse_qs(u.query, keep_blank_values=False).get("bvid")
+        if bvids and _BVID_FULL.fullmatch(bvids[0]):
+            return bvids[0]
+    return None
+
+
 def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) -> RichMessage:
     result = RichMessage()
     pieces, direct = [], []
@@ -128,19 +161,28 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
     def links(value: str):
         candidates = BV.findall(URL.sub(" ", value))
         for raw in URL.findall(html.unescape(value)):
-            bvid = extract_bvid(raw.rstrip("。，）)"))
+            cleaned_url = raw.rstrip("。，）)")
+            bvid = _extract_bili_url_bvid(cleaned_url) or extract_bvid(cleaned_url)
             if bvid:
                 candidates.append(bvid)
         for bvid in candidates:
             if bvid not in result.video_ids and len(result.video_ids) < 5:
                 result.video_ids.append(bvid)
         for raw in URL.findall(html.unescape(value)):
-            parsed = urlsplit(raw.rstrip("。，）)"))
+            try:
+                parsed = urlsplit(raw.rstrip("。，）)"))
+                port = parsed.port
+            except ValueError:
+                continue
             if (
-                parsed.hostname == "b23.tv"
+                parsed.scheme in {"https", "http"}
+                and (parsed.hostname or "").lower() == "b23.tv"
                 and not parsed.username
                 and not parsed.password
-                and parsed.port in {None, 443}
+                and (
+                    (parsed.scheme == "https" and port in {None, 443})
+                    or (parsed.scheme == "http" and port in {None, 80})
+                )
                 and re.fullmatch(r"/[A-Za-z0-9]{1,32}", parsed.path)
             ):
                 url = "https://b23.tv" + parsed.path

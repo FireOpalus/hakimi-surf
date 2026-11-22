@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import json
 import random
 from pathlib import Path
@@ -775,16 +776,22 @@ def test_phase3_extended_specs_and_validation():
         description="Run patrol",
         budget_lane="patrol",
         quotas=[{"name": "bili_patrols", "unlimited_flag": "bili_patrols_unlimited"}],
-        timeout_seconds=180.0,
+        timeout_seconds=1500.0,
         handler=noop,
     )
     assert patrol_action.to_hello_dict()["budget_lane"] == "patrol"
     assert patrol_action.to_hello_dict()["quotas"] == [
         {"name": "bili_patrols", "unlimited_flag": "bili_patrols_unlimited"}
     ]
-    assert patrol_action.to_hello_dict()["timeout_seconds"] == 180.0
+    assert patrol_action.to_hello_dict()["timeout_seconds"] == 1500.0
+    assert (
+        ActionSpec(
+            name="bili.max", description="Max", timeout_seconds=1800.0, handler=noop
+        ).to_hello_dict()["timeout_seconds"]
+        == 1800.0
+    )
 
-    for bad_timeout in (0.5, 301.0, True, float("nan")):
+    for bad_timeout in (0.5, 1801.0, True, float("nan")):
         with pytest.raises(ValidationError):
             ActionSpec(
                 name="bili.bad",
@@ -792,6 +799,11 @@ def test_phase3_extended_specs_and_validation():
                 timeout_seconds=bad_timeout,  # type: ignore[arg-type]
                 handler=noop,
             )
+
+    assert (
+        inspect.signature(HakimiPluginClient.ai_video_analyze).parameters["timeout"].default
+        == 720.0
+    )
 
     with pytest.raises(ValidationError):
         ActionSpec(
@@ -960,6 +972,70 @@ async def test_phase3_ai_helpers_notify_telemetry_and_acks():
             "mode": "subtitle",
             "material_scope": "subtitles",
         }
+
+        # 4b. bili_memory_preferences & bili_commit_private_topic
+        mp_task = asyncio.create_task(client.bili_memory_preferences())
+        mp_req = await sock.wait_sent(lambda m: m.get("type") == "bili.memory_preferences")
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": mp_req["id"],
+                "ok": True,
+                "result": {
+                    "preferences": {
+                        "recent_chat_topics": ["帮我找个天文视频"],
+                        "private_topic_refs": ["recent_chat_topics:0"],
+                    },
+                    "private_topic": {
+                        "handle": "hdl-1",
+                        "owner_private": True,
+                        "audience": "a" * 64,
+                        "session_scope": "s" * 64,
+                    },
+                },
+            }
+        )
+        mp_res = await mp_task
+        assert mp_res["private_topic"]["handle"] == "hdl-1"
+
+        cm_task = asyncio.create_task(client.bili_commit_private_topic("hdl-1", "BV1xx411c7mD"))
+        cm_req = await sock.wait_sent(lambda m: m.get("type") == "bili.private_topic_commit")
+        assert cm_req["handle"] == "hdl-1"
+        assert cm_req["bvid"] == "BV1xx411c7mD"
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": cm_req["id"],
+                "ok": True,
+                "result": {
+                    "committed": True,
+                    "owner_private": True,
+                    "audience": "a" * 64,
+                    "session_scope": "s" * 64,
+                },
+            }
+        )
+        assert (await cm_task)["committed"] is True
+
+        cm_err_task = asyncio.create_task(
+            client.bili_commit_private_topic("hdl-revoked", "BV1xx411c7mD")
+        )
+        cm_err_req = await sock.wait_sent(
+            lambda m: (
+                m.get("type") == "bili.private_topic_commit" and m.get("handle") == "hdl-revoked"
+            )
+        )
+        await sock.push(
+            {
+                "type": "kernel.result",
+                "id": cm_err_req["id"],
+                "ok": False,
+                "error": "bili_private_request_revoked",
+            }
+        )
+        with pytest.raises(PluginRpcError) as cm_err:
+            await cm_err_task
+        assert cm_err.value.code == "bili_private_request_revoked"
 
         # 5. notify_owner
         await client.notify_owner("风控触发", code="bili_risk")

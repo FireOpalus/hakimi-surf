@@ -16,7 +16,12 @@ import pytest
 from pydantic import ValidationError
 
 from hakimi_plugin_sdk import PluginRpcError, PluginRuntimeConfig
-from plugins.bilibili.client import BiliClientError, BiliPublicClient, extract_bvid
+from plugins.bilibili.client import (
+    BiliClientError,
+    BiliPublicClient,
+    extract_bvid,
+    extract_video_ref,
+)
 from plugins.bilibili.patrol import (
     BiliPatrolEngine,
     BiliPolicy,
@@ -24,6 +29,7 @@ from plugins.bilibili.patrol import (
     Pick,
     Selection,
     has_voucher,
+    learning_source_label,
     subtitle_text,
     subtitle_timestamp,
     validate_cookie,
@@ -347,21 +353,48 @@ def test_zero_hakimi_imports_in_bilibili_plugin() -> None:
 
 def test_extract_bvid_and_validation_helpers() -> None:
     assert extract_bvid(BV1) == BV1
+    assert extract_video_ref(BV1) == (BV1, 1)
     assert extract_bvid(f"看看这个 https://www.bilibili.com/video/{BV1}?spm_id_from=333") == BV1
+    assert extract_video_ref(f"https://www.bilibili.com/video/{BV1}?p=3&spm_id_from=333") == (
+        BV1,
+        3,
+    )
+    assert extract_video_ref(f"https://www.bilibili.com/video/{BV1}?p=999") == (BV1, 999)
+    assert extract_video_ref(f"https://www.bilibili.com/video/{BV1}?p=0") == (BV1, 1)
+    assert extract_video_ref(f"https://www.bilibili.com/video/{BV1}?p=1000") == (BV1, 1)
+    assert extract_video_ref(f"https://www.bilibili.com/video/{BV1}?p=abc") == (BV1, 1)
     assert extract_bvid(f"https://m.bilibili.com/video/{BV2}/") == BV2
     assert extract_bvid(f"https://bilibili.com/video/{BV3}") == BV3
+    assert extract_video_ref(f"http://www.bilibili.com/video/{BV1}?p=2") == (BV1, 2)
+    assert extract_video_ref(f"http://m.bilibili.com:80/video/{BV2}/?p=5") == (BV2, 5)
+    assert extract_video_ref(f"https://www.bilibili.com:443/video/{BV3}?p=4") == (BV3, 4)
+    assert extract_video_ref(f"https://www.bilibili.com/festival?bvid={BV1}") == (BV1, 1)
+    assert extract_video_ref(f"https://www.bilibili.com/festival/spring_2025?bvid={BV2}&p=7") == (
+        BV2,
+        7,
+    )
+    assert extract_video_ref(f"http://bilibili.com/festival/my-event/?bvid={BV3}&p=2") == (BV3, 2)
     assert extract_bvid(f"https://www.bilibili.com/video/{BV1} {BV2}") == BV1
 
     for bad in (
         "https://127.0.0.1/video/" + BV1,
-        "http://www.bilibili.com/video/" + BV1,
+        "http://evil.test/video/" + BV1,
         "https://www.bilibili.com.evil.test/video/" + BV1,
         "https://www.bilibili.com@evil.test/video/" + BV1,
+        "https://user:pass@www.bilibili.com/video/" + BV1,
         "https://www.bilibili.com:8443/video/" + BV1,
+        "https://www.bilibili.com:80/video/" + BV1,
+        "http://www.bilibili.com:443/video/" + BV1,
+        "http://www.bilibili.com:8080/video/" + BV1,
         "https://www.bilibili.com/video/" + BV1 + "/../../admin",
+        "https://www.bilibili.com/festival/../admin?bvid=" + BV1,
+        "https://www.bilibili.com/festival/a/b?bvid=" + BV1,
+        "https://www.bilibili.com/festival/bad..slug?bvid=" + BV1,
+        "https://www.bilibili.com/festival?bvid=NOTABVID",
         "https://b23.tv/abc123",
     ):
-        assert extract_bvid(bad) is None
+        assert extract_bvid(bad) is None, bad
+        assert extract_video_ref(bad) is None, bad
 
     # WBI fixed vector matching built-in bili_watcher
     values = {"foo": "114", "bar": "514", "zab": 1919810}
@@ -817,7 +850,7 @@ async def test_patrol_engine_full_run_once_two_picks_events_and_interactions() -
         ev1, ev2 = fake_client.world_events
         assert ev1["event_type"] == "bili_video_watched"
         assert ev1["business_key"] == BV1
-        assert ev1["report_text"].startswith(f"公开文本学习 · {BV1}")
+        assert ev1["report_text"].startswith(f"公开字幕学习 · {BV1}")
         assert ev1["mood_longnick"] is None
 
         assert ev2["business_key"] == BV2
@@ -973,7 +1006,7 @@ async def test_plugin_main_hello_and_all_rpcs(monkeypatch: pytest.MonkeyPatch) -
     assert hello["thinking_scenes"][0]["output_cap"] == "summary_output_tokens"
     assert hello["actions"][0]["name"] == "bili.patrol"
     assert hello["actions"][0]["budget_lane"] == "patrol"
-    assert hello["actions"][0]["timeout_seconds"] == 180.0
+    assert hello["actions"][0]["timeout_seconds"] == 1500.0
     assert hello["actions"][0]["aliases"] == [
         ["bilibili_surf", "patrol", False],
         ["bilibili_surf", "run_once", False],
@@ -1081,15 +1114,52 @@ async def test_plugin_main_hello_and_all_rpcs(monkeypatch: pytest.MonkeyPatch) -
                             },
                         }
                     )
-                elif ftype == "node.call":
+                elif ftype == "bili.memory_preferences":
                     await sock.push(
                         {
                             "type": "kernel.result",
                             "id": fid,
                             "ok": True,
-                            "result": {"location": f"https://www.bilibili.com/video/{BV1}"},
+                            "result": {"preferences": {}, "private_topic": None},
                         }
                     )
+                elif ftype == "bili.private_topic_commit":
+                    await sock.push(
+                        {
+                            "type": "kernel.result",
+                            "id": fid,
+                            "ok": True,
+                            "result": {
+                                "committed": True,
+                                "owner_private": False,
+                                "audience": "a" * 64,
+                                "session_scope": "s" * 64,
+                            },
+                        }
+                    )
+                elif ftype == "node.call":
+                    if frame.get("action") == "bili.cover_thumb":
+                        await sock.push(
+                            {
+                                "type": "kernel.result",
+                                "id": fid,
+                                "ok": True,
+                                "result": {
+                                    "mime_type": "image/jpeg",
+                                    "bytes": 4,
+                                    "data_b64": base64.b64encode(b"jpeg").decode("ascii"),
+                                },
+                            }
+                        )
+                    else:
+                        await sock.push(
+                            {
+                                "type": "kernel.result",
+                                "id": fid,
+                                "ok": True,
+                                "result": {"location": f"https://www.bilibili.com/video/{BV1}"},
+                            }
+                        )
 
     async def rpc(
         sock: _FakeSocket, req_id: str, method: str, params: dict[str, Any] | None = None
@@ -1131,6 +1201,21 @@ async def test_plugin_main_hello_and_all_rpcs(monkeypatch: pytest.MonkeyPatch) -
             # Public RPCs
             r_short = await rpc(sock, "r-1", "bili.resolve_short", {"url": "https://b23.tv/abc123"})
             assert r_short["ok"] and r_short["result"] == {"bvid": BV1}
+            r_cov = await rpc(
+                sock,
+                "r-cov",
+                "bili.cover_thumb",
+                {"url": "https://i0.hdslb.com/bfs/archive/cover.jpg"},
+            )
+            assert r_cov["ok"] and r_cov["result"]["found"] is True
+            assert r_cov["result"]["thumbnail"]["bytes"] == 4
+            r_cov_bad = await rpc(
+                sock,
+                "r-cov-bad",
+                "bili.cover_thumb",
+                {"url": "http://i0.hdslb.com/bfs/archive/cover.jpg"},
+            )
+            assert r_cov_bad["ok"] and r_cov_bad["result"] == {"found": False, "thumbnail": None}
             await sock.push({"type": "node.state", "connected": False})
             await asyncio.sleep(0.02)
 
@@ -1351,3 +1436,541 @@ async def test_patrol_engine_edge_cases_caps_delegated_risk_and_cover() -> None:
         assert res_mid["status"] == "failed" and res_mid["reason"] == "bili_settings_changed"
     finally:
         await http.aclose()
+
+
+async def test_resolve_short_supports_http_page_and_festival_targets() -> None:
+    targets = [
+        f"http://www.bilibili.com/video/{BV1}?p=3",
+        f"https://www.bilibili.com/festival/spring_2025?bvid={BV2}&p=2",
+        f"https://m.bilibili.com/festival?bvid={BV3}",
+        f"https://www.bilibili.com/festival/../admin?bvid={BV1}",
+        f"http://www.bilibili.com:8080/video/{BV1}",
+    ]
+    idx = [0]
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        loc = targets[idx[0]]
+        idx[0] += 1
+        return httpx.Response(302, headers={"Location": loc})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        pub = BiliPublicClient(
+            None,
+            http,
+            clock=lambda: 100.0,
+            sleep=lambda _: asyncio.sleep(0),
+            env_defaults={"bilibili_min_interval_seconds": 0.0},
+        )
+        assert await pub.resolve_short("https://b23.tv/p1") == BV1
+        assert await pub.resolve_short("https://b23.tv/p2") == BV2
+        assert await pub.resolve_short("https://b23.tv/p3") == BV3
+        with pytest.raises(BiliClientError, match="bilibili_short_link_target_forbidden"):
+            await pub.resolve_short("https://b23.tv/p4")
+        with pytest.raises(BiliClientError, match="bilibili_short_link_target_forbidden"):
+            await pub.resolve_short("https://b23.tv/p5")
+    finally:
+        await http.aclose()
+
+
+async def test_learning_source_label_all_four_sources_and_material_cover_cid() -> None:
+    assert learning_source_label("video", "metadata_only") == "公开原片学习"
+    assert learning_source_label("video", "full_subtitle") == "公开原片学习"
+    assert learning_source_label("cn_storyboard", "metadata_only") == "公开关键帧摘要"
+    assert learning_source_label("text", "full_subtitle") == "公开字幕学习"
+    assert learning_source_label("text", "partial_subtitle") == "公开字幕学习"
+    assert learning_source_label("text", "metadata_only") == "公开简介评论摘要"
+    assert learning_source_label("metadata", "metadata_only") == "公开简介评论摘要"
+
+    now_box = [1_700_000_000.0]
+    responses = _make_bili_http_responses()
+    view_by_bvid = {
+        BV1: {
+            **responses["/x/web-interface/view"],
+            "bvid": BV1,
+            "aid": 100,
+            "cid": 2001,
+            "pic": "http://i0.hdslb.com/bfs/archive/cover1.jpg",
+        },
+        BV2: {
+            **responses["/x/web-interface/view"],
+            "bvid": BV2,
+            "aid": 101,
+            "cid": 2002,
+            "pic": "//archive.biliimg.com/bfs/new/cover2.png",
+        },
+        BV3: {
+            **responses["/x/web-interface/view"],
+            "bvid": BV3,
+            "aid": 102,
+            "cid": 2003,
+            "pic": "https://evil.invalid/bfs/archive/bad.jpg",
+        },
+    }
+    http_calls: list[httpx.Request] = []
+    http = _make_mock_http(responses, http_calls, view_by_bvid=view_by_bvid)
+    fake_client = _FakePluginClient(
+        {
+            "policy": {"enabled": True},
+            "credentials": {
+                "creds": {
+                    "sessdata": "s-cookie",
+                    "bili_jct": "j" * 32,
+                    "buvid3": "b3",
+                    "buvid4": "b4",
+                },
+                "source": "sqlite",
+            },
+        }
+    )
+    try:
+        engine = BiliPatrolEngine(
+            fake_client, http, clock=lambda: now_box[0], sleep=lambda _: asyncio.sleep(0)
+        )
+        await engine.initialize()
+        await engine.nav()
+
+        _, m1 = await engine.material(BV1)
+        assert m1["cid"] == 2001
+        assert m1["cover_url"] == "https://i0.hdslb.com/bfs/archive/cover1.jpg"
+
+        _, m2 = await engine.material(BV2)
+        assert m2["cid"] == 2002
+        assert m2["cover_url"] == "https://archive.biliimg.com/bfs/new/cover2.png"
+
+        _, m3 = await engine.material(BV3)
+        assert m3["cid"] == 2003
+        assert "cover_url" not in m3
+
+        # fetch_cover_thumbnail strictly rejects http:// even though material() normalizes pic
+        engine.set_node_connected(True)
+        fake_client.node_handler = lambda *_: {
+            "mime_type": "image/jpeg",
+            "bytes": 4,
+            "data_b64": base64.b64encode(b"jpeg").decode("ascii"),
+        }
+        assert (
+            await engine.fetch_cover_thumbnail("http://i0.hdslb.com/bfs/archive/cover1.jpg") is None
+        )
+        assert not fake_client.node_calls
+        assert (await engine.fetch_cover_thumbnail(m1["cover_url"]))["bytes"] == 4
+
+        # Verify run_once emits exact labels for video, cn_storyboard, full_subtitle, metadata_only
+        engine.set_node_connected(False)
+        for idx, (bv, va_resp, expected_label) in enumerate(
+            [
+                (
+                    BV1,
+                    {"text": "原片内容", "mode": "video", "material_scope": "metadata_only"},
+                    "公开原片学习",
+                ),
+                (
+                    BV2,
+                    {
+                        "text": "关键帧内容",
+                        "mode": "cn_storyboard",
+                        "material_scope": "metadata_only",
+                    },
+                    "公开关键帧摘要",
+                ),
+                (
+                    BV3,
+                    {"text": "简介摘要", "mode": "text", "material_scope": "metadata_only"},
+                    "公开简介评论摘要",
+                ),
+            ]
+        ):
+            responses["/x/web-interface/wbi/index/top/feed/rcmd"]["item"] = [
+                {
+                    "goto": "av",
+                    "bvid": bv,
+                    "title": f"标题{idx}",
+                    "owner": {"name": "UP"},
+                    "tname": "科技",
+                }
+            ]
+            fake_client.selection_response = json.dumps({"selected": [{"bvid": bv}]})
+            fake_client.video_analyze_response = va_resp
+            res = await engine.run_once(slot=f"label-{idx}")
+            assert res == {"status": "done", "learned": 1, "reason": None}
+            assert fake_client.world_events[-1]["report_text"].startswith(
+                f"{expected_label} · {bv}"
+            )
+    finally:
+        await http.aclose()
+
+
+async def test_cdn_errors_decoupled_from_12h_cooldown() -> None:
+    now_box = [1_700_000_000.0]
+    responses = _make_bili_http_responses()
+    subtitle_status_code = [403]
+    api_status_code = [200]
+    spi_status_code = [200]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.host == "aisubtitle.hdslb.com":
+            return httpx.Response(subtitle_status_code[0], text="cdn error")
+        if req.url.path == "/x/frontend/finger/spi" and spi_status_code[0] != 200:
+            return httpx.Response(spi_status_code[0], text="edge error")
+        if req.url.path == "/x/web-interface/view" and api_status_code[0] != 200:
+            return httpx.Response(api_status_code[0], text="api edge error")
+        value = responses[req.url.path]
+        return httpx.Response(200, json={"code": 0, "data": value})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    fake_client = _FakePluginClient(
+        {
+            "policy": {"enabled": True},
+            "credentials": {
+                "creds": {
+                    "sessdata": "s-cookie",
+                    "bili_jct": "j" * 32,
+                    "buvid3": "b3",
+                    "buvid4": "",
+                },
+                "source": "sqlite",
+            },
+        }
+    )
+    try:
+        engine = BiliPatrolEngine(
+            fake_client, http, clock=lambda: now_box[0], sleep=lambda _: asyncio.sleep(0)
+        )
+        await engine.initialize()
+
+        # 1) SPI HTTP 403 / 567 never triggers 12h cooldown
+        for sc in (403, 567):
+            spi_status_code[0] = sc
+            engine.buvid4_device = None
+            await engine.nav()
+            assert engine.blocked_until == 0.0
+            assert not fake_client.owner_notifications
+        spi_status_code[0] = 200
+        engine.buvid4_device = None
+        await engine.nav()
+        assert engine.creds["buvid4"] == "spi-buvid4-value"
+
+        # 2) Subtitle CDN HTTP 403 / 567 / 429 / 412 / 503 never triggers 12h cooldown
+        for sc in (403, 567, 429, 412, 503):
+            subtitle_status_code[0] = sc
+            with pytest.raises(BiliClientError, match="bili_account_unavailable"):
+                await engine._request(
+                    "https://aisubtitle.hdslb.com/bfs/subtitle/test.json", subtitle=True
+                )
+            assert engine.blocked_until == 0.0
+            assert not fake_client.owner_notifications
+
+            # And public_material degrades cleanly to metadata_only without cooldown
+            mat = await engine.public_material({"bvid": BV1, "title": "T", "description": "D"})
+            assert mat["subtitle_status"] == "unavailable"
+            assert mat["material_scope"] == "metadata_only"
+            assert engine.blocked_until == 0.0
+
+        # 3) Delegated subtitle CDN 403 / 567 / 429 / 412 never triggers 12h cooldown
+        engine.set_node_connected(True)
+        for code_str in ("403", "567", "429", "412"):
+            fake_client.node_handler = lambda _act, _p, c=code_str: (_ for _ in ()).throw(
+                PluginRpcError("bili_http_status", c)
+            )
+            with pytest.raises(BiliClientError, match="bili_account_unavailable"):
+                await engine._request(
+                    "https://aisubtitle.hdslb.com/bfs/subtitle/test.json", subtitle=True
+                )
+            assert engine.blocked_until == 0.0
+
+        # 4) API HTTP 403 / 567 (local & delegated) never triggers 12h cooldown
+        for code_str in ("403", "567"):
+            fake_client.node_handler = lambda _act, _p, c=code_str: (_ for _ in ()).throw(
+                PluginRpcError("bili_http_status", c)
+            )
+            with pytest.raises(BiliClientError, match="bili_account_unavailable"):
+                await engine._request("/x/web-interface/view", {"bvid": BV1})
+            assert engine.blocked_until == 0.0
+
+        engine.set_node_connected(False)
+        for sc in (403, 567):
+            api_status_code[0] = sc
+            with pytest.raises(BiliClientError, match="bili_account_unavailable"):
+                await engine._request("/x/web-interface/view", {"bvid": BV1})
+            assert engine.blocked_until == 0.0
+            assert not fake_client.owner_notifications
+
+        # 5) API HTTP 412 & 429 DO trigger 12h cooldown
+        for sc in (412, 429):
+            api_status_code[0] = sc
+            engine.blocked_until = 0.0
+            with pytest.raises(BiliClientError, match="bili_account_risk"):
+                await engine._request("/x/web-interface/view", {"bvid": BV1})
+            assert engine.blocked_until == now_box[0] + 43200
+    finally:
+        await http.aclose()
+
+
+async def test_patrol_engine_memory_preferences_private_isolation_and_revocation() -> None:
+    class _PrefPluginClient(_FakePluginClient):
+        def __init__(self, initial_kv: dict[str, Any] | None = None) -> None:
+            super().__init__(initial_kv)
+            self.pref_handler: Any = None
+            self.commit_calls: list[tuple[str, str]] = []
+            self.commit_handler: Any = None
+
+        async def bili_memory_preferences(self) -> dict[str, Any]:
+            if self.pref_handler is None:
+                return {"preferences": {}, "private_topic": None}
+            res = self.pref_handler()
+            if asyncio.iscoroutine(res):
+                return await res
+            return res
+
+        async def bili_commit_private_topic(self, handle: str, bvid: str) -> dict[str, Any]:
+            self.commit_calls.append((handle, bvid))
+            if self.commit_handler is None:
+                return {
+                    "committed": True,
+                    "owner_private": False,
+                    "audience": "f" * 64,
+                    "session_scope": "s" * 64,
+                }
+            res = self.commit_handler(handle, bvid)
+            if asyncio.iscoroutine(res):
+                return await res
+            return res
+
+    now_box = [1_700_000_000.0]
+    responses = _make_bili_http_responses()
+    view_by_bvid = {
+        BV1: {**responses["/x/web-interface/view"], "bvid": BV1, "aid": 100, "cid": 200},
+        BV2: {
+            **responses["/x/web-interface/view"],
+            "bvid": BV2,
+            "aid": 101,
+            "cid": 201,
+            "title": "极光延时摄影",
+        },
+        BV3: {
+            **responses["/x/web-interface/view"],
+            "bvid": BV3,
+            "aid": 102,
+            "cid": 202,
+            "title": "天文望远镜入门",
+        },
+    }
+    http_calls: list[httpx.Request] = []
+    http = _make_mock_http(responses, http_calls, view_by_bvid=view_by_bvid)
+    client = _PrefPluginClient(
+        {
+            "policy": {"enabled": True, "allow_like": True},
+            "credentials": {
+                "creds": {
+                    "sessdata": "s-cookie",
+                    "bili_jct": "j" * 32,
+                    "buvid3": "b3",
+                    "buvid4": "b4",
+                },
+                "source": "sqlite",
+            },
+        }
+    )
+
+    try:
+        engine = BiliPatrolEngine(
+            client, http, clock=lambda: now_box[0], sleep=lambda _: asyncio.sleep(0)
+        )
+        await engine.initialize()
+
+        # 1) plugin_unknown_method degrades gracefully + forged private_topic_ref blocked
+        client.pref_handler = lambda: (_ for _ in ()).throw(PluginRpcError("plugin_unknown_method"))
+        client.selection_response = json.dumps(
+            {
+                "selected": [
+                    {
+                        "bvid": BV1,
+                        "share_owner": True,
+                        "private_topic_ref": "owner:20000",
+                    }
+                ]
+            }
+        )
+        res1 = await engine.run_once(slot="priv-1")
+        assert res1 == {"status": "done", "learned": 1, "reason": None}
+        assert client.world_events[-1]["importance"] == "normal"
+        assert "title" in client.world_events[-1]["payload"]
+
+        # 2) Non-owner private topic: strips title/summary, no report/mood/POST, 24h scope filter
+        friend_scope = "1" * 64
+        other_scope = "2" * 64
+        friend_audience = "a" * 64
+        client.pref_handler = lambda: {
+            "preferences": {
+                "recent_chat_topics": ["帮我找个极光视频"],
+                "private_topic_refs": ["recent_chat_topics:0"],
+            },
+            "private_topic": {
+                "handle": "hdl-friend",
+                "owner_private": False,
+                "audience": friend_audience,
+                "session_scope": friend_scope,
+            },
+        }
+        client.commit_handler = lambda _h, _bv: {
+            "committed": True,
+            "owner_private": False,
+            "audience": friend_audience,
+            "session_scope": friend_scope,
+        }
+        client.selection_response = json.dumps(
+            {
+                "selected": [{"bvid": BV2, "like": True, "share_owner": True}],
+                "mood_longnick": "不应公开的私聊心情",
+            }
+        )
+        http_calls.clear()
+        res2 = await engine.run_once(slot="priv-2")
+        assert res2 == {"status": "done", "learned": 1, "reason": None}
+        assert client.commit_calls == [("hdl-friend", BV2)]
+        ev_priv = client.world_events[-1]
+        assert set(ev_priv["payload"]) == {
+            "bvid",
+            "learning_seconds",
+            "activity_kind",
+            "private_first",
+            "owner_private",
+            "audience",
+        }
+        assert ev_priv["payload"]["private_first"] is True
+        assert ev_priv["payload"]["owner_private"] is False
+        assert ev_priv["payload"]["audience"] == friend_audience
+        assert "title" not in ev_priv["payload"] and "summary" not in ev_priv["payload"]
+        assert ev_priv["importance"] == "normal"
+        assert ev_priv["report_text"] is None
+        assert ev_priv["mood_longnick"] is None
+        assert not any(r.method == "POST" for r in http_calls)
+
+        # 24h visibility isolation & priority sorting
+        assert await engine.lookup_watched(BV2, session_scope=friend_scope) is not None
+        assert await engine.lookup_watched(BV2, session_scope=other_scope) is None
+        assert await engine.lookup_watched(BV2, session_scope="") is None
+        assert [i["bvid"] for i in await engine.recent_surfed(session_scope="")] == [BV1]
+        assert [i["bvid"] for i in await engine.recent_surfed(session_scope=other_scope)] == [BV1]
+        # Matching private scope sees BV2 prioritized first ahead of BV1
+        assert [i["bvid"] for i in await engine.recent_surfed(session_scope=friend_scope)] == [
+            BV2,
+            BV1,
+        ]
+        # After 24h expiry, visible publicly
+        now_box[0] += 24 * 3600 + 1
+        assert await engine.lookup_watched(BV2, session_scope="") is not None
+
+        # 3) Commit revoked -> fails without writing watched.<bvid> or marking done
+        responses["/x/web-interface/wbi/index/top/feed/rcmd"]["item"] = [
+            {
+                "goto": "av",
+                "bvid": BV3,
+                "title": "天文望远镜入门",
+                "owner": {"name": "UP3"},
+                "tname": "科技",
+            }
+        ]
+        client.pref_handler = lambda: {
+            "preferences": {
+                "recent_chat_topics": ["想看天文视频"],
+                "private_topic_refs": ["recent_chat_topics:0"],
+            },
+            "private_topic": {
+                "handle": "hdl-revoked",
+                "owner_private": True,
+                "audience": "b" * 64,
+                "session_scope": "3" * 64,
+            },
+        }
+        client.commit_handler = lambda _h, _bv: (_ for _ in ()).throw(
+            PluginRpcError("bili_private_request_revoked")
+        )
+        client.selection_response = json.dumps({"selected": [{"bvid": BV3}]})
+        res3 = await engine.run_once(slot="priv-3")
+        assert res3["status"] == "failed"
+        assert res3["reason"] == "bili_private_request_revoked"
+        assert res3["learned"] == 0
+        assert res3.get("requires_review") is True
+        assert f"watched.{BV3}" not in client.kv
+        assert await engine.lookup_watched(BV3, session_scope="3" * 64) is None
+
+        # 4) _bounded() dropping memory_preferences clears private_topic
+        engine.watched_index["items"].pop(BV3, None)
+        engine.max_context_bytes = 600
+        client.pref_handler = lambda: {
+            "preferences": {
+                "recent_chat_topics": ["超长私聊主题" * 80],
+                "private_topic_refs": ["recent_chat_topics:0"],
+            },
+            "private_topic": {
+                "handle": "hdl-dropped",
+                "owner_private": True,
+                "audience": "b" * 64,
+                "session_scope": "3" * 64,
+            },
+        }
+        client.commit_calls.clear()
+        res4 = await engine.run_once(slot="priv-4")
+        assert res4 == {"status": "done", "learned": 1, "reason": None}
+        assert not client.commit_calls
+        assert "private_first" not in client.world_events[-1]["payload"]
+
+        # 5) Owner private topic: high importance, keeps report_text, no title/summary/mood/POST
+        engine.watched_index["items"].pop(BV3, None)
+        engine.max_context_bytes = 48_000
+        owner_scope = "9" * 64
+        owner_aud = "e" * 64
+        client.pref_handler = lambda: {
+            "preferences": {
+                "recent_chat_topics": ["主人想看天文视频"],
+                "private_topic_refs": ["recent_chat_topics:0"],
+            },
+            "private_topic": {
+                "handle": "hdl-owner",
+                "owner_private": True,
+                "audience": owner_aud,
+                "session_scope": owner_scope,
+            },
+        }
+        client.commit_handler = lambda _h, _bv: {
+            "committed": True,
+            "owner_private": True,
+            "audience": owner_aud,
+            "session_scope": owner_scope,
+        }
+        client.selection_response = json.dumps(
+            {"selected": [{"bvid": BV3, "like": True}], "mood_longnick": "不该发的签名"}
+        )
+        http_calls.clear()
+        res5 = await engine.run_once(slot="priv-5")
+        assert res5 == {"status": "done", "learned": 1, "reason": None}
+        ev_owner = client.world_events[-1]
+        assert ev_owner["importance"] == "high"
+        assert ev_owner["payload"]["private_first"] is True
+        assert ev_owner["payload"]["owner_private"] is True
+        assert ev_owner["payload"]["audience"] == owner_aud
+        assert "title" not in ev_owner["payload"] and "summary" not in ev_owner["payload"]
+        assert ev_owner["report_text"] is not None and BV3 in ev_owner["report_text"]
+        assert ev_owner["mood_longnick"] is None
+        assert not any(r.method == "POST" for r in http_calls)
+    finally:
+        await http.aclose()
+
+
+def test_bili_plugin_url_validators_reject_invalid_ports_without_crashing() -> None:
+    from plugins.bilibili.client import (
+        BiliClientError,
+        _is_valid_short_link,
+        extract_video_ref,
+    )
+    from plugins.bilibili.patrol import _validate_subtitle_url
+
+    assert _is_valid_short_link("https://b23.tv:99999/AbCd12") is None
+    assert _is_valid_short_link("https://b23.tv:abc/AbCd12") is None
+    assert _is_valid_short_link("https://b23.tv:443/AbCd12") == "b23.tv"
+    assert extract_video_ref(f"http://www.bilibili.com:99999/video/{BV1}?p=2") is None
+    assert extract_video_ref(f"https://www.bilibili.com:abc/festival/2026?bvid={BV1}&p=3") is None
+    with pytest.raises(BiliClientError) as exc_info:
+        _validate_subtitle_url("https://aisubtitle.hdslb.com:99999/bfs/ai_subtitle/demo.json")
+    assert exc_info.value.code == "bili_subtitle_host_forbidden"

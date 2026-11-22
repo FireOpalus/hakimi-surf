@@ -97,7 +97,7 @@ class BilibiliPlugin:
                         ["bilibili_surf", "patrol", False],
                         ["bilibili_surf", "run_once", False],
                     ],
-                    timeout_seconds=180.0,
+                    timeout_seconds=1500.0,
                     handler=self._handle_patrol_action,
                 ),
             ),
@@ -134,6 +134,7 @@ class BilibiliPlugin:
         self.client.rpc("bili.lookup_watched")(self._rpc_lookup_watched)
         self.client.rpc("bili.recent_surfed")(self._rpc_recent_surfed)
         self.client.rpc("bili.ensure_buvid4")(self._rpc_ensure_buvid4)
+        self.client.rpc("bili.cover_thumb")(self._rpc_cover_thumb)
 
         self.client.rpc("bili.account.status")(self._rpc_account_status)
         self.client.rpc("bili.account.set_policy")(self._rpc_account_set_policy)
@@ -295,7 +296,8 @@ class BilibiliPlugin:
             if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
             else 360
         )
-        entry = await self.engine.lookup_watched(bvid, limit=limit)
+        session_scope = str(params.get("session_scope") or "").strip()
+        entry = await self.engine.lookup_watched(bvid, limit=limit, session_scope=session_scope)
         return {"found": entry is not None, "entry": entry}
 
     async def _rpc_recent_surfed(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -321,7 +323,10 @@ class BilibiliPlugin:
             and math.isfinite(float(raw_now))
             else None
         )
-        items = await self.engine.recent_surfed(limit=limit, max_age=max_age, now=now)
+        session_scope = str(params.get("session_scope") or "").strip()
+        items = await self.engine.recent_surfed(
+            limit=limit, max_age=max_age, now=now, session_scope=session_scope
+        )
         return {"items": items}
 
     async def _rpc_ensure_buvid4(self, _params: dict[str, Any]) -> dict[str, Any]:
@@ -331,6 +336,15 @@ class BilibiliPlugin:
             "buvid4_configured": bool(creds.get("buvid4")),
             "credentials": {k: bool(v) for k, v in creds.items()},
         }
+
+    async def _rpc_cover_thumb(self, params: dict[str, Any]) -> dict[str, Any]:
+        raw_url = params.get("cover_url")
+        if not isinstance(raw_url, str) or not raw_url:
+            raw_url = params.get("url")
+        if not isinstance(raw_url, str) or not raw_url:
+            return {"found": False, "thumbnail": None}
+        thumb = await self.engine.fetch_cover_thumbnail(raw_url)
+        return {"found": thumb is not None, "thumbnail": thumb}
 
     async def _rpc_account_status(self, _params: dict[str, Any]) -> dict[str, Any]:
         return await self.engine.status()
@@ -379,7 +393,12 @@ class BilibiliPlugin:
             and math.isfinite(float(raw_now))
             else None
         )
-        return {"recent_bili_surfed": await self.engine.recent_surfed(limit=limit, now=now)}
+        session_scope = str(params.get("session_scope") or "").strip()
+        return {
+            "recent_bili_surfed": await self.engine.recent_surfed(
+                limit=limit, now=now, session_scope=session_scope
+            )
+        }
 
     async def _rpc_patrol_entry(self, params: dict[str, Any]) -> dict[str, Any]:
         bvid = str(params.get("bvid") or "")
@@ -389,7 +408,8 @@ class BilibiliPlugin:
             if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
             else 1200
         )
-        entry = await self.engine.lookup_watched(bvid, limit=limit)
+        session_scope = str(params.get("session_scope") or "").strip()
+        entry = await self.engine.lookup_watched(bvid, limit=limit, session_scope=session_scope)
         return {
             "business_key": f"bili-account:{bvid}",
             "prior_patrol_notes": entry["prior_patrol_notes"] if entry else "",

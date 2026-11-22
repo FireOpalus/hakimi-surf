@@ -272,7 +272,7 @@ class ActionSpec(BaseModel):
     aliases: list[list[Any]] = Field(default_factory=list)
     budget_lane: Literal["patrol", "proactive"] | None = None
     quotas: list[dict[str, str]] | None = None
-    timeout_seconds: float | None = Field(default=None, ge=1.0, le=300.0)
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=1800.0)
     handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
     @field_validator("name")
@@ -737,7 +737,7 @@ class HakimiPluginClient:
         material: dict[str, Any],
         *,
         budget_lane: str = "patrol",
-        timeout: float = 180.0,  # noqa: ASYNC109
+        timeout: float = 720.0,  # noqa: ASYNC109
     ) -> dict[str, Any]:
         """Run kernel video analysis for a Bilibili video (`thinking_scenes` scope)."""
         res = await self._kernel_request(
@@ -747,6 +747,32 @@ class HakimiPluginClient:
                 "material": dict(material),
                 "budget_lane": budget_lane,
             },
+            timeout=timeout,
+        )
+        return _as_result_dict(res)
+
+    async def bili_memory_preferences(
+        self,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        """Fetch sanitized Bilibili memory preferences and optional private topic handle."""
+        res = await self._kernel_request(
+            {"type": "bili.memory_preferences"},
+            timeout=timeout,
+        )
+        return _as_result_dict(res)
+
+    async def bili_commit_private_topic(
+        self,
+        handle: str,
+        bvid: str,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        """Commit a served private Bilibili video topic handle in the kernel."""
+        res = await self._kernel_request(
+            {"type": "bili.private_topic_commit", "handle": handle, "bvid": bvid},
             timeout=timeout,
         )
         return _as_result_dict(res)

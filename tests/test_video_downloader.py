@@ -3,6 +3,7 @@ import json
 import stat
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import hakimi.video_download_worker as worker
@@ -15,7 +16,11 @@ from hakimi.video_download_worker import (
     anonymous_nav_keys,
     check_risk_payload,
     classify_error,
+    download_cdn_stream,
+    execute,
     inspect_media,
+    resolve_part_metadata,
+    select_dash_streams,
     select_format,
     validate_info,
 )
@@ -71,13 +76,35 @@ def test_no_high_resolution_or_unbounded_fallback(fmt):
         select_format({"duration": 60, "formats": [fmt]})
 
 
-def test_silent_mp4_only_when_no_available_audio_track():
+def test_no_silent_dash_downgrade_and_akamai_audio_accepted():
     silent = video(acodec="none", filesize=100)
-    chosen = select_format({"duration": 60, "formats": [silent]})
-    assert chosen["format_id"] == "360" and chosen["acodec"] == "none"
-    assert "requested_formats" not in chosen
+    with pytest.raises(WorkerError, match="video_download_no_audio_track"):
+        select_format({"duration": 60, "formats": [silent]})
+
+    blocked_audio = video(
+        format_id="audio",
+        ext="m4a",
+        vcodec="none",
+        url="https://evil.akamaized.net/audio.m4s",
+        filesize=500,
+    )
+    with pytest.raises(WorkerError, match="video_download_cdn_host_blocked"):
+        select_format({"duration": 60, "formats": [silent, blocked_audio]})
+
+    akamai_audio = video(
+        format_id="audio",
+        ext="m4a",
+        vcodec="none",
+        url="https://upos-hz-mirrorakam.akamaized.net/upgcxcode/audio.m4s",
+        filesize=500,
+    )
+    assert select_format({"duration": 60, "formats": [silent, akamai_audio]})["format_id"] == (
+        "360+audio"
+    )
+
     muxed = video(format_id="480", height=480, width=854, filesize=2000)
     assert select_format({"duration": 60, "formats": [silent, muxed]})["format_id"] == "480"
+
     audio = video(format_id="audio", ext="m4a", vcodec="none", filesize=500)
     assert select_format({"duration": 60, "formats": [silent, audio]})["format_id"] == "360+audio"
     audio["filesize"] = MAX_BYTES + 1
@@ -117,7 +144,8 @@ def test_duration_must_be_known_before_download(duration):
 @pytest.mark.parametrize(
     "update",
     [
-        {"id": BV + "_p1"},
+        {"id": BV + "_p2"},
+        {"id": "BV1Q541167Qg"},
         {"_type": "playlist"},
         {"entries": []},
         {"is_live": True},
@@ -128,6 +156,13 @@ def test_duration_must_be_known_before_download(duration):
 def test_single_public_video_only(update):
     with pytest.raises(WorkerError, match="video_download_restricted"):
         validate_info({"id": BV, "duration": 60, **update}, BV, 480)
+
+
+def test_validate_info_allows_matching_multipart_id():
+    assert validate_info({"id": BV + "_p1", "duration": 60}, BV, 480, page=1) == 60
+    assert validate_info({"id": BV + "_p2", "duration": 90}, BV, 480, page=2) == 90
+    with pytest.raises(WorkerError, match="video_download_restricted"):
+        validate_info({"id": BV + "_p1", "duration": 60}, BV, 480, page=2)
 
 
 @pytest.mark.parametrize(
@@ -398,3 +433,293 @@ def test_vertical_square_and_ultrawide_540p_videos_accepted(
     else:
         with pytest.raises(WorkerError, match="video_download_invalid_media"):
             inspect_media(path, 480)
+
+
+@pytest.mark.parametrize(
+    "url,accepted",
+    [
+        ("https://upos-hz-mirrorakam.akamaized.net/upgcxcode/video.m4s", True),
+        ("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/video.m4s", True),
+        ("https://cn-bj-fx-01.bilivideo.cn/upgcxcode/audio.m4s", True),
+        ("https://www.bilibili.com/video/" + BV + "?p=2", True),
+        ("https://evil.akamaized.net/upgcxcode/video.m4s", False),
+        ("https://foo.upos-hz-mirrorakam.akamaized.net/upgcxcode/video.m4s", False),
+        ("https://upos-hz-mirrorakam.akamaized.net.evil.test/v.m4s", False),
+        ("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/video.m4s", False),
+        ("https://upos-hz-mirrorakam.akamaized.net:8443/upgcxcode/video.m4s", False),
+        ("https://bilivideo.com/v.m4s", False),
+        ("https://api.bilibili.com/x/../secret", False),
+    ],
+)
+def test_cdn_host_allowlist_akamai_and_ssrf_boundary(url, accepted):
+    if accepted:
+        assert allowed_url(url) == url
+    else:
+        with pytest.raises(WorkerError, match="video_download_network_forbidden"):
+            allowed_url(url)
+
+
+def test_classify_error_decouples_cdn_403_and_567_from_account_risk():
+    assert classify_error("HTTP Error 567") == "video_download_cdn_http_567"
+    assert classify_error("HTTP Error 403 Forbidden") == "video_download_cdn_http_403"
+    assert classify_error("HTTP Error 412 Precondition Failed") == "video_download_risk"
+    assert classify_error("HTTP Error 429 Too Many Requests") == "video_download_risk"
+    assert classify_error("request timed out") == "video_download_timeout"
+
+
+def test_select_dash_streams_prefers_avc1_and_refuses_silent_download():
+    dash = {
+        "video": [
+            {
+                "id": 80,
+                "width": 1920,
+                "height": 1080,
+                "bandwidth": 300_000,
+                "codecs": "avc1.640028",
+                "mimeType": "video/mp4",
+                "baseUrl": "https://upos-sz-mirrorcosov.bilivideo.com/1080.m4s",
+            },
+            {
+                "id": 32,
+                "width": 852,
+                "height": 480,
+                "bandwidth": 200_000,
+                "codecs": "av01.0.00M.08",
+                "mimeType": "video/mp4",
+                "baseUrl": "https://upos-sz-mirrorcosov.bilivideo.com/480_av01.m4s",
+            },
+            {
+                "id": 16,
+                "width": 640,
+                "height": 360,
+                "bandwidth": 400_000,
+                "codecs": "avc1.64001e",
+                "mimeType": "video/mp4",
+                "baseUrl": "https://evil.example/blocked.m4s",
+                "backupUrl": ["https://upos-hz-mirrorakam.akamaized.net/360_avc1.m4s"],
+            },
+            {
+                "id": 32,
+                "width": 852,
+                "height": 480,
+                "bandwidth": 350_000,
+                "codecs": "hvc1.1.6.L93.90",
+                "mimeType": "video/mp4",
+                "baseUrl": "https://upos-sz-mirrorcosov.bilivideo.com/480_hvc1.m4s",
+            },
+        ],
+        "audio": [
+            {
+                "id": 30216,
+                "bandwidth": 64_000,
+                "codecs": "mp4a.40.2",
+                "baseUrl": "https://upos-hz-mirrorakam.akamaized.net/audio.m4s",
+            }
+        ],
+    }
+    chosen = select_dash_streams(dash, 60.0)
+    assert chosen["video"]["codecs"].startswith("avc1")
+    assert chosen["video"]["urls"] == ["https://upos-hz-mirrorakam.akamaized.net/360_avc1.m4s"]
+    assert chosen["audio"]["urls"] == ["https://upos-hz-mirrorakam.akamaized.net/audio.m4s"]
+
+    # When avc1 is absent, hvc1 beats av01.
+    dash_no_avc = {
+        **dash,
+        "video": [v for v in dash["video"] if not v["codecs"].startswith("avc1")],
+    }
+    assert select_dash_streams(dash_no_avc, 60.0)["video"]["codecs"].startswith("hvc1")
+
+    # Blocked audio host -> cdn_host_blocked (never silent download).
+    dash_blocked_audio = {
+        **dash,
+        "audio": [
+            {"id": 30216, "bandwidth": 64_000, "baseUrl": "https://evil.akamaized.net/audio.m4s"}
+        ],
+    }
+    with pytest.raises(WorkerError, match="video_download_cdn_host_blocked"):
+        select_dash_streams(dash_blocked_audio, 60.0)
+
+    # Missing audio tracks -> no_audio_track (never silent download).
+    with pytest.raises(WorkerError, match="video_download_no_audio_track"):
+        select_dash_streams({**dash, "audio": []}, 60.0)
+
+
+def test_resolve_part_metadata_supports_multipart_pages():
+    view = {
+        "bvid": BV,
+        "cid": 1001,
+        "duration": 180,
+        "pages": [
+            {"page": 1, "cid": 1001, "duration": 60},
+            {"page": 2, "cid": 2002, "duration": 120},
+        ],
+    }
+    assert resolve_part_metadata(view, BV, 480, page=1) == (1001, 60.0)
+    assert resolve_part_metadata(view, BV, 480, page=2) == (2002, 120.0)
+    with pytest.raises(WorkerError, match="video_download_part_not_found"):
+        resolve_part_metadata(view, BV, 480, page=3)
+    with pytest.raises(WorkerError, match="video_download_duration"):
+        resolve_part_metadata(view, BV, 90, page=2)
+    with pytest.raises(WorkerError, match="video_download_restricted"):
+        resolve_part_metadata({**view, "is_upower_exclusive": True}, BV, 480, page=1)
+
+
+def test_direct_wbi_execute_range_header_cookie_isolation_backup_failover_and_multipart(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "cookies.txt").write_text(
+        "# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tsecret-sess-123\n"
+    )
+    requests_seen: list[httpx.Request] = []
+    sleeps: list[float] = []
+    playurl_cids: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        requests_seen.append(req)
+        host = req.url.host
+        if host == "api.bilibili.com":
+            assert "SESSDATA=secret-sess-123" in req.headers.get("cookie", "")
+            if req.url.path == "/x/web-interface/nav":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "isLogin": True,
+                            "wbi_img": {
+                                "img_url": "https://i0.hdslb.com/bfs/wbi/" + "a" * 32 + ".png",
+                                "sub_url": "https://i0.hdslb.com/bfs/wbi/" + "b" * 32 + ".png",
+                            },
+                        },
+                    },
+                )
+            if req.url.path == "/x/web-interface/view":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "bvid": BV,
+                            "cid": 111,
+                            "duration": 120,
+                            "pages": [
+                                {"page": 1, "cid": 111, "duration": 60},
+                                {"page": 2, "cid": 222, "duration": 45},
+                            ],
+                        },
+                    },
+                )
+            if req.url.path == "/x/player/wbi/playurl":
+                playurl_cids.append(req.url.params.get("cid", ""))
+                assert req.url.params.get("w_rid") and req.url.params.get("wts")
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "dash": {
+                                "video": [
+                                    {
+                                        "id": 16,
+                                        "width": 640,
+                                        "height": 360,
+                                        "bandwidth": 200_000,
+                                        "codecs": "avc1.64001e",
+                                        "mimeType": "video/mp4",
+                                        "baseUrl": "https://upos-sz-mirrorcosov.bilivideo.com/v.m4s",
+                                        "backupUrl": [
+                                            "https://upos-hz-mirrorakam.akamaized.net/v.m4s"
+                                        ],
+                                    }
+                                ],
+                                "audio": [
+                                    {
+                                        "id": 30216,
+                                        "bandwidth": 64_000,
+                                        "codecs": "mp4a.40.2",
+                                        "baseUrl": "https://upos-sz-mirrorcosov.bilivideo.com/a.m4s",
+                                        "backupUrl": [
+                                            "https://upos-hz-mirrorakam.akamaized.net/a.m4s"
+                                        ],
+                                    }
+                                ],
+                            }
+                        },
+                    },
+                )
+        # CDN requests must NEVER receive Cookie and MUST send Range: bytes=0-.
+        assert "cookie" not in {k.lower() for k in req.headers}
+        assert req.headers.get("range") == "bytes=0-"
+        if host == "upos-sz-mirrorcosov.bilivideo.com":
+            return httpx.Response(567 if req.url.path == "/v.m4s" else 403)
+        if host == "upos-hz-mirrorakam.akamaized.net":
+            body = b"mock-akamai-bytes"
+            return httpx.Response(
+                206,
+                content=body,
+                headers={"Content-Range": f"bytes 0-{len(body) - 1}/{len(body)}"},
+            )
+        raise AssertionError(f"Unexpected host {host}")
+
+    def fake_mux(v_path, a_path, out_path):
+        assert v_path.read_bytes() == b"mock-akamai-bytes"
+        assert a_path.read_bytes() == b"mock-akamai-bytes"
+        out_path.write_bytes(b"muxed-mp4-data")
+
+    monkeypatch.setattr(worker, "_mux_dash_streams", fake_mux)
+    monkeypatch.setattr(worker, "inspect_media", lambda path, limit: 45.0)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        res = execute(
+            {"bvid": BV, "max_seconds": 300, "proxy": "", "page": 2},
+            http_client=client,
+            sleep_fn=lambda s: sleeps.append(s),
+        )
+
+    assert res == {"status": "ok", "duration": 45.0}
+    assert playurl_cids == ["222"]
+    assert not (tmp_path / "video.m4s").exists()
+    assert not (tmp_path / "audio.m4s").exists()
+    # API pacing (2..6s) ran twice (before view and playurl); CDN retry sleeps are <= 1.0s.
+    api_sleeps = [s for s in sleeps if s >= 2.0]
+    assert len(api_sleeps) == 2
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        (567, "video_download_cdn_http_567"),
+        (403, "video_download_cdn_http_403"),
+        (503, "video_download_cdn_http_5xx"),
+    ],
+)
+def test_cdn_stream_all_failed_returns_fine_grained_code(tmp_path, status, expected):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.headers.get("range") == "bytes=0-"
+        return httpx.Response(status)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(WorkerError, match=expected):
+            download_cdn_stream(
+                client,
+                [
+                    "https://upos-sz-mirrorcosov.bilivideo.com/a.m4s",
+                    "https://upos-hz-mirrorakam.akamaized.net/a.m4s",
+                ],
+                tmp_path / "a.m4s",
+                max_bytes=MAX_BYTES,
+                sleep_fn=lambda _: None,
+            )
+
+
+async def test_video_downloader_passes_page_and_fine_grained_failure_codes(runner):
+    downloader = runner(
+        "cfg = json.loads(Path('request.json').read_text())\n"
+        "assert cfg['page'] == 2\n"
+        "print(json.dumps({'status':'error','error':'video_download_cdn_http_567'}))\n"
+    )
+    with pytest.raises(Rejected, match="^video_download_cdn_http_567$"):
+        async with downloader.download(BV, page=2):
+            pytest.fail("must not yield")
+    assert not list(downloader.root.iterdir())

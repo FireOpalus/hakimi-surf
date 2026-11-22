@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import logging
 import math
@@ -25,6 +26,10 @@ log = logging.getLogger("hakimi")
 BVID = r"BV[1-9A-HJ-NP-Za-km-z]{10}"
 BVID_RE = re.compile(rf"^{BVID}$")
 MID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
+COVER_URL_RE = re.compile(
+    r"^https://(?:i[0-2]\.hdslb\.com|archive\.biliimg\.com)/bfs/[A-Za-z0-9_./-]+$"
+)
+MAX_COVER_THUMB_BYTES = 98_304
 CREDENTIAL_KEYS = ("sessdata", "bili_jct", "buvid3", "buvid4")
 RISK_COOLDOWN_SECONDS = 43200.0
 
@@ -106,6 +111,20 @@ def _finite_float(value: Any) -> float | None:
         return None
     fval = float(value)
     return fval if math.isfinite(fval) else None
+
+
+def _private_priority_visible(
+    meta: dict[str, Any] | None, *, session_scope: str, now: float
+) -> tuple[bool, bool]:
+    if not isinstance(meta, dict):
+        return True, False
+    p_scope = str(meta.get("private_scope") or "")
+    exp = _finite_float(meta.get("private_expires_at")) or 0.0
+    if p_scope and exp > now:
+        if session_scope and session_scope == p_scope:
+            return True, True
+        return False, False
+    return True, False
 
 
 class RemoteBiliClient:
@@ -577,6 +596,52 @@ class RemoteBiliWatcher:
             return fallback
         return dict(res)
 
+    async def fetch_cover_thumbnail(self, cover_url: str) -> dict[str, Any] | None:
+        """Fetch a bounded JPEG cover thumbnail via external `bilibili_surf` plugin."""
+        if (
+            not isinstance(cover_url, str)
+            or ".." in cover_url
+            or not COVER_URL_RE.fullmatch(cover_url)
+        ):
+            return None
+        proxy = self._online_proxy()
+        if proxy is None or not proxy.enabled or self._inside_own_reader():
+            return None
+        try:
+            res = await proxy.call_raw_rpc("bili.cover_thumb", {"url": cover_url}, timeout=15.0)
+        except (Rejected, TimeoutError, ValueError):
+            return None
+        candidate = res.get("thumbnail") if isinstance(res, dict) and "thumbnail" in res else res
+        if not isinstance(candidate, dict) or candidate.get("mime_type") != "image/jpeg":
+            return None
+        n_bytes = candidate.get("bytes")
+        data_b64 = candidate.get("data_b64")
+        if (
+            isinstance(n_bytes, bool)
+            or not isinstance(n_bytes, int)
+            or not (1 <= n_bytes <= MAX_COVER_THUMB_BYTES)
+            or not isinstance(data_b64, str)
+            or not data_b64
+        ):
+            return None
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except ValueError:
+            return None
+        if not (1 <= len(raw) <= MAX_COVER_THUMB_BYTES):
+            return None
+        return dict(candidate)
+
+    async def _active_private_priority_map(self, current: float) -> dict[str, str]:
+        async with self.store.lock:
+            if not await self._table_exists("bili_private_share_priority"):
+                return {}
+            rows = await self.store.all(
+                "SELECT bvid, session_scope FROM bili_private_share_priority WHERE expires_at>?",
+                (current,),
+            )
+        return {str(r[0]): str(r[1]) for r in rows}
+
     async def _kv_actions_by_bvid(self, bvids: list[str]) -> dict[str, list[str]]:
         if not bvids:
             return {}
@@ -617,6 +682,16 @@ class RemoteBiliWatcher:
     async def _lookup_watched_fallback(
         self, bvid: str, *, message: Message | None, notes_limit: int, secrets: list[str]
     ) -> dict[str, Any] | None:
+        now = self.clock()
+        scope = (
+            self.store.session_scope(message)
+            if message is not None and message.kind == "private"
+            else ""
+        )
+        prio_map = await self._active_private_priority_map(now)
+        if bvid in prio_map and prio_map[bvid] != scope:
+            return None
+
         watched_index = await self._kv_get("watched_index")
         item: dict[str, Any] | None = None
         if isinstance(watched_index, dict):
@@ -626,9 +701,17 @@ class RemoteBiliWatcher:
                 if isinstance(raw_item, dict):
                     if raw_item.get("status") != "done" or not raw_item.get("has_summary", True):
                         return None
+                    item_visible, _ = _private_priority_visible(
+                        raw_item, session_scope=scope, now=now
+                    )
+                    if not item_visible:
+                        return None
                     item = raw_item
         doc = await self._kv_get(f"watched.{bvid}")
         if isinstance(doc, dict) and doc.get("summary"):
+            doc_visible, _ = _private_priority_visible(doc, session_scope=scope, now=now)
+            if not doc_visible:
+                return None
             try:
                 notes = redact_public_summary(
                     safe_output(str(doc["summary"]), secrets, limit=notes_limit)
@@ -651,11 +734,6 @@ class RemoteBiliWatcher:
                 "prior_patrol_notes": notes,
             }
 
-        scope = (
-            self.store.session_scope(message)
-            if message is not None and message.kind == "private"
-            else ""
-        )
         async with self.store.lock:
             if not await self._table_exists("bili_watched_history"):
                 return None
@@ -666,7 +744,7 @@ class RemoteBiliWatcher:
                     "LEFT JOIN bili_private_share_priority p ON p.bvid=h.bvid AND p.expires_at>? "
                     "WHERE h.bvid=? AND h.status='done' AND h.summary IS NOT NULL "
                     "AND (p.bvid IS NULL OR p.session_scope=?)",
-                    (self.clock(), bvid, scope),
+                    (now, bvid, scope),
                 )
             else:
                 row = await self.store.one(
@@ -699,13 +777,21 @@ class RemoteBiliWatcher:
         if not isinstance(bvid, str) or not BVID_RE.fullmatch(bvid):
             return None
         notes_limit = min(1200, max(1, int(limit)))
+        scope = (
+            self.store.session_scope(message)
+            if message is not None and message.kind == "private"
+            else ""
+        )
+        prio_map = await self._active_private_priority_map(self.clock())
+        if bvid in prio_map and prio_map[bvid] != scope:
+            return None
         secrets = self._all_secrets()
         proxy = self._online_proxy()
         if proxy is not None and not self._inside_own_reader():
             try:
                 res = await proxy.call_raw_rpc(
                     "bili.lookup_watched",
-                    {"bvid": bvid, "limit": notes_limit},
+                    {"bvid": bvid, "limit": notes_limit, "session_scope": scope},
                 )
             except Rejected as exc:
                 if str(exc) in _RPC_TRANSPORT_ERRORS:
@@ -750,26 +836,49 @@ class RemoteBiliWatcher:
         message: Message | None,
         secrets: list[str],
     ) -> list[dict[str, Any]]:
+        scope = (
+            self.store.session_scope(message)
+            if message is not None and message.kind == "private"
+            else ""
+        )
+        prio_map = await self._active_private_priority_map(current)
         watched_index = await self._kv_get("watched_index")
         if isinstance(watched_index, dict) and isinstance(watched_index.get("items"), dict):
-            eligible = [
-                (bv, item)
-                for bv, item in watched_index["items"].items()
-                if isinstance(item, dict)
-                and item.get("status") == "done"
-                and item.get("has_summary", True)
-                and (_finite_float(item.get("created")) or 0.0) >= current - max_age
-            ]
+            eligible: list[tuple[str, dict[str, Any], bool]] = []
+            for bv, item in watched_index["items"].items():
+                if (
+                    not isinstance(item, dict)
+                    or item.get("status") != "done"
+                    or not item.get("has_summary", True)
+                    or (_finite_float(item.get("created")) or 0.0) < current - max_age
+                ):
+                    continue
+                if bv in prio_map and prio_map[bv] != scope:
+                    continue
+                item_visible, item_prio = _private_priority_visible(
+                    item, session_scope=scope, now=current
+                )
+                if not item_visible:
+                    continue
+                is_prio = item_prio or (bool(scope) and prio_map.get(bv) == scope)
+                eligible.append((bv, item, is_prio))
             eligible.sort(
-                key=lambda pair: _finite_float(pair[1].get("created")) or 0.0,
+                key=lambda triple: (
+                    1 if triple[2] else 0,
+                    _finite_float(triple[1].get("created")) or 0.0,
+                ),
                 reverse=True,
             )
-            selected = eligible[:limit]
-            actions_map = await self._kv_actions_by_bvid([bv for bv, _ in selected])
+            actions_map = await self._kv_actions_by_bvid([bv for bv, _, _ in eligible[: limit * 2]])
             results: list[dict[str, Any]] = []
-            for bv, item in selected:
+            for bv, item, _ in eligible:
+                if len(results) >= limit:
+                    break
                 doc = await self._kv_get(f"watched.{bv}")
                 if not isinstance(doc, dict) or not doc.get("summary"):
+                    continue
+                doc_visible, _ = _private_priority_visible(doc, session_scope=scope, now=current)
+                if not doc_visible:
                     continue
                 try:
                     notes = redact_public_summary(
@@ -796,11 +905,6 @@ class RemoteBiliWatcher:
                 results.append(entry)
             return results
 
-        scope = (
-            self.store.session_scope(message)
-            if message is not None and message.kind == "private"
-            else ""
-        )
         async with self.store.lock:
             if not await self._table_exists("bili_watched_history"):
                 return []
@@ -855,13 +959,24 @@ class RemoteBiliWatcher:
     ) -> list[dict[str, Any]]:
         current = self.clock() if now is None else float(now)
         max_items = max(1, int(limit))
+        scope = (
+            self.store.session_scope(message)
+            if message is not None and message.kind == "private"
+            else ""
+        )
+        prio_map = await self._active_private_priority_map(current)
         secrets = self._all_secrets()
         proxy = self._online_proxy()
         if proxy is not None and not self._inside_own_reader():
             try:
                 res = await proxy.call_raw_rpc(
                     "bili.recent_surfed",
-                    {"limit": max_items, "max_age": float(max_age), "now": current},
+                    {
+                        "limit": max_items,
+                        "max_age": float(max_age),
+                        "now": current,
+                        "session_scope": scope,
+                    },
                 )
             except Rejected as exc:
                 if str(exc) in _RPC_TRANSPORT_ERRORS:
@@ -877,11 +992,15 @@ class RemoteBiliWatcher:
             if not isinstance(raw_items, list):
                 return []
             out: list[dict[str, Any]] = []
-            for item in raw_items[:max_items]:
+            for item in raw_items:
+                if len(out) >= max_items:
+                    break
                 if not isinstance(item, dict):
                     continue
                 bv = str(item.get("bvid") or "")
                 if not BVID_RE.fullmatch(bv):
+                    continue
+                if bv in prio_map and prio_map[bv] != scope:
                     continue
                 try:
                     notes = redact_public_summary(
@@ -1185,7 +1304,7 @@ class RemoteBiliWatcher:
             check_enabled=True, unavailable_code="bilibili_module_unavailable"
         )
         try:
-            res = await proxy.call_raw_rpc("bili.account.run_once", {"slot": slot}, timeout=180.0)
+            res = await proxy.call_raw_rpc("bili.account.run_once", {"slot": slot}, timeout=1500.0)
         except Rejected as exc:
             code = str(exc)
             if code in _RISK_CODES or code == "bili_account_cooling_down":

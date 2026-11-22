@@ -23,8 +23,11 @@ from websockets.asyncio.server import serve
 from node_agent.bili_collector import (
     COVER_MAX_JPEG_BYTES,
     STORYBOARD_MAX_JPEG_BYTES,
+    STORYBOARD_YTDLP_FORMAT,
     BiliCollector,
     CollectorError,
+    _classify_ytdlp_error,
+    _validate_videoshot_url,
 )
 from node_agent.config import NodeAgentSettings
 from node_agent.daemon import NodeDaemon, compute_backoff_step, decode_node_frame
@@ -326,18 +329,25 @@ async def test_cover_thumb_pillow_cap_exif_bomb_and_ssrf(tmp_path: Path) -> None
 
 
 async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     temp_root = tmp_path / "node_bili_jobs"
     stale_dir = temp_root / ("job-" + "a" * 32)
     stale_dir.mkdir(parents=True)
     (stale_dir / "leftover.txt").write_text("stale", encoding="utf-8")
 
-    collector = BiliCollector(min_interval=0.0, temp_dir=temp_root)
+    def videoshot_empty_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.bilibili.com"
+        assert request.url.path == "/x/player/videoshot"
+        return httpx.Response(200, json={"code": 0, "data": {"image": []}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(videoshot_empty_handler))
+    collector = BiliCollector(min_interval=0.0, temp_dir=temp_root, http_client=client)
     observed: dict[str, Any] = {"cookie_mode": None, "cookie_wiped_before_ffprobe": False}
     seen_ytdlp_argv: list[str] = []
     block_ytdlp = asyncio.Event()
     ytdlp_started = asyncio.Event()
+    timeout_ytdlp = False
 
     async def fake_exec(
         argv: list[str], *, cwd: Path, env: dict[str, str], wait_limit: float
@@ -346,11 +356,14 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
         assert "NODE_WS_TOKEN" not in env
         tool = Path(argv[0]).name
         if "yt-dlp" in tool or "yt_dlp" in " ".join(argv):
+            seen_ytdlp_argv.clear()
             seen_ytdlp_argv.extend(argv)
             cookie_file = cwd / "cookies.txt"
             assert cookie_file.exists()
             observed["cookie_mode"] = stat.S_IMODE(cookie_file.lstat().st_mode)
             assert "SESSDATA\tcn-temp-cookie-val" in cookie_file.read_text(encoding="utf-8")
+            if timeout_ytdlp:
+                raise CollectorError("video_download_timeout")
             if block_ytdlp.is_set():
                 ytdlp_started.set()
                 await asyncio.sleep(10)
@@ -371,6 +384,7 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
         raise AssertionError(f"Unexpected argv: {argv}")
 
     monkeypatch.setattr(collector, "_exec_bounded", fake_exec)
+    caplog.set_level(logging.INFO, logger="node_agent.bili")
     try:
         sb = await collector.video_storyboard(
             {
@@ -383,15 +397,19 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
         assert "--no-playlist" in seen_ytdlp_argv
         assert "--max-filesize" in seen_ytdlp_argv
         assert "40M" in seen_ytdlp_argv
-        assert "worst[ext=mp4]/mp4" in seen_ytdlp_argv
+        assert STORYBOARD_YTDLP_FORMAT in seen_ytdlp_argv
+        assert "worst[ext=mp4]/mp4" not in seen_ytdlp_argv
         assert observed["cookie_mode"] == 0o600
         assert observed["cookie_wiped_before_ffprobe"] is True
+        assert f"event=bili_videoshot_fallback bvid={TEST_BVID}" in caplog.text
+        assert "cn-temp-cookie-val" not in caplog.text
 
         raw_jpeg = base64.b64decode(sb["data_b64"])
         assert sb["bvid"] == TEST_BVID
         assert sb["duration"] == 900.0
         assert sb["mime_type"] == "image/jpeg"
         assert sb["grid"] == "3x3"
+        assert sb["source"] == "ytdlp_fallback"
         assert sb["bytes"] == len(raw_jpeg)
         assert 1 <= sb["bytes"] <= STORYBOARD_MAX_JPEG_BYTES
         with Image.open(io.BytesIO(raw_jpeg)) as sheet:
@@ -412,6 +430,21 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
             )
         assert list(temp_root.iterdir()) == []
 
+        # Timeout in yt-dlp must ALSO wipe job directory and cookies and log desensitized reason.
+        timeout_ytdlp = True
+        with pytest.raises(CollectorError, match="video_download_timeout"):
+            await collector.video_storyboard(
+                {
+                    "bvid": TEST_BVID,
+                    "max_seconds": 120,
+                    "cookies": {"sessdata": "cn-temp-cookie-val"},
+                }
+            )
+        timeout_ytdlp = False
+        assert list(temp_root.iterdir()) == []
+        assert "fallback_reason=video_download_timeout" in caplog.text
+        assert "cn-temp-cookie-val" not in caplog.text
+
         # Mid-flight cancellation must STILL wipe temporary cookies and job directory.
         block_ytdlp.set()
         task = asyncio.create_task(
@@ -430,6 +463,380 @@ async def test_video_storyboard_cookie_cleanup_cancellation_and_3x3_cap(
         assert list(temp_root.iterdir()) == []
     finally:
         await collector.close()
+        await client.aclose()
+
+
+def _make_sprite_sheet_jpeg(
+    cols: int, rows: int, cell_w: int, cell_h: int, colors: list[tuple[int, int, int]]
+) -> bytes:
+    sheet = Image.new("RGB", (cols * cell_w, rows * cell_h), (0, 0, 0))
+    for idx, color in enumerate(colors[: cols * rows]):
+        r, c = divmod(idx, cols)
+        tile = Image.new("RGB", (cell_w, cell_h), color)
+        sheet.paste(tile, (c * cell_w, r * cell_h))
+    buf = io.BytesIO()
+    sheet.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+async def test_video_storyboard_videoshot_primary_long_video_and_multipart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cell_colors = [
+        (220, 30, 30),
+        (30, 220, 30),
+        (30, 30, 220),
+        (220, 220, 30),
+        (220, 30, 220),
+        (30, 220, 220),
+        (200, 120, 40),
+        (120, 40, 200),
+        (40, 200, 120),
+    ]
+    hi_res_sheet = _make_sprite_sheet_jpeg(3, 3, 480, 270, cell_colors)
+    compact_sheet = _make_sprite_sheet_jpeg(10, 10, 160, 90, cell_colors * 12)
+    bomb_buf = io.BytesIO()
+    Image.new("RGB", (6000, 5000), (0, 0, 0)).save(bomb_buf, format="PNG")
+    bomb_sheet = bomb_buf.getvalue()
+
+    seen_requests: list[tuple[str, str, dict[str, str]]] = []
+    mode: dict[str, str] = {"kind": "basic"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append((request.method, str(request.url), dict(request.headers)))
+        if request.url.host == "api.bilibili.com" and request.url.path == "/x/web-interface/view":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "bvid": TEST_BVID,
+                        "pages": [
+                            {"page": 1, "cid": 10001, "duration": 120},
+                            {"page": 2, "cid": 20002, "duration": 245},
+                        ],
+                    },
+                },
+            )
+        if request.url.host == "api.bilibili.com" and request.url.path == "/x/player/videoshot":
+            if mode["kind"] == "basic":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "img_x_len": 3,
+                            "img_y_len": 3,
+                            "img_x_size": 480,
+                            "img_y_size": 270,
+                            "image": ["//i0.hdslb.com/bfs/videoshot/basic_0.jpg"],
+                            "index": [0, 5, 10, 15, 20, 25, 30, 35, 45],
+                        },
+                    },
+                )
+            if mode["kind"] == "long":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "img_x_len": 10,
+                            "img_y_len": 10,
+                            "img_x_size": 160,
+                            "img_y_size": 90,
+                            "image": [
+                                f"//i1.hdslb.com/bfs/videoshot/long_{i}.jpg" for i in range(20)
+                            ],
+                            "index": list(range(0, 2000)),
+                        },
+                    },
+                )
+            if mode["kind"] == "empty":
+                return httpx.Response(200, json={"code": 0, "data": {"image": []}})
+            if mode["kind"] == "bomb":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "img_x_len": 10,
+                            "img_y_len": 10,
+                            "img_x_size": 160,
+                            "img_y_size": 90,
+                            "image": ["https://i0.hdslb.com/bfs/videoshot/bomb.png"],
+                            "index": [0, 5, 10, 15, 20, 25, 30, 35, 40],
+                        },
+                    },
+                )
+        if request.url.host in {"i0.hdslb.com", "i1.hdslb.com"}:
+            if request.url.path.endswith("basic_0.jpg"):
+                return httpx.Response(200, content=hi_res_sheet)
+            if request.url.path.endswith("bomb.png"):
+                return httpx.Response(200, content=bomb_sheet)
+            return httpx.Response(200, content=compact_sheet)
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    temp_root = tmp_path / "videoshot_jobs"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    collector = BiliCollector(min_interval=0.0, temp_dir=temp_root, http_client=client)
+
+    async def forbid_subprocess(
+        argv: list[str], *, cwd: Path, env: dict[str, str], wait_limit: float
+    ) -> tuple[int, bytes, bytes]:
+        raise AssertionError(f"Subprocess must not run on videoshot path: {argv}")
+
+    monkeypatch.setattr(collector, "_exec_bounded", forbid_subprocess)
+    caplog.set_level(logging.INFO, logger="node_agent.bili")
+    try:
+        # 1. Primary 3x3 videoshot path: zero subprocesses, capped to 960x540, exact cell layout.
+        res = await collector.video_storyboard(
+            {"bvid": TEST_BVID, "cookies": {"sessdata": "api-only-secret-val"}}
+        )
+        assert res["bvid"] == TEST_BVID
+        assert res["source"] == "videoshot"
+        assert res["grid"] == "3x3"
+        assert res["mime_type"] == "image/jpeg"
+        assert res["duration"] == 45.0
+        raw_jpeg = base64.b64decode(res["data_b64"])
+        assert res["bytes"] == len(raw_jpeg)
+        assert 1 <= res["bytes"] <= STORYBOARD_MAX_JPEG_BYTES
+        assert not temp_root.exists()
+        with Image.open(io.BytesIO(raw_jpeg)) as img:
+            assert img.format == "JPEG"
+            assert img.size == (960, 540)
+            tl_r, tl_g, tl_b = img.getpixel((160, 90))
+            br_r, br_g, br_b = img.getpixel((800, 450))
+            assert tl_r > 180 and tl_g < 80 and tl_b < 80
+            assert br_g > 160 and br_b > 80 and br_r < 90
+        api_reqs = [r for r in seen_requests if "api.bilibili.com" in r[1]]
+        cdn_reqs = [r for r in seen_requests if "hdslb.com" in r[1]]
+        assert len(api_reqs) == 1 and "SESSDATA=api-only-secret-val" in api_reqs[0][2].get(
+            "cookie", ""
+        )
+        assert len(cdn_reqs) == 1 and "cookie" not in {k.lower() for k in cdn_reqs[0][2]}
+
+        # 2. Long >15min video with videoshot_only=True downloads at most 9 of 20 sprite sheets.
+        seen_requests.clear()
+        mode["kind"] = "long"
+        long_res = await collector.video_storyboard(
+            {
+                "bvid": TEST_BVID,
+                "duration": 1800,
+                "videoshot_only": True,
+            }
+        )
+        assert long_res["source"] == "videoshot"
+        assert long_res["duration"] == 1800.0
+        long_cdn_reqs = [r for r in seen_requests if "hdslb.com" in r[1]]
+        assert 1 <= len(long_cdn_reqs) <= 9
+
+        # 3. Multi-part with explicit cid skips /x/web-interface/view and passes cid to videoshot.
+        seen_requests.clear()
+        mode["kind"] = "basic"
+        cid_res = await collector.video_storyboard({"bvid": TEST_BVID, "page": 2, "cid": 887766})
+        assert cid_res["source"] == "videoshot"
+        assert not any("/x/web-interface/view" in r[1] for r in seen_requests)
+        vs_urls = [r[1] for r in seen_requests if "/x/player/videoshot" in r[1]]
+        assert len(vs_urls) == 1 and "cid=887766" in vs_urls[0] and "index=1" in vs_urls[0]
+
+        # 4. Multi-part without cid queries /x/web-interface/view for pages[page-1].cid & duration.
+        seen_requests.clear()
+        page_res = await collector.video_storyboard({"bvid": TEST_BVID, "page": 2})
+        assert page_res["source"] == "videoshot"
+        assert page_res["duration"] == 245.0
+        assert any("/x/web-interface/view" in r[1] for r in seen_requests)
+        vs_urls = [r[1] for r in seen_requests if "/x/player/videoshot" in r[1]]
+        assert len(vs_urls) == 1 and "cid=20002" in vs_urls[0]
+
+        # 5. videoshot_only=True fails cleanly without falling back to yt-dlp when empty.
+        mode["kind"] = "empty"
+        with pytest.raises(CollectorError, match="videoshot_unavailable"):
+            await collector.video_storyboard({"bvid": TEST_BVID, "videoshot_only": True})
+        assert "fallback_reason=videoshot_only" in caplog.text
+
+        # 6. Decompression bomb sprite sheet is rejected safely.
+        mode["kind"] = "bomb"
+        with pytest.raises(CollectorError, match="videoshot_invalid_media"):
+            await collector.video_storyboard({"bvid": TEST_BVID, "videoshot_only": True})
+        assert "api-only-secret-val" not in caplog.text
+
+        # 7. >15min fallback rejects fast before yt-dlp; invalid params raise invalid_params.
+        mode["kind"] = "empty"
+        with pytest.raises(CollectorError, match="video_download_duration"):
+            await collector.video_storyboard(
+                {"bvid": TEST_BVID, "duration": 1800, "max_seconds": 1800}
+            )
+        for bad_params in (
+            {"bvid": TEST_BVID, "page": 0},
+            {"bvid": TEST_BVID, "page": 1000},
+            {"bvid": TEST_BVID, "cid": -1},
+            {"bvid": TEST_BVID, "duration": float("nan")},
+            {"bvid": TEST_BVID, "videoshot_only": "yes"},
+        ):
+            with pytest.raises(CollectorError, match="invalid_params"):
+                await collector.video_storyboard(bad_params)
+    finally:
+        await collector.close()
+        await client.aclose()
+
+
+async def test_videoshot_url_ssrf_allowlist_and_cookie_isolation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert (
+        _validate_videoshot_url("//i0.hdslb.com/bfs/videoshot/demo.jpg")
+        == "https://i0.hdslb.com/bfs/videoshot/demo.jpg"
+    )
+    assert (
+        _validate_videoshot_url("https://i1.hdslb.com/bfs/videoshot/demo.jpg?auth_key=abc")
+        == "https://i1.hdslb.com/bfs/videoshot/demo.jpg?auth_key=abc"
+    )
+    assert (
+        _validate_videoshot_url("https://sub.i2.hdslb.com:443/bfs/videoshot/demo.jpg")
+        == "https://sub.i2.hdslb.com:443/bfs/videoshot/demo.jpg"
+    )
+
+    for bad_url in (
+        "https://evil.com/bfs/videoshot/a.jpg",
+        "//evil.com/bfs/videoshot/a.jpg",
+        "https://hdslb.com/bfs/videoshot/a.jpg",
+        "https://evil-hdslb.com/bfs/videoshot/a.jpg",
+        "https://i0.hdslb.com.evil.com/bfs/videoshot/a.jpg",
+        "https://127.0.0.1/bfs/videoshot/a.jpg",
+        "http://i0.hdslb.com/bfs/videoshot/a.jpg",
+        "https://i0.hdslb.com:8443/bfs/videoshot/a.jpg",
+        "https://user:pass@i0.hdslb.com/bfs/videoshot/a.jpg",
+        "https://i0.hdslb.com/bfs/videoshot/a.jpg#frag",
+        "https://i0.hdslb.com/other/videoshot/a.jpg",
+        "https://i0.hdslb.com/bfs/",
+        "https://i0.hdslb.com/bfs/videoshot/../secret.jpg",
+        "https://i0.hdslb.com/bfs/%2e%2e/secret.jpg",
+    ):
+        with pytest.raises(CollectorError, match="videoshot_host_forbidden"):
+            _validate_videoshot_url(bad_url)
+
+    seen_hosts: list[tuple[str, dict[str, str]]] = []
+    secret_sess = "never-send-to-hdslb-cdn-991122"
+
+    def evil_handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append((request.url.host, dict(request.headers)))
+        if request.url.host == "api.bilibili.com":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "img_x_len": 3,
+                        "img_y_len": 3,
+                        "img_x_size": 160,
+                        "img_y_size": 90,
+                        "image": ["https://evil-hdslb.com/bfs/videoshot/pwn.jpg"],
+                        "index": [0, 5, 10],
+                    },
+                },
+            )
+        raise AssertionError(f"SSRF target must never be requested: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(evil_handler))
+    collector = BiliCollector(min_interval=0.0, temp_dir=tmp_path / "ssrf_jobs", http_client=client)
+    caplog.set_level(logging.DEBUG, logger="node_agent.bili")
+    try:
+        with pytest.raises(CollectorError, match="videoshot_host_forbidden"):
+            await collector.video_storyboard(
+                {
+                    "bvid": TEST_BVID,
+                    "videoshot_only": True,
+                    "cookies": {"sessdata": secret_sess},
+                }
+            )
+        assert [host for host, _ in seen_hosts] == ["api.bilibili.com"]
+        assert secret_sess not in caplog.text
+    finally:
+        await collector.close()
+        await client.aclose()
+
+
+async def test_classify_ytdlp_error_and_desensitized_fallback_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert (
+        _classify_ytdlp_error("ERROR: unable to download video data: HTTP Error 567: EdgeOne")
+        == "video_download_cdn_http_567"
+    )
+    assert _classify_ytdlp_error("HTTP 567 blocked") == "video_download_cdn_http_567"
+    assert (
+        _classify_ytdlp_error("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+        == "video_download_cdn_http_403"
+    )
+    assert _classify_ytdlp_error("HTTP 403 Forbidden") == "video_download_cdn_http_403"
+
+    for risk_msg in (
+        "API error -352",
+        "API error -412",
+        "v_voucher check failed",
+        "HTTP Error 412: Precondition Failed",
+        "HTTP Error 429: Too Many Requests",
+        "captcha verification required",
+        "rate limit exceeded",
+    ):
+        assert _classify_ytdlp_error(risk_msg) == "video_download_risk"
+
+    assert _classify_ytdlp_error("API error -101") == "video_download_cookie_expired"
+    assert _classify_ytdlp_error("Login required") == "video_download_cookie_expired"
+    assert _classify_ytdlp_error("Read timed out") == "video_download_timeout"
+    assert _classify_ytdlp_error("Connection timeout") == "video_download_timeout"
+    assert (
+        _classify_ytdlp_error("ERROR: Requested format is not available") == "video_download_format"
+    )
+    assert _classify_ytdlp_error("premium-only stream") == "video_download_restricted"
+    assert _classify_ytdlp_error("File is larger than max-filesize") == "video_download_size"
+    assert _classify_ytdlp_error("unexpected failure") == "video_download_unavailable"
+
+    secret_sess = "super-secret-sessdata-must-not-log-7788"
+    captured_argv: list[str] = []
+
+    def fallback_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/x/web-interface/view":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"pages": [{"cid": 1}, {"cid": 2}, {"cid": 3}]}},
+            )
+        return httpx.Response(200, json={"code": -404, "data": None})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(fallback_handler))
+    collector = BiliCollector(min_interval=0.0, temp_dir=tmp_path / "err_jobs", http_client=client)
+
+    async def fake_fail_exec(
+        argv: list[str], *, cwd: Path, env: dict[str, str], wait_limit: float
+    ) -> tuple[int, bytes, bytes]:
+        _ = cwd, env, wait_limit
+        captured_argv.extend(argv)
+        return (
+            1,
+            b"",
+            f"ERROR: HTTP Error 567 while using SESSDATA={secret_sess}".encode(),
+        )
+
+    monkeypatch.setattr(collector, "_exec_bounded", fake_fail_exec)
+    caplog.set_level(logging.INFO, logger="node_agent.bili")
+    try:
+        with pytest.raises(CollectorError, match="video_download_cdn_http_567"):
+            await collector.video_storyboard(
+                {
+                    "bvid": TEST_BVID,
+                    "page": 3,
+                    "cookies": {"sessdata": secret_sess},
+                }
+            )
+        assert f"https://www.bilibili.com/video/{TEST_BVID}?p=3" in captured_argv
+        assert STORYBOARD_YTDLP_FORMAT in captured_argv
+        assert "event=bili_videoshot_fallback" in caplog.text
+        assert "event=bili_storyboard_failed" in caplog.text
+        assert "fallback_reason=video_download_cdn_http_567" in caplog.text
+        assert secret_sess not in caplog.text
+    finally:
+        await collector.close()
+        await client.aclose()
 
 
 async def test_daemon_hello_concurrent_nonblocking_ping_and_reconnect_backoff(
@@ -608,3 +1015,23 @@ def test_packaging_hardening_invariants() -> None:
         assert live_tok not in env_example
     with pytest.raises(ValidationError):
         NodeAgentSettings(_env_file=repo / "node_agent/.env.node.example")
+
+
+async def test_bili_collector_subtitle_invalid_port_rejected_cleanly(tmp_path: Path) -> None:
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _req: httpx.Response(200, json={"body": []}))
+    )
+    collector = BiliCollector(min_interval=0.0, temp_dir=tmp_path / "jobs", http_client=http)
+    try:
+        with pytest.raises(CollectorError) as exc_info:
+            await collector.request(
+                {
+                    "method": "GET",
+                    "path": "https://aisubtitle.hdslb.com:99999/bfs/ai_subtitle/demo.json",
+                    "subtitle": True,
+                }
+            )
+        assert exc_info.value.code == "bili_subtitle_host_forbidden"
+    finally:
+        await collector.close()
+        await http.aclose()

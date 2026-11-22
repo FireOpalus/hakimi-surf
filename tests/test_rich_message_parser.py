@@ -168,3 +168,75 @@ def test_plain_slash_command_does_not_bypass_at_only(settings):
         settings,
     )
     assert not result.addressed
+
+
+def test_bilibili_legacy_http_multipart_and_festival_urls_parsed_safely():
+    res = parse_message(
+        [
+            {
+                "type": "text",
+                "data": {
+                    "text": (
+                        f"旧链 http://www.bilibili.com/video/{BV}?p=2 "
+                        "活动 https://www.bilibili.com/festival/2026bnj?bvid=BV1Q541167Qg&p=3 "
+                        "短链 http://b23.tv/AbCd12"
+                    )
+                },
+            }
+        ],
+        "10000",
+    )
+    assert res.video_ids == [BV, "BV1Q541167Qg"]
+    assert res.short_urls == ["https://b23.tv/AbCd12"]
+
+    # Untrusted / spoofed URLs must still be rejected.
+    bad = parse_message(
+        [
+            {
+                "type": "text",
+                "data": {
+                    "text": (
+                        f"https://www.bilibili.com.evil.test/video/{BV} "
+                        f"http://www.bilibili.com:443/video/{BV} "
+                        f"https://www.bilibili.com/festival/../../admin?bvid={BV} "
+                        f"https://evil.test/festival/demo?bvid={BV}"
+                    )
+                },
+            }
+        ],
+        "10000",
+    )
+    assert bad.video_ids == []
+
+
+def test_bilibili_invalid_port_urls_never_crash_parse_message():
+    res = parse_message(
+        [
+            {
+                "type": "text",
+                "data": {
+                    "text": (
+                        f"坏端口1 http://www.bilibili.com:99999/video/{BV} "
+                        f"坏端口2 https://www.bilibili.com:abc/video/{BV}?p=2 "
+                        f"坏端口3 http://www.bilibili.com:99999/festival/2026bnj?bvid={BV} "
+                        "坏短链1 http://b23.tv:99999/AbCd12 "
+                        "坏短链2 https://b23.tv:abc/ZyXw98"
+                    )
+                },
+            }
+        ],
+        "10000",
+    )
+    assert res.video_ids == []
+    assert res.short_urls == []
+
+    # Valid links in the same message still parse cleanly after invalid-port URLs.
+    mixed = parse_message(
+        f"http://www.bilibili.com:99999/video/{BV} "
+        "http://b23.tv:99999/bad "
+        "https://www.bilibili.com/video/BV1Q541167Qg?p=2 "
+        "http://b23.tv/Good12",
+        "10000",
+    )
+    assert mixed.video_ids == ["BV1Q541167Qg"]
+    assert mixed.short_urls == ["https://b23.tv/Good12"]

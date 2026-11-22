@@ -164,7 +164,7 @@ def _bili_hello(**overrides: Any) -> dict[str, Any]:
                     ["bilibili_surf", "patrol", False],
                     ["bilibili_surf", "run_once", False],
                 ],
-                "timeout_seconds": 180.0,
+                "timeout_seconds": 1500.0,
             }
         ],
     }
@@ -1712,3 +1712,414 @@ async def test_plugin_structured_ai_generate_validation_and_scope_guards(setting
     await bus.close()
     await svc.stop()
     await store.close()
+
+
+async def test_bili_memory_preferences_and_private_topic_commit_isolation(
+    phase3_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hakimi.session_manager import SessionManager
+
+    _, svc, bus, _ = phase3_env
+    svc.modules.unregister("bilibili_surf")
+    svc.s.onebot_allowed_users = {"20000", "30000", "40001"}
+    svc.s.onebot_allowed_groups = {"40000"}
+    sessions = svc.sessions = SessionManager(svc.s, svc.store)
+
+    await bus.create_plugin(
+        "bilibili_surf",
+        "B 站巡逻",
+        ["actions", "sensors", "thinking_scenes", "node_bridge", "owner_notify"],
+    )
+    await bus.create_plugin("foreign_mp", "Foreign", ["actions", "sensors"])
+
+    # Timeout upper bound: 1800.0 accepted, 1801.0 rejected (1008)
+    bad_timeout_sock = _Phase3Socket()
+    bad_timeout_run = asyncio.create_task(
+        bus.serve(
+            bad_timeout_sock.receive,
+            bad_timeout_sock.send,
+            bad_timeout_sock.close,
+            source_ip="127.0.0.1",
+            plugin_id="bilibili_surf",
+        )
+    )
+    bad_actions = [dict(_bili_hello()["actions"][0], timeout_seconds=1801.0)]
+    await bad_timeout_sock.push(_bili_hello(actions=bad_actions))
+    await asyncio.wait_for(bad_timeout_run, 2.0)
+    assert bad_timeout_sock.closed_codes == [1008]
+
+    # Foreign plugin cannot call bili.memory_preferences or bili.private_topic_commit -> 1008
+    for bad_frame in (
+        {"type": "bili.memory_preferences", "id": "f-mp"},
+        {"type": "bili.private_topic_commit", "id": "f-cm", "handle": "h1", "bvid": BV1},
+    ):
+        f_sock = _Phase3Socket()
+        f_run = asyncio.create_task(
+            bus.serve(
+                f_sock.receive,
+                f_sock.send,
+                f_sock.close,
+                source_ip="127.0.0.1",
+                plugin_id="foreign_mp",
+            )
+        )
+        await f_sock.push(
+            {
+                "type": "plugin.hello",
+                "protocol_version": 1,
+                "display_name": "Foreign",
+                "scopes": ["actions", "sensors"],
+            }
+        )
+        await f_sock.recv_until(lambda m: m["type"] == "plugin.ready")
+        await f_sock.push(bad_frame)
+        await asyncio.wait_for(f_run, 2.0)
+        assert f_sock.closed_codes == [1008]
+
+    # Seed private requests (owner + friend) and public group chat
+    owner_msg = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="ev-owner-1",
+        user_id="20000",
+        kind="private",
+        conversation_id="20000",
+        text="帮我找个量子计算视频 13800138000",
+        addressed=True,
+        created_at=100.0,
+    )
+    friend_msg = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="ev-friend-1",
+        user_id="30000",
+        kind="private",
+        conversation_id="30000",
+        text="推荐一个极光视频 test@example.com",
+        addressed=True,
+        created_at=200.0,
+    )
+    group_msg = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="ev-group-1",
+        user_id="30000",
+        kind="group",
+        conversation_id="40000",
+        text="群里大家最近都在聊太空望远镜",
+        addressed=True,
+        created_at=300.0,
+    )
+    await sessions.remember(owner_msg, owner_msg.text, "好")
+    await sessions.remember(friend_msg, friend_msg.text, "好")
+    await sessions.remember(group_msg, group_msg.text, "好")
+    await sessions.dual.record_chronicle(
+        group_msg,
+        topic="社区兴趣",
+        text="大家喜欢聊航天发射与天文观测",
+        category="event",
+        tags=["space"],
+        source_id="src-group-1",
+        created_at=310.0,
+    )
+
+    registry = [(svc.store.session_scope(m), m) for m in (owner_msg, friend_msg, group_msg)]
+
+    async def _ordered_sessions() -> list[tuple[str, Message]]:
+        return registry
+
+    monkeypatch.setattr(svc.store.runtime, "sessions", _ordered_sessions)
+    orig_snapshot = sessions.snapshot
+
+    async def _group_snapshot_only(target: Message) -> dict[str, Any]:
+        assert target.kind == "group", "private selector must not load summaries or snapshots"
+        return await orig_snapshot(target)
+
+    monkeypatch.setattr(sessions, "snapshot", _group_snapshot_only)
+
+    b_sock = _Phase3Socket()
+    b_run = asyncio.create_task(
+        bus.serve(
+            b_sock.receive,
+            b_sock.send,
+            b_sock.close,
+            source_ip="127.0.0.1",
+            plugin_id="bilibili_surf",
+        )
+    )
+    await b_sock.push(_bili_hello())
+    await b_sock.recv_until(lambda m: m["type"] == "plugin.ready")
+
+    try:
+        # 1) First memory_preferences selects newer friend request (created_at=200 > 100)
+        await b_sock.push({"type": "bili.memory_preferences", "id": "mp-1"})
+        mp1 = (await b_sock.recv_until(lambda m: m.get("id") == "mp-1"))[-1]
+        assert mp1["ok"] is True
+        res1 = mp1["result"]
+        assert res1["preferences"]["private_topic_refs"] == ["recent_chat_topics:0"]
+        assert len(res1["preferences"]["recent_chat_topics"]) == 1
+        assert "极光视频" in res1["preferences"]["recent_chat_topics"][0]
+        assert "test@example.com" not in json.dumps(res1, ensure_ascii=False)
+        assert "30000" not in json.dumps(res1, ensure_ascii=False)
+        assert res1["private_topic"]["owner_private"] is False
+        assert res1["private_topic"]["session_scope"] == svc.store.session_scope(friend_msg)
+        h1 = res1["private_topic"]["handle"]
+
+        # Unknown handle fails with bili_private_request_revoked
+        await b_sock.push(
+            {
+                "type": "bili.private_topic_commit",
+                "id": "cm-bad",
+                "handle": "nonexistent-handle",
+                "bvid": BV1,
+            }
+        )
+        cm_bad = (await b_sock.recv_until(lambda m: m.get("id") == "cm-bad"))[-1]
+        assert cm_bad["ok"] is False and cm_bad["error"] == "bili_private_request_revoked"
+
+        # 2) Commit friend handle atomically writes served_private_topics + private_share_priority
+        await b_sock.push(
+            {"type": "bili.private_topic_commit", "id": "cm-1", "handle": h1, "bvid": BV1}
+        )
+        cm1 = (await b_sock.recv_until(lambda m: m.get("id") == "cm-1"))[-1]
+        assert cm1["ok"] is True
+        assert cm1["result"] == {
+            "committed": True,
+            "owner_private": False,
+            "audience": res1["private_topic"]["audience"],
+            "session_scope": svc.store.session_scope(friend_msg),
+        }
+        served_rows = await svc.store.all("SELECT receipt FROM bili_served_private_topics")
+        assert len(served_rows) == 1
+        assert served_rows[0][0] not in json.dumps(res1, ensure_ascii=False)
+        prio_row = await svc.store.one(
+            "SELECT session_scope, expires_at FROM bili_private_share_priority WHERE bvid=?",
+            (BV1,),
+        )
+        assert prio_row is not None and prio_row[0] == svc.store.session_scope(friend_msg)
+
+        # 3) Next memory_preferences rotates to owner request (friend request already served)
+        await b_sock.push({"type": "bili.memory_preferences", "id": "mp-2"})
+        mp2 = (await b_sock.recv_until(lambda m: m.get("id") == "mp-2"))[-1]
+        assert mp2["ok"] is True
+        res2 = mp2["result"]
+        assert res2["private_topic"]["owner_private"] is True
+        assert "13800138000" not in json.dumps(res2, ensure_ascii=False)
+        assert "20000" not in json.dumps(res2, ensure_ascii=False)
+        h2 = res2["private_topic"]["handle"]
+
+        # Clearing owner's session revokes handle h2 before commit
+        await sessions.clear(owner_msg)
+        await b_sock.push(
+            {"type": "bili.private_topic_commit", "id": "cm-2-revoked", "handle": h2, "bvid": BV2}
+        )
+        cm2_rev = (await b_sock.recv_until(lambda m: m.get("id") == "cm-2-revoked"))[-1]
+        assert cm2_rev["ok"] is False and cm2_rev["error"] == "bili_private_request_revoked"
+        assert len(await svc.store.all("SELECT receipt FROM bili_served_private_topics")) == 1
+
+        # 4) With no pending private requests, memory_preferences returns public group topics
+        await b_sock.push({"type": "bili.memory_preferences", "id": "mp-3"})
+        mp3 = (await b_sock.recv_until(lambda m: m.get("id") == "mp-3"))[-1]
+        assert mp3["ok"] is True
+        res3 = mp3["result"]
+        assert res3["private_topic"] is None
+        assert "private_topic_refs" not in res3["preferences"]
+        assert any("太空望远镜" in t for t in res3["preferences"].get("recent_chat_topics", []))
+        assert any("天文观测" in t for t in res3["preferences"].get("community_topics", []))
+
+        # 5) DB write failure on priority rolls back served_private_topics atomically
+        await sessions.remember(owner_msg, "帮我找个火箭视频", "好")
+        await b_sock.push({"type": "bili.memory_preferences", "id": "mp-4"})
+        mp4 = (await b_sock.recv_until(lambda m: m.get("id") == "mp-4"))[-1]
+        h4 = mp4["result"]["private_topic"]["handle"]
+        await svc.store.db.execute(
+            "CREATE TRIGGER reject_prio BEFORE INSERT ON bili_private_share_priority "
+            "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
+        )
+        await b_sock.push(
+            {"type": "bili.private_topic_commit", "id": "cm-4-fail", "handle": h4, "bvid": BV2}
+        )
+        cm4_fail = (await b_sock.recv_until(lambda m: m.get("id") == "cm-4-fail"))[-1]
+        assert cm4_fail["ok"] is False and cm4_fail["error"] == "bili_private_commit_failed"
+        assert len(await svc.store.all("SELECT receipt FROM bili_served_private_topics")) == 1
+        await svc.store.db.execute("DROP TRIGGER reject_prio")
+    finally:
+        await b_sock.close(1000)
+        await asyncio.wait_for(b_run, 2.0)
+
+    # 6) Reconnect creates a new session; old handle h4 cannot be used across sessions
+    b_sock2 = _Phase3Socket()
+    b_run2 = asyncio.create_task(
+        bus.serve(
+            b_sock2.receive,
+            b_sock2.send,
+            b_sock2.close,
+            source_ip="127.0.0.1",
+            plugin_id="bilibili_surf",
+        )
+    )
+    await b_sock2.push(_bili_hello())
+    await b_sock2.recv_until(lambda m: m["type"] == "plugin.ready")
+    try:
+        await b_sock2.push(
+            {"type": "bili.private_topic_commit", "id": "cm-cross", "handle": h4, "bvid": BV2}
+        )
+        cm_cross = (await b_sock2.recv_until(lambda m: m.get("id") == "cm-cross"))[-1]
+        assert cm_cross["ok"] is False and cm_cross["error"] == "bili_private_request_revoked"
+    finally:
+        await b_sock2.close(1000)
+        await asyncio.wait_for(b_run2, 2.0)
+
+
+async def test_bili_private_handle_ttl_and_max_commits_enforced(phase3_env: Any) -> None:
+    import time
+
+    from hakimi.plugin_bus import _BILI_PRIVATE_HANDLE_TTL_SECONDS
+    from hakimi.session_manager import SessionManager
+
+    _, svc, bus, _ = phase3_env
+    svc.modules.unregister("bilibili_surf")
+    svc.s.onebot_allowed_users = {"20000", "30000"}
+    svc.s.onebot_allowed_groups = set()
+    sessions = svc.sessions = SessionManager(svc.s, svc.store)
+    now_box = [time.time()]
+    bus.clock = lambda: now_box[0]
+
+    await bus.create_plugin(
+        "bilibili_surf",
+        "B 站巡逻",
+        ["actions", "sensors", "thinking_scenes", "node_bridge", "owner_notify"],
+    )
+
+    bv3 = "BV1GJ411x7h7"
+    bv4 = "BV1fK4y1t7hj"
+    owner_msg = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="ev-owner-limit",
+        user_id="20000",
+        kind="private",
+        conversation_id="20000",
+        text="帮我找个火箭发射视频",
+        addressed=True,
+        created_at=now_box[0],
+    )
+    friend_msg = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="ev-friend-ttl",
+        user_id="30000",
+        kind="private",
+        conversation_id="30000",
+        text="帮我找个深海鱼视频",
+        addressed=True,
+        created_at=now_box[0] + 1.0,
+    )
+    await sessions.remember(owner_msg, owner_msg.text, "好的")
+
+    sock = _Phase3Socket()
+    run = asyncio.create_task(
+        bus.serve(
+            sock.receive,
+            sock.send,
+            sock.close,
+            source_ip="127.0.0.1",
+            plugin_id="bilibili_surf",
+        )
+    )
+    await sock.push(_bili_hello())
+    await sock.recv_until(lambda m: m["type"] == "plugin.ready")
+    try:
+        # 1) Max commits per handle is 2 (aligning with max 2 videos/round); 3rd is revoked.
+        await sock.push({"type": "bili.memory_preferences", "id": "mp-limit"})
+        mp_limit = (await sock.recv_until(lambda m: m.get("id") == "mp-limit"))[-1]
+        assert mp_limit["ok"] is True
+        h_limit = mp_limit["result"]["private_topic"]["handle"]
+
+        for idx, bvid in enumerate((BV1, BV2), start=1):
+            req_id = f"cm-ok-{idx}"
+            await sock.push(
+                {
+                    "type": "bili.private_topic_commit",
+                    "id": req_id,
+                    "handle": h_limit,
+                    "bvid": bvid,
+                }
+            )
+            cm = (await sock.recv_until(lambda m, rid=req_id: m.get("id") == rid))[-1]
+            assert cm["ok"] is True and cm["result"]["committed"] is True
+
+        await sock.push(
+            {
+                "type": "bili.private_topic_commit",
+                "id": "cm-over-limit",
+                "handle": h_limit,
+                "bvid": bv3,
+            }
+        )
+        cm_over = (await sock.recv_until(lambda m: m.get("id") == "cm-over-limit"))[-1]
+        assert cm_over["ok"] is False and cm_over["error"] == "bili_private_request_revoked"
+        assert (
+            await svc.store.one("SELECT bvid FROM bili_private_share_priority WHERE bvid=?", (bv3,))
+            is None
+        )
+
+        # 2) Handle expires after 30 minutes (TTL) and is evicted without DB write.
+        await sessions.remember(friend_msg, friend_msg.text, "好的")
+        await sock.push({"type": "bili.memory_preferences", "id": "mp-ttl"})
+        mp_ttl = (await sock.recv_until(lambda m: m.get("id") == "mp-ttl"))[-1]
+        assert mp_ttl["ok"] is True
+        h_ttl = mp_ttl["result"]["private_topic"]["handle"]
+
+        now_box[0] += _BILI_PRIVATE_HANDLE_TTL_SECONDS
+        await sock.push(
+            {
+                "type": "bili.private_topic_commit",
+                "id": "cm-expired",
+                "handle": h_ttl,
+                "bvid": bv3,
+            }
+        )
+        cm_exp = (await sock.recv_until(lambda m: m.get("id") == "cm-expired"))[-1]
+        assert cm_exp["ok"] is False and cm_exp["error"] == "bili_private_request_revoked"
+        assert (
+            await svc.store.one("SELECT bvid FROM bili_private_share_priority WHERE bvid=?", (bv3,))
+            is None
+        )
+
+        # 3) Handle expiring mid-round after 1st commit also rejects 2nd commit.
+        await sock.push({"type": "bili.memory_preferences", "id": "mp-mid-ttl"})
+        mp_mid = (await sock.recv_until(lambda m: m.get("id") == "mp-mid-ttl"))[-1]
+        assert mp_mid["ok"] is True
+        h_mid = mp_mid["result"]["private_topic"]["handle"]
+
+        now_box[0] += 60.0
+        await sock.push(
+            {
+                "type": "bili.private_topic_commit",
+                "id": "cm-mid-1",
+                "handle": h_mid,
+                "bvid": bv3,
+            }
+        )
+        cm_mid1 = (await sock.recv_until(lambda m: m.get("id") == "cm-mid-1"))[-1]
+        assert cm_mid1["ok"] is True
+
+        now_box[0] += _BILI_PRIVATE_HANDLE_TTL_SECONDS
+        await sock.push(
+            {
+                "type": "bili.private_topic_commit",
+                "id": "cm-mid-2-exp",
+                "handle": h_mid,
+                "bvid": bv4,
+            }
+        )
+        cm_mid2 = (await sock.recv_until(lambda m: m.get("id") == "cm-mid-2-exp"))[-1]
+        assert cm_mid2["ok"] is False and cm_mid2["error"] == "bili_private_request_revoked"
+        assert (
+            await svc.store.one("SELECT bvid FROM bili_private_share_priority WHERE bvid=?", (bv4,))
+            is None
+        )
+    finally:
+        await sock.close(1000)
+        await asyncio.wait_for(run, 2.0)
