@@ -908,3 +908,141 @@ async def test_integration_with_provider_routing_and_env_defaults_and_bq_errors(
         assert mgr.hard_stop_exhausted() is True
     finally:
         await store.close()
+
+
+async def test_gcp_admin_reconciliation_states_and_read_only_safety(settings):
+    """Verify /admin/api/gcp-billing attaches read-only reconciliation across all statuses."""
+    settings.admin_token = SecretStr(TOKEN)
+    settings.daily_usd = Decimal("1000")
+    settings.monthly_usd = Decimal("1000")
+    settings.total_usd = Decimal("1000")
+    settings.user_daily_usd = Decimal("1000")
+    sa = make_sa_info(project_id="rec-proj-1")
+    headers = {"Authorization": "Bearer " + TOKEN}
+    watermark_ts = 1_760_000_000.0
+    bq_state = {"gross": "10.0000", "used": "10.0000", "net": "0.0000"}
+
+    def gcp_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URI:
+            return httpx.Response(200, json={"access_token": "rec-tok", "expires_in": 3600})
+        body = json.loads(request.content.decode())
+        if "UNNEST(credits) AS c" in body["query"] and "GROUP BY" in body["query"]:
+            return httpx.Response(
+                200,
+                json={
+                    "jobComplete": True,
+                    "schema": {"fields": [{"name": "credit_name"}, {"name": "used_usd"}]},
+                    "rows": [{"f": [{"v": "Free Trial"}, {"v": bq_state["used"]}]}],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "jobComplete": True,
+                "schema": {
+                    "fields": [
+                        {"name": "gross_cost_usd"},
+                        {"name": "net_cost_usd"},
+                        {"name": "latest_usage_end_ts"},
+                        {"name": "currency"},
+                    ]
+                },
+                "rows": [
+                    {
+                        "f": [
+                            {"v": bq_state["gross"]},
+                            {"v": bq_state["net"]},
+                            {"v": str(int(watermark_ts))},
+                            {"v": "USD"},
+                        ]
+                    }
+                ],
+            },
+        )
+
+    app = create_app(settings, gateway_factory=FakeGateway, start_workers=False)
+    app.include_router(gcp_admin_router)
+    async with app.router.lifespan_context(app):
+        app.state.gcp_transport = httpx.MockTransport(gcp_handler)
+        store = app.state.service.store
+
+        # Seed $10.00 settled pre-watermark spend on vertex_paid
+        rid1 = await store.reserve("u1", "chat", Decimal("12.00"), provider="vertex_paid")
+        await store.settle(rid1, Decimal("10.00"), provider="vertex_paid")
+        async with store.transaction():
+            await store.db.execute(
+                "UPDATE ledger_times SET created=? WHERE id=?", (watermark_ts - 120, rid1)
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers=headers,
+        ) as client:
+            # 1. Before BigQuery sync -> not_synced, still exposes local reference baseline.
+            before = (await client.get("/admin/api/gcp-billing")).json()
+            assert "reconciliation" in before
+            rec0 = before["reconciliation"]
+            assert rec0["status"] == "not_synced"
+            assert rec0["billing_actual_usd"] is None
+            assert rec0["cost_delta_usd"] is None
+            assert rec0["local_charged_usd"] == pytest.approx(10.0)
+            assert rec0["local_reference_usd"] == pytest.approx(10.0)
+            assert rec0["local_vertex_charged_usd"] == pytest.approx(10.0)
+            assert "private_key" not in json.dumps(before)
+
+            # Configure SA + BigQuery
+            assert (
+                await client.post(
+                    "/admin/api/gcp-billing/credentials",
+                    json={"gcp_service_account_json": json.dumps(sa)},
+                )
+            ).status_code == 200
+            assert (
+                await client.put(
+                    "/admin/api/gcp-billing",
+                    json={
+                        "bigquery_enabled": True,
+                        "billing_project": "rec-proj-1",
+                        "billing_table": "ds.tbl",
+                        "initial_credits_usd": "100",
+                    },
+                )
+            ).status_code == 200
+
+            # 2. BigQuery gross == $10.00 vs local $10.00 -> in_sync
+            sync_in = (await client.post("/admin/api/gcp-billing/sync-bigquery")).json()
+            rec1 = sync_in["reconciliation"]
+            assert rec1["status"] == "in_sync"
+            assert rec1["billing_actual_usd"] == pytest.approx(10.0)
+            assert rec1["cost_delta_usd"] == pytest.approx(0.0)
+            assert rec1["cost_delta_ratio"] == pytest.approx(0.0)
+            assert rec1["credit_utilization_ratio"] == pytest.approx(0.1)
+
+            # 3. Add $4.00 post-watermark unsettled local spend -> export_lag
+            rid2 = await store.reserve("u1", "chat", Decimal("5.00"), provider="vertex_paid")
+            await store.settle(rid2, Decimal("4.00"), provider="vertex_paid")
+            async with store.transaction():
+                await store.db.execute(
+                    "UPDATE ledger_times SET created=? WHERE id=?", (watermark_ts + 300, rid2)
+                )
+            lag_view = (await client.get("/admin/api/gcp-billing")).json()
+            rec2 = lag_view["reconciliation"]
+            assert rec2["status"] == "export_lag"
+            assert rec2["cost_delta_usd"] == pytest.approx(-4.0)
+            assert rec2["billing_plus_unsettled_usd"] == pytest.approx(14.0)
+            assert rec2["cost_delta_after_unsettled_usd"] == pytest.approx(0.0)
+
+            # 4. BigQuery jumps to $30.00 (other GCP services / drift) -> drift_detected
+            bq_state["gross"] = "30.0000"
+            bq_state["used"] = "28.0000"
+            bq_state["net"] = "2.0000"
+            drift_view = (await client.post("/admin/api/gcp-billing/sync-bigquery")).json()
+            rec3 = drift_view["reconciliation"]
+            assert rec3["status"] == "drift_detected"
+            assert rec3["billing_actual_usd"] == pytest.approx(30.0)
+            assert rec3["billing_net_usd"] == pytest.approx(2.0)
+            assert rec3["cost_delta_usd"] == pytest.approx(16.0)
+            assert rec3["cost_delta_ratio"] > 0.5
+            assert rec3["credit_utilization_ratio"] == pytest.approx(0.28)
+            assert "private_key" not in json.dumps(drift_view)

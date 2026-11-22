@@ -1,4 +1,69 @@
 <section id="ledger" class="tab" role="tabpanel" aria-labelledby="nav-ledger" hidden>
+  <div id="cloud-resources-card" class="card cloud-hub">
+    <div class="row between">
+      <h2>统一云资源总览</h2>
+      <div class="row">
+        <button id="cloud-sync-bq" type="button" class="primary" disabled>同步 BigQuery</button>
+        <button id="cloud-sync-mon" type="button" class="secondary" disabled>拉取 Monitoring</button>
+        <button id="cloud-refresh" type="button" class="secondary">刷新云资源</button>
+        <button type="button" class="secondary" data-open-tab="colab-compute">Colab 算力详情 →</button>
+      </div>
+    </div>
+    <p class="muted">统一汇总 GCP Cloud Billing 赠金余额对账（实花 vs 本地估算差额）与 Colab GPU 算力状态、热会话保活、14/30 天 CU 消耗趋势及三级加速效率。</p>
+
+    <div class="cloud-section">
+      <div class="cloud-subhead">
+        <h3>GCP 赠金与账单对账</h3>
+      </div>
+      <div id="cloud-gcp-pills" class="pill-row"></div>
+      <div class="cloud-progress-row">
+        <div class="row between"><small>赠金抵扣进度（BigQuery UNNEST(credits)）</small><small id="cloud-gcp-credit-label" class="muted">等待同步</small></div>
+        <progress id="cloud-gcp-credit-bar" max="100" value="0" aria-label="GCP 赠金使用比例"></progress>
+      </div>
+      <div id="cloud-gcp-kpis" class="kpi-strip"></div>
+      <p id="cloud-gcp-sync-meta" class="muted"></p>
+    </div>
+
+    <hr>
+
+    <div class="cloud-section">
+      <div class="cloud-subhead">
+        <h3>Colab 算力与 CU 消耗趋势</h3>
+        <div class="segmented" role="group" aria-label="切换 CU 趋势周期">
+          <button id="cloud-trend-14d" type="button" class="seg-btn" aria-pressed="true" data-trend-days="14">近 14 天</button>
+          <button id="cloud-trend-30d" type="button" class="seg-btn" aria-pressed="false" data-trend-days="30">近 30 天</button>
+        </div>
+      </div>
+      <div id="cloud-colab-pills" class="pill-row"></div>
+      <div id="cloud-colab-kpis" class="kpi-strip"></div>
+      <div id="cloud-warm-sessions" class="warm-strip" aria-live="polite"></div>
+
+      <div class="cloud-chart-box">
+        <div class="cloud-chart-head">
+          <div class="cloud-legend" aria-hidden="true">
+            <span class="cloud-legend-item"><i class="legend-swatch legend-swatch-cu"></i>每日 CU 消耗</span>
+            <span class="cloud-legend-item"><i class="legend-swatch legend-swatch-jobs"></i>每日作业数</span>
+          </div>
+          <p id="cloud-trend-readout" class="cloud-trend-readout muted" aria-live="polite">悬停或选中柱条查看单日明细</p>
+        </div>
+        <div id="cloud-cu-chart" class="cloud-chart-canvas"></div>
+        <p id="cloud-cu-chart-note" class="muted cloud-chart-note"></p>
+      </div>
+
+      <div class="cloud-split-grid">
+        <div class="sub-card">
+          <div class="sub-card-head"><h3>按 GPU 类型消耗分布</h3></div>
+          <div id="cloud-gpu-breakdown" class="cloud-meter-list"></div>
+        </div>
+        <div class="sub-card">
+          <div class="sub-card-head"><h3>直传 / 热机 / 缓存效率概览</h3></div>
+          <div id="cloud-accel-stats" class="cloud-meter-list"></div>
+          <p id="cloud-accel-note" class="muted cloud-accel-note"></p>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="row between">
       <h2>Token 与费用账本</h2>

@@ -424,13 +424,18 @@ function formatInboxTime(v){
 }
 function renderColabOverview(d){
   if(!d)return;
+  cachedColabOverview=d;
+  colabUnavailableReason='';
   const w=d.worker||{},c=d.config||{},t=d.today||{};
-  $('colab-pills').replaceChildren(
+  const warmSessions=Array.isArray(d.warm_sessions)?d.warm_sessions:(Array.isArray(w.warm_sessions)?w.warm_sessions:[]);
+  const warmLead=warmSessions[0]||null;
+  $('colab-pills').replaceChildren(...[
     d.configured?pill('Worker 已配置','ok'):pill('未配置 COLAB_WORKER_URL','muted'),
     w.reachable?pill('Worker 在线','ok'):pill(d.configured?'Worker 离线':'未连接',d.configured?'err':'muted'),
     c.enabled?pill('调度开启 · 首选 '+(c.preferred_gpu||'L4'),'vertex'):pill('调度已暂停','warn'),
-    ((w.active_sessions||0)>0||w.running_job_id)?pill('活跃会话 '+(w.active_sessions||0)+(w.running_job_id?' · 作业 '+String(w.running_job_id).slice(0,8):''),'paid'):pill('当前无活跃会话','muted')
-  );
+    ((w.active_sessions||0)>0||w.running_job_id)?pill('活跃会话 '+(w.active_sessions||0)+(w.running_job_id?' · 作业 '+String(w.running_job_id).slice(0,8):''),'paid'):pill('当前无活跃会话','muted'),
+    warmLead?pill('热机保活 '+warmSessions.length+' · '+String(warmLead.gpu||'L4')+' 剩余 '+formatTtlCompact(warmLead.remaining_ttl_seconds),'ok'):null
+  ].filter(Boolean));
   const cuAvail=w.compute_units!=null?Number(w.compute_units):null;
   const jobsCount=Number(t.jobs_count??0);
   const jobsLimit=Number(t.daily_job_limit??c.daily_job_limit??0);
@@ -473,6 +478,8 @@ function renderColabOverview(d){
   $('colab-reset').disabled=false;
   $('colab-terminate-sessions').disabled=!d.configured;
   clearDirty('colab-config-form');
+  syncTrendButtons();
+  renderColabAnalyticsOnPage(d,'colab');
 
   table('colab-jobs-table',['作业 ID','类型','目标','状态','GPU','CU 消耗','错误信息','操作'],(d.jobs||[]).map(job=>{
     const p=job.payload||{};

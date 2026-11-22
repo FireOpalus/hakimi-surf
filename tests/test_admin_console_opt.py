@@ -498,3 +498,454 @@ async def test_admin_common_domain_lock_partial_body_and_binary_upload(settings)
         )
     assert exc_info.value.status_code == 408
     assert exc_info.value.detail == "upload_timeout"
+
+
+def test_unified_cloud_resource_view_dom_contract_and_csp():
+    """Verify Unified Cloud Resource View DOM IDs, #6 Colab schema hooks, SVG chart, and CSP."""
+    html = ADMIN_HTML.read_text(encoding="utf-8")
+    assert audit_html(html) == []
+
+    collector = _IdCollector()
+    collector.feed(html)
+    id_set = set(collector.ids)
+    assert len(collector.ids) == len(id_set)
+
+    required_ids = (
+        "cloud-resources-card",
+        "cloud-sync-bq",
+        "cloud-sync-mon",
+        "cloud-refresh",
+        "cloud-gcp-pills",
+        "cloud-gcp-credit-label",
+        "cloud-gcp-credit-bar",
+        "cloud-gcp-kpis",
+        "cloud-gcp-sync-meta",
+        "cloud-trend-14d",
+        "cloud-trend-30d",
+        "cloud-colab-pills",
+        "cloud-colab-kpis",
+        "cloud-warm-sessions",
+        "cloud-trend-readout",
+        "cloud-cu-chart",
+        "cloud-cu-chart-note",
+        "cloud-gpu-breakdown",
+        "cloud-accel-stats",
+        "cloud-accel-note",
+        "colab-analytics-card",
+        "colab-trend-14d",
+        "colab-trend-30d",
+        "colab-warm-sessions",
+        "colab-trend-readout",
+        "colab-cu-chart",
+        "colab-cu-chart-note",
+        "colab-gpu-breakdown",
+        "colab-accel-stats",
+        "colab-accel-note",
+        "overview-go-colab",
+    )
+    for elem_id in required_ids:
+        assert elem_id in id_set, f"Missing unified cloud DOM id: {elem_id}"
+
+    scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert len(scripts) == 1
+    script = scripts[0]
+
+    # Verify #6 Colab contract fields & GCP reconciliation fields are consumed without query params.
+    for token in (
+        "cu_trend",
+        "gpu_breakdown",
+        "warm_sessions",
+        "acceleration_stats",
+        "last_14d_cu_used",
+        "last_30d_cu_used",
+        "remaining_ttl_seconds",
+        "drive_direct_jobs",
+        "drive_direct_fallbacks",
+        "warm_reuse_hits",
+        "warm_cold_starts",
+        "cache_weight_hits",
+        "cache_weight_misses",
+        "cache_venv_hits",
+        "cache_venv_misses",
+        "reconciliation",
+        "cost_delta_usd",
+        "cost_delta_after_unsettled_usd",
+        "createElementNS",
+        "http://www.w3.org/2000/svg",
+    ):
+        assert token in script, f"Expected cloud resource contract token {token!r} in JS"
+
+    # Zero query parameters in API routes, zero external chart CDNs, strict CSP.
+    assert not re.search(r"api\(\s*['\"][^'\"\n]*\?", script)
+    assert "chart.js" not in html.lower()
+    assert "echarts" not in html.lower()
+    assert "d3.min.js" not in html.lower()
+    policy = content_security_policy(html)
+    assert "script-src 'sha256-" in policy
+    assert "style-src 'sha256-" in policy
+
+
+def test_unified_cloud_resource_view_js_runtime_and_degradation():
+    """Execute assembled JS renderers in a mock DOM (jsc/node) to verify rendering & fallback."""
+    import json
+    import shutil
+
+    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+    runner: list[str] | None = None
+    if shutil.which("node"):
+        runner = ["node", "-e"]
+    elif jsc_path.is_file():
+        runner = [str(jsc_path), "-e"]
+    if runner is None:
+        pytest.skip("No local JS engine (node/jsc) available for DOM renderer execution test")
+
+    core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
+    ledger_js = (ADMIN_DIR / "src" / "js" / "02-overview-ledger.js").read_text(encoding="utf-8")
+    shell_js = (ADMIN_DIR / "src" / "js" / "08-modules-shell.js").read_text(encoding="utf-8")
+    colab_start = shell_js.index("const colabErrorLabels=")
+    colab_end = shell_js.index("function renderColabInbox(")
+    colab_view_js = shell_js[colab_start:colab_end]
+
+    # Collect every static HTML ID so the mock document returns a valid MockElement for all of them.
+    html = ADMIN_HTML.read_text(encoding="utf-8")
+    collector = _IdCollector()
+    collector.feed(html)
+    all_ids_json = json.dumps(sorted(set(collector.ids)))
+
+    harness = f"""
+    const ALL_IDS = {all_ids_json};
+    class MockNode {{
+      constructor(tag, ns) {{
+        this.tagName = String(tag || 'div').toUpperCase();
+        this.namespaceURI = ns || null;
+        this.children = [];
+        this.attrs = {{}};
+        this.dataset = {{}};
+        this.listeners = {{}};
+        this._text = '';
+        this.hidden = false;
+        this.disabled = false;
+        this.checked = false;
+        this.value = '';
+        this.className = '';
+        this.open = false;
+        this.classList = {{
+          add(){{}}, remove(){{}}, toggle(){{}}, contains(){{ return false; }}
+        }};
+      }}
+      get textContent() {{
+        if (this.children.length) {{
+          return this._text + this.children.map(c => c.textContent).join('');
+        }}
+        return this._text;
+      }}
+      set textContent(v) {{ this._text = String(v ?? ''); this.children = []; }}
+      setAttribute(k, v) {{
+        if (k === 'class') this.className = String(v);
+        this.attrs[k] = String(v);
+      }}
+      getAttribute(k) {{ return this.attrs[k] ?? null; }}
+      removeAttribute(k) {{ delete this.attrs[k]; }}
+      append(...nodes) {{
+        for (const n of nodes) {{
+          if (n instanceof MockNode) {{
+            this.children.push(n);
+          }} else {{
+            const t = new MockNode('#text'); t._text = String(n); this.children.push(t);
+          }}
+        }}
+      }}
+      replaceChildren(...nodes) {{
+        this.children = []; this._text = ''; this.append(...nodes);
+      }}
+      addEventListener(evt, fn) {{ (this.listeners[evt] ||= []).push(fn); }}
+      dispatch(evt) {{
+        for (const fn of (this.listeners[evt] || [])) {{
+          fn({{ target: this, preventDefault(){{}} }});
+        }}
+      }}
+      querySelector() {{ return null; }}
+      querySelectorAll() {{ return []; }}
+      closest() {{ return null; }}
+      focus() {{}}
+      select() {{}}
+      remove() {{}}
+    }}
+    const Node = MockNode;
+    const byId = new Map();
+    for (const id of ALL_IDS) {{
+      const n = new MockNode('div');
+      n.id = id;
+      byId.set(id, n);
+    }}
+    const document = {{
+      body: new MockNode('body'),
+      documentElement: new MockNode('html'),
+      hidden: false,
+      activeElement: null,
+      title: '',
+      getElementById(id) {{ return byId.get(id) || null; }},
+      createElement(tag) {{ return new MockNode(tag); }},
+      createElementNS(ns, tag) {{ return new MockNode(tag, ns); }},
+      createTextNode(t) {{ const n = new MockNode('#text'); n._text = String(t); return n; }},
+      addEventListener() {{}},
+      querySelectorAll() {{ return []; }}
+    }};
+    class AbortController {{
+      constructor() {{ this.signal = {{ aborted: false }}; }}
+      abort() {{ this.signal.aborted = true; }}
+    }}
+    function setTimeout(){{ return 0; }}
+    function clearTimeout(){{}}
+    function clearInterval(){{}}
+    const location = {{ hash: '', pathname: '/admin' }};
+    const history = {{ replaceState(){{}}, pushState(){{}} }};
+    function previewWakeWindow(){{}}
+    function lifeFmt(v){{ return String(v||''); }}
+    function showNotebookAvailability(){{}}
+    function stampDashboard(){{}}
+    function providerBadge(p){{ return String(p||''); }}
+
+    {core_js}
+    {ledger_js}
+    {colab_view_js}
+
+    function walk(node, acc=[]) {{
+      acc.push(node);
+      for (const c of (node.children || [])) walk(c, acc);
+      return acc;
+    }}
+    function assert(cond, msg) {{ if (!cond) throw new Error('ASSERT FAILED: ' + msg); }}
+
+    // 1. Full contract rendering (GCP reconciliation + 30d Colab trend + warm + GPU + accel)
+    const trend30 = [];
+    for (let i = 1; i <= 30; i++) {{
+      trend30.push({{
+        date: '2026-11-' + String(i).padStart(2, '0'),
+        jobs: i % 3 === 0 ? 2 : (i % 2),
+        succeeded: i % 2,
+        failed: i % 3 === 0 ? 1 : 0,
+        cancelled: 0,
+        cu_used: Number((i * 0.12).toFixed(3))
+      }});
+    }}
+    const xss = '<img src=x onerror=alert(1)>';
+    const fullColab = {{
+      configured: true,
+      source: 'sqlite',
+      config: {{
+        enabled: true, preferred_gpu: 'L4', fallback_gpus: ['T4'],
+        daily_job_limit: 5, daily_cu_budget: 10
+      }},
+      worker: {{ reachable: true, compute_units: 42.5, active_sessions: 1, running_job_id: null }},
+      today: {{ jobs_count: 2, cu_used: 0.85, daily_job_limit: 5, daily_cu_budget: 10 }},
+      jobs: [],
+      summary: {{
+        total_jobs: 18, succeeded_jobs: 16, failed_jobs: 2, cancelled_jobs: 0,
+        running_jobs: 0, queued_jobs: 0, success_rate: 16/18,
+        total_cu_used: 12.345, last_14d_cu_used: 6.789, last_30d_cu_used: 12.345,
+        last_14d_jobs: 10, last_30d_jobs: 18
+      }},
+      cu_trend: trend30,
+      gpu_breakdown: [
+        {{ gpu: 'L4', jobs: 15, succeeded: 14, failed: 1, cu_used: 10.2, cu_share: 0.826 }},
+        {{ gpu: 'T4', jobs: 3, succeeded: 2, failed: 1, cu_used: 2.145, cu_share: 0.174 }}
+      ],
+      warm_sessions: [
+        {{
+          session_name: 'sess-' + xss,
+          gpu: 'L4',
+          idle_ttl_seconds: 360,
+          remaining_ttl_seconds: 215,
+          created_at: 1760000000,
+          last_used_at: 1760000100,
+          expires_at: 1760000460,
+          reuse_count: 3,
+          setup_ready: true
+        }}
+      ],
+      acceleration_stats: {{
+        warm_pool_enabled: true, warm_allowed_gpus: ['L4', 'T4'],
+        warm_idle_ttl_seconds: 360, warm_max_ttl_seconds: 900, warm_active_count: 1,
+        drive_direct_jobs: 12, drive_direct_fallbacks: 2,
+        warm_reuse_hits: 9, warm_cold_starts: 5,
+        cache_weight_hits: 11, cache_weight_misses: 3,
+        cache_venv_hits: 8, cache_venv_misses: 6, measured_jobs: 14
+      }}
+    }};
+    cachedColabOverview = fullColab;
+    renderUnifiedCloudColab(fullColab, '');
+    renderColabAnalyticsOnPage(fullColab, 'colab');
+
+    const chartNodes14 = walk($('cloud-cu-chart'));
+    const hits14 = chartNodes14.filter(n => n.className === 'cu-hit');
+    assert(hits14.length === 14, '14d chart expected 14 hit targets, got ' + hits14.length);
+    assert(chartNodes14.some(n => n.tagName === 'POLYLINE'), '14d chart missing polyline');
+    for (const n of chartNodes14) {{
+      for (const [k, v] of Object.entries(n.attrs)) {{
+        assert(!String(v).includes('NaN'), 'SVG attr NaN: ' + k + '=' + v);
+      }}
+    }}
+    // Hover a day column updates readout text
+    hits14[0].dispatch('mouseenter');
+    assert(
+      $('cloud-trend-readout').textContent.includes('2026-11-17'),
+      'hover readout date mismatch'
+    );
+    hits14[0].dispatch('mouseleave');
+    assert(
+      $('cloud-trend-readout').textContent.includes('近 14 天合计'),
+      'leave readout reset mismatch'
+    );
+
+    // Switch to 30d window
+    $('cloud-trend-30d').dispatch('click');
+    assert(cloudTrendDays === 30, 'trend toggle did not switch to 30');
+    assert($('cloud-trend-30d').getAttribute('aria-pressed') === 'true', '30d aria-pressed');
+    assert($('colab-trend-30d').getAttribute('aria-pressed') === 'true', 'colab 30d sync');
+    const hits30 = walk($('cloud-cu-chart')).filter(n => n.className === 'cu-hit');
+    assert(hits30.length === 30, '30d chart expected 30 hit targets, got ' + hits30.length);
+
+    // Warm session rendered with XSS stored safely as plain textContent (never HTML tag)
+    const warmNodes = walk($('cloud-warm-sessions'));
+    assert(!warmNodes.some(n => n.tagName === 'IMG'), 'XSS must never create IMG element');
+    assert(
+      $('cloud-warm-sessions').textContent.includes('热机 L4'),
+      'warm session GPU pill missing'
+    );
+    assert(
+      $('cloud-warm-sessions').textContent.includes('3 分 35 秒'),
+      'warm TTL formatting missing'
+    );
+
+    // GPU breakdown & acceleration stats rendered
+    assert($('cloud-gpu-breakdown').textContent.includes('L4'), 'GPU L4 missing');
+    assert($('cloud-gpu-breakdown').textContent.includes('82.6%'), 'GPU share missing');
+    assert($('cloud-accel-stats').textContent.includes('Drive 直传'), 'Drive direct missing');
+    assert($('cloud-accel-stats').textContent.includes('85.7%'), 'Drive direct rate missing');
+
+    // 2. GCP reconciliation rendering (both backend-supplied & legacy fallback)
+    const gcpSynced = {{
+      config: {{
+        bigquery_enabled: true, enforce_credit_hard_stop: true, initial_credits_usd: 300
+      }},
+      bigquery: {{
+        synced: true, initial_credits_usd: 300, credits_used_usd: 45.5,
+        settled_remaining_usd: 254.5, unsettled_local_usd: 0.5, realtime_remaining_usd: 254.0,
+        gross_cost_usd: 45.5, net_cost_usd: 0,
+        latest_usage_end_ts: 1760000000, last_sync_at: 1760000600
+      }},
+      monitoring: {{ status: 'in_sync', last_sync_at: 1760000600, delta_tokens: 0 }},
+      reconciliation: {{
+        status: 'in_sync', billing_actual_usd: 45.5, billing_net_usd: 0,
+        billing_plus_unsettled_usd: 46.0, local_reference_usd: 45.48,
+        local_reference_basis: 'estimated', cost_delta_usd: 0.02,
+        cost_delta_after_unsettled_usd: 0.52, cost_delta_ratio: 0.00044,
+        credit_utilization_ratio: 45.5/300, monitoring_status: 'in_sync'
+      }}
+    }};
+    renderUnifiedCloudGcp(gcpSynced, {{ mode: 'gcp', exhausted: false }}, null);
+    assert($('cloud-gcp-pills').textContent.includes('账单对账已对齐'), 'in_sync pill missing');
+    assert($('cloud-gcp-kpis').textContent.includes('+$0.0200'), 'signed delta missing');
+
+    // Legacy GCP without reconciliation key -> falls back cleanly using dashboard usage
+    const gcpLegacy = {{
+      config: {{ bigquery_enabled: true, initial_credits_usd: 100 }},
+      bigquery: {{
+        synced: true, initial_credits_usd: 100, credits_used_usd: 10,
+        settled_remaining_usd: 90, unsettled_local_usd: 5, realtime_remaining_usd: 85,
+        gross_cost_usd: 10, net_cost_usd: 0
+      }},
+      monitoring: {{ status: 'not_synced' }}
+    }};
+    renderUnifiedCloudGcp(gcpLegacy, null, {{
+      cost_estimates: {{
+        lifetime: {{
+          charged_microdollars: 15000000, estimated_microdollars: 15000000, complete: true
+        }}
+      }}
+    }});
+    assert(
+      $('cloud-gcp-pills').textContent.includes('导出延迟正常'),
+      'legacy export_lag fallback missing'
+    );
+
+    // 3. Legacy Colab payload (none of the #6 fields) & unavailable Colab (null)
+    const legacyColab = {{
+      configured: true,
+      config: {{ enabled: true, preferred_gpu: 'L4', daily_job_limit: 5, daily_cu_budget: 10 }},
+      worker: {{ reachable: true, compute_units: 12.0 }},
+      today: {{ jobs_count: 1, cu_used: 0.4, daily_job_limit: 5, daily_cu_budget: 10 }},
+      jobs: [{{ id: 'j1', status: 'succeeded', cu_used: 0.4 }}]
+    }};
+    renderUnifiedCloudColab(legacyColab, '');
+    const legacyChartTxt = $('cloud-cu-chart').textContent;
+    assert(
+      legacyChartTxt.includes('暂未返回') || legacyChartTxt.includes('未返回'),
+      'legacy trend empty state missing'
+    );
+    assert($('cloud-gpu-breakdown').textContent.includes('未返回'), 'legacy GPU fallback');
+    assert($('cloud-accel-stats').textContent.includes('未上报'), 'legacy accel fallback');
+
+    // Unavailable Colab (503) with empty & non-empty reason + zero-data 30d trend
+    renderUnifiedCloudColab(null, '');
+    assert($('cloud-colab-pills').textContent.includes('暂不可用'), 'unavail pill missing');
+    assert(
+      !$('cloud-colab-pills').textContent.includes('null'),
+      'empty unavailReason must not render literal null text'
+    );
+    renderUnifiedCloudColab(null, 'Colab Worker 尚未配置');
+    assert($('cloud-colab-pills').textContent.includes('Colab Worker 尚未配置'), 'reason pill');
+
+    // renderColabOverview without warm sessions must never render literal "null" in colab-pills
+    renderColabOverview({{
+      configured: true,
+      source: 'default',
+      config: {{ enabled: true, preferred_gpu: 'L4', fallback_gpus: ['T4'],
+        daily_job_limit: 5, daily_cu_budget: 10 }},
+      worker: {{ reachable: true, compute_units: 10.0, active_sessions: 0, warm_sessions: [] }},
+      today: {{ jobs_count: 0, cu_used: 0, daily_job_limit: 5, daily_cu_budget: 10 }},
+      jobs: [],
+      warm_sessions: []
+    }});
+    assert(
+      !$('colab-pills').textContent.includes('null'),
+      'colab-pills without warm sessions must not render literal null text'
+    );
+
+    // renderGcpBilling & renderUnifiedBalance without optional pills must not render literal null
+    renderGcpBilling(gcpLegacy);
+    assert(!$('gcp-mon-pills').textContent.includes('null'), 'gcp-mon-pills literal null');
+    renderUnifiedBalance({{ mode: 'none' }}, null, null);
+    assert(
+      !$('unified-balance-pills').textContent.includes('null'),
+      'unified-balance-pills literal null'
+    );
+
+    const zeroTrend = trend30.map(d => ({{
+      date: d.date, jobs: 0, succeeded: 0, failed: 0, cancelled: 0, cu_used: 0
+    }}));
+    renderCuTrendChart(
+      'cloud-cu-chart', 'cloud-trend-readout', 'cloud-cu-chart-note', zeroTrend, 14
+    );
+    for (const n of walk($('cloud-cu-chart'))) {{
+      for (const [k, v] of Object.entries(n.attrs)) {{
+        assert(!String(v).includes('NaN'), 'Zero-trend SVG attr NaN: ' + k + '=' + v);
+      }}
+    }}
+
+    // 4. Logout clears all cloud view state
+    logout();
+    assert(cloudTrendDays === 14, 'logout should reset trend days to 14');
+    assert($('cloud-cu-chart').children.length === 0, 'logout should clear cloud-cu-chart');
+    assert($('cloud-sync-bq').disabled === true, 'logout should disable cloud-sync-bq');
+    """
+
+    proc = subprocess.run(
+        [*runner, harness],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"JS runtime test failed:\n{proc.stderr}\n{proc.stdout}"

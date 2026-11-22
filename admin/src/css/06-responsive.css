@@ -31,6 +31,7 @@
   #last-updated { display: none; }
   .finder-button { min-width: 0; }
   .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cloud-split-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 740px) {

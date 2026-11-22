@@ -174,6 +174,42 @@
     <p id="colab-state" class="muted" aria-live="polite"></p>
     <dl id="colab-drive-details" class="node-details"></dl>
   </div>
+  <div id="colab-analytics-card" class="card">
+    <div class="row between">
+      <h2>热会话、CU 消耗趋势与三级加速</h2>
+      <div class="row">
+        <div class="segmented" role="group" aria-label="切换 Colab CU 趋势周期">
+          <button id="colab-trend-14d" type="button" class="seg-btn" aria-pressed="true" data-trend-days="14">近 14 天</button>
+          <button id="colab-trend-30d" type="button" class="seg-btn" aria-pressed="false" data-trend-days="30">近 30 天</button>
+        </div>
+        <button type="button" class="secondary" data-open-tab="ledger">统一云资源视图 →</button>
+      </div>
+    </div>
+    <p class="muted">实时展示热保活会话（仅 L4/T4 允许短时保活，H100/A100/G4 不保活）、近 14/30 天每日 CU 消耗与作业数趋势、按 GPU 类型分布及 Drive 直传 / 权重缓存命中效率。</p>
+    <div id="colab-warm-sessions" class="warm-strip" aria-live="polite"></div>
+    <div class="cloud-chart-box">
+      <div class="cloud-chart-head">
+        <div class="cloud-legend" aria-hidden="true">
+          <span class="cloud-legend-item"><i class="legend-swatch legend-swatch-cu"></i>每日 CU 消耗</span>
+          <span class="cloud-legend-item"><i class="legend-swatch legend-swatch-jobs"></i>每日作业数</span>
+        </div>
+        <p id="colab-trend-readout" class="cloud-trend-readout muted" aria-live="polite">悬停或选中柱条查看单日明细</p>
+      </div>
+      <div id="colab-cu-chart" class="cloud-chart-canvas"></div>
+      <p id="colab-cu-chart-note" class="muted cloud-chart-note"></p>
+    </div>
+    <div class="cloud-split-grid">
+      <div class="sub-card">
+        <div class="sub-card-head"><h3>按 GPU 类型消耗分布</h3></div>
+        <div id="colab-gpu-breakdown" class="cloud-meter-list"></div>
+      </div>
+      <div class="sub-card">
+        <div class="sub-card-head"><h3>直传 / 热机 / 缓存效率概览</h3></div>
+        <div id="colab-accel-stats" class="cloud-meter-list"></div>
+        <p id="colab-accel-note" class="muted cloud-accel-note"></p>
+      </div>
+    </div>
+  </div>
   <div class="card">
     <h2>算力调度与预算配置</h2>
     <p id="colab-config-source" class="muted"></p>

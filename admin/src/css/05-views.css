@@ -467,3 +467,138 @@ body:not(.authenticated) main {
 /* 插件权限勾选 */
 .scope-checks { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 4px 0 2px; }
 .scope-checks label { display: inline-flex; align-items: center; gap: 5px; margin: 0; color: var(--ink); font-size: 12px; cursor: pointer; }
+
+/* 统一云资源视图（GCP 赠金对账 + Colab CU 消耗趋势） */
+.cloud-hub .cloud-section h3 { margin: 4px 0 0; font-size: 14.5px; font-weight: 700; color: var(--ink); }
+.cloud-subhead { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 14px; margin-bottom: 10px; }
+.cloud-progress-row { display: grid; gap: 6px; margin: 10px 0 14px; }
+.cloud-progress-row progress { height: 9px; }
+.cloud-progress-row progress[data-level=warn] { --fill: var(--warn); }
+.cloud-progress-row progress[data-level=err] { --fill: var(--bad); }
+
+.segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--soft-2);
+}
+.seg-btn {
+  min-height: 28px;
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  transition: background .15s ease, color .15s ease, box-shadow .15s ease;
+}
+.seg-btn:hover:not([aria-pressed=true]) { color: var(--ink); background: var(--hover-tint); }
+.seg-btn[aria-pressed=true] {
+  background: var(--grad-accent);
+  color: var(--on-accent);
+  box-shadow: 0 2px 8px var(--glow-1);
+}
+
+.warm-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+.warm-strip-idle {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 12px;
+  background: var(--card-2);
+  font-size: 12px;
+  color: var(--muted);
+}
+.warm-card {
+  display: grid;
+  gap: 7px;
+  padding: 12px 14px;
+  border: 1px solid var(--good-line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--good-bg) 55%, var(--card));
+  min-width: 0;
+}
+.warm-card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; }
+.warm-card-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; font: 11.5px var(--mono); color: var(--muted); }
+.warm-card progress { height: 6px; --fill: var(--good); --track: color-mix(in srgb, var(--good) 16%, transparent); }
+
+.cloud-chart-box {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: var(--card-2);
+  margin: 12px 0 16px;
+}
+.cloud-chart-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 10px;
+}
+.cloud-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; font-size: 11.5px; color: var(--muted); font-weight: 600; }
+.cloud-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.legend-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; }
+.legend-swatch-cu { background: var(--accent); }
+.legend-swatch-jobs { background: var(--vertex-ink); border-radius: 50%; }
+.cloud-trend-readout { margin: 0; font: 600 12px var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+.cloud-chart-canvas { width: 100%; min-width: 0; overflow-x: auto; }
+.cloud-chart-svg {
+  display: block;
+  width: 100%;
+  min-width: 440px;
+  height: 214px;
+  fill: none;
+  stroke: none;
+  stroke-width: 0;
+  overflow: visible;
+}
+.cloud-chart-svg .cu-grid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 3; }
+.cloud-chart-svg .cu-axis-line { stroke: var(--line-strong); stroke-width: 1; }
+.cloud-chart-svg .cu-axis-text { fill: var(--muted); stroke: none; font: 10.5px var(--mono); }
+.cloud-chart-svg .cu-axis-right { fill: var(--vertex-ink); stroke: none; font: 10.5px var(--mono); }
+.cloud-chart-svg .cu-bar { fill: var(--accent); fill-opacity: .76; stroke: none; transition: fill-opacity .14s ease; }
+.cloud-chart-svg .cu-bar-zero { fill: var(--line-strong); fill-opacity: .42; stroke: none; }
+.cloud-chart-svg .cu-bar-active { fill: var(--accent); fill-opacity: 1; }
+.cloud-chart-svg .cu-line { fill: none; stroke: var(--vertex-ink); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.cloud-chart-svg .cu-dot { fill: var(--card); stroke: var(--vertex-ink); stroke-width: 2; transition: r .12s ease; }
+.cloud-chart-svg .cu-dot-active { fill: var(--vertex-ink); stroke: var(--card); stroke-width: 2; }
+.cloud-chart-svg .cu-hit { fill: transparent; stroke: none; cursor: pointer; }
+.cloud-chart-svg .cu-hit:hover, .cloud-chart-svg .cu-hit:focus { fill: var(--hover-tint); outline: none; }
+.cloud-chart-note { margin: 8px 0 0; font-size: 11.5px; }
+
+.cloud-split-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+.cloud-meter-list { display: grid; gap: 11px; margin-top: 8px; }
+.cloud-meter-row { display: grid; gap: 5px; }
+.cloud-meter-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 10px;
+  font-size: 12.5px;
+}
+.cloud-meter-title { display: inline-flex; align-items: center; gap: 7px; font-weight: 650; color: var(--ink); }
+.cloud-meter-val { font: 600 12px var(--mono); color: var(--ink); }
+.cloud-meter-meta { font-size: 11px; color: var(--muted); }
+.cloud-meter-row progress { height: 7px; }
+.cloud-meter-row progress[data-tone=ok] { --fill: var(--good); }
+.cloud-meter-row progress[data-tone=vertex] { --fill: var(--vertex-ink); }
+.cloud-meter-row progress[data-tone=warn] { --fill: var(--warn); }
+.cloud-accel-note { margin: 12px 0 0; font-size: 11.5px; }
