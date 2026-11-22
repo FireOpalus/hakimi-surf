@@ -756,3 +756,685 @@ def test_build_dataset_extra_corpus_no_tts_and_cache_invalidation(tmp_path: Path
     assert ns_all.extra_dry_dir == extra_dry
     assert ns_all.extra_songs_dir == extra_songs
     assert ns_all.no_tts is True
+
+
+def test_p0_drive_direct_cover_fallback_and_zero_token_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_tok = "ya29.super-secret-direct-token-999999"
+
+    # 1) _redact_cmd & _redact_text must never expose secret env values or Bearer tokens
+    redacted = colab_rvc._redact_cmd(
+        [
+            "exec",
+            "-s",
+            "sess1",
+            "--env",
+            f"HAKIMI_DRIVE_ACCESS_TOKEN={secret_tok}",
+            "--env",
+            "HAKIMI_PITCH=0",
+        ],
+        secret_tok,
+    )
+    assert secret_tok not in redacted
+    assert "HAKIMI_DRIVE_ACCESS_TOKEN=[REDACTED]" in redacted
+    assert "HAKIMI_PITCH=0" in redacted
+    assert secret_tok not in colab_rvc._redact_text(f"Authorization: Bearer {secret_tok}")
+
+    # 2) Direct Drive happy path: zero WS uploads, zero WS downloads
+    ws_uploads: list[str] = []
+    ws_downloads: list[str] = []
+    stopped: list[str] = []
+    captured_envs: list[tuple[str, dict[str, str]]] = []
+
+    monkeypatch.setattr(colab_rvc, "provision_gpu", lambda s, gpu="L4", **kw: "L4")
+    monkeypatch.setattr(colab_rvc, "stop_session", stopped.append)
+    monkeypatch.setattr(
+        colab_rvc,
+        "upload_file_chunked",
+        lambda s, lp, rp, **kw: ws_uploads.append(rp),
+    )
+    monkeypatch.setattr(
+        colab_rvc,
+        "download_chunked_dir",
+        lambda s, rdir, lout: ws_downloads.append(rdir) or lout,
+    )
+
+    def fake_exec_ok(session: str, action: str, env_vars=None) -> str:
+        env_copy = dict(env_vars or {})
+        captured_envs.append((action, env_copy))
+        if action == "setup":
+            return (
+                colab_rvc.CACHE_STATUS_PREFIX
+                + json.dumps({"weight_cache_hit": True, "weight_cache_has_sep_models": True})
+                + "\n"
+                + colab_rvc.STATUS_OK_MARKER
+            )
+        assert action == "cover"
+        out_payload = {
+            "chorus": {
+                "file_id": "drv_chorus_001",
+                "name": "yu_ai_chorus.mp3",
+                "sha256": "a" * 64,
+                "size": 123456,
+                "duration_ms": 50000,
+            },
+            "full": {"file_id": "drv_full_001", "name": "yu_ai_full.mp3"},
+            "meta": {"chorus_start_sec": 72.5, "chorus_start_reason": "dsp_vocal_rms"},
+        }
+        return (
+            colab_rvc.DRIVE_OUTPUTS_PREFIX
+            + json.dumps(out_payload)
+            + "\n"
+            + colab_rvc.STATUS_OK_MARKER
+        )
+
+    monkeypatch.setattr(colab_rvc, "exec_remote_worker", fake_exec_ok)
+    res = colab_rvc.run_cover_pipeline(
+        session="sess-direct",
+        gpu_spec="L4,T4",
+        cover_dir=tmp_path / "cover_ok",
+        drive_access_token=secret_tok,
+        drive_source_file_id="drv_src_1",
+        drive_source_ext=".flac",
+        drive_pth_file_id="drv_pth_1",
+        drive_index_file_id="drv_idx_1",
+        drive_songs_folder_id="drv_songs_folder_1",
+        cover_prefix="yu_ai",
+        song_title="雨爱",
+        cache_folder_id="drv_cache_folder_1",
+        cache_weights_file_id="drv_wcache_1",
+        cache_weights_sha256="b" * 64,
+        keep_session_on_success=True,
+    )
+    assert ws_uploads == []
+    assert ws_downloads == []
+    assert stopped == []
+    assert res["session_kept"] is True
+    assert res["drive_outputs"]["chorus"]["file_id"] == "drv_chorus_001"
+    assert res["acceleration"]["drive_direct"] is True
+    assert res["acceleration"]["drive_direct_fallback"] is False
+    assert res["acceleration"]["weight_cache_hit"] is True
+    cover_env = captured_envs[1][1]
+    assert cover_env["HAKIMI_DRIVE_SOURCE_FILE_ID"] == "drv_src_1"
+    assert cover_env["HAKIMI_DRIVE_PTH_FILE_ID"] == "drv_pth_1"
+    assert cover_env["HAKIMI_DRIVE_SONGS_FOLDER_ID"] == "drv_songs_folder_1"
+
+    # 3) Direct input failure + direct output failure -> transparent WS fallback
+    local_src = tmp_path / "fallback_src.m4a"
+    local_pth = tmp_path / "hakimi.pth"
+    local_idx = tmp_path / "hakimi.index"
+    local_src.write_bytes(b"M4A")
+    local_pth.write_bytes(b"PTH")
+    local_idx.write_bytes(b"IDX")
+
+    cover_calls = 0
+
+    def fake_exec_fallback(session: str, action: str, env_vars=None) -> str:
+        nonlocal cover_calls
+        if action == "setup":
+            return colab_rvc.STATUS_OK_MARKER
+        cover_calls += 1
+        if cover_calls == 1:
+            raise RuntimeError(
+                "Remote worker action 'cover' failed: drive_direct_input_failed:source:HTTPError"
+            )
+        # Second attempt succeeds without direct Drive outputs -> triggers WS download fallback
+        assert "HAKIMI_DRIVE_SOURCE_FILE_ID" not in (env_vars or {})
+        assert "HAKIMI_DRIVE_PTH_FILE_ID" not in (env_vars or {})
+        return colab_rvc.STATUS_OK_MARKER
+
+    def fake_dl_chunks(session: str, rdir: str, lout: Path) -> Path:
+        ws_downloads.append(rdir)
+        lout.parent.mkdir(parents=True, exist_ok=True)
+        lout.write_bytes(b"ID3mp3")
+        return lout
+
+    def fake_run_colab_meta(args: list[str], **kwargs):
+        del kwargs
+        Path(args[-1]).write_text(json.dumps({"chorus_start_sec": 60.0}), encoding="utf-8")
+        return 0, ""
+
+    monkeypatch.setattr(colab_rvc, "exec_remote_worker", fake_exec_fallback)
+    monkeypatch.setattr(colab_rvc, "download_chunked_dir", fake_dl_chunks)
+    monkeypatch.setattr(colab_rvc, "_run_colab", fake_run_colab_meta)
+
+    fb_res = colab_rvc.run_cover_pipeline(
+        session="sess-fb",
+        gpu_spec="L4",
+        cover_dir=tmp_path / "cover_fb",
+        ensure_local_source_fn=lambda: local_src,
+        ensure_local_model_fn=lambda: (local_pth, local_idx),
+        drive_access_token=secret_tok,
+        drive_source_file_id="drv_src_bad",
+        drive_pth_file_id="drv_pth_bad",
+        drive_index_file_id="drv_idx_bad",
+        drive_songs_folder_id="drv_songs_folder_1",
+        keep_session_on_success=False,
+    )
+    assert cover_calls == 2
+    assert len(ws_uploads) == 3  # pth + idx + source
+    assert "/content/out_chunks/cover_chorus" in ws_downloads
+    assert fb_res["drive_outputs"] is None
+    assert fb_res["chorus_mp3"].is_file()
+    assert fb_res["acceleration"]["drive_direct_fallback"] is True
+    assert "sess-fb" in stopped
+
+    # 4) Remote _dispatch_env pops HAKIMI_DRIVE_ACCESS_TOKEN so child processes never inherit it
+    #    and scrubs token from logs and STATUS ERROR line.
+    seen_child_env: list[str | None] = []
+    monkeypatch.setenv("HAKIMI_COLAB_ACTION", "setup")
+    monkeypatch.setenv("HAKIMI_DRIVE_ACCESS_TOKEN", secret_tok)
+
+    def fake_action_setup(**kwargs):
+        seen_child_env.append(os.environ.get("HAKIMI_DRIVE_ACCESS_TOKEN"))
+        assert kwargs["drive_token"] == secret_tok
+        raise RuntimeError(f"simulated error carrying {secret_tok}")
+
+    monkeypatch.setattr(colab_remote, "action_setup", fake_action_setup)
+    buf = io.StringIO()
+    import contextlib
+    import os
+
+    with contextlib.redirect_stdout(buf):
+        with pytest.raises(RuntimeError):
+            colab_remote.main(argv=None)
+    assert seen_child_env == [None]
+    assert secret_tok not in buf.getvalue()
+    assert "[REDACTED]" in buf.getvalue()
+    assert os.environ.get("HAKIMI_DRIVE_ACCESS_TOKEN") is None
+    monkeypatch.delenv("HAKIMI_COLAB_ACTION", raising=False)
+
+
+def test_p1_run_cover_pipeline_warm_reuse_and_high_gpu_never_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provision_calls: list[str] = []
+    exec_actions: list[str] = []
+    stopped: list[str] = []
+
+    def fake_provision(session: str, gpu: str = "L4", **kw) -> str:
+        provision_calls.append(gpu)
+        return gpu.split(",")[0]
+
+    def fake_exec(session: str, action: str, env_vars=None) -> str:
+        exec_actions.append(action)
+        out = {
+            "chorus": {
+                "file_id": "drv_c1",
+                "name": "c.mp3",
+                "sha256": "c" * 64,
+                "size": 1000,
+                "duration_ms": 50000,
+            },
+            "full": {"file_id": "drv_f1", "name": "f.mp3"},
+            "meta": {"chorus_start_sec": 30.0},
+        }
+        if action == "cover":
+            return (
+                colab_rvc.DRIVE_OUTPUTS_PREFIX + json.dumps(out) + "\n" + colab_rvc.STATUS_OK_MARKER
+            )
+        return colab_rvc.STATUS_OK_MARKER
+
+    monkeypatch.setattr(colab_rvc, "provision_gpu", fake_provision)
+    monkeypatch.setattr(colab_rvc, "exec_remote_worker", fake_exec)
+    monkeypatch.setattr(colab_rvc, "stop_session", stopped.append)
+
+    # Warm reuse on L4 with setup_ready skips BOTH provision_gpu and setup!
+    warm_res = colab_rvc.run_cover_pipeline(
+        session="warm-l4",
+        gpu_spec="L4,T4",
+        cover_dir=tmp_path / "warm",
+        drive_access_token="ya29.tok",
+        drive_source_file_id="src1",
+        drive_pth_file_id="pth1",
+        drive_index_file_id="idx1",
+        drive_songs_folder_id="songs1",
+        reuse_session=True,
+        reused_gpu="L4",
+        reused_setup_ready=True,
+        keep_session_on_success=True,
+    )
+    assert provision_calls == []
+    assert exec_actions == ["cover"]
+    assert stopped == []
+    assert warm_res["session_kept"] is True
+    assert warm_res["acceleration"]["warm_reused"] is True
+
+    # High-price GPUs (H100/A100/G4) MUST ALWAYS be stopped even if keep_session_on_success=True
+    for banned_gpu in ("H100", "A100", "G4"):
+        stopped.clear()
+        hi_res = colab_rvc.run_cover_pipeline(
+            session=f"sess-{banned_gpu}",
+            gpu_spec=banned_gpu,
+            cover_dir=tmp_path / banned_gpu,
+            drive_access_token="ya29.tok",
+            drive_source_file_id="src1",
+            drive_pth_file_id="pth1",
+            drive_index_file_id="idx1",
+            drive_songs_folder_id="songs1",
+            keep_session_on_success=True,
+        )
+        assert hi_res["session_kept"] is False
+        assert f"sess-{banned_gpu}" in stopped
+
+    # probe_warm_session parses healthy vs broken
+    monkeypatch.setattr(
+        colab_rvc,
+        "_run_colab",
+        lambda args, **kw: (0, '__HAKIMI_WARM_PROBE__={"ok": true, "setup_ready": true}\n'),
+    )
+    assert colab_rvc.probe_warm_session("warm-l4") == {"healthy": True, "setup_ready": True}
+    monkeypatch.setattr(colab_rvc, "_run_colab", lambda args, **kw: (1, "connection refused"))
+    assert colab_rvc.probe_warm_session("warm-l4") == {"healthy": False, "setup_ready": False}
+
+
+def test_p2_weight_and_venv_cache_pack_restore_and_setup_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1) Weight cache pack -> restore roundtrip + checksum & traversal guards
+    src_applio = tmp_path / "src_applio"
+    src_sep = tmp_path / "src_sep"
+    (src_applio / "rvc" / "models" / "predictors").mkdir(parents=True)
+    (src_applio / "rvc" / "models" / "embedders" / "contentvec").mkdir(parents=True)
+    (src_applio / "rvc" / "models" / "predictors" / "rmvpe.pt").write_bytes(b"RMVPE-WEIGHTS")
+    (src_applio / "rvc" / "models" / "embedders" / "contentvec" / "pytorch_model.bin").write_bytes(
+        b"CONTENTVEC"
+    )
+    src_sep.mkdir(parents=True)
+    (src_sep / colab_remote.PRIMARY_SEP_MODELS[0]).write_bytes(b"BS-ROFORMER-CKPT")
+    (src_sep / colab_remote.KARAOKE_SEP_MODELS[0]).write_bytes(b"KARAOKE-CKPT")
+    (src_sep / colab_remote.DEREVERB_MODELS[0]).write_bytes(b"DEREVERB-CKPT")
+
+    w_tar = tmp_path / "weights.tar"
+    packed_w = colab_remote.pack_weight_cache(w_tar, applio_dir=src_applio, sep_models_dir=src_sep)
+    assert packed_w["file_count"] == 5
+    assert packed_w["sep_model_files"] == 3
+    assert packed_w["applio_model_files"] == 2
+
+    dst_applio = tmp_path / "dst_applio"
+    dst_sep = tmp_path / "dst_sep"
+    with pytest.raises(ValueError, match="weight_cache_sha256_mismatch"):
+        colab_remote.restore_weight_cache(
+            w_tar, expected_sha256="0" * 64, applio_dir=dst_applio, sep_models_dir=dst_sep
+        )
+
+    restored_w = colab_remote.restore_weight_cache(
+        w_tar,
+        expected_sha256=packed_w["sha256"],
+        applio_dir=dst_applio,
+        sep_models_dir=dst_sep,
+    )
+    assert restored_w["file_count"] == 5
+    assert colab_remote._has_applio_pretrained_weights(dst_applio, mode="cover") is True
+    assert (dst_sep / colab_remote.PRIMARY_SEP_MODELS[0]).read_bytes() == b"BS-ROFORMER-CKPT"
+
+    # Malicious symlink inside weight tar must be rejected
+    bad_w_tar = tmp_path / "bad_weights.tar"
+    with tarfile.open(bad_w_tar, "w") as tf:
+        ti = tarfile.TarInfo("sep_models/evil.ckpt")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = "/etc/passwd"
+        tf.addfile(ti)
+    with pytest.raises(ValueError, match="Unsafe member"):
+        colab_remote.restore_weight_cache(bad_w_tar, applio_dir=dst_applio, sep_models_dir=dst_sep)
+
+    # 2) Venv cache pack -> strict fingerprint gate -> restore + unsafe symlink rejection
+    src_rvc = tmp_path / "src_rvc_venv"
+    src_sep_v = tmp_path / "src_sep_venv"
+    (src_rvc / "bin").mkdir(parents=True)
+    (src_sep_v / "bin").mkdir(parents=True)
+    (src_rvc / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (src_rvc / "bin" / "python3").symlink_to("python")
+    (src_sep_v / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    fp_ok = colab_remote.compute_runtime_fingerprint(
+        python_version="3.12", cuda_version="12.4", os_id="ubuntu22.04", arch="x86_64"
+    )
+    fp_other = colab_remote.compute_runtime_fingerprint(
+        python_version="3.12", cuda_version="12.1", os_id="ubuntu22.04", arch="x86_64"
+    )
+    v_tar = tmp_path / "venv.tar.gz"
+    packed_v = colab_remote.pack_venv_cache(
+        v_tar, rvc_venv=src_rvc, sep_venv=src_sep_v, fingerprint=fp_ok
+    )
+
+    dst_rvc = tmp_path / "dst_rvc_venv"
+    dst_sep_v = tmp_path / "dst_sep_venv"
+    with pytest.raises(ValueError, match="venv_fingerprint_mismatch"):
+        colab_remote.restore_venv_cache(
+            v_tar,
+            expected_sha256=packed_v["sha256"],
+            expected_fingerprint=fp_ok,
+            actual_fingerprint=fp_other,
+            rvc_venv=dst_rvc,
+            sep_venv=dst_sep_v,
+        )
+
+    colab_remote.restore_venv_cache(
+        v_tar,
+        expected_sha256=packed_v["sha256"],
+        expected_fingerprint=fp_ok,
+        actual_fingerprint=fp_ok,
+        rvc_venv=dst_rvc,
+        sep_venv=dst_sep_v,
+    )
+    assert (dst_rvc / "bin" / "python").is_file()
+    assert (dst_sep_v / "bin" / "python").is_file()
+
+    # Unsafe symlink escaping venv is rejected
+    bad_v_tar = tmp_path / "bad_venv.tar.gz"
+    with tarfile.open(bad_v_tar, "w:gz") as tf:
+        ti = tarfile.TarInfo("rvc-venv/bin/evil")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = "/etc/passwd"
+        tf.addfile(ti)
+    bad_v_sha = colab_remote.sha256_file(bad_v_tar)
+    with pytest.raises(ValueError, match="Unsafe symlink"):
+        colab_remote.restore_venv_cache(
+            bad_v_tar,
+            expected_sha256=bad_v_sha,
+            expected_fingerprint=fp_ok,
+            actual_fingerprint=fp_ok,
+            rvc_venv=tmp_path / "bad_dst_rvc",
+            sep_venv=tmp_path / "bad_dst_sep",
+        )
+
+    # 3) action_setup() integration: HIT skips prerequisites/pip; MISS falls back + atomic writeback
+    setup_root = tmp_path / "setup_hit"
+    applio_hit = setup_root / "Applio"
+    applio_hit.mkdir(parents=True)
+    (applio_hit / "core.py").write_text("# stub\n", encoding="utf-8")
+    (applio_hit / "requirements-engine.txt").write_text("torch\n", encoding="utf-8")
+
+    monkeypatch.setattr(colab_remote, "DEFAULT_WORK_DIR", setup_root / "work")
+    monkeypatch.setattr(colab_remote, "SETUP_MARKER", setup_root / ".setup_done")
+    monkeypatch.setattr(colab_remote, "_ensure_ffmpeg", lambda: None)
+    monkeypatch.setattr(colab_remote, "_ensure_uv", lambda: "uv")
+    monkeypatch.setattr(colab_remote, "compute_runtime_fingerprint", lambda **kw: fp_ok)
+
+    hit_cmds: list[list[str]] = []
+
+    def fake_run_hit(cmd, **kwargs):
+        del kwargs
+        hit_cmds.append(list(cmd))
+        return colab_remote.subprocess.CompletedProcess(
+            cmd, 0, stdout="NVIDIA L4 | CUDA Version: 12.4\n", stderr=""
+        )
+
+    monkeypatch.setattr(colab_remote, "_run", fake_run_hit)
+    monkeypatch.setattr(
+        colab_remote,
+        "_drive_download_to_path",
+        lambda tok, fid, dest: (
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            or dest.write_bytes(w_tar.read_bytes() if fid == "w_fid" else v_tar.read_bytes())
+            or dest
+        ),
+    )
+
+    hit_status = colab_remote.action_setup(
+        applio_dir=applio_hit,
+        rvc_venv=setup_root / "rvc-venv",
+        sep_venv=setup_root / "sep-venv",
+        sep_models_dir=setup_root / "sep-models",
+        mode="cover",
+        drive_token="ya29.cache-tok",
+        cache_folder_id="cache_folder_1",
+        cache_weights_file_id="w_fid",
+        cache_weights_sha256=packed_w["sha256"],
+        cache_venv_enabled=True,
+        cache_venv_file_id="v_fid",
+        cache_venv_sha256=packed_v["sha256"],
+        cache_venv_fingerprint=fp_ok,
+    )
+    assert hit_status["weight_cache_hit"] is True
+    assert hit_status["venv_cache_hit"] is True
+    assert not any("prerequisites" in c for c in hit_cmds)
+    assert not any("pip" in c for c in hit_cmds)
+
+    # Corrupt checksum + fingerprint mismatch -> transparent fallback + atomic write-back order
+    fb_root = tmp_path / "setup_fb"
+    applio_fb = fb_root / "Applio"
+    applio_fb.mkdir(parents=True)
+    (applio_fb / "core.py").write_text("# stub\n", encoding="utf-8")
+    (applio_fb / "requirements-engine.txt").write_text("torch\n", encoding="utf-8")
+    (fb_root / "rvc-venv" / "bin").mkdir(parents=True)
+    (fb_root / "rvc-venv" / "bin" / "python").write_text("", encoding="utf-8")
+    (fb_root / "sep-venv" / "bin").mkdir(parents=True)
+    (fb_root / "sep-venv" / "bin" / "python").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(colab_remote, "DEFAULT_WORK_DIR", fb_root / "work")
+    monkeypatch.setattr(colab_remote, "SETUP_MARKER", fb_root / ".setup_done")
+    fb_cmds: list[list[str]] = []
+
+    def fake_run_fb(cmd, **kwargs):
+        del kwargs
+        fb_cmds.append(list(cmd))
+        if "prerequisites" in cmd:
+            (applio_fb / "rvc" / "models" / "predictors").mkdir(parents=True, exist_ok=True)
+            (applio_fb / "rvc" / "models" / "embedders" / "contentvec").mkdir(
+                parents=True, exist_ok=True
+            )
+            (applio_fb / "rvc" / "models" / "predictors" / "rmvpe.pt").write_bytes(b"RMVPE")
+            (applio_fb / "rvc" / "models" / "embedders" / "contentvec" / "model.bin").write_bytes(
+                b"CV"
+            )
+        return colab_remote.subprocess.CompletedProcess(
+            cmd, 0, stdout="NVIDIA L4 | CUDA Version: 12.4\n", stderr=""
+        )
+
+    upload_order: list[str] = []
+
+    def fake_up_path(tok, folder, local_path, drive_name, mime, **kw):
+        del tok, folder, local_path, mime, kw
+        upload_order.append(drive_name)
+        return {"file_id": f"up_{len(upload_order)}", "name": drive_name, "size": 100}
+
+    monkeypatch.setattr(colab_remote, "_run", fake_run_fb)
+    monkeypatch.setattr(colab_remote, "_drive_upload_from_path", fake_up_path)
+
+    fb_status = colab_remote.action_setup(
+        applio_dir=applio_fb,
+        rvc_venv=fb_root / "rvc-venv",
+        sep_venv=fb_root / "sep-venv",
+        sep_models_dir=fb_root / "sep-models",
+        mode="cover",
+        drive_token="ya29.cache-tok",
+        cache_folder_id="cache_folder_1",
+        cache_weights_file_id="w_fid",
+        cache_weights_sha256="f" * 64,  # intentional mismatch -> fallback!
+        cache_venv_enabled=True,
+        cache_venv_file_id="v_fid",
+        cache_venv_sha256=packed_v["sha256"],
+        cache_venv_fingerprint=fp_other,  # intentional fingerprint mismatch -> fallback!
+        cache_writeback=True,
+    )
+    assert fb_status["weight_cache_hit"] is False
+    assert fb_status["venv_cache_hit"] is False
+    assert fb_status["venv_fallback_reason"] == "fingerprint_mismatch"
+    assert fb_status["weight_cache_written"] is True
+    assert fb_status["venv_cache_written"] is True
+    assert any("prerequisites" in c for c in fb_cmds)
+    assert any("pip" in c for c in fb_cmds)
+    # Atomic write-back order: archive uploaded BEFORE its .manifest.json commit!
+    w_key = colab_remote.compute_weight_cache_key("cover")
+    w_archive_idx = next(
+        i for i, n in enumerate(upload_order) if n.startswith(f"{w_key}_") and n.endswith(".tar")
+    )
+    w_manifest_idx = upload_order.index(f"{w_key}.manifest.json")
+    assert w_archive_idx < w_manifest_idx
+    v_manifest_idx = next(
+        i
+        for i, n in enumerate(upload_order)
+        if n.startswith("venv_") and n.endswith(".manifest.json")
+    )
+    v_archive_idx = next(
+        i for i, n in enumerate(upload_order) if n.startswith("venv_") and n.endswith(".tar.gz")
+    )
+    assert v_archive_idx < v_manifest_idx
+
+
+def test_p2_venv_cache_rejects_symlink_directory_traversal_and_prefix_collision(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    fp = "ubuntu22.04_x86_64_py3.12_cuda12.4"
+
+    def _build_tar(path: Path, entries: list[tuple[str, str, bytes | str]]) -> str:
+        with tarfile.open(path, "w:gz") as tf:
+            for name, kind, data in entries:
+                ti = tarfile.TarInfo(name)
+                if kind == "sym":
+                    ti.type = tarfile.SYMTYPE
+                    ti.linkname = str(data)
+                    tf.addfile(ti)
+                else:
+                    raw = data if isinstance(data, bytes) else data.encode("utf-8")
+                    ti.size = len(raw)
+                    tf.addfile(ti, io.BytesIO(raw))
+        return colab_remote.sha256_file(path)
+
+    # 1) Absolute symlink pointing to directory prefix + write through symlink -> MUST reject
+    t_dir_esc = tmp_path / "dir_escape.tar.gz"
+    sha1 = _build_tar(
+        t_dir_esc,
+        [
+            ("rvc-venv/link", "sym", "/root/.local/share/uv/python/foo"),
+            ("rvc-venv/link/pwned", "file", b"evil"),
+            ("rvc-venv/bin/python", "file", b"py"),
+            ("sep-venv/bin/python", "file", b"py"),
+        ],
+    )
+    with pytest.raises(ValueError, match="Unsafe symlink"):
+        colab_remote.restore_venv_cache(
+            t_dir_esc,
+            expected_sha256=sha1,
+            expected_fingerprint=fp,
+            actual_fingerprint=fp,
+            rvc_venv=tmp_path / "out1_rvc",
+            sep_venv=tmp_path / "out1_sep",
+        )
+
+    # 2) Prefix collision (/usr/bin/python_evil) -> MUST reject
+    t_prefix = tmp_path / "prefix_collision.tar.gz"
+    sha2 = _build_tar(
+        t_prefix,
+        [
+            ("rvc-venv/bin/python", "sym", "/usr/bin/python_evil"),
+            ("sep-venv/bin/python", "file", b"py"),
+        ],
+    )
+    with pytest.raises(ValueError, match="Unsafe symlink"):
+        colab_remote.restore_venv_cache(
+            t_prefix,
+            expected_sha256=sha2,
+            expected_fingerprint=fp,
+            actual_fingerprint=fp,
+            rvc_venv=tmp_path / "out2_rvc",
+            sep_venv=tmp_path / "out2_sep",
+        )
+
+    # 3) Valid bin python symlink + regular file traversing through that symlink -> MUST reject
+    t_bin_trav = tmp_path / "bin_traverse.tar.gz"
+    sha3 = _build_tar(
+        t_bin_trav,
+        [
+            ("rvc-venv/bin/python", "sym", "/usr/bin/python3.12"),
+            ("rvc-venv/bin/python/pwned", "file", b"evil"),
+            ("sep-venv/bin/python", "file", b"py"),
+        ],
+    )
+    with pytest.raises(ValueError, match="Path traverses symlink"):
+        colab_remote.restore_venv_cache(
+            t_bin_trav,
+            expected_sha256=sha3,
+            expected_fingerprint=fp,
+            actual_fingerprint=fp,
+            rvc_venv=tmp_path / "out3_rvc",
+            sep_venv=tmp_path / "out3_sep",
+        )
+
+    # 4) Relative symlink + regular file traversing through it -> MUST reject
+    t_rel_trav = tmp_path / "rel_traverse.tar.gz"
+    sha4 = _build_tar(
+        t_rel_trav,
+        [
+            ("rvc-venv/lib64", "sym", "lib"),
+            ("rvc-venv/lib64/pwned", "file", b"evil"),
+            ("rvc-venv/bin/python", "file", b"py"),
+            ("sep-venv/bin/python", "file", b"py"),
+        ],
+    )
+    with pytest.raises(ValueError, match="Path traverses symlink"):
+        colab_remote.restore_venv_cache(
+            t_rel_trav,
+            expected_sha256=sha4,
+            expected_fingerprint=fp,
+            actual_fingerprint=fp,
+            rvc_venv=tmp_path / "out4_rvc",
+            sep_venv=tmp_path / "out4_sep",
+        )
+
+    # 5) Valid bin-only absolute Python symlinks + safe relative symlink -> SUCCEEDS
+    t_ok = tmp_path / "valid_venv.tar.gz"
+    sha5 = _build_tar(
+        t_ok,
+        [
+            ("rvc-venv/bin/python", "sym", "/usr/bin/python3.12"),
+            ("rvc-venv/bin/python3", "sym", "python"),
+            (
+                "sep-venv/bin/python",
+                "sym",
+                "/root/.local/share/uv/python/cpython-3.12.7-linux-x86_64/bin/python3.12",
+            ),
+        ],
+    )
+    dst_rvc = tmp_path / "ok_rvc"
+    dst_sep = tmp_path / "ok_sep"
+    colab_remote.restore_venv_cache(
+        t_ok,
+        expected_sha256=sha5,
+        expected_fingerprint=fp,
+        actual_fingerprint=fp,
+        rvc_venv=dst_rvc,
+        sep_venv=dst_sep,
+    )
+    assert os.readlink(dst_rvc / "bin" / "python") == "/usr/bin/python3.12"
+    assert os.readlink(dst_rvc / "bin" / "python3") == "python"
+    assert os.readlink(dst_sep / "bin" / "python").endswith("/bin/python3.12")
+
+
+def test_p0_remote_exception_scrubs_custom_opaque_token_in_stdout_and_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import contextlib
+    import traceback
+
+    opaque_tok = "opaque-custom-token-99887766"
+    monkeypatch.setenv("HAKIMI_COLAB_ACTION", "setup")
+    monkeypatch.setenv("HAKIMI_DRIVE_ACCESS_TOKEN", opaque_tok)
+
+    def boom(**kwargs):
+        del kwargs
+        raise RuntimeError(f"upstream rejected {opaque_tok} at step 1")
+
+    monkeypatch.setattr(colab_remote, "action_setup", boom)
+    out_buf = io.StringIO()
+    tb_text = ""
+    exc_text = ""
+    with contextlib.redirect_stdout(out_buf):
+        try:
+            colab_remote.main(argv=None)
+        except RuntimeError as exc:
+            exc_text = str(exc)
+            tb_text = traceback.format_exc()
+
+    assert opaque_tok not in out_buf.getvalue()
+    assert opaque_tok not in exc_text
+    assert opaque_tok not in tb_text
+    assert "[REDACTED]" in out_buf.getvalue()
+    assert "[REDACTED]" in exc_text
+    assert opaque_tok not in colab_remote._ACTIVE_SECRETS
+    monkeypatch.delenv("HAKIMI_COLAB_ACTION", raising=False)

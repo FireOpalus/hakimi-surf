@@ -37,22 +37,29 @@ DRIVE_FILES_API = "https://www.googleapis.com/drive/v3/files"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SUBFOLDER_NAMES: tuple[str, ...] = ("models", "songs", "inbox")
+CACHE_FOLDER_NAME = "cache"
 ROOT_FOLDER_NAME = "Hakimi_Songs"
 
 FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 FOLDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
 SAFE_FILENAME_RE = re.compile(r"^[^\x00-\x1f/\\]{1,160}$")
+CACHE_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{4,128}$")
+SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+_OAUTH_TOKEN_RE = re.compile(r"(?:ya29\.[A-Za-z0-9._-]+|1//[A-Za-z0-9._-]+)")
+_BEARER_RE = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 
 MAX_CREDENTIALS_BYTES = 65_536
 MAX_JSON_RESPONSE_BYTES = 1_048_576
+MAX_CACHE_MANIFEST_BYTES = 262_144
 MULTIPART_THRESHOLD_BYTES = 4 * 1024 * 1024
 RESUMABLE_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_DRIVE_UPLOAD_BYTES = 250 * 1024 * 1024
+MAX_CACHE_UPLOAD_BYTES = 3 * 1024 * 1024 * 1024
 MAX_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_SONG_DOWNLOAD_BYTES = 30 * 1024 * 1024
 
-DriveRole = Literal["root", "models", "songs", "inbox"]
-DriveSubRole = Literal["models", "songs", "inbox"]
+DriveRole = Literal["root", "models", "songs", "inbox", "cache"]
+DriveSubRole = Literal["models", "songs", "inbox", "cache"]
 TransportFn = Callable[
     [str, str, dict[str, str], bytes | None, float],
     tuple[int, dict[str, str], bytes],
@@ -153,6 +160,16 @@ def sanitize_drive_filename(name: str) -> str:
 
 def _escape_drive_query_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def scrub_drive_secrets(text: Any, *extra_secrets: str) -> str:
+    """Redact OAuth access/refresh tokens, Bearer headers, and explicit secrets."""
+    out = str(text or "")
+    out = _OAUTH_TOKEN_RE.sub("[REDACTED]", out)
+    out = _BEARER_RE.sub(r"\1[REDACTED]", out)
+    for sec in sorted({s for s in extra_secrets if s and len(s) >= 6}, key=len, reverse=True):
+        out = out.replace(sec, "[REDACTED]")
+    return out
 
 
 def _read_private_json(path: Path) -> dict[str, Any]:
@@ -274,7 +291,10 @@ class ColabDriveClient:
         self._cred_info: dict[str, Any] | None = None
         self._access_token: str = ""
         self._token_expires_at: float = 0.0
+        self._token_wall_expires_at: float = 0.0
         self._tree: DriveFolderTree | None = None
+        self._cache_folder_id: str = ""
+        self._cache_folder_root_id: str = ""
 
     @property
     def folder_tree(self) -> DriveFolderTree | None:
@@ -342,11 +362,30 @@ class ColabDriveClient:
         ttl = max(60, min(3600, int(expires_in))) if isinstance(expires_in, (int, float)) else 3600
         self._access_token = token.strip()
         self._token_expires_at = time.monotonic() + ttl - 30
+        self._token_wall_expires_at = time.time() + ttl
         return self._access_token
 
-    def get_short_lived_token(self) -> str:
-        """Return a valid short-lived Bearer access token for optional direct Drive transfer."""
-        return self._get_access_token(force_refresh=False)
+    def get_short_lived_token(
+        self,
+        *,
+        force_refresh: bool = False,
+        min_ttl_seconds: int = 120,
+    ) -> dict[str, Any]:
+        """Return an in-memory short-lived Bearer access token and expiry metadata only.
+
+        Never exposes `refresh_token`, `client_id`, `client_secret`, or raw OAuth JSON.
+        """
+        min_ttl = max(30, min(1800, int(min_ttl_seconds)))
+        remaining_usable = self._token_expires_at - time.monotonic()
+        need_refresh = force_refresh or not self._access_token or remaining_usable < min_ttl
+        token = self._get_access_token(force_refresh=need_refresh)
+        expires_in = max(0, int(round(self._token_wall_expires_at - time.time())))
+        return {
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+            "expires_at": round(self._token_wall_expires_at, 3),
+        }
 
     def _api_request(
         self,
@@ -521,15 +560,41 @@ class ColabDriveClient:
         )
         return self._tree
 
+    def ensure_cache_folder(
+        self,
+        root_folder_id: str = "",
+        *,
+        force_refresh: bool = False,
+    ) -> str:
+        """Lazily resolve or create `Hakimi_Songs/cache/` for versioned weight/venv caches."""
+        tree = self.ensure_folder_tree(root_folder_id, force_refresh=force_refresh)
+        if not force_refresh and self._cache_folder_id and self._cache_folder_root_id == tree.root:
+            return self._cache_folder_id
+        cache_id = self._find_or_create_folder(CACHE_FOLDER_NAME, tree.root, role="cache")
+        self._cache_folder_id = cache_id
+        self._cache_folder_root_id = tree.root
+        return cache_id
+
+    def _folder_id_for_role(self, role: DriveRole) -> str:
+        if role == "cache":
+            return self.ensure_cache_folder()
+        return self.ensure_folder_tree().folder_for(role)
+
+    def _upload_limit_for_role(self, role: DriveSubRole) -> int:
+        if role == "inbox":
+            return MAX_INBOX_UPLOAD_BYTES
+        if role == "cache":
+            return MAX_CACHE_UPLOAD_BYTES
+        return MAX_DRIVE_UPLOAD_BYTES
+
     def list_folder(
         self,
         role: DriveSubRole,
         *,
         page_size: int = 100,
     ) -> list[dict[str, Any]]:
-        """List non-trashed files directly inside models/, songs/, or inbox/."""
-        tree = self.ensure_folder_tree()
-        parent_id = tree.folder_for(role)
+        """List non-trashed files directly inside models/, songs/, inbox/, or cache/."""
+        parent_id = self._folder_id_for_role(role)
         bounded_size = max(1, min(int(page_size), 200))
         q = (
             f"'{_escape_drive_query_literal(parent_id)}' in parents "
@@ -586,8 +651,7 @@ class ColabDriveClient:
     ) -> dict[str, Any]:
         """Verify that a Drive file ID exists, is not trashed, and lives under Hakimi_Songs/."""
         fid = validate_drive_id(file_id)
-        tree = self.ensure_folder_tree()
-        allowed_parents = {tree.folder_for(role) for role in allowed_roles}
+        allowed_parents = {self._folder_id_for_role(role) for role in allowed_roles}
         meta = self._api_json(
             "GET",
             f"{DRIVE_FILES_API}/{fid}",
@@ -634,8 +698,7 @@ class ColabDriveClient:
     ) -> dict[str, Any] | None:
         """Find a single non-trashed file by exact filename within a scoped subfolder."""
         clean_name = sanitize_drive_filename(filename)
-        tree = self.ensure_folder_tree()
-        parent_id = tree.folder_for(role)
+        parent_id = self._folder_id_for_role(role)
         q = (
             f"'{_escape_drive_query_literal(parent_id)}' in parents "
             f"and name = '{_escape_drive_query_literal(clean_name)}' "
@@ -646,7 +709,7 @@ class ColabDriveClient:
             DRIVE_FILES_API,
             params={
                 "q": q,
-                "fields": "files(id,name,size,modifiedTime,mimeType)",
+                "fields": "files(id,name,size,modifiedTime,mimeType,appProperties)",
                 "pageSize": 5,
                 "supportsAllDrives": "true",
                 "includeItemsFromAllDrives": "true",
@@ -663,6 +726,7 @@ class ColabDriveClient:
             "size": int(raw_size) if raw_size is not None and str(raw_size).isdigit() else 0,
             "modified_time": str(first.get("modifiedTime") or ""),
             "mime_type": str(first.get("mimeType") or "application/octet-stream"),
+            "app_properties": dict(first.get("appProperties") or {}),
         }
 
     def download_bytes(
@@ -729,17 +793,16 @@ class ColabDriveClient:
         replace_existing: bool = True,
         app_properties: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Upload bounded bytes into one of models/, songs/, or inbox/."""
+        """Upload bounded bytes into one of models/, songs/, inbox/, or cache/."""
         clean_name = sanitize_drive_filename(filename)
         if not isinstance(raw, (bytes, bytearray)) or not raw:
             raise ColabDriveError("drive_invalid_payload", "Upload payload cannot be empty")
         data = bytes(raw)
-        limit = MAX_INBOX_UPLOAD_BYTES if role == "inbox" else MAX_DRIVE_UPLOAD_BYTES
+        limit = self._upload_limit_for_role(role)
         if len(data) > limit:
             raise ColabDriveError("drive_file_too_large", "Upload payload exceeds allowed size")
 
-        tree = self.ensure_folder_tree()
-        parent_id = tree.folder_for(role)
+        parent_id = self._folder_id_for_role(role)
         existing = self.resolve_named_file(role, clean_name) if replace_existing else None
         props = _build_app_properties(role, app_properties)
 
@@ -778,11 +841,11 @@ class ColabDriveClient:
         replace_existing: bool = True,
         app_properties: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Upload a local file into models/, songs/, or inbox/."""
+        """Upload a local file into models/, songs/, inbox/, or cache/."""
         if not local_path.is_file():
             raise ColabDriveError("drive_local_file_missing", f"Local file missing: {local_path}")
         size = local_path.stat().st_size
-        limit = MAX_INBOX_UPLOAD_BYTES if role == "inbox" else MAX_DRIVE_UPLOAD_BYTES
+        limit = self._upload_limit_for_role(role)
         if size <= 0 or size > limit:
             raise ColabDriveError("drive_file_too_large", "Local file size invalid for upload")
         name = sanitize_drive_filename(drive_name or local_path.name)
@@ -798,8 +861,7 @@ class ColabDriveClient:
                 app_properties=app_properties,
             )
 
-        tree = self.ensure_folder_tree()
-        parent_id = tree.folder_for(role)
+        parent_id = self._folder_id_for_role(role)
         existing = self.resolve_named_file(role, name) if replace_existing else None
         props = _build_app_properties(role, app_properties)
         resp = self._upload_resumable_file(
@@ -818,6 +880,83 @@ class ColabDriveClient:
             "size": size,
             "mime_type": str(resp.get("mimeType") or resolved_mime),
         }
+
+    def resolve_model_files(self, model_name: str) -> dict[str, dict[str, Any]] | None:
+        """Return Drive metadata for `<model>.pth` and `<model>.index` if both exist in models/."""
+        clean_model = re.sub(r"[^A-Za-z0-9_-]", "", model_name.strip())
+        if not clean_model or clean_model != model_name.strip():
+            raise ColabDriveError("drive_invalid_filename", "Invalid RVC model name")
+        remote_pth = self.resolve_named_file("models", f"{clean_model}.pth")
+        if remote_pth is None:
+            return None
+        remote_idx = self.resolve_named_file("models", f"{clean_model}.index")
+        if remote_idx is None:
+            return None
+        return {"pth": remote_pth, "index": remote_idx}
+
+    def resolve_cache_manifest(
+        self,
+        cache_key: str,
+        *,
+        expected_kind: str = "",
+        expected_fingerprint: str = "",
+    ) -> dict[str, Any] | None:
+        """Resolve and validate a versioned cache manifest inside `Hakimi_Songs/cache/`.
+
+        Returns `None` on missing manifest, corrupt JSON, version/fingerprint mismatch, or
+        missing/out-of-scope archive so callers can fall back transparently.
+        """
+        clean_key = cache_key.strip()
+        if not CACHE_KEY_RE.fullmatch(clean_key):
+            return None
+        entry = self.resolve_named_file("cache", f"{clean_key}.manifest.json")
+        if entry is None:
+            return None
+        try:
+            raw = self.download_bytes(
+                entry["id"],
+                allowed_roles=("cache",),
+                max_bytes=MAX_CACHE_MANIFEST_BYTES,
+            )
+            manifest = json.loads(raw.decode("utf-8"))
+        except (ColabDriveError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(manifest, dict):
+            return None
+        if str(manifest.get("version_key") or "") != clean_key:
+            return None
+        if expected_kind and str(manifest.get("kind") or "") != expected_kind:
+            return None
+        if expected_fingerprint and str(manifest.get("fingerprint") or "") != expected_fingerprint:
+            return None
+        archive_id = str(manifest.get("archive_file_id") or "").strip()
+        sha256_hex = str(manifest.get("sha256") or "").strip().lower()
+        if not archive_id or not SHA256_HEX_RE.fullmatch(sha256_hex):
+            return None
+        try:
+            self.verify_file_in_tree(archive_id, allowed_roles=("cache",))
+        except ColabDriveError:
+            return None
+        validated = dict(manifest)
+        validated["archive_file_id"] = archive_id
+        validated["sha256"] = sha256_hex
+        validated["manifest_file_id"] = entry["id"]
+        return validated
+
+    def write_cache_manifest(self, cache_key: str, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Atomically commit a versioned cache manifest JSON inside `Hakimi_Songs/cache/`."""
+        clean_key = cache_key.strip()
+        if not CACHE_KEY_RE.fullmatch(clean_key):
+            raise ColabDriveError("drive_invalid_filename", "Invalid cache key")
+        payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return self.upload_bytes(
+            "cache",
+            f"{clean_key}.manifest.json",
+            payload,
+            mime_type="application/json",
+            replace_existing=True,
+            app_properties={"cache_key": clean_key[:100]},
+        )
 
     def ensure_model_files(self, model_name: str, local_dir: Path) -> tuple[Path, Path]:
         """Return local `(pth_path, index_path)`, pulling from Hakimi_Songs/models/ if absent."""

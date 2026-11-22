@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
@@ -37,6 +38,10 @@ _FOLDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
 _DRIVE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{16,64}$")
 _SAFE_FILENAME_RE = re.compile(r"^[^\x00-\x1f/\\]{1,160}$")
+_OAUTH_TOKEN_RE = re.compile(r"(?:ya29\.[A-Za-z0-9._-]+|1//[A-Za-z0-9._-]+)")
+_BEARER_TOKEN_RE = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_DEFAULT_WARM_ALLOWED_GPUS: tuple[str, ...] = ("L4", "T4")
+_ACCELERATION_SAMPLE_LIMIT = 200
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS colab_jobs (
@@ -212,6 +217,155 @@ def _sanitize_filename(filename: str) -> str:
     return cleaned
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        if isinstance(value, float) and not math.isfinite(value):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _default_warm_pool() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "allowed_gpus": list(_DEFAULT_WARM_ALLOWED_GPUS),
+        "idle_ttl_seconds": 360,
+        "max_ttl_seconds": 900,
+        "active_count": 0,
+    }
+
+
+def _normalize_warm_sessions(raw: Any, *, now: float) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        session_name = str(item.get("session_name") or "").strip()
+        gpu = str(item.get("gpu") or "").strip().upper()
+        if not session_name or not gpu:
+            continue
+        created_at = _safe_float(item.get("created_at"), 0.0)
+        last_used_at = _safe_float(item.get("last_used_at"), created_at)
+        idle_ttl_seconds = max(0, _safe_int(item.get("idle_ttl_seconds"), 0))
+        raw_expires = item.get("expires_at")
+        if raw_expires is not None and not isinstance(raw_expires, bool):
+            expires_at = _safe_float(raw_expires, 0.0)
+        elif last_used_at > 0.0 and idle_ttl_seconds > 0:
+            expires_at = last_used_at + float(idle_ttl_seconds)
+        else:
+            rem_fallback = _safe_float(item.get("remaining_ttl_seconds"), 0.0)
+            expires_at = (now + rem_fallback) if rem_fallback > 0.0 else 0.0
+        if not math.isfinite(expires_at) or expires_at <= now:
+            continue
+        remaining_ttl = max(0, int(round(expires_at - now)))
+        out.append(
+            {
+                "session_name": session_name,
+                "gpu": gpu,
+                "idle_ttl_seconds": idle_ttl_seconds,
+                "remaining_ttl_seconds": remaining_ttl,
+                "created_at": created_at,
+                "last_used_at": last_used_at,
+                "expires_at": expires_at,
+                "reuse_count": max(0, _safe_int(item.get("reuse_count"), 0)),
+                "setup_ready": bool(item.get("setup_ready", False)),
+            }
+        )
+    return out
+
+
+def _normalize_warm_pool(raw: Any, *, active_count: int) -> dict[str, Any]:
+    base = _default_warm_pool()
+    base["active_count"] = max(0, int(active_count))
+    if not isinstance(raw, dict):
+        return base
+    if "enabled" in raw:
+        base["enabled"] = bool(raw.get("enabled"))
+    raw_gpus = raw.get("allowed_gpus")
+    if isinstance(raw_gpus, (list, tuple)):
+        gpus: list[str] = []
+        for g in raw_gpus:
+            cleaned = str(g or "").strip().upper()
+            if cleaned and cleaned not in gpus:
+                gpus.append(cleaned)
+        base["allowed_gpus"] = gpus
+    if "idle_ttl_seconds" in raw:
+        base["idle_ttl_seconds"] = max(0, _safe_int(raw.get("idle_ttl_seconds"), 360))
+    if "max_ttl_seconds" in raw:
+        base["max_ttl_seconds"] = max(0, _safe_int(raw.get("max_ttl_seconds"), 900))
+    return base
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def _accumulate_acceleration(counters: dict[str, int], acc: dict[str, Any]) -> None:
+    counters["measured_jobs"] += 1
+
+    dd_used = _first_present(acc, "drive_direct", "drive_direct_used")
+    dd_fallback = _first_present(acc, "drive_direct_fallback", "drive_fallback")
+    dd_mode = (
+        str(_first_present(acc, "drive_transfer_mode", "transfer_mode", "drive_direct_mode") or "")
+        .strip()
+        .lower()
+    )
+    if dd_used is True or dd_mode in {"direct", "drive_direct"}:
+        counters["drive_direct_jobs"] += 1
+    elif isinstance(dd_used, str):
+        norm_dd = dd_used.strip().lower()
+        if norm_dd in {"direct", "drive_direct", "hit", "used"}:
+            counters["drive_direct_jobs"] += 1
+        elif norm_dd in {"fallback", "drive_fallback", "ws_fallback"}:
+            counters["drive_direct_fallbacks"] += 1
+    if dd_fallback is True or dd_mode in {"fallback", "drive_fallback", "ws_fallback"}:
+        counters["drive_direct_fallbacks"] += 1
+
+    warm_val = _first_present(
+        acc, "warm_reused", "warm_session_reused", "warm_reuse", "session_reused", "warm_hit"
+    )
+    session_mode = str(_first_present(acc, "session_mode", "warm_mode") or "").strip().lower()
+    if warm_val is True or session_mode in {"warm", "reused", "warm_reuse"}:
+        counters["warm_reuse_hits"] += 1
+    elif warm_val is False or session_mode in {"cold", "cold_start"}:
+        counters["warm_cold_starts"] += 1
+
+    cache_sub = acc.get("cache_status") if isinstance(acc.get("cache_status"), dict) else {}
+    weight_hit = _first_present(acc, "weight_cache_hit", "cache_weight_hit")
+    if weight_hit is None:
+        weight_hit = _first_present(cache_sub, "weight_cache_hit", "cache_weight_hit")
+    if weight_hit is True:
+        counters["cache_weight_hits"] += 1
+    elif weight_hit is False:
+        counters["cache_weight_misses"] += 1
+
+    venv_hit = _first_present(acc, "venv_cache_hit", "cache_venv_hit")
+    if venv_hit is None:
+        venv_hit = _first_present(cache_sub, "venv_cache_hit", "cache_venv_hit")
+    if venv_hit is True:
+        counters["cache_venv_hits"] += 1
+    elif venv_hit is False:
+        counters["cache_venv_misses"] += 1
+
+
 class ColabComputeHub:
     """Thin in-process coordinator communicating with `scripts/colab_worker.py` via HTTP."""
 
@@ -247,6 +401,8 @@ class ColabComputeHub:
         self._worker_reachable = False
         self._last_status_poll_at = 0.0
         self._orphan_seen_since: float | None = None
+        self._last_warm_sessions: list[dict[str, Any]] = []
+        self._last_warm_pool: dict[str, Any] = _default_warm_pool()
 
     def _default_config(self) -> ColabConfig:
         folder_id = str(getattr(self.s, "colab_drive_songs_folder_id", "") or "").strip()
@@ -272,6 +428,8 @@ class ColabComputeHub:
 
     def _scrub(self, text: Any) -> str:
         out = " ".join(str(text or "").split())
+        out = _OAUTH_TOKEN_RE.sub("[REDACTED]", out)
+        out = _BEARER_TOKEN_RE.sub(r"\1[REDACTED]", out)
         secrets = list(configured_secrets(self.s))
         tok = self._worker_token()
         if tok:
@@ -402,11 +560,29 @@ class ColabComputeHub:
             "updated_at": float(row["updated_at"]),
         }
 
+    def _live_warm_sessions(self, now: float | None = None) -> list[dict[str, Any]]:
+        current = self._clock() if now is None else now
+        live: list[dict[str, Any]] = []
+        for item in self._last_warm_sessions:
+            expires_at = _safe_float(item.get("expires_at"), 0.0)
+            if not math.isfinite(expires_at) or expires_at <= current:
+                continue
+            live.append(
+                {
+                    **item,
+                    "remaining_ttl_seconds": max(0, int(round(expires_at - current))),
+                }
+            )
+        return live
+
     async def status_summary(self) -> dict[str, Any]:
         """Return fast, non-blocking cached status summary without performing HTTP requests."""
         if not self.initialized:
             await self.initialize()
         is_cfg = self.configured()
+        warm_sessions = self._live_warm_sessions() if is_cfg else []
+        warm_count = len(warm_sessions)
+        warm_gpus = "/".join(dict.fromkeys(s["gpu"] for s in warm_sessions if s.get("gpu")))
         if not is_cfg:
             state = "unconfigured"
             detail = "等待配置 Colab Worker 地址与凭证"
@@ -419,6 +595,16 @@ class ColabComputeHub:
         elif self._queued_jobs > 0:
             state = "ready"
             detail = f"排队等待 {self._queued_jobs} 项作业"
+        elif warm_count > 0:
+            state = "ready"
+            gpu_label = f" {warm_gpus}" if warm_gpus else ""
+            if self._last_cu_balance is not None:
+                detail = (
+                    f"热机待命{gpu_label}（{warm_count} 会话） · "
+                    f"余额 {self._last_cu_balance:.2f} CU"
+                )
+            else:
+                detail = f"热机待命{gpu_label}（{warm_count} 会话）"
         elif self._last_cu_balance is not None:
             state = "ready"
             detail = f"就绪 · 余额 {self._last_cu_balance:.2f} CU"
@@ -437,16 +623,21 @@ class ColabComputeHub:
             "queued_jobs": self._queued_jobs,
             "last_cu_balance": self._last_cu_balance,
             "last_error": self._last_error,
+            "warm_active_count": warm_count,
+            "warm_sessions": warm_sessions,
         }
 
     async def _poll_worker_status(self) -> dict[str, Any]:
         if not self.configured():
+            self._last_warm_sessions = []
+            self._last_warm_pool = _default_warm_pool()
             return {
                 "reachable": False,
                 "compute_units": None,
                 "active_sessions": 0,
                 "running_job_id": None,
                 "drive_folders": None,
+                "warm_sessions": [],
                 "error": "colab_unconfigured",
             }
         try:
@@ -455,48 +646,68 @@ class ColabComputeHub:
                 self._worker_reachable = False
                 err = f"worker_http_{resp.status_code}"
                 self._last_error = err
+                self._last_warm_sessions = []
+                self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
                 return {
                     "reachable": False,
                     "compute_units": self._last_cu_balance,
                     "active_sessions": 0,
                     "running_job_id": None,
                     "drive_folders": None,
+                    "warm_sessions": [],
                     "error": err,
                 }
             data = resp.json()
+            if not isinstance(data, dict):
+                data = {}
+            now = self._clock()
             reachable = bool(data.get("reachable", True))
             cu = data.get("compute_units")
-            if isinstance(cu, (int, float)):
+            has_cu = isinstance(cu, (int, float)) and not isinstance(cu, bool)
+            if has_cu:
                 self._last_cu_balance = float(cu)
+            raw_err = data.get("error")
+            clean_err = self._scrub(raw_err) if raw_err else None
+            warm_sessions = _normalize_warm_sessions(data.get("warm_sessions"), now=now)
+            warm_pool = _normalize_warm_pool(data.get("warm_pool"), active_count=len(warm_sessions))
             self._worker_reachable = reachable
-            self._last_error = data.get("error")
-            self._last_status_poll_at = self._clock()
+            self._last_error = clean_err
+            self._last_status_poll_at = now
+            self._last_warm_sessions = warm_sessions
+            self._last_warm_pool = warm_pool
             return {
                 "reachable": reachable,
-                "compute_units": float(cu) if isinstance(cu, (int, float)) else None,
-                "active_sessions": int(data.get("active_sessions") or 0),
+                "compute_units": float(cu) if has_cu else None,
+                "active_sessions": max(0, _safe_int(data.get("active_sessions"), 0)),
                 "running_job_id": data.get("running_job_id"),
                 "drive_folders": data.get("drive_folders"),
-                "error": data.get("error"),
+                "warm_sessions": [dict(item) for item in warm_sessions],
+                "error": clean_err,
             }
         except Rejected as exc:
+            self._last_warm_sessions = []
+            self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
             return {
                 "reachable": False,
                 "compute_units": self._last_cu_balance,
                 "active_sessions": 0,
                 "running_job_id": None,
                 "drive_folders": None,
+                "warm_sessions": [],
                 "error": str(exc),
             }
         except Exception as exc:
             err = self._scrub(type(exc).__name__)
             self._last_error = err
+            self._last_warm_sessions = []
+            self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
             return {
                 "reachable": False,
                 "compute_units": self._last_cu_balance,
                 "active_sessions": 0,
                 "running_job_id": None,
                 "drive_folders": None,
+                "warm_sessions": [],
                 "error": err,
             }
 
@@ -521,11 +732,187 @@ class ColabComputeHub:
             "daily_cu_budget": self.config.daily_cu_budget,
         }
 
+    async def _compute_analytics(
+        self,
+        warm_sessions: list[dict[str, Any]],
+        warm_pool: dict[str, Any],
+    ) -> dict[str, Any]:
+        tz = ZoneInfo(self.s.bot_timezone)
+        today_date = datetime.fromtimestamp(self._clock(), tz).date()
+        days_30 = [
+            (today_date - timedelta(days=offset)).isoformat() for offset in range(29, -1, -1)
+        ]
+        start_day, end_day = days_30[0], days_30[-1]
+
+        async with self.store.lock:
+            summary_row = await self.store.one(
+                "SELECT "
+                "COUNT(*) AS total_jobs, "
+                "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) "
+                "AS succeeded_jobs, "
+                "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) "
+                "AS failed_jobs, "
+                "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) "
+                "AS cancelled_jobs, "
+                "COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) "
+                "AS running_jobs, "
+                "COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) "
+                "AS queued_jobs, "
+                "COALESCE(SUM(cu_used), 0.0) AS total_cu_used "
+                "FROM colab_jobs"
+            )
+            trend_rows = await self.store.all(
+                "SELECT "
+                "day, "
+                "COUNT(*) AS jobs, "
+                "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded, "
+                "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed, "
+                "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled, "
+                "COALESCE(SUM(cu_used), 0.0) AS cu_used "
+                "FROM colab_jobs "
+                "WHERE day >= ? AND day <= ? "
+                "GROUP BY day",
+                (start_day, end_day),
+            )
+            gpu_rows = await self.store.all(
+                "SELECT "
+                "COALESCE(NULLIF(assigned_gpu, ''), preferred_gpu) AS gpu, "
+                "COUNT(*) AS jobs, "
+                "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded, "
+                "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed, "
+                "COALESCE(SUM(cu_used), 0.0) AS cu_used "
+                "FROM colab_jobs "
+                "WHERE status != 'cancelled' OR started_at IS NOT NULL "
+                "GROUP BY COALESCE(NULLIF(assigned_gpu, ''), preferred_gpu) "
+                "ORDER BY cu_used DESC, jobs DESC, gpu ASC"
+            )
+            acc_rows = await self.store.all(
+                "SELECT id, result FROM colab_jobs "
+                "WHERE status NOT IN ('queued', 'running') "
+                "ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, created_at DESC "
+                "LIMIT ?",
+                (_ACCELERATION_SAMPLE_LIMIT,),
+            )
+
+        trend_map: dict[str, Any] = {str(r["day"]): r for r in trend_rows}
+        cu_trend: list[dict[str, Any]] = []
+        raw_cu_by_day: list[float] = []
+        for day_str in days_30:
+            row = trend_map.get(day_str)
+            if row is None:
+                raw_cu_by_day.append(0.0)
+                cu_trend.append(
+                    {
+                        "date": day_str,
+                        "jobs": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "cancelled": 0,
+                        "cu_used": 0.0,
+                    }
+                )
+            else:
+                raw_cu = float(row["cu_used"] or 0.0)
+                raw_cu_by_day.append(raw_cu)
+                cu_trend.append(
+                    {
+                        "date": day_str,
+                        "jobs": int(row["jobs"] or 0),
+                        "succeeded": int(row["succeeded"] or 0),
+                        "failed": int(row["failed"] or 0),
+                        "cancelled": int(row["cancelled"] or 0),
+                        "cu_used": round(raw_cu, 4),
+                    }
+                )
+
+        total_jobs = int(summary_row["total_jobs"] or 0) if summary_row else 0
+        succeeded_jobs = int(summary_row["succeeded_jobs"] or 0) if summary_row else 0
+        failed_jobs = int(summary_row["failed_jobs"] or 0) if summary_row else 0
+        cancelled_jobs = int(summary_row["cancelled_jobs"] or 0) if summary_row else 0
+        running_jobs = int(summary_row["running_jobs"] or 0) if summary_row else 0
+        queued_jobs = int(summary_row["queued_jobs"] or 0) if summary_row else 0
+        total_cu_used = float(summary_row["total_cu_used"] or 0.0) if summary_row else 0.0
+        terminal_denom = succeeded_jobs + failed_jobs
+        success_rate = round(succeeded_jobs / terminal_denom, 4) if terminal_denom > 0 else None
+
+        summary = {
+            "total_jobs": total_jobs,
+            "succeeded_jobs": succeeded_jobs,
+            "failed_jobs": failed_jobs,
+            "cancelled_jobs": cancelled_jobs,
+            "running_jobs": running_jobs,
+            "queued_jobs": queued_jobs,
+            "success_rate": success_rate,
+            "total_cu_used": round(total_cu_used, 4),
+            "last_14d_cu_used": round(sum(raw_cu_by_day[-14:]), 4),
+            "last_30d_cu_used": round(sum(raw_cu_by_day), 4),
+            "last_14d_jobs": sum(item["jobs"] for item in cu_trend[-14:]),
+            "last_30d_jobs": sum(item["jobs"] for item in cu_trend),
+        }
+
+        total_gpu_cu = sum(float(r["cu_used"] or 0.0) for r in gpu_rows)
+        gpu_breakdown: list[dict[str, Any]] = []
+        for row in gpu_rows:
+            raw_cu = float(row["cu_used"] or 0.0)
+            gpu_breakdown.append(
+                {
+                    "gpu": str(row["gpu"] or ""),
+                    "jobs": int(row["jobs"] or 0),
+                    "succeeded": int(row["succeeded"] or 0),
+                    "failed": int(row["failed"] or 0),
+                    "cu_used": round(raw_cu, 4),
+                    "cu_share": round(raw_cu / total_gpu_cu, 4) if total_gpu_cu > 0.0 else 0.0,
+                }
+            )
+
+        counters = {
+            "drive_direct_jobs": 0,
+            "drive_direct_fallbacks": 0,
+            "warm_reuse_hits": 0,
+            "warm_cold_starts": 0,
+            "cache_weight_hits": 0,
+            "cache_weight_misses": 0,
+            "cache_venv_hits": 0,
+            "cache_venv_misses": 0,
+            "measured_jobs": 0,
+        }
+        for row in acc_rows:
+            blob = row["result"]
+            if not blob:
+                continue
+            opened = self._open_blob(str(row["id"]), "result", blob)
+            if not isinstance(opened, dict):
+                continue
+            acc = opened.get("acceleration")
+            if isinstance(acc, dict) and acc:
+                _accumulate_acceleration(counters, acc)
+
+        acceleration_stats = {
+            "warm_pool_enabled": bool(warm_pool.get("enabled", False)),
+            "warm_allowed_gpus": list(
+                warm_pool.get("allowed_gpus", list(_DEFAULT_WARM_ALLOWED_GPUS))
+            ),
+            "warm_idle_ttl_seconds": int(warm_pool.get("idle_ttl_seconds", 360)),
+            "warm_max_ttl_seconds": int(warm_pool.get("max_ttl_seconds", 900)),
+            "warm_active_count": len(warm_sessions),
+            **counters,
+        }
+
+        return {
+            "summary": summary,
+            "cu_trend": cu_trend,
+            "gpu_breakdown": gpu_breakdown,
+            "warm_sessions": [dict(item) for item in warm_sessions],
+            "acceleration_stats": acceleration_stats,
+        }
+
     async def admin_overview(self) -> dict[str, Any]:
         await self.initialize()
         worker = await self._poll_worker_status()
         today = await self._today_usage()
         jobs = await self.list_jobs(limit=30)
+        warm_sessions = list(worker.get("warm_sessions") or [])
+        analytics = await self._compute_analytics(warm_sessions, self._last_warm_pool)
         return {
             "configured": self.configured(),
             "source": "sqlite" if self._overridden else "default",
@@ -533,6 +920,7 @@ class ColabComputeHub:
             "worker": worker,
             "today": today,
             "jobs": jobs,
+            **analytics,
         }
 
     async def set_config(self, cfg: ColabConfig | None) -> dict[str, Any]:
@@ -757,6 +1145,8 @@ class ColabComputeHub:
             await self._refresh_cached_counts()
 
         self._orphan_seen_since = None
+        self._last_warm_sessions = []
+        self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
         return {
             "terminated_sessions": int(worker_data.get("terminated_sessions") or 0),
             "cancelled_jobs": cancelled_jobs or int(worker_data.get("cancelled_jobs") or 0),
@@ -1111,6 +1501,8 @@ class ColabComputeHub:
                                 await self._request(
                                     "POST", "/v1/sessions/terminate", timeout_sec=20.0
                                 )
+                                self._last_warm_sessions = []
+                                self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
                             except Rejected:
                                 pass
                             self._orphan_seen_since = None
@@ -1147,6 +1539,10 @@ class ColabComputeHub:
                                 "gpu_candidates": gpu_candidates,
                                 "timeout_seconds": self.config.job_timeout_seconds,
                                 "drive_songs_folder_id": self.config.drive_songs_folder_id,
+                                "allow_warm_keepalive": bool(
+                                    self.config.enabled
+                                    and (self.config.daily_cu_budget - usage["cu_used"]) >= 0.5
+                                ),
                                 "payload": next_job["payload"],
                             }
                             try:

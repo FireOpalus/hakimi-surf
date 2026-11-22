@@ -13,11 +13,14 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,10 +32,21 @@ from typing import Any
 DEFAULT_APPLIO_DIR = Path("/content/Applio")
 DEFAULT_RVC_VENV = Path("/content/rvc-venv")
 DEFAULT_SEP_VENV = Path("/content/sep-venv")
+DEFAULT_SEP_MODELS_DIR = Path("/tmp/audio-separator-models")
 DEFAULT_WORK_DIR = Path("/content/work")
 DEFAULT_OUT_DIR = Path("/content/out")
 DEFAULT_CHUNKS_DIR = Path("/content/out_chunks")
 SETUP_MARKER = Path("/content/.hakimi_setup_done")
+
+WEIGHT_CACHE_SCHEMA_VERSION = "v1"
+VENV_CACHE_SCHEMA_VERSION = "v1"
+_WEIGHT_CACHE_EXTS = frozenset(
+    {".ckpt", ".onnx", ".pth", ".pt", ".bin", ".safetensors", ".yaml", ".yml", ".json", ".th"}
+)
+_ALLOWED_VENV_ABS_PYTHON_RE = re.compile(
+    r"^(?:/usr/bin|/usr/local/bin|/opt/conda/bin)/python(?:\d+(?:\.\d+)?)?$"
+    r"|^/root/\.local/share/uv/python/[A-Za-z0-9._-]+/bin/python(?:\d+(?:\.\d+)?)?$"
+)
 
 PRIMARY_SEP_MODELS = (
     "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
@@ -48,6 +62,14 @@ DEREVERB_MODEL = DEREVERB_MODELS[0]
 SUPPORTED_AUDIO_EXTS = frozenset({".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"})
 MAX_CHORUS_BYTES = 1_750_000
 STATUS_PREFIX = "__HAKIMI_COLAB_STATUS__="
+DRIVE_OUTPUTS_PREFIX = "__HAKIMI_DRIVE_OUTPUTS__="
+DRIVE_DIRECT_ERROR_PREFIX = "__HAKIMI_DRIVE_DIRECT_ERROR__="
+CACHE_STATUS_PREFIX = "__HAKIMI_CACHE_STATUS__="
+
+_OAUTH_TOKEN_RE = re.compile(r"(?:ya29\.[A-Za-z0-9._-]+|1//[A-Za-z0-9._-]+)")
+_BEARER_RE = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+_ACTIVE_SECRETS: set[str] = set()
 
 _TRAD_TO_SIMP = str.maketrans(
     "愛淚夢聲憶雲風裏這麼為說還點樣覺過來時間對會沒開關氣離聽見給讓頭臉邊難誰錯變濕積儲記",
@@ -55,8 +77,18 @@ _TRAD_TO_SIMP = str.maketrans(
 )
 
 
+def scrub_secrets(text: Any) -> str:
+    """Redact active short-lived tokens and Google OAuth patterns from logs/errors."""
+    out = str(text or "")
+    out = _OAUTH_TOKEN_RE.sub("[REDACTED]", out)
+    out = _BEARER_RE.sub(r"\1[REDACTED]", out)
+    for sec in sorted((s for s in _ACTIVE_SECRETS if len(s) >= 6), key=len, reverse=True):
+        out = out.replace(sec, "[REDACTED]")
+    return out
+
+
 def log(msg: str) -> None:
-    print(f"[hakimi-colab] {msg}", flush=True)
+    print(f"[hakimi-colab] {scrub_secrets(msg)}", flush=True)
 
 
 def sha256_file(path: Path) -> str:
@@ -159,10 +191,12 @@ def _run(
     capture: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     merged_env = os.environ.copy()
+    merged_env.pop("HAKIMI_DRIVE_ACCESS_TOKEN", None)
     merged_env.setdefault("PYTHONUNBUFFERED", "1")
     merged_env["MPLBACKEND"] = "Agg"
     if env:
         merged_env.update(env)
+        merged_env.pop("HAKIMI_DRIVE_ACCESS_TOKEN", None)
     log(f"$ {' '.join(cmd)}")
     if capture:
         return subprocess.run(
@@ -515,18 +549,759 @@ def _detect_mean_volume_db(path: Path) -> float:
     return float(match.group(1))
 
 
+def _sanitize_cache_token(value: str, fallback: str = "unknown") -> str:
+    cleaned = re.sub(r"[^a-z0-9._-]+", "", value.strip().lower())
+    return cleaned[:32] or fallback
+
+
+def compute_weight_cache_key(mode: str = "cover") -> str:
+    """Deterministic version key for high-frequency RVC + audio-separator weights."""
+    norm_mode = "cover" if str(mode or "").strip().lower() == "cover" else "all"
+    spec = {
+        "schema": WEIGHT_CACHE_SCHEMA_VERSION,
+        "mode": norm_mode,
+        "primary_sep": list(PRIMARY_SEP_MODELS),
+        "karaoke_sep": list(KARAOKE_SEP_MODELS),
+        "dereverb": list(DEREVERB_MODELS),
+        "applio_f0": "rmvpe",
+        "applio_embedder": "contentvec",
+    }
+    digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"weights_{norm_mode}_{digest[:12]}"
+
+
+def _detect_os_id() -> str:
+    os_release = Path("/etc/os-release")
+    if os_release.is_file():
+        vals: dict[str, str] = {}
+        for line in os_release.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip().strip('"').strip("'")
+        distro = vals.get("ID", "")
+        ver = vals.get("VERSION_ID", "")
+        if distro:
+            return _sanitize_cache_token(f"{distro}{ver}")
+    return _sanitize_cache_token(platform.system(), "unknown")
+
+
+def _detect_cuda_version(nvidia_smi_output: str = "") -> str:
+    if nvidia_smi_output:
+        match = re.search(r"CUDA Version:\s*([0-9]+\.[0-9]+)", nvidia_smi_output)
+        if match:
+            return _sanitize_cache_token(match.group(1))
+    cuda_json = Path("/usr/local/cuda/version.json")
+    if cuda_json.is_file():
+        try:
+            data = json.loads(cuda_json.read_text(encoding="utf-8"))
+            ver = str((data.get("cuda") or {}).get("version") or "")
+            if ver:
+                parts = ver.split(".")
+                return _sanitize_cache_token(".".join(parts[:2]))
+        except Exception:
+            pass
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0:
+            match = re.search(r"CUDA Version:\s*([0-9]+\.[0-9]+)", proc.stdout or "")
+            if match:
+                return _sanitize_cache_token(match.group(1))
+    except Exception:
+        pass
+    return "unknown"
+
+
+def compute_runtime_fingerprint(
+    *,
+    python_version: str = "",
+    cuda_version: str = "",
+    os_id: str = "",
+    arch: str = "",
+    nvidia_smi_output: str = "",
+) -> str:
+    """Compute base-image fingerprint (`os_arch_pyX.Y_cudaA.B`) gating venv cache reuse."""
+    py = _sanitize_cache_token(
+        python_version or f"{sys.version_info.major}.{sys.version_info.minor}"
+    )
+    os_tok = _sanitize_cache_token(os_id or _detect_os_id())
+    arch_tok = _sanitize_cache_token(arch or platform.machine())
+    cuda_tok = _sanitize_cache_token(cuda_version or _detect_cuda_version(nvidia_smi_output))
+    return f"{os_tok}_{arch_tok}_py{py}_cuda{cuda_tok}"
+
+
+def compute_venv_cache_key(fingerprint: str, *, req_hash: str = "") -> str:
+    """Deterministic version key for Python virtualenv cache bound to runtime fingerprint."""
+    safe_fp = re.sub(r"[^a-z0-9._-]+", "_", fingerprint.strip().lower()).strip("_") or "unknown"
+    spec = {
+        "schema": VENV_CACHE_SCHEMA_VERSION,
+        "fingerprint": safe_fp,
+        "req_hash": req_hash.strip().lower(),
+    }
+    digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"venv_{safe_fp[:48]}_{digest[:10]}"
+
+
+def _requirements_fingerprint(applio_dir: Path) -> str:
+    req_file = applio_dir / "requirements-engine.txt"
+    if not req_file.is_file():
+        return ""
+    return sha256_file(req_file)[:16]
+
+
+def _has_applio_pretrained_weights(applio_dir: Path, mode: str = "cover") -> bool:
+    """Check whether essential RMVPE + ContentVec (and HiFi-GAN for train) weights exist."""
+    search_roots = [applio_dir / "rvc" / "models", applio_dir / "assets"]
+    found_names: list[str] = []
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*"):
+            if p.is_file() and p.stat().st_size > 0:
+                found_names.append(p.as_posix().lower())
+    has_rmvpe = any(
+        "rmvpe" in name and name.endswith((".pt", ".pth", ".onnx")) for name in found_names
+    )
+    has_contentvec = any(
+        "contentvec" in name and name.endswith((".bin", ".pt", ".pth", ".safetensors"))
+        for name in found_names
+    )
+    if not (has_rmvpe and has_contentvec):
+        return False
+    if str(mode or "").strip().lower() != "cover":
+        has_hifigan = any("pretrained" in name and name.endswith(".pth") for name in found_names)
+        if not has_hifigan:
+            return False
+    return True
+
+
+def pack_weight_cache(
+    output_tar: Path,
+    *,
+    applio_dir: Path = DEFAULT_APPLIO_DIR,
+    sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
+) -> dict[str, Any]:
+    """Pack high-frequency separation + Applio pretrained weights into an uncompressed tar."""
+    entries: list[tuple[Path, str]] = []
+    sep_count = 0
+    applio_count = 0
+
+    if sep_models_dir.is_dir():
+        for p in sorted(sep_models_dir.rglob("*")):
+            if (
+                p.is_file()
+                and not p.is_symlink()
+                and not p.name.startswith(".")
+                and p.suffix.lower() in _WEIGHT_CACHE_EXTS
+            ):
+                rel = p.relative_to(sep_models_dir).as_posix()
+                entries.append((p, f"sep_models/{rel}"))
+                sep_count += 1
+
+    applio_rvc_models = applio_dir / "rvc" / "models"
+    if applio_rvc_models.is_dir():
+        for p in sorted(applio_rvc_models.rglob("*")):
+            if (
+                p.is_file()
+                and not p.is_symlink()
+                and not p.name.startswith(".")
+                and p.suffix.lower() in _WEIGHT_CACHE_EXTS
+            ):
+                rel = p.relative_to(applio_rvc_models).as_posix()
+                entries.append((p, f"applio_rvc_models/{rel}"))
+                applio_count += 1
+
+    applio_assets = applio_dir / "assets"
+    if applio_assets.is_dir():
+        for p in sorted(applio_assets.rglob("*")):
+            if (
+                p.is_file()
+                and not p.is_symlink()
+                and not p.name.startswith(".")
+                and p.suffix.lower() in _WEIGHT_CACHE_EXTS
+            ):
+                rel = p.relative_to(applio_assets).as_posix()
+                entries.append((p, f"applio_assets/{rel}"))
+                applio_count += 1
+
+    if not entries:
+        raise FileNotFoundError("No weight files found to pack into cache archive")
+
+    output_tar.parent.mkdir(parents=True, exist_ok=True)
+    tmp_tar = output_tar.with_suffix(output_tar.suffix + ".tmp")
+    try:
+        with tarfile.open(tmp_tar, "w") as tf:
+            for src_path, arcname in entries:
+                tf.add(src_path, arcname=arcname, recursive=False)
+        tmp_tar.replace(output_tar)
+    finally:
+        tmp_tar.unlink(missing_ok=True)
+
+    return {
+        "path": output_tar,
+        "sha256": sha256_file(output_tar),
+        "size": output_tar.stat().st_size,
+        "file_count": len(entries),
+        "sep_model_files": sep_count,
+        "applio_model_files": applio_count,
+    }
+
+
+def restore_weight_cache(
+    tar_path: Path,
+    *,
+    expected_sha256: str = "",
+    applio_dir: Path = DEFAULT_APPLIO_DIR,
+    sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
+) -> dict[str, Any]:
+    """Verify SHA-256 and safely restore cached separation + Applio weights."""
+    if not tar_path.is_file():
+        raise FileNotFoundError(f"Weight cache archive missing: {tar_path}")
+    actual_sha = sha256_file(tar_path)
+    if expected_sha256:
+        if not _SHA256_RE.fullmatch(expected_sha256.strip()) or (
+            actual_sha.lower() != expected_sha256.strip().lower()
+        ):
+            raise ValueError("weight_cache_sha256_mismatch")
+
+    allowed_roots = {
+        "sep_models": sep_models_dir,
+        "applio_rvc_models": applio_dir / "rvc" / "models",
+        "applio_assets": applio_dir / "assets",
+    }
+    restored = 0
+    sep_restored = 0
+    applio_restored = 0
+
+    with tempfile.TemporaryDirectory(prefix="hakimi_wcache_", dir=tar_path.parent) as stage_str:
+        stage_root = Path(stage_str).resolve()
+        with tarfile.open(tar_path, "r:*") as tf:
+            members = tf.getmembers()
+            for member in members:
+                if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                    raise ValueError(f"Unsafe member in weight cache archive: {member.name}")
+                clean_parts = Path(member.name).parts
+                if (
+                    not clean_parts
+                    or clean_parts[0] not in allowed_roots
+                    or any(part in {"..", "/"} for part in clean_parts)
+                ):
+                    raise ValueError(f"Disallowed path in weight cache archive: {member.name}")
+                target = (stage_root / member.name).resolve()
+                if not target.is_relative_to(stage_root):
+                    raise ValueError(f"Path traversal in weight cache archive: {member.name}")
+            if hasattr(tarfile, "data_filter"):
+                tf.extractall(stage_root, filter="data")
+            else:
+                tf.extractall(stage_root)
+
+        for prefix, dest_base in allowed_roots.items():
+            src_sub = stage_root / prefix
+            if not src_sub.is_dir():
+                continue
+            for item in sorted(src_sub.rglob("*")):
+                if not item.is_file():
+                    continue
+                rel = item.relative_to(src_sub)
+                dst = dest_base / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(item), str(dst))
+                restored += 1
+                if prefix == "sep_models":
+                    sep_restored += 1
+                else:
+                    applio_restored += 1
+
+    if restored == 0:
+        raise ValueError("weight_cache_empty")
+    return {
+        "file_count": restored,
+        "sep_model_files": sep_restored,
+        "applio_model_files": applio_restored,
+        "sha256": actual_sha,
+    }
+
+
+def _normalize_venv_member_parts(raw_name: str) -> tuple[str, ...]:
+    if not raw_name or raw_name.startswith("/") or "\\" in raw_name:
+        raise ValueError(f"Disallowed path in venv cache archive: {raw_name}")
+    raw_parts = raw_name.split("/")
+    cleaned: list[str] = []
+    for part in raw_parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError(f"Disallowed path in venv cache archive: {raw_name}")
+        cleaned.append(part)
+    if not cleaned or cleaned[0] not in {"rvc-venv", "sep-venv"}:
+        raise ValueError(f"Disallowed path in venv cache archive: {raw_name}")
+    return tuple(cleaned)
+
+
+def _is_safe_venv_symlink(
+    parts: tuple[str, ...],
+    linkname: str,
+    stage_root: Path,
+) -> bool:
+    if not linkname or "\x00" in linkname or "\\" in linkname:
+        return False
+    if os.path.isabs(linkname):
+        # Absolute symlinks are allowed ONLY directly under <venv>/bin/ pointing to an exact
+        # system/uv Python executable (never a directory prefix or arbitrary binary).
+        if len(parts) != 3 or parts[1] != "bin":
+            return False
+        if ".." in linkname.split("/") or linkname.endswith("/"):
+            return False
+        norm = os.path.normpath(linkname)
+        return bool(_ALLOWED_VENV_ABS_PYTHON_RE.fullmatch(norm))
+    top_root = (stage_root / parts[0]).resolve()
+    link_parent = stage_root.joinpath(*parts[:-1])
+    resolved = Path(os.path.normpath(str(link_parent / linkname)))
+    return resolved.is_relative_to(top_root)
+
+
+def pack_venv_cache(
+    output_tar: Path,
+    *,
+    rvc_venv: Path = DEFAULT_RVC_VENV,
+    sep_venv: Path = DEFAULT_SEP_VENV,
+    fingerprint: str,
+) -> dict[str, Any]:
+    """Pack `rvc-venv` and `sep-venv` into a gzipped tarball bound to runtime fingerprint."""
+    if not fingerprint or "unknown" in fingerprint:
+        raise ValueError("venv_fingerprint_unknown")
+    if not (rvc_venv / "bin" / "python").exists() or not (sep_venv / "bin" / "python").exists():
+        raise FileNotFoundError("Virtualenvs incomplete for cache packaging")
+    output_tar.parent.mkdir(parents=True, exist_ok=True)
+    tmp_tar = output_tar.with_suffix(output_tar.suffix + ".tmp")
+    try:
+        with tarfile.open(tmp_tar, "w:gz", compresslevel=1) as tf:
+            tf.add(rvc_venv, arcname="rvc-venv", recursive=True)
+            tf.add(sep_venv, arcname="sep-venv", recursive=True)
+        tmp_tar.replace(output_tar)
+    finally:
+        tmp_tar.unlink(missing_ok=True)
+    return {
+        "path": output_tar,
+        "sha256": sha256_file(output_tar),
+        "size": output_tar.stat().st_size,
+        "fingerprint": fingerprint,
+    }
+
+
+def restore_venv_cache(
+    tar_path: Path,
+    *,
+    expected_sha256: str,
+    expected_fingerprint: str,
+    actual_fingerprint: str,
+    rvc_venv: Path = DEFAULT_RVC_VENV,
+    sep_venv: Path = DEFAULT_SEP_VENV,
+) -> dict[str, Any]:
+    """Restore cached virtualenvs ONLY when base image fingerprint & SHA-256 match exactly."""
+    if (
+        not actual_fingerprint
+        or not expected_fingerprint
+        or "unknown" in actual_fingerprint
+        or actual_fingerprint != expected_fingerprint
+    ):
+        raise ValueError("venv_fingerprint_mismatch")
+    if not tar_path.is_file():
+        raise FileNotFoundError(f"Venv cache archive missing: {tar_path}")
+    actual_sha = sha256_file(tar_path)
+    if not _SHA256_RE.fullmatch(expected_sha256.strip()) or (
+        actual_sha.lower() != expected_sha256.strip().lower()
+    ):
+        raise ValueError("venv_cache_sha256_mismatch")
+
+    with tempfile.TemporaryDirectory(prefix="hakimi_vcache_", dir=tar_path.parent) as stage_str:
+        stage_root = Path(stage_str).resolve()
+        with tarfile.open(tar_path, "r:*") as tf:
+            members = tf.getmembers()
+            validated: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
+            symlink_paths: set[tuple[str, ...]] = set()
+            non_symlink_paths: set[tuple[str, ...]] = set()
+
+            for member in members:
+                if member.islnk() or member.isdev() or member.isfifo():
+                    raise ValueError(f"Unsafe member in venv cache archive: {member.name}")
+                if not (member.isdir() or member.isreg() or member.issym()):
+                    raise ValueError(f"Unsafe member in venv cache archive: {member.name}")
+                parts = _normalize_venv_member_parts(member.name)
+                target = Path(os.path.normpath(str(stage_root.joinpath(*parts))))
+                if not target.is_relative_to(stage_root):
+                    raise ValueError(f"Path traversal in venv cache archive: {member.name}")
+                if member.issym():
+                    if not _is_safe_venv_symlink(parts, member.linkname or "", stage_root):
+                        raise ValueError(f"Unsafe symlink in venv cache archive: {member.name}")
+                    if parts in non_symlink_paths:
+                        raise ValueError(f"Symlink collision in venv cache archive: {member.name}")
+                    symlink_paths.add(parts)
+                else:
+                    if parts in symlink_paths:
+                        raise ValueError(f"Symlink collision in venv cache archive: {member.name}")
+                    non_symlink_paths.add(parts)
+                validated.append((member, parts))
+
+            # Reject any member whose parent directory traverses a symlink entry.
+            for member, parts in validated:
+                for depth in range(1, len(parts)):
+                    if parts[:depth] in symlink_paths:
+                        raise ValueError(
+                            f"Path traverses symlink in venv cache archive: {member.name}"
+                        )
+
+            # Extract directories and regular files first; materialize validated symlinks last.
+            for member, parts in validated:
+                if member.issym():
+                    continue
+                dest = stage_root.joinpath(*parts)
+                if member.isdir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if not dest.parent.resolve().is_relative_to(stage_root):
+                    raise ValueError(f"Path traversal in venv cache archive: {member.name}")
+                src_fp = tf.extractfile(member)
+                if src_fp is None:
+                    raise ValueError(f"Unreadable member in venv cache archive: {member.name}")
+                with src_fp, dest.open("wb") as out_fp:
+                    shutil.copyfileobj(src_fp, out_fp, length=1024 * 1024)
+                mode = 0o755 if (member.mode & 0o111) else 0o644
+                os.chmod(dest, mode)
+
+            for member, parts in validated:
+                if not member.issym():
+                    continue
+                dest = stage_root.joinpath(*parts)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if not dest.parent.resolve().is_relative_to(stage_root):
+                    raise ValueError(f"Path traversal in venv cache archive: {member.name}")
+                if os.path.lexists(dest):
+                    dest.unlink()
+                os.symlink(member.linkname, dest)
+
+        staged_rvc = stage_root / "rvc-venv"
+        staged_sep = stage_root / "sep-venv"
+        if not os.path.lexists(staged_rvc / "bin" / "python") or not os.path.lexists(
+            staged_sep / "bin" / "python"
+        ):
+            raise ValueError("venv_cache_incomplete")
+
+        for staged, dst in ((staged_rvc, rvc_venv), (staged_sep, sep_venv)):
+            if dst.exists():
+                shutil.rmtree(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged), str(dst))
+
+    return {"fingerprint": actual_fingerprint, "sha256": actual_sha}
+
+
+def _try_restore_weight_cache_from_drive(
+    *,
+    drive_token: str,
+    cache_folder_id: str,
+    weight_cache_key: str,
+    applio_dir: Path,
+    sep_models_dir: Path,
+    work_dir: Path,
+    explicit_file_id: str = "",
+    explicit_sha256: str = "",
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """Attempt direct Drive restore of version-keyed weights cache; returns (hit, reason, info)."""
+    archive_id = explicit_file_id.strip()
+    expected_sha = explicit_sha256.strip().lower()
+    manifest_info: dict[str, Any] = {}
+    try:
+        if not archive_id:
+            if not cache_folder_id:
+                return False, "cache_folder_unconfigured", {}
+            entry = _drive_find_file_in_folder(
+                drive_token, cache_folder_id, f"{weight_cache_key}.manifest.json"
+            )
+            if entry is None:
+                return False, "cache_miss", {}
+            manifest_info = _drive_download_json(drive_token, entry["id"])
+            if str(manifest_info.get("version_key") or "") != weight_cache_key:
+                return False, "version_mismatch", {}
+            if str(manifest_info.get("kind") or "") != "weights":
+                return False, "kind_mismatch", {}
+            archive_id = str(manifest_info.get("archive_file_id") or "").strip()
+            expected_sha = str(manifest_info.get("sha256") or "").strip().lower()
+        if not archive_id or not _SHA256_RE.fullmatch(expected_sha):
+            return False, "manifest_invalid", {}
+
+        cache_tmp = work_dir / "_cache_dl"
+        cache_tmp.mkdir(parents=True, exist_ok=True)
+        tar_path = cache_tmp / f"{weight_cache_key}.tar"
+        try:
+            _drive_download_to_path(drive_token, archive_id, tar_path)
+            info = restore_weight_cache(
+                tar_path,
+                expected_sha256=expected_sha,
+                applio_dir=applio_dir,
+                sep_models_dir=sep_models_dir,
+            )
+            log(
+                f"Weight cache HIT ({weight_cache_key}): restored {info['file_count']} file(s) "
+                f"(sep={info['sep_model_files']}, applio={info['applio_model_files']})."
+            )
+            return True, None, info
+        finally:
+            tar_path.unlink(missing_ok=True)
+    except Exception as exc:
+        reason = scrub_secrets(f"{type(exc).__name__}:{exc}")[:120]
+        log(f"Weight cache fallback ({weight_cache_key}): {reason}")
+        return False, reason, {}
+
+
+def _try_restore_venv_cache_from_drive(
+    *,
+    drive_token: str,
+    cache_folder_id: str,
+    venv_cache_key: str,
+    actual_fingerprint: str,
+    rvc_venv: Path,
+    sep_venv: Path,
+    work_dir: Path,
+    explicit_file_id: str = "",
+    explicit_sha256: str = "",
+    explicit_fingerprint: str = "",
+) -> tuple[bool, str | None]:
+    """Attempt direct Drive restore of fingerprint-matched virtualenv cache."""
+    if not actual_fingerprint or "unknown" in actual_fingerprint:
+        return False, "fingerprint_unknown"
+    archive_id = explicit_file_id.strip()
+    expected_sha = explicit_sha256.strip().lower()
+    expected_fp = explicit_fingerprint.strip()
+    try:
+        if archive_id:
+            if expected_fp != actual_fingerprint:
+                log(
+                    f"Venv cache fingerprint mismatch: expected={expected_fp}, "
+                    f"actual={actual_fingerprint}; falling back to clean install."
+                )
+                return False, "fingerprint_mismatch"
+        else:
+            if not cache_folder_id:
+                return False, "cache_folder_unconfigured"
+            entry = _drive_find_file_in_folder(
+                drive_token, cache_folder_id, f"{venv_cache_key}.manifest.json"
+            )
+            if entry is None:
+                return False, "cache_miss"
+            manifest = _drive_download_json(drive_token, entry["id"])
+            if str(manifest.get("version_key") or "") != venv_cache_key:
+                return False, "version_mismatch"
+            if str(manifest.get("kind") or "") != "venv":
+                return False, "kind_mismatch"
+            expected_fp = str(manifest.get("fingerprint") or "").strip()
+            if expected_fp != actual_fingerprint:
+                return False, "fingerprint_mismatch"
+            archive_id = str(manifest.get("archive_file_id") or "").strip()
+            expected_sha = str(manifest.get("sha256") or "").strip().lower()
+
+        if not archive_id or not _SHA256_RE.fullmatch(expected_sha):
+            return False, "manifest_invalid"
+
+        cache_tmp = work_dir / "_cache_dl"
+        cache_tmp.mkdir(parents=True, exist_ok=True)
+        tar_path = cache_tmp / f"{venv_cache_key}.tar.gz"
+        try:
+            _drive_download_to_path(drive_token, archive_id, tar_path)
+            restore_venv_cache(
+                tar_path,
+                expected_sha256=expected_sha,
+                expected_fingerprint=expected_fp,
+                actual_fingerprint=actual_fingerprint,
+                rvc_venv=rvc_venv,
+                sep_venv=sep_venv,
+            )
+            log(f"Venv cache HIT ({venv_cache_key}, fp={actual_fingerprint}).")
+            return True, None
+        finally:
+            tar_path.unlink(missing_ok=True)
+    except Exception as exc:
+        reason = scrub_secrets(f"{type(exc).__name__}:{exc}")[:120]
+        log(f"Venv cache fallback ({venv_cache_key}): {reason}")
+        return False, reason
+
+
+def _writeback_weight_cache_to_drive(
+    *,
+    drive_token: str,
+    cache_folder_id: str,
+    weight_cache_key: str,
+    applio_dir: Path,
+    sep_models_dir: Path,
+    work_dir: Path,
+) -> bool:
+    """Atomically write weight tarball first, then commit manifest JSON to Hakimi_Songs/cache/."""
+    if not drive_token or not cache_folder_id:
+        return False
+    cache_tmp = work_dir / "_cache_wb"
+    cache_tmp.mkdir(parents=True, exist_ok=True)
+    tar_path = cache_tmp / f"{weight_cache_key}.tar"
+    try:
+        packed = pack_weight_cache(
+            tar_path,
+            applio_dir=applio_dir,
+            sep_models_dir=sep_models_dir,
+        )
+        archive_name = f"{weight_cache_key}_{packed['sha256'][:8]}.tar"
+        up = _drive_upload_from_path(
+            drive_token,
+            cache_folder_id,
+            tar_path,
+            archive_name,
+            "application/x-tar",
+            replace_existing=True,
+            app_properties={
+                "hakimi_songs_role": "cache",
+                "cache_kind": "weights",
+                "cache_key": weight_cache_key[:100],
+            },
+        )
+        manifest = {
+            "schema": WEIGHT_CACHE_SCHEMA_VERSION,
+            "kind": "weights",
+            "version_key": weight_cache_key,
+            "archive_file_id": up["file_id"],
+            "archive_name": up["name"],
+            "sha256": packed["sha256"],
+            "size": packed["size"],
+            "file_count": packed["file_count"],
+            "sep_model_files": packed["sep_model_files"],
+            "applio_model_files": packed["applio_model_files"],
+            "created_at": int(time.time()),
+        }
+        _drive_upload_json(
+            drive_token,
+            cache_folder_id,
+            f"{weight_cache_key}.manifest.json",
+            manifest,
+            replace_existing=True,
+            app_properties={"hakimi_songs_role": "cache", "cache_key": weight_cache_key[:100]},
+        )
+        log(
+            f"Weight cache atomic writeback committed: {weight_cache_key} "
+            f"({packed['size']} B, files={packed['file_count']})"
+        )
+        return True
+    except Exception as exc:
+        log(f"Warning: weight cache writeback skipped ({type(exc).__name__}: {exc})")
+        return False
+    finally:
+        tar_path.unlink(missing_ok=True)
+
+
+def _writeback_venv_cache_to_drive(
+    *,
+    drive_token: str,
+    cache_folder_id: str,
+    venv_cache_key: str,
+    fingerprint: str,
+    rvc_venv: Path,
+    sep_venv: Path,
+    work_dir: Path,
+) -> bool:
+    """Atomically write fingerprint-bound venv tarball first, then commit manifest JSON."""
+    if not drive_token or not cache_folder_id or not fingerprint or "unknown" in fingerprint:
+        return False
+    cache_tmp = work_dir / "_cache_wb"
+    cache_tmp.mkdir(parents=True, exist_ok=True)
+    tar_path = cache_tmp / f"{venv_cache_key}.tar.gz"
+    try:
+        packed = pack_venv_cache(
+            tar_path,
+            rvc_venv=rvc_venv,
+            sep_venv=sep_venv,
+            fingerprint=fingerprint,
+        )
+        archive_name = f"{venv_cache_key}_{packed['sha256'][:8]}.tar.gz"
+        up = _drive_upload_from_path(
+            drive_token,
+            cache_folder_id,
+            tar_path,
+            archive_name,
+            "application/gzip",
+            replace_existing=True,
+            app_properties={
+                "hakimi_songs_role": "cache",
+                "cache_kind": "venv",
+                "cache_key": venv_cache_key[:100],
+            },
+        )
+        manifest = {
+            "schema": VENV_CACHE_SCHEMA_VERSION,
+            "kind": "venv",
+            "version_key": venv_cache_key,
+            "fingerprint": fingerprint,
+            "archive_file_id": up["file_id"],
+            "archive_name": up["name"],
+            "sha256": packed["sha256"],
+            "size": packed["size"],
+            "created_at": int(time.time()),
+        }
+        _drive_upload_json(
+            drive_token,
+            cache_folder_id,
+            f"{venv_cache_key}.manifest.json",
+            manifest,
+            replace_existing=True,
+            app_properties={"hakimi_songs_role": "cache", "cache_key": venv_cache_key[:100]},
+        )
+        log(f"Venv cache atomic writeback committed: {venv_cache_key} ({packed['size']} B)")
+        return True
+    except Exception as exc:
+        log(f"Warning: venv cache writeback skipped ({type(exc).__name__}: {exc})")
+        return False
+    finally:
+        tar_path.unlink(missing_ok=True)
+
+
 def action_setup(
     *,
     applio_dir: Path = DEFAULT_APPLIO_DIR,
     rvc_venv: Path = DEFAULT_RVC_VENV,
     sep_venv: Path = DEFAULT_SEP_VENV,
+    sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
     force: bool = False,
     mode: str = "all",
-) -> None:
+    drive_token: str = "",
+    cache_folder_id: str = "",
+    cache_weights_file_id: str = "",
+    cache_weights_sha256: str = "",
+    cache_venv_enabled: bool = False,
+    cache_venv_file_id: str = "",
+    cache_venv_sha256: str = "",
+    cache_venv_fingerprint: str = "",
+    cache_writeback: bool = False,
+) -> dict[str, Any]:
     """Provision GPU check, ffmpeg, uv, Applio + rvc-venv, and audio-separator sep-venv."""
+    weight_cache_key = compute_weight_cache_key(mode)
+    cache_status: dict[str, Any] = {
+        "setup_skipped_warm": False,
+        "weight_cache_key": weight_cache_key,
+        "weight_cache_hit": None,
+        "weight_cache_written": False,
+        "weight_cache_has_sep_models": False,
+        "weight_fallback_reason": None,
+        "venv_cache_hit": None,
+        "venv_cache_written": False,
+        "venv_fallback_reason": None,
+        "runtime_fingerprint": "",
+    }
     if SETUP_MARKER.is_file() and not force and rvc_venv.exists() and sep_venv.exists():
         log("Setup marker already present; skipping environment reinstall.")
-        return
+        cache_status["setup_skipped_warm"] = True
+        return cache_status
 
     gpu_proc = _run(["nvidia-smi"], check=False, capture=True)
     if gpu_proc.returncode != 0:
@@ -535,6 +1310,9 @@ def action_setup(
             "Please allocate a GPU runtime (T4/L4)."
         )
     log((gpu_proc.stdout or "").splitlines()[0] if gpu_proc.stdout else "GPU verified.")
+
+    actual_fp = compute_runtime_fingerprint(nvidia_smi_output=gpu_proc.stdout or "")
+    cache_status["runtime_fingerprint"] = actual_fp
 
     _ensure_ffmpeg()
     uv_bin = _ensure_uv()
@@ -552,66 +1330,148 @@ def action_setup(
             ]
         )
 
-    if not (rvc_venv / "bin" / "python").is_file():
-        log(f"Creating {rvc_venv} (Python 3.12)...")
-        _run([uv_bin, "venv", "--python", "3.12", str(rvc_venv)])
-    rvc_py = str(rvc_venv / "bin" / "python")
-    req_file = applio_dir / "requirements-engine.txt"
-    log("Installing Applio engine dependencies into rvc-venv...")
-    _run([uv_bin, "pip", "install", "--python", rvc_py, "-r", str(req_file), "scikit-learn"])
+    venv_cache_key = compute_venv_cache_key(
+        actual_fp, req_hash=_requirements_fingerprint(applio_dir)
+    )
+    venv_hit = False
+    if cache_venv_enabled and drive_token and (cache_folder_id or cache_venv_file_id):
+        venv_hit, venv_reason = _try_restore_venv_cache_from_drive(
+            drive_token=drive_token,
+            cache_folder_id=cache_folder_id,
+            venv_cache_key=venv_cache_key,
+            actual_fingerprint=actual_fp,
+            rvc_venv=rvc_venv,
+            sep_venv=sep_venv,
+            work_dir=DEFAULT_WORK_DIR,
+            explicit_file_id=cache_venv_file_id,
+            explicit_sha256=cache_venv_sha256,
+            explicit_fingerprint=cache_venv_fingerprint,
+        )
+        cache_status["venv_cache_hit"] = venv_hit
+        cache_status["venv_fallback_reason"] = venv_reason
 
-    pretrain_flag = "--no-pretraineds-hifigan" if mode == "cover" else "--pretraineds-hifigan"
-    log("Downloading Applio pretrained weights & RMVPE/ContentVec...")
-    _run(
-        [
-            rvc_py,
-            str(applio_dir / "core.py"),
-            "prerequisites",
-            pretrain_flag,
-            "--models",
-            "--no-exe",
-        ],
-        cwd=applio_dir,
-        env={"APPLIO_ROOT": str(applio_dir), "APPLIO_LOGS_DIR": str(applio_dir / "logs")},
-    )
+    weight_hit = False
+    weight_info: dict[str, Any] = {}
+    if drive_token and (cache_folder_id or cache_weights_file_id):
+        weight_hit, weight_reason, weight_info = _try_restore_weight_cache_from_drive(
+            drive_token=drive_token,
+            cache_folder_id=cache_folder_id,
+            weight_cache_key=weight_cache_key,
+            applio_dir=applio_dir,
+            sep_models_dir=sep_models_dir,
+            work_dir=DEFAULT_WORK_DIR,
+            explicit_file_id=cache_weights_file_id,
+            explicit_sha256=cache_weights_sha256,
+        )
+        cache_status["weight_cache_hit"] = weight_hit
+        cache_status["weight_fallback_reason"] = weight_reason
+        cache_status["weight_cache_has_sep_models"] = bool(weight_info.get("sep_model_files"))
 
-    if not (sep_venv / "bin" / "python").is_file():
-        log(f"Creating {sep_venv} (Python 3.12)...")
-        _run([uv_bin, "venv", "--python", "3.12", str(sep_venv)])
-    sep_py = str(sep_venv / "bin" / "python")
-    log("Installing audio-separator[gpu] into sep-venv...")
-    _run(
-        [
-            uv_bin,
-            "pip",
-            "install",
-            "--python",
-            sep_py,
-            "audio-separator[gpu]",
-            "audioread",
-            "librosa<1.0",
-            "soundfile",
-            "numpy",
-        ]
-    )
-    _run([sep_py, "-c", "from audio_separator.separator import Separator; print('sep_import_ok')"])
-    log("Installing optional faster-whisper into sep-venv for lyric anchor detection...")
-    fw_proc = _run(
-        [uv_bin, "pip", "install", "--python", sep_py, "faster-whisper"],
-        check=False,
-    )
-    if fw_proc.returncode != 0:
-        log("Warning: faster-whisper install failed; cover will use fallback chorus timestamp.")
+    if not venv_hit:
+        if not (rvc_venv / "bin" / "python").is_file():
+            log(f"Creating {rvc_venv} (Python 3.12)...")
+            _run([uv_bin, "venv", "--python", "3.12", str(rvc_venv)])
+        rvc_py = str(rvc_venv / "bin" / "python")
+        req_file = applio_dir / "requirements-engine.txt"
+        log("Installing Applio engine dependencies into rvc-venv...")
+        _run([uv_bin, "pip", "install", "--python", rvc_py, "-r", str(req_file), "scikit-learn"])
+    else:
+        rvc_py = str(rvc_venv / "bin" / "python")
 
-    log("Restoring onnxruntime-gpu in sep-venv after faster-whisper install...")
-    _run([uv_bin, "pip", "uninstall", "--python", sep_py, "onnxruntime"], check=False)
-    _run(
-        [uv_bin, "pip", "install", "--python", sep_py, "--reinstall", "onnxruntime-gpu"],
-        check=False,
-    )
+    if weight_hit and _has_applio_pretrained_weights(applio_dir, mode=mode):
+        log("Applio pretrained weights restored from Drive cache; skipping prerequisites download.")
+    else:
+        pretrain_flag = "--no-pretraineds-hifigan" if mode == "cover" else "--pretraineds-hifigan"
+        log("Downloading Applio pretrained weights & RMVPE/ContentVec...")
+        _run(
+            [
+                rvc_py,
+                str(applio_dir / "core.py"),
+                "prerequisites",
+                pretrain_flag,
+                "--models",
+                "--no-exe",
+            ],
+            cwd=applio_dir,
+            env={"APPLIO_ROOT": str(applio_dir), "APPLIO_LOGS_DIR": str(applio_dir / "logs")},
+        )
+
+    if not venv_hit:
+        if not (sep_venv / "bin" / "python").is_file():
+            log(f"Creating {sep_venv} (Python 3.12)...")
+            _run([uv_bin, "venv", "--python", "3.12", str(sep_venv)])
+        sep_py = str(sep_venv / "bin" / "python")
+        log("Installing audio-separator[gpu] into sep-venv...")
+        _run(
+            [
+                uv_bin,
+                "pip",
+                "install",
+                "--python",
+                sep_py,
+                "audio-separator[gpu]",
+                "audioread",
+                "librosa<1.0",
+                "soundfile",
+                "numpy",
+            ]
+        )
+        _run(
+            [
+                sep_py,
+                "-c",
+                "from audio_separator.separator import Separator; print('sep_import_ok')",
+            ]
+        )
+        log("Installing optional faster-whisper into sep-venv for lyric anchor detection...")
+        fw_proc = _run(
+            [uv_bin, "pip", "install", "--python", sep_py, "faster-whisper"],
+            check=False,
+        )
+        if fw_proc.returncode != 0:
+            log("Warning: faster-whisper install failed; cover will use fallback chorus timestamp.")
+
+        log("Restoring onnxruntime-gpu in sep-venv after faster-whisper install...")
+        _run([uv_bin, "pip", "uninstall", "--python", sep_py, "onnxruntime"], check=False)
+        _run(
+            [uv_bin, "pip", "install", "--python", sep_py, "--reinstall", "onnxruntime-gpu"],
+            check=False,
+        )
+    else:
+        sep_py = str(sep_venv / "bin" / "python")
+        _run(
+            [
+                sep_py,
+                "-c",
+                "from audio_separator.separator import Separator; print('sep_import_ok')",
+            ]
+        )
 
     SETUP_MARKER.write_text("ok\n", encoding="utf-8")
+
+    if cache_writeback and drive_token and cache_folder_id:
+        if cache_venv_enabled and not venv_hit:
+            cache_status["venv_cache_written"] = _writeback_venv_cache_to_drive(
+                drive_token=drive_token,
+                cache_folder_id=cache_folder_id,
+                venv_cache_key=venv_cache_key,
+                fingerprint=actual_fp,
+                rvc_venv=rvc_venv,
+                sep_venv=sep_venv,
+                work_dir=DEFAULT_WORK_DIR,
+            )
+        if not weight_hit and _has_applio_pretrained_weights(applio_dir, mode=mode):
+            cache_status["weight_cache_written"] = _writeback_weight_cache_to_drive(
+                drive_token=drive_token,
+                cache_folder_id=cache_folder_id,
+                weight_cache_key=weight_cache_key,
+                applio_dir=applio_dir,
+                sep_models_dir=sep_models_dir,
+                work_dir=DEFAULT_WORK_DIR,
+            )
+
     log("Colab GPU environment setup complete.")
+    return cache_status
 
 
 def _normalize_mono_wav(src_path: Path, dst_path: Path, sample_rate: int) -> None:
@@ -889,7 +1749,7 @@ raise RuntimeError(f"All separation models failed: {last_err}")
             str(input_wav),
             str(sep_out_dir),
             json.dumps(list(model_names)),
-            "/tmp/audio-separator-models",
+            str(DEFAULT_SEP_MODELS_DIR),
         ],
         capture=True,
         check=False,
@@ -1358,7 +2218,91 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
-DRIVE_OUTPUTS_PREFIX = "__HAKIMI_DRIVE_OUTPUTS__="
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, D102
+        raise urllib.error.HTTPError(req.full_url, code, "Redirects are forbidden", headers, fp)
+
+
+_DRIVE_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _drive_urlopen(req: urllib.request.Request, *, timeout: float = 120.0):
+    parsed = urllib.parse.urlsplit(req.full_url)
+    if parsed.scheme != "https" or parsed.netloc != "www.googleapis.com":
+        raise ValueError("Disallowed Drive API endpoint")
+    return _DRIVE_OPENER.open(req, timeout=timeout)
+
+
+def _escape_drive_q(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _drive_find_file_in_folder(
+    access_token: str,
+    folder_id: str,
+    filename: str,
+) -> dict[str, Any] | None:
+    clean_folder = re.sub(r"[^A-Za-z0-9_-]", "", folder_id.strip())
+    if not clean_folder or clean_folder != folder_id.strip():
+        raise ValueError("Invalid Drive folder ID")
+    q = (
+        f"'{_escape_drive_q(clean_folder)}' in parents "
+        f"and name = '{_escape_drive_q(filename)}' "
+        "and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    query = urllib.parse.urlencode(
+        {
+            "q": q,
+            "fields": "files(id,name,size,modifiedTime,appProperties)",
+            "pageSize": "5",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        }
+    )
+    req = urllib.request.Request(
+        f"https://www.googleapis.com/drive/v3/files?{query}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    with _drive_urlopen(req, timeout=30.0) as resp:
+        data = json.loads(resp.read(1_048_576).decode("utf-8"))
+    files = data.get("files") or []
+    if not files:
+        return None
+    first = files[0]
+    return {
+        "id": str(first["id"]),
+        "name": str(first.get("name") or filename),
+        "size": int(first["size"]) if str(first.get("size") or "").isdigit() else 0,
+        "app_properties": dict(first.get("appProperties") or {}),
+    }
+
+
+def _drive_download_json(
+    access_token: str,
+    file_id: str,
+    *,
+    max_bytes: int = 262_144,
+) -> dict[str, Any]:
+    clean_id = re.sub(r"[^A-Za-z0-9_-]", "", file_id.strip())
+    if not clean_id or clean_id != file_id.strip():
+        raise ValueError("Invalid Drive file ID")
+    url = f"https://www.googleapis.com/drive/v3/files/{clean_id}?alt=media&supportsAllDrives=true"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+    with _drive_urlopen(req, timeout=30.0) as resp:
+        raw = resp.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("Drive JSON file exceeded limit")
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("Drive JSON payload is not an object")
+    return parsed
 
 
 def _drive_download_to_path(access_token: str, file_id: str, dest_path: Path) -> Path:
@@ -1370,10 +2314,13 @@ def _drive_download_to_path(access_token: str, file_id: str, dest_path: Path) ->
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
-    with urllib.request.urlopen(req, timeout=120) as resp, tmp_path.open("wb") as handle:
-        while chunk := resp.read(1024 * 1024):
-            handle.write(chunk)
-    tmp_path.replace(dest_path)
+    try:
+        with _drive_urlopen(req, timeout=180.0) as resp, tmp_path.open("wb") as handle:
+            while chunk := resp.read(1024 * 1024):
+                handle.write(chunk)
+        tmp_path.replace(dest_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     log(f"Direct Drive download complete -> {dest_path} ({dest_path.stat().st_size} B)")
     return dest_path
 
@@ -1384,94 +2331,209 @@ def _drive_upload_from_path(
     local_path: Path,
     drive_name: str,
     mime_type: str,
+    *,
+    replace_existing: bool = False,
+    app_properties: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Upload a local output artifact directly from Colab to Google Drive."""
+    """Upload a local artifact directly from Colab to Google Drive using bounded streaming."""
     clean_folder = re.sub(r"[^A-Za-z0-9_-]", "", folder_id.strip())
     if not clean_folder or clean_folder != folder_id.strip():
         raise ValueError("Invalid Drive folder ID")
-    data = local_path.read_bytes()
-    if len(data) <= 4 * 1024 * 1024:
-        boundary = f"hakimi_{uuid.uuid4().hex}"
-        meta = json.dumps(
-            {"name": drive_name, "parents": [clean_folder]}, ensure_ascii=False
-        ).encode("utf-8")
-        body = b"".join(
-            [
-                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode(),
-                meta,
-                f"\r\n--{boundary}\r\nContent-Type: {mime_type}\r\n\r\n".encode(),
-                data,
-                f"\r\n--{boundary}--\r\n".encode(),
-            ]
-        )
-        req = urllib.request.Request(
-            "https://www.googleapis.com/upload/drive/v3/files"
-            "?uploadType=multipart&supportsAllDrives=true&fields=id,name,size",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": f"multipart/related; boundary={boundary}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        log(f"Direct Drive upload complete: {drive_name} ({len(data)} B)")
-        return {"file_id": str(result["id"]), "name": str(result.get("name") or drive_name)}
+    total = local_path.stat().st_size
+    if total <= 0:
+        raise ValueError(f"Cannot upload empty file: {local_path}")
 
+    existing_id: str | None = None
+    if replace_existing:
+        existing = _drive_find_file_in_folder(access_token, clean_folder, drive_name)
+        if existing is not None:
+            existing_id = existing["id"]
+
+    meta_obj: dict[str, Any] = {"name": drive_name}
+    if existing_id is None:
+        meta_obj["parents"] = [clean_folder]
+    if app_properties:
+        meta_obj["appProperties"] = {
+            str(k)[:40]: str(v)[:120] for k, v in app_properties.items() if k and v is not None
+        }
+
+    if total <= 4 * 1024 * 1024:
+        data = local_path.read_bytes()
+        if existing_id is not None:
+            req = urllib.request.Request(
+                f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}"
+                "?uploadType=media&supportsAllDrives=true&fields=id,name,size",
+                data=data,
+                method="PATCH",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": mime_type,
+                },
+            )
+            with _drive_urlopen(req, timeout=120.0) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        else:
+            boundary = f"hakimi_{uuid.uuid4().hex}"
+            meta = json.dumps(meta_obj, ensure_ascii=False).encode("utf-8")
+            meta_hdr = (
+                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+            ).encode()
+            body = b"".join(
+                [
+                    meta_hdr,
+                    meta,
+                    f"\r\n--{boundary}\r\nContent-Type: {mime_type}\r\n\r\n".encode(),
+                    data,
+                    f"\r\n--{boundary}--\r\n".encode(),
+                ]
+            )
+            req = urllib.request.Request(
+                "https://www.googleapis.com/upload/drive/v3/files"
+                "?uploadType=multipart&supportsAllDrives=true&fields=id,name,size",
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+            )
+            with _drive_urlopen(req, timeout=120.0) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        log(f"Direct Drive upload complete: {drive_name} ({total} B)")
+        return {
+            "file_id": str(result["id"]),
+            "name": str(result.get("name") or drive_name),
+            "size": total,
+        }
+
+    init_method = "PATCH" if existing_id else "POST"
+    init_base = (
+        f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}"
+        if existing_id
+        else "https://www.googleapis.com/upload/drive/v3/files"
+    )
     init_req = urllib.request.Request(
-        "https://www.googleapis.com/upload/drive/v3/files"
-        "?uploadType=resumable&supportsAllDrives=true&fields=id,name,size",
-        data=json.dumps({"name": drive_name, "parents": [clean_folder]}, ensure_ascii=False).encode(
-            "utf-8"
-        ),
-        method="POST",
+        f"{init_base}?uploadType=resumable&supportsAllDrives=true&fields=id,name,size",
+        data=json.dumps(meta_obj, ensure_ascii=False).encode("utf-8"),
+        method=init_method,
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json; charset=UTF-8",
             "X-Upload-Content-Type": mime_type,
-            "X-Upload-Content-Length": str(len(data)),
+            "X-Upload-Content-Length": str(total),
         },
     )
-    with urllib.request.urlopen(init_req, timeout=60) as resp:
+    with _drive_urlopen(init_req, timeout=60.0) as resp:
         upload_url = resp.headers.get("Location", "")
     if not upload_url.startswith("https://www.googleapis.com/"):
         raise RuntimeError("Drive resumable upload init returned invalid Location")
 
     chunk_size = 4 * 1024 * 1024
     offset = 0
-    total = len(data)
-    while offset < total:
-        end = min(total, offset + chunk_size)
-        chunk = data[offset:end]
-        put_req = urllib.request.Request(
-            upload_url,
-            data=chunk,
-            method="PUT",
-            headers={
-                "Content-Length": str(len(chunk)),
-                "Content-Range": f"bytes {offset}-{end - 1}/{total}",
-                "Content-Type": mime_type,
-            },
-        )
-        try:
-            with urllib.request.urlopen(put_req, timeout=120) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-                log(f"Direct Drive upload complete: {drive_name} ({total} B)")
-                return {
-                    "file_id": str(result["id"]),
-                    "name": str(result.get("name") or drive_name),
-                }
-        except urllib.error.HTTPError as exc:
-            if exc.code == 308:
-                offset = end
-                continue
-            raise
+    with local_path.open("rb") as handle:
+        while offset < total:
+            end = min(total, offset + chunk_size)
+            expected_len = end - offset
+            if handle.tell() != offset:
+                handle.seek(offset)
+            chunk = handle.read(expected_len)
+            if len(chunk) != expected_len:
+                raise RuntimeError("Short read during Drive resumable upload")
+            put_req = urllib.request.Request(
+                upload_url,
+                data=chunk,
+                method="PUT",
+                headers={
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end - 1}/{total}",
+                    "Content-Type": mime_type,
+                },
+            )
+            try:
+                with _drive_urlopen(put_req, timeout=180.0) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                    log(f"Direct Drive upload complete: {drive_name} ({total} B)")
+                    return {
+                        "file_id": str(result["id"]),
+                        "name": str(result.get("name") or drive_name),
+                        "size": total,
+                    }
+            except urllib.error.HTTPError as exc:
+                if exc.code == 308:
+                    offset = end
+                    continue
+                raise
     raise RuntimeError("Direct Drive resumable upload ended without completion")
 
 
-def _dispatch_env(action: str) -> None:
-    drive_token = os.environ.get("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
+def _drive_upload_json(
+    access_token: str,
+    folder_id: str,
+    filename: str,
+    payload: dict[str, Any],
+    *,
+    replace_existing: bool = True,
+    app_properties: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    with tempfile.NamedTemporaryFile(prefix="hakimi_json_", suffix=".json", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        tmp.write(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    try:
+        return _drive_upload_from_path(
+            access_token,
+            folder_id,
+            tmp_path,
+            filename,
+            "application/json",
+            replace_existing=replace_existing,
+            app_properties=app_properties,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _download_drive_model_if_needed(
+    access_token: str,
+    file_id: str,
+    dest_path: Path,
+) -> bool:
+    """Download model file directly from Drive unless warm VM already holds the exact file_id."""
+    marker = dest_path.with_suffix(dest_path.suffix + ".drive_id")
+    if (
+        dest_path.is_file()
+        and dest_path.stat().st_size > 0
+        and marker.is_file()
+        and marker.read_text(encoding="utf-8").strip() == file_id
+    ):
+        log(f"Reusing warm model artifact already present: {dest_path.name}")
+        return False
+    _drive_download_to_path(access_token, file_id, dest_path)
+    marker.write_text(file_id, encoding="utf-8")
+    return True
+
+
+def _dispatch_env(action: str, drive_token: str | None = None) -> None:
+    token = (
+        os.environ.pop("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
+        if drive_token is None
+        else drive_token
+    )
+    registered = bool(token and token not in _ACTIVE_SECRETS)
+    if registered:
+        _ACTIVE_SECRETS.add(token)
+    try:
+        _dispatch_env_inner(action, token)
+    except Exception as exc:
+        safe_msg = scrub_secrets(exc)
+        if safe_msg != str(exc):
+            raise RuntimeError(safe_msg) from None
+        raise
+    finally:
+        if registered:
+            _ACTIVE_SECRETS.discard(token)
+
+
+def _dispatch_env_inner(action: str, drive_token: str) -> None:
     if action == "reassemble":
         reassemble_chunks(
             Path(os.environ["HAKIMI_CHUNK_DIR"]),
@@ -1485,9 +2547,22 @@ def _dispatch_env(action: str) -> None:
             _env_int("HAKIMI_CHUNK_MB", 6),
         )
     elif action == "setup":
-        action_setup(
-            force=os.environ.get("HAKIMI_FORCE", "").lower() in {"1", "true", "yes"},
+        cache_status = action_setup(
+            force=_env_bool("HAKIMI_FORCE", False),
             mode=os.environ.get("HAKIMI_SETUP_MODE", "all").strip().lower() or "all",
+            drive_token=drive_token,
+            cache_folder_id=os.environ.get("HAKIMI_CACHE_FOLDER_ID", "").strip(),
+            cache_weights_file_id=os.environ.get("HAKIMI_CACHE_WEIGHTS_FILE_ID", "").strip(),
+            cache_weights_sha256=os.environ.get("HAKIMI_CACHE_WEIGHTS_SHA256", "").strip(),
+            cache_venv_enabled=_env_bool("HAKIMI_CACHE_VENV_ENABLED", False),
+            cache_venv_file_id=os.environ.get("HAKIMI_CACHE_VENV_FILE_ID", "").strip(),
+            cache_venv_sha256=os.environ.get("HAKIMI_CACHE_VENV_SHA256", "").strip(),
+            cache_venv_fingerprint=os.environ.get("HAKIMI_CACHE_VENV_FINGERPRINT", "").strip(),
+            cache_writeback=_env_bool("HAKIMI_CACHE_WRITEBACK", False),
+        )
+        print(
+            CACHE_STATUS_PREFIX + json.dumps(cache_status, ensure_ascii=False),
+            flush=True,
         )
     elif action == "train":
         model_name = os.environ.get("HAKIMI_MODEL_NAME", "hakimi")
@@ -1502,28 +2577,72 @@ def _dispatch_env(action: str) -> None:
         )
         models_folder = os.environ.get("HAKIMI_DRIVE_MODELS_FOLDER_ID", "").strip()
         if drive_token and models_folder:
-            pth_up = _drive_upload_from_path(
-                drive_token, models_folder, final_pth, final_pth.name, "application/octet-stream"
-            )
-            idx_up = _drive_upload_from_path(
-                drive_token, models_folder, final_idx, final_idx.name, "application/octet-stream"
-            )
-            print(
-                DRIVE_OUTPUTS_PREFIX
-                + json.dumps({"pth": pth_up, "index": idx_up}, ensure_ascii=False),
-                flush=True,
-            )
+            try:
+                pth_sha = sha256_file(final_pth)
+                idx_sha = sha256_file(final_idx)
+                pth_up = _drive_upload_from_path(
+                    drive_token,
+                    models_folder,
+                    final_pth,
+                    final_pth.name,
+                    "application/octet-stream",
+                    replace_existing=True,
+                    app_properties={"hakimi_songs_role": "models"},
+                )
+                idx_up = _drive_upload_from_path(
+                    drive_token,
+                    models_folder,
+                    final_idx,
+                    final_idx.name,
+                    "application/octet-stream",
+                    replace_existing=True,
+                    app_properties={"hakimi_songs_role": "models"},
+                )
+                pth_up["sha256"] = pth_sha
+                idx_up["sha256"] = idx_sha
+                print(
+                    DRIVE_OUTPUTS_PREFIX
+                    + json.dumps({"pth": pth_up, "index": idx_up}, ensure_ascii=False),
+                    flush=True,
+                )
+            except Exception as exc:
+                log(
+                    "Warning: direct Drive train upload failed "
+                    f"({type(exc).__name__}: {exc}); host will fall back to chunk download."
+                )
     elif action == "cover":
         source_path = Path(os.environ.get("HAKIMI_SOURCE_AUDIO", "/content/work/source_song"))
         pth_path = Path(os.environ.get("HAKIMI_PTH_PATH", "/content/out/hakimi.pth"))
         index_path = Path(os.environ.get("HAKIMI_INDEX_PATH", "/content/out/hakimi.index"))
+        direct_inputs: list[str] = []
         if drive_token:
-            if src_fid := os.environ.get("HAKIMI_DRIVE_SOURCE_FILE_ID", "").strip():
-                _drive_download_to_path(drive_token, src_fid, source_path)
-            if pth_fid := os.environ.get("HAKIMI_DRIVE_PTH_FILE_ID", "").strip():
-                _drive_download_to_path(drive_token, pth_fid, pth_path)
-            if idx_fid := os.environ.get("HAKIMI_DRIVE_INDEX_FILE_ID", "").strip():
-                _drive_download_to_path(drive_token, idx_fid, index_path)
+            for env_key, target_name, dest, is_model in (
+                ("HAKIMI_DRIVE_SOURCE_FILE_ID", "source", source_path, False),
+                ("HAKIMI_DRIVE_PTH_FILE_ID", "pth", pth_path, True),
+                ("HAKIMI_DRIVE_INDEX_FILE_ID", "index", index_path, True),
+            ):
+                fid = os.environ.get(env_key, "").strip()
+                if not fid:
+                    continue
+                try:
+                    if is_model:
+                        _download_drive_model_if_needed(drive_token, fid, dest)
+                    else:
+                        _drive_download_to_path(drive_token, fid, dest)
+                    direct_inputs.append(target_name)
+                except Exception as exc:
+                    err_payload = {
+                        "stage": "input_download",
+                        "target": target_name,
+                        "error": scrub_secrets(f"{type(exc).__name__}: {exc}")[:160],
+                    }
+                    print(
+                        DRIVE_DIRECT_ERROR_PREFIX + json.dumps(err_payload, ensure_ascii=False),
+                        flush=True,
+                    )
+                    raise RuntimeError(
+                        f"drive_direct_input_failed:{target_name}:{type(exc).__name__}"
+                    ) from None
         meta = action_cover(
             source_audio=source_path,
             pth_path=pth_path,
@@ -1540,27 +2659,91 @@ def _dispatch_env(action: str) -> None:
         )
         songs_folder = os.environ.get("HAKIMI_DRIVE_SONGS_FOLDER_ID", "").strip()
         if drive_token and songs_folder:
-            raw_prefix = os.environ.get("HAKIMI_COVER_PREFIX", "cover").strip()
-            prefix = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", raw_prefix).strip("_") or "cover"
-            full_up = _drive_upload_from_path(
-                drive_token,
-                songs_folder,
-                DEFAULT_OUT_DIR / "cover_full.mp3",
-                f"{prefix}_full.mp3",
-                "audio/mpeg",
+            try:
+                raw_prefix = os.environ.get("HAKIMI_COVER_PREFIX", "cover").strip()
+                prefix = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", raw_prefix).strip("_") or "cover"
+                song_title = os.environ.get("HAKIMI_SONG_TITLE", raw_prefix).strip()[:80]
+                full_mp3 = DEFAULT_OUT_DIR / "cover_full.mp3"
+                chorus_mp3 = DEFAULT_OUT_DIR / "cover_chorus.mp3"
+                chorus_sha = sha256_file(chorus_mp3)
+                chorus_size = chorus_mp3.stat().st_size
+                try:
+                    chorus_dur_ms = int(round(_probe_duration_sec(chorus_mp3) * 1000.0))
+                except Exception:
+                    fallback_dur = float(meta.get("chorus_duration_sec", 50.0))
+                    chorus_dur_ms = int(round(fallback_dur * 1000.0))
+                chorus_up = _drive_upload_from_path(
+                    drive_token,
+                    songs_folder,
+                    chorus_mp3,
+                    f"{prefix}_{chorus_sha[:8]}_chorus.mp3",
+                    "audio/mpeg",
+                    replace_existing=True,
+                    app_properties={
+                        "hakimi_songs_role": "songs",
+                        "song_title": song_title,
+                        "kind": "chorus",
+                    },
+                )
+                chorus_up["sha256"] = chorus_sha
+                chorus_up["size"] = chorus_size
+                chorus_up["duration_ms"] = chorus_dur_ms
+                full_up = _drive_upload_from_path(
+                    drive_token,
+                    songs_folder,
+                    full_mp3,
+                    f"{prefix}_{chorus_sha[:8]}_full.mp3",
+                    "audio/mpeg",
+                    replace_existing=True,
+                    app_properties={
+                        "hakimi_songs_role": "songs",
+                        "song_title": song_title,
+                        "kind": "full",
+                    },
+                )
+                payload_json = json.dumps(
+                    {
+                        "full": full_up,
+                        "chorus": chorus_up,
+                        "meta": meta,
+                        "drive_direct_inputs": direct_inputs,
+                    },
+                    ensure_ascii=False,
+                )
+                print(DRIVE_OUTPUTS_PREFIX + payload_json, flush=True)
+            except Exception as exc:
+                log(
+                    "Warning: direct Drive cover upload failed "
+                    f"({type(exc).__name__}: {exc}); host will fall back to chunk download."
+                )
+
+        cache_folder = os.environ.get("HAKIMI_CACHE_FOLDER_ID", "").strip()
+        if (
+            drive_token
+            and cache_folder
+            and _env_bool("HAKIMI_CACHE_WRITEBACK", False)
+            and _env_bool("HAKIMI_CACHE_WEIGHTS_WRITEBACK_AFTER_COVER", False)
+        ):
+            w_key = compute_weight_cache_key("cover")
+            written = _writeback_weight_cache_to_drive(
+                drive_token=drive_token,
+                cache_folder_id=cache_folder,
+                weight_cache_key=w_key,
+                applio_dir=DEFAULT_APPLIO_DIR,
+                sep_models_dir=DEFAULT_SEP_MODELS_DIR,
+                work_dir=DEFAULT_WORK_DIR,
             )
-            chorus_up = _drive_upload_from_path(
-                drive_token,
-                songs_folder,
-                DEFAULT_OUT_DIR / "cover_chorus.mp3",
-                f"{prefix}_chorus.mp3",
-                "audio/mpeg",
+            print(
+                CACHE_STATUS_PREFIX
+                + json.dumps(
+                    {
+                        "weight_cache_key": w_key,
+                        "weight_cache_written": written,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
             )
-            payload_json = json.dumps(
-                {"full": full_up, "chorus": chorus_up, "meta": meta},
-                ensure_ascii=False,
-            )
-            print(DRIVE_OUTPUTS_PREFIX + payload_json, flush=True)
     else:
         raise ValueError(f"Unsupported HAKIMI_COLAB_ACTION: {action!r}")
 
@@ -1610,12 +2793,15 @@ def main(argv: list[str] | None = None) -> int:
     actions = {"reassemble", "split", "setup", "train", "cover"}
     env_action = os.environ.get("HAKIMI_COLAB_ACTION", "").strip()
     effective_argv = sys.argv[1:] if argv is None else argv
+    drive_token = os.environ.pop("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
+    if drive_token:
+        _ACTIVE_SECRETS.add(drive_token)
 
     try:
         if env_action and (
             argv is None and (not effective_argv or effective_argv[0] not in actions)
         ):
-            _dispatch_env(env_action)
+            _dispatch_env(env_action, drive_token=drive_token)
         else:
             args = _build_parser().parse_args(effective_argv)
             if args.action == "split":
@@ -1655,8 +2841,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{STATUS_PREFIX}OK", flush=True)
         return 0
     except Exception as exc:
-        print(f"{STATUS_PREFIX}ERROR:{exc}", flush=True)
+        safe_err = scrub_secrets(exc)
+        print(f"{STATUS_PREFIX}ERROR:{safe_err}", flush=True)
+        if safe_err != str(exc):
+            raise RuntimeError(safe_err) from None
         raise
+    finally:
+        if drive_token:
+            _ACTIVE_SECRETS.discard(drive_token)
 
 
 if __name__ == "__main__":

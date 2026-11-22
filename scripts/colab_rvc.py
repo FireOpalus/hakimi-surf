@@ -23,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,13 @@ DEFAULT_ADMIN_BASE_URL = "http://127.0.0.1:12143"
 DEFAULT_CHUNK_MB = 6
 STATUS_OK_MARKER = "__HAKIMI_COLAB_STATUS__=OK"
 STATUS_ERR_PREFIX = "__HAKIMI_COLAB_STATUS__=ERROR:"
+DRIVE_OUTPUTS_PREFIX = "__HAKIMI_DRIVE_OUTPUTS__="
+DRIVE_DIRECT_ERROR_PREFIX = "__HAKIMI_DRIVE_DIRECT_ERROR__="
+CACHE_STATUS_PREFIX = "__HAKIMI_CACHE_STATUS__="
+
+_OAUTH_TOKEN_RE = re.compile(r"(?:ya29\.[A-Za-z0-9._-]+|1//[A-Za-z0-9._-]+)")
+_BEARER_RE = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_SECRET_ENV_KEY_RE = re.compile(r"(?i)(?:TOKEN|SECRET|KEY|AUTH|PASSWORD)")
 
 MIME_BY_EXT = {
     ".mp3": "audio/mpeg",
@@ -190,8 +198,47 @@ def build_corpus_utterances() -> list[UtteranceSpec]:
 CORPUS_UTTERANCES = build_corpus_utterances()
 
 
+def _redact_text(text: Any, *extra_secrets: str) -> str:
+    """Scrub OAuth tokens, Bearer headers, and explicit secret values from text."""
+    out = str(text or "")
+    out = _OAUTH_TOKEN_RE.sub("[REDACTED]", out)
+    out = _BEARER_RE.sub(r"\1[REDACTED]", out)
+    for sec in sorted({s for s in extra_secrets if s and len(s) >= 6}, key=len, reverse=True):
+        out = out.replace(sec, "[REDACTED]")
+    return out
+
+
+def _redact_cmd(cmd: list[str], *extra_secrets: str) -> str:
+    """Format a command line safely without leaking `--env <SECRET>=<VALUE>` tokens."""
+    safe_parts: list[str] = []
+    redact_next = False
+    for part in cmd:
+        if redact_next:
+            redact_next = False
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if _SECRET_ENV_KEY_RE.search(k):
+                    safe_parts.append(f"{k}=[REDACTED]")
+                else:
+                    safe_parts.append(f"{k}={_redact_text(v, *extra_secrets)}")
+            else:
+                safe_parts.append(_redact_text(part, *extra_secrets))
+            continue
+        if part == "--env":
+            redact_next = True
+            safe_parts.append(part)
+            continue
+        if "=" in part:
+            k, _ = part.split("=", 1)
+            if _SECRET_ENV_KEY_RE.search(k):
+                safe_parts.append(f"{k}=[REDACTED]")
+                continue
+        safe_parts.append(_redact_text(part, *extra_secrets))
+    return " ".join(safe_parts)
+
+
 def log(msg: str) -> None:
-    print(f"[colab-rvc] {msg}", flush=True)
+    print(f"[colab-rvc] {_redact_text(msg)}", flush=True)
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -579,6 +626,7 @@ def _stream_process_with_watchdog(
     idle_timeout: float | None = 600.0,
     conn_lost_grace: float = 3.0,
     stream: bool = True,
+    redact_secrets: tuple[str, ...] = (),
 ) -> tuple[int, str]:
     proc = subprocess.Popen(
         cmd,
@@ -634,14 +682,17 @@ def _stream_process_with_watchdog(
                     proc.stdout.close()
                 except Exception:
                     pass
-            raise TimeoutError(f"Command stalled for {idle_timeout}s: {' '.join(cmd)}") from None
+            raise TimeoutError(
+                f"Command stalled for {idle_timeout}s: {_redact_cmd(cmd, *redact_secrets)}"
+            ) from None
 
         if item is None:
             break
+        safe_item = _redact_text(item, *redact_secrets)
         if stream:
-            sys.stdout.write(item)
+            sys.stdout.write(safe_item)
             sys.stdout.flush()
-        lines.append(item)
+        lines.append(safe_item)
         if not conn_lost and "Connection was lost." in item:
             conn_lost = True
             conn_lost_deadline = time.monotonic() + conn_lost_grace
@@ -676,6 +727,7 @@ def _run_colab(
     stream: bool = True,
     stdin_text: str | None = None,
     idle_timeout: float | None = 600.0,
+    redact_secrets: tuple[str, ...] = (),
 ) -> tuple[int, str]:
     _ensure_colab_installed()
     if require_adc and not COLAB_ADC_PATH.is_file():
@@ -691,9 +743,10 @@ def _run_colab(
         stdin_text=stdin_text,
         idle_timeout=idle_timeout,
         stream=stream,
+        redact_secrets=redact_secrets,
     )
     if check and rc != 0:
-        raise RuntimeError(f"colab {' '.join(args)} failed (exit {rc})")
+        raise RuntimeError(f"colab {_redact_cmd(args, *redact_secrets)} failed (exit {rc})")
     return rc, output
 
 
@@ -816,6 +869,19 @@ print(json.dumps(adc))
     _run_colab(["usage"], check=False)
 
 
+def _parse_prefixed_json(output: str, prefix: str) -> dict[str, Any] | None:
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            raw = stripped[len(prefix) :].strip()
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else None
+            except ValueError:
+                return None
+    return None
+
+
 def exec_remote_worker(
     session: str,
     action: str,
@@ -823,33 +889,75 @@ def exec_remote_worker(
 ) -> str:
     """Execute scripts/colab_remote_rvc.py on the Colab session and verify sentinel."""
     args = ["exec", "-s", session, "--timeout", "0", "--env", f"HAKIMI_COLAB_ACTION={action}"]
+    secrets_list: list[str] = []
     for k, v in (env_vars or {}).items():
-        args.extend(["--env", f"{k}={v}"])
+        val = str(v)
+        args.extend(["--env", f"{k}={val}"])
+        if _SECRET_ENV_KEY_RE.search(k) and len(val) >= 6:
+            secrets_list.append(val)
+    redact_secrets = tuple(secrets_list)
     args.extend(["-f", str(REMOTE_WORKER_PATH)])
 
     max_attempts = 3 if action in {"setup", "reassemble", "split"} else 1
     output = ""
     for attempt in range(1, max_attempts + 1):
         try:
-            _, output = _run_colab(args, check=True, stream=True, idle_timeout=600.0)
+            _, output = _run_colab(
+                args,
+                check=True,
+                stream=True,
+                idle_timeout=600.0,
+                redact_secrets=redact_secrets,
+            )
             break
         except (ColabConnectionLostError, TimeoutError) as exc:
             if attempt >= max_attempts:
                 raise
             log(
                 f"Transient Colab failure during '{action}' "
-                f"(attempt {attempt}/{max_attempts}: {exc}); retrying in 5s..."
+                f"(attempt {attempt}/{max_attempts}: {_redact_text(exc, *redact_secrets)}); "
+                "retrying in 5s..."
             )
             time.sleep(5.0)
 
     for line in reversed(output.splitlines()):
         if line.startswith(STATUS_ERR_PREFIX):
-            raise RuntimeError(
-                f"Remote worker action '{action}' failed: {line[len(STATUS_ERR_PREFIX) :]}"
-            )
+            err_tail = _redact_text(line[len(STATUS_ERR_PREFIX) :], *redact_secrets)
+            raise RuntimeError(f"Remote worker action '{action}' failed: {err_tail}")
     if STATUS_OK_MARKER not in output:
         raise RuntimeError(f"Remote worker action '{action}' did not emit {STATUS_OK_MARKER}")
     return output
+
+
+def probe_warm_session(session: str) -> dict[str, Any]:
+    """Check whether a warm-kept Colab session is responsive and already setup-ready."""
+    code = (
+        "import json\n"
+        "from pathlib import Path\n"
+        "ready = (\n"
+        "    Path('/content/.hakimi_setup_done').is_file()\n"
+        "    and Path('/content/rvc-venv/bin/python').exists()\n"
+        "    and Path('/content/sep-venv/bin/python').exists()\n"
+        ")\n"
+        "payload = json.dumps({'ok': True, 'setup_ready': ready})\n"
+        "print('__HAKIMI_WARM_PROBE__=' + payload, flush=True)\n"
+    )
+    try:
+        rc, out = _run_colab(
+            ["exec", "-s", session, "--timeout", "25"],
+            stdin_text=code,
+            stream=False,
+            idle_timeout=25.0,
+            check=False,
+        )
+    except Exception:
+        return {"healthy": False, "setup_ready": False}
+    if rc != 0:
+        return {"healthy": False, "setup_ready": False}
+    parsed = _parse_prefixed_json(out, "__HAKIMI_WARM_PROBE__=")
+    if not parsed or not parsed.get("ok"):
+        return {"healthy": False, "setup_ready": False}
+    return {"healthy": True, "setup_ready": bool(parsed.get("setup_ready"))}
 
 
 def _ensure_remote_dirs(session: str, remote_dirs: list[str]) -> None:
@@ -1291,9 +1399,9 @@ def run_cover_pipeline(
     *,
     session: str,
     gpu_spec: str,
-    source_path: Path,
-    pth_path: Path,
-    index_path: Path,
+    source_path: Path | None = None,
+    pth_path: Path | None = None,
+    index_path: Path | None = None,
     cover_dir: Path,
     model_name: str = "hakimi",
     pitch: int = 0,
@@ -1304,38 +1412,256 @@ def run_cover_pipeline(
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
     fallback_start_sec: float = 60.0,
+    ensure_local_source_fn: Callable[[], Path] | None = None,
+    ensure_local_model_fn: Callable[[], tuple[Path, Path]] | None = None,
+    drive_access_token: str = "",
+    drive_source_file_id: str = "",
+    drive_source_ext: str = ".m4a",
+    drive_pth_file_id: str = "",
+    drive_index_file_id: str = "",
+    drive_songs_folder_id: str = "",
+    cover_prefix: str = "",
+    song_title: str = "",
+    cache_folder_id: str = "",
+    cache_weights_file_id: str = "",
+    cache_weights_sha256: str = "",
+    cache_venv_enabled: bool = False,
+    cache_venv_file_id: str = "",
+    cache_venv_sha256: str = "",
+    cache_venv_fingerprint: str = "",
+    cache_writeback: bool = False,
+    reuse_session: bool = False,
+    reused_gpu: str = "",
+    reused_setup_ready: bool = False,
+    keep_session_on_success: bool = False,
 ) -> dict[str, Any]:
-    """Provision Colab GPU, run setup + RVC cover, download outputs, and always stop session."""
-    assigned_gpu = provision_gpu(session, gpu=gpu_spec)
+    """Run Colab RVC cover with Drive direct transfer, warm session reuse, and weight cache."""
+    warm_reused = bool(reuse_session and reused_gpu)
+    assigned_gpu = reused_gpu if warm_reused else provision_gpu(session, gpu=gpu_spec)
+    can_keep_session = bool(keep_session_on_success and assigned_gpu in {"L4", "T4"})
+    succeeded = False
+    drive_direct_used = False
+    drive_direct_fallback = False
+    weight_cache_hit: bool | None = None
+    weight_cache_written = False
+    weight_cache_has_sep = False
+    venv_cache_hit: bool | None = None
+    venv_cache_written = False
+
+    def _resolve_local_source() -> Path:
+        nonlocal source_path
+        if source_path is not None and source_path.is_file():
+            return source_path
+        if ensure_local_source_fn is not None:
+            source_path = ensure_local_source_fn()
+            return source_path
+        raise FileNotFoundError("Local source audio unavailable for WS fallback")
+
+    def _resolve_local_model() -> tuple[Path, Path]:
+        nonlocal pth_path, index_path
+        if (
+            pth_path is not None
+            and index_path is not None
+            and pth_path.is_file()
+            and index_path.is_file()
+        ):
+            return pth_path, index_path
+        if ensure_local_model_fn is not None:
+            pth_path, index_path = ensure_local_model_fn()
+            return pth_path, index_path
+        raise FileNotFoundError("Local RVC model files unavailable for WS fallback")
+
     try:
-        exec_remote_worker(session, "setup", {"HAKIMI_SETUP_MODE": "cover"})
+        if not (warm_reused and reused_setup_ready):
+            setup_env: dict[str, str] = {"HAKIMI_SETUP_MODE": "cover"}
+            if drive_access_token and (cache_folder_id or cache_weights_file_id):
+                setup_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
+                if cache_folder_id:
+                    setup_env["HAKIMI_CACHE_FOLDER_ID"] = cache_folder_id
+                if cache_weights_file_id:
+                    setup_env["HAKIMI_CACHE_WEIGHTS_FILE_ID"] = cache_weights_file_id
+                if cache_weights_sha256:
+                    setup_env["HAKIMI_CACHE_WEIGHTS_SHA256"] = cache_weights_sha256
+                if cache_venv_enabled:
+                    setup_env["HAKIMI_CACHE_VENV_ENABLED"] = "1"
+                if cache_venv_file_id:
+                    setup_env["HAKIMI_CACHE_VENV_FILE_ID"] = cache_venv_file_id
+                if cache_venv_sha256:
+                    setup_env["HAKIMI_CACHE_VENV_SHA256"] = cache_venv_sha256
+                if cache_venv_fingerprint:
+                    setup_env["HAKIMI_CACHE_VENV_FINGERPRINT"] = cache_venv_fingerprint
+                if cache_writeback:
+                    setup_env["HAKIMI_CACHE_WRITEBACK"] = "1"
+            setup_out = exec_remote_worker(session, "setup", setup_env)
+            c_stat = _parse_prefixed_json(setup_out, CACHE_STATUS_PREFIX) or {}
+            if c_stat.get("weight_cache_hit") is not None:
+                weight_cache_hit = bool(c_stat.get("weight_cache_hit"))
+            weight_cache_written = bool(c_stat.get("weight_cache_written"))
+            weight_cache_has_sep = bool(c_stat.get("weight_cache_has_sep_models"))
+            if c_stat.get("venv_cache_hit") is not None:
+                venv_cache_hit = bool(c_stat.get("venv_cache_hit"))
+            venv_cache_written = bool(c_stat.get("venv_cache_written"))
+
         remote_pth = f"/content/out/{model_name}.pth"
         remote_idx = f"/content/out/{model_name}.index"
-        upload_file_chunked(session, pth_path, remote_pth, tag=f"{model_name}_pth")
-        upload_file_chunked(session, index_path, remote_idx, tag=f"{model_name}_idx")
-        full_mp3, chorus_mp3, meta = _run_remote_cover(
-            session,
-            source_path=source_path,
-            remote_pth=remote_pth,
-            remote_idx=remote_idx,
-            cover_dir=cover_dir,
-            pitch=pitch,
-            index_rate=index_rate,
-            protect=protect,
-            volume_envelope=volume_envelope,
-            start_sec=start_sec,
-            duration_sec=duration_sec,
-            chorus_anchor=chorus_anchor,
-            fallback_start_sec=fallback_start_sec,
+        use_direct_model = bool(drive_access_token and drive_pth_file_id and drive_index_file_id)
+        use_direct_source = bool(drive_access_token and drive_source_file_id)
+        use_direct_outputs = bool(drive_access_token and drive_songs_folder_id)
+
+        if not use_direct_model:
+            loc_pth, loc_idx = _resolve_local_model()
+            upload_file_chunked(session, loc_pth, remote_pth, tag=f"{model_name}_pth")
+            upload_file_chunked(session, loc_idx, remote_idx, tag=f"{model_name}_idx")
+
+        if use_direct_source:
+            ext = drive_source_ext if drive_source_ext.startswith(".") else ".m4a"
+            remote_source = f"/content/work/source_song{ext}"
+        else:
+            loc_src = _resolve_local_source()
+            ext = loc_src.suffix or ".m4a"
+            remote_source = f"/content/work/source_song{ext}"
+            upload_file_chunked(session, loc_src, remote_source, tag="source_song")
+
+        cover_env: dict[str, str] = {
+            "HAKIMI_SOURCE_AUDIO": remote_source,
+            "HAKIMI_PTH_PATH": remote_pth,
+            "HAKIMI_INDEX_PATH": remote_idx,
+            "HAKIMI_PITCH": str(pitch),
+            "HAKIMI_INDEX_RATE": str(index_rate),
+            "HAKIMI_PROTECT": str(protect),
+            "HAKIMI_VOLUME_ENVELOPE": str(volume_envelope),
+            "HAKIMI_START_SEC": str(start_sec),
+            "HAKIMI_DURATION_SEC": str(duration_sec),
+            "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
+            "HAKIMI_FALLBACK_START_SEC": str(fallback_start_sec),
+        }
+        if drive_access_token and (use_direct_model or use_direct_source or use_direct_outputs):
+            cover_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
+        if use_direct_source:
+            cover_env["HAKIMI_DRIVE_SOURCE_FILE_ID"] = drive_source_file_id
+        if use_direct_model:
+            cover_env["HAKIMI_DRIVE_PTH_FILE_ID"] = drive_pth_file_id
+            cover_env["HAKIMI_DRIVE_INDEX_FILE_ID"] = drive_index_file_id
+        if use_direct_outputs:
+            cover_env["HAKIMI_DRIVE_SONGS_FOLDER_ID"] = drive_songs_folder_id
+            cover_env["HAKIMI_COVER_PREFIX"] = cover_prefix or "cover"
+            if song_title:
+                cover_env["HAKIMI_SONG_TITLE"] = song_title[:80]
+        if (
+            cache_writeback
+            and drive_access_token
+            and cache_folder_id
+            and not warm_reused
+            and not (weight_cache_hit and weight_cache_has_sep)
+        ):
+            cover_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
+            cover_env["HAKIMI_CACHE_FOLDER_ID"] = cache_folder_id
+            cover_env["HAKIMI_CACHE_WRITEBACK"] = "1"
+            cover_env["HAKIMI_CACHE_WEIGHTS_WRITEBACK_AFTER_COVER"] = "1"
+
+        try:
+            cover_out = exec_remote_worker(session, "cover", cover_env)
+        except RuntimeError as exc:
+            if (use_direct_source or use_direct_model) and "drive_direct_input_failed:" in str(exc):
+                log("Direct Drive input transfer failed; safely falling back to WS chunked upload.")
+                drive_direct_fallback = True
+                if use_direct_model:
+                    loc_pth, loc_idx = _resolve_local_model()
+                    upload_file_chunked(session, loc_pth, remote_pth, tag=f"{model_name}_pth")
+                    upload_file_chunked(session, loc_idx, remote_idx, tag=f"{model_name}_idx")
+                    cover_env.pop("HAKIMI_DRIVE_PTH_FILE_ID", None)
+                    cover_env.pop("HAKIMI_DRIVE_INDEX_FILE_ID", None)
+                if use_direct_source:
+                    loc_src = _resolve_local_source()
+                    ext = loc_src.suffix or ".m4a"
+                    remote_source = f"/content/work/source_song{ext}"
+                    upload_file_chunked(session, loc_src, remote_source, tag="source_song")
+                    cover_env["HAKIMI_SOURCE_AUDIO"] = remote_source
+                    cover_env.pop("HAKIMI_DRIVE_SOURCE_FILE_ID", None)
+                use_direct_source = False
+                use_direct_model = False
+                cover_out = exec_remote_worker(session, "cover", cover_env)
+            else:
+                raise
+
+        post_cache = _parse_prefixed_json(cover_out, CACHE_STATUS_PREFIX) or {}
+        if post_cache.get("weight_cache_written"):
+            weight_cache_written = True
+
+        drive_outputs = _parse_prefixed_json(cover_out, DRIVE_OUTPUTS_PREFIX)
+        chorus_out = drive_outputs.get("chorus") if isinstance(drive_outputs, dict) else None
+        full_out = drive_outputs.get("full") if isinstance(drive_outputs, dict) else None
+        direct_out_ok = (
+            isinstance(chorus_out, dict)
+            and bool(chorus_out.get("file_id"))
+            and bool(chorus_out.get("sha256"))
+            and int(chorus_out.get("size") or 0) > 0
         )
+
+        if direct_out_ok:
+            assert isinstance(drive_outputs, dict) and isinstance(chorus_out, dict)
+            drive_direct_used = True
+            meta = dict(drive_outputs.get("meta") or {})
+            succeeded = True
+            return {
+                "assigned_gpu": assigned_gpu,
+                "full_mp3": None,
+                "chorus_mp3": None,
+                "meta": meta,
+                "drive_outputs": {
+                    "chorus": chorus_out,
+                    "full": full_out if isinstance(full_out, dict) else {},
+                },
+                "session_kept": can_keep_session,
+                "acceleration": {
+                    "drive_direct": True,
+                    "drive_direct_fallback": drive_direct_fallback,
+                    "warm_reused": warm_reused,
+                    "weight_cache_hit": weight_cache_hit,
+                    "weight_cache_written": weight_cache_written,
+                    "venv_cache_hit": venv_cache_hit,
+                    "venv_cache_written": venv_cache_written,
+                },
+            }
+
+        if use_direct_outputs:
+            drive_direct_fallback = True
+            log("Direct Drive cover upload did not complete; falling back to WS chunk download.")
+        if use_direct_source or use_direct_model:
+            drive_direct_used = True
+
+        cover_dir.mkdir(parents=True, exist_ok=True)
+        full_mp3 = cover_dir / "cover_full.mp3"
+        chorus_mp3 = cover_dir / "cover_chorus.mp3"
+        meta_json = cover_dir / "cover_meta.json"
+        download_chunked_dir(session, "/content/out_chunks/cover_full", full_mp3)
+        download_chunked_dir(session, "/content/out_chunks/cover_chorus", chorus_mp3)
+        _run_colab(
+            ["download", "-s", session, "/content/out/cover_meta.json", str(meta_json)],
+            idle_timeout=90.0,
+        )
+        meta = json.loads(meta_json.read_text(encoding="utf-8"))
+        succeeded = True
         return {
             "assigned_gpu": assigned_gpu,
             "full_mp3": full_mp3,
             "chorus_mp3": chorus_mp3,
             "meta": meta,
+            "drive_outputs": None,
+            "session_kept": can_keep_session,
+            "acceleration": {
+                "drive_direct": drive_direct_used,
+                "drive_direct_fallback": drive_direct_fallback,
+                "warm_reused": warm_reused,
+                "weight_cache_hit": weight_cache_hit,
+                "weight_cache_written": weight_cache_written,
+                "venv_cache_hit": venv_cache_hit,
+                "venv_cache_written": venv_cache_written,
+            },
         }
     finally:
-        stop_session(session)
+        if not (succeeded and can_keep_session):
+            stop_session(session)
 
 
 def run_train_pipeline(
@@ -1349,25 +1675,107 @@ def run_train_pipeline(
     batch_size: int = 12,
     sample_rate: int = 48000,
     model_dir: Path = MODEL_DIR,
+    drive_access_token: str = "",
+    drive_models_folder_id: str = "",
+    cache_folder_id: str = "",
+    cache_weights_file_id: str = "",
+    cache_weights_sha256: str = "",
+    cache_venv_enabled: bool = False,
+    cache_writeback: bool = False,
 ) -> dict[str, Any]:
-    """Provision Colab GPU, run setup + RVC training, download weights, and always stop session."""
+    """Provision Colab GPU, run setup + RVC training, fetch/upload weights, and always stop."""
     assigned_gpu = provision_gpu(session, gpu=gpu_spec)
+    weight_cache_hit: bool | None = None
+    weight_cache_written = False
+    venv_cache_hit: bool | None = None
+    venv_cache_written = False
+    drive_direct_used = False
+    drive_direct_fallback = False
     try:
-        exec_remote_worker(session, "setup")
-        pth_out, idx_out = _run_remote_train(
-            session,
-            dataset_tar=dataset_tar,
-            model_name=model_name,
-            epochs=epochs,
-            save_every=save_every,
-            batch_size=batch_size,
-            sample_rate=sample_rate,
-            model_dir=model_dir,
+        setup_env: dict[str, str] = {"HAKIMI_SETUP_MODE": "all"}
+        if drive_access_token and (cache_folder_id or cache_weights_file_id):
+            setup_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
+            if cache_folder_id:
+                setup_env["HAKIMI_CACHE_FOLDER_ID"] = cache_folder_id
+            if cache_weights_file_id:
+                setup_env["HAKIMI_CACHE_WEIGHTS_FILE_ID"] = cache_weights_file_id
+            if cache_weights_sha256:
+                setup_env["HAKIMI_CACHE_WEIGHTS_SHA256"] = cache_weights_sha256
+            if cache_venv_enabled:
+                setup_env["HAKIMI_CACHE_VENV_ENABLED"] = "1"
+            if cache_writeback:
+                setup_env["HAKIMI_CACHE_WRITEBACK"] = "1"
+        setup_out = exec_remote_worker(session, "setup", setup_env)
+        c_stat = _parse_prefixed_json(setup_out, CACHE_STATUS_PREFIX) or {}
+        if c_stat.get("weight_cache_hit") is not None:
+            weight_cache_hit = bool(c_stat.get("weight_cache_hit"))
+        weight_cache_written = bool(c_stat.get("weight_cache_written"))
+        if c_stat.get("venv_cache_hit") is not None:
+            venv_cache_hit = bool(c_stat.get("venv_cache_hit"))
+        venv_cache_written = bool(c_stat.get("venv_cache_written"))
+
+        upload_file_chunked(session, dataset_tar, "/content/work/dataset.tar.gz", tag="dataset")
+        train_env: dict[str, str] = {
+            "HAKIMI_MODEL_NAME": model_name,
+            "HAKIMI_DATASET_TAR": "/content/work/dataset.tar.gz",
+            "HAKIMI_EPOCHS": str(epochs),
+            "HAKIMI_SAVE_EVERY": str(save_every),
+            "HAKIMI_BATCH_SIZE": str(batch_size),
+            "HAKIMI_SAMPLE_RATE": str(sample_rate),
+        }
+        use_direct_out = bool(drive_access_token and drive_models_folder_id)
+        if use_direct_out:
+            train_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
+            train_env["HAKIMI_DRIVE_MODELS_FOLDER_ID"] = drive_models_folder_id
+        train_out = exec_remote_worker(session, "train", train_env)
+        drive_outputs = _parse_prefixed_json(train_out, DRIVE_OUTPUTS_PREFIX)
+        pth_up = (drive_outputs or {}).get("pth") if isinstance(drive_outputs, dict) else None
+        idx_up = (drive_outputs or {}).get("index") if isinstance(drive_outputs, dict) else None
+        direct_ok = (
+            isinstance(pth_up, dict)
+            and isinstance(idx_up, dict)
+            and bool(pth_up.get("file_id"))
+            and bool(idx_up.get("file_id"))
         )
+        if direct_ok:
+            drive_direct_used = True
+            return {
+                "assigned_gpu": assigned_gpu,
+                "pth_path": None,
+                "index_path": None,
+                "drive_outputs": {"pth": pth_up, "index": idx_up},
+                "acceleration": {
+                    "drive_direct": True,
+                    "drive_direct_fallback": False,
+                    "warm_reused": False,
+                    "weight_cache_hit": weight_cache_hit,
+                    "weight_cache_written": weight_cache_written,
+                    "venv_cache_hit": venv_cache_hit,
+                    "venv_cache_written": venv_cache_written,
+                },
+            }
+
+        if use_direct_out:
+            drive_direct_fallback = True
+        model_dir.mkdir(parents=True, exist_ok=True)
+        pth_out = model_dir / f"{model_name}.pth"
+        idx_out = model_dir / f"{model_name}.index"
+        download_chunked_dir(session, f"/content/out_chunks/{model_name}_pth", pth_out)
+        download_chunked_dir(session, f"/content/out_chunks/{model_name}_index", idx_out)
         return {
             "assigned_gpu": assigned_gpu,
             "pth_path": pth_out,
             "index_path": idx_out,
+            "drive_outputs": None,
+            "acceleration": {
+                "drive_direct": drive_direct_used,
+                "drive_direct_fallback": drive_direct_fallback,
+                "warm_reused": False,
+                "weight_cache_hit": weight_cache_hit,
+                "weight_cache_written": weight_cache_written,
+                "venv_cache_hit": venv_cache_hit,
+                "venv_cache_written": venv_cache_written,
+            },
         }
     finally:
         stop_session(session)

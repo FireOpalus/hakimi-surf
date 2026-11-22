@@ -1467,3 +1467,746 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         "UVR-DeEcho-DeReverb.pth",
     )
     assert colab_remote.DEREVERB_MODEL == colab_remote.DEREVERB_MODELS[0]
+
+
+# ---------------------------------------------------------------------------
+# 5. P0 Drive direct token, P1 warm session pool, P2 cache, & CU analytics
+# ---------------------------------------------------------------------------
+
+
+def test_colab_drive_short_lived_token_and_cache_folder_isolation(tmp_path: Path) -> None:
+    cred_path = tmp_path / "secrets" / "colab-drive-oauth.json"
+    _write_fake_oauth(cred_path, refresh_token="1//never-expose-refresh-token")
+    token_calls = 0
+    backend = FakeDriveBackend()
+
+    def counting_transport(method, url, headers, body, timeout):
+        nonlocal token_calls
+        if url == colab_drive.TOKEN_URI:
+            token_calls += 1
+        return backend.transport(method, url, headers, body, timeout)
+
+    client = colab_drive.ColabDriveClient(cred_path, transport=counting_transport)
+
+    tok1 = client.get_short_lived_token()
+    assert set(tok1) == {"access_token", "token_type", "expires_in", "expires_at"}
+    assert tok1["access_token"] == "ya29.fake-access-token"
+    assert tok1["token_type"] == "Bearer"
+    assert tok1["expires_in"] > 3000
+    assert "refresh_token" not in tok1
+    assert "client_secret" not in tok1
+    assert "never-expose-refresh-token" not in json.dumps(tok1)
+    assert token_calls == 1
+
+    # Cached in RAM while TTL healthy; force_refresh fetches anew
+    tok2 = client.get_short_lived_token()
+    assert tok2["access_token"] == tok1["access_token"]
+    assert token_calls == 1
+    client.get_short_lived_token(force_refresh=True)
+    assert token_calls == 2
+
+    # ensure_folder_tree keeps 4-key contract; ensure_cache_folder resolves cache/ lazily
+    tree = client.ensure_folder_tree()
+    assert set(tree.as_dict()) == {"root", "models", "songs", "inbox"}
+    cache_fid = client.ensure_cache_folder()
+    assert cache_fid and cache_fid not in tree.as_dict().values()
+    assert client.ensure_cache_folder() == cache_fid
+
+    # Model file ID resolution
+    assert client.resolve_model_files("hakimi") is None
+    client.upload_bytes("models", "hakimi.pth", b"PTH-BYTES")
+    client.upload_bytes("models", "hakimi.index", b"IDX-BYTES")
+    resolved_models = client.resolve_model_files("hakimi")
+    assert resolved_models is not None
+    assert resolved_models["pth"]["name"] == "hakimi.pth"
+    assert resolved_models["index"]["name"] == "hakimi.index"
+
+    # Cache manifest write + validation + out-of-scope rejection
+    w_key = colab_remote.compute_weight_cache_key("cover")
+    arch_up = client.upload_bytes("cache", f"{w_key}_12345678.tar", b"TAR-BYTES")
+    sha_ok = "a" * 64
+    client.write_cache_manifest(
+        w_key,
+        {
+            "version_key": w_key,
+            "kind": "weights",
+            "archive_file_id": arch_up["file_id"],
+            "sha256": sha_ok,
+        },
+    )
+    hit = client.resolve_cache_manifest(w_key, expected_kind="weights")
+    assert hit is not None
+    assert hit["archive_file_id"] == arch_up["file_id"]
+    assert hit["sha256"] == sha_ok
+    assert client.resolve_cache_manifest(w_key, expected_kind="venv") is None
+
+    # Manifest pointing to outside_secret_file MUST be rejected (returns None)
+    client.write_cache_manifest(
+        "weights_evil_1234",
+        {
+            "version_key": "weights_evil_1234",
+            "kind": "weights",
+            "archive_file_id": "outside_secret_file",
+            "sha256": sha_ok,
+        },
+    )
+    assert client.resolve_cache_manifest("weights_evil_1234", expected_kind="weights") is None
+
+
+async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
+    tmp_path: Path,
+) -> None:
+    # 1) Hard GPU & TTL policy enforcement on WorkerConfig and WarmSessionPool
+    cfg_clamped = colab_worker.WorkerConfig(
+        token="worker-secret-token-123456",
+        warm_allowed_gpus=("H100", "A100", "G4", "L4", "T4"),
+        warm_idle_ttl_seconds=86400,  # 24h attempt must be clamped to 900s!
+    )
+    assert cfg_clamped.warm_allowed_gpus == ("L4", "T4")
+    assert cfg_clamped.warm_idle_ttl_seconds == colab_worker.MAX_WARM_IDLE_TTL_SECONDS
+    assert cfg_clamped.warm_pool_enabled is True
+
+    cfg_off = colab_worker.WorkerConfig(
+        token="worker-secret-token-123456",
+        warm_idle_ttl_seconds=0,
+    )
+    assert cfg_off.warm_pool_enabled is False
+
+    cfg_only_banned = colab_worker.WorkerConfig(
+        token="worker-secret-token-123456",
+        warm_allowed_gpus=("H100", "A100", "G4"),
+    )
+    assert cfg_only_banned.warm_allowed_gpus == ()
+    assert cfg_only_banned.warm_pool_enabled is False
+
+    pool = colab_worker.WarmSessionPool(max_sessions=1)
+    for banned in ("H100", "A100", "G4"):
+        refused = pool.put(
+            colab_worker.WarmSessionEntry(
+                session_name=f"bad-{banned}",
+                gpu=banned,
+                idle_ttl_seconds=360,
+                created_at=1000.0,
+                last_used_at=1000.0,
+                expires_at=1360.0,
+            )
+        )
+        assert len(refused) == 1 and refused[0].gpu == banned
+    assert pool.snapshot(now=1000.0) == []
+
+    # 2) End-to-end Worker warm reuse + Drive direct + probe fallback + expiry + shutdown
+    cred = tmp_path / "secrets" / "drive.json"
+    _write_fake_oauth(cred)
+    backend = FakeDriveBackend()
+    drive_client = colab_drive.ColabDriveClient(cred, transport=backend.transport)
+    drive_client.ensure_folder_tree()
+    drive_client.upload_bytes("models", "hakimi.pth", b"DRV-PTH")
+    drive_client.upload_bytes("models", "hakimi.index", b"DRV-IDX")
+    inbox_up = drive_client.upload_bytes("inbox", "song.m4a", b"RAW-M4A", mime_type="audio/mp4")
+
+    clock_now = [1_700_000_000.0]
+    stopped_sessions: list[str] = []
+    probe_state = {"healthy": True, "setup_ready": True}
+    usage_state = {"cu": 50.0, "active": 0}
+    runner_calls: list[dict[str, Any]] = []
+
+    def fake_cover_runner(**kwargs):
+        runner_calls.append(dict(kwargs))
+        # Verify short-lived access token is passed in RAM & never leaked
+        assert kwargs["drive_access_token"] == "ya29.fake-access-token"
+        assert kwargs["drive_source_file_id"] == inbox_up["file_id"]
+        assert kwargs["drive_pth_file_id"]
+        assert kwargs["drive_index_file_id"]
+        assigned = kwargs.get("reused_gpu") or kwargs["gpu_spec"].split(",")[0]
+        return {
+            "assigned_gpu": assigned,
+            "chorus_mp3": None,
+            "full_mp3": None,
+            "meta": {"chorus_start_sec": 42.0, "chorus_start_reason": "dsp_vocal_rms"},
+            "drive_outputs": {
+                "chorus": {
+                    "file_id": "drv_direct_chorus_1",
+                    "name": "c.mp3",
+                    "sha256": "d" * 64,
+                    "size": 98765,
+                    "duration_ms": 50000,
+                },
+                "full": {"file_id": "drv_direct_full_1", "name": "f.mp3"},
+            },
+            "session_kept": True,
+            "acceleration": {
+                "drive_direct": True,
+                "drive_direct_fallback": False,
+                "warm_reused": bool(kwargs.get("reuse_session")),
+                "weight_cache_hit": True,
+                "weight_cache_written": False,
+                "venv_cache_hit": False,
+                "venv_cache_written": False,
+            },
+        }
+
+    def fake_train_runner(**kwargs):
+        return {
+            "assigned_gpu": kwargs["gpu_spec"].split(",")[0],
+            "pth_path": None,
+            "index_path": None,
+            "drive_outputs": {
+                "pth": {"file_id": "drv_tr_pth", "sha256": "e" * 64},
+                "index": {"file_id": "drv_tr_idx", "sha256": "f" * 64},
+            },
+        }
+
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "dataset.tar.gz").write_bytes(b"tar")
+
+    cfg = colab_worker.WorkerConfig(
+        token="worker-secret-token-123456",
+        model_dir=tmp_path / "models",
+        dataset_dir=dataset_dir,
+        work_root=tmp_path / "work",
+        warm_pool_enabled=True,
+        warm_idle_ttl_seconds=360,
+        warm_min_cu_balance=2.0,
+    )
+    app = colab_worker.create_worker_app(
+        cfg,
+        drive_factory=lambda _r: drive_client,
+        usage_fn=lambda: {
+            "reachable": True,
+            "compute_units": usage_state["cu"],
+            "usage_rate": 0.0,
+            "active_sessions": usage_state["active"],
+            "sessions": [],
+            "error": None,
+        },
+        stop_all_fn=lambda extra=None: {
+            "terminated_sessions": len(extra or []),
+            "sessions": list(extra or []),
+        },
+        stop_session_fn=stopped_sessions.append,
+        probe_session_fn=lambda _s: dict(probe_state),
+        cover_runner=fake_cover_runner,
+        train_runner=fake_train_runner,
+        clock=lambda: clock_now[0],
+    )
+    headers = {"Authorization": f"Bearer {cfg.token}"}
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12146",
+        ) as client:
+            # Cover 1 (L4): cold boot -> parked in warm pool
+            j1 = "1" * 32
+            r1 = await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j1,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4", "T4"],
+                    "payload": {"title": "暖机测试1", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            assert r1.status_code == 202
+            if (t1 := app.state.worker_state.tasks.get(j1)) is not None:
+                await t1
+            st1 = (await client.get(f"/v1/jobs/{j1}", headers=headers)).json()
+            assert st1["status"] == "succeeded"
+            assert st1["result"]["drive_chorus_id"] == "drv_direct_chorus_1"
+            assert st1["result"]["acceleration"]["drive_direct"] is True
+            assert st1["result"]["acceleration"]["warm_reused"] is False
+            assert "ya29.fake-access-token" not in json.dumps(st1)
+
+            # Warm session exposed on /health, /healthz, and /v1/status (without tokens)
+            h_resp = await client.get("/health")
+            assert h_resp.status_code == 200
+            h_json = h_resp.json()
+            assert h_json["ok"] is True
+            assert h_json["warm_active_count"] == 1
+            assert h_json["warm_sessions"][0]["gpu"] == "L4"
+            assert h_json["warm_sessions"][0]["reuse_count"] == 0
+            assert "ya29.fake-access-token" not in h_resp.text
+            assert (await client.get("/healthz")).json()["warm_active_count"] == 1
+
+            # Cover 2 (L4): probes healthy -> reuses exact warm session!
+            clock_now[0] += 60.0
+            j2 = "2" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j2,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4", "T4"],
+                    "payload": {"title": "暖机测试2", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t2 := app.state.worker_state.tasks.get(j2)) is not None:
+                await t2
+            st2 = (await client.get(f"/v1/jobs/{j2}", headers=headers)).json()
+            assert st2["status"] == "succeeded"
+            assert st2["result"]["acceleration"]["warm_reused"] is True
+            assert runner_calls[1]["reuse_session"] is True
+            assert runner_calls[1]["session"] == runner_calls[0]["session"]
+            h2 = (await client.get("/health")).json()
+            assert h2["warm_sessions"][0]["reuse_count"] == 1
+            assert stopped_sessions == []
+
+            # Cover 3 (L4) when probe FAILS -> stops broken warm session & cold-boots cleanly!
+            probe_state["healthy"] = False
+            j3 = "3" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j3,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4"],
+                    "payload": {"title": "探活失败回退", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t3 := app.state.worker_state.tasks.get(j3)) is not None:
+                await t3
+            assert runner_calls[0]["session"] in stopped_sessions
+            assert runner_calls[2]["reuse_session"] is False
+
+            # High-GPU (H100) cover -> Worker refuses to park & stops session immediately!
+            probe_state["healthy"] = True
+            j4 = "4" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j4,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["H100"],
+                    "payload": {"title": "高价卡禁保活", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t4 := app.state.worker_state.tasks.get(j4)) is not None:
+                await t4
+            assert runner_calls[3]["session"] in stopped_sessions
+            assert (await client.get("/health")).json()["warm_active_count"] == 0
+
+            # Park L4 again, then advance clock past 360s TTL -> reaper automatically stops it!
+            j5 = "5" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j5,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4"],
+                    "payload": {"title": "到期回收", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t5 := app.state.worker_state.tasks.get(j5)) is not None:
+                await t5
+            assert (await client.get("/health")).json()["warm_active_count"] == 1
+            clock_now[0] += 400.0
+            reaped = await app.state.worker_state.reap_expired_warm_sessions()
+            assert reaped == 1
+            assert runner_calls[4]["session"] in stopped_sessions
+            assert (await client.get("/health")).json()["warm_active_count"] == 0
+
+            # Park L4 again, then rvc_train drains & stops it immediately (never keeps train warm)
+            j6 = "6" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j6,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4"],
+                    "payload": {"title": "训练前排空", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t6 := app.state.worker_state.tasks.get(j6)) is not None:
+                await t6
+            j_tr = "7" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j_tr,
+                    "job_type": "rvc_train",
+                    "gpu_candidates": ["H100"],
+                    "payload": {"model_name": "hakimi"},
+                },
+            )
+            if (t_tr := app.state.worker_state.tasks.get(j_tr)) is not None:
+                await t_tr
+            assert runner_calls[5]["session"] in stopped_sessions
+            assert (await client.get("/health")).json()["warm_active_count"] == 0
+
+            # Budget guard 1: allow_warm_keepalive=False refuses to park & stops session
+            j_nobudget = "9" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j_nobudget,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4"],
+                    "allow_warm_keepalive": False,
+                    "payload": {"title": "预算不足禁保活", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t_nb := app.state.worker_state.tasks.get(j_nobudget)) is not None:
+                await t_nb
+            assert runner_calls[6]["session"] in stopped_sessions
+            assert (await client.get("/health")).json()["warm_active_count"] == 0
+
+            # Budget guard 2: CU balance below warm_min_cu_balance refuses to park & stops
+            usage_state["cu"] = 0.5
+            j_lowcu = "a" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j_lowcu,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4"],
+                    "payload": {"title": "余额偏低禁保活", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t_lc := app.state.worker_state.tasks.get(j_lowcu)) is not None:
+                await t_lc
+            assert runner_calls[7]["session"] in stopped_sessions
+            assert (await client.get("/health")).json()["warm_active_count"] == 0
+            usage_state["cu"] = 50.0
+
+            # Park one final L4 session and verify lifespan exit cleans it up!
+            j7 = "8" * 32
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": j7,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4"],
+                    "payload": {"title": "退出清理", "inbox_file_id": inbox_up["file_id"]},
+                },
+            )
+            if (t7 := app.state.worker_state.tasks.get(j7)) is not None:
+                await t7
+            final_warm_sess = runner_calls[8]["session"]
+            assert (await client.get("/health")).json()["warm_active_count"] == 1
+
+    # Lifespan exited -> graceful shutdown MUST have stopped final_warm_sess
+    assert final_warm_sess in stopped_sessions
+    assert app.state.worker_state.warm_pool.snapshot(now=clock_now[0]) == []
+
+
+async def test_colab_compute_cu_trend_gpu_breakdown_warm_status_and_token_scrub(
+    settings, store, tmp_path: Path
+) -> None:
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    clock_now = [1_700_000_000.0]
+    tz = ZoneInfo(settings.bot_timezone)
+    today_date = datetime.fromtimestamp(clock_now[0], tz).date()
+
+    warm_status_mode = {"legacy": False}
+
+    def fake_worker_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/status":
+            if warm_status_mode["legacy"]:
+                return httpx.Response(
+                    200,
+                    json={
+                        "reachable": True,
+                        "compute_units": 88.5,
+                        "active_sessions": 0,
+                        "running_job_id": None,
+                        "drive_folders": {"root": "r", "models": "m", "songs": "s", "inbox": "i"},
+                        "error": "token leak ya29.secret-abc123456 Bearer supersecret999",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "reachable": True,
+                    "compute_units": 88.5,
+                    "active_sessions": 1,
+                    "running_job_id": None,
+                    "drive_folders": {"root": "r", "models": "m", "songs": "s", "inbox": "i"},
+                    "warm_sessions": [
+                        {
+                            "session_name": "hakimi-warm-l4",
+                            "gpu": "L4",
+                            "idle_ttl_seconds": 360,
+                            "remaining_ttl_seconds": 240,
+                            "created_at": clock_now[0] - 120.0,
+                            "last_used_at": clock_now[0] - 120.0,
+                            "expires_at": clock_now[0] + 240.0,
+                            "reuse_count": 2,
+                            "setup_ready": True,
+                        }
+                    ],
+                    "warm_pool": {
+                        "enabled": True,
+                        "allowed_gpus": ["L4", "T4"],
+                        "idle_ttl_seconds": 360,
+                        "max_ttl_seconds": 900,
+                        "active_count": 1,
+                    },
+                    "error": None,
+                },
+            )
+        if request.url.path == "/v1/jobs" and request.method == "POST":
+            body = json.loads(request.content.decode("utf-8"))
+            dispatched_bodies.append(body)
+            return httpx.Response(202, json={"job_id": body["job_id"], "status": "running"})
+        return httpx.Response(404)
+
+    dispatched_bodies: list[dict[str, Any]] = []
+    s = _worker_settings(settings, "http://127.0.0.1:12146", "worker-secret-token-123456")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(fake_worker_handler),
+        base_url="http://127.0.0.1:12146",
+    ) as mock_http:
+        hub = ColabComputeHub(s, store, None, http=mock_http, clock=lambda: clock_now[0])
+        await hub.initialize()
+
+        # 1) Empty DB overview
+        empty_ov = await hub.admin_overview()
+        assert len(empty_ov["cu_trend"]) == 30
+        assert empty_ov["cu_trend"][-1]["date"] == today_date.isoformat()
+        assert empty_ov["cu_trend"][0]["date"] == (today_date - timedelta(days=29)).isoformat()
+        assert all(d["cu_used"] == 0.0 and d["jobs"] == 0 for d in empty_ov["cu_trend"])
+        assert empty_ov["summary"]["success_rate"] is None
+        assert empty_ov["gpu_breakdown"] == []
+        assert empty_ov["acceleration_stats"]["measured_jobs"] == 0
+        assert empty_ov["acceleration_stats"]["warm_pool_enabled"] is True
+        assert len(empty_ov["warm_sessions"]) == 1
+        assert empty_ov["worker"]["warm_sessions"] == empty_ov["warm_sessions"]
+
+        # Non-blocking status_summary reflects live warm sessions and drops them after expiry
+        st_warm = await hub.status_summary()
+        assert st_warm["warm_active_count"] == 1
+        assert "L4" in st_warm["detail"]
+        clock_now[0] += 300.0  # past expires_at
+        st_expired = await hub.status_summary()
+        assert st_expired["warm_active_count"] == 0
+        clock_now[0] -= 300.0
+
+        # 2) Seed multi-day persisted jobs (including legacy job without acceleration & -45d job)
+        async def _seed_job(
+            jid: str,
+            day_offset: int,
+            status: str,
+            pref_gpu: str,
+            assigned_gpu: str | None,
+            cu: float,
+            *,
+            started: bool = True,
+            result: dict[str, Any] | None = None,
+        ) -> None:
+            ts = clock_now[0] - day_offset * 86400.0
+            day_s = (today_date - timedelta(days=day_offset)).isoformat()
+            sealed_p = hub._seal_blob(jid, "payload", {"title": jid})
+            sealed_r = hub._seal_blob(jid, "result", result) if result is not None else None
+            async with store.transaction():
+                await store.db.execute(
+                    "INSERT INTO colab_jobs ("
+                    "id, job_type, status, requester, preferred_gpu, assigned_gpu, "
+                    "payload, result, error_code, error, cu_used, created_at, "
+                    "started_at, finished_at, updated_at, day"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        jid,
+                        "rvc_cover",
+                        status,
+                        "owner",
+                        pref_gpu,
+                        assigned_gpu,
+                        sealed_p,
+                        sealed_r,
+                        None,
+                        None,
+                        cu,
+                        ts,
+                        ts if started else None,
+                        ts + 60.0 if status in {"succeeded", "failed", "cancelled"} else None,
+                        ts + 60.0,
+                        day_s,
+                    ),
+                )
+
+        # Today: L4 succeeded (direct + warm + weight hit)
+        await _seed_job(
+            "a" * 32,
+            0,
+            "succeeded",
+            "L4",
+            "L4",
+            1.25,
+            result={
+                "title": "today_ok",
+                "acceleration": {
+                    "drive_direct": True,
+                    "drive_direct_fallback": False,
+                    "warm_reused": True,
+                    "weight_cache_hit": True,
+                    "venv_cache_hit": True,
+                },
+            },
+        )
+        # -5d: T4 failed (direct fallback + cold + weight miss + venv miss)
+        await _seed_job(
+            "b" * 32,
+            5,
+            "failed",
+            "L4",
+            "T4",
+            0.5,
+            result={
+                "error_code": "colab_worker_error",
+                "acceleration": {
+                    "drive_direct": False,
+                    "drive_direct_fallback": True,
+                    "warm_reused": False,
+                    "weight_cache_hit": False,
+                    "venv_cache_hit": False,
+                },
+            },
+        )
+        # -20d: H100 succeeded (legacy job without acceleration -> skipped in measured_jobs)
+        await _seed_job("c" * 32, 20, "succeeded", "H100", "H100", 4.0, result={"title": "legacy"})
+        # -2d: Unstarted cancelled job -> excluded from gpu_breakdown
+        await _seed_job("d" * 32, 2, "cancelled", "A100", None, 0.0, started=False)
+        # -45d: Outside 30-day trend window, included in lifetime totals
+        await _seed_job("e" * 32, 45, "succeeded", "L4", "L4", 2.0, result={"title": "old"})
+
+        ov = await hub.admin_overview()
+        assert ov["summary"]["total_jobs"] == 5
+        assert ov["summary"]["succeeded_jobs"] == 3
+        assert ov["summary"]["failed_jobs"] == 1
+        assert ov["summary"]["cancelled_jobs"] == 1
+        assert ov["summary"]["success_rate"] == 0.75
+        assert ov["summary"]["total_cu_used"] == 7.75
+        assert ov["summary"]["last_14d_cu_used"] == 1.75
+        assert ov["summary"]["last_30d_cu_used"] == 5.75
+        assert ov["summary"]["last_14d_jobs"] == 3  # today + -5d + -2d cancelled
+        assert ov["summary"]["last_30d_jobs"] == 4
+
+        by_date = {d["date"]: d for d in ov["cu_trend"]}
+        assert by_date[today_date.isoformat()]["cu_used"] == 1.25
+        assert by_date[(today_date - timedelta(days=5)).isoformat()]["failed"] == 1
+        assert by_date[(today_date - timedelta(days=20)).isoformat()]["cu_used"] == 4.0
+        assert (today_date - timedelta(days=45)).isoformat() not in by_date
+
+        # GPU breakdown sorted by cu_used DESC: H100 (4.0) > L4 (3.25) > T4 (0.5); A100 excluded!
+        assert [g["gpu"] for g in ov["gpu_breakdown"]] == ["H100", "L4", "T4"]
+        assert ov["gpu_breakdown"][0]["cu_share"] == round(4.0 / 7.75, 4)
+        assert ov["gpu_breakdown"][1]["jobs"] == 2
+        assert ov["gpu_breakdown"][1]["cu_used"] == 3.25
+
+        acc = ov["acceleration_stats"]
+        assert acc["measured_jobs"] == 2
+        assert acc["drive_direct_jobs"] == 1
+        assert acc["drive_direct_fallbacks"] == 1
+        assert acc["warm_reuse_hits"] == 1
+        assert acc["warm_cold_starts"] == 1
+        assert acc["cache_weight_hits"] == 1
+        assert acc["cache_weight_misses"] == 1
+        assert acc["cache_venv_hits"] == 1
+        assert acc["cache_venv_misses"] == 1
+
+        # 3) Legacy worker response without warm_sessions/warm_pool + token scrubbing
+        warm_status_mode["legacy"] = True
+        legacy_ov = await hub.admin_overview()
+        assert legacy_ov["warm_sessions"] == []
+        assert legacy_ov["worker"]["warm_sessions"] == []
+        assert "ya29.secret-abc123456" not in str(legacy_ov["worker"]["error"])
+        assert "supersecret999" not in str(legacy_ov["worker"]["error"])
+        scrubbed = hub._scrub("err ya29.abc1234567 1//refresh99999 Bearer tok12345678")
+        assert "ya29.abc1234567" not in scrubbed
+        assert "1//refresh99999" not in scrubbed
+        assert "tok12345678" not in scrubbed
+
+        # 4) Low remaining daily CU budget (<0.5) disables allow_warm_keepalive on dispatch
+        await hub.set_config(ColabConfig(daily_job_limit=10, daily_cu_budget=1.5))
+        await hub.submit_job("rvc_cover", {"title": "低预算单", "auto_search": True})
+        await hub.scheduler_step()
+        assert len(dispatched_bodies) == 1
+        assert dispatched_bodies[0]["allow_warm_keepalive"] is False
+        await hub.close()
+
+
+async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
+    tmp_path: Path,
+) -> None:
+    cred = tmp_path / "secrets" / "drive.json"
+    _write_fake_oauth(cred)
+    backend = FakeDriveBackend()
+    drive_client = colab_drive.ColabDriveClient(cred, transport=backend.transport)
+    drive_client.ensure_folder_tree()
+
+    stopped: list[str] = []
+    secret_worker_tok = "worker-secret-token-654321"
+    cfg = colab_worker.WorkerConfig(
+        token=secret_worker_tok,
+        model_dir=tmp_path / "models",
+        dataset_dir=tmp_path / "dataset",
+        work_root=tmp_path / "work",
+    )
+    app = colab_worker.create_worker_app(
+        cfg,
+        drive_factory=lambda _r: drive_client,
+        usage_fn=lambda: {
+            "reachable": False,
+            "compute_units": None,
+            "usage_rate": None,
+            "active_sessions": 0,
+            "sessions": [],
+            "error": (
+                f"auth failed tok={secret_worker_tok} ya29.leak-oauth-123456 Bearer secretbearer999"
+            ),
+        },
+        stop_session_fn=stopped.append,
+    )
+    headers = {"Authorization": f"Bearer {secret_worker_tok}"}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://127.0.0.1:12146",
+    ) as client:
+        st = await client.get("/v1/status", headers=headers)
+        assert st.status_code == 200
+        err_msg = str(st.json()["error"])
+        assert secret_worker_tok not in err_msg
+        assert "ya29.leak-oauth-123456" not in err_msg
+        assert "secretbearer999" not in err_msg
+        assert "[REDACTED]" in err_msg
+
+        # Cancelling a job whose session_name is parked in warm_pool must evict the handle
+        state = app.state.worker_state
+        sess_name = "hakimi-warm-cancel-1"
+        state.warm_pool.put(
+            colab_worker.WarmSessionEntry(
+                session_name=sess_name,
+                gpu="L4",
+                idle_ttl_seconds=360,
+                created_at=1000.0,
+                last_used_at=1000.0,
+                expires_at=9_999_999_999.0,
+            )
+        )
+        jid = "f" * 32
+        state.jobs[jid] = colab_worker.WorkerJobRecord(
+            job_id=jid,
+            job_type="rvc_cover",
+            status="running",
+            gpu_candidates=["L4"],
+            session_name=sess_name,
+        )
+        state.running_job_id = jid
+        res = await client.post(f"/v1/jobs/{jid}/cancel", headers=headers)
+        assert res.status_code == 200
+        assert sess_name in stopped
+        assert state.warm_pool.snapshot() == []
