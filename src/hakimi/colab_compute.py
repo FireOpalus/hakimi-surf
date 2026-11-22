@@ -144,9 +144,9 @@ class _RvcCoverJobPayload(BaseModel):
     duration_sec: float = Field(default=50.0, ge=5.0, le=56.0, allow_inf_nan=False)
     fallback_start_sec: float = Field(default=60.0, ge=0.0, le=600.0, allow_inf_nan=False)
     model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
-    index_rate: float = Field(default=0.55, ge=0.0, le=1.0, allow_inf_nan=False)
-    protect: float = Field(default=0.33, ge=0.0, le=0.5, allow_inf_nan=False)
-    volume_envelope: float = Field(default=0.85, ge=0.0, le=1.0, allow_inf_nan=False)
+    index_rate: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+    protect: float = Field(default=0.28, ge=0.0, le=0.5, allow_inf_nan=False)
+    volume_envelope: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
 
     @field_validator("title")
     @classmethod
@@ -189,10 +189,10 @@ class _RvcTrainJobPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
-    epochs: int = Field(default=250, ge=10, le=1000)
-    save_every: int = Field(default=50, ge=5, le=500)
-    batch_size: int = Field(default=8, ge=1, le=32)
-    sample_rate: Literal[32000, 40000, 48000] = 40000
+    epochs: int = Field(default=150, ge=10, le=1000)
+    save_every: int = Field(default=30, ge=5, le=500)
+    batch_size: int = Field(default=12, ge=1, le=32)
+    sample_rate: Literal[32000, 40000, 48000] = 48000
     force_dataset: bool = False
 
 

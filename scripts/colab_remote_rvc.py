@@ -36,10 +36,16 @@ SETUP_MARKER = Path("/content/.hakimi_setup_done")
 
 PRIMARY_SEP_MODELS = (
     "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
-    "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
     "UVR-MDX-NET-Inst_HQ_3.onnx",
 )
-DEREVERB_MODEL = "UVR-DeEcho-DeReverb.pth"
+KARAOKE_SEP_MODELS = ("mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",)
+DEREVERB_MODELS = (
+    "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt",
+    "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
+    "UVR-DeEcho-DeReverb.pth",
+)
+DEREVERB_MODEL = DEREVERB_MODELS[0]
+SUPPORTED_AUDIO_EXTS = frozenset({".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"})
 MAX_CHORUS_BYTES = 1_750_000
 STATUS_PREFIX = "__HAKIMI_COLAB_STATUS__="
 
@@ -597,36 +603,102 @@ def action_setup(
     if fw_proc.returncode != 0:
         log("Warning: faster-whisper install failed; cover will use fallback chorus timestamp.")
 
+    log("Restoring onnxruntime-gpu in sep-venv after faster-whisper install...")
+    _run([uv_bin, "pip", "uninstall", "--python", sep_py, "onnxruntime"], check=False)
+    _run(
+        [uv_bin, "pip", "install", "--python", sep_py, "--reinstall", "onnxruntime-gpu"],
+        check=False,
+    )
+
     SETUP_MARKER.write_text("ok\n", encoding="utf-8")
     log("Colab GPU environment setup complete.")
+
+
+def _normalize_mono_wav(src_path: Path, dst_path: Path, sample_rate: int) -> None:
+    """Transcode an audio clip into mono PCM16 WAV at the target training sample rate."""
+    _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src_path),
+            "-ar",
+            str(sample_rate),
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(dst_path),
+        ]
+    )
 
 
 def action_train(
     *,
     model_name: str = "hakimi",
     dataset_tar: Path = DEFAULT_WORK_DIR / "dataset.tar.gz",
-    epochs: int = 250,
-    save_every: int = 50,
-    batch_size: int = 8,
-    sample_rate: int = 40000,
+    epochs: int = 150,
+    save_every: int = 30,
+    batch_size: int = 12,
+    sample_rate: int = 48000,
     chunk_mb: int = 6,
     applio_dir: Path = DEFAULT_APPLIO_DIR,
     rvc_venv: Path = DEFAULT_RVC_VENV,
+    sep_venv: Path = DEFAULT_SEP_VENV,
     out_dir: Path = DEFAULT_OUT_DIR,
     chunks_dir: Path = DEFAULT_CHUNKS_DIR,
 ) -> tuple[Path, Path]:
-    """Run Applio preprocess -> extract -> train -> index -> chunked export."""
+    """Run dataset preparation/separation -> Applio preprocess -> extract -> train -> export."""
     if not dataset_tar.is_file():
         raise FileNotFoundError(f"Dataset archive not found: {dataset_tar}")
+
+    raw_dir = DEFAULT_WORK_DIR / "dataset_raw"
+    if raw_dir.exists():
+        shutil.rmtree(raw_dir)
+    _safe_extract_tar(dataset_tar, raw_dir)
 
     dataset_dir = DEFAULT_WORK_DIR / "dataset"
     if dataset_dir.exists():
         shutil.rmtree(dataset_dir)
-    _safe_extract_tar(dataset_tar, dataset_dir)
-    wav_files = sorted(p for p in dataset_dir.rglob("*.wav") if p.is_file())
-    if len(wav_files) < 10:
-        raise ValueError(f"Expected >= 10 .wav files in dataset, found {len(wav_files)}")
-    log(f"Extracted {len(wav_files)} training WAV files into {dataset_dir}")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    train_sep_dir = DEFAULT_WORK_DIR / "train_sep"
+    if train_sep_dir.exists():
+        shutil.rmtree(train_sep_dir)
+
+    songs_root = raw_dir / "songs"
+    song_inputs: list[Path] = []
+    dry_inputs: list[Path] = []
+    for path in sorted(raw_dir.rglob("*")):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.suffix.lower() not in SUPPORTED_AUDIO_EXTS:
+            continue
+        if path.is_relative_to(songs_root):
+            song_inputs.append(path)
+        else:
+            dry_inputs.append(path)
+
+    sep_py = str(sep_venv / "bin" / "python")
+    for idx, song_src in enumerate(song_inputs, start=1):
+        log(f"Separating vocals from training song {idx}/{len(song_inputs)}: {song_src.name}...")
+        dry_stem, _, _ = _separate_clean_lead_vocals(
+            sep_py, song_src, train_sep_dir / f"song_{idx:04d}", label=song_src.name
+        )
+        _normalize_mono_wav(dry_stem, dataset_dir / f"song_{idx:04d}.wav", sample_rate)
+
+    for idx, dry_src in enumerate(dry_inputs, start=1):
+        _normalize_mono_wav(dry_src, dataset_dir / f"clip_{idx:04d}.wav", sample_rate)
+
+    prepared_wavs = sorted(p for p in dataset_dir.glob("*.wav") if p.is_file())
+    if len(prepared_wavs) < 1:
+        raise ValueError(
+            f"Expected >= 1 prepared .wav files in dataset, found {len(prepared_wavs)}"
+        )
+    log(
+        f"Prepared {len(prepared_wavs)} training WAV files "
+        f"({len(dry_inputs)} dry, {len(song_inputs)} songs) in {dataset_dir}"
+    )
 
     rvc_py = str(rvc_venv / "bin" / "python")
     logs_dir = applio_dir / "logs"
@@ -844,24 +916,109 @@ raise RuntimeError(f"All separation models failed: {last_err}")
             (
                 p
                 for p in files
-                if any(k in p.name.lower() for k in ("no reverb", "no echo", "noreverb", "noecho"))
+                if any(
+                    k in p.name.lower()
+                    for k in ("no reverb", "no echo", "noreverb", "noecho", "dry")
+                )
             ),
             files[0],
         )
         return dry, None
 
-    vocals = next((p for p in files if "vocal" in p.name.lower()), None)
     inst = next(
-        (p for p in files if "instrumental" in p.name.lower() or "no vocal" in p.name.lower()),
+        (
+            p
+            for p in files
+            if any(k in p.name.lower() for k in ("instrumental", "no vocal", "no_vocal", "backing"))
+        ),
+        None,
+    )
+    vocals = next(
+        (p for p in files if "vocal" in p.name.lower() and p != inst),
         None,
     )
     if vocals is None or inst is None:
         if len(files) >= 2:
-            vocals = vocals or files[0]
-            inst = inst or files[1]
+            if vocals is None:
+                vocals = files[0] if inst != files[0] else files[1]
+            if inst is None:
+                inst = files[1] if vocals != files[1] else files[0]
         else:
             raise FileNotFoundError(f"Could not resolve vocals/instrumental stems from {files}")
     return vocals, inst
+
+
+def _separate_clean_lead_vocals(
+    sep_py: str,
+    input_audio: Path,
+    work_dir: Path,
+    *,
+    label: str = "cover",
+) -> tuple[Path, Path, Path | None]:
+    """Run primary separation -> best-effort karaoke -> best-effort dereverb.
+
+    Returns ``(dry_lead_vocals_wav, instrumental_wav, backing_vocals_wav)``.
+    """
+    vocals_wav, inst_wav = _separate_with_sep_venv(
+        sep_py, input_audio, work_dir / "stems", PRIMARY_SEP_MODELS
+    )
+    assert inst_wav is not None
+
+    lead_vocals_wav = vocals_wav
+    backing_vocals_wav: Path | None = None
+    try:
+        log(f"Running best-effort karaoke lead/backing vocal separation ({label})...")
+        lead_vocals_wav, backing_vocals_wav = _separate_with_sep_venv(
+            sep_py, vocals_wav, work_dir / "karaoke", KARAOKE_SEP_MODELS
+        )
+    except Exception as exc:
+        log(f"Warning: karaoke separation skipped ({label}: {exc}); keeping full vocals stem.")
+        lead_vocals_wav = vocals_wav
+        backing_vocals_wav = None
+
+    dry_vocals_wav = lead_vocals_wav
+    try:
+        log(f"Running best-effort de-echo/de-reverb pass on lead vocals ({label})...")
+        dry_vocals_wav, _ = _separate_with_sep_venv(
+            sep_py,
+            lead_vocals_wav,
+            work_dir / "dereverb",
+            DEREVERB_MODELS,
+            is_dereverb=True,
+        )
+    except Exception as exc:
+        log(f"De-reverb skipped ({label}: {exc}); proceeding with lead vocals stem.")
+        dry_vocals_wav = lead_vocals_wav
+
+    return dry_vocals_wav, inst_wav, backing_vocals_wav
+
+
+def build_mix_filter_complex(gain_db: float, *, has_backing: bool = False) -> str:
+    """Build ffmpeg filter_complex graph for vocal de-harshing, ambience, and mastering."""
+    vocal_bus = (
+        f"[0:a]volume={gain_db:.2f}dB,highpass=f=85,"
+        "equalizer=f=6800:t=q:w=2.0:g=-2.0,"
+        "acompressor=threshold=-18dB:ratio=2.2:attack=12:release=140:makeup=1dB,"
+        "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];"
+        "[vwet]highpass=f=300,lowpass=f=3800,"
+        "aecho=0.8:0.6:23|41|67:0.18|0.12|0.08,volume=0.12[vamb];"
+        "[vdry][vamb]amix=inputs=2:duration=longest:normalize=0[v];"
+    )
+    inst_bus = "[1:a]volume=-0.8dB[inst];"
+    if has_backing:
+        return (
+            vocal_bus
+            + inst_bus
+            + "[2:a]volume=-2.5dB[bg];"
+            + "[v][inst][bg]amix=inputs=3:duration=longest:normalize=0,"
+            + "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]"
+        )
+    return (
+        vocal_bus
+        + inst_bus
+        + "[v][inst]amix=inputs=2:duration=longest:normalize=0,"
+        + "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]"
+    )
 
 
 def _transcribe_for_chorus(sep_py: str, dry_vocals_wav: Path) -> list[dict[str, Any]]:
@@ -960,9 +1117,9 @@ def action_cover(
     pth_path: Path,
     index_path: Path,
     pitch: int = 0,
-    index_rate: float = 0.55,
-    protect: float = 0.33,
-    volume_envelope: float = 0.85,
+    index_rate: float = 0.25,
+    protect: float = 0.28,
+    volume_envelope: float = 0.25,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -1012,20 +1169,9 @@ def action_cover(
     rvc_py = str(rvc_venv / "bin" / "python")
 
     log("Separating vocals and instrumental...")
-    vocals_wav, inst_wav = _separate_with_sep_venv(
-        sep_py, source_wav, work_cover / "stems", PRIMARY_SEP_MODELS
+    dry_vocals_wav, inst_wav, backing_vocals_wav = _separate_clean_lead_vocals(
+        sep_py, source_wav, work_cover, label="cover"
     )
-    assert inst_wav is not None
-
-    dry_vocals_wav = vocals_wav
-    try:
-        log("Running best-effort de-echo/de-reverb pass on vocals...")
-        dry_vocals_wav, _ = _separate_with_sep_venv(
-            sep_py, vocals_wav, work_cover / "dereverb", (DEREVERB_MODEL,), is_dereverb=True
-        )
-    except Exception as exc:
-        log(f"De-reverb skipped ({exc}); proceeding with primary vocals stem.")
-        dry_vocals_wav = vocals_wav
 
     converted_wav = work_cover / "vocals_hakimi.wav"
     log(f"Running Applio RVC inference (pitch={pitch}, index_rate={index_rate})...")
@@ -1054,6 +1200,7 @@ def action_cover(
             "rmvpe",
             "--embedder-model",
             "contentvec",
+            "--split-audio",
             "--export-format",
             "WAV",
         ],
@@ -1065,22 +1212,24 @@ def action_cover(
 
     orig_db = _detect_mean_volume_db(dry_vocals_wav)
     conv_db = _detect_mean_volume_db(converted_wav)
-    gain_db = max(-12.0, min(12.0, (orig_db - conv_db) + 1.0))
+    gain_db = max(-12.0, min(12.0, orig_db - conv_db))
     log(f"Loudness match: orig={orig_db:.1f} dB, conv={conv_db:.1f} dB -> gain={gain_db:+.2f} dB")
 
     cover_full_mp3 = out_dir / "cover_full.mp3"
-    filter_complex = (
-        f"[0:a]volume={gain_db:.2f}dB,highpass=f=80,aecho=0.8:0.88:45:0.18[v];"
-        "[v][1:a]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[m]"
-    )
-    _run(
+    has_backing = backing_vocals_wav is not None
+    filter_complex = build_mix_filter_complex(gain_db, has_backing=has_backing)
+    mix_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(converted_wav),
+        "-i",
+        str(inst_wav),
+    ]
+    if backing_vocals_wav is not None:
+        mix_cmd.extend(["-i", str(backing_vocals_wav)])
+    mix_cmd.extend(
         [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(converted_wav),
-            "-i",
-            str(inst_wav),
             "-filter_complex",
             filter_complex,
             "-map",
@@ -1098,6 +1247,7 @@ def action_cover(
             str(cover_full_mp3),
         ]
     )
+    _run(mix_cmd)
 
     clamped_dur = round(max(5.0, min(56.0, float(duration_sec))), 2)
     if total_duration > 0:
@@ -1184,6 +1334,8 @@ def action_cover(
         "protect": protect,
         "volume_envelope": volume_envelope,
         "loudness_gain_db": round(gain_db, 2),
+        "karaoke_backing_separated": backing_vocals_wav is not None,
+        "split_audio": True,
         "cover_full_bytes": cover_full_mp3.stat().st_size,
         "cover_chorus_bytes": cover_chorus_mp3.stat().st_size,
     }
@@ -1343,10 +1495,10 @@ def _dispatch_env(action: str) -> None:
         final_pth, final_idx = action_train(
             model_name=model_name,
             dataset_tar=Path(os.environ.get("HAKIMI_DATASET_TAR", "/content/work/dataset.tar.gz")),
-            epochs=_env_int("HAKIMI_EPOCHS", 250),
-            save_every=_env_int("HAKIMI_SAVE_EVERY", 50),
-            batch_size=_env_int("HAKIMI_BATCH_SIZE", 8),
-            sample_rate=_env_int("HAKIMI_SAMPLE_RATE", 40000),
+            epochs=_env_int("HAKIMI_EPOCHS", 150),
+            save_every=_env_int("HAKIMI_SAVE_EVERY", 30),
+            batch_size=_env_int("HAKIMI_BATCH_SIZE", 12),
+            sample_rate=_env_int("HAKIMI_SAMPLE_RATE", 48000),
             chunk_mb=_env_int("HAKIMI_CHUNK_MB", 6),
         )
         models_folder = os.environ.get("HAKIMI_DRIVE_MODELS_FOLDER_ID", "").strip()
@@ -1378,9 +1530,9 @@ def _dispatch_env(action: str) -> None:
             pth_path=pth_path,
             index_path=index_path,
             pitch=_env_int("HAKIMI_PITCH", 0),
-            index_rate=_env_float("HAKIMI_INDEX_RATE", 0.55),
-            protect=_env_float("HAKIMI_PROTECT", 0.33),
-            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.85),
+            index_rate=_env_float("HAKIMI_INDEX_RATE", 0.25),
+            protect=_env_float("HAKIMI_PROTECT", 0.28),
+            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.25),
             start_sec=os.environ.get("HAKIMI_START_SEC", "auto"),
             duration_sec=_env_float("HAKIMI_DURATION_SEC", 50.0),
             chorus_anchor=os.environ.get("HAKIMI_CHORUS_ANCHOR", ""),
@@ -1435,19 +1587,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train = sub.add_parser("train")
     p_train.add_argument("--model-name", default="hakimi")
     p_train.add_argument("--dataset-tar", type=Path, default=DEFAULT_WORK_DIR / "dataset.tar.gz")
-    p_train.add_argument("--epochs", type=int, default=250)
-    p_train.add_argument("--save-every", type=int, default=50)
-    p_train.add_argument("--batch-size", type=int, default=8)
-    p_train.add_argument("--sample-rate", type=int, default=40000)
+    p_train.add_argument("--epochs", type=int, default=150)
+    p_train.add_argument("--save-every", type=int, default=30)
+    p_train.add_argument("--batch-size", type=int, default=12)
+    p_train.add_argument("--sample-rate", type=int, default=48000)
 
     p_cover = sub.add_parser("cover")
     p_cover.add_argument("--source", type=Path, required=True)
     p_cover.add_argument("--pth", type=Path, required=True)
     p_cover.add_argument("--index", type=Path, required=True)
     p_cover.add_argument("--pitch", type=int, default=0)
-    p_cover.add_argument("--index-rate", type=float, default=0.55)
-    p_cover.add_argument("--protect", type=float, default=0.33)
-    p_cover.add_argument("--volume-envelope", type=float, default=0.85)
+    p_cover.add_argument("--index-rate", type=float, default=0.25)
+    p_cover.add_argument("--protect", type=float, default=0.28)
+    p_cover.add_argument("--volume-envelope", type=float, default=0.25)
     p_cover.add_argument("--start", default="auto")
     p_cover.add_argument("--duration", type=float, default=50.0)
     p_cover.add_argument("--chorus-anchor", default="")

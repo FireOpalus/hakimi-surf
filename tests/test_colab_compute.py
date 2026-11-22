@@ -1362,3 +1362,108 @@ async def test_colab_admin_drive_inbox_streaming_oversize(
                 assert os.listdir(worker_tmp) == []
         finally:
             await worker_client.aclose()
+
+
+def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
+    import inspect
+
+    from hakimi.colab_compute import _RvcCoverJobPayload, _RvcTrainJobPayload
+
+    # 1. Cover defaults: 0.25 / 0.28 / 0.25
+    w_cover = colab_worker.RvcCoverPayload(title="test")
+    assert (w_cover.index_rate, w_cover.protect, w_cover.volume_envelope) == (0.25, 0.28, 0.25)
+
+    h_cover = _RvcCoverJobPayload(title="test")
+    assert (h_cover.index_rate, h_cover.protect, h_cover.volume_envelope) == (0.25, 0.28, 0.25)
+
+    sig_cov_rvc = inspect.signature(colab_rvc.run_cover_pipeline).parameters
+    assert sig_cov_rvc["index_rate"].default == 0.25
+    assert sig_cov_rvc["protect"].default == 0.28
+    assert sig_cov_rvc["volume_envelope"].default == 0.25
+
+    sig_cov_rem = inspect.signature(colab_remote.action_cover).parameters
+    assert sig_cov_rem["index_rate"].default == 0.25
+    assert sig_cov_rem["protect"].default == 0.28
+    assert sig_cov_rem["volume_envelope"].default == 0.25
+
+    rvc_cover_args = colab_rvc._build_parser().parse_args(
+        ["cover", "--source", "s.mp3", "--title", "t"]
+    )
+    assert (rvc_cover_args.index_rate, rvc_cover_args.protect, rvc_cover_args.volume_envelope) == (
+        0.25,
+        0.28,
+        0.25,
+    )
+    rem_cover_args = colab_remote._build_parser().parse_args(
+        ["cover", "--source", "s.mp3", "--pth", "m.pth", "--index", "m.index"]
+    )
+    assert (rem_cover_args.index_rate, rem_cover_args.protect, rem_cover_args.volume_envelope) == (
+        0.25,
+        0.28,
+        0.25,
+    )
+
+    # 2. Train defaults: 150 / 30 / 12 / 48000 & train CLI --gpu default
+    w_train = colab_worker.RvcTrainPayload()
+    assert (w_train.epochs, w_train.save_every, w_train.batch_size, w_train.sample_rate) == (
+        150,
+        30,
+        12,
+        48000,
+    )
+
+    h_train = _RvcTrainJobPayload()
+    assert (h_train.epochs, h_train.save_every, h_train.batch_size, h_train.sample_rate) == (
+        150,
+        30,
+        12,
+        48000,
+    )
+
+    sig_tr_rvc = inspect.signature(colab_rvc.run_train_pipeline).parameters
+    assert (
+        sig_tr_rvc["epochs"].default,
+        sig_tr_rvc["save_every"].default,
+        sig_tr_rvc["batch_size"].default,
+        sig_tr_rvc["sample_rate"].default,
+    ) == (150, 30, 12, 48000)
+
+    sig_tr_rem = inspect.signature(colab_remote.action_train).parameters
+    assert (
+        sig_tr_rem["epochs"].default,
+        sig_tr_rem["save_every"].default,
+        sig_tr_rem["batch_size"].default,
+        sig_tr_rem["sample_rate"].default,
+    ) == (150, 30, 12, 48000)
+
+    rvc_train_args = colab_rvc._build_parser().parse_args(["train"])
+    assert (
+        rvc_train_args.epochs,
+        rvc_train_args.save_every,
+        rvc_train_args.batch_size,
+        rvc_train_args.sample_rate,
+        rvc_train_args.gpu,
+    ) == (150, 30, 12, 48000, "H100,A100,L4")
+
+    rem_train_args = colab_remote._build_parser().parse_args(["train"])
+    assert (
+        rem_train_args.epochs,
+        rem_train_args.save_every,
+        rem_train_args.batch_size,
+        rem_train_args.sample_rate,
+    ) == (150, 30, 12, 48000)
+
+    # 3. Separation constants check
+    assert colab_remote.PRIMARY_SEP_MODELS == (
+        "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        "UVR-MDX-NET-Inst_HQ_3.onnx",
+    )
+    assert colab_remote.KARAOKE_SEP_MODELS == (
+        "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+    )
+    assert colab_remote.DEREVERB_MODELS == (
+        "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt",
+        "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
+        "UVR-DeEcho-DeReverb.pth",
+    )
+    assert colab_remote.DEREVERB_MODEL == colab_remote.DEREVERB_MODELS[0]

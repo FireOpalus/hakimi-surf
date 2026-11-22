@@ -38,9 +38,12 @@ MAIN_ENV_PATH = REPO_ROOT / ".env"
 REMOTE_WORKER_PATH = REPO_ROOT / "scripts" / "colab_remote_rvc.py"
 
 DATASET_DIR = REPO_ROOT / "data" / "rvc_datasets" / "hakimi_breezeblue"
+EXTRA_DRY_DIR = REPO_ROOT / "data" / "rvc_datasets" / "hakimi_extra"
+EXTRA_SONGS_DIR = REPO_ROOT / "data" / "rvc_datasets" / "hakimi_extra_songs"
 MODEL_DIR = REPO_ROOT / "data" / "rvc_models" / "hakimi"
 SOURCES_DIR = REPO_ROOT / "data" / "rvc_sources"
 COVERS_DIR = REPO_ROOT / "data" / "rvc_covers"
+SUPPORTED_AUDIO_EXTS = frozenset({".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"})
 
 DEFAULT_ADMIN_BASE_URL = "http://127.0.0.1:12143"
 DEFAULT_CHUNK_MB = 6
@@ -304,6 +307,40 @@ class _BreezeHttpError(RuntimeError):
         super().__init__(f"BreezeBlue HTTP {status_code}: {detail[:200]}")
 
 
+def _safe_archive_filename(path: Path) -> str:
+    stem = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", path.stem).strip("_") or "audio"
+    return f"{stem}{path.suffix.lower()}"
+
+
+def _collect_extra_audio(
+    extra_dir: Path | None, prefix: str
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    if extra_dir is None or not extra_dir.is_dir():
+        return [], []
+    paths = sorted(
+        (
+            p
+            for p in extra_dir.rglob("*")
+            if p.is_file()
+            and not p.name.startswith(".")
+            and p.suffix.lower() in SUPPORTED_AUDIO_EXTS
+        ),
+        key=lambda p: str(p),
+    )
+    records: list[dict[str, Any]] = []
+    for idx, p in enumerate(paths, start=1):
+        st = p.stat()
+        records.append(
+            {
+                "name": p.relative_to(extra_dir).as_posix(),
+                "arcname": f"{prefix}/{idx:03d}_{_safe_archive_filename(p)}",
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
+            }
+        )
+    return paths, records
+
+
 def build_dataset(
     *,
     dataset_dir: Path = DATASET_DIR,
@@ -312,8 +349,18 @@ def build_dataset(
     min_seconds: float = 300.0,
     tts_fn: Any = None,
     sleep_fn: Any = time.sleep,
+    extra_dry_dir: Path | None = None,
+    extra_songs_dir: Path | None = None,
+    include_tts: bool = True,
 ) -> dict[str, Any]:
-    """Synthesize dry Mandarin WAV clips via BreezeBlue and pack dataset.tar.gz."""
+    """Synthesize dry Mandarin WAV clips (optional) + pack extra corpus into dataset.tar.gz."""
+    extra_dry_paths, extra_dry_files = _collect_extra_audio(extra_dry_dir, "dry")
+    extra_songs_paths, extra_songs_files = _collect_extra_audio(extra_songs_dir, "songs")
+    if not include_tts and (len(extra_dry_paths) + len(extra_songs_paths)) < 1:
+        raise ValueError(
+            "include_tts=False requires at least 1 audio file in extra_dry_dir or extra_songs_dir."
+        )
+
     dataset_dir.mkdir(parents=True, exist_ok=True)
     clips_dir = dataset_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -323,9 +370,20 @@ def build_dataset(
     if not force and tar_path.is_file() and manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            tts_ok = (
+                (
+                    int(manifest.get("tts_clip_count", manifest.get("clip_count", 0)))
+                    >= len(CORPUS_UTTERANCES)
+                    and float(manifest.get("total_duration_sec", 0.0)) >= min_seconds
+                )
+                if include_tts
+                else (len(extra_dry_files) + len(extra_songs_files)) >= 1
+            )
             if (
-                int(manifest.get("clip_count", 0)) >= len(CORPUS_UTTERANCES)
-                and float(manifest.get("total_duration_sec", 0.0)) >= min_seconds
+                manifest.get("include_tts") is include_tts
+                and tts_ok
+                and manifest.get("extra_dry_files") == extra_dry_files
+                and manifest.get("extra_songs_files") == extra_songs_files
                 and _sha256_file(tar_path) == manifest.get("dataset_tar_sha256")
             ):
                 log(
@@ -336,108 +394,133 @@ def build_dataset(
         except Exception:
             pass
 
-    env = parse_env_file(voice_env_path)
-    api_key = env.get("BREEZEBLUE_API_KEY", "").strip()
-    voice_id = env.get("BREEZEBLUE_VOICE_ID", "").strip()
-    model_id = env.get("BREEZEBLUE_MODEL_ID", "breeze-tts-2").strip() or "breeze-tts-2"
-    base_url = env.get("BREEZEBLUE_BASE_URL", "https://api.breeze.blue").strip()
-    if not api_key or not voice_id:
-        raise RuntimeError(f"Missing BREEZEBLUE_API_KEY or BREEZEBLUE_VOICE_ID in {voice_env_path}")
-
-    caller = tts_fn or _breezeblue_tts_post
-    chosen_format = "wav_48000"
+    chosen_format = "none"
     sample_rate = 0
     total_duration = 0.0
-    synthesized_count = 0
-    skipped_count = 0
-    utterances = CORPUS_UTTERANCES
+    voice_id = ""
+    model_id = ""
+    tts_clips: list[Path] = []
 
-    for idx, spec in enumerate(utterances, start=1):
-        clip_path = clips_dir / f"utt_{idx:03d}.wav"
-        if not force and clip_path.is_file():
-            existing_dur = _wav_duration_sec(clip_path)
-            if existing_dur is not None and existing_dur >= 1.5:
-                if sample_rate == 0:
-                    with wave.open(str(clip_path), "rb") as wf:
-                        sample_rate = wf.getframerate()
-                total_duration += existing_dur
-                skipped_count += 1
-                continue
-
-        raw_wav = b""
-        last_err: Exception | None = None
-        for attempt in range(4):
-            try:
-                raw_wav = caller(
-                    base_url=base_url,
-                    api_key=api_key,
-                    voice_id=voice_id,
-                    model_id=model_id,
-                    text=spec.text,
-                    instructions=spec.instructions,
-                    speed=spec.speed,
-                    output_format=chosen_format,
-                )
-                break
-            except _BreezeHttpError as exc:
-                last_err = exc
-                if idx == 1 and chosen_format == "wav_48000" and 400 <= exc.status_code < 429:
-                    log("BreezeBlue rejected output_format=wav_48000; falling back to wav (24kHz).")
-                    chosen_format = "wav"
-                    continue
-                if exc.status_code in {429, 500, 502, 503, 504} and attempt < 3:
-                    delay = 1.5 * (2**attempt)
-                    log(f"Utterance {idx} hit HTTP {exc.status_code}; retrying in {delay:.1f}s...")
-                    sleep_fn(delay)
-                    continue
-                raise
-            except Exception as exc:
-                last_err = exc
-                if attempt < 3:
-                    delay = 1.5 * (2**attempt)
-                    log(
-                        f"Utterance {idx} error ({type(exc).__name__}); retrying in {delay:.1f}s..."
-                    )
-                    sleep_fn(delay)
-                    continue
-                raise
-
-        if not raw_wav:
-            raise RuntimeError(f"Empty audio returned for utterance {idx}: {last_err}")
-
-        tmp_clip = clip_path.with_suffix(".wav.tmp")
-        tmp_clip.write_bytes(raw_wav)
-        dur = _wav_duration_sec(tmp_clip)
-        if dur is None or dur < 1.0:
-            tmp_clip.unlink(missing_ok=True)
-            raise RuntimeError(f"Invalid WAV response for utterance {idx} (dur={dur})")
-        tmp_clip.replace(clip_path)
-
-        if sample_rate == 0:
-            with wave.open(str(clip_path), "rb") as wf:
-                sample_rate = wf.getframerate()
-        total_duration += dur
-        synthesized_count += 1
-        if idx % 10 == 0 or idx == len(utterances):
-            log(
-                f"Dataset progress: {idx}/{len(utterances)} clips "
-                f"(new={synthesized_count}, cached={skipped_count}, total={total_duration:.1f}s)"
+    if include_tts:
+        env = parse_env_file(voice_env_path)
+        api_key = env.get("BREEZEBLUE_API_KEY", "").strip()
+        voice_id = env.get("BREEZEBLUE_VOICE_ID", "").strip()
+        model_id = env.get("BREEZEBLUE_MODEL_ID", "breeze-tts-2").strip() or "breeze-tts-2"
+        base_url = env.get("BREEZEBLUE_BASE_URL", "https://api.breeze.blue").strip()
+        if not api_key or not voice_id:
+            raise RuntimeError(
+                f"Missing BREEZEBLUE_API_KEY or BREEZEBLUE_VOICE_ID in {voice_env_path}"
             )
-        sleep_fn(0.35)
 
-    if total_duration < min_seconds:
-        raise RuntimeError(
-            f"Total dataset duration {total_duration:.1f}s is below required {min_seconds:.1f}s"
-        )
+        caller = tts_fn or _breezeblue_tts_post
+        chosen_format = "wav_48000"
+        synthesized_count = 0
+        skipped_count = 0
+        utterances = CORPUS_UTTERANCES
+
+        for idx, spec in enumerate(utterances, start=1):
+            clip_path = clips_dir / f"utt_{idx:03d}.wav"
+            tts_clips.append(clip_path)
+            if not force and clip_path.is_file():
+                existing_dur = _wav_duration_sec(clip_path)
+                if existing_dur is not None and existing_dur >= 1.5:
+                    if sample_rate == 0:
+                        with wave.open(str(clip_path), "rb") as wf:
+                            sample_rate = wf.getframerate()
+                    total_duration += existing_dur
+                    skipped_count += 1
+                    continue
+
+            raw_wav = b""
+            last_err: Exception | None = None
+            for attempt in range(4):
+                try:
+                    raw_wav = caller(
+                        base_url=base_url,
+                        api_key=api_key,
+                        voice_id=voice_id,
+                        model_id=model_id,
+                        text=spec.text,
+                        instructions=spec.instructions,
+                        speed=spec.speed,
+                        output_format=chosen_format,
+                    )
+                    break
+                except _BreezeHttpError as exc:
+                    last_err = exc
+                    if idx == 1 and chosen_format == "wav_48000" and 400 <= exc.status_code < 429:
+                        log(
+                            "BreezeBlue rejected output_format=wav_48000; "
+                            "falling back to wav (24kHz)."
+                        )
+                        chosen_format = "wav"
+                        continue
+                    if exc.status_code in {429, 500, 502, 503, 504} and attempt < 3:
+                        delay = 1.5 * (2**attempt)
+                        log(
+                            f"Utterance {idx} hit HTTP {exc.status_code}; "
+                            f"retrying in {delay:.1f}s..."
+                        )
+                        sleep_fn(delay)
+                        continue
+                    raise
+                except Exception as exc:
+                    last_err = exc
+                    if attempt < 3:
+                        delay = 1.5 * (2**attempt)
+                        log(
+                            f"Utterance {idx} error ({type(exc).__name__}); "
+                            f"retrying in {delay:.1f}s..."
+                        )
+                        sleep_fn(delay)
+                        continue
+                    raise
+
+            if not raw_wav:
+                raise RuntimeError(f"Empty audio returned for utterance {idx}: {last_err}")
+
+            tmp_clip = clip_path.with_suffix(".wav.tmp")
+            tmp_clip.write_bytes(raw_wav)
+            dur = _wav_duration_sec(tmp_clip)
+            if dur is None or dur < 1.0:
+                tmp_clip.unlink(missing_ok=True)
+                raise RuntimeError(f"Invalid WAV response for utterance {idx} (dur={dur})")
+            tmp_clip.replace(clip_path)
+
+            if sample_rate == 0:
+                with wave.open(str(clip_path), "rb") as wf:
+                    sample_rate = wf.getframerate()
+            total_duration += dur
+            synthesized_count += 1
+            if idx % 10 == 0 or idx == len(utterances):
+                log(
+                    f"Dataset progress: {idx}/{len(utterances)} clips "
+                    f"(new={synthesized_count}, cached={skipped_count}, "
+                    f"total={total_duration:.1f}s)"
+                )
+            sleep_fn(0.35)
+
+        if total_duration < min_seconds:
+            raise RuntimeError(
+                f"Total dataset duration {total_duration:.1f}s is below required {min_seconds:.1f}s"
+            )
 
     tmp_tar = tar_path.with_suffix(".tar.gz.tmp")
     with tarfile.open(tmp_tar, "w:gz") as tf:
-        for clip in sorted(clips_dir.glob("utt_*.wav")):
+        for clip in tts_clips:
             tf.add(clip, arcname=clip.name)
+        for src_path, rec in zip(extra_dry_paths, extra_dry_files, strict=True):
+            tf.add(src_path, arcname=rec["arcname"])
+        for src_path, rec in zip(extra_songs_paths, extra_songs_files, strict=True):
+            tf.add(src_path, arcname=rec["arcname"])
     tmp_tar.replace(tar_path)
 
     manifest = {
-        "clip_count": len(utterances),
+        "clip_count": len(tts_clips) + len(extra_dry_files) + len(extra_songs_files),
+        "tts_clip_count": len(tts_clips),
+        "include_tts": include_tts,
+        "extra_dry_files": extra_dry_files,
+        "extra_songs_files": extra_songs_files,
         "total_duration_sec": round(total_duration, 2),
         "sample_rate": sample_rate,
         "voice_id": voice_id,
@@ -449,7 +532,8 @@ def build_dataset(
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     log(
         f"Dataset archive ready: {tar_path} "
-        f"({manifest['clip_count']} clips, {manifest['total_duration_sec']}s, {sample_rate}Hz)"
+        f"({manifest['clip_count']} clips, extra_dry={len(extra_dry_files)}, "
+        f"extra_songs={len(extra_songs_files)}, tts={include_tts}, {sample_rate}Hz)"
     )
     return manifest
 
@@ -1213,9 +1297,9 @@ def run_cover_pipeline(
     cover_dir: Path,
     model_name: str = "hakimi",
     pitch: int = 0,
-    index_rate: float = 0.55,
-    protect: float = 0.33,
-    volume_envelope: float = 0.85,
+    index_rate: float = 0.25,
+    protect: float = 0.28,
+    volume_envelope: float = 0.25,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -1260,10 +1344,10 @@ def run_train_pipeline(
     gpu_spec: str,
     dataset_tar: Path,
     model_name: str = "hakimi",
-    epochs: int = 250,
-    save_every: int = 50,
-    batch_size: int = 8,
-    sample_rate: int = 40000,
+    epochs: int = 150,
+    save_every: int = 30,
+    batch_size: int = 12,
+    sample_rate: int = 48000,
     model_dir: Path = MODEL_DIR,
 ) -> dict[str, Any]:
     """Provision Colab GPU, run setup + RVC training, download weights, and always stop session."""
@@ -1515,7 +1599,18 @@ def _slugify(title: str) -> str:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
-    tar_path = args.dataset_tar or (DATASET_DIR / "dataset.tar.gz")
+    if args.dataset_tar is not None:
+        tar_path = args.dataset_tar
+    else:
+        build_dataset(
+            dataset_dir=DATASET_DIR,
+            force=args.force_dataset,
+            min_seconds=args.min_seconds,
+            extra_dry_dir=args.extra_dry_dir,
+            extra_songs_dir=args.extra_songs_dir,
+            include_tts=not args.no_tts,
+        )
+        tar_path = DATASET_DIR / "dataset.tar.gz"
     if not tar_path.is_file():
         raise FileNotFoundError(
             f"Dataset archive not found at {tar_path}; run build-dataset first."
@@ -1592,6 +1687,9 @@ def cmd_all(args: argparse.Namespace) -> int:
         dataset_dir=DATASET_DIR,
         force=args.force_dataset,
         min_seconds=args.min_seconds,
+        extra_dry_dir=args.extra_dry_dir,
+        extra_songs_dir=args.extra_songs_dir,
+        include_tts=not args.no_tts,
     )
     tar_path = DATASET_DIR / "dataset.tar.gz"
     cover_dir = COVERS_DIR / _slugify(args.title)
@@ -1654,20 +1752,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("whoami", help="Verify Colab ADC auth and compute unit balance.")
 
+    def _add_extra_dataset_opts(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--extra-dry-dir", type=Path, default=EXTRA_DRY_DIR)
+        p.add_argument("--extra-songs-dir", type=Path, default=EXTRA_SONGS_DIR)
+        p.add_argument("--no-tts", action="store_true")
+
     p_ds = sub.add_parser(
         "build-dataset", help="Synthesize dry Mandarin WAV dataset via BreezeBlue."
     )
     p_ds.add_argument("--force", action="store_true", help="Regenerate all clips.")
     p_ds.add_argument("--min-seconds", type=float, default=300.0)
+    _add_extra_dataset_opts(p_ds)
 
     p_fetch = sub.add_parser("fetch-song", help="Download source song audio via yt-dlp.")
     p_fetch.add_argument("--url", required=True)
     p_fetch.add_argument("--out", type=Path, required=True)
 
-    def _add_session_opts(p: argparse.ArgumentParser) -> None:
+    def _add_session_opts(p: argparse.ArgumentParser, *, default_gpu: str = "L4") -> None:
         p.add_argument(
             "--gpu",
-            default="L4",
+            default=default_gpu,
             help="Preferred Colab GPU or comma-separated fallback list (e.g. H100,A100).",
         )
         p.add_argument("--strict-gpu", action="store_true")
@@ -1678,10 +1782,10 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--model-dir", type=Path, default=MODEL_DIR)
 
     def _add_train_opts(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--epochs", type=int, default=250)
-        p.add_argument("--save-every", type=int, default=50)
-        p.add_argument("--batch-size", type=int, default=8)
-        p.add_argument("--sample-rate", type=int, default=40000)
+        p.add_argument("--epochs", type=int, default=150)
+        p.add_argument("--save-every", type=int, default=30)
+        p.add_argument("--batch-size", type=int, default=12)
+        p.add_argument("--sample-rate", type=int, default=48000)
 
     def _add_cover_opts(p: argparse.ArgumentParser) -> None:
         p.add_argument("--source", type=Path, required=True)
@@ -1689,9 +1793,9 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--artist", default="")
         p.add_argument("--tags", default="")
         p.add_argument("--pitch", type=int, default=0)
-        p.add_argument("--index-rate", type=float, default=0.55)
-        p.add_argument("--protect", type=float, default=0.33)
-        p.add_argument("--volume-envelope", type=float, default=0.85)
+        p.add_argument("--index-rate", type=float, default=0.25)
+        p.add_argument("--protect", type=float, default=0.28)
+        p.add_argument("--volume-envelope", type=float, default=0.25)
         p.add_argument("--start", default="auto")
         p.add_argument("--duration", type=float, default=50.0)
         p.add_argument("--chorus-anchor", default="")
@@ -1700,8 +1804,11 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--admin-url", default=DEFAULT_ADMIN_BASE_URL)
 
     p_train = sub.add_parser("train", help="Train RVC v2 model on Colab GPU.")
-    _add_session_opts(p_train)
+    _add_session_opts(p_train, default_gpu="H100,A100,L4")
     _add_train_opts(p_train)
+    _add_extra_dataset_opts(p_train)
+    p_train.add_argument("--force-dataset", action="store_true")
+    p_train.add_argument("--min-seconds", type=float, default=300.0)
     p_train.add_argument("--dataset-tar", type=Path, default=None)
 
     p_cover = sub.add_parser("cover", help="Generate RVC cover on Colab GPU and upload to admin.")
@@ -1712,6 +1819,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_session_opts(p_all)
     _add_train_opts(p_all)
     _add_cover_opts(p_all)
+    _add_extra_dataset_opts(p_all)
     p_all.add_argument("--force-dataset", action="store_true")
     p_all.add_argument("--min-seconds", type=float, default=300.0)
 
@@ -1752,7 +1860,13 @@ def main(argv: list[str] | None = None) -> int:
         _run_colab(["usage"], check=False)
         return 0
     if args.command == "build-dataset":
-        build_dataset(force=args.force, min_seconds=args.min_seconds)
+        build_dataset(
+            force=args.force,
+            min_seconds=args.min_seconds,
+            extra_dry_dir=args.extra_dry_dir,
+            extra_songs_dir=args.extra_songs_dir,
+            include_tts=not args.no_tts,
+        )
         return 0
     if args.command == "fetch-song":
         fetch_song(args.url, args.out)
