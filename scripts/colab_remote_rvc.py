@@ -1200,7 +1200,6 @@ def action_cover(
             "rmvpe",
             "--embedder-model",
             "contentvec",
-            "--split-audio",
             "--export-format",
             "WAV",
         ],
@@ -1335,7 +1334,7 @@ def action_cover(
         "volume_envelope": volume_envelope,
         "loudness_gain_db": round(gain_db, 2),
         "karaoke_backing_separated": backing_vocals_wav is not None,
-        "split_audio": True,
+        "auto_pipeline_split": True,
         "cover_full_bytes": cover_full_mp3.stat().st_size,
         "cover_chorus_bytes": cover_chorus_mp3.stat().st_size,
     }

@@ -495,16 +495,20 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
         colab_remote.DEREVERB_MODELS,
     ]
     infer_cmd = next(c for c in cmds_ok if "infer" in c)
-    assert "--split-audio" in infer_cmd
+    assert "--split-audio" not in infer_cmd
     assert infer_cmd[infer_cmd.index("--index-rate") + 1] == "0.25"
     assert infer_cmd[infer_cmd.index("--protect") + 1] == "0.28"
     assert infer_cmd[infer_cmd.index("--volume-envelope") + 1] == "0.25"
+    assert infer_cmd[infer_cmd.index("--f0-method") + 1] == "rmvpe"
+    assert infer_cmd[infer_cmd.index("--embedder-model") + 1] == "contentvec"
+    assert infer_cmd[infer_cmd.index("--export-format") + 1] == "WAV"
     mix_cmd = next(c for c in cmds_ok if "-filter_complex" in c)
     assert mix_cmd.count("-i") == 3
     assert "volume=-2.00dB" in mix_cmd[mix_cmd.index("-filter_complex") + 1]
     assert "[v][inst][bg]amix=inputs=3" in mix_cmd[mix_cmd.index("-filter_complex") + 1]
     assert meta_ok["karaoke_backing_separated"] is True
-    assert meta_ok["split_audio"] is True
+    assert meta_ok["auto_pipeline_split"] is True
+    assert "split_audio" not in meta_ok
     assert meta_ok["loudness_gain_db"] == -2.0
 
     meta_fb, cmds_fb, _ = _run_cover_case(fail_karaoke=True)
@@ -512,7 +516,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     assert mix_fb.count("-i") == 2
     assert "[v][inst]amix=inputs=2" in mix_fb[mix_fb.index("-filter_complex") + 1]
     assert meta_fb["karaoke_backing_separated"] is False
-    assert meta_fb["split_audio"] is True
+    assert meta_fb["auto_pipeline_split"] is True
 
 
 def test_action_train_prepares_songs_and_dry_at_48khz(
