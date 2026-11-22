@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .models import Message, PlatformId
+from .platform_hooks import get_platform_hooks
 
 
 class OwnerBinding(BaseModel):
@@ -38,10 +39,9 @@ def permits_chat_export(message, settings, consumer):
     if not authorize(message.model_copy(update={"addressed": True}), settings):
         return False
     if chat_registry(settings) is None:
-        # Previously supported standalone QQ services have no host registry.
-        from .modules.platforms.qq.chat_policy import permits_chat_export as qq_export
-
-        return qq_export(message, consumer)
+        # Standalone callers without a host registry resolve via kernel platform hooks.
+        hooks = get_platform_hooks(message.platform)
+        return bool(hooks and hooks.permits_export(message, consumer))
     module = chat_module(settings, message.platform)
     return bool(module and module.permits_chat_export(message, consumer))
 

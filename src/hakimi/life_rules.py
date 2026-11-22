@@ -7,7 +7,8 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 from .modules.actions import reject_reason
 from .world_state import IntentTicketCreate, MilestoneEvent, private_event_for_owner
@@ -35,17 +36,47 @@ class Rule:
     match: Callable[[MilestoneEvent], Reaction | None]
 
 
-# Compatibility imports for callers of the pre-module rule API.
-def build_from_video(event):
-    from .modules.platforms.minecraft.inspiration import build_from_video as match
+_COMPAT_RULE_PROVIDERS: dict[str, Callable[..., Any]] = {}
+_RULE_MODULE_STEMS = ("inspiration", "milestones")
 
-    return match(event)
+
+def register_compat_rule_provider(name: str, provider: Callable[..., Any]) -> None:
+    """Register a rule factory for legacy direct callers without hardcoding platform imports."""
+    key = str(name or "").strip()
+    if not key:
+        raise ValueError("rule provider name must be non-empty")
+    if not callable(provider):
+        raise TypeError("rule provider must be callable")
+    _COMPAT_RULE_PROVIDERS[key] = provider
+
+
+def _resolve_compat_rule_provider(name: str) -> Callable[..., Any]:
+    provider = _COMPAT_RULE_PROVIDERS.get(name)
+    if provider is not None:
+        return provider
+    from .modules import PLATFORMS
+    from .modules.manifest import CATALOG
+
+    for platform in PLATFORMS:
+        base_dir = CATALOG / platform.path
+        for stem in _RULE_MODULE_STEMS:
+            if not (base_dir / f"{stem}.py").is_file():
+                continue
+            mod = import_module(f"hakimi.modules.platforms.{platform.name}.{stem}")
+            candidate = getattr(mod, name, None)
+            if callable(candidate):
+                _COMPAT_RULE_PROVIDERS[name] = candidate
+                return candidate
+    raise LookupError(f"rule_provider_not_found:{name}")
+
+
+# Compatibility wrappers for callers of the pre-module rule API.
+def build_from_video(event):
+    return _resolve_compat_rule_provider("build_from_video")(event)
 
 
 def milestone_sharing(settings):
-    from .modules.platforms.qq.milestones import milestone_sharing as declare
-
-    return declare(settings)
+    return _resolve_compat_rule_provider("milestone_sharing")(settings)
 
 
 class RuleDispatcher:

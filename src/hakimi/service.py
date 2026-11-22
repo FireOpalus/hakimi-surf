@@ -5,7 +5,7 @@ import json
 import logging
 import random
 import re
-import shlex
+import sys
 import time
 import uuid
 import weakref
@@ -16,11 +16,22 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from hakimi_plugin_sdk.bili_common import extract_bvid
+
 from . import text_card
-from .affection import _validate_platform_user
 from .attention import can_watch_video
 from .bili_bridge import RemoteBiliClient, RemoteBiliWatcher
 from .bot_server import is_persona_owner, untrusted_input
+from .commands import (
+    HELP as HELP,
+)
+from .commands import (
+    build_default_command_registry,
+    handle_affection_command,
+    handle_bind_command,
+    handle_learn_song_command,
+    handle_save_meme_command,
+)
 from .config import Settings, is_external_plugin
 from .drive_client import FolderDrive
 from .file_reader import FileReader
@@ -32,11 +43,22 @@ from .hot_ring import HotRing
 from .life_engine import LifeEngine
 from .link_preview import preview_links
 from .media import ImageLoader
-from .memes import (
-    MAX_UPLOAD_BYTES,
-    explicit_meme_request,
-    validate_meme_label,
+from .media_turn import (
+    PRIOR_FILE_REF_RE as PRIOR_FILE_REF_RE,
 )
+from .media_turn import (
+    PRIOR_IMAGE_REF_RE as PRIOR_IMAGE_REF_RE,
+)
+from .media_turn import (
+    auto_save_meme,
+    expand_forwards,
+    image_sender,
+    is_sticker_candidate,
+    load_message_images,
+    load_turn_files,
+    recall_historical_images,
+)
+from .memes import explicit_meme_request
 from .memory_compressor import check_memory_text
 from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
@@ -46,7 +68,7 @@ from .modules import ModuleRegistry, install_modules
 from .modules.actions import ActionCall, reject_reason
 from .modules.adapters import Sender, farewell_send_bypass, identifier, onebot_message
 from .modules.bili_watcher import BiliWatcher
-from .modules.bilibili import Bilibili, extract_bvid
+from .modules.bilibili import Bilibili
 from .modules.longnick import Longnick
 from .node_transport import NodeTransport
 from .outbound_actions import ChatActionTrigger, normalize_emoji_like, parse_actions
@@ -54,14 +76,12 @@ from .outgoing import PRE_DISPATCH_REJECTED, is_affection_muted_only, safe_deliv
 from .output_links import filter_reply_links
 from .plugin_kernel import PluginKernel
 from .public_memory import PublicMemory
-from .rich_message_parser import parse_forward
 from .roaming_logger import PatrolDiary, redact_public_summary
 from .routing import RouteDecision
 from .security import Rejected, authorize, configured_secrets, owner, safe_output
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
 from .social import chat_module, confirmed_message_id
-from .songs import explicit_song_request
 from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
@@ -72,38 +92,6 @@ from .world_experience import SOCIAL_LOW
 from .world_state import WorldStateManager
 
 log = logging.getLogger("hakimi")
-PRIOR_IMAGE_REF_RE = re.compile(
-    r"(?:这|那|上|刚|前|原).{0,6}(?:张|幅|个)?(?:图|截图|照片|画面|报错图)"
-    r"|(?:图|截图|照片)(?:里|中|上)"
-    r"|(?:看|瞅|瞧|分析|解释|推导)(?:下|一下|看)?.{0,6}(?:图|截图|照片)"
-)
-PRIOR_FILE_REF_RE = re.compile(
-    r"(?:文件|日志|代码|脚本|配置|报错)"
-    r"|\.(?:log|txt|py|json|ya?ml|toml|md|js|ts|sh|sql)\b",
-    re.I,
-)
-HELP = """哈基米在这里。私聊可直接提问或发 B 站视频；群聊也支持按语境看图、联网和聊视频。
-/哈基米 或 /哈基米 帮助：查看本指令说明
-/new-session：清空当前会话上下文，保留记忆开关
-/search <内容> 或 /搜索 <内容>：显式联网检索公开信息（日常对话也会按需自动检索）
-/watch-video（随 B 站链接或引用视频发送）：请求原片画面/音频分析（默认优先读字幕与热评摘要）
-/哈基米 记忆 开：为当前私聊或本群启用短期与双轨记忆
-/哈基米 记忆 关 或 /哈基米 清空：关闭并删除当前会话记忆
-外部 Bot 默认按阈值限流；群内记忆与策略由配置中的主人管理，私聊记忆绝不进入群聊。
-以下指令需真实主人权限（群内可用）：
-/存表情 <标签>（或 /偷表情、/save-meme）：引用或附带图片（静图/透明PNG/GIF）存进本地表情包库
-/bot-interact：群内 @ 外部 Bot 授权其本群临时互动（10 分钟最多 2 轮）
-以下功能仅限配置中的主人私聊使用：
-/deep <问题或视频链接>：本次启用 high 档深度分析
-/set-sign <签名>：手动设置 50 字以内纯文本 QQ 个签
-/mute <QQ> 或 /unmute <QQ>：应用层屏蔽或解除（默认不删好友）
-/mute-approve <编号> 或 /mute-reject <编号>：批准或驳回屏蔽申请
-（如需同时删除好友，须在 /mute 或 /mute-approve 末尾加 --delete-friend）
-/affection [QQ] [分数]（或 /好感度）：查看或调整指定用户好感度档案（仅主人私聊）
-/学歌 <歌名> [pitch=-24..24]（或 /learn-song）：提交 Colab 学歌任务（可附带音频）
-/哈基米 订阅 <UP主UID> / /哈基米 退订 <UP主UID>：UP 更新私聊提醒（直播开播监控可在 /admin 添加）
-/哈基米 订阅列表 / /哈基米 报告 / /哈基米 状态：查看订阅、近 7 天巡逻报告与今日额度
-链接与小号巡逻优先阅读公开字幕与热评资料；原片分析受后台开关、时长、体积和每日次数限制。"""
 
 _LEARN_SONG_ACTION_NAME = "song_studio.learn_song"
 
@@ -255,6 +243,7 @@ class Service:
             if getattr(self.node_transport, "on_state", None) is None:
                 self.node_transport.on_state = self._relay_node_state
         settings._thinking_scenes = self.modules.thinking_scenes
+        self.commands = build_default_command_registry()
         self.life_engine = LifeEngine(self)
 
     @property
@@ -939,465 +928,24 @@ class Service:
                 await sd.close()
 
     async def command(self, message: Message) -> str | None:
-        if self.bot_guard.known_bot(message):
-            return None
-        prefix = self.s.command_prefix
-        direct = message.command_text if message.command_text is not None else message.text
-        for module in (self.moderation, self.longnick):
-            result = await module.command(message)
-            if result is not None:
-                return result
-        if re.match(r"^/bot-interact(?:\s|$)", direct):
-            return await self.bot_guard.grant(message)
-        if direct == "/new-session":
-            if message.kind == "group" and not owner(message, self.s):
-                raise Rejected("group_owner_only")
-            await self.sessions.clear(message)
-            return "已清空当前会话上下文，记忆开关保持原设置。"
-        meme_match = re.match(
-            r"^(?:/(?:存表情|偷表情|save-meme)|" + re.escape(prefix) + r"\s*(?:存表情|偷表情))"
-            r"(?:\s+(.*))?$",
-            direct.strip(),
-            re.DOTALL,
-        )
-        if meme_match:
-            return await self._save_meme_command(message, meme_match[1] or "")
-        aff_match = re.match(
-            r"^(?:/(?:affection|好感度)|(?:"
-            + re.escape(prefix)
-            + r"|/哈基米)\s+好感度)(?:\s+(.*))?$",
-            direct.strip(),
-        )
-        if aff_match:
-            return await self._affection_command(message, aff_match[1] or "")
-        bind_match = re.match(r"^/bind(?:\s+(.*))?$", direct.strip())
-        if bind_match:
-            return await self._bind_command(message, bind_match[1] or "")
-        learn_match = re.match(
-            r"^(?:/(?:学歌|learn-song)|" + re.escape(prefix) + r"\s*学歌)(?:\s+(.*))?$",
-            direct.strip(),
-            re.DOTALL,
-        )
-        if learn_match:
-            return await self._learn_song_command(message, learn_match[1] or "")
-        if not direct.startswith(prefix):
-            return None
-        command = direct[len(prefix) :].strip()
-        subject = self.store.subject(message)
-        if command in {"", "帮助"}:
-            return HELP
-        if (
-            command in {"清空", "记忆 关", "记忆 开"}
-            and message.kind == "group"
-            and not owner(message, self.s)
-        ):
-            raise Rejected("group_owner_only")
-        if command in {"清空", "记忆 关"}:
-            await self.sessions.clear(message, enabled=False)
-            return "已关闭并删除当前会话中的记忆。"
-        if command == "记忆 开":
-            await self.sessions.enable(message)
-            return "已启用当前会话的短期记忆；本群成员共用本群上下文，其他群和私聊均独立。"
-        privileged = command in {"订阅列表", "报告", "状态"} or command.startswith(("订阅", "退订"))
-        if not privileged:
-            return None
-        if message.kind != "private" or not owner(message, self.s):
-            raise Rejected("owner_private_only")
-        if command == "订阅列表":
-            subscriptions = await self.store.subscriptions(subject)
-            return "已订阅 UP：" + ("、".join(s["mid"] for s in subscriptions) or "暂无")
-        if command == "报告":
-            reports = await self.store.latest_reports(subject)
-            return "\n\n".join(reports) if reports else "最近七天暂无巡逻摘要。"
-        if command == "状态":
-            usage = await self.store.usage()
-            amount = sum(x["amount"] for x in usage["lanes"]) / 1_000_000
-            return (
-                f"{self.s.bot_timezone} {usage['day_local']}：已计入费用（含预留）${amount:.4f}；"
-                f"每日全局上限 ${self.s.daily_usd}。"
-            )
-        match = re.fullmatch(r"(订阅|退订) ([1-9][0-9]{0,19})", command)
-        if not match:
-            return "格式：/哈基米 订阅 <数字UID> 或 /哈基米 退订 <数字UID>"
-        if match[1] == "退订":
-            await self.store.remove_subscription(subject, match[2])
-            return "已取消该 UP 主的巡逻订阅。"
-        if self.modules.inactive_reason("bilibili_surf") or not self.s.bilibili_enabled:
-            return "B 站读取功能尚未开启。"
-        await self.store.add_subscription(message, match[2])
-        tip = (
-            "发现更新后会私聊汇报。"
-            if self.proactive.matches(message) and self.proactive.delivery_enabled
-            else "新摘要会保存在 /哈基米 报告 中。"
-        )
-        return "已订阅；首次巡逻仅建立基线。" + tip
+        return await self.commands.dispatch(self, message)
 
     async def _bind_command(self, message: Message, raw_args: str) -> str:
-        identity = getattr(self, "identity", None)
-        if identity is None:
-            return "跨平台账号绑定服务暂未就绪，请稍后再试。"
-        arg = raw_args.strip()
-        try:
-            if not arg:
-                code = await identity.create_bind_code(message)
-                return (
-                    f"已生成一次性跨平台绑定码：{code}\n"
-                    f"请在 5 分钟内使用另一个平台的账号私聊发送：/bind {code}\n"
-                    "绑定完成后好感度与权限将自动合并同步（绑定码仅限单次使用）。"
-                )
-            await identity.redeem_bind_code(
-                message,
-                arg,
-                affection=self.store.runtime.affection,
-                moderation=self.moderation,
-            )
-            self.record("identity_bound")
-            return "跨平台账号绑定成功！已合并同步好感度与账号状态~"
-        except Rejected as exc:
-            code = str(exc).strip()
-            messages = {
-                "bind_private_only": "为了安全，跨平台账号绑定仅支持在私聊中使用哦~",
-                "bind_bot_forbidden": "Bot 账号不支持使用 /bind 绑定。",
-                "protected_identity": "主人账号由系统配置受保护绑定，不支持通过 /bind 合并或修改。",
-                "bind_muted_forbidden": "当前账号状态受限，暂无法使用 /bind 绑定。",
-                "bind_rate_limited": "生成绑定码太频繁啦，请过几分钟再试~",
-                "bind_code_generation_failed": "暂时未能生成绑定码，请稍后再试~",
-                "bind_cooldown": "绑定码错误次数过多，已触发冷却保护，请 15 分钟后再试~",
-                "invalid_bind_code": "绑定码无效或已过期，请核对后再试，或发送 /bind 重新生成。",
-                "bind_same_account": (
-                    "不能绑定当前同一个账号哦，请用另一个平台或账号私聊发送绑定码。"
-                ),
-                "bind_already_linked": "这两个账号已经绑定在同一个身份档案下啦，无需重复绑定~",
-                "person_not_found": "未找到对应的身份档案，请重新发送 /bind 获取新绑定码。",
-            }
-            return messages.get(code, "绑定操作未完成，请稍后重试或联系管理员处理。")
+        return await handle_bind_command(self, message, raw_args)
 
     async def _affection_command(self, message: Message, raw_args: str) -> str:
-        if message.kind != "private" or not owner(message, self.s):
-            raise Rejected("owner_private_only")
-        aff = self.store.runtime.affection
-        args = raw_args.strip().split()
-        if not args:
-            st = await aff.status()
-            owner_prof = await aff.profile(
-                message.platform, message.user_id, message.sender_nickname
-            )
-            users = st["users"]
-            blacklisted = [u for u in users if u["score"] == 0 and not u["is_owner"]]
-            bl_text = (
-                "、".join(f"{u['nickname']}({u['user_id']})" for u in blacklisted[:10]) or "暂无"
-            )
-            cap = st["config"]["daily_positive_cap"]
-            init_score = st["config"]["initial_score"]
-            return (
-                f"好感度系统：{'已启用' if st['config']['enabled'] else '已停用'}"
-                f"（初始 {init_score}，日正增长上限 +{cap}）。\n"
-                f"BOISER 当前羁绊：{owner_prof['score']} 分"
-                f"（{owner_prof['lv']} {owner_prof['tier_label']}）。\n"
-                f"已建档用户：{len(users)} 人；拉黑(0分)：{len(blacklisted)} 人（{bl_text}）。\n"
-                "用法：/affection <QQ> 查看档案，或 /affection <QQ> <0..120> 调整分数。"
-            )
-        if len(args) > 2:
-            return "用法：/affection [QQ] [0..120]"
-        raw_target = args[0].strip()
-        if raw_target.startswith("qq:"):
-            target_platform, target_uid = "qq", raw_target[3:]
-        elif raw_target.startswith("onebot:"):
-            target_platform, target_uid = "onebot", raw_target[7:]
-        else:
-            target_platform, target_uid = "onebot", raw_target
-        try:
-            target_uid = _validate_platform_user(target_platform, target_uid)
-        except Rejected:
-            return "用法：/affection [QQ] [0..120]，目标账号格式不正确。"
-        if len(args) == 1:
-            prof = await aff.profile(target_platform, target_uid)
-            safety_tag = ""
-            if prof.get("is_owner") or prof.get("safety_status") == "owner_immune":
-                safety_tag = "｜风控免疫"
-            else:
-                viol_30d = int(prof.get("violations_30d", 0) or 0)
-                if viol_30d > 0:
-                    safety_tag = (
-                        f"｜30天安全拦截 {viol_30d}次({prof.get('safety_status') or 'watch'})"
-                    )
-            reply = (
-                f"{prof['nickname']}（{prof['platform']}:{prof['user_id']}）：{prof['score']} 分｜"
-                f"{prof['lv']} {prof['tier_label']}｜"
-                f"今日正向 +{prof['today_positive_gain']}/{prof['daily_positive_cap']}"
-                f"{'｜已拉黑静音' if prof['muted'] else ''}"
-                f"{safety_tag}"
-            )
-            if hasattr(aff, "user_history"):
-                recent = await aff.user_history(target_platform, target_uid, limit=3)
-                if recent:
-                    reply += "\n最近变动：" + "、".join(
-                        f"{int(h['delta']):+d}({h['reason']})" for h in recent
-                    )
-            return reply
-        if not re.fullmatch(r"-?[0-9]{1,4}", args[1]):
-            return "分数需为 0～120 之间的整数（Owner 下限 100，普通成员上限 100）。"
-        target_score = int(args[1])
-        if not 0 <= target_score <= 120:
-            return "分数需为 0～120 之间的整数（Owner 下限 100，普通成员上限 100）。"
-        try:
-            updated = await aff.set_user_score(
-                target_uid,
-                target_score,
-                platform=target_platform,
-                reason="owner_cmd",
-                moderation=self.moderation,
-            )
-        except Rejected as exc:
-            return f"设置失败：{exc}"
-        return (
-            f"已将 {updated['nickname']}（{updated['user_id']}）好感度设为 {updated['score']} 分"
-            f"（{updated['lv']} {updated['tier_label']}）"
-            + ("，并已同步应用层静音。" if updated["muted"] else "。")
-        )
+        return await handle_affection_command(self, message, raw_args)
 
     async def _save_meme_command(self, message: Message, raw_label: str) -> str:
-        if not owner(message, self.s):
-            raise Rejected("group_owner_only" if message.kind == "group" else "owner_private_only")
-        raw_label = raw_label.strip()
-        if not raw_label:
-            return "用法：引用带图消息（或附图同发）并发送 /存表情 <1~24字标签>"
-        try:
-            label = validate_meme_label(raw_label)
-        except Rejected:
-            return "标签格式不对，请用 1～24 个汉字、字母、数字、下划线或短横线。"
-        if not message.images and message.forward_ids and not message.context_expanded:
-            try:
-                message = await self.expand_forwards(message)
-            except Rejected:
-                return "转发内容展开失败，无法获取其中的图片。"
-        if not message.images:
-            return "未找到图片，请引用包含表情包的消息或随指令附带图片。"
-        if not hasattr(self.images, "fetch_raw"):
-            return "当前图片加载器不支持原始下载，请在管理后台上传。"
-        try:
-            raw = await self.images.fetch_raw(message.images[0], max_bytes=MAX_UPLOAD_BYTES)
-            saved = await self.memes.upload_bytes(label, raw)
-        except Rejected as exc:
-            code = str(exc)
-            messages = {
-                "image_too_large": "图片太大啦，单张表情不能超过 5 MiB。",
-                "meme_upload_too_large": "图片太大啦，单张表情不能超过 5 MiB。",
-                "meme_label_exists": f"标签「{label}」里已经有这张图啦，换个标签或直接用就行~",
-                "meme_library_full": (
-                    "表情包库已经满啦（最多 100 张 / 50 MiB），去后台删几张再来吧。"
-                ),
-                "invalid_meme_label": (
-                    "标签格式不对，请用 1～24 个汉字、字母、数字、下划线或短横线。"
-                ),
-            }
-            if code in messages:
-                return messages[code]
-            if code.startswith(("meme_image_", "invalid_meme_")):
-                return "这张图格式或尺寸不支持呢（支持 jpg / png / gif / webp）。"
-            return f"保存表情失败（{code}）。"
-        extra = "（动画已取第一帧）" if saved.get("first_frame_only") else ""
-        return f"表情已存好啦：标签「{saved['label']}」，随时可以用~{extra}"
+        return await handle_save_meme_command(self, message, raw_label)
 
     async def _learn_song_command(self, message: Message, raw_args: str) -> str:
-        if message.kind != "private" or not owner(message, self.s):
-            raise Rejected("owner_private_only")
-        stripped = raw_args.strip()
-        if not stripped:
-            return (
-                "用法：/学歌 <歌名> [pitch=-24..24] [artist=原唱] [tags=标签] "
-                "[inbox=文件名] [--no-search]；可附带音频文件"
-                "（.mp3/.wav/.flac/.m4a/.ogg/.opus）。"
-            )
-        try:
-            tokens = shlex.split(stripped)
-        except ValueError:
-            tokens = stripped.split()
-
-        title_parts: list[str] = []
-        artist = ""
-        tags = ""
-        inbox_filename = ""
-        pitch = 0
-        auto_search = True
-        idx = 0
-        while idx < len(tokens):
-            tok = tokens[idx]
-            low = tok.lower()
-            if low in {"--no-search", "--nosearch"}:
-                auto_search = False
-            elif low.startswith("auto_search="):
-                val = tok.split("=", 1)[1].strip().lower()
-                if val in {"0", "false", "no", "off"}:
-                    auto_search = False
-                elif val in {"1", "true", "yes", "on"}:
-                    auto_search = True
-                else:
-                    return "auto_search 参数需为 true 或 false。"
-            elif low in {"--pitch", "-p"}:
-                if idx + 1 >= len(tokens):
-                    return "用法：--pitch <整数 -24..24>"
-                idx += 1
-                raw_pitch = tokens[idx].strip()
-                if not re.fullmatch(r"[+-]?[0-9]{1,3}", raw_pitch):
-                    return "pitch 必须是整数（范围 -24 到 24）。"
-                pitch = int(raw_pitch)
-            elif low.startswith(("pitch=", "--pitch=", "pitch:", "变调=")):
-                sep = ":" if low.startswith("pitch:") else "="
-                raw_pitch = tok.split(sep, 1)[1].strip()
-                if not re.fullmatch(r"[+-]?[0-9]{1,3}", raw_pitch):
-                    return "pitch 必须是整数（范围 -24 到 24）。"
-                pitch = int(raw_pitch)
-            elif low in {"--artist", "-a"}:
-                if idx + 1 >= len(tokens):
-                    return "用法：--artist <原唱歌手>"
-                idx += 1
-                artist = tokens[idx].strip()
-            elif low.startswith(("artist=", "--artist=")):
-                artist = tok.split("=", 1)[1].strip()
-            elif low in {"--tags", "-t"}:
-                if idx + 1 >= len(tokens):
-                    return "用法：--tags <标签>"
-                idx += 1
-                tags = tokens[idx].strip()
-            elif low.startswith(("tags=", "--tags=")):
-                tags = tok.split("=", 1)[1].strip()
-            elif low in {"--inbox", "-i"}:
-                if idx + 1 >= len(tokens):
-                    return "用法：--inbox <云盘inbox文件名>"
-                idx += 1
-                inbox_filename = tokens[idx].strip()
-            elif low.startswith(("inbox=", "--inbox=")):
-                inbox_filename = tok.split("=", 1)[1].strip()
-            else:
-                title_parts.append(tok)
-            idx += 1
-
-        if not -24 <= pitch <= 24:
-            return "pitch 范围需在 -24 到 24 之间。"
-        raw_title = " ".join(title_parts).strip().strip("《》\"'").strip()
-        if not raw_title:
-            return "请提供歌名，例如：/学歌 晴天 pitch=-2"
-
-        if not message.files and message.forward_ids and not message.context_expanded:
-            try:
-                message = await self.expand_forwards(message)
-            except Rejected:
-                return "转发内容展开失败，无法读取音频附件。"
-
-        audio_bytes: bytes | None = None
-        audio_filename = ""
-        if message.files:
-            try:
-                audio_bytes, audio_filename = await self.files.read_audio_attachment(
-                    message.files[0], message
-                )
-            except Rejected as exc:
-                code = str(exc)
-                if code == "invalid_song_audio":
-                    return "音频附件格式不支持，仅支持 .mp3 / .wav / .flac / .m4a / .ogg / .opus。"
-                if code == "oversized":
-                    return "音频附件太大啦（最大支持 100 MiB），请剪辑或压缩后再发。"
-                if code == "unavailable":
-                    return "音频附件下载失败，请重新发送或上传到云盘 Hakimi_Songs/inbox/。"
-                return f"读取音频附件失败（{code}）。"
-
-        songs = getattr(self, "songs", None)
-        if songs is None or not hasattr(songs, "request_learn_song"):
-            return "歌单工坊模块尚未就绪，请稍后再试。"
-        try:
-            job = await songs.request_learn_song(
-                raw_title,
-                artist=artist,
-                tags=tags,
-                pitch=pitch,
-                audio_bytes=audio_bytes,
-                audio_filename=audio_filename,
-                inbox_filename=inbox_filename,
-                auto_search=auto_search,
-                requester="owner",
-            )
-        except Rejected as exc:
-            code = str(exc)
-            err_map = {
-                "colab_unconfigured": "Colab 云端算力未配置，请先在后台或环境变量配置 Worker。",
-                "colab_disabled": "Colab 云端算力当前已停用，请先在后台启用。",
-                "colab_worker_unavailable": "Colab Worker 暂时离线或不可达，请检查后台状态。",
-                "colab_daily_job_limit": "今日 Colab 学歌作业次数已达上限啦。",
-                "colab_daily_limit": "今日 Colab 学歌作业次数已达上限啦。",
-                "colab_daily_cu_budget": "今日 Colab CU 预算已用完啦。",
-                "colab_budget_exceeded": "今日 Colab CU 预算已用完啦。",
-                "colab_job_limit_reached": "Colab 任务队列已满，请稍等当前任务跑完再试。",
-                "colab_drive_not_configured": "Drive 歌单目录未配置，暂时无法上传/检索云盘。",
-                "colab_drive_invalid_file": "指定的云盘 inbox 文件无效，请核对文件名。",
-                "song_drive_not_configured": "歌单云盘 Drive 凭证未配置，暂时无法上传/检索云盘。",
-                "song_drive_credentials_invalid": (
-                    "歌单云盘 Drive 凭证无效或权限不安全，请检查后台配置。"
-                ),
-                "song_drive_insufficient_scope": (
-                    "歌单云盘 Drive 凭证缺少 drive.file 权限，请重新授权。"
-                ),
-                "song_drive_reauth_required": "歌单云盘 Drive 授权已过期或被撤销，请重新授权。",
-                "song_drive_invalid_file": "指定的云盘 inbox 文件无效，请核对文件名。",
-                "song_drive_folder_unavailable": (
-                    "歌单云盘 Hakimi_Songs 目录不可用或无写入权限，请检查后台目录设置。"
-                ),
-                "song_drive_upload_failed": "上传原曲到云盘 inbox 失败，请稍后重试。",
-                "song_inbox_upload_too_large": "音频超过 100 MiB 上限，请先压缩或截取后再试。",
-                "colab_invalid_job": "提交学歌参数无效，请检查歌名或选项。",
-                "invalid_song_title": (
-                    "歌名格式不太对，支持 1～60 字多语种文字、数字与常见标点"
-                    '（不可含 / \\ < > " 等特殊符号）。'
-                ),
-                "invalid_song_meta": "歌手或标签格式过长或包含非法字符。",
-                "invalid_song_pitch": "pitch 范围需在 -24 到 24 之间。",
-                "invalid_song_audio": "音频格式不支持或文件已损坏。",
-                "invalid_drive_file_id": "云盘文件标识无效，请重试。",
-                "song_upload_too_large": "音频超过体积上限，请先压缩或截取后再试。",
-                "song_source_required": "未附音频且已关闭自动搜歌，请附带音频或开启自动搜索。",
-                "song_title_exists": f"歌单里已经有《{raw_title}》啦，换一首或先在后台删除旧版吧。",
-                "song_library_full": "歌单已满（最多 300 首），去后台清理几首再来学吧。",
-            }
-            return err_map.get(code, f"提交学歌任务失败（{code}）。")
-
-        job_id = str(job.get("id") or job.get("job_id") or "")
-        pitch_note = f"，变调 {pitch:+d}" if pitch else ""
-        if audio_bytes is not None:
-            source_note = "（已使用附带音频）"
-        elif inbox_filename:
-            source_note = "（云盘原曲）"
-        else:
-            source_note = "（自动检索原曲）"
-        return (
-            f"收到！已开始练习《{raw_title}》{source_note}（任务 {job_id}{pitch_note}），"
-            "学好后会来叫你~"
-        )
+        return await handle_learn_song_command(self, message, raw_args)
 
     async def _auto_save_meme(
         self, message: Message, candidates: list[Message], label: str
     ) -> bool:
-        if not hasattr(self.images, "fetch_raw"):
-            return False
-        ref = next(
-            (img for item in reversed(candidates) for img in reversed(item.images)),
-            None,
-        )
-        if ref is None and message.reply_ids:
-            for reply_id in reversed(message.reply_ids):
-                replied = await self.lookup_received(message, reply_id)
-                if replied and replied.images:
-                    ref = replied.images[-1]
-                    break
-        if ref is None:
-            return False
-        try:
-            raw = await self.images.fetch_raw(ref, max_bytes=MAX_UPLOAD_BYTES)
-            await self.memes.upload_bytes(label, raw)
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return False
+        return await auto_save_meme(self, message, candidates, label)
 
     def output(self, text: str) -> str:
         return safe_output(text, self.secrets, limit=self.s.send_max_chars)
@@ -1484,21 +1032,24 @@ class Service:
             for m in members
         )
 
+    def _is_explicit_song_request(self, *texts: str) -> bool:
+        songs = getattr(self, "songs", None)
+        if songs is None:
+            return False
+        checker = getattr(songs, "explicit_song_request", None)
+        if callable(checker):
+            return bool(checker(*texts))
+        mod = sys.modules.get(type(songs).__module__)
+        mod_checker = getattr(mod, "explicit_song_request", None) if mod is not None else None
+        if callable(mod_checker):
+            return bool(mod_checker(*texts))
+        return False
+
     def image_sender(self, message):
-        nickname = message.sender_nickname.strip()[:40] or "群友"
-        token = self.store.vault.digest("image-speaker", *message.subject_parts(self.s.namespace))[
-            :6
-        ]
-        return f"{nickname}（成员标识 {token}）"
+        return image_sender(self, message)
 
     def _is_sticker_candidate(self, message, ref) -> bool:
-        if getattr(ref, "is_sticker", False):
-            return True
-        if isinstance(self.images, ImageLoader):
-            cached = self.images.cache_get(self.store.session_scope(message), ref)
-            if cached is not None and cached.digest and self.memes.semantic_label(cached.digest):
-                return True
-        return False
+        return is_sticker_candidate(self, message, ref)
 
     async def message_images(
         self,
@@ -1511,92 +1062,16 @@ class Service:
         nearby_origin="紧邻群消息",
         selected_members=None,
     ):
-        selected, seen = [], set()
-        for origin, messages in (
-            ("本批消息", reversed(members)),
-            (nearby_origin, reversed(nearby)),
-        ):
-            entries = []
-            for item in messages:
-                candidate = (
-                    item.model_copy(update={"addressed": True}) if item.kind == "group" else item
-                )
-                if not authorize(candidate, self.s) or other_mentions(item):
-                    continue
-                for ref in item.images:
-                    if ref.identity not in seen:
-                        seen.add(ref.identity)
-                        entries.append((ref, item, origin))
-            if origin == nearby_origin and entries:
-                regular = [e for e in entries if not self._is_sticker_candidate(message, e[0])]
-                stickers = [e for e in entries if self._is_sticker_candidate(message, e[0])]
-                entries = regular + stickers
-            selected.extend(entries)
-        # Expanded forward images can lack an original-user mapping; never invent authorship.
-        for ref in message.images if include_current else []:
-            if ref.identity not in seen:
-                selected.append((ref, message, "转发材料，原始作者未核实"))
-                seen.add(ref.identity)
-        omitted = max(0, len(selected) - limit)
-        selected = selected[:limit]
-        if not selected:
-            return [], []
-        refs = [entry[0] for entry in selected]
-        if hasattr(self.images, "load_results"):
-            results = await self.images.load_results(
-                refs,
-                **(
-                    {"scope": self.store.session_scope(message)}
-                    if isinstance(self.images, ImageLoader)
-                    else {}
-                ),
-            )
-        else:
-            results = await self.images.load(refs)  # Compatible injected loaders in integrations.
-        images, sources = [], []
-        valid_loaded = sum(1 for item in results if item is not None)
-        for (ref, member, origin), loaded in zip(selected, results, strict=True):
-            data = {
-                "sender": f"{ref.sender_nickname or '群友'}(QQ:{ref.sender_id})"
-                if ref.sender_id
-                else self.image_sender(member),
-                "origin": origin if ref.origin in {"", "当前消息"} else origin + " / " + ref.origin,
-            }
-            if loaded is None:
-                data["status"] = (
-                    self.images.failure_status(ref)
-                    if hasattr(self.images, "failure_status")
-                    else "unavailable"
-                )
-            elif valid_loaded == 1 and len(loaded.tiles) == 2 and len(images) + 2 <= limit:
-                split_imgs = loaded.tile_images()
-                if selected_members is not None:
-                    selected_members.append(member)
-                semantic = self.memes.semantic_label(loaded.digest)
-                for part_idx, part_img in enumerate(split_imgs, 1):
-                    images.append(part_img)
-                    part_data = {
-                        **data,
-                        "image_number": len(images),
-                        "status": "available",
-                        "slice": f"{part_idx}/2",
-                    }
-                    if semantic and part_idx == 1:
-                        part_data["local_sticker_label"] = semantic
-                    sources.append(part_data)
-                continue
-            else:
-                images.append(loaded)
-                data.update(image_number=len(images), status="available")
-                if selected_members is not None:
-                    selected_members.append(member)
-                semantic = self.memes.semantic_label(loaded.digest)
-                if semantic:
-                    data["local_sticker_label"] = semantic
-            sources.append(data)
-        if omitted:
-            sources.append({"status": "omitted", "count": omitted})
-        return images, sources
+        return await load_message_images(
+            self,
+            message,
+            members,
+            nearby,
+            limit=limit,
+            include_current=include_current,
+            nearby_origin=nearby_origin,
+            selected_members=selected_members,
+        )
 
     async def _load_turn_files(
         self,
@@ -1606,110 +1081,12 @@ class Service:
         history_events: set[str],
         current_events: set[str],
     ) -> tuple[list[dict], list[dict], list[str]]:
-        candidates: list[tuple] = []
-        seen_ids: set[str] = set()
-        for item in reversed(members):
-            check = item.model_copy(update={"addressed": True}) if item.kind == "group" else item
-            if not authorize(check, self.s) or other_mentions(item):
-                continue
-            for ref in item.files:
-                if ref.identity not in seen_ids:
-                    seen_ids.add(ref.identity)
-                    candidates.append((ref, item, "本批消息"))
-        for ref in message.files:
-            if ref.identity not in seen_ids:
-                seen_ids.add(ref.identity)
-                candidates.append((ref, message, "引用或转发材料"))
-        if not candidates and (message.kind == "group" or PRIOR_FILE_REF_RE.search(message.text)):
-            consumed = (
-                await self.store.groups.consumed_file_events(message)
-                if message.kind == "group"
-                else set()
-            )
-            mention_any = bool(PRIOR_FILE_REF_RE.search(message.text))
-            nearby_pool = [m for m in filtered_nearby if m.files and m.event_id not in consumed]
-            hot_pool = [
-                m
-                for m in self.hot.recent_with_files(
-                    message, exclude_events={*current_events, *consumed}
-                )
-                if m.event_id not in history_events
-            ]
-            seen_events: set[str] = set()
-            for item in reversed([*hot_pool, *nearby_pool]):
-                if item.event_id in seen_events:
-                    continue
-                seen_events.add(item.event_id)
-                if item.user_id != message.user_id and (message.kind != "group" or not mention_any):
-                    continue
-                if await self.recalled([item]):
-                    continue
-                check = (
-                    item.model_copy(update={"addressed": True}) if item.kind == "group" else item
-                )
-                if not authorize(check, self.s) or other_mentions(item):
-                    continue
-                for ref in item.files:
-                    if ref.identity not in seen_ids:
-                        seen_ids.add(ref.identity)
-                        candidates.append((ref, item, "近期群聊文件"))
-        if not candidates:
-            return [], [], []
-        selected: list[Message] = []
-        attachments, sources = await self.files.load_for_turn(
-            message, candidates, limit=1, selected_members=selected
+        return await load_turn_files(
+            self, message, members, filtered_nearby, history_events, current_events
         )
-        consumed_events = [
-            m.event_id for m in selected if m.event_id and m.event_id not in current_events
-        ]
-        return attachments, sources, consumed_events
 
     async def expand_forwards(self, message: Message) -> Message:
-        texts, images = [message.text], list(message.images)
-        seen_ids = {i.identity for i in images}
-        files = list(message.files)
-        seen_file_ids = {f.identity for f in files}
-        videos, shorts = list(message.video_ids), list(message.short_urls)
-        statuses = set(message.context_status)
-        for forward_id in message.forward_ids:
-            rich = parse_forward(await self.sender.forward(forward_id), message.bot_id)
-            if rich.truncated:
-                statuses.add("truncated")
-            texts.append(rich.text)
-            for img in rich.images:
-                if img.identity not in seen_ids:
-                    images.append(img)
-                    seen_ids.add(img.identity)
-            for fref in rich.files:
-                if fref.identity not in seen_file_ids:
-                    files.append(fref)
-                    seen_file_ids.add(fref.identity)
-            videos.extend(v for v in rich.video_ids if v not in videos)
-            shorts.extend(u for u in rich.short_urls if u not in shorts)
-            # No recursive get_forward_msg calls: a quoted reference cannot fan out requests.
-        text = "\n".join(texts)
-        if len(text) > 24000:
-            raise Rejected("forward_too_large")
-        if len(images) > 2:
-            images = images[:2]
-            statuses.add("truncated")
-        if len(files) > 2:
-            files = files[:2]
-            statuses.add("truncated")
-        if any(secret and len(secret) >= 8 and secret in text for secret in self.secrets):
-            raise Rejected("credential_in_input")
-        return message.model_copy(
-            update={
-                "text": text,
-                "images": images,
-                "files": files,
-                "video_ids": videos[:5],
-                "short_urls": shorts[:5],
-                "forward_ids": [],
-                "context_expanded": True,
-                "context_status": sorted(statuses),
-            }
-        )
+        return await expand_forwards(self, message)
 
     async def summarize(
         self,
@@ -2377,64 +1754,27 @@ class Service:
                 if m.context_status
             )
         if img_limit > 0 and not sandbox and not images and PRIOR_IMAGE_REF_RE.search(message.text):
-            candidates = self.hot.recent_with_images(
+            recalled_images, recalled_sources = await recall_historical_images(
+                self,
                 message,
-                exclude_events={*current_events, *(m.event_id for m in image_nearby)},
+                members,
+                intent=intent,
+                img_limit=img_limit,
+                digested_events=digested_events,
+                current_events=current_events,
+                image_nearby=image_nearby,
+                aff_active=aff_active,
+                caps=caps,
+                recalled_members=recalled_members,
+                neighbour_members=neighbour_members,
+                job_subject=job["subject"],
+                message_guard=message_guard,
             )
-            valid_candidates = []
-            for item in candidates:
-                if not await self.recalled([item]):
-                    valid_candidates.append(item)
-            if valid_candidates:
-                mentioned_peers = {
-                    uid for m in members for uid in m.mentioned_ids if uid != self.s.onebot_self_id
-                }
-                tier_hint = getattr(intent, "tier", 2)
-
-                def _recall_rank(idx_item):
-                    idx, item = idx_item
-                    speaker_match = (item.user_id in mentioned_peers) or bool(
-                        item.sender_nickname and item.sender_nickname in message.text
-                    )
-                    undigested = item.event_id not in digested_events
-                    return (
-                        1 if speaker_match else 0,
-                        1 if (tier_hint < 4 and undigested) else 0,
-                        idx,
-                    )
-
-                ordered_candidates = [
-                    item for _, item in sorted(enumerate(valid_candidates), key=_recall_rank)
-                ]
-                recalled_members.clear()
-                recalled_images, recalled_sources = await self.message_images(
-                    message,
-                    [],
-                    ordered_candidates,
-                    limit=img_limit,
-                    include_current=False,
-                    nearby_origin="历史消息附图",
-                    selected_members=recalled_members,
-                )
-                if aff_active and caps.low_res_images_only and recalled_images:
-                    recalled_images = [
-                        dataclasses.replace(i, resolution="low") for i in recalled_images
-                    ]
-                await message_guard()
-                if recalled_images:
-                    late_images = True
-                    neighbour_members.extend(recalled_members)
-                    await self.ai.screen(
-                        {"image_sources": recalled_sources, "historical_image_recall": True},
-                        job["subject"],
-                        purpose="source",
-                        message=message,
-                        images=[i.gate() for i in recalled_images],
-                        before_call=message_guard,
-                    )
-                    image_sources.extend(recalled_sources)
-                    images.extend(recalled_images)
-                    payload["image_sources"] = image_sources
+            if recalled_images:
+                late_images = True
+                image_sources.extend(recalled_sources)
+                images.extend(recalled_images)
+                payload["image_sources"] = image_sources
         file_attachments, file_sources, consumed_file_events = [], [], []
         if (
             not sandbox
@@ -2539,7 +1879,7 @@ class Service:
             voice_supported, _ = self.platform_voice_capability(message)
             voice_aff_ok = (not aff_active) or caps.allow_sticker
             explicit_voice = explicit_voice_request(*(m.text for m in members), message.text)
-            explicit_song = explicit_song_request(*(m.text for m in members), message.text)
+            explicit_song = self._is_explicit_song_request(*(m.text for m in members), message.text)
             explicit_voice_bypass = (explicit_voice or explicit_song) and (
                 message.kind == "private" or verified_owner_turn
             )

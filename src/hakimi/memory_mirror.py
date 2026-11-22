@@ -9,6 +9,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .memory_compressor import check_memory_text
+from .platform_hooks import get_platform_hooks
 from .security import Rejected
 from .social import chat_module, chat_registry
 from .work_usage import model_work
@@ -74,10 +75,9 @@ class MemoryMirror:
         if message.kind != "group":
             return False
         if chat_registry(self.s) is None:
-            # Legacy standalone maintenance callers have only the configured QQ transports.
-            from .modules.platforms.qq.chat_policy import permits_memory_mirror
-
-            return permits_memory_mirror(message, self.s)
+            # Legacy standalone maintenance callers resolve via kernel platform hooks.
+            hooks = get_platform_hooks(message.platform)
+            return bool(hooks and hooks.permits_memory_mirror(message, self.s))
         module = chat_module(self.s, message.platform)
         return bool(module and module.permits_memory_mirror(message, self.s))
 

@@ -31,8 +31,6 @@ from .life_rules import RuleDispatcher
 from .life_workers import ActionWorkers
 from .modules.actions import ActionCall, GateDecision, HourlyAction, Mode, Outcome, reject_reason
 from .modules.base import sanitize_sensor_text
-from .modules.qq_delivery import JIT_TRIGGER_MESSAGE as JIT_TRIGGER_MESSAGE
-from .modules.qq_policy import DESKTOP_CONTEXT_HINT as DESKTOP_CONTEXT_HINT
 from .planning_journal import PlannerJournal
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
@@ -50,6 +48,12 @@ from .world_state import (
 
 log = logging.getLogger("hakimi")
 
+JIT_TRIGGER_MESSAGE = (
+    "[系统主动意图触发：这是你自己先前排定的主动发言时刻。请结合 "
+    "jit_proactive_intent、待分享见闻与近期上下文，用自然松弛的口语开口；"
+    "私聊可自然开启新话头或挂念日常，群聊若正逢严肃争执或完全插不上嘴可将 abstain 设为 true]"
+)
+DESKTOP_CONTEXT_HINT = "BOISER 近期刚在电脑端忙正事，默契关心一句注意休息喝水，绝不问怎么没回消息"
 GROUP_SCRUBBED_INTENT_NOTE = "去群里看看大家在聊什么，顺势自然接话或结合公开见闻互动"
 NEAR_HORIZON_SECONDS = 3 * 3600
 ACTIVE_SESSION_REVIEW_SECONDS = 60 * 60

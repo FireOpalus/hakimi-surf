@@ -13,6 +13,7 @@ from .models import Message
 from .modules.adapters import farewell_send_bypass
 from .outbound_actions import bubble_segments, parse_actions, valid_receipt
 from .output_links import filter_reply_links
+from .platform_hooks import get_platform_hooks
 from .security import Rejected, authorize, configured_secrets, safe_output
 from .social import chat_module, confirmed_message_id
 from .text_card import should_render_rich_card
@@ -807,8 +808,6 @@ async def deliver_proactive_jit(
     before_delivery: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict:
     """Deliver JIT proactive bubbles sequentially with at-most-once ambiguity safety."""
-    from .modules.qq_audience import allowed_proactive_message
-
     is_group = message.kind == "group"
     public_chat = is_group or not is_persona_owner(message, service.s)
     secrets = getattr(service, "secrets", None) or configured_secrets(service.s)
@@ -905,9 +904,11 @@ async def deliver_proactive_jit(
     identity = getattr(service, "identity", None)
 
     def permitted() -> bool:
+        hooks = get_platform_hooks(message.platform)
         return (
             still_allowed()
-            and allowed_proactive_message(message, service.s)
+            and hooks is not None
+            and bool(hooks.allowed_proactive(message, service.s))
             and authorize(message, service.s)
             and (identity is None or not identity.is_muted(message.platform, message.user_id))
         )

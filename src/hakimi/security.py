@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from .bot_server import is_persona_owner
 from .config import Settings
 from .models import Message
+from .platform_hooks import get_platform_hooks
 from .reply_style import clean_chinese_punctuation
 
 # Server-only per-settings hooks; a copied sandbox Settings has no registration.
@@ -159,10 +160,15 @@ def authorize(message: Message, settings: Settings, *, _bot_exempt=False) -> boo
         ):
             return False
         return module.authorize_chat(message, settings, bot_exempt=_bot_exempt)
-    # Detached settings (including the isolated admin sandbox) have only the built-in transports.
-    from .modules.platforms.qq.chat_policy import qq_authorize
-
-    return qq_authorize(message, settings, _bot_exempt=_bot_exempt)
+    # Detached settings (including the isolated admin sandbox) use registered platform hooks.
+    if message.user_id == message.bot_id or (
+        message.kind == "private" and message.conversation_id != message.user_id
+    ):
+        return False
+    hooks = get_platform_hooks(message.platform)
+    if hooks is None:
+        return False
+    return bool(hooks.authorize(message, settings, _bot_exempt=_bot_exempt))
 
 
 def safe_output(text: str, secrets: list[str], limit: int = 1800) -> str:
