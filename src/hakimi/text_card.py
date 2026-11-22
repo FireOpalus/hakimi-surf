@@ -1,16 +1,52 @@
-"""In-memory Markdown/code/table card renderer using Pillow; no browser or disk files."""
+"""Markdown/code/table card renderer with remote `doc_render` routing and Pillow fallback."""
 
+import asyncio
 import base64
 import io
+import logging
+import os
 import re
+import threading
 from pathlib import Path
+from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from .security import Rejected
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # pragma: no cover - optional when Pillow is stripped from main engine
+    Image = ImageDraw = ImageFont = None  # type: ignore[assignment]
+
+log = logging.getLogger("hakimi")
 
 CARD_WIDTH = 960
 MAX_CARD_HEIGHT = 4400
 MAX_CARD_BYTES = 4_500_000
+MAX_REMOTE_CARD_BYTES = 5 * 1024 * 1024
+MAX_RENDER_PIXELS = 1440 * 6000
 MAX_INPUT_CHARS = 8000
+DOC_RENDER_PLUGIN_ID = "doc_render"
+DOC_RENDER_CARD_ACTION = "doc_render.render_card"
+_DOC_RENDER_FALLBACK_ERRORS = frozenset(
+    {
+        "plugin_offline",
+        "plugin_disabled",
+        "plugin_disconnected",
+        "plugin_not_dispatched",
+        "plugin_rpc_timeout",
+        "action_not_found",
+        "plugin_internal_error",
+        "plugin_blob_backpressure",
+        "plugin_blob_corrupt",
+        "plugin_blob_invalid",
+        "render_failed",
+    }
+)
+
+_BRIDGE_LOCK = threading.Lock()
+_REMOTE_PLUGIN_BUS: Any = None
+_REMOTE_ONLY: bool | None = None
+
 TABLE_SEP_RE = re.compile(r"^\s*\|?(?:\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$")
 FENCE_START_RE = re.compile(r"^\s*```([A-Za-z0-9_+#.\-]*)\s*$")
 FENCE_END_RE = re.compile(r"^\s*```\s*$")
@@ -25,6 +61,92 @@ MONO_FONT_PATHS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     *CJK_FONT_PATHS,
 )
+
+
+def configure_remote_bridge(plugin_bus: Any, *, remote_only: bool | None = None) -> None:
+    """Bind or clear the process-wide PluginBus handle used for remote `doc_render` card calls."""
+    global _REMOTE_PLUGIN_BUS, _REMOTE_ONLY
+    with _BRIDGE_LOCK:
+        _REMOTE_PLUGIN_BUS = plugin_bus
+        _REMOTE_ONLY = remote_only
+
+
+def _get_bridge_state() -> tuple[Any, bool | None]:
+    with _BRIDGE_LOCK:
+        return _REMOTE_PLUGIN_BUS, _REMOTE_ONLY
+
+
+def _resolve_remote_only(explicit: bool | None, configured: bool | None) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    if configured is not None:
+        return bool(configured)
+    return os.getenv("DOC_RENDER_REMOTE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _doc_render_card_online(bus: Any) -> bool:
+    if bus is None:
+        return False
+    has_tool = getattr(bus, "has_tool", None)
+    if callable(has_tool):
+        return bool(has_tool(DOC_RENDER_PLUGIN_ID, DOC_RENDER_CARD_ACTION))
+    is_online = getattr(bus, "is_plugin_online", None)
+    if callable(is_online):
+        return bool(is_online(DOC_RENDER_PLUGIN_ID))
+    return False
+
+
+def _active_bus_loop(bus: Any) -> asyncio.AbstractEventLoop | None:
+    if bus is None:
+        return None
+    loop = getattr(bus, "event_loop", None)
+    if loop is None:
+        loop = getattr(bus, "_loop", None)
+    if isinstance(loop, asyncio.AbstractEventLoop) and not loop.is_closed() and loop.is_running():
+        return loop
+    return None
+
+
+def _encode_validated_card_blob(raw: Any, *, expected_fmt: str | None = None) -> str:
+    if not isinstance(raw, (bytes, bytearray)) or not raw or len(raw) > MAX_CARD_BYTES:
+        raise Rejected("render_failed")
+    data = bytes(raw)
+    is_png = data.startswith(b"\x89PNG\r\n\x1a\n")
+    is_jpeg = data.startswith(b"\xff\xd8\xff")
+    if expected_fmt == "png" and not is_png:
+        raise Rejected("render_failed")
+    if expected_fmt == "jpeg" and not is_jpeg:
+        raise Rejected("render_failed")
+    if not (is_png or is_jpeg):
+        raise Rejected("render_failed")
+    return "base64://" + base64.b64encode(data).decode("ascii")
+
+
+async def _invoke_remote_render_card(
+    bus: Any,
+    text: str,
+    *,
+    fmt: str = "png",
+    width: int = CARD_WIDTH,
+    max_height: int = MAX_CARD_HEIGHT,
+    theme: str = "lavender",
+    timeout: float = 20.0,  # noqa: ASYNC109
+) -> str:
+    res = await bus.invoke_tool(
+        DOC_RENDER_PLUGIN_ID,
+        DOC_RENDER_CARD_ACTION,
+        {
+            "text": text[:MAX_INPUT_CHARS],
+            "format": fmt,
+            "width": width,
+            "max_height": max_height,
+            "theme": theme,
+        },
+        max_request_blob_bytes=0,
+        max_response_blob_bytes=MAX_REMOTE_CARD_BYTES,
+        timeout=timeout,
+    )
+    return _encode_validated_card_blob(getattr(res, "blob", None), expected_fmt=fmt)
 
 
 def should_render_rich_card(text: str, mode: str = "rich_auto") -> bool:
@@ -44,7 +166,7 @@ def should_render_rich_card(text: str, mode: str = "rich_auto") -> bool:
     return False
 
 
-def _load_font(paths: tuple[str, ...], size: int) -> ImageFont.ImageFont:
+def _load_font(paths: tuple[str, ...], size: int) -> Any:
     chosen = next((p for p in paths if Path(p).is_file()), None)
     return ImageFont.truetype(chosen, size) if chosen else ImageFont.load_default(size=size)
 
@@ -254,8 +376,10 @@ def _parse_blocks(text: str) -> list[tuple]:
     return blocks or [("para", "")]
 
 
-def render_card(text: str) -> str:
-    """Render plain text or Markdown (headings, code blocks, GFM tables) to JPEG base64."""
+def _render_card_local(text: str, *, fmt: str = "jpeg") -> str:
+    """In-process Pillow fallback renderer returning `base64://...` JPEG or PNG."""
+    if Image is None or ImageDraw is None or ImageFont is None:
+        raise Rejected("doc_render_remote_unavailable")
     text = str(text or "")[:MAX_INPUT_CHARS]
     font_body = _load_font(CJK_FONT_PATHS, 22)
     font_small = _load_font(CJK_FONT_PATHS, 17)
@@ -498,6 +622,8 @@ def render_card(text: str) -> str:
 
     footer_note_h = 34 if truncated else 0
     canvas_h = min(MAX_CARD_HEIGHT, max(180, y + footer_note_h + 52))
+    if CARD_WIDTH * canvas_h > MAX_RENDER_PIXELS:
+        raise Rejected("card_too_large")
     image = Image.new("RGB", (CARD_WIDTH, canvas_h), "#f2eef9")
     draw = ImageDraw.Draw(image)
     draw.rounded_rectangle(
@@ -518,6 +644,20 @@ def render_card(text: str) -> str:
             font=font_small,
             fill="#807994",
         )
+    norm_fmt = str(fmt or "jpeg").strip().lower()
+    if norm_fmt == "png":
+        for compress_level in (6, 9):
+            target = io.BytesIO()
+            image.save(target, format="PNG", optimize=True, compress_level=compress_level)
+            raw = target.getvalue()
+            if len(raw) <= MAX_CARD_BYTES:
+                return "base64://" + base64.b64encode(raw).decode("ascii")
+        quantized = image.quantize(colors=256)
+        target = io.BytesIO()
+        quantized.save(target, format="PNG", optimize=True, compress_level=9)
+        raw = target.getvalue()
+        return "base64://" + base64.b64encode(raw).decode("ascii")
+
     for quality in (88, 80, 72):
         target = io.BytesIO()
         image.save(target, format="JPEG", quality=quality, optimize=True)
@@ -525,6 +665,86 @@ def render_card(text: str) -> str:
         if len(raw) <= MAX_CARD_BYTES or quality == 72:
             return "base64://" + base64.b64encode(raw).decode("ascii")
     return "base64://"
+
+
+async def render_card_async(
+    text: str,
+    *,
+    plugin_bus: Any = None,
+    fmt: str = "png",
+    width: int = CARD_WIDTH,
+    max_height: int = MAX_CARD_HEIGHT,
+    theme: str = "lavender",
+    remote_only: bool | None = None,
+    timeout: float = 20.0,  # noqa: ASYNC109
+) -> str:
+    """Render card via remote `doc_render` plugin when online, with graceful Pillow fallback."""
+    configured_bus, configured_remote_only = _get_bridge_state()
+    bus = plugin_bus if plugin_bus is not None else configured_bus
+    strict = _resolve_remote_only(remote_only, configured_remote_only)
+    raw_text = str(text or "")
+
+    if _doc_render_card_online(bus) and raw_text.strip():
+        try:
+            return await _invoke_remote_render_card(
+                bus,
+                raw_text,
+                fmt=fmt,
+                width=width,
+                max_height=max_height,
+                theme=theme,
+                timeout=timeout,
+            )
+        except Rejected as exc:
+            if str(exc) in _DOC_RENDER_FALLBACK_ERRORS:
+                if strict:
+                    raise Rejected("doc_render_remote_unavailable") from None
+                log.warning("event=doc_render_card_fallback reason=%s", str(exc))
+            else:
+                raise
+    elif strict:
+        raise Rejected("doc_render_remote_unavailable")
+
+    return await asyncio.to_thread(_render_card_local, raw_text, fmt=fmt)
+
+
+def render_card(text: str) -> str:
+    """Render plain text or Markdown card, routing to remote `doc_render` from worker threads."""
+    bus, configured_remote_only = _get_bridge_state()
+    strict = _resolve_remote_only(None, configured_remote_only)
+    raw_text = str(text or "")
+
+    if _doc_render_card_online(bus) and raw_text.strip():
+        loop = _active_bus_loop(bus)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is not None and loop is not running:
+            fut = asyncio.run_coroutine_threadsafe(
+                _invoke_remote_render_card(bus, raw_text, fmt="png"),
+                loop,
+            )
+            try:
+                return fut.result(timeout=22.0)
+            except Rejected as exc:
+                if str(exc) in _DOC_RENDER_FALLBACK_ERRORS:
+                    if strict:
+                        raise Rejected("doc_render_remote_unavailable") from None
+                    log.warning("event=doc_render_card_sync_fallback reason=%s", str(exc))
+                else:
+                    raise
+            except (TimeoutError, RuntimeError, OSError) as exc:
+                fut.cancel()
+                if strict:
+                    raise Rejected("doc_render_remote_unavailable") from None
+                log.warning("event=doc_render_card_sync_fallback exception=%s", type(exc).__name__)
+        elif strict:
+            raise Rejected("doc_render_remote_unavailable")
+    elif strict:
+        raise Rejected("doc_render_remote_unavailable")
+
+    return _render_card_local(raw_text, fmt="jpeg")
 
 
 def _draw_rich_lines(
