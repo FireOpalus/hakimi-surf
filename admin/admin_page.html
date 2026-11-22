@@ -3356,8 +3356,15 @@ body:not(.authenticated) main {
         <button type="button" class="secondary" data-open-tab="colab-compute">查看作业队列 →</button>
       </div>
     </div>
-    <p class="muted">提交到 Colab GPU Worker 自动执行人声分离、RVC 翻唱推理与高潮切片，成品将自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。若未选择 Drive <code>inbox/</code> 原曲且启用自动检索，Worker 会尝试搜索干净官方原版。</p>
+    <p class="muted">提交到 Colab GPU Worker 自动执行人声分离、RVC 翻唱推理与高潮切片，成品将自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。若未选择 Drive <code>inbox/</code> 原曲且启用自动检索，Worker 会尝试搜索干净官方原版；<code>drive.file</code> 最小权限模式下也可直接在此上传本地原曲到收件箱，或在 QQ 私聊发送音频附带 <code>/学歌</code>。</p>
     <p id="song-learn-colab-hint" class="muted"></p>
+    <div class="sub-card">
+      <div class="row">
+        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 18 MiB）</label>
+        <input id="song-inbox-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac">
+        <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
+      </div>
+    </div>
     <form id="song-learn-form">
       <div class="song-meta">
         <label for="song-learn-title">歌名（必填，1～40字）<input id="song-learn-title" maxlength="40" required placeholder="例如：晴天"></label>
@@ -7034,6 +7041,8 @@ const songErrorLabels={
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
   colab_daily_limit_reached:'今日 Colab 作业次数或 CU 预算已达上限',
+  colab_inbox_upload_too_large:'上传原曲超过 18 MiB 上限',
+  colab_drive_invalid_file:'原曲文件名无效',
   song_upload_too_large:'上传音频超过 12 MiB 上限',
   song_audio_required:'请先选择有效的音频文件'
 };
@@ -7099,6 +7108,33 @@ async function songRequest(path,method='GET',body,extraHeaders={}){
     throw Error(songErrorLabels[detail]||detail);
   }
   return r;
+}
+async function uploadInboxAudio(file){
+  const signal=sessionRequests.signal;
+  const contentType=(file.type&&/^audio\/(?:mpeg|mp3|wav|x-wav|wave|ogg|opus|mp4|x-m4a|flac)$/i.test(file.type))?file.type:'application/octet-stream';
+  const r=await fetch('/admin/api/colab/drive/inbox',{
+    method:'POST',
+    signal,
+    headers:{
+      Authorization:'Bearer '+token,
+      'Content-Type':contentType,
+      'X-Drive-Filename':encodeURIComponent(file.name)
+    },
+    body:file,
+    cache:'no-store',
+    credentials:'omit',
+    redirect:'error'
+  });
+  let data=null;
+  try{data=await r.json();}catch{}
+  if(signal.aborted)throw new DOMException('请求已取消','AbortError');
+  if(!r.ok){
+    if(r.status===401||r.status===403)logout();
+    const detail=data?.detail||('HTTP '+r.status);
+    throw Error(mapSongError({message:detail}));
+  }
+  if(!data)throw Error('服务器未返回有效 JSON');
+  return data;
 }
 function setSelectedSongFile(file){
   if(!file){selectedSongFile=null;text('song-file-name','未选择音频文件');return;}
@@ -7251,6 +7287,19 @@ $('song-cache-evict').addEventListener('click',e=>busy(e.target,async()=>{
 $('song-learn-refresh-inbox').addEventListener('click',e=>busy(e.target,async()=>{
   const count=await loadSongInboxSelect(true);
   notice('已刷新 Drive inbox 收件箱（共 '+count+' 首待学原曲）');
+}));
+$('song-inbox-upload').addEventListener('click',e=>busy(e.target,async()=>{
+  const file=$('song-inbox-file').files?.[0];
+  if(!file)throw Error('请先选择要上传的原曲音频文件');
+  if(file.size<=0)throw Error(songErrorLabels.invalid_song_audio);
+  if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name))throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac 格式的原曲音频');
+  if(file.size>18*1024*1024)throw Error(songErrorLabels.colab_inbox_upload_too_large);
+  const res=await uploadInboxAudio(file);
+  if(!token)return;
+  $('song-inbox-file').value='';
+  prefillSongLearn({id:res.file_id,name:res.name,size:res.size});
+  await loadSongInboxSelect(false);
+  notice('已上传原曲「'+res.name+'」到 Drive inbox，可直接发起 Colab 学歌');
 }));
 $('song-learn-inbox').addEventListener('change',e=>{
   const fname=e.target.value.trim();

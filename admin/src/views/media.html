@@ -41,8 +41,15 @@
         <button type="button" class="secondary" data-open-tab="colab-compute">查看作业队列 →</button>
       </div>
     </div>
-    <p class="muted">提交到 Colab GPU Worker 自动执行人声分离、RVC 翻唱推理与高潮切片，成品将自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。若未选择 Drive <code>inbox/</code> 原曲且启用自动检索，Worker 会尝试搜索干净官方原版。</p>
+    <p class="muted">提交到 Colab GPU Worker 自动执行人声分离、RVC 翻唱推理与高潮切片，成品将自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。若未选择 Drive <code>inbox/</code> 原曲且启用自动检索，Worker 会尝试搜索干净官方原版；<code>drive.file</code> 最小权限模式下也可直接在此上传本地原曲到收件箱，或在 QQ 私聊发送音频附带 <code>/学歌</code>。</p>
     <p id="song-learn-colab-hint" class="muted"></p>
+    <div class="sub-card">
+      <div class="row">
+        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 18 MiB）</label>
+        <input id="song-inbox-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac">
+        <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
+      </div>
+    </div>
     <form id="song-learn-form">
       <div class="song-meta">
         <label for="song-learn-title">歌名（必填，1～40字）<input id="song-learn-title" maxlength="40" required placeholder="例如：晴天"></label>

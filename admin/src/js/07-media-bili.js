@@ -217,6 +217,8 @@ const songErrorLabels={
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
   colab_daily_limit_reached:'今日 Colab 作业次数或 CU 预算已达上限',
+  colab_inbox_upload_too_large:'上传原曲超过 18 MiB 上限',
+  colab_drive_invalid_file:'原曲文件名无效',
   song_upload_too_large:'上传音频超过 12 MiB 上限',
   song_audio_required:'请先选择有效的音频文件'
 };
@@ -282,6 +284,33 @@ async function songRequest(path,method='GET',body,extraHeaders={}){
     throw Error(songErrorLabels[detail]||detail);
   }
   return r;
+}
+async function uploadInboxAudio(file){
+  const signal=sessionRequests.signal;
+  const contentType=(file.type&&/^audio\/(?:mpeg|mp3|wav|x-wav|wave|ogg|opus|mp4|x-m4a|flac)$/i.test(file.type))?file.type:'application/octet-stream';
+  const r=await fetch('/admin/api/colab/drive/inbox',{
+    method:'POST',
+    signal,
+    headers:{
+      Authorization:'Bearer '+token,
+      'Content-Type':contentType,
+      'X-Drive-Filename':encodeURIComponent(file.name)
+    },
+    body:file,
+    cache:'no-store',
+    credentials:'omit',
+    redirect:'error'
+  });
+  let data=null;
+  try{data=await r.json();}catch{}
+  if(signal.aborted)throw new DOMException('请求已取消','AbortError');
+  if(!r.ok){
+    if(r.status===401||r.status===403)logout();
+    const detail=data?.detail||('HTTP '+r.status);
+    throw Error(mapSongError({message:detail}));
+  }
+  if(!data)throw Error('服务器未返回有效 JSON');
+  return data;
 }
 function setSelectedSongFile(file){
   if(!file){selectedSongFile=null;text('song-file-name','未选择音频文件');return;}
@@ -434,6 +463,19 @@ $('song-cache-evict').addEventListener('click',e=>busy(e.target,async()=>{
 $('song-learn-refresh-inbox').addEventListener('click',e=>busy(e.target,async()=>{
   const count=await loadSongInboxSelect(true);
   notice('已刷新 Drive inbox 收件箱（共 '+count+' 首待学原曲）');
+}));
+$('song-inbox-upload').addEventListener('click',e=>busy(e.target,async()=>{
+  const file=$('song-inbox-file').files?.[0];
+  if(!file)throw Error('请先选择要上传的原曲音频文件');
+  if(file.size<=0)throw Error(songErrorLabels.invalid_song_audio);
+  if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name))throw Error('仅支持 mp3/wav/ogg/opus/m4a/flac 格式的原曲音频');
+  if(file.size>18*1024*1024)throw Error(songErrorLabels.colab_inbox_upload_too_large);
+  const res=await uploadInboxAudio(file);
+  if(!token)return;
+  $('song-inbox-file').value='';
+  prefillSongLearn({id:res.file_id,name:res.name,size:res.size});
+  await loadSongInboxSelect(false);
+  notice('已上传原曲「'+res.name+'」到 Drive inbox，可直接发起 Colab 学歌');
 }));
 $('song-learn-inbox').addEventListener('change',e=>{
   const fname=e.target.value.trim();

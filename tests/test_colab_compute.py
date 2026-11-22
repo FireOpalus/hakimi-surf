@@ -11,7 +11,7 @@ import sys
 import wave
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 import pytest
@@ -810,5 +810,169 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                     resp = await client.post("/admin/api/colab/terminate-sessions")
                     assert resp.status_code == 200
                 assert (await client.post("/admin/api/colab/terminate-sessions")).status_code == 429
+        finally:
+            await worker_client.aclose()
+
+
+async def test_colab_admin_drive_inbox_upload(settings, tmp_path: Path) -> None:
+    app_w, cfg_w, drive_client, _ = _build_test_worker(tmp_path)
+    s = _worker_settings(
+        settings,
+        "http://127.0.0.1:19999",
+        cfg_w.token,
+        admin_token=SecretStr(ADMIN_TOKEN),
+    )
+    app = create_app(s, gateway_factory=FakeGateway, start_workers=False)
+    async with app.router.lifespan_context(app):
+        mod = app.state.service.modules.systems["colab_compute"]
+        worker_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_w),
+            base_url="http://127.0.0.1:19999",
+        )
+        mod.compute._injected_http = worker_client
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:12141",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            ) as client:
+                mp3_bytes = _fake_mp3_bytes(b"inbox-source")
+
+                # Unauthenticated request rejected
+                unauth = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Authorization": "",
+                        "Content-Type": "audio/mpeg",
+                        "X-Drive-Filename": quote("晴天.mp3"),
+                    },
+                    content=mp3_bytes,
+                )
+                assert unauth.status_code == 401
+
+                # Missing / blank / oversized header / traversal / bad extension / empty / too large
+                missing = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={"Content-Type": "audio/mpeg"},
+                    content=mp3_bytes,
+                )
+                assert missing.status_code == 400
+                assert missing.json()["detail"] == "colab_drive_invalid_file"
+
+                too_long_hdr = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "audio/mpeg",
+                        "X-Drive-Filename": ("a" * 510) + ".mp3",
+                    },
+                    content=mp3_bytes,
+                )
+                assert too_long_hdr.status_code == 400
+                assert too_long_hdr.json()["detail"] == "colab_drive_invalid_file"
+
+                for bad_name in ("../a.mp3", "..%2Fa.mp3", "sub\\a.mp3", "a%00.mp3"):
+                    trav = await client.post(
+                        "/admin/api/colab/drive/inbox",
+                        headers={
+                            "Content-Type": "audio/mpeg",
+                            "X-Drive-Filename": bad_name,
+                        },
+                        content=mp3_bytes,
+                    )
+                    assert trav.status_code == 400
+                    assert trav.json()["detail"] == "colab_drive_invalid_file"
+
+                for bad_ext in ("evil.txt", "noext", "bad."):
+                    resp = await client.post(
+                        "/admin/api/colab/drive/inbox",
+                        headers={
+                            "Content-Type": "audio/mpeg",
+                            "X-Drive-Filename": bad_ext,
+                        },
+                        content=mp3_bytes,
+                    )
+                    assert resp.status_code == 400
+                    assert resp.json()["detail"] == "invalid_song_audio"
+
+                empty_body = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "audio/mpeg",
+                        "X-Drive-Filename": quote("晴天.mp3"),
+                    },
+                    content=b"",
+                )
+                assert empty_body.status_code == 400
+                assert empty_body.json()["detail"] == "invalid_song_audio"
+
+                bad_mime = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "text/plain",
+                        "X-Drive-Filename": quote("晴天.mp3"),
+                    },
+                    content=mp3_bytes,
+                )
+                assert bad_mime.status_code == 415
+                assert bad_mime.json()["detail"] == "invalid_song_audio"
+
+                compressed = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "audio/mpeg",
+                        "Content-Encoding": "gzip",
+                        "X-Drive-Filename": quote("晴天.mp3"),
+                    },
+                    content=mp3_bytes,
+                )
+                assert compressed.status_code == 415
+                assert compressed.json()["detail"] == "compressed_song_upload_forbidden"
+
+                oversized = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "audio/mpeg",
+                        "X-Drive-Filename": quote("晴天.mp3"),
+                    },
+                    content=b"0" * (18 * 1024 * 1024 + 1),
+                )
+                assert oversized.status_code == 413
+                assert oversized.json()["detail"] == "colab_inbox_upload_too_large"
+                assert drive_client.list_inbox() == []
+
+                # Valid Unicode MP3 upload proxies to worker /v1/drive/inbox
+                ok = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "audio/mpeg",
+                        "X-Drive-Filename": quote("晴天.mp3"),
+                    },
+                    content=mp3_bytes,
+                )
+                assert ok.status_code == 200
+                body = ok.json()
+                assert body["name"] == "晴天.mp3"
+                assert body["size"] == len(mp3_bytes)
+                assert body["file_id"]
+
+                # Verify filename/extension normalization (uppercase ext & spaces)
+                ok_norm = await client.post(
+                    "/admin/api/colab/drive/inbox",
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "X-Drive-Filename": quote("周杰伦 晴天 (Live).MP3"),
+                    },
+                    content=mp3_bytes,
+                )
+                assert ok_norm.status_code == 200
+                assert ok_norm.json()["name"] == "周杰伦_晴天_Live.mp3"
+
+                inbox = await client.get("/admin/api/colab/drive/inbox")
+                assert inbox.status_code == 200
+                names = {item["name"]: item for item in inbox.json()["items"]}
+                assert "晴天.mp3" in names
+                assert names["晴天.mp3"]["id"] == body["file_id"]
+                assert names["晴天.mp3"]["size"] == len(mp3_bytes)
+                assert "周杰伦_晴天_Live.mp3" in names
         finally:
             await worker_client.aclose()
