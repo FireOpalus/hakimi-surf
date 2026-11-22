@@ -376,8 +376,8 @@
         <article class="plugin-card">
           <header><h3><a href="plugins/minecraft/plugin_main.py">Minecraft 桥接</a></h3><code>minecraft</code></header>
           <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>mc.*</code></div>
-          <p>独立游玩决策脑与桥接控制，协同境内节点 <code>mc_agent</code> 与 <code>mc-powerd</code> 调度游戏目标与里程碑。</p>
-          <div class="plugin-links"><a href="plugins/minecraft/plugin_main.py">plugin_main.py</a><a href="plugins/minecraft/play_brain.py">play_brain.py</a></div>
+          <p>三层游玩大脑与桥接控制：境内第 0 层 <code>mc_agent</code>（0 Token）负责背包快照、自动吃穿、2×2/3×3 合成与护卫打怪；境外第 1 层复用内核静态白名单 <code>gemini-decision-1</code> 做巡航门控与公屏意图搭车；第 2 层主模型仅在需参数规划或公屏聊天时唤醒，协同 <code>mc-powerd</code> 调度目标与里程碑。</p>
+          <div class="plugin-links"><a href="plugins/minecraft/plugin_main.py">plugin_main.py</a><a href="plugins/minecraft/play_brain.py">play_brain.py</a><a href="src/hakimi/decision_templates.py">decision_templates.py</a><a href="mc_agent/src/behaviors.mjs">behaviors.mjs</a></div>
         </article>
         <article class="plugin-card">
           <header><h3><a href="plugins/bilibili/plugin_main.py">B 站冲浪巡逻</a></h3><code>bilibili_surf</code></header>
@@ -447,8 +447,8 @@
     <section class="chapter" id="deployment" aria-labelledby="deployment-title">
       <div class="section-head"><h2 id="deployment-title">模块在哪里运行</h2><p>引擎、管理台与外部适配端的连接方向</p></div>
       <div class="lanes">
-        <div class="lane"><h3>境内 · QQ / NapCat</h3><span class="link-label">反向 WSS</span><div><strong>境外 Nginx → hakimi-bot</strong><p>QQ 事件进入 OneBot 接入层，回复与回执复用已认证的连接。</p></div></div>
-        <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集；游戏端由 <code>mc_agent</code> 常驻待机，配合境内回环守护进程 <code>mc-powerd</code> 按需唤醒与闲置自动休眠 Minecraft 服务端，支持管理台、自主规划及通用 <code>owner_chat</code> 即时触发。</p></div></div>
+        <div class="lane"><h3>境内 · QQ / NapCat</h3><span class="link-label">反向 WSS</span><div><strong>境外 Nginx → hakimi-bot</strong><p>QQ 事件进入 OneBot 接入层，回复与回执复用已认证的连接；语音经 <code>get_record(out_format="mp3")</code> 拉取原声直传 Gemini（取消 NapCat ASR）。</p></div></div>
+        <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集；游戏端由第 0 层 <code>mc_agent</code>（0 Token 背包快照、自动吃穿、2×2/3×3 合成与护卫打怪）常驻待机，配合境内回环守护进程 <code>mc-powerd</code> 按需唤醒与闲置自动休眠 Minecraft 服务端，支持管理台、自主规划及通用 <code>owner_chat</code> 即时触发。</p></div></div>
         <div class="lane"><h3>桌面 · 语音与看屏适配端</h3><span class="link-label">两条可选 WS</span><div><strong>境外 FastAPI → 对应常驻服务</strong><p>语音与看屏分别配置入口、校验适配端身份。屏幕隐私开关与会话模式控制帧的使用范围。</p></div></div>
         <div class="lane"><h3>境外宿主机 · Colab Worker</h3><span class="link-label">Docker 网桥回环</span><div><strong>境外 hakimi-bot → 172.19.0.1:12146（Bearer 隔离）</strong><p>宿主机独立守护进程 <code>hakimi-colab-worker.service</code>（<code>scripts/colab_worker.py</code> + <code>scripts/colab_jobs/</code> 插件式 GPU 作业包）纯化为通用 GPU 作业控制面与执行层：凭据与 Colab CLI 不进只读容器，剥离全部 Drive OAuth 与 <code>/v1/drive/*</code> 代理，严格按作业级 GPU 候选链派发（<code>L4</code>/<code>T4</code> 满足余额门槛时短时热保活），仅凭瞬态 <code>dispatch_context</code> 短效令牌访问授权对象。</p></div></div>
         <div class="lane"><h3>Google Drive · Hakimi_Songs/</h3><span class="link-label">主引擎直连 HTTPS</span><div><strong>境外 hakimi-bot（SongDriveStore）→ Google Drive v3 API</strong><p><code>song_studio</code> 复用只读 <code>/run/secrets/roaming-oauth.json</code> 独立管理翻唱主存、模型与原曲收件箱（2 MiB 分块 Resumable 流式上传 ≤ 100 MiB，播放与管理不依赖 Colab Worker 在线）。</p></div></div>
@@ -462,21 +462,21 @@
       <div class="section-head"><h2 id="conversation-title">一次对话共享哪些服务</h2></div>
       <ol class="pipeline" aria-label="QQ 来信到确认回复的先后顺序">
         <li id="bot-routing"><h3>协议准入</h3><p>经 <code>PlatformPolicyHooks</code>（未知平台 fail-closed）按真实身份、会话名单、Bot 策略与作息处理来信；确定性斜杠/前缀指令经 <code>CommandRegistry</code> 在入模前完成协议层 Owner 鉴权并执行。</p></li>
-        <li id="context"><h3>门卫与上下文</h3><p>门卫评估接话和安全。A 放静态人设，B 放会话热史，C 放当轮发言、<code>media_turn</code> 筛选的图/文件、获准召回的记忆与工具资料。</p></li>
+        <li id="context"><h3>门卫与上下文</h3><p>门卫评估接话和安全。A 放静态人设，B 放会话热史，C 放当轮发言、<code>media_turn</code> 筛选的图/语音/文件、获准召回的记忆与工具资料。</p></li>
         <li id="provider-routing"><h3>模型与输出审核</h3><p>模型网关按场景、隐私策略及预算路由请求。生成结果经审核并转换为气泡、引用或本地表情等动作。</p></li>
         <li id="delivery-audit"><h3>Outbox 与 ACK</h3><p>投递前复核权限和时效。助手正文按已确认的发送回执入史，审计记录丢弃、拦截、成功或待确认结果。</p></li>
       </ol>
       <dl class="notes" id="memory">
         <div id="memory-batching"><dt>会话记忆</dt><dd>热史按会话隔离。裁剪的历史进入冷存档，后台按批提炼画像与编年史，再由当前会话按需召回。</dd></div>
         <div id="interaction-chain"><dt>模型续链</dt><dd>符合条件的主对话按模型与历史版本复用已确认的交互标识。收到发送回执后才提交新的本地续链。</dd></div>
-        <div id="image-context"><dt>图片与文件</dt><dd>由 <code>media_turn.py</code> 从当轮、引用、转发和邻近消息筛选媒体（普通图优先于贴纸，转发限 24,000 字/2 图/2 文件并拦截凭据泄露）。图片经大小、像素与来源检查；富文档解析与长文卡片渲染优先交由独立容器 <code>doc_render</code>（纯内存防炸弹），离线平滑回退内核。</dd></div>
+        <div id="image-context"><dt>图片、语音与文件</dt><dd>由 <code>media_turn.py</code> 从当轮、引用、转发和邻近消息筛选媒体（普通图优先于贴纸，转发限 24,000 字/2 图/2 文件并拦截凭据泄露）。图片经大小、像素与来源检查；QQ 语音经 <code>get_record(out_format="mp3")</code> 拉取（仅认 base64 或公网 IP 钉死 HTTPS，禁读本地路径），由 <code>audio_media.py</code> 调 <code>ffmpeg</code> 转为 16 kHz 单声道 32 kbps MP3 后以原生 <code>AudioContentParam</code> 直传 Gemini（取消 NapCat ASR，不触发文本斜杠指令），同轮 0 额外调用附带 <code>audio_gist</code> 写入会话历史与双轨记忆；富文档解析与长文卡片渲染优先交由独立容器 <code>doc_render</code>（纯内存防炸弹），离线平滑回退内核。</dd></div>
         <div id="owner-memory"><dt>Owner 私有背景</dt><dd id="affection">协议身份与会话场景决定私有数据的可见范围。<span id="conversation-style">群聊使用公开人设，好感度只影响可用互动。</span></dd></div>
         <div id="rest-hours"><dt>作息与主动行动</dt><dd>世界状态记录清醒、休息与精力。LifeBlockPlanner 读取日程和待办，执行时再核对模块就绪状态与发送窗口。</dd></div>
         <div id="billing"><dt>预算与用量</dt><dd id="thinking-accounting">付费请求先在 SQLite 中预留，再按返回用量结算；模型、思考档位与 <code>model_work</code>（含 <code>plugin_bus</code>、伴看与语音伴随独立归属）按真实业务维度聚合为 <code>usage.categories</code>（与既有 <code>usage.lanes</code> 总额严格守恒），供运行概览与账本拆细展示。</dd></div>
         <div id="search-routing"><dt>联网取证</dt><dd>外网检索与链接预览优先委派给 <code>web_tools</code> 容器（公网 IP 钉死与逐跳 SSRF 拦截），离线回退内核；预算与安全审查仍由引擎门卫把关。</dd></div>
         <div><dt>模块归档</dt><dd>具备归档授权的模块通过 Drive 同步服务使用指定目录并记录回执；歌单工坊则通过独立的 <code>SongDriveStore</code> 直连 <code>Hakimi_Songs/</code>（严禁触碰 <code>Antigravity_Memory</code>）。</dd></div>
       </dl>
-      <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/commands.py">指令注册表</a><a href="src/hakimi/media_turn.py">轮次富媒体</a><a href="src/hakimi/platform_hooks.py">平台策略钩子</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/store.py">账本与用量归类</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a><a href="src/hakimi/plugin_bus/__init__.py">插件总线子包</a></div>
+      <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/commands.py">指令注册表</a><a href="src/hakimi/media_turn.py">轮次富媒体</a><a href="src/hakimi/audio_media.py">原生音频转码</a><a href="src/hakimi/decision_templates.py">Decisions 静态模板</a><a href="src/hakimi/platform_hooks.py">平台策略钩子</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/store.py">账本与用量归类</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a><a href="src/hakimi/plugin_bus/__init__.py">插件总线子包</a></div>
     </section>
   </main>
   <footer><span>Hakimi Surf · v2.1.0 · 4 个平台插件 + 21 个常驻系统模块 + 6 个远程插件容器 · 2026-11-22</span><a href="#top">回到图首 ↑</a></footer>
