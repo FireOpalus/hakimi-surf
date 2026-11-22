@@ -21,6 +21,23 @@ const WHITESPACE_RE = /\s+/g;
 const ROLE_TAG_RE = /\[role=/gi;
 const CQ_TAG_RE = /\[cq:/gi;
 const BROADCAST_AT_RE = /@(everyone|all|全体成员)/gi;
+export const CANONICAL_ITEM_ID_RE = /^[a-z0-9_]{1,48}$/;
+export const PLAYER_ID_RE = /^[A-Za-z0-9_]{1,16}$/;
+
+export function normalizeCanonicalItemId(raw) {
+  if (typeof raw !== "string") return "";
+  let cleaned = raw.trim().toLowerCase();
+  if (cleaned.startsWith("minecraft:")) {
+    cleaned = cleaned.slice("minecraft:".length);
+  }
+  return CANONICAL_ITEM_ID_RE.test(cleaned) ? cleaned : "";
+}
+
+export function normalizePlayerId(raw) {
+  if (typeof raw !== "string") return "";
+  const cleaned = raw.trim();
+  return PLAYER_ID_RE.test(cleaned) ? cleaned : "";
+}
 
 export class ProtocolError extends Error {
   constructor(code) {
@@ -129,6 +146,12 @@ export function loadConfig(env = process.env) {
   );
   const mcCompanionMode = parseBoolEnv(env.MC_COMPANION_MODE, false);
   const mcCompanionLocalChatReply = parseBoolEnv(env.MC_COMPANION_LOCAL_CHAT_REPLY, true);
+  const mcAutoEat = parseBoolEnv(env.MC_AUTO_EAT, true);
+  const mcAutoEquip = parseBoolEnv(env.MC_AUTO_EQUIP, true);
+  const mcCombatMode = (unquoteEnvValue(env.MC_COMBAT_MODE ?? "") || "evade").toLowerCase();
+  if (mcCombatMode !== "evade" && mcCombatMode !== "guard") {
+    throw new ProtocolError("invalid_mc_combat_mode");
+  }
 
   return Object.freeze({
     bridgeHost,
@@ -152,6 +175,9 @@ export function loadConfig(env = process.env) {
     mcSoloMaxMinutes,
     mcCompanionMode,
     mcCompanionLocalChatReply,
+    mcAutoEat,
+    mcAutoEquip,
+    mcCombatMode,
   });
 }
 

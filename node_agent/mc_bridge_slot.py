@@ -27,6 +27,80 @@ _BRIDGE_MAX_FRAME_BYTES = 262_144
 _BRIDGE_EVENT_QUEUE_SIZE = 64
 _RPC_ERROR_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _SNAPSHOT_META_KEYS = ("bridge_ready", "mc_enabled", "mc_configured", "paused")
+_EQUIPMENT_SLOTS = ("main_hand", "off_hand", "head", "chest", "legs", "feet")
+_CANONICAL_ITEM_ID_RE = re.compile(r"^[a-z0-9_]{1,48}$")
+_INVENTORY_ENTRY_RE = re.compile(r"^([a-z0-9_]{1,48}):([1-9][0-9]{0,4})$")
+_PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+_VALID_COMBAT_MODES = frozenset({"evade", "guard"})
+
+
+def _empty_equipment() -> dict[str, str]:
+    return {slot: "" for slot in _EQUIPMENT_SLOTS}
+
+
+def _sanitize_item_id(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip().lower()
+    if cleaned.startswith("minecraft:"):
+        cleaned = cleaned[len("minecraft:") :]
+    return cleaned if _CANONICAL_ITEM_ID_RE.fullmatch(cleaned) else ""
+
+
+def _sanitize_equipment(raw: Any) -> dict[str, str]:
+    out = _empty_equipment()
+    if not isinstance(raw, dict):
+        return out
+    for slot in _EQUIPMENT_SLOTS:
+        out[slot] = _sanitize_item_id(raw.get(slot))
+    return out
+
+
+def _sanitize_inventory_summary(raw: Any) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if len(out) >= 16:
+            break
+        if not isinstance(entry, str):
+            continue
+        cleaned = entry.strip().lower()
+        if cleaned.startswith("minecraft:"):
+            cleaned = cleaned[len("minecraft:") :]
+        match = _INVENTORY_ENTRY_RE.fullmatch(cleaned)
+        if not match:
+            continue
+        item_id, count_str = match.group(1), match.group(2)
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        out.append(f"{item_id}:{count_str}")
+    return out
+
+
+def _sanitize_free_slots(raw: Any) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    if 0 <= raw <= 36:
+        return raw
+    return None
+
+
+def _sanitize_combat_mode(raw: Any, fallback: str = "evade") -> str:
+    safe_fallback = fallback if fallback in _VALID_COMBAT_MODES else "evade"
+    if not isinstance(raw, str):
+        return safe_fallback
+    cleaned = raw.strip().lower()
+    return cleaned if cleaned in _VALID_COMBAT_MODES else safe_fallback
+
+
+def _sanitize_guard_target(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip()
+    return cleaned if _PLAYER_ID_RE.fullmatch(cleaned) else ""
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -137,6 +211,11 @@ class McBridgeSlot:
             "pos": None,
             "health": None,
             "food": None,
+            "equipment": _empty_equipment(),
+            "inventory_summary": [],
+            "free_slots": None,
+            "combat_mode": "evade",
+            "guard_target": "",
             "activity": "",
             "nearby_entities": [],
             "recent_chat_or_sign": "",
@@ -144,10 +223,20 @@ class McBridgeSlot:
         }
 
     def current_snapshot(self) -> dict[str, Any]:
-        """Return a shallow-copied snapshot dict safe for upstream node.hello/mc.snapshot sync."""
+        """Return a copied snapshot dict safe for upstream node.hello/mc.snapshot sync."""
         snap = dict(self._latest_snapshot)
         if isinstance(snap.get("nearby_entities"), list):
             snap["nearby_entities"] = list(snap["nearby_entities"])
+        if isinstance(snap.get("nearby_players"), list):
+            snap["nearby_players"] = list(snap["nearby_players"])
+        if isinstance(snap.get("equipment"), dict):
+            snap["equipment"] = dict(snap["equipment"])
+        else:
+            snap["equipment"] = _empty_equipment()
+        if isinstance(snap.get("inventory_summary"), list):
+            snap["inventory_summary"] = list(snap["inventory_summary"])
+        else:
+            snap["inventory_summary"] = []
         return snap
 
     def start(self) -> None:
@@ -230,6 +319,43 @@ class McBridgeSlot:
         self._activity = activity
         self._updated_at = updated_at
 
+        prev_combat_mode = _sanitize_combat_mode(self._latest_snapshot.get("combat_mode"), "evade")
+        combat_mode = (
+            _sanitize_combat_mode(raw["combat_mode"], prev_combat_mode)
+            if "combat_mode" in raw
+            else prev_combat_mode
+        )
+        if connected:
+            equipment = (
+                _sanitize_equipment(raw["equipment"])
+                if "equipment" in raw
+                else _sanitize_equipment(self._latest_snapshot.get("equipment"))
+            )
+            inventory_summary = (
+                _sanitize_inventory_summary(raw["inventory_summary"])
+                if "inventory_summary" in raw
+                else _sanitize_inventory_summary(self._latest_snapshot.get("inventory_summary"))
+            )
+            free_slots = (
+                _sanitize_free_slots(raw["free_slots"])
+                if "free_slots" in raw
+                else _sanitize_free_slots(self._latest_snapshot.get("free_slots"))
+            )
+            guard_target = (
+                (
+                    _sanitize_guard_target(raw["guard_target"])
+                    if "guard_target" in raw
+                    else _sanitize_guard_target(self._latest_snapshot.get("guard_target"))
+                )
+                if combat_mode == "guard"
+                else ""
+            )
+        else:
+            equipment = _empty_equipment()
+            inventory_summary = []
+            free_slots = None
+            guard_target = ""
+
         merged = dict(self._latest_snapshot)
         merged.update(raw)
         merged["connected"] = connected
@@ -239,6 +365,11 @@ class McBridgeSlot:
         merged["paused"] = paused
         merged["activity"] = activity
         merged["updated_at"] = updated_at
+        merged["equipment"] = equipment
+        merged["inventory_summary"] = inventory_summary
+        merged["free_slots"] = free_slots
+        merged["combat_mode"] = combat_mode
+        merged["guard_target"] = guard_target
         if isinstance(merged.get("nearby_entities"), list):
             merged["nearby_entities"] = list(merged["nearby_entities"])
         self._latest_snapshot = merged
@@ -252,7 +383,7 @@ class McBridgeSlot:
                 if key in data and key not in merged:
                     merged[key] = data[key]
             default_ready = bool(data.get("bridge_ready", True))
-            self._apply_snapshot_dict(merged, default_bridge_ready=default_ready)
+            data["snapshot"] = self._apply_snapshot_dict(merged, default_bridge_ready=default_ready)
             return
 
         patch: dict[str, Any] = {}
@@ -263,6 +394,8 @@ class McBridgeSlot:
             "mc_configured",
             "paused",
             "activity",
+            "combat_mode",
+            "guard_target",
             "updated_at",
         ):
             if key in data:
@@ -413,6 +546,13 @@ class McBridgeSlot:
                     "pos": None,
                     "health": None,
                     "food": None,
+                    "equipment": _empty_equipment(),
+                    "inventory_summary": [],
+                    "free_slots": None,
+                    "combat_mode": _sanitize_combat_mode(
+                        self._latest_snapshot.get("combat_mode"), "evade"
+                    ),
+                    "guard_target": "",
                     "nearby_entities": [],
                     "activity": "MC容器重连中",
                     "updated_at": now,

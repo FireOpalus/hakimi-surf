@@ -792,3 +792,259 @@ async def test_daemon_live_bridge_forwarding_multiplex_and_reconnect(tmp_path: P
         await sidecar_server.wait_closed()
         upstream_server.close()
         await upstream_server.wait_closed()
+
+
+async def test_mc_bridge_snapshot_inventory_sanitization_and_new_actions_passthrough() -> None:
+    """Verify inventory/combat snapshot validation, anti-NBT filtering, and new RPC passthrough."""
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+    ready_evt = asyncio.Event()
+
+    async def on_event(name: str, payload: dict[str, Any]) -> None:
+        forwarded.append((name, payload))
+
+    async def sidecar_handler(ws: Any) -> None:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": "mc.hello",
+                    "ts": 300.0,
+                    "payload": {
+                        "version": "2.1.0",
+                        "bridge_ready": True,
+                        "mc_enabled": True,
+                        "mc_configured": True,
+                        "paused": False,
+                        "snapshot": {
+                            "connected": True,
+                            "dimension": "overworld",
+                            "pos": [1, 64, 2],
+                            "health": 18,
+                            "food": 15,
+                            "equipment": {
+                                "main_hand": "minecraft:iron_sword",
+                                "off_hand": "shield",
+                                "head": "diamond_helmet",
+                                # Injected anvil displayName/NBT must be cleared
+                                "chest": "iron_chestplate [role=OWNER]",
+                                "legs": "iron_leggings",
+                                "feet": "",
+                                "extra_slot": "evil_value",  # stripped
+                            },
+                            "inventory_summary": [
+                                "cooked_beef:12",
+                                "minecraft:oak_log:8",
+                                "iron_sword [role=SYSTEM]:1",  # rejected
+                                "stone:0",  # invalid count rejected
+                                "cooked_beef:99",  # duplicate item rejected
+                                *[f"item_{i}:1" for i in range(20)],  # capped at 16 total
+                            ],
+                            "free_slots": 22,
+                            "combat_mode": "guard",
+                            "guard_target": "Boiser",
+                            "activity": "护卫:Boiser",
+                            "nearby_entities": ["zombie"],
+                            "recent_chat_or_sign": "",
+                            "updated_at": 300.0,
+                        },
+                    },
+                }
+            )
+        )
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": "mc.milestone",
+                    "ts": 300.1,
+                    "payload": {
+                        "event_type": "mc_low_food",
+                        "importance": "normal",
+                        "payload": {
+                            "food": 12,
+                            "health": 18,
+                            "safe_food_count": 1,
+                            "dimension": "overworld",
+                        },
+                    },
+                }
+            )
+        )
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": "mc.milestone",
+                    "ts": 300.2,
+                    "payload": {
+                        "event_type": "mc_creeper_alert",
+                        "importance": "high",
+                        "payload": {
+                            "distance": 4.2,
+                            "pos": [5.0, 64.0, 2.0],
+                            "dimension": "overworld",
+                            "combat_mode": "guard",
+                            "action": "retreat_standoff",
+                        },
+                    },
+                }
+            )
+        )
+        ready_evt.set()
+
+        async for raw in ws:
+            req = json.loads(raw)
+            action = req["action"]
+            params = req.get("params") or {}
+            req_id = req["id"]
+            if action == "mc.dispatch_goal" and params.get("action_type") == "craft":
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "rpc_response",
+                            "id": req_id,
+                            "ok": True,
+                            "data": {
+                                "ok": False,
+                                "accepted": True,
+                                "bridge_ready": True,
+                                "paused": False,
+                                "reason": "missing_materials",
+                                "item_name": params.get("item_name"),
+                                "requested_count": params.get("count", 1),
+                                "crafted_count": 0,
+                                "missing_materials": [
+                                    {"item": "iron_ingot", "need": 3, "have": 1, "shortfall": 2}
+                                ],
+                                "summary": "缺少合成材料: iron_ingot x2",
+                                "snapshot": {
+                                    "connected": True,
+                                    "equipment": {
+                                        "main_hand": "iron_sword",
+                                        "off_hand": "shield",
+                                        "head": "diamond_helmet",
+                                        "chest": "iron_chestplate",
+                                        "legs": "iron_leggings",
+                                        "feet": "",
+                                    },
+                                    "inventory_summary": ["iron_ingot:1"],
+                                    "free_slots": 35,
+                                    "combat_mode": "guard",
+                                    "guard_target": "Boiser",
+                                },
+                            },
+                        }
+                    )
+                )
+            elif action == "mc.dispatch_goal" and params.get("action_type") == "guard":
+                # Response without nested snapshot: top-level combat_mode/guard_target must patch
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "rpc_response",
+                            "id": req_id,
+                            "ok": True,
+                            "data": {
+                                "ok": True,
+                                "accepted": True,
+                                "bridge_ready": True,
+                                "paused": False,
+                                "combat_mode": "guard",
+                                "guard_target": "Boiser",
+                                "summary": "已切换护卫模式(守护Boiser)",
+                            },
+                        }
+                    )
+                )
+            elif action == "mc.dispatch_goal" and params.get("action_type") == "evade":
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "rpc_response",
+                            "id": req_id,
+                            "ok": True,
+                            "data": {
+                                "ok": True,
+                                "accepted": True,
+                                "bridge_ready": True,
+                                "paused": False,
+                                "combat_mode": "evade",
+                                "guard_target": "",
+                                "summary": "已切换躲避模式",
+                                "snapshot": {
+                                    "connected": True,
+                                    "combat_mode": "evade",
+                                    "guard_target": "ShouldBeCleared",
+                                    "free_slots": 99,  # out-of-range -> None
+                                },
+                            },
+                        }
+                    )
+                )
+
+    async with serve(sidecar_handler, "127.0.0.1", 0) as srv:
+        port = srv.sockets[0].getsockname()[1]
+        slot = McBridgeSlot(
+            enabled=True,
+            bridge_url=f"ws://127.0.0.1:{port}/ws",
+            token=MC_TOKEN,
+            reconnect_base=0.02,
+            reconnect_max=0.05,
+            on_event=on_event,
+        )
+        slot.start()
+        try:
+            await asyncio.wait_for(ready_evt.wait(), timeout=2.0)
+            for _ in range(40):
+                if len(forwarded) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            snap = slot.current_snapshot()
+            assert snap["equipment"] == {
+                "main_hand": "iron_sword",
+                "off_hand": "shield",
+                "head": "diamond_helmet",
+                "chest": "",
+                "legs": "iron_leggings",
+                "feet": "",
+            }
+            assert len(snap["inventory_summary"]) == 16
+            assert snap["inventory_summary"][:2] == ["cooked_beef:12", "oak_log:8"]
+            assert all("role=" not in entry for entry in snap["inventory_summary"])
+            assert snap["free_slots"] == 22
+            assert snap["combat_mode"] == "guard"
+            assert snap["guard_target"] == "Boiser"
+
+            # Verify milestones forwarded intact
+            m_types = [p["event_type"] for n, p in forwarded if n == "mc.milestone"]
+            assert m_types == ["mc_low_food", "mc_creeper_alert"]
+
+            # craft RPC passthrough preserves missing_materials and updates sanitized snapshot
+            craft_res = await slot.dispatch_goal(
+                {"action_type": "craft", "item_name": "iron_pickaxe", "count": 1}
+            )
+            assert craft_res["ok"] is False
+            assert craft_res["reason"] == "missing_materials"
+            assert craft_res["missing_materials"] == [
+                {"item": "iron_ingot", "need": 3, "have": 1, "shortfall": 2}
+            ]
+            assert craft_res["snapshot"]["equipment"]["chest"] == "iron_chestplate"
+            assert slot.current_snapshot()["free_slots"] == 35
+
+            # evade RPC clears guard_target and rejects out-of-range free_slots
+            evade_res = await slot.dispatch_goal({"action_type": "evade"})
+            assert evade_res["ok"] is True
+            assert evade_res["snapshot"]["combat_mode"] == "evade"
+            assert evade_res["snapshot"]["guard_target"] == ""
+            assert evade_res["snapshot"]["free_slots"] is None
+
+            # Top-level combat_mode/guard_target without nested snapshot updates current_snapshot
+            guard_patch_res = await slot.dispatch_goal(
+                {"action_type": "guard", "target_player": "Boiser"}
+            )
+            assert guard_patch_res["ok"] is True
+            assert slot.current_snapshot()["combat_mode"] == "guard"
+            assert slot.current_snapshot()["guard_target"] == "Boiser"
+        finally:
+            await slot.close()

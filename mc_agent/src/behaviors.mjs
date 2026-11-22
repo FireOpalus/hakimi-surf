@@ -6,8 +6,32 @@ import {
   ChatRingBuffer,
   ProtocolError,
   hasForbiddenTargetOverride,
+  normalizePlayerId,
   sanitizeMcText,
 } from "./protocol.mjs";
+import {
+  LOW_FOOD_THRESHOLD,
+  autoEquipBestGear,
+  collectInventorySnapshot,
+  countSafeFood,
+  createEmptyEquipment,
+  equipBestHarvestTool,
+  performAutoEat,
+  shouldTriggerAutoEat,
+} from "./survival.mjs";
+import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
+import {
+  CREEPER_SAFE_DISTANCE,
+  HOSTILE_MOBS,
+  applyNoDigMovements,
+  computeRetreatTarget,
+  createCombatState,
+  findNearestCreeper,
+  lowerShield,
+  runGuardCombatStep,
+} from "./combat.mjs";
+
+export { HOSTILE_MOBS };
 
 const { Movements, goals } = pathfinderPkg;
 const { GoalFollow, GoalNear, GoalNearXZ } = goals;
@@ -27,6 +51,9 @@ export const ALLOWED_GOAL_ACTIONS = new Set([
   "chat",
   "stop",
   "idle",
+  "craft",
+  "guard",
+  "evade",
 ]);
 
 export const RARE_BLOCKS = new Set([
@@ -53,33 +80,10 @@ const DEFAULT_GATHER_BLOCKS = [
   "cobblestone",
 ];
 
-export const HOSTILE_MOBS = new Set([
-  "zombie",
-  "skeleton",
-  "creeper",
-  "spider",
-  "cave_spider",
-  "enderman",
-  "witch",
-  "pillager",
-  "drowned",
-  "husk",
-  "stray",
-  "slime",
-  "phantom",
-  "bogged",
-  "breeze",
-  "blaze",
-  "piglin_brute",
-  "vindicator",
-  "evoker",
-  "ravager",
-  "warden",
-  "zombified_piglin",
-]);
-
 const STAY_CMD_RE = /停下|别动|原地|等我|待着|\bstay\b|\bstop\b/i;
 const FOLLOW_CMD_RE = /跟上|过来|跟我走|跟我来|陪我|走吧|\bfollow\b|\bcome\b/i;
+const GUARD_CMD_RE = /护卫|保护我|打怪|帮我打|警戒|战斗模式|\bguard\b/i;
+const EVADE_CMD_RE = /躲避|别打|撤退|避战|躲怪|逃跑模式|\bevade\b/i;
 const GREET_CMD_RE = /宝宝|哈基米|猫猫|geminy|吉米奈|大小姐|在吗|你好|\bhi\b|\bhello\b/i;
 
 function roundCoord(v) {
@@ -144,6 +148,9 @@ export class McRuntime {
     idleDisconnectMs = undefined,
     soloMaxSessionMs = undefined,
     companionTickMs = 1_500,
+    survivalTickMs = 1_500,
+    eatTimeoutMs = 4_000,
+    lowFoodCooldownMs = 180_000,
     soloWanderIntervalMs = 25_000,
     companionReplyCooldownMs = 5_000,
     hostileAlertCooldownMs = 60_000,
@@ -194,6 +201,11 @@ export class McRuntime {
     this.pos = null;
     this.health = null;
     this.food = null;
+    this.equipment = createEmptyEquipment();
+    this.inventorySummary = [];
+    this.freeSlots = null;
+    this.combatMode = config.mcCombatMode === "guard" ? "guard" : "evade";
+    this.guardTarget = "";
     this.activity = "待机";
     this.nearbyEntities = [];
     this.chatBuffer = new ChatRingBuffer(3, 120);
@@ -201,6 +213,8 @@ export class McRuntime {
 
     this.bot = null;
     this._snapshotTimer = null;
+    this._survivalTimer = null;
+    this._combatMicroTimer = null;
     this._reconnectTimer = null;
     this._reconnectAttempts = 0;
     this._manualDisconnect = false;
@@ -218,6 +232,18 @@ export class McRuntime {
       typeof companionTickMs === "number" && Number.isFinite(companionTickMs)
         ? Math.max(25, companionTickMs)
         : 1_500;
+    this.survivalTickMs =
+      typeof survivalTickMs === "number" && Number.isFinite(survivalTickMs)
+        ? Math.max(25, survivalTickMs)
+        : 1_500;
+    this.eatTimeoutMs =
+      typeof eatTimeoutMs === "number" && Number.isFinite(eatTimeoutMs)
+        ? Math.max(50, eatTimeoutMs)
+        : 4_000;
+    this.lowFoodCooldownMs =
+      typeof lowFoodCooldownMs === "number" && Number.isFinite(lowFoodCooldownMs)
+        ? Math.max(0, lowFoodCooldownMs)
+        : 180_000;
     this.soloWanderIntervalMs =
       typeof soloWanderIntervalMs === "number" && Number.isFinite(soloWanderIntervalMs)
         ? Math.max(50, soloWanderIntervalMs)
@@ -237,6 +263,19 @@ export class McRuntime {
     this._lastSoloWanderAtMs = 0;
     this._lastAutoReplyAtMs = -Infinity;
     this._lastHostileAlertAtMs = -Infinity;
+    this._lastLowFoodAtMs = -Infinity;
+    this._eatingLock = { eating: false };
+    this._combatState = createCombatState();
+    this._survivalTickRunning = false;
+    this._companionTickRunning = false;
+  }
+
+  get _eating() {
+    return this._eatingLock.eating;
+  }
+
+  set _eating(val) {
+    this._eatingLock.eating = Boolean(val);
   }
 
   start() {
@@ -261,6 +300,7 @@ export class McRuntime {
     this._soloSinceMs = null;
     this._cancelWakePoll();
     this._clearReconnectTimer();
+    this._stopSurvivalLoop();
     this._stopCompanionLoop();
     this._stopSnapshotTimer();
     this._cancelActiveGoal();
@@ -278,6 +318,15 @@ export class McRuntime {
     };
   }
 
+  _resolveGuardTargetName() {
+    if (this.combatMode !== "guard" || !this.connected) return "";
+    if (this.guardTarget) {
+      return normalizePlayerId(this.guardTarget);
+    }
+    const nearest = this.bot ? this._findNearestAllowedPlayer(this.bot) : null;
+    return nearest ? normalizePlayerId(nearest.player.username) : "";
+  }
+
   getSnapshot() {
     return {
       connected: this.connected,
@@ -289,6 +338,11 @@ export class McRuntime {
       pos: this.pos ? [...this.pos] : null,
       health: this.health,
       food: this.food,
+      equipment: this.connected ? { ...this.equipment } : createEmptyEquipment(),
+      inventory_summary: this.connected ? [...this.inventorySummary] : [],
+      free_slots: this.connected ? this.freeSlots : null,
+      combat_mode: this.combatMode,
+      guard_target: this._resolveGuardTargetName(),
       active_task: this._activeGoalCancel && this.connected && !this.paused ? this.activeTask : "",
       activity: sanitizeMcText(this.activity, 64) || (this.connected ? "原地待命" : "待机"),
       nearby_entities: [...this.nearbyEntities],
@@ -369,6 +423,10 @@ export class McRuntime {
     if (nextFood !== null) {
       this.food = nextFood;
     }
+    const invSnap = collectInventorySnapshot(bot);
+    this.equipment = invSnap.equipment;
+    this.inventorySummary = invSnap.inventory_summary;
+    this.freeSlots = invSnap.free_slots;
     this.nearbyEntities = this._collectNearbyEntities(bot);
     if (this._hasOtherPlayer(bot)) {
       this._lastActivityOrHumanAtMs = this.nowFn();
@@ -505,16 +563,146 @@ export class McRuntime {
     }
   }
 
+  _startSurvivalLoop() {
+    this._stopSurvivalLoop();
+    if (!this.connected) return;
+    this._survivalTimer = setInterval(() => {
+      if (!this.connected || this._stopped) {
+        this._stopSurvivalLoop();
+        return;
+      }
+      void this._survivalTick();
+    }, this.survivalTickMs);
+    if (typeof this._survivalTimer.unref === "function") {
+      this._survivalTimer.unref();
+    }
+  }
+
+  _stopSurvivalLoop() {
+    if (this._survivalTimer) {
+      clearInterval(this._survivalTimer);
+      this._survivalTimer = null;
+    }
+  }
+
+  async _survivalTick() {
+    const bot = this.bot;
+    if (!this.connected || !bot || this.paused || this._stopped || this._survivalTickRunning) {
+      return;
+    }
+    this._survivalTickRunning = true;
+    try {
+      const nextHealth = readNonNegativeFinite(bot.health);
+      if (nextHealth !== null) this.health = nextHealth;
+      const nextFood = readNonNegativeFinite(bot.food);
+      if (nextFood !== null) this.food = nextFood;
+
+      if (this.config.mcAutoEat !== false) {
+        if (!this._eatingLock.eating && shouldTriggerAutoEat(this.health, this.food)) {
+          await performAutoEat(bot, this._eatingLock, {
+            health: this.health,
+            eatTimeoutMs: this.eatTimeoutMs,
+            onBeforeEat: () => lowerShield(bot, this._combatState),
+          });
+          this._refreshFromBot();
+        }
+        if (bot.inventory) {
+          const safeFoodCount = countSafeFood(bot);
+          if (safeFoodCount <= LOW_FOOD_THRESHOLD) {
+            const nowMs = this.nowFn();
+            if (nowMs - this._lastLowFoodAtMs >= this.lowFoodCooldownMs) {
+              const imp =
+                safeFoodCount === 0 && this.food !== null && this.food <= 10 ? "high" : "normal";
+              const emitted = this._emitMilestone("mc_low_food", imp, {
+                food: this.food,
+                health: this.health,
+                safe_food_count: safeFoodCount,
+                dimension: this.dimension || "overworld",
+              });
+              if (emitted) {
+                this._lastLowFoodAtMs = nowMs;
+              }
+            }
+          }
+        }
+      }
+
+      if (
+        this.config.mcAutoEquip !== false &&
+        !this._eatingLock.eating &&
+        !this._activeGoalCancel &&
+        bot.inventory
+      ) {
+        const equipped = await autoEquipBestGear(bot, { includeShield: true });
+        if (equipped.length > 0) {
+          this._refreshFromBot();
+          this._emitSnapshot();
+        }
+      }
+    } catch {
+      // Never crash survival reflex tick
+    } finally {
+      this._survivalTickRunning = false;
+    }
+  }
+
+  _triggerUrgentEat() {
+    const bot = this.bot;
+    if (
+      this.config.mcAutoEat === false ||
+      this._eatingLock.eating ||
+      !this.connected ||
+      !bot ||
+      this.paused ||
+      this._stopped
+    ) {
+      return;
+    }
+    void performAutoEat(bot, this._eatingLock, {
+      health: this.health,
+      eatTimeoutMs: this.eatTimeoutMs,
+      onBeforeEat: () => lowerShield(bot, this._combatState),
+    })
+      .then(() => {
+        if (this.connected && this.bot === bot) {
+          this._refreshFromBot();
+        }
+      })
+      .catch(() => {});
+  }
+
+  _clearCombatMicroTimer() {
+    if (this._combatMicroTimer) {
+      clearTimeout(this._combatMicroTimer);
+      this._combatMicroTimer = null;
+    }
+  }
+
+  _scheduleCombatMicroTick(cooldownMs = 625) {
+    if (this._combatMicroTimer || !this.connected || this._stopped || this.paused) return;
+    const delayMs = Math.max(80, Math.min(350, Math.floor((cooldownMs || 625) / 2)));
+    this._combatMicroTimer = setTimeout(() => {
+      this._combatMicroTimer = null;
+      if (this.connected && !this._stopped && !this.paused && this.combatMode === "guard") {
+        void this._companionTick();
+      }
+    }, delayMs);
+    if (typeof this._combatMicroTimer.unref === "function") {
+      this._combatMicroTimer.unref();
+    }
+  }
+
   _startCompanionLoop() {
     this._stopCompanionLoop();
-    if (!this.connected || !this.config.mcCompanionMode) return;
+    if (!this.connected) return;
+    if (!this.config.mcCompanionMode && this.combatMode !== "guard") return;
     this._lastSoloWanderAtMs = this.nowFn() - Math.floor(this.soloWanderIntervalMs * 0.6);
     this._companionTimer = setInterval(() => {
       if (!this.connected || this._stopped) {
         this._stopCompanionLoop();
         return;
       }
-      this._companionTick();
+      void this._companionTick();
     }, this.companionTickMs);
     if (typeof this._companionTimer.unref === "function") {
       this._companionTimer.unref();
@@ -522,6 +710,7 @@ export class McRuntime {
   }
 
   _stopCompanionLoop() {
+    this._clearCombatMicroTimer();
     if (this._companionTimer) {
       clearInterval(this._companionTimer);
       this._companionTimer = null;
@@ -612,109 +801,242 @@ export class McRuntime {
     return best;
   }
 
-  _companionTick() {
+  _findGuardedPlayer(bot) {
+    if (!bot?.entity?.position || this.config.mcAllowedPlayers.size === 0) return null;
+    if (this.guardTarget) {
+      const targetLower = this.guardTarget.toLowerCase();
+      if (this.config.mcAllowedPlayers.has(targetLower)) {
+        for (const p of Object.values(bot.players || {})) {
+          if (
+            p &&
+            typeof p.username === "string" &&
+            p.username.toLowerCase() === targetLower &&
+            p.username !== bot.username &&
+            p.entity?.position
+          ) {
+            return { player: p, dist: this._distanceBetween(bot.entity.position, p.entity.position) };
+          }
+        }
+      }
+    }
+    return this._findNearestAllowedPlayer(bot);
+  }
+
+  _handleCreeperAlert(creeper, nearbyPlayer) {
+    const nowMs = this.nowFn();
+    this._emitMilestone("mc_creeper_alert", "high", {
+      distance: roundCoord(creeper.dist),
+      pos: this._vecToTuple(creeper.entity?.position),
+      dimension: this.dimension || "overworld",
+      combat_mode: this.combatMode,
+      action: "retreat_standoff",
+    });
+    if (nearbyPlayer && nowMs - this._lastHostileAlertAtMs >= this.hostileAlertCooldownMs) {
+      if (this._tryCompanionChat("小心！旁边有苦力怕，我先拉远距离躲开喵~")) {
+        this._lastHostileAlertAtMs = nowMs;
+      }
+    }
+  }
+
+  _handleCombatRetreatAlert({ health, food }) {
+    this._emitMilestone("mc_combat_retreat", "high", {
+      health,
+      food,
+      reason: "low_health",
+      resume_health: 12,
+      dimension: this.dimension || "overworld",
+    });
+  }
+
+  async _companionTick() {
     const bot = this.bot;
     if (
-      !this.config.mcCompanionMode ||
+      (!this.config.mcCompanionMode && this.combatMode !== "guard") ||
       !this.connected ||
       !bot ||
       this.paused ||
       this._stopped ||
-      this._activeGoalCancel
+      this._activeGoalCancel ||
+      this._companionTickRunning
     ) {
       return;
     }
     const origin = bot.entity?.position;
     if (!origin) return;
-    const nowMs = this.nowFn();
-    const allowed = this._findNearestAllowedPlayer(bot);
-    const hostile = this._findNearestHostile(bot, 8);
 
-    // 1. Self-preservation: evade nearby hostile mob
-    if (hostile) {
-      const dx = (origin.x ?? 0) - (hostile.entity.position.x ?? 0);
-      const dz = (origin.z ?? 0) - (hostile.entity.position.z ?? 0);
-      const len = Math.hypot(dx, dz) || 1;
-      let tx = Math.round((origin.x ?? 0) + (dx / len) * 10);
-      let tz = Math.round((origin.z ?? 0) + (dz / len) * 10);
+    this._companionTickRunning = true;
+    try {
+      const nowMs = this.nowFn();
+      const nextHealth = readNonNegativeFinite(bot.health);
+      if (nextHealth !== null) this.health = nextHealth;
+      const nextFood = readNonNegativeFinite(bot.food);
+      if (nextFood !== null) this.food = nextFood;
+
+      const allowed =
+        this.combatMode === "guard"
+          ? this._findGuardedPlayer(bot)
+          : this._findNearestAllowedPlayer(bot);
+
+      // 1. Combat / Self-preservation layer
+      if (this.combatMode === "guard") {
+        const combatRes = await runGuardCombatStep({
+          bot,
+          combatState: this._combatState,
+          guardedPlayer: allowed?.player ?? null,
+          health: this.health,
+          food: this.food,
+          nowMs,
+          autoEquip: this.config.mcAutoEquip !== false,
+          eating: this._eatingLock.eating,
+          lookAtEntityFn: (b, e) => this._lookAtEntity(b, e),
+          onNeedHealEat: () => this._triggerUrgentEat(),
+          onCreeperAlert: (creeper) => this._handleCreeperAlert(creeper, allowed?.player ?? null),
+          onRetreatAlert: (info) => this._handleCombatRetreatAlert(info),
+        });
+        if (combatRes.handled) {
+          this._followingPlayer = null;
+          this.activity = sanitizeMcText(combatRes.activity, 64) || "护卫警戒";
+          if (combatRes.inCombat) {
+            this._scheduleCombatMicroTick(combatRes.cooldownMs);
+          } else {
+            this._clearCombatMicroTimer();
+          }
+          return;
+        }
+        this._clearCombatMicroTimer();
+      } else {
+        this._clearCombatMicroTimer();
+        lowerShield(bot, this._combatState);
+        const creeper = findNearestCreeper(bot, CREEPER_SAFE_DISTANCE);
+        if (creeper) {
+          const dest = computeRetreatTarget(
+            origin,
+            creeper.entity.position,
+            10,
+            allowed?.player?.entity?.position ?? null,
+          );
+          applyNoDigMovements(bot);
+          try {
+            bot.pathfinder?.setGoal?.(new GoalNearXZ(dest.x, dest.z, 2), true);
+          } catch {
+            // Ignore pathfinder errors
+          }
+          this._followingPlayer = null;
+          this.activity = "远离苦力怕";
+          this._handleCreeperAlert(creeper, allowed?.player ?? null);
+          return;
+        }
+        const hostile = this._findNearestHostile(bot, 8);
+        if (hostile) {
+          const dx = (origin.x ?? 0) - (hostile.entity.position.x ?? 0);
+          const dz = (origin.z ?? 0) - (hostile.entity.position.z ?? 0);
+          const len = Math.hypot(dx, dz) || 1;
+          let tx = Math.round((origin.x ?? 0) + (dx / len) * 10);
+          let tz = Math.round((origin.z ?? 0) + (dz / len) * 10);
+          if (
+            allowed &&
+            allowed.dist <= 24 &&
+            this._distanceBetween(allowed.player.entity.position, hostile.entity.position) >
+              hostile.dist + 2
+          ) {
+            tx = Math.round(allowed.player.entity.position.x ?? tx);
+            tz = Math.round(allowed.player.entity.position.z ?? tz);
+          }
+          applyNoDigMovements(bot);
+          try {
+            bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
+          } catch {
+            // Ignore pathfinder errors
+          }
+          this._followingPlayer = null;
+          this.activity = "躲避怪物";
+          if (allowed && nowMs - this._lastHostileAlertAtMs >= this.hostileAlertCooldownMs) {
+            if (this._tryCompanionChat("呀！旁边有怪物靠近我，快救救猫猫喵~")) {
+              this._lastHostileAlertAtMs = nowMs;
+            }
+          }
+          return;
+        }
+      }
+
+      // 2. Accompany nearest / guarded whitelisted player (look + continuous follow)
+      if (allowed) {
+        const uname = sanitizeMcText(allowed.player.username, 20);
+        const key = allowed.player.username.toLowerCase();
+        this._lookAtEntity(bot, allowed.player.entity);
+        if (!this._greetedPlayers.has(key)) {
+          this._greetedPlayers.add(key);
+          try {
+            bot.swingArm?.("right");
+          } catch {
+            // Ignore swing errors
+          }
+          this._tryCompanionChat("来啦！看到你上线了喵~");
+        }
+        if (!this._stayPut && allowed.dist > 4.2) {
+          if (this.combatMode === "guard") {
+            applyNoDigMovements(bot);
+          } else {
+            this._ensurePathfinder(bot);
+          }
+          try {
+            bot.pathfinder?.setGoal?.(new GoalFollow(allowed.player.entity, 3), true);
+            this._followingPlayer = allowed.player.username;
+            this.activity = this.combatMode === "guard" ? `护卫:${uname}` : `陪伴:${uname}`;
+          } catch {
+            // Ignore pathfinder errors
+          }
+        } else if (allowed.dist <= 3.6 && this._followingPlayer) {
+          try {
+            bot.pathfinder?.setGoal?.(null);
+          } catch {
+            // Ignore stop errors
+          }
+          this._followingPlayer = null;
+          this.activity = this._stayPut
+            ? `原地等${uname}`
+            : this.combatMode === "guard"
+              ? `守护${uname}`
+              : `陪在${uname}身边`;
+        }
+        return;
+      }
+
+      // 3. Gentle solo stroll when alone (only when MC_COMPANION_MODE is enabled)
       if (
-        allowed &&
-        allowed.dist <= 24 &&
-        this._distanceBetween(allowed.player.entity.position, hostile.entity.position) > hostile.dist + 2
+        this.config.mcCompanionMode &&
+        !this._stayPut &&
+        nowMs - this._lastSoloWanderAtMs >= this.soloWanderIntervalMs
       ) {
-        tx = Math.round(allowed.player.entity.position.x ?? tx);
-        tz = Math.round(allowed.player.entity.position.z ?? tz);
-      }
-      this._ensurePathfinder(bot);
-      try {
-        bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
-      } catch {
-        // Ignore pathfinder errors
-      }
-      this._followingPlayer = null;
-      this.activity = "躲避怪物";
-      if (allowed && nowMs - this._lastHostileAlertAtMs >= this.hostileAlertCooldownMs) {
-        if (this._tryCompanionChat("呀！旁边有怪物靠近我，快救救猫猫喵~")) {
-          this._lastHostileAlertAtMs = nowMs;
-        }
-      }
-      return;
-    }
-
-    // 2. Accompany nearest whitelisted player (look + continuous follow)
-    if (allowed) {
-      const uname = sanitizeMcText(allowed.player.username, 20);
-      const key = allowed.player.username.toLowerCase();
-      this._lookAtEntity(bot, allowed.player.entity);
-      if (!this._greetedPlayers.has(key)) {
-        this._greetedPlayers.add(key);
-        try {
-          bot.swingArm?.("right");
-        } catch {
-          // Ignore swing errors
-        }
-        this._tryCompanionChat("来啦！看到你上线了喵~");
-      }
-      if (!this._stayPut && allowed.dist > 4.2) {
+        this._lastSoloWanderAtMs = nowMs;
+        const dx = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
+        const dz = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
+        const wx = Math.round((origin.x ?? 0) + dx);
+        const wz = Math.round((origin.z ?? 0) + dz);
         this._ensurePathfinder(bot);
         try {
-          bot.pathfinder?.setGoal?.(new GoalFollow(allowed.player.entity, 3), true);
-          this._followingPlayer = allowed.player.username;
-          this.activity = `陪伴:${uname}`;
+          bot.pathfinder?.setGoal?.(new GoalNearXZ(wx, wz, 2), false);
+          this.activity = "四周闲逛";
         } catch {
-          // Ignore pathfinder errors
+          // Ignore wander errors
         }
-      } else if (allowed.dist <= 3.6 && this._followingPlayer) {
-        try {
-          bot.pathfinder?.setGoal?.(null);
-        } catch {
-          // Ignore stop errors
-        }
-        this._followingPlayer = null;
-        this.activity = this._stayPut ? `原地等${uname}` : `陪在${uname}身边`;
       }
-      return;
-    }
-
-    // 3. Gentle solo stroll when alone (does NOT reset idle auto-disconnect clock)
-    if (!this._stayPut && nowMs - this._lastSoloWanderAtMs >= this.soloWanderIntervalMs) {
-      this._lastSoloWanderAtMs = nowMs;
-      const dx = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
-      const dz = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
-      const wx = Math.round((origin.x ?? 0) + dx);
-      const wz = Math.round((origin.z ?? 0) + dz);
-      this._ensurePathfinder(bot);
-      try {
-        bot.pathfinder?.setGoal?.(new GoalNearXZ(wx, wz, 2), false);
-        this.activity = "四周闲逛";
-      } catch {
-        // Ignore wander errors
-      }
+    } catch {
+      // Never crash companion/combat loop
+    } finally {
+      this._companionTickRunning = false;
     }
   }
 
   _handleCompanionChat(username, rawMessage) {
-    if (!this.config.mcCompanionMode || this.paused || !this.connected || !this.bot) return;
+    if (
+      (!this.config.mcCompanionMode && this.combatMode !== "guard") ||
+      this.paused ||
+      !this.connected ||
+      !this.bot
+    ) {
+      return;
+    }
     if (!username || !this.config.mcAllowedPlayers.has(username.toLowerCase())) return;
     const trimmed = String(rawMessage || "").trim();
     if (!trimmed || trimmed.startsWith("/")) return;
@@ -727,12 +1049,39 @@ export class McRuntime {
       message: cleanMsg,
     });
     const matched = Object.values(this.bot.players || {}).find(
-      (p) => p && typeof p.username === "string" && p.username.toLowerCase() === username.toLowerCase(),
+      (p) =>
+        p &&
+        typeof p.username === "string" &&
+        p.username.toLowerCase() === username.toLowerCase(),
     );
     if (matched?.entity) {
       this._lookAtEntity(this.bot, matched.entity);
     }
     if (this.config.mcCompanionLocalChatReply === false) {
+      return;
+    }
+    if (EVADE_CMD_RE.test(cleanMsg)) {
+      this.combatMode = "evade";
+      this.guardTarget = "";
+      this._clearCombatMicroTimer();
+      lowerShield(this.bot, this._combatState);
+      this._combatState.retreating = false;
+      this._combatState.activeTargetId = null;
+      this.activity = "躲避模式";
+      this._tryCompanionChat("好哒，切回躲避模式，遇到怪我会先躲开喵~");
+      this._emitSnapshot();
+      return;
+    }
+    if (GUARD_CMD_RE.test(cleanMsg)) {
+      this.combatMode = "guard";
+      this.guardTarget = normalizePlayerId(matched?.username || cleanUser);
+      this._stayPut = false;
+      this.activity = this.guardTarget ? `护卫:${this.guardTarget}` : "护卫警戒";
+      if (!this._companionTimer) {
+        this._startCompanionLoop();
+      }
+      this._tryCompanionChat("收到！进入护卫模式，猫猫来保护你喵~");
+      this._emitSnapshot();
       return;
     }
     if (STAY_CMD_RE.test(cleanMsg)) {
@@ -954,8 +1303,12 @@ export class McRuntime {
       typeof bot.pathfinder.setMovements === "function" &&
       bot.registry?.blocksByName
     ) {
-      const movements = new Movements(bot);
-      bot.pathfinder.setMovements(movements);
+      try {
+        const movements = new Movements(bot);
+        bot.pathfinder.setMovements(movements);
+      } catch {
+        // Ignore Movements init error on partial mock registries
+      }
     }
   }
 
@@ -1014,6 +1367,10 @@ export class McRuntime {
       this.health = readNonNegativeFinite(bot.health);
       this.food = readNonNegativeFinite(bot.food);
       this._prevHealth = this.health;
+      const invSnap = collectInventorySnapshot(bot);
+      this.equipment = invSnap.equipment;
+      this.inventorySummary = invSnap.inventory_summary;
+      this.freeSlots = invSnap.free_slots;
       this.nearbyEntities = this._collectNearbyEntities(bot);
       if (
         !this.activity ||
@@ -1026,6 +1383,7 @@ export class McRuntime {
         this.activity = this.paused ? "已暂停" : "原地待命";
       }
       this._startSnapshotTimer();
+      this._startSurvivalLoop();
       this._startCompanionLoop();
       this._emitSnapshot();
     });
@@ -1039,6 +1397,12 @@ export class McRuntime {
       this.health = readNonNegativeFinite(bot.health);
       this.food = readNonNegativeFinite(bot.food);
       this._prevHealth = this.health;
+      this._combatState.retreating = false;
+      lowerShield(bot, this._combatState);
+      const invSnap = collectInventorySnapshot(bot);
+      this.equipment = invSnap.equipment;
+      this.inventorySummary = invSnap.inventory_summary;
+      this.freeSlots = invSnap.free_slots;
       this.nearbyEntities = this._collectNearbyEntities(bot);
       if (this.activity === "等待复活") {
         this.activity = this.paused ? "已暂停" : "原地待命";
@@ -1073,6 +1437,10 @@ export class McRuntime {
     bot.on("death", () => {
       if (this.bot !== bot) return;
       this._cancelActiveGoal();
+      this._clearCombatMicroTimer();
+      lowerShield(bot, this._combatState);
+      this._combatState.retreating = false;
+      this._combatState.activeTargetId = null;
       const prevActivity = sanitizeMcText(this.activity, 48) || "探索";
       this._refreshFromBot();
       this.health = 0;
@@ -1154,9 +1522,13 @@ export class McRuntime {
   _handleBotEnd(bot) {
     if (this.bot !== bot) return;
     const wasConnected = this.connected;
+    this._stopSurvivalLoop();
     this._stopCompanionLoop();
     this._stopSnapshotTimer();
     this._cancelActiveGoal();
+    lowerShield(bot, this._combatState);
+    this._combatState = createCombatState();
+    this._eatingLock.eating = false;
     this._followingPlayer = null;
     this._greetedPlayers.clear();
     this.bot = null;
@@ -1166,6 +1538,10 @@ export class McRuntime {
     this.pos = null;
     this.health = null;
     this.food = null;
+    this.equipment = createEmptyEquipment();
+    this.inventorySummary = [];
+    this.freeSlots = null;
+    this.guardTarget = "";
     this.nearbyEntities = [];
     this._prevHealth = null;
     if (!this.activity.startsWith("筹备建造:")) {
@@ -1182,9 +1558,13 @@ export class McRuntime {
     this._soloSinceMs = null;
     if (!bot) return;
     this.bot = null;
+    this._stopSurvivalLoop();
     this._stopCompanionLoop();
     this._stopSnapshotTimer();
     this._cancelActiveGoal();
+    lowerShield(bot, this._combatState);
+    this._combatState = createCombatState();
+    this._eatingLock.eating = false;
     this._followingPlayer = null;
     this._greetedPlayers.clear();
     const wasConnected = this.connected;
@@ -1193,6 +1573,10 @@ export class McRuntime {
     this.pos = null;
     this.health = null;
     this.food = null;
+    this.equipment = createEmptyEquipment();
+    this.inventorySummary = [];
+    this.freeSlots = null;
+    this.guardTarget = "";
     this.nearbyEntities = [];
     this._prevHealth = null;
     if (intentional && !this.activity.startsWith("筹备建造:")) {
@@ -1332,6 +1716,8 @@ export class McRuntime {
   async pause() {
     this._cancelWakePoll();
     this._cancelActiveGoal();
+    this._clearCombatMicroTimer();
+    lowerShield(this.bot, this._combatState);
     this.paused = true;
     this.activity = "已暂停";
     this._emitSnapshot();
@@ -1438,6 +1824,8 @@ export class McRuntime {
     if (actionType === "idle" || actionType === "stop") {
       this._stayPut = true;
       this._followingPlayer = null;
+      this._clearCombatMicroTimer();
+      lowerShield(this.bot, this._combatState);
       this._cancelActiveGoal();
       try {
         this.bot?.pathfinder?.stop?.();
@@ -1766,6 +2154,10 @@ export class McRuntime {
           await this._gotoGoal(new GoalNear(coords[0], coords[1], coords[2], 3), signal);
         }
         if (signal.aborted) return { aborted: true };
+        if (block && this.config.mcAutoEquip !== false && !this._eatingLock.eating) {
+          await equipBestHarvestTool(bot, block);
+        }
+        if (signal.aborted) return { aborted: true };
         if (block && typeof bot.dig === "function") {
           await bot.dig(block);
         }
@@ -1989,6 +2381,167 @@ export class McRuntime {
         paused: false,
         summary,
         message: cleanMsg,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "craft") {
+      const parsed = parseCraftParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          summary: parsed.error === "invalid_item_name" ? "合成物品ID无效" : "合成数量需为1到16的整数",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = `合成:${parsed.itemName}`;
+      this._emitSnapshot();
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        return await executeCraftAction(bot, params, {
+          gotoFn: (goal, sig) => this._gotoGoal(goal, sig),
+          autoEquip: this.config.mcAutoEquip !== false,
+          signal,
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "合成超时" : "合成已取消",
+          item_name: parsed.itemName,
+          requested_count: parsed.count,
+          crafted_count: 0,
+          missing_materials: [],
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "craft",
+          summary: outcome.summary,
+          item_name: outcome.item_name,
+          crafted_count: outcome.crafted_count,
+        });
+        return {
+          ok: true,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          ...outcome,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      return {
+        ok: false,
+        accepted: outcome?.accepted ?? true,
+        bridge_ready: true,
+        paused: false,
+        reason: outcome?.reason || "craft_failed",
+        summary: outcome?.summary || `合成${parsed.itemName}失败`,
+        item_name: outcome?.item_name ?? parsed.itemName,
+        requested_count: outcome?.requested_count ?? parsed.count,
+        crafted_count: outcome?.crafted_count ?? 0,
+        missing_materials: Array.isArray(outcome?.missing_materials)
+          ? outcome.missing_materials
+          : [],
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "guard") {
+      const rawTarget =
+        params.target_player !== undefined
+          ? params.target_player
+          : params.player !== undefined
+            ? params.player
+            : "";
+      const trimmedTarget = typeof rawTarget === "string" ? rawTarget.trim() : "";
+      let resolvedTarget = "";
+      if (trimmedTarget) {
+        const cleanTarget = normalizePlayerId(trimmedTarget);
+        if (
+          !cleanTarget ||
+          this.config.mcAllowedPlayers.size === 0 ||
+          !this.config.mcAllowedPlayers.has(cleanTarget.toLowerCase())
+        ) {
+          return {
+            ok: false,
+            accepted: false,
+            bridge_ready: true,
+            paused: false,
+            reason: "player_not_allowed",
+            summary: "目标玩家不在允许列表",
+            snapshot: this.getSnapshot(),
+          };
+        }
+        const matchedOnline = Object.values(bot.players || {}).find(
+          (p) =>
+            p &&
+            typeof p.username === "string" &&
+            p.username.toLowerCase() === cleanTarget.toLowerCase(),
+        );
+        const matchedAllowed = this.config.mcAllowedPlayerList.find(
+          (u) => u.toLowerCase() === cleanTarget.toLowerCase(),
+        );
+        resolvedTarget = normalizePlayerId(matchedOnline?.username || matchedAllowed || cleanTarget);
+      }
+
+      this.combatMode = "guard";
+      this.guardTarget = resolvedTarget;
+      this._stayPut = false;
+      if (!this._companionTimer) {
+        this._startCompanionLoop();
+      }
+      this._refreshFromBot();
+      const effectiveTarget = this._resolveGuardTargetName();
+      this.activity = effectiveTarget ? `护卫:${effectiveTarget}` : "护卫警戒";
+      this._emitSnapshot();
+      const summary = effectiveTarget
+        ? `已切换护卫模式(守护${effectiveTarget})`
+        : "已切换护卫模式";
+      return {
+        ok: true,
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        combat_mode: "guard",
+        guard_target: effectiveTarget,
+        summary,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "evade") {
+      this.combatMode = "evade";
+      this.guardTarget = "";
+      this._clearCombatMicroTimer();
+      lowerShield(bot, this._combatState);
+      this._combatState.retreating = false;
+      this._combatState.activeTargetId = null;
+      if (!this.config.mcCompanionMode) {
+        this._stopCompanionLoop();
+      }
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : "原地待命";
+      this._emitSnapshot();
+      return {
+        ok: true,
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        combat_mode: "evade",
+        guard_target: "",
+        summary: "已切换躲避模式",
         snapshot: this.getSnapshot(),
       };
     }
