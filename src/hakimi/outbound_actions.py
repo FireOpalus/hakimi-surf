@@ -133,10 +133,12 @@ class ChatActions(BaseModel):
     trigger_action: ChatActionTrigger | None = None
     voice_text: str | None = None
     sing_song: str | None = None
+    audio_gist: str | None = None
 
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
 MAX_IMAGE_DIGEST_CHARS = 120
+MAX_AUDIO_GIST_CHARS = 80
 
 
 def require_all_schema_fields(node: Any) -> Any:
@@ -295,6 +297,7 @@ def parse_actions(
     allow_voice: bool = False,
     allow_sing_song: bool = False,
     song_titles: Iterable[str] = (),
+    allow_audio_gist: bool = False,
 ):
     try:
         value = json.loads(raw)
@@ -323,6 +326,18 @@ def parse_actions(
     actions.image_digest = (actions.image_digest or "").replace("\n", " ").strip()[
         :MAX_IMAGE_DIGEST_CHARS
     ] or None
+    if allow_audio_gist and not actions.abstain and isinstance(actions.audio_gist, str):
+        secrets = configured_secrets(settings) if settings else []
+        raw_gist = actions.audio_gist
+        cleaned_gist = " ".join(clean_text(raw_gist).split()).strip()
+        if cleaned_gist and not any(
+            s and len(s) >= 8 and (s in raw_gist or s in cleaned_gist) for s in secrets
+        ):
+            actions.audio_gist = cleaned_gist[:MAX_AUDIO_GIST_CHARS].strip() or None
+        else:
+            actions.audio_gist = None
+    else:
+        actions.audio_gist = None
     actions.emoji_like = normalize_emoji_like(actions.emoji_like) if allow_emoji_like else None
     poke_pool = (set(allowed_poke) - blocked_ids) if allowed_poke is not None else allowed
     actions.poke_qq = (

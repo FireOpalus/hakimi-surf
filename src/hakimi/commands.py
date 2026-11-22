@@ -211,6 +211,8 @@ class CommandRegistry:
     async def dispatch(self, service: Any, message: Message) -> str | None:
         if service.bot_guard.known_bot(message):
             return None
+        if any(a.origin in {"", "当前消息"} for a in getattr(message, "audios", ())):
+            return None
         prefix = service.s.command_prefix
         direct = message.command_text if message.command_text is not None else message.text
         for resolver in self._delegates:

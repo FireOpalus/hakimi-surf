@@ -9,7 +9,8 @@ from urllib.parse import urlsplit
 
 from hakimi_plugin_sdk.bili_common import BV_RE, extract_url_bvid
 
-from .models import FileRef, ImageRef
+from .audio_media import valid_record_file_id, validate_audio_url
+from .models import AudioRef, FileRef, ImageRef
 from .security import Rejected, clean_text
 
 BV = BV_RE
@@ -86,6 +87,36 @@ def parse_file_ref(data: dict) -> FileRef | None:
     return ref if ref.identity else None
 
 
+def parse_audio_ref(data: dict) -> AudioRef | None:
+    if not isinstance(data, dict):
+        return None
+    file_id = valid_record_file_id(data.get("file", ""))
+    raw_url = data.get("url", "")
+    url = ""
+    if isinstance(raw_url, str) and raw_url:
+        try:
+            url = validate_audio_url(raw_url)
+        except Rejected:
+            url = ""
+    raw_size = data.get("file_size", data.get("size"))
+    size = (
+        int(raw_size)
+        if not isinstance(raw_size, bool) and re.fullmatch(r"[0-9]{1,15}", str(raw_size or ""))
+        else None
+    )
+    raw_duration = data.get("duration", data.get("seconds"))
+    duration: float | None = None
+    if raw_duration is not None and not isinstance(raw_duration, bool):
+        try:
+            parsed_duration = float(raw_duration)
+            if 0 < parsed_duration <= 86400:
+                duration = parsed_duration
+        except (TypeError, ValueError):
+            duration = None
+    ref = AudioRef(url=url, file=file_id, file_size=size, duration=duration)
+    return ref if ref.identity else None
+
+
 @dataclass
 class RichMessage:
     text: str = ""
@@ -95,6 +126,7 @@ class RichMessage:
     reply_ids: list[str] = field(default_factory=list)
     images: list[ImageRef] = field(default_factory=list)
     files: list[FileRef] = field(default_factory=list)
+    audios: list[AudioRef] = field(default_factory=list)
     video_ids: list[str] = field(default_factory=list)
     short_urls: list[str] = field(default_factory=list)
     forward_ids: list[str] = field(default_factory=list)
@@ -311,8 +343,16 @@ def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) ->
                         result.truncated = True
                 label = ref.name if ref and ref.name else ""
                 add(f"[文件：{label}]" if label else "[文件]")
+            elif kind == "record":
+                ref = parse_audio_ref(data)
+                if ref and ref.identity not in [a.identity for a in result.audios]:
+                    if len(result.audios) < 64:
+                        result.audios.append(ref)
+                    else:
+                        result.truncated = True
+                add("[语音]")
             else:
-                # Never execute unknown segments (music, record, video, xml, location, poke, etc.).
+                # Never execute unknown segments (music, video, xml, location, poke, etc.).
                 add("[其他消息段]")
 
     walk(message)
@@ -361,6 +401,20 @@ def parse_forward(data: dict, bot_id: str, *, include_authors: bool = False) -> 
                 if ref.identity not in [f.identity for f in result.files]:
                     if len(result.files) < 2:
                         result.files.append(
+                            ref.model_copy(
+                                update={
+                                    "sender_id": uid if uid != "未知" else "",
+                                    "sender_nickname": name,
+                                    "origin": "转发记录（作者声明）",
+                                }
+                            )
+                        )
+                    else:
+                        result.truncated = True
+            for ref in rich.audios:
+                if ref.identity not in [a.identity for a in result.audios]:
+                    if len(result.audios) < 64:
+                        result.audios.append(
                             ref.model_copy(
                                 update={
                                     "sender_id": uid if uid != "未知" else "",

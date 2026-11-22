@@ -23,9 +23,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from hakimi_plugin_sdk.bili_common import extract_bvid
 
 from .attention import can_watch_video
+from .audio_media import MAX_INLINE_AUDIO_BYTES, ModelAudio
 from .bot_server import assemble_chat_input, escape_data, prompt_context, untrusted_input
 from .config import Settings
 from .context_budget import estimate_tokens
+from .decision_templates import DecisionTemplate, get_decision_template, parse_template_answers
 from .dual_memory import EXTRACTION_INSTRUCTION, EXTRACTION_RESPONSE_FORMAT
 from .gateway import FilterManager, redact_excerpt
 from .generation_policy import GenerationPlan, Scenario, generation_plan
@@ -376,6 +378,22 @@ def probability(answer: Any, attribute: str) -> float:
     if not math.isfinite(value) or not 0 <= value <= 1:
         raise Rejected("invalid_decision")
     return value
+
+
+def _validate_audios(audios: list[ModelAudio] | None) -> tuple[list[ModelAudio], int]:
+    items = list(audios or [])
+    if not items:
+        return [], 0
+    total_bytes = 0
+    total_tokens = 0
+    for audio in items:
+        if not isinstance(audio, ModelAudio):
+            raise Rejected("invalid_audio")
+        total_bytes += audio.validate()
+        if total_bytes > MAX_INLINE_AUDIO_BYTES:
+            raise Rejected("audio_too_large")
+        total_tokens += audio.tokens
+    return items, total_tokens
 
 
 class GenerationTimeout(Exception):
@@ -1254,6 +1272,7 @@ class GeminiGateway:
         group: bool = False,
         budget_lane: str = "chat",
         images: list[ModelImage] | None = None,
+        audios: list[ModelAudio] | None = None,
         message: Message | None = None,
         trace: dict | None = None,
         audit_source: str = "production",
@@ -1265,6 +1284,7 @@ class GeminiGateway:
         audit_job_id: str | None = None,
         known_bot: bool | None = None,
         module_queries: dict[str, str] | None = None,
+        decision_template: str | None = None,
         _digest_review: DigestReviewCredit | None = None,
     ) -> str:
         await self._ensure_routing_ready()
@@ -1289,6 +1309,15 @@ class GeminiGateway:
         )
         bot_gated = inbound and is_bot and not bot_invited
         query = questions(purpose)
+        active_template: DecisionTemplate | None = None
+        if decision_template is not None:
+            if inbound:
+                raise Rejected("invalid_decision_template")
+            active_template = get_decision_template(decision_template, purpose=purpose)
+            template_questions = active_template.question_map()
+            if set(template_questions) & set(query):
+                raise Rejected("invalid_decision_template")
+            query = {**query, **template_questions}
         group_policy = (
             self.s.group_policies.get(f"{message.platform}:{message.conversation_id}", "at_only")
             if message and message.kind == "group"
@@ -1380,13 +1409,20 @@ class GeminiGateway:
         images = images or []
         if len(images) > 2 or (video is not None and images):
             raise Rejected("too_many_images")
+        audio_items, audio_token_reserve = _validate_audios(audios)
+        if video is not None and audio_items:
+            raise Rejected("audio_video_mixed_forbidden")
         if video is not None:
             video.validate()
         model_input = (
             [{"type": "text", "text": data}, video.block()]
             if video is not None
-            else [{"type": "text", "text": data}, *(i.block() for i in images)]
-            if images
+            else [
+                {"type": "text", "text": data},
+                *(i.block() for i in images),
+                *(a.block() for a in audio_items),
+            ]
+            if (images or audio_items)
             else data
         )
         report = trace if trace is not None else {}
@@ -1431,11 +1467,13 @@ class GeminiGateway:
             "attempts": attempts,
             "work_kind": budget_lane + ".screen." + purpose,
             "image_tokens": len(images) * self.s.image_token_reserve
+            + audio_token_reserve
             + (video.tokens if video else 0),
             "before_call": before_call,
             "context_limit": source_limit + 12000,
             "fallback_media_tokens": (
                 sum(1120 if i.resolution == "high" else 560 for i in images)
+                + audio_token_reserve
                 + (video.tokens if video else 0)
             ),
             "thinking_level": "none",
@@ -1449,12 +1487,22 @@ class GeminiGateway:
                 or set(payload) != {"generated_text"}
                 or not isinstance(payload["generated_text"], str)
                 or images
+                or audio_items
                 or video is not None
+                or active_template is not None
             ):
                 raise Rejected("invalid_digest_review")
             call_kwargs["digest_review"] = _digest_review
+        long_audio = sum(a.duration_sec for a in audio_items) > 60
         decision_timeout = (
-            max(self.s.decision_timeout, 60) if video is not None else self.s.decision_timeout
+            max(self.s.decision_timeout, 60)
+            if video is not None
+            else max(self.s.decision_timeout, 45)
+            if long_audio
+            else self.s.decision_timeout
+        )
+        decision_timeout_kw: dict[str, Any] = (
+            {"timeout": 60} if video is not None else {"timeout": 45} if long_audio else {}
         )
         free_client = self.free_decision_client if privacy_level == "low" else None
 
@@ -1473,7 +1521,7 @@ class GeminiGateway:
                             model=self.s.decision_model,
                             input=model_input,
                             questions=query,
-                            **({"timeout": 60} if video is not None else {}),
+                            **decision_timeout_kw,
                         ),
                         **call_kwargs,
                         price_override=(Decimal(0), Decimal(0)),
@@ -1493,7 +1541,7 @@ class GeminiGateway:
                             model=self.s.decision_model,
                             input=model_input,
                             questions=query,
-                            **({"timeout": 60} if video is not None else {}),
+                            **decision_timeout_kw,
                         ),
                         **call_kwargs,
                         provider="gemini_paid",
@@ -1513,7 +1561,7 @@ class GeminiGateway:
                         model=self.s.decision_model,
                         input=model_input,
                         questions=query,
-                        **({"timeout": 60} if video is not None else {}),
+                        **decision_timeout_kw,
                     ),
                     **call_kwargs,
                     provider="gemini_paid",
@@ -1555,6 +1603,11 @@ class GeminiGateway:
                     raise Rejected("invalid_decision")
             if not inbound:
                 read_noul(result.answers, "should_reply")
+                if active_template is not None:
+                    parsed_template = parse_template_answers(active_template, result.answers)
+                    report["answers"].update(parsed_template)
+                    report["template"] = active_template.template_id
+                    report["template_decisions"] = parsed_template
                 report.update(result="chat", reason="safe_source_or_output")
                 return "chat"
             reply, _ = read_noul(result.answers, "should_reply")
@@ -1792,6 +1845,7 @@ class GeminiGateway:
         deep: bool = False,
         budget_lane: str = "chat",
         images: list[ModelImage] | None = None,
+        audios: list[ModelAudio] | None = None,
         message: Message | None = None,
         audit_source: str = "production",
         with_longnick: bool = False,
@@ -1832,6 +1886,7 @@ class GeminiGateway:
             not life_plan or morning_thinking not in ("medium", "high")
         ):
             raise Rejected("invalid_life_plan")
+        audio_items, audio_token_reserve = _validate_audios(audios)
         if life_plan and (
             budget_lane != "proactive"
             or memory_archive
@@ -1839,6 +1894,7 @@ class GeminiGateway:
             or deep
             or with_longnick
             or images
+            or audio_items
             or video is not None
         ):
             raise Rejected("invalid_life_plan")
@@ -1868,10 +1924,18 @@ class GeminiGateway:
             and payload.get("analysis_mode") == "cn_keyframe_storyboard"
             and len(images) == 1
         )
+        if video is not None and audio_items:
+            raise Rejected("audio_video_mixed_forbidden")
         if video is not None:
             video.validate()
             if images or scenario != Scenario.BILIBILI_SUMMARY:
                 raise Rejected("invalid_generation_video")
+        if audio_items and scenario in {
+            Scenario.BILIBILI_SUMMARY,
+            Scenario.DAILY_DIARY,
+            Scenario.MEMORY_COMPRESSION,
+        }:
+            raise Rejected("invalid_generation_audios")
         if len(images) > 2 or (
             scenario in {Scenario.BILIBILI_SUMMARY, Scenario.DAILY_DIARY}
             and images
@@ -2180,8 +2244,12 @@ class GeminiGateway:
             model_input = (
                 [{"type": "text", "text": wire_data}, video.block()]
                 if video
-                else [{"type": "text", "text": wire_data}, *(i.block() for i in images)]
-                if chat or images
+                else [
+                    {"type": "text", "text": wire_data},
+                    *(i.block() for i in images),
+                    *(a.block() for a in audio_items),
+                ]
+                if chat or images or audio_items
                 else wire_data
             )
             if generation_trace is not None:
@@ -2233,13 +2301,17 @@ class GeminiGateway:
                     config_kwargs["response_mime_type"] = "application/json"
                     config_kwargs["response_json_schema"] = active_response_schema
                 gc_config = types.GenerateContentConfig(**config_kwargs)
-                if images:
+                if images or audio_items:
                     parts = [types.Part.from_text(text=reserve_data)]
                     for img in images:
                         parts.append(
                             types.Part.from_bytes(
                                 data=base64.b64decode(img.data), mime_type=img.mime_type
                             )
+                        )
+                    for audio in audio_items:
+                        parts.append(
+                            types.Part.from_bytes(data=audio.raw_bytes(), mime_type=audio.mime_type)
                         )
                     gc_contents: Any = [types.Content(role="user", parts=parts)]
                 else:
@@ -2358,6 +2430,7 @@ class GeminiGateway:
                 **({"digest_review": review} if review is not None else {}),
                 stream_retryable=use_stream,
                 image_tokens=len(images) * self.s.image_token_reserve
+                + audio_token_reserve
                 + (video.tokens if video else 0),
                 before_call=before_call,
                 context_limit=(
@@ -2369,6 +2442,7 @@ class GeminiGateway:
                 ),
                 fallback_media_tokens=(
                     sum(1120 if i.resolution == "high" else 560 for i in images)
+                    + audio_token_reserve
                     + (video.tokens if video else 0)
                 ),
                 cached_prefix_tokens=cached_prefix,
@@ -2575,6 +2649,7 @@ class GeminiGateway:
                         anchor=Anchor(reply_id=parsed_actions.anchor.reply_id),
                         sticker=Sticker(),
                         image_digest=None,
+                        audio_gist=None,
                         emoji_like=parsed_actions.emoji_like,
                         poke_qq=parsed_actions.poke_qq,
                         affection_delta=parsed_actions.affection_delta,

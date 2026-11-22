@@ -8,6 +8,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .audio_media import MAX_INLINE_AUDIO_BYTES, AudioLoader, ModelAudio
 from .group_pipeline import other_mentions
 from .media import ImageLoader
 from .memes import MAX_UPLOAD_BYTES
@@ -19,6 +20,10 @@ PRIOR_IMAGE_REF_RE = re.compile(
     r"(?:这|那|上|刚|前|原).{0,6}(?:张|幅|个)?(?:图|截图|照片|画面|报错图)"
     r"|(?:图|截图|照片)(?:里|中|上)"
     r"|(?:看|瞅|瞧|分析|解释|推导)(?:下|一下|看)?.{0,6}(?:图|截图|照片)"
+)
+PRIOR_AUDIO_REF_RE = re.compile(
+    r"(?:这|那|上|刚|前|原).{0,6}(?:条|段|个)?(?:语音|声音|录音)"
+    r"|(?:听|帮我听)(?:下|一下|听)?.{0,6}(?:语音|录音|刚才|说的)"
 )
 PRIOR_FILE_REF_RE = re.compile(
     r"(?:文件|日志|代码|脚本|配置|报错)"
@@ -143,6 +148,87 @@ async def load_message_images(
     return images, sources
 
 
+async def load_message_audios(
+    service: Any,
+    message: Message,
+    members: list[Message],
+    nearby: list[Message],
+    *,
+    include_current: bool = True,
+    nearby_origin: str = "紧邻群消息",
+    selected_members: list[Message] | None = None,
+    max_total_bytes: int = MAX_INLINE_AUDIO_BYTES,
+) -> tuple[list[ModelAudio], list[dict[str, Any]], dict[str, list[float]]]:
+    """Load turn audios without business count/duration caps, bounded by inline byte cap."""
+    selected: list[tuple[Any, Message, str]] = []
+    seen: set[str] = set()
+    for origin, messages in (
+        ("本批消息", members),
+        (nearby_origin, nearby),
+    ):
+        for item in messages:
+            candidate = (
+                item.model_copy(update={"addressed": True}) if item.kind == "group" else item
+            )
+            if not authorize(candidate, service.s) or other_mentions(item):
+                continue
+            for ref in item.audios:
+                if ref.identity and ref.identity not in seen:
+                    seen.add(ref.identity)
+                    selected.append((ref, item, origin))
+    for ref in message.audios if include_current else []:
+        if ref.identity and ref.identity not in seen:
+            selected.append((ref, message, "引用或转发材料"))
+            seen.add(ref.identity)
+    if not selected:
+        return [], [], {}
+    refs = [entry[0] for entry in selected]
+    loader = getattr(service, "audios", None)
+    if loader is None:
+        return [], [], {}
+    if hasattr(loader, "load_results"):
+        results = await loader.load_results(
+            refs,
+            **(
+                {
+                    "scope": service.store.session_scope(message),
+                    "max_total_bytes": max_total_bytes,
+                }
+                if isinstance(loader, AudioLoader)
+                else {}
+            ),
+        )
+    else:
+        results = await loader.load(refs)
+    audios: list[ModelAudio] = []
+    sources: list[dict[str, Any]] = []
+    durations_by_event: dict[str, list[float]] = {}
+    for (ref, member, origin), loaded in zip(selected, results, strict=True):
+        data: dict[str, Any] = {
+            "sender": f"{ref.sender_nickname or '群友'}(QQ:{ref.sender_id})"
+            if ref.sender_id
+            else service.image_sender(member),
+            "origin": origin if ref.origin in {"", "当前消息"} else origin + " / " + ref.origin,
+        }
+        if loaded is None:
+            data["status"] = (
+                loader.failure_status(ref) if hasattr(loader, "failure_status") else "unavailable"
+            )
+        else:
+            audios.append(loaded)
+            data.update(
+                audio_number=len(audios),
+                status="available",
+                duration_sec=round(loaded.duration_sec, 1),
+            )
+            if selected_members is not None:
+                selected_members.append(member)
+            if member.event_id:
+                durations_by_event.setdefault(member.event_id, []).append(loaded.duration_sec)
+        sources.append(data)
+    return audios, sources, durations_by_event
+
+
 async def load_turn_files(
     service: Any,
     message: Message,
@@ -213,6 +299,8 @@ async def expand_forwards(service: Any, message: Message) -> Message:
     seen_ids = {i.identity for i in images}
     files = list(message.files)
     seen_file_ids = {f.identity for f in files}
+    audios = list(message.audios)
+    seen_audio_ids = {a.identity for a in audios}
     videos, shorts = list(message.video_ids), list(message.short_urls)
     statuses = set(message.context_status)
     for forward_id in message.forward_ids:
@@ -228,6 +316,10 @@ async def expand_forwards(service: Any, message: Message) -> Message:
             if fref.identity not in seen_file_ids:
                 files.append(fref)
                 seen_file_ids.add(fref.identity)
+        for aref in rich.audios:
+            if aref.identity not in seen_audio_ids:
+                audios.append(aref)
+                seen_audio_ids.add(aref.identity)
         videos.extend(v for v in rich.video_ids if v not in videos)
         shorts.extend(u for u in rich.short_urls if u not in shorts)
         # No recursive get_forward_msg calls: a quoted reference cannot fan out requests.
@@ -240,6 +332,9 @@ async def expand_forwards(service: Any, message: Message) -> Message:
     if len(files) > 2:
         files = files[:2]
         statuses.add("truncated")
+    if len(audios) > 64:
+        audios = audios[:64]
+        statuses.add("truncated")
     if any(secret and len(secret) >= 8 and secret in text for secret in service.secrets):
         raise Rejected("credential_in_input")
     return message.model_copy(
@@ -247,6 +342,7 @@ async def expand_forwards(service: Any, message: Message) -> Message:
             "text": text,
             "images": images,
             "files": files,
+            "audios": audios,
             "video_ids": videos[:5],
             "short_urls": shorts[:5],
             "forward_ids": [],

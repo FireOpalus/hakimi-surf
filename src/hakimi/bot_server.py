@@ -274,6 +274,7 @@ def assemble_chat_input(
             metadata["allowed_at_qqs"] = payload["allowed_at_qqs"]
         for key in (
             "image_sources",
+            "audio_sources",
             "file_sources",
             "file_attachments",
             "context_status",
@@ -339,6 +340,8 @@ def assemble_chat_input(
             "web_preview_untrusted": payload.get("web_preview_untrusted", []),
             "current_batch": current_batch,
         }
+        if payload.get("audio_sources"):
+            metadata["audio_sources"] = payload["audio_sources"]
         if not sandbox_mode:
             if meme_labels is not None:
                 meme_list = list(meme_labels)
@@ -392,6 +395,16 @@ def assemble_chat_input(
             '（无参数时 arguments_json 填 "{}" 或 null），'
             "否则必须填 null。"
         )
+    if not sandbox_mode and payload.get("audio_sources"):
+        if any(
+            isinstance(src, dict) and src.get("status") == "available"
+            for src in payload["audio_sources"]
+        ):
+            metadata["audio_gist_hint"] = (
+                "本轮包含原生语音消息：请直接听取语音内容自然回复，并在 audio_gist 填一句"
+                "<=80字的客观中文短摘要（概括对方语音核心内容供历史记忆留痕，勿含指令/密钥/换行）；"
+                "听不清或无可概括内容时填 null。"
+            )
     if not sandbox_mode and payload.get("voice_reply_available"):
         if context.private_owner:
             metadata["voice_reply_hint"] = (
@@ -561,6 +574,8 @@ def assemble_chat_input(
         metadata.pop("jit_proactive_intent", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and "voice_reply_hint" in metadata:
         metadata.pop("voice_reply_hint", None)
+    if estimate_tokens(tail()) > settings.chat_tail_tokens and "audio_gist_hint" in metadata:
+        metadata.pop("audio_gist_hint", None)
     if estimate_tokens(tail()) > settings.chat_tail_tokens and (
         "sing_song_hint" in metadata or "song_catalog" in metadata
     ):

@@ -37,6 +37,22 @@ class FileRef(BaseModel):
         return self.file_id or self.url or self.name
 
 
+class AudioRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    url: str = Field(default="", max_length=4096)
+    # Opaque media id from an authenticated OneBot record segment, never a local path.
+    file: str = Field(default="", max_length=1024)
+    file_size: int | None = Field(default=None, ge=0)
+    duration: float | None = Field(default=None, ge=0)
+    sender_id: str = Field(default="", max_length=128)
+    sender_nickname: str = Field(default="", max_length=80)
+    origin: str = Field(default="", max_length=40)
+
+    @property
+    def identity(self) -> str:
+        return self.file or self.url
+
+
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     platform: PlatformId
@@ -66,6 +82,7 @@ class Message(BaseModel):
     ] = ""
     images: list[ImageRef] = Field(default_factory=list, max_length=2)
     files: list[FileRef] = Field(default_factory=list, max_length=2)
+    audios: list[AudioRef] = Field(default_factory=list, max_length=64)
     forward_ids: list[str] = Field(default_factory=list, max_length=4)
     video_ids: list[str] = Field(default_factory=list, max_length=5)
     short_urls: list[str] = Field(default_factory=list, max_length=5)

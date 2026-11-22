@@ -20,6 +20,7 @@ from hakimi_plugin_sdk.bili_common import extract_bvid
 
 from . import text_card
 from .attention import can_watch_video
+from .audio_media import MAX_INLINE_AUDIO_BYTES, AudioLoader
 from .bili_bridge import RemoteBiliClient, RemoteBiliWatcher
 from .bot_server import is_persona_owner, untrusted_input
 from .commands import (
@@ -44,6 +45,9 @@ from .life_engine import LifeEngine
 from .link_preview import preview_links
 from .media import ImageLoader
 from .media_turn import (
+    PRIOR_AUDIO_REF_RE as PRIOR_AUDIO_REF_RE,
+)
+from .media_turn import (
     PRIOR_FILE_REF_RE as PRIOR_FILE_REF_RE,
 )
 from .media_turn import (
@@ -54,6 +58,7 @@ from .media_turn import (
     expand_forwards,
     image_sender,
     is_sticker_candidate,
+    load_message_audios,
     load_message_images,
     load_turn_files,
     recall_historical_images,
@@ -79,7 +84,7 @@ from .public_memory import PublicMemory
 from .roaming_logger import PatrolDiary, redact_public_summary
 from .routing import RouteDecision
 from .security import Rejected, authorize, configured_secrets, owner, safe_output
-from .session_manager import SessionManager
+from .session_manager import SessionManager, apply_audio_memory_tags
 from .session_scheduler import SessionScheduler
 from .social import chat_module, confirmed_message_id
 from .store import Store
@@ -116,6 +121,7 @@ class Service:
         sender: Sender,
         *,
         image_loader: ImageLoader | None = None,
+        audio_loader: AudioLoader | None = None,
         diary: PatrolDiary | None = None,
         notebook=None,
         drive: FolderDrive | None = None,
@@ -143,6 +149,9 @@ class Service:
         self.background_tasks = set()
         self.bot_guard = store.bot_guard
         self.images = image_loader or ImageLoader(
+            settings, transport=getattr(sender, "onebot", None)
+        )
+        self.audios = audio_loader or AudioLoader(
             settings, transport=getattr(sender, "onebot", None)
         )
         self.files = FileReader(settings, store, transport=getattr(sender, "onebot", None))
@@ -683,6 +692,10 @@ class Service:
                     await self.images.load_results(
                         message.images, scope=self.store.session_scope(message)
                     )
+                if message.audios and isinstance(self.audios, AudioLoader):
+                    await self.audios.load_results(
+                        message.audios, scope=self.store.session_scope(message)
+                    )
 
             _, links = await asyncio.gather(
                 hydrate(),
@@ -788,7 +801,13 @@ class Service:
         if message.platform not in {"onebot", "qq"}:
             # Replies and media references from other transports may never invoke OneBot RPCs.
             message = message.model_copy(
-                update={"images": [], "files": [], "forward_ids": [], "context_expanded": True}
+                update={
+                    "images": [],
+                    "files": [],
+                    "audios": [],
+                    "forward_ids": [],
+                    "context_expanded": True,
+                }
             )
         await self.proactive.note_activity(message)
         if any(secret and len(secret) >= 8 and secret in message.text for secret in self.secrets):
@@ -824,7 +843,9 @@ class Service:
                 return "resting"
             # Start hydration before opening the debounce window. Context-only images
             # in an admitted group can support the next addressed message; no LLM call.
-            if (message.images or "http" in message.text) and len(self.background_tasks) < 32:
+            if (message.images or message.audios or "http" in message.text) and len(
+                self.background_tasks
+            ) < 32:
                 if len(self.enrichments) >= 256:
                     oldest = next(iter(self.enrichments))
                     self.enrichments.pop(oldest).cancel()
@@ -1071,6 +1092,28 @@ class Service:
             include_current=include_current,
             nearby_origin=nearby_origin,
             selected_members=selected_members,
+        )
+
+    async def message_audios(
+        self,
+        message,
+        members,
+        nearby,
+        *,
+        include_current=True,
+        nearby_origin="紧邻群消息",
+        selected_members=None,
+        max_total_bytes=MAX_INLINE_AUDIO_BYTES,
+    ):
+        return await load_message_audios(
+            self,
+            message,
+            members,
+            nearby,
+            include_current=include_current,
+            nearby_origin=nearby_origin,
+            selected_members=selected_members,
+            max_total_bytes=max_total_bytes,
         )
 
     async def _load_turn_files(
@@ -1381,13 +1424,20 @@ class Service:
         direct_chat = message.kind == "private" or message.addressed
         if direct_chat:
             await turn.enter_async_context(self.world_state.experience.chatting())
-        fixed = await self.command(message)
+        has_direct_audio = any(a.origin in {"", "当前消息"} for a in message.audios) or any(
+            a.origin in {"", "当前消息"} for m in members for a in m.audios
+        )
+        fixed = None if has_direct_audio else await self.command(message)
         if fixed is not None:
             await self.store.enqueue_reply(job["id"], message, self.output(fixed))
             return
         direct = message.command_text if message.command_text is not None else message.text
         deep_match = re.fullmatch(r"/deep(?:\s+(.*))?", direct, re.DOTALL)
-        deep = deep_match is not None and not self.bot_guard.known_bot(message)
+        deep = (
+            (not has_direct_audio)
+            and deep_match is not None
+            and not self.bot_guard.known_bot(message)
+        )
         if deep:
             if message.kind != "private" or not owner(message, self.s):
                 raise Rejected("owner_private_only")
@@ -1435,6 +1485,9 @@ class Service:
             )
             if aff_active and caps.low_res_images_only and images:
                 images = [dataclasses.replace(i, resolution="low") for i in images]
+        audios, audio_sources, audio_durations = await self.message_audios(
+            message, members or [message], []
+        )
         # Open exactly one physical database; never search other conversations.
         session = await self.sessions.snapshot(message)
         history = session["recent_messages"]
@@ -1496,6 +1549,8 @@ class Service:
             payload["web_preview_untrusted"] = previews[:2]
         if image_sources:
             payload["image_sources"] = image_sources
+        if audio_sources:
+            payload["audio_sources"] = audio_sources
         # Attribute strikes to this incoming content, never to another member's history.
         # Stored history, summaries and model outputs were screened on entry/creation.
         current = {
@@ -1549,6 +1604,7 @@ class Service:
                 **({"module_queries": module_queries} if module_queries else {}),
                 **({"relevance_context": relevance} if relevance else {}),
                 **({"images": [i.gate() for i in images]} if images else {}),
+                **({"audios": [a.gate() for a in audios]} if audios else {}),
             )
         except Rejected as exc:
             if (
@@ -1577,7 +1633,10 @@ class Service:
             await self.diary.group(job["id"], message, members=members)
         if not sandbox:
             if not await self.sessions.admit_history(
-                message, members, expected_epoch=session["epoch"]
+                message,
+                members,
+                expected_epoch=session["epoch"],
+                **({"audio_durations": audio_durations} if audio_durations else {}),
             ):
                 await self.store.runtime.filters.update_audit(
                     audit_id, "cancelled", "epoch_changed"
@@ -1685,6 +1744,8 @@ class Service:
         history_events: set[str] = set()
         selected_neighbour_members = []
         neighbour_image_events = []
+        selected_neighbour_audio_members = []
+        neighbour_audio_events = []
         late_images = False
         digested_events = {
             match.group(1)
@@ -1748,6 +1809,70 @@ class Service:
                 images.extend(neighbour_images)
                 if neighbour_sources:
                     payload["image_sources"] = image_sources
+            if not audios and filtered_nearby:
+                consumed_audio_events = await self.store.groups.consumed_audio_events(message)
+                audio_nearby = [
+                    m
+                    for m in filtered_nearby
+                    if m.audios
+                    and m.event_id not in consumed_audio_events
+                    and (m.user_id == message.user_id or PRIOR_AUDIO_REF_RE.search(message.text))
+                ]
+                if audio_nearby:
+                    (
+                        neighbour_audios,
+                        neighbour_audio_sources,
+                        neighbour_audio_durations,
+                    ) = await self.message_audios(
+                        message,
+                        [],
+                        audio_nearby,
+                        include_current=False,
+                        selected_members=selected_neighbour_audio_members,
+                    )
+                    recalled_members.extend(selected_neighbour_audio_members)
+                    await message_guard()
+                    if neighbour_audios:
+                        await self.ai.screen(
+                            {
+                                "audio_sources": neighbour_audio_sources,
+                                "nearby_group_context": nearby_context,
+                            },
+                            job["subject"],
+                            purpose="source",
+                            message=message,
+                            audios=[a.gate() for a in neighbour_audios],
+                            before_call=message_guard,
+                        )
+                        neighbour_audio_events = [
+                            m.event_id
+                            for m in audio_nearby
+                            if m.event_id
+                            and (
+                                m in selected_neighbour_audio_members
+                                or any(
+                                    a.identity
+                                    in {
+                                        ref.identity
+                                        for sm in selected_neighbour_audio_members
+                                        for ref in sm.audios
+                                    }
+                                    for a in m.audios
+                                )
+                            )
+                        ]
+                        for source in neighbour_audio_sources:
+                            if "audio_number" in source:
+                                source = {
+                                    **source,
+                                    "audio_number": source["audio_number"] + len(audios),
+                                }
+                            audio_sources.append(source)
+                        audios.extend(neighbour_audios)
+                        for eid, durs in neighbour_audio_durations.items():
+                            audio_durations.setdefault(eid, []).extend(durs)
+                        if audio_sources:
+                            payload["audio_sources"] = audio_sources
             payload["context_status"].extend(
                 {"event_id": m.event_id, "states": m.context_status}
                 for m in filtered_nearby
@@ -1909,7 +2034,7 @@ class Service:
                 payload["song_catalog"] = self.songs.catalog_entries()
         context_members = list(members)
         if message.kind == "group":
-            context_members.extend(neighbour_members if images else [])
+            context_members.extend(neighbour_members if (images or audios) else [])
             for entry in history:
                 if entry.get("role") == "user" and re.fullmatch(
                     r"[1-9][0-9]{0,19}", str(entry.get("user_id", ""))
@@ -1926,6 +2051,7 @@ class Service:
                                 "forward_ids": [],
                                 "images": [],
                                 "files": [],
+                                "audios": [],
                             }
                         )
                     )
@@ -2145,6 +2271,15 @@ class Service:
                 and hasattr(self.sender, "typing")
             ):
                 await self.sender.typing(message)
+            audio_turn = bool(audios)
+            audio_event_ids = list(
+                dict.fromkeys(
+                    [
+                        *audio_durations.keys(),
+                        *(m.event_id for m in members if m.audios and m.event_id),
+                    ]
+                )
+            )
             gen_trace = {}
             try:
                 generated = await self.ai.generate(
@@ -2160,6 +2295,7 @@ class Service:
                     cancel_event=batch.cancel if batch else None,
                     generation_trace=gen_trace,
                     **({"images": images} if images else {}),
+                    **({"audios": audios} if audios else {}),
                 )
             except BaseException:
                 if gen_trace.get("chain_invalidate"):
@@ -2178,6 +2314,7 @@ class Service:
             allowed_reply = payload["allowed_reply_ids"]
             payload.clear()
             images.clear()
+            audios.clear()
             if generated.lstrip().startswith("{"):
                 allowed_poke = (
                     set()
@@ -2210,6 +2347,8 @@ class Service:
                     extra_parse_kwargs["allow_sing_song"] = allow_sing_song
                 if has_varkw or "song_titles" in parse_params:
                     extra_parse_kwargs["song_titles"] = self.songs.titles
+                if has_varkw or "allow_audio_gist" in parse_params:
+                    extra_parse_kwargs["allow_audio_gist"] = audio_turn
                 actions, folded = parse_actions(
                     generated,
                     public=public,
@@ -2347,6 +2486,24 @@ class Service:
                     )
                 if actions.image_digest:
                     check_memory_text(actions.image_digest, self.s)
+                if actions.audio_gist:
+                    try:
+                        check_memory_text(actions.audio_gist, self.s)
+                    except Rejected:
+                        actions.audio_gist = None
+                if (
+                    not sandbox
+                    and actions.audio_gist
+                    and (audio_event_ids or (audio_turn and message.event_id))
+                ):
+                    await self.sessions.annotate_audio_gist(
+                        message,
+                        audio_event_ids,
+                        actions.audio_gist,
+                        fallback_event_id=message.event_id or None,
+                        durations=audio_durations,
+                        expected_epoch=session["epoch"],
+                    )
                 chain_commit = gen_trace.get("chain_commit")
                 await self.store.enqueue_reply(
                     job["id"],
@@ -2388,9 +2545,23 @@ class Service:
                     consumed_image_events=neighbour_image_events,
                     consumed_file_events=consumed_file_events,
                 )
+                if neighbour_audio_events:
+                    await self.store.groups.mark_audios_consumed(message, neighbour_audio_events)
                 if not sandbox and not actions.abstain and not farewell_bypass:
+                    recap_message = message
+                    if audio_turn:
+                        msg_durs = audio_durations.get(message.event_id) or [
+                            d for ds in audio_durations.values() for d in ds
+                        ]
+                        recap_message = message.model_copy(
+                            update={
+                                "text": apply_audio_memory_tags(
+                                    message.text, msg_durs, gist=actions.audio_gist
+                                )
+                            }
+                        )
                     self._record_owner_turn_recap(
-                        message,
+                        recap_message,
                         " ".join(b.strip() for b in actions.bubbles if b.strip())
                         or (folded or "")
                         or (actions.voice_text or "")

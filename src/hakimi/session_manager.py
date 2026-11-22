@@ -2,21 +2,72 @@
 
 import asyncio
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 
 import aiosqlite
 
+from .audio_media import format_audio_memory_tag
 from .bot_server import history_lines, is_persona_owner
 from .config import Settings
 from .context_budget import estimate_tokens
 from .dual_memory import SCHEMA as DUAL_SCHEMA
 from .dual_memory import DualMemory
 from .models import Message
-from .outbound_actions import MAX_IMAGE_DIGEST_CHARS
+from .outbound_actions import MAX_AUDIO_GIST_CHARS, MAX_IMAGE_DIGEST_CHARS
 from .public_memory import PublicMemory
 from .security import Rejected
 from .store import Store
+
+_AUDIO_TAG_RE = re.compile(r"\[语音(?:\s+(\d+)s)?\]")
+
+
+def apply_audio_memory_tags(
+    text: str,
+    durations: list[float] | None = None,
+    *,
+    gist: str | None = None,
+) -> str:
+    """Format or annotate '[语音]' placeholders as '[语音 12s]' / '[语音 12s: <gist>]'."""
+    cleaned_gist = " ".join((gist or "").split())[:MAX_AUDIO_GIST_CHARS].strip() or None
+    durs = list(durations or ())
+    if not durs and not cleaned_gist:
+        return text
+
+    result = text
+    if durs:
+        idx = 0
+        total = len(durs)
+
+        def _replace(match: re.Match[str]) -> str:
+            nonlocal idx
+            if idx < total:
+                dur = durs[idx]
+                idx += 1
+                attach = cleaned_gist if (cleaned_gist and idx == total) else None
+                return format_audio_memory_tag(dur, attach)
+            return match.group(0)
+
+        result = _AUDIO_TAG_RE.sub(_replace, result, count=total)
+        while idx < total:
+            dur = durs[idx]
+            idx += 1
+            attach = cleaned_gist if (cleaned_gist and idx == total) else None
+            tag = format_audio_memory_tag(dur, attach)
+            result = f"{result} {tag}".strip() if result else tag
+        return result
+
+    # No explicit durations list, annotate the last existing [语音 ...] placeholder if present.
+    matches = list(_AUDIO_TAG_RE.finditer(result))
+    if matches:
+        last = matches[-1]
+        existing_secs = float(last.group(1)) if last.group(1) else None
+        replacement = format_audio_memory_tag(existing_secs, cleaned_gist)
+        return result[: last.start()] + replacement + result[last.end() :]
+    tag = format_audio_memory_tag(None, cleaned_gist)
+    return f"{result} {tag}".strip() if result else tag
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_meta (
@@ -416,6 +467,7 @@ class SessionManager:
                 "reply_ids": [],
                 "forward_ids": [],
                 "images": [],
+                "audios": [],
                 "mentioned_ids": [],
                 "created_at": time.time(),
                 "context_expanded": True,
@@ -441,7 +493,14 @@ class SessionManager:
                 await on_confirmed()
             return True
 
-    async def admit_history(self, message, members, *, expected_epoch):
+    async def admit_history(
+        self,
+        message,
+        members,
+        *,
+        expected_epoch,
+        audio_durations: dict[str, list[float]] | None = None,
+    ):
         """Only screened originals may move from the receipt journal into model history."""
         async with self.database(message) as (db, key):
             async with db.execute("SELECT epoch FROM rolling_state") as cur:
@@ -463,6 +522,9 @@ class SessionManager:
                     text = member.text
                     if member.images:
                         text += " [附图]"
+                    durs = (audio_durations or {}).get(member.event_id)
+                    if durs:
+                        text = apply_audio_memory_tags(text, durs)
                     await db.execute(
                         "INSERT INTO recent_messages(payload,expires) VALUES (?,?)",
                         (
@@ -495,6 +557,70 @@ class SessionManager:
                     await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
                     await db.execute("DELETE FROM interaction_chains")
             return True
+
+    async def annotate_audio_gist(
+        self,
+        message: Message,
+        event_ids: list[str],
+        gist: str,
+        *,
+        fallback_event_id: str | None = None,
+        durations: dict[str, list[float]] | None = None,
+        expected_epoch: int,
+    ) -> bool:
+        """Annotate a screened audio turn in recent_messages with '[语音 Ns: <gist>]'.
+
+        Matches audio-carrying primary `event_ids` first so a follow-up plain-text message in a
+        debounced batch is never mislabeled; falls back to `fallback_event_id` only when none of
+        the primary audio events exist in `recent_messages` (e.g., nearby/quoted audio).
+        """
+        cleaned = " ".join(str(gist or "").split())[:MAX_AUDIO_GIST_CHARS].strip()
+        primary_ids = [str(eid) for eid in (event_ids or ()) if eid]
+        fallback_id = str(fallback_event_id or "").strip() or None
+        if not cleaned or (not primary_ids and not fallback_id):
+            return False
+        primary_set = set(primary_ids)
+        dur_map = durations or {}
+        fallback_durs = [d for ds in dur_map.values() for d in ds]
+        async with self.database(message, preserve_history=True) as (db, key):
+            async with db.execute("SELECT epoch FROM rolling_state") as cur:
+                if (await cur.fetchone())[0] != expected_epoch:
+                    return False
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                if not (await cur.fetchone())[0]:
+                    return False
+            async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id DESC") as cur:
+                rows = await cur.fetchall()
+            decoded: list[tuple[int, dict]] = []
+            for row_id, blob in rows:
+                item = self.vault.open(key, blob)
+                if item.get("role") != "user":
+                    continue
+                eid = str(item.get("event_id") or "")
+                if eid in primary_set:
+                    row_durs = dur_map.get(eid)
+                    item["text"] = apply_audio_memory_tags(
+                        str(item.get("text", "")), row_durs, gist=cleaned
+                    )
+                    await db.execute(
+                        "UPDATE recent_messages SET payload=? WHERE id=?",
+                        (self.vault.seal(key, item), row_id),
+                    )
+                    return True
+                decoded.append((row_id, item))
+            if fallback_id:
+                for row_id, item in decoded:
+                    if str(item.get("event_id") or "") == fallback_id:
+                        row_durs = dur_map.get(fallback_id) or fallback_durs
+                        item["text"] = apply_audio_memory_tags(
+                            str(item.get("text", "")), row_durs, gist=cleaned
+                        )
+                        await db.execute(
+                            "UPDATE recent_messages SET payload=? WHERE id=?",
+                            (self.vault.seal(key, item), row_id),
+                        )
+                        return True
+        return False
 
     async def reply(self, message, text, receipt_id, *, expected_epoch):
         """Append an assistant turn once, without duplicating already stored user messages."""

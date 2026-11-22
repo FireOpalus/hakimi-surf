@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS group_consumed_files (
  PRIMARY KEY(scope,event_id)
 );
 CREATE INDEX IF NOT EXISTS group_consumed_files_scope ON group_consumed_files(scope,at);
+CREATE TABLE IF NOT EXISTS group_consumed_audios (
+ scope TEXT NOT NULL, event_id TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(scope,event_id)
+);
+CREATE INDEX IF NOT EXISTS group_consumed_audios_scope ON group_consumed_audios(scope,at);
 """
 MAX_BATCH_MESSAGES = 16
 MAX_BATCH_CHARS = 24000
@@ -61,6 +66,8 @@ def other_mentions(message: Message | None) -> bool:
 
 
 def direct_command(message):
+    if any(a.origin in {"", "当前消息"} for a in getattr(message, "audios", ())):
+        return False
     direct = message.command_text if message.command_text is not None else message.text
     return direct.lstrip().startswith("/")
 
@@ -104,7 +111,7 @@ class GroupPipeline:
         explicit = message.attention_reason in {"mention", "reply"} or message.kind == "private"
         raw = message.command_text if message.command_text is not None else message.text
         spoken = re.sub(
-            r"\[(?:图片|商城贴纸|提及机器人|提及群友|附图|文件(?:[:：][^\]]*)?)\]", "", raw
+            r"\[(?:图片|商城贴纸|提及机器人|提及群友|附图|语音|文件(?:[:：][^\]]*)?)\]", "", raw
         ).strip()
         pure_image = bool(message.images or message.files) and not spoken
         incomplete = pure_image or (
@@ -421,6 +428,7 @@ class GroupPipeline:
                     "addressed": bool(addressed),
                     "attention_reason": attention_reason,
                     "images": unique("images", 2),
+                    "audios": unique("audios", 64),
                     "forward_ids": unique("forward_ids", 4),
                     "video_ids": unique("video_ids", 5),
                     "short_urls": unique("short_urls", 5),
@@ -548,6 +556,12 @@ class GroupPipeline:
     async def mark_files_consumed(self, message, event_ids) -> None:
         await self._mark_consumed("group_consumed_files", message, event_ids)
 
+    async def consumed_audio_events(self, message) -> set[str]:
+        return await self._consumed_events("group_consumed_audios", message)
+
+    async def mark_audios_consumed(self, message, event_ids) -> None:
+        await self._mark_consumed("group_consumed_audios", message, event_ids)
+
     async def clear_recent(self, message):
         scope = self.store.session_scope(message)
         async with self.store.transaction():
@@ -561,6 +575,10 @@ class GroupPipeline:
             )
             await self.store.db.execute(
                 "DELETE FROM group_consumed_files WHERE scope=?",
+                (scope,),
+            )
+            await self.store.db.execute(
+                "DELETE FROM group_consumed_audios WHERE scope=?",
                 (scope,),
             )
             # A reset also discards accepted inputs that have not started processing.
@@ -584,6 +602,9 @@ class GroupPipeline:
         )
         await self.store.db.execute(
             "DELETE FROM group_consumed_files WHERE at<?", (now - CONTEXT_TTL,)
+        )
+        await self.store.db.execute(
+            "DELETE FROM group_consumed_audios WHERE at<?", (now - CONTEXT_TTL,)
         )
         await self.store.db.execute(
             "DELETE FROM group_debounce_batches WHERE first_at<? AND NOT EXISTS "
