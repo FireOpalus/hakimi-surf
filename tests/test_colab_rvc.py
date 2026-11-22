@@ -460,6 +460,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
         fail_karaoke: bool,
         backing_gain_db: float = -14.0,
         skip_backing: bool = True,
+        skip_dereverb: bool = True,
     ) -> tuple[dict[str, object], list[list[str]], list[tuple[str, tuple[str, ...]]]]:
         case_dir = tmp_path / case_name
         work_dir = case_dir / "work"
@@ -537,6 +538,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
             index_path=idx_path,
             backing_gain_db=backing_gain_db,
             skip_backing=skip_backing,
+            skip_dereverb=skip_dereverb,
             applio_dir=applio_dir,
             rvc_venv=rvc_venv,
             sep_venv=sep_venv,
@@ -546,7 +548,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
         return meta, cmds, sep_calls
 
     meta_ok, cmds_ok, seps_ok = _run_cover_case(
-        case_name="karaoke", fail_karaoke=False, skip_backing=False
+        case_name="karaoke", fail_karaoke=False, skip_backing=False, skip_dereverb=False
     )
     assert [m for _, m in seps_ok] == [
         colab_remote.PRIMARY_SEP_MODELS,
@@ -557,7 +559,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     assert "--split-audio" not in infer_cmd
     assert infer_cmd[infer_cmd.index("--index-rate") + 1] == "0.15"
     assert infer_cmd[infer_cmd.index("--protect") + 1] == "0.42"
-    assert infer_cmd[infer_cmd.index("--volume-envelope") + 1] == "0.55"
+    assert infer_cmd[infer_cmd.index("--volume-envelope") + 1] == "0.12"
     assert infer_cmd[infer_cmd.index("--f0-method") + 1] == "rmvpe"
     assert infer_cmd[infer_cmd.index("--embedder-model") + 1] == "contentvec"
     assert infer_cmd[infer_cmd.index("--export-format") + 1] == "WAV"
@@ -571,24 +573,23 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     assert meta_ok["karaoke_backing_separated"] is True
     assert meta_ok["backing_gain_db"] == -14.0
     assert meta_ok["skip_backing"] is False
+    assert meta_ok["skip_dereverb"] is False
     assert meta_ok["auto_pipeline_split"] is True
     assert "split_audio" not in meta_ok
     assert meta_ok["loudness_gain_db"] == -2.0
 
-    # Default skip_backing=True skips karaoke separation altogether, preserving full lead vocals
+    # Default skip_backing=True & skip_dereverb=True preserve full lead vocals
     meta_skip, cmds_skip, seps_skip = _run_cover_case(
         case_name="skip_bg", fail_karaoke=False, backing_gain_db=-18.0, skip_backing=True
     )
-    assert [m for _, m in seps_skip] == [
-        colab_remote.PRIMARY_SEP_MODELS,
-        colab_remote.DEREVERB_MODELS,
-    ]
+    assert [m for _, m in seps_skip] == [colab_remote.PRIMARY_SEP_MODELS]
     mix_skip = next(c for c in cmds_skip if "-filter_complex" in c)
     assert mix_skip.count("-i") == 2
     assert "[v][inst]amix=inputs=2" in mix_skip[mix_skip.index("-filter_complex") + 1]
     assert "[2:a]" not in mix_skip[mix_skip.index("-filter_complex") + 1]
     assert meta_skip["karaoke_backing_separated"] is False
     assert meta_skip["skip_backing"] is True
+    assert meta_skip["skip_dereverb"] is True
     assert meta_skip["backing_gain_db"] == -18.0
 
     # Out-of-range backing_gain_db is clamped to [-24.0, -6.0] in both ffmpeg graph and meta
@@ -1534,11 +1535,12 @@ def test_p0_remote_exception_scrubs_custom_opaque_token_in_stdout_and_traceback(
 def test_backing_mix_params_env_and_cli_passthrough(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 1) colab_rvc CLI parser exposes --backing-gain-db and --skip-backing/--no-skip-backing
+    # 1) colab_rvc CLI parser exposes --backing-gain-db, --skip-backing, and --skip-dereverb
     parser = colab_rvc._build_parser()
     ns_default = parser.parse_args(["cover", "--source", "s.mp3", "--title", "枝垂桜"])
     assert ns_default.backing_gain_db == -14.0
     assert ns_default.skip_backing is True
+    assert ns_default.skip_dereverb is True
     ns_custom = parser.parse_args(
         [
             "cover",
@@ -1549,12 +1551,14 @@ def test_backing_mix_params_env_and_cli_passthrough(
             "--backing-gain-db",
             "-16.5",
             "--no-skip-backing",
+            "--no-skip-dereverb",
         ]
     )
     assert ns_custom.backing_gain_db == -16.5
     assert ns_custom.skip_backing is False
+    assert ns_custom.skip_dereverb is False
 
-    # 2) run_cover_pipeline forwards HAKIMI_BACKING_GAIN_DB & HAKIMI_SKIP_BACKING & validates inputs
+    # 2) run_cover_pipeline forwards HAKIMI_BACKING_GAIN_DB, SKIP_BACKING, SKIP_DEREVERB
     captured_envs: list[dict[str, str]] = []
     monkeypatch.setattr(colab_rvc, "provision_gpu", lambda s, gpu="L4", **kw: "L4")
     monkeypatch.setattr(colab_rvc, "stop_session", lambda _s: None)
@@ -1593,9 +1597,11 @@ def test_backing_mix_params_env_and_cli_passthrough(
         drive_songs_folder_id="songs1",
         backing_gain_db=-30.0,  # clamped to -24.0
         skip_backing=True,
+        skip_dereverb=False,
     )
     assert captured_envs[-1]["HAKIMI_BACKING_GAIN_DB"] == "-24.0"
     assert captured_envs[-1]["HAKIMI_SKIP_BACKING"] == "1"
+    assert captured_envs[-1]["HAKIMI_SKIP_DEREVERB"] == "0"
 
     for bad_bg in (True, float("nan"), float("inf")):
         with pytest.raises(ValueError):
@@ -1612,8 +1618,15 @@ def test_backing_mix_params_env_and_cli_passthrough(
             cover_dir=tmp_path / "bad2",
             skip_backing="1",  # type: ignore[arg-type]
         )
+    with pytest.raises(ValueError):
+        colab_rvc.run_cover_pipeline(
+            session="sess-bad3",
+            gpu_spec="L4",
+            cover_dir=tmp_path / "bad3",
+            skip_dereverb="1",  # type: ignore[arg-type]
+        )
 
-    # 3) Remote _dispatch_env reads HAKIMI_BACKING_GAIN_DB (clamped) & HAKIMI_SKIP_BACKING
+    # 3) Remote _dispatch_env reads HAKIMI_BACKING_GAIN_DB, SKIP_BACKING, and SKIP_DEREVERB
     seen_cover_kwargs: list[dict[str, object]] = []
 
     def fake_action_cover(**kwargs):
@@ -1621,21 +1634,27 @@ def test_backing_mix_params_env_and_cli_passthrough(
         return {
             "backing_gain_db": kwargs["backing_gain_db"],
             "skip_backing": kwargs["skip_backing"],
+            "skip_dereverb": kwargs["skip_dereverb"],
         }
 
     monkeypatch.setattr(colab_remote, "action_cover", fake_action_cover)
     monkeypatch.setenv("HAKIMI_BACKING_GAIN_DB", "-2.0")
     monkeypatch.setenv("HAKIMI_SKIP_BACKING", "0")
+    monkeypatch.setenv("HAKIMI_SKIP_DEREVERB", "0")
     colab_remote._dispatch_env("cover", drive_token="")
     assert seen_cover_kwargs[-1]["backing_gain_db"] == -6.0
     assert seen_cover_kwargs[-1]["skip_backing"] is False
+    assert seen_cover_kwargs[-1]["skip_dereverb"] is False
 
     monkeypatch.delenv("HAKIMI_SKIP_BACKING", raising=False)
+    monkeypatch.delenv("HAKIMI_SKIP_DEREVERB", raising=False)
     colab_remote._dispatch_env("cover", drive_token="")
     assert seen_cover_kwargs[-1]["skip_backing"] is True
+    assert seen_cover_kwargs[-1]["skip_dereverb"] is True
 
     monkeypatch.setenv("HAKIMI_BACKING_GAIN_DB", "nan")
     with pytest.raises(ValueError, match="finite"):
         colab_remote._dispatch_env("cover", drive_token="")
     monkeypatch.delenv("HAKIMI_BACKING_GAIN_DB", raising=False)
     monkeypatch.delenv("HAKIMI_SKIP_BACKING", raising=False)
+    monkeypatch.delenv("HAKIMI_SKIP_DEREVERB", raising=False)

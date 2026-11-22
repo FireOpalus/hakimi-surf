@@ -122,7 +122,7 @@ class RvcCoverPayload(BaseModel):
     model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
     index_rate: float = Field(default=0.15, ge=0.0, le=1.0, allow_inf_nan=False)
     protect: float = Field(default=0.42, ge=0.0, le=0.5, allow_inf_nan=False)
-    volume_envelope: float = Field(default=0.55, ge=0.0, le=1.0, allow_inf_nan=False)
+    volume_envelope: float = Field(default=0.12, ge=0.0, le=1.0, allow_inf_nan=False)
     backing_gain_db: float = Field(
         default=DEFAULT_BACKING_GAIN_DB,
         ge=MIN_BACKING_GAIN_DB,
@@ -130,6 +130,7 @@ class RvcCoverPayload(BaseModel):
         allow_inf_nan=False,
     )
     skip_backing: bool = True
+    skip_dereverb: bool = True
 
     @field_validator("title")
     @classmethod
@@ -153,11 +154,11 @@ class RvcCoverPayload(BaseModel):
     def _check_numeric_not_bool(cls, v: Any, info: Any) -> Any:
         return reject_bool_num(v, name=str(info.field_name))
 
-    @field_validator("skip_backing", mode="before")
+    @field_validator("skip_backing", "skip_dereverb", mode="before")
     @classmethod
-    def _check_skip_backing(cls, v: Any) -> bool:
+    def _check_bool_flags(cls, v: Any, info: Any) -> bool:
         if not isinstance(v, bool):
-            raise ValueError("skip_backing must be a boolean")
+            raise ValueError(f"{info.field_name} must be a boolean")
         return v
 
     @field_validator("inbox_file_id")
@@ -396,6 +397,7 @@ class RvcCoverHandler(JobHandler):
                 "volume_envelope": payload.volume_envelope,
                 "backing_gain_db": payload.backing_gain_db,
                 "skip_backing": payload.skip_backing,
+                "skip_dereverb": payload.skip_dereverb,
                 "start_sec": payload.start_sec,
                 "duration_sec": payload.duration_sec,
                 "chorus_anchor": payload.chorus_anchor,

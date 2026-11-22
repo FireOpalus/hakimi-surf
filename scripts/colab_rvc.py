@@ -1412,6 +1412,11 @@ def _validate_backing_gain_db(value: float) -> float:
     return max(MIN_BACKING_GAIN_DB, min(MAX_BACKING_GAIN_DB, val))
 
 
+def _validate_bool_flag(name: str, value: Any) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+
+
 def run_cover_pipeline(
     *,
     session: str,
@@ -1424,9 +1429,10 @@ def run_cover_pipeline(
     pitch: int = 0,
     index_rate: float = 0.15,
     protect: float = 0.42,
-    volume_envelope: float = 0.55,
+    volume_envelope: float = 0.12,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
     skip_backing: bool = True,
+    skip_dereverb: bool = True,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -1455,8 +1461,8 @@ def run_cover_pipeline(
     keep_session_on_success: bool = False,
 ) -> dict[str, Any]:
     """Run Colab RVC cover with Drive direct transfer, warm session reuse, and weight cache."""
-    if not isinstance(skip_backing, bool):
-        raise ValueError("skip_backing must be a boolean")
+    _validate_bool_flag("skip_backing", skip_backing)
+    _validate_bool_flag("skip_dereverb", skip_dereverb)
     clamped_backing_gain_db = _validate_backing_gain_db(backing_gain_db)
     warm_reused = bool(reuse_session and reused_gpu)
     assigned_gpu = reused_gpu if warm_reused else provision_gpu(session, gpu=gpu_spec)
@@ -1554,6 +1560,7 @@ def run_cover_pipeline(
             "HAKIMI_VOLUME_ENVELOPE": str(volume_envelope),
             "HAKIMI_BACKING_GAIN_DB": f"{clamped_backing_gain_db:.1f}",
             "HAKIMI_SKIP_BACKING": "1" if skip_backing else "0",
+            "HAKIMI_SKIP_DEREVERB": "1" if skip_dereverb else "0",
             "HAKIMI_START_SEC": str(start_sec),
             "HAKIMI_DURATION_SEC": str(duration_sec),
             "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
@@ -1992,9 +1999,10 @@ def _run_remote_cover(
     fallback_start_sec: float,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
     skip_backing: bool = True,
+    skip_dereverb: bool = True,
 ) -> tuple[Path, Path, dict[str, Any]]:
-    if not isinstance(skip_backing, bool):
-        raise ValueError("skip_backing must be a boolean")
+    _validate_bool_flag("skip_backing", skip_backing)
+    _validate_bool_flag("skip_dereverb", skip_dereverb)
     clamped_backing_gain_db = _validate_backing_gain_db(backing_gain_db)
     ext = source_path.suffix or ".m4a"
     remote_source = f"/content/work/source_song{ext}"
@@ -2012,6 +2020,7 @@ def _run_remote_cover(
             "HAKIMI_VOLUME_ENVELOPE": str(volume_envelope),
             "HAKIMI_BACKING_GAIN_DB": f"{clamped_backing_gain_db:.1f}",
             "HAKIMI_SKIP_BACKING": "1" if skip_backing else "0",
+            "HAKIMI_SKIP_DEREVERB": "1" if skip_dereverb else "0",
             "HAKIMI_START_SEC": str(start_sec),
             "HAKIMI_DURATION_SEC": str(duration_sec),
             "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
@@ -2104,6 +2113,7 @@ def cmd_cover(args: argparse.Namespace) -> int:
             fallback_start_sec=args.fallback_start,
             backing_gain_db=args.backing_gain_db,
             skip_backing=args.skip_backing,
+            skip_dereverb=args.skip_dereverb,
         )
     finally:
         if not args.keep_session:
@@ -2163,6 +2173,7 @@ def cmd_all(args: argparse.Namespace) -> int:
             fallback_start_sec=args.fallback_start,
             backing_gain_db=args.backing_gain_db,
             skip_backing=args.skip_backing,
+            skip_dereverb=args.skip_dereverb,
         )
     finally:
         if not args.keep_session:
@@ -2238,9 +2249,10 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--pitch", type=int, default=0)
         p.add_argument("--index-rate", type=float, default=0.15)
         p.add_argument("--protect", type=float, default=0.42)
-        p.add_argument("--volume-envelope", type=float, default=0.55)
+        p.add_argument("--volume-envelope", type=float, default=0.12)
         p.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
         p.add_argument("--skip-backing", action=argparse.BooleanOptionalAction, default=True)
+        p.add_argument("--skip-dereverb", action=argparse.BooleanOptionalAction, default=True)
         p.add_argument("--start", default="auto")
         p.add_argument("--duration", type=float, default=50.0)
         p.add_argument("--chorus-anchor", default="")

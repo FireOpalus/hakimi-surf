@@ -460,7 +460,7 @@ class RvcCoverJobPayload(BaseModel):
     model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
     index_rate: float = Field(default=0.15, ge=0.0, le=1.0, allow_inf_nan=False)
     protect: float = Field(default=0.42, ge=0.0, le=0.5, allow_inf_nan=False)
-    volume_envelope: float = Field(default=0.55, ge=0.0, le=1.0, allow_inf_nan=False)
+    volume_envelope: float = Field(default=0.12, ge=0.0, le=1.0, allow_inf_nan=False)
     backing_gain_db: float = Field(
         default=DEFAULT_BACKING_GAIN_DB,
         ge=MIN_BACKING_GAIN_DB,
@@ -468,6 +468,7 @@ class RvcCoverJobPayload(BaseModel):
         allow_inf_nan=False,
     )
     skip_backing: bool = True
+    skip_dereverb: bool = True
 
     @field_validator("title")
     @classmethod
@@ -487,11 +488,11 @@ class RvcCoverJobPayload(BaseModel):
     def _check_backing_gain_db(cls, value: Any) -> Any:
         return _reject_bool_num(value, name="backing_gain_db")
 
-    @field_validator("skip_backing", mode="before")
+    @field_validator("skip_backing", "skip_dereverb", mode="before")
     @classmethod
-    def _check_skip_backing(cls, value: Any) -> bool:
+    def _check_bool_flags(cls, value: Any, info: Any) -> bool:
         if not isinstance(value, bool):
-            raise ValueError("skip_backing must be a boolean")
+            raise ValueError(f"{info.field_name} must be a boolean")
         return value
 
     @field_validator("inbox_file_id")
@@ -1355,6 +1356,7 @@ class SongLibrary:
         auto_search: bool = True,
         backing_gain_db: float | None = None,
         skip_backing: bool | None = None,
+        skip_dereverb: bool | None = None,
         requester: str = "owner",
     ) -> dict[str, Any]:
         """Submit an asynchronous Colab RVC cover job via upload, Drive inbox, or auto-search."""
@@ -1384,10 +1386,14 @@ class SongLibrary:
             ):
                 raise Rejected("colab_invalid_job")
             payload["backing_gain_db"] = bg_val
-        if skip_backing is not None:
-            if not isinstance(skip_backing, bool):
-                raise Rejected("colab_invalid_job")
-            payload["skip_backing"] = skip_backing
+        for flag_name, flag_val in (
+            ("skip_backing", skip_backing),
+            ("skip_dereverb", skip_dereverb),
+        ):
+            if flag_val is not None:
+                if not isinstance(flag_val, bool):
+                    raise Rejected("colab_invalid_job")
+                payload[flag_name] = flag_val
 
         if audio_bytes is not None:
             if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:

@@ -1640,7 +1640,7 @@ def test_colab_decoupling_static_ast_and_routes() -> None:
 def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
     import inspect
 
-    # 1. Cover defaults: 0.15 / 0.42 / 0.55 and backing mix -14.0 / skip_backing=True
+    # 1. Cover defaults: 0.15 / 0.42 / 0.12 and backing=-14.0, skip_backing=True, skip_dereverb=True
     w_cover = colab_jobs_rvc.RvcCoverPayload(title="test")
     assert (
         w_cover.index_rate,
@@ -1648,7 +1648,8 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         w_cover.volume_envelope,
         w_cover.backing_gain_db,
         w_cover.skip_backing,
-    ) == (0.15, 0.42, 0.55, -14.0, True)
+        w_cover.skip_dereverb,
+    ) == (0.15, 0.42, 0.12, -14.0, True, True)
 
     h_cover = RvcCoverJobPayload(title="test")
     assert (
@@ -1657,30 +1658,35 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         h_cover.volume_envelope,
         h_cover.backing_gain_db,
         h_cover.skip_backing,
-    ) == (0.15, 0.42, 0.55, -14.0, True)
+        h_cover.skip_dereverb,
+    ) == (0.15, 0.42, 0.12, -14.0, True, True)
 
-    # Strict validation for backing_gain_db (finite float in [-24, -6], no bool) & skip_backing
+    # Strict validation for backing_gain_db (finite float in [-24, -6], no bool) & bool flags
     for model_cls in (colab_jobs_rvc.RvcCoverPayload, RvcCoverJobPayload):
         for bad_bg in (True, False, float("nan"), float("inf"), -24.5, -5.5):
             with pytest.raises(ValidationError):
                 model_cls(title="test", backing_gain_db=bad_bg)  # type: ignore[arg-type]
-        for bad_skip in (1, 0, "true"):
+        for bad_flag in (1, 0, "true"):
             with pytest.raises(ValidationError):
-                model_cls(title="test", skip_backing=bad_skip)  # type: ignore[arg-type]
+                model_cls(title="test", skip_backing=bad_flag)  # type: ignore[arg-type]
+            with pytest.raises(ValidationError):
+                model_cls(title="test", skip_dereverb=bad_flag)  # type: ignore[arg-type]
 
     sig_cov_rvc = inspect.signature(colab_rvc.run_cover_pipeline).parameters
     assert sig_cov_rvc["index_rate"].default == 0.15
     assert sig_cov_rvc["protect"].default == 0.42
-    assert sig_cov_rvc["volume_envelope"].default == 0.55
+    assert sig_cov_rvc["volume_envelope"].default == 0.12
     assert sig_cov_rvc["backing_gain_db"].default == -14.0
     assert sig_cov_rvc["skip_backing"].default is True
+    assert sig_cov_rvc["skip_dereverb"].default is True
 
     sig_cov_rem = inspect.signature(colab_remote.action_cover).parameters
     assert sig_cov_rem["index_rate"].default == 0.15
     assert sig_cov_rem["protect"].default == 0.42
-    assert sig_cov_rem["volume_envelope"].default == 0.55
+    assert sig_cov_rem["volume_envelope"].default == 0.12
     assert sig_cov_rem["backing_gain_db"].default == -14.0
     assert sig_cov_rem["skip_backing"].default is True
+    assert sig_cov_rem["skip_dereverb"].default is True
 
     rvc_cover_args = colab_rvc._build_parser().parse_args(
         ["cover", "--source", "s.mp3", "--title", "t"]
@@ -1691,7 +1697,8 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         rvc_cover_args.volume_envelope,
         rvc_cover_args.backing_gain_db,
         rvc_cover_args.skip_backing,
-    ) == (0.15, 0.42, 0.55, -14.0, True)
+        rvc_cover_args.skip_dereverb,
+    ) == (0.15, 0.42, 0.12, -14.0, True, True)
     rem_cover_args = colab_remote._build_parser().parse_args(
         ["cover", "--source", "s.mp3", "--pth", "m.pth", "--index", "m.index"]
     )
@@ -1701,7 +1708,8 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         rem_cover_args.volume_envelope,
         rem_cover_args.backing_gain_db,
         rem_cover_args.skip_backing,
-    ) == (0.15, 0.42, 0.55, -14.0, True)
+        rem_cover_args.skip_dereverb,
+    ) == (0.15, 0.42, 0.12, -14.0, True, True)
 
     # 2. Train defaults: 150 / 30 / 12 / 48000 & train CLI --gpu default
     w_train = colab_jobs_rvc.RvcTrainPayload()
@@ -2784,6 +2792,7 @@ async def test_colab_jobs_dynamic_handler_registry_rvc_mixing_and_cli_help(
                         "inbox_file_id": inbox_up["file_id"],
                         "backing_gain_db": -16.5,
                         "skip_backing": True,
+                        "skip_dereverb": False,
                     },
                     "dispatch_context": _make_drive_dispatch_context(
                         tree,
@@ -2799,6 +2808,7 @@ async def test_colab_jobs_dynamic_handler_registry_rvc_mixing_and_cli_help(
             assert job_mix["status"] == "succeeded"
             assert captured_cover_kwargs[-1]["backing_gain_db"] == -16.5
             assert captured_cover_kwargs[-1]["skip_backing"] is True
+            assert captured_cover_kwargs[-1]["skip_dereverb"] is False
     finally:
         colab_jobs.unregister_job_handler("demo_whisper")
         assert colab_jobs.get_job_handler("demo_whisper") is None
@@ -2840,6 +2850,7 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
     await lib.request_learn_song("枝垂桜", auto_search=True)
     assert submitted[-1][1]["backing_gain_db"] == -14.0
     assert submitted[-1][1]["skip_backing"] is True
+    assert submitted[-1][1]["skip_dereverb"] is True
 
     # Explicit mixing overrides pass through cleanly
     await lib.request_learn_song(
@@ -2847,9 +2858,11 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
         auto_search=True,
         backing_gain_db=-16.0,
         skip_backing=False,
+        skip_dereverb=False,
     )
     assert submitted[-1][1]["backing_gain_db"] == -16.0
     assert submitted[-1][1]["skip_backing"] is False
+    assert submitted[-1][1]["skip_dereverb"] is False
 
     # Invalid mixing parameters are strictly rejected
     for bad_bg in (True, float("nan"), float("inf"), -25.0, -5.0):
@@ -2864,4 +2877,10 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
             "枝垂桜",
             auto_search=True,
             skip_backing="1",  # type: ignore[arg-type]
+        )
+    with pytest.raises(Rejected, match="colab_invalid_job"):
+        await lib.request_learn_song(
+            "枝垂桜",
+            auto_search=True,
+            skip_dereverb="1",  # type: ignore[arg-type]
         )

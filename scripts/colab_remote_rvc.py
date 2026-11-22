@@ -1818,10 +1818,11 @@ def _separate_clean_lead_vocals(
     *,
     label: str = "cover",
     skip_backing: bool = False,
+    skip_dereverb: bool = False,
 ) -> tuple[Path, Path, Path | None]:
-    """Run primary separation -> optional karaoke -> best-effort dereverb.
+    """Run primary separation -> optional karaoke -> optional best-effort dereverb.
 
-    Returns ``(dry_lead_vocals_wav, instrumental_wav, backing_vocals_wav)``.
+    Returns ``(lead_vocals_wav, instrumental_wav, backing_vocals_wav)``.
     """
     vocals_wav, inst_wav = _separate_with_sep_venv(
         sep_py, input_audio, work_dir / "stems", PRIMARY_SEP_MODELS
@@ -1846,6 +1847,13 @@ def _separate_clean_lead_vocals(
             lead_vocals_wav = vocals_wav
             backing_vocals_wav = None
 
+    if skip_dereverb:
+        log(
+            f"Skipping de-echo/de-reverb pass ({label}: skip_dereverb=True); "
+            "preserving full breathy/reverb lead vocal body."
+        )
+        return lead_vocals_wav, inst_wav, backing_vocals_wav
+
     dry_vocals_wav = lead_vocals_wav
     try:
         log(f"Running best-effort de-echo/de-reverb pass on lead vocals ({label})...")
@@ -1861,6 +1869,11 @@ def _separate_clean_lead_vocals(
         dry_vocals_wav = lead_vocals_wav
 
     return dry_vocals_wav, inst_wav, backing_vocals_wav
+
+
+def _require_bool_arg(name: str, value: Any) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
 
 
 def _clamp_backing_gain_db(value: float) -> float:
@@ -2021,9 +2034,10 @@ def action_cover(
     pitch: int = 0,
     index_rate: float = 0.15,
     protect: float = 0.42,
-    volume_envelope: float = 0.55,
+    volume_envelope: float = 0.12,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
     skip_backing: bool = True,
+    skip_dereverb: bool = True,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -2036,8 +2050,8 @@ def action_cover(
     chunks_dir: Path = DEFAULT_CHUNKS_DIR,
 ) -> dict[str, Any]:
     """Separate stems, run RVC voice conversion, loudness-match mix, and trim chorus."""
-    if not isinstance(skip_backing, bool):
-        raise ValueError("skip_backing must be a boolean")
+    _require_bool_arg("skip_backing", skip_backing)
+    _require_bool_arg("skip_dereverb", skip_dereverb)
     effective_backing_gain_db = round(_clamp_backing_gain_db(backing_gain_db), 1)
     if not source_audio.is_file():
         raise FileNotFoundError(f"Source song audio not found: {source_audio}")
@@ -2077,7 +2091,12 @@ def action_cover(
 
     log("Separating vocals and instrumental...")
     dry_vocals_wav, inst_wav, backing_vocals_wav = _separate_clean_lead_vocals(
-        sep_py, source_wav, work_cover, label="cover", skip_backing=skip_backing
+        sep_py,
+        source_wav,
+        work_cover,
+        label="cover",
+        skip_backing=skip_backing,
+        skip_dereverb=skip_dereverb,
     )
 
     converted_wav = work_cover / "vocals_hakimi.wav"
@@ -2248,6 +2267,7 @@ def action_cover(
         "loudness_gain_db": round(gain_db, 2),
         "backing_gain_db": effective_backing_gain_db,
         "skip_backing": skip_backing,
+        "skip_dereverb": skip_dereverb,
         "karaoke_backing_separated": backing_vocals_wav is not None,
         "auto_pipeline_split": True,
         "cover_full_bytes": cover_full_mp3.stat().st_size,
@@ -2710,11 +2730,12 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
             pitch=_env_int("HAKIMI_PITCH", 0),
             index_rate=_env_float("HAKIMI_INDEX_RATE", 0.15),
             protect=_env_float("HAKIMI_PROTECT", 0.42),
-            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.55),
+            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.12),
             backing_gain_db=_clamp_backing_gain_db(
                 _env_float("HAKIMI_BACKING_GAIN_DB", DEFAULT_BACKING_GAIN_DB)
             ),
             skip_backing=_env_bool("HAKIMI_SKIP_BACKING", True),
+            skip_dereverb=_env_bool("HAKIMI_SKIP_DEREVERB", True),
             start_sec=os.environ.get("HAKIMI_START_SEC", "auto"),
             duration_sec=_env_float("HAKIMI_DURATION_SEC", 50.0),
             chorus_anchor=os.environ.get("HAKIMI_CHORUS_ANCHOR", ""),
@@ -2845,9 +2866,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cover.add_argument("--pitch", type=int, default=0)
     p_cover.add_argument("--index-rate", type=float, default=0.15)
     p_cover.add_argument("--protect", type=float, default=0.42)
-    p_cover.add_argument("--volume-envelope", type=float, default=0.55)
+    p_cover.add_argument("--volume-envelope", type=float, default=0.12)
     p_cover.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
     p_cover.add_argument("--skip-backing", action=argparse.BooleanOptionalAction, default=True)
+    p_cover.add_argument("--skip-dereverb", action=argparse.BooleanOptionalAction, default=True)
     p_cover.add_argument("--start", default="auto")
     p_cover.add_argument("--duration", type=float, default=50.0)
     p_cover.add_argument("--chorus-anchor", default="")
@@ -2901,6 +2923,7 @@ def main(argv: list[str] | None = None) -> int:
                     volume_envelope=args.volume_envelope,
                     backing_gain_db=args.backing_gain_db,
                     skip_backing=args.skip_backing,
+                    skip_dereverb=args.skip_dereverb,
                     start_sec=args.start,
                     duration_sec=args.duration,
                     chorus_anchor=args.chorus_anchor,

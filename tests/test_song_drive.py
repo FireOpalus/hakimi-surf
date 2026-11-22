@@ -1113,7 +1113,8 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             norm_cover["protect"],
             norm_cover["volume_envelope"],
             norm_cover["skip_backing"],
-        ) == (0.15, 0.42, 0.55, True)
+            norm_cover["skip_dereverb"],
+        ) == (0.15, 0.42, 0.12, True, True)
         with pytest.raises(Rejected, match="song_source_required"):
             cover_val({"title": "雨爱", "auto_search": False})
         with pytest.raises(Rejected, match="colab_invalid_job"):
