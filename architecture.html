@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="Hakimi Surf v2.1.0 模块架构图。查看四个平台插件、二十一个常驻系统模块，以及动作、事件与跨日待办如何连接世界引擎。">
+  <meta name="description" content="Hakimi Surf v2.1.0 模块架构图。查看四个平台插件、二十一个常驻系统模块与六个进程外远程插件容器，以及动作、事件与跨日待办如何连接世界引擎。">
   <title>万物皆模块 · Hakimi Surf 项目架构图</title>
   <style>
     :root {
@@ -20,6 +20,8 @@
       --platform-bg: #e2f2e9;
       --system: #85401e;
       --system-bg: #f9ece1;
+      --remote: #264d73;
+      --remote-bg: #e4eef7;
       --kernel: #203f43;
       --on-kernel: #f5f8f2;
       --on-kernel-muted: #cbdcd5;
@@ -40,6 +42,8 @@
         --platform-bg: #193a31;
         --system: #ffc199;
         --system-bg: #3c2d24;
+        --remote: #9cc6f0;
+        --remote-bg: #1b2f43;
         --kernel: #27494b;
       }
     }
@@ -173,6 +177,19 @@
     .companion .speech-flow { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .65rem; color: var(--system); margin: .75rem 0; font-size: .88rem; }
     .speech-flow b { background: var(--system-bg); padding: .22rem .55rem; border-radius: .25rem; }
     .companion .refs { margin-top: .55rem; }
+    .bus-bar { padding: .85rem 1.1rem; margin-bottom: 1rem; border: 1px solid var(--rule); border-left: 4px solid var(--remote); border-radius: .4rem; background: var(--sheet); font-size: .85rem; color: var(--muted); }
+    .bus-bar strong { color: var(--ink); }
+    .plugin-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .95rem; }
+    .plugin-card { display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--rule); border-top: 3px solid var(--remote); border-radius: .45rem; padding: .9rem 1rem; background: var(--sheet); }
+    .plugin-card header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .3rem .6rem; }
+    .plugin-card h3 { font-size: 1rem; color: var(--remote); }
+    .plugin-card header code { font-size: .74rem; color: var(--muted); }
+    .plugin-meta { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .5rem; margin-top: .45rem; font-size: .76rem; color: var(--muted); }
+    .plugin-badge { display: inline-block; background: var(--remote-bg); color: var(--remote); padding: .12rem .45rem; border-radius: .25rem; font: 600 .74rem/1.4 var(--mono); text-decoration: none; }
+    .plugin-badge:hover { text-decoration: underline; }
+    .plugin-card p { font-size: .83rem; color: var(--muted); margin: .55rem 0 .65rem; }
+    .plugin-links { margin-top: auto; display: flex; flex-wrap: wrap; gap: .25rem .75rem; font-size: .76rem; color: var(--muted); }
+    .plugin-grid + .refs { margin-top: .85rem; }
     .lanes { border-block-end: 1px solid var(--rule); }
     .lane { display: grid; grid-template-columns: 1fr minmax(7rem,.68fr) 1.65fr; gap: .7rem 1.2rem; align-items: center; padding: .75rem .8rem; border-top: 1px solid var(--rule); }
     .lane:nth-child(odd) { background: var(--sheet); }
@@ -200,10 +217,11 @@
       .bank header code, .outlet h4 code { display: block; width: 100%; margin: 0; }
       .deps > div { grid-template-columns: minmax(0,1fr) .8rem minmax(0,1.2fr); }
       .route { --route-gap: 1.1rem; }
+      .plugin-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 44rem) {
       main, footer, .mast { width: calc(100% - 1.75rem); }
-      .hero, .banks, .hub, .contracts, .route, .notes { grid-template-columns: minmax(0,1fr); }
+      .hero, .banks, .hub, .contracts, .route, .notes, .plugin-grid { grid-template-columns: minmax(0,1fr); }
       .hero { padding-top: 1.8rem; }
       .repo-chain { margin-top: .2rem; }
       .fig-head small { width: 100%; }
@@ -233,7 +251,7 @@
       .bank header code { width: 100%; margin: 0; }
     }
     @media print {
-      :root { color-scheme: light; --paper: white; --sheet: white; --ink: #172d31; --muted: #354c4a; --platform: #005a49; --system: #773719; --rule: #a6b2ae; --platform-bg: #eaf3ee; --system-bg: #faf0e7; }
+      :root { color-scheme: light; --paper: white; --sheet: white; --ink: #172d31; --muted: #354c4a; --platform: #005a49; --system: #773719; --remote: #1e4266; --rule: #a6b2ae; --platform-bg: #eaf3ee; --system-bg: #faf0e7; --remote-bg: #eaf1f8; }
       body { font-size: 10pt; print-color-adjust: exact; }
       main, footer, .mast { width: 100%; }
       .mast nav, .skip, footer > a { display: none; }
@@ -241,7 +259,7 @@
       .hero h1 { font-size: 30pt; }
       .atlas { background-image: none; }
       .chapter { margin-top: 1.4rem; }
-      .atlas, .trace, .companion, .lane, .notes > div { break-inside: avoid; }
+      .atlas, .trace, .companion, .bus-bar, .plugin-card, .lane, .notes > div { break-inside: avoid; }
       .section-head { break-after: avoid; }
     }
   </style>
@@ -251,7 +269,7 @@
   <header class="mast" id="top">
     <div class="brand"><strong>Hakimi Surf</strong><small>v2.1.0</small></div>
     <nav aria-label="架构图导航">
-      <a href="#overview">模块总图</a><a href="#fieldwork">跨模块协作</a><a href="#deployment">部署边界</a><a href="#pipeline">对话与记忆</a>
+      <a href="#overview">模块总图</a><a href="#remote-plugins">远程插件</a><a href="#fieldwork">跨模块协作</a><a href="#deployment">部署边界</a><a href="#pipeline">对话与记忆</a>
     </nav>
   </header>
 
@@ -268,7 +286,7 @@
           <li><a href="src/hakimi/modules/.gitmodules">hakimi-modules</a></li>
           <li>4 个平台仓</li>
         </ol>
-        <small>主仓固定目录仓提交，目录仓再固定各平台提交。常驻模块随主仓发布。</small>
+        <small>主仓固定目录仓提交，目录仓再固定各平台提交。常驻模块与 6 个远程插件源码随主仓发布。</small>
       </aside>
     </div>
 
@@ -343,6 +361,52 @@
       <figcaption class="refs"><a href="src/hakimi/service.py">Service 装配入口</a><a href="src/hakimi/system_modules/__init__.py">常驻模块的依赖排序</a><a href="src/hakimi/modules/__init__.py">平台发现与装载</a><a href="src/hakimi/modules/base.py">注册表与模块接口</a></figcaption>
     </figure>
 
+    <section class="chapter" id="remote-plugins" aria-labelledby="remote-title">
+      <div class="section-head"><h2 id="remote-title">进程外远程插件 × 6</h2><p>独立容器经 <code>plugin_bus</code> 内部 WebSocket 与双向有界分块 Blob 总线接入引擎</p></div>
+      <div class="bus-bar">
+        <strong>统一隔离与传输契约：</strong>全部 6 个容器执行只读根文件系统（<code>read_only</code>）、<code>cap_drop: [ALL]</code>、<code>no-new-privileges</code>、非 root（<code>10001:10001</code>）与零宿主机卷挂载，经 <code>ws://hakimi-bot:12141/ws/plugin</code> 令牌鉴权连接。控制面维持 256 KiB WS 帧上限；大载荷经 <code>invoke_tool</code> 走双向有界分块 Blob 协议（128 KiB 分片 / 40 MiB 硬限 / SHA-256 校验 / 60s TTL）。外置工具容器离线时默认平滑回退主引擎，支持按需启用严格仅远程模式。
+      </div>
+      <div class="plugin-grid">
+        <article class="plugin-card">
+          <header><h3><a href="plugins/weather/plugin_main.py">天气观测</a></h3><code>weather</code></header>
+          <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>weather.read</code></div>
+          <p>承接 Open-Meteo 实时天气与地理编码查询，响应对话查天气与自主规划天气观测。</p>
+          <div class="plugin-links"><a href="plugins/weather/plugin_main.py">plugin_main.py</a><a href="compose.plugins.yaml">hakimi-plugin-weather</a></div>
+        </article>
+        <article class="plugin-card">
+          <header><h3><a href="plugins/minecraft/plugin_main.py">Minecraft 桥接</a></h3><code>minecraft</code></header>
+          <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>mc.*</code></div>
+          <p>独立游玩决策脑与桥接控制，协同境内节点 <code>mc_agent</code> 与 <code>mc-powerd</code> 调度游戏目标与里程碑。</p>
+          <div class="plugin-links"><a href="plugins/minecraft/plugin_main.py">plugin_main.py</a><a href="plugins/minecraft/play_brain.py">play_brain.py</a></div>
+        </article>
+        <article class="plugin-card">
+          <header><h3><a href="plugins/bilibili/plugin_main.py">B 站冲浪巡逻</a></h3><code>bilibili_surf</code></header>
+          <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>bili.*</code></div>
+          <p>独占 B 站巡逻小号状态、冷却域与视频学习流程，可委派境内节点执行采集任务。</p>
+          <div class="plugin-links"><a href="plugins/bilibili/plugin_main.py">plugin_main.py</a><a href="plugins/bilibili/patrol.py">patrol.py</a><a href="plugins/bilibili/client.py">client.py</a></div>
+        </article>
+        <article class="plugin-card">
+          <header><h3><a href="plugins/web_tools/plugin_main.py">外网检索与预览</a></h3><code>web_tools</code></header>
+          <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>web_tools.search</code> · <code>web_tools.preview</code></div>
+          <p>外置外网搜索与链接抓取，收紧主容器出网边界；公网 IP 钉死、逐跳重定向 SSRF 拦截与有界解压，预算与内容审核仍由内核门卫统一把关。</p>
+          <div class="plugin-links"><a href="plugins/web_tools/search.py">search.py</a><a href="plugins/web_tools/preview.py">preview.py</a><a href="plugins/web_tools/ssrf.py">ssrf.py</a><a href="src/hakimi/web_search.py">web_search.py</a><a href="src/hakimi/link_preview.py">link_preview.py</a></div>
+        </article>
+        <article class="plugin-card">
+          <header><h3><a href="plugins/doc_render/plugin_main.py">富文档解析与卡片渲染</a></h3><code>doc_render</code></header>
+          <div class="plugin-meta"><a class="plugin-badge" href="plugins/doc_render/Dockerfile">独立重渲染镜像</a><code>doc_render.read_file</code> · <code>doc_render.render_card</code></div>
+          <p>独占 Pillow、中文字体与 PDF/Office 解析库，避免重依赖污染轻量镜像与主引擎；纯内存字节解析（禁路径读取、防 Zip/XXE/FlateDecode 炸弹与画布像素硬顶），二进制附件与卡片走有界分块 Blob 总线。</p>
+          <div class="plugin-links"><a href="plugins/doc_render/parser.py">parser.py</a><a href="plugins/doc_render/renderer.py">renderer.py</a><a href="plugins/doc_render/Dockerfile">Dockerfile</a><a href="src/hakimi/file_reader.py">file_reader.py</a><a href="src/hakimi/text_card.py">text_card.py</a></div>
+        </article>
+        <article class="plugin-card">
+          <header><h3><a href="plugins/song_finder/plugin_main.py">独立找歌音源检索器</a></h3><code>song_finder</code></header>
+          <div class="plugin-meta"><a class="plugin-badge" href="plugins/song_finder/Dockerfile">独立音源镜像</a><code>song_finder.search</code> · <code>song_finder.fetch_source</code></div>
+          <p>与 <code>bilibili_surf</code> 严格物理隔离：零导入、零共用 B 站巡逻小号 Cookie 与冷却状态；独占 <code>yt-dlp</code> + <code>ffmpeg</code> 镜像（<code>-protocol_whitelist file</code>、按源独立熔断、全链路匿名），产出干净原曲经 Blob 总线交给 <code>song_studio</code> 写入 <code>Hakimi_Songs/inbox/</code>。</p>
+          <div class="plugin-links"><a href="plugins/song_finder/providers.py">providers.py</a><a href="plugins/song_finder/Dockerfile">Dockerfile</a><a href="src/hakimi/songs.py">songs.py</a><a href="src/hakimi/system_modules/song_studio.py">song_studio.py</a></div>
+        </article>
+      </div>
+      <div class="refs"><a href="src/hakimi/plugin_bus.py">远程插件总线</a><a href="src/hakimi_plugin_sdk/protocol.py">分块 Blob 协议</a><a href="src/hakimi_plugin_sdk/client.py">插件 SDK 客户端</a><a href="compose.plugins.yaml">6 容器编排</a><a href="scripts/deploy_plugins.sh">启停脚本</a><a href="plugins/Dockerfile">轻量公共镜像</a></div>
+    </section>
+
     <section class="chapter" id="fieldwork" aria-labelledby="contracts-title">
       <div class="section-head"><h2 id="contracts-title">动作、事件与跨日待办</h2></div>
       <div class="contracts">
@@ -380,9 +444,10 @@
         <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集；游戏端由 <code>mc_agent</code> 常驻待机，配合境内回环守护进程 <code>mc-powerd</code> 按需唤醒与闲置自动休眠 Minecraft 服务端，支持管理台、自主规划及通用 <code>owner_chat</code> 即时触发。</p></div></div>
         <div class="lane"><h3>桌面 · 语音与看屏适配端</h3><span class="link-label">两条可选 WS</span><div><strong>境外 FastAPI → 对应常驻服务</strong><p>语音与看屏分别配置入口、校验适配端身份。屏幕隐私开关与会话模式控制帧的使用范围。</p></div></div>
         <div class="lane"><h3>境外宿主机 · Colab Worker</h3><span class="link-label">Docker 网桥回环</span><div><strong>境外 hakimi-bot → 172.19.0.1:12146（Bearer 隔离）</strong><p>宿主机独立守护进程承接白名单 GPU 作业与 <code>Hakimi_Songs/</code> 云盘代理，凭据与 Colab CLI 不进只读容器。</p></div></div>
+        <div class="lane"><h3>境外内网 · 6 个远程插件容器</h3><span class="link-label">内部 WS + 分块 Blob</span><div><strong>6 个只读隔离容器 ↔ 境外 hakimi-bot /ws/plugin</strong><p><code>weather</code>、<code>minecraft</code>、<code>bilibili_surf</code> 与 <code>web_tools</code> 复用轻量镜像；<code>doc_render</code> 独占重渲染镜像；<code>song_finder</code> 独占匿名音源镜像并与 <code>bilibili_surf</code> 严格物理隔离。</p></div></div>
         <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
       </div>
-      <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="node_agent/compose.cn.yaml">境内执行节点</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
+      <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="compose.plugins.yaml">远程插件编排</a><a href="scripts/deploy_plugins.sh">插件启停脚本</a><a href="node_agent/compose.cn.yaml">境内执行节点</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
     </section>
 
     <section class="chapter" id="pipeline" aria-labelledby="conversation-title">
@@ -396,16 +461,16 @@
       <dl class="notes" id="memory">
         <div id="memory-batching"><dt>会话记忆</dt><dd>热史按会话隔离。裁剪的历史进入冷存档，后台按批提炼画像与编年史，再由当前会话按需召回。</dd></div>
         <div id="interaction-chain"><dt>模型续链</dt><dd>符合条件的主对话按模型与历史版本复用已确认的交互标识。收到发送回执后才提交新的本地续链。</dd></div>
-        <div id="image-context"><dt>图片与文件</dt><dd>从当轮、引用和邻近消息选择媒体。图片经过大小、像素与来源检查，文本附件受文件类型和体积限制。</dd></div>
+        <div id="image-context"><dt>图片与文件</dt><dd>从当轮、引用和邻近消息选择媒体。图片经大小、像素与来源检查；富文档解析与长文卡片渲染优先交由独立容器 <code>doc_render</code>（纯内存防炸弹），离线平滑回退内核。</dd></div>
         <div id="owner-memory"><dt>Owner 私有背景</dt><dd id="affection">协议身份与会话场景决定私有数据的可见范围。<span id="conversation-style">群聊使用公开人设，好感度只影响可用互动。</span></dd></div>
         <div id="rest-hours"><dt>作息与主动行动</dt><dd>世界状态记录清醒、休息与精力。LifeBlockPlanner 读取日程和待办，执行时再核对模块就绪状态与发送窗口。</dd></div>
         <div id="billing"><dt>预算与用量</dt><dd id="thinking-accounting">付费请求先在 SQLite 中预留，再按返回用量结算。模型、思考档位和动作标识用于归账。</dd></div>
-        <div id="search-routing"><dt>联网取证</dt><dd>独立搜索请求获取外部材料，筛查来源后将相关信息交给本轮对话。</dd></div>
+        <div id="search-routing"><dt>联网取证</dt><dd>外网检索与链接预览优先委派给 <code>web_tools</code> 容器（公网 IP 钉死与逐跳 SSRF 拦截），离线回退内核；预算与安全审查仍由引擎门卫把关。</dd></div>
         <div><dt>模块归档</dt><dd>具备归档授权的模块通过 Drive 同步服务使用指定目录。同步结果按调用模块记录。</dd></div>
       </dl>
       <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a></div>
     </section>
   </main>
-  <footer><span>Hakimi Surf · v2.1.0 · 4 个平台插件 + 21 个常驻系统模块 · 2026-11-22</span><a href="#top">回到图首 ↑</a></footer>
+  <footer><span>Hakimi Surf · v2.1.0 · 4 个平台插件 + 21 个常驻系统模块 + 6 个远程插件容器 · 2026-11-22</span><a href="#top">回到图首 ↑</a></footer>
 </body>
 </html>
