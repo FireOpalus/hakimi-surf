@@ -33,8 +33,10 @@ TEST_MESSAGE = "BOISER，这是哈基米的主动私信通路测试喵~"
 
 
 class OwnerProactive:
-    def __init__(self, service, *, clock=time.time, rng=None):
-        self.service, self.s, self.store = service, service.s, service.store
+    def __init__(self, service, *, clock=time.time, rng=None, settings=None, store=None):
+        self.service = service
+        self.s = settings if settings is not None else service.s
+        self.store = store if store is not None else service.store
         self.clock, self.rng = clock, rng or random.SystemRandom()
         self.zone = ZoneInfo(self.s.bot_timezone)
         self.platform = self.s.owner_delivery_platform
@@ -61,7 +63,13 @@ class OwnerProactive:
         )
         self.policy_lock = asyncio.Lock()
         self.delivery_lock = asyncio.Lock()
+        self._fallback_dialogue_lock = asyncio.Lock()
         self.wakeup = asyncio.Event()
+        self.last_worker_error: str | None = None
+        self.last_delivery_error: str | None = None
+
+    def _dialogue_lock(self):
+        return getattr(self.service, "owner_dialogue_lock", None) or self._fallback_dialogue_lock
 
     @property
     def delivery_enabled(self):
@@ -69,7 +77,10 @@ class OwnerProactive:
         if module is None:
             return False
         if self.platform == "onebot":
-            return module.scheduling(self.service.life_engine.config).owner_delivery_enabled
+            engine = getattr(self.service, "life_engine", None)
+            if engine is None:
+                return False
+            return module.scheduling(engine.config).owner_delivery_enabled
         return self.s.proactive_dm_enabled and self.configured
 
     @property
@@ -164,7 +175,7 @@ class OwnerProactive:
     def onebot_connected(self):
         if not self.s.onebot_enabled:
             return False
-        transport = getattr(self.service.sender, "onebot", None)
+        transport = getattr(getattr(self.service, "sender", None), "onebot", None)
         if self.s.onebot_mode == "http":
             return transport is not None
         ready = getattr(transport, "ready", None)
@@ -259,7 +270,7 @@ class OwnerProactive:
                 )
             await self.digests.recover_links_tx(now)
         # Complete confirmed deliveries before workers can read Owner memory.
-        async with self.service.owner_dialogue_lock:
+        async with self._dialogue_lock():
             await self._repair_confirmed()
 
     async def note_activity(self, message):
@@ -850,7 +861,7 @@ class OwnerProactive:
     async def deliver_once(self):
         async with (
             self.delivery_lock,
-            self.service.owner_dialogue_lock,
+            self._dialogue_lock(),
             AsyncExitStack() as activity,
         ):
             await self._repair_confirmed()
@@ -1010,9 +1021,11 @@ class OwnerProactive:
         while True:
             try:
                 await self.tick()
+                self.last_worker_error = None
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self.last_worker_error = type(exc).__name__
                 log.info("event=owner_dm_worker_error")
             await asyncio.sleep(10)
 
@@ -1021,6 +1034,7 @@ class OwnerProactive:
             try:
                 self.wakeup.clear()
                 sent = await self.deliver_once()
+                self.last_delivery_error = None
                 if sent:
                     await asyncio.sleep(2)
                 else:
@@ -1030,7 +1044,8 @@ class OwnerProactive:
                         pass
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self.last_delivery_error = type(exc).__name__
                 log.info("event=owner_dm_worker_error")
                 await asyncio.sleep(5)
 

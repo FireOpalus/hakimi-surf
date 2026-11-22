@@ -558,3 +558,21 @@ class MemeLibrary:
     def semantic_label(self, digest):
         label = self.source_hashes.get(digest)
         return label if label in self.labels else None
+
+    def status_summary(self) -> dict[str, object]:
+        """Return a fast, non-blocking read-only summary of local meme storage."""
+        all_entries = (*self._entries.values(), *self._variants.values())
+        total_bytes = sum(int(e.get("byte_size", 0)) for e in all_entries)
+        directory_ready = not self.root.is_symlink() and self.root.is_dir()
+        return {
+            "initialized": self.initialized,
+            "directory_ready": directory_ready,
+            "labels_count": len(self._entries),
+            "variants_count": len(self._variants),
+            "total_count": len(all_entries),
+            "total_bytes": total_bytes,
+            "max_memes": MAX_MEMES,
+            "max_bytes": MAX_LIBRARY_BYTES,
+            "storage_mode": "local",
+            "drive_backup_enabled": False,
+        }

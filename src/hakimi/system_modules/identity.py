@@ -21,9 +21,6 @@ class Module(SystemModule):
         self.identity = IdentityService(resources.settings, resources.store, resources.service)
         if resources.store.runtime is not None:
             resources.store.runtime.identity = self.identity
-            aff = getattr(resources.store.runtime, "affection", None)
-            if aff is not None and hasattr(aff, "bind_identity"):
-                aff.bind_identity(self.identity)
 
     async def initialize(self) -> None:
         await self.identity.initialize()

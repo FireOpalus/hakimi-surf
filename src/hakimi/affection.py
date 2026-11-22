@@ -2748,6 +2748,23 @@ class AffectionManager:
         )
         return items
 
+    def status_summary(self) -> dict[str, Any]:
+        """Return a fast, non-blocking in-memory summary for system module status."""
+        tracked_count = len(self._user_scores)
+        blacklisted_count = sum(
+            1 for score, is_owner in self._user_scores.values() if not is_owner and score <= 0
+        )
+        return {
+            "initialized": self.initialized,
+            "enabled": bool(self.config.enabled),
+            "tracked_count": tracked_count,
+            "persons_count": len(self._person_scores),
+            "blacklisted_count": blacklisted_count,
+            "identity_bound": self._identity is not None,
+            "migrated_to_person": self._migrated_to_person,
+            "source": "admin" if self.overridden else "env",
+        }
+
     async def status(self) -> dict[str, Any]:
         await self.initialize()
         return {

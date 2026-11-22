@@ -6,7 +6,9 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
@@ -22,6 +24,7 @@ from hakimi.outbound_actions import ChatActionTrigger
 from hakimi.plugin_bus import RESERVED_PLUGIN_IDS
 from hakimi.security import Rejected
 from hakimi.service import Service
+from hakimi.store import Store
 from hakimi.system_modules import SystemResources
 from hakimi.system_modules.gcp_billing import Module as GcpBillingSystemModule
 from hakimi.system_modules.voice_companion import Module as VoiceCompanionSystemModule
@@ -612,3 +615,175 @@ async def test_owner_chat_learn_song_handle_message_passes_context_message_e2e(
         assert submitted == []
     finally:
         await svc.stop()
+
+
+def _valid_admin_tabs() -> set[str]:
+    html = (Path(__file__).resolve().parents[1] / "admin" / "admin_page.html").read_text(
+        encoding="utf-8"
+    )
+    return set(re.findall(r'data-tab="([^"]+)"', html))
+
+
+async def test_wave2_system_modules_wiring_reserved_ids_and_admin_panels(settings):
+    s = settings.model_copy(update={"admin_token": SecretStr(TOKEN)})
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+
+    expected_all = {
+        "affection",
+        "colab_compute",
+        "database_backup",
+        "drive_sync",
+        "event_ledger",
+        "gcp_billing",
+        "group_memory_mirror",
+        "identity",
+        "meme_library",
+        "memory_compressor",
+        "memory_hub",
+        "owner_notebook",
+        "patrol_diary",
+        "plugin_bus",
+        "proactive_delivery",
+        "screen_watch",
+        "song_studio",
+        "surf_mirror",
+        "video_watch",
+        "voice_companion",
+        "voice_gateway",
+    }
+    wave2_panels = {
+        "proactive_delivery": "proactive",
+        "video_watch": "bili-account",
+        "affection": "community",
+        "memory_compressor": "memory",
+        "meme_library": "memes",
+    }
+
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        names = list(svc.modules.systems.keys())
+        assert set(names) == expected_all
+        assert len(names) == 21
+
+        for mod_id in wave2_panels:
+            assert mod_id in RESERVED_PLUGIN_IDS
+            assert svc.modules.get(mod_id) is None
+            assert not hasattr(svc.modules.systems[mod_id], "enabled")
+            assert mod_id not in svc.modules.catalog.owners.values()
+            with pytest.raises(Rejected, match="reserved_plugin_id"):
+                await svc.plugin_bus.create_plugin(mod_id, "Spoof", ["actions"])
+
+        assert names.index("event_ledger") < names.index("proactive_delivery")
+        assert names.index("identity") < names.index("affection")
+        assert names.index("memory_hub") < names.index("memory_compressor")
+
+        assert svc.proactive is svc.modules.systems["proactive_delivery"].proactive
+        assert svc.modules.owner_delivery is svc.proactive
+        assert svc.video_watch is svc.modules.systems["video_watch"].watch
+        assert svc.affection is svc.modules.systems["affection"].manager
+        assert svc.store.runtime.affection is svc.affection
+        assert svc.affection._identity is svc.identity
+        assert svc.compressor is svc.modules.systems["memory_compressor"].compressor
+        assert svc.memes is svc.modules.systems["meme_library"].library
+        assert svc.store.runtime.memes is svc.memes
+
+        valid_tabs = _valid_admin_tabs()
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        ) as client:
+            sys_mods = {m["id"]: m for m in (await client.get("/admin/api/system-modules")).json()}
+            assert set(sys_mods) == expected_all
+            for mod_id, expected_panel in wave2_panels.items():
+                assert sys_mods[mod_id]["panel"] == expected_panel
+                assert expected_panel in valid_tabs
+                assert "enabled" not in sys_mods[mod_id]
+                deny = await client.put(
+                    f"/admin/api/life/modules/{mod_id}/enabled", json={"enabled": False}
+                )
+                assert deny.status_code == 404
+            for mod_id, entry in sys_mods.items():
+                if entry["panel"] is not None:
+                    assert entry["panel"] in valid_tabs, (mod_id, entry["panel"])
+
+
+async def test_wave2_workers_migration_and_proactive_deferred_init_order(settings):
+    s = settings.model_copy(
+        update={
+            "admin_token": SecretStr(TOKEN),
+            "owner_qq_id": "20000",
+            "onebot_enabled": True,
+            "proactive_dm_enabled": True,
+        }
+    )
+
+    # Pre-seed SQLite with owner_delivery_enabled=False and a legacy pending proactive outbox row.
+    # Deferred proactive_delivery.initialize() runs AFTER life_engine.initialize(), so the persisted
+    # disable switch cancels the legacy row instead of migrating it under stale .env defaults.
+    pre_store = Store(s)
+    await pre_store.open()
+    try:
+        now = time.time()
+        msg = Message(
+            platform="onebot",
+            bot_id=s.onebot_self_id,
+            kind="private",
+            conversation_id="20000",
+            user_id="20000",
+            event_id="legacy-owner-dm",
+            text="",
+            addressed=True,
+            created_at=now,
+        )
+        await pre_store.runtime.save_config(
+            "life_engine",
+            {"module_settings": {"qq_social": {"owner_delivery_enabled": False}}},
+        )
+        async with pre_store.transaction():
+            await pre_store.db.execute(
+                "INSERT INTO outbox(id,payload,status,created,expires) VALUES (?,?,?,?,?)",
+                (
+                    "legacy-proactive-1",
+                    pre_store.vault.seal(
+                        "legacy-proactive-1",
+                        {"proactive": True, "message": msg.model_dump(), "text": "旧主动消息"},
+                    ),
+                    "pending",
+                    now,
+                    now + 3600,
+                ),
+            )
+    finally:
+        await pre_store.close()
+
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=True)
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        assert svc.proactive.delivery_enabled is False
+        async with svc.store.lock:
+            outbox_row = await svc.store.one(
+                "SELECT status FROM outbox WHERE id=?", ("legacy-proactive-1",)
+            )
+            dm_row = await svc.store.one(
+                "SELECT status FROM pending_owner_dms WHERE id=?", ("legacy-proactive-1",)
+            )
+        assert outbox_row is not None and outbox_row[0] == "cancelled"
+        assert dm_row is None
+
+        task_names = [t.get_name() for t in svc.tasks]
+        assert task_names.count("proactive_delivery") == 2
+        assert task_names.count("memory_compressor") == 1
+        assert "owner-operational-alerts" not in task_names
+        assert "owner-dm-delivery" not in task_names
+        assert "memory-archive" not in task_names
+        assert svc.recovery_task is not None
+        assert svc.recovery_task.get_name() == "compression-recovery"
+        assert not any(t.done() for t in svc.tasks)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+        ) as client:
+            assert (await client.get("/healthz")).status_code == 200

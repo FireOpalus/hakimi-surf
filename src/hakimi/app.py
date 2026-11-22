@@ -127,6 +127,8 @@ def create_app(
                         node_transport=node_transport,
                     )
                     for module in service.modules.systems.values():
+                        if module.module_id == "proactive_delivery":
+                            continue
                         await module.initialize()
                     if "song_studio" not in service.modules.systems and hasattr(service, "songs"):
                         await service.songs.initialize()
@@ -141,13 +143,20 @@ def create_app(
                     await service.moderation.initialize()
                     await service.longnick.initialize()
                     await service.bili_watcher.initialize()
-                    await service.video_watch.initialize()
-                    await service.memes.initialize()
+                    if "video_watch" not in service.modules.systems and hasattr(
+                        service, "video_watch"
+                    ):
+                        await service.video_watch.initialize()
+                    if "meme_library" not in service.modules.systems and hasattr(service, "memes"):
+                        await service.memes.initialize()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
                     for module in service.modules.all():
                         await resources.enter_async_context(module.lifespan())
-                    await service.proactive.initialize()
+                    if "proactive_delivery" in service.modules.systems:
+                        await service.modules.systems["proactive_delivery"].initialize()
+                    else:
+                        await service.proactive.initialize()
                     from .outgoing import recover_receipts
 
                     await recover_receipts(service)

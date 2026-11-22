@@ -33,11 +33,10 @@ from .link_preview import preview_links
 from .media import ImageLoader
 from .memes import (
     MAX_UPLOAD_BYTES,
-    MemeLibrary,
     explicit_meme_request,
     validate_meme_label,
 )
-from .memory_compressor import MemoryCompressor, check_memory_text
+from .memory_compressor import check_memory_text
 from .mentions import parse_reply, valid_at_targets
 from .message_context import MessageContextResolver
 from .models import Message, Video
@@ -48,7 +47,6 @@ from .modules.adapters import Sender, farewell_send_bypass, identifier, onebot_m
 from .modules.bili_watcher import BiliWatcher
 from .modules.bilibili import Bilibili, extract_bvid
 from .modules.longnick import Longnick
-from .modules.proactive_dm import OwnerProactive
 from .node_transport import NodeTransport
 from .outbound_actions import ChatActionTrigger, normalize_emoji_like, parse_actions
 from .outgoing import PRE_DISPATCH_REJECTED, is_affection_muted_only, safe_delivery_detail
@@ -66,7 +64,6 @@ from .songs import explicit_song_request
 from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
-from .video_watch import VideoWatch
 from .voice_reply import explicit_voice_request
 from .web_search import explicit_search, search_query
 from .work_usage import model_work
@@ -166,11 +163,9 @@ class Service:
         self.ingress_scheduler = SessionScheduler()
         self.dialogue_scheduler = SessionScheduler()
         self.public_memory = PublicMemory(store)
-        self.compressor = MemoryCompressor(settings, self.sessions, gateway, store)
         self.recovery_task = None
         self.poll_lock = asyncio.Lock()
         self.owner_dialogue_lock = asyncio.Lock()
-        self.proactive = OwnerProactive(self)
         self.started_at = time.monotonic()
         self.counters: Counter = Counter()
         self.tasks: list[asyncio.Task] = []
@@ -183,12 +178,9 @@ class Service:
             if is_external_plugin(settings, "bilibili_surf")
             else BiliWatcher(self)
         )
-        self.video_watch = VideoWatch(self)
-        self.memes = MemeLibrary(store)
-        store.runtime.memes = self.memes
         self._lurk_react_at: dict[str, float] = {}
         self._last_aff_recovery_at: float = 0.0
-        self.modules = ModuleRegistry(owner_delivery=self.proactive)
+        self.modules = ModuleRegistry()
         settings._chat_registry = weakref.ref(self.modules)
         self.kernel = PluginKernel()
         install_system_modules(
@@ -217,6 +209,9 @@ class Service:
         self.event_ledger = self.modules.systems["event_ledger"].ledger
         self.modules.event_ledger = self.event_ledger
         self.sessions.event_ledger = self.event_ledger
+        self.proactive = self.modules.systems["proactive_delivery"].proactive
+        self.modules.owner_delivery = self.proactive
+        self.video_watch = self.modules.systems["video_watch"].watch
         self.screen_watch = self.modules.systems["screen_watch"].screen_watch
         self.voice_companion = self.modules.systems["voice_companion"].companion
         self.voice_reply = self.modules.systems["voice_gateway"].reply
@@ -226,10 +221,14 @@ class Service:
         store.runtime.songs = self.songs
         self.gcp_billing = self.modules.systems["gcp_billing"].manager
         self.identity = self.modules.systems["identity"].identity
+        self.affection = self.modules.systems["affection"].manager
         self.memory_hub = self.modules.systems["memory_hub"].hub
+        self.compressor = self.modules.systems["memory_compressor"].compressor
+        self.memes = self.modules.systems["meme_library"].library
         self.plugin_bus = self.modules.systems["plugin_bus"].plugin_bus
         store.runtime.identity = self.identity
-        store.runtime.affection.bind_identity(self.identity)
+        store.runtime.affection = self.affection
+        store.runtime.memes = self.memes
         self.kernel.provide_core("identity", self.identity)
         self.kernel.provide_core("memory_hub", self.memory_hub)
         self.kernel.provide_core("event_ledger", self.event_ledger)
@@ -883,11 +882,8 @@ class Service:
         ]
         self.tasks += [
             asyncio.create_task(self.delivery(), name="delivery"),
-            asyncio.create_task(self.compressor.run(), name="memory-archive"),
             asyncio.create_task(self.patrol(), name="patrol"),
             asyncio.create_task(self.janitor(), name="janitor"),
-            asyncio.create_task(self.proactive.run(), name="owner-operational-alerts"),
-            asyncio.create_task(self.proactive.delivery(), name="owner-dm-delivery"),
             asyncio.create_task(self.life_engine.run(), name="life-engine"),
         ]
         for module in self.modules.systems.values():

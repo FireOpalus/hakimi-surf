@@ -357,6 +357,21 @@ class MemoryCompressor:
             async with self.sessions.database(message, preserve_history=True) as (db, _):
                 await db.execute("UPDATE memory_control SET last_nightly=?", (day,))
 
+    def status_summary(self) -> dict[str, object]:
+        """Return a pure in-memory status summary without I/O or cloud access."""
+        runtime = getattr(self.store, "runtime", None)
+        comp_cfg = getattr(runtime, "compression", None) if runtime is not None else None
+        compression_enabled = bool(getattr(comp_cfg, "enabled", True))
+        now_mono = self.clock()
+        backoff_slices = sum(1 for _, until in self.slice_backoff.values() if until > now_mono)
+        return {
+            "prefix_history_enabled": bool(self.s.prefix_history_enabled),
+            "compression_enabled": compression_enabled,
+            "active_tasks": len(self.tasks),
+            "backoff_slices": backoff_slices,
+            "archive_time": str(self.s.memory_archive_time),
+        }
+
     async def run(self):
         # This worker polls local SQLite only. The LLM runs only for a durable unattempted slice.
         last_scan = float("-inf")

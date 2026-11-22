@@ -188,8 +188,10 @@ async def guard_call(callback):
 
 
 class VideoWatch:
-    def __init__(self, service, *, downloader=None, clock=time.time):
-        self.svc, self.s, self.store = service, service.s, service.store
+    def __init__(self, service, *, downloader=None, clock=time.time, settings=None, store=None):
+        self.svc = service
+        self.s = settings if settings is not None else service.s
+        self.store = store if store is not None else service.store
         self.clock = clock
         self.zone = ZoneInfo(self.s.bot_timezone)
         self.env_config = VideoWatchConfig.from_settings(self.s)
