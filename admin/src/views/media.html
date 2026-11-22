@@ -24,7 +24,7 @@
         <button id="song-refresh" type="button" class="secondary">刷新歌单</button>
       </div>
     </div>
-    <p class="muted">Google Drive <code>Hakimi_Songs/</code> 主存与本地有界 LRU 热缓存由歌单工坊独立管理（纯本地上传曲目永不被淘汰），歌单试听与管理不依赖 Colab GPU Worker 在线。模型仅从歌单标题白名单里挑选。</p>
+    <p class="muted">Google Drive <code>Hakimi_Songs/</code> 主存与本地有界 LRU 热缓存由歌单工坊独立管理（纯本地上传曲目永不被淘汰），歌单试听与版本切换不依赖 Colab GPU Worker 在线。双引擎 SVC 翻唱会同时保留候选版本与猫猫亲听点评，支持随时试听对比并一键切换点唱生效版。</p>
     <div id="song-storage-pills" class="pill-row"></div>
     <p id="song-cache-state" class="muted" role="status" aria-live="polite"></p>
     <div class="row">
@@ -72,7 +72,7 @@
         <button type="button" class="secondary" data-open-tab="colab-compute">查看作业队列 →</button>
       </div>
     </div>
-    <p class="muted">歌单播放、Drive 主存、本地热缓存与原曲收件箱均由歌单工坊独立管理（不依赖 Colab Worker 在线）；提交异步学歌任务时会经 Colab GPU 算力执行人声分离与 RVC 翻唱推理，并支持通过独立找歌插件检索官方原版，成品自动归档至 Google Drive <code>Hakimi_Songs/songs/</code> 并加入歌单。也可在 QQ 私聊发送音频附带 <code>/学歌</code>。</p>
+    <p class="muted">歌单播放、Drive 主存、本地热缓存与原曲收件箱均由歌单工坊独立管理（不依赖 Colab Worker 在线）；提交异步学歌任务时默认经 Colab GPU 共享分轨双出片（<code>YingMusic-SVC</code> + <code>Seed-VC</code>），再由猫猫主模型原声亲听自选并保留双版本可随时切换，也保留经典 <code>RVC</code> 可选。也可在 QQ 私聊发送音频附带 <code>/学歌</code>。</p>
     <p id="song-learn-colab-hint" class="muted"></p>
     <form id="song-learn-form">
       <div class="song-meta">
@@ -82,6 +82,14 @@
         <label for="song-learn-pitch">升降调 Pitch（-24～24，默认 0）<input id="song-learn-pitch" type="number" min="-24" max="24" step="1" value="0" required></label>
       </div>
       <div class="grid">
+        <label for="song-learn-engine">翻唱引擎
+          <select id="song-learn-engine">
+            <option value="dual" selected>双引擎猫猫亲挑（YingMusic-SVC + Seed-VC，默认）</option>
+            <option value="yingmusic_svc">仅 YingMusic-SVC（强气息张力 · 固定 0 移调）</option>
+            <option value="seed_vc">仅 Seed-VC（干净顺滑 · 跨语种稳咬字）</option>
+            <option value="rvc">经典 RVC（保留兼容）</option>
+          </select>
+        </label>
         <label for="song-learn-inbox">Drive <code>Hakimi_Songs/inbox/</code> 已有原曲（可选）
           <select id="song-learn-inbox">
             <option value="">不指定文件（使用下方自动检索）</option>
@@ -92,6 +100,70 @@
             <option value="">默认 L4（自动回退 T4）</option>
           </select>
         </label>
+      </div>
+      <p id="song-learn-pitch-hint" class="muted">双引擎模式：YingMusic-SVC 固定 0 半音防与伴奏走调；Seed-VC 按上方 Pitch 移调（默认 0），双版均存档保留并由猫猫原声亲听自选。</p>
+      <div id="song-learn-svc-fields" class="song-engine-panel">
+        <div class="row between">
+          <strong>Zero-shot SVC 参考干声（Drive <code>models/</code>）</strong>
+          <button id="song-learn-refresh-voices" type="button" class="secondary">刷新干声 / 模型列表</button>
+        </div>
+        <div class="grid">
+          <label for="song-learn-ref-voice">参考干声（可选，留空自动选用默认猫猫干声）
+            <select id="song-learn-ref-voice">
+              <option value="">自动选用默认参考干声（hakimi_ref）</option>
+            </select>
+          </label>
+          <div class="row">
+            <label for="song-ref-voice-file">上传新参考干声到 <code>models/</code>（wav/flac/mp3/m4a/ogg/opus，≤ 20 MiB）
+              <input id="song-ref-voice-file" type="file" accept=".wav,.flac,.mp3,.m4a,.ogg,.opus">
+            </label>
+            <button id="song-ref-voice-upload" type="button" class="secondary">上传参考干声</button>
+          </div>
+        </div>
+        <p id="song-ref-voice-hint" class="muted">正在检测 Drive <code>models/</code> 中的参考干声…</p>
+        <details id="song-learn-svc-adv" class="provider-fold">
+          <summary>SVC 高级推理选项（可选，留空按默认 35 步执行）</summary>
+          <div class="song-meta">
+            <label for="song-learn-svc-steps">扩散推理步数 svc_steps（10～100，留空默认 35）
+              <input id="song-learn-svc-steps" type="number" min="10" max="100" step="1" placeholder="默认 35">
+            </label>
+          </div>
+        </details>
+      </div>
+      <div id="song-learn-rvc-fields" class="song-engine-panel" hidden>
+        <div class="row between">
+          <strong>经典 RVC 音色权重与推理参数</strong>
+          <button id="song-learn-refresh-rvc-models" type="button" class="secondary">刷新模型列表</button>
+        </div>
+        <div class="grid">
+          <label for="song-learn-model">RVC 权重模型（Drive <code>models/</code>）
+            <select id="song-learn-model">
+              <option value="hakimi">hakimi（默认）</option>
+            </select>
+          </label>
+        </div>
+        <details id="song-learn-rvc-adv" class="provider-fold">
+          <summary>RVC 推理与混音参数（已回调至普适均衡默认值）</summary>
+          <p id="song-learn-rvc-defaults-hint" class="muted">当前普适默认值：volume_envelope 0.25 · skip_dereverb 关闭（启用去混响）· index_rate 0.15 · protect 0.42 · backing_gain_db -14 dB · skip_backing 开启</p>
+          <div class="song-meta">
+            <label for="song-learn-rvc-volume-envelope">音量包络 volume_envelope（0～1，默认 0.25）
+              <input id="song-learn-rvc-volume-envelope" type="number" min="0" max="1" step="0.01" value="0.25">
+            </label>
+            <label for="song-learn-rvc-index-rate">特征检索比 index_rate（0～1，默认 0.15）
+              <input id="song-learn-rvc-index-rate" type="number" min="0" max="1" step="0.01" value="0.15">
+            </label>
+            <label for="song-learn-rvc-protect">清音保护 protect（0～0.5，默认 0.42）
+              <input id="song-learn-rvc-protect" type="number" min="0" max="0.5" step="0.01" value="0.42">
+            </label>
+            <label for="song-learn-rvc-backing-gain">和声伴唱增益 backing_gain_db（-24～-6，默认 -14）
+              <input id="song-learn-rvc-backing-gain" type="number" min="-24" max="-6" step="0.5" value="-14">
+            </label>
+          </div>
+          <div class="row">
+            <label><input id="song-learn-rvc-skip-dereverb" type="checkbox"> 跳过主唱去混响（skip_dereverb，默认关闭即启用去混响）</label>
+            <label><input id="song-learn-rvc-skip-backing" type="checkbox" checked> 独唱跳过和声分离（skip_backing，默认开启）</label>
+          </div>
+        </details>
       </div>
       <div class="row">
         <label><input id="song-learn-auto-search" type="checkbox" checked> 未指定文件时自动检索官方原版</label>

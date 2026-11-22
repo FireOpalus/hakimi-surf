@@ -43,6 +43,7 @@ from hakimi.songs import (
 from hakimi.system_modules import SystemResources
 from hakimi.system_modules.song_studio import Module as SongStudioModule
 from tests.fakes import FakeGateway
+from tests.test_sdk_contract import sdk_pair as sdk_pair
 
 ADMIN_TOKEN = "song-studio-test-admin-token-never-live"
 
@@ -867,8 +868,12 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
                 "default_gpu": "L4",
                 "fallback_gpus": ["T4"],
                 "allowed_gpus": ["L4", "T4", "A100", "H100"],
-                "timeout_seconds": 1800,
+                "timeout_seconds": 2400,
             }
+            assert listing["default_engine"] == "dual"
+            assert listing["available_engines"] == ["dual", "yingmusic_svc", "seed_vc", "rvc"]
+            assert listing["rvc_defaults"]["volume_envelope"] == 0.25
+            assert listing["rvc_defaults"]["skip_dereverb"] is False
             by_title = {item["title"]: item for item in listing["items"]}
             assert by_title["本地测试歌"]["cached_local"] is True
             assert by_title["本地测试歌"]["drive_backed"] is False
@@ -1084,7 +1089,7 @@ async def test_song_studio_gpu_policy_registration_early_reject_and_command_erro
     assert RVC_COVER_DEFAULT_GPU == "L4"
     assert RVC_COVER_FALLBACK_GPUS == ("T4",)
     assert RVC_COVER_ALLOWED_GPUS == ("L4", "T4", "A100", "H100")
-    assert RVC_COVER_TIMEOUT_SECONDS == 1800
+    assert RVC_COVER_TIMEOUT_SECONDS == 2400
     assert "G4" not in RVC_COVER_ALLOWED_GPUS
     assert RVC_TRAIN_DEFAULT_GPU == "H100"
     assert RVC_TRAIN_FALLBACK_GPUS == ("A100",)
@@ -1212,7 +1217,7 @@ async def test_song_studio_gpu_policy_registration_early_reject_and_command_erro
     assert cover_spec["default_gpu"] == "L4"
     assert cover_spec["fallback_gpus"] == ("T4",)
     assert cover_spec["allowed_gpus"] == ("L4", "T4", "A100", "H100")
-    assert cover_spec["timeout_seconds"] == 1800
+    assert cover_spec["timeout_seconds"] == 2400
 
     train_spec = compute.registered["rvc_train"]
     assert train_spec["owner_module"] == "song_studio"
@@ -1233,14 +1238,14 @@ async def test_song_studio_gpu_policy_registration_early_reject_and_command_erro
         "default_gpu": "L4",
         "fallback_gpus": ["T4"],
         "allowed_gpus": ["L4", "T4", "A100", "H100"],
-        "timeout_seconds": 1800,
+        "timeout_seconds": 2400,
     }
     fallback_lib = SongLibrary(store, compute=None)
     assert fallback_lib.learn_gpu_policy() == {
         "default_gpu": "L4",
         "fallback_gpus": ["T4"],
         "allowed_gpus": ["L4", "T4", "A100", "H100"],
-        "timeout_seconds": 1800,
+        "timeout_seconds": 2400,
     }
 
     # 4) Early GPU validation blocks Drive upload and remote song_finder before any I/O
@@ -1329,7 +1334,7 @@ async def test_song_studio_real_colab_hub_registration_and_admin_learn_gpu_e2e(
             "default_gpu": "L4",
             "fallback_gpus": ["T4"],
             "allowed_gpus": ["L4", "T4", "A100", "H100"],
-            "timeout_seconds": 1800,
+            "timeout_seconds": 2400,
         }
         assert hub.get_job_type_spec("rvc_train") == {
             "job_type": "rvc_train",
@@ -1358,7 +1363,7 @@ async def test_song_studio_real_colab_hub_registration_and_admin_learn_gpu_e2e(
                 "default_gpu": "L4",
                 "fallback_gpus": ["T4"],
                 "allowed_gpus": ["L4", "T4", "A100", "H100"],
-                "timeout_seconds": 1800,
+                "timeout_seconds": 2400,
             }
 
             default_learn = await client.post(
@@ -1383,3 +1388,881 @@ async def test_song_studio_real_colab_hub_registration_and_admin_learn_gpu_e2e(
             )
             assert rejected_learn.status_code == 400
             assert rejected_learn.json()["detail"] == "colab_gpu_not_allowed"
+
+
+async def test_song_studio_main_model_blind_ab_audition_real_gateway_and_anti_bias(
+    settings, store, sdk_pair
+):
+    """Verify dual-engine audition uses main model (not decision-1), blind A/B, & proactive lane."""
+    import json
+
+    from hakimi.gemini import GeminiGateway
+    from hakimi.security import Rejected
+    from hakimi.system_modules.song_studio import (
+        SONG_AUDITION_RESPONSE_SCHEMA,
+        SONG_AUDITION_SCENE_KEY,
+        _parse_audition_verdict,
+    )
+    from tests.test_sdk_contract import decision_response, interaction_response
+
+    def _schema_keys(node: Any) -> set[str]:
+        keys: set[str] = set()
+        if isinstance(node, dict):
+            keys.update(node.keys())
+            for value in node.values():
+                keys.update(_schema_keys(value))
+        elif isinstance(node, list):
+            for item in node:
+                keys.update(_schema_keys(item))
+        return keys
+
+    # Verify serving-safe strict JSON Schema: all core fields in `required`, zero length/regex caps
+    assert set(SONG_AUDITION_RESPONSE_SCHEMA["required"]) == {
+        "winner",
+        "pick_reason",
+        "review_note",
+        "a_impression",
+        "b_impression",
+    }
+    assert SONG_AUDITION_RESPONSE_SCHEMA.get("additionalProperties") is False
+    forbidden_schema_keys = {
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+    }
+    assert not (_schema_keys(SONG_AUDITION_RESPONSE_SCHEMA) & forbidden_schema_keys)
+
+    # Verify Python-side post-parse cleaning & truncation + blank-field rejection
+    parsed_long = _parse_audition_verdict(
+        json.dumps(
+            {
+                "winner": "A",
+                "pick_reason": "音准超稳" * 50,
+                "review_note": "听起来超自然\x00\n" + "开心" * 150,
+                "a_impression": "甲" * 120,
+                "b_impression": "乙" * 130,
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert parsed_long.winner == "A"
+    assert len(parsed_long.pick_reason) == 160
+    assert len(parsed_long.review_note) == 240
+    assert "\x00" not in parsed_long.review_note
+    assert len(parsed_long.a_impression) == 100
+    assert len(parsed_long.b_impression) == 100
+    for blank_patch in ({"pick_reason": "   \x00\n "}, {"review_note": "\t  "}):
+        bad_payload = {
+            "winner": "A",
+            "pick_reason": "有效理由",
+            "review_note": "有效点评",
+            "a_impression": "A 印象",
+            "b_impression": "B 印象",
+            **blank_patch,
+        }
+        with pytest.raises(Rejected, match="invalid_audition_output"):
+            _parse_audition_verdict(json.dumps(bad_payload, ensure_ascii=False))
+
+    seen_decisions: list[dict[str, Any]] = []
+    seen_interactions: list[dict[str, Any]] = []
+    verdict_to_return: dict[str, Any] = {
+        "winner": "B",
+        "pick_reason": "候选B气息更自然，弱副歌衔接平稳没有电音感。",
+        "review_note": "这首高潮唱起来超顺滑，轻柔段落也不会掉下去，我很喜欢这版喵~",
+        "a_impression": "音色贴脸但尾音略有一点紧。",
+        "b_impression": "自然透亮、咬字清楚且和伴奏贴得很稳。",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if request.url.path.endswith("decisions"):
+            seen_decisions.append(body)
+            return httpx.Response(200, json=decision_response())
+        seen_interactions.append(body)
+        resp = interaction_response()
+        resp["steps"][0]["content"][0]["text"] = json.dumps(verdict_to_return, ensure_ascii=False)
+        return httpx.Response(200, json=resp)
+
+    compute = _FakeColabCompute(is_configured=True)
+    proactive = _FakeProactive()
+
+    class _FakeColabMod:
+        module_id = "colab_compute"
+
+        def __init__(self) -> None:
+            self.compute = compute
+
+    class _FakeDriveMod:
+        module_id = "drive_sync"
+
+    registry = ModuleRegistry()
+    registry.systems["colab_compute"] = _FakeColabMod()  # type: ignore[assignment]
+    registry.systems["drive_sync"] = _FakeDriveMod()  # type: ignore[assignment]
+
+    gw = GeminiGateway(settings, store, *sdk_pair(handler))
+    try:
+        resources = SystemResources(
+            settings=settings,
+            store=store,
+            gateway=gw,
+            http=None,
+            service=SimpleNamespace(proactive=proactive),  # type: ignore[arg-type]
+        )
+        mod = SongStudioModule(resources, registry)
+        # Register thinking scene onto settings just as Service does at boot
+        settings._thinking_scenes = {scene.key: scene for scene in mod.thinking_scenes}
+        assert SONG_AUDITION_SCENE_KEY in settings._thinking_scenes
+        await mod.initialize()
+
+        mp3_ying = _make_mp3_bytes(b"yingmusic-svc-shidarezakura", total_size=720)
+        mp3_seed = _make_mp3_bytes(b"seed-vc-shidarezakura", total_size=680)
+        compute.drive_files["drv-ying-c"] = mp3_ying
+        compute.drive_files["drv-seed-c"] = mp3_seed
+
+        # Deterministic no-op shuffle -> A=yingmusic_svc, B=seed_vc; verdict picks B -> seed_vc!
+        class _FixedNoSwapRng:
+            def shuffle(self, seq: list[Any]) -> None:
+                return None
+
+        mod._audition_rng = _FixedNoSwapRng()  # type: ignore[assignment]
+        hook = compute.hooks["rvc_cover"]
+        await hook(
+            {
+                "id": "job-dual-1",
+                "job_type": "rvc_cover",
+                "status": "succeeded",
+                "payload": {"title": "枝垂桜", "engine": "dual"},
+                "result": {
+                    "title": "枝垂桜",
+                    "artist": "Anna",
+                    "tags": "日系",
+                    "engine_requested": "dual",
+                    "engine_used": "yingmusic_svc",
+                    "digest": hashlib.sha256(mp3_ying).hexdigest(),
+                    "byte_size": len(mp3_ying),
+                    "duration_ms": 48000,
+                    "drive_chorus_id": "drv-ying-c",
+                    "drive_full_id": "drv-ying-f",
+                    "candidates": [
+                        {
+                            "key": "yingmusic_svc",
+                            "engine": "yingmusic_svc",
+                            "status": "succeeded",
+                            "digest": hashlib.sha256(mp3_ying).hexdigest(),
+                            "byte_size": len(mp3_ying),
+                            "duration_ms": 48000,
+                            "drive_chorus_id": "drv-ying-c",
+                            "drive_full_id": "drv-ying-f",
+                            "acoustic_metrics": {
+                                "chorus_mean_db": -12.1,
+                                "chorus_dynamic_range_db": 7.2,
+                                "clipped_peak_flag": False,
+                            },
+                        },
+                        {
+                            "key": "seed_vc",
+                            "engine": "seed_vc",
+                            "status": "succeeded",
+                            "digest": hashlib.sha256(mp3_seed).hexdigest(),
+                            "byte_size": len(mp3_seed),
+                            "duration_ms": 48000,
+                            "drive_chorus_id": "drv-seed-c",
+                            "drive_full_id": "drv-seed-f",
+                            "acoustic_metrics": {
+                                "chorus_mean_db": -11.4,
+                                "chorus_dynamic_range_db": 5.3,
+                                "clipped_peak_flag": False,
+                            },
+                        },
+                    ],
+                },
+            }
+        )
+
+        # 1) Main model: store=False, strict schema, interleaved A/B labels, blind prompt
+        assert len(seen_interactions) == 1
+        req = seen_interactions[0]
+        assert req["model"].startswith("gemini-4-")
+        assert req["store"] is False
+        assert req["response_format"]["mime_type"] == "application/json"
+        assert set(req["response_format"]["schema"]["required"]) == set(
+            SONG_AUDITION_RESPONSE_SCHEMA["required"]
+        )
+        raw_input = req["input"]
+        assert isinstance(raw_input, list) and raw_input
+        blocks = (
+            raw_input[0]["content"]
+            if isinstance(raw_input[0], dict) and "content" in raw_input[0]
+            else raw_input
+        )
+        text_blobs = [b["text"] for b in blocks if b.get("type") == "text"]
+        audio_blobs = [b for b in blocks if b.get("type") == "audio"]
+        assert len(audio_blobs) == 2
+        assert [b["mime_type"] for b in audio_blobs] == ["audio/mp3", "audio/mp3"]
+        assert "【候选A】" in text_blobs and "【候选B】" in text_blobs
+        assert blocks[blocks.index({"type": "text", "text": "【候选A】"}) + 1]["type"] == "audio"
+        assert blocks[blocks.index({"type": "text", "text": "【候选B】"}) + 1]["type"] == "audio"
+        dumped_text = "\n".join(text_blobs) + "\n" + str(req.get("system_instruction", ""))
+        for leaked_engine in ("yingmusic_svc", "seed_vc"):
+            assert leaked_engine not in dumped_text
+
+        # 2) gemini-decision-1 was NEVER called with audio to pick a candidate (text screen only)
+        assert len(seen_decisions) == 1
+        assert not isinstance(seen_decisions[0]["input"], list)
+
+        # 3) Proactive budget lane accounted the audition call
+        usage = await store.usage()
+        proactive_lane = next((x for x in usage["lanes"] if x["lane"] == "proactive"), None)
+        assert proactive_lane is not None and proactive_lane["amount"] > 0
+
+        # 4) Winner is seed_vc (slot B), both takes archived, review_note saved & notified
+        listed = await mod.songs.list()
+        assert len(listed) == 1
+        song = listed[0]
+        assert song["title"] == "枝垂桜"
+        assert song["active_engine"] == "seed_vc"
+        assert song["active_take"] == "seed_vc"
+        assert song["audition_status"] == "picked"
+        assert song["audition_selected_engine"] == "seed_vc"
+        assert "超顺滑" in song["review_note"]
+        assert song["cached_local"] is True
+        assert len(song["takes"]) == 2
+        takes_by_key = {t["key"]: t for t in song["takes"]}
+        assert takes_by_key["seed_vc"]["active"] is True
+        assert takes_by_key["yingmusic_svc"]["active"] is False
+        assert takes_by_key["yingmusic_svc"]["playable"] is True
+        assert "Seed-VC" in proactive.alerts[-1][1]
+        assert "超顺滑" in proactive.alerts[-1][1]
+
+        # 5) Reverse A/B shuffle + overlong verdict text -> sanitized & truncated without fallback
+        class _ReverseRng:
+            def shuffle(self, seq: list[Any]) -> None:
+                seq.reverse()
+
+        verdict_to_return = {
+            "winner": "B",
+            "pick_reason": "副歌衔接非常自然且真唱共鸣很足" * 14,
+            "review_note": "这版高潮听着超顺滑超自然喵~" + "太好听了" * 70,
+            "a_impression": "甲" * 120,
+            "b_impression": "乙" * 125,
+        }
+        mod._audition_rng = _ReverseRng()  # type: ignore[assignment]
+        await hook(
+            {
+                "id": "job-dual-2",
+                "job_type": "rvc_cover",
+                "status": "succeeded",
+                "payload": {"title": "枝垂桜", "engine": "dual"},
+                "result": {
+                    "title": "枝垂桜",
+                    "artist": "Anna",
+                    "tags": "日系",
+                    "engine_requested": "dual",
+                    "candidates": [
+                        {
+                            "key": "yingmusic_svc",
+                            "engine": "yingmusic_svc",
+                            "status": "succeeded",
+                            "digest": hashlib.sha256(mp3_ying).hexdigest(),
+                            "byte_size": len(mp3_ying),
+                            "duration_ms": 48000,
+                            "drive_chorus_id": "drv-ying-c",
+                            "drive_full_id": "drv-ying-f",
+                        },
+                        {
+                            "key": "seed_vc",
+                            "engine": "seed_vc",
+                            "status": "succeeded",
+                            "digest": hashlib.sha256(mp3_seed).hexdigest(),
+                            "byte_size": len(mp3_seed),
+                            "duration_ms": 48000,
+                            "drive_chorus_id": "drv-seed-c",
+                            "drive_full_id": "drv-seed-f",
+                        },
+                    ],
+                },
+            }
+        )
+        song_rev = (await mod.songs.list())[0]
+        assert song_rev["active_engine"] == "yingmusic_svc"
+        assert song_rev["active_take"] == "yingmusic_svc"
+        assert song_rev["audition_status"] == "picked"
+        assert len(song_rev["review_note"]) == 240
+        assert "超顺滑" in song_rev["review_note"]
+        stored_entry = mod.songs._entries[song_rev["id"]]
+        assert len(stored_entry["audition_meta"]["pick_reason"]) == 160
+
+        # 6) SQLite reload preserves takes, review_note, audition_status, and active_engine
+        reloaded = SongLibrary(store, compute=compute)
+        await reloaded.initialize()
+        reloaded_song = (await reloaded.list())[0]
+        assert reloaded_song["active_engine"] == "yingmusic_svc"
+        assert reloaded_song["active_take"] == "yingmusic_svc"
+        assert reloaded_song["audition_status"] == "picked"
+        assert len(reloaded_song["review_note"]) == 240
+        assert "超顺滑" in reloaded_song["review_note"]
+        assert len(reloaded_song["takes"]) == 2
+    finally:
+        await gw.close()
+
+
+async def test_song_studio_audition_graceful_degradation_and_failure_notices(
+    settings, store, monkeypatch: pytest.MonkeyPatch
+):
+    """Single-candidate, gateway errors, oversized inline caps, and SVC failure notifications."""
+    compute = _FakeColabCompute(is_configured=True)
+    proactive = _FakeProactive()
+
+    class _FailingGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate(self, *args: Any, **kwargs: Any) -> str:
+            self.calls += 1
+            raise Rejected("budget_hard_stop")
+
+    gw = _FailingGateway()
+
+    class _FakeColabMod:
+        module_id = "colab_compute"
+
+        def __init__(self) -> None:
+            self.compute = compute
+
+    class _FakeDriveMod:
+        module_id = "drive_sync"
+
+    registry = ModuleRegistry()
+    registry.systems["colab_compute"] = _FakeColabMod()  # type: ignore[assignment]
+    registry.systems["drive_sync"] = _FakeDriveMod()  # type: ignore[assignment]
+    resources = SystemResources(
+        settings=settings,
+        store=store,
+        gateway=gw,  # type: ignore[arg-type]
+        http=None,
+        service=SimpleNamespace(proactive=proactive),  # type: ignore[arg-type]
+    )
+    mod = SongStudioModule(resources, registry)
+    await mod.initialize()
+    hook = compute.hooks["rvc_cover"]
+
+    mp3_a = _make_mp3_bytes(b"single-surviving-seed", total_size=500)
+    compute.drive_files["drv-single-seed"] = mp3_a
+
+    # 1) Dual job where only seed_vc succeeded -> 0 LLM calls, fallback_single
+    await hook(
+        {
+            "id": "job-single-1",
+            "job_type": "rvc_cover",
+            "status": "succeeded",
+            "payload": {"title": "半边成功曲", "engine": "dual"},
+            "result": {
+                "title": "半边成功曲",
+                "engine_requested": "dual",
+                "candidates": [
+                    {
+                        "key": "yingmusic_svc",
+                        "engine": "yingmusic_svc",
+                        "status": "failed",
+                        "error_code": "svc_oom",
+                    },
+                    {
+                        "key": "seed_vc",
+                        "engine": "seed_vc",
+                        "status": "succeeded",
+                        "digest": hashlib.sha256(mp3_a).hexdigest(),
+                        "byte_size": len(mp3_a),
+                        "duration_ms": 30000,
+                        "drive_chorus_id": "drv-single-seed",
+                    },
+                ],
+            },
+        }
+    )
+    assert gw.calls == 0
+    s1 = await mod.songs.get_entry_by_title("半边成功曲")
+    assert s1 is not None
+    assert s1["active_engine"] == "seed_vc"
+    assert s1["audition_status"] == "fallback_single"
+    assert len(s1["takes"]) == 2
+    assert "自动降级" in proactive.alerts[-1][1]
+
+    # 2) Both succeeded but gateway raises budget_hard_stop -> deterministic fallback, both kept
+    mp3_y = _make_mp3_bytes(b"fallback-ying-track", total_size=520)
+    mp3_s = _make_mp3_bytes(b"fallback-seed-track", total_size=510)
+    compute.drive_files["drv-fb-y"] = mp3_y
+    compute.drive_files["drv-fb-s"] = mp3_s
+    await hook(
+        {
+            "id": "job-fb-err",
+            "job_type": "rvc_cover",
+            "status": "succeeded",
+            "payload": {"title": "降级保底曲", "engine": "dual"},
+            "result": {
+                "title": "降级保底曲",
+                "engine_requested": "dual",
+                "candidates": [
+                    {
+                        "key": "seed_vc",
+                        "engine": "seed_vc",
+                        "status": "succeeded",
+                        "digest": hashlib.sha256(mp3_s).hexdigest(),
+                        "byte_size": len(mp3_s),
+                        "duration_ms": 32000,
+                        "drive_chorus_id": "drv-fb-s",
+                    },
+                    {
+                        "key": "yingmusic_svc",
+                        "engine": "yingmusic_svc",
+                        "status": "succeeded",
+                        "digest": hashlib.sha256(mp3_y).hexdigest(),
+                        "byte_size": len(mp3_y),
+                        "duration_ms": 32000,
+                        "drive_chorus_id": "drv-fb-y",
+                    },
+                ],
+            },
+        }
+    )
+    assert gw.calls == 1
+    s2 = await mod.songs.get_entry_by_title("降级保底曲")
+    assert s2 is not None
+    assert s2["active_engine"] == "yingmusic_svc"
+    assert s2["audition_status"] == "fallback_error"
+    assert len(s2["takes"]) == 2
+    assert all(t["playable"] for t in s2["takes"])
+
+    # 3) Inline audio byte cap enforced -> degrades cleanly without losing takes
+    mp3_y2 = _make_mp3_bytes(b"oversize-ying", total_size=530)
+    mp3_s2 = _make_mp3_bytes(b"oversize-seed", total_size=540)
+    compute.drive_files["drv-os-y"] = mp3_y2
+    compute.drive_files["drv-os-s"] = mp3_s2
+    monkeypatch.setattr("hakimi.audio_media.MAX_INLINE_AUDIO_BYTES", 200)
+    await hook(
+        {
+            "id": "job-os-1",
+            "job_type": "rvc_cover",
+            "status": "succeeded",
+            "payload": {"title": "超限降级曲", "engine": "dual"},
+            "result": {
+                "title": "超限降级曲",
+                "engine_requested": "dual",
+                "candidates": [
+                    {
+                        "key": "yingmusic_svc",
+                        "engine": "yingmusic_svc",
+                        "status": "succeeded",
+                        "digest": hashlib.sha256(mp3_y2).hexdigest(),
+                        "byte_size": len(mp3_y2),
+                        "duration_ms": 20000,
+                        "drive_chorus_id": "drv-os-y",
+                    },
+                    {
+                        "key": "seed_vc",
+                        "engine": "seed_vc",
+                        "status": "succeeded",
+                        "digest": hashlib.sha256(mp3_s2).hexdigest(),
+                        "byte_size": len(mp3_s2),
+                        "duration_ms": 20000,
+                        "drive_chorus_id": "drv-os-s",
+                    },
+                ],
+            },
+        }
+    )
+    assert gw.calls == 1  # Exceeded inline cap -> gateway never invoked
+    s3 = await mod.songs.get_entry_by_title("超限降级曲")
+    assert s3 is not None and s3["audition_status"] == "fallback_error" and len(s3["takes"]) == 2
+
+    # 4) New failure error code notifications
+    await hook(
+        {
+            "id": "job-noref",
+            "job_type": "rvc_cover",
+            "status": "failed",
+            "error_code": "ref_voice_not_found",
+            "payload": {"title": "缺干声曲"},
+            "result": {},
+        }
+    )
+    assert "参考干声" in proactive.alerts[-1][1]
+    await hook(
+        {
+            "id": "job-allfail",
+            "job_type": "rvc_cover",
+            "status": "failed",
+            "error_code": "svc_all_engines_failed",
+            "payload": {"title": "双挂曲"},
+            "result": {},
+        }
+    )
+    assert "双引擎 SVC" in proactive.alerts[-1][1]
+
+
+async def test_song_multi_take_admin_api_commands_and_owner_chat_actions(
+    settings, fake_ffmpeg_bins, tmp_path: Path
+):
+    """Test take preview/activate APIs, /学歌 engine options, /换歌版本, and owner chat actions."""
+    from hakimi.models import Message
+    from hakimi.outbound_actions import ChatActionTrigger
+
+    ffm, ffp = fake_ffmpeg_bins
+    s = settings.model_copy(
+        update={
+            "data_dir": tmp_path / "multitake_e2e",
+            "admin_token": SecretStr(ADMIN_TOKEN),
+            "owner_qq_id": "20000",
+        }
+    )
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        lib = svc.songs
+        lib.ffmpeg_bin = ffm
+        lib.ffprobe_bin = ffp
+        compute = _FakeColabCompute(is_configured=True)
+        lib.compute = compute
+        svc.colab_compute = compute
+
+        # No multi-take songs yet -> song_studio.switch_version is NOT exposed in owner chat actions
+        initial_actions = [a["action_name"] for a in svc._collect_owner_chat_actions()]
+        assert "song_studio.learn_song" in initial_actions
+        assert "song_studio.switch_version" not in initial_actions
+
+        mp3_ying = _make_mp3_bytes(b"take-ying-audio-data", total_size=420)
+        mp3_seed = _make_mp3_bytes(b"take-seed-audio-data", total_size=430)
+        compute.drive_files["drv-t-ying"] = mp3_ying
+        compute.drive_files["drv-t-seed"] = mp3_seed
+
+        entry = await lib.register_colab_cover(
+            title="枝垂桜",
+            artist="Anna",
+            tags="日系",
+            digest=hashlib.sha256(mp3_ying).hexdigest(),
+            byte_size=len(mp3_ying),
+            duration_ms=45000,
+            drive_chorus_id="drv-t-ying",
+            drive_full_id="drv-t-ying-full",
+            chorus_bytes=mp3_ying,
+            active_engine="yingmusic_svc",
+            active_take="yingmusic_svc",
+            audition_status="picked",
+            review_note="高潮共鸣很饱满喵~",
+            audition_meta={"selected_engine": "yingmusic_svc"},
+            takes=[
+                {
+                    "key": "yingmusic_svc",
+                    "engine": "yingmusic_svc",
+                    "status": "succeeded",
+                    "digest": hashlib.sha256(mp3_ying).hexdigest(),
+                    "byte_size": len(mp3_ying),
+                    "duration_ms": 45000,
+                    "drive_chorus_id": "drv-t-ying",
+                    "drive_full_id": "drv-t-ying-full",
+                },
+                {
+                    "key": "seed_vc",
+                    "engine": "seed_vc",
+                    "status": "succeeded",
+                    "digest": hashlib.sha256(mp3_seed).hexdigest(),
+                    "byte_size": len(mp3_seed),
+                    "duration_ms": 45000,
+                    "drive_chorus_id": "drv-t-seed",
+                    "drive_full_id": "drv-t-seed-full",
+                },
+                {
+                    "key": "rvc",
+                    "engine": "rvc",
+                    "status": "failed",
+                    "error_code": "model_not_found",
+                },
+            ],
+        )
+        song_id = entry["id"]
+
+        # Multi-take song exists -> song_studio.switch_version IS now exposed in owner chat actions
+        with_switch = [a["action_name"] for a in svc._collect_owner_chat_actions()]
+        assert "song_studio.switch_version" in with_switch
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        ) as client:
+            # Preview active & non-active takes via path params (no query params)
+            r_ying = await client.get(f"/admin/api/songs/{song_id}/takes/yingmusic_svc/audio")
+            assert r_ying.status_code == 200 and r_ying.content == mp3_ying
+            r_seed = await client.get(f"/admin/api/songs/{song_id}/takes/seed_vc/audio")
+            assert r_seed.status_code == 200 and r_seed.content == mp3_seed
+
+            # Failed / missing / invalid take error codes
+            assert (
+                await client.get(f"/admin/api/songs/{song_id}/takes/rvc/audio")
+            ).status_code == 409
+            assert (
+                await client.get(f"/admin/api/songs/{song_id}/takes/missing/audio")
+            ).status_code == 404
+            assert (
+                await client.get(f"/admin/api/songs/{song_id}/takes/BAD!/audio")
+            ).status_code == 400
+            assert (
+                await client.get(f"/admin/api/songs/{song_id}/takes/seed_vc/audio?x=1")
+            ).status_code == 400
+
+            # Activate seed_vc -> clears old local file, updates SQLite, preserves review_note
+            assert (lib.root / f"{song_id}.mp3").is_file()
+            act = await client.post(f"/admin/api/songs/{song_id}/takes/seed_vc/activate")
+            assert act.status_code == 200
+            act_data = act.json()
+            assert act_data["active_engine"] == "seed_vc"
+            assert act_data["active_take"] == "seed_vc"
+            assert act_data["audition_status"] == "manual"
+            assert act_data["audition_selected_engine"] == "yingmusic_svc"
+            assert act_data["review_note"] == "高潮共鸣很饱满喵~"
+            assert not (lib.root / f"{song_id}.mp3").exists()
+
+            # Delivery now plays the switched seed_vc version!
+            delivered, fmt, mime, dur, canon = await lib.load_for_delivery("枝垂桜")
+            assert delivered == mp3_seed and fmt == "mp3" and mime == "audio/mpeg"
+            assert dur == 45000 and canon == "枝垂桜"
+
+            # POST /admin/api/songs/learn with new engine/ref_voice/svc_steps & validation
+            ok_dual = await client.post(
+                "/admin/api/songs/learn",
+                json={
+                    "title": "夜に駆ける",
+                    "engine": "dual",
+                    "ref_voice": "hakimi_ref.wav",
+                    "svc_steps": 40,
+                    "auto_search": True,
+                },
+            )
+            assert ok_dual.status_code == 200
+            assert ok_dual.json()["engine"] == "dual"
+            assert compute.submitted_jobs[-1][1]["engine"] == "dual"
+            assert compute.submitted_jobs[-1][1]["ref_voice"] == "hakimi_ref.wav"
+            assert compute.submitted_jobs[-1][1]["svc_steps"] == 40
+
+            ok_rvc = await client.post(
+                "/admin/api/songs/learn",
+                json={
+                    "title": "晴天",
+                    "engine": "rvc",
+                    "model_name": "hakimi",
+                    "volume_envelope": 0.2,
+                    "skip_dereverb": True,
+                    "auto_search": True,
+                },
+            )
+            assert ok_rvc.status_code == 200
+            assert ok_rvc.json()["engine"] == "rvc"
+            assert compute.submitted_jobs[-1][1]["volume_envelope"] == 0.2
+            assert compute.submitted_jobs[-1][1]["skip_dereverb"] is True
+
+            bad_eng = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "晴天", "engine": "unknown_engine"},
+            )
+            assert bad_eng.status_code == 400 and bad_eng.json()["detail"] == "invalid_song_engine"
+
+            bad_ref = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "晴天", "ref_voice": "hakimi.pth"},
+            )
+            assert bad_ref.status_code == 400 and bad_ref.json()["detail"] == "invalid_ref_voice"
+
+        # Chat commands: /学歌 with engine & ref, /换歌版本 list & switch
+        owner_dm = Message(
+            platform="onebot",
+            bot_id="10000",
+            event_id="ev-cmd-1",
+            user_id="20000",
+            kind="private",
+            conversation_id="20000",
+            text="/学歌 晴天 engine=seed ref=hakimi_ref.wav pitch=1 gpu=A100",
+            addressed=True,
+            created_at=time.time(),
+        )
+        learn_reply = await svc.command(owner_dm)
+        assert learn_reply is not None and "Seed-VC" in learn_reply
+        assert compute.submitted_jobs[-1][1]["engine"] == "seed_vc"
+        assert compute.submitted_jobs[-1][1]["ref_voice"] == "hakimi_ref.wav"
+        assert compute.submitted_gpus[-1] == "A100"
+
+        list_reply = await svc.command(owner_dm.model_copy(update={"text": "/换歌版本 枝垂桜"}))
+        assert list_reply is not None
+        assert "yingmusic_svc" in list_reply and "seed_vc" in list_reply
+        assert "高潮共鸣很饱满喵~" in list_reply
+
+        switch_reply = await svc.command(
+            owner_dm.model_copy(update={"text": "/换歌版本 枝垂桜 ying"})
+        )
+        assert switch_reply is not None and "YingMusic-SVC" in switch_reply
+        assert (await lib.get_entry_by_title("枝垂桜"))["active_engine"] == "yingmusic_svc"
+
+        # Non-owner denied on /换歌版本
+        stranger_dm = owner_dm.model_copy(
+            update={"user_id": "30000", "conversation_id": "30000", "text": "/换歌版本 枝垂桜 seed"}
+        )
+        with pytest.raises(Rejected, match="owner_private_only"):
+            await svc.command(stranger_dm)
+
+        # Owner chat action: song_studio.switch_version works for owner and is blocked for non-owner
+        await svc._run_owner_chat_action(
+            ChatActionTrigger(
+                action_name="song_studio.switch_version",
+                arguments_json='{"title": "枝垂桜", "take": "seed_vc"}',
+            ),
+            context_message=stranger_dm,
+        )
+        assert (await lib.get_entry_by_title("枝垂桜"))["active_engine"] == "yingmusic_svc"
+
+        await svc._run_owner_chat_action(
+            ChatActionTrigger(
+                action_name="song_studio.switch_version",
+                arguments_json='{"title": "枝垂桜", "take": "seed_vc"}',
+            ),
+            context_message=owner_dm,
+        )
+        assert (await lib.get_entry_by_title("枝垂桜"))["active_engine"] == "seed_vc"
+
+
+async def test_gemini_gateway_audio_labels_validation_vertex_interleaving_and_long_audio_deadline(
+    settings, store, sdk_pair
+):
+    """Verify audio_labels validation, Vertex interleaving, and >60s deadline on GeminiGateway."""
+    import base64
+    import json
+
+    from hakimi.audio_media import ModelAudio
+    from hakimi.gemini import GeminiGateway
+    from hakimi.provider_routing import ProviderRoutingConfig
+    from hakimi.system_modules.song_studio import (
+        SONG_AUDITION_INSTRUCTION,
+        SONG_AUDITION_RESPONSE_SCHEMA,
+        SONG_AUDITION_SCENE_KEY,
+    )
+    from hakimi.thinking_policy import ThinkingScene
+    from tests.test_sdk_contract import decision_response
+
+    settings._thinking_scenes = {
+        SONG_AUDITION_SCENE_KEY: ThinkingScene(
+            SONG_AUDITION_SCENE_KEY,
+            "翻唱原声亲听选片",
+            default="medium",
+            levels=("low", "medium", "high"),
+            output_tokens=1536,
+        )
+    }
+
+    mp3_a = _make_mp3_bytes(b"vertex-audio-a", total_size=300)
+    mp3_b = _make_mp3_bytes(b"vertex-audio-b", total_size=320)
+    a1 = ModelAudio(
+        data=base64.b64encode(mp3_a).decode("ascii"),
+        mime_type="audio/mp3",
+        duration_sec=45.0,
+        byte_size=len(mp3_a),
+        digest=hashlib.sha256(mp3_a).hexdigest(),
+    )
+    a2 = ModelAudio(
+        data=base64.b64encode(mp3_b).decode("ascii"),
+        mime_type="audio/mp3",
+        duration_sec=45.0,
+        byte_size=len(mp3_b),
+        digest=hashlib.sha256(mp3_b).hexdigest(),
+    )
+
+    captured_gc: list[dict[str, Any]] = []
+
+    class _FakeVertexModels:
+        async def generate_content(self, *, model: str, contents: Any, config: Any) -> Any:
+            captured_gc.append({"model": model, "contents": contents, "config": config})
+            verdict = json.dumps(
+                {
+                    "winner": "A",
+                    "pick_reason": "A更自然",
+                    "review_note": "A版很好听喵~",
+                    "a_impression": "自然",
+                    "b_impression": "略闷",
+                },
+                ensure_ascii=False,
+            )
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        finish_reason="STOP",
+                        content=SimpleNamespace(
+                            parts=[SimpleNamespace(text=verdict, thought=False)]
+                        ),
+                    )
+                ],
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=3200,
+                    candidates_token_count=80,
+                    thoughts_token_count=0,
+                    cached_content_token_count=0,
+                    total_token_count=3280,
+                ),
+            )
+
+    fake_vertex = SimpleNamespace(aio=SimpleNamespace(models=_FakeVertexModels()))
+
+    def dec_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=decision_response())
+
+    gw = GeminiGateway(settings, store, *sdk_pair(dec_handler), vertex_chat_client=fake_vertex)
+    try:
+        await gw.routing.initialize()
+        await gw.routing.set_config(
+            ProviderRoutingConfig(
+                vertex_enabled=True,
+                vertex_protocol="generate_content",
+                vertex_fallback_to_gemini=False,
+            )
+        )
+
+        # Invalid audio_labels shapes rejected before dispatch
+        for bad_labels in ("AB", ["【候选A】"], ["", "【候选B】"], [123, "【候选B】"]):
+            with pytest.raises(Rejected, match="invalid_audio"):
+                await gw.generate(
+                    {"task": "audition"},
+                    "system:song_studio",
+                    scenario=SONG_AUDITION_SCENE_KEY,
+                    budget_lane="proactive",
+                    audios=[a1, a2],
+                    audio_labels=bad_labels,  # type: ignore[arg-type]
+                    plugin_instruction=SONG_AUDITION_INSTRUCTION,
+                    response_schema=SONG_AUDITION_RESPONSE_SCHEMA,
+                )
+        assert captured_gc == []
+
+        # Valid Vertex call interleaves labels + audio Parts and raises timeout >= 90s
+        out = await gw.generate(
+            {"task": "audition"},
+            "system:song_studio",
+            scenario=SONG_AUDITION_SCENE_KEY,
+            budget_lane="proactive",
+            audios=[a1, a2],
+            audio_labels=["【候选A】", "【候选B】"],
+            plugin_instruction=SONG_AUDITION_INSTRUCTION,
+            response_schema=SONG_AUDITION_RESPONSE_SCHEMA,
+        )
+        assert json.loads(out)["winner"] == "A"
+        assert len(captured_gc) == 1
+        gc_call = captured_gc[0]
+        assert gc_call["config"].http_options.timeout >= 90_000
+        parts = gc_call["contents"][0].parts
+        # [wire_data_text, label_A, audio_A, label_B, audio_B]
+        assert len(parts) == 5
+        assert parts[1].text == "【候选A】"
+        assert parts[2].inline_data.mime_type == "audio/mp3"
+        assert parts[2].inline_data.data == mp3_a
+        assert parts[3].text == "【候选B】"
+        assert parts[4].inline_data.mime_type == "audio/mp3"
+        assert parts[4].inline_data.data == mp3_b
+    finally:
+        await gw.close()

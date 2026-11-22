@@ -70,8 +70,10 @@ RESUMABLE_CHUNK_GRANULARITY = 256 * 1024
 RESUMABLE_CHUNK_BYTES = 2 * 1024 * 1024  # 2 MiB (8 * 256 KiB); keeps peak RAM <= 4 MiB
 MAX_RESUMABLE_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_REF_VOICE_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_SONG_DOWNLOAD_BYTES = 30 * 1024 * 1024
 MAX_SONG_UPLOAD_BYTES = 30 * 1024 * 1024
+REF_VOICE_EXTENSIONS: frozenset[str] = frozenset({"wav", "flac", "mp3", "m4a", "ogg", "opus"})
 
 _CONFIG_KEY = "song_studio_drive_config"
 _VAULT_CFG_CTX = "admin:song_studio_drive_config"
@@ -159,6 +161,25 @@ def scrub_drive_secrets(text: Any, *extra_secrets: str) -> str:
     for sec in sorted({s for s in extra_secrets if s and len(s) >= 6}, key=len, reverse=True):
         out = out.replace(sec, "[REDACTED]")
     return out[:220]
+
+
+def is_ref_voice_filename(name: Any) -> bool:
+    """Return True when `name` has an allowed Zero-shot SVC reference voice audio extension."""
+    if not isinstance(name, str) or not name.strip():
+        return False
+    _, dot, ext = name.strip().rpartition(".")
+    return bool(dot and ext.lower() in REF_VOICE_EXTENSIONS)
+
+
+def _ref_voice_priority(name: str) -> int:
+    low = name.strip().lower()
+    if low == "hakimi_ref.wav":
+        return 0
+    if low.startswith("hakimi_ref") and low.endswith(".wav"):
+        return 1
+    if low.startswith("hakimi_ref"):
+        return 2
+    return 3
 
 
 def _escape_drive_query_literal(value: str) -> str:
@@ -997,6 +1018,150 @@ class SongDriveStore:
             return None
         return {"pth": remote_pth, "index": remote_idx}
 
+    async def list_models_assets(self) -> dict[str, Any]:
+        """List Zero-shot reference voice audio files and RVC weights in `Hakimi_Songs/models/`."""
+        parent_id = await self._folder_id_for_role("models")
+        q = (
+            f"'{_escape_drive_query_literal(parent_id)}' in parents "
+            f"and mimeType != '{FOLDER_MIME}' and trashed = false"
+        )
+        listing = await self._api_json(
+            "GET",
+            DRIVE_FILES_API,
+            params={
+                "q": q,
+                "fields": "files(id,name,mimeType,size,modifiedTime,parents,trashed)",
+                "orderBy": "modifiedTime desc",
+                "pageSize": "100",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+            },
+        )
+        raw_voices: list[dict[str, Any]] = []
+        pth_stems: set[str] = set()
+        index_stems: set[str] = set()
+
+        for raw in listing.get("files") or []:
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("trashed") is True or raw.get("mimeType") == FOLDER_MIME:
+                continue
+            parents = raw.get("parents")
+            if parents is not None and parents != [parent_id]:
+                continue
+            try:
+                fid = validate_drive_id(str(raw.get("id") or ""))
+            except Rejected:
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            raw_size = raw.get("size")
+            size_val = int(raw_size) if raw_size is not None and str(raw_size).isdigit() else 0
+            low = name.lower()
+            if low.endswith(".pth"):
+                stem = name[:-4].strip()
+                if MODEL_NAME_RE.fullmatch(stem):
+                    pth_stems.add(stem)
+                continue
+            if low.endswith(".index"):
+                stem = name[:-6].strip()
+                if MODEL_NAME_RE.fullmatch(stem):
+                    index_stems.add(stem)
+                continue
+            if is_ref_voice_filename(name):
+                raw_voices.append(
+                    {
+                        "id": fid,
+                        "name": name,
+                        "size": size_val,
+                        "modified_time": str(raw.get("modifiedTime") or ""),
+                        "mime_type": str(raw.get("mimeType") or "application/octet-stream"),
+                    }
+                )
+
+        default_id = ""
+        default_name = ""
+        if raw_voices:
+            best_idx = min(
+                range(len(raw_voices)),
+                key=lambda idx: (_ref_voice_priority(raw_voices[idx]["name"]), idx),
+            )
+            default_id = raw_voices[best_idx]["id"]
+            default_name = raw_voices[best_idx]["name"]
+
+        ref_voices = [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "size": item["size"],
+                "modified_time": item["modified_time"],
+                "default": item["id"] == default_id,
+            }
+            for item in raw_voices
+        ]
+        rvc_models = [
+            {"name": stem, "has_index": stem in index_stems} for stem in sorted(pth_stems)
+        ]
+        return {
+            "ref_voices": ref_voices,
+            "rvc_models": rvc_models,
+            "default_ref_voice": default_name,
+        }
+
+    async def resolve_ref_voice(
+        self,
+        file_id: str = "",
+        filename: str = "",
+    ) -> dict[str, Any]:
+        """Resolve a Zero-shot reference voice audio file strictly inside `Hakimi_Songs/models/`."""
+        if isinstance(file_id, str) and file_id.strip():
+            try:
+                meta = await self._verify_file_in_role(file_id.strip(), "models")
+            except Rejected as exc:
+                if str(exc) == "song_drive_not_found":
+                    raise Rejected("ref_voice_not_found") from None
+                raise
+            name = str(meta.get("name") or "").strip()
+            if not is_ref_voice_filename(name):
+                raise Rejected("invalid_ref_voice")
+            raw_size = meta.get("size")
+            return {
+                "id": str(meta["id"]),
+                "name": name,
+                "size": int(raw_size) if raw_size is not None and str(raw_size).isdigit() else 0,
+                "modified_time": str(meta.get("modifiedTime") or ""),
+                "mime_type": str(meta.get("mimeType") or "application/octet-stream"),
+            }
+        if isinstance(filename, str) and filename.strip():
+            try:
+                clean_name = sanitize_drive_filename(filename)
+            except Rejected:
+                raise Rejected("invalid_ref_voice") from None
+            if not is_ref_voice_filename(clean_name):
+                raise Rejected("invalid_ref_voice")
+            found = await self._resolve_named_file("models", clean_name)
+            if found is None:
+                raise Rejected("ref_voice_not_found")
+            return {
+                "id": found["id"],
+                "name": found["name"],
+                "size": found["size"],
+                "modified_time": found["modified_time"],
+                "mime_type": found["mime_type"],
+            }
+        assets = await self.list_models_assets()
+        for item in assets["ref_voices"]:
+            if item.get("default"):
+                return {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "size": item["size"],
+                    "modified_time": item.get("modified_time", ""),
+                    "mime_type": "application/octet-stream",
+                }
+        raise Rejected("ref_voice_not_found")
+
     async def _download_role_bytes(
         self,
         file_id: str,
@@ -1269,27 +1434,27 @@ class SongDriveStore:
                 req.stream = httpx.ByteStream(b"")
         return status, resp_headers, raw
 
-    async def upload_inbox_stream(
+    async def _upload_role_stream(
         self,
+        role: DriveSubRole,
         filename: str,
         stream: AsyncIterator[bytes],
         *,
         mime_type: str = "application/octet-stream",
         content_length: int | None = None,
-        max_bytes: int = MAX_INBOX_UPLOAD_BYTES,
+        max_bytes: int,
+        hard_limit_bytes: int,
+        too_large_code: str,
+        app_properties: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Stream an audio file into `Hakimi_Songs/inbox/` via Drive v3 Resumable Upload.
-
-        Uses 256 KiB-aligned chunks (default 2 MiB) so uploading up to 100 MiB keeps peak
-        in-process memory strictly bounded (<= 4 MiB).
-        """
+        """Stream an audio file into a scoped Drive subfolder via Resumable Upload."""
         await self.initialize()
         if not self.configured():
             raise Rejected("song_drive_not_configured")
         clean_name = sanitize_drive_filename(filename)
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise Rejected("song_drive_invalid_file")
-        effective_max = min(max_bytes, MAX_INBOX_UPLOAD_BYTES)
+        effective_max = min(max_bytes, hard_limit_bytes)
 
         if content_length is not None:
             if isinstance(content_length, bool) or not isinstance(content_length, int):
@@ -1299,7 +1464,7 @@ class SongDriveStore:
             if content_length == 0:
                 raise Rejected("invalid_song_audio")
             if content_length > effective_max:
-                raise Rejected("song_inbox_upload_too_large")
+                raise Rejected(too_large_code)
 
         resolved_mime = (mime_type or "application/octet-stream").split(";")[0].strip()
         if not resolved_mime:
@@ -1316,11 +1481,11 @@ class SongDriveStore:
                 first_non_empty = bytes(part)
 
         if len(first_non_empty) > effective_max:
-            raise Rejected("song_inbox_upload_too_large")
+            raise Rejected(too_large_code)
 
-        parent_id = await self._folder_id_for_role("inbox")
-        existing = await self._resolve_named_file("inbox", clean_name)
-        props = _build_app_properties("inbox", None)
+        parent_id = await self._folder_id_for_role(role)
+        existing = await self._resolve_named_file(role, clean_name)
+        props = _build_app_properties(role, app_properties)
         upload_url = await self._start_resumable_session(
             parent_id,
             clean_name,
@@ -1339,7 +1504,7 @@ class SongDriveStore:
         async def _feed_bytes(data: bytes) -> None:
             nonlocal offset, total_seen
             if total_seen + len(data) > effective_max:
-                raise Rejected("song_inbox_upload_too_large")
+                raise Rejected(too_large_code)
             total_seen += len(data)
             view = memoryview(data)
             pos = 0
@@ -1412,6 +1577,59 @@ class SongDriveStore:
             buf.clear()
             if not completed:
                 await self._abort_resumable_session(upload_url)
+
+    async def upload_inbox_stream(
+        self,
+        filename: str,
+        stream: AsyncIterator[bytes],
+        *,
+        mime_type: str = "application/octet-stream",
+        content_length: int | None = None,
+        max_bytes: int = MAX_INBOX_UPLOAD_BYTES,
+    ) -> dict[str, Any]:
+        """Stream an audio file into `Hakimi_Songs/inbox/` via Drive v3 Resumable Upload.
+
+        Uses 256 KiB-aligned chunks (default 2 MiB) so uploading up to 100 MiB keeps peak
+        in-process memory strictly bounded (<= 4 MiB).
+        """
+        return await self._upload_role_stream(
+            "inbox",
+            filename,
+            stream,
+            mime_type=mime_type,
+            content_length=content_length,
+            max_bytes=max_bytes,
+            hard_limit_bytes=MAX_INBOX_UPLOAD_BYTES,
+            too_large_code="song_inbox_upload_too_large",
+        )
+
+    async def upload_ref_voice_stream(
+        self,
+        filename: str,
+        stream: AsyncIterator[bytes],
+        *,
+        mime_type: str = "application/octet-stream",
+        content_length: int | None = None,
+        max_bytes: int = MAX_REF_VOICE_UPLOAD_BYTES,
+    ) -> dict[str, Any]:
+        """Stream a Zero-shot reference voice audio file into `Hakimi_Songs/models/` (<= 20 MiB)."""
+        try:
+            clean_name = sanitize_drive_filename(filename)
+        except Rejected:
+            raise Rejected("invalid_ref_voice") from None
+        if not is_ref_voice_filename(clean_name):
+            raise Rejected("invalid_ref_voice")
+        return await self._upload_role_stream(
+            "models",
+            clean_name,
+            stream,
+            mime_type=mime_type,
+            content_length=content_length,
+            max_bytes=max_bytes,
+            hard_limit_bytes=MAX_REF_VOICE_UPLOAD_BYTES,
+            too_large_code="song_ref_voice_too_large",
+            app_properties={"asset_kind": "ref_voice"},
+        )
 
     async def _upload_role_bytes(
         self,

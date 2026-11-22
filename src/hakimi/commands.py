@@ -16,6 +16,7 @@ from .affection import _validate_platform_user
 from .memes import MAX_UPLOAD_BYTES, validate_meme_label
 from .models import Message
 from .security import Rejected, owner
+from .songs import DEFAULT_COVER_ENGINE, normalize_cover_engine, normalize_take_key
 
 PermissionMode = Literal["public", "group_owner", "owner", "owner_private"]
 CommandHandler = Callable[[Any, Message, str], Awaitable[str | None]]
@@ -39,7 +40,9 @@ HELP = """哈基米在这里。私聊可直接提问或发 B 站视频；群聊�
 /mute-approve <编号> 或 /mute-reject <编号>：批准或驳回屏蔽申请
 （如需同时删除好友，须在 /mute 或 /mute-approve 末尾加 --delete-friend）
 /affection [QQ] [分数]（或 /好感度）：查看或调整指定用户好感度档案（仅主人私聊）
-/学歌 <歌名> [pitch=-24..24]（或 /learn-song）：提交 Colab 学歌任务（可附带音频）
+/学歌 <歌名> [engine=dual|yingmusic_svc|seed_vc|rvc] [ref=干声] [pitch=-24..24]（或 /learn-song）：
+  提交 Colab 学歌任务（可附带音频）
+/换歌版本 <歌名> [版本名]（或 /switch-song、/切歌版本）：查看候选版本与点评，或切换默认版本
 /哈基米 订阅 <UP主UID> / /哈基米 退订 <UP主UID>：UP 更新私聊提醒（直播开播监控可在 /admin 添加）
 /哈基米 订阅列表 / /哈基米 报告 / /哈基米 状态：查看订阅、近 7 天巡逻报告与今日额度
 链接与小号巡逻优先阅读公开字幕与热评资料；原片分析受后台开关、时长、体积和每日次数限制。"""
@@ -469,14 +472,35 @@ async def handle_save_meme_command(service: Any, message: Message, raw_label: st
     return f"表情已存好啦：标签「{saved['label']}」，随时可以用~{extra}"
 
 
+_ENGINE_CMD_LABELS = {
+    "dual": "双引擎猫猫亲挑",
+    "yingmusic_svc": "YingMusic-SVC",
+    "seed_vc": "Seed-VC",
+    "rvc": "RVC",
+}
+_SWITCH_KNOWN_TAKES = frozenset(
+    {
+        "ying",
+        "yingmusic",
+        "yingmusic-svc",
+        "yingmusic_svc",
+        "seed",
+        "seedvc",
+        "seed-vc",
+        "seed_vc",
+        "rvc",
+    }
+)
+
+
 async def handle_learn_song_command(service: Any, message: Message, raw_args: str) -> str:
     _enforce_permission(service, message, "owner_private")
     stripped = raw_args.strip()
     if not stripped:
         return (
-            "用法：/学歌 <歌名> [pitch=-24..24] [artist=原唱] [tags=标签] "
-            "[inbox=文件名] [--no-search]；可附带音频文件"
-            "（.mp3/.wav/.flac/.m4a/.ogg/.opus）。"
+            "用法：/学歌 <歌名> [engine=dual|yingmusic_svc|seed_vc|rvc] [ref=干声文件名] "
+            "[pitch=-24..24] [artist=原唱] [tags=标签] [inbox=文件名] [gpu=L4|T4|A100|H100] "
+            "[--no-search]；可附带音频文件（.mp3/.wav/.flac/.m4a/.ogg/.opus）。"
         )
     try:
         tokens = shlex.split(stripped)
@@ -487,6 +511,10 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
     artist = ""
     tags = ""
     inbox_filename = ""
+    engine = DEFAULT_COVER_ENGINE
+    ref_voice = ""
+    model_name = "hakimi"
+    gpu: str | None = None
     pitch = 0
     auto_search = True
     idx = 0
@@ -503,6 +531,41 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
                 auto_search = True
             else:
                 return "auto_search 参数需为 true 或 false。"
+        elif low in {"--engine", "-e"}:
+            if idx + 1 >= len(tokens):
+                return "用法：--engine <dual|yingmusic_svc|seed_vc|rvc>"
+            idx += 1
+            try:
+                engine = normalize_cover_engine(tokens[idx], allow_aliases=True)
+            except Rejected:
+                return "engine 仅支持 dual（默认双引擎）、yingmusic_svc、seed_vc 或 rvc。"
+        elif low.startswith(("engine=", "--engine=", "引擎=")):
+            raw_eng = tok.split("=", 1)[1].strip()
+            try:
+                engine = normalize_cover_engine(raw_eng, allow_aliases=True)
+            except Rejected:
+                return "engine 仅支持 dual（默认双引擎）、yingmusic_svc、seed_vc 或 rvc。"
+        elif low in {"--ref", "--ref-voice"}:
+            if idx + 1 >= len(tokens):
+                return "用法：--ref <云盘models目录参考干声文件名>"
+            idx += 1
+            ref_voice = tokens[idx].strip()
+        elif low.startswith(("ref=", "--ref=", "ref_voice=", "--ref-voice=")):
+            ref_voice = tok.split("=", 1)[1].strip()
+        elif low in {"--model", "-m"}:
+            if idx + 1 >= len(tokens):
+                return "用法：--model <RVC模型名>"
+            idx += 1
+            model_name = tokens[idx].strip()
+        elif low.startswith(("model=", "--model=", "model_name=")):
+            model_name = tok.split("=", 1)[1].strip()
+        elif low in {"--gpu", "-g"}:
+            if idx + 1 >= len(tokens):
+                return "用法：--gpu <L4|T4|A100|H100>"
+            idx += 1
+            gpu = tokens[idx].strip()
+        elif low.startswith(("gpu=", "--gpu=")):
+            gpu = tok.split("=", 1)[1].strip()
         elif low in {"--pitch", "-p"}:
             if idx + 1 >= len(tokens):
                 return "用法：--pitch <整数 -24..24>"
@@ -574,18 +637,25 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
     songs = getattr(service, "songs", None)
     if songs is None or not hasattr(songs, "request_learn_song"):
         return "歌单工坊模块尚未就绪，请稍后再试。"
+    req_kwargs: dict[str, Any] = {
+        "artist": artist,
+        "tags": tags,
+        "pitch": pitch,
+        "engine": engine,
+        "audio_bytes": audio_bytes,
+        "audio_filename": audio_filename,
+        "inbox_filename": inbox_filename,
+        "auto_search": auto_search,
+        "requester": "owner",
+    }
+    if ref_voice:
+        req_kwargs["ref_voice"] = ref_voice
+    if model_name and model_name != "hakimi":
+        req_kwargs["model_name"] = model_name
+    if gpu:
+        req_kwargs["gpu"] = gpu
     try:
-        job = await songs.request_learn_song(
-            raw_title,
-            artist=artist,
-            tags=tags,
-            pitch=pitch,
-            audio_bytes=audio_bytes,
-            audio_filename=audio_filename,
-            inbox_filename=inbox_filename,
-            auto_search=auto_search,
-            requester="owner",
-        )
+        job = await songs.request_learn_song(raw_title, **req_kwargs)
     except Rejected as exc:
         code = str(exc)
         err_map = {
@@ -615,6 +685,13 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
             "song_inbox_upload_too_large": "音频超过 100 MiB 上限，请先压缩或截取后再试。",
             "colab_invalid_job": "提交学歌参数无效，请检查歌名或选项。",
             "colab_gpu_not_allowed": "当前任务不支持所选 GPU 型号，请更换可用显卡喵。",
+            "invalid_song_engine": (
+                "engine 仅支持 dual（默认双引擎）、yingmusic_svc、seed_vc 或 rvc。"
+            ),
+            "invalid_ref_voice": (
+                "参考干声文件名无效，仅支持 models/ 目录下的 .wav/.flac/.mp3/.m4a/.ogg/.opus。"
+            ),
+            "ref_voice_not_found": "未在云盘 Hakimi_Songs/models/ 中找到指定的参考干声文件。",
             "invalid_song_title": (
                 "歌名格式不太对，支持 1～60 字多语种文字、数字与常见标点"
                 '（不可含 / \\ < > " 等特殊符号）。'
@@ -632,6 +709,7 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
 
     job_id = str(job.get("id") or job.get("job_id") or "")
     pitch_note = f"，变调 {pitch:+d}" if pitch else ""
+    engine_label = _ENGINE_CMD_LABELS.get(engine, engine)
     if audio_bytes is not None:
         source_note = "（已使用附带音频）"
     elif inbox_filename:
@@ -639,8 +717,103 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
     else:
         source_note = "（自动检索原曲）"
     return (
-        f"收到！已开始练习《{raw_title}》{source_note}（任务 {job_id}{pitch_note}），"
-        "学好后会来叫你~"
+        f"收到！已开始练习《{raw_title}》{source_note}"
+        f"（{engine_label}，任务 {job_id}{pitch_note}），学好后会来叫你~"
+    )
+
+
+async def handle_switch_song_version_command(service: Any, message: Message, raw_args: str) -> str:
+    _enforce_permission(service, message, "owner_private")
+    stripped = raw_args.strip()
+    if not stripped:
+        return (
+            "用法：/换歌版本 <歌名> [版本名]；不写版本名可查看该曲目所有已保留版本，"
+            "版本名支持 yingmusic_svc（或 ying）、seed_vc（或 seed）、rvc。"
+        )
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError:
+        tokens = stripped.split()
+
+    title_parts: list[str] = []
+    take_key = ""
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        low = tok.lower()
+        if low in {"--take", "--version", "-v"}:
+            if idx + 1 >= len(tokens):
+                return "用法：/换歌版本 <歌名> <版本名>"
+            idx += 1
+            take_key = tokens[idx].strip()
+        elif low.startswith(("take=", "version=", "engine=", "版本=")):
+            take_key = tok.split("=", 1)[1].strip()
+        else:
+            title_parts.append(tok)
+        idx += 1
+
+    if not take_key and len(title_parts) >= 2 and title_parts[-1].lower() in _SWITCH_KNOWN_TAKES:
+        take_key = title_parts.pop()
+
+    raw_title = " ".join(title_parts).strip().strip("《》\"'").strip()
+    if not raw_title:
+        return "请提供歌名，例如：/换歌版本 枝垂桜 seed_vc"
+
+    songs = getattr(service, "songs", None)
+    if songs is None or not hasattr(songs, "switch_take"):
+        return "歌单工坊模块尚未就绪，请稍后再试。"
+
+    if not take_key:
+        entry = await songs.get_entry_by_title(raw_title)
+        if entry is None:
+            return f"歌单里还没找到《{raw_title}》呢~"
+        takes = entry.get("takes") or []
+        if not takes:
+            eng = _ENGINE_CMD_LABELS.get(
+                str(entry.get("active_engine") or ""), str(entry.get("active_engine") or "默认")
+            )
+            return f"《{entry['title']}》当前只有单版本（{eng}），暂无其他候选版本可切换。"
+        lines = [f"《{entry['title']}》已保留版本："]
+        for t in takes:
+            t_label = _ENGINE_CMD_LABELS.get(str(t.get("engine") or ""), str(t.get("engine") or ""))
+            if t.get("active"):
+                mark = "【当前生效】"
+            elif t.get("playable"):
+                mark = "（可切换）"
+            else:
+                mark = "（不可用）"
+            lines.append(f"- {t['key']}（{t_label}）{mark}")
+        note = str(entry.get("review_note") or "").strip()
+        if note:
+            lines.append(f"猫猫试听点评：{note}")
+        lines.append(f"发送 /换歌版本 {entry['title']} <版本名> 即可切换默认播放版本。")
+        return "\n".join(lines)
+
+    try:
+        normalized_take = normalize_take_key(take_key, allow_aliases=True)
+        updated = await songs.switch_take(raw_title, normalized_take, by_title=True)
+    except Rejected as exc:
+        code = str(exc)
+        err_map = {
+            "song_not_found": f"歌单里还没找到《{raw_title}》呢~",
+            "invalid_song_take": (
+                "版本名格式不对，支持 yingmusic_svc（ying）、seed_vc（seed）或 rvc。"
+            ),
+            "song_take_not_found": (
+                f"《{raw_title}》没有保留「{take_key}」这个候选版本，"
+                f"发送 /换歌版本 {raw_title} 可查看可用版本。"
+            ),
+            "song_take_unavailable": f"《{raw_title}》的「{take_key}」版本当前不可播放，无法切换。",
+            "song_already_exists": "目标版本的音频指纹与歌单中其他曲目冲突，暂无法切换。",
+        }
+        return err_map.get(code, f"切换歌曲版本失败（{code}）。")
+
+    eng_label = _ENGINE_CMD_LABELS.get(
+        str(updated.get("active_engine") or ""), str(updated.get("active_engine") or "")
+    )
+    return (
+        f"好呀！已将《{updated['title']}》的默认播放版本切换为 "
+        f"{eng_label}（{updated.get('active_take') or normalized_take}），下次点唱就会唱这版喵~"
     )
 
 
@@ -699,6 +872,15 @@ def build_default_command_registry() -> CommandRegistry:
         dotall=True,
         permission="owner_private",
         description="提交 Colab 学歌任务",
+    )
+    registry.register(
+        "/换歌版本",
+        handle_switch_song_version_command,
+        aliases=("/switch-song", "/切歌版本"),
+        prefix_aliases=("换歌版本", "切歌版本"),
+        dotall=False,
+        permission="owner_private",
+        description="查看或切换歌曲候选版本",
     )
 
     registry.register_prefix("", handle_help_command, aliases=("帮助",), permission="public")

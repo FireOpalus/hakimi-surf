@@ -52,6 +52,14 @@ DEFAULT_CHUNK_MB = 6
 DEFAULT_BACKING_GAIN_DB = -14.0
 MIN_BACKING_GAIN_DB = -24.0
 MAX_BACKING_GAIN_DB = -6.0
+DEFAULT_VOLUME_ENVELOPE = 0.25
+DEFAULT_SKIP_DEREVERB = False
+VALID_COVER_ENGINES: tuple[str, ...] = ("dual", "yingmusic_svc", "seed_vc", "rvc")
+DEFAULT_COVER_ENGINE = "dual"
+DEFAULT_SVC_STEPS = 35
+MIN_SVC_STEPS = 10
+MAX_SVC_STEPS = 100
+DEFAULT_SVC_CFG = 0.7
 STATUS_OK_MARKER = "__HAKIMI_COLAB_STATUS__=OK"
 STATUS_ERR_PREFIX = "__HAKIMI_COLAB_STATUS__=ERROR:"
 DRIVE_OUTPUTS_PREFIX = "__HAKIMI_DRIVE_OUTPUTS__="
@@ -934,18 +942,41 @@ def exec_remote_worker(
 
 
 def probe_warm_session(session: str) -> dict[str, Any]:
-    """Check whether a warm-kept Colab session is responsive and already setup-ready."""
+    """Check whether a warm-kept Colab session is responsive and setup-ready per capability."""
     code = (
         "import json\n"
         "from pathlib import Path\n"
-        "ready = (\n"
+        "sep_ready = (\n"
+        "    (Path('/content/.hakimi_sep_setup_done').is_file() "
+        "or Path('/content/.hakimi_setup_done').is_file())\n"
+        "    and Path('/content/sep-venv/bin/python').exists()\n"
+        ")\n"
+        "svc_ready = (\n"
+        "    Path('/content/.hakimi_svc_setup_done').is_file()\n"
+        "    and Path('/content/svc-venv/bin/python').exists()\n"
+        ")\n"
+        "rvc_ready = (\n"
         "    Path('/content/.hakimi_setup_done').is_file()\n"
         "    and Path('/content/rvc-venv/bin/python').exists()\n"
         "    and Path('/content/sep-venv/bin/python').exists()\n"
         ")\n"
-        "payload = json.dumps({'ok': True, 'setup_ready': ready})\n"
+        "ready = bool(rvc_ready or (sep_ready and svc_ready))\n"
+        "payload = json.dumps({\n"
+        "    'ok': True,\n"
+        "    'setup_ready': ready,\n"
+        "    'sep_ready': sep_ready,\n"
+        "    'svc_ready': svc_ready,\n"
+        "    'rvc_ready': rvc_ready,\n"
+        "})\n"
         "print('__HAKIMI_WARM_PROBE__=' + payload, flush=True)\n"
     )
+    unhealthy = {
+        "healthy": False,
+        "setup_ready": False,
+        "sep_ready": False,
+        "svc_ready": False,
+        "rvc_ready": False,
+    }
     try:
         rc, out = _run_colab(
             ["exec", "-s", session, "--timeout", "25"],
@@ -955,13 +986,20 @@ def probe_warm_session(session: str) -> dict[str, Any]:
             check=False,
         )
     except Exception:
-        return {"healthy": False, "setup_ready": False}
+        return unhealthy
     if rc != 0:
-        return {"healthy": False, "setup_ready": False}
+        return unhealthy
     parsed = _parse_prefixed_json(out, "__HAKIMI_WARM_PROBE__=")
     if not parsed or not parsed.get("ok"):
-        return {"healthy": False, "setup_ready": False}
-    return {"healthy": True, "setup_ready": bool(parsed.get("setup_ready"))}
+        return unhealthy
+    setup_ready = bool(parsed.get("setup_ready"))
+    return {
+        "healthy": True,
+        "setup_ready": setup_ready,
+        "sep_ready": bool(parsed.get("sep_ready", setup_ready)),
+        "svc_ready": bool(parsed.get("svc_ready", False)),
+        "rvc_ready": bool(parsed.get("rvc_ready", setup_ready)),
+    }
 
 
 def _ensure_remote_dirs(session: str, remote_dirs: list[str]) -> None:
@@ -1417,6 +1455,23 @@ def _validate_bool_flag(name: str, value: Any) -> None:
         raise ValueError(f"{name} must be a boolean")
 
 
+def _validate_cover_engine(engine: str) -> str:
+    norm = str(engine or "").strip().lower()
+    if norm not in VALID_COVER_ENGINES:
+        raise ValueError(f"Unsupported cover engine: {engine!r}")
+    return norm
+
+
+def _validate_svc_steps(steps: int | None) -> int | None:
+    if steps is None:
+        return None
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise ValueError("svc_steps must be an integer, not bool")
+    if not (MIN_SVC_STEPS <= steps <= MAX_SVC_STEPS):
+        raise ValueError(f"svc_steps must be between {MIN_SVC_STEPS} and {MAX_SVC_STEPS}")
+    return steps
+
+
 def run_cover_pipeline(
     *,
     session: str,
@@ -1424,26 +1479,33 @@ def run_cover_pipeline(
     source_path: Path | None = None,
     pth_path: Path | None = None,
     index_path: Path | None = None,
+    ref_audio_path: Path | None = None,
     cover_dir: Path,
+    engine: str | None = None,
+    svc_steps: int | None = None,
+    svc_cfg: float = DEFAULT_SVC_CFG,
     model_name: str = "hakimi",
     pitch: int = 0,
     index_rate: float = 0.15,
     protect: float = 0.42,
-    volume_envelope: float = 0.12,
+    volume_envelope: float = DEFAULT_VOLUME_ENVELOPE,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
     skip_backing: bool = True,
-    skip_dereverb: bool = True,
+    skip_dereverb: bool = DEFAULT_SKIP_DEREVERB,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
     fallback_start_sec: float = 60.0,
     ensure_local_source_fn: Callable[[], Path] | None = None,
     ensure_local_model_fn: Callable[[], tuple[Path, Path]] | None = None,
+    ensure_local_ref_fn: Callable[[], Path] | None = None,
     drive_access_token: str = "",
     drive_source_file_id: str = "",
     drive_source_ext: str = ".m4a",
     drive_pth_file_id: str = "",
     drive_index_file_id: str = "",
+    drive_ref_audio_file_id: str = "",
+    drive_ref_audio_ext: str = ".wav",
     drive_songs_folder_id: str = "",
     cover_prefix: str = "",
     song_title: str = "",
@@ -1458,12 +1520,36 @@ def run_cover_pipeline(
     reuse_session: bool = False,
     reused_gpu: str = "",
     reused_setup_ready: bool = False,
+    reused_sep_ready: bool | None = None,
+    reused_svc_ready: bool | None = None,
+    reused_rvc_ready: bool | None = None,
     keep_session_on_success: bool = False,
 ) -> dict[str, Any]:
-    """Run Colab RVC cover with Drive direct transfer, warm session reuse, and weight cache."""
+    """Run Colab SVC/RVC cover with Drive direct transfer, warm session reuse, and weight cache."""
     _validate_bool_flag("skip_backing", skip_backing)
     _validate_bool_flag("skip_dereverb", skip_dereverb)
     clamped_backing_gain_db = _validate_backing_gain_db(backing_gain_db)
+    validated_steps = _validate_svc_steps(svc_steps)
+    if isinstance(svc_cfg, bool) or not math.isfinite(float(svc_cfg)):
+        raise ValueError("svc_cfg must be a finite float")
+    clamped_svc_cfg = max(0.0, min(1.5, float(svc_cfg)))
+
+    if engine is None or not str(engine).strip():
+        has_ref_hint = bool(
+            ref_audio_path is not None or drive_ref_audio_file_id or ensure_local_ref_fn is not None
+        )
+        has_rvc_hint = bool(
+            pth_path is not None
+            or index_path is not None
+            or drive_pth_file_id
+            or drive_index_file_id
+            or ensure_local_model_fn is not None
+        )
+        effective_engine = "rvc" if (has_rvc_hint and not has_ref_hint) else DEFAULT_COVER_ENGINE
+    else:
+        effective_engine = _validate_cover_engine(engine)
+    is_rvc = effective_engine == "rvc"
+
     warm_reused = bool(reuse_session and reused_gpu)
     assigned_gpu = reused_gpu if warm_reused else provision_gpu(session, gpu=gpu_spec)
     can_keep_session = bool(keep_session_on_success and assigned_gpu in {"L4", "T4"})
@@ -1499,9 +1585,28 @@ def run_cover_pipeline(
             return pth_path, index_path
         raise FileNotFoundError("Local RVC model files unavailable for WS fallback")
 
+    def _resolve_local_ref() -> Path:
+        nonlocal ref_audio_path
+        if ref_audio_path is not None and ref_audio_path.is_file():
+            return ref_audio_path
+        if ensure_local_ref_fn is not None:
+            ref_audio_path = ensure_local_ref_fn()
+            return ref_audio_path
+        raise FileNotFoundError("Local SVC reference voice unavailable for WS fallback")
+
+    if is_rvc:
+        profile_setup_ready = (
+            reused_rvc_ready if reused_rvc_ready is not None else reused_setup_ready
+        )
+    else:
+        eff_sep = reused_sep_ready if reused_sep_ready is not None else reused_setup_ready
+        eff_svc = reused_svc_ready if reused_svc_ready is not None else reused_setup_ready
+        profile_setup_ready = bool(eff_sep and eff_svc)
+
     try:
-        if not (warm_reused and reused_setup_ready):
-            setup_env: dict[str, str] = {"HAKIMI_SETUP_MODE": "cover"}
+        if not (warm_reused and profile_setup_ready):
+            setup_mode = "cover" if is_rvc else "svc"
+            setup_env: dict[str, str] = {"HAKIMI_SETUP_MODE": setup_mode}
             if drive_access_token and (cache_folder_id or cache_weights_file_id):
                 setup_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
                 if cache_folder_id:
@@ -1510,15 +1615,15 @@ def run_cover_pipeline(
                     setup_env["HAKIMI_CACHE_WEIGHTS_FILE_ID"] = cache_weights_file_id
                 if cache_weights_sha256:
                     setup_env["HAKIMI_CACHE_WEIGHTS_SHA256"] = cache_weights_sha256
-                if cache_venv_enabled:
+                if is_rvc and cache_venv_enabled:
                     setup_env["HAKIMI_CACHE_VENV_ENABLED"] = "1"
-                if cache_venv_file_id:
+                if is_rvc and cache_venv_file_id:
                     setup_env["HAKIMI_CACHE_VENV_FILE_ID"] = cache_venv_file_id
-                if cache_venv_sha256:
+                if is_rvc and cache_venv_sha256:
                     setup_env["HAKIMI_CACHE_VENV_SHA256"] = cache_venv_sha256
-                if cache_venv_fingerprint:
+                if is_rvc and cache_venv_fingerprint:
                     setup_env["HAKIMI_CACHE_VENV_FINGERPRINT"] = cache_venv_fingerprint
-                if cache_writeback:
+                if is_rvc and cache_writeback:
                     setup_env["HAKIMI_CACHE_WRITEBACK"] = "1"
             setup_out = exec_remote_worker(session, "setup", setup_env)
             c_stat = _parse_prefixed_json(setup_out, CACHE_STATUS_PREFIX) or {}
@@ -1532,14 +1637,26 @@ def run_cover_pipeline(
 
         remote_pth = f"/content/out/{model_name}.pth"
         remote_idx = f"/content/out/{model_name}.index"
-        use_direct_model = bool(drive_access_token and drive_pth_file_id and drive_index_file_id)
+        ref_ext = drive_ref_audio_ext if drive_ref_audio_ext.startswith(".") else ".wav"
+        remote_ref = f"/content/out/hakimi_ref{ref_ext}"
+
+        use_direct_model = bool(
+            is_rvc and drive_access_token and drive_pth_file_id and drive_index_file_id
+        )
+        use_direct_ref = bool(not is_rvc and drive_access_token and drive_ref_audio_file_id)
         use_direct_source = bool(drive_access_token and drive_source_file_id)
         use_direct_outputs = bool(drive_access_token and drive_songs_folder_id)
 
-        if not use_direct_model:
+        if is_rvc and not use_direct_model:
             loc_pth, loc_idx = _resolve_local_model()
             upload_file_chunked(session, loc_pth, remote_pth, tag=f"{model_name}_pth")
             upload_file_chunked(session, loc_idx, remote_idx, tag=f"{model_name}_idx")
+
+        if not is_rvc and not use_direct_ref:
+            loc_ref = _resolve_local_ref()
+            ref_ext = loc_ref.suffix or ".wav"
+            remote_ref = f"/content/out/hakimi_ref{ref_ext}"
+            upload_file_chunked(session, loc_ref, remote_ref, tag="svc_ref_audio")
 
         if use_direct_source:
             ext = drive_source_ext if drive_source_ext.startswith(".") else ".m4a"
@@ -1551,9 +1668,8 @@ def run_cover_pipeline(
             upload_file_chunked(session, loc_src, remote_source, tag="source_song")
 
         cover_env: dict[str, str] = {
+            "HAKIMI_COVER_ENGINE": effective_engine,
             "HAKIMI_SOURCE_AUDIO": remote_source,
-            "HAKIMI_PTH_PATH": remote_pth,
-            "HAKIMI_INDEX_PATH": remote_idx,
             "HAKIMI_PITCH": str(pitch),
             "HAKIMI_INDEX_RATE": str(index_rate),
             "HAKIMI_PROTECT": str(protect),
@@ -1565,21 +1681,35 @@ def run_cover_pipeline(
             "HAKIMI_DURATION_SEC": str(duration_sec),
             "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
             "HAKIMI_FALLBACK_START_SEC": str(fallback_start_sec),
+            "HAKIMI_SVC_CFG": str(clamped_svc_cfg),
         }
-        if drive_access_token and (use_direct_model or use_direct_source or use_direct_outputs):
+        if validated_steps is not None:
+            cover_env["HAKIMI_SVC_STEPS"] = str(validated_steps)
+        if is_rvc:
+            cover_env["HAKIMI_PTH_PATH"] = remote_pth
+            cover_env["HAKIMI_INDEX_PATH"] = remote_idx
+        else:
+            cover_env["HAKIMI_REF_AUDIO"] = remote_ref
+
+        if drive_access_token and (
+            use_direct_model or use_direct_ref or use_direct_source or use_direct_outputs
+        ):
             cover_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
         if use_direct_source:
             cover_env["HAKIMI_DRIVE_SOURCE_FILE_ID"] = drive_source_file_id
         if use_direct_model:
             cover_env["HAKIMI_DRIVE_PTH_FILE_ID"] = drive_pth_file_id
             cover_env["HAKIMI_DRIVE_INDEX_FILE_ID"] = drive_index_file_id
+        if use_direct_ref:
+            cover_env["HAKIMI_DRIVE_REF_VOICE_FILE_ID"] = drive_ref_audio_file_id
         if use_direct_outputs:
             cover_env["HAKIMI_DRIVE_SONGS_FOLDER_ID"] = drive_songs_folder_id
             cover_env["HAKIMI_COVER_PREFIX"] = cover_prefix or "cover"
             if song_title:
                 cover_env["HAKIMI_SONG_TITLE"] = song_title[:80]
         if (
-            cache_writeback
+            is_rvc
+            and cache_writeback
             and drive_access_token
             and cache_folder_id
             and not warm_reused
@@ -1593,7 +1723,9 @@ def run_cover_pipeline(
         try:
             cover_out = exec_remote_worker(session, "cover", cover_env)
         except RuntimeError as exc:
-            if (use_direct_source or use_direct_model) and "drive_direct_input_failed:" in str(exc):
+            if (
+                use_direct_source or use_direct_model or use_direct_ref
+            ) and "drive_direct_input_failed:" in str(exc):
                 log("Direct Drive input transfer failed; safely falling back to WS chunked upload.")
                 drive_direct_fallback = True
                 if use_direct_model:
@@ -1602,6 +1734,13 @@ def run_cover_pipeline(
                     upload_file_chunked(session, loc_idx, remote_idx, tag=f"{model_name}_idx")
                     cover_env.pop("HAKIMI_DRIVE_PTH_FILE_ID", None)
                     cover_env.pop("HAKIMI_DRIVE_INDEX_FILE_ID", None)
+                if use_direct_ref:
+                    loc_ref = _resolve_local_ref()
+                    ref_ext = loc_ref.suffix or ".wav"
+                    remote_ref = f"/content/out/hakimi_ref{ref_ext}"
+                    upload_file_chunked(session, loc_ref, remote_ref, tag="svc_ref_audio")
+                    cover_env["HAKIMI_REF_AUDIO"] = remote_ref
+                    cover_env.pop("HAKIMI_DRIVE_REF_VOICE_FILE_ID", None)
                 if use_direct_source:
                     loc_src = _resolve_local_source()
                     ext = loc_src.suffix or ".m4a"
@@ -1611,6 +1750,7 @@ def run_cover_pipeline(
                     cover_env.pop("HAKIMI_DRIVE_SOURCE_FILE_ID", None)
                 use_direct_source = False
                 use_direct_model = False
+                use_direct_ref = False
                 cover_out = exec_remote_worker(session, "cover", cover_env)
             else:
                 raise
@@ -1622,6 +1762,7 @@ def run_cover_pipeline(
         drive_outputs = _parse_prefixed_json(cover_out, DRIVE_OUTPUTS_PREFIX)
         chorus_out = drive_outputs.get("chorus") if isinstance(drive_outputs, dict) else None
         full_out = drive_outputs.get("full") if isinstance(drive_outputs, dict) else None
+        cands_out = drive_outputs.get("candidates") if isinstance(drive_outputs, dict) else None
         direct_out_ok = (
             isinstance(chorus_out, dict)
             and bool(chorus_out.get("file_id"))
@@ -1634,15 +1775,19 @@ def run_cover_pipeline(
             drive_direct_used = True
             meta = dict(drive_outputs.get("meta") or {})
             succeeded = True
+            out_drive_map: dict[str, Any] = {
+                "chorus": chorus_out,
+                "full": full_out if isinstance(full_out, dict) else {},
+            }
+            if isinstance(cands_out, list):
+                out_drive_map["candidates"] = cands_out
             return {
                 "assigned_gpu": assigned_gpu,
                 "full_mp3": None,
                 "chorus_mp3": None,
+                "candidate_files": {},
                 "meta": meta,
-                "drive_outputs": {
-                    "chorus": chorus_out,
-                    "full": full_out if isinstance(full_out, dict) else {},
-                },
+                "drive_outputs": out_drive_map,
                 "session_kept": can_keep_session,
                 "acceleration": {
                     "drive_direct": True,
@@ -1658,7 +1803,7 @@ def run_cover_pipeline(
         if use_direct_outputs:
             drive_direct_fallback = True
             log("Direct Drive cover upload did not complete; falling back to WS chunk download.")
-        if use_direct_source or use_direct_model:
+        if use_direct_source or use_direct_model or use_direct_ref:
             drive_direct_used = True
 
         cover_dir.mkdir(parents=True, exist_ok=True)
@@ -1672,11 +1817,32 @@ def run_cover_pipeline(
             idle_timeout=90.0,
         )
         meta = json.loads(meta_json.read_text(encoding="utf-8"))
+        candidate_files: dict[str, dict[str, Path]] = {}
+        raw_cands = meta.get("candidates")
+        if isinstance(raw_cands, list):
+            for cand in raw_cands:
+                if not isinstance(cand, dict) or cand.get("status") != "succeeded":
+                    continue
+                eng = str(cand.get("engine") or "").strip()
+                if not eng:
+                    continue
+                c_chorus_dir = str(cand.get("chorus_chunk_dir") or "")
+                c_full_dir = str(cand.get("full_chunk_dir") or "")
+                if c_chorus_dir and c_full_dir:
+                    c_chorus_local = cover_dir / f"cover_{eng}_chorus.mp3"
+                    c_full_local = cover_dir / f"cover_{eng}_full.mp3"
+                    download_chunked_dir(session, c_full_dir, c_full_local)
+                    download_chunked_dir(session, c_chorus_dir, c_chorus_local)
+                    candidate_files[eng] = {
+                        "full_mp3": c_full_local,
+                        "chorus_mp3": c_chorus_local,
+                    }
         succeeded = True
         return {
             "assigned_gpu": assigned_gpu,
             "full_mp3": full_mp3,
             "chorus_mp3": chorus_mp3,
+            "candidate_files": candidate_files,
             "meta": meta,
             "drive_outputs": None,
             "session_kept": can_keep_session,
@@ -1986,8 +2152,11 @@ def _run_remote_cover(
     session: str,
     *,
     source_path: Path,
-    remote_pth: str,
-    remote_idx: str,
+    remote_pth: str = "",
+    remote_idx: str = "",
+    remote_ref: str = "",
+    engine: str = "rvc",
+    svc_steps: int | None = None,
     cover_dir: Path,
     pitch: int,
     index_rate: float,
@@ -1999,34 +2168,40 @@ def _run_remote_cover(
     fallback_start_sec: float,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
     skip_backing: bool = True,
-    skip_dereverb: bool = True,
+    skip_dereverb: bool = DEFAULT_SKIP_DEREVERB,
 ) -> tuple[Path, Path, dict[str, Any]]:
     _validate_bool_flag("skip_backing", skip_backing)
     _validate_bool_flag("skip_dereverb", skip_dereverb)
     clamped_backing_gain_db = _validate_backing_gain_db(backing_gain_db)
+    effective_engine = _validate_cover_engine(engine)
+    validated_steps = _validate_svc_steps(svc_steps)
     ext = source_path.suffix or ".m4a"
     remote_source = f"/content/work/source_song{ext}"
     upload_file_chunked(session, source_path, remote_source, tag="source_song")
-    exec_remote_worker(
-        session,
-        "cover",
-        {
-            "HAKIMI_SOURCE_AUDIO": remote_source,
-            "HAKIMI_PTH_PATH": remote_pth,
-            "HAKIMI_INDEX_PATH": remote_idx,
-            "HAKIMI_PITCH": str(pitch),
-            "HAKIMI_INDEX_RATE": str(index_rate),
-            "HAKIMI_PROTECT": str(protect),
-            "HAKIMI_VOLUME_ENVELOPE": str(volume_envelope),
-            "HAKIMI_BACKING_GAIN_DB": f"{clamped_backing_gain_db:.1f}",
-            "HAKIMI_SKIP_BACKING": "1" if skip_backing else "0",
-            "HAKIMI_SKIP_DEREVERB": "1" if skip_dereverb else "0",
-            "HAKIMI_START_SEC": str(start_sec),
-            "HAKIMI_DURATION_SEC": str(duration_sec),
-            "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
-            "HAKIMI_FALLBACK_START_SEC": str(fallback_start_sec),
-        },
-    )
+    env_vars: dict[str, str] = {
+        "HAKIMI_COVER_ENGINE": effective_engine,
+        "HAKIMI_SOURCE_AUDIO": remote_source,
+        "HAKIMI_PITCH": str(pitch),
+        "HAKIMI_INDEX_RATE": str(index_rate),
+        "HAKIMI_PROTECT": str(protect),
+        "HAKIMI_VOLUME_ENVELOPE": str(volume_envelope),
+        "HAKIMI_BACKING_GAIN_DB": f"{clamped_backing_gain_db:.1f}",
+        "HAKIMI_SKIP_BACKING": "1" if skip_backing else "0",
+        "HAKIMI_SKIP_DEREVERB": "1" if skip_dereverb else "0",
+        "HAKIMI_START_SEC": str(start_sec),
+        "HAKIMI_DURATION_SEC": str(duration_sec),
+        "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
+        "HAKIMI_FALLBACK_START_SEC": str(fallback_start_sec),
+    }
+    if remote_pth:
+        env_vars["HAKIMI_PTH_PATH"] = remote_pth
+    if remote_idx:
+        env_vars["HAKIMI_INDEX_PATH"] = remote_idx
+    if remote_ref:
+        env_vars["HAKIMI_REF_AUDIO"] = remote_ref
+    if validated_steps is not None:
+        env_vars["HAKIMI_SVC_STEPS"] = str(validated_steps)
+    exec_remote_worker(session, "cover", env_vars)
     cover_dir.mkdir(parents=True, exist_ok=True)
     full_mp3 = cover_dir / "cover_full.mp3"
     chorus_mp3 = cover_dir / "cover_chorus.mp3"
@@ -2083,25 +2258,46 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_cover(args: argparse.Namespace) -> int:
+    engine = _validate_cover_engine(args.engine)
+    is_rvc = engine == "rvc"
     pth_local = args.model_dir / f"{args.model_name}.pth"
     idx_local = args.model_dir / f"{args.model_name}.index"
-    if not pth_local.is_file() or not idx_local.is_file():
-        raise FileNotFoundError(
-            f"Local model files not found in {args.model_dir}; run train first."
-        )
+    ref_local: Path | None = args.ref_audio
+    if is_rvc:
+        if not pth_local.is_file() or not idx_local.is_file():
+            raise FileNotFoundError(
+                f"Local model files not found in {args.model_dir}; run train first."
+            )
+    else:
+        if ref_local is None or not ref_local.is_file():
+            raise FileNotFoundError(
+                f"SVC reference audio required via --ref-audio for engine={engine!r}."
+            )
     cover_dir = COVERS_DIR / _slugify(args.title)
     provision_gpu(args.session, gpu=args.gpu, strict_gpu=args.strict_gpu, high_mem=args.high_mem)
     try:
-        exec_remote_worker(args.session, "setup", {"HAKIMI_SETUP_MODE": "cover"})
-        remote_pth = f"/content/out/{args.model_name}.pth"
-        remote_idx = f"/content/out/{args.model_name}.index"
-        upload_file_chunked(args.session, pth_local, remote_pth, tag=f"{args.model_name}_pth")
-        upload_file_chunked(args.session, idx_local, remote_idx, tag=f"{args.model_name}_idx")
+        setup_mode = "cover" if is_rvc else "svc"
+        exec_remote_worker(args.session, "setup", {"HAKIMI_SETUP_MODE": setup_mode})
+        remote_pth = ""
+        remote_idx = ""
+        remote_ref = ""
+        if is_rvc:
+            remote_pth = f"/content/out/{args.model_name}.pth"
+            remote_idx = f"/content/out/{args.model_name}.index"
+            upload_file_chunked(args.session, pth_local, remote_pth, tag=f"{args.model_name}_pth")
+            upload_file_chunked(args.session, idx_local, remote_idx, tag=f"{args.model_name}_idx")
+        else:
+            assert ref_local is not None
+            remote_ref = f"/content/out/hakimi_ref{ref_local.suffix or '.wav'}"
+            upload_file_chunked(args.session, ref_local, remote_ref, tag="svc_ref_audio")
         _, chorus_mp3, meta = _run_remote_cover(
             args.session,
             source_path=args.source,
             remote_pth=remote_pth,
             remote_idx=remote_idx,
+            remote_ref=remote_ref,
+            engine=engine,
+            svc_steps=args.svc_steps,
             cover_dir=cover_dir,
             pitch=args.pitch,
             index_rate=args.index_rate,
@@ -2241,18 +2437,25 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--batch-size", type=int, default=12)
         p.add_argument("--sample-rate", type=int, default=48000)
 
-    def _add_cover_opts(p: argparse.ArgumentParser) -> None:
+    def _add_cover_opts(p: argparse.ArgumentParser, *, default_engine: str = "dual") -> None:
         p.add_argument("--source", type=Path, required=True)
         p.add_argument("--title", required=True)
         p.add_argument("--artist", default="")
         p.add_argument("--tags", default="")
+        p.add_argument("--engine", choices=VALID_COVER_ENGINES, default=default_engine)
+        p.add_argument("--ref-audio", type=Path, default=None)
+        p.add_argument("--svc-steps", type=int, default=None)
         p.add_argument("--pitch", type=int, default=0)
         p.add_argument("--index-rate", type=float, default=0.15)
         p.add_argument("--protect", type=float, default=0.42)
-        p.add_argument("--volume-envelope", type=float, default=0.12)
+        p.add_argument("--volume-envelope", type=float, default=DEFAULT_VOLUME_ENVELOPE)
         p.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
         p.add_argument("--skip-backing", action=argparse.BooleanOptionalAction, default=True)
-        p.add_argument("--skip-dereverb", action=argparse.BooleanOptionalAction, default=True)
+        p.add_argument(
+            "--skip-dereverb",
+            action=argparse.BooleanOptionalAction,
+            default=DEFAULT_SKIP_DEREVERB,
+        )
         p.add_argument("--start", default="auto")
         p.add_argument("--duration", type=float, default=50.0)
         p.add_argument("--chorus-anchor", default="")
@@ -2268,14 +2471,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--min-seconds", type=float, default=300.0)
     p_train.add_argument("--dataset-tar", type=Path, default=None)
 
-    p_cover = sub.add_parser("cover", help="Generate RVC cover on Colab GPU and upload to admin.")
+    p_cover = sub.add_parser(
+        "cover", help="Generate SVC/RVC cover on Colab GPU and upload to admin."
+    )
     _add_session_opts(p_cover)
-    _add_cover_opts(p_cover)
+    _add_cover_opts(p_cover, default_engine=DEFAULT_COVER_ENGINE)
 
     p_all = sub.add_parser("all", help="Build dataset -> train -> cover -> upload in one GPU VM.")
     _add_session_opts(p_all)
     _add_train_opts(p_all)
-    _add_cover_opts(p_all)
+    _add_cover_opts(p_all, default_engine="rvc")
     _add_extra_dataset_opts(p_all)
     p_all.add_argument("--force-dataset", action="store_true")
     p_all.add_argument("--min-seconds", type=float, default=300.0)

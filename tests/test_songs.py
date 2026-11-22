@@ -819,3 +819,71 @@ async def test_sing_song_cross_platform_plugin_ogg_opus(settings, fake_ffmpeg_pa
             await client.stop()
             server_task.cancel()
             await asyncio.gather(server_task, return_exceptions=True)
+
+
+async def test_multi_take_switch_delivers_switched_version_in_mp3_and_ogg_opus(
+    store, fake_ffmpeg_path
+):
+    """Switching a song's active take immediately changes load_for_delivery across formats."""
+    hdr = b"ID3\x03\x00\x00\x00\x00\x00\x00\xff\xfb\x90\x00"
+    mp3_a = hdr + b"TAKE_A_AUDIO_PAYLOAD" * 16
+    mp3_b = hdr + b"TAKE_B_AUDIO_PAYLOAD" * 16
+    dig_a = hashlib.sha256(mp3_a).hexdigest()
+    dig_b = hashlib.sha256(mp3_b).hexdigest()
+
+    class _StubDrive:
+        def configured(self) -> bool:
+            return True
+
+        async def download_song(self, file_id: str) -> bytes:
+            return {"drv-a": mp3_a, "drv-b": mp3_b}[file_id]
+
+    lib = SongLibrary(store, drive=_StubDrive())
+    await lib.initialize()
+    entry = await lib.register_colab_cover(
+        title="换版实测曲",
+        digest=dig_a,
+        byte_size=len(mp3_a),
+        duration_ms=20000,
+        drive_chorus_id="drv-a",
+        chorus_bytes=mp3_a,
+        active_engine="yingmusic_svc",
+        active_take="yingmusic_svc",
+        audition_status="picked",
+        review_note="A版先入库喵~",
+        takes=[
+            {
+                "key": "yingmusic_svc",
+                "engine": "yingmusic_svc",
+                "status": "succeeded",
+                "digest": dig_a,
+                "byte_size": len(mp3_a),
+                "duration_ms": 20000,
+                "drive_chorus_id": "drv-a",
+            },
+            {
+                "key": "seed_vc",
+                "engine": "seed_vc",
+                "status": "succeeded",
+                "digest": dig_b,
+                "byte_size": len(mp3_b),
+                "duration_ms": 21000,
+                "drive_chorus_id": "drv-b",
+            },
+        ],
+    )
+    raw1, fmt1, _, dur1, _ = await lib.load_for_delivery("换版实测曲", preferred_fmt="mp3")
+    assert raw1 == mp3_a and fmt1 == "mp3" and dur1 == 20000
+
+    switched = await lib.switch_take(entry["id"], "seed_vc")
+    assert switched["active_take"] == "seed_vc"
+    assert switched["active_engine"] == "seed_vc"
+
+    raw2, fmt2, _, dur2, _ = await lib.load_for_delivery("换版实测曲", preferred_fmt="mp3")
+    assert raw2 == mp3_b and fmt2 == "mp3" and dur2 == 21000
+
+    ogg2, fmt_o, mime_o, dur_o, _ = await lib.load_for_delivery(
+        "换版实测曲", preferred_fmt="ogg_opus"
+    )
+    assert fmt_o == "ogg_opus" and mime_o == "audio/ogg" and dur_o == 21000
+    assert ogg2.startswith(b"OggS")

@@ -5,7 +5,7 @@ import json
 import math
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -1846,6 +1846,7 @@ class GeminiGateway:
         budget_lane: str = "chat",
         images: list[ModelImage] | None = None,
         audios: list[ModelAudio] | None = None,
+        audio_labels: Sequence[str] | None = None,
         message: Message | None = None,
         audit_source: str = "production",
         with_longnick: bool = False,
@@ -1887,6 +1888,20 @@ class GeminiGateway:
         ):
             raise Rejected("invalid_life_plan")
         audio_items, audio_token_reserve = _validate_audios(audios)
+        normalized_audio_labels: list[str] | None = None
+        if audio_labels is not None:
+            if isinstance(audio_labels, (str, bytes)) or not isinstance(audio_labels, Sequence):
+                raise Rejected("invalid_audio")
+            if len(audio_labels) != len(audio_items):
+                raise Rejected("invalid_audio")
+            normalized_audio_labels = []
+            for raw_label in audio_labels:
+                if not isinstance(raw_label, str):
+                    raise Rejected("invalid_audio")
+                cleaned_label = " ".join(clean_text(raw_label).split()).strip()[:64]
+                if not cleaned_label:
+                    raise Rejected("invalid_audio")
+                normalized_audio_labels.append(cleaned_label)
         if life_plan and (
             budget_lane != "proactive"
             or memory_archive
@@ -2241,13 +2256,20 @@ class GeminiGateway:
                 if len(wire_data.encode()) > limit:
                     raise Rejected("context_too_large")
                 reserve_data = wire_data
+            audio_blocks: list[dict[str, Any]] = []
+            if normalized_audio_labels is not None:
+                for label, audio in zip(normalized_audio_labels, audio_items, strict=True):
+                    audio_blocks.append({"type": "text", "text": label})
+                    audio_blocks.append(audio.block())
+            else:
+                audio_blocks.extend(a.block() for a in audio_items)
             model_input = (
                 [{"type": "text", "text": wire_data}, video.block()]
                 if video
                 else [
                     {"type": "text", "text": wire_data},
                     *(i.block() for i in images),
-                    *(a.block() for a in audio_items),
+                    *audio_blocks,
                 ]
                 if chat or images or audio_items
                 else wire_data
@@ -2278,11 +2300,14 @@ class GeminiGateway:
             cached_prefix = (
                 max(0, estimate_tokens(reserve_data) - estimate_tokens(wire_data)) if prev_id else 0
             )
+            long_audio = sum(a.duration_sec for a in audio_items) > 60
             deadline_seconds = (
                 self.s.memory_flex_timeout
                 if memory_archive
                 else max(self.s.generation_timeout, 120)
                 if video
+                else max(self.s.generation_timeout, 90)
+                if long_audio
                 else self.s.generation_timeout
             )
 
@@ -2309,10 +2334,21 @@ class GeminiGateway:
                                 data=base64.b64decode(img.data), mime_type=img.mime_type
                             )
                         )
-                    for audio in audio_items:
-                        parts.append(
-                            types.Part.from_bytes(data=audio.raw_bytes(), mime_type=audio.mime_type)
-                        )
+                    if normalized_audio_labels is not None:
+                        for label, audio in zip(normalized_audio_labels, audio_items, strict=True):
+                            parts.append(types.Part.from_text(text=label))
+                            parts.append(
+                                types.Part.from_bytes(
+                                    data=audio.raw_bytes(), mime_type=audio.mime_type
+                                )
+                            )
+                    else:
+                        for audio in audio_items:
+                            parts.append(
+                                types.Part.from_bytes(
+                                    data=audio.raw_bytes(), mime_type=audio.mime_type
+                                )
+                            )
                     gc_contents: Any = [types.Content(role="user", parts=parts)]
                 else:
                     gc_contents = reserve_data
@@ -2357,6 +2393,11 @@ class GeminiGateway:
                                 else {}
                             ),
                             automatic_continuation=False,
+                            **(
+                                {"timeout": max(int(self.s.generation_timeout), 90)}
+                                if long_audio
+                                else {}
+                            ),
                             generation_config={
                                 "max_output_tokens": active_plan.output_tokens,
                                 "thinking_level": active_plan.thinking_level,
@@ -2400,6 +2441,8 @@ class GeminiGateway:
                         if memory_archive
                         else {"timeout": 120}
                         if video is not None
+                        else {"timeout": max(int(self.s.generation_timeout), 90)}
+                        if long_audio
                         else {}
                     ),
                     generation_config={

@@ -400,9 +400,13 @@ const colabErrorLabels={
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
   colab_invalid_job:'作业类型未注册或参数无效',
   colab_job_not_found:'未找到指定作业',
-  colab_job_not_cancellable:'该作业当前状态不可取消'
+  colab_job_not_cancellable:'该作业当前状态不可取消',
+  ref_voice_not_found:'Drive models/ 未找到可用参考干声',
+  svc_all_engines_failed:'双引擎 SVC 推理均失败',
+  invalid_song_engine:'翻唱引擎参数无效'
 };
-const colabJobTypeLabels={rvc_cover:'RVC 翻唱学歌',rvc_train:'RVC 音色训练'};
+const colabJobTypeLabels={rvc_cover:'翻唱学歌 (SVC/RVC)',rvc_train:'RVC 音色训练'};
+const colabEngineLabels={dual:'双引擎亲挑',yingmusic_svc:'YingMusic-SVC',seed_vc:'Seed-VC',rvc:'RVC'};
 const colabJobStatusLabels={queued:'排队中',running:'运行中',succeeded:'已完成',failed:'失败',cancelled:'已取消'};
 const colabJobStatusVariant={queued:'warn',running:'paid',succeeded:'ok',failed:'err',cancelled:'muted'};
 
@@ -474,11 +478,27 @@ function renderColabOverview(d){
 
   table('colab-jobs-table',['作业 ID','类型','目标','状态','GPU','CU 消耗','错误信息','操作'],(d.jobs||[]).map(job=>{
     const p=job.payload||{};
+    const r=job.result&&typeof job.result==='object'?job.result:{};
     const target=p.title||p.model_name||p.query||p.target||p.inbox_filename||'—';
-    const targetDisplay=target+(p.pitch?'（Pitch '+(p.pitch>0?'+'+p.pitch:p.pitch)+'）':'');
+    const engReq=String(r.engine_requested||p.engine||'').trim();
+    const engUsed=String(r.engine_used||'').trim();
+    const cands=Array.isArray(r.candidates)?r.candidates:[];
+    const targetMeta=[];
+    if(engReq)targetMeta.push(colabEngineLabels[engReq]||engReq);
+    if(cands.length){
+      const okCount=cands.filter(c=>c&&c.status==='succeeded').length;
+      targetMeta.push(okCount+'/'+cands.length+' 候选成功'+(engUsed&&engUsed!==engReq?' → '+(colabEngineLabels[engUsed]||engUsed):''));
+    }else if(engUsed&&engUsed!==engReq){
+      targetMeta.push('→ '+(colabEngineLabels[engUsed]||engUsed));
+    }
+    if(p.pitch)targetMeta.push('Pitch '+(p.pitch>0?'+'+p.pitch:p.pitch));
+    const targetDisplay=target+(targetMeta.length?'（'+targetMeta.join(' · ')+'）':'');
     const gpu=job.assigned_gpu||job.preferred_gpu||'—';
     const cu=job.cu_used!=null?Number(job.cu_used).toFixed(3):'—';
-    const errText=[colabErrorLabels[job.error_code]||job.error_code,job.error].filter(Boolean).join(' · ')||'—';
+    const failedCands=cands
+      .filter(c=>c&&c.status==='failed')
+      .map(c=>(colabEngineLabels[c.engine]||c.engine||c.key||'候选')+':'+(colabErrorLabels[c.error_code]||c.error_code||c.error||'失败'));
+    const errText=[colabErrorLabels[job.error_code]||job.error_code,job.error,...failedCands].filter(Boolean).join(' · ')||'—';
     const canCancel=job.status==='queued'||job.status==='running';
     const actionNode=canCancel?button('取消',async()=>{
       if(!(await confirmDialog('确认取消 Colab 作业「'+target+'」('+(String(job.id||'').slice(0,8))+')？',{danger:true,confirmLabel:'取消作业'})))return;

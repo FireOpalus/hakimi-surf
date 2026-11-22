@@ -486,11 +486,18 @@ class WorkerState:
                 probe = {"healthy": False, "setup_ready": False}
             if probe.get("healthy"):
                 record.session_name = claimed.session_name
+                setup_ready = bool(probe.get("setup_ready"))
+                sep_ready = bool(probe["sep_ready"]) if "sep_ready" in probe else setup_ready
+                svc_ready = bool(probe["svc_ready"]) if "svc_ready" in probe else setup_ready
+                rvc_ready = bool(probe["rvc_ready"]) if "rvc_ready" in probe else setup_ready
                 return WarmSessionClaim(
                     entry=claimed,
                     reused=True,
                     gpu=claimed.gpu,
-                    setup_ready=bool(probe.get("setup_ready")),
+                    setup_ready=setup_ready,
+                    sep_ready=sep_ready,
+                    svc_ready=svc_ready,
+                    rvc_ready=rvc_ready,
                 )
             self._stop_sessions_sync([claimed])
             return WarmSessionClaim()

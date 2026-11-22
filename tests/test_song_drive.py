@@ -885,8 +885,17 @@ async def test_song_playback_and_admin_drive_routes_work_without_colab_compute(
                     "default_gpu": "L4",
                     "fallback_gpus": ["T4"],
                     "allowed_gpus": ["L4", "T4", "A100", "H100"],
-                    "timeout_seconds": 1800,
+                    "timeout_seconds": 2400,
                 }
+                assert songs_data["default_engine"] == "dual"
+                assert songs_data["available_engines"] == [
+                    "dual",
+                    "yingmusic_svc",
+                    "seed_vc",
+                    "rvc",
+                ]
+                assert songs_data["rvc_defaults"]["volume_envelope"] == 0.25
+                assert songs_data["rvc_defaults"]["skip_dereverb"] is False
 
                 # Disallowed GPU rejects with 400 before touching Drive or Colab
                 req_before = len(srv.requests)
@@ -1124,13 +1133,14 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
         cover_val = compute.registered["rvc_cover"]["validator"]
         train_val = compute.registered["rvc_train"]["validator"]
         norm_cover = cover_val({"title": "雨爱", "auto_search": True})
+        assert norm_cover["engine"] == "dual"
         assert (
             norm_cover["index_rate"],
             norm_cover["protect"],
             norm_cover["volume_envelope"],
             norm_cover["skip_backing"],
             norm_cover["skip_dereverb"],
-        ) == (0.15, 0.42, 0.12, True, True)
+        ) == (0.15, 0.42, 0.25, True, False)
         with pytest.raises(Rejected, match="song_source_required"):
             cover_val({"title": "雨爱", "auto_search": False})
         with pytest.raises(Rejected, match="colab_invalid_job"):
@@ -1146,12 +1156,17 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
         assert RvcCoverJobPayload(title="t").protect == 0.42
         assert RvcTrainJobPayload().sample_rate == 48000
 
-        # pre_dispatch for rvc_cover returns exact transient dispatch_context contract
+        # pre_dispatch for rvc_cover (engine="rvc") resolves pth/index without requiring ref_audio
         cover_ctx = await compute.registered["rvc_cover"]["pre_dispatch"](
             {
                 "id": "job-cover-1",
                 "job_type": "rvc_cover",
-                "payload": {"title": "雨爱", "inbox_filename": "rain.m4a", "model_name": "hakimi"},
+                "payload": {
+                    "title": "雨爱",
+                    "engine": "rvc",
+                    "inbox_filename": "rain.m4a",
+                    "model_name": "hakimi",
+                },
             }
         )
         assert set(cover_ctx) == {"drive"}
@@ -1172,6 +1187,41 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             "inbox_name": "rain.m4a",
             "pth_file_id": "mdl_pth_101",
             "index_file_id": "mdl_idx_101",
+            "ref_audio_file_id": "",
+            "ref_audio_name": "",
+            "cache_weights_file_id": "arc_cover_1",
+            "cache_weights_sha256": cover_sha,
+        }
+
+        # pre_dispatch for dual/SVC raises ref_voice_not_found when models/ has no ref audio
+        with pytest.raises(Rejected, match="ref_voice_not_found"):
+            await compute.registered["rvc_cover"]["pre_dispatch"](
+                {
+                    "id": "job-cover-noref",
+                    "job_type": "rvc_cover",
+                    "payload": {"title": "雨爱", "engine": "dual", "inbox_filename": "rain.m4a"},
+                }
+            )
+
+        # Adding ref voice in models/ lets dual/SVC resolve ref_audio without needing pth/index
+        srv.add_file("ref_alt_1", name="other_voice.wav", parent_id=srv.models_id, data=b"WAV_A")
+        srv.add_file("ref_22s_1", name="hakimi_ref_22s.wav", parent_id=srv.models_id, data=b"WAV_B")
+        srv.add_file("ref_def_1", name="hakimi_ref.wav", parent_id=srv.models_id, data=b"WAV_C")
+
+        dual_ctx = await compute.registered["rvc_cover"]["pre_dispatch"](
+            {
+                "id": "job-cover-dual",
+                "job_type": "rvc_cover",
+                "payload": {"title": "雨爱", "engine": "dual", "inbox_filename": "rain.m4a"},
+            }
+        )
+        assert dual_ctx["drive"]["files"] == {
+            "inbox_file_id": "inbox_101",
+            "inbox_name": "rain.m4a",
+            "pth_file_id": "",
+            "index_file_id": "",
+            "ref_audio_file_id": "ref_def_1",
+            "ref_audio_name": "hakimi_ref.wav",
             "cache_weights_file_id": "arc_cover_1",
             "cache_weights_sha256": cover_sha,
         }
@@ -1197,6 +1247,8 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             "inbox_name": "",
             "pth_file_id": "",
             "index_file_id": "",
+            "ref_audio_file_id": "",
+            "ref_audio_name": "",
             "cache_weights_file_id": "arc_train_1",
             "cache_weights_sha256": train_sha,
         }
@@ -1221,3 +1273,130 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
                 gpu="G4",
             )
         assert len(srv.requests) == req_count_before_gpu_reject
+
+
+async def test_song_drive_ref_voice_priority_and_streaming_upload_limits(
+    settings, store, tmp_path: Path
+):
+    from hakimi.song_drive import MAX_REF_VOICE_UPLOAD_BYTES
+
+    oauth = _write_oauth_json(tmp_path / "roaming-oauth.json")
+    s = settings.model_copy(
+        update={
+            "data_dir": tmp_path / "ref_voice_data",
+            "song_drive_oauth_file": oauth,
+            "admin_token": SecretStr(ADMIN_TOKEN),
+        }
+    )
+    srv = _FakeGoogleDriveServer()
+    srv.add_file("pth_h", name="hakimi.pth", parent_id=srv.models_id, data=b"PTH")
+    srv.add_file("idx_h", name="hakimi.index", parent_id=srv.models_id, data=b"IDX")
+    srv.add_file("pth_no_idx", name="solo.pth", parent_id=srv.models_id, data=b"PTH2")
+    srv.add_file("ref_other", name="custom.flac", parent_id=srv.models_id, data=b"FLAC")
+    srv.add_file("ref_22s", name="hakimi_ref_22s.wav", parent_id=srv.models_id, data=b"WAV22")
+    srv.add_file("outside_wav", name="hakimi_ref.wav", parent_id=srv.inbox_id, data=b"OUTSIDE")
+
+    async with srv.client() as http:
+        drive = SongDriveStore(s, store, http=http)
+        await drive.initialize()
+
+        # Priority: hakimi_ref*.wav beats custom.flac when exact hakimi_ref.wav is absent
+        assets = await drive.list_models_assets()
+        assert assets["default_ref_voice"] == "hakimi_ref_22s.wav"
+        assert assets["rvc_models"] == [
+            {"name": "hakimi", "has_index": True},
+            {"name": "solo", "has_index": False},
+        ]
+        by_name = {v["name"]: v for v in assets["ref_voices"]}
+        assert by_name["hakimi_ref_22s.wav"]["default"] is True
+        assert by_name["custom.flac"]["default"] is False
+        assert (await drive.resolve_ref_voice())["id"] == "ref_22s"
+
+        # Exact hakimi_ref.wav takes top priority over hakimi_ref_22s.wav
+        srv.add_file("ref_exact", name="hakimi_ref.wav", parent_id=srv.models_id, data=b"WAV0")
+        assert (await drive.resolve_ref_voice())["id"] == "ref_exact"
+
+        # Outside-scope file ID rejected; non-audio extension rejected
+        with pytest.raises(Rejected, match="song_drive_file_outside_scope"):
+            await drive.resolve_ref_voice(file_id="outside_wav")
+        with pytest.raises(Rejected, match="invalid_ref_voice"):
+            await drive.resolve_ref_voice(file_id="pth_h")
+        with pytest.raises(Rejected, match="invalid_ref_voice"):
+            await drive.resolve_ref_voice(filename="hakimi.pth")
+        with pytest.raises(Rejected, match="ref_voice_not_found"):
+            await drive.resolve_ref_voice(filename="missing.wav")
+
+        # Streaming upload into models/ enforces audio extension and 20 MiB cap
+        async def _chunks(blob: bytes):
+            yield blob[:128]
+            yield blob[128:]
+
+        uploaded = await drive.upload_ref_voice_stream(
+            "hakimi_new.wav",
+            _chunks(b"RIFF" + b"X" * 512),
+            mime_type="audio/wav",
+            content_length=516,
+        )
+        assert uploaded["name"] == "hakimi_new.wav"
+        assert uploaded["size"] == 516
+        assert srv.files[uploaded["file_id"]]["parents"] == [srv.models_id]
+
+        with pytest.raises(Rejected, match="invalid_ref_voice"):
+            await drive.upload_ref_voice_stream("bad.pth", _chunks(b"DATA"))
+        with pytest.raises(Rejected, match="song_ref_voice_too_large"):
+            await drive.upload_ref_voice_stream(
+                "huge.wav",
+                _chunks(b"A" * 16),
+                content_length=MAX_REF_VOICE_UPLOAD_BYTES + 1,
+            )
+
+        # Admin HTTP endpoints: GET /admin/api/songs/voices & POST /admin/api/songs/ref-voices
+        app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+        async with app.router.lifespan_context(app):
+            app.state.service.songs.drive._injected_http = http
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:12141",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            ) as client:
+                voices_resp = await client.get("/admin/api/songs/voices")
+                assert voices_resp.status_code == 200
+                vdata = voices_resp.json()
+                assert vdata["default_ref_voice"] == "hakimi_ref.wav"
+                assert any(v["name"] == "hakimi_new.wav" for v in vdata["ref_voices"])
+                assert {"name": "hakimi", "has_index": True} in vdata["rvc_models"]
+
+                # Bad extension -> 400 invalid_ref_voice; oversized -> 413 song_ref_voice_too_large
+                assert (
+                    await client.post(
+                        "/admin/api/songs/ref-voices",
+                        content=b"DATA",
+                        headers={
+                            "Content-Type": "audio/wav",
+                            "X-Drive-Filename": "evil.pth",
+                        },
+                    )
+                ).status_code == 400
+                big_resp = await client.post(
+                    "/admin/api/songs/ref-voices",
+                    content=b"x",
+                    headers={
+                        "Content-Type": "audio/wav",
+                        "Content-Length": str(MAX_REF_VOICE_UPLOAD_BYTES + 1),
+                        "X-Drive-Filename": "big.wav",
+                    },
+                )
+                assert big_resp.status_code == 413
+                assert big_resp.json()["detail"] == "song_ref_voice_too_large"
+
+                ok_up = await client.post(
+                    "/admin/api/songs/ref-voices",
+                    content=b"RIFF_HTTP_VOICE_DATA",
+                    headers={
+                        "Content-Type": "audio/wav",
+                        "X-Drive-Filename": "hakimi_http.wav",
+                    },
+                )
+                assert ok_up.status_code == 200
+                assert ok_up.json()["name"] == "hakimi_http.wav"
+                assert ok_up.json()["size"] == len(b"RIFF_HTTP_VOICE_DATA")

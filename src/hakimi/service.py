@@ -11,7 +11,7 @@ import uuid
 import weakref
 from collections import Counter
 from contextlib import AsyncExitStack, nullcontext
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -99,6 +99,7 @@ from .world_state import WorldStateManager
 log = logging.getLogger("hakimi")
 
 _LEARN_SONG_ACTION_NAME = "song_studio.learn_song"
+_SWITCH_SONG_VERSION_ACTION_NAME = "song_studio.switch_version"
 
 
 class _LearnSongArgs(BaseModel):
@@ -107,8 +108,24 @@ class _LearnSongArgs(BaseModel):
     title: str = Field(min_length=1, max_length=60, description="歌曲名称")
     artist: str = Field(default="", max_length=40, description="原唱歌手（可选）")
     tags: str = Field(default="", max_length=80, description="风格标签（可选）")
+    engine: Literal["dual", "yingmusic_svc", "seed_vc", "rvc"] = Field(
+        default="dual",
+        description="翻唱引擎：dual（默认双引擎猫猫亲挑）/ yingmusic_svc / seed_vc / rvc",
+    )
+    ref_voice: str = Field(default="", max_length=160, description="参考干声文件名（可选）")
     pitch: int = Field(default=0, ge=-24, le=24, description="升降调半音数（-24..24，默认0）")
     auto_search: bool = Field(default=True, description="未附带音频时是否自动检索原版伴奏/原唱")
+
+
+class _SwitchSongVersionArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    title: str = Field(min_length=1, max_length=60, description="歌单中的歌曲名称")
+    take: str = Field(
+        min_length=1,
+        max_length=32,
+        description="目标候选版本键或引擎名（如 yingmusic_svc / seed_vc / rvc）",
+    )
 
 
 class Service:
@@ -387,10 +404,32 @@ class Service:
                 {
                     "action_name": _LEARN_SONG_ACTION_NAME,
                     "description": (
-                        "用 Colab 学唱一首新歌并加入歌单（支持附带音频文件或自动检索原曲）"
+                        "用 Colab 学唱一首新歌并加入歌单"
+                        "（默认双引擎亲听自选，支持附带音频或自动检索原曲）"
                     ),
                     "arguments": schema.get("properties", {}),
                     "required": list(schema.get("required", ())),
+                }
+            )
+            items.sort(key=lambda item: item["action_name"])
+        songs_lib = getattr(self, "songs", None)
+        has_switchable = (
+            callable(getattr(songs_lib, "has_switchable_takes", None))
+            and songs_lib.has_switchable_takes()
+        )
+        if (
+            len(items) < 12
+            and action_modes.get(_SWITCH_SONG_VERSION_ACTION_NAME, "active") != "off"
+            and has_switchable
+            and not any(item["action_name"] == _SWITCH_SONG_VERSION_ACTION_NAME for item in items)
+        ):
+            switch_schema = _SwitchSongVersionArgs.model_json_schema()
+            items.append(
+                {
+                    "action_name": _SWITCH_SONG_VERSION_ACTION_NAME,
+                    "description": "将歌单中某首多版本曲目的当前默认播放版本切换为指定候选版",
+                    "arguments": switch_schema.get("properties", {}),
+                    "required": list(switch_schema.get("required", ())),
                 }
             )
             items.sort(key=lambda item: item["action_name"])
@@ -497,16 +536,19 @@ class Service:
                     return
 
         try:
-            await songs.request_learn_song(
-                title,
-                artist=args.artist.strip(),
-                tags=args.tags.strip(),
-                pitch=args.pitch,
-                audio_bytes=audio_bytes,
-                audio_filename=audio_filename,
-                auto_search=args.auto_search,
-                requester="owner_chat",
-            )
+            req_kwargs: dict[str, Any] = {
+                "artist": args.artist.strip(),
+                "tags": args.tags.strip(),
+                "engine": args.engine,
+                "pitch": args.pitch,
+                "audio_bytes": audio_bytes,
+                "audio_filename": audio_filename,
+                "auto_search": args.auto_search,
+                "requester": "owner_chat",
+            }
+            if args.ref_voice.strip():
+                req_kwargs["ref_voice"] = args.ref_voice.strip()
+            await songs.request_learn_song(title, **req_kwargs)
         except Rejected as exc:
             log.info(
                 "event=owner_chat_action_done action=%s status=gated_skip reason=%s",
@@ -538,6 +580,93 @@ class Service:
             except Exception:
                 pass
 
+    async def _run_switch_song_version_owner_action(
+        self,
+        trigger: ChatActionTrigger,
+        cfg: Any,
+        *,
+        context_message: Message | None = None,
+    ) -> None:
+        if context_message is not None and not owner(context_message, self.s):
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=owner_only",
+                _SWITCH_SONG_VERSION_ACTION_NAME,
+            )
+            return
+        if cfg.action_modes.get(_SWITCH_SONG_VERSION_ACTION_NAME, "active") == "off":
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=action_disabled",
+                _SWITCH_SONG_VERSION_ACTION_NAME,
+            )
+            return
+        songs = getattr(self, "songs", None)
+        if songs is None or not hasattr(songs, "switch_take"):
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip "
+                "reason=song_studio_unavailable",
+                _SWITCH_SONG_VERSION_ACTION_NAME,
+            )
+            return
+        parsed_args: dict[str, Any] = {}
+        raw_args_json = trigger.arguments_json
+        if isinstance(raw_args_json, str) and raw_args_json.strip():
+            try:
+                loaded = json.loads(raw_args_json)
+            except (ValueError, TypeError):
+                log.info(
+                    "event=owner_chat_action_done action=%s status=not_dispatched "
+                    "reason=invalid_action_arguments",
+                    _SWITCH_SONG_VERSION_ACTION_NAME,
+                )
+                return
+            if not isinstance(loaded, dict):
+                log.info(
+                    "event=owner_chat_action_done action=%s status=not_dispatched "
+                    "reason=invalid_action_arguments",
+                    _SWITCH_SONG_VERSION_ACTION_NAME,
+                )
+                return
+            parsed_args = loaded
+        try:
+            args = _SwitchSongVersionArgs.model_validate(parsed_args)
+        except ValidationError:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip "
+                "reason=invalid_action_arguments",
+                _SWITCH_SONG_VERSION_ACTION_NAME,
+            )
+            return
+        title = args.title.strip().strip("《》").strip()
+        if not title:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip "
+                "reason=invalid_song_title",
+                _SWITCH_SONG_VERSION_ACTION_NAME,
+            )
+            return
+        try:
+            await songs.switch_take(title, args.take.strip(), by_title=True)
+        except Rejected as exc:
+            log.info(
+                "event=owner_chat_action_done action=%s status=gated_skip reason=%s",
+                _SWITCH_SONG_VERSION_ACTION_NAME,
+                self._safe_action_reason(exc),
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "event=owner_chat_action_done action=%s status=not_dispatched reason=%s",
+                _SWITCH_SONG_VERSION_ACTION_NAME,
+                type(exc).__name__,
+            )
+            return
+        log.info(
+            "event=owner_chat_action_done action=%s status=done reason=switched",
+            _SWITCH_SONG_VERSION_ACTION_NAME,
+        )
+
     async def _run_owner_chat_action(
         self, trigger: ChatActionTrigger, context_message: Message | None = None
     ) -> None:
@@ -554,6 +683,11 @@ class Service:
         if raw_name == _LEARN_SONG_ACTION_NAME:
             await self._run_learn_song_owner_action(
                 trigger, engine, cfg, context_message=context_message
+            )
+            return
+        if raw_name == _SWITCH_SONG_VERSION_ACTION_NAME:
+            await self._run_switch_song_version_owner_action(
+                trigger, cfg, context_message=context_message
             )
             return
         spec = catalog.actions.get(raw_name)

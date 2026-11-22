@@ -934,7 +934,32 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
       job_types: fullColab.job_types,
       worker: {{ reachable: true, compute_units: 10.0, active_sessions: 0, warm_sessions: [] }},
       today: {{ jobs_count: 7, cu_used: 3.45 }},
-      jobs: [],
+      jobs: [
+        {{
+          id: 'job_dual_partial',
+          job_type: 'rvc_cover',
+          status: 'succeeded',
+          preferred_gpu: 'L4',
+          assigned_gpu: 'L4',
+          cu_used: 0.42,
+          created_at: 1763800000,
+          finished_at: 1763800400,
+          payload: {{ title: '枝垂桜', engine: 'dual', pitch: 0 }},
+          result: {{
+            engine_requested: 'dual',
+            engine_used: 'seed_vc',
+            candidates: [
+              {{
+                key: 'yingmusic_svc',
+                engine: 'yingmusic_svc',
+                status: 'failed',
+                error_code: 'svc_oom'
+              }},
+              {{ key: 'seed_vc', engine: 'seed_vc', status: 'succeeded' }}
+            ]
+          }}
+        }}
+      ],
       warm_sessions: []
     }});
     assert(
@@ -960,12 +985,20 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
     );
     const policyTxt = $('colab-job-policies-table').textContent;
     assert(
-      policyTxt.includes('RVC 翻唱学歌（rvc_cover）')
+      policyTxt.includes('翻唱学歌 (SVC/RVC)（rvc_cover）')
         && policyTxt.includes('L4 / T4 / A100 / H100')
         && policyTxt.includes('RVC 音色训练（rvc_train）')
         && policyTxt.includes('H100 / A100')
         && policyTxt.includes('3600 秒'),
       'colab-job-policies-table content mismatch: ' + policyTxt
+    );
+    const jobsTxt = $('colab-jobs-table').textContent;
+    assert(
+      jobsTxt.includes('枝垂桜')
+        && jobsTxt.includes('双引擎亲挑')
+        && jobsTxt.includes('1/2 候选成功 → Seed-VC')
+        && jobsTxt.includes('YingMusic-SVC:svc_oom'),
+      'colab-jobs-table dual candidate display mismatch: ' + jobsTxt
     );
     assert(
       !walk($('colab-job-policies-table')).some(n => n.tagName === 'IMG'),
@@ -1065,6 +1098,27 @@ def test_colab_and_songs_ui_physical_decoupling():
         "song-inbox-file",
         "song-inbox-upload",
         "song-learn-heading",
+        "song-learn-engine",
+        "song-learn-pitch-hint",
+        "song-learn-svc-fields",
+        "song-learn-refresh-voices",
+        "song-learn-ref-voice",
+        "song-ref-voice-file",
+        "song-ref-voice-upload",
+        "song-ref-voice-hint",
+        "song-learn-svc-adv",
+        "song-learn-svc-steps",
+        "song-learn-rvc-fields",
+        "song-learn-refresh-rvc-models",
+        "song-learn-model",
+        "song-learn-rvc-adv",
+        "song-learn-rvc-defaults-hint",
+        "song-learn-rvc-volume-envelope",
+        "song-learn-rvc-index-rate",
+        "song-learn-rvc-protect",
+        "song-learn-rvc-backing-gain",
+        "song-learn-rvc-skip-dereverb",
+        "song-learn-rvc-skip-backing",
         "song-learn-inbox",
         "song-learn-gpu",
     ):
@@ -1074,8 +1128,12 @@ def test_colab_and_songs_ui_physical_decoupling():
     assert len(scripts) == 1
     script = scripts[0]
     assert "/admin/api/songs/inbox" in script
+    assert "/admin/api/songs/ref-voices" in script
     assert "api('songs/inbox')" in script
     assert "api('songs/storage'" in script
+    assert "api('songs/voices')" in script
+    assert "/takes/'+" in script and "+'/audio'" in script
+    assert "+'/activate'" in script
     assert "supported_job_types" in script
     assert "colab_gpu_not_allowed" in script
     assert "learn_gpu_policy" in script
@@ -1261,9 +1319,22 @@ def test_colab_and_songs_ui_physical_decoupling():
 
     // 4. Song learn GPU policy select rendering, result GPU badge, error map & reset
     assert(
-      songErrorLabels.colab_gpu_not_allowed === 'RVC 翻唱暂不支持该 GPU 型号（已排除不兼容卡型）',
+      songErrorLabels.colab_gpu_not_allowed
+        === '翻唱作业（SVC/RVC）暂不支持该 GPU 型号（已排除不兼容卡型）',
       'song colab_gpu_not_allowed label missing'
     );
+    for (const code of [
+      'invalid_song_engine',
+      'invalid_song_take',
+      'invalid_ref_voice',
+      'song_take_not_found',
+      'ref_voice_not_found',
+      'song_take_unavailable',
+      'song_ref_voice_too_large',
+      'svc_all_engines_failed'
+    ]) {{
+      assert(Boolean(songErrorLabels[code]), 'missing songErrorLabels.' + code);
+    }}
     renderSongLearnGpuPolicy(null);
     const defOpts = $('song-learn-gpu').options;
     assert(defOpts.length === 5, 'default GPU policy should render 5 options');
@@ -1297,18 +1368,143 @@ def test_colab_and_songs_ui_physical_decoupling():
       'XSS in allowed_gpus must never create IMG element'
     );
     showSongLearnResult(
-      {{ id: 'job_abc', status: 'queued', preferred_gpu: 'A100' }},
+      {{ id: 'job_abc', status: 'queued', preferred_gpu: 'A100', engine: 'dual' }},
       '晴天',
       '晴天 - 周杰伦.mp3',
       0
     );
     assert(
-      $('song-learn-result').textContent.includes('首选 GPU：A100'),
-      'song-learn-result must display preferred_gpu'
+      $('song-learn-result').textContent.includes('首选 GPU：A100')
+        && $('song-learn-result').textContent.includes('双引擎亲挑'),
+      'song-learn-result must display preferred_gpu and engine'
     );
     $('song-learn-gpu').value = 'T4';
+    $('song-learn-engine').value = 'rvc';
+    syncSongLearnEngineFields();
+    assert($('song-learn-svc-fields').hidden === true, 'rvc mode must hide SVC fields');
+    assert($('song-learn-rvc-fields').hidden === false, 'rvc mode must show RVC fields');
     clearSongLearnForm();
     assert($('song-learn-gpu').value === '', 'clearSongLearnForm must reset song-learn-gpu');
+    assert($('song-learn-engine').value === 'dual', 'clearSongLearnForm must reset engine to dual');
+    assert($('song-learn-svc-fields').hidden === false, 'dual mode must show SVC fields');
+    assert($('song-learn-rvc-fields').hidden === true, 'dual mode must hide RVC fields');
+    assert(
+      $('song-learn-rvc-volume-envelope').value === '0.25'
+        && $('song-learn-rvc-skip-dereverb').checked === false
+        && $('song-learn-rvc-index-rate').value === '0.15'
+        && $('song-learn-rvc-protect').value === '0.42'
+        && $('song-learn-rvc-backing-gain').value === '-14'
+        && $('song-learn-rvc-skip-backing').checked === true,
+      'rolled-back RVC default values mismatch'
+    );
+
+    // 5. Ref voices & RVC models rendering (with XSS guard)
+    renderSongVoices({{
+      default_ref_voice: 'hakimi_ref_22s.wav',
+      ref_voices: [
+        {{ id: 'ref_1', name: 'hakimi_ref_22s.wav', size: 1196032, default: true }},
+        {{ id: 'ref_xss', name: xss + '.wav', size: 2048, default: false }}
+      ],
+      rvc_models: [
+        {{ name: 'hakimi', has_index: true }},
+        {{ name: 'alt_' + xss, has_index: false }}
+      ]
+    }});
+    assert(
+      $('song-learn-ref-voice').options.length === 3
+        && $('song-learn-ref-voice').options[0].textContent.includes('hakimi_ref_22s.wav'),
+      'ref voice select mismatch'
+    );
+    assert(
+      $('song-learn-model').options.length === 2
+        && $('song-learn-model').options[1].textContent.includes('缺 .index'),
+      'rvc model select mismatch'
+    );
+    assert(
+      !walk($('song-learn-ref-voice')).some(n => n.tagName === 'IMG')
+        && !walk($('song-learn-model')).some(n => n.tagName === 'IMG'),
+      'XSS in voices/models must never create IMG element'
+    );
+
+    // 6. Dual-engine song card rendering: engine badge, review_note, takes list, legacy fallback
+    renderSongList([
+      {{
+        id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        title: '枝垂桜',
+        artist: 'Anna',
+        tags: '日语 治愈',
+        duration_ms: 50000,
+        byte_size: 801271,
+        drive_backed: true,
+        drive_full_backed: true,
+        cached_local: true,
+        source_origin: 'colab',
+        active_engine: 'yingmusic_svc',
+        active_take: 'yingmusic_svc',
+        audition_status: 'picked',
+        audition_selected_engine: 'yingmusic_svc',
+        review_note: '这版气息张力很足，听感更真唱喵~ ' + xss,
+        takes: [
+          {{
+            key: 'yingmusic_svc',
+            engine: 'yingmusic_svc',
+            status: 'succeeded',
+            active: true,
+            playable: true,
+            duration_ms: 50000,
+            byte_size: 801271,
+            drive_full_backed: true,
+            acoustic_metrics: {{
+              chorus_mean_db: -11.5,
+              chorus_dynamic_range_db: 6.4,
+              clipped_peak_flag: false
+            }}
+          }},
+          {{
+            key: 'seed_vc',
+            engine: 'seed_vc',
+            status: 'succeeded',
+            active: false,
+            playable: true,
+            duration_ms: 50000,
+            byte_size: 790000,
+            drive_full_backed: true,
+            acoustic_metrics: {{
+              chorus_mean_db: -12.0,
+              chorus_dynamic_range_db: 5.1,
+              clipped_peak_flag: false
+            }}
+          }}
+        ]
+      }},
+      {{
+        id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        title: '旧歌兼容',
+        artist: '',
+        tags: '',
+        duration_ms: 42000,
+        byte_size: 650000,
+        drive_backed: false,
+        source_origin: 'local'
+      }}
+    ], songGeneration);
+    const listText = $('song-list').textContent;
+    assert(
+      listText.includes('YingMusic-SVC')
+        && listText.includes('猫猫亲挑')
+        && listText.includes('这版气息张力很足')
+        && listText.includes('保留候选版本（2）')
+        && listText.includes('Seed-VC')
+        && listText.includes('高潮 -11.5 dB')
+        && listText.includes('动态差 6.4 dB')
+        && listText.includes('设为当前')
+        && listText.includes('旧歌兼容'),
+      'dual-engine song card render mismatch: ' + listText
+    );
+    assert(
+      !walk($('song-list')).some(n => n.tagName === 'IMG'),
+      'XSS in review_note or song metadata must never create IMG element'
+    );
     """
 
     proc = subprocess.run(
@@ -1482,9 +1678,10 @@ def test_colab_config_and_song_learn_form_submit_payloads():
       assert(calls[0].data.job_timeout_seconds === 2400, 'timeout mismatch');
       assert(calls[0].data.auto_terminate_orphan_minutes === 30, 'orphan mins mismatch');
 
-      // 2. #song-learn-form without explicit GPU omits gpu field
+      // 2. #song-learn-form without explicit GPU omits gpu field and defaults to engine=dual
       $('song-learn-title').value = '晴天';
       $('song-learn-pitch').value = '0';
+      $('song-learn-engine').value = '';
       $('song-learn-inbox').value = '';
       $('song-learn-gpu').value = '';
       $('song-learn-auto-search').checked = true;
@@ -1492,14 +1689,21 @@ def test_colab_config_and_song_learn_form_submit_payloads():
       await Promise.all(pendingTasks.splice(0));
       assert(calls.length === 2, 'expected first song learn POST');
       assert(!('gpu' in calls[1].data), 'default GPU selection must omit gpu field');
+      assert(calls[1].data.engine === 'dual', 'default engine must be dual');
+      assert(!('volume_envelope' in calls[1].data), 'SVC mode must omit RVC params');
       assert(
-        $('song-learn-result').textContent.includes('首选 GPU：L4'),
-        'default submit result must show preferred_gpu L4'
+        $('song-learn-result').textContent.includes('首选 GPU：L4')
+          && $('song-learn-result').textContent.includes('双引擎亲挑'),
+        'default submit result must show preferred_gpu L4 and engine'
       );
 
-      // 3. #song-learn-form with explicit GPU sends gpu and resets select after submit
+      // 3. #song-learn-form with explicit GPU + seed_vc + ref_voice + svc_steps
       $('song-learn-title').value = '夜曲';
       $('song-learn-pitch').value = '2';
+      $('song-learn-engine').value = 'seed_vc';
+      $('song-learn-ref-voice').value = 'hakimi_ref_22s.wav';
+      $('song-learn-ref-voice').selectedOptions = [{{ dataset: {{ fileId: 'ref_id_1' }} }}];
+      $('song-learn-svc-steps').value = '40';
       $('song-learn-inbox').value = '';
       $('song-learn-gpu').value = 'A100';
       $('song-learn-auto-search').checked = true;
@@ -1507,11 +1711,117 @@ def test_colab_config_and_song_learn_form_submit_payloads():
       await Promise.all(pendingTasks.splice(0));
       assert(calls.length === 3, 'expected second song learn POST');
       assert(calls[2].data.gpu === 'A100', 'explicit GPU selection must send gpu=A100');
+      assert(calls[2].data.engine === 'seed_vc', 'engine must be seed_vc');
+      assert(calls[2].data.ref_voice === 'hakimi_ref_22s.wav', 'ref_voice mismatch');
+      assert(calls[2].data.ref_audio_file_id === 'ref_id_1', 'ref_audio_file_id mismatch');
+      assert(calls[2].data.svc_steps === 40, 'svc_steps mismatch');
+      assert(!('model_name' in calls[2].data), 'seed_vc must omit RVC model_name');
       assert(
         $('song-learn-result').textContent.includes('首选 GPU：A100'),
         'override submit result must show preferred_gpu A100'
       );
       assert($('song-learn-gpu').value === '', 'song-learn-gpu must reset after submit');
+      assert($('song-learn-engine').value === 'dual', 'engine must reset to dual after submit');
+
+      // 4. #song-learn-form in rvc mode sends rolled-back RVC defaults and omits SVC fields
+      $('song-learn-title').value = '老歌测试';
+      $('song-learn-pitch').value = '-2';
+      $('song-learn-engine').value = 'rvc';
+      $('song-learn-model').value = 'hakimi';
+      $('song-learn-rvc-volume-envelope').value = '0.25';
+      $('song-learn-rvc-index-rate').value = '0.15';
+      $('song-learn-rvc-protect').value = '0.42';
+      $('song-learn-rvc-backing-gain').value = '-14';
+      $('song-learn-rvc-skip-dereverb').checked = false;
+      $('song-learn-rvc-skip-backing').checked = true;
+      $('song-learn-inbox').value = '';
+      $('song-learn-gpu').value = '';
+      $('song-learn-auto-search').checked = true;
+      $('song-learn-form').dispatch('submit');
+      await Promise.all(pendingTasks.splice(0));
+      assert(calls.length === 4, 'expected third song learn POST');
+      assert(calls[3].data.engine === 'rvc', 'engine must be rvc');
+      assert(calls[3].data.model_name === 'hakimi', 'model_name mismatch');
+      assert(calls[3].data.volume_envelope === 0.25, 'volume_envelope mismatch');
+      assert(calls[3].data.skip_dereverb === false, 'skip_dereverb mismatch');
+      assert(calls[3].data.skip_backing === true, 'skip_backing mismatch');
+      assert(calls[3].data.backing_gain_db === -14, 'backing_gain_db mismatch');
+      assert(!('ref_voice' in calls[3].data) && !('svc_steps' in calls[3].data), 'rvc omits SVC');
+
+      // 5. Dual-engine song take preview & activate buttons use path-only URLs (zero query params)
+      token = 'test-token';
+      const fetchPaths = [];
+      const origCreateObjectURL = globalThis.URL?.createObjectURL;
+      globalThis.URL = {{
+        createObjectURL() {{ return 'blob:take-seed-vc'; }},
+        revokeObjectURL() {{}}
+      }};
+      songRequest = async (path) => {{
+        fetchPaths.push('/admin/api/songs' + path);
+        return {{ blob: async () => ({{}}) }};
+      }};
+      function walkAll(node, acc=[]) {{
+        acc.push(node);
+        for (const c of (node.children || [])) walkAll(c, acc);
+        return acc;
+      }}
+      renderSongList([
+        {{
+          id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          title: '枝垂桜',
+          duration_ms: 50000,
+          byte_size: 800000,
+          drive_backed: true,
+          active_engine: 'yingmusic_svc',
+          active_take: 'yingmusic_svc',
+          takes: [
+            {{
+              key: 'yingmusic_svc',
+              engine: 'yingmusic_svc',
+              status: 'succeeded',
+              active: true,
+              playable: true
+            }},
+            {{
+              key: 'seed_vc',
+              engine: 'seed_vc',
+              status: 'succeeded',
+              active: false,
+              playable: true
+            }}
+          ]
+        }}
+      ], songGeneration);
+      const btns = walkAll($('song-list')).filter(n => n.tagName === 'BUTTON');
+      const previewAltBtn = btns.find(b => b.textContent === '试听此版');
+      const activateAltBtn = btns.find(b => b.textContent === '设为当前');
+      assert(Boolean(previewAltBtn) && Boolean(activateAltBtn), 'take action buttons missing');
+      previewAltBtn.dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      const expectedTakeUrl =
+        '/admin/api/songs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/takes/seed_vc/audio';
+      assert(
+        fetchPaths.length === 1
+          && fetchPaths[0] === expectedTakeUrl
+          && !fetchPaths[0].includes('?'),
+        'take preview URL mismatch: ' + JSON.stringify(fetchPaths)
+      );
+      assert(
+        $('song-list').textContent.includes('正在试听备用版：Seed-VC'),
+        'playing hint should show non-active take preview'
+      );
+      activateAltBtn.dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        calls.length === 5
+          && calls[4].method === 'POST'
+          && calls[4].path === 'songs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/takes/seed_vc/activate'
+          && !calls[4].path.includes('?'),
+        'take activate API mismatch: ' + JSON.stringify(calls[4])
+      );
+      if (origCreateObjectURL) globalThis.URL.createObjectURL = origCreateObjectURL;
+      if (typeof print === 'function') print('FORM_AND_TAKES_OK');
+      else console.log('FORM_AND_TAKES_OK');
     }})().catch(err => {{
       if (typeof process !== 'undefined' && process.exit) {{
         console.error(err);
@@ -1529,3 +1839,6 @@ def test_colab_config_and_song_learn_form_submit_payloads():
         check=False,
     )
     assert proc.returncode == 0, f"Form submit JS test failed:\n{proc.stderr}\n{proc.stdout}"
+    assert "FORM_AND_TAKES_OK" in proc.stdout, (
+        f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"
+    )

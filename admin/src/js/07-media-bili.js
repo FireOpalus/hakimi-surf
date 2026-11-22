@@ -197,13 +197,67 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
-let songGeneration=0,selectedSongFile=null,pendingSongLearn=null,lastSongStorageState=null;
+let songGeneration=0,selectedSongFile=null,pendingSongLearn=null,pendingRefVoice=null,lastSongStorageState=null,defaultSongEngine='dual',rvcParamsTouched=false;
 const songBlobCache=new Map();
+
+const defaultRvcParams={
+  model_name:'hakimi',
+  volume_envelope:0.25,
+  skip_dereverb:false,
+  index_rate:0.15,
+  protect:0.42,
+  backing_gain_db:-14,
+  skip_backing:true
+};
+let currentRvcDefaults={...defaultRvcParams};
+
+const songEngineLabels={
+  dual:'双引擎猫猫亲挑（YingMusic-SVC + Seed-VC）',
+  yingmusic_svc:'YingMusic-SVC',
+  seed_vc:'Seed-VC',
+  rvc:'经典 RVC',
+  local:'本地上传'
+};
+const songEngineShortLabels={
+  dual:'双引擎亲挑',
+  yingmusic_svc:'YingMusic-SVC',
+  seed_vc:'Seed-VC',
+  rvc:'RVC',
+  local:'本地上传'
+};
+const songEnginePillVariant={
+  yingmusic_svc:'vertex',
+  seed_vc:'ok',
+  rvc:'free',
+  dual:'paid',
+  local:'muted'
+};
+const songAuditionStatusLabels={
+  picked:'猫猫原声亲听自选',
+  fallback_single:'单候选自动入库',
+  fallback_error:'亲听降级保底入库',
+  manual:'手动指定版本',
+  none:''
+};
+const songPitchHints={
+  dual:'双引擎模式：YingMusic-SVC 固定 0 半音防与伴奏走调；Seed-VC 按上方 Pitch 移调（默认 0），双版均存档保留并由猫猫原声亲听自选。',
+  yingmusic_svc:'YingMusic-SVC 严格锁定 0 半音防与伴奏走调（此模式下忽略非 0 Pitch 移调）。',
+  seed_vc:'Seed-VC 按上方 Pitch 移调（-24～24，默认 0），已关闭自动移调防走调。',
+  rvc:'经典 RVC 模式：按上方 Pitch 移调（-24～24，默认 0），需 Drive models/ 下存在对应 .pth 与 .index 权重。'
+};
 
 const songErrorLabels={
   invalid_song_title:'歌名格式无效（支持 1～60 字多语种文字、数字与常见标点，不可含 / \\ < > " 等特殊符号）',
   invalid_song_meta:'原唱或标签元数据格式无效',
   invalid_song_pitch:'升降调 Pitch 须为 -24～24 之间的整数',
+  invalid_song_engine:'翻唱引擎参数无效（仅支持 dual / yingmusic_svc / seed_vc / rvc）',
+  invalid_song_take:'候选版本标识无效',
+  invalid_ref_voice:'参考干声文件名或格式无效（支持 wav/flac/mp3/m4a/ogg/opus）',
+  song_take_not_found:'未找到该曲目的指定候选版本',
+  ref_voice_not_found:'Drive models/ 目录中未找到可用参考干声，请先上传参考干声',
+  song_take_unavailable:'该候选版本暂不可用或尚未生成可播放音频',
+  song_ref_voice_too_large:'上传参考干声超过 20 MiB 上限',
+  svc_all_engines_failed:'双引擎 SVC 推理均失败，请前往「Colab 云端算力」查看作业详情',
   invalid_drive_file_id:'Drive 原曲文件 ID 格式无效',
   song_source_required:'请选择 Drive inbox 原曲文件，或勾选「未指定文件时自动检索官方原版」',
   invalid_song_audio:'音频文件无效或不受支持',
@@ -222,7 +276,7 @@ const songErrorLabels={
   colab_unconfigured:'Colab 云端算力 Worker 尚未配置，请先在「Colab 云端算力」检查配置',
   colab_disabled:'Colab 云端算力调度当前已关闭，请先开启后再试',
   colab_worker_unavailable:'Colab Worker 当前离线或不可达，请稍后重试',
-  colab_gpu_not_allowed:'RVC 翻唱暂不支持该 GPU 型号（已排除不兼容卡型）',
+  colab_gpu_not_allowed:'翻唱作业（SVC/RVC）暂不支持该 GPU 型号（已排除不兼容卡型）',
   colab_daily_job_limit:'今日 Colab 作业次数已达上限',
   colab_daily_cu_budget:'今日 Colab CU 预算已耗尽',
   colab_job_limit_reached:'Colab 排队/并发作业已达上限',
@@ -267,6 +321,122 @@ function sanitizeSongTitleStem(filename){
   const cleaned=stem.replace(/[^\p{L}\p{M}\p{N}\s_\-'’‘&!?！？,，.。、~～+:：·・—–()（）\[\]【】「」『』@#%*=♡♥★☆♪♫]/gu,' ').replace(/\s+/g,' ').trim();
   return cleaned.slice(0,60).trim();
 }
+function revokeSongBlobs(songId,onlyActive=false){
+  const prefix=String(songId||'')+':';
+  for(const [key,url] of [...songBlobCache.entries()]){
+    const match=onlyActive?(key===songId||key===prefix+'active'):(key===songId||key.startsWith(prefix));
+    if(match){
+      URL.revokeObjectURL(url);
+      songBlobCache.delete(key);
+    }
+  }
+}
+function formatTakeAcousticSummary(metrics){
+  if(!metrics||typeof metrics!=='object')return '';
+  const parts=[];
+  const mean=Number(metrics.chorus_mean_db);
+  if(Number.isFinite(mean))parts.push('高潮 '+mean.toFixed(1)+' dB');
+  const dyn=Number(metrics.chorus_dynamic_range_db);
+  if(Number.isFinite(dyn))parts.push('动态差 '+dyn.toFixed(1)+' dB');
+  if(metrics.clipped_peak_flag)parts.push('削波提示');
+  return parts.join(' · ');
+}
+function applySongRvcDefaults(defaults,force=false){
+  const src=defaults&&typeof defaults==='object'?defaults:{};
+  const numOr=(v,fb)=>{const n=Number(v);return Number.isFinite(n)?n:fb;};
+  currentRvcDefaults={
+    model_name:String(src.model_name||defaultRvcParams.model_name).trim()||'hakimi',
+    volume_envelope:numOr(src.volume_envelope,defaultRvcParams.volume_envelope),
+    skip_dereverb:typeof src.skip_dereverb==='boolean'?src.skip_dereverb:defaultRvcParams.skip_dereverb,
+    index_rate:numOr(src.index_rate,defaultRvcParams.index_rate),
+    protect:numOr(src.protect,defaultRvcParams.protect),
+    backing_gain_db:numOr(src.backing_gain_db,defaultRvcParams.backing_gain_db),
+    skip_backing:typeof src.skip_backing==='boolean'?src.skip_backing:defaultRvcParams.skip_backing
+  };
+  const d=currentRvcDefaults;
+  if($('song-learn-rvc-defaults-hint')){
+    text('song-learn-rvc-defaults-hint','当前普适默认值：volume_envelope '+d.volume_envelope+' · skip_dereverb '+(d.skip_dereverb?'开启':'关闭（启用去混响）')+' · index_rate '+d.index_rate+' · protect '+d.protect+' · backing_gain_db '+d.backing_gain_db+' dB · skip_backing '+(d.skip_backing?'开启':'关闭'));
+  }
+  if(force){
+    if($('song-learn-rvc-volume-envelope'))$('song-learn-rvc-volume-envelope').value=String(d.volume_envelope);
+    if($('song-learn-rvc-index-rate'))$('song-learn-rvc-index-rate').value=String(d.index_rate);
+    if($('song-learn-rvc-protect'))$('song-learn-rvc-protect').value=String(d.protect);
+    if($('song-learn-rvc-backing-gain'))$('song-learn-rvc-backing-gain').value=String(d.backing_gain_db);
+    if($('song-learn-rvc-skip-dereverb'))$('song-learn-rvc-skip-dereverb').checked=Boolean(d.skip_dereverb);
+    if($('song-learn-rvc-skip-backing'))$('song-learn-rvc-skip-backing').checked=Boolean(d.skip_backing);
+  }
+}
+function syncSongLearnEngineFields(){
+  const engine=String($('song-learn-engine')?.value||defaultSongEngine||'dual').trim()||'dual';
+  const isRvc=engine==='rvc';
+  const svcBox=$('song-learn-svc-fields');
+  const rvcBox=$('song-learn-rvc-fields');
+  if(svcBox){
+    svcBox.hidden=isRvc;
+    for(const node of (svcBox.querySelectorAll?.('input,select')||[]))node.disabled=isRvc;
+  }
+  if(rvcBox){
+    rvcBox.hidden=!isRvc;
+    for(const node of (rvcBox.querySelectorAll?.('input,select')||[]))node.disabled=!isRvc;
+  }
+  if($('song-learn-pitch-hint')){
+    text('song-learn-pitch-hint',songPitchHints[engine]||songPitchHints.dual);
+  }
+}
+function renderSongVoices(data,errMsg=''){
+  const d=data&&typeof data==='object'?data:{};
+  const refVoices=Array.isArray(d.ref_voices)?d.ref_voices:[];
+  const rvcModels=Array.isArray(d.rvc_models)?d.rvc_models:[];
+  const defRef=String(d.default_ref_voice||'').trim();
+
+  const refSel=$('song-learn-ref-voice');
+  if(refSel){
+    const prev=pendingRefVoice?pendingRefVoice.name:refSel.value;
+    const firstLabel=defRef?('自动选用默认参考干声（'+defRef+'）'):(errMsg?'自动选用默认参考干声（models/ 暂不可读）':'自动选用默认参考干声（hakimi_ref）');
+    const opts=[selectOption('',firstLabel)];
+    for(const v of refVoices){
+      const name=String(v?.name||'').trim();
+      if(!name)continue;
+      const label=name+(v.default?'（默认）':'')+(v.size!=null?' · '+formatByteSize(v.size):'');
+      const opt=selectOption(name,label);
+      opt.dataset.fileId=String(v.id||'');
+      opts.push(opt);
+    }
+    if(prev&&!opts.some(o=>o.value===prev)){
+      const extra=selectOption(prev,prev+'（已选）');
+      extra.dataset.fileId=String(pendingRefVoice?.id||'');
+      opts.push(extra);
+    }
+    refSel.replaceChildren(...opts);
+    refSel.value=prev||'';
+  }
+  if(pendingRefVoice)pendingRefVoice=null;
+
+  if($('song-ref-voice-hint')){
+    if(errMsg){
+      text('song-ref-voice-hint','Drive models/ 参考干声列表暂不可读：'+errMsg);
+    }else if(refVoices.length){
+      text('song-ref-voice-hint','已在 Drive models/ 检测到 '+refVoices.length+' 份参考干声'+(defRef?'（默认：'+defRef+'）':'')+'；Zero-shot SVC 将自动规整至 ≤ 24 秒 44.1 kHz 单声道。');
+    }else{
+      text('song-ref-voice-hint','Drive models/ 暂未检测到参考干声，可在此直接上传 15～30 秒清晰猫猫干声（wav/flac/mp3/m4a/ogg/opus，≤ 20 MiB）。');
+    }
+  }
+
+  const modelSel=$('song-learn-model');
+  if(modelSel){
+    const prevModel=modelSel.value||currentRvcDefaults.model_name||'hakimi';
+    const mOpts=[];
+    for(const m of rvcModels){
+      const name=String(m?.name||'').trim();
+      if(!name)continue;
+      const label=name+(m.has_index===false?'（缺 .index）':'');
+      mOpts.push(selectOption(name,label));
+    }
+    if(!mOpts.length)mOpts.push(selectOption('hakimi','hakimi（默认）'));
+    modelSel.replaceChildren(...mOpts);
+    modelSel.value=mOpts.some(o=>o.value===prevModel)?prevModel:mOpts[0].value;
+  }
+}
 const defaultLearnGpuPolicy={default_gpu:'L4',fallback_gpus:['T4'],allowed_gpus:['L4','T4','A100','H100']};
 function renderSongLearnGpuPolicy(policy){
   const sel=$('song-learn-gpu');
@@ -294,19 +464,38 @@ function clearSongLearnForm(){
   $('song-learn-inbox').value='';
   $('song-learn-gpu').value='';
   $('song-learn-auto-search').checked=true;
+  if($('song-learn-engine'))$('song-learn-engine').value=defaultSongEngine||'dual';
+  if($('song-learn-ref-voice'))$('song-learn-ref-voice').value='';
+  if($('song-learn-svc-steps'))$('song-learn-svc-steps').value='';
+  if($('song-learn-model'))$('song-learn-model').value=currentRvcDefaults.model_name||'hakimi';
+  rvcParamsTouched=false;
+  applySongRvcDefaults(currentRvcDefaults,true);
+  syncSongLearnEngineFields();
 }
-function showSongLearnResult(job,title,inboxFilename,pitch){
+function showSongLearnResult(job,title,inboxFilename,pitch,opts={}){
   const jobId=job?.id||job?.job_id||'—';
   const status=job?.status||'queued';
   const prefGpu=String(job?.preferred_gpu||job?.assigned_gpu||'').trim();
+  const engine=String(job?.engine||job?.payload?.engine||opts.engine||defaultSongEngine||'dual').trim()||'dual';
+  const engineShort=songEngineShortLabels[engine]||engine;
+  const engineFull=songEngineLabels[engine]||engine;
   const box=$('song-learn-result');
   const head=el('div',undefined,'sub-card-head');
   head.append(...[
     el('h3','已提交学歌作业：'+title),
     pill('状态：'+status,'ok'),
+    pill('引擎：'+engineShort,songEnginePillVariant[engine]||'muted'),
     prefGpu?pill('首选 GPU：'+prefGpu,'vertex'):null
   ].filter(Boolean));
-  const info=el('p','作业 ID：'+jobId+(prefGpu?' · 首选 GPU：'+prefGpu:'')+(inboxFilename?' · 原曲来源：Drive inbox / '+inboxFilename:' · 自动检索官方原版')+' · 升降调：'+(pitch>0?'+'+pitch:String(pitch)),'muted');
+  const detailParts=[
+    '作业 ID：'+jobId,
+    '引擎：'+engineFull,
+    prefGpu?('首选 GPU：'+prefGpu):'',
+    engine==='rvc'?(opts.modelName?'RVC 权重：'+opts.modelName:''):(opts.refVoice?'参考干声：'+opts.refVoice:'参考干声：自动默认'),
+    inboxFilename?('原曲来源：Drive inbox / '+inboxFilename):'自动检索官方原版',
+    engine==='yingmusic_svc'?'移调：固定 0 半音':'升降调：'+(pitch>0?'+'+pitch:String(pitch))
+  ].filter(Boolean);
+  const info=el('p',detailParts.join(' · '),'muted');
   const actions=el('div',undefined,'row');
   const jumpBtn=el('button','前往 Colab 云端算力查看队列 →','secondary');
   jumpBtn.type='button';
@@ -357,6 +546,33 @@ async function uploadInboxAudio(file){
   const signal=sessionRequests.signal;
   const contentType=(file.type&&/^audio\/(?:mpeg|mp3|wav|x-wav|wave|ogg|opus|mp4|x-m4a|flac)$/i.test(file.type))?file.type:'application/octet-stream';
   const r=await fetch('/admin/api/songs/inbox',{
+    method:'POST',
+    signal,
+    headers:{
+      Authorization:'Bearer '+token,
+      'Content-Type':contentType,
+      'X-Drive-Filename':encodeURIComponent(file.name)
+    },
+    body:file,
+    cache:'no-store',
+    credentials:'omit',
+    redirect:'error'
+  });
+  let data=null;
+  try{data=await r.json();}catch{}
+  if(signal.aborted)throw new DOMException('请求已取消','AbortError');
+  if(!r.ok){
+    if(r.status===401||r.status===403)logout();
+    const detail=data?.detail||('HTTP '+r.status);
+    throw Error(mapSongError({message:detail}));
+  }
+  if(!data)throw Error('服务器未返回有效 JSON');
+  return data;
+}
+async function uploadRefVoiceAudio(file){
+  const signal=sessionRequests.signal;
+  const contentType=(file.type&&/^audio\/(?:mpeg|mp3|wav|x-wav|wave|ogg|opus|mp4|x-m4a|flac)$/i.test(file.type))?file.type:'application/octet-stream';
+  const r=await fetch('/admin/api/songs/ref-voices',{
     method:'POST',
     signal,
     headers:{
@@ -483,8 +699,8 @@ function renderSongInboxTable(items,errMsg=''){
       },'secondary'),
       button('直接学歌',async()=>{
         const title=await promptDialog('直接发起 Colab 学歌',{
-          message:'原曲文件：'+item.name+'（默认升降调 Pitch = 0）',
-          hint:'请确认或修改入库歌名（1～60字，提交后将立即提交 RVC 翻唱作业）：',
+          message:'原曲文件：'+item.name+'（默认双引擎猫猫亲挑 · Pitch = 0）',
+          hint:'请确认或修改入库歌名（1～60字，提交后将执行双引擎共享分轨翻唱并由猫猫亲听自选）：',
           defaultValue:sanitizeSongTitleStem(item.name),
           placeholder:'输入歌名（1～60字）',
           confirmLabel:'立即提交作业'
@@ -492,6 +708,7 @@ function renderSongInboxTable(items,errMsg=''){
         if(title===null)return;
         const clean=title.trim();
         if(!clean)throw Error('请填写歌名（1～60字）');
+        const eng=defaultSongEngine||'dual';
         let job;
         try{
           job=await api('songs/learn','POST',{
@@ -499,13 +716,14 @@ function renderSongInboxTable(items,errMsg=''){
             inbox_filename:item.name,
             inbox_file_id:item.id||'',
             pitch:0,
+            engine:eng,
             auto_search:false
           });
         }catch(err){
           if(err?.name==='AbortError')throw err;
           throw Error(mapSongError(err));
         }
-        showSongLearnResult(job,clean,item.name,0);
+        showSongLearnResult(job,clean,item.name,0,{engine:eng});
         notice('已发起学歌作业「'+clean+'」（'+(job?.id||job?.job_id||'queued')+'），可在「Colab 云端算力」查看进度');
       },'primary')
     );
@@ -551,6 +769,22 @@ async function loadSongInbox(strict=false){
   renderSongInboxSelect(items,errMsg);
   return items.length;
 }
+async function loadSongVoices(strict=false){
+  let data=null,errMsg='';
+  try{
+    data=await api('songs/voices');
+    if(!token)return null;
+  }catch(err){
+    if(err?.name==='AbortError')throw err;
+    errMsg=mapSongError(err);
+    if(strict){
+      renderSongVoices(null,errMsg);
+      throw Error(errMsg);
+    }
+  }
+  renderSongVoices(data,errMsg);
+  return data;
+}
 function renderSongStorageBar(d){
   const driveCount=Number(d.drive_backed_count??0);
   const cacheBytes=Number(d.cache_bytes??0);
@@ -566,10 +800,19 @@ function renderSongStorageBar(d){
     pill(colabOk?'Colab GPU 算力就绪':'Colab GPU 算力未配置',colabOk?'vertex':'muted')
   );
   text('song-cache-state','Drive 云盘（歌单工坊独立直连）：'+(driveOk?'已配置':'未配置')+' · Drive 主存 '+driveCount+' 首 · 本地 LRU 热缓存占用 '+formatByteSize(cacheBytes)+' / '+formatByteSize(cacheMax)+'（共 '+cachedCount+' 首缓存；纯本地上传曲目永不淘汰）· Colab GPU 算力（仅学歌推理）：'+(colabOk?'已配置':'未配置'));
-  text('song-learn-colab-hint',(driveOk?'Drive 歌单主存与原曲收件箱已独立就绪；':'提示：Drive 歌单存储尚未配置，收件箱与云盘归档暂不可用；')+(colabOk?'Colab GPU 算力已就绪，提交后将在云端执行人声分离与 RVC 翻唱推理，完成后自动入库并通知 Owner。':'当前 Colab GPU Worker 尚未配置，仍可正常播放歌单、管理 Drive 收件箱或手动上传翻唱成品；如需自动学歌请在「Colab 云端算力」配置 Worker。'));
+  text('song-learn-colab-hint',(driveOk?'Drive 歌单主存与原曲收件箱已独立就绪；':'提示：Drive 歌单存储尚未配置，收件箱与云盘归档暂不可用；')+(colabOk?'Colab GPU 算力已就绪，默认共享分轨产出 YingMusic-SVC 与 Seed-VC 双版候选，由猫猫原声亲听自选入库并保留双版本可随时切换（亦保留 RVC 可选）。':'当前 Colab GPU Worker 尚未配置，仍可正常播放歌单、切换已存档版本、管理 Drive 收件箱或手动上传翻唱成品；如需自动学歌请在「Colab 云端算力」配置 Worker。'));
 }
 function songStoragePills(item){
   const badges=[];
+  const activeEngine=String(item.active_engine||item.engine||(item.source_origin==='colab'?'rvc':'')).trim();
+  if(activeEngine){
+    badges.push(pill(songEngineShortLabels[activeEngine]||activeEngine,songEnginePillVariant[activeEngine]||'muted'));
+  }
+  const audStatus=String(item.audition_status||'none').trim();
+  if(audStatus==='picked')badges.push(pill('猫猫亲挑','paid'));
+  else if(audStatus==='fallback_single')badges.push(pill('单候选入库','muted'));
+  else if(audStatus==='fallback_error')badges.push(pill('保底入库','warn'));
+  else if(audStatus==='manual'&&Array.isArray(item.takes)&&item.takes.length>1)badges.push(pill('手动切版','free'));
   if(item.drive_backed)badges.push(pill('Drive 已存档','ok'));
   if(item.drive_full_backed)badges.push(pill('完整版已备份','vertex'));
   if(item.drive_backed){
@@ -580,10 +823,161 @@ function songStoragePills(item){
   if(item.source_origin==='colab')badges.push(pill('Colab 翻唱','free'));
   return pillRow(...badges);
 }
+function renderSongCard(item,generation){
+  const card=el('article',undefined,'song-item');
+  const slot=el('div',undefined,'song-audio-slot');
+  const playingHint=el('small','','song-playing-hint');
+  playingHint.hidden=true;
+  const activeCacheKey=item.id+':active';
+  const activeEngine=String(item.active_engine||item.engine||'').trim();
+  const activeEngineLabel=songEngineShortLabels[activeEngine]||activeEngine||'当前版';
+
+  if(songBlobCache.has(activeCacheKey)){
+    mountSongAudio(slot,songBlobCache.get(activeCacheKey),false);
+  }else{
+    const playBtn=button('试听',async()=>{
+      let url=songBlobCache.get(activeCacheKey);
+      if(!url){
+        const response=await songRequest('/'+encodeURIComponent(item.id)+'/audio');
+        const blob=await response.blob();
+        if(!token)return;
+        url=songBlobCache.get(activeCacheKey);
+        if(!url){
+          url=URL.createObjectURL(blob);
+          songBlobCache.set(activeCacheKey,url);
+        }
+      }
+      if(generation===songGeneration){
+        mountSongAudio(slot,url,true);
+        playingHint.hidden=true;
+        playingHint.textContent='';
+      }
+    },'secondary');
+    slot.append(playBtn);
+  }
+
+  const meta=[item.artist?('原唱：'+item.artist):'',item.tags?('标签：'+item.tags):''].filter(Boolean).join(' · ');
+  const spec=((item.duration_ms||0)/1000).toFixed(1)+' 秒 · '+Math.ceil((item.byte_size||0)/1024)+' KiB';
+  card.append(el('h3',item.title));
+  if(meta)card.append(el('small',meta));
+  card.append(el('small',spec),songStoragePills(item));
+
+  const reviewNote=String(item.review_note||'').trim();
+  if(reviewNote){
+    const revBox=el('div',undefined,'song-review');
+    const revHead=el('div',undefined,'song-review-head');
+    const audLabel=songAuditionStatusLabels[item.audition_status]||'猫猫亲听点评';
+    revHead.append(el('strong',audLabel));
+    const selEng=String(item.audition_selected_engine||'').trim();
+    if(selEng&&activeEngine&&selEng!==activeEngine){
+      revHead.append(el('small','原猫猫亲挑：'+(songEngineShortLabels[selEng]||selEng)));
+    }else if(selEng){
+      revHead.append(el('small','亲听胜出：'+(songEngineShortLabels[selEng]||selEng)));
+    }
+    revBox.append(revHead,el('p',reviewNote));
+    card.append(revBox);
+  }
+
+  card.append(slot,playingHint);
+
+  const takes=Array.isArray(item.takes)?item.takes:[];
+  if(takes.length){
+    const takesBox=el('div',undefined,'song-takes');
+    takesBox.append(el('small','保留候选版本（'+takes.length+'）','song-takes-title'));
+    for(const tk of takes){
+      if(!tk||typeof tk!=='object')continue;
+      const takeKey=String(tk.key||tk.engine||'').trim();
+      const eng=String(tk.engine||takeKey).trim();
+      const engLabel=songEngineShortLabels[eng]||eng||takeKey||'未知版本';
+      const isActive=Boolean(tk.active||(item.active_take&&takeKey&&item.active_take===takeKey));
+      const row=el('div',undefined,'song-take-row'+(isActive?' active':''));
+      const head=el('div',undefined,'song-take-head');
+      const statusBadge=isActive
+        ?pill('当前生效','ok')
+        :(tk.status==='failed'
+          ?pill('失败','err')
+          :(tk.playable?pill('备用可切','muted'):pill(String(tk.status||'不可用'),'muted')));
+      head.append(el('span',engLabel,'song-take-name'),statusBadge);
+      row.append(head);
+
+      const tkSpecParts=[];
+      if(tk.duration_ms)tkSpecParts.push((Number(tk.duration_ms)/1000).toFixed(1)+'s');
+      if(tk.byte_size)tkSpecParts.push(Math.ceil(Number(tk.byte_size)/1024)+' KiB');
+      if(tk.drive_full_backed)tkSpecParts.push('含完整版');
+      const acSummary=formatTakeAcousticSummary(tk.acoustic_metrics);
+      if(acSummary)tkSpecParts.push(acSummary);
+      if(tk.status==='failed'&&tk.error_code){
+        tkSpecParts.push('原因：'+(songErrorLabels[tk.error_code]||tk.error_code));
+      }
+      if(tkSpecParts.length)row.append(el('small',tkSpecParts.join(' · '),'song-take-spec'));
+
+      if(tk.playable&&takeKey){
+        const acts=el('div',undefined,'song-take-actions');
+        acts.append(button(isActive?'试听当前版':'试听此版',async()=>{
+          const tkCacheKey=item.id+':take:'+takeKey;
+          let url=songBlobCache.get(tkCacheKey);
+          if(!url){
+            const response=await songRequest('/'+encodeURIComponent(item.id)+'/takes/'+encodeURIComponent(takeKey)+'/audio');
+            const blob=await response.blob();
+            if(!token)return;
+            url=songBlobCache.get(tkCacheKey);
+            if(!url){
+              url=URL.createObjectURL(blob);
+              songBlobCache.set(tkCacheKey,url);
+            }
+          }
+          if(generation===songGeneration){
+            mountSongAudio(slot,url,true);
+            playingHint.textContent=isActive
+              ?('当前试听：'+engLabel+'（当前生效版）')
+              :('正在试听备用版：'+engLabel+'（当前点唱生效版为 '+activeEngineLabel+'）');
+            playingHint.hidden=false;
+          }
+        },'secondary'));
+        if(!isActive){
+          acts.append(button('设为当前',async()=>{
+            try{
+              await api('songs/'+encodeURIComponent(item.id)+'/takes/'+encodeURIComponent(takeKey)+'/activate','POST');
+            }catch(err){
+              if(err?.name==='AbortError')throw err;
+              throw Error(mapSongError(err));
+            }
+            revokeSongBlobs(item.id,true);
+            notice('已将《'+item.title+'》当前生效版本切换为 '+engLabel);
+            await songs();
+          },'primary'));
+        }
+        row.append(acts);
+      }
+      takesBox.append(row);
+    }
+    card.append(takesBox);
+  }
+
+  card.append(button('删除',async()=>{
+    if(!(await confirmDialog('确认删除翻唱曲目「'+item.title+'」？歌单将立即更新。',{danger:true,confirmLabel:'删除曲目'})))return;
+    await api('songs/'+encodeURIComponent(item.id),'DELETE');
+    revokeSongBlobs(item.id,false);
+    notice('曲目已移除，歌单立即更新');
+    await songs();
+  },'danger'));
+  return card;
+}
+function renderSongList(items,generation){
+  const listEl=$('song-list');
+  listEl.replaceChildren();
+  if(!items||!items.length){
+    listEl.append(el('p','还没有录入翻唱曲目。可以通过上方「Colab 学一首新歌」或下方本地上传音频切片加入歌单。','muted'));
+    return;
+  }
+  for(const item of items){
+    listEl.append(renderSongCard(item,generation));
+  }
+}
 async function songs(){
   songGeneration++;
   const generation=songGeneration;
-  const [songsRes,storageRes]=await Promise.allSettled([api('songs'),loadSongStorage(false),loadSongInbox(false)]);
+  const [songsRes,storageRes]=await Promise.allSettled([api('songs'),loadSongStorage(false),loadSongInbox(false),loadSongVoices(false)]);
   if(songsRes.status==='rejected')throw songsRes.reason;
   const d=songsRes.value;
   if(!token||generation!==songGeneration)return;
@@ -596,58 +990,25 @@ async function songs(){
       error:d.drive_error||''
     });
   }
-  const validIds=new Set(d.items.map(item=>item.id));
-  for(const [id,url] of songBlobCache){
-    if(!validIds.has(id)){URL.revokeObjectURL(url);songBlobCache.delete(id);}
+  if(d.default_engine){
+    const prevDefault=defaultSongEngine;
+    defaultSongEngine=String(d.default_engine).trim()||'dual';
+    if($('song-learn-engine')&&(!$('song-learn-engine').value||$('song-learn-engine').value===prevDefault)){
+      $('song-learn-engine').value=defaultSongEngine;
+    }
+  }
+  applySongRvcDefaults(d.rvc_defaults,!rvcParamsTouched);
+  syncSongLearnEngineFields();
+  const validIds=new Set((d.items||[]).map(item=>item.id));
+  for(const [key,url] of [...songBlobCache.entries()]){
+    const sid=String(key).split(':')[0];
+    if(!validIds.has(sid)){URL.revokeObjectURL(url);songBlobCache.delete(key);}
   }
   renderSongStorageBar(d);
   renderSongLearnGpuPolicy(d.learn_gpu_policy);
   text('song-prompt-count','当前已加载到 Prompt 的有效曲目：'+(d.loaded_prompt_count??0));
-  text('song-state',d.items.length+' / '+(d.max_songs??300)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??524288000)/1048576).toFixed(0)+' MiB');
-  const listEl=$('song-list');
-  listEl.replaceChildren();
-  if(!d.items.length){listEl.append(el('p','还没有录入翻唱曲目。可以通过上方「Colab 学一首新歌」或下方本地上传音频切片加入歌单。','muted'));return;}
-  for(const item of d.items){
-    const card=el('article',undefined,'song-item');
-    const slot=el('div',undefined,'song-audio-slot');
-    if(songBlobCache.has(item.id)){
-      mountSongAudio(slot,songBlobCache.get(item.id),false);
-    }else{
-      const playBtn=button('试听',async()=>{
-        let url=songBlobCache.get(item.id);
-        if(!url){
-          const response=await songRequest('/'+encodeURIComponent(item.id)+'/audio');
-          const blob=await response.blob();
-          if(!token)return;
-          url=songBlobCache.get(item.id);
-          if(!url){
-            url=URL.createObjectURL(blob);
-            songBlobCache.set(item.id,url);
-          }
-        }
-        if(generation===songGeneration)mountSongAudio(slot,url,true);
-      },'secondary');
-      slot.append(playBtn);
-    }
-    const meta=[item.artist?('原唱：'+item.artist):'',item.tags?('标签：'+item.tags):''].filter(Boolean).join(' · ');
-    const spec=((item.duration_ms||0)/1000).toFixed(1)+' 秒 · '+Math.ceil((item.byte_size||0)/1024)+' KiB';
-    card.append(el('h3',item.title));
-    if(meta)card.append(el('small',meta));
-    card.append(
-      el('small',spec),
-      songStoragePills(item),
-      slot,
-      button('删除',async()=>{
-        if(!(await confirmDialog('确认删除翻唱曲目「'+item.title+'」？歌单将立即更新。',{danger:true,confirmLabel:'删除曲目'})))return;
-        await api('songs/'+encodeURIComponent(item.id),'DELETE');
-        const oldUrl=songBlobCache.get(item.id);
-        if(oldUrl){URL.revokeObjectURL(oldUrl);songBlobCache.delete(item.id);}
-        notice('曲目已移除，歌单立即更新');
-        await songs();
-      },'danger')
-    );
-    listEl.append(card);
-  }
+  text('song-state',(d.items||[]).length+' / '+(d.max_songs??300)+' 首 · '+((d.total_bytes??0)/1048576).toFixed(2)+' / '+((d.max_library_bytes??524288000)/1048576).toFixed(0)+' MiB');
+  renderSongList(d.items||[],generation);
 }
 $('song-refresh').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('songs','刷新歌单')))return;
@@ -664,6 +1025,42 @@ for(const refreshBtnId of ['song-refresh-inbox','song-learn-refresh-inbox']){
     notice('已刷新 Drive inbox 收件箱（共 '+count+' 首待学原曲）');
   }));
 }
+for(const voiceBtnId of ['song-learn-refresh-voices','song-learn-refresh-rvc-models']){
+  $(voiceBtnId).addEventListener('click',e=>busy(e.target,async()=>{
+    const res=await loadSongVoices(true);
+    const rvCount=Array.isArray(res?.ref_voices)?res.ref_voices.length:0;
+    const mCount=Array.isArray(res?.rvc_models)?res.rvc_models.length:0;
+    notice('已刷新 Drive models/ 音色列表（参考干声 '+rvCount+' 份 · RVC 权重 '+mCount+' 套）');
+  }));
+}
+$('song-learn-engine').addEventListener('change',()=>{
+  syncSongLearnEngineFields();
+});
+for(const rvcId of [
+  'song-learn-rvc-volume-envelope',
+  'song-learn-rvc-index-rate',
+  'song-learn-rvc-protect',
+  'song-learn-rvc-backing-gain',
+  'song-learn-rvc-skip-dereverb',
+  'song-learn-rvc-skip-backing'
+]){
+  $(rvcId).addEventListener('input',()=>{rvcParamsTouched=true;});
+  $(rvcId).addEventListener('change',()=>{rvcParamsTouched=true;});
+}
+$('song-ref-voice-upload').addEventListener('click',e=>busy(e.target,async()=>{
+  const file=$('song-ref-voice-file').files?.[0];
+  if(!file)throw Error('请先选择要上传的参考干声音频文件');
+  if(file.size<=0)throw Error(songErrorLabels.invalid_ref_voice);
+  if(!/\.(?:wav|flac|mp3|m4a|ogg|opus)$/i.test(file.name))throw Error(songErrorLabels.invalid_ref_voice);
+  if(file.size>20*1024*1024)throw Error(songErrorLabels.song_ref_voice_too_large);
+  const res=await uploadRefVoiceAudio(file);
+  if(!token)return;
+  $('song-ref-voice-file').value='';
+  const uploadedName=String(res.name||file.name);
+  pendingRefVoice={name:uploadedName,id:String(res.file_id||res.id||'')};
+  await loadSongVoices(false);
+  notice('已上传参考干声「'+uploadedName+'」到 Drive models/ 并自动选中');
+}));
 $('song-storage-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('song-storage-save'),async()=>{
@@ -674,7 +1071,7 @@ $('song-storage-form').addEventListener('submit',e=>{
     catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
     if(!token)return;
     renderSongStorageDetails(next);
-    await loadSongInbox(false);
+    await Promise.allSettled([loadSongInbox(false),loadSongVoices(false)]);
     notice('歌单 Drive 目录配置已保存并立即生效');
   });
 });
@@ -685,7 +1082,7 @@ $('song-storage-reset').addEventListener('click',e=>busy(e.target,async()=>{
   catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
   if(!token)return;
   renderSongStorageDetails(next);
-  await loadSongInbox(false);
+  await Promise.allSettled([loadSongInbox(false),loadSongVoices(false)]);
   notice('已恢复默认歌单 Drive 目录配置');
 }));
 $('song-inbox-upload').addEventListener('click',e=>busy(e.target,async()=>{
@@ -721,6 +1118,8 @@ $('song-learn-form').addEventListener('submit',e=>{
     if(!title)throw Error('请填写歌名（1～60字）');
     const pitch=Number($('song-learn-pitch').value||'0');
     if(!Number.isInteger(pitch)||pitch<-24||pitch>24)throw Error(songErrorLabels.invalid_song_pitch);
+    const engine=String($('song-learn-engine')?.value||defaultSongEngine||'dual').trim()||'dual';
+    if(!['dual','yingmusic_svc','seed_vc','rvc'].includes(engine))throw Error(songErrorLabels.invalid_song_engine);
     const sel=$('song-learn-inbox');
     const inboxFilename=sel.value.trim();
     const inboxFileId=sel.selectedOptions?.[0]?.dataset?.fileId||'';
@@ -732,6 +1131,7 @@ $('song-learn-form').addEventListener('submit',e=>{
       artist:$('song-learn-artist').value.trim(),
       tags:$('song-learn-tags').value.trim(),
       pitch,
+      engine,
       auto_search:autoSearch
     };
     if(chosenGpu)payload.gpu=chosenGpu;
@@ -739,13 +1139,45 @@ $('song-learn-form').addEventListener('submit',e=>{
       payload.inbox_filename=inboxFilename;
       if(inboxFileId)payload.inbox_file_id=inboxFileId;
     }
+    let refVoice='',modelName='';
+    if(engine==='rvc'){
+      modelName=String($('song-learn-model')?.value||currentRvcDefaults.model_name||'hakimi').trim()||'hakimi';
+      payload.model_name=modelName;
+      const parseBound=(id,fb,min,max,label)=>{
+        const raw=String($(id)?.value??'').trim();
+        if(!raw)return fb;
+        const n=Number(raw);
+        if(!Number.isFinite(n)||n<min||n>max)throw Error(label+' 须在 '+min+'～'+max+' 之间');
+        return n;
+      };
+      payload.volume_envelope=parseBound('song-learn-rvc-volume-envelope',currentRvcDefaults.volume_envelope,0,1,'volume_envelope');
+      payload.index_rate=parseBound('song-learn-rvc-index-rate',currentRvcDefaults.index_rate,0,1,'index_rate');
+      payload.protect=parseBound('song-learn-rvc-protect',currentRvcDefaults.protect,0,0.5,'protect');
+      payload.backing_gain_db=parseBound('song-learn-rvc-backing-gain',currentRvcDefaults.backing_gain_db,-24,-6,'backing_gain_db');
+      payload.skip_dereverb=$('song-learn-rvc-skip-dereverb')?Boolean($('song-learn-rvc-skip-dereverb').checked):Boolean(currentRvcDefaults.skip_dereverb);
+      payload.skip_backing=$('song-learn-rvc-skip-backing')?Boolean($('song-learn-rvc-skip-backing').checked):Boolean(currentRvcDefaults.skip_backing);
+    }else{
+      const refSel=$('song-learn-ref-voice');
+      refVoice=String(refSel?.value||'').trim();
+      const refFileId=refSel?.selectedOptions?.[0]?.dataset?.fileId||'';
+      if(refVoice){
+        payload.ref_voice=refVoice;
+        if(refFileId)payload.ref_audio_file_id=refFileId;
+      }
+      const rawSteps=String($('song-learn-svc-steps')?.value??'').trim();
+      if(rawSteps!==''){
+        const steps=Number(rawSteps);
+        if(!Number.isInteger(steps)||steps<10||steps>100)throw Error('SVC 扩散推理步数 svc_steps 须为 10～100 的整数');
+        payload.svc_steps=steps;
+      }
+    }
     let job;
     try{job=await api('songs/learn','POST',payload);}
     catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
     const jobId=job?.id||job?.job_id||'—';
-    showSongLearnResult(job,title,inboxFilename,pitch);
+    showSongLearnResult(job,title,inboxFilename,pitch,{engine,refVoice,modelName});
     clearSongLearnForm();
-    notice('已提交学歌任务「'+title+'」（作业 '+jobId+'），可在「Colab 云端算力」查看作业进度');
+    notice('已提交学歌任务「'+title+'」（'+(songEngineShortLabels[engine]||engine)+' · 作业 '+jobId+'），可在「Colab 云端算力」查看作业进度');
     await songs();
   });
 });
@@ -782,6 +1214,8 @@ $('song-upload').addEventListener('submit',e=>{
   });
 });
 
+syncSongLearnEngineFields();
+
 trackDirty('bili-policy','小号巡逻设置');
 trackDirty('video-watch-policy','原片分析设置');
 trackDirty('song-storage-form','歌单云盘目录');
@@ -792,11 +1226,18 @@ onLogout(()=>{
   clearSongPreviews(true);
   selectedSongFile=null;
   pendingSongLearn=null;
+  pendingRefVoice=null;
   lastSongStorageState=null;
+  defaultSongEngine='dual';
+  rvcParamsTouched=false;
+  currentRvcDefaults={...defaultRvcParams};
   clearSongLearnForm();
   $('song-learn-inbox').replaceChildren(selectOption('','不指定文件（使用下方自动检索）'));
+  $('song-learn-ref-voice').replaceChildren(selectOption('','自动选用默认参考干声（hakimi_ref）'));
+  $('song-learn-model').replaceChildren(selectOption('hakimi','hakimi（默认）'));
   $('song-learn-gpu').replaceChildren(selectOption('','默认 L4（自动回退 T4）'));
   $('song-learn-gpu').value='';
+  $('song-ref-voice-file').value='';
   $('song-learn-result').hidden=true;
   $('song-learn-result').replaceChildren();
   $('song-drive-details').replaceChildren();
@@ -805,6 +1246,7 @@ onLogout(()=>{
   $('song-storage-save').disabled=true;
   $('song-storage-reset').disabled=true;
   text('song-storage-source','');
+  text('song-ref-voice-hint','');
   text('song-file-name','未选择音频文件');
   text('meme-prompt-count','当前已加载到 Prompt 的有效表情数量：0');
   text('song-prompt-count','当前已加载到 Prompt 的有效曲目：0');

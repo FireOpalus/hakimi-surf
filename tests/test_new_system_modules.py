@@ -170,7 +170,7 @@ async def test_new_system_modules_topology_isolation_and_reserved_ids(settings):
                 "default_gpu": "L4",
                 "fallback_gpus": ["T4"],
                 "allowed_gpus": ["L4", "T4", "A100", "H100"],
-                "timeout_seconds": 1800,
+                "timeout_seconds": 2400,
             }
             assert job_specs["rvc_train"] == {
                 "job_type": "rvc_train",

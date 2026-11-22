@@ -765,6 +765,8 @@ def _make_drive_dispatch_context(
     inbox_name: str = "",
     pth_file_id: str = "",
     index_file_id: str = "",
+    ref_audio_file_id: str = "",
+    ref_audio_name: str = "",
     cache_weights_file_id: str = "",
     cache_weights_sha256: str = "",
 ) -> dict[str, Any]:
@@ -783,6 +785,8 @@ def _make_drive_dispatch_context(
                 "inbox_name": inbox_name,
                 "pth_file_id": pth_file_id,
                 "index_file_id": index_file_id,
+                "ref_audio_file_id": ref_audio_file_id,
+                "ref_audio_name": ref_audio_name,
                 "cache_weights_file_id": cache_weights_file_id,
                 "cache_weights_sha256": cache_weights_sha256,
             },
@@ -1129,7 +1133,12 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
                 "job_id": job_id,
                 "job_type": "rvc_cover",
                 "gpu_candidates": ["L4", "T4"],
-                "payload": {"title": "雨爱", "artist": "杨丞琳", "inbox_file_id": inbox_id},
+                "payload": {
+                    "title": "雨爱",
+                    "artist": "杨丞琳",
+                    "engine": "rvc",
+                    "inbox_file_id": inbox_id,
+                },
                 "dispatch_context": _make_drive_dispatch_context(
                     tree, inbox_file_id=inbox_id, inbox_name="yu_ai.m4a"
                 ),
@@ -1562,7 +1571,12 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
         )
         job = await hub.submit_job(
             "rvc_cover",
-            {"title": "小幸运", "artist": "田馥甄", "inbox_file_id": inbox_up["file_id"]},
+            {
+                "title": "小幸运",
+                "artist": "田馥甄",
+                "engine": "rvc",
+                "inbox_file_id": inbox_up["file_id"],
+            },
         )
         assert job["status"] == "queued"
 
@@ -1676,7 +1690,7 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                     "default_gpu": "L4",
                     "fallback_gpus": ["T4"],
                     "allowed_gpus": ["L4", "T4", "A100", "H100"],
-                    "timeout_seconds": 1800,
+                    "timeout_seconds": 2400,
                 }
                 assert policies["rvc_train"] == {
                     "job_type": "rvc_train",
@@ -1871,28 +1885,36 @@ def test_colab_decoupling_static_ast_and_routes() -> None:
 def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
     import inspect
 
-    # 1. Cover defaults: 0.15 / 0.42 / 0.12 and backing=-14.0, skip_backing=True, skip_dereverb=True
+    # 1. Cover defaults: engine=dual, 0.15/0.42/0.25, backing=-14.0, skip_backing=T, skip_dereverb=F
     w_cover = colab_jobs_rvc.RvcCoverPayload(title="test")
     assert (
+        w_cover.engine,
+        w_cover.ref_voice,
+        w_cover.ref_audio_file_id,
+        w_cover.svc_steps,
         w_cover.index_rate,
         w_cover.protect,
         w_cover.volume_envelope,
         w_cover.backing_gain_db,
         w_cover.skip_backing,
         w_cover.skip_dereverb,
-    ) == (0.15, 0.42, 0.12, -14.0, True, True)
+    ) == ("dual", "", "", None, 0.15, 0.42, 0.25, -14.0, True, False)
 
     h_cover = RvcCoverJobPayload(title="test")
     assert (
+        h_cover.engine,
+        h_cover.ref_voice,
+        h_cover.ref_audio_file_id,
+        h_cover.svc_steps,
         h_cover.index_rate,
         h_cover.protect,
         h_cover.volume_envelope,
         h_cover.backing_gain_db,
         h_cover.skip_backing,
         h_cover.skip_dereverb,
-    ) == (0.15, 0.42, 0.12, -14.0, True, True)
+    ) == ("dual", "", "", None, 0.15, 0.42, 0.25, -14.0, True, False)
 
-    # Strict validation for backing_gain_db (finite float in [-24, -6], no bool) & bool flags
+    # Strict validation for backing_gain_db (finite float in [-24, -6]), svc_steps & bool flags
     for model_cls in (colab_jobs_rvc.RvcCoverPayload, RvcCoverJobPayload):
         for bad_bg in (True, False, float("nan"), float("inf"), -24.5, -5.5):
             with pytest.raises(ValidationError):
@@ -1902,22 +1924,25 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
                 model_cls(title="test", skip_backing=bad_flag)  # type: ignore[arg-type]
             with pytest.raises(ValidationError):
                 model_cls(title="test", skip_dereverb=bad_flag)  # type: ignore[arg-type]
+        for bad_steps in (True, False, 5, 101):
+            with pytest.raises(ValidationError):
+                model_cls(title="test", svc_steps=bad_steps)  # type: ignore[arg-type]
 
     sig_cov_rvc = inspect.signature(colab_rvc.run_cover_pipeline).parameters
     assert sig_cov_rvc["index_rate"].default == 0.15
     assert sig_cov_rvc["protect"].default == 0.42
-    assert sig_cov_rvc["volume_envelope"].default == 0.12
+    assert sig_cov_rvc["volume_envelope"].default == 0.25
     assert sig_cov_rvc["backing_gain_db"].default == -14.0
     assert sig_cov_rvc["skip_backing"].default is True
-    assert sig_cov_rvc["skip_dereverb"].default is True
+    assert sig_cov_rvc["skip_dereverb"].default is False
 
     sig_cov_rem = inspect.signature(colab_remote.action_cover).parameters
     assert sig_cov_rem["index_rate"].default == 0.15
     assert sig_cov_rem["protect"].default == 0.42
-    assert sig_cov_rem["volume_envelope"].default == 0.12
+    assert sig_cov_rem["volume_envelope"].default == 0.25
     assert sig_cov_rem["backing_gain_db"].default == -14.0
     assert sig_cov_rem["skip_backing"].default is True
-    assert sig_cov_rem["skip_dereverb"].default is True
+    assert sig_cov_rem["skip_dereverb"].default is False
 
     rvc_cover_args = colab_rvc._build_parser().parse_args(
         ["cover", "--source", "s.mp3", "--title", "t"]
@@ -1929,7 +1954,7 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         rvc_cover_args.backing_gain_db,
         rvc_cover_args.skip_backing,
         rvc_cover_args.skip_dereverb,
-    ) == (0.15, 0.42, 0.12, -14.0, True, True)
+    ) == (0.15, 0.42, 0.25, -14.0, True, False)
     rem_cover_args = colab_remote._build_parser().parse_args(
         ["cover", "--source", "s.mp3", "--pth", "m.pth", "--index", "m.index"]
     )
@@ -1940,7 +1965,7 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         rem_cover_args.backing_gain_db,
         rem_cover_args.skip_backing,
         rem_cover_args.skip_dereverb,
-    ) == (0.15, 0.42, 0.12, -14.0, True, True)
+    ) == (0.15, 0.42, 0.25, -14.0, True, False)
 
     # 2. Train defaults: 150 / 30 / 12 / 48000 & train CLI --gpu default
     w_train = colab_jobs_rvc.RvcTrainPayload()
@@ -2276,7 +2301,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j1,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4", "T4"],
-                    "payload": {"title": "暖机测试1", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "暖机测试1",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2311,7 +2340,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j2,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4", "T4"],
-                    "payload": {"title": "暖机测试2", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "暖机测试2",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2336,7 +2369,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j3,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
-                    "payload": {"title": "探活失败回退", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "探活失败回退",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2355,7 +2392,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j4,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["H100"],
-                    "payload": {"title": "高价卡禁保活", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "高价卡禁保活",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2373,7 +2414,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j5,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
-                    "payload": {"title": "到期回收", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "到期回收",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2395,7 +2440,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j6,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
-                    "payload": {"title": "训练前排空", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "训练前排空",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2429,7 +2478,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
                     "allow_warm_keepalive": False,
-                    "payload": {"title": "预算不足禁保活", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "预算不足禁保活",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2448,7 +2501,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j_lowcu,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
-                    "payload": {"title": "余额偏低禁保活", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "余额偏低禁保活",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -2467,7 +2524,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_id": j7,
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
-                    "payload": {"title": "退出清理", "inbox_file_id": inbox_up["file_id"]},
+                    "payload": {
+                        "title": "退出清理",
+                        "engine": "rvc",
+                        "inbox_file_id": inbox_up["file_id"],
+                    },
                     "dispatch_context": cover_ctx,
                 },
             )
@@ -3280,6 +3341,7 @@ async def test_colab_jobs_dynamic_handler_registry_rvc_mixing_and_cli_help(
                     "gpu_candidates": ["L4"],
                     "payload": {
                         "title": "枝垂桜",
+                        "engine": "rvc",
                         "inbox_file_id": inbox_up["file_id"],
                         "backing_gain_db": -16.5,
                         "skip_backing": True,
@@ -3337,23 +3399,29 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
     lib = SongLibrary(store, compute=_StubCompute())
     await lib.initialize()
 
-    # Default call remains backward-compatible and normalizes defaults via RvcCoverJobPayload
+    # Default call normalizes defaults via RvcCoverJobPayload (engine=dual, universal RVC defaults)
     await lib.request_learn_song("枝垂桜", auto_search=True)
+    assert submitted[-1][1]["engine"] == "dual"
+    assert submitted[-1][1]["volume_envelope"] == 0.25
     assert submitted[-1][1]["backing_gain_db"] == -14.0
     assert submitted[-1][1]["skip_backing"] is True
-    assert submitted[-1][1]["skip_dereverb"] is True
+    assert submitted[-1][1]["skip_dereverb"] is False
 
-    # Explicit mixing overrides pass through cleanly
+    # Explicit mixing & engine overrides pass through cleanly
     await lib.request_learn_song(
         "枝垂桜",
         auto_search=True,
+        engine="rvc",
+        volume_envelope=0.18,
         backing_gain_db=-16.0,
         skip_backing=False,
-        skip_dereverb=False,
+        skip_dereverb=True,
     )
+    assert submitted[-1][1]["engine"] == "rvc"
+    assert submitted[-1][1]["volume_envelope"] == 0.18
     assert submitted[-1][1]["backing_gain_db"] == -16.0
     assert submitted[-1][1]["skip_backing"] is False
-    assert submitted[-1][1]["skip_dereverb"] is False
+    assert submitted[-1][1]["skip_dereverb"] is True
 
     # Invalid mixing parameters are strictly rejected
     for bad_bg in (True, float("nan"), float("inf"), -25.0, -5.0):

@@ -30,6 +30,20 @@ from . import (
 DEFAULT_BACKING_GAIN_DB = -14.0
 MIN_BACKING_GAIN_DB = -24.0
 MAX_BACKING_GAIN_DB = -6.0
+DEFAULT_VOLUME_ENVELOPE = 0.25
+DEFAULT_SKIP_DEREVERB = False
+CoverEngine = Literal["dual", "yingmusic_svc", "seed_vc", "rvc"]
+CANDIDATE_PRIORITY: tuple[str, ...] = ("yingmusic_svc", "seed_vc", "rvc")
+RVC_DEFAULT_PARAMS: dict[str, Any] = {
+    "volume_envelope": DEFAULT_VOLUME_ENVELOPE,
+    "skip_dereverb": DEFAULT_SKIP_DEREVERB,
+    "index_rate": 0.15,
+    "protect": 0.42,
+    "backing_gain_db": DEFAULT_BACKING_GAIN_DB,
+    "skip_backing": True,
+    "f0_method": "rmvpe",
+}
+_SUPPORTED_REF_AUDIO_EXTS = frozenset({".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"})
 
 
 def _load_colab_rvc_module():
@@ -104,12 +118,95 @@ def _probe_audio_duration_ms(path: Path, fallback_sec: float = 50.0) -> int:
     return int(round(max(1.0, min(60.0, fallback_sec)) * 1000.0))
 
 
+def _find_local_ref_voice(
+    model_dir: Path,
+    ref_voice: str,
+    model_name: str,
+) -> Path | None:
+    """Resolve a local zero-shot reference voice clip on host as a dev/test fallback."""
+    search_dirs = [model_dir, model_dir / "ref_voices", model_dir / model_name]
+    cleaned = ref_voice.strip()
+    if cleaned:
+        for base in search_dirs:
+            if not base.is_dir():
+                continue
+            exact = base / cleaned
+            if exact.is_file() and exact.suffix.lower() in _SUPPORTED_REF_AUDIO_EXTS:
+                return exact
+            for ext in sorted(_SUPPORTED_REF_AUDIO_EXTS):
+                stem_match = base / f"{cleaned}{ext}"
+                if stem_match.is_file():
+                    return stem_match
+        return None
+
+    for base in search_dirs:
+        if not base.is_dir():
+            continue
+        exact_default = base / "hakimi_ref.wav"
+        if exact_default.is_file():
+            return exact_default
+        prefixed = sorted(
+            (
+                p
+                for p in base.iterdir()
+                if p.is_file()
+                and p.name.lower().startswith("hakimi_ref")
+                and p.suffix.lower() in _SUPPORTED_REF_AUDIO_EXTS
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if prefixed:
+            return prefixed[0]
+        any_audio = sorted(
+            (
+                p
+                for p in base.iterdir()
+                if p.is_file() and p.suffix.lower() in _SUPPORTED_REF_AUDIO_EXTS
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if any_audio:
+            return any_audio[0]
+    return None
+
+
+def _normalize_candidate_entry(raw: dict[str, Any]) -> dict[str, Any]:
+    eng = str(raw.get("engine") or raw.get("key") or "rvc").strip().lower()
+    key = str(raw.get("key") or eng).strip().lower()
+    status = "succeeded" if str(raw.get("status") or "").lower() == "succeeded" else "failed"
+    metrics = raw.get("acoustic_metrics")
+    return {
+        "key": key,
+        "engine": eng,
+        "status": status,
+        "error_code": str(raw["error_code"]) if raw.get("error_code") else None,
+        "error": str(raw["error"]) if raw.get("error") else None,
+        "digest": str(raw.get("digest") or ""),
+        "byte_size": int(raw.get("byte_size") or 0),
+        "full_byte_size": int(raw.get("full_byte_size") or 0),
+        "duration_ms": int(raw.get("duration_ms") or 0),
+        "drive_chorus_id": str(raw.get("drive_chorus_id") or ""),
+        "drive_full_id": str(raw.get("drive_full_id") or ""),
+        "chorus_filename": str(raw.get("chorus_filename") or ""),
+        "full_filename": str(raw.get("full_filename") or ""),
+        "loudness_gain_db": float(raw.get("loudness_gain_db") or 0.0),
+        "elapsed_sec": float(raw.get("elapsed_sec") or 0.0),
+        "acoustic_metrics": dict(metrics) if isinstance(metrics, dict) else {},
+    }
+
+
 class RvcCoverPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1, max_length=80)
     artist: str = Field(default="", max_length=60)
     tags: str = Field(default="", max_length=120)
+    engine: CoverEngine = "dual"
+    ref_voice: str = Field(default="", max_length=160)
+    ref_audio_file_id: str = Field(default="", max_length=128)
+    svc_steps: int | None = Field(default=None, ge=10, le=100)
     pitch: int = Field(default=0, ge=-24, le=24)
     auto_search: bool = True
     query: str = Field(default="", max_length=120)
@@ -122,7 +219,9 @@ class RvcCoverPayload(BaseModel):
     model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
     index_rate: float = Field(default=0.15, ge=0.0, le=1.0, allow_inf_nan=False)
     protect: float = Field(default=0.42, ge=0.0, le=0.5, allow_inf_nan=False)
-    volume_envelope: float = Field(default=0.12, ge=0.0, le=1.0, allow_inf_nan=False)
+    volume_envelope: float = Field(
+        default=DEFAULT_VOLUME_ENVELOPE, ge=0.0, le=1.0, allow_inf_nan=False
+    )
     backing_gain_db: float = Field(
         default=DEFAULT_BACKING_GAIN_DB,
         ge=MIN_BACKING_GAIN_DB,
@@ -130,7 +229,7 @@ class RvcCoverPayload(BaseModel):
         allow_inf_nan=False,
     )
     skip_backing: bool = True
-    skip_dereverb: bool = True
+    skip_dereverb: bool = DEFAULT_SKIP_DEREVERB
 
     @field_validator("title")
     @classmethod
@@ -142,6 +241,7 @@ class RvcCoverPayload(BaseModel):
 
     @field_validator(
         "pitch",
+        "svc_steps",
         "duration_sec",
         "fallback_start_sec",
         "index_rate",
@@ -152,6 +252,8 @@ class RvcCoverPayload(BaseModel):
     )
     @classmethod
     def _check_numeric_not_bool(cls, v: Any, info: Any) -> Any:
+        if v is None and str(info.field_name) == "svc_steps":
+            return None
         return reject_bool_num(v, name=str(info.field_name))
 
     @field_validator("skip_backing", "skip_dereverb", mode="before")
@@ -161,14 +263,14 @@ class RvcCoverPayload(BaseModel):
             raise ValueError(f"{info.field_name} must be a boolean")
         return v
 
-    @field_validator("inbox_file_id")
+    @field_validator("inbox_file_id", "ref_audio_file_id")
     @classmethod
-    def _check_inbox_id(cls, v: str) -> str:
+    def _check_drive_file_ids(cls, v: str) -> str:
         return validate_drive_id(v, allow_empty=True)
 
-    @field_validator("inbox_filename")
+    @field_validator("inbox_filename", "ref_voice")
     @classmethod
-    def _check_inbox_filename(cls, v: str) -> str:
+    def _check_safe_filenames(cls, v: str) -> str:
         cleaned = v.strip()
         if not cleaned:
             return ""
@@ -210,12 +312,19 @@ class RvcTrainPayload(BaseModel):
 
 
 class RvcCoverHandler(JobHandler):
-    """Colab GPU handler for RVC cover generation with 3-tier acceleration."""
+    """Colab GPU handler for dual-engine SVC / RVC cover generation with 3-tier acceleration."""
 
     job_type = "rvc_cover"
     payload_model = RvcCoverPayload
     allow_warm_keepalive = True
-    allowed_error_codes = frozenset({"source_not_found", "model_not_found"})
+    allowed_error_codes = frozenset(
+        {
+            "source_not_found",
+            "model_not_found",
+            "ref_voice_not_found",
+            "svc_all_engines_failed",
+        }
+    )
 
     def validate_payload(self, payload: dict[str, Any]) -> RvcCoverPayload:
         if not isinstance(payload, dict):
@@ -231,6 +340,7 @@ class RvcCoverHandler(JobHandler):
         parsed_payload: RvcCoverPayload,
     ) -> tuple[dict[str, Any], str]:
         payload = parsed_payload
+        is_rvc = payload.engine == "rvc"
         drive_ctx, drive = ctx.build_ephemeral_drive(required_roles=("songs",))
         songs_folder_id = drive.folder_for("songs")
         slug = colab_rvc_mod._slugify(payload.title)
@@ -312,49 +422,103 @@ class RvcCoverHandler(JobHandler):
             if ctx.is_cancelled():
                 raise RuntimeError("cancelled")
 
-            # 3) Resolve RVC model weights from dispatch_context or local fallback
-            model_subdir = ctx.config.model_dir / payload.model_name
+            # 3) Resolve engine voice asset: RVC (.pth+.index) OR SVC zero-shot reference audio
             pth_path: Path | None = None
             index_path: Path | None = None
             drive_pth_file_id = ""
             drive_index_file_id = ""
             ensure_local_model_fn: Callable[[], tuple[Path, Path]] | None = None
 
-            ctx_pth_id = drive_ctx.files.pth_file_id
-            ctx_index_id = drive_ctx.files.index_file_id
-            if ctx_pth_id and ctx_index_id:
-                drive.verify_file_in_folders(ctx_pth_id, allowed_roles=("models",))
-                drive.verify_file_in_folders(ctx_index_id, allowed_roles=("models",))
+            ref_audio_path: Path | None = None
+            drive_ref_audio_file_id = ""
+            drive_ref_audio_ext = ".wav"
+            effective_ref_name = ""
+            ensure_local_ref_fn: Callable[[], Path] | None = None
 
-                def _dl_model_local() -> tuple[Path, Path]:
-                    pth_dst = drive.download_file(
-                        ctx_pth_id,
-                        tmp_models_dir / f"{payload.model_name}.pth",
-                        allowed_roles=("models",),
-                    )
-                    idx_dst = drive.download_file(
-                        ctx_index_id,
-                        tmp_models_dir / f"{payload.model_name}.index",
-                        allowed_roles=("models",),
-                    )
-                    return pth_dst, idx_dst
+            if is_rvc:
+                model_subdir = ctx.config.model_dir / payload.model_name
+                ctx_pth_id = drive_ctx.files.pth_file_id
+                ctx_index_id = drive_ctx.files.index_file_id
+                if ctx_pth_id and ctx_index_id:
+                    drive.verify_file_in_folders(ctx_pth_id, allowed_roles=("models",))
+                    drive.verify_file_in_folders(ctx_index_id, allowed_roles=("models",))
 
-                if drive_token:
-                    drive_pth_file_id = ctx_pth_id
-                    drive_index_file_id = ctx_index_id
-                    ensure_local_model_fn = _dl_model_local
+                    def _dl_model_local() -> tuple[Path, Path]:
+                        pth_dst = drive.download_file(
+                            ctx_pth_id,
+                            tmp_models_dir / f"{payload.model_name}.pth",
+                            allowed_roles=("models",),
+                        )
+                        idx_dst = drive.download_file(
+                            ctx_index_id,
+                            tmp_models_dir / f"{payload.model_name}.index",
+                            allowed_roles=("models",),
+                        )
+                        return pth_dst, idx_dst
+
+                    if drive_token:
+                        drive_pth_file_id = ctx_pth_id
+                        drive_index_file_id = ctx_index_id
+                        ensure_local_model_fn = _dl_model_local
+                    else:
+                        pth_path, index_path = _dl_model_local()
                 else:
-                    pth_path, index_path = _dl_model_local()
+                    local_pth = model_subdir / f"{payload.model_name}.pth"
+                    local_idx = model_subdir / f"{payload.model_name}.index"
+                    if local_pth.is_file() and local_idx.is_file():
+                        pth_path, index_path = local_pth, local_idx
+                    else:
+                        raise EphemeralDriveError(
+                            "model_not_found",
+                            f"Model files not found for {payload.model_name}",
+                        )
             else:
-                local_pth = model_subdir / f"{payload.model_name}.pth"
-                local_idx = model_subdir / f"{payload.model_name}.index"
-                if local_pth.is_file() and local_idx.is_file():
-                    pth_path, index_path = local_pth, local_idx
-                else:
+                ctx_ref_id = drive_ctx.files.ref_audio_file_id
+                if (
+                    payload.ref_audio_file_id
+                    and ctx_ref_id
+                    and payload.ref_audio_file_id != ctx_ref_id
+                ):
                     raise EphemeralDriveError(
-                        "model_not_found",
-                        f"Model files not found for {payload.model_name}",
+                        "drive_file_outside_scope",
+                        "Payload ref_audio_file_id does not match authorized dispatch_context",
                     )
+                resolved_ref_id = ctx_ref_id or payload.ref_audio_file_id
+                resolved_ref_name = drive_ctx.files.ref_audio_name or payload.ref_voice
+
+                if resolved_ref_id:
+                    ref_meta = drive.verify_file_in_folders(
+                        resolved_ref_id, allowed_roles=("models",)
+                    )
+                    effective_ref_name = (
+                        resolved_ref_name or str(ref_meta.get("name") or "") or "hakimi_ref.wav"
+                    )
+                    drive_ref_audio_ext = Path(effective_ref_name).suffix.lower() or ".wav"
+
+                    def _dl_ref_local() -> Path:
+                        return drive.download_file(
+                            resolved_ref_id,
+                            tmp_models_dir / f"hakimi_ref{drive_ref_audio_ext}",
+                            allowed_roles=("models",),
+                        )
+
+                    if drive_token:
+                        drive_ref_audio_file_id = resolved_ref_id
+                        ensure_local_ref_fn = _dl_ref_local
+                    else:
+                        ref_audio_path = _dl_ref_local()
+                else:
+                    local_ref = _find_local_ref_voice(
+                        ctx.config.model_dir, payload.ref_voice, payload.model_name
+                    )
+                    if local_ref is not None:
+                        ref_audio_path = local_ref
+                        effective_ref_name = local_ref.name
+                    else:
+                        raise EphemeralDriveError(
+                            "ref_voice_not_found",
+                            "Zero-shot reference voice audio not found in models/",
+                        )
 
             # 4) Version-keyed weight cache metadata from dispatch_context (Tier 3)
             cache_folder_id = (
@@ -389,7 +553,10 @@ class RvcCoverHandler(JobHandler):
                 "source_path": source_path,
                 "pth_path": pth_path,
                 "index_path": index_path,
+                "ref_audio_path": ref_audio_path,
                 "cover_dir": cover_dir,
+                "engine": payload.engine,
+                "svc_steps": payload.svc_steps,
                 "model_name": payload.model_name,
                 "pitch": payload.pitch,
                 "index_rate": payload.index_rate,
@@ -404,11 +571,14 @@ class RvcCoverHandler(JobHandler):
                 "fallback_start_sec": payload.fallback_start_sec,
                 "ensure_local_source_fn": ensure_local_source_fn,
                 "ensure_local_model_fn": ensure_local_model_fn,
+                "ensure_local_ref_fn": ensure_local_ref_fn,
                 "drive_access_token": drive_token,
                 "drive_source_file_id": drive_source_file_id,
                 "drive_source_ext": drive_source_ext,
                 "drive_pth_file_id": drive_pth_file_id,
                 "drive_index_file_id": drive_index_file_id,
+                "drive_ref_audio_file_id": drive_ref_audio_file_id,
+                "drive_ref_audio_ext": drive_ref_audio_ext,
                 # colab_rvc.run_cover_pipeline parameter name for direct songs/ output folder
                 "drive_songs_folder_id": songs_folder_id if drive_token else "",
                 "cover_prefix": slug,
@@ -421,9 +591,17 @@ class RvcCoverHandler(JobHandler):
                 "reuse_session": warm_reused,
                 "reused_gpu": reused_gpu,
                 "reused_setup_ready": reused_setup_ready,
+                "reused_sep_ready": warm_claim.sep_ready if warm_reused else None,
+                "reused_svc_ready": warm_claim.svc_ready if warm_reused else None,
+                "reused_rvc_ready": warm_claim.rvc_ready if warm_reused else None,
                 "keep_session_on_success": want_keep_warm,
             }
-            pipe_res = cover_runner(**_filter_runner_kwargs(cover_runner, runner_kwargs))
+            try:
+                pipe_res = cover_runner(**_filter_runner_kwargs(cover_runner, runner_kwargs))
+            except RuntimeError as exc:
+                if "svc_all_engines_failed:" in str(exc):
+                    raise EphemeralDriveError("svc_all_engines_failed", str(exc)) from None
+                raise
             assigned_gpu = str(pipe_res.get("assigned_gpu") or reused_gpu or ctx.gpu_candidates[0])
 
             # 7) Park warm session ONLY if strictly eligible; otherwise guarantee termination
@@ -435,12 +613,55 @@ class RvcCoverHandler(JobHandler):
             drive_outputs = pipe_res.get("drive_outputs")
             chorus_out = drive_outputs.get("chorus") if isinstance(drive_outputs, dict) else None
             full_out = drive_outputs.get("full") if isinstance(drive_outputs, dict) else None
+            direct_cands = (
+                drive_outputs.get("candidates") if isinstance(drive_outputs, dict) else None
+            )
+
+            normalized_candidates: list[dict[str, Any]] = []
+            default_eng = "yingmusic_svc" if payload.engine == "dual" else payload.engine
+            engine_used = str(meta.get("engine_used") or default_eng)
+
             if (
                 isinstance(chorus_out, dict)
                 and chorus_out.get("file_id")
                 and chorus_out.get("sha256")
                 and int(chorus_out.get("size") or 0) > 0
             ):
+                if isinstance(direct_cands, list) and direct_cands:
+                    normalized_candidates = [
+                        _normalize_candidate_entry(c) for c in direct_cands if isinstance(c, dict)
+                    ]
+                elif isinstance(meta.get("candidates"), list) and meta["candidates"]:
+                    normalized_candidates = [
+                        _normalize_candidate_entry(c)
+                        for c in meta["candidates"]
+                        if isinstance(c, dict)
+                    ]
+                else:
+                    normalized_candidates = [
+                        _normalize_candidate_entry(
+                            {
+                                "key": engine_used,
+                                "engine": engine_used,
+                                "status": "succeeded",
+                                "digest": str(chorus_out["sha256"]),
+                                "byte_size": int(chorus_out["size"]),
+                                "full_byte_size": int((full_out or {}).get("size") or 0),
+                                "duration_ms": int(
+                                    chorus_out.get("duration_ms")
+                                    or round(
+                                        float(meta.get("chorus_duration_sec", payload.duration_sec))
+                                        * 1000.0
+                                    )
+                                ),
+                                "drive_chorus_id": str(chorus_out["file_id"]),
+                                "drive_full_id": str((full_out or {}).get("file_id") or ""),
+                                "chorus_filename": str(chorus_out.get("name") or ""),
+                                "full_filename": str((full_out or {}).get("name") or ""),
+                                "loudness_gain_db": float(meta.get("loudness_gain_db") or 0.0),
+                            }
+                        )
+                    ]
                 digest = str(chorus_out["sha256"])
                 byte_size = int(chorus_out["size"])
                 duration_ms = int(
@@ -450,34 +671,180 @@ class RvcCoverHandler(JobHandler):
                 drive_chorus_id = str(chorus_out["file_id"])
                 drive_full_id = str((full_out or {}).get("file_id") or "")
             else:
-                chorus_mp3 = Path(pipe_res["chorus_mp3"])
-                full_mp3 = Path(pipe_res["full_mp3"])
-                chorus_bytes = chorus_mp3.read_bytes()
-                digest = _sha256_bytes(chorus_bytes)
-                byte_size = len(chorus_bytes)
-                duration_ms = _probe_audio_duration_ms(
-                    chorus_mp3, float(meta.get("chorus_duration_sec", payload.duration_sec))
-                )
-                chorus_up = drive.upload_file(
-                    "songs",
-                    chorus_mp3,
-                    drive_name=f"{slug}_{digest[:8]}_chorus.mp3",
-                    mime_type="audio/mpeg",
-                    replace_existing=True,
-                    app_properties={"song_title": payload.title[:80], "kind": "chorus"},
-                )
-                drive_chorus_id = str(chorus_up["file_id"])
-                drive_full_id = ""
-                if full_mp3.is_file():
-                    full_up = drive.upload_file(
+                cand_files = pipe_res.get("candidate_files")
+                meta_cands = meta.get("candidates")
+                if (
+                    isinstance(cand_files, dict)
+                    and cand_files
+                    and isinstance(meta_cands, list)
+                    and meta_cands
+                ):
+                    single_legacy_rvc = (
+                        len(meta_cands) == 1 and str(meta_cands[0].get("engine") or "") == "rvc"
+                    )
+                    for raw_cand in meta_cands:
+                        if not isinstance(raw_cand, dict):
+                            continue
+                        norm = _normalize_candidate_entry(raw_cand)
+                        if norm["status"] != "succeeded":
+                            normalized_candidates.append(norm)
+                            continue
+                        eng = norm["engine"]
+                        file_pair = cand_files.get(eng) or {}
+                        c_chorus_mp3 = Path(file_pair.get("chorus_mp3") or pipe_res["chorus_mp3"])
+                        c_full_mp3 = Path(file_pair.get("full_mp3") or pipe_res["full_mp3"])
+                        c_bytes = c_chorus_mp3.read_bytes()
+                        c_digest = _sha256_bytes(c_bytes)
+                        c_size = len(c_bytes)
+                        c_dur_ms = _probe_audio_duration_ms(
+                            c_chorus_mp3,
+                            float(meta.get("chorus_duration_sec", payload.duration_sec)),
+                        )
+                        if single_legacy_rvc:
+                            c_chorus_name = f"{slug}_{c_digest[:8]}_chorus.mp3"
+                            c_full_name = f"{slug}_{c_digest[:8]}_full.mp3"
+                        else:
+                            c_chorus_name = f"{slug}_{eng}_{c_digest[:8]}_chorus.mp3"
+                            c_full_name = f"{slug}_{eng}_{c_digest[:8]}_full.mp3"
+                        c_chorus_up = drive.upload_file(
+                            "songs",
+                            c_chorus_mp3,
+                            drive_name=c_chorus_name,
+                            mime_type="audio/mpeg",
+                            replace_existing=True,
+                            app_properties={
+                                "song_title": payload.title[:80],
+                                "kind": "chorus",
+                                "engine": eng,
+                            },
+                        )
+                        c_full_id = ""
+                        c_full_size = 0
+                        if c_full_mp3.is_file():
+                            c_full_size = c_full_mp3.stat().st_size
+                            c_full_up = drive.upload_file(
+                                "songs",
+                                c_full_mp3,
+                                drive_name=c_full_name,
+                                mime_type="audio/mpeg",
+                                replace_existing=True,
+                                app_properties={
+                                    "song_title": payload.title[:80],
+                                    "kind": "full",
+                                    "engine": eng,
+                                },
+                            )
+                            c_full_id = str(c_full_up["file_id"])
+                        norm["digest"] = c_digest
+                        norm["byte_size"] = c_size
+                        norm["full_byte_size"] = c_full_size
+                        norm["duration_ms"] = c_dur_ms
+                        norm["drive_chorus_id"] = str(c_chorus_up["file_id"])
+                        norm["drive_full_id"] = c_full_id
+                        norm["chorus_filename"] = c_chorus_name
+                        norm["full_filename"] = c_full_name if c_full_id else ""
+                        normalized_candidates.append(norm)
+
+                    succeeded_cands = [
+                        c for c in normalized_candidates if c["status"] == "succeeded"
+                    ]
+                    if not succeeded_cands:
+                        raise EphemeralDriveError(
+                            "svc_all_engines_failed", "No succeeded cover candidate available"
+                        )
+                    primary = next(
+                        (
+                            c
+                            for pref in CANDIDATE_PRIORITY
+                            for c in succeeded_cands
+                            if c["engine"] == pref
+                        ),
+                        succeeded_cands[0],
+                    )
+                    engine_used = primary["engine"]
+                    digest = primary["digest"]
+                    byte_size = primary["byte_size"]
+                    duration_ms = primary["duration_ms"]
+                    drive_chorus_id = primary["drive_chorus_id"]
+                    drive_full_id = primary["drive_full_id"]
+                else:
+                    chorus_mp3 = Path(pipe_res["chorus_mp3"])
+                    full_mp3 = Path(pipe_res["full_mp3"])
+                    chorus_bytes = chorus_mp3.read_bytes()
+                    digest = _sha256_bytes(chorus_bytes)
+                    byte_size = len(chorus_bytes)
+                    duration_ms = _probe_audio_duration_ms(
+                        chorus_mp3, float(meta.get("chorus_duration_sec", payload.duration_sec))
+                    )
+                    chorus_name = f"{slug}_{digest[:8]}_chorus.mp3"
+                    full_name = f"{slug}_{digest[:8]}_full.mp3"
+                    chorus_up = drive.upload_file(
                         "songs",
-                        full_mp3,
-                        drive_name=f"{slug}_{digest[:8]}_full.mp3",
+                        chorus_mp3,
+                        drive_name=chorus_name,
                         mime_type="audio/mpeg",
                         replace_existing=True,
-                        app_properties={"song_title": payload.title[:80], "kind": "full"},
+                        app_properties={
+                            "song_title": payload.title[:80],
+                            "kind": "chorus",
+                            "engine": engine_used,
+                        },
                     )
-                    drive_full_id = str(full_up["file_id"])
+                    drive_chorus_id = str(chorus_up["file_id"])
+                    drive_full_id = ""
+                    full_byte_size = 0
+                    if full_mp3.is_file():
+                        full_byte_size = full_mp3.stat().st_size
+                        full_up = drive.upload_file(
+                            "songs",
+                            full_mp3,
+                            drive_name=full_name,
+                            mime_type="audio/mpeg",
+                            replace_existing=True,
+                            app_properties={
+                                "song_title": payload.title[:80],
+                                "kind": "full",
+                                "engine": engine_used,
+                            },
+                        )
+                        drive_full_id = str(full_up["file_id"])
+                    normalized_candidates = [
+                        _normalize_candidate_entry(
+                            {
+                                "key": engine_used,
+                                "engine": engine_used,
+                                "status": "succeeded",
+                                "digest": digest,
+                                "byte_size": byte_size,
+                                "full_byte_size": full_byte_size,
+                                "duration_ms": duration_ms,
+                                "drive_chorus_id": drive_chorus_id,
+                                "drive_full_id": drive_full_id,
+                                "chorus_filename": chorus_name,
+                                "full_filename": full_name if drive_full_id else "",
+                                "loudness_gain_db": float(meta.get("loudness_gain_db") or 0.0),
+                            }
+                        )
+                    ]
+
+            succeeded_final = [c for c in normalized_candidates if c["status"] == "succeeded"]
+            if succeeded_final:
+                primary_final = next(
+                    (
+                        c
+                        for pref in CANDIDATE_PRIORITY
+                        for c in succeeded_final
+                        if c["engine"] == pref
+                    ),
+                    succeeded_final[0],
+                )
+                engine_used = primary_final["engine"]
+                if not drive_chorus_id and primary_final["drive_chorus_id"]:
+                    digest = primary_final["digest"]
+                    byte_size = primary_final["byte_size"]
+                    duration_ms = primary_final["duration_ms"]
+                    drive_chorus_id = primary_final["drive_chorus_id"]
+                    drive_full_id = primary_final["drive_full_id"]
 
             raw_accel = pipe_res.get("acceleration")
             accel = dict(raw_accel) if isinstance(raw_accel, dict) else {}
@@ -495,13 +862,19 @@ class RvcCoverHandler(JobHandler):
                 "title": payload.title,
                 "artist": payload.artist,
                 "tags": payload.tags,
+                "engine_requested": payload.engine,
+                "engine_used": engine_used,
+                "ref_voice": effective_ref_name or str(meta.get("ref_voice") or ""),
                 "digest": digest,
                 "byte_size": byte_size,
                 "duration_ms": duration_ms,
                 "drive_chorus_id": drive_chorus_id,
                 "drive_full_id": drive_full_id,
                 "chorus_start_sec": float(meta.get("chorus_start_sec", 0.0)),
+                "chorus_duration_sec": float(meta.get("chorus_duration_sec", payload.duration_sec)),
                 "chorus_start_reason": str(meta.get("chorus_start_reason", "")),
+                "source_duration_sec": float(meta.get("source_duration_sec", 0.0)),
+                "candidates": normalized_candidates,
                 "acceleration": accel,
             }
             return result, assigned_gpu
@@ -640,6 +1013,11 @@ __all__ = [
     "DEFAULT_BACKING_GAIN_DB",
     "MIN_BACKING_GAIN_DB",
     "MAX_BACKING_GAIN_DB",
+    "DEFAULT_VOLUME_ENVELOPE",
+    "DEFAULT_SKIP_DEREVERB",
+    "RVC_DEFAULT_PARAMS",
+    "CoverEngine",
+    "CANDIDATE_PRIORITY",
     "RvcCoverPayload",
     "RvcTrainPayload",
     "RvcCoverHandler",

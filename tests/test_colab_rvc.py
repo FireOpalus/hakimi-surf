@@ -310,22 +310,44 @@ def test_run_colab_kills_hung_connection_lost_subprocess(
 
 
 def test_build_mix_filter_complex_with_and_without_backing() -> None:
-    fg_no_bg = colab_remote.build_mix_filter_complex(-1.25, has_backing=False)
+    expected_compand = (
+        "compand=attacks=0.05:decays=0.35:soft-knee=6:"
+        "points=-80/-80|-48/-48|-36/-31.5|-24/-19|-14/-12.5|-6/-6|0/-1,"
+    )
+    expected_comp = "acompressor=threshold=-20dB:ratio=2.2:attack=12:release=170:makeup=1.5dB,"
+
+    # Default vocal_profile="svc" uses 3200 Hz +1.2 dB light presence & 6800 Hz -1.5 dB
+    fg_svc = colab_remote.build_mix_filter_complex(-1.25, has_backing=False)
+    assert (
+        "[0:a]volume=-1.25dB,highpass=f=85,"
+        "equalizer=f=3200:t=q:w=1.4:g=1.2,"
+        "equalizer=f=6800:t=q:w=2.0:g=-1.5," in fg_svc
+    )
+    assert expected_compand in fg_svc
+    assert expected_comp in fg_svc
+    assert "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];" in fg_svc
+    assert (
+        "[vwet]highpass=f=300,lowpass=f=4000,aecho=0.8:0.6:23|41|67:0.16|0.10|0.06,volume=0.12[vamb];"
+        in fg_svc
+    )
+    assert "[1:a]volume=-0.8dB[inst];" in fg_svc
+    assert "[v][inst]amix=inputs=2:duration=longest:normalize=0," in fg_svc
+    assert "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]" in fg_svc
+    assert "[2:a]" not in fg_svc
+
+    # vocal_profile="rvc" preserves 3100 Hz -1.2 dB & 6800 Hz -2.0 dB de-harshing + weak lift
+    fg_rvc = colab_remote.build_mix_filter_complex(-1.25, has_backing=False, vocal_profile="rvc")
     assert (
         "[0:a]volume=-1.25dB,highpass=f=85,"
         "equalizer=f=3100:t=q:w=1.5:g=-1.2,"
-        "equalizer=f=6800:t=q:w=2.0:g=-2.0," in fg_no_bg
+        "equalizer=f=6800:t=q:w=2.0:g=-2.0," in fg_rvc
     )
-    assert "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=160:makeup=2.2dB," in fg_no_bg
-    assert "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];" in fg_no_bg
+    assert expected_compand in fg_rvc
+    assert expected_comp in fg_rvc
     assert (
         "[vwet]highpass=f=300,lowpass=f=3800,aecho=0.8:0.6:23|41|67:0.18|0.12|0.08,volume=0.12[vamb];"
-        in fg_no_bg
+        in fg_rvc
     )
-    assert "[1:a]volume=-0.8dB[inst];" in fg_no_bg
-    assert "[v][inst]amix=inputs=2:duration=longest:normalize=0," in fg_no_bg
-    assert "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]" in fg_no_bg
-    assert "[2:a]" not in fg_no_bg
 
     # Default skip_backing=True keeps 2-input mix even when has_backing=True
     fg_default_skip = colab_remote.build_mix_filter_complex(2.5, has_backing=True)
@@ -335,7 +357,7 @@ def test_build_mix_filter_complex_with_and_without_backing() -> None:
     # Explicit skip_backing=False enables -14.0 dB + 220..3200 Hz bandpass backing mix
     fg_with_bg = colab_remote.build_mix_filter_complex(2.5, has_backing=True, skip_backing=False)
     assert "[0:a]volume=2.50dB," in fg_with_bg
-    assert "equalizer=f=3100:t=q:w=1.5:g=-1.2," in fg_with_bg
+    assert "equalizer=f=3200:t=q:w=1.4:g=1.2," in fg_with_bg
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-14.0dB[bg];" in fg_with_bg
     assert "[v][inst][bg]amix=inputs=3:duration=longest:normalize=0," in fg_with_bg
     assert "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]" in fg_with_bg
@@ -361,7 +383,7 @@ def test_build_mix_filter_complex_with_and_without_backing() -> None:
     )
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-16.5dB[bg];" in fg_custom
 
-    # Strict validation: reject bool, non-finite, and injection strings
+    # Strict validation: reject bool, non-finite, injection strings, and bad vocal_profile
     for bad_bg in (True, False, float("nan"), float("inf"), float("-inf"), "-10;aeval=0"):
         with pytest.raises(ValueError):
             colab_remote.build_mix_filter_complex(
@@ -379,6 +401,8 @@ def test_build_mix_filter_complex_with_and_without_backing() -> None:
                 has_backing=True,
                 skip_backing=bad_skip,  # type: ignore[arg-type]
             )
+    with pytest.raises(ValueError, match="vocal_profile"):
+        colab_remote.build_mix_filter_complex(0.0, vocal_profile="invalid")
 
 
 def test_action_setup_restores_onnxruntime_gpu_and_dereverb_dry_keyword(
@@ -526,9 +550,14 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
             cmds.append(list(cmd))
             if "infer" in cmd and "--output-path" in cmd:
                 Path(cmd[cmd.index("--output-path") + 1]).write_bytes(_make_wav_bytes(2.0, 44100))
-            elif cmd[0] == "ffmpeg":
-                Path(cmd[-1]).write_bytes(b"ID3fake-mp3")
-            return colab_remote.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            elif cmd[0] == "ffmpeg" and cmd[-1] != "-":
+                if str(cmd[-1]).endswith(".wav"):
+                    Path(cmd[-1]).write_bytes(_make_wav_bytes(2.0, 16000))
+                else:
+                    Path(cmd[-1]).write_bytes(b"ID3fake-mp3")
+            return colab_remote.subprocess.CompletedProcess(
+                cmd, 0, stdout="", stderr="mean_volume: -14.0 dB\nmax_volume: -1.5 dB\n"
+            )
 
         monkeypatch.setattr(colab_remote, "_run", fake_run)
 
@@ -559,7 +588,7 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     assert "--split-audio" not in infer_cmd
     assert infer_cmd[infer_cmd.index("--index-rate") + 1] == "0.15"
     assert infer_cmd[infer_cmd.index("--protect") + 1] == "0.42"
-    assert infer_cmd[infer_cmd.index("--volume-envelope") + 1] == "0.12"
+    assert infer_cmd[infer_cmd.index("--volume-envelope") + 1] == "0.25"
     assert infer_cmd[infer_cmd.index("--f0-method") + 1] == "rmvpe"
     assert infer_cmd[infer_cmd.index("--embedder-model") + 1] == "contentvec"
     assert infer_cmd[infer_cmd.index("--export-format") + 1] == "WAV"
@@ -568,8 +597,15 @@ def test_action_cover_karaoke_split_audio_and_graceful_fallback(
     assert mix_cmd.count("-i") == 3
     assert "volume=-2.00dB" in mix_graph
     assert "equalizer=f=3100:t=q:w=1.5:g=-1.2" in mix_graph
+    assert "compand=attacks=0.05:decays=0.35:soft-knee=6:" in mix_graph
     assert "[2:a]highpass=f=220,lowpass=f=3200,volume=-14.0dB[bg];" in mix_graph
     assert "[v][inst][bg]amix=inputs=3" in mix_graph
+    assert meta_ok["engine_requested"] == "rvc"
+    assert meta_ok["engine_used"] == "rvc"
+    assert len(meta_ok["candidates"]) == 1
+    assert meta_ok["candidates"][0]["engine"] == "rvc"
+    assert meta_ok["candidates"][0]["status"] == "succeeded"
+    assert meta_ok["candidates"][0]["acoustic_metrics"]["clipped_peak_flag"] is False
     assert meta_ok["karaoke_backing_separated"] is True
     assert meta_ok["backing_gain_db"] == -14.0
     assert meta_ok["skip_backing"] is False
@@ -1110,15 +1146,43 @@ def test_p1_run_cover_pipeline_warm_reuse_and_high_gpu_never_kept(
         assert hi_res["session_kept"] is False
         assert f"sess-{banned_gpu}" in stopped
 
-    # probe_warm_session parses healthy vs broken
+    # probe_warm_session parses healthy (legacy & per-capability) vs broken
     monkeypatch.setattr(
         colab_rvc,
         "_run_colab",
         lambda args, **kw: (0, '__HAKIMI_WARM_PROBE__={"ok": true, "setup_ready": true}\n'),
     )
-    assert colab_rvc.probe_warm_session("warm-l4") == {"healthy": True, "setup_ready": True}
+    assert colab_rvc.probe_warm_session("warm-l4") == {
+        "healthy": True,
+        "setup_ready": True,
+        "sep_ready": True,
+        "svc_ready": False,
+        "rvc_ready": True,
+    }
+    monkeypatch.setattr(
+        colab_rvc,
+        "_run_colab",
+        lambda args, **kw: (
+            0,
+            '__HAKIMI_WARM_PROBE__={"ok": true, "setup_ready": true, '
+            '"sep_ready": true, "svc_ready": true, "rvc_ready": false}\n',
+        ),
+    )
+    assert colab_rvc.probe_warm_session("warm-l4") == {
+        "healthy": True,
+        "setup_ready": True,
+        "sep_ready": True,
+        "svc_ready": True,
+        "rvc_ready": False,
+    }
     monkeypatch.setattr(colab_rvc, "_run_colab", lambda args, **kw: (1, "connection refused"))
-    assert colab_rvc.probe_warm_session("warm-l4") == {"healthy": False, "setup_ready": False}
+    assert colab_rvc.probe_warm_session("warm-l4") == {
+        "healthy": False,
+        "setup_ready": False,
+        "sep_ready": False,
+        "svc_ready": False,
+        "rvc_ready": False,
+    }
 
 
 def test_p2_weight_and_venv_cache_pack_restore_and_setup_fallback(
@@ -1535,12 +1599,14 @@ def test_p0_remote_exception_scrubs_custom_opaque_token_in_stdout_and_traceback(
 def test_backing_mix_params_env_and_cli_passthrough(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 1) colab_rvc CLI parser exposes --backing-gain-db, --skip-backing, and --skip-dereverb
+    # 1) colab_rvc CLI parser exposes rolled-back defaults & new SVC options
     parser = colab_rvc._build_parser()
     ns_default = parser.parse_args(["cover", "--source", "s.mp3", "--title", "枝垂桜"])
+    assert ns_default.engine == "dual"
+    assert ns_default.volume_envelope == 0.25
     assert ns_default.backing_gain_db == -14.0
     assert ns_default.skip_backing is True
-    assert ns_default.skip_dereverb is True
+    assert ns_default.skip_dereverb is False
     ns_custom = parser.parse_args(
         [
             "cover",
@@ -1548,15 +1614,21 @@ def test_backing_mix_params_env_and_cli_passthrough(
             "s.mp3",
             "--title",
             "枝垂桜",
+            "--engine",
+            "rvc",
+            "--svc-steps",
+            "40",
             "--backing-gain-db",
             "-16.5",
             "--no-skip-backing",
-            "--no-skip-dereverb",
+            "--skip-dereverb",
         ]
     )
+    assert ns_custom.engine == "rvc"
+    assert ns_custom.svc_steps == 40
     assert ns_custom.backing_gain_db == -16.5
     assert ns_custom.skip_backing is False
-    assert ns_custom.skip_dereverb is False
+    assert ns_custom.skip_dereverb is True
 
     # 2) run_cover_pipeline forwards HAKIMI_BACKING_GAIN_DB, SKIP_BACKING, SKIP_DEREVERB
     captured_envs: list[dict[str, str]] = []
@@ -1599,6 +1671,8 @@ def test_backing_mix_params_env_and_cli_passthrough(
         skip_backing=True,
         skip_dereverb=False,
     )
+    assert captured_envs[-1]["HAKIMI_COVER_ENGINE"] == "rvc"
+    assert captured_envs[-1]["HAKIMI_VOLUME_ENVELOPE"] == "0.25"
     assert captured_envs[-1]["HAKIMI_BACKING_GAIN_DB"] == "-24.0"
     assert captured_envs[-1]["HAKIMI_SKIP_BACKING"] == "1"
     assert captured_envs[-1]["HAKIMI_SKIP_DEREVERB"] == "0"
@@ -1626,7 +1700,7 @@ def test_backing_mix_params_env_and_cli_passthrough(
             skip_dereverb="1",  # type: ignore[arg-type]
         )
 
-    # 3) Remote _dispatch_env reads HAKIMI_BACKING_GAIN_DB, SKIP_BACKING, and SKIP_DEREVERB
+    # 3) Remote _dispatch_env reads HAKIMI_BACKING_GAIN_DB, SKIP_BACKING, and rolled-back defaults
     seen_cover_kwargs: list[dict[str, object]] = []
 
     def fake_action_cover(**kwargs):
@@ -1640,17 +1714,18 @@ def test_backing_mix_params_env_and_cli_passthrough(
     monkeypatch.setattr(colab_remote, "action_cover", fake_action_cover)
     monkeypatch.setenv("HAKIMI_BACKING_GAIN_DB", "-2.0")
     monkeypatch.setenv("HAKIMI_SKIP_BACKING", "0")
-    monkeypatch.setenv("HAKIMI_SKIP_DEREVERB", "0")
+    monkeypatch.setenv("HAKIMI_SKIP_DEREVERB", "1")
     colab_remote._dispatch_env("cover", drive_token="")
     assert seen_cover_kwargs[-1]["backing_gain_db"] == -6.0
     assert seen_cover_kwargs[-1]["skip_backing"] is False
-    assert seen_cover_kwargs[-1]["skip_dereverb"] is False
+    assert seen_cover_kwargs[-1]["skip_dereverb"] is True
 
     monkeypatch.delenv("HAKIMI_SKIP_BACKING", raising=False)
     monkeypatch.delenv("HAKIMI_SKIP_DEREVERB", raising=False)
     colab_remote._dispatch_env("cover", drive_token="")
     assert seen_cover_kwargs[-1]["skip_backing"] is True
-    assert seen_cover_kwargs[-1]["skip_dereverb"] is True
+    assert seen_cover_kwargs[-1]["skip_dereverb"] is False
+    assert seen_cover_kwargs[-1]["volume_envelope"] == 0.25
 
     monkeypatch.setenv("HAKIMI_BACKING_GAIN_DB", "nan")
     with pytest.raises(ValueError, match="finite"):
@@ -1658,3 +1733,755 @@ def test_backing_mix_params_env_and_cli_passthrough(
     monkeypatch.delenv("HAKIMI_BACKING_GAIN_DB", raising=False)
     monkeypatch.delenv("HAKIMI_SKIP_BACKING", raising=False)
     monkeypatch.delenv("HAKIMI_SKIP_DEREVERB", raising=False)
+
+
+def test_dual_svc_shared_separation_aligned_chorus_and_lock_semitone_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "work"
+    out_dir = tmp_path / "out"
+    chunks_dir = tmp_path / "chunks"
+    sep_venv = tmp_path / "sep-venv"
+    svc_venv = tmp_path / "svc-venv"
+    seed_vc_dir = tmp_path / "seed-vc"
+    ying_dir = tmp_path / "YingMusic-SVC"
+    hf_cache = tmp_path / "svc-hf-cache"
+    for v in (sep_venv, svc_venv):
+        (v / "bin").mkdir(parents=True)
+        (v / "bin" / "python").write_text("", encoding="utf-8")
+    seed_vc_dir.mkdir(parents=True)
+    (seed_vc_dir / "inference.py").write_text("# seed-vc\n", encoding="utf-8")
+    ying_dir.mkdir(parents=True)
+    (ying_dir / "my_inference.py").write_text("# ying\n", encoding="utf-8")
+
+    src_song = tmp_path / "shidarezakura.flac"
+    src_song.write_bytes(b"fLaCfake")
+    ref_audio = tmp_path / "hakimi_ref_22s.wav"
+    ref_audio.write_bytes(_make_wav_bytes(3.0, 24000))
+
+    monkeypatch.setattr(colab_remote, "DEFAULT_WORK_DIR", work_dir)
+    monkeypatch.setattr(colab_remote, "_probe_duration_sec", lambda _p: 210.0)
+    monkeypatch.setattr(colab_remote, "_transcribe_for_chorus", lambda *_a: [])
+
+    sep_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fake_sep(sep_py, input_wav, sep_out_dir, model_names, *, is_dereverb=False):
+        del sep_py, input_wav, is_dereverb
+        sep_out_dir.mkdir(parents=True, exist_ok=True)
+        sep_calls.append((sep_out_dir.name, tuple(model_names)))
+        voc = sep_out_dir / "vocals.wav"
+        inst = sep_out_dir / "instrumental.wav"
+        voc.write_bytes(_make_wav_bytes(2.0, 44100))
+        inst.write_bytes(_make_wav_bytes(2.0, 44100))
+        return voc, inst
+
+    monkeypatch.setattr(colab_remote, "_separate_with_sep_venv", fake_sep)
+
+    cmds: list[list[str]] = []
+    ying_scripts: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        del kwargs
+        cmds.append(list(cmd))
+        if len(cmd) >= 2 and str(cmd[1]).endswith("_run_yingmusic.py"):
+            ying_scripts.append(Path(cmd[1]).read_text(encoding="utf-8"))
+            sub_out = Path(cmd[4])
+            sub_out.mkdir(parents=True, exist_ok=True)
+            (sub_out / "ref_44k_vocals_0.wav").write_bytes(_make_wav_bytes(2.0, 44100))
+        elif len(cmd) >= 2 and str(cmd[1]).endswith("inference.py"):
+            sub_out = Path(cmd[cmd.index("--output") + 1])
+            sub_out.mkdir(parents=True, exist_ok=True)
+            (sub_out / "vc_out.wav").write_bytes(_make_wav_bytes(2.0, 44100))
+        elif cmd[0] == "ffmpeg" and cmd[-1] != "-":
+            target = Path(cmd[-1])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.suffix == ".wav":
+                target.write_bytes(_make_wav_bytes(2.0, 16000))
+            else:
+                target.write_bytes(b"ID3mp3-" + target.name.encode("utf-8"))
+        return colab_remote.subprocess.CompletedProcess(
+            cmd, 0, stdout="", stderr="mean_volume: -15.2 dB\nmax_volume: -1.1 dB\n"
+        )
+
+    monkeypatch.setattr(colab_remote, "_run", fake_run)
+
+    meta = colab_remote.action_cover(
+        source_audio=src_song,
+        ref_audio=ref_audio,
+        engine="dual",
+        pitch=5,
+        svc_steps=40,
+        start_sec="135",
+        duration_sec=50.0,
+        sep_venv=sep_venv,
+        svc_venv=svc_venv,
+        seed_vc_dir=seed_vc_dir,
+        yingmusic_dir=ying_dir,
+        svc_hf_cache=hf_cache,
+        out_dir=out_dir,
+        chunks_dir=chunks_dir,
+    )
+
+    # 1) BS-RoFormer separation runs ONCE; no karaoke / no dereverb in SVC mode
+    assert [m for _, m in sep_calls] == [colab_remote.PRIMARY_SEP_MODELS]
+
+    # 2) Reference voice normalized to <=24s mono 44.1kHz PCM16
+    ref_ff = next(c for c in cmds if c[0] == "ffmpeg" and "-t" in c and "24" in c)
+    assert ref_ff[ref_ff.index("-ar") + 1] == "44100"
+    assert ref_ff[ref_ff.index("-ac") + 1] == "1"
+
+    # 3) Shared HF cache symlinks created for both repos
+    assert (seed_vc_dir / "checkpoints" / "hf_cache").is_symlink()
+    assert (ying_dir / "checkpoints" / "hf_cache").is_symlink()
+    assert (seed_vc_dir / "checkpoints" / "hf_cache").resolve() == hf_cache.resolve()
+    assert (ying_dir / "checkpoints" / "hf_cache").resolve() == hf_cache.resolve()
+
+    # 4) YingMusic-SVC strictly hard-locks semi_tone_shift=0 even when pitch=5!
+    assert len(ying_scripts) == 1
+    assert "semi_tone_shift=0," in ying_scripts[0]
+    assert "f0_condition=True," in ying_scripts[0]
+    ying_cmd = next(c for c in cmds if len(c) >= 2 and str(c[1]).endswith("_run_yingmusic.py"))
+    assert ying_cmd[5] == "40"
+
+    # 5) Seed-VC receives --f0-condition True --auto-f0-adjust False --semi-tone-shift 5
+    seed_cmd = next(c for c in cmds if len(c) >= 2 and str(c[1]).endswith("inference.py"))
+    assert seed_cmd[seed_cmd.index("--f0-condition") + 1] == "True"
+    assert seed_cmd[seed_cmd.index("--auto-f0-adjust") + 1] == "False"
+    assert seed_cmd[seed_cmd.index("--semi-tone-shift") + 1] == "5"
+    assert seed_cmd[seed_cmd.index("--diffusion-steps") + 1] == "40"
+    assert seed_cmd[seed_cmd.index("--fp16") + 1] == "True"
+
+    # 6) Both candidates mix with SVC profile (3200 Hz +1.2 dB + weak lift) & aligned chorus window
+    mix_cmds = [c for c in cmds if "-filter_complex" in c]
+    assert len(mix_cmds) == 2
+    for mc in mix_cmds:
+        fg = mc[mc.index("-filter_complex") + 1]
+        assert "equalizer=f=3200:t=q:w=1.4:g=1.2," in fg
+        assert "compand=attacks=0.05:decays=0.35:soft-knee=6:" in fg
+
+    chorus_cmds = [c for c in cmds if c[0] == "ffmpeg" and "-ss" in c]
+    assert len(chorus_cmds) == 2
+    assert chorus_cmds[0][chorus_cmds[0].index("-ss") + 1] == "135.00"
+    assert chorus_cmds[1][chorus_cmds[1].index("-ss") + 1] == "135.00"
+    assert chorus_cmds[0][chorus_cmds[0].index("-t") + 1] == "50.00"
+    assert chorus_cmds[1][chorus_cmds[1].index("-t") + 1] == "50.00"
+
+    # 7) Metadata & candidate schema complete and backward-compatible
+    assert meta["engine_requested"] == "dual"
+    assert meta["engine_used"] == "yingmusic_svc"
+    assert meta["ref_voice"] == "hakimi_ref_22s.wav"
+    assert meta["chorus_start_sec"] == 135.0
+    assert meta["chorus_duration_sec"] == 50.0
+    assert len(meta["candidates"]) == 2
+    assert [c["engine"] for c in meta["candidates"]] == ["yingmusic_svc", "seed_vc"]
+    for cand in meta["candidates"]:
+        assert cand["status"] == "succeeded"
+        assert cand["error"] is None
+        assert len(cand["digest"]) == 64
+        assert cand["byte_size"] > 0
+        assert cand["full_byte_size"] > 0
+        metrics = cand["acoustic_metrics"]
+        for req_key in (
+            "vocal_mean_db",
+            "vocal_max_db",
+            "mix_mean_db",
+            "mix_max_db",
+            "chorus_mean_db",
+            "chorus_max_db",
+            "chorus_p10_rms_db",
+            "chorus_p90_rms_db",
+            "chorus_dynamic_range_db",
+            "chorus_weak_ratio",
+            "clipped_peak_flag",
+        ):
+            assert req_key in metrics
+    assert (out_dir / "cover_chorus.mp3").is_file()
+    assert (out_dir / "cover_full.mp3").is_file()
+
+
+def test_dual_svc_single_engine_failure_isolation_and_all_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _run_case(name: str, *, fail_ying: bool, fail_seed: bool):
+        base = tmp_path / name
+        work_dir = base / "work"
+        out_dir = base / "out"
+        chunks_dir = base / "chunks"
+        sep_venv = base / "sep-venv"
+        svc_venv = base / "svc-venv"
+        seed_dir = base / "seed-vc"
+        ying_dir = base / "YingMusic-SVC"
+        for v in (sep_venv, svc_venv):
+            (v / "bin").mkdir(parents=True)
+            (v / "bin" / "python").write_text("", encoding="utf-8")
+        seed_dir.mkdir(parents=True)
+        (seed_dir / "inference.py").write_text("", encoding="utf-8")
+        ying_dir.mkdir(parents=True)
+        (ying_dir / "my_inference.py").write_text("", encoding="utf-8")
+
+        src = base / "song.mp3"
+        src.write_bytes(b"ID3")
+        ref = base / "hakimi_ref.wav"
+        ref.write_bytes(_make_wav_bytes(2.0, 24000))
+
+        monkeypatch.setattr(colab_remote, "DEFAULT_WORK_DIR", work_dir)
+        monkeypatch.setattr(colab_remote, "_probe_duration_sec", lambda _p: 120.0)
+        monkeypatch.setattr(colab_remote, "_transcribe_for_chorus", lambda *_a: [])
+
+        def fake_sep(sep_py, input_wav, sep_out_dir, model_names, *, is_dereverb=False):
+            del sep_py, input_wav, model_names, is_dereverb
+            sep_out_dir.mkdir(parents=True, exist_ok=True)
+            voc = sep_out_dir / "vocals.wav"
+            inst = sep_out_dir / "instrumental.wav"
+            voc.write_bytes(_make_wav_bytes(2.0, 44100))
+            inst.write_bytes(_make_wav_bytes(2.0, 44100))
+            return voc, inst
+
+        monkeypatch.setattr(colab_remote, "_separate_with_sep_venv", fake_sep)
+
+        def fake_run(cmd, **kwargs):
+            del kwargs
+            if len(cmd) >= 2 and str(cmd[1]).endswith("_run_yingmusic.py"):
+                if fail_ying:
+                    raise RuntimeError("CUDA OOM ya29.secret-leak-token")
+                sub_out = Path(cmd[4])
+                sub_out.mkdir(parents=True, exist_ok=True)
+                (sub_out / "out.wav").write_bytes(_make_wav_bytes(2.0, 44100))
+            elif len(cmd) >= 2 and str(cmd[1]).endswith("inference.py"):
+                if fail_seed:
+                    raise RuntimeError("Seed-VC crash")
+                sub_out = Path(cmd[cmd.index("--output") + 1])
+                sub_out.mkdir(parents=True, exist_ok=True)
+                (sub_out / "vc.wav").write_bytes(_make_wav_bytes(2.0, 44100))
+            elif cmd[0] == "ffmpeg" and cmd[-1] != "-":
+                target = Path(cmd[-1])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(
+                    _make_wav_bytes(1.0, 16000) if target.suffix == ".wav" else b"ID3mp3-seed"
+                )
+            return colab_remote.subprocess.CompletedProcess(
+                cmd, 0, stdout="", stderr="mean_volume: -14.0 dB\nmax_volume: -1.0 dB\n"
+            )
+
+        monkeypatch.setattr(colab_remote, "_run", fake_run)
+        return colab_remote.action_cover(
+            source_audio=src,
+            ref_audio=ref,
+            engine="dual",
+            start_sec="30",
+            sep_venv=sep_venv,
+            svc_venv=svc_venv,
+            seed_vc_dir=seed_dir,
+            yingmusic_dir=ying_dir,
+            svc_hf_cache=base / "hf_cache",
+            out_dir=out_dir,
+            chunks_dir=chunks_dir,
+        )
+
+    # Partial failure: YingMusic fails, Seed-VC succeeds -> job succeeds cleanly with scrubbed err
+    meta_partial = _run_case("partial", fail_ying=True, fail_seed=False)
+    assert meta_partial["engine_requested"] == "dual"
+    assert meta_partial["engine_used"] == "seed_vc"
+    by_eng = {c["engine"]: c for c in meta_partial["candidates"]}
+    assert by_eng["yingmusic_svc"]["status"] == "failed"
+    assert by_eng["yingmusic_svc"]["error_code"] == "yingmusic_svc_failed"
+    assert "ya29.secret-leak-token" not in (by_eng["yingmusic_svc"]["error"] or "")
+    assert "[REDACTED]" in (by_eng["yingmusic_svc"]["error"] or "")
+    assert by_eng["seed_vc"]["status"] == "succeeded"
+
+    # Both fail -> raises svc_all_engines_failed
+    with pytest.raises(RuntimeError, match="svc_all_engines_failed:"):
+        _run_case("all_fail", fail_ying=True, fail_seed=True)
+
+
+def test_action_setup_svc_mode_skips_applio_and_shares_hf_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Build a weight cache tar containing both sep_models and applio_rvc_models
+    src_applio = tmp_path / "src_applio"
+    src_sep = tmp_path / "src_sep"
+    (src_applio / "rvc" / "models" / "predictors").mkdir(parents=True)
+    (src_applio / "rvc" / "models" / "predictors" / "rmvpe.pt").write_bytes(b"RMVPE")
+    src_sep.mkdir(parents=True)
+    (src_sep / colab_remote.PRIMARY_SEP_MODELS[0]).write_bytes(b"BS-ROFORMER")
+    w_tar = tmp_path / "weights_cover.tar"
+    packed = colab_remote.pack_weight_cache(w_tar, applio_dir=src_applio, sep_models_dir=src_sep)
+
+    root = tmp_path / "svc_vm"
+    applio_dir = root / "Applio"
+    sep_venv = root / "sep-venv"
+    svc_venv = root / "svc-venv"
+    seed_dir = root / "seed-vc"
+    ying_dir = root / "YingMusic-SVC"
+    hf_cache = root / "svc-hf-cache"
+    sep_models_dir = root / "sep_models"
+
+    monkeypatch.setattr(colab_remote, "DEFAULT_WORK_DIR", root / "work")
+    monkeypatch.setattr(colab_remote, "SETUP_MARKER", root / ".hakimi_setup_done")
+    monkeypatch.setattr(colab_remote, "SEP_SETUP_MARKER", root / ".hakimi_sep_setup_done")
+    monkeypatch.setattr(colab_remote, "SVC_SETUP_MARKER", root / ".hakimi_svc_setup_done")
+    monkeypatch.setattr(colab_remote, "_ensure_ffmpeg", lambda: None)
+    monkeypatch.setattr(colab_remote, "_ensure_svc_system_deps", lambda: None)
+    monkeypatch.setattr(colab_remote, "_ensure_uv", lambda: "uv")
+    monkeypatch.setattr(
+        colab_remote,
+        "_drive_download_to_path",
+        lambda _tok, _fid, dest: (
+            dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_bytes(w_tar.read_bytes())
+        ),
+    )
+
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        del kwargs
+        cmds.append(list(cmd))
+        if cmd[:2] == ["uv", "venv"]:
+            venv_p = Path(cmd[-1])
+            (venv_p / "bin").mkdir(parents=True, exist_ok=True)
+            (venv_p / "bin" / "python").write_text("", encoding="utf-8")
+        elif cmd[:2] == ["git", "clone"]:
+            repo_p = Path(cmd[-1])
+            repo_p.mkdir(parents=True, exist_ok=True)
+            if "seed-vc" in str(cmd):
+                (repo_p / "inference.py").write_text("", encoding="utf-8")
+            elif "YingMusic-SVC" in str(cmd):
+                (repo_p / "my_inference.py").write_text("", encoding="utf-8")
+        return colab_remote.subprocess.CompletedProcess(
+            cmd, 0, stdout="NVIDIA L4 | CUDA Version: 12.4\n", stderr=""
+        )
+
+    monkeypatch.setattr(colab_remote, "_run", fake_run)
+
+    status = colab_remote.action_setup(
+        applio_dir=applio_dir,
+        rvc_venv=root / "rvc-venv",
+        sep_venv=sep_venv,
+        svc_venv=svc_venv,
+        seed_vc_dir=seed_dir,
+        yingmusic_dir=ying_dir,
+        svc_hf_cache=hf_cache,
+        sep_models_dir=sep_models_dir,
+        mode="svc",
+        drive_token="ya29.tok",
+        cache_folder_id="cache_1",
+        cache_weights_file_id="w_1",
+        cache_weights_sha256=packed["sha256"],
+    )
+    assert status["setup_mode"] == "svc"
+    assert status["weight_cache_hit"] is True
+    assert status["weight_cache_has_sep_models"] is True
+    # Only sep_models restored; Applio never cloned or restored
+    assert (sep_models_dir / colab_remote.PRIMARY_SEP_MODELS[0]).is_file()
+    assert not applio_dir.exists()
+    assert not any("Applio" in " ".join(c) for c in cmds)
+    assert not any("prerequisites" in c for c in cmds)
+    assert (seed_dir / "checkpoints" / "hf_cache").resolve() == hf_cache.resolve()
+    assert (ying_dir / "checkpoints" / "hf_cache").resolve() == hf_cache.resolve()
+    assert (root / ".hakimi_sep_setup_done").is_file()
+    assert (root / ".hakimi_svc_setup_done").is_file()
+
+    # Second call on warm VM skips completely with zero commands
+    cmds.clear()
+    status2 = colab_remote.action_setup(
+        applio_dir=applio_dir,
+        rvc_venv=root / "rvc-venv",
+        sep_venv=sep_venv,
+        svc_venv=svc_venv,
+        seed_vc_dir=seed_dir,
+        yingmusic_dir=ying_dir,
+        svc_hf_cache=hf_cache,
+        sep_models_dir=sep_models_dir,
+        mode="svc",
+    )
+    assert status2["setup_skipped_warm"] is True
+    assert cmds == []
+
+
+def test_compute_acoustic_metrics_real_wav_dynamics_and_clipping(tmp_path: Path) -> None:
+    import math
+    import shutil
+    import struct
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+
+    sr = 16000
+    # 2s soft (-24 dBFS) + 2s loud (-6 dBFS) sine wave
+    samples: list[int] = []
+    for idx in range(sr * 2):
+        amp = 32767.0 * (10.0 ** (-24.0 / 20.0))
+        samples.append(int(amp * math.sin(2.0 * math.pi * 440.0 * idx / sr)))
+    for idx in range(sr * 2):
+        amp = 32767.0 * (10.0 ** (-6.0 / 20.0))
+        samples.append(int(amp * math.sin(2.0 * math.pi * 440.0 * idx / sr)))
+
+    wav_path = tmp_path / "dynamic_vocal.wav"
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+    metrics = colab_remote.compute_acoustic_metrics(
+        wav_path, wav_path, wav_path, tmp_path / "probe"
+    )
+    assert metrics["chorus_p10_rms_db"] < metrics["chorus_p90_rms_db"]
+    assert metrics["chorus_dynamic_range_db"] > 12.0
+    assert metrics["chorus_weak_ratio"] >= 0.35
+    assert metrics["clipped_peak_flag"] is False
+
+
+def test_colab_jobs_rvc_dual_svc_payload_handler_and_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic import ValidationError
+
+    # Load scripts/colab_jobs package cleanly
+    pkg_dir = REPO_ROOT / "scripts" / "colab_jobs"
+    if "colab_jobs" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "colab_jobs",
+            pkg_dir / "__init__.py",
+            submodule_search_locations=[str(pkg_dir)],
+        )
+        assert spec is not None and spec.loader is not None
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["colab_jobs"] = pkg
+        spec.loader.exec_module(pkg)
+    colab_jobs = sys.modules["colab_jobs"]
+    rvc_mod = colab_jobs.rvc
+
+    # 1) RvcCoverPayload locked defaults & strict validation
+    p_def = rvc_mod.RvcCoverPayload(title="枝垂桜")
+    assert p_def.engine == "dual"
+    assert p_def.ref_voice == ""
+    assert p_def.ref_audio_file_id == ""
+    assert p_def.svc_steps is None
+    assert p_def.volume_envelope == 0.25
+    assert p_def.skip_dereverb is False
+    assert p_def.index_rate == 0.15
+    assert p_def.protect == 0.42
+    assert p_def.backing_gain_db == -14.0
+    assert p_def.skip_backing is True
+
+    for bad_kw in (
+        {"engine": "unknown"},
+        {"svc_steps": True},
+        {"svc_steps": 5},
+        {"svc_steps": 120},
+        {"ref_audio_file_id": "root"},
+        {"ref_voice": "../evil.wav"},
+        {"unknown_extra": 1},
+    ):
+        with pytest.raises(ValidationError):
+            rvc_mod.RvcCoverPayload(title="枝垂桜", **bad_kw)
+
+    # 2) DriveFilesContext accepts ref_audio_file_id & ref_audio_name
+    dfc = colab_jobs.DriveFilesContext(
+        ref_audio_file_id="drv_ref_001",
+        ref_audio_name="hakimi_ref_22s.wav",
+    )
+    assert dfc.ref_audio_file_id == "drv_ref_001"
+    assert dfc.ref_audio_name == "hakimi_ref_22s.wav"
+
+    # 3) RvcCoverHandler in dual mode: Drive direct happy path + ref_voice_not_found + WS fallback
+    uploaded_names: list[str] = []
+
+    def fake_transport(method: str, url: str, headers: dict, body: bytes | None, timeout: float):
+        del headers, timeout
+        if method == "GET" and "/files/drv_ref_001" in url:
+            meta = {
+                "id": "drv_ref_001",
+                "name": "hakimi_ref_22s.wav",
+                "parents": ["folder_models"],
+                "mimeType": "audio/wav",
+                "size": "1144364",
+                "trashed": False,
+            }
+            return 200, {}, json.dumps(meta).encode("utf-8")
+        if method == "GET" and "/files/drv_inbox_1" in url:
+            meta = {
+                "id": "drv_inbox_1",
+                "name": "Anna_-_枝垂桜.flac",
+                "parents": ["folder_inbox"],
+                "mimeType": "audio/flac",
+                "size": "10000",
+                "trashed": False,
+            }
+            return 200, {}, json.dumps(meta).encode("utf-8")
+        if method == "GET" and "q=" in url:
+            return 200, {}, json.dumps({"files": []}).encode("utf-8")
+        if method == "POST" and "/upload/drive/v3/files" in url:
+            # Extract multipart filename for assertions
+            text = (body or b"").decode("utf-8", errors="ignore")
+            m = json.loads(text.split("\r\n\r\n", 1)[1].split("\r\n--", 1)[0])
+            uploaded_names.append(m["name"])
+            return (
+                200,
+                {},
+                json.dumps({"id": f"up_{len(uploaded_names)}", "name": m["name"]}).encode("utf-8"),
+            )
+        return 404, {}, b"{}"
+
+    class _Cfg:
+        model_dir = tmp_path / "empty_models"
+        drive_direct_enabled = True
+        cache_enabled = True
+        cache_venv_enabled = False
+        cache_writeback = True
+
+    handler = rvc_mod.RvcCoverHandler()
+
+    # Missing ref voice raises ref_voice_not_found (never blocked on missing RVC .pth/.index)
+    ctx_missing_ref = colab_jobs.WorkerJobContext(
+        job_id="a" * 16,
+        job_type="rvc_cover",
+        gpu_candidates=("L4", "T4"),
+        session_name="sess-1",
+        config=_Cfg(),
+        dispatch_context=colab_jobs.DispatchContext(
+            drive=colab_jobs.DriveDispatchContext(
+                access_token="ya29.ephem-tok",
+                folders=colab_jobs.DriveFoldersContext(
+                    root="folder_root",
+                    models="folder_models",
+                    songs="folder_songs",
+                    inbox="folder_inbox",
+                ),
+                files=colab_jobs.DriveFilesContext(
+                    inbox_file_id="drv_inbox_1",
+                    inbox_name="Anna_-_枝垂桜.flac",
+                ),
+            )
+        ),
+        drive_transport=fake_transport,
+    )
+    with pytest.raises(colab_jobs.EphemeralDriveError) as err_missing:
+        handler.run_sync(
+            ctx_missing_ref,
+            rvc_mod.RvcCoverPayload(title="枝垂桜", inbox_file_id="drv_inbox_1", engine="dual"),
+        )
+    assert err_missing.value.code == "ref_voice_not_found"
+
+    # Direct Drive dual happy path
+    seen_runner_kw: dict[str, object] = {}
+
+    def fake_dual_direct_runner(**kwargs):
+        seen_runner_kw.update(kwargs)
+        cands = [
+            {
+                "key": "yingmusic_svc",
+                "engine": "yingmusic_svc",
+                "status": "succeeded",
+                "digest": "1" * 64,
+                "byte_size": 800000,
+                "full_byte_size": 5000000,
+                "duration_ms": 50000,
+                "drive_chorus_id": "drv_ying_c",
+                "drive_full_id": "drv_ying_f",
+                "chorus_filename": "枝垂桜_yingmusic_svc_11111111_chorus.mp3",
+                "full_filename": "枝垂桜_yingmusic_svc_11111111_full.mp3",
+                "loudness_gain_db": -2.1,
+                "elapsed_sec": 45.2,
+                "acoustic_metrics": {"chorus_dynamic_range_db": 6.4, "clipped_peak_flag": False},
+            },
+            {
+                "key": "seed_vc",
+                "engine": "seed_vc",
+                "status": "succeeded",
+                "digest": "2" * 64,
+                "byte_size": 790000,
+                "full_byte_size": 4900000,
+                "duration_ms": 50000,
+                "drive_chorus_id": "drv_seed_c",
+                "drive_full_id": "drv_seed_f",
+                "chorus_filename": "枝垂桜_seed_vc_22222222_chorus.mp3",
+                "full_filename": "枝垂桜_seed_vc_22222222_full.mp3",
+                "loudness_gain_db": 3.5,
+                "elapsed_sec": 46.1,
+                "acoustic_metrics": {"chorus_dynamic_range_db": 5.1, "clipped_peak_flag": False},
+            },
+        ]
+        return {
+            "assigned_gpu": "L4",
+            "full_mp3": None,
+            "chorus_mp3": None,
+            "meta": {
+                "engine_requested": "dual",
+                "engine_used": "yingmusic_svc",
+                "chorus_start_sec": 135.0,
+                "chorus_duration_sec": 50.0,
+                "chorus_start_reason": "dsp_vocal_rms",
+                "source_duration_sec": 209.5,
+                "candidates": cands,
+            },
+            "drive_outputs": {
+                "chorus": {
+                    "file_id": "drv_ying_c",
+                    "sha256": "1" * 64,
+                    "size": 800000,
+                    "duration_ms": 50000,
+                },
+                "full": {"file_id": "drv_ying_f", "size": 5000000},
+                "candidates": cands,
+            },
+            "session_kept": False,
+        }
+
+    ctx_dual = colab_jobs.WorkerJobContext(
+        job_id="b" * 16,
+        job_type="rvc_cover",
+        gpu_candidates=("L4", "T4"),
+        session_name="sess-2",
+        config=_Cfg(),
+        dispatch_context=colab_jobs.DispatchContext(
+            drive=colab_jobs.DriveDispatchContext(
+                access_token="ya29.ephem-tok",
+                folders=colab_jobs.DriveFoldersContext(
+                    root="folder_root",
+                    models="folder_models",
+                    songs="folder_songs",
+                    inbox="folder_inbox",
+                ),
+                files=colab_jobs.DriveFilesContext(
+                    inbox_file_id="drv_inbox_1",
+                    inbox_name="Anna_-_枝垂桜.flac",
+                    ref_audio_file_id="drv_ref_001",
+                    ref_audio_name="hakimi_ref_22s.wav",
+                ),
+            )
+        ),
+        drive_transport=fake_transport,
+        overrides={"cover_runner": fake_dual_direct_runner},
+    )
+    res_dual, gpu_used = handler.run_sync(
+        ctx_dual,
+        rvc_mod.RvcCoverPayload(
+            title="枝垂桜",
+            inbox_file_id="drv_inbox_1",
+            engine="dual",
+            svc_steps=35,
+        ),
+    )
+    assert gpu_used == "L4"
+    assert seen_runner_kw["engine"] == "dual"
+    assert seen_runner_kw["drive_ref_audio_file_id"] == "drv_ref_001"
+    assert seen_runner_kw["drive_pth_file_id"] == ""
+    assert res_dual["engine_requested"] == "dual"
+    assert res_dual["engine_used"] == "yingmusic_svc"
+    assert res_dual["ref_voice"] == "hakimi_ref_22s.wav"
+    assert res_dual["drive_chorus_id"] == "drv_ying_c"
+    assert res_dual["drive_full_id"] == "drv_ying_f"
+    assert res_dual["chorus_duration_sec"] == 50.0
+    assert res_dual["source_duration_sec"] == 209.5
+    assert len(res_dual["candidates"]) == 2
+    assert res_dual["candidates"][1]["drive_chorus_id"] == "drv_seed_c"
+
+    # WS chunk fallback path uploads BOTH candidates cleanly via ephemeral Drive client
+    def fake_dual_ws_runner(**kwargs):
+        cdir = Path(kwargs["cover_dir"])
+        cdir.mkdir(parents=True, exist_ok=True)
+        yc = cdir / "cover_yingmusic_svc_chorus.mp3"
+        yf = cdir / "cover_yingmusic_svc_full.mp3"
+        sc = cdir / "cover_seed_vc_chorus.mp3"
+        sf = cdir / "cover_seed_vc_full.mp3"
+        yc.write_bytes(b"ID3ying-chorus")
+        yf.write_bytes(b"ID3ying-full")
+        sc.write_bytes(b"ID3seed-chorus")
+        sf.write_bytes(b"ID3seed-full")
+        return {
+            "assigned_gpu": "L4",
+            "chorus_mp3": yc,
+            "full_mp3": yf,
+            "candidate_files": {
+                "yingmusic_svc": {"chorus_mp3": yc, "full_mp3": yf},
+                "seed_vc": {"chorus_mp3": sc, "full_mp3": sf},
+            },
+            "meta": {
+                "engine_requested": "dual",
+                "engine_used": "yingmusic_svc",
+                "chorus_start_sec": 135.0,
+                "chorus_duration_sec": 50.0,
+                "candidates": [
+                    {"key": "yingmusic_svc", "engine": "yingmusic_svc", "status": "succeeded"},
+                    {"key": "seed_vc", "engine": "seed_vc", "status": "succeeded"},
+                ],
+            },
+            "drive_outputs": None,
+        }
+
+    ctx_dual.overrides = {"cover_runner": fake_dual_ws_runner}
+    uploaded_names.clear()
+    res_ws, _ = handler.run_sync(
+        ctx_dual,
+        rvc_mod.RvcCoverPayload(title="枝垂桜", inbox_file_id="drv_inbox_1", engine="dual"),
+    )
+    assert len(uploaded_names) == 4
+    assert any("_yingmusic_svc_" in n and n.endswith("_chorus.mp3") for n in uploaded_names)
+    assert any("_seed_vc_" in n and n.endswith("_full.mp3") for n in uploaded_names)
+    assert res_ws["candidates"][0]["drive_chorus_id"] == "up_1"
+    assert res_ws["candidates"][1]["drive_chorus_id"] == "up_3"
+
+    # 4) run_cover_pipeline SVC setup mode & warm capability mismatch triggers setup cleanly
+    pipe_actions: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(colab_rvc, "provision_gpu", lambda s, gpu="L4", **kw: "L4")
+    monkeypatch.setattr(colab_rvc, "stop_session", lambda _s: None)
+
+    def fake_exec_svc(_sess: str, action: str, env_vars=None) -> str:
+        pipe_actions.append((action, dict(env_vars or {})))
+        if action == "cover":
+            payload = {
+                "chorus": {
+                    "file_id": "drv_yc",
+                    "name": "y_c.mp3",
+                    "sha256": "3" * 64,
+                    "size": 1234,
+                    "duration_ms": 50000,
+                },
+                "full": {"file_id": "drv_yf", "name": "y_f.mp3"},
+                "candidates": [
+                    {
+                        "key": "yingmusic_svc",
+                        "engine": "yingmusic_svc",
+                        "status": "succeeded",
+                        "drive_chorus_id": "drv_yc",
+                        "drive_full_id": "drv_yf",
+                    }
+                ],
+                "meta": {"engine_requested": "dual", "engine_used": "yingmusic_svc"},
+            }
+            return (
+                colab_rvc.DRIVE_OUTPUTS_PREFIX
+                + json.dumps(payload)
+                + "\n"
+                + colab_rvc.STATUS_OK_MARKER
+            )
+        return colab_rvc.STATUS_OK_MARKER
+
+    monkeypatch.setattr(colab_rvc, "exec_remote_worker", fake_exec_svc)
+    # Warm VM had RVC ready, NOT SVC ready -> MUST run setup(mode="svc")!
+    colab_rvc.run_cover_pipeline(
+        session="warm-rvc-only",
+        gpu_spec="L4",
+        cover_dir=tmp_path / "svc_pipe",
+        engine="dual",
+        svc_steps=35,
+        drive_access_token="ya29.tok",
+        drive_source_file_id="src1",
+        drive_ref_audio_file_id="drv_ref_001",
+        drive_songs_folder_id="songs1",
+        reuse_session=True,
+        reused_gpu="L4",
+        reused_setup_ready=True,
+        reused_sep_ready=True,
+        reused_svc_ready=False,
+        reused_rvc_ready=True,
+        keep_session_on_success=True,
+    )
+    assert [a for a, _ in pipe_actions] == ["setup", "cover"]
+    assert pipe_actions[0][1]["HAKIMI_SETUP_MODE"] == "svc"
+    assert pipe_actions[1][1]["HAKIMI_COVER_ENGINE"] == "dual"
+    assert pipe_actions[1][1]["HAKIMI_DRIVE_REF_VOICE_FILE_ID"] == "drv_ref_001"
+    assert pipe_actions[1][1]["HAKIMI_SVC_STEPS"] == "35"
+    assert "HAKIMI_CACHE_WEIGHTS_WRITEBACK_AFTER_COVER" not in pipe_actions[1][1]

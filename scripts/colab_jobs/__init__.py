@@ -632,6 +632,8 @@ class DriveFilesContext(BaseModel):
     inbox_name: str = Field(default="", max_length=160)
     pth_file_id: str = Field(default="", max_length=128)
     index_file_id: str = Field(default="", max_length=128)
+    ref_audio_file_id: str = Field(default="", max_length=128)
+    ref_audio_name: str = Field(default="", max_length=160)
     cache_weights_file_id: str = Field(default="", max_length=128)
     cache_weights_sha256: str = Field(default="", max_length=64)
 
@@ -639,6 +641,7 @@ class DriveFilesContext(BaseModel):
         "inbox_file_id",
         "pth_file_id",
         "index_file_id",
+        "ref_audio_file_id",
         "cache_weights_file_id",
         mode="before",
     )
@@ -650,13 +653,13 @@ class DriveFilesContext(BaseModel):
             raise ValueError("file ID must be a string")
         return validate_drive_id(value, allow_empty=True)
 
-    @field_validator("inbox_name", mode="before")
+    @field_validator("inbox_name", "ref_audio_name", mode="before")
     @classmethod
-    def _check_inbox_name(cls, value: Any) -> str:
+    def _check_safe_names(cls, value: Any, info: Any) -> str:
         if value is None:
             return ""
         if not isinstance(value, str):
-            raise ValueError("inbox_name must be a string")
+            raise ValueError(f"{info.field_name} must be a string")
         cleaned = value.strip()
         if not cleaned:
             return ""
@@ -712,6 +715,9 @@ class WarmSessionClaim:
     reused: bool = False
     gpu: str = ""
     setup_ready: bool = False
+    sep_ready: bool = False
+    svc_ready: bool = False
+    rvc_ready: bool = False
 
 
 @dataclass

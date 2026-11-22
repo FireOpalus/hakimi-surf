@@ -1,4 +1,4 @@
-"""Authenticated bounded audio uploads, Drive storage/inbox, and Colab cover controls."""
+"""Authenticated bounded audio uploads, Drive storage/inbox, and Colab SVC/RVC cover controls."""
 
 from __future__ import annotations
 
@@ -13,11 +13,16 @@ from .security import Rejected
 from .songs import (
     ALLOWED_SONG_EXTENSIONS,
     ALLOWED_SONG_MIMES,
+    AVAILABLE_COVER_ENGINES,
+    DEFAULT_COVER_ENGINE,
+    MAX_BACKING_GAIN_DB,
+    MAX_REF_VOICE_UPLOAD_BYTES,
     MAX_SONG_DURATION_SECONDS,
     MAX_SONG_LIBRARY_BYTES,
     MAX_SONG_PITCH,
     MAX_SONG_UPLOAD_BYTES,
     MAX_SONGS,
+    MIN_BACKING_GAIN_DB,
     MIN_SONG_PITCH,
     _safe_learn_upload_name,
     validate_clip_window,
@@ -27,12 +32,16 @@ from .songs import (
 router = APIRouter(prefix="/admin/api/songs")
 
 MAX_ADMIN_INBOX_UPLOAD_BYTES = MAX_SONG_UPLOAD_BYTES
+MAX_ADMIN_REF_VOICE_UPLOAD_BYTES = MAX_REF_VOICE_UPLOAD_BYTES
 
 _BAD_REQUEST_CODES = frozenset(
     {
         "invalid_song_title",
         "invalid_song_meta",
         "invalid_song_pitch",
+        "invalid_song_engine",
+        "invalid_song_take",
+        "invalid_ref_voice",
         "invalid_song_audio",
         "invalid_song_clip",
         "invalid_song_duration",
@@ -51,12 +60,15 @@ _PAYLOAD_TOO_LARGE_CODES = frozenset(
     {
         "song_upload_too_large",
         "song_inbox_upload_too_large",
+        "song_ref_voice_too_large",
         "colab_inbox_upload_too_large",
     }
 )
 _NOT_FOUND_CODES = frozenset(
     {
         "song_not_found",
+        "song_take_not_found",
+        "ref_voice_not_found",
         "song_drive_not_found",
         "source_not_found",
     }
@@ -66,6 +78,8 @@ _CONFLICT_CODES = frozenset(
         "song_title_exists",
         "song_already_exists",
         "song_library_full",
+        "song_take_unavailable",
+        "svc_all_engines_failed",
         "colab_disabled",
         "colab_daily_job_limit",
         "colab_daily_cu_budget",
@@ -109,6 +123,22 @@ class LearnSongBody(BaseModel):
     artist: str = Field(default="", max_length=80)
     tags: str = Field(default="", max_length=120)
     pitch: int = Field(default=0, ge=MIN_SONG_PITCH, le=MAX_SONG_PITCH)
+    engine: str = Field(default=DEFAULT_COVER_ENGINE, max_length=32)
+    ref_voice: str = Field(default="", max_length=160)
+    ref_audio_file_id: str = Field(default="", max_length=128)
+    svc_steps: int | None = Field(default=None, ge=10, le=100)
+    model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
+    index_rate: float | int | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    protect: float | int | None = Field(default=None, ge=0.0, le=0.5, allow_inf_nan=False)
+    volume_envelope: float | int | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    backing_gain_db: float | int | None = Field(
+        default=None,
+        ge=MIN_BACKING_GAIN_DB,
+        le=MAX_BACKING_GAIN_DB,
+        allow_inf_nan=False,
+    )
+    skip_backing: bool | None = None
+    skip_dereverb: bool | None = None
     inbox_filename: str = Field(default="", max_length=200)
     inbox_file_id: str = Field(default="", max_length=256)
     auto_search: bool = True
@@ -131,7 +161,11 @@ def _map_song_rejected(exc: Rejected) -> HTTPException:
         return HTTPException(404, code)
     if code == "compressed_song_upload_forbidden":
         return HTTPException(415, code)
-    if code in {"song_upload_timeout", "song_inbox_upload_timeout"}:
+    if code in {
+        "song_upload_timeout",
+        "song_inbox_upload_timeout",
+        "song_ref_voice_upload_timeout",
+    }:
         return HTTPException(408, code)
     if code in _UNAVAILABLE_CODES:
         return HTTPException(503, code)
@@ -167,6 +201,57 @@ def _float_header(request: Request, name: str, *, default: float) -> float:
         raise Rejected("invalid_song_clip") from None
 
 
+def _parse_stream_audio_headers(
+    request: Request,
+    *,
+    max_bytes: int,
+    invalid_name_code: str,
+    invalid_audio_code: str,
+    too_large_code: str,
+    fallback_stem: str,
+) -> tuple[str, str, int | None]:
+    raw_header = request.headers.get("x-drive-filename", "")
+    if len(raw_header) > 512:
+        raise HTTPException(400, invalid_name_code)
+    decoded_name = unquote(raw_header).strip()
+    if (
+        not decoded_name
+        or "/" in decoded_name
+        or "\\" in decoded_name
+        or ".." in decoded_name
+        or any(ord(ch) < 32 for ch in decoded_name)
+    ):
+        raise HTTPException(400, invalid_name_code)
+    _, dot, ext = decoded_name.rpartition(".")
+    if not dot or ext.lower() not in ALLOWED_SONG_EXTENSIONS:
+        raise HTTPException(400, invalid_audio_code)
+    try:
+        safe_name, mime_type = _safe_learn_upload_name(decoded_name, fallback_stem)
+    except Rejected as exc:
+        raise _map_song_rejected(exc) from None
+
+    if request.headers.get("content-encoding", "identity") != "identity":
+        raise HTTPException(415, "compressed_song_upload_forbidden")
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type not in ALLOWED_SONG_MIMES:
+        raise HTTPException(415, invalid_audio_code)
+
+    raw_len = request.headers.get("content-length")
+    declared: int | None = None
+    if raw_len is not None and raw_len.strip() != "":
+        try:
+            declared = int(raw_len.strip())
+        except ValueError:
+            raise HTTPException(400, "invalid_content_length") from None
+        if declared < 0:
+            raise HTTPException(400, "invalid_content_length")
+        if declared > max_bytes:
+            raise HTTPException(413, too_large_code)
+        if declared == 0:
+            raise HTTPException(400, invalid_audio_code)
+    return safe_name, mime_type, declared
+
+
 @router.get("")
 async def songs(request: Request):
     lib = library(request)
@@ -188,6 +273,9 @@ async def songs(request: Request):
         "drive_folders": drive_status.get("folders"),
         "drive_error": drive_status.get("error"),
         "learn_gpu_policy": lib.learn_gpu_policy(),
+        "default_engine": DEFAULT_COVER_ENGINE,
+        "available_engines": list(AVAILABLE_COVER_ENGINES),
+        "rvc_defaults": lib.rvc_defaults(),
     }
 
 
@@ -226,46 +314,14 @@ async def song_inbox(request: Request):
 
 @router.post("/inbox")
 async def upload_song_inbox(request: Request):
-    raw_header = request.headers.get("x-drive-filename", "")
-    if len(raw_header) > 512:
-        raise HTTPException(400, "song_drive_invalid_file")
-    decoded_name = unquote(raw_header).strip()
-    if (
-        not decoded_name
-        or "/" in decoded_name
-        or "\\" in decoded_name
-        or ".." in decoded_name
-        or any(ord(ch) < 32 for ch in decoded_name)
-    ):
-        raise HTTPException(400, "song_drive_invalid_file")
-    _, dot, ext = decoded_name.rpartition(".")
-    if not dot or ext.lower() not in ALLOWED_SONG_EXTENSIONS:
-        raise HTTPException(400, "invalid_song_audio")
-    try:
-        safe_name, mime_type = _safe_learn_upload_name(decoded_name, "track")
-    except Rejected as exc:
-        raise _map_song_rejected(exc) from None
-
-    if request.headers.get("content-encoding", "identity") != "identity":
-        raise HTTPException(415, "compressed_song_upload_forbidden")
-    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
-    if content_type not in ALLOWED_SONG_MIMES:
-        raise HTTPException(415, "invalid_song_audio")
-
-    raw_len = request.headers.get("content-length")
-    declared: int | None = None
-    if raw_len is not None and raw_len.strip() != "":
-        try:
-            declared = int(raw_len.strip())
-        except ValueError:
-            raise HTTPException(400, "invalid_content_length") from None
-        if declared < 0:
-            raise HTTPException(400, "invalid_content_length")
-        if declared > MAX_ADMIN_INBOX_UPLOAD_BYTES:
-            raise HTTPException(413, "song_inbox_upload_too_large")
-        if declared == 0:
-            raise HTTPException(400, "invalid_song_audio")
-
+    safe_name, mime_type, declared = _parse_stream_audio_headers(
+        request,
+        max_bytes=MAX_ADMIN_INBOX_UPLOAD_BYTES,
+        invalid_name_code="song_drive_invalid_file",
+        invalid_audio_code="invalid_song_audio",
+        too_large_code="song_inbox_upload_too_large",
+        fallback_stem="track",
+    )
     try:
         async with asyncio.timeout(300):
             res = await library(request).upload_inbox_stream(
@@ -277,6 +333,40 @@ async def upload_song_inbox(request: Request):
             )
     except TimeoutError:
         raise HTTPException(408, "song_inbox_upload_timeout") from None
+    except Rejected as exc:
+        raise _map_song_rejected(exc) from None
+    return {"file_id": res["file_id"], "name": res["name"], "size": res["size"]}
+
+
+@router.get("/voices")
+async def song_voices(request: Request):
+    try:
+        return await library(request).list_voices()
+    except Rejected as exc:
+        raise _map_song_rejected(exc) from None
+
+
+@router.post("/ref-voices")
+async def upload_song_ref_voice(request: Request):
+    safe_name, mime_type, declared = _parse_stream_audio_headers(
+        request,
+        max_bytes=MAX_ADMIN_REF_VOICE_UPLOAD_BYTES,
+        invalid_name_code="invalid_ref_voice",
+        invalid_audio_code="invalid_ref_voice",
+        too_large_code="song_ref_voice_too_large",
+        fallback_stem="ref_voice",
+    )
+    try:
+        async with asyncio.timeout(180):
+            res = await library(request).upload_ref_voice_stream(
+                safe_name,
+                request.stream(),
+                mime_type=mime_type,
+                content_length=declared,
+                max_bytes=MAX_ADMIN_REF_VOICE_UPLOAD_BYTES,
+            )
+    except TimeoutError:
+        raise HTTPException(408, "song_ref_voice_upload_timeout") from None
     except Rejected as exc:
         raise _map_song_rejected(exc) from None
     return {"file_id": res["file_id"], "name": res["name"], "size": res["size"]}
@@ -325,6 +415,21 @@ async def learn(request: Request):
                 artist=payload.artist,
                 tags=payload.tags,
                 pitch=payload.pitch,
+                engine=payload.engine,
+                ref_voice=payload.ref_voice,
+                ref_audio_file_id=payload.ref_audio_file_id,
+                svc_steps=payload.svc_steps,
+                model_name=payload.model_name,
+                index_rate=(float(payload.index_rate) if payload.index_rate is not None else None),
+                protect=(float(payload.protect) if payload.protect is not None else None),
+                volume_envelope=(
+                    float(payload.volume_envelope) if payload.volume_envelope is not None else None
+                ),
+                backing_gain_db=(
+                    float(payload.backing_gain_db) if payload.backing_gain_db is not None else None
+                ),
+                skip_backing=payload.skip_backing,
+                skip_dereverb=payload.skip_dereverb,
                 inbox_filename=payload.inbox_filename,
                 inbox_file_id=payload.inbox_file_id,
                 auto_search=payload.auto_search,
@@ -340,6 +445,24 @@ async def evict_cache(request: Request):
     async with domain_lock(request, "songs"):
         try:
             return await library(request).evict_cache()
+        except Rejected as exc:
+            raise _map_song_rejected(exc) from None
+
+
+@router.get("/{song_id}/takes/{take_key}/audio")
+async def preview_take(request: Request, song_id: str, take_key: str):
+    try:
+        raw, mime = await library(request).take_audio_bytes(song_id, take_key)
+    except Rejected as exc:
+        raise _map_song_rejected(exc) from None
+    return Response(raw, media_type=mime)
+
+
+@router.post("/{song_id}/takes/{take_key}/activate")
+async def activate_take(request: Request, song_id: str, take_key: str):
+    async with domain_lock(request, "songs"):
+        try:
+            return await library(request).switch_take(song_id, take_key, by_title=False)
         except Rejected as exc:
             raise _map_song_rejected(exc) from None
 

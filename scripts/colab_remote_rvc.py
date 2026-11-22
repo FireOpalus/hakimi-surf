@@ -32,11 +32,59 @@ from typing import Any
 DEFAULT_APPLIO_DIR = Path("/content/Applio")
 DEFAULT_RVC_VENV = Path("/content/rvc-venv")
 DEFAULT_SEP_VENV = Path("/content/sep-venv")
+DEFAULT_SVC_VENV = Path("/content/svc-venv")
+DEFAULT_SEED_VC_DIR = Path("/content/seed-vc")
+DEFAULT_YINGMUSIC_DIR = Path("/content/YingMusic-SVC")
+DEFAULT_SVC_HF_CACHE = Path("/content/svc-hf-cache")
 DEFAULT_SEP_MODELS_DIR = Path("/tmp/audio-separator-models")
 DEFAULT_WORK_DIR = Path("/content/work")
 DEFAULT_OUT_DIR = Path("/content/out")
 DEFAULT_CHUNKS_DIR = Path("/content/out_chunks")
 SETUP_MARKER = Path("/content/.hakimi_setup_done")
+SEP_SETUP_MARKER = Path("/content/.hakimi_sep_setup_done")
+SVC_SETUP_MARKER = Path("/content/.hakimi_svc_setup_done")
+
+VALID_COVER_ENGINES: tuple[str, ...] = ("dual", "yingmusic_svc", "seed_vc", "rvc")
+DUAL_ENGINE_ORDER: tuple[str, ...] = ("yingmusic_svc", "seed_vc")
+CANDIDATE_PRIORITY: tuple[str, ...] = ("yingmusic_svc", "seed_vc", "rvc")
+DEFAULT_COVER_ENGINE = "dual"
+DEFAULT_SVC_STEPS = 35
+MIN_SVC_STEPS = 10
+MAX_SVC_STEPS = 100
+DEFAULT_SVC_CFG = 0.7
+DEFAULT_VOLUME_ENVELOPE = 0.25
+DEFAULT_SKIP_DEREVERB = False
+RVC_DEFAULT_PARAMS: dict[str, Any] = {
+    "volume_envelope": DEFAULT_VOLUME_ENVELOPE,
+    "skip_dereverb": DEFAULT_SKIP_DEREVERB,
+    "index_rate": 0.15,
+    "protect": 0.42,
+    "backing_gain_db": -14.0,
+    "skip_backing": True,
+    "f0_method": "rmvpe",
+}
+SVC_PIP_PACKAGES: tuple[str, ...] = (
+    "torch==2.5.1",
+    "torchaudio==2.5.1",
+    "numpy<2.2",
+    "scipy",
+    "soundfile",
+    "librosa",
+    "pydub",
+    "pyyaml",
+    "munch==4.0.0",
+    "einops==0.8.0",
+    "accelerate",
+    "huggingface_hub>=0.28.1,<1.0",
+    "transformers==4.46.3",
+    "descript-audio-codec==1.0.0",
+    "hydra-core",
+    "rotary-embedding-torch",
+    "beartype",
+    "tqdm",
+    "matplotlib",
+    "pyloudnorm",
+)
 
 WEIGHT_CACHE_SCHEMA_VERSION = "v1"
 VENV_CACHE_SCHEMA_VERSION = "v1"
@@ -271,6 +319,38 @@ def _ensure_ffmpeg() -> None:
     log("Installing ffmpeg via apt-get...")
     _run(["apt-get", "update", "-qq"])
     _run(["apt-get", "install", "-y", "-qq", "ffmpeg"])
+
+
+def _ensure_svc_system_deps() -> None:
+    """Ensure ffmpeg, sox, and git are installed for 44.1 kHz SVC engines."""
+    if (
+        shutil.which("ffmpeg")
+        and shutil.which("ffprobe")
+        and shutil.which("sox")
+        and shutil.which("git")
+    ):
+        return
+    log("Installing ffmpeg/sox/git via apt-get for SVC runtime...")
+    _run(["apt-get", "update", "-qq"])
+    _run(["apt-get", "install", "-y", "-qq", "ffmpeg", "sox", "libsox-fmt-all", "git"])
+
+
+def _link_shared_hf_cache(repo_dir: Path, shared_cache_dir: Path) -> None:
+    """Symlink `<repo>/checkpoints/hf_cache` -> shared HF cache so SVC engines share weights."""
+    shared_cache_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = repo_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    link_path = ckpt_dir / "hf_cache"
+    if link_path.is_symlink():
+        if os.readlink(link_path) == str(shared_cache_dir):
+            return
+        link_path.unlink()
+    elif link_path.exists():
+        if link_path.is_dir():
+            shutil.rmtree(link_path)
+        else:
+            link_path.unlink()
+    os.symlink(str(shared_cache_dir), str(link_path))
 
 
 def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
@@ -529,7 +609,8 @@ def _probe_duration_sec(path: Path) -> float:
     return float(proc.stdout.strip())
 
 
-def _detect_mean_volume_db(path: Path) -> float:
+def _detect_volume_stats(path: Path) -> tuple[float, float]:
+    """Return `(mean_volume_db, max_volume_db)` via ffmpeg `volumedetect`."""
     proc = _run(
         [
             "ffmpeg",
@@ -546,10 +627,97 @@ def _detect_mean_volume_db(path: Path) -> float:
         capture=True,
     )
     text = (proc.stderr or "") + "\n" + (proc.stdout or "")
-    match = re.search(r"mean_volume:\s*([-+]?\d+(?:\.\d+)?)\s*dB", text)
-    if not match:
-        return -18.0
-    return float(match.group(1))
+    mean_match = re.search(r"mean_volume:\s*([-+]?\d+(?:\.\d+)?)\s*dB", text)
+    max_match = re.search(r"max_volume:\s*([-+]?\d+(?:\.\d+)?)\s*dB", text)
+    mean_db = float(mean_match.group(1)) if mean_match else -18.0
+    max_db = float(max_match.group(1)) if max_match else -1.0
+    return mean_db, max_db
+
+
+def _detect_mean_volume_db(path: Path) -> float:
+    mean_db, _ = _detect_volume_stats(path)
+    return mean_db
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return -60.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = (max(0.0, min(100.0, pct)) / 100.0) * (len(sorted_values) - 1)
+    lo = int(math.floor(rank))
+    hi = min(len(sorted_values) - 1, int(math.ceil(rank)))
+    if lo == hi:
+        return sorted_values[lo]
+    frac = rank - lo
+    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
+
+
+def compute_acoustic_metrics(
+    vocal_wav: Path,
+    mix_mp3: Path,
+    chorus_mp3: Path,
+    work_dir: Path,
+) -> dict[str, Any]:
+    """Compute lightweight loudness, weak-section dynamics, and clipping metrics."""
+    vocal_mean_db, vocal_max_db = _detect_volume_stats(vocal_wav)
+    mix_mean_db, mix_max_db = _detect_volume_stats(mix_mp3)
+    chorus_mean_db, chorus_max_db = _detect_volume_stats(chorus_mp3)
+
+    p10_db = chorus_mean_db
+    p90_db = chorus_mean_db
+    dynamic_range_db = 0.0
+    weak_ratio = 0.0
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    probe_wav = work_dir / "chorus_probe.wav"
+    try:
+        dec = _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(chorus_mp3),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(probe_wav),
+            ],
+            check=False,
+            capture=True,
+        )
+        if dec.returncode == 0 and probe_wav.is_file() and probe_wav.stat().st_size > 44:
+            bins, _ = compute_wav_rms_envelope(probe_wav, bin_sec=0.5)
+            dbs = [20.0 * math.log10(val / 32768.0) for val in bins if val > 0.0]
+            active_dbs = [d for d in dbs if d > -45.0]
+            if active_dbs:
+                sorted_dbs = sorted(active_dbs)
+                p10_db = _percentile(sorted_dbs, 10.0)
+                p90_db = _percentile(sorted_dbs, 90.0)
+                dynamic_range_db = max(0.0, p90_db - p10_db)
+                weak_thresh = p90_db - 8.0
+                weak_ratio = sum(1 for d in active_dbs if d < weak_thresh) / float(len(active_dbs))
+    except Exception as exc:
+        log(f"Warning: chorus RMS dynamics probe skipped ({type(exc).__name__}: {exc})")
+    finally:
+        probe_wav.unlink(missing_ok=True)
+
+    return {
+        "vocal_mean_db": round(vocal_mean_db, 2),
+        "vocal_max_db": round(vocal_max_db, 2),
+        "mix_mean_db": round(mix_mean_db, 2),
+        "mix_max_db": round(mix_max_db, 2),
+        "chorus_mean_db": round(chorus_mean_db, 2),
+        "chorus_max_db": round(chorus_max_db, 2),
+        "chorus_p10_rms_db": round(p10_db, 2),
+        "chorus_p90_rms_db": round(p90_db, 2),
+        "chorus_dynamic_range_db": round(dynamic_range_db, 2),
+        "chorus_weak_ratio": round(weak_ratio, 3),
+        "clipped_peak_flag": bool(chorus_max_db >= -0.1 or mix_max_db >= -0.1),
+    }
 
 
 def _sanitize_cache_token(value: str, fallback: str = "unknown") -> str:
@@ -762,6 +930,7 @@ def restore_weight_cache(
     expected_sha256: str = "",
     applio_dir: Path = DEFAULT_APPLIO_DIR,
     sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
+    only_prefixes: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Verify SHA-256 and safely restore cached separation + Applio weights."""
     if not tar_path.is_file():
@@ -778,6 +947,9 @@ def restore_weight_cache(
         "applio_rvc_models": applio_dir / "rvc" / "models",
         "applio_assets": applio_dir / "assets",
     }
+    target_prefixes = (
+        frozenset(only_prefixes) if only_prefixes is not None else frozenset(allowed_roots)
+    )
     restored = 0
     sep_restored = 0
     applio_restored = 0
@@ -805,6 +977,8 @@ def restore_weight_cache(
                 tf.extractall(stage_root)
 
         for prefix, dest_base in allowed_roots.items():
+            if prefix not in target_prefixes:
+                continue
             src_sub = stage_root / prefix
             if not src_sub.is_dir():
                 continue
@@ -1016,6 +1190,7 @@ def _try_restore_weight_cache_from_drive(
     work_dir: Path,
     explicit_file_id: str = "",
     explicit_sha256: str = "",
+    only_prefixes: tuple[str, ...] | None = None,
 ) -> tuple[bool, str | None, dict[str, Any]]:
     """Attempt direct Drive restore of version-keyed weights cache; returns (hit, reason, info)."""
     archive_id = explicit_file_id.strip()
@@ -1050,6 +1225,7 @@ def _try_restore_weight_cache_from_drive(
                 expected_sha256=expected_sha,
                 applio_dir=applio_dir,
                 sep_models_dir=sep_models_dir,
+                only_prefixes=only_prefixes,
             )
             log(
                 f"Weight cache HIT ({weight_cache_key}): restored {info['file_count']} file(s) "
@@ -1269,11 +1445,120 @@ def _writeback_venv_cache_to_drive(
         tar_path.unlink(missing_ok=True)
 
 
+def _effective_marker(marker: Path, default_path: Path) -> Path:
+    if marker != default_path:
+        return marker
+    if SETUP_MARKER != Path("/content/.hakimi_setup_done"):
+        return SETUP_MARKER.parent / default_path.name
+    return marker
+
+
+def _setup_sep_venv(uv_bin: str, sep_venv: Path) -> None:
+    if not (sep_venv / "bin" / "python").is_file():
+        log(f"Creating {sep_venv} (Python 3.12)...")
+        _run([uv_bin, "venv", "--python", "3.12", str(sep_venv)])
+    sep_py = str(sep_venv / "bin" / "python")
+    log("Installing audio-separator[gpu] into sep-venv...")
+    _run(
+        [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            sep_py,
+            "audio-separator[gpu]",
+            "audioread",
+            "librosa<1.0",
+            "soundfile",
+            "numpy",
+        ]
+    )
+    _run(
+        [
+            sep_py,
+            "-c",
+            "from audio_separator.separator import Separator; print('sep_import_ok')",
+        ]
+    )
+    log("Installing optional faster-whisper into sep-venv for lyric anchor detection...")
+    fw_proc = _run(
+        [uv_bin, "pip", "install", "--python", sep_py, "faster-whisper"],
+        check=False,
+    )
+    if fw_proc.returncode != 0:
+        log("Warning: faster-whisper install failed; cover will use fallback chorus timestamp.")
+
+    log("Restoring onnxruntime-gpu in sep-venv after faster-whisper install...")
+    _run([uv_bin, "pip", "uninstall", "--python", sep_py, "onnxruntime"], check=False)
+    _run(
+        [uv_bin, "pip", "install", "--python", sep_py, "--reinstall", "onnxruntime-gpu"],
+        check=False,
+    )
+
+
+def _setup_svc_runtime(
+    uv_bin: str,
+    *,
+    svc_venv: Path,
+    seed_vc_dir: Path,
+    yingmusic_dir: Path,
+    svc_hf_cache: Path,
+) -> None:
+    _ensure_svc_system_deps()
+    if not (svc_venv / "bin" / "python").is_file():
+        log(f"Creating isolated {svc_venv} (Python 3.12) for 44.1 kHz SVC...")
+        _run([uv_bin, "venv", "--python", "3.12", str(svc_venv)])
+    svc_py = str(svc_venv / "bin" / "python")
+    log("Installing tested Seed-VC / YingMusic-SVC dependencies into svc-venv...")
+    _run([uv_bin, "pip", "install", "--python", svc_py, *SVC_PIP_PACKAGES])
+    _run(
+        [
+            svc_py,
+            "-c",
+            (
+                "import torch, torchaudio, transformers, dac; "
+                "assert torch.cuda.is_available(); "
+                "print('svc_import_ok', torch.__version__, transformers.__version__)"
+            ),
+        ]
+    )
+    if not (seed_vc_dir / "inference.py").is_file():
+        log(f"Cloning Plachtaa/seed-vc into {seed_vc_dir}...")
+        _run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/Plachtaa/seed-vc.git",
+                str(seed_vc_dir),
+            ]
+        )
+    if not (yingmusic_dir / "my_inference.py").is_file():
+        log(f"Cloning GiantAILab/YingMusic-SVC into {yingmusic_dir}...")
+        _run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/GiantAILab/YingMusic-SVC.git",
+                str(yingmusic_dir),
+            ]
+        )
+    _link_shared_hf_cache(seed_vc_dir, svc_hf_cache)
+    _link_shared_hf_cache(yingmusic_dir, svc_hf_cache)
+
+
 def action_setup(
     *,
     applio_dir: Path = DEFAULT_APPLIO_DIR,
     rvc_venv: Path = DEFAULT_RVC_VENV,
     sep_venv: Path = DEFAULT_SEP_VENV,
+    svc_venv: Path = DEFAULT_SVC_VENV,
+    seed_vc_dir: Path = DEFAULT_SEED_VC_DIR,
+    yingmusic_dir: Path = DEFAULT_YINGMUSIC_DIR,
+    svc_hf_cache: Path = DEFAULT_SVC_HF_CACHE,
     sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
     force: bool = False,
     mode: str = "all",
@@ -1287,9 +1572,16 @@ def action_setup(
     cache_venv_fingerprint: str = "",
     cache_writeback: bool = False,
 ) -> dict[str, Any]:
-    """Provision GPU check, ffmpeg, uv, Applio + rvc-venv, and audio-separator sep-venv."""
-    weight_cache_key = compute_weight_cache_key(mode)
+    """Provision GPU check, ffmpeg, uv, sep-venv, and requested SVC or Applio/RVC runtime."""
+    norm_mode = str(mode or "all").strip().lower() or "all"
+    is_svc_only = norm_mode == "svc"
+    cache_key_mode = "cover" if norm_mode in {"cover", "svc", "rvc"} else "all"
+    weight_cache_key = compute_weight_cache_key(cache_key_mode)
+    sep_marker = _effective_marker(SEP_SETUP_MARKER, Path("/content/.hakimi_sep_setup_done"))
+    svc_marker = _effective_marker(SVC_SETUP_MARKER, Path("/content/.hakimi_svc_setup_done"))
+
     cache_status: dict[str, Any] = {
+        "setup_mode": norm_mode,
         "setup_skipped_warm": False,
         "weight_cache_key": weight_cache_key,
         "weight_cache_hit": None,
@@ -1301,7 +1593,18 @@ def action_setup(
         "venv_fallback_reason": None,
         "runtime_fingerprint": "",
     }
-    if SETUP_MARKER.is_file() and not force and rvc_venv.exists() and sep_venv.exists():
+    if is_svc_only:
+        if (
+            not force
+            and sep_marker.is_file()
+            and svc_marker.is_file()
+            and sep_venv.exists()
+            and svc_venv.exists()
+        ):
+            log("SVC + separator setup markers already present; skipping reinstall.")
+            cache_status["setup_skipped_warm"] = True
+            return cache_status
+    elif SETUP_MARKER.is_file() and not force and rvc_venv.exists() and sep_venv.exists():
         log("Setup marker already present; skipping environment reinstall.")
         cache_status["setup_skipped_warm"] = True
         return cache_status
@@ -1319,6 +1622,48 @@ def action_setup(
 
     _ensure_ffmpeg()
     uv_bin = _ensure_uv()
+
+    if is_svc_only:
+        if drive_token and (cache_folder_id or cache_weights_file_id):
+            weight_hit, weight_reason, weight_info = _try_restore_weight_cache_from_drive(
+                drive_token=drive_token,
+                cache_folder_id=cache_folder_id,
+                weight_cache_key=weight_cache_key,
+                applio_dir=applio_dir,
+                sep_models_dir=sep_models_dir,
+                work_dir=DEFAULT_WORK_DIR,
+                explicit_file_id=cache_weights_file_id,
+                explicit_sha256=cache_weights_sha256,
+                only_prefixes=("sep_models",),
+            )
+            cache_status["weight_cache_hit"] = weight_hit
+            cache_status["weight_fallback_reason"] = weight_reason
+            cache_status["weight_cache_has_sep_models"] = bool(weight_info.get("sep_model_files"))
+
+        if force or not (sep_marker.is_file() and (sep_venv / "bin" / "python").is_file()):
+            _setup_sep_venv(uv_bin, sep_venv)
+            sep_marker.parent.mkdir(parents=True, exist_ok=True)
+            sep_marker.write_text("ok\n", encoding="utf-8")
+        else:
+            log("Reusing warm sep-venv already installed on this Colab VM.")
+
+        if force or not (svc_marker.is_file() and (svc_venv / "bin" / "python").is_file()):
+            _setup_svc_runtime(
+                uv_bin,
+                svc_venv=svc_venv,
+                seed_vc_dir=seed_vc_dir,
+                yingmusic_dir=yingmusic_dir,
+                svc_hf_cache=svc_hf_cache,
+            )
+            svc_marker.parent.mkdir(parents=True, exist_ok=True)
+            svc_marker.write_text("ok\n", encoding="utf-8")
+        else:
+            _link_shared_hf_cache(seed_vc_dir, svc_hf_cache)
+            _link_shared_hf_cache(yingmusic_dir, svc_hf_cache)
+            log("Reusing warm svc-venv already installed on this Colab VM.")
+
+        log("Colab GPU SVC environment setup complete (Applio/RVC skipped).")
+        return cache_status
 
     if not (applio_dir / "core.py").is_file():
         log(f"Cloning Applio into {applio_dir}...")
@@ -1381,10 +1726,12 @@ def action_setup(
     else:
         rvc_py = str(rvc_venv / "bin" / "python")
 
-    if weight_hit and _has_applio_pretrained_weights(applio_dir, mode=mode):
+    if weight_hit and _has_applio_pretrained_weights(applio_dir, mode=cache_key_mode):
         log("Applio pretrained weights restored from Drive cache; skipping prerequisites download.")
     else:
-        pretrain_flag = "--no-pretraineds-hifigan" if mode == "cover" else "--pretraineds-hifigan"
+        pretrain_flag = (
+            "--no-pretraineds-hifigan" if cache_key_mode == "cover" else "--pretraineds-hifigan"
+        )
         log("Downloading Applio pretrained weights & RMVPE/ContentVec...")
         _run(
             [
@@ -1399,47 +1746,10 @@ def action_setup(
             env={"APPLIO_ROOT": str(applio_dir), "APPLIO_LOGS_DIR": str(applio_dir / "logs")},
         )
 
-    if not venv_hit:
-        if not (sep_venv / "bin" / "python").is_file():
-            log(f"Creating {sep_venv} (Python 3.12)...")
-            _run([uv_bin, "venv", "--python", "3.12", str(sep_venv)])
-        sep_py = str(sep_venv / "bin" / "python")
-        log("Installing audio-separator[gpu] into sep-venv...")
-        _run(
-            [
-                uv_bin,
-                "pip",
-                "install",
-                "--python",
-                sep_py,
-                "audio-separator[gpu]",
-                "audioread",
-                "librosa<1.0",
-                "soundfile",
-                "numpy",
-            ]
-        )
-        _run(
-            [
-                sep_py,
-                "-c",
-                "from audio_separator.separator import Separator; print('sep_import_ok')",
-            ]
-        )
-        log("Installing optional faster-whisper into sep-venv for lyric anchor detection...")
-        fw_proc = _run(
-            [uv_bin, "pip", "install", "--python", sep_py, "faster-whisper"],
-            check=False,
-        )
-        if fw_proc.returncode != 0:
-            log("Warning: faster-whisper install failed; cover will use fallback chorus timestamp.")
-
-        log("Restoring onnxruntime-gpu in sep-venv after faster-whisper install...")
-        _run([uv_bin, "pip", "uninstall", "--python", sep_py, "onnxruntime"], check=False)
-        _run(
-            [uv_bin, "pip", "install", "--python", sep_py, "--reinstall", "onnxruntime-gpu"],
-            check=False,
-        )
+    if not venv_hit and (
+        force or not (sep_marker.is_file() and (sep_venv / "bin" / "python").is_file())
+    ):
+        _setup_sep_venv(uv_bin, sep_venv)
     else:
         sep_py = str(sep_venv / "bin" / "python")
         _run(
@@ -1450,6 +1760,9 @@ def action_setup(
             ]
         )
 
+    sep_marker.parent.mkdir(parents=True, exist_ok=True)
+    sep_marker.write_text("ok\n", encoding="utf-8")
+    SETUP_MARKER.parent.mkdir(parents=True, exist_ok=True)
     SETUP_MARKER.write_text("ok\n", encoding="utf-8")
 
     if cache_writeback and drive_token and cache_folder_id:
@@ -1463,7 +1776,7 @@ def action_setup(
                 sep_venv=sep_venv,
                 work_dir=DEFAULT_WORK_DIR,
             )
-        if not weight_hit and _has_applio_pretrained_weights(applio_dir, mode=mode):
+        if not weight_hit and _has_applio_pretrained_weights(applio_dir, mode=cache_key_mode):
             cache_status["weight_cache_written"] = _writeback_weight_cache_to_drive(
                 drive_token=drive_token,
                 cache_folder_id=cache_folder_id,
@@ -1889,14 +2202,39 @@ def _clamp_backing_gain_db(value: float) -> float:
     return max(MIN_BACKING_GAIN_DB, min(MAX_BACKING_GAIN_DB, val))
 
 
+def _validate_cover_engine(engine: str) -> str:
+    norm = str(engine or "").strip().lower()
+    if norm not in VALID_COVER_ENGINES:
+        raise ValueError(f"Unsupported cover engine: {engine!r}")
+    return norm
+
+
+def _validate_svc_steps(steps: int | None) -> int:
+    if steps is None:
+        return DEFAULT_SVC_STEPS
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise ValueError("svc_steps must be an integer, not bool")
+    if not (MIN_SVC_STEPS <= steps <= MAX_SVC_STEPS):
+        raise ValueError(f"svc_steps must be between {MIN_SVC_STEPS} and {MAX_SVC_STEPS}")
+    return steps
+
+
+def _validate_vocal_profile(vocal_profile: str) -> str:
+    norm = str(vocal_profile or "").strip().lower()
+    if norm not in {"svc", "rvc"}:
+        raise ValueError(f"Unsupported vocal_profile: {vocal_profile!r}")
+    return norm
+
+
 def build_mix_filter_complex(
     gain_db: float,
     *,
     has_backing: bool = False,
     backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
     skip_backing: bool = True,
+    vocal_profile: str = "svc",
 ) -> str:
-    """Build ffmpeg filter_complex graph for vocal presence, de-harshing, and mastering."""
+    """Build ffmpeg filter_complex graph with weak-section dynamic lift and profile EQ."""
     if isinstance(gain_db, bool):
         raise ValueError("gain_db must be numeric, not bool")
     try:
@@ -1908,16 +2246,33 @@ def build_mix_filter_complex(
     if not isinstance(skip_backing, bool):
         raise ValueError("skip_backing must be a boolean")
     clamped_db = _clamp_backing_gain_db(backing_gain_db)
+    profile = _validate_vocal_profile(vocal_profile)
 
+    if profile == "rvc":
+        eq_chain = "equalizer=f=3100:t=q:w=1.5:g=-1.2,equalizer=f=6800:t=q:w=2.0:g=-2.0,"
+        amb_send = (
+            "[vwet]highpass=f=300,lowpass=f=3800,"
+            "aecho=0.8:0.6:23|41|67:0.18|0.12|0.08,volume=0.12[vamb];"
+        )
+    else:
+        eq_chain = "equalizer=f=3200:t=q:w=1.4:g=1.2,equalizer=f=6800:t=q:w=2.0:g=-1.5,"
+        amb_send = (
+            "[vwet]highpass=f=300,lowpass=f=4000,"
+            "aecho=0.8:0.6:23|41|67:0.16|0.10|0.06,volume=0.12[vamb];"
+        )
+
+    weak_lift = (
+        "compand=attacks=0.05:decays=0.35:soft-knee=6:"
+        "points=-80/-80|-48/-48|-36/-31.5|-24/-19|-14/-12.5|-6/-6|0/-1,"
+        "acompressor=threshold=-20dB:ratio=2.2:attack=12:release=170:makeup=1.5dB,"
+    )
     vocal_bus = (
         f"[0:a]volume={clean_gain:.2f}dB,highpass=f=85,"
-        "equalizer=f=3100:t=q:w=1.5:g=-1.2,"
-        "equalizer=f=6800:t=q:w=2.0:g=-2.0,"
-        "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=160:makeup=2.2dB,"
-        "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];"
-        "[vwet]highpass=f=300,lowpass=f=3800,"
-        "aecho=0.8:0.6:23|41|67:0.18|0.12|0.08,volume=0.12[vamb];"
-        "[vdry][vamb]amix=inputs=2:duration=longest:normalize=0[v];"
+        + eq_chain
+        + weak_lift
+        + "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];"
+        + amb_send
+        + "[vdry][vamb]amix=inputs=2:duration=longest:normalize=0[v];"
     )
     inst_bus = "[1:a]volume=-0.8dB[inst];"
     if has_backing and not skip_backing:
@@ -2026,88 +2381,55 @@ print("__WHISPER_SEGS__=" + json.dumps(out, ensure_ascii=False))
     return []
 
 
-def action_cover(
-    *,
-    source_audio: Path,
-    pth_path: Path,
-    index_path: Path,
-    pitch: int = 0,
-    index_rate: float = 0.15,
-    protect: float = 0.42,
-    volume_envelope: float = 0.12,
-    backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
-    skip_backing: bool = True,
-    skip_dereverb: bool = True,
-    start_sec: str = "auto",
-    duration_sec: float = 50.0,
-    chorus_anchor: str = "",
-    fallback_start_sec: float = 60.0,
-    chunk_mb: int = 6,
-    applio_dir: Path = DEFAULT_APPLIO_DIR,
-    rvc_venv: Path = DEFAULT_RVC_VENV,
-    sep_venv: Path = DEFAULT_SEP_VENV,
-    out_dir: Path = DEFAULT_OUT_DIR,
-    chunks_dir: Path = DEFAULT_CHUNKS_DIR,
-) -> dict[str, Any]:
-    """Separate stems, run RVC voice conversion, loudness-match mix, and trim chorus."""
-    _require_bool_arg("skip_backing", skip_backing)
-    _require_bool_arg("skip_dereverb", skip_dereverb)
-    effective_backing_gain_db = round(_clamp_backing_gain_db(backing_gain_db), 1)
-    if not source_audio.is_file():
-        raise FileNotFoundError(f"Source song audio not found: {source_audio}")
-    if not pth_path.is_file():
-        raise FileNotFoundError(f"RVC .pth model not found: {pth_path}")
-    if not index_path.is_file():
-        raise FileNotFoundError(f"RVC .index file not found: {index_path}")
-
-    work_cover = DEFAULT_WORK_DIR / "cover_work"
-    if work_cover.exists():
-        shutil.rmtree(work_cover)
-    work_cover.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    source_wav = work_cover / "source.wav"
-    log(f"Normalizing source audio {source_audio} -> {source_wav}...")
+def _normalize_ref_voice(ref_audio: Path, dst_wav: Path) -> Path:
+    """Normalize zero-shot reference audio to mono 44.1 kHz PCM16 WAV capped at 24s."""
+    dst_wav.parent.mkdir(parents=True, exist_ok=True)
     _run(
         [
             "ffmpeg",
             "-y",
+            "-t",
+            "24",
             "-i",
-            str(source_audio),
+            str(ref_audio),
             "-ar",
             "44100",
             "-ac",
-            "2",
+            "1",
             "-c:a",
             "pcm_s16le",
-            str(source_wav),
+            str(dst_wav),
         ]
     )
-    total_duration = _probe_duration_sec(source_wav)
-    log(f"Source track duration: {total_duration:.2f}s")
+    if not dst_wav.is_file():
+        raise FileNotFoundError(f"Normalized reference voice missing: {dst_wav}")
+    return dst_wav
 
-    sep_py = str(sep_venv / "bin" / "python")
-    rvc_py = str(rvc_venv / "bin" / "python")
 
-    log("Separating vocals and instrumental...")
-    dry_vocals_wav, inst_wav, backing_vocals_wav = _separate_clean_lead_vocals(
-        sep_py,
-        source_wav,
-        work_cover,
-        label="cover",
-        skip_backing=skip_backing,
-        skip_dereverb=skip_dereverb,
+def _run_rvc_inference(
+    rvc_py: str,
+    *,
+    applio_dir: Path,
+    vocals_wav: Path,
+    converted_wav: Path,
+    pth_path: Path,
+    index_path: Path,
+    pitch: int,
+    index_rate: float,
+    volume_envelope: float,
+    protect: float,
+) -> Path:
+    log(
+        f"Running Applio RVC inference (pitch={pitch}, index_rate={index_rate}, "
+        f"volume_envelope={volume_envelope})..."
     )
-
-    converted_wav = work_cover / "vocals_hakimi.wav"
-    log(f"Running Applio RVC inference (pitch={pitch}, index_rate={index_rate})...")
     _run(
         [
             rvc_py,
             str(applio_dir / "core.py"),
             "infer",
             "--input-path",
-            str(dry_vocals_wav),
+            str(vocals_wav),
             "--output-path",
             str(converted_wav),
             "--pth-path",
@@ -2134,20 +2456,180 @@ def action_cover(
     )
     if not converted_wav.is_file():
         raise FileNotFoundError(f"RVC inference output missing: {converted_wav}")
+    return converted_wav
 
-    orig_db = _detect_mean_volume_db(dry_vocals_wav)
+
+def _run_seed_vc_inference(
+    svc_py: str,
+    *,
+    seed_vc_dir: Path,
+    hf_cache_dir: Path,
+    vocals_wav: Path,
+    ref_wav: Path,
+    work_dir: Path,
+    steps: int,
+    cfg: float,
+    pitch: int,
+) -> Path:
+    sub_out = work_dir / "seed_vc_raw"
+    if sub_out.exists():
+        shutil.rmtree(sub_out)
+    sub_out.mkdir(parents=True, exist_ok=True)
+    _link_shared_hf_cache(seed_vc_dir, hf_cache_dir)
+    log(f"Running Seed-VC 44.1kHz F0 inference (steps={steps}, cfg={cfg}, pitch={pitch})...")
+    _run(
+        [
+            svc_py,
+            str(seed_vc_dir / "inference.py"),
+            "--source",
+            str(vocals_wav),
+            "--target",
+            str(ref_wav),
+            "--output",
+            str(sub_out),
+            "--diffusion-steps",
+            str(steps),
+            "--inference-cfg-rate",
+            str(cfg),
+            "--f0-condition",
+            "True",
+            "--auto-f0-adjust",
+            "False",
+            "--semi-tone-shift",
+            str(int(pitch)),
+            "--fp16",
+            "True",
+        ],
+        cwd=seed_vc_dir,
+        env={
+            "USE_TF": "0",
+            "USE_TORCH": "1",
+            "USE_JAX": "0",
+            "HF_HUB_CACHE": str(hf_cache_dir),
+        },
+    )
+    wavs = sorted(sub_out.rglob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not wavs:
+        raise FileNotFoundError("Seed-VC inference produced no WAV output")
+    return wavs[0]
+
+
+def _run_yingmusic_svc_inference(
+    svc_py: str,
+    *,
+    yingmusic_dir: Path,
+    hf_cache_dir: Path,
+    vocals_wav: Path,
+    ref_wav: Path,
+    work_dir: Path,
+    steps: int,
+    cfg: float,
+) -> Path:
+    """Run YingMusic-SVC 44.1kHz inference with semi_tone_shift strictly hard-locked to 0."""
+    sub_out = work_dir / "yingmusic_raw"
+    if sub_out.exists():
+        shutil.rmtree(sub_out)
+    sub_out.mkdir(parents=True, exist_ok=True)
+    _link_shared_hf_cache(yingmusic_dir, hf_cache_dir)
+
+    runner = sub_out / "_run_yingmusic.py"
+    runner.write_text(
+        "import os, sys, types\n"
+        "import torch\n"
+        "from huggingface_hub import hf_hub_download\n"
+        "os.environ['HF_HUB_CACHE'] = sys.argv[6]\n"
+        "sys.path.insert(0, os.getcwd())\n"
+        "import my_inference as mi\n"
+        "ckpt_path = hf_hub_download(\n"
+        "    repo_id='GiantAILab/YingMusic-SVC',\n"
+        "    filename='YingMusic-SVC-full.pt',\n"
+        "    cache_dir=sys.argv[6],\n"
+        ")\n"
+        "args = types.SimpleNamespace(\n"
+        "    source=sys.argv[1],\n"
+        "    target=sys.argv[2],\n"
+        "    diffusion_steps=int(sys.argv[4]),\n"
+        "    length_adjust=1.0,\n"
+        "    inference_cfg_rate=float(sys.argv[5]),\n"
+        "    f0_condition=True,\n"
+        "    semi_tone_shift=0,\n"
+        "    checkpoint=ckpt_path,\n"
+        "    config='./configs/YingMusic-SVC.yml',\n"
+        "    expname='hakimi_run',\n"
+        "    output=sys.argv[3],\n"
+        "    cuda=torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'),\n"
+        "    fp16=True,\n"
+        "    accompany=None,\n"
+        ")\n"
+        "bundle = mi.load_models_api(args, device=args.cuda)\n"
+        "out_wav = mi.run_inference(args, bundle, device=args.cuda)\n"
+        "print('__YING_OUT__=' + str(out_wav), flush=True)\n",
+        encoding="utf-8",
+    )
+    log(
+        f"Running YingMusic-SVC 44.1kHz inference "
+        f"(steps={steps}, cfg={cfg}, semi_tone_shift=0 locked)..."
+    )
+    _run(
+        [
+            svc_py,
+            str(runner),
+            str(vocals_wav),
+            str(ref_wav),
+            str(sub_out),
+            str(steps),
+            str(cfg),
+            str(hf_cache_dir),
+        ],
+        cwd=yingmusic_dir,
+        env={
+            "USE_TF": "0",
+            "USE_TORCH": "1",
+            "USE_JAX": "0",
+            "HF_HUB_CACHE": str(hf_cache_dir),
+        },
+    )
+    wavs = sorted(sub_out.rglob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not wavs:
+        raise FileNotFoundError("YingMusic-SVC inference produced no WAV output")
+    return wavs[0]
+
+
+def _mix_and_slice_candidate(
+    *,
+    engine_key: str,
+    converted_wav: Path,
+    lead_vocals_wav: Path,
+    inst_wav: Path,
+    backing_vocals_wav: Path | None,
+    effective_backing_gain_db: float,
+    skip_backing: bool,
+    chosen_start: float,
+    clamped_dur: float,
+    chunk_mb: int,
+    work_cover: Path,
+    out_dir: Path,
+    chunks_dir: Path,
+) -> tuple[Path, Path, float, dict[str, Any]]:
+    orig_db = _detect_mean_volume_db(lead_vocals_wav)
     conv_db = _detect_mean_volume_db(converted_wav)
     gain_db = max(-12.0, min(12.0, orig_db - conv_db))
-    log(f"Loudness match: orig={orig_db:.1f} dB, conv={conv_db:.1f} dB -> gain={gain_db:+.2f} dB")
+    log(
+        f"[{engine_key}] Loudness match: orig={orig_db:.1f} dB, "
+        f"conv={conv_db:.1f} dB -> gain={gain_db:+.2f} dB"
+    )
 
-    cover_full_mp3 = out_dir / "cover_full.mp3"
+    full_mp3 = out_dir / f"cover_{engine_key}_full.mp3"
+    chorus_mp3 = out_dir / f"cover_{engine_key}_chorus.mp3"
     has_backing = backing_vocals_wav is not None
     use_backing = has_backing and not skip_backing
+    vocal_profile = "rvc" if engine_key == "rvc" else "svc"
     filter_complex = build_mix_filter_complex(
         gain_db,
         has_backing=has_backing,
         backing_gain_db=effective_backing_gain_db,
         skip_backing=skip_backing,
+        vocal_profile=vocal_profile,
     )
     mix_cmd = [
         "ffmpeg",
@@ -2175,37 +2657,12 @@ def action_cover(
             "44100",
             "-ac",
             "2",
-            str(cover_full_mp3),
+            str(full_mp3),
         ]
     )
     _run(mix_cmd)
 
-    clamped_dur = round(max(5.0, min(56.0, float(duration_sec))), 2)
-    if total_duration > 0:
-        clamped_dur = round(min(clamped_dur, max(5.0, total_duration)), 2)
-
-    segments: list[dict[str, Any]] = []
-    if str(start_sec).strip().lower() == "auto":
-        segments = _transcribe_for_chorus(sep_py, dry_vocals_wav)
-        if segments:
-            (out_dir / "lyrics_timestamps.json").write_text(
-                json.dumps(segments, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        chosen_start, start_reason = find_chorus_start_sec(
-            segments,
-            chorus_anchor,
-            fallback_start_sec,
-            total_duration,
-            clamped_dur,
-            vocal_wav=dry_vocals_wav,
-        )
-    else:
-        chosen_start = _clamp_start(float(start_sec), total_duration, clamped_dur)
-        start_reason = "explicit"
-
     fade_out_start = max(0.0, clamped_dur - 1.5)
-    cover_chorus_mp3 = out_dir / "cover_chorus.mp3"
     _run(
         [
             "ffmpeg",
@@ -2215,7 +2672,7 @@ def action_cover(
             "-t",
             f"{clamped_dur:.2f}",
             "-i",
-            str(cover_full_mp3),
+            str(full_mp3),
             "-af",
             f"afade=t=in:st=0:d=0.3,afade=t=out:st={fade_out_start:.2f}:d=1.5",
             "-map_metadata",
@@ -2228,18 +2685,21 @@ def action_cover(
             "44100",
             "-ac",
             "2",
-            str(cover_chorus_mp3),
+            str(chorus_mp3),
         ]
     )
-    if cover_chorus_mp3.stat().st_size > MAX_CHORUS_BYTES:
-        log("Chorus MP3 exceeded 1.75 MB; re-encoding at 96k mono for SongLibrary headroom...")
-        tmp_mono = work_cover / "cover_chorus_mono.mp3"
+    if chorus_mp3.stat().st_size > MAX_CHORUS_BYTES:
+        log(
+            f"[{engine_key}] Chorus MP3 exceeded 1.75 MB; "
+            "re-encoding at 96k mono for SongLibrary headroom..."
+        )
+        tmp_mono = work_cover / f"cover_{engine_key}_chorus_mono.mp3"
         _run(
             [
                 "ffmpeg",
                 "-y",
                 "-i",
-                str(cover_chorus_mp3),
+                str(chorus_mp3),
                 "-map_metadata",
                 "-1",
                 "-c:a",
@@ -2253,9 +2713,290 @@ def action_cover(
                 str(tmp_mono),
             ]
         )
-        tmp_mono.replace(cover_chorus_mp3)
+        tmp_mono.replace(chorus_mp3)
+
+    metrics = compute_acoustic_metrics(
+        converted_wav, full_mp3, chorus_mp3, work_cover / f"metrics_{engine_key}"
+    )
+    split_file(full_mp3, chunks_dir / f"cover_{engine_key}_full", chunk_mb=chunk_mb)
+    split_file(chorus_mp3, chunks_dir / f"cover_{engine_key}_chorus", chunk_mb=chunk_mb)
+    return full_mp3, chorus_mp3, gain_db, metrics
+
+
+def action_cover(
+    *,
+    source_audio: Path,
+    pth_path: Path | None = None,
+    index_path: Path | None = None,
+    ref_audio: Path | None = None,
+    engine: str | None = None,
+    svc_steps: int | None = None,
+    svc_cfg: float = DEFAULT_SVC_CFG,
+    pitch: int = 0,
+    index_rate: float = 0.15,
+    protect: float = 0.42,
+    volume_envelope: float = DEFAULT_VOLUME_ENVELOPE,
+    backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
+    skip_backing: bool = True,
+    skip_dereverb: bool = DEFAULT_SKIP_DEREVERB,
+    start_sec: str = "auto",
+    duration_sec: float = 50.0,
+    chorus_anchor: str = "",
+    fallback_start_sec: float = 60.0,
+    chunk_mb: int = 6,
+    applio_dir: Path = DEFAULT_APPLIO_DIR,
+    rvc_venv: Path = DEFAULT_RVC_VENV,
+    sep_venv: Path = DEFAULT_SEP_VENV,
+    svc_venv: Path = DEFAULT_SVC_VENV,
+    seed_vc_dir: Path = DEFAULT_SEED_VC_DIR,
+    yingmusic_dir: Path = DEFAULT_YINGMUSIC_DIR,
+    svc_hf_cache: Path = DEFAULT_SVC_HF_CACHE,
+    out_dir: Path = DEFAULT_OUT_DIR,
+    chunks_dir: Path = DEFAULT_CHUNKS_DIR,
+) -> dict[str, Any]:
+    """Run shared BS-RoFormer separation, SVC/RVC engine(s), weak-lift mix, and aligned chorus."""
+    _require_bool_arg("skip_backing", skip_backing)
+    _require_bool_arg("skip_dereverb", skip_dereverb)
+    effective_backing_gain_db = round(_clamp_backing_gain_db(backing_gain_db), 1)
+    effective_svc_steps = _validate_svc_steps(svc_steps)
+    if isinstance(svc_cfg, bool) or not math.isfinite(float(svc_cfg)):
+        raise ValueError("svc_cfg must be a finite float")
+    effective_svc_cfg = max(0.0, min(1.5, float(svc_cfg)))
+
+    if engine is None or not str(engine).strip():
+        resolved_engine = "rvc" if (pth_path is not None and ref_audio is None) else "dual"
+    else:
+        resolved_engine = _validate_cover_engine(engine)
+    target_engines: tuple[str, ...] = (
+        DUAL_ENGINE_ORDER if resolved_engine == "dual" else (resolved_engine,)
+    )
+    uses_rvc = "rvc" in target_engines
+    uses_svc = any(e in {"yingmusic_svc", "seed_vc"} for e in target_engines)
+
+    if not source_audio.is_file():
+        raise FileNotFoundError(f"Source song audio not found: {source_audio}")
+    if uses_rvc:
+        if pth_path is None or not pth_path.is_file():
+            raise FileNotFoundError(f"RVC .pth model not found: {pth_path}")
+        if index_path is None or not index_path.is_file():
+            raise FileNotFoundError(f"RVC .index file not found: {index_path}")
+    if uses_svc:
+        if ref_audio is None or not ref_audio.is_file():
+            raise FileNotFoundError(f"SVC reference voice audio not found: {ref_audio}")
+
+    work_cover = DEFAULT_WORK_DIR / "cover_work"
+    if work_cover.exists():
+        shutil.rmtree(work_cover)
+    work_cover.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    source_wav = work_cover / "source.wav"
+    log(f"Normalizing source audio {source_audio} -> {source_wav}...")
+    _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_audio),
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+            str(source_wav),
+        ]
+    )
+    total_duration = _probe_duration_sec(source_wav)
+    log(f"Source track duration: {total_duration:.2f}s (engine={resolved_engine})")
+
+    ref_wav: Path | None = None
+    if uses_svc and ref_audio is not None:
+        ref_wav = _normalize_ref_voice(ref_audio, work_cover / "ref_44k.wav")
+
+    sep_py = str(sep_venv / "bin" / "python")
+    rvc_py = str(rvc_venv / "bin" / "python")
+    svc_py = str(svc_venv / "bin" / "python")
+
+    # Shared separation ONCE; SVC consumes clean BS-RoFormer lead vocal directly (no dereverb).
+    effective_skip_dereverb = skip_dereverb if uses_rvc else True
+    log("Separating vocals and instrumental (shared BS-RoFormer pass)...")
+    lead_vocals_wav, inst_wav, backing_vocals_wav = _separate_clean_lead_vocals(
+        sep_py,
+        source_wav,
+        work_cover,
+        label="cover",
+        skip_backing=skip_backing,
+        skip_dereverb=effective_skip_dereverb,
+    )
+
+    clamped_dur = round(max(5.0, min(56.0, float(duration_sec))), 2)
+    if total_duration > 0:
+        clamped_dur = round(min(clamped_dur, max(5.0, total_duration)), 2)
+
+    segments: list[dict[str, Any]] = []
+    if str(start_sec).strip().lower() == "auto":
+        segments = _transcribe_for_chorus(sep_py, lead_vocals_wav)
+        if segments:
+            (out_dir / "lyrics_timestamps.json").write_text(
+                json.dumps(segments, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        chosen_start, start_reason = find_chorus_start_sec(
+            segments,
+            chorus_anchor,
+            fallback_start_sec,
+            total_duration,
+            clamped_dur,
+            vocal_wav=lead_vocals_wav,
+        )
+    else:
+        chosen_start = _clamp_start(float(start_sec), total_duration, clamped_dur)
+        start_reason = "explicit"
+
+    candidates: list[dict[str, Any]] = []
+    candidate_paths: dict[str, tuple[Path, Path]] = {}
+    first_exc: Exception | None = None
+
+    for eng in target_engines:
+        started_t = time.monotonic()
+        try:
+            if eng == "rvc":
+                assert pth_path is not None and index_path is not None
+                converted_wav = _run_rvc_inference(
+                    rvc_py,
+                    applio_dir=applio_dir,
+                    vocals_wav=lead_vocals_wav,
+                    converted_wav=work_cover / "vocals_hakimi.wav",
+                    pth_path=pth_path,
+                    index_path=index_path,
+                    pitch=pitch,
+                    index_rate=index_rate,
+                    volume_envelope=volume_envelope,
+                    protect=protect,
+                )
+            elif eng == "seed_vc":
+                assert ref_wav is not None
+                converted_wav = _run_seed_vc_inference(
+                    svc_py,
+                    seed_vc_dir=seed_vc_dir,
+                    hf_cache_dir=svc_hf_cache,
+                    vocals_wav=lead_vocals_wav,
+                    ref_wav=ref_wav,
+                    work_dir=work_cover,
+                    steps=effective_svc_steps,
+                    cfg=effective_svc_cfg,
+                    pitch=pitch,
+                )
+            elif eng == "yingmusic_svc":
+                assert ref_wav is not None
+                converted_wav = _run_yingmusic_svc_inference(
+                    svc_py,
+                    yingmusic_dir=yingmusic_dir,
+                    hf_cache_dir=svc_hf_cache,
+                    vocals_wav=lead_vocals_wav,
+                    ref_wav=ref_wav,
+                    work_dir=work_cover,
+                    steps=effective_svc_steps,
+                    cfg=effective_svc_cfg,
+                )
+            else:
+                raise ValueError(f"Unsupported engine: {eng!r}")
+
+            full_mp3, chorus_mp3, gain_db, metrics = _mix_and_slice_candidate(
+                engine_key=eng,
+                converted_wav=converted_wav,
+                lead_vocals_wav=lead_vocals_wav,
+                inst_wav=inst_wav,
+                backing_vocals_wav=backing_vocals_wav,
+                effective_backing_gain_db=effective_backing_gain_db,
+                skip_backing=skip_backing,
+                chosen_start=chosen_start,
+                clamped_dur=clamped_dur,
+                chunk_mb=chunk_mb,
+                work_cover=work_cover,
+                out_dir=out_dir,
+                chunks_dir=chunks_dir,
+            )
+            try:
+                chorus_dur_ms = int(round(_probe_duration_sec(chorus_mp3) * 1000.0))
+            except Exception:
+                chorus_dur_ms = int(round(clamped_dur * 1000.0))
+            elapsed_sec = round(max(0.0, time.monotonic() - started_t), 2)
+            cand_entry = {
+                "key": eng,
+                "engine": eng,
+                "status": "succeeded",
+                "error_code": None,
+                "error": None,
+                "digest": sha256_file(chorus_mp3),
+                "byte_size": chorus_mp3.stat().st_size,
+                "full_byte_size": full_mp3.stat().st_size,
+                "duration_ms": chorus_dur_ms,
+                "drive_chorus_id": "",
+                "drive_full_id": "",
+                "chorus_filename": chorus_mp3.name,
+                "full_filename": full_mp3.name,
+                "local_chorus_file": chorus_mp3.name,
+                "local_full_file": full_mp3.name,
+                "chorus_chunk_dir": str(chunks_dir / f"cover_{eng}_chorus"),
+                "full_chunk_dir": str(chunks_dir / f"cover_{eng}_full"),
+                "loudness_gain_db": round(gain_db, 2),
+                "elapsed_sec": elapsed_sec,
+                "acoustic_metrics": metrics,
+            }
+            candidates.append(cand_entry)
+            candidate_paths[eng] = (full_mp3, chorus_mp3)
+        except Exception as exc:
+            if first_exc is None:
+                first_exc = exc
+            safe_err = scrub_secrets(f"{type(exc).__name__}: {exc}")[:200]
+            log(f"[{eng}] Candidate failed (isolated): {safe_err}")
+            candidates.append(
+                {
+                    "key": eng,
+                    "engine": eng,
+                    "status": "failed",
+                    "error_code": f"{eng}_failed",
+                    "error": safe_err,
+                    "digest": "",
+                    "byte_size": 0,
+                    "full_byte_size": 0,
+                    "duration_ms": 0,
+                    "drive_chorus_id": "",
+                    "drive_full_id": "",
+                    "chorus_filename": "",
+                    "full_filename": "",
+                    "loudness_gain_db": 0.0,
+                    "elapsed_sec": round(max(0.0, time.monotonic() - started_t), 2),
+                    "acoustic_metrics": {},
+                }
+            )
+
+    succeeded = [c for c in candidates if c["status"] == "succeeded"]
+    if not succeeded:
+        if resolved_engine == "rvc" and first_exc is not None:
+            raise first_exc
+        summary = "; ".join(f"{c['engine']}={c['error']}" for c in candidates)
+        raise RuntimeError(f"svc_all_engines_failed:{summary[:240]}")
+
+    primary = next(
+        (c for pref in CANDIDATE_PRIORITY for c in succeeded if c["engine"] == pref),
+        succeeded[0],
+    )
+    primary_eng = str(primary["engine"])
+    primary_full, primary_chorus = candidate_paths[primary_eng]
+    cover_full_mp3 = out_dir / "cover_full.mp3"
+    cover_chorus_mp3 = out_dir / "cover_chorus.mp3"
+    shutil.copy2(primary_full, cover_full_mp3)
+    shutil.copy2(primary_chorus, cover_chorus_mp3)
 
     meta = {
+        "engine_requested": resolved_engine,
+        "engine_used": primary_eng,
+        "ref_voice": ref_audio.name if ref_audio is not None else "",
+        "svc_steps": effective_svc_steps if uses_svc else None,
+        "svc_cfg": effective_svc_cfg if uses_svc else None,
         "source_duration_sec": round(total_duration, 2),
         "chorus_start_sec": chosen_start,
         "chorus_duration_sec": clamped_dur,
@@ -2264,7 +3005,7 @@ def action_cover(
         "index_rate": index_rate,
         "protect": protect,
         "volume_envelope": volume_envelope,
-        "loudness_gain_db": round(gain_db, 2),
+        "loudness_gain_db": primary["loudness_gain_db"],
         "backing_gain_db": effective_backing_gain_db,
         "skip_backing": skip_backing,
         "skip_dereverb": skip_dereverb,
@@ -2272,6 +3013,7 @@ def action_cover(
         "auto_pipeline_split": True,
         "cover_full_bytes": cover_full_mp3.stat().st_size,
         "cover_chorus_bytes": cover_chorus_mp3.stat().st_size,
+        "candidates": candidates,
     }
     (out_dir / "cover_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
@@ -2279,7 +3021,11 @@ def action_cover(
     )
     split_file(cover_full_mp3, chunks_dir / "cover_full", chunk_mb=chunk_mb)
     split_file(cover_chorus_mp3, chunks_dir / "cover_chorus", chunk_mb=chunk_mb)
-    log(f"Cover ready: start={chosen_start}s dur={clamped_dur}s ({start_reason})")
+    log(
+        f"Cover ready: engine={resolved_engine} used={primary_eng} "
+        f"ok={len(succeeded)}/{len(candidates)} start={chosen_start}s "
+        f"dur={clamped_dur}s ({start_reason})"
+    )
     return meta
 
 
@@ -2692,15 +3438,32 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
                 )
     elif action == "cover":
         source_path = Path(os.environ.get("HAKIMI_SOURCE_AUDIO", "/content/work/source_song"))
-        pth_path = Path(os.environ.get("HAKIMI_PTH_PATH", "/content/out/hakimi.pth"))
-        index_path = Path(os.environ.get("HAKIMI_INDEX_PATH", "/content/out/hakimi.index"))
+        raw_engine = os.environ.get("HAKIMI_COVER_ENGINE", "").strip().lower()
+        pth_env = os.environ.get("HAKIMI_PTH_PATH", "").strip()
+        index_env = os.environ.get("HAKIMI_INDEX_PATH", "").strip()
+        ref_env = os.environ.get("HAKIMI_REF_AUDIO", "").strip()
+        drive_ref_fid = os.environ.get("HAKIMI_DRIVE_REF_VOICE_FILE_ID", "").strip()
+        pth_path = Path(pth_env) if pth_env else Path("/content/out/hakimi.pth")
+        index_path = Path(index_env) if index_env else Path("/content/out/hakimi.index")
+        ref_audio: Path | None = (
+            Path(ref_env)
+            if ref_env
+            else (Path("/content/out/hakimi_ref.wav") if drive_ref_fid else None)
+        )
+        svc_steps_raw = os.environ.get("HAKIMI_SVC_STEPS", "").strip()
+        svc_steps = int(svc_steps_raw) if svc_steps_raw else None
+        svc_cfg = _env_float("HAKIMI_SVC_CFG", DEFAULT_SVC_CFG)
+
         direct_inputs: list[str] = []
         if drive_token:
-            for env_key, target_name, dest, is_model in (
+            dl_targets: list[tuple[str, str, Path, bool]] = [
                 ("HAKIMI_DRIVE_SOURCE_FILE_ID", "source", source_path, False),
                 ("HAKIMI_DRIVE_PTH_FILE_ID", "pth", pth_path, True),
                 ("HAKIMI_DRIVE_INDEX_FILE_ID", "index", index_path, True),
-            ):
+            ]
+            if ref_audio is not None:
+                dl_targets.append(("HAKIMI_DRIVE_REF_VOICE_FILE_ID", "ref_audio", ref_audio, True))
+            for env_key, target_name, dest, is_model in dl_targets:
                 fid = os.environ.get(env_key, "").strip()
                 if not fid:
                     continue
@@ -2725,17 +3488,21 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
                     ) from None
         meta = action_cover(
             source_audio=source_path,
-            pth_path=pth_path,
-            index_path=index_path,
+            pth_path=pth_path if (raw_engine == "rvc" or not raw_engine) else None,
+            index_path=index_path if (raw_engine == "rvc" or not raw_engine) else None,
+            ref_audio=ref_audio,
+            engine=raw_engine or None,
+            svc_steps=svc_steps,
+            svc_cfg=svc_cfg,
             pitch=_env_int("HAKIMI_PITCH", 0),
             index_rate=_env_float("HAKIMI_INDEX_RATE", 0.15),
             protect=_env_float("HAKIMI_PROTECT", 0.42),
-            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.12),
+            volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", DEFAULT_VOLUME_ENVELOPE),
             backing_gain_db=_clamp_backing_gain_db(
                 _env_float("HAKIMI_BACKING_GAIN_DB", DEFAULT_BACKING_GAIN_DB)
             ),
             skip_backing=_env_bool("HAKIMI_SKIP_BACKING", True),
-            skip_dereverb=_env_bool("HAKIMI_SKIP_DEREVERB", True),
+            skip_dereverb=_env_bool("HAKIMI_SKIP_DEREVERB", DEFAULT_SKIP_DEREVERB),
             start_sec=os.environ.get("HAKIMI_START_SEC", "auto"),
             duration_sec=_env_float("HAKIMI_DURATION_SEC", 50.0),
             chorus_anchor=os.environ.get("HAKIMI_CHORUS_ANCHOR", ""),
@@ -2748,49 +3515,145 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
                 raw_prefix = os.environ.get("HAKIMI_COVER_PREFIX", "cover").strip()
                 prefix = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", raw_prefix).strip("_") or "cover"
                 song_title = os.environ.get("HAKIMI_SONG_TITLE", raw_prefix).strip()[:80]
-                full_mp3 = DEFAULT_OUT_DIR / "cover_full.mp3"
-                chorus_mp3 = DEFAULT_OUT_DIR / "cover_chorus.mp3"
-                chorus_sha = sha256_file(chorus_mp3)
-                chorus_size = chorus_mp3.stat().st_size
-                try:
-                    chorus_dur_ms = int(round(_probe_duration_sec(chorus_mp3) * 1000.0))
-                except Exception:
-                    fallback_dur = float(meta.get("chorus_duration_sec", 50.0))
-                    chorus_dur_ms = int(round(fallback_dur * 1000.0))
-                chorus_up = _drive_upload_from_path(
-                    drive_token,
-                    songs_folder,
-                    chorus_mp3,
-                    f"{prefix}_{chorus_sha[:8]}_chorus.mp3",
-                    "audio/mpeg",
-                    replace_existing=True,
-                    app_properties={
-                        "hakimi_songs_role": "songs",
-                        "song_title": song_title,
-                        "kind": "chorus",
-                    },
-                )
-                chorus_up["sha256"] = chorus_sha
-                chorus_up["size"] = chorus_size
-                chorus_up["duration_ms"] = chorus_dur_ms
-                full_up = _drive_upload_from_path(
-                    drive_token,
-                    songs_folder,
-                    full_mp3,
-                    f"{prefix}_{chorus_sha[:8]}_full.mp3",
-                    "audio/mpeg",
-                    replace_existing=True,
-                    app_properties={
-                        "hakimi_songs_role": "songs",
-                        "song_title": song_title,
-                        "kind": "full",
-                    },
-                )
+                raw_cands = meta.get("candidates")
+                cands_list = list(raw_cands) if isinstance(raw_cands, list) and raw_cands else []
+                primary_eng = str(meta.get("engine_used") or "")
+                uploaded_candidates: list[dict[str, Any]] = []
+                primary_chorus_up: dict[str, Any] | None = None
+                primary_full_up: dict[str, Any] | None = None
+
+                if cands_list:
+                    single_legacy_rvc = (
+                        len(cands_list) == 1 and str(cands_list[0].get("engine") or "") == "rvc"
+                    )
+                    for cand in cands_list:
+                        cand_copy = {
+                            k: v
+                            for k, v in cand.items()
+                            if k
+                            not in {
+                                "local_chorus_file",
+                                "local_full_file",
+                                "chorus_chunk_dir",
+                                "full_chunk_dir",
+                            }
+                        }
+                        if cand.get("status") != "succeeded":
+                            uploaded_candidates.append(cand_copy)
+                            continue
+                        eng = str(cand.get("engine") or "rvc")
+                        c_chorus_path = DEFAULT_OUT_DIR / str(
+                            cand.get("local_chorus_file") or f"cover_{eng}_chorus.mp3"
+                        )
+                        c_full_path = DEFAULT_OUT_DIR / str(
+                            cand.get("local_full_file") or f"cover_{eng}_full.mp3"
+                        )
+                        c_sha = str(cand.get("digest") or sha256_file(c_chorus_path))
+                        c_size = c_chorus_path.stat().st_size
+                        c_full_size = c_full_path.stat().st_size
+                        try:
+                            c_dur_ms = int(round(_probe_duration_sec(c_chorus_path) * 1000.0))
+                        except Exception:
+                            fallback_dur = float(meta.get("chorus_duration_sec", 50.0))
+                            c_dur_ms = int(cand.get("duration_ms") or round(fallback_dur * 1000.0))
+                        if single_legacy_rvc:
+                            c_chorus_name = f"{prefix}_{c_sha[:8]}_chorus.mp3"
+                            c_full_name = f"{prefix}_{c_sha[:8]}_full.mp3"
+                        else:
+                            c_chorus_name = f"{prefix}_{eng}_{c_sha[:8]}_chorus.mp3"
+                            c_full_name = f"{prefix}_{eng}_{c_sha[:8]}_full.mp3"
+                        c_chorus_up = _drive_upload_from_path(
+                            drive_token,
+                            songs_folder,
+                            c_chorus_path,
+                            c_chorus_name,
+                            "audio/mpeg",
+                            replace_existing=True,
+                            app_properties={
+                                "hakimi_songs_role": "songs",
+                                "song_title": song_title,
+                                "kind": "chorus",
+                                "engine": eng,
+                            },
+                        )
+                        c_chorus_up["sha256"] = c_sha
+                        c_chorus_up["size"] = c_size
+                        c_chorus_up["duration_ms"] = c_dur_ms
+                        c_full_up = _drive_upload_from_path(
+                            drive_token,
+                            songs_folder,
+                            c_full_path,
+                            c_full_name,
+                            "audio/mpeg",
+                            replace_existing=True,
+                            app_properties={
+                                "hakimi_songs_role": "songs",
+                                "song_title": song_title,
+                                "kind": "full",
+                                "engine": eng,
+                            },
+                        )
+                        cand_copy["digest"] = c_sha
+                        cand_copy["byte_size"] = c_size
+                        cand_copy["full_byte_size"] = c_full_size
+                        cand_copy["duration_ms"] = c_dur_ms
+                        cand_copy["drive_chorus_id"] = str(c_chorus_up["file_id"])
+                        cand_copy["drive_full_id"] = str(c_full_up["file_id"])
+                        cand_copy["chorus_filename"] = c_chorus_name
+                        cand_copy["full_filename"] = c_full_name
+                        uploaded_candidates.append(cand_copy)
+                        if primary_chorus_up is None or eng == primary_eng:
+                            primary_chorus_up = c_chorus_up
+                            primary_full_up = c_full_up
+                else:
+                    full_mp3 = DEFAULT_OUT_DIR / "cover_full.mp3"
+                    chorus_mp3 = DEFAULT_OUT_DIR / "cover_chorus.mp3"
+                    chorus_sha = sha256_file(chorus_mp3)
+                    chorus_size = chorus_mp3.stat().st_size
+                    try:
+                        chorus_dur_ms = int(round(_probe_duration_sec(chorus_mp3) * 1000.0))
+                    except Exception:
+                        fallback_dur = float(meta.get("chorus_duration_sec", 50.0))
+                        chorus_dur_ms = int(round(fallback_dur * 1000.0))
+                    primary_chorus_up = _drive_upload_from_path(
+                        drive_token,
+                        songs_folder,
+                        chorus_mp3,
+                        f"{prefix}_{chorus_sha[:8]}_chorus.mp3",
+                        "audio/mpeg",
+                        replace_existing=True,
+                        app_properties={
+                            "hakimi_songs_role": "songs",
+                            "song_title": song_title,
+                            "kind": "chorus",
+                        },
+                    )
+                    primary_chorus_up["sha256"] = chorus_sha
+                    primary_chorus_up["size"] = chorus_size
+                    primary_chorus_up["duration_ms"] = chorus_dur_ms
+                    primary_full_up = _drive_upload_from_path(
+                        drive_token,
+                        songs_folder,
+                        full_mp3,
+                        f"{prefix}_{chorus_sha[:8]}_full.mp3",
+                        "audio/mpeg",
+                        replace_existing=True,
+                        app_properties={
+                            "hakimi_songs_role": "songs",
+                            "song_title": song_title,
+                            "kind": "full",
+                        },
+                    )
+
+                out_meta = dict(meta)
+                if uploaded_candidates:
+                    out_meta["candidates"] = uploaded_candidates
                 payload_json = json.dumps(
                     {
-                        "full": full_up,
-                        "chorus": chorus_up,
-                        "meta": meta,
+                        "full": primary_full_up or {},
+                        "chorus": primary_chorus_up or {},
+                        "candidates": uploaded_candidates,
+                        "meta": out_meta,
                         "drive_direct_inputs": direct_inputs,
                     },
                     ensure_ascii=False,
@@ -2808,6 +3671,7 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
             and cache_folder
             and _env_bool("HAKIMI_CACHE_WRITEBACK", False)
             and _env_bool("HAKIMI_CACHE_WEIGHTS_WRITEBACK_AFTER_COVER", False)
+            and _has_applio_pretrained_weights(DEFAULT_APPLIO_DIR, mode="cover")
         ):
             w_key = compute_weight_cache_key("cover")
             written = _writeback_weight_cache_to_drive(
@@ -2850,6 +3714,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_setup = sub.add_parser("setup")
     p_setup.add_argument("--force", action="store_true")
+    p_setup.add_argument("--mode", default="all")
 
     p_train = sub.add_parser("train")
     p_train.add_argument("--model-name", default="hakimi")
@@ -2861,15 +3726,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_cover = sub.add_parser("cover")
     p_cover.add_argument("--source", type=Path, required=True)
-    p_cover.add_argument("--pth", type=Path, required=True)
-    p_cover.add_argument("--index", type=Path, required=True)
+    p_cover.add_argument("--engine", choices=VALID_COVER_ENGINES, default=DEFAULT_COVER_ENGINE)
+    p_cover.add_argument("--ref-audio", type=Path, default=None)
+    p_cover.add_argument("--svc-steps", type=int, default=None)
+    p_cover.add_argument("--svc-cfg", type=float, default=DEFAULT_SVC_CFG)
+    p_cover.add_argument("--pth", type=Path, default=None)
+    p_cover.add_argument("--index", type=Path, default=None)
     p_cover.add_argument("--pitch", type=int, default=0)
     p_cover.add_argument("--index-rate", type=float, default=0.15)
     p_cover.add_argument("--protect", type=float, default=0.42)
-    p_cover.add_argument("--volume-envelope", type=float, default=0.12)
+    p_cover.add_argument("--volume-envelope", type=float, default=DEFAULT_VOLUME_ENVELOPE)
     p_cover.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
     p_cover.add_argument("--skip-backing", action=argparse.BooleanOptionalAction, default=True)
-    p_cover.add_argument("--skip-dereverb", action=argparse.BooleanOptionalAction, default=True)
+    p_cover.add_argument(
+        "--skip-dereverb", action=argparse.BooleanOptionalAction, default=DEFAULT_SKIP_DEREVERB
+    )
     p_cover.add_argument("--start", default="auto")
     p_cover.add_argument("--duration", type=float, default=50.0)
     p_cover.add_argument("--chorus-anchor", default="")
@@ -2902,7 +3773,7 @@ def main(argv: list[str] | None = None) -> int:
                     remove_chunks=not args.keep_chunks,
                 )
             elif args.action == "setup":
-                action_setup(force=args.force)
+                action_setup(force=args.force, mode=args.mode)
             elif args.action == "train":
                 action_train(
                     model_name=args.model_name,
@@ -2917,6 +3788,10 @@ def main(argv: list[str] | None = None) -> int:
                     source_audio=args.source,
                     pth_path=args.pth,
                     index_path=args.index,
+                    ref_audio=args.ref_audio,
+                    engine=args.engine,
+                    svc_steps=args.svc_steps,
+                    svc_cfg=args.svc_cfg,
                     pitch=args.pitch,
                     index_rate=args.index_rate,
                     protect=args.protect,

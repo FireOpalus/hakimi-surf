@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -28,23 +29,48 @@ log = logging.getLogger("hakimi")
 
 MAX_SONG_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_LEARN_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_REF_VOICE_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_STORED_SONG_BYTES = 1_800_000
 MAX_SONG_DURATION_SECONDS = 58.0
 MIN_SONG_DURATION_MS = 1000
 MAX_SONGS = 300
+MAX_SONG_TAKES = 8
+MAX_REVIEW_NOTE_LEN = 300
 MAX_SONG_LIBRARY_BYTES = 500 * 1024 * 1024
 MAX_PROMPT_SONGS = 40
 DEFAULT_SONG_CACHE_MAX_BYTES = 30 * 1024 * 1024
 CACHE_EVICT_INTERVAL_SECONDS = 1800.0
 MIN_SONG_PITCH = -24
 MAX_SONG_PITCH = 24
+CoverEngine = Literal["dual", "yingmusic_svc", "seed_vc", "rvc"]
+DEFAULT_COVER_ENGINE: CoverEngine = "dual"
+AVAILABLE_COVER_ENGINES: tuple[str, ...] = ("dual", "yingmusic_svc", "seed_vc", "rvc")
+SINGLE_COVER_ENGINES: tuple[str, ...] = ("yingmusic_svc", "seed_vc", "rvc")
+AUDITION_STATUSES: frozenset[str] = frozenset(
+    {"picked", "fallback_single", "fallback_error", "manual", "none"}
+)
+RVC_DEFAULT_INDEX_RATE = 0.15
+RVC_DEFAULT_PROTECT = 0.42
+RVC_DEFAULT_VOLUME_ENVELOPE = 0.25
 DEFAULT_BACKING_GAIN_DB = -14.0
 MIN_BACKING_GAIN_DB = -24.0
 MAX_BACKING_GAIN_DB = -6.0
+RVC_DEFAULT_SKIP_BACKING = True
+RVC_DEFAULT_SKIP_DEREVERB = False
+RVC_DEFAULT_PARAMS: dict[str, Any] = {
+    "model_name": "hakimi",
+    "index_rate": RVC_DEFAULT_INDEX_RATE,
+    "protect": RVC_DEFAULT_PROTECT,
+    "volume_envelope": RVC_DEFAULT_VOLUME_ENVELOPE,
+    "backing_gain_db": DEFAULT_BACKING_GAIN_DB,
+    "skip_backing": RVC_DEFAULT_SKIP_BACKING,
+    "skip_dereverb": RVC_DEFAULT_SKIP_DEREVERB,
+    "f0_method": "rmvpe",
+}
 RVC_COVER_DEFAULT_GPU = "L4"
 RVC_COVER_FALLBACK_GPUS: tuple[str, ...] = ("T4",)
 RVC_COVER_ALLOWED_GPUS: tuple[str, ...] = ("L4", "T4", "A100", "H100")
-RVC_COVER_TIMEOUT_SECONDS = 1800
+RVC_COVER_TIMEOUT_SECONDS = 2400
 RVC_TRAIN_DEFAULT_GPU = "H100"
 RVC_TRAIN_FALLBACK_GPUS: tuple[str, ...] = ("A100",)
 RVC_TRAIN_ALLOWED_GPUS: tuple[str, ...] = ("H100", "A100")
@@ -71,8 +97,12 @@ ALLOWED_SONG_TITLE_PUNCT = frozenset(
     " _-'’‘&!?！？,，.。、~～+:：·・—–()（）[]【】「」『』@#%*=♡♥★☆♪♫"
 )
 SONG_ID_RE = re.compile(r"^[a-f0-9]{32}\Z")
+TAKE_KEY_RE = re.compile(r"^[a-z0-9_-]{1,32}\Z")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}\Z")
+_MODEL_NAME_RE = re.compile(r"^[a-z0-9_-]{1,32}\Z")
 _DRIVE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
 _SAFE_INBOX_FILENAME_RE = re.compile(r"^[^\x00-\x1f/\\]{1,160}\Z")
+_ACOUSTIC_KEY_RE = re.compile(r"^[a-z0-9_]{1,40}\Z")
 ALLOWED_SONG_EXTENSIONS = frozenset({"mp3", "wav", "ogg", "opus", "m4a", "flac"})
 MIME_BY_SONG_EXTENSION = {
     "mp3": "audio/mpeg",
@@ -118,7 +148,13 @@ CREATE TABLE IF NOT EXISTS song_library (
   drive_chorus_id TEXT NOT NULL DEFAULT '',
   drive_full_id TEXT NOT NULL DEFAULT '',
   source_origin TEXT NOT NULL DEFAULT 'local',
-  last_used_at REAL NOT NULL DEFAULT 0
+  last_used_at REAL NOT NULL DEFAULT 0,
+  active_engine TEXT NOT NULL DEFAULT '',
+  active_take TEXT NOT NULL DEFAULT '',
+  takes_json TEXT NOT NULL DEFAULT '[]',
+  audition_status TEXT NOT NULL DEFAULT 'none',
+  review_note TEXT NOT NULL DEFAULT '',
+  audition_meta_json TEXT NOT NULL DEFAULT '{}'
 );
 """
 
@@ -127,6 +163,12 @@ _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("drive_full_id", "TEXT NOT NULL DEFAULT ''"),
     ("source_origin", "TEXT NOT NULL DEFAULT 'local'"),
     ("last_used_at", "REAL NOT NULL DEFAULT 0"),
+    ("active_engine", "TEXT NOT NULL DEFAULT ''"),
+    ("active_take", "TEXT NOT NULL DEFAULT ''"),
+    ("takes_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("audition_status", "TEXT NOT NULL DEFAULT 'none'"),
+    ("review_note", "TEXT NOT NULL DEFAULT ''"),
+    ("audition_meta_json", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
 
@@ -179,6 +221,222 @@ def validate_song_pitch(pitch: Any) -> int:
     if pitch < MIN_SONG_PITCH or pitch > MAX_SONG_PITCH:
         raise Rejected("invalid_song_pitch")
     return pitch
+
+
+def normalize_cover_engine(raw: Any, *, allow_aliases: bool = False) -> str:
+    """Validate and normalize cover synthesis engine identifier."""
+    if raw is None:
+        return DEFAULT_COVER_ENGINE
+    if not isinstance(raw, str):
+        raise Rejected("invalid_song_engine")
+    cleaned = clean_text(raw).strip().lower()
+    if not cleaned:
+        return DEFAULT_COVER_ENGINE
+    if allow_aliases:
+        alias_map = {
+            "ying": "yingmusic_svc",
+            "yingmusic": "yingmusic_svc",
+            "yingmusic-svc": "yingmusic_svc",
+            "seed": "seed_vc",
+            "seedvc": "seed_vc",
+            "seed-vc": "seed_vc",
+            "both": "dual",
+            "双引擎": "dual",
+        }
+        cleaned = alias_map.get(cleaned, cleaned)
+    if cleaned not in AVAILABLE_COVER_ENGINES:
+        raise Rejected("invalid_song_engine")
+    return cleaned
+
+
+def normalize_take_key(raw: Any, *, allow_aliases: bool = False) -> str:
+    """Validate and normalize a path-safe take key or engine alias."""
+    if not isinstance(raw, str):
+        raise Rejected("invalid_song_take")
+    cleaned = clean_text(raw).strip().lower()
+    if allow_aliases:
+        alias_map = {
+            "ying": "yingmusic_svc",
+            "yingmusic": "yingmusic_svc",
+            "yingmusic-svc": "yingmusic_svc",
+            "seed": "seed_vc",
+            "seedvc": "seed_vc",
+            "seed-vc": "seed_vc",
+        }
+        cleaned = alias_map.get(cleaned, cleaned)
+    if not cleaned or not TAKE_KEY_RE.fullmatch(cleaned):
+        raise Rejected("invalid_song_take")
+    return cleaned
+
+
+def _sanitize_ref_voice(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise Rejected("invalid_ref_voice")
+    cleaned = clean_text(raw).strip()
+    if not cleaned:
+        return ""
+    if (
+        len(cleaned) > 160
+        or ".." in cleaned
+        or "/" in cleaned
+        or "\\" in cleaned
+        or not _SAFE_INBOX_FILENAME_RE.fullmatch(cleaned)
+    ):
+        raise Rejected("invalid_ref_voice")
+    _, dot, ext = cleaned.rpartition(".")
+    if not dot or ext.lower() not in ALLOWED_SONG_EXTENSIONS:
+        raise Rejected("invalid_ref_voice")
+    return cleaned
+
+
+def sanitize_acoustic_metrics(raw: Any) -> dict[str, float | bool]:
+    """Extract a bounded dictionary of finite numeric/bool acoustic metrics."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float | bool] = {}
+    for key, val in raw.items():
+        if len(out) >= 20:
+            break
+        if not isinstance(key, str) or not _ACOUSTIC_KEY_RE.fullmatch(key):
+            continue
+        if isinstance(val, bool):
+            out[key] = val
+        elif isinstance(val, (int, float)) and math.isfinite(float(val)):
+            out[key] = round(float(val), 4)
+    return out
+
+
+def sanitize_review_note(raw: Any) -> str:
+    """Normalize a single-line bounded audition review note."""
+    if not isinstance(raw, str):
+        return ""
+    cleaned = " ".join(clean_text(raw).split()).strip()
+    return cleaned[:MAX_REVIEW_NOTE_LEN].strip()
+
+
+def _take_is_playable(take: dict[str, Any]) -> bool:
+    return (
+        take.get("status") == "succeeded"
+        and bool(take.get("drive_chorus_id"))
+        and isinstance(take.get("digest"), str)
+        and bool(_SHA256_RE.fullmatch(take["digest"]))
+        and isinstance(take.get("byte_size"), int)
+        and not isinstance(take.get("byte_size"), bool)
+        and 0 < take["byte_size"] <= MAX_STORED_SONG_BYTES
+        and isinstance(take.get("duration_ms"), int)
+        and not isinstance(take.get("duration_ms"), bool)
+        and MIN_SONG_DURATION_MS <= take["duration_ms"] <= 60_000
+    )
+
+
+def normalize_song_takes(raw_takes: Any) -> list[dict[str, Any]]:
+    """Validate and normalize archived candidate takes for a song entry."""
+    if not isinstance(raw_takes, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for item in raw_takes:
+        if len(out) >= MAX_SONG_TAKES:
+            break
+        if not isinstance(item, dict):
+            continue
+        raw_engine = str(item.get("engine") or "").strip().lower()
+        if raw_engine not in SINGLE_COVER_ENGINES:
+            continue
+        raw_key = str(item.get("key") or raw_engine).strip().lower()
+        if not TAKE_KEY_RE.fullmatch(raw_key) or raw_key in seen_keys:
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status not in {"succeeded", "failed"}:
+            continue
+        digest = str(item.get("digest") or "").strip().lower()
+        if digest and not _SHA256_RE.fullmatch(digest):
+            digest = ""
+        try:
+            byte_size = (
+                int(item["byte_size"])
+                if not isinstance(item.get("byte_size"), bool) and item.get("byte_size") is not None
+                else 0
+            )
+        except (TypeError, ValueError):
+            byte_size = 0
+        try:
+            duration_ms = (
+                int(item["duration_ms"])
+                if not isinstance(item.get("duration_ms"), bool)
+                and item.get("duration_ms") is not None
+                else 0
+            )
+        except (TypeError, ValueError):
+            duration_ms = 0
+        try:
+            drive_chorus_id = _sanitize_drive_id(item.get("drive_chorus_id") or "")
+        except Rejected:
+            drive_chorus_id = ""
+        try:
+            drive_full_id = _sanitize_drive_id(item.get("drive_full_id") or "")
+        except Rejected:
+            drive_full_id = ""
+        raw_err = str(item.get("error_code") or "").strip()
+        error_code = raw_err[:48] if re.fullmatch(r"[a-z0-9_.-]{1,48}", raw_err) else ""
+        try:
+            created = float(item.get("created") or 0.0)
+            if not math.isfinite(created):
+                created = 0.0
+        except (TypeError, ValueError):
+            created = 0.0
+        take: dict[str, Any] = {
+            "key": raw_key,
+            "engine": raw_engine,
+            "status": status,
+            "digest": digest,
+            "byte_size": max(0, byte_size),
+            "duration_ms": max(0, duration_ms),
+            "drive_chorus_id": drive_chorus_id,
+            "drive_full_id": drive_full_id,
+            "error_code": error_code,
+            "acoustic_metrics": sanitize_acoustic_metrics(item.get("acoustic_metrics")),
+            "created": created,
+        }
+        seen_keys.add(raw_key)
+        out.append(take)
+    return out
+
+
+def sanitize_audition_meta(raw: Any) -> dict[str, Any]:
+    """Keep only bounded non-sensitive audition metadata for SQLite storage."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in (
+        "selected_engine",
+        "selected_take",
+        "engine_requested",
+        "model_lane",
+        "pick_reason",
+    ):
+        val = raw.get(key)
+        if isinstance(val, str) and val.strip():
+            out[key] = " ".join(clean_text(val).split()).strip()[:200]
+    ab_order = raw.get("ab_order")
+    if isinstance(ab_order, list) and len(ab_order) <= 4:
+        clean_order = [
+            str(x).strip()[:32]
+            for x in ab_order
+            if isinstance(x, str) and TAKE_KEY_RE.fullmatch(x.strip())
+        ]
+        if clean_order:
+            out["ab_order"] = clean_order
+    for bool_key in ("manual_override",):
+        if isinstance(raw.get(bool_key), bool):
+            out[bool_key] = raw[bool_key]
+    for ts_key in ("reviewed_at", "switched_at"):
+        val = raw.get(ts_key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+            out[ts_key] = round(float(val), 3)
+    return out
 
 
 def _sanitize_drive_id(raw: Any) -> str:
@@ -473,6 +731,10 @@ class RvcCoverJobPayload(BaseModel):
     title: str = Field(min_length=1, max_length=80)
     artist: str = Field(default="", max_length=60)
     tags: str = Field(default="", max_length=120)
+    engine: CoverEngine = DEFAULT_COVER_ENGINE
+    ref_voice: str = Field(default="", max_length=160)
+    ref_audio_file_id: str = Field(default="", max_length=128)
+    svc_steps: int | None = Field(default=None, ge=10, le=100)
     pitch: int = Field(default=0, ge=MIN_SONG_PITCH, le=MAX_SONG_PITCH)
     auto_search: bool = True
     query: str = Field(default="", max_length=120)
@@ -483,17 +745,19 @@ class RvcCoverJobPayload(BaseModel):
     duration_sec: float = Field(default=50.0, ge=5.0, le=56.0, allow_inf_nan=False)
     fallback_start_sec: float = Field(default=60.0, ge=0.0, le=600.0, allow_inf_nan=False)
     model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
-    index_rate: float = Field(default=0.15, ge=0.0, le=1.0, allow_inf_nan=False)
-    protect: float = Field(default=0.42, ge=0.0, le=0.5, allow_inf_nan=False)
-    volume_envelope: float = Field(default=0.12, ge=0.0, le=1.0, allow_inf_nan=False)
+    index_rate: float = Field(default=RVC_DEFAULT_INDEX_RATE, ge=0.0, le=1.0, allow_inf_nan=False)
+    protect: float = Field(default=RVC_DEFAULT_PROTECT, ge=0.0, le=0.5, allow_inf_nan=False)
+    volume_envelope: float = Field(
+        default=RVC_DEFAULT_VOLUME_ENVELOPE, ge=0.0, le=1.0, allow_inf_nan=False
+    )
     backing_gain_db: float = Field(
         default=DEFAULT_BACKING_GAIN_DB,
         ge=MIN_BACKING_GAIN_DB,
         le=MAX_BACKING_GAIN_DB,
         allow_inf_nan=False,
     )
-    skip_backing: bool = True
-    skip_dereverb: bool = True
+    skip_backing: bool = RVC_DEFAULT_SKIP_BACKING
+    skip_dereverb: bool = RVC_DEFAULT_SKIP_DEREVERB
 
     @field_validator("title")
     @classmethod
@@ -503,15 +767,22 @@ class RvcCoverJobPayload(BaseModel):
             raise ValueError("title cannot be empty")
         return cleaned
 
-    @field_validator("pitch", mode="before")
+    @field_validator(
+        "pitch",
+        "svc_steps",
+        "duration_sec",
+        "fallback_start_sec",
+        "index_rate",
+        "protect",
+        "volume_envelope",
+        "backing_gain_db",
+        mode="before",
+    )
     @classmethod
-    def _check_pitch(cls, value: Any) -> Any:
-        return _reject_bool_num(value, name="pitch")
-
-    @field_validator("backing_gain_db", mode="before")
-    @classmethod
-    def _check_backing_gain_db(cls, value: Any) -> Any:
-        return _reject_bool_num(value, name="backing_gain_db")
+    def _check_numeric_not_bool(cls, value: Any, info: Any) -> Any:
+        if value is None and info.field_name == "svc_steps":
+            return None
+        return _reject_bool_num(value, name=str(info.field_name))
 
     @field_validator("skip_backing", "skip_dereverb", mode="before")
     @classmethod
@@ -520,12 +791,12 @@ class RvcCoverJobPayload(BaseModel):
             raise ValueError(f"{info.field_name} must be a boolean")
         return value
 
-    @field_validator("inbox_file_id")
+    @field_validator("inbox_file_id", "ref_audio_file_id")
     @classmethod
-    def _check_inbox_id(cls, value: str) -> str:
+    def _check_drive_file_id(cls, value: str, info: Any) -> str:
         cleaned = value.strip()
         if cleaned and (cleaned.lower() == "root" or not _DRIVE_FILE_ID_RE.fullmatch(cleaned)):
-            raise ValueError("invalid inbox_file_id")
+            raise ValueError(f"invalid {info.field_name}")
         return cleaned
 
     @field_validator("inbox_filename")
@@ -541,6 +812,24 @@ class RvcCoverJobPayload(BaseModel):
             or not _SAFE_INBOX_FILENAME_RE.fullmatch(cleaned)
         ):
             raise ValueError("invalid inbox_filename")
+        return cleaned
+
+    @field_validator("ref_voice")
+    @classmethod
+    def _check_ref_voice(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        if (
+            ".." in cleaned
+            or "/" in cleaned
+            or "\\" in cleaned
+            or not _SAFE_INBOX_FILENAME_RE.fullmatch(cleaned)
+        ):
+            raise ValueError("invalid ref_voice")
+        _, dot, ext = cleaned.rpartition(".")
+        if not dot or ext.lower() not in ALLOWED_SONG_EXTENSIONS:
+            raise ValueError("invalid ref_voice")
         return cleaned
 
 
@@ -695,6 +984,37 @@ class SongLibrary:
             content_length=content_length,
             max_bytes=max_bytes,
         )
+
+    async def list_voices(self) -> dict[str, Any]:
+        """List Zero-shot reference voice audio files and RVC models in `Hakimi_Songs/models/`."""
+        if self.drive is None:
+            raise Rejected("song_drive_not_configured")
+        return await self.drive.list_models_assets()
+
+    async def upload_ref_voice_stream(
+        self,
+        filename: str,
+        stream: AsyncIterator[bytes],
+        *,
+        mime_type: str = "application/octet-stream",
+        content_length: int | None = None,
+        max_bytes: int = MAX_REF_VOICE_UPLOAD_BYTES,
+    ) -> dict[str, Any]:
+        """Stream a Zero-shot reference voice audio file into `Hakimi_Songs/models/` (<= 20 MiB)."""
+        if self.drive is None:
+            raise Rejected("song_drive_not_configured")
+        return await self.drive.upload_ref_voice_stream(
+            filename,
+            stream,
+            mime_type=mime_type,
+            content_length=content_length,
+            max_bytes=max_bytes,
+        )
+
+    @staticmethod
+    def rvc_defaults() -> dict[str, Any]:
+        """Return single-source universal RVC cover defaults."""
+        return dict(RVC_DEFAULT_PARAMS)
 
     async def drive_storage_status(self, *, probe: bool = False) -> dict[str, Any]:
         """Return Drive storage configuration and resolved folder tree independent of Colab."""
@@ -953,7 +1273,35 @@ class SongLibrary:
         self.titles = tuple(sorted(e["title"] for e in self._entries.values()))
 
     @staticmethod
-    def _public(entry: dict[str, Any]) -> dict[str, Any]:
+    def _public_take(take: dict[str, Any], *, active_take: str) -> dict[str, Any]:
+        return {
+            "key": take["key"],
+            "engine": take["engine"],
+            "status": take["status"],
+            "active": bool(active_take and take["key"] == active_take),
+            "playable": _take_is_playable(take),
+            "duration_ms": int(take.get("duration_ms") or 0),
+            "byte_size": int(take.get("byte_size") or 0),
+            "drive_backed": bool(take.get("drive_chorus_id")),
+            "drive_full_backed": bool(take.get("drive_full_id")),
+            "error_code": str(take.get("error_code") or ""),
+            "acoustic_metrics": dict(take.get("acoustic_metrics") or {}),
+        }
+
+    @classmethod
+    def _public(cls, entry: dict[str, Any]) -> dict[str, Any]:
+        source_origin = str(entry.get("source_origin") or "local")
+        active_engine = str(entry.get("active_engine") or "").strip()
+        if not active_engine:
+            active_engine = "local" if source_origin == "local" else "rvc"
+        active_take = str(entry.get("active_take") or "").strip()
+        takes = entry.get("takes") if isinstance(entry.get("takes"), list) else []
+        audition_meta = (
+            entry.get("audition_meta") if isinstance(entry.get("audition_meta"), dict) else {}
+        )
+        audition_status = str(entry.get("audition_status") or "none").strip()
+        if audition_status not in AUDITION_STATUSES:
+            audition_status = "none"
         return {
             "id": entry["id"],
             "title": entry["title"],
@@ -965,7 +1313,13 @@ class SongLibrary:
             "cached_local": bool(entry.get("cached_local", False)),
             "drive_backed": bool(entry.get("drive_chorus_id")),
             "drive_full_backed": bool(entry.get("drive_full_id")),
-            "source_origin": str(entry.get("source_origin") or "local"),
+            "source_origin": source_origin,
+            "active_engine": active_engine,
+            "active_take": active_take,
+            "audition_status": audition_status,
+            "audition_selected_engine": str(audition_meta.get("selected_engine") or ""),
+            "review_note": str(entry.get("review_note") or ""),
+            "takes": [cls._public_take(take, active_take=active_take) for take in takes],
         }
 
     def cache_stats(self) -> dict[str, Any]:
@@ -1081,6 +1435,33 @@ class SongLibrary:
                     item["last_used_at"] = float(item.get("last_used_at") or 0.0)
                 except (TypeError, ValueError):
                     item["last_used_at"] = 0.0
+                item["active_engine"] = str(item.get("active_engine") or "").strip()
+                item["active_take"] = str(item.get("active_take") or "").strip()
+                raw_audition_status = str(item.get("audition_status") or "none").strip()
+                item["audition_status"] = (
+                    raw_audition_status if raw_audition_status in AUDITION_STATUSES else "none"
+                )
+                item["review_note"] = sanitize_review_note(item.get("review_note") or "")
+                raw_takes_json = item.get("takes_json") or "[]"
+                try:
+                    parsed_takes = (
+                        json.loads(raw_takes_json)
+                        if isinstance(raw_takes_json, str)
+                        else raw_takes_json
+                    )
+                except (TypeError, ValueError):
+                    parsed_takes = []
+                item["takes"] = normalize_song_takes(parsed_takes)
+                raw_meta_json = item.get("audition_meta_json") or "{}"
+                try:
+                    parsed_meta = (
+                        json.loads(raw_meta_json)
+                        if isinstance(raw_meta_json, str)
+                        else raw_meta_json
+                    )
+                except (TypeError, ValueError):
+                    parsed_meta = {}
+                item["audition_meta"] = sanitize_audition_meta(parsed_meta)
                 if not self._valid_entry(item):
                     if isinstance(item.get("id"), str):
                         stale_ids.append(item["id"])
@@ -1125,6 +1506,13 @@ class SongLibrary:
                 break
         return items
 
+    def has_switchable_takes(self) -> bool:
+        """Return True if at least one loaded song has 2+ playable archived takes."""
+        return any(
+            sum(1 for t in (entry.get("takes") or []) if _take_is_playable(t)) >= 2
+            for entry in self._entries.values()
+        )
+
     def resolve_title(self, raw: str | None) -> str | None:
         """Resolve an input title strictly against loaded song titles."""
         if not isinstance(raw, str):
@@ -1149,13 +1537,26 @@ class SongLibrary:
                 )
             ]
 
+    async def get_entry_by_title(self, title: str) -> dict[str, Any] | None:
+        """Return public metadata for a loaded song matching `title` (case-insensitive)."""
+        await self.initialize()
+        async with self.lock:
+            canonical = self.resolve_title(title)
+            if canonical is None:
+                return None
+            entry = next((e for e in self._entries.values() if e["title"] == canonical), None)
+            return self._public(entry) if entry is not None else None
+
     async def _insert_entry_tx(self, entry: dict[str, Any]) -> None:
+        takes_json = json.dumps(entry.get("takes") or [], ensure_ascii=False)
+        meta_json = json.dumps(entry.get("audition_meta") or {}, ensure_ascii=False)
         await self.store.db.execute(
             "INSERT INTO song_library ("
             "id, title, artist, tags, filename, mime_type, digest, byte_size, "
             "duration_ms, created, drive_chorus_id, drive_full_id, "
-            "source_origin, last_used_at"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "source_origin, last_used_at, active_engine, active_take, takes_json, "
+            "audition_status, review_note, audition_meta_json"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 entry["id"],
                 entry["title"],
@@ -1171,6 +1572,12 @@ class SongLibrary:
                 entry["drive_full_id"],
                 entry["source_origin"],
                 entry["last_used_at"],
+                str(entry.get("active_engine") or ""),
+                str(entry.get("active_take") or ""),
+                takes_json,
+                str(entry.get("audition_status") or "none"),
+                str(entry.get("review_note") or ""),
+                meta_json,
             ),
         )
 
@@ -1239,6 +1646,12 @@ class SongLibrary:
                 "source_origin": "local",
                 "last_used_at": now,
                 "cached_local": True,
+                "active_engine": "local",
+                "active_take": "",
+                "takes": [],
+                "audition_status": "none",
+                "review_note": "",
+                "audition_meta": {},
             }
             self._write(stored_filename, normalized.data)
             try:
@@ -1264,13 +1677,19 @@ class SongLibrary:
         drive_full_id: str = "",
         chorus_bytes: bytes | None = None,
         replace: bool = True,
+        active_engine: str = "",
+        active_take: str = "",
+        takes: list[dict[str, Any]] | None = None,
+        audition_status: str = "none",
+        review_note: str = "",
+        audition_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Register or replace a Drive-backed Colab RVC cover in the songbook."""
+        """Register or replace a Drive-backed Colab SVC/RVC cover in the songbook."""
         clean_title = validate_song_title(title)
         clean_artist = validate_song_meta(artist, max_len=40)
         clean_tags = validate_song_meta(tags, max_len=80)
         clean_digest = str(digest).strip().lower() if isinstance(digest, str) else ""
-        if not re.fullmatch(r"[a-f0-9]{64}", clean_digest):
+        if not _SHA256_RE.fullmatch(clean_digest):
             raise Rejected("invalid_song_audio")
         if (
             isinstance(byte_size, bool)
@@ -1303,6 +1722,36 @@ class SongLibrary:
                 or hashlib.sha256(validated_bytes).hexdigest() != clean_digest
             ):
                 raise Rejected("invalid_song_audio")
+
+        clean_takes = normalize_song_takes(takes) if takes is not None else []
+        clean_active_take = ""
+        if isinstance(active_take, str) and active_take.strip():
+            cand_key = active_take.strip().lower()
+            if TAKE_KEY_RE.fullmatch(cand_key):
+                clean_active_take = cand_key
+        if not clean_active_take and clean_takes:
+            matched = next(
+                (
+                    t["key"]
+                    for t in clean_takes
+                    if t["status"] == "succeeded"
+                    and (
+                        t.get("digest") == clean_digest
+                        or t.get("drive_chorus_id") == clean_chorus_id
+                    )
+                ),
+                "",
+            )
+            clean_active_take = matched
+        clean_active_engine = str(active_engine or "").strip().lower()
+        if clean_active_engine not in SINGLE_COVER_ENGINES:
+            matched_take = next((t for t in clean_takes if t["key"] == clean_active_take), None)
+            clean_active_engine = matched_take["engine"] if matched_take else "rvc"
+        clean_audition_status = str(audition_status or "none").strip()
+        if clean_audition_status not in AUDITION_STATUSES:
+            clean_audition_status = "none"
+        clean_review_note = sanitize_review_note(review_note)
+        clean_audition_meta = sanitize_audition_meta(audition_meta)
 
         await self.initialize()
         async with self.lock:
@@ -1339,6 +1788,12 @@ class SongLibrary:
                 "source_origin": "colab",
                 "last_used_at": now if validated_bytes is not None else 0.0,
                 "cached_local": validated_bytes is not None,
+                "active_engine": clean_active_engine,
+                "active_take": clean_active_take,
+                "takes": clean_takes,
+                "audition_status": clean_audition_status,
+                "review_note": clean_review_note,
+                "audition_meta": clean_audition_meta,
             }
 
             if validated_bytes is not None:
@@ -1415,6 +1870,14 @@ class SongLibrary:
         artist: str = "",
         tags: str = "",
         pitch: int = 0,
+        engine: str = DEFAULT_COVER_ENGINE,
+        ref_voice: str = "",
+        ref_audio_file_id: str = "",
+        svc_steps: int | None = None,
+        model_name: str = "hakimi",
+        index_rate: float | None = None,
+        protect: float | None = None,
+        volume_envelope: float | None = None,
         audio_bytes: bytes | None = None,
         audio_filename: str = "",
         inbox_filename: str = "",
@@ -1426,11 +1889,32 @@ class SongLibrary:
         gpu: str | None = None,
         requester: str = "owner",
     ) -> dict[str, Any]:
-        """Submit an asynchronous Colab RVC cover job via upload, Drive inbox, or auto-search."""
+        """Submit an asynchronous Colab SVC/RVC cover job via upload, inbox, or auto-search."""
         clean_title = validate_song_title(title)
         clean_artist = validate_song_meta(artist, max_len=40)
         clean_tags = validate_song_meta(tags, max_len=80)
         clean_pitch = validate_song_pitch(pitch)
+        clean_engine = normalize_cover_engine(engine)
+        clean_ref_voice = _sanitize_ref_voice(ref_voice)
+        clean_ref_audio_id = _sanitize_drive_id(ref_audio_file_id)
+        if clean_ref_audio_id.lower() == "root":
+            raise Rejected("invalid_drive_file_id")
+        clean_model_name = (
+            str(model_name or "hakimi").strip() if isinstance(model_name, str) else ""
+        )
+        if not clean_model_name:
+            clean_model_name = "hakimi"
+        if not _MODEL_NAME_RE.fullmatch(clean_model_name):
+            raise Rejected("colab_invalid_job")
+
+        clean_svc_steps: int | None = None
+        if svc_steps is not None:
+            if isinstance(svc_steps, bool) or not isinstance(svc_steps, int):
+                raise Rejected("colab_invalid_job")
+            if not (10 <= svc_steps <= 100):
+                raise Rejected("colab_invalid_job")
+            clean_svc_steps = svc_steps
+
         clean_gpu: str | None = None
         if gpu is not None:
             if not isinstance(gpu, str):
@@ -1440,6 +1924,35 @@ class SongLibrary:
                 if normalized_gpu not in RVC_COVER_ALLOWED_GPUS:
                     raise Rejected("colab_gpu_not_allowed")
                 clean_gpu = normalized_gpu
+
+        optional_floats: dict[str, float] = {}
+        for param_name, raw_val, lo, hi in (
+            ("index_rate", index_rate, 0.0, 1.0),
+            ("protect", protect, 0.0, 0.5),
+            ("volume_envelope", volume_envelope, 0.0, 1.0),
+            ("backing_gain_db", backing_gain_db, MIN_BACKING_GAIN_DB, MAX_BACKING_GAIN_DB),
+        ):
+            if raw_val is not None:
+                if isinstance(raw_val, bool):
+                    raise Rejected("colab_invalid_job")
+                try:
+                    fval = float(raw_val)
+                except (TypeError, ValueError):
+                    raise Rejected("colab_invalid_job") from None
+                if not math.isfinite(fval) or not (lo <= fval <= hi):
+                    raise Rejected("colab_invalid_job")
+                optional_floats[param_name] = fval
+
+        optional_bools: dict[str, bool] = {}
+        for flag_name, flag_val in (
+            ("skip_backing", skip_backing),
+            ("skip_dereverb", skip_dereverb),
+        ):
+            if flag_val is not None:
+                if not isinstance(flag_val, bool):
+                    raise Rejected("colab_invalid_job")
+                optional_bools[flag_name] = flag_val
+
         if not self._compute_configured():
             raise Rejected("colab_unconfigured")
         await self.initialize()
@@ -1448,28 +1961,19 @@ class SongLibrary:
             "title": clean_title,
             "artist": clean_artist,
             "tags": clean_tags,
+            "engine": clean_engine,
             "pitch": clean_pitch,
         }
-        if backing_gain_db is not None:
-            if isinstance(backing_gain_db, bool):
-                raise Rejected("colab_invalid_job")
-            try:
-                bg_val = float(backing_gain_db)
-            except (TypeError, ValueError):
-                raise Rejected("colab_invalid_job") from None
-            if not math.isfinite(bg_val) or not (
-                MIN_BACKING_GAIN_DB <= bg_val <= MAX_BACKING_GAIN_DB
-            ):
-                raise Rejected("colab_invalid_job")
-            payload["backing_gain_db"] = bg_val
-        for flag_name, flag_val in (
-            ("skip_backing", skip_backing),
-            ("skip_dereverb", skip_dereverb),
-        ):
-            if flag_val is not None:
-                if not isinstance(flag_val, bool):
-                    raise Rejected("colab_invalid_job")
-                payload[flag_name] = flag_val
+        if clean_ref_voice:
+            payload["ref_voice"] = clean_ref_voice
+        if clean_ref_audio_id:
+            payload["ref_audio_file_id"] = clean_ref_audio_id
+        if clean_svc_steps is not None:
+            payload["svc_steps"] = clean_svc_steps
+        if clean_model_name != "hakimi":
+            payload["model_name"] = clean_model_name
+        payload.update(optional_floats)
+        payload.update(optional_bools)
 
         if audio_bytes is not None:
             if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
@@ -1523,7 +2027,10 @@ class SongLibrary:
         submit_kwargs: dict[str, Any] = {"requester": requester}
         if clean_gpu is not None or _accepts_kwarg(self.compute.submit_job, "gpu"):
             submit_kwargs["gpu"] = clean_gpu
-        return await self.compute.submit_job("rvc_cover", payload, **submit_kwargs)
+        job = await self.compute.submit_job("rvc_cover", payload, **submit_kwargs)
+        if isinstance(job, dict) and "engine" not in job:
+            return {**job, "engine": clean_engine}
+        return job
 
     async def _touch_last_used(self, entry: dict[str, Any], now: float) -> None:
         entry["cached_local"] = True
@@ -1600,6 +2107,140 @@ class SongLibrary:
             raise Rejected("song_unavailable")
         raw, loaded = await self._load_entry_audio(song_id)
         return raw, loaded["mime_type"]
+
+    async def take_audio_bytes(self, song_id: str, take_key: str) -> tuple[bytes, str]:
+        """Load MP3 audio bytes for a specific archived candidate take without touching active."""
+        await self.initialize()
+        if not isinstance(song_id, str) or not SONG_ID_RE.fullmatch(song_id):
+            raise Rejected("song_not_found")
+        clean_key = normalize_take_key(take_key)
+        async with self.lock:
+            entry = self._entries.get(song_id)
+            if entry is None:
+                raise Rejected("song_not_found")
+            takes = entry.get("takes") if isinstance(entry.get("takes"), list) else []
+            target = next((t for t in takes if t["key"] == clean_key), None)
+            if target is None:
+                raise Rejected("song_take_not_found")
+            is_active = bool(entry.get("active_take") and entry["active_take"] == target["key"])
+            if not is_active:
+                if not _take_is_playable(target) or not self._can_download_drive_song():
+                    raise Rejected("song_take_unavailable")
+                take_snapshot = dict(target)
+
+        if is_active:
+            try:
+                return await self.audio_bytes(song_id)
+            except Rejected:
+                raise Rejected("song_take_unavailable") from None
+
+        try:
+            downloaded = await self._download_drive_song(take_snapshot["drive_chorus_id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise Rejected("song_take_unavailable") from None
+
+        if not isinstance(downloaded, (bytes, bytearray)):
+            raise Rejected("song_take_unavailable")
+        raw = bytes(downloaded)
+        if (
+            not raw
+            or len(raw) > MAX_STORED_SONG_BYTES
+            or len(raw) != int(take_snapshot["byte_size"])
+            or not _is_valid_mp3_bytes(raw)
+            or hashlib.sha256(raw).hexdigest() != take_snapshot["digest"]
+        ):
+            raise Rejected("song_take_unavailable")
+        return raw, "audio/mpeg"
+
+    async def switch_take(
+        self,
+        song_id_or_title: str,
+        take_key: str,
+        *,
+        by_title: bool = False,
+    ) -> dict[str, Any]:
+        """Switch a song's active playable take to another archived candidate take."""
+        await self.initialize()
+        clean_key = normalize_take_key(take_key, allow_aliases=by_title)
+        async with self.lock:
+            if by_title:
+                canonical = self.resolve_title(song_id_or_title)
+                if canonical is None:
+                    raise Rejected("song_not_found")
+                entry = next((e for e in self._entries.values() if e["title"] == canonical), None)
+            else:
+                if not isinstance(song_id_or_title, str) or not SONG_ID_RE.fullmatch(
+                    song_id_or_title
+                ):
+                    raise Rejected("song_not_found")
+                entry = self._entries.get(song_id_or_title)
+            if entry is None:
+                raise Rejected("song_not_found")
+
+            takes = entry.get("takes") if isinstance(entry.get("takes"), list) else []
+            target = next((t for t in takes if t["key"] == clean_key), None)
+            if target is None:
+                by_engine = [t for t in takes if t["engine"] == clean_key]
+                if len(by_engine) == 1:
+                    target = by_engine[0]
+            if target is None:
+                raise Rejected("song_take_not_found")
+            if not _take_is_playable(target):
+                raise Rejected("song_take_unavailable")
+
+            if entry.get("active_take") == target["key"] and entry["digest"] == target["digest"]:
+                return self._public(entry)
+
+            if any(
+                e["digest"] == target["digest"] and e["id"] != entry["id"]
+                for e in self._entries.values()
+            ):
+                raise Rejected("song_already_exists")
+
+            new_meta = dict(entry.get("audition_meta") or {})
+            new_meta["manual_override"] = True
+            new_meta["switched_at"] = round(time.time(), 3)
+            new_meta = sanitize_audition_meta(new_meta)
+            meta_json = json.dumps(new_meta, ensure_ascii=False)
+            new_audition_status = "manual"
+
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "UPDATE song_library SET "
+                    "digest=?, byte_size=?, duration_ms=?, drive_chorus_id=?, drive_full_id=?, "
+                    "last_used_at=?, active_engine=?, active_take=?, audition_status=?, "
+                    "audition_meta_json=? "
+                    "WHERE id=?",
+                    (
+                        target["digest"],
+                        int(target["byte_size"]),
+                        int(target["duration_ms"]),
+                        target["drive_chorus_id"],
+                        target.get("drive_full_id", ""),
+                        0.0,
+                        target["engine"],
+                        target["key"],
+                        new_audition_status,
+                        meta_json,
+                        entry["id"],
+                    ),
+                )
+
+            entry["digest"] = target["digest"]
+            entry["byte_size"] = int(target["byte_size"])
+            entry["duration_ms"] = int(target["duration_ms"])
+            entry["drive_chorus_id"] = target["drive_chorus_id"]
+            entry["drive_full_id"] = target.get("drive_full_id", "")
+            entry["last_used_at"] = 0.0
+            entry["cached_local"] = False
+            entry["active_engine"] = target["engine"]
+            entry["active_take"] = target["key"]
+            entry["audition_status"] = new_audition_status
+            entry["audition_meta"] = new_meta
+            await asyncio.to_thread(self._unlink, entry["filename"])
+            return self._public(entry)
 
     async def load_for_delivery(
         self,

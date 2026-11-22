@@ -435,7 +435,7 @@ body:not(.authenticated) main {
 .meme-q-item input { flex: 1; min-width: 160px; }
 
 /* 猫猫歌单 */
-.song-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
+.song-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 16px; }
 .song-item {
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -451,7 +451,68 @@ body:not(.authenticated) main {
 .song-item > audio { width: 100%; margin: 8px 0; }
 .song-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 10px 0; }
 .song-meta label { display: block; font-size: 12px; color: var(--muted); }
-.song-meta input { display: block; width: 100%; margin-top: 4px; }
+.song-meta input, .song-meta select { display: block; width: 100%; margin-top: 4px; }
+.song-engine-panel {
+  margin: 10px 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--soft-2);
+}
+.song-engine-panel > .row:first-child { margin-bottom: 8px; }
+.song-review {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--chip-line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--grad-soft), var(--soft-2);
+}
+.song-review-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--accent);
+}
+.song-review-head small { margin: 0; color: var(--muted); font-size: 11px; }
+.song-review p { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--ink); }
+.song-playing-hint { margin: -4px 0 8px; font-size: 11.5px; color: var(--accent); }
+.song-takes {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+.song-takes-title { font-size: 11.5px; font-weight: 650; color: var(--muted); margin: 0; }
+.song-take-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+.song-take-row.active {
+  border-color: var(--good-line);
+  background: color-mix(in srgb, var(--good-bg) 42%, var(--card));
+}
+.song-take-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.song-take-name { font-size: 12.5px; font-weight: 650; color: var(--ink); }
+.song-take-spec { font-size: 11px; color: var(--muted); margin: 0; }
+.song-take-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.song-take-actions button { min-height: 28px; padding: 4px 10px; font-size: 11.5px; }
 
 /* 模型与思考场景配置 */
 .scene-heading { margin-top: 24px; }
