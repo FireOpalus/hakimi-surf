@@ -1188,27 +1188,68 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
 
 
 def test_colab_config_validation() -> None:
-    cfg = ColabConfig(preferred_gpu="H100", fallback_gpus=["H100", "L4", "L4", "T4"])
-    assert cfg.fallback_gpus == ["H100", "L4", "T4"]
-    assert "drive_songs_folder_id" not in ColabConfig.model_fields
-    with pytest.raises(ValidationError):
-        ColabConfig(unknown_field="x")  # type: ignore[call-arg]
-    with pytest.raises(ValidationError):
-        ColabConfig(daily_job_limit=True)  # type: ignore[arg-type]
-    with pytest.raises(ValidationError):
-        ColabConfig(drive_songs_folder_id="drv_folder_0000000001")  # type: ignore[call-arg]
+    cfg = ColabConfig()
+    assert cfg.enabled is True
+    assert cfg.job_timeout_seconds == 1800
+    assert cfg.auto_terminate_orphan_minutes == 20
+    assert set(ColabConfig.model_fields) == {
+        "enabled",
+        "job_timeout_seconds",
+        "auto_terminate_orphan_minutes",
+    }
+
+    custom = ColabConfig(
+        enabled=False,
+        job_timeout_seconds=2400,
+        auto_terminate_orphan_minutes=30,
+    )
+    assert custom.enabled is False
+    assert custom.job_timeout_seconds == 2400
+    assert custom.auto_terminate_orphan_minutes == 30
+
+    for removed_kwargs in (
+        {"unknown_field": "x"},
+        {"preferred_gpu": "H100"},
+        {"fallback_gpus": ["L4", "T4"]},
+        {"daily_job_limit": 5},
+        {"daily_cu_budget": 10.0},
+        {"drive_songs_folder_id": "drv_folder_0000000001"},
+    ):
+        with pytest.raises(ValidationError):
+            ColabConfig(**removed_kwargs)  # type: ignore[arg-type]
+
+    for bad_kwargs in (
+        {"enabled": 1},
+        {"enabled": "true"},
+        {"job_timeout_seconds": True},
+        {"job_timeout_seconds": 60},
+        {"job_timeout_seconds": 9000},
+        {"auto_terminate_orphan_minutes": False},
+        {"auto_terminate_orphan_minutes": 4},
+        {"auto_terminate_orphan_minutes": 180},
+    ):
+        with pytest.raises(ValidationError):
+            ColabConfig(**bad_kwargs)  # type: ignore[arg-type]
 
 
 async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispatch(
     settings, store
 ) -> None:
-    # 1) Legacy SQLite admin_config("colab_compute_config") with removed drive_songs_folder_id
+    # 1) Seed legacy SQLite admin_config("colab_compute_config") with all 5 removed fields
+    #    AND a legacy colab_jobs table lacking the new fallback_gpus column.
     legacy_payload = {
+        "enabled": True,
         "preferred_gpu": "A100",
+        "fallback_gpus": ["L4", "T4"],
         "daily_job_limit": 9,
+        "daily_cu_budget": 25.0,
         "drive_songs_folder_id": "drv_legacy_songs_99",
+        "job_timeout_seconds": 2400,
+        "auto_terminate_orphan_minutes": 35,
     }
     sealed = store.vault.seal("admin:colab_compute_config", legacy_payload)
+    legacy_job_id = "0" * 32
+    sealed_legacy_job_payload = store.vault.seal(f"colab:payload:{legacy_job_id}", {"name": "old"})
     async with store.transaction():
         await store.db.execute(
             "CREATE TABLE IF NOT EXISTS admin_config (key TEXT PRIMARY KEY, payload BLOB NOT NULL)"
@@ -1216,6 +1257,38 @@ async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispat
         await store.db.execute(
             "INSERT OR REPLACE INTO admin_config VALUES (?, ?)",
             ("colab_compute_config", sealed),
+        )
+        await store.db.execute(
+            "CREATE TABLE IF NOT EXISTS colab_jobs ("
+            "id TEXT PRIMARY KEY, job_type TEXT NOT NULL, status TEXT NOT NULL, "
+            "requester TEXT NOT NULL DEFAULT 'owner', preferred_gpu TEXT NOT NULL DEFAULT 'L4', "
+            "assigned_gpu TEXT, payload BLOB NOT NULL, result BLOB, error_code TEXT, "
+            "error TEXT, cu_used REAL NOT NULL DEFAULT 0.0, created_at REAL NOT NULL, "
+            "started_at REAL, finished_at REAL, updated_at REAL NOT NULL, day TEXT NOT NULL)"
+        )
+        await store.db.execute(
+            "INSERT INTO colab_jobs ("
+            "id, job_type, status, requester, preferred_gpu, assigned_gpu, payload, result, "
+            "error_code, error, cu_used, created_at, started_at, finished_at, updated_at, day"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                legacy_job_id,
+                "demo_gpu",
+                "succeeded",
+                "owner",
+                "L4",
+                "L4",
+                sealed_legacy_job_payload,
+                None,
+                None,
+                None,
+                0.5,
+                1_700_000_000.0,
+                1_700_000_001.0,
+                1_700_000_010.0,
+                1_700_000_010.0,
+                "2023-11-14",
+            ),
         )
 
     dispatched: list[dict[str, Any]] = []
@@ -1248,18 +1321,33 @@ async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispat
         hub = ColabComputeHub(s, store, None, http=mock_http)
         await hub.initialize()
 
-        # Legacy field ignored gracefully, valid overrides preserved, SQLite row kept for migration
-        assert hub.config.preferred_gpu == "A100"
-        assert hub.config.daily_job_limit == 9
-        assert not hasattr(hub.config, "drive_songs_folder_id")
+        # Legacy fields ignored gracefully, valid overrides preserved, SQLite row kept intact
+        assert hub.config.enabled is True
+        assert hub.config.job_timeout_seconds == 2400
+        assert hub.config.auto_terminate_orphan_minutes == 35
+        for removed_attr in (
+            "preferred_gpu",
+            "fallback_gpus",
+            "daily_job_limit",
+            "daily_cu_budget",
+            "drive_songs_folder_id",
+        ):
+            assert not hasattr(hub.config, removed_attr)
         async with store.lock:
             row = await store.one(
                 "SELECT payload FROM admin_config WHERE key=?", ("colab_compute_config",)
             )
+            cols = {str(r["name"]) for r in await store.all("PRAGMA table_info(colab_jobs)")}
+        assert "fallback_gpus" in cols
         assert row is not None
         assert store.vault.open("admin:colab_compute_config", row[0])["drive_songs_folder_id"] == (
             "drv_legacy_songs_99"
         )
+
+        # Legacy job row (fallback_gpus IS NULL) is readable before registration -> []
+        legacy_jobs_before = await hub.list_jobs()
+        assert legacy_jobs_before[0]["id"] == legacy_job_id
+        assert legacy_jobs_before[0]["fallback_gpus"] == []
 
         # All removed Drive proxy methods MUST be absent from ColabComputeHub
         for removed_method in (
@@ -1277,7 +1365,7 @@ async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispat
         with pytest.raises(Rejected, match="colab_invalid_job"):
             await hub.submit_job("rvc_cover", {"title": "未注册"})
 
-        # Register dynamic job type with validator + pre_dispatch + on_complete
+        # Register dynamic job type with validator + pre_dispatch + on_complete + GPU policy
         ephemeral_secret = "ya29.ephemeral-dispatch-secret-999"
         pre_dispatch_mode = {"mode": "reject_clean"}
         completed_events: list[dict[str, Any]] = []
@@ -1311,12 +1399,32 @@ async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispat
             validator=validate_demo,
             pre_dispatch=pre_dispatch_demo,
             on_complete=on_demo_done,
+            owner_module="demo_mod",
+            default_gpu="L4",
+            fallback_gpus=("T4",),
+            allowed_gpus=("L4", "T4", "A100"),
         )
         assert hub.is_registered_job_type("demo_gpu")
         assert hub.registered_job_types() == ("demo_gpu",)
+        # Legacy NULL fallback_gpus now safely falls back to registered spec!
+        legacy_jobs_after = await hub.list_jobs()
+        assert next(j for j in legacy_jobs_after if j["id"] == legacy_job_id)["fallback_gpus"] == [
+            "T4"
+        ]
 
         ov = await hub.admin_overview()
         assert ov["supported_job_types"] == ["demo_gpu"]
+        assert ov["job_types"] == [
+            {
+                "job_type": "demo_gpu",
+                "owner_module": "demo_mod",
+                "default_gpu": "L4",
+                "fallback_gpus": ["T4"],
+                "allowed_gpus": ["L4", "T4", "A100"],
+                "timeout_seconds": 2400,
+            }
+        ]
+        assert set(ov["today"]) == {"jobs_count", "cu_used"}
         assert ov["worker"]["supported_job_types"] == ["demo_gpu"]
         assert "drive_folders" not in ov["worker"]
 
@@ -1366,6 +1474,8 @@ async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispat
         await hub.scheduler_step()
         assert len(dispatched) == 1
         assert dispatched[0]["job_id"] == j_ok["id"]
+        assert dispatched[0]["gpu_candidates"] == ["L4", "T4"]
+        assert dispatched[0]["timeout_seconds"] == 2400
         assert "drive_songs_folder_id" not in dispatched[0]
         assert dispatched[0]["dispatch_context"]["drive"]["access_token"] == ephemeral_secret
 
@@ -1380,6 +1490,27 @@ async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispat
             assert ephemeral_secret not in json.dumps(opened_p)
         assert ephemeral_secret not in json.dumps(await hub.list_jobs())
         assert ephemeral_secret not in json.dumps(await hub.admin_overview())
+
+        # Legacy SQLite config containing ONLY removed fields also upgrades cleanly to defaults
+        only_legacy = store.vault.seal(
+            "admin:colab_compute_config",
+            {
+                "preferred_gpu": "T4",
+                "fallback_gpus": ["L4"],
+                "daily_job_limit": 2,
+                "daily_cu_budget": 3.0,
+                "drive_songs_folder_id": "drv_only_legacy",
+            },
+        )
+        async with store.transaction():
+            await store.db.execute(
+                "INSERT OR REPLACE INTO admin_config VALUES (?, ?)",
+                ("colab_compute_config", only_legacy),
+            )
+        hub2 = ColabComputeHub(s, store, None, http=mock_http)
+        await hub2.initialize()
+        assert hub2.config == ColabConfig()
+        await hub2.close()
         await hub.close()
 
 
@@ -1459,18 +1590,14 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
         await hub.scheduler_step()
         assert usage_state["active"] == 0
 
-        # Daily limit & budget enforcement
-        await hub.set_config(ColabConfig(daily_job_limit=1, daily_cu_budget=10.0))
-        with pytest.raises(Rejected, match="colab_daily_job_limit"):
-            await hub.submit_job("rvc_cover", {"title": "超限歌曲", "auto_search": True})
-        await hub.set_config(ColabConfig(daily_job_limit=5, daily_cu_budget=0.0))
-        with pytest.raises(Rejected, match="colab_daily_cu_budget"):
-            await hub.submit_job("rvc_cover", {"title": "预算为零", "auto_search": True})
-
-        # Job timeout handling
-        await hub.set_config(
-            ColabConfig(daily_job_limit=5, daily_cu_budget=10.0, job_timeout_seconds=120)
-        )
+        # No daily job/CU limits: high historical CU and >5 jobs still accepted,
+        # while MAX_QUEUED_JOBS=20 guardrail and job timeout remain enforced.
+        async with store.transaction():
+            await store.db.execute(
+                "UPDATE colab_jobs SET cu_used=500.0 WHERE id=?",
+                (job["id"],),
+            )
+        await hub.set_config(ColabConfig(job_timeout_seconds=120))
         slow_job = await hub.submit_job("rvc_cover", {"title": "超时测试", "auto_search": True})
         async with store.transaction():
             await store.db.execute(
@@ -1480,6 +1607,17 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
         await hub.scheduler_step()
         timed_out = next(j for j in await hub.list_jobs() if j["id"] == slow_job["id"])
         assert timed_out["status"] == "failed" and timed_out["error_code"] == "job_timeout"
+
+        # Fill queue up to MAX_QUEUED_JOBS (20) despite 500 CU used today; 21st rejected.
+        queued_ids: list[str] = []
+        for idx in range(20):
+            q_job = await hub.submit_job(
+                "rvc_cover", {"title": f"队列测试-{idx}", "auto_search": True}
+            )
+            queued_ids.append(q_job["id"])
+        assert len(queued_ids) == 20
+        with pytest.raises(Rejected, match="colab_job_limit_reached"):
+            await hub.submit_job("rvc_cover", {"title": "超队列上限", "auto_search": True})
 
         await hub.close()
 
@@ -1524,32 +1662,60 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                 assert ov.status_code == 200
                 ov_json = ov.json()
                 assert ov_json["configured"] is True
-                assert "drive_songs_folder_id" not in ov_json["config"]
+                assert set(ov_json["config"]) == {
+                    "enabled",
+                    "job_timeout_seconds",
+                    "auto_terminate_orphan_minutes",
+                }
+                assert set(ov_json["today"]) == {"jobs_count", "cu_used"}
                 assert set(ov_json["supported_job_types"]) >= {"rvc_cover", "rvc_train"}
+                policies = {item["job_type"]: item for item in ov_json["job_types"]}
+                assert policies["rvc_cover"] == {
+                    "job_type": "rvc_cover",
+                    "owner_module": "song_studio",
+                    "default_gpu": "L4",
+                    "fallback_gpus": ["T4"],
+                    "allowed_gpus": ["L4", "T4", "A100", "H100"],
+                    "timeout_seconds": 1800,
+                }
+                assert policies["rvc_train"] == {
+                    "job_type": "rvc_train",
+                    "owner_module": "song_studio",
+                    "default_gpu": "H100",
+                    "fallback_gpus": ["A100"],
+                    "allowed_gpus": ["H100", "A100"],
+                    "timeout_seconds": 3600,
+                }
                 assert ov_json["worker"]["reachable"] is True
                 assert ov_json["worker"]["compute_units"] == 100.0
                 assert "drive_folders" not in ov_json["worker"]
                 assert ov_json["worker"]["supported_job_types"] == ["rvc_cover", "rvc_train"]
                 assert cfg_w.token not in ov.text
 
-                # Update & reset config; legacy drive_songs_folder_id rejected by extra="forbid"
-                bad_put = await client.put(
-                    "/admin/api/colab",
-                    json={"drive_songs_folder_id": "drv_folder_0000000001"},
-                )
-                assert bad_put.status_code == 400
+                # Update & reset config; removed legacy fields rejected by extra="forbid"
+                for legacy_body in (
+                    {"drive_songs_folder_id": "drv_folder_0000000001"},
+                    {"preferred_gpu": "A100"},
+                    {"fallback_gpus": ["T4"]},
+                    {"daily_job_limit": 8},
+                    {"daily_cu_budget": 10.0},
+                ):
+                    bad_put = await client.put("/admin/api/colab", json=legacy_body)
+                    assert bad_put.status_code == 400
 
                 put = await client.put(
                     "/admin/api/colab",
-                    json={"preferred_gpu": "A100", "daily_job_limit": 8},
+                    json={"job_timeout_seconds": 2400, "auto_terminate_orphan_minutes": 30},
                 )
                 assert put.status_code == 200
-                assert put.json()["config"]["preferred_gpu"] == "A100"
+                assert put.json()["config"]["job_timeout_seconds"] == 2400
+                assert put.json()["config"]["auto_terminate_orphan_minutes"] == 30
                 assert put.json()["source"] == "sqlite"
 
                 delete = await client.delete("/admin/api/colab")
                 assert delete.status_code == 200
-                assert delete.json()["config"]["preferred_gpu"] == "L4"
+                assert delete.json()["config"]["job_timeout_seconds"] == 1800
+                assert delete.json()["config"]["auto_terminate_orphan_minutes"] == 20
                 assert delete.json()["source"] == "default"
 
                 # Unregistered & invalid job_type rejected with 400
@@ -1566,7 +1732,43 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                 )
                 assert bad_name.status_code == 400
 
-                # Submit & cancel registered job (registered by song_studio)
+                # Disallowed GPU or fallback GPU returns 400 colab_gpu_not_allowed
+                bad_cover_gpu = await client.post(
+                    "/admin/api/colab/jobs",
+                    json={
+                        "job_type": "rvc_cover",
+                        "payload": {"title": "禁G4", "auto_search": True},
+                        "gpu": "G4",
+                    },
+                )
+                assert bad_cover_gpu.status_code == 400
+                assert bad_cover_gpu.json()["detail"] == "colab_gpu_not_allowed"
+
+                bad_cover_fb = await client.post(
+                    "/admin/api/colab/jobs",
+                    json={
+                        "job_type": "rvc_cover",
+                        "payload": {"title": "禁回退G4", "auto_search": True},
+                        "gpu": "L4",
+                        "fallback_gpus": ["G4"],
+                    },
+                )
+                assert bad_cover_fb.status_code == 400
+                assert bad_cover_fb.json()["detail"] == "colab_gpu_not_allowed"
+
+                for banned_train_gpu in ("T4", "L4", "G4"):
+                    bad_train_gpu = await client.post(
+                        "/admin/api/colab/jobs",
+                        json={
+                            "job_type": "rvc_train",
+                            "payload": {"model_name": "hakimi"},
+                            "gpu": banned_train_gpu,
+                        },
+                    )
+                    assert bad_train_gpu.status_code == 400
+                    assert bad_train_gpu.json()["detail"] == "colab_gpu_not_allowed"
+
+                # Submit default, explicit GPU override, and explicit empty fallback_gpus=[]
                 sub = await client.post(
                     "/admin/api/colab/jobs",
                     json={
@@ -1575,9 +1777,38 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                     },
                 )
                 assert sub.status_code == 200
+                assert sub.json()["preferred_gpu"] == "L4"
+                assert sub.json()["fallback_gpus"] == ["T4"]
                 jid = sub.json()["id"]
                 can = await client.post(f"/admin/api/colab/jobs/{jid}/cancel")
                 assert can.status_code == 200 and can.json()["status"] == "cancelled"
+
+                sub_override = await client.post(
+                    "/admin/api/colab/jobs",
+                    json={
+                        "job_type": "rvc_cover",
+                        "payload": {"title": "强指定A100", "auto_search": True},
+                        "gpu": "A100",
+                    },
+                )
+                assert sub_override.status_code == 200
+                assert sub_override.json()["preferred_gpu"] == "A100"
+                assert sub_override.json()["fallback_gpus"] == ["L4", "T4"]
+                await client.post(f"/admin/api/colab/jobs/{sub_override.json()['id']}/cancel")
+
+                sub_strict = await client.post(
+                    "/admin/api/colab/jobs",
+                    json={
+                        "job_type": "rvc_train",
+                        "payload": {"model_name": "hakimi"},
+                        "gpu": "A100",
+                        "fallback_gpus": [],
+                    },
+                )
+                assert sub_strict.status_code == 200
+                assert sub_strict.json()["preferred_gpu"] == "A100"
+                assert sub_strict.json()["fallback_gpus"] == []
+                await client.post(f"/admin/api/colab/jobs/{sub_strict.json()['id']}/cancel")
 
                 # Removed /admin/api/colab/drive/inbox routes MUST return 404
                 assert (await client.get("/admin/api/colab/drive/inbox")).status_code == 404
@@ -2480,13 +2711,273 @@ async def test_colab_compute_cu_trend_gpu_breakdown_warm_status_and_token_scrub(
         assert "1//refresh99999" not in scrubbed
         assert "tok12345678" not in scrubbed
 
-        # 4) Low remaining daily CU budget (<0.5) disables allow_warm_keepalive on dispatch
-        await hub.set_config(ColabConfig(daily_job_limit=10, daily_cu_budget=1.5))
-        await hub.submit_job("rvc_cover", {"title": "低预算单", "auto_search": True})
+        # 4) No daily CU cap: dispatch succeeds regardless of today's CU usage,
+        #    and allow_warm_keepalive follows config.enabled (worker enforces real CU balance).
+        await hub.set_config(ColabConfig(enabled=True, job_timeout_seconds=1500))
+        await hub.submit_job("rvc_cover", {"title": "无日限额单", "auto_search": True})
         await hub.scheduler_step()
         assert len(dispatched_bodies) == 1
-        assert dispatched_bodies[0]["allow_warm_keepalive"] is False
+        assert dispatched_bodies[0]["allow_warm_keepalive"] is True
+        assert dispatched_bodies[0]["gpu_candidates"] == ["L4"]
+        assert dispatched_bodies[0]["timeout_seconds"] == 1500
         assert "drive_songs_folder_id" not in dispatched_bodies[0]
+        await hub.close()
+
+
+async def test_colab_module_gpu_policies_overrides_fallbacks_and_timeouts(settings, store) -> None:
+    clock_now = [1_700_000_000.0]
+    dispatched: list[dict[str, Any]] = []
+    job_statuses: dict[str, dict[str, Any]] = {}
+
+    def mock_worker(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/status":
+            return httpx.Response(
+                200,
+                json={
+                    "reachable": True,
+                    "compute_units": 95.0,
+                    "active_sessions": 0,
+                    "running_job_id": None,
+                    "supported_job_types": ["rvc_cover", "rvc_train", "custom_gpu"],
+                    "warm_sessions": [],
+                    "error": None,
+                },
+            )
+        if request.url.path == "/v1/jobs" and request.method == "POST":
+            body = json.loads(request.content.decode("utf-8"))
+            dispatched.append(body)
+            job_statuses[body["job_id"]] = {"status": "running"}
+            return httpx.Response(202, json={"job_id": body["job_id"], "status": "running"})
+        if request.url.path.startswith("/v1/jobs/") and request.method == "GET":
+            jid = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=job_statuses.get(jid, {"status": "running"}))
+        if request.url.path.endswith("/cancel") and request.method == "POST":
+            return httpx.Response(200, json={"status": "cancelled"})
+        return httpx.Response(404)
+
+    s = _worker_settings(settings, "http://127.0.0.1:12146", "worker-secret-token-123456")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_worker),
+        base_url="http://127.0.0.1:12146",
+    ) as mock_http:
+        hub = ColabComputeHub(s, store, None, http=mock_http, clock=lambda: clock_now[0])
+        await hub.initialize()
+
+        # 1) Registration policy validation errors
+        with pytest.raises(ValueError):
+            hub.register_job_type("bad_def", validator=lambda p: p, default_gpu="RTX4090")  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            hub.register_job_type("bad_allow_empty", validator=lambda p: p, allowed_gpus=())
+        with pytest.raises(ValueError):
+            hub.register_job_type(
+                "bad_allow_item",
+                validator=lambda p: p,
+                allowed_gpus=("L4", "V100"),  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError):
+            hub.register_job_type(
+                "bad_def_not_allowed",
+                validator=lambda p: p,
+                default_gpu="G4",
+                allowed_gpus=("L4", "T4"),
+            )
+        with pytest.raises(ValueError):
+            hub.register_job_type(
+                "bad_fb_not_allowed",
+                validator=lambda p: p,
+                default_gpu="L4",
+                fallback_gpus=("G4",),
+                allowed_gpus=("L4", "T4"),
+            )
+        for bad_to in (True, False, 119, 7201, 120.5):
+            with pytest.raises(ValueError):
+                hub.register_job_type(
+                    "bad_to",
+                    validator=lambda p: p,
+                    timeout_seconds=bad_to,  # type: ignore[arg-type]
+                )
+
+        # 2) Register rvc_cover (L4->T4, ban G4), rvc_train (H100->A100, ban T4/L4/G4),
+        #    and custom_gpu (frozenset allowed_gpus, dedup fallbacks, no spec timeout)
+        hub.register_job_type(
+            "rvc_cover",
+            validator=validate_rvc_cover_payload,
+            owner_module="song_studio",
+            default_gpu="L4",
+            fallback_gpus=("L4", "T4", "T4"),
+            allowed_gpus=("L4", "T4", "A100", "H100", "L4"),
+            timeout_seconds=1800,
+        )
+        hub.register_job_type(
+            "rvc_train",
+            validator=validate_rvc_train_payload,
+            owner_module="song_studio",
+            default_gpu="H100",
+            fallback_gpus=("A100",),
+            allowed_gpus=("H100", "A100"),
+            timeout_seconds=3600,
+        )
+        hub.register_job_type(
+            "custom_gpu",
+            validator=lambda p: dict(p),
+            owner_module="research",
+            default_gpu="L4",
+            fallback_gpus=("T4",),
+            allowed_gpus=frozenset({"T4", "L4"}),
+        )
+
+        assert hub.get_job_type_spec("nonexistent") is None
+        cover_spec = hub.get_job_type_spec("rvc_cover")
+        assert cover_spec == {
+            "job_type": "rvc_cover",
+            "owner_module": "song_studio",
+            "default_gpu": "L4",
+            "fallback_gpus": ["T4"],
+            "allowed_gpus": ["L4", "T4", "A100", "H100"],
+            "timeout_seconds": 1800,
+        }
+        train_spec = hub.get_job_type_spec("rvc_train")
+        assert train_spec == {
+            "job_type": "rvc_train",
+            "owner_module": "song_studio",
+            "default_gpu": "H100",
+            "fallback_gpus": ["A100"],
+            "allowed_gpus": ["H100", "A100"],
+            "timeout_seconds": 3600,
+        }
+        custom_spec = hub.get_job_type_spec("custom_gpu")
+        assert custom_spec is not None
+        assert custom_spec["allowed_gpus"] == ["L4", "T4"]
+        assert custom_spec["timeout_seconds"] == 1800  # falls back to config.job_timeout_seconds
+
+        # 3) Disallowed GPU / invalid GPU rejections
+        with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+            await hub.submit_job("rvc_cover", {"title": "禁G4", "auto_search": True}, gpu="G4")
+        with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+            await hub.submit_job(
+                "rvc_cover",
+                {"title": "禁回退G4", "auto_search": True},
+                gpu="L4",
+                fallback_gpus=["T4", "G4"],
+            )
+        with pytest.raises(Rejected, match="colab_invalid_job"):
+            await hub.submit_job("rvc_cover", {"title": "假卡", "auto_search": True}, gpu="RTX4090")
+        with pytest.raises(Rejected, match="colab_invalid_job"):
+            await hub.submit_job(
+                "rvc_cover",
+                {"title": "假回退卡", "auto_search": True},
+                fallback_gpus=["RTX4090"],
+            )
+        for banned in ("T4", "L4", "G4"):
+            with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+                await hub.submit_job("rvc_train", {"model_name": "hakimi"}, gpu=banned)
+            with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+                await hub.submit_job(
+                    "rvc_train", {"model_name": "hakimi"}, gpu="H100", fallback_gpus=[banned]
+                )
+
+        # 4) Dispatch gpu_candidates isolation + explicit override + explicit empty fallback_gpus=[]
+        cases = [
+            ("rvc_cover", {"title": "c1", "auto_search": True}, None, None, ["L4", "T4"], 1800),
+            (
+                "rvc_cover",
+                {"title": "c2", "auto_search": True},
+                "A100",
+                None,
+                ["A100", "L4", "T4"],
+                1800,
+            ),
+            ("rvc_cover", {"title": "c3", "auto_search": True}, "H100", [], ["H100"], 1800),
+            (
+                "rvc_cover",
+                {"title": "c4", "auto_search": True},
+                "T4",
+                ["A100", "T4", "A100"],
+                ["T4", "A100"],
+                1800,
+            ),
+            ("rvc_train", {"model_name": "hakimi"}, None, None, ["H100", "A100"], 3600),
+            ("rvc_train", {"model_name": "hakimi"}, "A100", [], ["A100"], 3600),
+            ("custom_gpu", {"k": "v1"}, None, None, ["L4", "T4"], 300),
+        ]
+        # Set global timeout=300 to prove spec.timeout_seconds overrides global default
+        await hub.set_config(ColabConfig(job_timeout_seconds=300))
+
+        for jtype, payload, gpu, fbs, expected_candidates, expected_timeout in cases:
+            submitted = await hub.submit_job(jtype, payload, gpu=gpu, fallback_gpus=fbs)
+            assert submitted["preferred_gpu"] == expected_candidates[0]
+            assert submitted["fallback_gpus"] == expected_candidates[1:]
+            await hub.scheduler_step()
+            assert dispatched[-1]["job_id"] == submitted["id"]
+            assert dispatched[-1]["gpu_candidates"] == expected_candidates
+            assert dispatched[-1]["timeout_seconds"] == expected_timeout
+            assert dispatched[-1]["allow_warm_keepalive"] is True
+            # Mark succeeded so serial queue advances (>5 jobs total with high CU, no daily cap!)
+            job_statuses[submitted["id"]] = {
+                "status": "succeeded",
+                "assigned_gpu": expected_candidates[0],
+                "cu_used": 12.5,
+                "result": {"ok": True},
+            }
+            await hub.scheduler_step()
+
+        assert len(dispatched) == 7
+        today_stats = await hub._today_usage()
+        assert today_stats == {"jobs_count": 7, "cu_used": 87.5}
+
+        # 5) Running timeout uses spec.timeout_seconds (3600s for rvc_train) over config (300s)
+        train_job = await hub.submit_job("rvc_train", {"model_name": "hakimi"})
+        await hub.scheduler_step()
+        clock_now[0] += 2000.0  # > 300s global config, < 3600s rvc_train spec timeout
+        await hub.scheduler_step()
+        mid_train = next(j for j in await hub.list_jobs() if j["id"] == train_job["id"])
+        assert mid_train["status"] == "running"
+
+        clock_now[0] += 1700.0  # now 3700s > 3600s -> times out!
+        await hub.scheduler_step()
+        done_train = next(j for j in await hub.list_jobs() if j["id"] == train_job["id"])
+        assert done_train["status"] == "failed"
+        assert done_train["error_code"] == "job_timeout"
+
+        # 6) Pre-upgrade queued row with banned GPU (G4 for rvc_cover) is rejected at dispatch
+        bad_legacy_id = "f" * 31 + "1"
+        sealed_bad = hub._seal_blob(
+            bad_legacy_id, "payload", {"title": "旧队列G4", "auto_search": True}
+        )
+        async with store.transaction():
+            await store.db.execute(
+                "INSERT INTO colab_jobs ("
+                "id, job_type, status, requester, preferred_gpu, fallback_gpus, assigned_gpu, "
+                "payload, result, error_code, error, cu_used, created_at, "
+                "started_at, finished_at, updated_at, day"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    bad_legacy_id,
+                    "rvc_cover",
+                    "queued",
+                    "owner",
+                    "G4",
+                    None,
+                    None,
+                    sealed_bad,
+                    None,
+                    None,
+                    None,
+                    0.0,
+                    clock_now[0],
+                    None,
+                    None,
+                    clock_now[0],
+                    hub._local_day(clock_now[0]),
+                ),
+            )
+        before_dispatch_len = len(dispatched)
+        await hub.scheduler_step()
+        assert len(dispatched) == before_dispatch_len
+        rejected_legacy = next(j for j in await hub.list_jobs() if j["id"] == bad_legacy_id)
+        assert rejected_legacy["status"] == "failed"
+        assert rejected_legacy["error_code"] == "colab_gpu_not_allowed"
+
         await hub.close()
 
 

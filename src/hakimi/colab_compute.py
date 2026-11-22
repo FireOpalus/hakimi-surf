@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS colab_jobs (
   status TEXT NOT NULL,
   requester TEXT NOT NULL DEFAULT 'owner',
   preferred_gpu TEXT NOT NULL DEFAULT 'L4',
+  fallback_gpus TEXT,
   assigned_gpu TEXT,
   payload BLOB NOT NULL,
   result BLOB,
@@ -67,19 +69,15 @@ def _reject_bool_num(value: Any, *, name: str) -> Any:
 
 
 class ColabConfig(BaseModel):
-    """Runtime-configurable Colab GPU scheduling and budget limits."""
+    """Runtime-configurable global Colab operational guardrails."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    preferred_gpu: GpuType = "L4"
-    fallback_gpus: list[GpuType] = Field(default_factory=lambda: ["L4", "T4"], max_length=5)
-    daily_job_limit: int = Field(default=5, ge=0, le=50)
-    daily_cu_budget: float = Field(default=10.0, ge=0.0, le=200.0, allow_inf_nan=False)
     job_timeout_seconds: int = Field(default=1800, ge=120, le=7200)
     auto_terminate_orphan_minutes: int = Field(default=20, ge=5, le=120)
 
-    @field_validator("enabled")
+    @field_validator("enabled", mode="before")
     @classmethod
     def _check_enabled(cls, value: Any) -> bool:
         if not isinstance(value, bool):
@@ -87,7 +85,6 @@ class ColabConfig(BaseModel):
         return value
 
     @field_validator(
-        "daily_job_limit",
         "job_timeout_seconds",
         "auto_terminate_orphan_minutes",
         mode="before",
@@ -96,26 +93,17 @@ class ColabConfig(BaseModel):
     def _check_int_not_bool(cls, value: Any, info: Any) -> Any:
         return _reject_bool_num(value, name=str(info.field_name))
 
-    @field_validator("daily_cu_budget", mode="before")
-    @classmethod
-    def _check_float_not_bool(cls, value: Any) -> Any:
-        return _reject_bool_num(value, name="daily_cu_budget")
-
-    @field_validator("fallback_gpus")
-    @classmethod
-    def _dedup_fallbacks(cls, value: list[GpuType]) -> list[GpuType]:
-        out: list[GpuType] = []
-        for gpu in value:
-            if gpu not in out:
-                out.append(gpu)
-        return out
-
 
 @dataclass(frozen=True)
 class _RegisteredJobSpec:
     job_type: str
     validator: Callable[[dict[str, Any]], dict[str, Any]]
     pre_dispatch: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
+    owner_module: str = ""
+    default_gpu: GpuType = "L4"
+    fallback_gpus: tuple[GpuType, ...] = ()
+    allowed_gpus: tuple[GpuType, ...] = VALID_GPUS
+    timeout_seconds: int | None = None
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -316,8 +304,15 @@ class ColabComputeHub:
         validator: Callable[[dict[str, Any]], dict[str, Any]],
         pre_dispatch: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None,
         on_complete: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        owner_module: str = "",
+        default_gpu: GpuType = "L4",
+        fallback_gpus: tuple[GpuType, ...] | list[GpuType] = (),
+        allowed_gpus: (
+            tuple[GpuType, ...] | list[GpuType] | frozenset[GpuType] | set[GpuType] | None
+        ) = None,
+        timeout_seconds: int | None = None,
     ) -> None:
-        """Register a whitelisted GPU job type with validator and optional lifecycle callbacks."""
+        """Register a whitelisted GPU job type with policy, validator, and lifecycle callbacks."""
         if not isinstance(job_type, str) or not _JOB_TYPE_RE.fullmatch(job_type):
             raise ValueError(f"Invalid Colab job_type: {job_type!r}")
         if not callable(validator):
@@ -326,15 +321,99 @@ class ColabComputeHub:
             raise TypeError("pre_dispatch must be callable or None")
         if on_complete is not None and not callable(on_complete):
             raise TypeError("on_complete must be callable or None")
+        if not isinstance(owner_module, str):
+            raise TypeError("owner_module must be a string")
+        if not isinstance(default_gpu, str) or default_gpu not in VALID_GPUS:
+            raise ValueError(f"Invalid default_gpu: {default_gpu!r}")
+
+        if allowed_gpus is None:
+            clean_allowed: tuple[GpuType, ...] = VALID_GPUS
+        else:
+            if not isinstance(allowed_gpus, (tuple, list, set, frozenset)):
+                raise ValueError("allowed_gpus must be a tuple, list, or set of valid GPUs")
+            if isinstance(allowed_gpus, (set, frozenset)):
+                for item in allowed_gpus:
+                    if not isinstance(item, str) or item not in VALID_GPUS:
+                        raise ValueError(f"Invalid GPU in allowed_gpus: {item!r}")
+                clean_allowed = tuple(g for g in VALID_GPUS if g in allowed_gpus)
+            else:
+                dedup_allowed: list[GpuType] = []
+                for item in allowed_gpus:
+                    if not isinstance(item, str) or item not in VALID_GPUS:
+                        raise ValueError(f"Invalid GPU in allowed_gpus: {item!r}")
+                    if item not in dedup_allowed:
+                        dedup_allowed.append(item)  # type: ignore[arg-type]
+                clean_allowed = tuple(dedup_allowed)
+            if not clean_allowed:
+                raise ValueError("allowed_gpus must not be empty")
+
+        if default_gpu not in clean_allowed:
+            raise ValueError(f"default_gpu {default_gpu!r} must be in allowed_gpus")
+
+        if not isinstance(fallback_gpus, (tuple, list)):
+            raise ValueError("fallback_gpus must be a tuple or list of valid GPUs")
+        clean_fallbacks: list[GpuType] = []
+        for item in fallback_gpus:
+            if not isinstance(item, str) or item not in VALID_GPUS:
+                raise ValueError(f"Invalid GPU in fallback_gpus: {item!r}")
+            if item not in clean_allowed:
+                raise ValueError(f"fallback GPU {item!r} must be in allowed_gpus")
+            if item != default_gpu and item not in clean_fallbacks:
+                clean_fallbacks.append(item)  # type: ignore[arg-type]
+
+        clean_timeout: int | None
+        if timeout_seconds is None:
+            clean_timeout = None
+        else:
+            if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
+                raise ValueError("timeout_seconds must be an integer, not bool")
+            if not (120 <= timeout_seconds <= 7200):
+                raise ValueError("timeout_seconds must be between 120 and 7200")
+            clean_timeout = timeout_seconds
+
         self._job_types[job_type] = _RegisteredJobSpec(
             job_type=job_type,
             validator=validator,
             pre_dispatch=pre_dispatch,
+            owner_module=owner_module.strip()[:64],
+            default_gpu=default_gpu,
+            fallback_gpus=tuple(clean_fallbacks),
+            allowed_gpus=clean_allowed,
+            timeout_seconds=clean_timeout,
         )
         if on_complete is not None:
             hooks = self._hooks.setdefault(job_type, [])
             if on_complete not in hooks:
                 hooks.append(on_complete)
+
+    def _spec_to_dict(self, spec: _RegisteredJobSpec) -> dict[str, Any]:
+        return {
+            "job_type": spec.job_type,
+            "owner_module": spec.owner_module,
+            "default_gpu": spec.default_gpu,
+            "fallback_gpus": list(spec.fallback_gpus),
+            "allowed_gpus": list(spec.allowed_gpus),
+            "timeout_seconds": (
+                spec.timeout_seconds
+                if spec.timeout_seconds is not None
+                else self.config.job_timeout_seconds
+            ),
+        }
+
+    def job_type_specs(self) -> list[dict[str, Any]]:
+        return [self._spec_to_dict(self._job_types[name]) for name in sorted(self._job_types)]
+
+    def get_job_type_spec(self, job_type: str) -> dict[str, Any] | None:
+        if not isinstance(job_type, str):
+            return None
+        spec = self._job_types.get(job_type)
+        return self._spec_to_dict(spec) if spec is not None else None
+
+    def _effective_timeout(self, job_type: str) -> int:
+        spec = self._job_types.get(job_type)
+        if spec is not None and spec.timeout_seconds is not None:
+            return spec.timeout_seconds
+        return self.config.job_timeout_seconds
 
     def is_registered_job_type(self, job_type: str) -> bool:
         return isinstance(job_type, str) and job_type in self._job_types
@@ -418,6 +497,14 @@ class ColabComputeHub:
                 return
             async with self.store.lock:
                 await self.store.db.executescript(SCHEMA)
+            async with self.store.transaction():
+                cols = {
+                    str(r["name"]) for r in await self.store.all("PRAGMA table_info(colab_jobs)")
+                }
+                if "fallback_gpus" not in cols:
+                    await self.store.db.execute(
+                        "ALTER TABLE colab_jobs ADD COLUMN fallback_gpus TEXT"
+                    )
                 await self.store.db.execute(
                     "CREATE TABLE IF NOT EXISTS admin_config "
                     "(key TEXT PRIMARY KEY, payload BLOB NOT NULL)"
@@ -473,16 +560,64 @@ class ColabComputeHub:
         except Exception:
             return None
 
+    def _decode_row_fallbacks(
+        self,
+        raw_fallbacks: Any,
+        *,
+        job_type: str,
+        preferred_gpu: str,
+    ) -> list[str]:
+        spec = self._job_types.get(job_type)
+        if raw_fallbacks is None:
+            if spec is None:
+                return []
+            out: list[str] = []
+            for candidate in (spec.default_gpu, *spec.fallback_gpus):
+                if candidate != preferred_gpu and candidate not in out:
+                    out.append(candidate)
+            return out
+        parsed: Any = raw_fallbacks
+        if isinstance(raw_fallbacks, (bytes, bytearray)):
+            try:
+                parsed = json.loads(raw_fallbacks.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                parsed = None
+        elif isinstance(raw_fallbacks, str):
+            try:
+                parsed = json.loads(raw_fallbacks)
+            except ValueError:
+                parsed = None
+        if not isinstance(parsed, list):
+            return []
+        allowed = spec.allowed_gpus if spec is not None else VALID_GPUS
+        out = []
+        for item in parsed:
+            if (
+                isinstance(item, str)
+                and item in VALID_GPUS
+                and item in allowed
+                and item != preferred_gpu
+                and item not in out
+            ):
+                out.append(item)
+        return out
+
     def _row_to_job(self, row: Any) -> dict[str, Any]:
         job_id = str(row["id"])
+        job_type = str(row["job_type"])
+        preferred_gpu = str(row["preferred_gpu"])
+        raw_fb = row["fallback_gpus"] if "fallback_gpus" in row.keys() else None
         payload = self._open_blob(job_id, "payload", row["payload"]) or {}
         result = self._open_blob(job_id, "result", row["result"])
         return {
             "id": job_id,
-            "job_type": str(row["job_type"]),
+            "job_type": job_type,
             "status": str(row["status"]),
             "requester": str(row["requester"]),
-            "preferred_gpu": str(row["preferred_gpu"]),
+            "preferred_gpu": preferred_gpu,
+            "fallback_gpus": self._decode_row_fallbacks(
+                raw_fb, job_type=job_type, preferred_gpu=preferred_gpu
+            ),
             "assigned_gpu": row["assigned_gpu"],
             "payload": payload,
             "result": result,
@@ -670,8 +805,6 @@ class ColabComputeHub:
         return {
             "jobs_count": jobs_count,
             "cu_used": round(cu_used, 4),
-            "daily_job_limit": self.config.daily_job_limit,
-            "daily_cu_budget": self.config.daily_cu_budget,
         }
 
     async def _compute_analytics(
@@ -860,6 +993,7 @@ class ColabComputeHub:
             "source": "sqlite" if self._overridden else "default",
             "config": self.config.model_dump(mode="json"),
             "supported_job_types": list(self.registered_job_types()),
+            "job_types": self.job_type_specs(),
             "worker": worker,
             "today": today,
             "jobs": jobs,
@@ -894,7 +1028,8 @@ class ColabComputeHub:
         job_type: str,
         payload: dict[str, Any],
         gpu: str | None,
-    ) -> tuple[dict[str, Any], GpuType]:
+        fallback_gpus: list[str] | tuple[str, ...] | None,
+    ) -> tuple[dict[str, Any], GpuType, list[GpuType]]:
         if (
             not isinstance(job_type, str)
             or job_type not in self._job_types
@@ -916,12 +1051,31 @@ class ColabComputeHub:
             raise Rejected("colab_invalid_job")
 
         if gpu is None:
-            chosen_gpu: GpuType = self.config.preferred_gpu
-        elif gpu in VALID_GPUS:
-            chosen_gpu = gpu  # type: ignore[assignment]
+            chosen_gpu: GpuType = spec.default_gpu
         else:
-            raise Rejected("colab_invalid_job")
-        return clean_payload, chosen_gpu
+            if not isinstance(gpu, str) or gpu not in VALID_GPUS:
+                raise Rejected("colab_invalid_job")
+            if gpu not in spec.allowed_gpus:
+                raise Rejected("colab_gpu_not_allowed")
+            chosen_gpu = gpu  # type: ignore[assignment]
+
+        clean_fallbacks: list[GpuType] = []
+        if fallback_gpus is not None:
+            if not isinstance(fallback_gpus, (list, tuple)):
+                raise Rejected("colab_invalid_job")
+            for item in fallback_gpus:
+                if not isinstance(item, str) or item not in VALID_GPUS:
+                    raise Rejected("colab_invalid_job")
+                if item not in spec.allowed_gpus:
+                    raise Rejected("colab_gpu_not_allowed")
+                if item != chosen_gpu and item not in clean_fallbacks:
+                    clean_fallbacks.append(item)  # type: ignore[arg-type]
+        else:
+            for candidate in (spec.default_gpu, *spec.fallback_gpus):
+                if candidate != chosen_gpu and candidate not in clean_fallbacks:
+                    clean_fallbacks.append(candidate)
+
+        return clean_payload, chosen_gpu, clean_fallbacks
 
     async def submit_job(
         self,
@@ -930,6 +1084,7 @@ class ColabComputeHub:
         *,
         requester: str = "owner",
         gpu: str | None = None,
+        fallback_gpus: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         await self.initialize()
         if not self.configured():
@@ -937,7 +1092,9 @@ class ColabComputeHub:
         if not self.config.enabled:
             raise Rejected("colab_disabled")
 
-        clean_payload, chosen_gpu = self._validate_job_inputs(job_type, payload, gpu)
+        clean_payload, chosen_gpu, job_fallbacks = self._validate_job_inputs(
+            job_type, payload, gpu, fallback_gpus
+        )
         clean_requester = str(requester or "owner")[:32]
         now = self._clock()
         day = self._local_day(now)
@@ -945,48 +1102,31 @@ class ColabComputeHub:
 
         async with self._op_lock:
             async with self.store.lock:
-                row_today_cnt = await self.store.one(
-                    "SELECT COUNT(*) FROM colab_jobs "
-                    "WHERE day=? AND (status != 'cancelled' OR started_at IS NOT NULL)",
-                    (day,),
-                )
-                row_today_cu = await self.store.one(
-                    "SELECT COALESCE(SUM(cu_used), 0.0) FROM colab_jobs WHERE day=?",
-                    (day,),
-                )
                 row_pending = await self.store.one(
                     "SELECT COUNT(*) FROM colab_jobs WHERE status IN ('queued', 'running')"
                 )
-            today_count = (
-                int(row_today_cnt[0]) if row_today_cnt and row_today_cnt[0] is not None else 0
-            )
-            today_cu = (
-                float(row_today_cu[0]) if row_today_cu and row_today_cu[0] is not None else 0.0
-            )
             pending_count = int(row_pending[0]) if row_pending and row_pending[0] is not None else 0
 
-            if today_count >= self.config.daily_job_limit:
-                raise Rejected("colab_daily_job_limit")
-            if self.config.daily_cu_budget <= 0 or today_cu >= self.config.daily_cu_budget:
-                raise Rejected("colab_daily_cu_budget")
             if pending_count >= MAX_QUEUED_JOBS:
                 raise Rejected("colab_job_limit_reached")
 
             sealed_payload = self._seal_blob(job_id, "payload", clean_payload)
             assert sealed_payload is not None
+            fallbacks_json = json.dumps(job_fallbacks)
             async with self.store.transaction():
                 await self.store.db.execute(
                     "INSERT INTO colab_jobs ("
-                    "id, job_type, status, requester, preferred_gpu, assigned_gpu, "
+                    "id, job_type, status, requester, preferred_gpu, fallback_gpus, assigned_gpu, "
                     "payload, result, error_code, error, cu_used, created_at, "
                     "started_at, finished_at, updated_at, day"
-                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         job_id,
                         job_type,
                         "queued",
                         clean_requester,
                         chosen_gpu,
+                        fallbacks_json,
                         None,
                         sealed_payload,
                         None,
@@ -1009,6 +1149,7 @@ class ColabComputeHub:
             "status": "queued",
             "requester": clean_requester,
             "preferred_gpu": chosen_gpu,
+            "fallback_gpus": list(job_fallbacks),
             "assigned_gpu": None,
             "payload": clean_payload,
             "result": None,
@@ -1182,7 +1323,8 @@ class ColabComputeHub:
                     job = self._row_to_job(row)
                     job_id = job["id"]
                     started = job["started_at"] or job["created_at"]
-                    if now - started > self.config.job_timeout_seconds:
+                    effective_timeout = self._effective_timeout(job["job_type"])
+                    if now - started > effective_timeout:
                         try:
                             await self._request(
                                 "POST", f"/v1/jobs/{job_id}/cancel", timeout_sec=8.0
@@ -1193,7 +1335,7 @@ class ColabComputeHub:
                             job_id,
                             status="failed",
                             error_code="job_timeout",
-                            error=f"Exceeded {self.config.job_timeout_seconds}s timeout",
+                            error=f"Exceeded {effective_timeout}s timeout",
                         )
                         if done is not None:
                             finished_to_notify.append(done)
@@ -1267,128 +1409,121 @@ class ColabComputeHub:
                         )
                     if next_row is not None:
                         next_job = self._row_to_job(next_row)
-                        usage = await self._today_usage()
-                        if usage["cu_used"] >= self.config.daily_cu_budget:
+                        spec = self._job_types.get(next_job["job_type"])
+                        if spec is None:
                             done = await self._finalize_job(
                                 next_job["id"],
                                 status="failed",
-                                error_code="colab_daily_cu_budget",
-                                error="Daily CU budget exhausted",
+                                error_code="colab_invalid_job",
+                                error="Unregistered job type",
+                            )
+                            if done is not None:
+                                finished_to_notify.append(done)
+                        elif next_job["preferred_gpu"] not in spec.allowed_gpus:
+                            done = await self._finalize_job(
+                                next_job["id"],
+                                status="failed",
+                                error_code="colab_gpu_not_allowed",
+                                error="Preferred GPU not allowed for job type",
                             )
                             if done is not None:
                                 finished_to_notify.append(done)
                         else:
-                            spec = self._job_types.get(next_job["job_type"])
-                            if spec is None:
-                                done = await self._finalize_job(
-                                    next_job["id"],
-                                    status="failed",
-                                    error_code="colab_invalid_job",
-                                    error="Unregistered job type",
-                                )
-                                if done is not None:
-                                    finished_to_notify.append(done)
-                            else:
-                                dispatch_ctx: dict[str, Any] | None = None
-                                pre_failed = False
-                                if spec.pre_dispatch is not None:
-                                    try:
-                                        dispatch_ctx = await spec.pre_dispatch(dict(next_job))
-                                    except Rejected as exc:
-                                        err_code = str(exc) or "colab_pre_dispatch_failed"
-                                        done = await self._finalize_job(
-                                            next_job["id"],
-                                            status="failed",
-                                            error_code=err_code,
-                                            error=err_code,
-                                        )
-                                        if done is not None:
-                                            finished_to_notify.append(done)
-                                        pre_failed = True
-                                    except asyncio.CancelledError:
-                                        raise
-                                    except Exception as exc:
-                                        done = await self._finalize_job(
-                                            next_job["id"],
-                                            status="failed",
-                                            error_code="colab_pre_dispatch_failed",
-                                            error=self._scrub(type(exc).__name__),
-                                        )
-                                        if done is not None:
-                                            finished_to_notify.append(done)
-                                        pre_failed = True
-                                if not pre_failed and dispatch_ctx is not None:
-                                    if not isinstance(dispatch_ctx, dict):
-                                        done = await self._finalize_job(
-                                            next_job["id"],
-                                            status="failed",
-                                            error_code="colab_pre_dispatch_failed",
-                                            error="Invalid dispatch context",
-                                        )
-                                        if done is not None:
-                                            finished_to_notify.append(done)
-                                        pre_failed = True
-                                if not pre_failed:
-                                    gpu_candidates = [next_job["preferred_gpu"]]
-                                    for fb in self.config.fallback_gpus:
-                                        if fb not in gpu_candidates:
-                                            gpu_candidates.append(fb)
-                                    body: dict[str, Any] = {
-                                        "job_id": next_job["id"],
-                                        "job_type": next_job["job_type"],
-                                        "gpu_candidates": gpu_candidates,
-                                        "timeout_seconds": self.config.job_timeout_seconds,
-                                        "allow_warm_keepalive": bool(
-                                            self.config.enabled
-                                            and (self.config.daily_cu_budget - usage["cu_used"])
-                                            >= 0.5
-                                        ),
-                                        "payload": next_job["payload"],
-                                    }
-                                    if dispatch_ctx:
-                                        body["dispatch_context"] = dispatch_ctx
-                                    try:
-                                        disp = await self._request(
-                                            "POST", "/v1/jobs", json_body=body, timeout_sec=8.0
-                                        )
-                                        if disp.status_code in {200, 202}:
-                                            async with self.store.transaction():
-                                                await self.store.db.execute(
-                                                    "UPDATE colab_jobs SET status='running', "
-                                                    "started_at=?, updated_at=? WHERE id=?",
-                                                    (now, now, next_job["id"]),
-                                                )
-                                            await self._refresh_cached_counts()
-                                        elif disp.status_code == 400:
-                                            worker_code = "colab_invalid_job"
-                                            try:
-                                                err_data = disp.json()
-                                                if isinstance(err_data, dict):
-                                                    detail = str(
-                                                        err_data.get("detail") or ""
-                                                    ).strip()
-                                                    if detail in {
-                                                        "colab_invalid_job",
-                                                        "drive_context_required",
-                                                        "colab_drive_not_configured",
-                                                        "song_source_required",
-                                                    }:
-                                                        worker_code = detail
-                                            except ValueError:
-                                                pass
-                                            done = await self._finalize_job(
-                                                next_job["id"],
-                                                status="failed",
-                                                error_code=worker_code,
-                                                error="Worker rejected job payload",
+                            dispatch_ctx: dict[str, Any] | None = None
+                            pre_failed = False
+                            if spec.pre_dispatch is not None:
+                                try:
+                                    dispatch_ctx = await spec.pre_dispatch(dict(next_job))
+                                except Rejected as exc:
+                                    err_code = str(exc) or "colab_pre_dispatch_failed"
+                                    done = await self._finalize_job(
+                                        next_job["id"],
+                                        status="failed",
+                                        error_code=err_code,
+                                        error=err_code,
+                                    )
+                                    if done is not None:
+                                        finished_to_notify.append(done)
+                                    pre_failed = True
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as exc:
+                                    done = await self._finalize_job(
+                                        next_job["id"],
+                                        status="failed",
+                                        error_code="colab_pre_dispatch_failed",
+                                        error=self._scrub(type(exc).__name__),
+                                    )
+                                    if done is not None:
+                                        finished_to_notify.append(done)
+                                    pre_failed = True
+                            if not pre_failed and dispatch_ctx is not None:
+                                if not isinstance(dispatch_ctx, dict):
+                                    done = await self._finalize_job(
+                                        next_job["id"],
+                                        status="failed",
+                                        error_code="colab_pre_dispatch_failed",
+                                        error="Invalid dispatch context",
+                                    )
+                                    if done is not None:
+                                        finished_to_notify.append(done)
+                                    pre_failed = True
+                            if not pre_failed:
+                                gpu_candidates: list[str] = [next_job["preferred_gpu"]]
+                                for fb in next_job.get("fallback_gpus") or ():
+                                    if fb in spec.allowed_gpus and fb not in gpu_candidates:
+                                        gpu_candidates.append(fb)
+                                effective_timeout = self._effective_timeout(next_job["job_type"])
+                                body: dict[str, Any] = {
+                                    "job_id": next_job["id"],
+                                    "job_type": next_job["job_type"],
+                                    "gpu_candidates": gpu_candidates,
+                                    "timeout_seconds": effective_timeout,
+                                    "allow_warm_keepalive": bool(self.config.enabled),
+                                    "payload": next_job["payload"],
+                                }
+                                if dispatch_ctx:
+                                    body["dispatch_context"] = dispatch_ctx
+                                try:
+                                    disp = await self._request(
+                                        "POST", "/v1/jobs", json_body=body, timeout_sec=8.0
+                                    )
+                                    if disp.status_code in {200, 202}:
+                                        async with self.store.transaction():
+                                            await self.store.db.execute(
+                                                "UPDATE colab_jobs SET status='running', "
+                                                "started_at=?, updated_at=? WHERE id=?",
+                                                (now, now, next_job["id"]),
                                             )
-                                            if done is not None:
-                                                finished_to_notify.append(done)
-                                    except Rejected:
-                                        pass
-                                    finally:
-                                        dispatch_ctx = None
-                                        body.pop("dispatch_context", None)
+                                        await self._refresh_cached_counts()
+                                    elif disp.status_code == 400:
+                                        worker_code = "colab_invalid_job"
+                                        try:
+                                            err_data = disp.json()
+                                            if isinstance(err_data, dict):
+                                                detail = str(err_data.get("detail") or "").strip()
+                                                if detail in {
+                                                    "colab_invalid_job",
+                                                    "drive_context_required",
+                                                    "colab_drive_not_configured",
+                                                    "song_source_required",
+                                                }:
+                                                    worker_code = detail
+                                        except ValueError:
+                                            pass
+                                        done = await self._finalize_job(
+                                            next_job["id"],
+                                            status="failed",
+                                            error_code=worker_code,
+                                            error="Worker rejected job payload",
+                                        )
+                                        if done is not None:
+                                            finished_to_notify.append(done)
+                                except Rejected:
+                                    pass
+                                finally:
+                                    dispatch_ctx = None
+                                    body.pop("dispatch_context", None)
 
         for done_job in finished_to_notify:
             await self._fire_hooks(done_job)

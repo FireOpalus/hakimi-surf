@@ -155,9 +155,31 @@ async def test_new_system_modules_topology_isolation_and_reserved_ids(settings):
             colab_resp = await client.get("/admin/api/colab")
             assert colab_resp.status_code == 200
             colab_ov = colab_resp.json()
-            assert "drive_songs_folder_id" not in colab_ov["config"]
+            assert set(colab_ov["config"]) == {
+                "enabled",
+                "job_timeout_seconds",
+                "auto_terminate_orphan_minutes",
+            }
+            assert set(colab_ov["today"]) == {"jobs_count", "cu_used"}
             assert "drive_folders" not in colab_ov["worker"]
             assert set(colab_ov["supported_job_types"]) >= {"rvc_cover", "rvc_train"}
+            job_specs = {item["job_type"]: item for item in colab_ov["job_types"]}
+            assert job_specs["rvc_cover"] == {
+                "job_type": "rvc_cover",
+                "owner_module": "song_studio",
+                "default_gpu": "L4",
+                "fallback_gpus": ["T4"],
+                "allowed_gpus": ["L4", "T4", "A100", "H100"],
+                "timeout_seconds": 1800,
+            }
+            assert job_specs["rvc_train"] == {
+                "job_type": "rvc_train",
+                "owner_module": "song_studio",
+                "default_gpu": "H100",
+                "fallback_gpus": ["A100"],
+                "allowed_gpus": ["H100", "A100"],
+                "timeout_seconds": 3600,
+            }
             colab_desc = sys_mods["colab_compute"]["description"]
             assert "GPU" in colab_desc
             assert "翻唱" not in colab_desc
@@ -350,8 +372,14 @@ async def test_owner_chat_learn_song_command_and_action_e2e(
             }
 
         async def fake_submit_job(
-            job_type: str, payload: dict, *, requester: str = "owner", gpu: str | None = None
+            job_type: str,
+            payload: dict,
+            *,
+            requester: str = "owner",
+            gpu: str | None = None,
+            fallback_gpus: list[str] | tuple[str, ...] | None = None,
         ) -> dict:
+            del gpu, fallback_gpus
             submitted_jobs.append((job_type, dict(payload), requester))
             return {
                 "id": f"job{len(submitted_jobs):029d}",
@@ -542,8 +570,14 @@ async def test_owner_chat_learn_song_handle_message_passes_context_message_e2e(
             return {"file_id": "inbox-e2e-1", "name": filename, "size": len(raw)}
 
         async def fake_submit(
-            job_type: str, payload: dict, *, requester: str = "owner", gpu: str | None = None
+            job_type: str,
+            payload: dict,
+            *,
+            requester: str = "owner",
+            gpu: str | None = None,
+            fallback_gpus: list[str] | tuple[str, ...] | None = None,
         ):
+            del gpu, fallback_gpus
             submitted.append((job_type, dict(payload), requester))
             return {
                 "id": "e2ejob00000000000000000000000001",

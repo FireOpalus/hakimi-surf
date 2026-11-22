@@ -18,11 +18,10 @@ _STATUS_MAP = {
     "colab_worker_unavailable": 503,
     "colab_job_not_found": 404,
     "colab_invalid_job": 400,
+    "colab_gpu_not_allowed": 400,
     "drive_context_required": 400,
     "song_source_required": 400,
     "colab_disabled": 409,
-    "colab_daily_job_limit": 409,
-    "colab_daily_cu_budget": 409,
     "colab_job_limit_reached": 409,
     "colab_job_not_cancellable": 409,
     "colab_pre_dispatch_failed": 409,
@@ -35,6 +34,7 @@ class ColabJobRequest(BaseModel):
     job_type: str = Field(pattern=r"^[a-z][a-z0-9_]{1,31}$")
     payload: dict[str, Any]
     gpu: GpuType | None = None
+    fallback_gpus: list[GpuType] | None = Field(default=None, max_length=5)
 
 
 def _compute(request: Request) -> ColabComputeHub:
@@ -89,6 +89,7 @@ async def colab_submit_job(request: Request):
                 req.payload,
                 requester="admin",
                 gpu=req.gpu,
+                fallback_gpus=req.fallback_gpus,
             )
         except Rejected as exc:
             _raise_http(exc)
