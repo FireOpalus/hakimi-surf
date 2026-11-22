@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="Hakimi Surf v2.1.0 模块架构图。查看四个平台插件、九个常驻系统模块，以及动作、事件与跨日待办如何连接世界引擎。">
+  <meta name="description" content="Hakimi Surf v2.1.0 模块架构图。查看四个平台插件、二十一个常驻系统模块，以及动作、事件与跨日待办如何连接世界引擎。">
   <title>万物皆模块 · Hakimi Surf 项目架构图</title>
   <style>
     :root {
@@ -287,20 +287,44 @@
           <i class="pin" aria-hidden="true"></i>
         </section>
         <section class="bank resident" aria-labelledby="resident-title">
-          <header><h3 id="resident-title">常驻系统模块 × 9</h3><code>SystemModule</code></header>
+          <header><h3 id="resident-title">常驻系统模块 × 21</h3><code>SystemModule</code></header>
           <p>启动时按 <code>requires</code> 排列依赖顺序。箭头从前置服务指向使用它的模块，各功能的授权和连接条件分别生效。</p>
           <dl class="deps" aria-label="前置服务与依赖该服务的模块">
             <div>
               <dt><a href="src/hakimi/system_modules/drive_sync.py">Drive 同步</a><span class="arrow" aria-hidden="true">→</span></dt>
-              <dd><a href="src/hakimi/system_modules/patrol_diary.py">巡逻日记</a><a href="src/hakimi/system_modules/database_backup.py">数据库备份</a><a href="src/hakimi/system_modules/group_memory_mirror.py">群记忆镜像</a><a href="src/hakimi/system_modules/surf_mirror.py">冲浪镜像</a></dd>
+              <dd><a href="src/hakimi/system_modules/patrol_diary.py">巡逻日记</a><a href="src/hakimi/system_modules/database_backup.py">数据库备份</a><a href="src/hakimi/system_modules/group_memory_mirror.py">群记忆镜像</a><a href="src/hakimi/system_modules/surf_mirror.py">分身镜像</a></dd>
             </div>
             <div>
-              <dt><span><a href="src/hakimi/system_modules/event_ledger.py">待办账本</a> ＋ <a href="src/hakimi/system_modules/owner_notebook.py">Owner 只读记忆</a></span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dt><span><a href="src/hakimi/system_modules/colab_compute.py">Colab 算力</a> ＋ Drive 同步</span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/song_studio.py">歌单工坊</a></dd>
+            </div>
+            <div>
+              <dt><a href="src/hakimi/system_modules/event_ledger.py">待办账本</a><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/plugin_bus.py">远程插件总线</a><a href="src/hakimi/system_modules/proactive_delivery.py">主动投递</a></dd>
+            </div>
+            <div>
+              <dt><a href="src/hakimi/system_modules/identity.py">统一身份</a><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/affection.py">好感度权限</a></dd>
+            </div>
+            <div>
+              <dt><span>待办账本 ＋ 统一身份 ＋ <a href="src/hakimi/system_modules/owner_notebook.py">Owner 只读记忆</a></span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/memory_hub.py">统一记忆中枢</a></dd>
+            </div>
+            <div>
+              <dt><span>统一记忆中枢</span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dd><a href="src/hakimi/system_modules/memory_compressor.py">记忆归档压缩</a></dd>
+            </div>
+            <div>
+              <dt><span>待办账本 ＋ Owner 只读记忆</span><span class="arrow" aria-hidden="true">→</span></dt>
               <dd><a href="src/hakimi/system_modules/screen_watch.py">屏幕伴看</a></dd>
             </div>
             <div>
-              <dt><span>待办账本 ＋ Owner 只读记忆 ＋ 屏幕伴看</span><span class="arrow" aria-hidden="true">→</span></dt>
+              <dt><span>待办账本 ＋ Owner 只读记忆 ＋ 屏幕伴看 ＋ <a href="src/hakimi/system_modules/voice_gateway.py">语音网关</a></span><span class="arrow" aria-hidden="true">→</span></dt>
               <dd><a href="src/hakimi/system_modules/voice_companion.py">语音伴随</a></dd>
+            </div>
+            <div>
+              <dt><span>独立常驻服务</span><span class="arrow" aria-hidden="true">·</span></dt>
+              <dd><a href="src/hakimi/system_modules/gcp_billing.py">GCP 账单对账</a><a href="src/hakimi/system_modules/video_watch.py">双轨看片引擎</a><a href="src/hakimi/system_modules/meme_library.py">本地表情包库</a></dd>
             </div>
           </dl>
           <i class="pin" aria-hidden="true"></i>
@@ -355,6 +379,7 @@
         <div class="lane"><h3>境内 · QQ / NapCat</h3><span class="link-label">反向 WSS</span><div><strong>境外 Nginx → hakimi-bot</strong><p>QQ 事件进入 OneBot 接入层，回复与回执复用已认证的连接。</p></div></div>
         <div class="lane"><h3>境内 · node_agent</h3><span class="link-label">独立节点 WSS</span><div><strong>境外 NodeTransport ↔ B 站与 Minecraft 插件</strong><p>境内节点上报能力，按请求接收限定任务。B 站可委派采集；游戏端由 <code>mc_agent</code> 常驻待机，配合境内回环守护进程 <code>mc-powerd</code> 按需唤醒与闲置自动休眠 Minecraft 服务端，支持管理台、自主规划及通用 <code>owner_chat</code> 即时触发。</p></div></div>
         <div class="lane"><h3>桌面 · 语音与看屏适配端</h3><span class="link-label">两条可选 WS</span><div><strong>境外 FastAPI → 对应常驻服务</strong><p>语音与看屏分别配置入口、校验适配端身份。屏幕隐私开关与会话模式控制帧的使用范围。</p></div></div>
+        <div class="lane"><h3>境外宿主机 · Colab Worker</h3><span class="link-label">Docker 网桥回环</span><div><strong>境外 hakimi-bot → 172.19.0.1:12146（Bearer 隔离）</strong><p>宿主机独立守护进程承接白名单 GPU 作业与 <code>Hakimi_Songs/</code> 云盘代理，凭据与 Colab CLI 不进只读容器。</p></div></div>
         <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
       </div>
       <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="node_agent/compose.cn.yaml">境内执行节点</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
@@ -381,6 +406,6 @@
       <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a></div>
     </section>
   </main>
-  <footer><span>Hakimi Surf · v2.1.0 · 源码快照 <a href="https://github.com/FireOpalus/hakimi-surf/tree/220043c4deda1e8f397ddabbc7fd4b8102714f57"><code>220043c</code></a> · 2026-11-20</span><a href="#top">回到图首 ↑</a></footer>
+  <footer><span>Hakimi Surf · v2.1.0 · 4 个平台插件 + 21 个常驻系统模块 · 2026-11-22</span><a href="#top">回到图首 ↑</a></footer>
 </body>
 </html>
