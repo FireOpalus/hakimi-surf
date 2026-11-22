@@ -39,6 +39,7 @@ _BAD_REQUEST_CODES = frozenset(
         "invalid_drive_file_id",
         "song_source_required",
         "colab_invalid_job",
+        "colab_gpu_not_allowed",
         "colab_drive_invalid_file",
         "song_drive_invalid_file",
         "song_drive_file_outside_scope",
@@ -111,6 +112,7 @@ class LearnSongBody(BaseModel):
     inbox_filename: str = Field(default="", max_length=200)
     inbox_file_id: str = Field(default="", max_length=256)
     auto_search: bool = True
+    gpu: str | None = Field(default=None, max_length=16)
 
 
 class SongStorageBody(BaseModel):
@@ -185,6 +187,7 @@ async def songs(request: Request):
         "drive_config_source": str(drive_status.get("source") or "none"),
         "drive_folders": drive_status.get("folders"),
         "drive_error": drive_status.get("error"),
+        "learn_gpu_policy": lib.learn_gpu_policy(),
     }
 
 
@@ -325,6 +328,7 @@ async def learn(request: Request):
                 inbox_filename=payload.inbox_filename,
                 inbox_file_id=payload.inbox_file_id,
                 auto_search=payload.auto_search,
+                gpu=payload.gpu,
                 requester="admin",
             )
         except Rejected as exc:

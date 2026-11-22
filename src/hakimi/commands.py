@@ -612,6 +612,7 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
             "song_drive_upload_failed": "上传原曲到云盘 inbox 失败，请稍后重试。",
             "song_inbox_upload_too_large": "音频超过 100 MiB 上限，请先压缩或截取后再试。",
             "colab_invalid_job": "提交学歌参数无效，请检查歌名或选项。",
+            "colab_gpu_not_allowed": "当前任务不支持所选 GPU 型号，请更换可用显卡喵。",
             "invalid_song_title": (
                 "歌名格式不太对，支持 1～60 字多语种文字、数字与常见标点"
                 '（不可含 / \\ < > " 等特殊符号）。'

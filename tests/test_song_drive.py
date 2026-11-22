@@ -881,6 +881,22 @@ async def test_song_playback_and_admin_drive_routes_work_without_colab_compute(
                 assert songs_data["drive_config_source"] == "default"
                 assert songs_data["drive_folders"]["songs"] == srv.songs_id
                 assert songs_data["drive_error"] is None
+                assert songs_data["learn_gpu_policy"] == {
+                    "default_gpu": "L4",
+                    "fallback_gpus": ["T4"],
+                    "allowed_gpus": ["L4", "T4", "A100", "H100"],
+                    "timeout_seconds": 1800,
+                }
+
+                # Disallowed GPU rejects with 400 before touching Drive or Colab
+                req_before = len(srv.requests)
+                bad_gpu_resp = await client.post(
+                    "/admin/api/songs/learn",
+                    json={"title": "晴天", "inbox_filename": "晴天.m4a", "gpu": "G4"},
+                )
+                assert bad_gpu_resp.status_code == 400
+                assert bad_gpu_resp.json()["detail"] == "colab_gpu_not_allowed"
+                assert len(srv.requests) == req_before
 
                 # GET /admin/api/songs/storage
                 st_resp = await client.get("/admin/api/songs/storage")
@@ -1193,3 +1209,15 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             await compute.registered["rvc_cover"]["pre_dispatch"](
                 {"id": "job-unconf", "job_type": "rvc_cover", "payload": {"title": "雨爱"}}
             )
+
+        # Early GPU rejection avoids uploading audio_bytes to real SongDriveStore
+        mod.drive.s = s
+        req_count_before_gpu_reject = len(srv.requests)
+        with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+            await mod.songs.request_learn_song(
+                "雨爱",
+                audio_bytes=b"RAW_AUDIO_NO_DRIVE_UPLOAD",
+                audio_filename="rain.mp3",
+                gpu="G4",
+            )
+        assert len(srv.requests) == req_count_before_gpu_reject

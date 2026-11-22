@@ -27,6 +27,14 @@ from hakimi.songs import (
     MAX_LEARN_UPLOAD_BYTES,
     MAX_SONG_TITLE_LEN,
     MAX_STORED_SONG_BYTES,
+    RVC_COVER_ALLOWED_GPUS,
+    RVC_COVER_DEFAULT_GPU,
+    RVC_COVER_FALLBACK_GPUS,
+    RVC_COVER_TIMEOUT_SECONDS,
+    RVC_TRAIN_ALLOWED_GPUS,
+    RVC_TRAIN_DEFAULT_GPU,
+    RVC_TRAIN_FALLBACK_GPUS,
+    RVC_TRAIN_TIMEOUT_SECONDS,
     SongLibrary,
     _safe_learn_upload_name,
     is_valid_song_title,
@@ -121,6 +129,7 @@ class _FakeColabCompute:
         self.download_calls: list[str] = []
         self.inbox_uploads: list[tuple[str, bytes, str]] = []
         self.submitted_jobs: list[tuple[str, dict[str, Any], str]] = []
+        self.submitted_gpus: list[str | None] = []
         self.hooks: dict[str, Any] = {}
         self.download_error: Exception | None = None
         self.submit_error: Exception | None = None
@@ -157,12 +166,14 @@ class _FakeColabCompute:
         if self.submit_error is not None:
             raise self.submit_error
         self.submitted_jobs.append((job_type, dict(payload), requester))
+        self.submitted_gpus.append(gpu)
         job_id = uuid.uuid4().hex
         return {
             "id": job_id,
             "job_type": job_type,
             "status": "queued",
             "requester": requester,
+            "preferred_gpu": gpu or RVC_COVER_DEFAULT_GPU,
             "payload": dict(payload),
             "created_at": time.time(),
         }
@@ -852,6 +863,12 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
             assert listing["drive_folders"] is None
             assert listing["drive_error"] is None
             assert listing["colab_configured"] is True
+            assert listing["learn_gpu_policy"] == {
+                "default_gpu": "L4",
+                "fallback_gpus": ["T4"],
+                "allowed_gpus": ["L4", "T4", "A100", "H100"],
+                "timeout_seconds": 1800,
+            }
             by_title = {item["title"]: item for item in listing["items"]}
             assert by_title["本地测试歌"]["cached_local"] is True
             assert by_title["本地测试歌"]["drive_backed"] is False
@@ -882,7 +899,7 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
             assert bad_src.status_code == 400
             assert bad_src.json()["detail"] == "song_source_required"
 
-            # Valid learn request
+            # Valid learn request (default GPU -> L4)
             ok_learn = await client.post(
                 "/admin/api/songs/learn",
                 json={
@@ -896,7 +913,48 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
             )
             assert ok_learn.status_code == 200
             assert ok_learn.json()["job_type"] == "rvc_cover"
+            assert ok_learn.json()["preferred_gpu"] == "L4"
             assert ok_learn.json()["payload"]["inbox_filename"] == "qilixiang.flac"
+            assert compute.submitted_gpus[-1] is None
+
+            # Optional per-request GPU override (normalized) & blank treated as default
+            gpu_learn = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "花海", "auto_search": True, "gpu": "A100"},
+            )
+            assert gpu_learn.status_code == 200
+            assert gpu_learn.json()["preferred_gpu"] == "A100"
+            assert compute.submitted_gpus[-1] == "A100"
+
+            blank_gpu_learn = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "枫", "auto_search": True, "gpu": "   "},
+            )
+            assert blank_gpu_learn.status_code == 200
+            assert blank_gpu_learn.json()["preferred_gpu"] == "L4"
+            assert compute.submitted_gpus[-1] is None
+
+            # Disallowed GPU (e.g. G4 excluded for RVC sm_120) rejected with 400 before submit
+            prev_submits = len(compute.submitted_jobs)
+            bad_gpu = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "晴天", "auto_search": True, "gpu": "G4"},
+            )
+            assert bad_gpu.status_code == 400
+            assert bad_gpu.json()["detail"] == "colab_gpu_not_allowed"
+            assert len(compute.submitted_jobs) == prev_submits
+            assert (
+                await client.post(
+                    "/admin/api/songs/learn",
+                    json={"title": "晴天", "auto_search": True, "gpu": 123},
+                )
+            ).status_code == 400
+            assert (
+                await client.post(
+                    "/admin/api/songs/learn",
+                    json={"title": "晴天", "auto_search": True, "gpu": "A" * 17},
+                )
+            ).status_code == 400
 
             # Error mappings: 409 conflict & 503 unconfigured
             compute.submit_error = Rejected("colab_daily_job_limit")
@@ -1019,3 +1077,309 @@ async def test_song_library_uses_direct_drive_store_independently_of_colab(store
     assert job["id"] == "gpu-job-1"
     assert drive.inbox_uploads == [("新曲.flac", b"AUDIO_RAW", "audio/flac")]
     assert gpu_compute.submitted[-1][1]["inbox_file_id"] == "direct-inbox-1"
+
+
+async def test_song_studio_gpu_policy_registration_early_reject_and_command_error(settings, store):
+    # 1) Single-source module constants
+    assert RVC_COVER_DEFAULT_GPU == "L4"
+    assert RVC_COVER_FALLBACK_GPUS == ("T4",)
+    assert RVC_COVER_ALLOWED_GPUS == ("L4", "T4", "A100", "H100")
+    assert RVC_COVER_TIMEOUT_SECONDS == 1800
+    assert "G4" not in RVC_COVER_ALLOWED_GPUS
+    assert RVC_TRAIN_DEFAULT_GPU == "H100"
+    assert RVC_TRAIN_FALLBACK_GPUS == ("A100",)
+    assert RVC_TRAIN_ALLOWED_GPUS == ("H100", "A100")
+    assert RVC_TRAIN_TIMEOUT_SECONDS == 3600
+    assert all(gpu not in RVC_TRAIN_ALLOWED_GPUS for gpu in ("T4", "L4", "G4"))
+
+    # 2) Policy-aware compute stub receives full GPU policies from SongStudioModule.initialize()
+    class _PolicyComputeStub:
+        def __init__(self) -> None:
+            self.registered: dict[str, dict[str, Any]] = {}
+            self.submitted: list[tuple[str, dict[str, Any], str, str | None]] = []
+
+        def configured(self) -> bool:
+            return True
+
+        def register_job_type(
+            self,
+            job_type: str,
+            *,
+            validator: Any,
+            pre_dispatch: Any = None,
+            on_complete: Any = None,
+            owner_module: str = "",
+            default_gpu: str = "L4",
+            fallback_gpus: tuple[str, ...] = (),
+            allowed_gpus: tuple[str, ...] | None = None,
+            timeout_seconds: int | None = None,
+        ) -> None:
+            self.registered[job_type] = {
+                "validator": validator,
+                "pre_dispatch": pre_dispatch,
+                "on_complete": on_complete,
+                "owner_module": owner_module,
+                "default_gpu": default_gpu,
+                "fallback_gpus": tuple(fallback_gpus),
+                "allowed_gpus": tuple(allowed_gpus or ()),
+                "timeout_seconds": timeout_seconds,
+            }
+
+        def get_job_type_spec(self, job_type: str) -> dict[str, Any] | None:
+            raw = self.registered.get(job_type)
+            if raw is None:
+                return None
+            return {
+                "job_type": job_type,
+                "owner_module": raw["owner_module"],
+                "default_gpu": raw["default_gpu"],
+                "fallback_gpus": list(raw["fallback_gpus"]),
+                "allowed_gpus": list(raw["allowed_gpus"]),
+                "timeout_seconds": raw["timeout_seconds"],
+            }
+
+        async def submit_job(
+            self,
+            job_type: str,
+            payload: dict[str, Any],
+            *,
+            requester: str = "owner",
+            gpu: str | None = None,
+        ) -> dict[str, Any]:
+            spec = self.registered[job_type]
+            chosen = gpu or spec["default_gpu"]
+            if chosen not in spec["allowed_gpus"]:
+                raise Rejected("colab_gpu_not_allowed")
+            self.submitted.append((job_type, dict(payload), requester, gpu))
+            return {
+                "id": uuid.uuid4().hex,
+                "job_type": job_type,
+                "status": "queued",
+                "preferred_gpu": chosen,
+                "payload": dict(payload),
+            }
+
+    class _TrackingDriveStub:
+        def __init__(self) -> None:
+            self.uploads: list[tuple[str, bytes, str]] = []
+
+        def configured(self) -> bool:
+            return True
+
+        async def upload_inbox_bytes(
+            self, filename: str, raw: bytes, *, mime_type: str = "application/octet-stream"
+        ) -> dict[str, Any]:
+            self.uploads.append((filename, raw, mime_type))
+            return {"file_id": "drv-inbox-1", "name": filename, "size": len(raw)}
+
+    class _TrackingPluginBus:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def has_tool(self, plugin_id: str, action: str, *, require_enabled: bool = True) -> bool:
+            return plugin_id == "song_finder" and action == "song_finder.fetch_source"
+
+        async def invoke_tool(self, *args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            raise AssertionError("song_finder must not be invoked when GPU is rejected")
+
+    compute = _PolicyComputeStub()
+
+    class _FakeColabMod:
+        module_id = "colab_compute"
+
+        def __init__(self) -> None:
+            self.compute = compute
+
+    class _FakeDriveMod:
+        module_id = "drive_sync"
+
+    registry = ModuleRegistry()
+    registry.systems["colab_compute"] = _FakeColabMod()  # type: ignore[assignment]
+    registry.systems["drive_sync"] = _FakeDriveMod()  # type: ignore[assignment]
+    resources = SystemResources(
+        settings=settings,
+        store=store,
+        gateway=FakeGateway(),  # type: ignore[arg-type]
+        http=None,
+        service=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    mod = SongStudioModule(resources, registry)
+    await mod.initialize()
+
+    cover_spec = compute.registered["rvc_cover"]
+    assert cover_spec["owner_module"] == "song_studio"
+    assert cover_spec["default_gpu"] == "L4"
+    assert cover_spec["fallback_gpus"] == ("T4",)
+    assert cover_spec["allowed_gpus"] == ("L4", "T4", "A100", "H100")
+    assert cover_spec["timeout_seconds"] == 1800
+
+    train_spec = compute.registered["rvc_train"]
+    assert train_spec["owner_module"] == "song_studio"
+    assert train_spec["default_gpu"] == "H100"
+    assert train_spec["fallback_gpus"] == ("A100",)
+    assert train_spec["allowed_gpus"] == ("H100", "A100")
+    assert train_spec["timeout_seconds"] == 3600
+
+    # Verify rvc_train rejects T4 / L4 / G4 under the registered spec
+    for disallowed_train_gpu in ("T4", "L4", "G4"):
+        with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+            await compute.submit_job(
+                "rvc_train", {"model_name": "hakimi"}, gpu=disallowed_train_gpu
+            )
+
+    # 3) learn_gpu_policy reads from compute spec and falls back cleanly when compute=None
+    assert mod.songs.learn_gpu_policy() == {
+        "default_gpu": "L4",
+        "fallback_gpus": ["T4"],
+        "allowed_gpus": ["L4", "T4", "A100", "H100"],
+        "timeout_seconds": 1800,
+    }
+    fallback_lib = SongLibrary(store, compute=None)
+    assert fallback_lib.learn_gpu_policy() == {
+        "default_gpu": "L4",
+        "fallback_gpus": ["T4"],
+        "allowed_gpus": ["L4", "T4", "A100", "H100"],
+        "timeout_seconds": 1800,
+    }
+
+    # 4) Early GPU validation blocks Drive upload and remote song_finder before any I/O
+    drive_stub = _TrackingDriveStub()
+    bus_stub = _TrackingPluginBus()
+    mod.songs.drive = drive_stub
+    mod.songs.plugin_bus = bus_stub
+
+    for bad_gpu in ("G4", "g4", "  g4 ", "RTX4090", 42):
+        with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+            await mod.songs.request_learn_song(
+                "晴天",
+                audio_bytes=b"RAW_AUDIO_SHOULD_NOT_UPLOAD",
+                audio_filename="晴天.mp3",
+                gpu=bad_gpu,  # type: ignore[arg-type]
+            )
+    with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+        await mod.songs.request_learn_song("晴天", auto_search=True, gpu="G4")
+    assert drive_stub.uploads == []
+    assert bus_stub.calls == 0
+    assert compute.submitted == []
+
+    # Allowed GPUs normalize case/whitespace and pass through cleanly
+    for raw_gpu, expected_gpu in (
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("l4", "L4"),
+        (" t4 ", "T4"),
+        ("a100", "A100"),
+        ("H100", "H100"),
+    ):
+        job = await mod.songs.request_learn_song(
+            "晴天",
+            inbox_filename="sun.mp3",
+            auto_search=False,
+            gpu=raw_gpu,
+        )
+        assert compute.submitted[-1][3] == expected_gpu
+        assert job["preferred_gpu"] == (expected_gpu or "L4")
+
+    # 5) /学歌 command maps colab_gpu_not_allowed to a friendly message
+    from hakimi.commands import handle_learn_song_command
+    from hakimi.models import Message
+
+    class _RejectGpuSongs:
+        async def request_learn_song(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise Rejected("colab_gpu_not_allowed")
+
+    fake_svc = SimpleNamespace(
+        s=settings.model_copy(update={"owner_qq_id": "20000"}),
+        songs=_RejectGpuSongs(),
+    )
+    msg = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="ev-gpu-err",
+        user_id="20000",
+        kind="private",
+        conversation_id="20000",
+        text="/学歌 晴天",
+        addressed=True,
+        created_at=time.time(),
+    )
+    reply = await handle_learn_song_command(fake_svc, msg, "晴天")
+    assert reply == "当前任务不支持所选 GPU 型号，请更换可用显卡喵。"
+
+
+async def test_song_studio_real_colab_hub_registration_and_admin_learn_gpu_e2e(
+    settings, tmp_path: Path
+):
+    s = settings.model_copy(
+        update={
+            "data_dir": tmp_path / "e2e_song_gpu",
+            "admin_token": SecretStr(ADMIN_TOKEN),
+            "colab_worker_url": "http://127.0.0.1:12146",
+            "colab_worker_token": SecretStr("test-colab-worker-token-never-live"),
+        }
+    )
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+    async with app.router.lifespan_context(app):
+        hub = app.state.service.colab_compute
+        assert hub.get_job_type_spec("rvc_cover") == {
+            "job_type": "rvc_cover",
+            "owner_module": "song_studio",
+            "default_gpu": "L4",
+            "fallback_gpus": ["T4"],
+            "allowed_gpus": ["L4", "T4", "A100", "H100"],
+            "timeout_seconds": 1800,
+        }
+        assert hub.get_job_type_spec("rvc_train") == {
+            "job_type": "rvc_train",
+            "owner_module": "song_studio",
+            "default_gpu": "H100",
+            "fallback_gpus": ["A100"],
+            "allowed_gpus": ["H100", "A100"],
+            "timeout_seconds": 3600,
+        }
+
+        train_job = await hub.submit_job("rvc_train", {"model_name": "hakimi"})
+        assert train_job["preferred_gpu"] == "H100"
+        assert train_job["fallback_gpus"] == ["A100"]
+        for bad_train_gpu in ("T4", "L4", "G4"):
+            with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
+                await hub.submit_job("rvc_train", {"model_name": "hakimi"}, gpu=bad_train_gpu)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        ) as client:
+            songs_resp = await client.get("/admin/api/songs")
+            assert songs_resp.status_code == 200
+            assert songs_resp.json()["learn_gpu_policy"] == {
+                "default_gpu": "L4",
+                "fallback_gpus": ["T4"],
+                "allowed_gpus": ["L4", "T4", "A100", "H100"],
+                "timeout_seconds": 1800,
+            }
+
+            default_learn = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "晴天", "auto_search": True},
+            )
+            assert default_learn.status_code == 200
+            assert default_learn.json()["preferred_gpu"] == "L4"
+            assert default_learn.json()["fallback_gpus"] == ["T4"]
+
+            override_learn = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "夜曲", "auto_search": True, "gpu": "A100"},
+            )
+            assert override_learn.status_code == 200
+            assert override_learn.json()["preferred_gpu"] == "A100"
+            assert override_learn.json()["fallback_gpus"] == ["L4", "T4"]
+
+            rejected_learn = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "稻香", "auto_search": True, "gpu": "G4"},
+            )
+            assert rejected_learn.status_code == 400
+            assert rejected_learn.json()["detail"] == "colab_gpu_not_allowed"

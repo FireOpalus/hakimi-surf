@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
@@ -10,6 +11,14 @@ from typing import TYPE_CHECKING, Any
 from ..security import Rejected
 from ..song_drive import SongDriveStore, compute_weight_cache_key
 from ..songs import (
+    RVC_COVER_ALLOWED_GPUS,
+    RVC_COVER_DEFAULT_GPU,
+    RVC_COVER_FALLBACK_GPUS,
+    RVC_COVER_TIMEOUT_SECONDS,
+    RVC_TRAIN_ALLOWED_GPUS,
+    RVC_TRAIN_DEFAULT_GPU,
+    RVC_TRAIN_FALLBACK_GPUS,
+    RVC_TRAIN_TIMEOUT_SECONDS,
     RvcCoverJobPayload,
     RvcTrainJobPayload,
     SongLibrary,
@@ -25,6 +34,24 @@ if TYPE_CHECKING:
 log = logging.getLogger("hakimi")
 
 _SUCCESS_STATUSES = frozenset({"succeeded", "completed", "ok", "done"})
+
+
+def _filter_supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return kwargs
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key in params
+        and params[key].kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+
 
 __all__ = [
     "Module",
@@ -74,17 +101,38 @@ class Module(SystemModule):
         await self.drive.initialize()
         await self.songs.initialize()
         if not self._hook_registered and self.compute is not None:
-            if hasattr(self.compute, "register_job_type"):
-                self.compute.register_job_type(
+            register_fn = getattr(self.compute, "register_job_type", None)
+            if callable(register_fn):
+                register_fn(
                     "rvc_cover",
-                    validator=validate_rvc_cover_payload,
-                    pre_dispatch=self._prepare_rvc_cover_dispatch,
-                    on_complete=self._on_rvc_cover_completed,
+                    **_filter_supported_kwargs(
+                        register_fn,
+                        {
+                            "validator": validate_rvc_cover_payload,
+                            "pre_dispatch": self._prepare_rvc_cover_dispatch,
+                            "on_complete": self._on_rvc_cover_completed,
+                            "owner_module": self.module_id,
+                            "default_gpu": RVC_COVER_DEFAULT_GPU,
+                            "fallback_gpus": RVC_COVER_FALLBACK_GPUS,
+                            "allowed_gpus": RVC_COVER_ALLOWED_GPUS,
+                            "timeout_seconds": RVC_COVER_TIMEOUT_SECONDS,
+                        },
+                    ),
                 )
-                self.compute.register_job_type(
+                register_fn(
                     "rvc_train",
-                    validator=validate_rvc_train_payload,
-                    pre_dispatch=self._prepare_rvc_train_dispatch,
+                    **_filter_supported_kwargs(
+                        register_fn,
+                        {
+                            "validator": validate_rvc_train_payload,
+                            "pre_dispatch": self._prepare_rvc_train_dispatch,
+                            "owner_module": self.module_id,
+                            "default_gpu": RVC_TRAIN_DEFAULT_GPU,
+                            "fallback_gpus": RVC_TRAIN_FALLBACK_GPUS,
+                            "allowed_gpus": RVC_TRAIN_ALLOWED_GPUS,
+                            "timeout_seconds": RVC_TRAIN_TIMEOUT_SECONDS,
+                        },
+                    ),
                 )
                 self._hook_registered = True
             elif hasattr(self.compute, "register_completion_hook"):

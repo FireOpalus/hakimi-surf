@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import math
 import os
@@ -40,6 +41,14 @@ MAX_SONG_PITCH = 24
 DEFAULT_BACKING_GAIN_DB = -14.0
 MIN_BACKING_GAIN_DB = -24.0
 MAX_BACKING_GAIN_DB = -6.0
+RVC_COVER_DEFAULT_GPU = "L4"
+RVC_COVER_FALLBACK_GPUS: tuple[str, ...] = ("T4",)
+RVC_COVER_ALLOWED_GPUS: tuple[str, ...] = ("L4", "T4", "A100", "H100")
+RVC_COVER_TIMEOUT_SECONDS = 1800
+RVC_TRAIN_DEFAULT_GPU = "H100"
+RVC_TRAIN_FALLBACK_GPUS: tuple[str, ...] = ("A100",)
+RVC_TRAIN_ALLOWED_GPUS: tuple[str, ...] = ("H100", "A100")
+RVC_TRAIN_TIMEOUT_SECONDS = 3600
 SONG_FINDER_PLUGIN_ID = "song_finder"
 SONG_FINDER_FETCH_ACTION = "song_finder.fetch_source"
 SONG_FINDER_MAX_AUDIO_BYTES = 40 * 1024 * 1024
@@ -438,6 +447,22 @@ def _reject_bool_num(value: Any, *, name: str) -> Any:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be numeric, not bool")
     return value
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 class RvcCoverJobPayload(BaseModel):
@@ -1342,6 +1367,47 @@ class SongLibrary:
                 await self._evict_cache_locked(keep_ids={song_id})
             return self._public(entry)
 
+    def learn_gpu_policy(self) -> dict[str, Any]:
+        """Return the active GPU policy for `rvc_cover` learning jobs."""
+        spec: Any = None
+        get_spec = getattr(self.compute, "get_job_type_spec", None)
+        if callable(get_spec):
+            spec = get_spec("rvc_cover")
+        if isinstance(spec, dict):
+            default_gpu = str(spec.get("default_gpu") or RVC_COVER_DEFAULT_GPU).strip().upper()
+            raw_fallbacks = spec.get("fallback_gpus")
+            fallback_gpus = (
+                [str(g).strip().upper() for g in raw_fallbacks if str(g).strip()]
+                if isinstance(raw_fallbacks, (list, tuple))
+                else list(RVC_COVER_FALLBACK_GPUS)
+            )
+            raw_allowed = spec.get("allowed_gpus")
+            allowed_gpus = (
+                [str(g).strip().upper() for g in raw_allowed if str(g).strip()]
+                if isinstance(raw_allowed, (list, tuple))
+                else list(RVC_COVER_ALLOWED_GPUS)
+            )
+            raw_timeout = spec.get("timeout_seconds")
+            timeout_seconds = (
+                int(raw_timeout)
+                if isinstance(raw_timeout, int)
+                and not isinstance(raw_timeout, bool)
+                and raw_timeout > 0
+                else RVC_COVER_TIMEOUT_SECONDS
+            )
+            return {
+                "default_gpu": default_gpu or RVC_COVER_DEFAULT_GPU,
+                "fallback_gpus": fallback_gpus,
+                "allowed_gpus": allowed_gpus or list(RVC_COVER_ALLOWED_GPUS),
+                "timeout_seconds": timeout_seconds,
+            }
+        return {
+            "default_gpu": RVC_COVER_DEFAULT_GPU,
+            "fallback_gpus": list(RVC_COVER_FALLBACK_GPUS),
+            "allowed_gpus": list(RVC_COVER_ALLOWED_GPUS),
+            "timeout_seconds": RVC_COVER_TIMEOUT_SECONDS,
+        }
+
     async def request_learn_song(
         self,
         title: str,
@@ -1357,6 +1423,7 @@ class SongLibrary:
         backing_gain_db: float | None = None,
         skip_backing: bool | None = None,
         skip_dereverb: bool | None = None,
+        gpu: str | None = None,
         requester: str = "owner",
     ) -> dict[str, Any]:
         """Submit an asynchronous Colab RVC cover job via upload, Drive inbox, or auto-search."""
@@ -1364,6 +1431,15 @@ class SongLibrary:
         clean_artist = validate_song_meta(artist, max_len=40)
         clean_tags = validate_song_meta(tags, max_len=80)
         clean_pitch = validate_song_pitch(pitch)
+        clean_gpu: str | None = None
+        if gpu is not None:
+            if not isinstance(gpu, str):
+                raise Rejected("colab_gpu_not_allowed")
+            normalized_gpu = gpu.strip().upper()
+            if normalized_gpu:
+                if normalized_gpu not in RVC_COVER_ALLOWED_GPUS:
+                    raise Rejected("colab_gpu_not_allowed")
+                clean_gpu = normalized_gpu
         if not self._compute_configured():
             raise Rejected("colab_unconfigured")
         await self.initialize()
@@ -1444,7 +1520,10 @@ class SongLibrary:
             else:
                 raise Rejected("song_source_required")
 
-        return await self.compute.submit_job("rvc_cover", payload, requester=requester)
+        submit_kwargs: dict[str, Any] = {"requester": requester}
+        if clean_gpu is not None or _accepts_kwarg(self.compute.submit_job, "gpu"):
+            submit_kwargs["gpu"] = clean_gpu
+        return await self.compute.submit_job("rvc_cover", payload, **submit_kwargs)
 
     async def _touch_last_used(self, entry: dict[str, Any], now: float) -> None:
         entry["cached_local"] = True
