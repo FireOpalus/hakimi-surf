@@ -37,6 +37,9 @@ DEFAULT_SONG_CACHE_MAX_BYTES = 30 * 1024 * 1024
 CACHE_EVICT_INTERVAL_SECONDS = 1800.0
 MIN_SONG_PITCH = -24
 MAX_SONG_PITCH = 24
+DEFAULT_BACKING_GAIN_DB = -14.0
+MIN_BACKING_GAIN_DB = -24.0
+MAX_BACKING_GAIN_DB = -6.0
 SONG_FINDER_PLUGIN_ID = "song_finder"
 SONG_FINDER_FETCH_ACTION = "song_finder.fetch_source"
 SONG_FINDER_MAX_AUDIO_BYTES = 40 * 1024 * 1024
@@ -458,6 +461,13 @@ class RvcCoverJobPayload(BaseModel):
     index_rate: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
     protect: float = Field(default=0.28, ge=0.0, le=0.5, allow_inf_nan=False)
     volume_envelope: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+    backing_gain_db: float = Field(
+        default=DEFAULT_BACKING_GAIN_DB,
+        ge=MIN_BACKING_GAIN_DB,
+        le=MAX_BACKING_GAIN_DB,
+        allow_inf_nan=False,
+    )
+    skip_backing: bool = False
 
     @field_validator("title")
     @classmethod
@@ -471,6 +481,18 @@ class RvcCoverJobPayload(BaseModel):
     @classmethod
     def _check_pitch(cls, value: Any) -> Any:
         return _reject_bool_num(value, name="pitch")
+
+    @field_validator("backing_gain_db", mode="before")
+    @classmethod
+    def _check_backing_gain_db(cls, value: Any) -> Any:
+        return _reject_bool_num(value, name="backing_gain_db")
+
+    @field_validator("skip_backing", mode="before")
+    @classmethod
+    def _check_skip_backing(cls, value: Any) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError("skip_backing must be a boolean")
+        return value
 
     @field_validator("inbox_file_id")
     @classmethod
@@ -1331,6 +1353,8 @@ class SongLibrary:
         inbox_filename: str = "",
         inbox_file_id: str = "",
         auto_search: bool = True,
+        backing_gain_db: float | None = None,
+        skip_backing: bool | None = None,
         requester: str = "owner",
     ) -> dict[str, Any]:
         """Submit an asynchronous Colab RVC cover job via upload, Drive inbox, or auto-search."""
@@ -1348,6 +1372,22 @@ class SongLibrary:
             "tags": clean_tags,
             "pitch": clean_pitch,
         }
+        if backing_gain_db is not None:
+            if isinstance(backing_gain_db, bool):
+                raise Rejected("colab_invalid_job")
+            try:
+                bg_val = float(backing_gain_db)
+            except (TypeError, ValueError):
+                raise Rejected("colab_invalid_job") from None
+            if not math.isfinite(bg_val) or not (
+                MIN_BACKING_GAIN_DB <= bg_val <= MAX_BACKING_GAIN_DB
+            ):
+                raise Rejected("colab_invalid_job")
+            payload["backing_gain_db"] = bg_val
+        if skip_backing is not None:
+            if not isinstance(skip_backing, bool):
+                raise Rejected("colab_invalid_job")
+            payload["skip_backing"] = skip_backing
 
         if audio_bytes is not None:
             if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:

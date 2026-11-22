@@ -50,6 +50,8 @@ colab_drive = _load_script("colab_drive", "scripts/colab_drive.py")
 colab_remote = _load_script("colab_remote_rvc", "scripts/colab_remote_rvc.py")
 colab_rvc = _load_script("colab_rvc", "scripts/colab_rvc.py")
 colab_worker = _load_script("colab_worker", "scripts/colab_worker.py")
+colab_jobs = colab_worker.colab_jobs_mod
+colab_jobs_rvc = colab_jobs.rvc
 
 
 class FakeDriveBackend:
@@ -1601,6 +1603,8 @@ def test_colab_decoupling_static_ast_and_routes() -> None:
         REPO_ROOT / "src" / "hakimi" / "colab_admin.py",
         REPO_ROOT / "src" / "hakimi" / "system_modules" / "colab_compute.py",
         REPO_ROOT / "scripts" / "colab_worker.py",
+        REPO_ROOT / "scripts" / "colab_jobs" / "__init__.py",
+        REPO_ROOT / "scripts" / "colab_jobs" / "rvc.py",
     )
     for path in targets:
         src = path.read_text(encoding="utf-8")
@@ -1619,49 +1623,88 @@ def test_colab_decoupling_static_ast_and_routes() -> None:
         assert "colab_drive.py" not in src, path
         assert "roaming-oauth.json" not in src, path
         assert "colab-drive-oauth.json" not in src, path
-        if path.name != "colab_worker.py":
+        if path.name != "rvc.py":
             assert "drive_songs_folder_id" not in src, path
+
+    worker_src = (REPO_ROOT / "scripts" / "colab_worker.py").read_text(encoding="utf-8")
+    for extracted_symbol in (
+        "class RvcCoverPayload",
+        "class RvcTrainPayload",
+        "def _run_cover_sync",
+        "def _run_train_sync",
+        "class EphemeralDriveClient",
+    ):
+        assert extracted_symbol not in worker_src
 
 
 def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
     import inspect
 
-    # 1. Cover defaults: 0.25 / 0.28 / 0.25
-    w_cover = colab_worker.RvcCoverPayload(title="test")
-    assert (w_cover.index_rate, w_cover.protect, w_cover.volume_envelope) == (0.25, 0.28, 0.25)
+    # 1. Cover defaults: 0.25 / 0.28 / 0.25 and backing mix -14.0 / False
+    w_cover = colab_jobs_rvc.RvcCoverPayload(title="test")
+    assert (
+        w_cover.index_rate,
+        w_cover.protect,
+        w_cover.volume_envelope,
+        w_cover.backing_gain_db,
+        w_cover.skip_backing,
+    ) == (0.25, 0.28, 0.25, -14.0, False)
 
     h_cover = RvcCoverJobPayload(title="test")
-    assert (h_cover.index_rate, h_cover.protect, h_cover.volume_envelope) == (0.25, 0.28, 0.25)
+    assert (
+        h_cover.index_rate,
+        h_cover.protect,
+        h_cover.volume_envelope,
+        h_cover.backing_gain_db,
+        h_cover.skip_backing,
+    ) == (0.25, 0.28, 0.25, -14.0, False)
+
+    # Strict validation for backing_gain_db (finite float in [-24, -6], no bool) & skip_backing
+    for model_cls in (colab_jobs_rvc.RvcCoverPayload, RvcCoverJobPayload):
+        for bad_bg in (True, False, float("nan"), float("inf"), -24.5, -5.5):
+            with pytest.raises(ValidationError):
+                model_cls(title="test", backing_gain_db=bad_bg)  # type: ignore[arg-type]
+        for bad_skip in (1, 0, "true"):
+            with pytest.raises(ValidationError):
+                model_cls(title="test", skip_backing=bad_skip)  # type: ignore[arg-type]
 
     sig_cov_rvc = inspect.signature(colab_rvc.run_cover_pipeline).parameters
     assert sig_cov_rvc["index_rate"].default == 0.25
     assert sig_cov_rvc["protect"].default == 0.28
     assert sig_cov_rvc["volume_envelope"].default == 0.25
+    assert sig_cov_rvc["backing_gain_db"].default == -14.0
+    assert sig_cov_rvc["skip_backing"].default is False
 
     sig_cov_rem = inspect.signature(colab_remote.action_cover).parameters
     assert sig_cov_rem["index_rate"].default == 0.25
     assert sig_cov_rem["protect"].default == 0.28
     assert sig_cov_rem["volume_envelope"].default == 0.25
+    assert sig_cov_rem["backing_gain_db"].default == -14.0
+    assert sig_cov_rem["skip_backing"].default is False
 
     rvc_cover_args = colab_rvc._build_parser().parse_args(
         ["cover", "--source", "s.mp3", "--title", "t"]
     )
-    assert (rvc_cover_args.index_rate, rvc_cover_args.protect, rvc_cover_args.volume_envelope) == (
-        0.25,
-        0.28,
-        0.25,
-    )
+    assert (
+        rvc_cover_args.index_rate,
+        rvc_cover_args.protect,
+        rvc_cover_args.volume_envelope,
+        rvc_cover_args.backing_gain_db,
+        rvc_cover_args.skip_backing,
+    ) == (0.25, 0.28, 0.25, -14.0, False)
     rem_cover_args = colab_remote._build_parser().parse_args(
         ["cover", "--source", "s.mp3", "--pth", "m.pth", "--index", "m.index"]
     )
-    assert (rem_cover_args.index_rate, rem_cover_args.protect, rem_cover_args.volume_envelope) == (
-        0.25,
-        0.28,
-        0.25,
-    )
+    assert (
+        rem_cover_args.index_rate,
+        rem_cover_args.protect,
+        rem_cover_args.volume_envelope,
+        rem_cover_args.backing_gain_db,
+        rem_cover_args.skip_backing,
+    ) == (0.25, 0.28, 0.25, -14.0, False)
 
     # 2. Train defaults: 150 / 30 / 12 / 48000 & train CLI --gpu default
-    w_train = colab_worker.RvcTrainPayload()
+    w_train = colab_jobs_rvc.RvcTrainPayload()
     assert (w_train.epochs, w_train.save_every, w_train.batch_size, w_train.sample_rate) == (
         150,
         30,
@@ -2557,3 +2600,268 @@ async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
         assert res.status_code == 200
         assert sess_name in stopped
         assert state.warm_pool.snapshot() == []
+
+
+async def test_colab_jobs_dynamic_handler_registry_rvc_mixing_and_cli_help(
+    tmp_path: Path,
+) -> None:
+    from pydantic import BaseModel, ConfigDict, Field
+
+    class _DemoWhisperPayload(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        clip_id: str = Field(min_length=1, max_length=64)
+        language: str = Field(default="auto", max_length=16)
+        fail_with_secret: bool = False
+
+    class _DemoCustomError(RuntimeError):
+        def __init__(self, code: str, msg: str) -> None:
+            self.code = code
+            super().__init__(msg)
+
+    seen_contexts: list[dict[str, Any]] = []
+
+    class _DemoWhisperHandler(colab_jobs.JobHandler):
+        job_type = "demo_whisper"
+        payload_model = _DemoWhisperPayload
+        allow_warm_keepalive = True
+        allowed_error_codes = frozenset({"custom_audio_error"})
+
+        def run_sync(
+            self,
+            ctx: colab_jobs.WorkerJobContext,
+            parsed_payload: _DemoWhisperPayload,
+        ) -> tuple[dict[str, Any], str]:
+            has_drive = ctx.dispatch_context is not None and ctx.dispatch_context.drive is not None
+            seen_contexts.append(
+                {
+                    "job_id": ctx.job_id,
+                    "clip_id": parsed_payload.clip_id,
+                    "has_drive": has_drive,
+                    "can_keep_l4": ctx.can_keep_warm("L4"),
+                    "can_keep_h100": ctx.can_keep_warm("H100"),
+                }
+            )
+            if parsed_payload.fail_with_secret:
+                tok = (
+                    ctx.dispatch_context.drive.access_token
+                    if (ctx.dispatch_context and ctx.dispatch_context.drive)
+                    else ""
+                )
+                raise _DemoCustomError(
+                    "custom_audio_error",
+                    f"decode failed tok={tok} ya29.demo-secret-123 "
+                    "1//demo-refresh-456 Bearer demo999999",
+                )
+            return {
+                "clip_id": parsed_payload.clip_id,
+                "transcript": f"ok:{parsed_payload.language}",
+            }, ctx.gpu_candidates[0]
+
+    captured_cover_kwargs: list[dict[str, Any]] = []
+
+    def tracking_cover_runner(**kwargs):
+        captured_cover_kwargs.append(dict(kwargs))
+        c_dir = Path(kwargs["cover_dir"])
+        c_dir.mkdir(parents=True, exist_ok=True)
+        chorus = c_dir / "cover_chorus.mp3"
+        full = c_dir / "cover_full.mp3"
+        chorus.write_bytes(_fake_mp3_bytes(b"mix-chorus"))
+        full.write_bytes(_fake_mp3_bytes(b"mix-full"))
+        return {
+            "assigned_gpu": "L4",
+            "chorus_mp3": chorus,
+            "full_mp3": full,
+            "meta": {"chorus_start_sec": 45.0, "chorus_duration_sec": 50.0},
+        }
+
+    # 1) Dynamic plugin handler registration + duplicate rejection + end-to-end dispatch
+    handler = _DemoWhisperHandler()
+    colab_jobs.register_job_handler(handler)
+    try:
+        with pytest.raises(ValueError, match="already registered"):
+            colab_jobs.register_job_handler(handler)
+        assert colab_jobs.get_job_handler("demo_whisper") is handler
+        assert "demo_whisper" in colab_jobs.registered_job_types()
+
+        app, cfg, drive_client, tree, _, _ = _build_test_worker(
+            tmp_path, cover_runner=tracking_cover_runner
+        )
+        headers = {"Authorization": f"Bearer {cfg.token}"}
+        ephem_tok = "opaque_custom_handler_tok_777888"
+        inbox_up = drive_client.upload_bytes(
+            "inbox", "shidarezakura.m4a", b"RAW_M4A", mime_type="audio/mp4"
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12146",
+        ) as client:
+            st = (await client.get("/v1/status", headers=headers)).json()
+            assert st["supported_job_types"] == ["demo_whisper", "rvc_cover", "rvc_train"]
+
+            # Invalid payload for custom handler rejected with 400
+            bad = await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={"job_id": "1" * 32, "job_type": "demo_whisper", "payload": {"bad": 1}},
+            )
+            assert bad.status_code == 400
+            assert bad.json()["detail"] == "colab_invalid_job"
+
+            # Valid custom handler job succeeds without leaking dispatch_context or tokens
+            ok_jid = "2" * 32
+            sub_ok = await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": ok_jid,
+                    "job_type": "demo_whisper",
+                    "gpu_candidates": ["L4"],
+                    "payload": {"clip_id": "clip-01", "language": "ja"},
+                    "dispatch_context": _make_drive_dispatch_context(tree, access_token=ephem_tok),
+                },
+            )
+            assert sub_ok.status_code == 202
+            if (t_ok := app.state.worker_state.tasks.get(ok_jid)) is not None:
+                await t_ok
+            rec_ok = app.state.worker_state.jobs[ok_jid]
+            assert not hasattr(rec_ok, "dispatch_context")
+            job_ok = (await client.get(f"/v1/jobs/{ok_jid}", headers=headers)).json()
+            assert job_ok["status"] == "succeeded"
+            assert job_ok["assigned_gpu"] == "L4"
+            assert job_ok["result"] == {"clip_id": "clip-01", "transcript": "ok:ja"}
+            assert "dispatch_context" not in job_ok
+            assert ephem_tok not in json.dumps(job_ok)
+            assert seen_contexts[-1] == {
+                "job_id": ok_jid,
+                "clip_id": "clip-01",
+                "has_drive": True,
+                "can_keep_l4": True,
+                "can_keep_h100": False,
+            }
+
+            # Custom handler allowed error_code + full token scrubbing on failure
+            fail_jid = "3" * 32
+            sub_fail = await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": fail_jid,
+                    "job_type": "demo_whisper",
+                    "gpu_candidates": ["L4"],
+                    "payload": {"clip_id": "clip-02", "fail_with_secret": True},
+                    "dispatch_context": _make_drive_dispatch_context(tree, access_token=ephem_tok),
+                },
+            )
+            assert sub_fail.status_code == 202
+            if (t_fail := app.state.worker_state.tasks.get(fail_jid)) is not None:
+                await t_fail
+            job_fail = (await client.get(f"/v1/jobs/{fail_jid}", headers=headers)).json()
+            assert job_fail["status"] == "failed"
+            assert job_fail["error_code"] == "custom_audio_error"
+            dumped_fail = json.dumps(job_fail)
+            for secret_val in (
+                ephem_tok,
+                "ya29.demo-secret-123",
+                "1//demo-refresh-456",
+                "demo999999",
+                cfg.token,
+            ):
+                assert secret_val not in dumped_fail
+
+            # 3) RVC cover mixing params pass through worker -> RvcCoverHandler -> cover_runner
+            mix_jid = "4" * 32
+            sub_mix = await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": mix_jid,
+                    "job_type": "rvc_cover",
+                    "gpu_candidates": ["L4"],
+                    "payload": {
+                        "title": "枝垂桜",
+                        "inbox_file_id": inbox_up["file_id"],
+                        "backing_gain_db": -16.5,
+                        "skip_backing": True,
+                    },
+                    "dispatch_context": _make_drive_dispatch_context(
+                        tree,
+                        inbox_file_id=inbox_up["file_id"],
+                        inbox_name="shidarezakura.m4a",
+                    ),
+                },
+            )
+            assert sub_mix.status_code == 202
+            if (t_mix := app.state.worker_state.tasks.get(mix_jid)) is not None:
+                await t_mix
+            job_mix = (await client.get(f"/v1/jobs/{mix_jid}", headers=headers)).json()
+            assert job_mix["status"] == "succeeded"
+            assert captured_cover_kwargs[-1]["backing_gain_db"] == -16.5
+            assert captured_cover_kwargs[-1]["skip_backing"] is True
+    finally:
+        colab_jobs.unregister_job_handler("demo_whisper")
+        assert colab_jobs.get_job_handler("demo_whisper") is None
+
+
+def test_colab_worker_cli_help_standalone() -> None:
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "colab_worker.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15.0,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--host" in proc.stdout and "--port" in proc.stdout
+
+
+async def test_song_library_request_learn_song_mixing_params(store) -> None:
+    from hakimi.songs import SongLibrary
+
+    submitted: list[tuple[str, dict[str, Any]]] = []
+
+    class _StubCompute:
+        def configured(self) -> bool:
+            return True
+
+        async def submit_job(
+            self, job_type: str, payload: dict[str, Any], *, requester: str = "owner"
+        ) -> dict[str, Any]:
+            del requester
+            validated = validate_rvc_cover_payload(payload)
+            submitted.append((job_type, validated))
+            return {"id": "a" * 32, "job_type": job_type, "payload": validated}
+
+    lib = SongLibrary(store, compute=_StubCompute())
+    await lib.initialize()
+
+    # Default call remains backward-compatible and normalizes defaults via RvcCoverJobPayload
+    await lib.request_learn_song("枝垂桜", auto_search=True)
+    assert submitted[-1][1]["backing_gain_db"] == -14.0
+    assert submitted[-1][1]["skip_backing"] is False
+
+    # Explicit mixing overrides pass through cleanly
+    await lib.request_learn_song(
+        "枝垂桜",
+        auto_search=True,
+        backing_gain_db=-16.0,
+        skip_backing=True,
+    )
+    assert submitted[-1][1]["backing_gain_db"] == -16.0
+    assert submitted[-1][1]["skip_backing"] is True
+
+    # Invalid mixing parameters are strictly rejected
+    for bad_bg in (True, float("nan"), float("inf"), -25.0, -5.0):
+        with pytest.raises(Rejected, match="colab_invalid_job"):
+            await lib.request_learn_song(
+                "枝垂桜",
+                auto_search=True,
+                backing_gain_db=bad_bg,  # type: ignore[arg-type]
+            )
+    with pytest.raises(Rejected, match="colab_invalid_job"):
+        await lib.request_learn_song(
+            "枝垂桜",
+            auto_search=True,
+            skip_backing="1",  # type: ignore[arg-type]
+        )

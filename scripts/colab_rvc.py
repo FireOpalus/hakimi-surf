@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -48,6 +49,9 @@ SUPPORTED_AUDIO_EXTS = frozenset({".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opu
 
 DEFAULT_ADMIN_BASE_URL = "http://127.0.0.1:12143"
 DEFAULT_CHUNK_MB = 6
+DEFAULT_BACKING_GAIN_DB = -14.0
+MIN_BACKING_GAIN_DB = -24.0
+MAX_BACKING_GAIN_DB = -6.0
 STATUS_OK_MARKER = "__HAKIMI_COLAB_STATUS__=OK"
 STATUS_ERR_PREFIX = "__HAKIMI_COLAB_STATUS__=ERROR:"
 DRIVE_OUTPUTS_PREFIX = "__HAKIMI_DRIVE_OUTPUTS__="
@@ -1395,6 +1399,19 @@ def stop_all_sessions(extra_sessions: list[str] | None = None) -> dict[str, Any]
     return {"terminated_sessions": len(stopped), "sessions": stopped}
 
 
+def _validate_backing_gain_db(value: float) -> float:
+    """Validate finite non-bool numeric backing_gain_db and clamp to [-24.0, -6.0] dB."""
+    if isinstance(value, bool):
+        raise ValueError("backing_gain_db must be numeric, not bool")
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("backing_gain_db must be a finite float") from None
+    if not math.isfinite(val):
+        raise ValueError("backing_gain_db must be finite")
+    return max(MIN_BACKING_GAIN_DB, min(MAX_BACKING_GAIN_DB, val))
+
+
 def run_cover_pipeline(
     *,
     session: str,
@@ -1408,6 +1425,8 @@ def run_cover_pipeline(
     index_rate: float = 0.25,
     protect: float = 0.28,
     volume_envelope: float = 0.25,
+    backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
+    skip_backing: bool = False,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -1436,6 +1455,9 @@ def run_cover_pipeline(
     keep_session_on_success: bool = False,
 ) -> dict[str, Any]:
     """Run Colab RVC cover with Drive direct transfer, warm session reuse, and weight cache."""
+    if not isinstance(skip_backing, bool):
+        raise ValueError("skip_backing must be a boolean")
+    clamped_backing_gain_db = _validate_backing_gain_db(backing_gain_db)
     warm_reused = bool(reuse_session and reused_gpu)
     assigned_gpu = reused_gpu if warm_reused else provision_gpu(session, gpu=gpu_spec)
     can_keep_session = bool(keep_session_on_success and assigned_gpu in {"L4", "T4"})
@@ -1530,6 +1552,8 @@ def run_cover_pipeline(
             "HAKIMI_INDEX_RATE": str(index_rate),
             "HAKIMI_PROTECT": str(protect),
             "HAKIMI_VOLUME_ENVELOPE": str(volume_envelope),
+            "HAKIMI_BACKING_GAIN_DB": f"{clamped_backing_gain_db:.1f}",
+            "HAKIMI_SKIP_BACKING": "1" if skip_backing else "0",
             "HAKIMI_START_SEC": str(start_sec),
             "HAKIMI_DURATION_SEC": str(duration_sec),
             "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
@@ -1966,7 +1990,12 @@ def _run_remote_cover(
     duration_sec: float,
     chorus_anchor: str,
     fallback_start_sec: float,
+    backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
+    skip_backing: bool = False,
 ) -> tuple[Path, Path, dict[str, Any]]:
+    if not isinstance(skip_backing, bool):
+        raise ValueError("skip_backing must be a boolean")
+    clamped_backing_gain_db = _validate_backing_gain_db(backing_gain_db)
     ext = source_path.suffix or ".m4a"
     remote_source = f"/content/work/source_song{ext}"
     upload_file_chunked(session, source_path, remote_source, tag="source_song")
@@ -1981,6 +2010,8 @@ def _run_remote_cover(
             "HAKIMI_INDEX_RATE": str(index_rate),
             "HAKIMI_PROTECT": str(protect),
             "HAKIMI_VOLUME_ENVELOPE": str(volume_envelope),
+            "HAKIMI_BACKING_GAIN_DB": f"{clamped_backing_gain_db:.1f}",
+            "HAKIMI_SKIP_BACKING": "1" if skip_backing else "0",
             "HAKIMI_START_SEC": str(start_sec),
             "HAKIMI_DURATION_SEC": str(duration_sec),
             "HAKIMI_CHORUS_ANCHOR": chorus_anchor,
@@ -2071,6 +2102,8 @@ def cmd_cover(args: argparse.Namespace) -> int:
             duration_sec=args.duration,
             chorus_anchor=args.chorus_anchor,
             fallback_start_sec=args.fallback_start,
+            backing_gain_db=args.backing_gain_db,
+            skip_backing=args.skip_backing,
         )
     finally:
         if not args.keep_session:
@@ -2128,6 +2161,8 @@ def cmd_all(args: argparse.Namespace) -> int:
             duration_sec=args.duration,
             chorus_anchor=args.chorus_anchor,
             fallback_start_sec=args.fallback_start,
+            backing_gain_db=args.backing_gain_db,
+            skip_backing=args.skip_backing,
         )
     finally:
         if not args.keep_session:
@@ -2204,6 +2239,8 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--index-rate", type=float, default=0.25)
         p.add_argument("--protect", type=float, default=0.28)
         p.add_argument("--volume-envelope", type=float, default=0.25)
+        p.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
+        p.add_argument("--skip-backing", action="store_true")
         p.add_argument("--start", default="auto")
         p.add_argument("--duration", type=float, default=50.0)
         p.add_argument("--chorus-anchor", default="")

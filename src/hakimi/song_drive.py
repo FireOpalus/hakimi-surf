@@ -1230,28 +1230,43 @@ class SongDriveStore:
             "Content-Type": mime_type,
         }
         client = await self._http()
+        req = client.build_request(
+            "PUT",
+            upload_url,
+            headers=req_headers,
+            content=chunk,
+            timeout=httpx.Timeout(max(self._timeout, 120.0), connect=10.0),
+        )
+        resp: httpx.Response | None = None
         try:
-            async with client.stream(
-                "PUT",
-                upload_url,
-                headers=req_headers,
-                content=chunk,
-                follow_redirects=False,
-                timeout=httpx.Timeout(max(self._timeout, 120.0), connect=10.0),
-            ) as resp:
-                status = resp.status_code
-                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-                raw = await self._read_bounded_response(
-                    resp,
-                    max_bytes=MAX_JSON_RESPONSE_BYTES,
-                    too_large_code="song_drive_response_too_large",
-                )
+            resp = await client.send(req, stream=True, follow_redirects=False)
+            status = resp.status_code
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            raw = await self._read_bounded_response(
+                resp,
+                max_bytes=MAX_JSON_RESPONSE_BYTES,
+                too_large_code="song_drive_response_too_large",
+            )
         except Rejected:
             raise
         except httpx.TimeoutException:
             raise Rejected("song_drive_network_timeout") from None
         except (httpx.HTTPError, OSError):
             raise Rejected("song_drive_network_error") from None
+        finally:
+            try:
+                if resp is not None:
+                    await resp.aclose()
+            except Exception:
+                pass
+            finally:
+                if resp is not None:
+                    resp._request = None
+                # Explicitly detach the transmitted chunk from httpx.Request (_content and
+                # ByteStream) so cyclic Request/Response references never retain multi-MiB
+                # uploaded chunks until the next cyclic GC sweep.
+                req._content = b""
+                req.stream = httpx.ByteStream(b"")
         return status, resp_headers, raw
 
     async def upload_inbox_stream(

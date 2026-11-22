@@ -61,6 +61,9 @@ DEREVERB_MODELS = (
 DEREVERB_MODEL = DEREVERB_MODELS[0]
 SUPPORTED_AUDIO_EXTS = frozenset({".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"})
 MAX_CHORUS_BYTES = 1_750_000
+DEFAULT_BACKING_GAIN_DB = -14.0
+MIN_BACKING_GAIN_DB = -24.0
+MAX_BACKING_GAIN_DB = -6.0
 STATUS_PREFIX = "__HAKIMI_COLAB_STATUS__="
 DRIVE_OUTPUTS_PREFIX = "__HAKIMI_DRIVE_OUTPUTS__="
 DRIVE_DIRECT_ERROR_PREFIX = "__HAKIMI_DRIVE_DIRECT_ERROR__="
@@ -1853,10 +1856,42 @@ def _separate_clean_lead_vocals(
     return dry_vocals_wav, inst_wav, backing_vocals_wav
 
 
-def build_mix_filter_complex(gain_db: float, *, has_backing: bool = False) -> str:
-    """Build ffmpeg filter_complex graph for vocal de-harshing, ambience, and mastering."""
+def _clamp_backing_gain_db(value: float) -> float:
+    """Validate finite non-bool numeric backing_gain_db and clamp to [-24.0, -6.0] dB."""
+    if isinstance(value, bool):
+        raise ValueError("backing_gain_db must be numeric, not bool")
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("backing_gain_db must be a finite float") from None
+    if not math.isfinite(val):
+        raise ValueError("backing_gain_db must be finite")
+    return max(MIN_BACKING_GAIN_DB, min(MAX_BACKING_GAIN_DB, val))
+
+
+def build_mix_filter_complex(
+    gain_db: float,
+    *,
+    has_backing: bool = False,
+    backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
+    skip_backing: bool = False,
+) -> str:
+    """Build ffmpeg filter_complex graph for vocal presence, de-harshing, and mastering."""
+    if isinstance(gain_db, bool):
+        raise ValueError("gain_db must be numeric, not bool")
+    try:
+        clean_gain = float(gain_db)
+    except (TypeError, ValueError):
+        raise ValueError("gain_db must be a finite float") from None
+    if not math.isfinite(clean_gain):
+        raise ValueError("gain_db must be finite")
+    if not isinstance(skip_backing, bool):
+        raise ValueError("skip_backing must be a boolean")
+    clamped_db = _clamp_backing_gain_db(backing_gain_db)
+
     vocal_bus = (
-        f"[0:a]volume={gain_db:.2f}dB,highpass=f=85,"
+        f"[0:a]volume={clean_gain:.2f}dB,highpass=f=85,"
+        "equalizer=f=3200:t=q:w=1.4:g=1.8,"
         "equalizer=f=6800:t=q:w=2.0:g=-2.0,"
         "acompressor=threshold=-18dB:ratio=2.2:attack=12:release=140:makeup=1dB,"
         "aformat=channel_layouts=stereo,asplit=2[vdry][vwet];"
@@ -1865,11 +1900,11 @@ def build_mix_filter_complex(gain_db: float, *, has_backing: bool = False) -> st
         "[vdry][vamb]amix=inputs=2:duration=longest:normalize=0[v];"
     )
     inst_bus = "[1:a]volume=-0.8dB[inst];"
-    if has_backing:
+    if has_backing and not skip_backing:
         return (
             vocal_bus
             + inst_bus
-            + "[2:a]volume=-2.5dB[bg];"
+            + f"[2:a]highpass=f=220,lowpass=f=3200,volume={clamped_db:.1f}dB[bg];"
             + "[v][inst][bg]amix=inputs=3:duration=longest:normalize=0,"
             + "alimiter=level_in=1:level_out=0.92:limit=0.92:attack=5:release=60[m]"
         )
@@ -1980,6 +2015,8 @@ def action_cover(
     index_rate: float = 0.25,
     protect: float = 0.28,
     volume_envelope: float = 0.25,
+    backing_gain_db: float = DEFAULT_BACKING_GAIN_DB,
+    skip_backing: bool = False,
     start_sec: str = "auto",
     duration_sec: float = 50.0,
     chorus_anchor: str = "",
@@ -1992,6 +2029,9 @@ def action_cover(
     chunks_dir: Path = DEFAULT_CHUNKS_DIR,
 ) -> dict[str, Any]:
     """Separate stems, run RVC voice conversion, loudness-match mix, and trim chorus."""
+    if not isinstance(skip_backing, bool):
+        raise ValueError("skip_backing must be a boolean")
+    effective_backing_gain_db = round(_clamp_backing_gain_db(backing_gain_db), 1)
     if not source_audio.is_file():
         raise FileNotFoundError(f"Source song audio not found: {source_audio}")
     if not pth_path.is_file():
@@ -2076,7 +2116,13 @@ def action_cover(
 
     cover_full_mp3 = out_dir / "cover_full.mp3"
     has_backing = backing_vocals_wav is not None
-    filter_complex = build_mix_filter_complex(gain_db, has_backing=has_backing)
+    use_backing = has_backing and not skip_backing
+    filter_complex = build_mix_filter_complex(
+        gain_db,
+        has_backing=has_backing,
+        backing_gain_db=effective_backing_gain_db,
+        skip_backing=skip_backing,
+    )
     mix_cmd = [
         "ffmpeg",
         "-y",
@@ -2085,7 +2131,7 @@ def action_cover(
         "-i",
         str(inst_wav),
     ]
-    if backing_vocals_wav is not None:
+    if use_backing and backing_vocals_wav is not None:
         mix_cmd.extend(["-i", str(backing_vocals_wav)])
     mix_cmd.extend(
         [
@@ -2193,6 +2239,8 @@ def action_cover(
         "protect": protect,
         "volume_envelope": volume_envelope,
         "loudness_gain_db": round(gain_db, 2),
+        "backing_gain_db": effective_backing_gain_db,
+        "skip_backing": skip_backing,
         "karaoke_backing_separated": backing_vocals_wav is not None,
         "auto_pipeline_split": True,
         "cover_full_bytes": cover_full_mp3.stat().st_size,
@@ -2215,7 +2263,12 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
-    return float(raw) if raw else default
+    if not raw:
+        return default
+    val = float(raw)
+    if not math.isfinite(val):
+        raise ValueError(f"{name} must be finite")
+    return val
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -2651,6 +2704,10 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
             index_rate=_env_float("HAKIMI_INDEX_RATE", 0.25),
             protect=_env_float("HAKIMI_PROTECT", 0.28),
             volume_envelope=_env_float("HAKIMI_VOLUME_ENVELOPE", 0.25),
+            backing_gain_db=_clamp_backing_gain_db(
+                _env_float("HAKIMI_BACKING_GAIN_DB", DEFAULT_BACKING_GAIN_DB)
+            ),
+            skip_backing=_env_bool("HAKIMI_SKIP_BACKING", False),
             start_sec=os.environ.get("HAKIMI_START_SEC", "auto"),
             duration_sec=_env_float("HAKIMI_DURATION_SEC", 50.0),
             chorus_anchor=os.environ.get("HAKIMI_CHORUS_ANCHOR", ""),
@@ -2782,6 +2839,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cover.add_argument("--index-rate", type=float, default=0.25)
     p_cover.add_argument("--protect", type=float, default=0.28)
     p_cover.add_argument("--volume-envelope", type=float, default=0.25)
+    p_cover.add_argument("--backing-gain-db", type=float, default=DEFAULT_BACKING_GAIN_DB)
+    p_cover.add_argument("--skip-backing", action="store_true")
     p_cover.add_argument("--start", default="auto")
     p_cover.add_argument("--duration", type=float, default=50.0)
     p_cover.add_argument("--chorus-anchor", default="")
@@ -2833,6 +2892,8 @@ def main(argv: list[str] | None = None) -> int:
                     index_rate=args.index_rate,
                     protect=args.protect,
                     volume_envelope=args.volume_envelope,
+                    backing_gain_db=args.backing_gain_db,
+                    skip_backing=args.skip_backing,
                     start_sec=args.start,
                     duration_sec=args.duration,
                     chorus_anchor=args.chorus_anchor,
