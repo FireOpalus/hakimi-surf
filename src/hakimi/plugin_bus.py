@@ -63,6 +63,7 @@ from .screen_watch import decode_b64_frames, decode_ws_json_frame
 from .security import Rejected, clean_text, configured_secrets, safe_output
 from .social import confirmed_message_id, owner_target, permits_chat_export
 from .thinking_policy import CORE_THINKING_SCENES, THINKING_LEVELS, OutputCap, ThinkingScene
+from .work_usage import model_work
 from .world_state import IntentTicketCreate, private_event_audience
 
 log = logging.getLogger("hakimi")
@@ -3131,13 +3132,14 @@ class PluginBus:
                     return
                 max_bytes = int(getattr(self.s, "max_context_bytes", 48_000))
                 bounded_payload = _bound_ai_payload(raw_payload, self._all_secrets(), max_bytes)
-                await ai.screen(
-                    bounded_payload,
-                    f"plugin:{session.plugin_id}",
-                    purpose="source",
-                    budget_lane=lane,
-                    images=images or None,
-                )
+                with model_work(f"plugin.{session.plugin_id}.screen", req_id, independent=True):
+                    await ai.screen(
+                        bounded_payload,
+                        f"plugin:{session.plugin_id}",
+                        purpose="source",
+                        budget_lane=lane,
+                        images=images or None,
+                    )
                 await self._send_frame(
                     session,
                     {
@@ -3310,15 +3312,16 @@ class PluginBus:
                 if validated_schema is not None:
                     extra_kwargs["response_schema"] = validated_schema
 
-                raw_text = await ai.generate(
-                    bounded_payload,
-                    f"plugin:{session.plugin_id}",
-                    scenario=resolved_scenario,
-                    budget_lane=lane,
-                    images=images or None,
-                    audit_source="production",
-                    **extra_kwargs,
-                )
+                with model_work(scenario, req_id, independent=True):
+                    raw_text = await ai.generate(
+                        bounded_payload,
+                        f"plugin:{session.plugin_id}",
+                        scenario=resolved_scenario,
+                        budget_lane=lane,
+                        images=images or None,
+                        audit_source="production",
+                        **extra_kwargs,
+                    )
                 clean_reply = safe_output(str(raw_text or ""), secrets_list, limit=out_limit)
                 await self._send_frame(
                     session,
@@ -3393,7 +3396,8 @@ class PluginBus:
 
                 video_watch = getattr(self.service, "video_watch", None)
                 if video_watch is not None and hasattr(video_watch, "analyze"):
-                    res = await video_watch.analyze(bvid, clean_material, subject, PATROL_LANE)
+                    with model_work(f"plugin.{session.plugin_id}.video", req_id, independent=True):
+                        res = await video_watch.analyze(bvid, clean_material, subject, PATROL_LANE)
                     out_text = redact_public_summary(
                         safe_output(str(res.text or ""), secrets_list, limit=1000)
                     )
@@ -3418,19 +3422,20 @@ class PluginBus:
                         return
                     max_bytes = int(getattr(self.s, "max_context_bytes", 48_000))
                     bounded_mat = _bound_ai_payload(clean_material, secrets_list, max_bytes)
-                    await ai.screen(
-                        bounded_mat,
-                        subject,
-                        purpose="source",
-                        budget_lane=PATROL_LANE,
-                    )
-                    raw_text = await ai.generate(
-                        bounded_mat,
-                        subject,
-                        scenario=Scenario.BILI_LEARNING,
-                        budget_lane=PATROL_LANE,
-                        audit_source="production",
-                    )
+                    with model_work(f"plugin.{session.plugin_id}.video", req_id, independent=True):
+                        await ai.screen(
+                            bounded_mat,
+                            subject,
+                            purpose="source",
+                            budget_lane=PATROL_LANE,
+                        )
+                        raw_text = await ai.generate(
+                            bounded_mat,
+                            subject,
+                            scenario=Scenario.BILI_LEARNING,
+                            budget_lane=PATROL_LANE,
+                            audit_source="production",
+                        )
                     out_text = redact_public_summary(
                         safe_output(str(raw_text or ""), secrets_list, limit=1000)
                     )

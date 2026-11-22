@@ -23,6 +23,7 @@ from .models import Message
 from .modules.base import sanitize_sensor_text
 from .screen_watch import decode_b64_frames, decode_ws_json_frame, strip_markdown_noise
 from .security import Rejected, clean_text, configured_secrets, safe_output
+from .work_usage import model_work
 
 log = logging.getLogger("hakimi")
 
@@ -787,17 +788,18 @@ class VoiceCompanion:
         )
         budget_lane = "proactive" if allow_silent else "chat"
         try:
-            full_text = await self.service.ai.generate(
-                payload,
-                subject,
-                scenario="voice.companion",
-                budget_lane=budget_lane,
-                images=frames or None,
-                message=msg,
-                audit_source="production",
-                cancel_event=cancel_event,
-                on_text=on_delta if is_owner else None,
-            )
+            with model_work("voice.companion", f"{session.id[:8]}:{turn_id}", independent=True):
+                full_text = await self.service.ai.generate(
+                    payload,
+                    subject,
+                    scenario="voice.companion",
+                    budget_lane=budget_lane,
+                    images=frames or None,
+                    message=msg,
+                    audit_source="production",
+                    cancel_event=cancel_event,
+                    on_text=on_delta if is_owner else None,
+                )
             if cancel_event.is_set():
                 raise asyncio.CancelledError
             if (not is_owner or not streamed_any) and full_text:

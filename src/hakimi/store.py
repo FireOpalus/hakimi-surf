@@ -125,6 +125,39 @@ def microdollars(value: Decimal) -> int:
     return int((value * 1_000_000).to_integral_value(rounding=ROUND_CEILING))
 
 
+def _classify_usage_category(lane: str, work_kind: str, subject: str) -> str:
+    kind = (work_kind or "").strip()
+    if lane == "chat":
+        if kind.startswith("voice.companion"):
+            return "voice_companion"
+        return "chat"
+    if lane == "proactive":
+        if kind.startswith("world.plan"):
+            return "world_plan"
+        if (
+            kind.startswith("mc.")
+            or kind.startswith("plugin.minecraft")
+            or subject == "plugin:minecraft"
+        ):
+            return "minecraft"
+        if kind.startswith("qq.speak"):
+            return "qq_proactive"
+        if kind.startswith("qq.owner_digest"):
+            return "owner_digest"
+        if kind.startswith("screen.watch"):
+            return "screen_watch"
+        if kind.startswith("voice.companion"):
+            return "voice_companion"
+        return "proactive_other"
+    if lane == "patrol":
+        if kind.startswith("diary."):
+            return "patrol_diary"
+        return "patrol"
+    if lane in ("memory", "memory_flex", "admin"):
+        return lane
+    return lane
+
+
 @dataclass(frozen=True)
 class DigestReviewCredit:
     """One local authorization for a daily digest's mandatory Decisions output review."""
@@ -1243,6 +1276,49 @@ class Store:
                     (period, lane, usage.cached_tokens, max(1, usage.input_tokens - 2050)),
                 )
 
+    async def _usage_categories(self, day: str) -> list[dict[str, Any]]:
+        rows = await self.all(
+            "SELECT l.lane AS lane,"
+            " COALESCE(NULLIF(w.root_kind,''), NULLIF(w.kind,''), '') AS work_kind,"
+            " l.subject AS subject,"
+            " SUM(l.amount) AS amount,"
+            " COUNT(*) AS calls "
+            "FROM ledger l LEFT JOIN ledger_work w ON w.id=l.id "
+            "WHERE l.day=? AND l.lane<>'search' "
+            "GROUP BY l.lane, COALESCE(NULLIF(w.root_kind,''), NULLIF(w.kind,''), ''), l.subject",
+            (day,),
+        )
+        buckets: dict[str, dict[str, Any]] = {}
+        lane_weights: dict[str, dict[str, list[int]]] = {}
+        for row in rows:
+            lane = str(row["lane"])
+            work_kind = str(row["work_kind"] or "")
+            subject = str(row["subject"] or "")
+            amount = int(row["amount"] or 0)
+            calls = int(row["calls"] or 0)
+            category = _classify_usage_category(lane, work_kind, subject)
+            entry = buckets.get(category)
+            if entry is None:
+                entry = {"category": category, "lane": lane, "amount": 0, "calls": 0}
+                buckets[category] = entry
+                lane_weights[category] = {}
+            entry["amount"] += amount
+            entry["calls"] += calls
+            lw = lane_weights[category].setdefault(lane, [0, 0])
+            lw[0] += amount
+            lw[1] += calls
+        for category, entry in buckets.items():
+            weights = lane_weights[category]
+            if len(weights) > 1:
+                entry["lane"] = max(
+                    weights.items(),
+                    key=lambda item: (item[1][0], item[1][1], item[0] == "chat", item[0]),
+                )[0]
+        return sorted(
+            buckets.values(),
+            key=lambda item: (-item["amount"], -item["calls"], item["category"]),
+        )
+
     async def usage_overview(self) -> dict:
         day = self.local_now().date().isoformat()
         async with self.lock:
@@ -1251,6 +1327,7 @@ class Store:
                 "FROM ledger WHERE day=? AND lane<>'search' GROUP BY lane",
                 (day,),
             )
+            categories = await self._usage_categories(day)
             statuses = await self.all("SELECT status,COUNT(*) AS n FROM jobs GROUP BY status")
         return {
             "day": day,
@@ -1261,6 +1338,7 @@ class Store:
             # Deprecated alias for existing clients; the bucket is now explicitly local.
             "day_utc": day,
             "lanes": [dict(r) for r in rows],
+            "categories": categories,
             "jobs": [dict(r) for r in statuses],
         }
 
@@ -1272,6 +1350,7 @@ class Store:
                 "FROM ledger WHERE day=? AND lane<>'search' GROUP BY lane",
                 (day,),
             )
+            categories = await self._usage_categories(day)
             statuses = await self.all("SELECT status,COUNT(*) AS n FROM jobs GROUP BY status")
             token_usage, cost_estimates = {}, {}
             history_row = await self.one("SELECT value FROM meta WHERE key='usage_history_v1'")
@@ -1398,6 +1477,7 @@ class Store:
                 # Deprecated alias for existing clients; the bucket is now explicitly local.
                 "day_utc": day,
                 "lanes": [dict(r) for r in rows],
+                "categories": categories,
                 "jobs": [dict(r) for r in statuses],
                 "token_usage": token_usage,
                 "cost_estimates": cost_estimates,

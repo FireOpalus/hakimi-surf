@@ -627,20 +627,22 @@ function renderOverviewRoutingGcp(d,prov,gcp,colab){
   }
 }
 
-const laneNames={chat:'主对话',patrol:'B 站巡逻',memory:'记忆',memory_flex:'记忆 Flex',admin:'管理测试',proactive:'主动私信',search:'联网检索'};
+const laneNames={chat:'主对话',patrol:'B 站巡逻',memory:'记忆',memory_flex:'记忆 Flex',admin:'管理测试',proactive:'世界引擎与主动生成',search:'联网检索'};
+const categoryNames={chat:'主对话',world_plan:'世界引擎规划',minecraft:'Minecraft 游玩',qq_proactive:'主动社交（群/私信）',owner_digest:'Owner 晚间日报',screen_watch:'屏幕伴看',voice_companion:'语音伴随',proactive_other:'其他主动生成',patrol:'B 站巡逻',patrol_diary:'巡逻日记',memory:'记忆提炼',memory_flex:'记忆 Flex',admin:'管理测试',search:'联网检索'};
 const percent=new Intl.NumberFormat('zh-CN',{style:'percent',maximumFractionDigits:1});
 function renderLanes(lanes,total){
   const rows=[...lanes].sort((a,b)=>b.amount-a.amount||b.calls-a.calls);
   $('lanes-empty').hidden=rows.length>0;
-  $('lane-stats').replaceChildren(...rows.map(lane=>{
-    const label=laneNames[lane.lane]||lane.lane;
+  $('lane-stats').replaceChildren(...rows.map(item=>{
+    const key=item.category||item.lane;
+    const label=categoryNames[key]||laneNames[key]||key;
     const row=el('div',undefined,'lane'),track=el('dd'),bar=el('progress');
     bar.max=100;
-    bar.value=total>0?100*lane.amount/total:0;
+    bar.value=total>0?100*item.amount/total:0;
     bar.setAttribute('aria-label',label+'占当日分项费用的比例');
     track.append(bar);
     const amount=el('dd',undefined,'lane-amount');
-    amount.append(el('span',usd(lane.amount/1e6)),el('small',lane.calls+' 次'));
+    amount.append(el('span',usd(item.amount/1e6)),el('small',item.calls+' 次'));
     row.append(el('dt',label),track,amount);
     return row;
   }));
@@ -683,7 +685,9 @@ async function dashboard(initial,{lightweight=false}={}){
   renderRestHours(d.rest_hours);
   showNotebookAvailability(Boolean(d.notebook?.enabled));
   const usage=d.usage,lanes=usage.lanes||[];
+  const breakdown=Array.isArray(usage.categories)&&usage.categories.length?usage.categories:lanes;
   const laneTotal=lanes.reduce((sum,lane)=>sum+lane.amount,0);
+  const breakdownTotal=breakdown.reduce((sum,item)=>sum+item.amount,0);
   const calls=lanes.reduce((sum,lane)=>sum+lane.calls,0);
   const metric=code=>(d.metrics||[]).filter(m=>m.source==='production'&&m.code===code).reduce((sum,m)=>sum+m.n,0);
   text('stat-calls',calls.toLocaleString('zh-CN'));
@@ -716,7 +720,7 @@ async function dashboard(initial,{lightweight=false}={}){
   $('budget-label').hidden=budgetNotes.length===0;
   text('budget-left',usd(Math.max(0,limit-spent)));
   text('rate-label',d.minute_requests+' / '+d.minute_limit);
-  renderLanes(lanes,laneTotal);
+  renderLanes(breakdown,breakdownTotal);
   renderOverviewRoutingGcp(d,prov,gcp,colab);
 }
 
@@ -991,7 +995,7 @@ async function ledger(){
   text('budget-source','配置来自 '+policy.source+' · '+(d.budget_status?.hard_stop?'当前暂停付费工作':'当前允许按额度调用')+((d.budget_status?.daily_calendar_carry||d.budget_status?.monthly_calendar_carry)?' · 历史时区迁移保守占用（日/月）：'+money(d.budget_status.daily_calendar_carry||0)+' / '+money(d.budget_status.monthly_calendar_carry||0)+'，不代表新增真实花销':''));
   const b=d.budget_status||{},sb=b.sub_budgets||{};
   renderUnifiedBalance(balVal,gcpVal,b.gcp_billing);
-  table('budget-periods',['范围','账单扣账额','上限'],[['今日 '+(b.day_local||b.day||b.day_utc||''),money(b.daily),money(b.daily_limit)],['本月 '+(b.month_local||b.month||b.month_utc||''),money(b.monthly),money(b.monthly_limit)],['累计总上限（.env）',money(b.total),Number(b.total_limit)===0?'未设累计上限':money(b.total_limit)],['单用户今日最高',money(b.user_top_daily||0),money(b.user_daily_limit??0)],['B 站巡逻今日',money(sb.patrol?.used||0),money(sb.patrol?.limit??0)],['记忆提炼今日',money(sb.memory?.used||0),money(sb.memory?.limit??0)],['主动私信今日',money(sb.proactive?.used||0),money(sb.proactive?.limit??0)],['管理沙盒今日',money(sb.admin?.used||0),money(sb.admin?.limit??0)]]);
+  table('budget-periods',['范围','账单扣账额','上限'],[['今日 '+(b.day_local||b.day||b.day_utc||''),money(b.daily),money(b.daily_limit)],['本月 '+(b.month_local||b.month||b.month_utc||''),money(b.monthly),money(b.monthly_limit)],['累计总上限（.env）',money(b.total),Number(b.total_limit)===0?'未设累计上限':money(b.total_limit)],['单用户今日最高',money(b.user_top_daily||0),money(b.user_daily_limit??0)],['B 站巡逻今日',money(sb.patrol?.used||0),money(sb.patrol?.limit??0)],['记忆提炼今日',money(sb.memory?.used||0),money(sb.memory?.limit??0)],['世界引擎与主动生成今日',money(sb.proactive?.used||0),money(sb.proactive?.limit??0)],['管理沙盒今日',money(sb.admin?.used||0),money(sb.admin?.limit??0)]]);
   if(gcpVal)renderGcpBilling(gcpVal);
   else renderUnifiedCloudGcp(null,balVal,usage);
   if(colabRes.status==='fulfilled'){

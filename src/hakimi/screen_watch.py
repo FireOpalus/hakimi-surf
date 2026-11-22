@@ -23,6 +23,7 @@ from .media import ModelImage, normalize_image
 from .models import Message
 from .modules.base import sanitize_sensor_text
 from .security import Rejected, clean_text, configured_secrets, safe_output
+from .work_usage import model_work
 
 log = logging.getLogger("hakimi")
 
@@ -432,16 +433,17 @@ class ScreenWatch:
         payload.update(await self._gather_owner_context(owner_msg, now))
 
         try:
-            raw = await self.service.ai.generate(
-                payload,
-                f"screen:owner:{self.s.owner_qq_id}",
-                scenario="screen.watch",
-                budget_lane="proactive",
-                images=frames or None,
-                message=owner_msg,
-                audit_source="production",
-                cancel_event=cancel_event,
-            )
+            with model_work("screen.watch", tid, independent=True):
+                raw = await self.service.ai.generate(
+                    payload,
+                    f"screen:owner:{self.s.owner_qq_id}",
+                    scenario="screen.watch",
+                    budget_lane="proactive",
+                    images=frames or None,
+                    message=owner_msg,
+                    audit_source="production",
+                    cancel_event=cancel_event,
+                )
             if cancel_event.is_set():
                 raise asyncio.CancelledError
             trimmed = str(raw or "").strip()
