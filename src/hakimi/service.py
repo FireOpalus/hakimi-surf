@@ -934,6 +934,9 @@ class Service:
             await vc.close()
         if cc := getattr(self, "colab_compute", None):
             await cc.close()
+        if songs := getattr(self, "songs", None):
+            if (sd := getattr(songs, "drive", None)) is not None and hasattr(sd, "close"):
+                await sd.close()
 
     async def command(self, message: Message) -> str | None:
         if self.bot_guard.known_bot(message):
@@ -1327,6 +1330,20 @@ class Service:
                 "colab_job_limit_reached": "Colab 任务队列已满，请稍等当前任务跑完再试。",
                 "colab_drive_not_configured": "Drive 歌单目录未配置，暂时无法上传/检索云盘。",
                 "colab_drive_invalid_file": "指定的云盘 inbox 文件无效，请核对文件名。",
+                "song_drive_not_configured": "歌单云盘 Drive 凭证未配置，暂时无法上传/检索云盘。",
+                "song_drive_credentials_invalid": (
+                    "歌单云盘 Drive 凭证无效或权限不安全，请检查后台配置。"
+                ),
+                "song_drive_insufficient_scope": (
+                    "歌单云盘 Drive 凭证缺少 drive.file 权限，请重新授权。"
+                ),
+                "song_drive_reauth_required": "歌单云盘 Drive 授权已过期或被撤销，请重新授权。",
+                "song_drive_invalid_file": "指定的云盘 inbox 文件无效，请核对文件名。",
+                "song_drive_folder_unavailable": (
+                    "歌单云盘 Hakimi_Songs 目录不可用或无写入权限，请检查后台目录设置。"
+                ),
+                "song_drive_upload_failed": "上传原曲到云盘 inbox 失败，请稍后重试。",
+                "song_inbox_upload_too_large": "音频超过 100 MiB 上限，请先压缩或截取后再试。",
                 "colab_invalid_job": "提交学歌参数无效，请检查歌名或选项。",
                 "invalid_song_title": (
                     "歌名格式不太对，支持 1～60 字多语种文字、数字与常见标点"

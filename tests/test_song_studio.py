@@ -846,6 +846,11 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
             assert listing["cache_bytes"] == 450
             assert listing["cached_count"] == 1
             assert listing["drive_backed_count"] == 1
+            assert listing["drive_configured"] is False
+            assert listing["drive_songs_folder_id"] == ""
+            assert listing["drive_config_source"] == "none"
+            assert listing["drive_folders"] is None
+            assert listing["drive_error"] is None
             assert listing["colab_configured"] is True
             by_title = {item["title"]: item for item in listing["items"]}
             assert by_title["本地测试歌"]["cached_local"] is True
@@ -949,3 +954,68 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
             local_item = by_title["本地测试歌"]
             local_audio = await client.get(f"/admin/api/songs/{local_item['id']}/audio")
             assert local_audio.status_code == 200
+
+
+async def test_song_library_uses_direct_drive_store_independently_of_colab(store):
+    class _DirectDriveStub:
+        def __init__(self) -> None:
+            self.songs_map: dict[str, bytes] = {}
+            self.inbox_uploads: list[tuple[str, bytes, str]] = []
+
+        def configured(self) -> bool:
+            return True
+
+        async def download_song(self, file_id: str) -> bytes:
+            return self.songs_map[file_id]
+
+        async def upload_inbox_bytes(
+            self, filename: str, raw: bytes, *, mime_type: str = "application/octet-stream"
+        ) -> dict[str, Any]:
+            self.inbox_uploads.append((filename, raw, mime_type))
+            return {"file_id": "direct-inbox-1", "name": filename, "size": len(raw)}
+
+    class _PureGpuComputeStub:
+        def __init__(self) -> None:
+            self.submitted: list[tuple[str, dict[str, Any], str]] = []
+
+        def configured(self) -> bool:
+            return True
+
+        async def submit_job(
+            self, job_type: str, payload: dict[str, Any], *, requester: str = "owner"
+        ) -> dict[str, Any]:
+            self.submitted.append((job_type, dict(payload), requester))
+            return {"id": "gpu-job-1", "job_type": job_type, "status": "queued", "payload": payload}
+
+    drive = _DirectDriveStub()
+    mp3 = _make_mp3_bytes(b"direct-drive-no-colab", total_size=320)
+    drive.songs_map["drv-direct-1"] = mp3
+
+    # Playback works with compute=None!
+    lib = SongLibrary(store, compute=None, drive=drive)
+    await lib.initialize()
+    assert lib.cache_stats()["drive_configured"] is True
+    assert lib.cache_stats()["colab_configured"] is False
+
+    entry = await lib.register_colab_cover(
+        title="独立云盘曲",
+        digest=hashlib.sha256(mp3).hexdigest(),
+        byte_size=len(mp3),
+        duration_ms=7000,
+        drive_chorus_id="drv-direct-1",
+    )
+    raw, mime = await lib.audio_bytes(entry["id"])
+    assert raw == mp3 and mime == "audio/mpeg"
+
+    # Learn song uploads directly to drive and submits job to pure-GPU compute (no Drive proxy)
+    gpu_compute = _PureGpuComputeStub()
+    lib.compute = gpu_compute
+    job = await lib.request_learn_song(
+        "新曲",
+        audio_bytes=b"AUDIO_RAW",
+        audio_filename="新曲.flac",
+        requester="owner",
+    )
+    assert job["id"] == "gpu-job-1"
+    assert drive.inbox_uploads == [("新曲.flac", b"AUDIO_RAW", "audio/flac")]
+    assert gpu_compute.submitted[-1][1]["inbox_file_id"] == "direct-inbox-1"

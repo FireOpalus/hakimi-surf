@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import json
@@ -12,7 +13,7 @@ import sys
 import wave
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -21,6 +22,12 @@ from pydantic import SecretStr, ValidationError
 from hakimi.app import create_app
 from hakimi.colab_compute import ColabComputeHub, ColabConfig
 from hakimi.security import Rejected
+from hakimi.songs import (
+    RvcCoverJobPayload,
+    RvcTrainJobPayload,
+    validate_rvc_cover_payload,
+    validate_rvc_train_payload,
+)
 from tests.fakes import FakeGateway
 from tests.test_admin import TOKEN as ADMIN_TOKEN
 
@@ -116,7 +123,7 @@ class FakeDriveBackend:
                         matched.append(folder)
             else:
                 for item in self.files.values():
-                    if item["trashed"]:
+                    if item.get("trashed"):
                         continue
                     parent_ok = any(f"'{p}' in parents" in q for p in item.get("parents", []))
                     name_ok = ("name =" not in q) or (f"name = '{item['name']}'" in q)
@@ -278,7 +285,6 @@ def _worker_settings(settings, url: str, token: str, **extra):
     updates = {
         "colab_worker_url": url,
         "colab_worker_token": SecretStr(token),
-        "colab_drive_songs_folder_id": "drv_folder_0000000001",
     }
     updates.update(extra)
     return settings.model_copy(update=updates)
@@ -744,8 +750,42 @@ def test_clean_source_filter_and_migrate_drive_idempotent(tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# 3. colab_worker tests
+# 3. colab_worker & EphemeralDriveClient tests
 # ---------------------------------------------------------------------------
+
+
+def _make_drive_dispatch_context(
+    tree: Any,
+    *,
+    access_token: str = "ya29.fake-access-token",
+    cache_folder_id: str = "",
+    inbox_file_id: str = "",
+    inbox_name: str = "",
+    pth_file_id: str = "",
+    index_file_id: str = "",
+    cache_weights_file_id: str = "",
+    cache_weights_sha256: str = "",
+) -> dict[str, Any]:
+    return {
+        "drive": {
+            "access_token": access_token,
+            "folders": {
+                "root": tree.root,
+                "models": tree.models,
+                "songs": tree.songs,
+                "inbox": tree.inbox,
+                "cache": cache_folder_id,
+            },
+            "files": {
+                "inbox_file_id": inbox_file_id,
+                "inbox_name": inbox_name,
+                "pth_file_id": pth_file_id,
+                "index_file_id": index_file_id,
+                "cache_weights_file_id": cache_weights_file_id,
+                "cache_weights_sha256": cache_weights_sha256,
+            },
+        }
+    }
 
 
 def _build_test_worker(
@@ -753,13 +793,14 @@ def _build_test_worker(
     *,
     clean_search_fn=None,
     cover_runner=None,
+    train_runner=None,
     stop_all_fn=None,
 ):
     cred = tmp_path / "secrets" / "drive.json"
     _write_fake_oauth(cred)
     backend = FakeDriveBackend()
     drive_client = colab_drive.ColabDriveClient(cred, transport=backend.transport)
-    drive_client.ensure_folder_tree()
+    tree = drive_client.ensure_folder_tree()
 
     model_dir = tmp_path / "rvc_models"
     (model_dir / "hakimi").mkdir(parents=True, exist_ok=True)
@@ -811,13 +852,129 @@ def _build_test_worker(
 
     app = colab_worker.create_worker_app(
         cfg,
-        drive_factory=lambda _root: drive_client,
+        drive_transport=backend.transport,
         usage_fn=usage_fn,
         stop_all_fn=stop_all_fn or default_stop_all,
         cover_runner=cover_runner or default_cover,
+        train_runner=train_runner,
         clean_search_fn=clean_search_fn,
     )
-    return app, cfg, drive_client, usage_state
+    return app, cfg, drive_client, tree, usage_state, backend
+
+
+def test_ephemeral_drive_client_scoping_resumable_and_token_guards(tmp_path: Path) -> None:
+    cred = tmp_path / "secrets" / "drive.json"
+    _write_fake_oauth(cred)
+    backend = FakeDriveBackend()
+    seed = colab_drive.ColabDriveClient(cred, transport=backend.transport)
+    tree = seed.ensure_folder_tree()
+    inbox_up = seed.upload_bytes("inbox", "track.m4a", b"M4A-INBOX", mime_type="audio/mp4")
+    pth_up = seed.upload_bytes("models", "hakimi.pth", b"PTH-BIN")
+
+    # Token & folder validation guards
+    for bad_tok in ("", "1//refresh-never-allowed", "Bearer ya29.abc", "ya29.bad space"):
+        with pytest.raises(colab_worker.EphemeralDriveError) as exc:
+            colab_worker.EphemeralDriveClient(bad_tok, tree.as_dict(), transport=backend.transport)
+        assert exc.value.code == "drive_token_failed"
+
+    with pytest.raises(colab_worker.EphemeralDriveError) as root_exc:
+        colab_worker.EphemeralDriveClient(
+            "ya29.fake-access-token",
+            {**tree.as_dict(), "songs": "root"},
+            transport=backend.transport,
+        )
+    assert root_exc.value.code == "drive_context_required"
+
+    ephem = colab_worker.EphemeralDriveClient(
+        "ya29.fake-access-token",
+        tree.as_dict(),
+        transport=backend.transport,
+    )
+
+    # In-scope downloads succeed for inbox/models
+    dl_inbox = ephem.download_file(
+        inbox_up["file_id"], tmp_path / "in.m4a", allowed_roles=("inbox",)
+    )
+    assert dl_inbox.read_bytes() == b"M4A-INBOX"
+    assert ephem.download_bytes(pth_up["file_id"], allowed_roles=("models",)) == b"PTH-BIN"
+
+    # Cross-role & out-of-scope downloads are strictly rejected
+    with pytest.raises(colab_worker.EphemeralDriveError) as cross_exc:
+        ephem.download_bytes(inbox_up["file_id"], allowed_roles=("models",))
+    assert cross_exc.value.code == "drive_file_outside_scope"
+
+    with pytest.raises(colab_worker.EphemeralDriveError) as out_exc:
+        ephem.download_bytes("outside_secret_file", allowed_roles=("inbox", "models", "songs"))
+    assert out_exc.value.code == "drive_file_outside_scope"
+
+    # Strict metadata checks: trashed=True, missing trashed, id mismatch, and folder MIME
+    backend.files["trashed_in_inbox"] = {
+        "id": "trashed_in_inbox",
+        "name": "deleted.m4a",
+        "parents": [tree.inbox],
+        "mimeType": "audio/mp4",
+        "size": "4",
+        "modifiedTime": "2026-11-21T00:00:00Z",
+        "trashed": True,
+        "data": b"DEAD",
+    }
+    backend.files["missing_trashed_flag"] = {
+        "id": "missing_trashed_flag",
+        "name": "untrusted.m4a",
+        "parents": [tree.inbox],
+        "mimeType": "audio/mp4",
+        "size": "4",
+        "modifiedTime": "2026-11-21T00:00:00Z",
+        "data": b"NOFL",
+    }
+    backend.files["mismatched_id_file"] = {
+        "id": "spoofed_other_id",
+        "name": "spoof.m4a",
+        "parents": [tree.inbox],
+        "mimeType": "audio/mp4",
+        "size": "4",
+        "modifiedTime": "2026-11-21T00:00:00Z",
+        "trashed": False,
+        "data": b"SPOF",
+    }
+    backend.files["folder_in_inbox"] = {
+        "id": "folder_in_inbox",
+        "name": "sub",
+        "parents": [tree.inbox],
+        "mimeType": colab_worker.FOLDER_MIME,
+        "size": "0",
+        "modifiedTime": "2026-11-21T00:00:00Z",
+        "trashed": False,
+        "data": b"",
+    }
+    for bad_fid in (
+        "trashed_in_inbox",
+        "missing_trashed_flag",
+        "mismatched_id_file",
+        "folder_in_inbox",
+    ):
+        with pytest.raises(colab_worker.EphemeralDriveError) as meta_exc:
+            ephem.download_bytes(bad_fid, allowed_roles=("inbox",))
+        assert meta_exc.value.code == "drive_file_outside_scope", bad_fid
+
+    # Upload restricted strictly to songs & models (never inbox/root)
+    small_mp3 = tmp_path / "cover.mp3"
+    small_mp3.write_bytes(_fake_mp3_bytes(b"ephem-small"))
+    with pytest.raises(colab_worker.EphemeralDriveError) as role_exc:
+        ephem.upload_file("inbox", small_mp3)  # type: ignore[arg-type]
+    assert role_exc.value.code == "drive_file_outside_scope"
+
+    up_song = ephem.upload_file("songs", small_mp3, mime_type="audio/mpeg")
+    assert seed.download_bytes(up_song["file_id"], allowed_roles=("songs",)) == (
+        small_mp3.read_bytes()
+    )
+
+    # Resumable upload (> 4 MiB) to models succeeds cleanly
+    big_pth = tmp_path / "big.pth"
+    big_bytes = b"PTH" + (b"\x7a" * (5 * 1024 * 1024 - 3))
+    big_pth.write_bytes(big_bytes)
+    up_model = ephem.upload_file("models", big_pth, drive_name="hakimi.pth")
+    assert seed.download_bytes(up_model["file_id"], allowed_roles=("models",)) == big_bytes
 
 
 async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) -> None:
@@ -825,9 +982,23 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
         del args, kwargs
         raise colab_rvc.SourceNotFoundError("source_not_found", "no clean original")
 
-    app, cfg, drive_client, usage_state = _build_test_worker(
+    app, cfg, drive_client, tree, usage_state, _ = _build_test_worker(
         tmp_path, clean_search_fn=failing_search
     )
+
+    # CLI parser accepts pure GPU worker args only (no --drive-cred-path or --songs-folder-id)
+    parsed_args = colab_worker._build_parser().parse_args(
+        ["--host", "127.0.0.1", "--port", "12146", "--allow-private"]
+    )
+    assert (parsed_args.host, parsed_args.port, parsed_args.allow_private) == (
+        "127.0.0.1",
+        12146,
+        True,
+    )
+    for removed_flag in ("--drive-cred-path", "--songs-folder-id"):
+        with pytest.raises(SystemExit):
+            colab_worker._build_parser().parse_args([removed_flag, "x"])
+
     headers = {"Authorization": f"Bearer {cfg.token}"}
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -835,6 +1006,25 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
     ) as client:
         assert (await client.get("/v1/status")).status_code == 401
         assert (await client.get("/v1/status?q=1", headers=headers)).status_code == 400
+        st_resp = await client.get("/v1/status", headers=headers)
+        assert st_resp.status_code == 200
+        st_json = st_resp.json()
+        assert "drive_folders" not in st_json
+        assert st_json["supported_job_types"] == ["rvc_cover", "rvc_train"]
+
+        # All removed /v1/drive/* proxy endpoints MUST return 404
+        assert (await client.get("/v1/drive/inbox", headers=headers)).status_code == 404
+        assert (
+            await client.post("/v1/drive/inbox", headers=headers, content=b"x")
+        ).status_code == 404
+        assert (
+            await client.get("/v1/drive/songs/outside_secret_file", headers=headers)
+        ).status_code == 404
+        assert (
+            await client.post("/v1/drive/songs", headers=headers, content=b"x")
+        ).status_code == 404
+
+        # Reject unknown job_type, legacy drive_songs_folder_id, refresh_token, and "root" folder
         assert (
             await client.post(
                 "/v1/jobs",
@@ -843,17 +1033,91 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
             )
         ).status_code == 400
         assert (
-            await client.get("/v1/drive/songs/outside_secret_file", headers=headers)
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": "a" * 32,
+                    "job_type": "rvc_cover",
+                    "drive_songs_folder_id": tree.root,
+                    "payload": {"title": "旧字段拒绝", "auto_search": True},
+                },
+            )
+        ).status_code == 400
+        assert (
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": "a" * 32,
+                    "job_type": "rvc_cover",
+                    "payload": {"title": "禁刷新令牌", "auto_search": True},
+                    "dispatch_context": _make_drive_dispatch_context(
+                        tree, access_token="1//refresh-token-forbidden"
+                    ),
+                },
+            )
+        ).status_code == 400
+        bad_root_ctx = _make_drive_dispatch_context(tree)
+        bad_root_ctx["drive"]["folders"]["songs"] = "root"
+        assert (
+            await client.post(
+                "/v1/jobs",
+                headers=headers,
+                json={
+                    "job_id": "a" * 32,
+                    "job_type": "rvc_cover",
+                    "payload": {"title": "禁root目录", "auto_search": True},
+                    "dispatch_context": bad_root_ctx,
+                },
+            )
         ).status_code == 400
 
-        # Upload to inbox and run rvc_cover successfully
-        up = await client.post(
-            "/v1/drive/inbox",
-            headers={**headers, "X-Drive-Filename": "yu_ai.m4a", "Content-Type": "audio/mp4"},
-            content=b"RAW_SOURCE_AUDIO",
+        # Missing dispatch_context for rvc_cover returns explicit drive_context_required error
+        no_ctx_id = "d" * 32
+        sub_no_ctx = await client.post(
+            "/v1/jobs",
+            headers=headers,
+            json={
+                "job_id": no_ctx_id,
+                "job_type": "rvc_cover",
+                "payload": {"title": "缺上下文", "auto_search": True},
+            },
         )
-        assert up.status_code == 200
-        inbox_id = up.json()["file_id"]
+        assert sub_no_ctx.status_code == 202
+        if (task_no_ctx := app.state.worker_state.tasks.get(no_ctx_id)) is not None:
+            await task_no_ctx
+        st_no_ctx = (await client.get(f"/v1/jobs/{no_ctx_id}", headers=headers)).json()
+        assert st_no_ctx["status"] == "failed"
+        assert st_no_ctx["error_code"] == "drive_context_required"
+
+        # Out-of-scope inbox file ID rejected even in Drive direct mode
+        out_id = "e" * 32
+        sub_out = await client.post(
+            "/v1/jobs",
+            headers=headers,
+            json={
+                "job_id": out_id,
+                "job_type": "rvc_cover",
+                "payload": {"title": "越权文件", "inbox_file_id": "outside_secret_file"},
+                "dispatch_context": _make_drive_dispatch_context(
+                    tree, inbox_file_id="outside_secret_file", inbox_name="secret.m4a"
+                ),
+            },
+        )
+        assert sub_out.status_code == 202
+        if (task_out := app.state.worker_state.tasks.get(out_id)) is not None:
+            await task_out
+        st_out = (await client.get(f"/v1/jobs/{out_id}", headers=headers)).json()
+        assert st_out["status"] == "failed"
+        assert st_out["error_code"] == "drive_file_outside_scope"
+        assert "ya29.fake-access-token" not in json.dumps(st_out)
+
+        # Seed inbox directly in Drive and run rvc_cover with ephemeral dispatch_context
+        inbox_up = drive_client.upload_bytes(
+            "inbox", "yu_ai.m4a", b"RAW_SOURCE_AUDIO", mime_type="audio/mp4"
+        )
+        inbox_id = inbox_up["file_id"]
 
         job_id = "b" * 32
         sub = await client.post(
@@ -864,11 +1128,16 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
                 "job_type": "rvc_cover",
                 "gpu_candidates": ["L4", "T4"],
                 "payload": {"title": "雨爱", "artist": "杨丞琳", "inbox_file_id": inbox_id},
+                "dispatch_context": _make_drive_dispatch_context(
+                    tree, inbox_file_id=inbox_id, inbox_name="yu_ai.m4a"
+                ),
             },
         )
         assert sub.status_code == 202
         if (task1 := app.state.worker_state.tasks.get(job_id)) is not None:
             await task1
+        rec1 = app.state.worker_state.jobs[job_id]
+        assert not hasattr(rec1, "dispatch_context")
         st = (await client.get(f"/v1/jobs/{job_id}", headers=headers)).json()
         assert st["status"] == "succeeded"
         assert st["assigned_gpu"] == "L4"
@@ -876,13 +1145,16 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
         assert st["result"]["drive_chorus_id"]
         assert st["result"]["drive_full_id"]
         assert cfg.token not in json.dumps(st)
+        assert "ya29.fake-access-token" not in json.dumps(st)
+        assert "dispatch_context" not in st
 
-        # Download generated chorus via Drive proxy
-        dl = await client.get(f"/v1/drive/songs/{st['result']['drive_chorus_id']}", headers=headers)
-        assert dl.status_code == 200
-        assert dl.content == _fake_mp3_bytes(b"chorus-audio")
+        # Verify EphemeralDriveClient fallback uploaded chorus audio into Hakimi_Songs/songs/
+        dl_bytes = drive_client.download_bytes(
+            st["result"]["drive_chorus_id"], allowed_roles=("songs",)
+        )
+        assert dl_bytes == _fake_mp3_bytes(b"chorus-audio")
 
-        # source_not_found error propagation
+        # source_not_found error propagation with valid Drive context
         nf_id = "c" * 32
         sub2 = await client.post(
             "/v1/jobs",
@@ -891,6 +1163,7 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
                 "job_id": nf_id,
                 "job_type": "rvc_cover",
                 "payload": {"title": "找不到原曲", "auto_search": True},
+                "dispatch_context": _make_drive_dispatch_context(tree),
             },
         )
         assert sub2.status_code == 202
@@ -905,7 +1178,6 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
         usage_state["active"] = 2
         term = await client.post("/v1/sessions/terminate", headers=headers)
         assert term.status_code == 200 and term.json()["terminated_sessions"] == 2
-    assert drive_client.folder_tree is not None
 
 
 # ---------------------------------------------------------------------------
@@ -916,18 +1188,203 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
 def test_colab_config_validation() -> None:
     cfg = ColabConfig(preferred_gpu="H100", fallback_gpus=["H100", "L4", "L4", "T4"])
     assert cfg.fallback_gpus == ["H100", "L4", "T4"]
+    assert "drive_songs_folder_id" not in ColabConfig.model_fields
     with pytest.raises(ValidationError):
         ColabConfig(unknown_field="x")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
         ColabConfig(daily_job_limit=True)  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
-        ColabConfig(drive_songs_folder_id="root")
+        ColabConfig(drive_songs_folder_id="drv_folder_0000000001")  # type: ignore[call-arg]
+
+
+async def test_colab_hub_legacy_config_migration_dynamic_registry_and_pre_dispatch(
+    settings, store
+) -> None:
+    # 1) Legacy SQLite admin_config("colab_compute_config") with removed drive_songs_folder_id
+    legacy_payload = {
+        "preferred_gpu": "A100",
+        "daily_job_limit": 9,
+        "drive_songs_folder_id": "drv_legacy_songs_99",
+    }
+    sealed = store.vault.seal("admin:colab_compute_config", legacy_payload)
+    async with store.transaction():
+        await store.db.execute(
+            "CREATE TABLE IF NOT EXISTS admin_config (key TEXT PRIMARY KEY, payload BLOB NOT NULL)"
+        )
+        await store.db.execute(
+            "INSERT OR REPLACE INTO admin_config VALUES (?, ?)",
+            ("colab_compute_config", sealed),
+        )
+
+    dispatched: list[dict[str, Any]] = []
+
+    def mock_worker(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/status":
+            return httpx.Response(
+                200,
+                json={
+                    "reachable": True,
+                    "compute_units": 42.0,
+                    "active_sessions": 0,
+                    "running_job_id": None,
+                    "supported_job_types": ["demo_gpu"],
+                    "warm_sessions": [],
+                    "error": None,
+                },
+            )
+        if request.url.path == "/v1/jobs" and request.method == "POST":
+            body = json.loads(request.content.decode("utf-8"))
+            dispatched.append(body)
+            return httpx.Response(202, json={"job_id": body["job_id"], "status": "running"})
+        return httpx.Response(404)
+
+    s = _worker_settings(settings, "http://127.0.0.1:12146", "worker-secret-token-123456")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_worker),
+        base_url="http://127.0.0.1:12146",
+    ) as mock_http:
+        hub = ColabComputeHub(s, store, None, http=mock_http)
+        await hub.initialize()
+
+        # Legacy field ignored gracefully, valid overrides preserved, SQLite row kept for migration
+        assert hub.config.preferred_gpu == "A100"
+        assert hub.config.daily_job_limit == 9
+        assert not hasattr(hub.config, "drive_songs_folder_id")
+        async with store.lock:
+            row = await store.one(
+                "SELECT payload FROM admin_config WHERE key=?", ("colab_compute_config",)
+            )
+        assert row is not None
+        assert store.vault.open("admin:colab_compute_config", row[0])["drive_songs_folder_id"] == (
+            "drv_legacy_songs_99"
+        )
+
+        # All removed Drive proxy methods MUST be absent from ColabComputeHub
+        for removed_method in (
+            "list_drive_inbox",
+            "upload_drive_inbox",
+            "upload_drive_inbox_stream",
+            "download_drive_song",
+            "upload_drive_song",
+        ):
+            assert not hasattr(hub, removed_method)
+
+        # Unregistered job_type is strictly rejected
+        assert hub.registered_job_types() == ()
+        assert not hub.is_registered_job_type("rvc_cover")
+        with pytest.raises(Rejected, match="colab_invalid_job"):
+            await hub.submit_job("rvc_cover", {"title": "未注册"})
+
+        # Register dynamic job type with validator + pre_dispatch + on_complete
+        ephemeral_secret = "ya29.ephemeral-dispatch-secret-999"
+        pre_dispatch_mode = {"mode": "reject_clean"}
+        completed_events: list[dict[str, Any]] = []
+
+        def validate_demo(payload: dict[str, Any]) -> dict[str, Any]:
+            name = str(payload.get("name") or "").strip()
+            if not name:
+                raise ValueError("missing name")
+            return {"name": name}
+
+        async def pre_dispatch_demo(job: dict[str, Any]) -> dict[str, Any]:
+            if pre_dispatch_mode["mode"] == "reject_clean":
+                raise Rejected("song_drive_not_configured")
+            if pre_dispatch_mode["mode"] == "reject_with_secrets":
+                raise Rejected(
+                    "err ya29.leak-pre-123456 1//refresh-pre-654321 Bearer secretprebearer999"
+                )
+            return {
+                "drive": {
+                    "access_token": ephemeral_secret,
+                    "folders": {"songs": "drv_songs_folder_1"},
+                    "files": {},
+                }
+            }
+
+        async def on_demo_done(job: dict[str, Any]) -> None:
+            completed_events.append(job)
+
+        hub.register_job_type(
+            "demo_gpu",
+            validator=validate_demo,
+            pre_dispatch=pre_dispatch_demo,
+            on_complete=on_demo_done,
+        )
+        assert hub.is_registered_job_type("demo_gpu")
+        assert hub.registered_job_types() == ("demo_gpu",)
+
+        ov = await hub.admin_overview()
+        assert ov["supported_job_types"] == ["demo_gpu"]
+        assert ov["worker"]["supported_job_types"] == ["demo_gpu"]
+        assert "drive_folders" not in ov["worker"]
+
+        # pre_dispatch Rejected -> job finalized as failed + hook triggered + worker NOT called
+        j_fail = await hub.submit_job("demo_gpu", {"name": "fail-case"})
+        await hub.scheduler_step()
+        assert dispatched == []
+        assert len(completed_events) == 1
+        assert completed_events[0]["id"] == j_fail["id"]
+        assert completed_events[0]["status"] == "failed"
+        assert completed_events[0]["error_code"] == "song_drive_not_configured"
+
+        # pre_dispatch Rejected containing tokens -> error_code, result, error & overview scrubbed
+        pre_dispatch_mode["mode"] = "reject_with_secrets"
+        j_leak = await hub.submit_job("demo_gpu", {"name": "leak-case"})
+        await hub.scheduler_step()
+        assert dispatched == []
+        assert len(completed_events) == 2
+        assert completed_events[1]["id"] == j_leak["id"]
+        assert completed_events[1]["status"] == "failed"
+        leaked_tokens = (
+            "ya29.leak-pre-123456",
+            "1//refresh-pre-654321",
+            "secretprebearer999",
+        )
+        async with store.lock:
+            leak_row = await store.one(
+                "SELECT error_code, error, result FROM colab_jobs WHERE id=?", (j_leak["id"],)
+            )
+        assert leak_row is not None
+        opened_leak_res = hub._open_blob(j_leak["id"], "result", leak_row["result"]) or {}
+        for blob_text in (
+            str(leak_row["error_code"] or ""),
+            str(leak_row["error"] or ""),
+            json.dumps(opened_leak_res),
+            json.dumps(completed_events[1]),
+            json.dumps(await hub.admin_overview()),
+        ):
+            for secret_val in leaked_tokens:
+                assert secret_val not in blob_text
+        assert "[REDACTED]" in str(leak_row["error_code"] or "")
+        assert "[REDACTED]" in str(opened_leak_res.get("error_code") or "")
+
+        # pre_dispatch success -> transient dispatch_context forwarded to worker, NEVER in SQLite
+        pre_dispatch_mode["mode"] = "ok"
+        j_ok = await hub.submit_job("demo_gpu", {"name": "ok-case"})
+        await hub.scheduler_step()
+        assert len(dispatched) == 1
+        assert dispatched[0]["job_id"] == j_ok["id"]
+        assert "drive_songs_folder_id" not in dispatched[0]
+        assert dispatched[0]["dispatch_context"]["drive"]["access_token"] == ephemeral_secret
+
+        # Verify zero token/dispatch_context persisted in SQLite or returned by list_jobs/overview
+        async with store.lock:
+            raw_rows = await store.all("SELECT id, payload, result, error FROM colab_jobs")
+        for r in raw_rows:
+            for col in (r["payload"], r["result"], r["error"]):
+                assert ephemeral_secret not in str(col or "")
+            opened_p = hub._open_blob(str(r["id"]), "payload", r["payload"]) or {}
+            assert "dispatch_context" not in opened_p
+            assert ephemeral_secret not in json.dumps(opened_p)
+        assert ephemeral_secret not in json.dumps(await hub.list_jobs())
+        assert ephemeral_secret not in json.dumps(await hub.admin_overview())
+        await hub.close()
 
 
 async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
     settings, store, tmp_path: Path
 ) -> None:
-    app_w, cfg_w, _, usage_state = _build_test_worker(tmp_path)
+    app_w, cfg_w, drive_client, tree, usage_state, _ = _build_test_worker(tmp_path)
     clock_now = [1_700_000_000.0]
 
     def fake_clock() -> float:
@@ -951,10 +1408,25 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
         async def on_cover(job: dict[str, Any]) -> None:
             hook_events.append(job)
 
-        hub.register_completion_hook("rvc_cover", on_cover)
+        async def pre_cover(job: dict[str, Any]) -> dict[str, Any]:
+            p = job["payload"]
+            return _make_drive_dispatch_context(
+                tree,
+                inbox_file_id=str(p.get("inbox_file_id") or ""),
+                inbox_name=str(p.get("inbox_filename") or "demo.m4a"),
+            )
 
-        # Submit job -> scheduler_step dispatches -> worker finishes -> next step invokes hook
-        inbox_up = await hub.upload_drive_inbox("demo.m4a", b"FAKE_M4A", mime_type="audio/mp4")
+        hub.register_job_type(
+            "rvc_cover",
+            validator=validate_rvc_cover_payload,
+            pre_dispatch=pre_cover,
+            on_complete=on_cover,
+        )
+
+        # Upload source to Drive inbox directly (decoupled from colab_compute) -> dispatch -> done
+        inbox_up = drive_client.upload_bytes(
+            "inbox", "demo.m4a", b"FAKE_M4A", mime_type="audio/mp4"
+        )
         job = await hub.submit_job(
             "rvc_cover",
             {"title": "小幸运", "artist": "田馥甄", "inbox_file_id": inbox_up["file_id"]},
@@ -971,7 +1443,9 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
         assert len(hook_events) == 1
         assert hook_events[0]["status"] == "succeeded"
         assert hook_events[0]["result"]["title"] == "小幸运"
-        downloaded = await hub.download_drive_song(hook_events[0]["result"]["drive_chorus_id"])
+        downloaded = drive_client.download_bytes(
+            hook_events[0]["result"]["drive_chorus_id"], allowed_roles=("songs",)
+        )
         assert downloaded == _fake_mp3_bytes(b"chorus-audio")
 
         # Orphan session auto-termination after auto_terminate_orphan_minutes
@@ -1009,7 +1483,7 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
 
 
 async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_path: Path) -> None:
-    app_w, cfg_w, _, usage_state = _build_test_worker(tmp_path)
+    app_w, cfg_w, _, _, usage_state, _ = _build_test_worker(tmp_path)
     # Point URL to closed loopback port for app startup to verify Module.status() never blocks.
     s = _worker_settings(
         settings,
@@ -1021,6 +1495,10 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
     async with app.router.lifespan_context(app):
         mod = app.state.service.modules.systems["colab_compute"]
         assert mod.admin_panel == "colab-compute"
+        assert "GPU" in mod.description
+        assert "翻唱" not in mod.description
+        assert "RVC" not in mod.description
+        assert "Hakimi_Songs" not in mod.description
         st = await mod.status()
         assert st["state"] == "ready" and st["configured"] is True
 
@@ -1044,13 +1522,21 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                 assert ov.status_code == 200
                 ov_json = ov.json()
                 assert ov_json["configured"] is True
+                assert "drive_songs_folder_id" not in ov_json["config"]
+                assert set(ov_json["supported_job_types"]) >= {"rvc_cover", "rvc_train"}
                 assert ov_json["worker"]["reachable"] is True
                 assert ov_json["worker"]["compute_units"] == 100.0
-                expected_keys = {"root", "models", "songs", "inbox"}
-                assert set(ov_json["worker"]["drive_folders"]) == expected_keys
+                assert "drive_folders" not in ov_json["worker"]
+                assert ov_json["worker"]["supported_job_types"] == ["rvc_cover", "rvc_train"]
                 assert cfg_w.token not in ov.text
 
-                # Update & reset config
+                # Update & reset config; legacy drive_songs_folder_id rejected by extra="forbid"
+                bad_put = await client.put(
+                    "/admin/api/colab",
+                    json={"drive_songs_folder_id": "drv_folder_0000000001"},
+                )
+                assert bad_put.status_code == 400
+
                 put = await client.put(
                     "/admin/api/colab",
                     json={"preferred_gpu": "A100", "daily_job_limit": 8},
@@ -1064,7 +1550,21 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                 assert delete.json()["config"]["preferred_gpu"] == "L4"
                 assert delete.json()["source"] == "default"
 
-                # Submit & cancel job
+                # Unregistered & invalid job_type rejected with 400
+                unreg = await client.post(
+                    "/admin/api/colab/jobs",
+                    json={"job_type": "unregistered_job", "payload": {}},
+                )
+                assert unreg.status_code == 400
+                assert unreg.json()["detail"] == "colab_invalid_job"
+
+                bad_name = await client.post(
+                    "/admin/api/colab/jobs",
+                    json={"job_type": "BAD-TYPE", "payload": {}},
+                )
+                assert bad_name.status_code == 400
+
+                # Submit & cancel registered job (registered by song_studio)
                 sub = await client.post(
                     "/admin/api/colab/jobs",
                     json={
@@ -1077,11 +1577,11 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                 can = await client.post(f"/admin/api/colab/jobs/{jid}/cancel")
                 assert can.status_code == 200 and can.json()["status"] == "cancelled"
 
-                # Drive inbox listing
-                await mod.compute.upload_drive_inbox("qingtian.wav", b"RIFFDATA")
-                inbox = await client.get("/admin/api/colab/drive/inbox")
-                assert inbox.status_code == 200
-                assert inbox.json()["items"][0]["name"] == "qingtian.wav"
+                # Removed /admin/api/colab/drive/inbox routes MUST return 404
+                assert (await client.get("/admin/api/colab/drive/inbox")).status_code == 404
+                assert (
+                    await client.post("/admin/api/colab/drive/inbox", content=b"x")
+                ).status_code == 404
 
                 # Emergency terminate + costly() rate limit
                 usage_state["active"] = 1
@@ -1095,285 +1595,42 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
             await worker_client.aclose()
 
 
-async def test_colab_admin_drive_inbox_upload(settings, tmp_path: Path) -> None:
-    app_w, cfg_w, drive_client, _ = _build_test_worker(tmp_path)
-    s = _worker_settings(
-        settings,
-        "http://127.0.0.1:19999",
-        cfg_w.token,
-        admin_token=SecretStr(ADMIN_TOKEN),
+def test_colab_decoupling_static_ast_and_routes() -> None:
+    targets = (
+        REPO_ROOT / "src" / "hakimi" / "colab_compute.py",
+        REPO_ROOT / "src" / "hakimi" / "colab_admin.py",
+        REPO_ROOT / "src" / "hakimi" / "system_modules" / "colab_compute.py",
+        REPO_ROOT / "scripts" / "colab_worker.py",
     )
-    app = create_app(s, gateway_factory=FakeGateway, start_workers=False)
-    async with app.router.lifespan_context(app):
-        mod = app.state.service.modules.systems["colab_compute"]
-        worker_client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app_w),
-            base_url="http://127.0.0.1:19999",
-        )
-        mod.compute._injected_http = worker_client
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://127.0.0.1:12141",
-                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
-            ) as client:
-                mp3_bytes = _fake_mp3_bytes(b"inbox-source")
-
-                # Unauthenticated request rejected
-                unauth = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Authorization": "",
-                        "Content-Type": "audio/mpeg",
-                        "X-Drive-Filename": quote("晴天.mp3"),
-                    },
-                    content=mp3_bytes,
-                )
-                assert unauth.status_code == 401
-
-                # Missing / blank / oversized header / traversal / bad extension / empty / too large
-                missing = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={"Content-Type": "audio/mpeg"},
-                    content=mp3_bytes,
-                )
-                assert missing.status_code == 400
-                assert missing.json()["detail"] == "colab_drive_invalid_file"
-
-                too_long_hdr = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "audio/mpeg",
-                        "X-Drive-Filename": ("a" * 510) + ".mp3",
-                    },
-                    content=mp3_bytes,
-                )
-                assert too_long_hdr.status_code == 400
-                assert too_long_hdr.json()["detail"] == "colab_drive_invalid_file"
-
-                for bad_name in ("../a.mp3", "..%2Fa.mp3", "sub\\a.mp3", "a%00.mp3"):
-                    trav = await client.post(
-                        "/admin/api/colab/drive/inbox",
-                        headers={
-                            "Content-Type": "audio/mpeg",
-                            "X-Drive-Filename": bad_name,
-                        },
-                        content=mp3_bytes,
-                    )
-                    assert trav.status_code == 400
-                    assert trav.json()["detail"] == "colab_drive_invalid_file"
-
-                for bad_ext in ("evil.txt", "noext", "bad."):
-                    resp = await client.post(
-                        "/admin/api/colab/drive/inbox",
-                        headers={
-                            "Content-Type": "audio/mpeg",
-                            "X-Drive-Filename": bad_ext,
-                        },
-                        content=mp3_bytes,
-                    )
-                    assert resp.status_code == 400
-                    assert resp.json()["detail"] == "invalid_song_audio"
-
-                empty_body = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "audio/mpeg",
-                        "X-Drive-Filename": quote("晴天.mp3"),
-                    },
-                    content=b"",
-                )
-                assert empty_body.status_code == 400
-                assert empty_body.json()["detail"] == "invalid_song_audio"
-
-                bad_mime = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "text/plain",
-                        "X-Drive-Filename": quote("晴天.mp3"),
-                    },
-                    content=mp3_bytes,
-                )
-                assert bad_mime.status_code == 415
-                assert bad_mime.json()["detail"] == "invalid_song_audio"
-
-                compressed = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "audio/mpeg",
-                        "Content-Encoding": "gzip",
-                        "X-Drive-Filename": quote("晴天.mp3"),
-                    },
-                    content=mp3_bytes,
-                )
-                assert compressed.status_code == 415
-                assert compressed.json()["detail"] == "compressed_song_upload_forbidden"
-
-                for bad_len in ("-1", "not-an-int"):
-                    bad_cl = await client.post(
-                        "/admin/api/colab/drive/inbox",
-                        headers={
-                            "Content-Type": "audio/mpeg",
-                            "Content-Length": bad_len,
-                            "X-Drive-Filename": quote("晴天.mp3"),
-                        },
-                        content=mp3_bytes,
-                    )
-                    assert bad_cl.status_code == 400
-                    assert bad_cl.json()["detail"] == "invalid_content_length"
-
-                oversized = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "audio/mpeg",
-                        "Content-Length": str(100 * 1024 * 1024 + 1),
-                        "X-Drive-Filename": quote("晴天.mp3"),
-                    },
-                    content=b"x",
-                )
-                assert oversized.status_code == 413
-                assert oversized.json()["detail"] == "colab_inbox_upload_too_large"
-                assert drive_client.list_inbox() == []
-
-                # Chunked stream (no Content-Length header) succeeds end-to-end
-                async def _chunked_ok():
-                    mid = len(mp3_bytes) // 2
-                    yield mp3_bytes[:mid]
-                    yield b""
-                    yield mp3_bytes[mid:]
-
-                ok_chunked = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "audio/mpeg",
-                        "X-Drive-Filename": quote("chunked.mp3"),
-                    },
-                    content=_chunked_ok(),
-                )
-                assert ok_chunked.status_code == 200
-                assert ok_chunked.json()["name"] == "chunked.mp3"
-                assert ok_chunked.json()["size"] == len(mp3_bytes)
-
-                # Valid Unicode MP3 upload proxies to worker /v1/drive/inbox
-                ok = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "audio/mpeg",
-                        "X-Drive-Filename": quote("晴天.mp3"),
-                    },
-                    content=mp3_bytes,
-                )
-                assert ok.status_code == 200
-                body = ok.json()
-                assert body["name"] == "晴天.mp3"
-                assert body["size"] == len(mp3_bytes)
-                assert body["file_id"]
-
-                # Verify filename/extension normalization (uppercase ext & spaces)
-                ok_norm = await client.post(
-                    "/admin/api/colab/drive/inbox",
-                    headers={
-                        "Content-Type": "application/octet-stream",
-                        "X-Drive-Filename": quote("周杰伦 晴天 (Live).MP3"),
-                    },
-                    content=mp3_bytes,
-                )
-                assert ok_norm.status_code == 200
-                assert ok_norm.json()["name"] == "周杰伦_晴天_Live.mp3"
-
-                inbox = await client.get("/admin/api/colab/drive/inbox")
-                assert inbox.status_code == 200
-                names = {item["name"]: item for item in inbox.json()["items"]}
-                assert "chunked.mp3" in names
-                assert "晴天.mp3" in names
-                assert names["晴天.mp3"]["id"] == body["file_id"]
-                assert names["晴天.mp3"]["size"] == len(mp3_bytes)
-                assert "周杰伦_晴天_Live.mp3" in names
-        finally:
-            await worker_client.aclose()
-
-
-async def test_colab_admin_drive_inbox_streaming_oversize(
-    settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import tempfile
-
-    worker_tmp = tmp_path / "worker_tmp"
-    worker_tmp.mkdir()
-    monkeypatch.setattr(tempfile, "tempdir", str(worker_tmp))
-
-    app_w, cfg_w, drive_client, _ = _build_test_worker(tmp_path)
-    s = _worker_settings(
-        settings,
-        "http://127.0.0.1:19999",
-        cfg_w.token,
-        admin_token=SecretStr(ADMIN_TOKEN),
-    )
-    app = create_app(s, gateway_factory=FakeGateway, start_workers=False)
-    async with app.router.lifespan_context(app):
-        mod = app.state.service.modules.systems["colab_compute"]
-        worker_client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app_w),
-            base_url="http://127.0.0.1:19999",
-        )
-        mod.compute._injected_http = worker_client
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="http://127.0.0.1:12141",
-                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
-            ) as client:
-
-                async def _chunked_100():
-                    for _ in range(5):
-                        yield b"a" * 20
-
-                # 1) Hub streaming limit enforced during chunked upload (max_bytes=64, stream=100B)
-                with monkeypatch.context() as mp:
-                    mp.setattr("hakimi.colab_admin.MAX_ADMIN_INBOX_UPLOAD_BYTES", 64)
-                    resp = await client.post(
-                        "/admin/api/colab/drive/inbox",
-                        headers={
-                            "Content-Type": "audio/mpeg",
-                            "X-Drive-Filename": quote("stream_big.mp3"),
-                        },
-                        content=_chunked_100(),
-                    )
-                assert resp.status_code == 413
-                assert resp.json()["detail"] == "colab_inbox_upload_too_large"
-                assert drive_client.list_inbox() == []
-                assert os.listdir(worker_tmp) == []
-
-                # 2) Worker streaming limit also maps cleanly to 413 & deletes temp file
-                with monkeypatch.context() as mp:
-                    mp.setattr("hakimi.colab_admin.MAX_ADMIN_INBOX_UPLOAD_BYTES", 256)
-                    mp.setattr(colab_worker, "MAX_INBOX_UPLOAD_BYTES", 64)
-                    resp_w = await client.post(
-                        "/admin/api/colab/drive/inbox",
-                        headers={
-                            "Content-Type": "audio/mpeg",
-                            "X-Drive-Filename": quote("worker_big.mp3"),
-                        },
-                        content=_chunked_100(),
-                    )
-                assert resp_w.status_code == 413
-                assert resp_w.json()["detail"] == "colab_inbox_upload_too_large"
-                assert drive_client.list_inbox() == []
-                assert os.listdir(worker_tmp) == []
-        finally:
-            await worker_client.aclose()
+    for path in targets:
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src, filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert "songs" not in alias.name.split("."), path
+                    assert "colab_drive" not in alias.name.split("."), path
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                assert "songs" not in mod.split("."), path
+                assert "colab_drive" not in mod.split("."), path
+        assert "/v1/drive/" not in src, path
+        assert "/drive/inbox" not in src, path
+        assert "colab_drive.py" not in src, path
+        assert "roaming-oauth.json" not in src, path
+        assert "colab-drive-oauth.json" not in src, path
+        if path.name != "colab_worker.py":
+            assert "drive_songs_folder_id" not in src, path
 
 
 def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
     import inspect
 
-    from hakimi.colab_compute import _RvcCoverJobPayload, _RvcTrainJobPayload
-
     # 1. Cover defaults: 0.25 / 0.28 / 0.25
     w_cover = colab_worker.RvcCoverPayload(title="test")
     assert (w_cover.index_rate, w_cover.protect, w_cover.volume_envelope) == (0.25, 0.28, 0.25)
 
-    h_cover = _RvcCoverJobPayload(title="test")
+    h_cover = RvcCoverJobPayload(title="test")
     assert (h_cover.index_rate, h_cover.protect, h_cover.volume_envelope) == (0.25, 0.28, 0.25)
 
     sig_cov_rvc = inspect.signature(colab_rvc.run_cover_pipeline).parameters
@@ -1412,7 +1669,7 @@ def test_rvc_cover_and_train_defaults_across_all_modules() -> None:
         48000,
     )
 
-    h_train = _RvcTrainJobPayload()
+    h_train = RvcTrainJobPayload()
     assert (h_train.epochs, h_train.save_every, h_train.batch_size, h_train.sample_rate) == (
         150,
         30,
@@ -1594,29 +1851,55 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
         assert len(refused) == 1 and refused[0].gpu == banned
     assert pool.snapshot(now=1000.0) == []
 
-    # 2) End-to-end Worker warm reuse + Drive direct + probe fallback + expiry + shutdown
+    # 2) End-to-end Worker warm reuse + Drive direct + cache weights + probe fallback + shutdown
     cred = tmp_path / "secrets" / "drive.json"
     _write_fake_oauth(cred)
     backend = FakeDriveBackend()
     drive_client = colab_drive.ColabDriveClient(cred, transport=backend.transport)
-    drive_client.ensure_folder_tree()
-    drive_client.upload_bytes("models", "hakimi.pth", b"DRV-PTH")
-    drive_client.upload_bytes("models", "hakimi.index", b"DRV-IDX")
+    tree = drive_client.ensure_folder_tree()
+    cache_fid = drive_client.ensure_cache_folder()
+    pth_up = drive_client.upload_bytes("models", "hakimi.pth", b"DRV-PTH")
+    idx_up = drive_client.upload_bytes("models", "hakimi.index", b"DRV-IDX")
     inbox_up = drive_client.upload_bytes("inbox", "song.m4a", b"RAW-M4A", mime_type="audio/mp4")
+    w_key = colab_remote.compute_weight_cache_key("cover")
+    cache_arch = drive_client.upload_bytes("cache", f"{w_key}_1234.tar", b"WEIGHT-TAR")
+    cache_sha = "a" * 64
+
+    cover_ctx = _make_drive_dispatch_context(
+        tree,
+        cache_folder_id=cache_fid,
+        inbox_file_id=inbox_up["file_id"],
+        inbox_name="song.m4a",
+        pth_file_id=pth_up["file_id"],
+        index_file_id=idx_up["file_id"],
+        cache_weights_file_id=cache_arch["file_id"],
+        cache_weights_sha256=cache_sha,
+    )
+    train_ctx = _make_drive_dispatch_context(
+        tree,
+        cache_folder_id=cache_fid,
+        cache_weights_file_id=cache_arch["file_id"],
+        cache_weights_sha256=cache_sha,
+    )
 
     clock_now = [1_700_000_000.0]
     stopped_sessions: list[str] = []
     probe_state = {"healthy": True, "setup_ready": True}
     usage_state = {"cu": 50.0, "active": 0}
     runner_calls: list[dict[str, Any]] = []
+    train_calls: list[dict[str, Any]] = []
 
     def fake_cover_runner(**kwargs):
         runner_calls.append(dict(kwargs))
-        # Verify short-lived access token is passed in RAM & never leaked
+        # Verify short-lived access token + 3-tier cache metadata passed in RAM & never leaked
         assert kwargs["drive_access_token"] == "ya29.fake-access-token"
         assert kwargs["drive_source_file_id"] == inbox_up["file_id"]
-        assert kwargs["drive_pth_file_id"]
-        assert kwargs["drive_index_file_id"]
+        assert kwargs["drive_pth_file_id"] == pth_up["file_id"]
+        assert kwargs["drive_index_file_id"] == idx_up["file_id"]
+        assert kwargs["drive_songs_folder_id"] == tree.songs
+        assert kwargs["cache_folder_id"] == cache_fid
+        assert kwargs["cache_weights_file_id"] == cache_arch["file_id"]
+        assert kwargs["cache_weights_sha256"] == cache_sha
         assigned = kwargs.get("reused_gpu") or kwargs["gpu_spec"].split(",")[0]
         return {
             "assigned_gpu": assigned,
@@ -1646,6 +1929,11 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
         }
 
     def fake_train_runner(**kwargs):
+        train_calls.append(dict(kwargs))
+        assert kwargs["drive_access_token"] == "ya29.fake-access-token"
+        assert kwargs["drive_models_folder_id"] == tree.models
+        assert kwargs["cache_folder_id"] == cache_fid
+        assert kwargs["cache_weights_file_id"] == cache_arch["file_id"]
         return {
             "assigned_gpu": kwargs["gpu_spec"].split(",")[0],
             "pth_path": None,
@@ -1671,7 +1959,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
     )
     app = colab_worker.create_worker_app(
         cfg,
-        drive_factory=lambda _r: drive_client,
+        drive_transport=backend.transport,
         usage_fn=lambda: {
             "reachable": True,
             "compute_units": usage_state["cu"],
@@ -1707,6 +1995,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4", "T4"],
                     "payload": {"title": "暖机测试1", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             assert r1.status_code == 202
@@ -1741,6 +2030,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4", "T4"],
                     "payload": {"title": "暖机测试2", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t2 := app.state.worker_state.tasks.get(j2)) is not None:
@@ -1765,6 +2055,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
                     "payload": {"title": "探活失败回退", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t3 := app.state.worker_state.tasks.get(j3)) is not None:
@@ -1783,6 +2074,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["H100"],
                     "payload": {"title": "高价卡禁保活", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t4 := app.state.worker_state.tasks.get(j4)) is not None:
@@ -1800,6 +2092,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
                     "payload": {"title": "到期回收", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t5 := app.state.worker_state.tasks.get(j5)) is not None:
@@ -1821,6 +2114,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
                     "payload": {"title": "训练前排空", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t6 := app.state.worker_state.tasks.get(j6)) is not None:
@@ -1834,10 +2128,12 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_train",
                     "gpu_candidates": ["H100"],
                     "payload": {"model_name": "hakimi"},
+                    "dispatch_context": train_ctx,
                 },
             )
             if (t_tr := app.state.worker_state.tasks.get(j_tr)) is not None:
                 await t_tr
+            assert len(train_calls) == 1
             assert runner_calls[5]["session"] in stopped_sessions
             assert (await client.get("/health")).json()["warm_active_count"] == 0
 
@@ -1852,6 +2148,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "gpu_candidates": ["L4"],
                     "allow_warm_keepalive": False,
                     "payload": {"title": "预算不足禁保活", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t_nb := app.state.worker_state.tasks.get(j_nobudget)) is not None:
@@ -1870,6 +2167,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
                     "payload": {"title": "余额偏低禁保活", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t_lc := app.state.worker_state.tasks.get(j_lowcu)) is not None:
@@ -1888,6 +2186,7 @@ async def test_worker_warm_pool_limits_reuse_probe_fallback_expiry_and_shutdown(
                     "job_type": "rvc_cover",
                     "gpu_candidates": ["L4"],
                     "payload": {"title": "退出清理", "inbox_file_id": inbox_up["file_id"]},
+                    "dispatch_context": cover_ctx,
                 },
             )
             if (t7 := app.state.worker_state.tasks.get(j7)) is not None:
@@ -1922,7 +2221,6 @@ async def test_colab_compute_cu_trend_gpu_breakdown_warm_status_and_token_scrub(
                         "compute_units": 88.5,
                         "active_sessions": 0,
                         "running_job_id": None,
-                        "drive_folders": {"root": "r", "models": "m", "songs": "s", "inbox": "i"},
                         "error": "token leak ya29.secret-abc123456 Bearer supersecret999",
                     },
                 )
@@ -1933,7 +2231,7 @@ async def test_colab_compute_cu_trend_gpu_breakdown_warm_status_and_token_scrub(
                     "compute_units": 88.5,
                     "active_sessions": 1,
                     "running_job_id": None,
-                    "drive_folders": {"root": "r", "models": "m", "songs": "s", "inbox": "i"},
+                    "supported_job_types": ["rvc_cover", "rvc_train"],
                     "warm_sessions": [
                         {
                             "session_name": "hakimi-warm-l4",
@@ -1971,6 +2269,8 @@ async def test_colab_compute_cu_trend_gpu_breakdown_warm_status_and_token_scrub(
     ) as mock_http:
         hub = ColabComputeHub(s, store, None, http=mock_http, clock=lambda: clock_now[0])
         await hub.initialize()
+        hub.register_job_type("rvc_cover", validator=validate_rvc_cover_payload)
+        hub.register_job_type("rvc_train", validator=validate_rvc_train_payload)
 
         # 1) Empty DB overview
         empty_ov = await hub.admin_overview()
@@ -2135,29 +2435,37 @@ async def test_colab_compute_cu_trend_gpu_breakdown_warm_status_and_token_scrub(
         await hub.scheduler_step()
         assert len(dispatched_bodies) == 1
         assert dispatched_bodies[0]["allow_warm_keepalive"] is False
+        assert "drive_songs_folder_id" not in dispatched_bodies[0]
         await hub.close()
 
 
 async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
     tmp_path: Path,
 ) -> None:
-    cred = tmp_path / "secrets" / "drive.json"
-    _write_fake_oauth(cred)
-    backend = FakeDriveBackend()
-    drive_client = colab_drive.ColabDriveClient(cred, transport=backend.transport)
-    drive_client.ensure_folder_tree()
-
     stopped: list[str] = []
     secret_worker_tok = "worker-secret-token-654321"
+    ephem_tok = "custom_ephemeral_token_987654"
+
+    def crashing_cover(**kwargs):
+        del kwargs
+        raise RuntimeError(
+            f"boom tok={secret_worker_tok} ephem={ephem_tok} "
+            "ya29.crash-token-999 1//refresh-leak-888 Bearer crashbearer777"
+        )
+
+    model_dir = tmp_path / "models"
+    (model_dir / "hakimi").mkdir(parents=True, exist_ok=True)
+    (model_dir / "hakimi" / "hakimi.pth").write_bytes(b"p")
+    (model_dir / "hakimi" / "hakimi.index").write_bytes(b"i")
+
     cfg = colab_worker.WorkerConfig(
         token=secret_worker_tok,
-        model_dir=tmp_path / "models",
+        model_dir=model_dir,
         dataset_dir=tmp_path / "dataset",
         work_root=tmp_path / "work",
     )
     app = colab_worker.create_worker_app(
         cfg,
-        drive_factory=lambda _r: drive_client,
         usage_fn=lambda: {
             "reachable": False,
             "compute_units": None,
@@ -2165,10 +2473,15 @@ async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
             "active_sessions": 0,
             "sessions": [],
             "error": (
-                f"auth failed tok={secret_worker_tok} ya29.leak-oauth-123456 Bearer secretbearer999"
+                f"auth failed tok={secret_worker_tok} ya29.leak-oauth-123456 "
+                "1//refresh-leak-123 Bearer secretbearer999"
             ),
         },
         stop_session_fn=stopped.append,
+        cover_runner=crashing_cover,
+        clean_search_fn=lambda _q, out_dir, artist="": (
+            (out_dir / "src.m4a").write_bytes(b"m4a") or (out_dir / "src.m4a")
+        ),
     )
     headers = {"Authorization": f"Bearer {secret_worker_tok}"}
 
@@ -2181,8 +2494,42 @@ async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
         err_msg = str(st.json()["error"])
         assert secret_worker_tok not in err_msg
         assert "ya29.leak-oauth-123456" not in err_msg
+        assert "1//refresh-leak-123" not in err_msg
         assert "secretbearer999" not in err_msg
         assert "[REDACTED]" in err_msg
+
+        # Failed job error MUST scrub ephemeral token, OAuth/refresh, Bearer & worker token
+        err_jid = "e" * 32
+        sub_err = await client.post(
+            "/v1/jobs",
+            headers=headers,
+            json={
+                "job_id": err_jid,
+                "job_type": "rvc_cover",
+                "payload": {"title": "脱敏测试", "auto_search": True},
+                "dispatch_context": {
+                    "drive": {
+                        "access_token": ephem_tok,
+                        "folders": {"songs": "drv_songs_0001"},
+                        "files": {},
+                    }
+                },
+            },
+        )
+        assert sub_err.status_code == 202
+        if (err_task := app.state.worker_state.tasks.get(err_jid)) is not None:
+            await err_task
+        job_err_resp = (await client.get(f"/v1/jobs/{err_jid}", headers=headers)).json()
+        assert job_err_resp["status"] == "failed"
+        dumped = json.dumps(job_err_resp)
+        for leaked in (
+            secret_worker_tok,
+            ephem_tok,
+            "ya29.crash-token-999",
+            "1//refresh-leak-888",
+            "crashbearer777",
+        ):
+            assert leaked not in dumped
 
         # Cancelling a job whose session_name is parked in warm_pool must evict the handle
         state = app.state.worker_state

@@ -1,47 +1,38 @@
-"""Authenticated control plane for Google Colab GPU scheduling and Drive inbox."""
+"""Authenticated control plane for Google Colab generic GPU scheduling."""
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Literal, NoReturn
-from urllib.parse import unquote
+from typing import Any, NoReturn
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .admin_common import body, domain_lock, partial_body, service
 from .colab_compute import ColabComputeHub, ColabConfig, GpuType
 from .security import Rejected
-from .songs import ALLOWED_SONG_EXTENSIONS, ALLOWED_SONG_MIMES, _safe_learn_upload_name
 
 router = APIRouter(prefix="/admin/api/colab")
-
-MAX_ADMIN_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 _STATUS_MAP = {
     "colab_unconfigured": 503,
     "colab_worker_unavailable": 503,
-    "colab_drive_not_configured": 503,
     "colab_job_not_found": 404,
     "colab_invalid_job": 400,
-    "colab_drive_invalid_file": 400,
-    "invalid_song_audio": 400,
+    "drive_context_required": 400,
     "song_source_required": 400,
     "colab_disabled": 409,
     "colab_daily_job_limit": 409,
     "colab_daily_cu_budget": 409,
     "colab_job_limit_reached": 409,
     "colab_job_not_cancellable": 409,
-    "colab_inbox_upload_too_large": 413,
-    "compressed_song_upload_forbidden": 415,
-    "song_upload_timeout": 408,
+    "colab_pre_dispatch_failed": 409,
 }
 
 
 class ColabJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    job_type: Literal["rvc_cover", "rvc_train"]
+    job_type: str = Field(pattern=r"^[a-z][a-z0-9_]{1,31}$")
     payload: dict[str, Any]
     gpu: GpuType | None = None
 
@@ -122,73 +113,3 @@ async def colab_terminate_sessions(request: Request):
             return await compute.emergency_terminate_sessions()
         except Rejected as exc:
             _raise_http(exc)
-
-
-@router.get("/drive/inbox")
-async def colab_drive_inbox(request: Request):
-    compute = _compute(request)
-    try:
-        items = await compute.list_drive_inbox()
-    except Rejected as exc:
-        _raise_http(exc)
-    return {"items": items}
-
-
-@router.post("/drive/inbox")
-async def colab_upload_drive_inbox(request: Request):
-    raw_header = request.headers.get("x-drive-filename", "")
-    if len(raw_header) > 512:
-        raise HTTPException(400, "colab_drive_invalid_file")
-    decoded_name = unquote(raw_header).strip()
-    if (
-        not decoded_name
-        or "/" in decoded_name
-        or "\\" in decoded_name
-        or ".." in decoded_name
-        or any(ord(ch) < 32 for ch in decoded_name)
-    ):
-        raise HTTPException(400, "colab_drive_invalid_file")
-    _, dot, ext = decoded_name.rpartition(".")
-    if not dot or ext.lower() not in ALLOWED_SONG_EXTENSIONS:
-        raise HTTPException(400, "invalid_song_audio")
-    try:
-        safe_name, mime_type = _safe_learn_upload_name(decoded_name, "track")
-    except Rejected as exc:
-        _raise_http(exc)
-
-    if request.headers.get("content-encoding", "identity") != "identity":
-        raise HTTPException(415, "compressed_song_upload_forbidden")
-    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
-    if content_type not in ALLOWED_SONG_MIMES:
-        raise HTTPException(415, "invalid_song_audio")
-
-    raw_len = request.headers.get("content-length")
-    declared: int | None = None
-    if raw_len is not None and raw_len.strip() != "":
-        try:
-            declared = int(raw_len.strip())
-        except ValueError:
-            raise HTTPException(400, "invalid_content_length") from None
-        if declared < 0:
-            raise HTTPException(400, "invalid_content_length")
-        if declared > MAX_ADMIN_INBOX_UPLOAD_BYTES:
-            raise HTTPException(413, "colab_inbox_upload_too_large")
-        if declared == 0:
-            raise HTTPException(400, "invalid_song_audio")
-
-    compute = _compute(request)
-    try:
-        async with asyncio.timeout(300):
-            res = await compute.upload_drive_inbox_stream(
-                safe_name,
-                request.stream(),
-                mime_type=mime_type,
-                content_length=declared,
-                max_bytes=MAX_ADMIN_INBOX_UPLOAD_BYTES,
-                timeout_sec=300.0,
-            )
-    except TimeoutError:
-        raise HTTPException(408, "song_upload_timeout") from None
-    except Rejected as exc:
-        _raise_http(exc)
-    return {"file_id": res["file_id"], "name": res["name"], "size": res["size"]}

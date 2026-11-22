@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
-from ..songs import SongLibrary
+from ..security import Rejected
+from ..song_drive import SongDriveStore, compute_weight_cache_key
+from ..songs import (
+    RvcCoverJobPayload,
+    RvcTrainJobPayload,
+    SongLibrary,
+    validate_rvc_cover_payload,
+    validate_rvc_train_payload,
+)
 from . import SystemModule
 
 if TYPE_CHECKING:
@@ -17,13 +26,21 @@ log = logging.getLogger("hakimi")
 
 _SUCCESS_STATUSES = frozenset({"succeeded", "completed", "ok", "done"})
 
+__all__ = [
+    "Module",
+    "RvcCoverJobPayload",
+    "RvcTrainJobPayload",
+    "validate_rvc_cover_payload",
+    "validate_rvc_train_payload",
+]
+
 
 class Module(SystemModule):
     module_id = "song_studio"
     display_name = "歌单与翻唱工坊"
     description = (
-        "管理猫猫翻唱歌单、Google Drive 音频主存、本地有界 LRU 热缓存，"
-        "并与 Colab 算力工坊联动完成异步学歌入库。"
+        "管理猫猫翻唱歌单、Google Drive Hakimi_Songs/ 音频主存与原曲收件箱、本地有界 LRU 热缓存，"
+        "并动态向 Colab 算力工坊注册翻唱/训练作业完成异步学歌入库。"
     )
     requires = ("colab_compute", "drive_sync")
     admin_panel = "songs"
@@ -37,9 +54,11 @@ class Module(SystemModule):
         plugin_bus = getattr(pb_module, "plugin_bus", None) or getattr(
             resources.service, "plugin_bus", None
         )
+        self.drive = SongDriveStore(resources.settings, resources.store)
         self.songs = SongLibrary(
             resources.store,
             compute=self.compute,
+            drive=self.drive,
             settings=resources.settings,
             plugin_bus=plugin_bus,
         )
@@ -52,14 +71,146 @@ class Module(SystemModule):
             pb = getattr(svc, "plugin_bus", None) if svc is not None else None
             if pb is not None:
                 self.songs.plugin_bus = pb
+        await self.drive.initialize()
         await self.songs.initialize()
-        if (
-            not self._hook_registered
-            and self.compute is not None
-            and hasattr(self.compute, "register_completion_hook")
-        ):
-            self.compute.register_completion_hook("rvc_cover", self._on_rvc_cover_completed)
-            self._hook_registered = True
+        if not self._hook_registered and self.compute is not None:
+            if hasattr(self.compute, "register_job_type"):
+                self.compute.register_job_type(
+                    "rvc_cover",
+                    validator=validate_rvc_cover_payload,
+                    pre_dispatch=self._prepare_rvc_cover_dispatch,
+                    on_complete=self._on_rvc_cover_completed,
+                )
+                self.compute.register_job_type(
+                    "rvc_train",
+                    validator=validate_rvc_train_payload,
+                    pre_dispatch=self._prepare_rvc_train_dispatch,
+                )
+                self._hook_registered = True
+            elif hasattr(self.compute, "register_completion_hook"):
+                self.compute.register_completion_hook("rvc_cover", self._on_rvc_cover_completed)
+                self._hook_registered = True
+
+    def _active_drive(self) -> SongDriveStore | Any:
+        drive = getattr(self.songs, "drive", None) or self.drive
+        if drive is None or not drive.configured():
+            raise Rejected("song_drive_not_configured")
+        return drive
+
+    async def _resolve_weight_cache(self, drive: Any, mode: str) -> tuple[str, str, str]:
+        cache_folder_id = ""
+        cache_weights_file_id = ""
+        cache_weights_sha256 = ""
+        try:
+            cache_folder_id = await drive.ensure_cache_folder()
+            cache_key = compute_weight_cache_key(mode)
+            manifest = await drive.resolve_cache_manifest(cache_key, expected_kind="weights")
+            if isinstance(manifest, dict):
+                cache_weights_file_id = str(manifest.get("archive_file_id") or "")
+                cache_weights_sha256 = str(manifest.get("sha256") or "")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return "", "", ""
+        return cache_folder_id, cache_weights_file_id, cache_weights_sha256
+
+    async def _prepare_rvc_cover_dispatch(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Build transient, in-memory Drive dispatch context for an `rvc_cover` job."""
+        drive = self._active_drive()
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+
+        tree = await drive.ensure_folder_tree()
+        token_info = await drive.get_short_lived_token(min_ttl_seconds=1800)
+        access_token = str(token_info.get("access_token") or "").strip()
+        if not access_token:
+            raise Rejected("song_drive_token_failed")
+
+        req_inbox_id = str(payload.get("inbox_file_id") or "").strip()
+        req_inbox_name = str(payload.get("inbox_filename") or "").strip()
+        inbox_file_id = ""
+        inbox_name = ""
+        if req_inbox_id or req_inbox_name:
+            inbox_meta = await drive.resolve_inbox_file(
+                file_id=req_inbox_id,
+                filename=req_inbox_name,
+            )
+            inbox_file_id = str(inbox_meta.get("id") or "")
+            inbox_name = str(inbox_meta.get("name") or req_inbox_name)
+
+        model_name = str(payload.get("model_name") or "hakimi").strip() or "hakimi"
+        pth_file_id = ""
+        index_file_id = ""
+        remote_models = await drive.resolve_model_files(model_name)
+        if isinstance(remote_models, dict):
+            pth_meta = remote_models.get("pth")
+            idx_meta = remote_models.get("index")
+            if isinstance(pth_meta, dict) and isinstance(idx_meta, dict):
+                pth_file_id = str(pth_meta.get("id") or "")
+                index_file_id = str(idx_meta.get("id") or "")
+
+        (
+            cache_folder_id,
+            cache_weights_file_id,
+            cache_weights_sha256,
+        ) = await self._resolve_weight_cache(drive, "cover")
+
+        return {
+            "drive": {
+                "access_token": access_token,
+                "folders": {
+                    "root": tree.root,
+                    "models": tree.models,
+                    "songs": tree.songs,
+                    "inbox": tree.inbox,
+                    "cache": cache_folder_id,
+                },
+                "files": {
+                    "inbox_file_id": inbox_file_id,
+                    "inbox_name": inbox_name,
+                    "pth_file_id": pth_file_id,
+                    "index_file_id": index_file_id,
+                    "cache_weights_file_id": cache_weights_file_id,
+                    "cache_weights_sha256": cache_weights_sha256,
+                },
+            }
+        }
+
+    async def _prepare_rvc_train_dispatch(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Build transient, in-memory Drive dispatch context for an `rvc_train` job."""
+        _ = job
+        drive = self._active_drive()
+        tree = await drive.ensure_folder_tree()
+        token_info = await drive.get_short_lived_token(min_ttl_seconds=1800)
+        access_token = str(token_info.get("access_token") or "").strip()
+        if not access_token:
+            raise Rejected("song_drive_token_failed")
+
+        (
+            cache_folder_id,
+            cache_weights_file_id,
+            cache_weights_sha256,
+        ) = await self._resolve_weight_cache(drive, "all")
+
+        return {
+            "drive": {
+                "access_token": access_token,
+                "folders": {
+                    "root": tree.root,
+                    "models": tree.models,
+                    "songs": tree.songs,
+                    "inbox": tree.inbox,
+                    "cache": cache_folder_id,
+                },
+                "files": {
+                    "inbox_file_id": "",
+                    "inbox_name": "",
+                    "pth_file_id": "",
+                    "index_file_id": "",
+                    "cache_weights_file_id": cache_weights_file_id,
+                    "cache_weights_sha256": cache_weights_sha256,
+                },
+            }
+        }
 
     async def _notify_owner(self, code: str, text: str) -> None:
         svc = getattr(self.resources, "service", None)

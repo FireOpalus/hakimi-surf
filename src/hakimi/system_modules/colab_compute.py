@@ -1,4 +1,4 @@
-"""Resident system module for loopback-isolated Colab GPU & Drive asset scheduling."""
+"""Resident system module for loopback-isolated Google Colab GPU compute scheduling."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ class Module(SystemModule):
     module_id = "colab_compute"
     display_name = "Colab 云端算力"
     description = (
-        "通过进程外 Worker 调度 Google Colab GPU 翻唱与 RVC 训练作业，"
-        "并托管 Hakimi_Songs/ 云盘音频目录。"
+        "通过进程外 Worker 调度 Google Colab 通用 GPU 云端算力，"
+        "统一管理 Compute Units 预算、热机保活与已注册作业队列。"
     )
     admin_panel = "colab-compute"
 

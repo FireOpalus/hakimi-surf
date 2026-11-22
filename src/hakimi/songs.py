@@ -13,10 +13,13 @@ import tempfile
 import time
 import unicodedata
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .security import Rejected, clean_text
 
@@ -56,6 +59,8 @@ ALLOWED_SONG_TITLE_PUNCT = frozenset(
     " _-'’‘&!?！？,，.。、~～+:：·・—–()（）[]【】「」『』@#%*=♡♥★☆♪♫"
 )
 SONG_ID_RE = re.compile(r"^[a-f0-9]{32}\Z")
+_DRIVE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
+_SAFE_INBOX_FILENAME_RE = re.compile(r"^[^\x00-\x1f/\\]{1,160}\Z")
 ALLOWED_SONG_EXTENSIONS = frozenset({"mp3", "wav", "ogg", "opus", "m4a", "flac"})
 MIME_BY_SONG_EXTENSION = {
     "mp3": "audio/mpeg",
@@ -426,6 +431,108 @@ async def transcode_mp3_to_ogg_opus(
         return ogg
 
 
+def _reject_bool_num(value: Any, *, name: str) -> Any:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric, not bool")
+    return value
+
+
+class RvcCoverJobPayload(BaseModel):
+    """Strict payload schema for Colab `rvc_cover` jobs registered by `song_studio`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=80)
+    artist: str = Field(default="", max_length=60)
+    tags: str = Field(default="", max_length=120)
+    pitch: int = Field(default=0, ge=MIN_SONG_PITCH, le=MAX_SONG_PITCH)
+    auto_search: bool = True
+    query: str = Field(default="", max_length=120)
+    inbox_file_id: str = Field(default="", max_length=128)
+    inbox_filename: str = Field(default="", max_length=160)
+    chorus_anchor: str = Field(default="", max_length=120)
+    start_sec: str | float | int = "auto"
+    duration_sec: float = Field(default=50.0, ge=5.0, le=56.0, allow_inf_nan=False)
+    fallback_start_sec: float = Field(default=60.0, ge=0.0, le=600.0, allow_inf_nan=False)
+    model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
+    index_rate: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+    protect: float = Field(default=0.28, ge=0.0, le=0.5, allow_inf_nan=False)
+    volume_envelope: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
+
+    @field_validator("title")
+    @classmethod
+    def _clean_title(cls, value: str) -> str:
+        cleaned = " ".join(value.split()).strip()
+        if not cleaned:
+            raise ValueError("title cannot be empty")
+        return cleaned
+
+    @field_validator("pitch", mode="before")
+    @classmethod
+    def _check_pitch(cls, value: Any) -> Any:
+        return _reject_bool_num(value, name="pitch")
+
+    @field_validator("inbox_file_id")
+    @classmethod
+    def _check_inbox_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned and (cleaned.lower() == "root" or not _DRIVE_FILE_ID_RE.fullmatch(cleaned)):
+            raise ValueError("invalid inbox_file_id")
+        return cleaned
+
+    @field_validator("inbox_filename")
+    @classmethod
+    def _check_inbox_filename(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        if (
+            ".." in cleaned
+            or "/" in cleaned
+            or "\\" in cleaned
+            or not _SAFE_INBOX_FILENAME_RE.fullmatch(cleaned)
+        ):
+            raise ValueError("invalid inbox_filename")
+        return cleaned
+
+
+class RvcTrainJobPayload(BaseModel):
+    """Strict payload schema for Colab `rvc_train` jobs registered by `song_studio`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
+    epochs: int = Field(default=150, ge=10, le=1000)
+    save_every: int = Field(default=30, ge=5, le=500)
+    batch_size: int = Field(default=12, ge=1, le=32)
+    sample_rate: Literal[32000, 40000, 48000] = 48000
+    force_dataset: bool = False
+
+
+def validate_rvc_cover_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize an `rvc_cover` job payload for ColabComputeHub."""
+    if not isinstance(payload, dict):
+        raise Rejected("colab_invalid_job")
+    try:
+        parsed = RvcCoverJobPayload.model_validate(payload)
+    except ValidationError:
+        raise Rejected("colab_invalid_job") from None
+    if not parsed.inbox_file_id and not parsed.inbox_filename and not parsed.auto_search:
+        raise Rejected("song_source_required")
+    return parsed.model_dump(mode="json")
+
+
+def validate_rvc_train_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize an `rvc_train` job payload for ColabComputeHub."""
+    if not isinstance(payload, dict):
+        raise Rejected("colab_invalid_job")
+    try:
+        parsed = RvcTrainJobPayload.model_validate(payload)
+    except ValidationError:
+        raise Rejected("colab_invalid_job") from None
+    return parsed.model_dump(mode="json")
+
+
 class SongLibrary:
     """Cover songbook backed by SQLite metadata, Google Drive storage, and a bounded local cache."""
 
@@ -436,6 +543,7 @@ class SongLibrary:
         ffmpeg_bin: str = "ffmpeg",
         ffprobe_bin: str = "ffprobe",
         compute: Any | None = None,
+        drive: Any | None = None,
         settings: Any | None = None,
         plugin_bus: Any | None = None,
         song_finder_remote_only: bool | None = None,
@@ -447,6 +555,7 @@ class SongLibrary:
         self.ffmpeg_bin = ffmpeg_bin
         self.ffprobe_bin = ffprobe_bin
         self.compute = compute
+        self.drive = drive
         self.plugin_bus = plugin_bus
         self._song_finder_remote_only_override = song_finder_remote_only
         self.lock = asyncio.Lock()
@@ -472,6 +581,90 @@ class SongLibrary:
             return False
         fn = getattr(self.compute, "configured", None)
         return bool(fn()) if callable(fn) else True
+
+    def _drive_configured(self) -> bool:
+        if self.drive is None:
+            return False
+        fn = getattr(self.drive, "configured", None)
+        return bool(fn()) if callable(fn) else True
+
+    def _use_direct_drive(self, legacy_compute_attr: str) -> bool:
+        if self.drive is None:
+            return False
+        if self._drive_configured():
+            return True
+        return not callable(getattr(self.compute, legacy_compute_attr, None))
+
+    def _can_download_drive_song(self) -> bool:
+        if self.drive is not None:
+            return True
+        return self._compute_configured() and callable(
+            getattr(self.compute, "download_drive_song", None)
+        )
+
+    async def _upload_inbox_bytes(
+        self, filename: str, raw: bytes, *, mime_type: str
+    ) -> dict[str, Any]:
+        if self._use_direct_drive("upload_drive_inbox"):
+            return await self.drive.upload_inbox_bytes(filename, raw, mime_type=mime_type)
+        legacy_fn = getattr(self.compute, "upload_drive_inbox", None)
+        if callable(legacy_fn):
+            return await legacy_fn(filename, raw, mime_type=mime_type)
+        raise Rejected("song_drive_not_configured")
+
+    async def _download_drive_song(self, file_id: str) -> bytes:
+        if self._use_direct_drive("download_drive_song"):
+            return await self.drive.download_song(file_id)
+        legacy_fn = getattr(self.compute, "download_drive_song", None)
+        if self._compute_configured() and callable(legacy_fn):
+            return await legacy_fn(file_id)
+        raise Rejected("song_unavailable")
+
+    async def list_inbox(self) -> dict[str, Any]:
+        """List pending original tracks in `Hakimi_Songs/inbox/` directly via SongDriveStore."""
+        if self.drive is None:
+            raise Rejected("song_drive_not_configured")
+        tree = await self.drive.ensure_folder_tree()
+        items = await self.drive.list_inbox()
+        return {"items": items, "folders": tree.as_dict()}
+
+    async def upload_inbox_stream(
+        self,
+        filename: str,
+        stream: AsyncIterator[bytes],
+        *,
+        mime_type: str = "application/octet-stream",
+        content_length: int | None = None,
+        max_bytes: int = MAX_LEARN_UPLOAD_BYTES,
+    ) -> dict[str, Any]:
+        """Stream an original track into `Hakimi_Songs/inbox/` directly via SongDriveStore."""
+        if self.drive is None:
+            raise Rejected("song_drive_not_configured")
+        return await self.drive.upload_inbox_stream(
+            filename,
+            stream,
+            mime_type=mime_type,
+            content_length=content_length,
+            max_bytes=max_bytes,
+        )
+
+    async def drive_storage_status(self, *, probe: bool = False) -> dict[str, Any]:
+        """Return Drive storage configuration and resolved folder tree independent of Colab."""
+        if self.drive is None:
+            return {
+                "configured": False,
+                "source": "none",
+                "drive_songs_folder_id": "",
+                "folders": None,
+                "error": None,
+            }
+        return await self.drive.status_overview(probe=probe)
+
+    async def set_drive_folder_id(self, folder_id: str | None) -> dict[str, Any]:
+        """Persist or reset the `Hakimi_Songs/` root folder ID override via SongDriveStore."""
+        if self.drive is None:
+            raise Rejected("song_drive_not_configured")
+        return await self.drive.set_folder_id(folder_id)
 
     def _song_finder_remote_only(self) -> bool:
         if self._song_finder_remote_only_override is not None:
@@ -736,6 +929,7 @@ class SongLibrary:
             "cache_max_bytes": self._cache_max_bytes(),
             "cached_count": len(cached_drive),
             "drive_backed_count": len(drive_entries),
+            "drive_configured": self._drive_configured(),
             "colab_configured": self._compute_configured(),
             "song_finder_online": self._song_finder_online(),
         }
@@ -1162,11 +1356,11 @@ class SongLibrary:
             if len(raw) > MAX_LEARN_UPLOAD_BYTES:
                 raise Rejected("song_upload_too_large")
             safe_name, mime_type = _safe_learn_upload_name(audio_filename, clean_title)
-            uploaded = await self.compute.upload_drive_inbox(safe_name, raw, mime_type=mime_type)
+            uploaded = await self._upload_inbox_bytes(safe_name, raw, mime_type=mime_type)
             raw_file_id = uploaded.get("file_id") if isinstance(uploaded, dict) else ""
             file_id = _sanitize_drive_id(raw_file_id)
             if not file_id:
-                raise Rejected("colab_drive_invalid_file")
+                raise Rejected("song_drive_invalid_file")
             payload["inbox_file_id"] = file_id
             payload["inbox_filename"] = str(uploaded.get("name") or safe_name)
             payload["auto_search"] = False
@@ -1183,13 +1377,13 @@ class SongLibrary:
                 fetched = await self._fetch_remote_song_source(clean_title, clean_artist)
                 if fetched is not None:
                     raw_source, safe_name, mime_type, source_provider = fetched
-                    uploaded = await self.compute.upload_drive_inbox(
+                    uploaded = await self._upload_inbox_bytes(
                         safe_name, raw_source, mime_type=mime_type
                     )
                     raw_file_id = uploaded.get("file_id") if isinstance(uploaded, dict) else ""
                     file_id = _sanitize_drive_id(raw_file_id)
                     if not file_id:
-                        raise Rejected("colab_drive_invalid_file")
+                        raise Rejected("song_drive_invalid_file")
                     payload["inbox_file_id"] = file_id
                     payload["inbox_filename"] = str(uploaded.get("name") or safe_name)
                     payload["auto_search"] = False
@@ -1223,7 +1417,7 @@ class SongLibrary:
             raw = await asyncio.to_thread(self._read, entry)
         except (OSError, Rejected):
             entry["cached_local"] = False
-            if not entry["drive_chorus_id"] or not self._compute_configured():
+            if not entry["drive_chorus_id"] or not self._can_download_drive_song():
                 raise Rejected("song_unavailable") from None
             return None, dict(entry)
         await self._touch_last_used(entry, time.time())
@@ -1248,7 +1442,7 @@ class SongLibrary:
 
             # Download from Google Drive outside self.lock.
             try:
-                downloaded = await self.compute.download_drive_song(drive_chorus_id)
+                downloaded = await self._download_drive_song(drive_chorus_id)
             except asyncio.CancelledError:
                 raise
             except Exception:

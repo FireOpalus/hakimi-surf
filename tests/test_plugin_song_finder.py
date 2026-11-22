@@ -21,10 +21,9 @@ import pytest
 from pydantic import SecretStr
 
 from hakimi.app import create_app
-from hakimi.colab_compute import _RvcCoverJobPayload
 from hakimi.modules import ModuleRegistry
 from hakimi.security import Rejected
-from hakimi.songs import SongLibrary
+from hakimi.songs import RvcCoverJobPayload, SongLibrary
 from hakimi.system_modules import SystemResources
 from hakimi.system_modules.song_studio import Module as SongStudioModule
 from plugins.song_finder.plugin_main import (
@@ -139,7 +138,7 @@ class _FakeColabCompute:
     ) -> dict[str, Any]:
         # Enforce the real strict Pydantic model (extra="forbid") on every submission!
         if job_type == "rvc_cover":
-            _RvcCoverJobPayload.model_validate(payload)
+            RvcCoverJobPayload.model_validate(payload)
         self.submitted_jobs.append((job_type, dict(payload), requester))
         return {
             "id": uuid.uuid4().hex,

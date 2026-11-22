@@ -1,4 +1,4 @@
-"""Loopback-isolated Google Colab GPU scheduler and Hakimi_Songs/ Drive proxy client."""
+"""Loopback-isolated Google Colab generic GPU compute scheduler."""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ import math
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -26,18 +25,12 @@ log = logging.getLogger("hakimi")
 
 GpuType = Literal["H100", "A100", "G4", "L4", "T4"]
 VALID_GPUS: tuple[GpuType, ...] = ("H100", "A100", "G4", "L4", "T4")
-VALID_JOB_TYPES = frozenset({"rvc_cover", "rvc_train"})
 MAX_QUEUED_JOBS = 20
-MAX_INBOX_UPLOAD_BYTES = 100 * 1024 * 1024
-MAX_SONG_UPLOAD_BYTES = 30 * 1024 * 1024
-MAX_DRIVE_DOWNLOAD_BYTES = 30 * 1024 * 1024
 
 _CONFIG_KEY = "colab_compute_config"
 _VAULT_CFG_CTX = "admin:colab_compute_config"
-_FOLDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
-_DRIVE_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{16,64}$")
-_SAFE_FILENAME_RE = re.compile(r"^[^\x00-\x1f/\\]{1,160}$")
+_JOB_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _OAUTH_TOKEN_RE = re.compile(r"(?:ya29\.[A-Za-z0-9._-]+|1//[A-Za-z0-9._-]+)")
 _BEARER_TOKEN_RE = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 _DEFAULT_WARM_ALLOWED_GPUS: tuple[str, ...] = ("L4", "T4")
@@ -85,7 +78,6 @@ class ColabConfig(BaseModel):
     daily_cu_budget: float = Field(default=10.0, ge=0.0, le=200.0, allow_inf_nan=False)
     job_timeout_seconds: int = Field(default=1800, ge=120, le=7200)
     auto_terminate_orphan_minutes: int = Field(default=20, ge=5, le=120)
-    drive_songs_folder_id: str = Field(default="", max_length=128)
 
     @field_validator("enabled")
     @classmethod
@@ -118,103 +110,12 @@ class ColabConfig(BaseModel):
                 out.append(gpu)
         return out
 
-    @field_validator("drive_songs_folder_id", mode="before")
-    @classmethod
-    def _check_folder_id(cls, value: Any) -> str:
-        if value is None:
-            return ""
-        if not isinstance(value, str):
-            raise ValueError("drive_songs_folder_id must be a string")
-        cleaned = value.strip()
-        if not cleaned:
-            return ""
-        if cleaned == "root" or not _FOLDER_ID_RE.fullmatch(cleaned):
-            raise ValueError("invalid drive_songs_folder_id")
-        return cleaned
 
-
-class _RvcCoverJobPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str = Field(min_length=1, max_length=80)
-    artist: str = Field(default="", max_length=60)
-    tags: str = Field(default="", max_length=120)
-    pitch: int = Field(default=0, ge=-24, le=24)
-    auto_search: bool = True
-    query: str = Field(default="", max_length=120)
-    inbox_file_id: str = Field(default="", max_length=128)
-    inbox_filename: str = Field(default="", max_length=160)
-    chorus_anchor: str = Field(default="", max_length=120)
-    start_sec: str | float | int = "auto"
-    duration_sec: float = Field(default=50.0, ge=5.0, le=56.0, allow_inf_nan=False)
-    fallback_start_sec: float = Field(default=60.0, ge=0.0, le=600.0, allow_inf_nan=False)
-    model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
-    index_rate: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
-    protect: float = Field(default=0.28, ge=0.0, le=0.5, allow_inf_nan=False)
-    volume_envelope: float = Field(default=0.25, ge=0.0, le=1.0, allow_inf_nan=False)
-
-    @field_validator("title")
-    @classmethod
-    def _clean_title(cls, value: str) -> str:
-        cleaned = " ".join(value.split()).strip()
-        if not cleaned:
-            raise ValueError("title cannot be empty")
-        return cleaned
-
-    @field_validator("pitch", mode="before")
-    @classmethod
-    def _check_pitch(cls, value: Any) -> Any:
-        return _reject_bool_num(value, name="pitch")
-
-    @field_validator("inbox_file_id")
-    @classmethod
-    def _check_inbox_id(cls, value: str) -> str:
-        cleaned = value.strip()
-        if cleaned and not _DRIVE_FILE_ID_RE.fullmatch(cleaned):
-            raise ValueError("invalid inbox_file_id")
-        return cleaned
-
-    @field_validator("inbox_filename")
-    @classmethod
-    def _check_inbox_filename(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            return ""
-        if (
-            ".." in cleaned
-            or "/" in cleaned
-            or "\\" in cleaned
-            or not _SAFE_FILENAME_RE.fullmatch(cleaned)
-        ):
-            raise ValueError("invalid inbox_filename")
-        return cleaned
-
-
-class _RvcTrainJobPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model_name: str = Field(default="hakimi", pattern=r"^[a-z0-9_-]{1,32}$")
-    epochs: int = Field(default=150, ge=10, le=1000)
-    save_every: int = Field(default=30, ge=5, le=500)
-    batch_size: int = Field(default=12, ge=1, le=32)
-    sample_rate: Literal[32000, 40000, 48000] = 48000
-    force_dataset: bool = False
-
-
-def _sanitize_filename(filename: str) -> str:
-    if not isinstance(filename, str):
-        raise Rejected("colab_drive_invalid_file")
-    cleaned = Path(filename.strip()).name.strip()
-    if (
-        not cleaned
-        or cleaned in {".", ".."}
-        or ".." in cleaned
-        or "/" in filename
-        or "\\" in filename
-        or not _SAFE_FILENAME_RE.fullmatch(cleaned)
-    ):
-        raise Rejected("colab_drive_invalid_file")
-    return cleaned
+@dataclass(frozen=True)
+class _RegisteredJobSpec:
+    job_type: str
+    validator: Callable[[dict[str, Any]], dict[str, Any]]
+    pre_dispatch: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -391,6 +292,7 @@ class ColabComputeHub:
         self._closed = False
         self._overridden = False
         self.config = self._default_config()
+        self._job_types: dict[str, _RegisteredJobSpec] = {}
         self._hooks: dict[str, list[Callable[[dict[str, Any]], Awaitable[None]]]] = {}
 
         # Non-blocking cached operational summary for SystemModule.status()
@@ -405,10 +307,40 @@ class ColabComputeHub:
         self._last_warm_pool: dict[str, Any] = _default_warm_pool()
 
     def _default_config(self) -> ColabConfig:
-        folder_id = str(getattr(self.s, "colab_drive_songs_folder_id", "") or "").strip()
-        if folder_id and _FOLDER_ID_RE.fullmatch(folder_id) and folder_id != "root":
-            return ColabConfig(drive_songs_folder_id=folder_id)
         return ColabConfig()
+
+    def register_job_type(
+        self,
+        job_type: str,
+        *,
+        validator: Callable[[dict[str, Any]], dict[str, Any]],
+        pre_dispatch: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None,
+        on_complete: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
+        """Register a whitelisted GPU job type with validator and optional lifecycle callbacks."""
+        if not isinstance(job_type, str) or not _JOB_TYPE_RE.fullmatch(job_type):
+            raise ValueError(f"Invalid Colab job_type: {job_type!r}")
+        if not callable(validator):
+            raise TypeError("validator must be callable")
+        if pre_dispatch is not None and not callable(pre_dispatch):
+            raise TypeError("pre_dispatch must be callable or None")
+        if on_complete is not None and not callable(on_complete):
+            raise TypeError("on_complete must be callable or None")
+        self._job_types[job_type] = _RegisteredJobSpec(
+            job_type=job_type,
+            validator=validator,
+            pre_dispatch=pre_dispatch,
+        )
+        if on_complete is not None:
+            hooks = self._hooks.setdefault(job_type, [])
+            if on_complete not in hooks:
+                hooks.append(on_complete)
+
+    def is_registered_job_type(self, job_type: str) -> bool:
+        return isinstance(job_type, str) and job_type in self._job_types
+
+    def registered_job_types(self) -> tuple[str, ...]:
+        return tuple(sorted(self._job_types))
 
     def _worker_url(self) -> str:
         return str(getattr(self.s, "colab_worker_url", "") or "").strip().rstrip("/")
@@ -498,7 +430,10 @@ class ColabComputeHub:
                 try:
                     raw = self.store.vault.open(_VAULT_CFG_CTX, row[0])
                     if isinstance(raw, dict):
-                        merged = {**default_cfg.model_dump(mode="json"), **raw}
+                        cleaned_raw = {
+                            k: v for k, v in raw.items() if k in ColabConfig.model_fields
+                        }
+                        merged = {**default_cfg.model_dump(mode="json"), **cleaned_raw}
                         self.config = ColabConfig.model_validate(merged)
                         self._overridden = True
                     else:
@@ -636,8 +571,8 @@ class ColabComputeHub:
                 "compute_units": None,
                 "active_sessions": 0,
                 "running_job_id": None,
-                "drive_folders": None,
                 "warm_sessions": [],
+                "supported_job_types": [],
                 "error": "colab_unconfigured",
             }
         try:
@@ -653,8 +588,8 @@ class ColabComputeHub:
                     "compute_units": self._last_cu_balance,
                     "active_sessions": 0,
                     "running_job_id": None,
-                    "drive_folders": None,
                     "warm_sessions": [],
+                    "supported_job_types": [],
                     "error": err,
                 }
             data = resp.json()
@@ -670,6 +605,13 @@ class ColabComputeHub:
             clean_err = self._scrub(raw_err) if raw_err else None
             warm_sessions = _normalize_warm_sessions(data.get("warm_sessions"), now=now)
             warm_pool = _normalize_warm_pool(data.get("warm_pool"), active_count=len(warm_sessions))
+            raw_types = data.get("supported_job_types")
+            supported_types: list[str] = []
+            if isinstance(raw_types, (list, tuple)):
+                for item in raw_types:
+                    cleaned = str(item or "").strip()
+                    if _JOB_TYPE_RE.fullmatch(cleaned) and cleaned not in supported_types:
+                        supported_types.append(cleaned)
             self._worker_reachable = reachable
             self._last_error = clean_err
             self._last_status_poll_at = now
@@ -680,8 +622,8 @@ class ColabComputeHub:
                 "compute_units": float(cu) if has_cu else None,
                 "active_sessions": max(0, _safe_int(data.get("active_sessions"), 0)),
                 "running_job_id": data.get("running_job_id"),
-                "drive_folders": data.get("drive_folders"),
                 "warm_sessions": [dict(item) for item in warm_sessions],
+                "supported_job_types": supported_types,
                 "error": clean_err,
             }
         except Rejected as exc:
@@ -692,8 +634,8 @@ class ColabComputeHub:
                 "compute_units": self._last_cu_balance,
                 "active_sessions": 0,
                 "running_job_id": None,
-                "drive_folders": None,
                 "warm_sessions": [],
+                "supported_job_types": [],
                 "error": str(exc),
             }
         except Exception as exc:
@@ -706,8 +648,8 @@ class ColabComputeHub:
                 "compute_units": self._last_cu_balance,
                 "active_sessions": 0,
                 "running_job_id": None,
-                "drive_folders": None,
                 "warm_sessions": [],
+                "supported_job_types": [],
                 "error": err,
             }
 
@@ -917,6 +859,7 @@ class ColabComputeHub:
             "configured": self.configured(),
             "source": "sqlite" if self._overridden else "default",
             "config": self.config.model_dump(mode="json"),
+            "supported_job_types": list(self.registered_job_types()),
             "worker": worker,
             "today": today,
             "jobs": jobs,
@@ -952,21 +895,25 @@ class ColabComputeHub:
         payload: dict[str, Any],
         gpu: str | None,
     ) -> tuple[dict[str, Any], GpuType]:
-        if job_type not in VALID_JOB_TYPES or not isinstance(payload, dict):
+        if (
+            not isinstance(job_type, str)
+            or job_type not in self._job_types
+            or not isinstance(payload, dict)
+        ):
             raise Rejected("colab_invalid_job")
+        spec = self._job_types[job_type]
         try:
-            if job_type == "rvc_cover":
-                parsed = _RvcCoverJobPayload.model_validate(payload)
-                if (
-                    not parsed.inbox_file_id
-                    and not parsed.inbox_filename
-                    and not parsed.auto_search
-                ):
-                    raise Rejected("song_source_required")
-            else:
-                parsed = _RvcTrainJobPayload.model_validate(payload)
-        except ValidationError:
+            validated = spec.validator(dict(payload))
+        except Rejected:
+            raise
+        except (ValidationError, ValueError, TypeError):
             raise Rejected("colab_invalid_job") from None
+        if isinstance(validated, BaseModel):
+            clean_payload = validated.model_dump(mode="json")
+        elif isinstance(validated, dict):
+            clean_payload = dict(validated)
+        else:
+            raise Rejected("colab_invalid_job")
 
         if gpu is None:
             chosen_gpu: GpuType = self.config.preferred_gpu
@@ -974,7 +921,7 @@ class ColabComputeHub:
             chosen_gpu = gpu  # type: ignore[assignment]
         else:
             raise Rejected("colab_invalid_job")
-        return parsed.model_dump(mode="json"), chosen_gpu
+        return clean_payload, chosen_gpu
 
     async def submit_job(
         self,
@@ -1153,218 +1100,14 @@ class ColabComputeHub:
             "detail": str(worker_data.get("detail") or "ok")[:120],
         }
 
-    async def list_drive_inbox(self) -> list[dict[str, Any]]:
-        await self.initialize()
-        resp = await self._request("GET", "/v1/drive/inbox", timeout_sec=10.0)
-        if resp.status_code == 503:
-            raise Rejected("colab_drive_not_configured")
-        if resp.status_code >= 400:
-            raise Rejected("colab_worker_unavailable")
-        data = resp.json()
-        raw_items = data.get("items") if isinstance(data, dict) else data
-        if not isinstance(raw_items, list):
-            return []
-        out: list[dict[str, Any]] = []
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            out.append(
-                {
-                    "id": str(item.get("id") or ""),
-                    "name": str(item.get("name") or ""),
-                    "size": int(item.get("size") or 0),
-                    "modified_time": str(item.get("modified_time") or ""),
-                }
-            )
-        return out
-
-    async def upload_drive_inbox(
-        self,
-        filename: str,
-        raw: bytes,
-        *,
-        mime_type: str = "application/octet-stream",
-        timeout_sec: float = 300.0,
-    ) -> dict[str, Any]:
-        await self.initialize()
-        clean_name = _sanitize_filename(filename)
-        if not isinstance(raw, (bytes, bytearray)) or not raw or len(raw) > MAX_INBOX_UPLOAD_BYTES:
-            raise Rejected("colab_drive_invalid_file")
-        resp = await self._request(
-            "POST",
-            "/v1/drive/inbox",
-            content=bytes(raw),
-            headers={
-                "Content-Type": mime_type or "application/octet-stream",
-                "X-Drive-Filename": quote(clean_name, safe=""),
-            },
-            timeout_sec=timeout_sec,
-        )
-        if resp.status_code == 400 or resp.status_code == 413:
-            raise Rejected("colab_drive_invalid_file")
-        if resp.status_code == 503:
-            raise Rejected("colab_drive_not_configured")
-        if resp.status_code >= 400:
-            raise Rejected("colab_worker_unavailable")
-        res = resp.json()
-        return {
-            "file_id": str(res["file_id"]),
-            "name": str(res.get("name") or clean_name),
-            "size": int(res.get("size") or len(raw)),
-        }
-
-    async def upload_drive_inbox_stream(
-        self,
-        filename: str,
-        stream: AsyncIterator[bytes],
-        *,
-        mime_type: str = "application/octet-stream",
-        content_length: int | None = None,
-        max_bytes: int = MAX_INBOX_UPLOAD_BYTES,
-        timeout_sec: float = 300.0,
-    ) -> dict[str, Any]:
-        """Stream an audio file directly to the host worker's /v1/drive/inbox endpoint."""
-        await self.initialize()
-        if not self.configured():
-            raise Rejected("colab_unconfigured")
-        clean_name = _sanitize_filename(filename)
-        if content_length is not None:
-            if isinstance(content_length, bool) or content_length < 0:
-                raise Rejected("colab_drive_invalid_file")
-            if content_length > max_bytes:
-                raise Rejected("colab_inbox_upload_too_large")
-            if content_length == 0:
-                raise Rejected("invalid_song_audio")
-
-        it = aiter(stream)
-        first = b""
-        while not first:
-            try:
-                chunk = await anext(it)
-            except StopAsyncIteration:
-                raise Rejected("invalid_song_audio") from None
-            if chunk:
-                first = bytes(chunk)
-        if len(first) > max_bytes:
-            raise Rejected("colab_inbox_upload_too_large")
-
-        total_bytes = 0
-
-        async def _gen() -> AsyncIterator[bytes]:
-            nonlocal total_bytes
-            total_bytes = len(first)
-            yield first
-            async for chunk in it:
-                if not chunk:
-                    continue
-                data = bytes(chunk)
-                total_bytes += len(data)
-                if total_bytes > max_bytes:
-                    raise Rejected("colab_inbox_upload_too_large")
-                yield data
-
-        client = await self._http()
-        url = f"{self._worker_url()}/v1/drive/inbox"
-        headers = {
-            "Authorization": f"Bearer {self._worker_token()}",
-            "Content-Type": mime_type or "application/octet-stream",
-            "X-Drive-Filename": quote(clean_name, safe=""),
-        }
-        try:
-            resp = await client.request(
-                "POST",
-                url,
-                headers=headers,
-                content=_gen(),
-                timeout=httpx.Timeout(timeout_sec, connect=10.0),
-            )
-        except Rejected:
-            raise
-        except (httpx.HTTPError, TimeoutError, OSError) as exc:
-            self._worker_reachable = False
-            self._last_error = self._scrub(type(exc).__name__)
-            raise Rejected("colab_worker_unavailable") from None
-
-        if resp.status_code == 413:
-            raise Rejected("colab_inbox_upload_too_large")
-        if resp.status_code == 400:
-            raise Rejected("colab_drive_invalid_file")
-        if resp.status_code == 503:
-            raise Rejected("colab_drive_not_configured")
-        if resp.status_code >= 400:
-            raise Rejected("colab_worker_unavailable")
-        try:
-            res = resp.json()
-        except ValueError:
-            raise Rejected("colab_worker_unavailable") from None
-        if not isinstance(res, dict) or not res.get("file_id"):
-            raise Rejected("colab_worker_unavailable")
-        return {
-            "file_id": str(res["file_id"]),
-            "name": str(res.get("name") or clean_name),
-            "size": int(res.get("size") or total_bytes),
-        }
-
-    async def download_drive_song(self, file_id: str) -> bytes:
-        await self.initialize()
-        if not isinstance(file_id, str) or not _DRIVE_FILE_ID_RE.fullmatch(file_id.strip()):
-            raise Rejected("colab_drive_invalid_file")
-        clean_id = file_id.strip()
-        resp = await self._request("GET", f"/v1/drive/songs/{clean_id}", timeout_sec=60.0)
-        if resp.status_code in {400, 404}:
-            raise Rejected("colab_drive_invalid_file")
-        if resp.status_code == 503:
-            raise Rejected("colab_drive_not_configured")
-        if resp.status_code >= 400:
-            raise Rejected("colab_worker_unavailable")
-        data = resp.content
-        if not data or len(data) > MAX_DRIVE_DOWNLOAD_BYTES:
-            raise Rejected("colab_drive_invalid_file")
-        return data
-
-    async def upload_drive_song(
-        self,
-        filename: str,
-        raw: bytes,
-        *,
-        title: str = "",
-        mime_type: str = "audio/mpeg",
-    ) -> dict[str, Any]:
-        await self.initialize()
-        clean_name = _sanitize_filename(filename)
-        if not isinstance(raw, (bytes, bytearray)) or not raw or len(raw) > MAX_SONG_UPLOAD_BYTES:
-            raise Rejected("colab_drive_invalid_file")
-        headers = {
-            "Content-Type": mime_type or "audio/mpeg",
-            "X-Drive-Filename": quote(clean_name, safe=""),
-        }
-        if title.strip():
-            headers["X-Song-Title"] = quote(title.strip()[:80], safe="")
-        resp = await self._request(
-            "POST",
-            "/v1/drive/songs",
-            content=bytes(raw),
-            headers=headers,
-            timeout_sec=60.0,
-        )
-        if resp.status_code in {400, 413}:
-            raise Rejected("colab_drive_invalid_file")
-        if resp.status_code == 503:
-            raise Rejected("colab_drive_not_configured")
-        if resp.status_code >= 400:
-            raise Rejected("colab_worker_unavailable")
-        res = resp.json()
-        return {
-            "file_id": str(res["file_id"]),
-            "name": str(res.get("name") or clean_name),
-        }
-
     def register_completion_hook(
         self,
         job_type: str,
         callback: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        self._hooks.setdefault(job_type, []).append(callback)
+        hooks = self._hooks.setdefault(job_type, [])
+        if callback not in hooks:
+            hooks.append(callback)
 
     async def _fire_hooks(self, job: dict[str, Any]) -> None:
         callbacks = list(self._hooks.get(job["job_type"], ()))
@@ -1387,10 +1130,16 @@ class ColabComputeHub:
     ) -> dict[str, Any] | None:
         now = self._clock()
         clean_err = self._scrub(error) if error else None
-        if status == "failed" and error_code:
-            res_obj = dict(result) if isinstance(result, dict) else {}
-            res_obj.setdefault("error_code", error_code)
+        clean_code = self._scrub(error_code)[:64] if error_code else None
+        if isinstance(result, dict):
+            res_obj = dict(result)
+            if res_obj.get("error_code"):
+                res_obj["error_code"] = self._scrub(res_obj["error_code"])[:64]
+            if status == "failed" and clean_code:
+                res_obj.setdefault("error_code", clean_code)
             result = res_obj
+        elif status == "failed" and clean_code:
+            result = {"error_code": clean_code}
         sealed_res = self._seal_blob(job_id, "result", result)
         async with self.store.transaction():
             await self.store.db.execute(
@@ -1401,7 +1150,7 @@ class ColabComputeHub:
                     status,
                     assigned_gpu,
                     sealed_res,
-                    error_code,
+                    clean_code,
                     clean_err,
                     max(0.0, float(cu_used or 0.0)),
                     now,
@@ -1529,45 +1278,117 @@ class ColabComputeHub:
                             if done is not None:
                                 finished_to_notify.append(done)
                         else:
-                            gpu_candidates = [next_job["preferred_gpu"]]
-                            for fb in self.config.fallback_gpus:
-                                if fb not in gpu_candidates:
-                                    gpu_candidates.append(fb)
-                            body = {
-                                "job_id": next_job["id"],
-                                "job_type": next_job["job_type"],
-                                "gpu_candidates": gpu_candidates,
-                                "timeout_seconds": self.config.job_timeout_seconds,
-                                "drive_songs_folder_id": self.config.drive_songs_folder_id,
-                                "allow_warm_keepalive": bool(
-                                    self.config.enabled
-                                    and (self.config.daily_cu_budget - usage["cu_used"]) >= 0.5
-                                ),
-                                "payload": next_job["payload"],
-                            }
-                            try:
-                                disp = await self._request(
-                                    "POST", "/v1/jobs", json_body=body, timeout_sec=8.0
+                            spec = self._job_types.get(next_job["job_type"])
+                            if spec is None:
+                                done = await self._finalize_job(
+                                    next_job["id"],
+                                    status="failed",
+                                    error_code="colab_invalid_job",
+                                    error="Unregistered job type",
                                 )
-                                if disp.status_code in {200, 202}:
-                                    async with self.store.transaction():
-                                        await self.store.db.execute(
-                                            "UPDATE colab_jobs SET status='running', started_at=?, "
-                                            "updated_at=? WHERE id=?",
-                                            (now, now, next_job["id"]),
+                                if done is not None:
+                                    finished_to_notify.append(done)
+                            else:
+                                dispatch_ctx: dict[str, Any] | None = None
+                                pre_failed = False
+                                if spec.pre_dispatch is not None:
+                                    try:
+                                        dispatch_ctx = await spec.pre_dispatch(dict(next_job))
+                                    except Rejected as exc:
+                                        err_code = str(exc) or "colab_pre_dispatch_failed"
+                                        done = await self._finalize_job(
+                                            next_job["id"],
+                                            status="failed",
+                                            error_code=err_code,
+                                            error=err_code,
                                         )
-                                    await self._refresh_cached_counts()
-                                elif disp.status_code == 400:
-                                    done = await self._finalize_job(
-                                        next_job["id"],
-                                        status="failed",
-                                        error_code="colab_invalid_job",
-                                        error="Worker rejected job payload",
-                                    )
-                                    if done is not None:
-                                        finished_to_notify.append(done)
-                            except Rejected:
-                                pass
+                                        if done is not None:
+                                            finished_to_notify.append(done)
+                                        pre_failed = True
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except Exception as exc:
+                                        done = await self._finalize_job(
+                                            next_job["id"],
+                                            status="failed",
+                                            error_code="colab_pre_dispatch_failed",
+                                            error=self._scrub(type(exc).__name__),
+                                        )
+                                        if done is not None:
+                                            finished_to_notify.append(done)
+                                        pre_failed = True
+                                if not pre_failed and dispatch_ctx is not None:
+                                    if not isinstance(dispatch_ctx, dict):
+                                        done = await self._finalize_job(
+                                            next_job["id"],
+                                            status="failed",
+                                            error_code="colab_pre_dispatch_failed",
+                                            error="Invalid dispatch context",
+                                        )
+                                        if done is not None:
+                                            finished_to_notify.append(done)
+                                        pre_failed = True
+                                if not pre_failed:
+                                    gpu_candidates = [next_job["preferred_gpu"]]
+                                    for fb in self.config.fallback_gpus:
+                                        if fb not in gpu_candidates:
+                                            gpu_candidates.append(fb)
+                                    body: dict[str, Any] = {
+                                        "job_id": next_job["id"],
+                                        "job_type": next_job["job_type"],
+                                        "gpu_candidates": gpu_candidates,
+                                        "timeout_seconds": self.config.job_timeout_seconds,
+                                        "allow_warm_keepalive": bool(
+                                            self.config.enabled
+                                            and (self.config.daily_cu_budget - usage["cu_used"])
+                                            >= 0.5
+                                        ),
+                                        "payload": next_job["payload"],
+                                    }
+                                    if dispatch_ctx:
+                                        body["dispatch_context"] = dispatch_ctx
+                                    try:
+                                        disp = await self._request(
+                                            "POST", "/v1/jobs", json_body=body, timeout_sec=8.0
+                                        )
+                                        if disp.status_code in {200, 202}:
+                                            async with self.store.transaction():
+                                                await self.store.db.execute(
+                                                    "UPDATE colab_jobs SET status='running', "
+                                                    "started_at=?, updated_at=? WHERE id=?",
+                                                    (now, now, next_job["id"]),
+                                                )
+                                            await self._refresh_cached_counts()
+                                        elif disp.status_code == 400:
+                                            worker_code = "colab_invalid_job"
+                                            try:
+                                                err_data = disp.json()
+                                                if isinstance(err_data, dict):
+                                                    detail = str(
+                                                        err_data.get("detail") or ""
+                                                    ).strip()
+                                                    if detail in {
+                                                        "colab_invalid_job",
+                                                        "drive_context_required",
+                                                        "colab_drive_not_configured",
+                                                        "song_source_required",
+                                                    }:
+                                                        worker_code = detail
+                                            except ValueError:
+                                                pass
+                                            done = await self._finalize_job(
+                                                next_job["id"],
+                                                status="failed",
+                                                error_code=worker_code,
+                                                error="Worker rejected job payload",
+                                            )
+                                            if done is not None:
+                                                finished_to_notify.append(done)
+                                    except Rejected:
+                                        pass
+                                    finally:
+                                        dispatch_ctx = None
+                                        body.pop("dispatch_context", None)
 
         for done_job in finished_to_notify:
             await self._fire_hooks(done_job)

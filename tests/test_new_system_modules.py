@@ -152,7 +152,17 @@ async def test_new_system_modules_topology_isolation_and_reserved_ids(settings):
             assert (
                 await client.get("/admin/api/colab", headers={"Authorization": ""})
             ).status_code == 401
-            assert (await client.get("/admin/api/colab")).status_code == 200
+            colab_resp = await client.get("/admin/api/colab")
+            assert colab_resp.status_code == 200
+            colab_ov = colab_resp.json()
+            assert "drive_songs_folder_id" not in colab_ov["config"]
+            assert "drive_folders" not in colab_ov["worker"]
+            assert set(colab_ov["supported_job_types"]) >= {"rvc_cover", "rvc_train"}
+            colab_desc = sys_mods["colab_compute"]["description"]
+            assert "GPU" in colab_desc
+            assert "翻唱" not in colab_desc
+            assert "RVC" not in colab_desc
+            assert "Hakimi_Songs" not in colab_desc
 
 
 async def test_voice_gateway_module_initialize_and_nonblocking_status(settings, store):
@@ -352,7 +362,7 @@ async def test_owner_chat_learn_song_command_and_action_e2e(
             }
 
         monkeypatch.setattr(svc.colab_compute, "close", tracked_close)
-        monkeypatch.setattr(svc.colab_compute, "upload_drive_inbox", fake_upload_inbox)
+        monkeypatch.setattr(svc.songs.drive, "upload_inbox_bytes", fake_upload_inbox)
         monkeypatch.setattr(svc.colab_compute, "submit_job", fake_submit_job)
 
         collected = svc._collect_owner_chat_actions()
@@ -543,7 +553,7 @@ async def test_owner_chat_learn_song_handle_message_passes_context_message_e2e(
                 "created_at": time.time(),
             }
 
-        monkeypatch.setattr(svc.colab_compute, "upload_drive_inbox", fake_upload)
+        monkeypatch.setattr(svc.songs.drive, "upload_inbox_bytes", fake_upload)
         monkeypatch.setattr(svc.colab_compute, "submit_job", fake_submit)
 
         now = int(time.time())

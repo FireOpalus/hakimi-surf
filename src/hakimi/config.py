@@ -389,6 +389,17 @@ class Settings(BaseSettings):
             "COLAB_DRIVE_SONGS_FOLDER_ID", "HAKIMI_COLAB_DRIVE_SONGS_FOLDER_ID"
         ),
     )
+    song_drive_oauth_file: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("SONG_DRIVE_OAUTH_FILE", "HAKIMI_SONG_DRIVE_OAUTH_FILE"),
+    )
+    song_drive_songs_folder_id: str = Field(
+        default="",
+        pattern=r"^[A-Za-z0-9_-]{0,128}$",
+        validation_alias=AliasChoices(
+            "SONG_DRIVE_SONGS_FOLDER_ID", "HAKIMI_SONG_DRIVE_SONGS_FOLDER_ID"
+        ),
+    )
     song_cache_max_bytes: int = Field(
         default=30 * 1024 * 1024,
         ge=1024 * 1024,
