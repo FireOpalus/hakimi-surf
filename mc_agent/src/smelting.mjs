@@ -641,6 +641,13 @@ export async function executeSmeltAction(
   const summary = partial
     ? `已部分熔炼出 ${spec.output} x${smeltedCount}/${requestedCount}（燃料:${fuel.fuelName}）`
     : `已熔炼出 ${spec.output} x${smeltedCount}（燃料:${fuel.fuelName}）`;
+  const furnacePos = furnaceBlock?.position
+    ? [
+        Math.floor(furnaceBlock.position.x),
+        Math.floor(furnaceBlock.position.y),
+        Math.floor(furnaceBlock.position.z),
+      ]
+    : undefined;
 
   return {
     ok: true,
@@ -652,6 +659,7 @@ export async function executeSmeltAction(
     partial,
     used_fuel: fuel.fuelName,
     used_furnace: true,
+    ...(furnacePos ? { furnace_pos: furnacePos } : {}),
     missing_materials: [],
     summary,
   };

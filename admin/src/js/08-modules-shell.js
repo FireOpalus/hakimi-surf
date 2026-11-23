@@ -234,6 +234,7 @@ async function loadModule(id){
     text('bili-module-backend','—');text('bili-module-autonomous','—');
   }else if(id==='minecraft'){
     $('mc-overview').replaceChildren();text('life-mc-status','');
+    text('mc-plan-summary','');$('mc-waypoints-list').replaceChildren();$('mc-action-log').replaceChildren();
     mcControls.forEach(control=>$(control).disabled=true);
   }
   const d=await api('life/modules/'+encodeURIComponent(id));

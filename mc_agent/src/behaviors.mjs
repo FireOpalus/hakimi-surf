@@ -22,6 +22,21 @@ import {
 import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
 import { executeSmeltAction, parseSmeltParams } from "./smelting.mjs";
 import {
+  applySafeMovements,
+  checkHarvestToolTier,
+  executeChestAction,
+  executeGiveAction,
+  executeHuntAction,
+  executePlaceAction,
+  executeSleepAction,
+  hasExposedFace,
+  isBedName,
+  parseChestParams,
+  parseGiveParams,
+  parseHuntParams,
+  parsePlaceParams,
+} from "./world_actions.mjs";
+import {
   CREEPER_SAFE_DISTANCE,
   HOSTILE_MOBS,
   applyNoDigMovements,
@@ -34,7 +49,7 @@ import {
 
 export { HOSTILE_MOBS };
 
-const { Movements, goals } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 const { GoalFollow, GoalNear, GoalNearXZ } = goals;
 
 export const ALLOWED_GOAL_ACTIONS = new Set([
@@ -56,6 +71,11 @@ export const ALLOWED_GOAL_ACTIONS = new Set([
   "smelt",
   "guard",
   "evade",
+  "hunt",
+  "sleep",
+  "chest",
+  "place",
+  "give",
 ]);
 
 export const NEARBY_RESOURCE_BLOCKS = new Set([
@@ -84,6 +104,9 @@ export const NEARBY_RESOURCE_BLOCKS = new Set([
   "furnace",
   "smoker",
   "blast_furnace",
+  "chest",
+  "trapped_chest",
+  "barrel",
   "hay_block",
   "wheat",
   "pumpkin",
@@ -191,6 +214,8 @@ export class McRuntime {
     hostileAlertCooldownMs = 60_000,
     pickupSettleMs = 120,
     smeltPollIntervalMs = 350,
+    stuckCheckIntervalMs = 2_500,
+    huntAttackCooldownMs = null,
   }) {
     this.config = config;
     this.createBotFn = createBotFn;
@@ -206,6 +231,14 @@ export class McRuntime {
       typeof smeltPollIntervalMs === "number" && Number.isFinite(smeltPollIntervalMs)
         ? Math.max(10, smeltPollIntervalMs)
         : 350;
+    this.stuckCheckIntervalMs =
+      typeof stuckCheckIntervalMs === "number" && Number.isFinite(stuckCheckIntervalMs)
+        ? Math.max(0, stuckCheckIntervalMs)
+        : 2_500;
+    this.huntAttackCooldownMs =
+      typeof huntAttackCooldownMs === "number" && Number.isFinite(huntAttackCooldownMs) && huntAttackCooldownMs > 0
+        ? huntAttackCooldownMs
+        : null;
     this.chatCooldownMs =
       typeof chatCooldownMs === "number" && Number.isFinite(chatCooldownMs)
         ? Math.max(0, chatCooldownMs)
@@ -578,7 +611,7 @@ export class McRuntime {
     try {
       const positions =
         bot.findBlocks({
-          matching: (b) => Boolean(b && NEARBY_RESOURCE_BLOCKS.has(b.name)),
+          matching: (b) => Boolean(b && (NEARBY_RESOURCE_BLOCKS.has(b.name) || isBedName(b.name))),
           point: bot.entity.position,
           maxDistance,
           count: 48,
@@ -589,7 +622,9 @@ export class McRuntime {
         if (ordered.length >= 12) break;
         const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
         const name = blk?.name;
-        if (!name || !NEARBY_RESOURCE_BLOCKS.has(name) || seen.has(name)) continue;
+        if (!name || (!NEARBY_RESOURCE_BLOCKS.has(name) && !isBedName(name)) || seen.has(name)) {
+          continue;
+        }
         seen.add(name);
         ordered.push(name);
       }
@@ -1386,22 +1421,8 @@ export class McRuntime {
     }
   }
 
-  _ensurePathfinder(bot) {
-    if (!bot.pathfinder && typeof bot.loadPlugin === "function" && bot.registry?.blocksByName) {
-      bot.loadPlugin(pathfinderPkg.pathfinder);
-    }
-    if (
-      bot.pathfinder &&
-      typeof bot.pathfinder.setMovements === "function" &&
-      bot.registry?.blocksByName
-    ) {
-      try {
-        const movements = new Movements(bot);
-        bot.pathfinder.setMovements(movements);
-      } catch {
-        // Ignore Movements init error on partial mock registries
-      }
-    }
+  _ensurePathfinder(bot, { allowDig = false } = {}) {
+    applySafeMovements(bot, { allowDig });
   }
 
   connectBot() {
@@ -1754,10 +1775,98 @@ export class McRuntime {
       throw new Error("pathfinder_unavailable");
     }
     this._ensurePathfinder(bot);
-    await bot.pathfinder.goto(goal).catch((err) => {
-      if (signal.aborted) return;
+
+    const checkMs = this.stuckCheckIntervalMs;
+    const startPos = this._vecToTuple(bot.entity?.position);
+    if (!checkMs || checkMs <= 0 || !startPos) {
+      await bot.pathfinder.goto(goal).catch((err) => {
+        if (signal?.aborted) return;
+        throw err;
+      });
+      return;
+    }
+
+    let stuckTimer = null;
+    let jumpTimer = null;
+    let lastPos = startPos;
+    let stuckStrikes = 0;
+    let markedStuck = false;
+
+    const cleanup = () => {
+      if (stuckTimer) {
+        clearInterval(stuckTimer);
+        stuckTimer = null;
+      }
+      if (jumpTimer) {
+        clearTimeout(jumpTimer);
+        jumpTimer = null;
+      }
+      try {
+        bot.setControlState?.("jump", false);
+      } catch {
+        // Ignore control reset errors
+      }
+    };
+
+    const gotoPromise = Promise.resolve(bot.pathfinder.goto(goal)).catch((err) => {
+      if (signal?.aborted || markedStuck) return;
       throw err;
     });
+
+    const stuckPromise = new Promise((_, reject) => {
+      stuckTimer = setInterval(() => {
+        if (signal?.aborted) {
+          cleanup();
+          return;
+        }
+        const curPos = this._vecToTuple(bot.entity?.position);
+        if (!curPos) return;
+        const moved = Math.hypot(
+          curPos[0] - lastPos[0],
+          curPos[1] - lastPos[1],
+          curPos[2] - lastPos[2],
+        );
+        lastPos = curPos;
+        if (moved >= 0.35) {
+          stuckStrikes = 0;
+          return;
+        }
+        stuckStrikes += 1;
+        if (stuckStrikes === 1) {
+          try {
+            bot.setControlState?.("jump", true);
+            jumpTimer = setTimeout(() => {
+              jumpTimer = null;
+              try {
+                bot.setControlState?.("jump", false);
+              } catch {
+                // Ignore jump release errors
+              }
+            }, 180);
+          } catch {
+            // Ignore jump trigger errors
+          }
+          return;
+        }
+        markedStuck = true;
+        cleanup();
+        try {
+          bot.pathfinder?.stop?.();
+          bot.pathfinder?.setGoal?.(null);
+        } catch {
+          // Ignore pathfinder stop errors
+        }
+        const err = new Error("path_stuck");
+        err.code = "path_stuck";
+        reject(err);
+      }, checkMs);
+    });
+
+    try {
+      await Promise.race([gotoPromise, stuckPromise]);
+    } finally {
+      cleanup();
+    }
   }
 
   _findNearestDroppedItem(bot, centerCoords, maxDist = 5) {
@@ -2211,11 +2320,16 @@ export class McRuntime {
       this.activity = `前往(${Math.round(coords.x)},${Math.round(coords.y)},${Math.round(coords.z)})`;
       this._emitSnapshot();
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
-        await this._gotoGoal(new GoalNear(coords.x, coords.y, coords.z, 1), signal);
-        return { ok: true };
+        try {
+          await this._gotoGoal(new GoalNear(coords.x, coords.y, coords.z, 1), signal);
+          return { ok: true };
+        } catch (err) {
+          if (err?.code === "path_stuck") return { stuck: true };
+          throw err;
+        }
       });
       this._refreshFromBot();
-      if (outcome?.timedOut || outcome?.aborted) {
+      if (outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
         this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
         if (this.connected) this._emitSnapshot();
         return {
@@ -2223,8 +2337,12 @@ export class McRuntime {
           accepted: true,
           bridge_ready: true,
           paused: false,
-          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
-          summary: outcome.timedOut ? "寻路超时" : "寻路已取消",
+          reason: outcome.stuck
+            ? "path_stuck"
+            : outcome.timedOut
+              ? "mc_goal_timeout"
+              : "mc_goal_cancelled",
+          summary: outcome.stuck ? "寻路卡住已中止" : outcome.timedOut ? "寻路超时" : "寻路已取消",
           snapshot: this.getSnapshot(),
         };
       }
@@ -2251,22 +2369,31 @@ export class McRuntime {
       this.activity = `探索(${targetX},${targetZ})`;
       this._emitSnapshot();
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
-        await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
-        return { ok: true };
+        try {
+          await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
+          return { ok: true };
+        } catch (err) {
+          if (err?.code === "path_stuck") return { stuck: true };
+          throw err;
+        }
       });
       this._refreshFromBot();
       const rare = this.connected ? this._scanRareBlocks(bot, 24) : [];
       const signs = this.connected ? this._scanSigns(bot, 24) : [];
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
-      if (outcome?.timedOut || outcome?.aborted) {
+      if (outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
           accepted: true,
           bridge_ready: true,
           paused: false,
-          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
-          summary: outcome.timedOut ? "探索超时" : "探索已取消",
+          reason: outcome.stuck
+            ? "path_stuck"
+            : outcome.timedOut
+              ? "mc_goal_timeout"
+              : "mc_goal_cancelled",
+          summary: outcome.stuck ? "探索寻路卡住" : outcome.timedOut ? "探索超时" : "探索已取消",
           snapshot: this.getSnapshot(),
         };
       }
@@ -2291,6 +2418,28 @@ export class McRuntime {
       const rawCount = params.count === undefined ? 1 : Number(params.count);
       const requestedCount =
         Number.isInteger(rawCount) && rawCount >= 1 ? Math.min(8, rawCount) : 1;
+
+      if (rawBlock) {
+        const tierCheck = checkHarvestToolTier(bot, rawBlock);
+        if (!tierCheck.ok) {
+          this._refreshFromBot();
+          this.activity = this.paused ? "已暂停" : "原地待命";
+          this._emitSnapshot();
+          return {
+            ok: false,
+            accepted: true,
+            bridge_ready: true,
+            paused: false,
+            reason: "tool_tier_too_low",
+            block: rawBlock,
+            required_tool: tierCheck.requiredTool,
+            best_tool: tierCheck.bestTool,
+            summary: `挖掘${rawBlock}需要至少${tierCheck.requiredTool}`,
+            snapshot: this.getSnapshot(),
+          };
+        }
+      }
+
       const targets = new Set(
         rawBlock ? [rawBlock] : actionType === "gather" ? DEFAULT_GATHER_BLOCKS : DEFAULT_MINE_BLOCKS,
       );
@@ -2303,7 +2452,7 @@ export class McRuntime {
               matching: (b) => Boolean(b && targets.has(b.name)),
               point: bot.entity?.position,
               maxDistance: 32,
-              count: Math.max(4, requestedCount * 2),
+              count: Math.max(8, requestedCount * 3),
             }) || []
           : [];
 
@@ -2326,6 +2475,7 @@ export class McRuntime {
       let collectedCount = 0;
       let lastBlockName = rawBlock || "block";
       let lastCoords = [0, 0, 0];
+      let blockedTierInfo = null;
       const visitedKeys = new Set();
 
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
@@ -2340,20 +2490,36 @@ export class McRuntime {
             break;
           }
           const positions = step === 0 ? initialPositions : findCandidatePositions();
-          let chosenBlock = null;
-          let chosenCoords = null;
+          const exposedCandidates = [];
+          const buriedCandidates = [];
           for (const p of positions) {
             const c = this._vecToTuple(p) || [0, 0, 0];
             const key = `${Math.floor(c[0])},${Math.floor(c[1])},${Math.floor(c[2])}`;
             if (visitedKeys.has(key)) continue;
             const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
             if (blk && !targets.has(blk.name)) continue;
-            chosenBlock = blk;
-            chosenCoords = c;
-            visitedKeys.add(key);
-            break;
+            const candName = blk?.name || rawBlock;
+            if (candName) {
+              const candTier = checkHarvestToolTier(bot, candName);
+              if (!candTier.ok) {
+                if (!blockedTierInfo) {
+                  blockedTierInfo = { block: candName, ...candTier };
+                }
+                continue;
+              }
+            }
+            const entry = { blk, coords: c, key };
+            if (hasExposedFace(bot, c)) {
+              exposedCandidates.push(entry);
+            } else {
+              buriedCandidates.push(entry);
+            }
           }
-          if (!chosenCoords) break;
+          const chosen = exposedCandidates[0] || buriedCandidates[0] || null;
+          if (!chosen) break;
+          const chosenBlock = chosen.blk;
+          const chosenCoords = chosen.coords;
+          visitedKeys.add(chosen.key);
 
           const blockName = sanitizeMcText(chosenBlock?.name || rawBlock || "block", 48);
           lastBlockName = blockName;
@@ -2368,10 +2534,18 @@ export class McRuntime {
           }
 
           if (bot.pathfinder?.goto) {
-            await this._gotoGoal(
-              new GoalNear(chosenCoords[0], chosenCoords[1], chosenCoords[2], 3),
-              signal,
-            );
+            try {
+              await this._gotoGoal(
+                new GoalNear(chosenCoords[0], chosenCoords[1], chosenCoords[2], 3),
+                signal,
+              );
+            } catch (err) {
+              if (err?.code === "path_stuck") {
+                if (collectedCount === 0) return { stuck: true };
+                break;
+              }
+              throw err;
+            }
           }
           if (signal.aborted) return { aborted: true };
           if (chosenBlock && this.config.mcAutoEquip !== false && !this._eatingLock.eating) {
@@ -2390,14 +2564,32 @@ export class McRuntime {
       this._refreshFromBot();
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
-      if ((outcome?.timedOut || outcome?.aborted) && collectedCount === 0) {
+      if (collectedCount === 0 && blockedTierInfo && !outcome?.stuck && !outcome?.timedOut && !outcome?.aborted) {
         return {
           ok: false,
           accepted: true,
           bridge_ready: true,
           paused: false,
-          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
-          summary: outcome.timedOut ? "采集超时" : "采集已取消",
+          reason: "tool_tier_too_low",
+          block: blockedTierInfo.block,
+          required_tool: blockedTierInfo.requiredTool,
+          best_tool: blockedTierInfo.bestTool,
+          summary: `挖掘${blockedTierInfo.block}需要至少${blockedTierInfo.requiredTool}`,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if ((outcome?.stuck || outcome?.timedOut || outcome?.aborted) && collectedCount === 0) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.stuck
+            ? "path_stuck"
+            : outcome.timedOut
+              ? "mc_goal_timeout"
+              : "mc_goal_cancelled",
+          summary: outcome.stuck ? "采集寻路卡住" : outcome.timedOut ? "采集超时" : "采集已取消",
           snapshot: this.getSnapshot(),
         };
       }
@@ -2863,6 +3055,259 @@ export class McRuntime {
         combat_mode: "evade",
         guard_target: "",
         summary: "已切换躲避模式",
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "hunt") {
+      const parsed = parseHuntParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          summary: `狩猎参数无效:${parsed.error}`,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = parsed.targetMob ? `狩猎:${parsed.targetMob}` : "狩猎觅食";
+      this._emitSnapshot();
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        return await executeHuntAction(bot, params, {
+          signal,
+          gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+          collectDrops: (b, c, sig) => this._collectNearbyDrops(b, c, sig),
+          attackCooldownOverrideMs: this.huntAttackCooldownMs,
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "狩猎超时" : "狩猎已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "hunt",
+          summary: outcome.summary,
+          target_mob: outcome.target_mob,
+          hunted_count: outcome.hunted_count,
+        });
+      }
+      return {
+        ok: Boolean(outcome?.ok),
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        ...outcome,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "sleep") {
+      this.activity = "找床睡觉";
+      this._emitSnapshot();
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        return await executeSleepAction(bot, params, {
+          signal,
+          gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "睡觉超时" : "睡觉已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "sleep",
+          summary: outcome.summary,
+          bed_pos: outcome.bed_pos,
+        });
+      }
+      return {
+        ok: Boolean(outcome?.ok),
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        ...outcome,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "chest") {
+      const parsed = parseChestParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          summary: `箱子参数无效:${parsed.error}`,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = parsed.mode === "withdraw" ? "箱子取物" : parsed.mode === "inspect" ? "查看箱子" : "箱子存物";
+      this._emitSnapshot();
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        return await executeChestAction(bot, params, {
+          signal,
+          gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "箱子交互超时" : "箱子交互已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "chest",
+          mode: outcome.mode,
+          summary: outcome.summary,
+          chest_pos: outcome.chest_pos,
+        });
+      }
+      return {
+        ok: Boolean(outcome?.ok),
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        ...outcome,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "place") {
+      const parsed = parsePlaceParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          summary: `放置参数无效:${parsed.error}`,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = `放置:${parsed.itemName}`;
+      this._emitSnapshot();
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        return await executePlaceAction(bot, params, { signal });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "放置超时" : "放置已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "place",
+          item_name: outcome.item_name,
+          placed_pos: outcome.placed_pos,
+          summary: outcome.summary,
+        });
+      }
+      return {
+        ok: Boolean(outcome?.ok),
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        ...outcome,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "give") {
+      const parsed = parseGiveParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          summary: `递物参数无效:${parsed.error}`,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = `递物:${parsed.targetPlayer}`;
+      this._emitSnapshot();
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        return await executeGiveAction(bot, params, {
+          signal,
+          gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+          allowedPlayers: this.config.mcAllowedPlayers,
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "递物超时" : "递物已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "give",
+          target_player: outcome.target_player,
+          item_name: outcome.item_name,
+          given_count: outcome.given_count,
+          summary: outcome.summary,
+        });
+      }
+      return {
+        ok: Boolean(outcome?.ok),
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        ...outcome,
         snapshot: this.getSnapshot(),
       };
     }

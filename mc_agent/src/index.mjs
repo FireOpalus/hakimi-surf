@@ -57,6 +57,8 @@ export function createMcBridgeServer(options = {}) {
     hostileAlertCooldownMs: options.hostileAlertCooldownMs,
     pickupSettleMs: options.pickupSettleMs,
     smeltPollIntervalMs: options.smeltPollIntervalMs,
+    stuckCheckIntervalMs: options.stuckCheckIntervalMs,
+    huntAttackCooldownMs: options.huntAttackCooldownMs,
   });
 
   const httpServer = http.createServer((req, res) => {

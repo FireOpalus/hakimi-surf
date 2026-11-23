@@ -280,17 +280,42 @@ $('life-gatekeeper-now').addEventListener('click',e=>busy(e.target,async()=>{
 }));
 
 const mcControls=['life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
+const mcTodLabels={day:'白天',sunset:'黄昏',night:'夜晚',sunrise:'黎明'};
 function renderMinecraft(mc){
+  const eq=mc.equipment||{};
+  const gear=[eq.main_hand,eq.off_hand,eq.head,eq.chest,eq.legs,eq.feet].filter(Boolean).join(', ')||'无装备';
+  const modeText=mc.combat_mode==='guard'?'护卫'+(mc.guard_target?' ('+mc.guard_target+')':''):'躲避';
+  const todText=mcTodLabels[mc.time_of_day]||'—';
   const fields=[
     ['境内连接',mc.bridge_ready?'桥接就绪':'未就绪'],['游戏连接',mc.connected?'游戏在线':'未进入游戏'],
     ['游戏配置',(mc.mc_enabled?'已启用':'未启用')+' / '+(mc.mc_configured?'已配置':'未配置')],
-    ['角色活动',mc.paused?'已暂停':mc.activity||'—']
+    ['角色活动',mc.paused?'已暂停':mc.activity||'—'],
+    ['昼夜 / 模式',todText+' · '+modeText],
+    ['装备 / 空槽',gear+(mc.free_slots!=null?'（空槽 '+mc.free_slots+'）':'')]
   ];
   $('mc-overview').replaceChildren(...fields.map(([name,value])=>{
     const row=el('div');row.append(el('dt',name),el('dd',value));return row;
   }));
   const position=Array.isArray(mc.pos)?mc.pos.join(', '):mc.pos;
   text('life-mc-status','维度 '+(mc.dimension||'—')+' · 坐标 '+(position||'—')+' · 生命 / 饱食 '+(mc.health??'—')+' / '+(mc.food??'—')+' · 更新 '+lifeFmt(mc.updated_at,displayZone));
+  const planParts=[];
+  if(mc.session_intent)planParts.push('会话意图：'+mc.session_intent);
+  if(mc.active_plan)planParts.push('连贯计划：'+mc.active_plan);
+  if(mc.brain_last_reason)planParts.push('最近决策：'+mc.brain_last_reason);
+  text('mc-plan-summary',planParts.length?planParts.join(' · '):'暂无连贯计划或决策记录。');
+  const wps=Array.isArray(mc.waypoints)?mc.waypoints:[];
+  $('mc-waypoints-list').replaceChildren(...(wps.length?wps.map(w=>{
+    const posStr=Array.isArray(w.pos)?w.pos.join(','):'';
+    return pill((w.name||'wp')+(posStr?' ('+posStr+')':''),'muted');
+  }):[pill('暂无已记录路标','muted')]));
+  const logs=Array.isArray(mc.action_log)?mc.action_log.slice().reverse():[];
+  table('mc-action-log',['时间','触发','动作','执行结果','理由 / 公屏'],logs.map(item=>[
+    lifeFmt(item.ts,displayZone),
+    item.trigger||'—',
+    item.action||'—',
+    item.outcome||'—',
+    [item.reason,item.say?'「'+item.say+'」':''].filter(Boolean).join(' · ')||'—'
+  ]),'暂无 MC 动作流水（上线执行动作后会在此展示最近 30 步）。');
   mcControls.forEach(id=>$(id).disabled=false);
 }
 async function sendMcGoal(actionType,topic='',message=''){

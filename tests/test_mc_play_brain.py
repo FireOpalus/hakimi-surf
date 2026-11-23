@@ -2214,3 +2214,249 @@ async def test_mc_plugin_tactical_event_downgrade_cooldown_and_smelt_gather_coun
         assert plugin.brain.recent_turns[-1]["outcome"] == "smelted:iron_ingotx2"
     finally:
         await plugin.close()
+
+
+async def test_mc_v29_world_actions_waypoints_active_plan_and_action_log() -> None:
+    """Verify v2.9 actions (hunt/sleep/chest/place/give), waypoints KV, chaining, and action log."""
+    from plugins.minecraft.play_brain import McBrainDecision
+
+    assert {"hunt", "sleep", "chest", "place", "give"} <= set(
+        MC_PLAY_RESPONSE_SCHEMA["properties"]["action"]["enum"]
+    )
+    assert {"target_mob", "mode", "next_goal"} <= set(MC_PLAY_RESPONSE_SCHEMA["required"])
+
+    clock_now = [2_000_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:12141/ws/plugin",
+        token="test-token",
+        clock=lambda: clock_now[0],
+        enable_brain=True,
+        brain_config=McBrainConfig(chained_step_interval_seconds=12.0),
+    )
+    kv_store: dict[str, Any] = {}
+    dispatched: list[dict[str, Any]] = []
+    next_receipts: dict[str, dict[str, Any]] = {
+        "hunt": {"ok": True, "accepted": True, "hunted_count": 2, "target_mob": "cow"},
+        "sleep": {"ok": True, "accepted": True, "slept": True, "bed_pos": [12, 64, -20]},
+        "chest": {
+            "ok": True,
+            "accepted": True,
+            "mode": "deposit",
+            "item_name": "cobblestone",
+            "moved_count": 32,
+            "chest_pos": [14, 64, -18],
+            "chest_summary": ["cobblestone:32"],
+        },
+        "place": {
+            "ok": True,
+            "accepted": True,
+            "item_name": "crafting_table",
+            "placed_pos": [11, 64, -19],
+        },
+        "give": {
+            "ok": True,
+            "accepted": True,
+            "target_player": "BOISER",
+            "item_name": "iron_ingot",
+            "given_count": 4,
+        },
+        "mine": {
+            "ok": False,
+            "accepted": True,
+            "reason": "tool_tier_too_low",
+            "block": "iron_ore",
+            "required_tool": "stone_pickaxe",
+        },
+    }
+
+    async def fake_node_call(action: str, params: dict[str, Any], **_kwargs: Any) -> Any:
+        del action
+        dispatched.append(dict(params))
+        act = str(params.get("action_type") or "")
+        return dict(next_receipts.get(act, {"ok": True, "accepted": True}))
+
+    async def fake_state_set(key: str, value: Any) -> None:
+        kv_store[key] = value
+
+    async def fake_state_get(key: str) -> Any:
+        return kv_store.get(key)
+
+    async def fake_push_status(_status: dict[str, Any]) -> None:
+        pass
+
+    plugin.client._ws = object()
+    plugin.client._connected = True
+    plugin.client.node_call = fake_node_call  # type: ignore[method-assign]
+    plugin.client.state_set = fake_state_set  # type: ignore[method-assign]
+    plugin.client.state_get = fake_state_get  # type: ignore[method-assign]
+    plugin.client.push_status = fake_push_status  # type: ignore[method-assign]
+
+    try:
+        plugin.bridge_ready = True
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(10.0, 64.0, -20.0),
+                nearby_entities=["cow"],
+                nearby_players=["BOISER"],
+            )
+        )
+
+        # 1. Dispatch hunt, sleep, chest, place, give through McPlayBrain with active_plan chaining
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="hunt",
+                target_mob="cow",
+                count=2,
+                reason="补点牛肉当口粮",
+                next_goal="回去熔炉烤牛肉并睡觉",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "hunt", "target_mob": "cow", "count": 2}
+        assert plugin.brain.recent_turns[-1]["outcome"] == "hunted:cowx2"
+        assert plugin.brain._active_plan == "回去熔炉烤牛肉并睡觉"
+        assert plugin.brain._chain_next_step is True
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="sleep",
+                reason="天黑先睡觉设重生点",
+                next_goal="明天整理箱子",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "slept:home"
+        assert "home" in plugin.brain._waypoints
+        assert plugin.brain._waypoints["home"]["pos"] == [12, 64, -20]
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="chest",
+                mode="deposit",
+                item_name="cobblestone",
+                count=32,
+                reason="存多余圆石腾空槽",
+                next_goal="放工作台并递铁给玩家",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "chest:deposit:cobblestonex32"
+        assert plugin.brain._waypoints["chest"]["pos"] == [14, 64, -18]
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="place",
+                item_name="crafting_table",
+                reason="把工作台放到家附近",
+                next_goal="给玩家递铁锭",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "placed:crafting_table"
+        assert plugin.brain._waypoints["workbench"]["pos"] == [11, 64, -19]
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="give",
+                target_player="BOISER",
+                item_name="iron_ingot",
+                count=4,
+                reason="递4个铁锭给BOISER",
+                next_goal="",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="BOISER",
+            trigger="player_chat",
+            input_summary="BOISER:给我四个铁锭",
+        )
+        assert dispatched[-1] == {
+            "action_type": "give",
+            "target_player": "BOISER",
+            "item_name": "iron_ingot",
+            "count": 4,
+        }
+        assert plugin.brain.recent_turns[-1]["outcome"] == "gave:iron_ingotx4@BOISER"
+
+        # 2. tool_tier_too_low formats cleanly and stops chaining on failure
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="mine",
+                block_type="iron_ore",
+                count=3,
+                reason="试试挖铁矿",
+                next_goal="烧铁做铁剑",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "mine:need_stone_pickaxe"
+        assert plugin.brain._chain_next_step is False
+
+        # 3. mc_death records last_death waypoint and state_payload includes sorted waypoints
+        plugin.brain.on_milestone(
+            "mc_death",
+            {"dimension": "overworld", "pos": [25.0, 64.0, -20.0], "activity": "探矿"},
+        )
+        assert plugin.brain._waypoints["last_death"]["pos"] == [25, 64, -20]
+        state = plugin.brain._state_payload(plugin.snapshot)
+        assert "waypoints" in state
+        wp_names = [w["name"] for w in state["waypoints"]]
+        assert {"home", "chest", "workbench", "last_death"} <= set(wp_names)
+        assert all("dist" in w for w in state["waypoints"])
+
+        # 4. Waypoints persisted to KV and reload cleanly on a fresh plugin instance
+        assert "mc_waypoints" in kv_store
+        plugin2 = MinecraftPlugin(
+            ws_url="ws://127.0.0.1:12141/ws/plugin",
+            token="test-token",
+            clock=lambda: clock_now[0],
+            enable_brain=True,
+        )
+        plugin2.client._ws = object()
+        plugin2.client._connected = True
+        plugin2.client.state_get = fake_state_get  # type: ignore[method-assign]
+        try:
+            await plugin2.brain.load_waypoints()
+            assert plugin2.brain._waypoints["home"]["pos"] == [12, 64, -20]
+            assert plugin2.brain._waypoints["chest"]["pos"] == [14, 64, -18]
+        finally:
+            await plugin2.close()
+
+        # 5. mc_low_food escalates to Layer 2 when raw cookable meat is in inventory
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(10.0, 64.0, -20.0),
+                inventory_summary=["beef:2"],
+                nearby_players=["BOISER"],
+            )
+        )
+        handled = await plugin.brain._try_fast_survival_milestone(
+            event_batch=[{"event_type": "mc_low_food", "safe_food_count": 0}],
+            snap=plugin.snapshot,
+            now=clock_now[0],
+        )
+        assert handled is False
+
+        # 6. Action log persists across disconnect and is exposed in status_dict()
+        assert len(plugin.brain.action_log) == 6
+        plugin.brain.on_disconnect()
+        status = plugin.status_dict()
+        assert len(status["action_log"]) == 6
+        assert status["action_log"][-1]["outcome"] == "mine:need_stone_pickaxe"
+        assert len(status["waypoints"]) >= 4
+    finally:
+        await plugin.close()

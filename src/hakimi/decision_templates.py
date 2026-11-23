@@ -147,12 +147,13 @@ _MC_CRUISE_GATE = DecisionTemplate(
                         "(switch to combat guard mode)."
                     ),
                     "gather": (
-                        "Gather or mine needed raw materials (wood, stone, ore, food resources) "
-                        "or explore for supplies."
+                        "Gather or mine needed raw materials (wood, stone, ore, food resources), "
+                        "hunt edible passive animals for food/wool, or explore for supplies."
                     ),
                     "craft_gear": (
                         "Craft or smelt missing/upgraded tools, weapons, shield, armor, "
-                        "cooked food, crafting table, or furnace using inventory materials."
+                        "cooked food, bed, chest, torches, crafting table, or furnace, "
+                        "or organize inventory/sleep at night."
                     ),
                     "fight_hostiles": (
                         "Immediate hostile mobs threaten the bot or guarded player and active "

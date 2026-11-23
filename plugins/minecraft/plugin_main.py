@@ -38,6 +38,8 @@ _MC_ALLOWED_DISPATCH_FIELDS = (
     "block_type",
     "item_name",
     "fuel_name",
+    "target_mob",
+    "mode",
     "count",
     "x",
     "y",
@@ -442,6 +444,63 @@ class DisconnectArgs(NoArgs):
     sleep_server: bool = False
 
 
+class HuntArgs(NoArgs):
+    target_mob: str = Field(default="", max_length=32)
+    count: int = Field(default=1, ge=1, le=3)
+
+    @field_validator("target_mob")
+    @classmethod
+    def _validate_target_mob(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        cleaned = _normalize_item_id(value)
+        if not cleaned:
+            raise ValueError("invalid_target_mob")
+        return cleaned
+
+
+class ChestArgs(NoArgs):
+    mode: Literal["deposit", "withdraw", "inspect"] = "deposit"
+    item_name: str = Field(default="", max_length=64)
+    count: int = Field(default=16, ge=1, le=64)
+
+    @field_validator("item_name")
+    @classmethod
+    def _validate_item_name(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        cleaned = _normalize_item_id(value)
+        if not cleaned:
+            raise ValueError("invalid_item_name")
+        return cleaned
+
+
+class PlaceArgs(NoArgs):
+    item_name: str = Field(min_length=1, max_length=64)
+
+    @field_validator("item_name")
+    @classmethod
+    def _validate_item_name(cls, value: str) -> str:
+        cleaned = _normalize_item_id(value)
+        if not cleaned:
+            raise ValueError("invalid_item_name")
+        return cleaned
+
+
+class GiveArgs(NoArgs):
+    target_player: str = Field(pattern=r"^[A-Za-z0-9_]{1,16}$")
+    item_name: str = Field(min_length=1, max_length=64)
+    count: int = Field(default=1, ge=1, le=64)
+
+    @field_validator("item_name")
+    @classmethod
+    def _validate_item_name(cls, value: str) -> str:
+        cleaned = _normalize_item_id(value)
+        if not cleaned:
+            raise ValueError("invalid_item_name")
+        return cleaned
+
+
 _CONNECT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -528,6 +587,47 @@ _DISCONNECT_SCHEMA: dict[str, Any] = {
     "required": [],
     "additionalProperties": False,
 }
+_HUNT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "target_mob": {"type": "string", "maxLength": 32, "default": ""},
+        "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
+_CHEST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["deposit", "withdraw", "inspect"],
+            "default": "deposit",
+        },
+        "item_name": {"type": "string", "maxLength": 64, "default": ""},
+        "count": {"type": "integer", "minimum": 1, "maximum": 64, "default": 16},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
+_PLACE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "item_name": {"type": "string", "minLength": 1, "maxLength": 64},
+    },
+    "required": ["item_name"],
+    "additionalProperties": False,
+}
+_GIVE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "target_player": {"type": "string", "minLength": 1, "maxLength": 16},
+        "item_name": {"type": "string", "minLength": 1, "maxLength": 64},
+        "count": {"type": "integer", "minimum": 1, "maximum": 64, "default": 1},
+    },
+    "required": ["target_player", "item_name"],
+    "additionalProperties": False,
+}
 
 _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "connect": (
@@ -555,6 +655,19 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
         _SMELT_SCHEMA,
         SmeltArgs,
     ),
+    "hunt": (
+        "在游戏里狩猎附近常见食用被动动物获取肉类与羊毛（严禁伤害玩家、村民与宠物）",
+        _HUNT_SCHEMA,
+        HuntArgs,
+    ),
+    "sleep": ("在游戏里寻找或放置床并入睡跳过黑夜与设置重生点", {}, NoArgs),
+    "chest": ("在游戏里操作附近箱子或木桶存入、取出或查看物资", _CHEST_SCHEMA, ChestArgs),
+    "place": (
+        "在游戏里安全放置白名单照明、功能或基础方块（火把、工作台、熔炉、箱子、床等）",
+        _PLACE_SCHEMA,
+        PlaceArgs,
+    ),
+    "give": ("在游戏里走到指定允许玩家身边并递出指定物品", _GIVE_SCHEMA, GiveArgs),
     "guard": ("在游戏里切换为贴身护卫模式保护玩家并击退敌对怪物", _GUARD_SCHEMA, GuardArgs),
     "evade": ("在游戏里切换为安全躲避模式避免交战并优先保命", {}, NoArgs),
     "goto": ("在游戏里前往指定坐标位置", _POSITION_SCHEMA, PositionArgs),
@@ -577,6 +690,11 @@ _MICRO_GAME_VERBS = frozenset(
         "gather",
         "craft",
         "smelt",
+        "hunt",
+        "sleep",
+        "chest",
+        "place",
+        "give",
         "guard",
         "evade",
         "goto",
@@ -589,7 +707,22 @@ _MICRO_GAME_VERBS = frozenset(
     }
 )
 _ADMIN_ONLY_VERBS = frozenset({"status", "pause", "resume"})
-_EFFORTFUL_VERBS = frozenset({"explore", "goto", "mine", "gather", "craft", "smelt", "follow"})
+_EFFORTFUL_VERBS = frozenset(
+    {
+        "explore",
+        "goto",
+        "mine",
+        "gather",
+        "craft",
+        "smelt",
+        "hunt",
+        "sleep",
+        "chest",
+        "place",
+        "give",
+        "follow",
+    }
+)
 _OWNER_CHAT_ORIGINS = ["planner", "owner_chat", "rule", "timer", "legacy", "admin"]
 _MACRO_PLANNER_ORIGINS = ["planner", "rule", "timer", "legacy", "admin"]
 _MICRO_GAME_ORIGINS = ["rule", "legacy", "admin"]
@@ -1183,6 +1316,7 @@ class MinecraftPlugin:
     async def _on_connect(self, welcome: dict[str, Any]) -> None:
         if "enabled" in welcome:
             self.enabled = bool(welcome["enabled"])
+        await self.brain.load_waypoints()
         if self.enable_brain:
             self.brain.start()
         await self.client.push_status(self.status_dict())
@@ -1346,6 +1480,10 @@ class MinecraftPlugin:
                     params.pop("target_player", None)
                 if verb == "smelt" and not params.get("fuel_name"):
                     params.pop("fuel_name", None)
+                if verb == "hunt" and not params.get("target_mob"):
+                    params.pop("target_mob", None)
+                if verb == "chest" and not params.get("item_name"):
+                    params.pop("item_name", None)
                 for axis in ("x", "y", "z"):
                     val = params.pop(axis, None)
                     if type(val) in (int, float) and math.isfinite(val):
@@ -1403,13 +1541,44 @@ class MinecraftPlugin:
             artifacts["output_item"] = clean_out
         if clean_fuel := _normalize_item_id(data.get("used_fuel")):
             artifacts["used_fuel"] = clean_fuel
-        for int_key in ("crafted_count", "smelted_count", "collected_count", "requested_count"):
+        if clean_req_tool := _normalize_item_id(data.get("required_tool")):
+            artifacts["required_tool"] = clean_req_tool
+        if clean_best_tool := _normalize_item_id(data.get("best_tool")):
+            artifacts["best_tool"] = clean_best_tool
+        if clean_mob := _normalize_item_id(data.get("target_mob")):
+            artifacts["target_mob"] = clean_mob
+        if data.get("mode") in ("deposit", "withdraw", "inspect"):
+            artifacts["mode"] = data["mode"]
+        for int_key in (
+            "crafted_count",
+            "smelted_count",
+            "collected_count",
+            "requested_count",
+            "hunted_count",
+            "moved_count",
+            "given_count",
+        ):
             raw_int = data.get(int_key)
             if isinstance(raw_int, int) and not isinstance(raw_int, bool) and raw_int >= 0:
                 artifacts[int_key] = raw_int
-        for bool_key in ("partial", "used_table", "used_furnace"):
+        for bool_key in (
+            "partial",
+            "used_table",
+            "used_furnace",
+            "slept",
+            "placed_bed",
+            "placed_chest",
+        ):
             if isinstance(data.get(bool_key), bool):
                 artifacts[bool_key] = data[bool_key]
+        for pos_key in ("bed_pos", "chest_pos", "furnace_pos", "placed_pos"):
+            norm_p = _normalize_pos(data.get(pos_key))
+            if isinstance(norm_p, tuple):
+                artifacts[pos_key] = [int(round(v)) for v in norm_p]
+        if isinstance(data.get("chest_summary"), (list, tuple)):
+            artifacts["chest_summary"] = _sanitize_inventory_summary(
+                data.get("chest_summary"), connected=True
+            )
         if isinstance(data.get("equipped_items"), (list, tuple)):
             artifacts["equipped_items"] = [
                 cid for raw_it in data["equipped_items"][:16] if (cid := _normalize_item_id(raw_it))
