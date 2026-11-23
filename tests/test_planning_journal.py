@@ -194,3 +194,31 @@ async def test_journal_commit_persists_optional_final_signature(dm):
     )
     clock_row2 = await dm.store.one("SELECT signature FROM life_planner_clock WHERE id=1")
     assert clock_row2[0] == "keep-sig"
+
+
+async def test_active_session_same_module_high_event_uses_15m_coalesce_cooldown(dm, monkeypatch):
+    from hakimi.life_engine import ACTIVE_SESSION_EVENT_COOLDOWN_SECONDS
+
+    engine = dm.service.life_engine
+    planner = engine.planner
+    ws = dm.service.world_state
+    fake = setup_model(dm, intents=[])
+
+    # Initial plan sets last_plan_at
+    await planner.plan_once(now=dm.clock())
+    assert len(fake.calls) == 1
+    base_plan_at = planner.last_plan_at
+
+    # Simulate active minecraft session -> same-module high event must NOT wake in 60s
+    monkeypatch.setattr(engine, "active_session_exit", lambda: ("minecraft", object()))
+    await ws.publish_event("minecraft", "mc_death", {}, importance="high", now=dm.clock() + 10)
+    assert planner.next_plan_at >= base_plan_at + ACTIVE_SESSION_EVENT_COOLDOWN_SECONDS
+
+    dm.time[0] = base_plan_at + 120
+    skipped = await planner.plan_once(now=dm.clock(), automatic=True)
+    assert skipped["status"] == "not_due"
+    assert len(fake.calls) == 1
+
+    # High event from a DIFFERENT module still wakes in 60s
+    await ws.publish_event("bilibili_surf", "bili_hot", {}, importance="high", now=dm.clock())
+    assert planner.next_plan_at <= dm.clock() + 10

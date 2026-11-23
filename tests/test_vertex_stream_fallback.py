@@ -290,3 +290,35 @@ async def test_vertex_generate_content_stream_429_respects_output_boundary(
         "code": "429",
         "fallback": "succeeded" if thought_only else "partial_output",
     }
+
+
+async def test_vertex_429_sets_cooldown_skipping_doomed_vertex_calls_when_fallback_enabled(
+    routes, message
+):
+    gate, calls, replies = routes
+    replies["vertex"].append(
+        httpx.Response(429, json={"error": {"code": 429, "message": "quota exhausted"}})
+    )
+    replies["developer"].extend(
+        [
+            httpx.Response(200, json=interaction_response()),
+            httpx.Response(200, json=interaction_response()),
+        ]
+    )
+
+    # First call hits Vertex 429 -> falls back to Developer API and activates 60s Vertex cooldown.
+    out1 = await gate.generate({"current_message": "你好"}, "subject", message=message)
+    assert json.loads(out1)["bubbles"]
+    assert len(calls["vertex"]) == 1
+    assert len(calls["developer"]) == 1
+    assert gate.vertex_blocked_until > time.monotonic()
+
+    # Second call during cooldown skips Vertex completely and goes straight to Developer API.
+    out2 = await gate.generate({"current_message": "再来一句"}, "subject", message=message)
+    assert json.loads(out2)["bubbles"]
+    assert len(calls["vertex"]) == 1
+    assert len(calls["developer"]) == 2
+
+    # Reloading provider clients clears the cooldown; disabling fallback never bypasses Vertex.
+    gate.reload_provider_clients()
+    assert gate.vertex_blocked_until == 0.0

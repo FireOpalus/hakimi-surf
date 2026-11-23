@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -1338,7 +1339,22 @@ class PluginBusDomainBridgeMixin:
                     )
                     return
                 try:
-                    data = await nt.call(action, params)
+                    call_kwargs: dict[str, Any] = {}
+                    if action == "mc.dispatch_goal":
+                        try:
+                            sig = inspect.signature(nt.call)
+                        except (TypeError, ValueError):
+                            sig = None
+                        if sig is not None and (
+                            "timeout" in sig.parameters
+                            or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in sig.parameters.values()
+                            )
+                        ):
+                            base_timeout = float(getattr(self.s, "node_ws_rpc_timeout", 15.0))
+                            call_kwargs["timeout"] = max(base_timeout, 40.0)
+                    data = await nt.call(action, params, **call_kwargs)
                 except asyncio.CancelledError:
                     raise
                 except Rejected as exc:

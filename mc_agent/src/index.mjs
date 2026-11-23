@@ -55,6 +55,8 @@ export function createMcBridgeServer(options = {}) {
     soloWanderIntervalMs: options.soloWanderIntervalMs,
     companionReplyCooldownMs: options.companionReplyCooldownMs,
     hostileAlertCooldownMs: options.hostileAlertCooldownMs,
+    pickupSettleMs: options.pickupSettleMs,
+    smeltPollIntervalMs: options.smeltPollIntervalMs,
   });
 
   const httpServer = http.createServer((req, res) => {

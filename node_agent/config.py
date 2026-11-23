@@ -125,7 +125,7 @@ class NodeAgentSettings(BaseSettings):
         validation_alias=AliasChoices("MC_BRIDGE_TOKEN", "mc_bridge_token"),
     )
     mc_rpc_timeout: float = Field(
-        default=15.0,
+        default=35.0,
         ge=1.0,
         le=60.0,
         validation_alias=AliasChoices("MC_RPC_TIMEOUT", "mc_rpc_timeout"),

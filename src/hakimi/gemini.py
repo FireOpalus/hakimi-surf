@@ -469,6 +469,7 @@ class GeminiGateway:
         self.prefixes = StaticPrefixes()
         self.prefix_runtime = PrefixRuntime()
         self.blocked_until = 0.0
+        self.vertex_blocked_until = 0.0
         self.files_client = files_client
         self._owned_files = files_client is None
         self.flex_client = chat_client
@@ -599,6 +600,7 @@ class GeminiGateway:
         self.vertex_chat_client = (
             self._injected_vertex_chat_client or self._owned_vertex_chat_client
         )
+        self.vertex_blocked_until = 0.0
         self._routing_generation = self.routing.generation
 
     async def _ensure_routing_ready(self) -> None:
@@ -1108,6 +1110,10 @@ class GeminiGateway:
                 if non_billable and model_lane in FLEX_MODELS and status == 503:
                     raise rejected("gemini_unavailable", "flex_capacity_busy") from None
                 if non_billable and status == 429:
+                    if provider == "vertex_paid" and vertex_fallback_eligible:
+                        self.vertex_blocked_until = max(
+                            self.vertex_blocked_until, time.monotonic() + 60
+                        )
                     raise rejected("gemini_unavailable", "rate_limited") from None
                 raise rejected("gemini_unavailable") from None
             elapsed = max(0.0, time.monotonic() - started_at)
@@ -2162,7 +2168,13 @@ class GeminiGateway:
                 and self._should_use_vertex()
             )
             vertex_client = self.vertex_chat_client if use_vertex else None
-            if use_vertex and vertex_client is None:
+            if use_vertex and (
+                vertex_client is None
+                or (
+                    self.routing.config.vertex_fallback_to_gemini
+                    and time.monotonic() < self.vertex_blocked_until
+                )
+            ):
                 if self.routing.config.vertex_fallback_to_gemini:
                     use_vertex = False
                 else:
@@ -2320,7 +2332,10 @@ class GeminiGateway:
                     "max_output_tokens": active_plan.output_tokens,
                     "automatic_continuation": False,
                     "thinking_config": types.ThinkingConfig(thinking_level=gc_thinking),
-                    "http_options": types.HttpOptions(timeout=int(deadline_seconds * 1000)),
+                    "http_options": types.HttpOptions(
+                        timeout=int(deadline_seconds * 1000),
+                        retry_options=types.HttpRetryOptions(attempts=1),
+                    ),
                 }
                 if active_response_schema is not None:
                     config_kwargs["response_mime_type"] = "application/json"
@@ -2537,6 +2552,10 @@ class GeminiGateway:
                 if used_provider != "vertex_paid":
                     raise
                 rate_limited = upstream_http_status(code) == 429
+                if rate_limited and self.routing.config.vertex_fallback_to_gemini:
+                    self.vertex_blocked_until = max(
+                        self.vertex_blocked_until, time.monotonic() + 60
+                    )
                 skip = None
                 if not self.routing.config.vertex_fallback_to_gemini:
                     skip = "disabled"

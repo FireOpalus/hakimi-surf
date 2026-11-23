@@ -57,6 +57,7 @@ DESKTOP_CONTEXT_HINT = "BOISER 近期刚在电脑端忙正事，默契关心一�
 GROUP_SCRUBBED_INTENT_NOTE = "去群里看看大家在聊什么，顺势自然接话或结合公开见闻互动"
 NEAR_HORIZON_SECONDS = 3 * 3600
 ACTIVE_SESSION_REVIEW_SECONDS = 60 * 60
+ACTIVE_SESSION_EVENT_COOLDOWN_SECONDS = 15 * 60
 SESSION_EXIT_COOLDOWN_SECONDS = 120.0
 
 
@@ -973,8 +974,14 @@ class LifeBlockPlanner:
             await self.journal.initialize(
                 now, initial_interval=self.config.planner_min_minutes * 60
             )
-            # Coalesce bursts and avoid waking the model for every row in a burst.
-            wake = max(now + 5, self.last_plan_at + 60)
+            # Coalesce bursts; when already inside an active session of the same module,
+            # avoid thrashing the macro planner every 60s on intra-session high events.
+            active_session = self.engine.active_session_exit()
+            same_active_module = (
+                active_session is not None and active_session[0] == event.source_module
+            )
+            min_gap = ACTIVE_SESSION_EVENT_COOLDOWN_SECONDS if same_active_module else 60
+            wake = max(now + 5, self.last_plan_at + min_gap)
             await self.journal.signal(wake)
             self.next_plan_at = min(self.next_plan_at or wake, wake)
             self.engine.wakeup.set()

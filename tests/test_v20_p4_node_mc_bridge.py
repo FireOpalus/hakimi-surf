@@ -1046,5 +1046,22 @@ async def test_mc_bridge_snapshot_inventory_sanitization_and_new_actions_passthr
             assert guard_patch_res["ok"] is True
             assert slot.current_snapshot()["combat_mode"] == "guard"
             assert slot.current_snapshot()["guard_target"] == "Boiser"
+
+            # Verify time_of_day & nearby_resources sanitization on snapshot apply
+            applied = slot._apply_snapshot_dict(
+                {
+                    "connected": True,
+                    "time_of_day": "NIGHT",
+                    "nearby_resources": ["oak_log", "minecraft:iron_ore", "BAD NAME!", "oak_log"],
+                }
+            )
+            assert applied["time_of_day"] == "night"
+            assert applied["nearby_resources"] == ["oak_log", "iron_ore"]
+            assert (
+                slot._apply_snapshot_dict({"connected": True, "time_of_day": "invalid"})[
+                    "time_of_day"
+                ]
+                == ""
+            )
         finally:
             await slot.close()

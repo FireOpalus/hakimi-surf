@@ -189,7 +189,7 @@ async def test_mc_play_scene_registration_macro_origins_and_session_intent(
         assert scene.label == "MC 实时游玩"
         assert scene.default == "low"
         assert tuple(scene.levels) == ("low", "medium", "high")
-        assert scene.output_tokens == 512
+        assert scene.output_tokens == 2048
 
         # Macro-only planner origins
         for verb in ("connect", "disconnect", "build_plan"):
@@ -2045,5 +2045,172 @@ async def test_mc_play_brain_no_replan_skip_emergency_retreat_and_receipt_checks
             plugin.status_dict()["brain_last_reason"]
             == "chat_intent:evade_rejected:dispatch_rejected"
         )
+    finally:
+        await plugin.close()
+
+
+async def test_mc_plugin_tactical_event_downgrade_cooldown_and_smelt_gather_count() -> None:
+    from plugins.minecraft.play_brain import McBrainDecision
+
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    dispatched: list[dict[str, Any]] = []
+    bridge_timeouts: list[tuple[str, float | None]] = []
+    clock_now = [1000.0]
+
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:12141/ws/plugin",
+        token="mc-tok",
+        clock=lambda: clock_now[0],
+        enable_brain=True,
+        brain_config=McBrainConfig(
+            cruise_interval_seconds=300.0,
+            solo_cruise_interval_seconds=300.0,
+        ),
+    )
+
+    async def _fake_emit_world_event(
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        importance: str = "normal",
+        business_key: str | None = None,
+    ) -> None:
+        emitted.append((event_type, importance, dict(payload)))
+
+    async def _fake_node_call(
+        action: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> dict[str, Any]:
+        bridge_timeouts.append((action, timeout))
+        if action == "mc.dispatch_goal":
+            p = dict(params or {})
+            dispatched.append(p)
+            if p.get("action_type") == "smelt":
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "item_name": "raw_iron",
+                    "output_item": "iron_ingot",
+                    "smelted_count": 2,
+                    "used_fuel": "coal",
+                    "used_furnace": True,
+                }
+            if p.get("action_type") == "gather":
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "block": "oak_log",
+                    "collected_count": 4,
+                }
+        return {"ok": True, "accepted": True}
+
+    plugin.client._connected = True  # type: ignore[attr-defined]
+    plugin.client._ws = object()  # type: ignore[attr-defined]
+    plugin.client.emit_world_event = _fake_emit_world_event  # type: ignore[method-assign]
+    plugin.client.node_call = _fake_node_call  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Snapshot exposes sanitized time_of_day & nearby_resources
+        await plugin.update_snapshot(
+            _connected_snapshot(
+                health=20.0,
+                time_of_day="day",
+                nearby_resources=["oak_log", "minecraft:stone", "BAD BLOCK!", "oak_log"],
+            )
+        )
+        assert plugin.snapshot.time_of_day == "day"
+        assert plugin.snapshot.nearby_resources == ["oak_log", "stone"]
+        assert plugin.brain._state_payload(plugin.snapshot)["time_of_day"] == "day"
+        assert plugin.brain._state_payload(plugin.snapshot)["nearby_resources"] == [
+            "oak_log",
+            "stone",
+        ]
+
+        # 2. Tactical survival alerts downgrade to normal and snapshot alert respects 60s cooldown
+        await plugin.update_snapshot(_connected_snapshot(health=3.0))
+        await plugin.update_snapshot(_connected_snapshot(health=10.0))
+        clock_now[0] += 5.0
+        await plugin.update_snapshot(_connected_snapshot(health=2.0))
+        health_emits = [e for e in emitted if e[0] == "mc_health_alert"]
+        assert len(health_emits) == 1
+        assert health_emits[0][1] == "normal"
+
+        # Explicit mc_creeper_alert(high) from CN downgrades to macro importance="normal"
+        await plugin._on_node_event(
+            {
+                "event": "mc.milestone",
+                "payload": {
+                    "event_type": "mc_creeper_alert",
+                    "importance": "high",
+                    "payload": {"distance": 4.2},
+                },
+            }
+        )
+        assert emitted[-1][0] == "mc_creeper_alert"
+        assert emitted[-1][1] == "normal"
+
+        # 3. mc_death emits high once per 10 minutes, subsequent rapid deaths downgrade to normal
+        await plugin._on_node_event(
+            {
+                "event": "mc.milestone",
+                "payload": {
+                    "event_type": "mc_death",
+                    "importance": "high",
+                    "payload": {"dimension": "overworld"},
+                },
+            }
+        )
+        clock_now[0] += 30.0
+        await plugin._on_node_event(
+            {
+                "event": "mc.milestone",
+                "payload": {
+                    "event_type": "mc_death",
+                    "importance": "high",
+                    "payload": {"dimension": "overworld"},
+                },
+            }
+        )
+        death_emits = [e for e in emitted if e[0] == "mc_death"]
+        assert [imp for _, imp, _ in death_emits] == ["high", "normal"]
+
+        # 4. Brain dispatches gather with count and smelt with 40s RPC timeout & structured outcomes
+        gather_dec = McBrainDecision(
+            say="",
+            action="gather",
+            block_type="oak_log",
+            count=4,
+            reason="先砍4根木头做木镐",
+        )
+        await plugin.brain._apply_decision(
+            gather_dec,
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "gather", "block_type": "oak_log", "count": 4}
+        assert bridge_timeouts[-1] == ("mc.dispatch_goal", 40.0)
+        assert plugin.brain.recent_turns[-1]["outcome"] == "gather:oak_logx4"
+
+        smelt_dec = McBrainDecision(
+            say="",
+            action="smelt",
+            item_name="raw_iron",
+            count=2,
+            reason="把粗铁烧成铁锭",
+        )
+        await plugin.brain._apply_decision(
+            smelt_dec,
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "smelt", "item_name": "raw_iron", "count": 2}
+        assert plugin.brain.recent_turns[-1]["outcome"] == "smelted:iron_ingotx2"
     finally:
         await plugin.close()

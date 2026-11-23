@@ -20,6 +20,7 @@ import {
   shouldTriggerAutoEat,
 } from "./survival.mjs";
 import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
+import { executeSmeltAction, parseSmeltParams } from "./smelting.mjs";
 import {
   CREEPER_SAFE_DISTANCE,
   HOSTILE_MOBS,
@@ -52,8 +53,42 @@ export const ALLOWED_GOAL_ACTIONS = new Set([
   "stop",
   "idle",
   "craft",
+  "smelt",
   "guard",
   "evade",
+]);
+
+export const NEARBY_RESOURCE_BLOCKS = new Set([
+  "oak_log",
+  "spruce_log",
+  "birch_log",
+  "jungle_log",
+  "acacia_log",
+  "dark_oak_log",
+  "mangrove_log",
+  "cherry_log",
+  "pale_oak_log",
+  "stone",
+  "cobblestone",
+  "coal_ore",
+  "deepslate_coal_ore",
+  "iron_ore",
+  "deepslate_iron_ore",
+  "copper_ore",
+  "deepslate_copper_ore",
+  "gold_ore",
+  "deepslate_gold_ore",
+  "diamond_ore",
+  "deepslate_diamond_ore",
+  "crafting_table",
+  "furnace",
+  "smoker",
+  "blast_furnace",
+  "hay_block",
+  "wheat",
+  "pumpkin",
+  "melon",
+  "sugar_cane",
 ]);
 
 export const RARE_BLOCKS = new Set([
@@ -154,13 +189,23 @@ export class McRuntime {
     soloWanderIntervalMs = 25_000,
     companionReplyCooldownMs = 5_000,
     hostileAlertCooldownMs = 60_000,
+    pickupSettleMs = 120,
+    smeltPollIntervalMs = 350,
   }) {
     this.config = config;
     this.createBotFn = createBotFn;
     this.onEvent = onEvent;
     this.snapshotIntervalMs = snapshotIntervalMs;
     this.milestoneCooldownMs = milestoneCooldownMs;
-    this.actionTimeoutMs = Math.min(30_000, Math.max(100, actionTimeoutMs));
+    this.actionTimeoutMs = Math.min(35_000, Math.max(100, actionTimeoutMs));
+    this.pickupSettleMs =
+      typeof pickupSettleMs === "number" && Number.isFinite(pickupSettleMs)
+        ? Math.max(0, pickupSettleMs)
+        : 120;
+    this.smeltPollIntervalMs =
+      typeof smeltPollIntervalMs === "number" && Number.isFinite(smeltPollIntervalMs)
+        ? Math.max(10, smeltPollIntervalMs)
+        : 350;
     this.chatCooldownMs =
       typeof chatCooldownMs === "number" && Number.isFinite(chatCooldownMs)
         ? Math.max(0, chatCooldownMs)
@@ -206,6 +251,8 @@ export class McRuntime {
     this.freeSlots = null;
     this.combatMode = config.mcCombatMode === "guard" ? "guard" : "evade";
     this.guardTarget = "";
+    this.timeOfDay = "";
+    this.nearbyResources = [];
     this.activity = "待机";
     this.nearbyEntities = [];
     this.chatBuffer = new ChatRingBuffer(3, 120);
@@ -343,6 +390,8 @@ export class McRuntime {
       free_slots: this.connected ? this.freeSlots : null,
       combat_mode: this.combatMode,
       guard_target: this._resolveGuardTargetName(),
+      time_of_day: this.connected ? this.timeOfDay : "",
+      nearby_resources: this.connected ? [...this.nearbyResources] : [],
       active_task: this._activeGoalCancel && this.connected && !this.paused ? this.activeTask : "",
       activity: sanitizeMcText(this.activity, 64) || (this.connected ? "原地待命" : "待机"),
       nearby_entities: [...this.nearbyEntities],
@@ -427,6 +476,8 @@ export class McRuntime {
     this.equipment = invSnap.equipment;
     this.inventorySummary = invSnap.inventory_summary;
     this.freeSlots = invSnap.free_slots;
+    this.timeOfDay = this._computeTimeOfDay(bot);
+    this.nearbyResources = this._collectNearbyResources(bot, 16);
     this.nearbyEntities = this._collectNearbyEntities(bot);
     if (this._hasOtherPlayer(bot)) {
       this._lastActivityOrHumanAtMs = this.nowFn();
@@ -505,6 +556,47 @@ export class McRuntime {
     }
     withDist.sort((a, b) => a.dist - b.dist);
     return withDist.slice(0, 5).map((item) => item.label);
+  }
+
+  _computeTimeOfDay(bot) {
+    if (!bot || !this.connected) return "";
+    const dim = String(this.dimension || bot.game?.dimension || "").toLowerCase();
+    if (dim && !dim.includes("overworld")) return "";
+    const rawTod = bot.time?.timeOfDay;
+    if (typeof rawTod !== "number" || !Number.isFinite(rawTod)) return "";
+    const tod = ((Math.floor(rawTod) % 24000) + 24000) % 24000;
+    if (tod < 12000) return "day";
+    if (tod < 13000) return "sunset";
+    if (tod < 23000) return "night";
+    return "sunrise";
+  }
+
+  _collectNearbyResources(bot, maxDistance = 16) {
+    if (!bot || !this.connected || typeof bot.findBlocks !== "function" || !bot.entity?.position) {
+      return [];
+    }
+    try {
+      const positions =
+        bot.findBlocks({
+          matching: (b) => Boolean(b && NEARBY_RESOURCE_BLOCKS.has(b.name)),
+          point: bot.entity.position,
+          maxDistance,
+          count: 48,
+        }) || [];
+      const seen = new Set();
+      const ordered = [];
+      for (const p of positions) {
+        if (ordered.length >= 12) break;
+        const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
+        const name = blk?.name;
+        if (!name || !NEARBY_RESOURCE_BLOCKS.has(name) || seen.has(name)) continue;
+        seen.add(name);
+        ordered.push(name);
+      }
+      return ordered;
+    } catch {
+      return [];
+    }
   }
 
   _startSnapshotTimer() {
@@ -1371,6 +1463,8 @@ export class McRuntime {
       this.equipment = invSnap.equipment;
       this.inventorySummary = invSnap.inventory_summary;
       this.freeSlots = invSnap.free_slots;
+      this.timeOfDay = this._computeTimeOfDay(bot);
+      this.nearbyResources = this._collectNearbyResources(bot, 16);
       this.nearbyEntities = this._collectNearbyEntities(bot);
       if (
         !this.activity ||
@@ -1403,6 +1497,8 @@ export class McRuntime {
       this.equipment = invSnap.equipment;
       this.inventorySummary = invSnap.inventory_summary;
       this.freeSlots = invSnap.free_slots;
+      this.timeOfDay = this._computeTimeOfDay(bot);
+      this.nearbyResources = this._collectNearbyResources(bot, 16);
       this.nearbyEntities = this._collectNearbyEntities(bot);
       if (this.activity === "等待复活") {
         this.activity = this.paused ? "已暂停" : "原地待命";
@@ -1542,6 +1638,8 @@ export class McRuntime {
     this.inventorySummary = [];
     this.freeSlots = null;
     this.guardTarget = "";
+    this.timeOfDay = "";
+    this.nearbyResources = [];
     this.nearbyEntities = [];
     this._prevHealth = null;
     if (!this.activity.startsWith("筹备建造:")) {
@@ -1577,6 +1675,8 @@ export class McRuntime {
     this.inventorySummary = [];
     this.freeSlots = null;
     this.guardTarget = "";
+    this.timeOfDay = "";
+    this.nearbyResources = [];
     this.nearbyEntities = [];
     this._prevHealth = null;
     if (intentional && !this.activity.startsWith("筹备建造:")) {
@@ -1598,7 +1698,7 @@ export class McRuntime {
 
   async _runBoundedGoal(actionType, timeoutMs, fn) {
     this._cancelActiveGoal();
-    const boundedMs = Math.min(30_000, Math.max(100, timeoutMs ?? this.actionTimeoutMs));
+    const boundedMs = Math.min(35_000, Math.max(100, timeoutMs ?? this.actionTimeoutMs));
     const controller = new AbortController();
     let timer = null;
     let timedOut = false;
@@ -1658,6 +1758,89 @@ export class McRuntime {
       if (signal.aborted) return;
       throw err;
     });
+  }
+
+  _findNearestDroppedItem(bot, centerCoords, maxDist = 5) {
+    if (!bot || !centerCoords) return null;
+    const [cx, cy, cz] = centerCoords;
+    let best = null;
+    for (const ent of Object.values(bot.entities || {})) {
+      if (!ent || ent === bot.entity || !ent.position) continue;
+      const entName = String(ent.name || "").toLowerCase();
+      const entDisplay = String(ent.displayName || "").toLowerCase();
+      const isDrop =
+        entName === "item" ||
+        entDisplay === "item" ||
+        (ent.type === "object" && (entName === "item" || ent.objectType === "Item"));
+      if (!isDrop) continue;
+      const dist = Math.hypot(
+        (ent.position.x ?? 0) - cx,
+        (ent.position.y ?? 0) - cy,
+        (ent.position.z ?? 0) - cz,
+      );
+      if (Number.isFinite(dist) && dist <= maxDist && (!best || dist < best.dist)) {
+        best = { entity: ent, pos: ent.position, dist };
+      }
+    }
+    return best;
+  }
+
+  async _collectNearbyDrops(bot, coords, signal) {
+    if (!bot || !coords || signal?.aborted) return;
+    if (this.pickupSettleMs > 0) {
+      await this._sleepAbortable(Math.min(80, this.pickupSettleMs), signal);
+      if (signal?.aborted) return;
+    }
+
+    const drop = this._findNearestDroppedItem(bot, coords, 5);
+    const origin = bot.entity?.position;
+    const distToBlock = origin
+      ? Math.hypot(
+          coords[0] - (origin.x ?? 0),
+          coords[1] - (origin.y ?? 0),
+          coords[2] - (origin.z ?? 0),
+        )
+      : 0;
+
+    let target = null;
+    if (drop?.pos) {
+      target = [drop.pos.x ?? coords[0], drop.pos.y ?? coords[1], drop.pos.z ?? coords[2]];
+    } else if (distToBlock > 1.5) {
+      target = coords;
+    }
+
+    if (target && bot.pathfinder?.goto) {
+      const subCtrl = new AbortController();
+      const onParentAbort = () => subCtrl.abort();
+      signal?.addEventListener?.("abort", onParentAbort, { once: true });
+      let subTimer = null;
+      try {
+        await Promise.race([
+          this._gotoGoal(new GoalNear(target[0], target[1], target[2], 1), subCtrl.signal),
+          new Promise((resolve) => {
+            subTimer = setTimeout(() => {
+              subCtrl.abort();
+              try {
+                bot.pathfinder?.stop?.();
+                bot.pathfinder?.setGoal?.(null);
+              } catch {
+                // Ignore stop errors
+              }
+              resolve();
+            }, 2_500);
+            if (typeof subTimer.unref === "function") subTimer.unref();
+          }),
+        ]);
+      } catch {
+        // Best-effort pickup; never fail a completed dig if drop fell down a hole
+      } finally {
+        if (subTimer) clearTimeout(subTimer);
+        signal?.removeEventListener?.("abort", onParentAbort);
+      }
+      if (!signal?.aborted && this.pickupSettleMs > 0) {
+        await this._sleepAbortable(this.pickupSettleMs, signal);
+      }
+    }
   }
 
   _scanRareBlocks(bot, maxDistance = 24) {
@@ -2009,7 +2192,7 @@ export class McRuntime {
     this._lastActivityOrHumanAtMs = this.nowFn();
     const timeoutMs =
       typeof params.timeout_ms === "number" && Number.isFinite(params.timeout_ms)
-        ? Math.min(30_000, Math.max(100, params.timeout_ms))
+        ? Math.min(35_000, Math.max(100, params.timeout_ms))
         : this.actionTimeoutMs;
 
     if (actionType === "goto") {
@@ -2105,23 +2288,27 @@ export class McRuntime {
       const rawBlock = sanitizeMcText(params.block_type || params.block || params.topic || "", 48)
         .toLowerCase()
         .replace(/[^a-z0-9_]/g, "");
+      const rawCount = params.count === undefined ? 1 : Number(params.count);
+      const requestedCount =
+        Number.isInteger(rawCount) && rawCount >= 1 ? Math.min(8, rawCount) : 1;
       const targets = new Set(
         rawBlock ? [rawBlock] : actionType === "gather" ? DEFAULT_GATHER_BLOCKS : DEFAULT_MINE_BLOCKS,
       );
       this.activity = rawBlock ? `采集:${rawBlock}` : actionType === "gather" ? "采集资源" : "采矿中";
       this._emitSnapshot();
 
-      const positions =
+      const findCandidatePositions = () =>
         typeof bot.findBlocks === "function"
           ? bot.findBlocks({
               matching: (b) => Boolean(b && targets.has(b.name)),
               point: bot.entity?.position,
               maxDistance: 32,
-              count: 4,
+              count: Math.max(4, requestedCount * 2),
             }) || []
           : [];
 
-      if (positions.length === 0) {
+      const initialPositions = findCandidatePositions();
+      if (initialPositions.length === 0) {
         this._refreshFromBot();
         this.activity = this.paused ? "已暂停" : "原地待命";
         this._emitSnapshot();
@@ -2136,38 +2323,74 @@ export class McRuntime {
         };
       }
 
-      const targetPos = positions[0];
-      const block = typeof bot.blockAt === "function" ? bot.blockAt(targetPos) : null;
-      const blockName = sanitizeMcText(block?.name || rawBlock || "block", 48);
-      const coords = this._vecToTuple(targetPos) || [0, 0, 0];
-
-      if (RARE_BLOCKS.has(blockName)) {
-        this._emitMilestone("mc_rare_find", "high", {
-          block: blockName,
-          pos: coords,
-          dimension: this.dimension || "overworld",
-        });
-      }
+      let collectedCount = 0;
+      let lastBlockName = rawBlock || "block";
+      let lastCoords = [0, 0, 0];
+      const visitedKeys = new Set();
 
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
-        if (bot.pathfinder?.goto) {
-          await this._gotoGoal(new GoalNear(coords[0], coords[1], coords[2], 3), signal);
+        for (let step = 0; step < requestedCount; step += 1) {
+          if (signal.aborted) return { aborted: true };
+          if (
+            collectedCount > 0 &&
+            this.combatMode === "evade" &&
+            typeof bot.health === "number" &&
+            bot.health <= 6
+          ) {
+            break;
+          }
+          const positions = step === 0 ? initialPositions : findCandidatePositions();
+          let chosenBlock = null;
+          let chosenCoords = null;
+          for (const p of positions) {
+            const c = this._vecToTuple(p) || [0, 0, 0];
+            const key = `${Math.floor(c[0])},${Math.floor(c[1])},${Math.floor(c[2])}`;
+            if (visitedKeys.has(key)) continue;
+            const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
+            if (blk && !targets.has(blk.name)) continue;
+            chosenBlock = blk;
+            chosenCoords = c;
+            visitedKeys.add(key);
+            break;
+          }
+          if (!chosenCoords) break;
+
+          const blockName = sanitizeMcText(chosenBlock?.name || rawBlock || "block", 48);
+          lastBlockName = blockName;
+          lastCoords = chosenCoords;
+
+          if (RARE_BLOCKS.has(blockName)) {
+            this._emitMilestone("mc_rare_find", "high", {
+              block: blockName,
+              pos: chosenCoords,
+              dimension: this.dimension || "overworld",
+            });
+          }
+
+          if (bot.pathfinder?.goto) {
+            await this._gotoGoal(
+              new GoalNear(chosenCoords[0], chosenCoords[1], chosenCoords[2], 3),
+              signal,
+            );
+          }
+          if (signal.aborted) return { aborted: true };
+          if (chosenBlock && this.config.mcAutoEquip !== false && !this._eatingLock.eating) {
+            await equipBestHarvestTool(bot, chosenBlock);
+          }
+          if (signal.aborted) return { aborted: true };
+          if (chosenBlock && typeof bot.dig === "function") {
+            await bot.dig(chosenBlock);
+          }
+          collectedCount += 1;
+          await this._collectNearbyDrops(bot, chosenCoords, signal);
         }
-        if (signal.aborted) return { aborted: true };
-        if (block && this.config.mcAutoEquip !== false && !this._eatingLock.eating) {
-          await equipBestHarvestTool(bot, block);
-        }
-        if (signal.aborted) return { aborted: true };
-        if (block && typeof bot.dig === "function") {
-          await bot.dig(block);
-        }
-        return { ok: true };
+        return { ok: collectedCount > 0 };
       });
 
       this._refreshFromBot();
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
-      if (outcome?.timedOut || outcome?.aborted) {
+      if ((outcome?.timedOut || outcome?.aborted) && collectedCount === 0) {
         return {
           ok: false,
           accepted: true,
@@ -2178,16 +2401,27 @@ export class McRuntime {
           snapshot: this.getSnapshot(),
         };
       }
-      const summary = `已采集${blockName}(${coords.join(",")})`;
-      this._emitMilestone("mc_goal_completed", "normal", { action_type: actionType, summary });
+      const summary =
+        collectedCount > 1
+          ? `已采集${lastBlockName} x${collectedCount}(${lastCoords.join(",")})`
+          : `已采集${lastBlockName}(${lastCoords.join(",")})`;
+      this._emitMilestone("mc_goal_completed", "normal", {
+        action_type: actionType,
+        summary,
+        block: lastBlockName,
+        collected_count: collectedCount,
+      });
       return {
         ok: true,
         accepted: true,
         bridge_ready: true,
         paused: false,
         summary,
-        block: blockName,
-        pos: coords,
+        block: lastBlockName,
+        pos: lastCoords,
+        collected_count: collectedCount,
+        requested_count: requestedCount,
+        partial: collectedCount < requestedCount,
         snapshot: this.getSnapshot(),
       };
     }
@@ -2451,6 +2685,93 @@ export class McRuntime {
         item_name: outcome?.item_name ?? parsed.itemName,
         requested_count: outcome?.requested_count ?? parsed.count,
         crafted_count: outcome?.crafted_count ?? 0,
+        missing_materials: Array.isArray(outcome?.missing_materials)
+          ? outcome.missing_materials
+          : [],
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "smelt") {
+      const parsed = parseSmeltParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          summary:
+            parsed.error === "invalid_item_name"
+              ? "熔炼物品ID无效"
+              : parsed.error === "invalid_fuel_name"
+                ? "燃料物品ID无效"
+                : "熔炼数量需为1到16的整数",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = `熔炼:${parsed.itemName}`;
+      this._emitSnapshot();
+      const smeltTimeoutMs =
+        typeof params.timeout_ms === "number" && Number.isFinite(params.timeout_ms)
+          ? Math.min(35_000, Math.max(100, params.timeout_ms))
+          : Math.min(32_000, Math.max(timeoutMs, 28_000));
+      const maxSmeltWaitMs = Math.max(200, smeltTimeoutMs - 3_000);
+      const outcome = await this._runBoundedGoal(actionType, smeltTimeoutMs, async (signal) => {
+        return await executeSmeltAction(bot, params, {
+          gotoFn: (goal, sig) => this._gotoGoal(goal, sig),
+          signal,
+          pollIntervalMs: this.smeltPollIntervalMs,
+          maxSmeltWaitMs,
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "熔炼超时" : "熔炼已取消",
+          item_name: parsed.itemName,
+          output_item: "",
+          requested_count: parsed.count,
+          smelted_count: 0,
+          missing_materials: [],
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "smelt",
+          summary: outcome.summary,
+          item_name: outcome.item_name,
+          output_item: outcome.output_item,
+          smelted_count: outcome.smelted_count,
+        });
+        return {
+          ok: true,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          ...outcome,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      return {
+        ok: false,
+        accepted: outcome?.accepted ?? true,
+        bridge_ready: true,
+        paused: false,
+        reason: outcome?.reason || "smelt_failed",
+        summary: outcome?.summary || `熔炼${parsed.itemName}失败`,
+        item_name: outcome?.item_name ?? parsed.itemName,
+        output_item: outcome?.output_item ?? "",
+        requested_count: outcome?.requested_count ?? parsed.count,
+        smelted_count: outcome?.smelted_count ?? 0,
         missing_materials: Array.isArray(outcome?.missing_materials)
           ? outcome.missing_materials
           : [],

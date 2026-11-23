@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -36,6 +37,7 @@ _MC_ALLOWED_DISPATCH_FIELDS = (
     "topic",
     "block_type",
     "item_name",
+    "fuel_name",
     "count",
     "x",
     "y",
@@ -53,6 +55,18 @@ _INVENTORY_ENTRY_RE = re.compile(r"^[a-z0-9_]{1,48}:[1-9][0-9]{0,4}\Z")
 _PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,16}\Z")
 _EQUIPMENT_SLOTS = ("main_hand", "off_hand", "head", "chest", "legs", "feet")
 _EMPTY_EQUIPMENT: dict[str, str] = {slot: "" for slot in _EQUIPMENT_SLOTS}
+_VALID_TIME_OF_DAY = frozenset({"day", "sunset", "night", "sunrise"})
+_TACTICAL_MC_EVENTS = frozenset(
+    {
+        "mc_health_alert",
+        "mc_creeper_alert",
+        "mc_combat_retreat",
+        "mc_low_food",
+    }
+)
+_HEALTH_ALERT_COOLDOWN_SECONDS = 60.0
+_DEATH_HIGH_COOLDOWN_SECONDS = 600.0
+_DISPATCH_GOAL_RPC_TIMEOUT = 40.0
 
 _BRIDGE_FLAG_KEYS = ("bridge_ready", "mc_enabled", "mc_configured", "paused")
 _NON_SNAPSHOT_KEYS = frozenset(
@@ -86,6 +100,8 @@ _SNAPSHOT_FIELD_KEYS = frozenset(
         "free_slots",
         "combat_mode",
         "guard_target",
+        "time_of_day",
+        "nearby_resources",
         "updated_at",
     }
 )
@@ -223,6 +239,39 @@ def _sanitize_missing_materials(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _sanitize_time_of_day(
+    raw: Any, *, connected: bool
+) -> Literal["", "day", "sunset", "night", "sunrise"]:
+    if not connected or not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip().lower()
+    if cleaned == "day":
+        return "day"
+    if cleaned == "sunset":
+        return "sunset"
+    if cleaned == "night":
+        return "night"
+    if cleaned == "sunrise":
+        return "sunrise"
+    return ""
+
+
+def _sanitize_nearby_resources(raw: Any, *, connected: bool) -> list[str]:
+    if not connected or not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if len(out) >= 12:
+            break
+        clean = _normalize_item_id(entry)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+    return out
+
+
 class MinecraftSnapshot(BaseModel):
     """Sanitized snapshot of the remote CN Mineflayer agent."""
 
@@ -243,6 +292,8 @@ class MinecraftSnapshot(BaseModel):
     free_slots: int | None = Field(default=None, ge=0, le=36)
     combat_mode: Literal["evade", "guard"] = "evade"
     guard_target: str = Field(default="", max_length=16)
+    time_of_day: Literal["", "day", "sunset", "night", "sunrise"] = ""
+    nearby_resources: list[str] = Field(default_factory=list, max_length=12)
     updated_at: float = 0.0
 
     @field_validator("equipment")
@@ -286,6 +337,16 @@ class MinecraftSnapshot(BaseModel):
             raise ValueError("invalid_guard_target")
         return value
 
+    @field_validator("nearby_resources")
+    @classmethod
+    def _validate_nearby_resources(cls, value: list[str]) -> list[str]:
+        if len(value) > 12:
+            raise ValueError("nearby_resources_too_long")
+        for entry in value:
+            if not isinstance(entry, str) or not _ITEM_ID_RE.fullmatch(entry):
+                raise ValueError("invalid_nearby_resource")
+        return value
+
 
 class NoArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
@@ -301,6 +362,7 @@ class BuildArgs(NoArgs):
 
 class BlockArgs(NoArgs):
     block_type: str = Field(default="", max_length=48, pattern=r"^[a-z0-9_:]*$")
+    count: int = Field(default=1, ge=1, le=8)
 
 
 class CraftArgs(NoArgs):
@@ -313,6 +375,30 @@ class CraftArgs(NoArgs):
         cleaned = _normalize_item_id(value)
         if not cleaned:
             raise ValueError("invalid_item_name")
+        return cleaned
+
+
+class SmeltArgs(NoArgs):
+    item_name: str = Field(min_length=1, max_length=64)
+    count: int = Field(default=1, ge=1, le=16)
+    fuel_name: str = Field(default="", max_length=64)
+
+    @field_validator("item_name")
+    @classmethod
+    def _validate_item_name(cls, value: str) -> str:
+        cleaned = _normalize_item_id(value)
+        if not cleaned:
+            raise ValueError("invalid_item_name")
+        return cleaned
+
+    @field_validator("fuel_name")
+    @classmethod
+    def _validate_fuel_name(cls, value: str) -> str:
+        if not value.strip():
+            return ""
+        cleaned = _normalize_item_id(value)
+        if not cleaned:
+            raise ValueError("invalid_fuel_name")
         return cleaned
 
 
@@ -376,6 +462,7 @@ _BLOCK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "block_type": {"type": "string", "maxLength": 48, "default": ""},
+        "count": {"type": "integer", "minimum": 1, "maximum": 8, "default": 1},
     },
     "required": [],
     "additionalProperties": False,
@@ -385,6 +472,16 @@ _CRAFT_SCHEMA: dict[str, Any] = {
     "properties": {
         "item_name": {"type": "string", "minLength": 1, "maxLength": 64},
         "count": {"type": "integer", "minimum": 1, "maximum": 16, "default": 1},
+    },
+    "required": ["item_name"],
+    "additionalProperties": False,
+}
+_SMELT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "item_name": {"type": "string", "minLength": 1, "maxLength": 64},
+        "count": {"type": "integer", "minimum": 1, "maximum": 16, "default": 1},
+        "fuel_name": {"type": "string", "maxLength": 64, "default": ""},
     },
     "required": ["item_name"],
     "additionalProperties": False,
@@ -453,6 +550,11 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
         _CRAFT_SCHEMA,
         CraftArgs,
     ),
+    "smelt": (
+        "在游戏里用熔炉烧炼粗矿、生肉或原木等物品（自动寻炉或合成放置熔炉与燃料）",
+        _SMELT_SCHEMA,
+        SmeltArgs,
+    ),
     "guard": ("在游戏里切换为贴身护卫模式保护玩家并击退敌对怪物", _GUARD_SCHEMA, GuardArgs),
     "evade": ("在游戏里切换为安全躲避模式避免交战并优先保命", {}, NoArgs),
     "goto": ("在游戏里前往指定坐标位置", _POSITION_SCHEMA, PositionArgs),
@@ -474,6 +576,7 @@ _MICRO_GAME_VERBS = frozenset(
         "mine",
         "gather",
         "craft",
+        "smelt",
         "guard",
         "evade",
         "goto",
@@ -486,7 +589,7 @@ _MICRO_GAME_VERBS = frozenset(
     }
 )
 _ADMIN_ONLY_VERBS = frozenset({"status", "pause", "resume"})
-_EFFORTFUL_VERBS = frozenset({"explore", "goto", "mine", "gather", "craft", "follow"})
+_EFFORTFUL_VERBS = frozenset({"explore", "goto", "mine", "gather", "craft", "smelt", "follow"})
 _OWNER_CHAT_ORIGINS = ["planner", "owner_chat", "rule", "timer", "legacy", "admin"]
 _MACRO_PLANNER_ORIGINS = ["planner", "rule", "timer", "legacy", "admin"]
 _MICRO_GAME_ORIGINS = ["rule", "legacy", "admin"]
@@ -526,6 +629,8 @@ class MinecraftPlugin:
         self.session_intent: str = ""
         self._sync_lock = asyncio.Lock()
         self._snapshot_seq: int = 0
+        self._last_health_alert_at: float = -1e9
+        self._last_death_high_at: float = -1e9
         self.brain = McPlayBrain(self, config=brain_config)
 
         if self.enable_brain:
@@ -536,7 +641,7 @@ class MinecraftPlugin:
                     label="MC 实时游玩",
                     default="low",
                     levels=("low", "medium", "high"),
-                    output_tokens=512,
+                    output_tokens=2048,
                 ),
             )
         else:
@@ -722,6 +827,10 @@ class MinecraftPlugin:
             and _PLAYER_ID_RE.fullmatch(raw_guard_target.strip())
             else ""
         )
+        time_of_day = _sanitize_time_of_day(data.get("time_of_day"), connected=connected)
+        nearby_resources = _sanitize_nearby_resources(
+            data.get("nearby_resources"), connected=connected
+        )
 
         return MinecraftSnapshot(
             connected=connected,
@@ -739,6 +848,8 @@ class MinecraftPlugin:
             free_slots=free_slots,
             combat_mode=combat_mode,
             guard_target=guard_target,
+            time_of_day=time_of_day,
+            nearby_resources=nearby_resources,
             updated_at=updated_at,
         )
 
@@ -774,6 +885,21 @@ class MinecraftPlugin:
                 self._has_snapshot = True
         return self.snapshot
 
+    def _macro_importance(
+        self,
+        event_type: str,
+        raw_importance: Literal["low", "normal", "high"],
+    ) -> Literal["low", "normal", "high"]:
+        """Downgrade tactical survival reflexes so they never wake the macro LifeBlockPlanner."""
+        if event_type in _TACTICAL_MC_EVENTS:
+            return "normal"
+        if event_type == "mc_death" and raw_importance == "high":
+            now = float(self.clock())
+            if now - self._last_death_high_at < _DEATH_HIGH_COOLDOWN_SECONDS:
+                return "normal"
+            self._last_death_high_at = now
+        return raw_importance
+
     async def _emit_milestone(
         self,
         event_type: str,
@@ -784,10 +910,11 @@ class MinecraftPlugin:
     ) -> None:
         if not self.client.connected:
             return
+        macro_imp = self._macro_importance(event_type, importance)
         await self.client.emit_world_event(
             event_type,
             payload if payload is not None else {},
-            importance=importance,
+            importance=macro_imp,
             business_key=business_key,
         )
 
@@ -815,6 +942,8 @@ class MinecraftPlugin:
             )
             exp_type = _sanitize_text(str(explicit["event_type"]), max_tokens=16)
             exp_payload = dict(explicit.get("payload") or {})
+            if exp_type in {"mc_health_alert", "mc_death"}:
+                self._last_health_alert_at = float(self.clock())
             await self._emit_milestone(
                 exp_type or str(explicit["event_type"]),
                 exp_payload,
@@ -854,13 +983,16 @@ class MinecraftPlugin:
             and prev.health is not None
             and ((prev.health > 0 and curr.health <= 0) or (prev.health > 4 and curr.health <= 4))
         ):
-            alert_payload = {"health": curr.health, "dimension": curr.dimension}
-            await self._emit_milestone(
-                "mc_health_alert",
-                alert_payload,
-                importance="high",
-            )
-            self.brain.on_milestone("mc_health_alert", alert_payload)
+            now = float(self.clock())
+            if now - self._last_health_alert_at >= _HEALTH_ALERT_COOLDOWN_SECONDS:
+                self._last_health_alert_at = now
+                alert_payload = {"health": curr.health, "dimension": curr.dimension}
+                await self._emit_milestone(
+                    "mc_health_alert",
+                    alert_payload,
+                    importance="normal",
+                )
+                self.brain.on_milestone("mc_health_alert", alert_payload)
         if was_initialized and prev.connected and not curr.connected:
             await self.brain.flush_session_recap(reason="disconnected")
         self.brain.on_snapshot(curr)
@@ -902,6 +1034,8 @@ class MinecraftPlugin:
             "free_slots": snap.free_slots,
             "combat_mode": snap.combat_mode,
             "guard_target": snap.guard_target,
+            "time_of_day": snap.time_of_day,
+            "nearby_resources": list(snap.nearby_resources[:12]),
             "updated_at": float(snap.updated_at),
             **self.brain.telemetry(),
         }
@@ -939,6 +1073,8 @@ class MinecraftPlugin:
             parts.append(f"见闻:{snap.recent_chat_or_sign}")
         if snap.combat_mode == "guard":
             parts.append(f"模式:护卫({snap.guard_target})" if snap.guard_target else "模式:护卫")
+        if snap.time_of_day:
+            parts.append(f"时段:{snap.time_of_day}")
         return _sanitize_text(" ".join(parts), max_tokens=90)
 
     async def _sensor_summary(self, _params: dict[str, Any] | None = None) -> str:
@@ -985,6 +1121,7 @@ class MinecraftPlugin:
         await self._push_status_and_activity()
 
     async def _call_bridge(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        rpc_timeout = _DISPATCH_GOAL_RPC_TIMEOUT if action == "mc.dispatch_goal" else 15.0
         if self.mc_bridge_url:
             endpoint = self.mc_bridge_url.rstrip("/")
             if not endpoint.endswith("/rpc"):
@@ -993,7 +1130,7 @@ class MinecraftPlugin:
                 resp = await self.http.post(
                     endpoint,
                     json={"action": action, "params": params},
-                    timeout=15.0,
+                    timeout=rpc_timeout,
                     follow_redirects=False,
                 )
                 resp.raise_for_status()
@@ -1008,7 +1145,17 @@ class MinecraftPlugin:
                 raise PluginRpcError("mc_bridge_invalid_response", "invalid bridge shape")
             return data
 
-        data = await self.client.node_call(action, params)
+        call_kwargs: dict[str, Any] = {}
+        try:
+            sig = inspect.signature(self.client.node_call)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None and (
+            "timeout" in sig.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        ):
+            call_kwargs["timeout"] = rpc_timeout
+        data = await self.client.node_call(action, params, **call_kwargs)
         self.node_online = True
         return data
 
@@ -1067,6 +1214,8 @@ class MinecraftPlugin:
                 }
             )
             business_key = payload.get("event_id") or frame.get("id")
+            if clean_type in {"mc_health_alert", "mc_death"}:
+                self._last_health_alert_at = float(self.clock())
             await self._emit_milestone(
                 clean_type,
                 event_data,
@@ -1195,6 +1344,8 @@ class MinecraftPlugin:
                 }
                 if verb == "guard" and not params.get("target_player"):
                     params.pop("target_player", None)
+                if verb == "smelt" and not params.get("fuel_name"):
+                    params.pop("fuel_name", None)
                 for axis in ("x", "y", "z"):
                     val = params.pop(axis, None)
                     if type(val) in (int, float) and math.isfinite(val):
@@ -1248,11 +1399,15 @@ class MinecraftPlugin:
             artifacts["phase"] = _sanitize_text(str(data["phase"]), max_tokens=12)
         if clean_item := _normalize_item_id(data.get("item_name")):
             artifacts["item_name"] = clean_item
-        for int_key in ("crafted_count", "requested_count"):
+        if clean_out := _normalize_item_id(data.get("output_item")):
+            artifacts["output_item"] = clean_out
+        if clean_fuel := _normalize_item_id(data.get("used_fuel")):
+            artifacts["used_fuel"] = clean_fuel
+        for int_key in ("crafted_count", "smelted_count", "collected_count", "requested_count"):
             raw_int = data.get(int_key)
             if isinstance(raw_int, int) and not isinstance(raw_int, bool) and raw_int >= 0:
                 artifacts[int_key] = raw_int
-        for bool_key in ("partial", "used_table"):
+        for bool_key in ("partial", "used_table", "used_furnace"):
             if isinstance(data.get(bool_key), bool):
                 artifacts[bool_key] = data[bool_key]
         if isinstance(data.get("equipped_items"), (list, tuple)):

@@ -32,6 +32,7 @@ _CANONICAL_ITEM_ID_RE = re.compile(r"^[a-z0-9_]{1,48}$")
 _INVENTORY_ENTRY_RE = re.compile(r"^([a-z0-9_]{1,48}):([1-9][0-9]{0,4})$")
 _PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 _VALID_COMBAT_MODES = frozenset({"evade", "guard"})
+_VALID_TIME_OF_DAY = frozenset({"day", "sunset", "night", "sunrise"})
 
 
 def _empty_equipment() -> dict[str, str]:
@@ -103,6 +104,29 @@ def _sanitize_guard_target(raw: Any) -> str:
     return cleaned if _PLAYER_ID_RE.fullmatch(cleaned) else ""
 
 
+def _sanitize_time_of_day(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip().lower()
+    return cleaned if cleaned in _VALID_TIME_OF_DAY else ""
+
+
+def _sanitize_nearby_resources(raw: Any) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if len(out) >= 12:
+            break
+        clean = _sanitize_item_id(entry)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+    return out
+
+
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     obj: dict[str, Any] = {}
     for key, value in pairs:
@@ -169,7 +193,7 @@ class McBridgeSlot:
         enabled: bool = False,
         bridge_url: str = "ws://hakimi-mc-agent:8791/ws",
         token: str = "",
-        rpc_timeout: float = 15.0,
+        rpc_timeout: float = 35.0,
         max_frame_bytes: int = _BRIDGE_MAX_FRAME_BYTES,
         reconnect_base: float = 0.5,
         reconnect_max: float = 15.0,
@@ -216,6 +240,8 @@ class McBridgeSlot:
             "free_slots": None,
             "combat_mode": "evade",
             "guard_target": "",
+            "time_of_day": "",
+            "nearby_resources": [],
             "activity": "",
             "nearby_entities": [],
             "recent_chat_or_sign": "",
@@ -237,6 +263,10 @@ class McBridgeSlot:
             snap["inventory_summary"] = list(snap["inventory_summary"])
         else:
             snap["inventory_summary"] = []
+        if isinstance(snap.get("nearby_resources"), list):
+            snap["nearby_resources"] = list(snap["nearby_resources"])
+        else:
+            snap["nearby_resources"] = []
         return snap
 
     def start(self) -> None:
@@ -350,11 +380,23 @@ class McBridgeSlot:
                 if combat_mode == "guard"
                 else ""
             )
+            time_of_day = (
+                _sanitize_time_of_day(raw["time_of_day"])
+                if "time_of_day" in raw
+                else _sanitize_time_of_day(self._latest_snapshot.get("time_of_day"))
+            )
+            nearby_resources = (
+                _sanitize_nearby_resources(raw["nearby_resources"])
+                if "nearby_resources" in raw
+                else _sanitize_nearby_resources(self._latest_snapshot.get("nearby_resources"))
+            )
         else:
             equipment = _empty_equipment()
             inventory_summary = []
             free_slots = None
             guard_target = ""
+            time_of_day = ""
+            nearby_resources = []
 
         merged = dict(self._latest_snapshot)
         merged.update(raw)
@@ -370,6 +412,8 @@ class McBridgeSlot:
         merged["free_slots"] = free_slots
         merged["combat_mode"] = combat_mode
         merged["guard_target"] = guard_target
+        merged["time_of_day"] = time_of_day
+        merged["nearby_resources"] = nearby_resources
         if isinstance(merged.get("nearby_entities"), list):
             merged["nearby_entities"] = list(merged["nearby_entities"])
         self._latest_snapshot = merged
@@ -553,6 +597,8 @@ class McBridgeSlot:
                         self._latest_snapshot.get("combat_mode"), "evade"
                     ),
                     "guard_target": "",
+                    "time_of_day": "",
+                    "nearby_resources": [],
                     "nearby_entities": [],
                     "activity": "MC容器重连中",
                     "updated_at": now,
