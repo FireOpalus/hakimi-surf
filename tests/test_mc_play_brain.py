@@ -2531,3 +2531,119 @@ async def test_mc_evade_alerts_and_low_food_stay_zero_token_without_resetting_cr
         assert plugin.brain._waypoints["last_death"]["pos"] == [1, 70, 2]
     finally:
         await plugin.close()
+
+
+async def test_mc_initial_15s_cold_start_wood_shortfall_and_shelter_action() -> None:
+    """Verify 15s cold-start cruise, craft need_logs formatting, and mc.shelter dispatch."""
+    from plugins.minecraft.play_brain import McBrainDecision
+
+    assert "shelter" in MC_PLAY_RESPONSE_SCHEMA["properties"]["action"]["enum"]
+    assert {"auto", "enter", "exit"} <= set(MC_PLAY_RESPONSE_SCHEMA["properties"]["mode"]["enum"])
+
+    clock_now = [4_000_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:12141/ws/plugin",
+        token="test-token",
+        clock=lambda: clock_now[0],
+        enable_brain=True,
+        brain_config=McBrainConfig(
+            solo_cruise_interval_seconds=150.0,
+            initial_cruise_delay_seconds=0.05,
+        ),
+    )
+    dispatched: list[dict[str, Any]] = []
+    screen_count = 0
+
+    async def fake_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+        if action == "mc.dispatch_goal":
+            dispatched.append(dict(params))
+            act = params.get("action_type")
+            if act == "craft":
+                return {
+                    "ok": False,
+                    "accepted": True,
+                    "reason": "missing_materials",
+                    "missing_materials": [{"item": "stick", "need": 1, "have": 0, "shortfall": 1}],
+                    "wood_shortfall_planks": 4,
+                    "wood_shortfall_logs": 1,
+                }
+            if act == "shelter":
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "mode": params.get("mode", "enter"),
+                    "sheltered": params.get("mode") != "exit",
+                    "shelter_pos": [0, 61, 0],
+                }
+        return {"ok": True, "accepted": True}
+
+    async def fake_budget(_lane: str = "proactive") -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        nonlocal screen_count
+        screen_count += 1
+        return {
+            "passed": True,
+            "template": MC_CRUISE_GATE_TEMPLATE,
+            "decisions": {
+                "should_replan": {
+                    "type": "noul",
+                    "value": False,
+                    "noul": 0.1,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "keep_current",
+                    "confidence": 0.9,
+                    "probabilities": {"keep_current": 0.9},
+                    "confident": True,
+                },
+            },
+        }
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+    plugin.apply_snapshot(_connected_snapshot(nearby_players=[]))
+
+    try:
+        # 1. Cold-start fires initial cruise after initial_cruise_delay_seconds (not 150s!)
+        plugin.brain.start()
+        await _wait_until(lambda: screen_count >= 1)
+        assert plugin.brain._first_cruise_pending is False
+
+        # 2. Craft wood shortfall includes need_logs:1 hint in outcome
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="craft",
+                item_name="wooden_sword",
+                count=1,
+                reason="做把木剑防身",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "missing:stickx1,need_logs:1"
+
+        # 3. Shelter action dispatches enter & exit cleanly
+        await plugin.brain._apply_decision(
+            McBrainDecision(
+                action="shelter",
+                mode="enter",
+                reason="夜晚无床先挖掩体苟到天亮",
+            ),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "shelter", "mode": "enter"}
+        assert plugin.brain.recent_turns[-1]["outcome"] == "shelter:entered"
+    finally:
+        await plugin.close()

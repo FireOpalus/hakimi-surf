@@ -418,10 +418,19 @@ async function preprocessWoodMaterials(
   }
 
   const planksForTable = needsTableCraft ? 4 : 0;
+  const singleBatchPlanks = specificPlankName ? (reqs.get(specificPlankName) ?? 0) : 0;
+  const singleBatchStickPlanks =
+    targetItemName !== "stick" && (reqs.get("stick") ?? 0) > haveSticks ? 2 : 0;
+  const minPlanksForOneWithTable = singleBatchPlanks + singleBatchStickPlanks + planksForTable;
   const totalPlanksNeed =
     (specificPlankName ? (reqs.get(specificPlankName) ?? 0) * batches : 0) +
     planksForSticks +
     planksForTable;
+  const maxPossiblePlanks = countAllPlanks(countsBefore) + countPotentialPlanksFromLogs(countsBefore);
+  // Avoid burning the last planks into sticks when total wood cannot even fund a crafting table + 1 item.
+  if (needsTableCraft && maxPossiblePlanks < minPlanksForOneWithTable) {
+    return;
+  }
 
   // Level 1: log -> planks (skip if target itself is a planks item)
   if (!isPlanksName(targetItemName)) {
@@ -575,10 +584,63 @@ export async function placeCraftingTableSafely(bot) {
   return { ok: false, reason: "table_placement_failed" };
 }
 
-function formatMissingSummary(missing) {
-  if (!missing || missing.length === 0) return "缺少合成材料";
-  const parts = missing.slice(0, 4).map((m) => `${m.item} x${m.shortfall}`);
-  return `缺少合成材料: ${parts.join(", ")}`;
+function countPotentialPlanksFromLogs(countsMap) {
+  let total = 0;
+  for (const [name, count] of countsMap.entries()) {
+    if (!LOG_TO_PLANKS.has(name) || count <= 0) continue;
+    const yieldPerLog = name.includes("bamboo_block") ? 2 : 4;
+    total += count * yieldPerLog;
+  }
+  return total;
+}
+
+/**
+ * Compute upstream wood shortfall (planks & logs) when crafting fails due to
+ * missing planks, sticks, or crafting_table wood so the planner knows to chop
+ * logs instead of trying to craft sticks out of thin air.
+ */
+export function computeWoodShortfall(
+  missing,
+  countsMap,
+  { needsTableCraft = false, recipePlanksForOne = 0 } = {},
+) {
+  let extraPlanksNeed = 0;
+  for (const entry of missing || []) {
+    if (!entry || typeof entry.shortfall !== "number" || entry.shortfall <= 0) continue;
+    if (isPlanksName(entry.item)) {
+      extraPlanksNeed += entry.shortfall;
+    } else if (entry.item === "stick") {
+      extraPlanksNeed += Math.ceil(entry.shortfall / 4) * 2;
+    } else if (entry.item === "crafting_table") {
+      extraPlanksNeed += entry.shortfall * 4;
+    }
+  }
+  if (needsTableCraft && (countsMap.get("crafting_table") ?? 0) === 0) {
+    const havePlanksNow = countAllPlanks(countsMap);
+    const tableAndRecipeNeed = 4 + Math.max(0, recipePlanksForOne);
+    const tableGap = Math.max(0, tableAndRecipeNeed - havePlanksNow);
+    extraPlanksNeed = Math.max(extraPlanksNeed, tableGap);
+  }
+  const logPlanksAvailable = countPotentialPlanksFromLogs(countsMap);
+  const netPlanksShortfall = Math.max(0, extraPlanksNeed - logPlanksAvailable);
+  return {
+    wood_shortfall_planks: netPlanksShortfall,
+    wood_shortfall_logs: netPlanksShortfall > 0 ? Math.ceil(netPlanksShortfall / 4) : 0,
+  };
+}
+
+function formatMissingSummary(missing, woodInfo = null) {
+  const base =
+    !missing || missing.length === 0
+      ? "缺少合成材料"
+      : `缺少合成材料: ${missing
+          .slice(0, 4)
+          .map((m) => `${m.item} x${m.shortfall}`)
+          .join(", ")}`;
+  if (woodInfo && woodInfo.wood_shortfall_logs > 0) {
+    return `${base}（还需约 ${woodInfo.wood_shortfall_logs} 根原木）`;
+  }
+  return base;
 }
 
 export async function executeCraftAction(
@@ -677,6 +739,16 @@ export async function executeCraftAction(
       const countsNow = countInventoryByName(bot);
       const bestMiss = pickBestRecipeAnalysis(allKnownRecipes, bot, requestedCount, countsNow);
       const missing = bestMiss?.missing ?? [];
+      let recipePlanksForOne = 0;
+      if (bestMiss) {
+        for (const [ingName, qty] of bestMiss.reqs.entries()) {
+          if (isPlanksName(ingName)) recipePlanksForOne += qty;
+        }
+      }
+      const woodInfo = computeWoodShortfall(missing, countsNow, {
+        needsTableCraft,
+        recipePlanksForOne,
+      });
       return {
         ok: false,
         accepted: true,
@@ -685,7 +757,8 @@ export async function executeCraftAction(
         requested_count: requestedCount,
         crafted_count: 0,
         missing_materials: missing,
-        summary: formatMissingSummary(missing),
+        ...(woodInfo.wood_shortfall_logs > 0 ? woodInfo : {}),
+        summary: formatMissingSummary(missing, woodInfo),
       };
     }
 
@@ -743,6 +816,10 @@ export async function executeCraftAction(
                 },
               ]
             : [{ item: "crafting_table", need: 1, have: 0, shortfall: 1 }];
+        const woodInfo = computeWoodShortfall(missing, curCounts, {
+          needsTableCraft: true,
+          recipePlanksForOne,
+        });
         return {
           ok: false,
           accepted: true,
@@ -751,7 +828,11 @@ export async function executeCraftAction(
           requested_count: requestedCount,
           crafted_count: 0,
           missing_materials: missing,
-          summary: "附近16格内无工作台且材料不足以制作工作台",
+          ...(woodInfo.wood_shortfall_logs > 0 ? woodInfo : {}),
+          summary:
+            woodInfo.wood_shortfall_logs > 0
+              ? `附近16格内无工作台且木料不足（还需约 ${woodInfo.wood_shortfall_logs} 根原木）`
+              : "附近16格内无工作台且材料不足以制作工作台",
         };
       }
 
@@ -822,6 +903,9 @@ export async function executeCraftAction(
     const bestMiss = pickBestRecipeAnalysis(allKnownRecipes, bot, requestedCount, countsAfter);
     const missing = bestMiss?.missing ?? [];
     if (missing.length > 0) {
+      const woodInfo = computeWoodShortfall(missing, countsAfter, {
+        needsTableCraft: !usedTable && needsTableCraft,
+      });
       return {
         ok: false,
         accepted: true,
@@ -830,7 +914,8 @@ export async function executeCraftAction(
         requested_count: requestedCount,
         crafted_count: 0,
         missing_materials: missing,
-        summary: formatMissingSummary(missing),
+        ...(woodInfo.wood_shortfall_logs > 0 ? woodInfo : {}),
+        summary: formatMissingSummary(missing, woodInfo),
       };
     }
     return {

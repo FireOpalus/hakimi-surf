@@ -501,6 +501,10 @@ class GiveArgs(NoArgs):
         return cleaned
 
 
+class ShelterArgs(NoArgs):
+    mode: Literal["auto", "enter", "exit"] = "auto"
+
+
 _CONNECT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -628,6 +632,18 @@ _GIVE_SCHEMA: dict[str, Any] = {
     "required": ["target_player", "item_name"],
     "additionalProperties": False,
 }
+_SHELTER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["auto", "enter", "exit"],
+            "default": "auto",
+        },
+    },
+    "required": [],
+    "additionalProperties": False,
+}
 
 _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
     "connect": (
@@ -668,6 +684,11 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
         PlaceArgs,
     ),
     "give": ("在游戏里走到指定允许玩家身边并递出指定物品", _GIVE_SCHEMA, GiveArgs),
+    "shelter": (
+        "夜晚无床遇险时就地挖建1x1x2安全掩体并封顶苟到天亮，或白天挖开离开掩体",
+        _SHELTER_SCHEMA,
+        ShelterArgs,
+    ),
     "guard": ("在游戏里切换为贴身护卫模式保护玩家并击退敌对怪物", _GUARD_SCHEMA, GuardArgs),
     "evade": ("在游戏里切换为安全躲避模式避免交战并优先保命", {}, NoArgs),
     "goto": ("在游戏里前往指定坐标位置", _POSITION_SCHEMA, PositionArgs),
@@ -695,6 +716,7 @@ _MICRO_GAME_VERBS = frozenset(
         "chest",
         "place",
         "give",
+        "shelter",
         "guard",
         "evade",
         "goto",
@@ -720,6 +742,7 @@ _EFFORTFUL_VERBS = frozenset(
         "chest",
         "place",
         "give",
+        "shelter",
         "follow",
     }
 )
@@ -1547,7 +1570,7 @@ class MinecraftPlugin:
             artifacts["best_tool"] = clean_best_tool
         if clean_mob := _normalize_item_id(data.get("target_mob")):
             artifacts["target_mob"] = clean_mob
-        if data.get("mode") in ("deposit", "withdraw", "inspect"):
+        if data.get("mode") in ("deposit", "withdraw", "inspect", "auto", "enter", "exit"):
             artifacts["mode"] = data["mode"]
         for int_key in (
             "crafted_count",
@@ -1557,6 +1580,8 @@ class MinecraftPlugin:
             "hunted_count",
             "moved_count",
             "given_count",
+            "wood_shortfall_planks",
+            "wood_shortfall_logs",
         ):
             raw_int = data.get(int_key)
             if isinstance(raw_int, int) and not isinstance(raw_int, bool) and raw_int >= 0:
@@ -1568,10 +1593,11 @@ class MinecraftPlugin:
             "slept",
             "placed_bed",
             "placed_chest",
+            "sheltered",
         ):
             if isinstance(data.get(bool_key), bool):
                 artifacts[bool_key] = data[bool_key]
-        for pos_key in ("bed_pos", "chest_pos", "furnace_pos", "placed_pos"):
+        for pos_key in ("bed_pos", "chest_pos", "furnace_pos", "placed_pos", "shelter_pos"):
             norm_p = _normalize_pos(data.get(pos_key))
             if isinstance(norm_p, tuple):
                 artifacts[pos_key] = [int(round(v)) for v in norm_p]

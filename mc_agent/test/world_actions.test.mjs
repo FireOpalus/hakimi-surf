@@ -4,15 +4,20 @@ import EventEmitter from "node:events";
 import vec3 from "vec3";
 
 import { McRuntime } from "../src/behaviors.mjs";
+import { computeWoodShortfall } from "../src/crafting.mjs";
 import { loadConfig } from "../src/protocol.mjs";
+import { createWaterFloatState, updateWaterFloatControl } from "../src/survival.mjs";
 import {
   applySafeMovements,
   checkHarvestToolTier,
+  createShelterState,
   executeChestAction,
   executeGiveAction,
   executeHuntAction,
   executePlaceAction,
+  executeShelterAction,
   executeSleepAction,
+  isDirectlyUnderfoot,
   isSafePlaceableBlock,
 } from "../src/world_actions.mjs";
 
@@ -432,4 +437,127 @@ test("ranged hostile (pillager at 14 blocks) triggers long-range sprint flee in 
   assert.ok(lastGoal.x <= -20);
 
   runtime.stop();
+});
+
+test("water float reflex, anti-underfoot dig guard, wood shortfall calculation, and mc.shelter enter/auto-exit", async () => {
+  // 1. Water float reflex sets jump=true in water and releases on dry land
+  const waterBot = makeBot({ pos: vec3(0, 64, 0) });
+  const floatState = createWaterFloatState();
+  waterBot.entity.isInWater = true;
+  assert.equal(updateWaterFloatControl(waterBot, floatState), true);
+  assert.equal(floatState.floating, true);
+  assert.deepEqual(waterBot._controlLog.at(-1), { control: "jump", state: true });
+
+  waterBot.entity.isInWater = false;
+  assert.equal(updateWaterFloatControl(waterBot, floatState), false);
+  assert.equal(floatState.floating, false);
+  assert.deepEqual(waterBot._controlLog.at(-1), { control: "jump", state: false });
+
+  // 2. Anti-underfoot dig guard blocks digging directly beneath feet
+  assert.equal(isDirectlyUnderfoot(waterBot, [0, 63, 0]), true);
+  assert.equal(isDirectlyUnderfoot(waterBot, [0, 62, 0]), true);
+  assert.equal(isDirectlyUnderfoot(waterBot, [1, 63, 0]), false);
+
+  const underfootBlocks = new Map([["0,63,0", { name: "stone", position: vec3(0, 63, 0) }]]);
+  const digBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "wooden_pickaxe", type: 10, count: 1 }],
+    blocks: underfootBlocks,
+  });
+  const digRuntime = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => digBot,
+    snapshotIntervalMs: 0,
+    survivalTickMs: 0,
+    companionTickMs: 0,
+    pickupSettleMs: 0,
+  });
+  digRuntime.connectBot();
+  digBot.emit("spawn");
+  const underfootRes = await digRuntime.dispatchGoal({ action_type: "mine", block_type: "stone", count: 1 });
+  assert.equal(underfootRes.ok, false);
+  assert.equal(underfootRes.reason, "unsafe_underfoot_block");
+  assert.equal(digBot._dug.length, 0);
+  digRuntime.stop();
+
+  // 3. computeWoodShortfall translates stick + missing crafting_table gap into upstream logs
+  const woodGap = computeWoodShortfall(
+    [{ item: "stick", need: 1, have: 0, shortfall: 1 }],
+    new Map([["oak_planks", 2]]),
+    { needsTableCraft: true, recipePlanksForOne: 2 },
+  );
+  assert.equal(woodGap.wood_shortfall_planks, 4);
+  assert.equal(woodGap.wood_shortfall_logs, 1);
+
+  // 4. mc.shelter digs 3-deep natural terrain shaft, caps above head, rejects sand-only inventory, and auto-exits at day
+  const noCapBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "sand", type: 12, count: 8 }],
+  });
+  const noCapRes = await executeShelterAction(noCapBot, { mode: "enter" });
+  assert.equal(noCapRes.ok, false);
+  assert.equal(noCapRes.reason, "no_shelter_blocks");
+
+  // Reject digging next to lava
+  const lavaBlocks = new Map([
+    ["0,63,0", { name: "dirt", position: vec3(0, 63, 0) }],
+    ["0,62,0", { name: "dirt", position: vec3(0, 62, 0) }],
+    ["0,61,0", { name: "dirt", position: vec3(0, 61, 0) }],
+    ["1,62,0", { name: "lava", position: vec3(1, 62, 0) }],
+  ]);
+  const lavaBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "dirt", type: 3, count: 6 }],
+    blocks: lavaBlocks,
+  });
+  const lavaRes = await executeShelterAction(lavaBot, { mode: "enter" });
+  assert.equal(lavaRes.ok, false);
+  assert.equal(lavaRes.reason, "unsafe_shelter_ground");
+
+  // Valid dirt ground -> enters shelter, seals cap at (0, 63, 0), then auto-exits on daytime survival tick
+  const shelterBlocks = new Map();
+  for (let y = 60; y <= 63; y += 1) {
+    for (let x = -2; x <= 3; x += 1) {
+      for (let z = -2; z <= 2; z += 1) {
+        shelterBlocks.set(`${x},${y},${z}`, { name: "dirt", position: vec3(x, y, z) });
+      }
+    }
+  }
+  const shelterBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "dirt", type: 3, count: 6 }],
+    blocks: shelterBlocks,
+  });
+  shelterBot.time = { timeOfDay: 16000 }; // night
+  const shelterRuntime = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "true" }),
+    createBotFn: () => shelterBot,
+    snapshotIntervalMs: 0,
+    survivalTickMs: 0,
+    companionTickMs: 0,
+  });
+  shelterRuntime.connectBot();
+  shelterBot.emit("spawn");
+
+  const enterRes = await shelterRuntime.dispatchGoal({ action_type: "shelter", mode: "enter" });
+  assert.equal(enterRes.ok, true);
+  assert.equal(enterRes.sheltered, true);
+  assert.deepEqual(enterRes.cap_pos, [0, 63, 0]);
+  assert.deepEqual(enterRes.shelter_pos, [0, 61, 0]);
+  assert.equal(shelterBot._dug.length, 3);
+  assert.equal(shelterBot._placed.length, 1);
+  assert.equal(shelterRuntime._shelterState.active, true);
+
+  // While sheltered at night, companion tick stays safely tucked in shelter
+  await shelterRuntime._companionTick();
+  assert.equal(shelterRuntime.activity, "掩体避险");
+
+  // Morning arrives -> survivalTick automatically digs out and clears shelter state
+  shelterBot.entity.position = vec3(0, 61, 0);
+  shelterBot.time = { timeOfDay: 2000 }; // day
+  await shelterRuntime._survivalTick();
+  assert.equal(shelterRuntime._shelterState.active, false);
+  assert.equal(shelterRuntime.activity, "原地待命");
+
+  shelterRuntime.stop();
 });

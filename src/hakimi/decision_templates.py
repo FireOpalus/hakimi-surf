@@ -153,7 +153,7 @@ _MC_CRUISE_GATE = DecisionTemplate(
                     "craft_gear": (
                         "Craft or smelt missing/upgraded tools, weapons, shield, armor, "
                         "cooked food, bed, chest, torches, crafting table, or furnace, "
-                        "or organize inventory/sleep at night."
+                        "or organize inventory, sleep, or dig an emergency night shelter."
                     ),
                     "fight_hostiles": (
                         "Immediate hostile mobs threaten the bot or guarded player and active "

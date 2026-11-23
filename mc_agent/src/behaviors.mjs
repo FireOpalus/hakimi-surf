@@ -15,26 +15,32 @@ import {
   collectInventorySnapshot,
   countSafeFood,
   createEmptyEquipment,
+  createWaterFloatState,
   equipBestHarvestTool,
   performAutoEat,
   shouldTriggerAutoEat,
+  updateWaterFloatControl,
 } from "./survival.mjs";
 import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
 import { executeSmeltAction, parseSmeltParams } from "./smelting.mjs";
 import {
   applySafeMovements,
   checkHarvestToolTier,
+  createShelterState,
   executeChestAction,
   executeGiveAction,
   executeHuntAction,
   executePlaceAction,
+  executeShelterAction,
   executeSleepAction,
   hasExposedFace,
   isBedName,
+  isDirectlyUnderfoot,
   parseChestParams,
   parseGiveParams,
   parseHuntParams,
   parsePlaceParams,
+  parseShelterParams,
 } from "./world_actions.mjs";
 import {
   CREEPER_SAFE_DISTANCE,
@@ -81,6 +87,7 @@ export const ALLOWED_GOAL_ACTIONS = new Set([
   "chest",
   "place",
   "give",
+  "shelter",
 ]);
 
 export const NEARBY_RESOURCE_BLOCKS = new Set([
@@ -313,6 +320,8 @@ export class McRuntime {
     this._prevHealth = null;
     this._lastChatAtMs = -Infinity;
     this._milestoneCooldowns = new Map();
+    this._waterFloatState = createWaterFloatState();
+    this._shelterState = createShelterState();
     this.companionTickMs =
       typeof companionTickMs === "number" && Number.isFinite(companionTickMs)
         ? Math.max(25, companionTickMs)
@@ -728,6 +737,30 @@ export class McRuntime {
       if (nextHealth !== null) this.health = nextHealth;
       const nextFood = readNonNegativeFinite(bot.food);
       if (nextFood !== null) this.food = nextFood;
+      this.timeOfDay = this._computeTimeOfDay(bot);
+
+      updateWaterFloatControl(bot, this._waterFloatState);
+
+      if (
+        this._shelterState.active &&
+        this.timeOfDay === "day" &&
+        !this._activeGoalCancel &&
+        !this._eatingLock.eating
+      ) {
+        await executeShelterAction(
+          bot,
+          { mode: "exit" },
+          {
+            shelterState: this._shelterState,
+            timeOfDay: this.timeOfDay,
+            gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+            autoEquip: this.config.mcAutoEquip !== false,
+          },
+        );
+        this._refreshFromBot();
+        this.activity = this.paused ? "已暂停" : "原地待命";
+        this._emitSnapshot();
+      }
 
       if (this.config.mcAutoEat !== false) {
         if (!this._eatingLock.eating && shouldTriggerAutoEat(this.health, this.food)) {
@@ -1063,6 +1096,11 @@ export class McRuntime {
       if (nextHealth !== null) this.health = nextHealth;
       const nextFood = readNonNegativeFinite(bot.food);
       if (nextFood !== null) this.food = nextFood;
+
+      if (this._shelterState.active) {
+        this.activity = "掩体避险";
+        return;
+      }
 
       const allowed =
         this.combatMode === "guard"
@@ -1556,8 +1594,21 @@ export class McRuntime {
       this._emitSnapshot();
     });
 
+    bot.on("physicsTick", () => {
+      if (this.bot !== bot || !this.connected || this.paused || this._stopped) return;
+      const nowMs = this.nowFn();
+      if (nowMs - this._waterFloatState.lastCheckMs < 250) return;
+      this._waterFloatState.lastCheckMs = nowMs;
+      updateWaterFloatControl(bot, this._waterFloatState);
+    });
+
     bot.on("respawn", () => {
       if (this.bot !== bot) return;
+      this._waterFloatState.floating = false;
+      this._shelterState.active = false;
+      this._shelterState.capPos = null;
+      this._shelterState.holePos = null;
+      this._shelterState.surfaceY = null;
       const newDim = sanitizeMcText(bot.game?.dimension || "", 24);
       const changed = newDim && newDim !== this.dimension;
       if (newDim) this.dimension = newDim;
@@ -1611,6 +1662,11 @@ export class McRuntime {
       lowerShield(bot, this._combatState);
       this._combatState.retreating = false;
       this._combatState.activeTargetId = null;
+      this._waterFloatState.floating = false;
+      this._shelterState.active = false;
+      this._shelterState.capPos = null;
+      this._shelterState.holePos = null;
+      this._shelterState.surfaceY = null;
       const prevActivity = sanitizeMcText(this.activity, 48) || "探索";
       this._refreshFromBot();
       this.health = 0;
@@ -1698,6 +1754,8 @@ export class McRuntime {
     this._cancelActiveGoal();
     lowerShield(bot, this._combatState);
     this._combatState = createCombatState();
+    this._waterFloatState = createWaterFloatState();
+    this._shelterState = createShelterState();
     this._eatingLock.eating = false;
     this._followingPlayer = null;
     this._greetedPlayers.clear();
@@ -1736,6 +1794,8 @@ export class McRuntime {
     this._cancelActiveGoal();
     lowerShield(bot, this._combatState);
     this._combatState = createCombatState();
+    this._waterFloatState = createWaterFloatState();
+    this._shelterState = createShelterState();
     this._eatingLock.eating = false;
     this._followingPlayer = null;
     this._greetedPlayers.clear();
@@ -2529,6 +2589,7 @@ export class McRuntime {
       let lastBlockName = rawBlock || "block";
       let lastCoords = [0, 0, 0];
       let blockedTierInfo = null;
+      let skippedUnderfoot = false;
       const visitedKeys = new Set();
 
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
@@ -2549,6 +2610,10 @@ export class McRuntime {
             const c = this._vecToTuple(p) || [0, 0, 0];
             const key = `${Math.floor(c[0])},${Math.floor(c[1])},${Math.floor(c[2])}`;
             if (visitedKeys.has(key)) continue;
+            if (isDirectlyUnderfoot(bot, c)) {
+              skippedUnderfoot = true;
+              continue;
+            }
             const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
             if (blk && !targets.has(blk.name)) continue;
             const candName = blk?.name || rawBlock;
@@ -2628,6 +2693,18 @@ export class McRuntime {
           required_tool: blockedTierInfo.requiredTool,
           best_tool: blockedTierInfo.bestTool,
           summary: `挖掘${blockedTierInfo.block}需要至少${blockedTierInfo.requiredTool}`,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (collectedCount === 0 && skippedUnderfoot && !outcome?.stuck && !outcome?.timedOut && !outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: "unsafe_underfoot_block",
+          block: rawBlock || lastBlockName,
+          summary: "跳过脚下正下方方块以防坠落",
           snapshot: this.getSnapshot(),
         };
       }
@@ -3368,6 +3445,68 @@ export class McRuntime {
           target_player: outcome.target_player,
           item_name: outcome.item_name,
           given_count: outcome.given_count,
+          summary: outcome.summary,
+        });
+      }
+      return {
+        ok: Boolean(outcome?.ok),
+        accepted: true,
+        bridge_ready: true,
+        paused: false,
+        ...outcome,
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "shelter") {
+      const parsed = parseShelterParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          summary: `掩体参数无效:${parsed.error}`,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = parsed.mode === "exit" ? "离开掩体" : "挖建夜间掩体";
+      this._emitSnapshot();
+      const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        return await executeShelterAction(bot, params, {
+          signal,
+          shelterState: this._shelterState,
+          timeOfDay: this.timeOfDay,
+          gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+          autoEquip: this.config.mcAutoEquip !== false,
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused
+        ? "已暂停"
+        : this._shelterState.active
+          ? "掩体避险"
+          : this.connected
+            ? "原地待命"
+            : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "掩体操作超时" : "掩体操作已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        this._emitMilestone("mc_goal_completed", "normal", {
+          action_type: "shelter",
+          mode: outcome.mode,
+          sheltered: outcome.sheltered,
           summary: outcome.summary,
         });
       }

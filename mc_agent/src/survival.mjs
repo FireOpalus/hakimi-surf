@@ -559,6 +559,60 @@ export function getWeaponAttackCooldownMs(itemName) {
   return DEFAULT_ATTACK_COOLDOWN_MS;
 }
 
+export function createWaterFloatState() {
+  return {
+    floating: false,
+    lastCheckMs: 0,
+  };
+}
+
+/**
+ * Keep the bot floating whenever submerged in water without interfering with
+ * normal dry-land jumping or pathfinder control.
+ */
+export function updateWaterFloatControl(bot, floatState) {
+  if (!bot || !floatState) return false;
+  let inWater = Boolean(bot.entity?.isInWater);
+  if (!inWater && bot.entity?.position && typeof bot.blockAt === "function") {
+    try {
+      const p = bot.entity.position;
+      const feetBlk = bot.blockAt({
+        x: Math.floor(p.x),
+        y: Math.floor(p.y),
+        z: Math.floor(p.z),
+      });
+      const feetName = normalizeCanonicalItemId(feetBlk?.name);
+      if (feetName === "water" || feetName === "flowing_water" || feetName === "bubble_column") {
+        inWater = true;
+      }
+    } catch {
+      // Ignore blockAt errors on partial mocks
+    }
+  }
+
+  if (inWater) {
+    if (!floatState.floating) {
+      try {
+        bot.setControlState?.("jump", true);
+        floatState.floating = true;
+      } catch {
+        // Ignore control errors
+      }
+    }
+    return true;
+  }
+
+  if (floatState.floating) {
+    try {
+      bot.setControlState?.("jump", false);
+    } catch {
+      // Ignore control errors
+    }
+    floatState.floating = false;
+  }
+  return false;
+}
+
 export async function equipBestWeapon(bot) {
   if (!bot) return "";
   const heldName = extractCanonicalItemName(bot.heldItem);

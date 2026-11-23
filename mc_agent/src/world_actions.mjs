@@ -3,6 +3,7 @@ import pathfinderPkg from "mineflayer-pathfinder";
 import { normalizeCanonicalItemId, normalizePlayerId } from "./protocol.mjs";
 import {
   extractCanonicalItemName,
+  equipBestHarvestTool,
   equipBestWeapon,
   getArmorInfo,
   getInventoryItems,
@@ -1199,6 +1200,390 @@ export async function executePlaceAction(bot, params, { signal = null } = {}) {
     item_name: itemName,
     placed_pos: placed.pos,
     summary: `已放置${itemName}(${placed.pos.join(",")})`,
+  };
+}
+
+export function isDirectlyUnderfoot(bot, pos) {
+  const origin = bot?.entity?.position;
+  if (!origin || !pos) return false;
+  const bx = Math.floor(origin.x);
+  const by = Math.floor(origin.y);
+  const bz = Math.floor(origin.z);
+  const tx = Math.floor(Array.isArray(pos) ? pos[0] : pos.x);
+  const ty = Math.floor(Array.isArray(pos) ? pos[1] : pos.y);
+  const tz = Math.floor(Array.isArray(pos) ? pos[2] : pos.z);
+  if (![bx, by, bz, tx, ty, tz].every(Number.isFinite)) return false;
+  return tx === bx && tz === bz && (ty === by - 1 || ty === by - 2);
+}
+
+const SHELTER_CAP_BLOCKS = new Set([
+  "dirt",
+  "cobblestone",
+  "cobbled_deepslate",
+  "stone",
+  "oak_planks",
+  "spruce_planks",
+  "birch_planks",
+  "jungle_planks",
+  "acacia_planks",
+  "dark_oak_planks",
+  "mangrove_planks",
+  "cherry_planks",
+  "sandstone",
+  "netherrack",
+  "andesite",
+  "diorite",
+  "granite",
+]);
+
+const SHELTER_DIGGABLE_TERRAIN = new Set([
+  "dirt",
+  "grass_block",
+  "coarse_dirt",
+  "podzol",
+  "rooted_dirt",
+  "mud",
+  "stone",
+  "cobblestone",
+  "andesite",
+  "diorite",
+  "granite",
+  "deepslate",
+  "cobbled_deepslate",
+  "sandstone",
+  "red_sandstone",
+  "clay",
+  "snow_block",
+  "netherrack",
+]);
+
+const SHELTER_HAZARD_BLOCKS = new Set([
+  "water",
+  "flowing_water",
+  "lava",
+  "flowing_lava",
+  "fire",
+  "soul_fire",
+  "magma_block",
+  "cactus",
+  "powder_snow",
+  "bubble_column",
+]);
+
+export function createShelterState() {
+  return {
+    active: false,
+    capPos: null,
+    holePos: null,
+    surfaceY: null,
+  };
+}
+
+export function parseShelterParams(params) {
+  const rawMode = params?.mode === undefined || params?.mode === "" ? "auto" : params.mode;
+  if (typeof rawMode !== "string") return { error: "invalid_shelter_mode" };
+  const mode = rawMode.trim().toLowerCase();
+  if (mode !== "enter" && mode !== "exit" && mode !== "auto") {
+    return { error: "invalid_shelter_mode" };
+  }
+  return { mode };
+}
+
+function isHazardousBlock(blk) {
+  if (!blk) return false;
+  return SHELTER_HAZARD_BLOCKS.has(normalizeCanonicalItemId(blk.name));
+}
+
+function isSolidNonHazardWall(blk) {
+  if (!blk) return false;
+  const name = normalizeCanonicalItemId(blk.name);
+  if (!name || UNSAFE_GROUND_BLOCKS.has(name) || SHELTER_HAZARD_BLOCKS.has(name)) return false;
+  return blk.boundingBox !== "empty";
+}
+
+export async function executeShelterAction(
+  bot,
+  params,
+  {
+    signal = null,
+    shelterState = null,
+    timeOfDay = "",
+    gotoGoal = null,
+    autoEquip = true,
+  } = {},
+) {
+  const parsed = parseShelterParams(params);
+  if (parsed.error) {
+    return { ok: false, reason: parsed.error, summary: `掩体参数无效:${parsed.error}` };
+  }
+  if (!bot || !bot.entity?.position || typeof bot.blockAt !== "function") {
+    return { ok: false, reason: "bot_not_ready", summary: "角色尚未就绪" };
+  }
+
+  const state = shelterState || createShelterState();
+  let effectiveMode = parsed.mode;
+  if (effectiveMode === "auto") {
+    effectiveMode =
+      state.active && (timeOfDay === "day" || timeOfDay === "sunrise") ? "exit" : "enter";
+  }
+
+  const origin = bot.entity.position;
+  const bx = Math.floor(origin.x);
+  const by = Math.floor(origin.y);
+  const bz = Math.floor(origin.z);
+
+  if (effectiveMode === "exit") {
+    const cap = Array.isArray(state.capPos) ? state.capPos : [bx, by + 2, bz];
+    const digBlockSafe = async (x, y, z) => {
+      if (signal?.aborted || typeof bot.dig !== "function") return;
+      const blk = bot.blockAt(vec3(x, y, z));
+      if (!blk) return;
+      const name = normalizeCanonicalItemId(blk.name);
+      if (!name || REPLACEABLE_BLOCKS.has(name) || isHazardousBlock(blk)) return;
+      if (!SHELTER_DIGGABLE_TERRAIN.has(name) && !SHELTER_CAP_BLOCKS.has(name)) return;
+      if (!checkHarvestToolTier(bot, name).ok) return;
+      if (autoEquip) {
+        await equipBestHarvestTool(bot, blk);
+      }
+      try {
+        await bot.dig(blk);
+      } catch {
+        // Best-effort exit dig
+      }
+    };
+
+    // 1. Open roof cap above head
+    await digBlockSafe(cap[0], cap[1], cap[2]);
+    await digBlockSafe(cap[0], cap[1] + 1, cap[2]);
+
+    // 2. Carve a safe 2-step staircase out in the first hazard-free cardinal direction
+    const dirs = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ];
+    let exitTarget = [bx, cap[1] + 1, bz];
+    for (const [dx, dz] of dirs) {
+      const s1a = bot.blockAt(vec3(bx + dx, by + 1, bz + dz));
+      const s1b = bot.blockAt(vec3(bx + dx, by + 2, bz + dz));
+      const s2a = bot.blockAt(vec3(bx + dx * 2, by + 2, bz + dz * 2));
+      if (isHazardousBlock(s1a) || isHazardousBlock(s1b) || isHazardousBlock(s2a)) continue;
+      await digBlockSafe(bx + dx, by + 1, bz + dz);
+      await digBlockSafe(bx + dx, by + 2, bz + dz);
+      await digBlockSafe(bx + dx, by + 3, bz + dz);
+      await digBlockSafe(bx + dx * 2, by + 2, bz + dz * 2);
+      await digBlockSafe(bx + dx * 2, by + 3, bz + dz * 2);
+      exitTarget = [bx + dx * 3, Math.max(by + 3, cap[1] + 1), bz + dz * 3];
+      break;
+    }
+
+    if (typeof gotoGoal === "function" && !signal?.aborted) {
+      try {
+        await gotoGoal(new GoalNear(exitTarget[0], exitTarget[1], exitTarget[2], 2), signal);
+      } catch {
+        // Ignore exit walk errors; shelter roof is already open
+      }
+    }
+
+    state.active = false;
+    state.capPos = null;
+    state.holePos = null;
+    state.surfaceY = null;
+    return {
+      ok: true,
+      mode: "exit",
+      sheltered: false,
+      summary: "已挖开封顶并离开夜间应急掩体",
+    };
+  }
+
+  // effectiveMode === "enter"
+  if (state.active) {
+    return {
+      ok: true,
+      mode: "enter",
+      sheltered: true,
+      shelter_pos: state.holePos || [bx, by, bz],
+      summary: "当前已在应急掩体内安全躲避",
+    };
+  }
+
+  const feetBlk = bot.blockAt(vec3(bx, by, bz));
+  if (bot.entity?.isInWater || isHazardousBlock(feetBlk)) {
+    return {
+      ok: false,
+      mode: "enter",
+      sheltered: false,
+      reason: "unsafe_shelter_ground",
+      summary: "当前位于水域或危险方块上，无法就地建掩体",
+    };
+  }
+
+  const capItem = getInventoryItems(bot).find((it) =>
+    SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it)),
+  );
+  if (!capItem) {
+    return {
+      ok: false,
+      mode: "enter",
+      sheltered: false,
+      reason: "no_shelter_blocks",
+      summary: "背包缺少泥土/圆石/木板等非重力封顶方块",
+    };
+  }
+
+  if (
+    typeof bot.dig !== "function" ||
+    typeof bot.equip !== "function" ||
+    typeof bot.placeBlock !== "function"
+  ) {
+    return {
+      ok: false,
+      mode: "enter",
+      sheltered: false,
+      reason: "shelter_unavailable",
+      summary: "当前客户端不支持挖建掩体",
+    };
+  }
+
+  // Verify 3-deep vertical shaft is natural terrain with solid safe floor at by-4
+  // and no water/lava adjacent to any dug level.
+  const b1 = bot.blockAt(vec3(bx, by - 1, bz));
+  const b2 = bot.blockAt(vec3(bx, by - 2, bz));
+  const b3 = bot.blockAt(vec3(bx, by - 3, bz));
+  const floor4 = bot.blockAt(vec3(bx, by - 4, bz));
+  const digTargets = [b1, b2, b3];
+
+  for (const blk of digTargets) {
+    const name = normalizeCanonicalItemId(blk?.name);
+    if (!name || !SHELTER_DIGGABLE_TERRAIN.has(name)) {
+      return {
+        ok: false,
+        mode: "enter",
+        sheltered: false,
+        reason: "unsafe_shelter_ground",
+        summary: "脚下非自然泥土/石质地面，跳过挖坑以防破坏建筑",
+      };
+    }
+    const tierCheck = checkHarvestToolTier(bot, name);
+    if (!tierCheck.ok) {
+      return {
+        ok: false,
+        mode: "enter",
+        sheltered: false,
+        reason: "tool_tier_too_low",
+        required_tool: tierCheck.requiredTool,
+        summary: `脚下是${name}，需要至少${tierCheck.requiredTool}才能挖掩体`,
+      };
+    }
+  }
+
+  if (!isSolidNonHazardWall(floor4)) {
+    return {
+      ok: false,
+      mode: "enter",
+      sheltered: false,
+      reason: "unsafe_shelter_ground",
+      summary: "脚下可能中空或临近危险方块，放弃挖掩体",
+    };
+  }
+
+  const cardinalOffsets = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ];
+  for (const dy of [-1, -2, -3]) {
+    for (const [dx, dz] of cardinalOffsets) {
+      const sideBlk = bot.blockAt(vec3(bx + dx, by + dy, bz + dz));
+      if (isHazardousBlock(sideBlk)) {
+        return {
+          ok: false,
+          mode: "enter",
+          sheltered: false,
+          reason: "unsafe_shelter_ground",
+          summary: "周边存在水域或岩浆，放弃挖掩体",
+        };
+      }
+    }
+  }
+
+  // Ensure at least one solid side wall at cap height (by - 1) to attach roof cap
+  let anchorWall = null;
+  let anchorFace = null;
+  for (const [dx, dz] of cardinalOffsets) {
+    const wall = bot.blockAt(vec3(bx + dx, by - 1, bz + dz));
+    if (isSolidNonHazardWall(wall)) {
+      anchorWall = wall;
+      anchorFace = vec3(-dx, 0, -dz);
+      break;
+    }
+  }
+  if (!anchorWall || !anchorFace) {
+    return {
+      ok: false,
+      mode: "enter",
+      sheltered: false,
+      reason: "no_shelter_wall_anchor",
+      summary: "周围缺少可封顶的实体侧壁",
+    };
+  }
+
+  // Dig 3 blocks straight down safely (zero fall damage: 3 blocks)
+  for (const blk of digTargets) {
+    if (signal?.aborted) {
+      return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
+    }
+    if (autoEquip) {
+      await equipBestHarvestTool(bot, blk);
+    }
+    try {
+      await bot.dig(blk);
+    } catch {
+      return {
+        ok: false,
+        mode: "enter",
+        sheltered: false,
+        reason: "shelter_dig_failed",
+        summary: "挖掘应急掩体失败",
+      };
+    }
+  }
+
+  if (signal?.aborted) {
+    return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
+  }
+
+  // Seal roof cap at (bx, by - 1, bz) — 1 full block above head (by - 2), zero suffocation
+  const freshCapItem =
+    getInventoryItems(bot).find((it) => SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it))) ||
+    capItem;
+  try {
+    await bot.equip(freshCapItem, "hand");
+    await bot.placeBlock(anchorWall, anchorFace);
+  } catch {
+    return {
+      ok: false,
+      mode: "enter",
+      sheltered: false,
+      reason: "shelter_seal_failed",
+      summary: "掩体封顶失败",
+    };
+  }
+
+  state.active = true;
+  state.capPos = [bx, by - 1, bz];
+  state.holePos = [bx, by - 3, bz];
+  state.surfaceY = by;
+  return {
+    ok: true,
+    mode: "enter",
+    sheltered: true,
+    shelter_pos: state.holePos,
+    cap_pos: state.capPos,
+    summary: `已就地挖好1x1x2应急掩体并封顶(${state.holePos.join(",")})，安全苟到天亮`,
   };
 }
 

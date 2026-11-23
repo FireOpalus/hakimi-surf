@@ -454,7 +454,7 @@ async def test_minecraft_hotplug_via_real_ws_plugin_node_bridge_and_world_reacti
             assert detail["status"]["bridge_ready"] is True
             assert detail["status"]["connected"] is True
             assert detail["status"]["dimension"] == "overworld"
-            assert len(detail["actions"]) == 25
+            assert len(detail["actions"]) == 26
             action_names = {a["name"] for a in detail["actions"]}
             assert {
                 "mc.chat",
@@ -467,6 +467,7 @@ async def test_minecraft_hotplug_via_real_ws_plugin_node_bridge_and_world_reacti
                 "mc.chest",
                 "mc.place",
                 "mc.give",
+                "mc.shelter",
                 "mc.guard",
                 "mc.evade",
             } <= action_names
