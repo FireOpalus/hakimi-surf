@@ -134,11 +134,13 @@ class ChatActions(BaseModel):
     voice_text: str | None = None
     sing_song: str | None = None
     audio_gist: str | None = None
+    search_query: str | None = None
 
 
 # Stable for BOTH personas and all tiers, including sandbox turns. Never put IDs/tags in schema.
 MAX_IMAGE_DIGEST_CHARS = 120
 MAX_AUDIO_GIST_CHARS = 80
+MAX_SEARCH_QUERY_CHARS = 120
 
 
 def require_all_schema_fields(node: Any) -> Any:
@@ -298,6 +300,7 @@ def parse_actions(
     allow_sing_song: bool = False,
     song_titles: Iterable[str] = (),
     allow_audio_gist: bool = False,
+    allow_web_search: bool = False,
 ):
     try:
         value = json.loads(raw)
@@ -398,6 +401,18 @@ def parse_actions(
         )
     else:
         actions.voice_text = None
+    if allow_web_search and not actions.abstain and isinstance(actions.search_query, str):
+        secrets = configured_secrets(settings) if settings else []
+        raw_sq = actions.search_query
+        cleaned_sq = " ".join(clean_text(raw_sq).split()).strip()
+        if 2 <= len(cleaned_sq) <= MAX_SEARCH_QUERY_CHARS and not any(
+            s and len(s) >= 8 and (s in raw_sq or s in cleaned_sq) for s in secrets
+        ):
+            actions.search_query = cleaned_sq
+        else:
+            actions.search_query = None
+    else:
+        actions.search_query = None
     clean = []
     for text in actions.bubbles:
         text, _ = extract_meme(text)

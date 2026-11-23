@@ -91,7 +91,13 @@ from .store import Store
 from .streaming import cancellable
 from .system_modules import SystemResources, install_system_modules
 from .voice_reply import explicit_voice_request
-from .web_search import explicit_search, search_query
+from .web_search import (
+    explicit_search,
+    has_concrete_search_subject,
+    natural_search_cue,
+    sanitize_model_search_query,
+    search_query,
+)
 from .work_usage import model_work
 from .world_experience import SOCIAL_LOW
 from .world_state import WorldStateManager
@@ -2317,7 +2323,62 @@ class Service:
             # Sources and generated summaries are deliberately excluded from conversation memory.
         else:
             allow_lookup = not sandbox and not self.bot_guard.known_bot(message)
-            explicit_web = explicit_search(members[-1].command_text or members[-1].text)
+            raw_turn_text = members[-1].command_text or members[-1].text
+            explicit_web = explicit_search(raw_turn_text)
+            natural_web_cue = natural_search_cue(raw_turn_text)
+            controller = self.store.runtime.web_search
+            defer_to_model_search = False
+
+            async def _execute_web_search(clean_query: str) -> None:
+                self.store.groups.phase(message, "generating")
+                active_batch = self.store.groups.active.get(self.store.session_scope(message))
+                payload["web_search_status"] = "unavailable"
+                try:
+                    findings = (
+                        await controller.execute_search(
+                            clean_query,
+                            job["subject"],
+                            ai=self.ai,
+                            before_call=message_guard,
+                            cancel_event=active_batch.cancel if active_batch else None,
+                            plugin_bus=self.plugin_bus,
+                        )
+                        if hasattr(controller, "execute_search")
+                        else await self.ai.search(
+                            clean_query,
+                            job["subject"],
+                            before_call=message_guard,
+                            cancel_event=active_batch.cancel if active_batch else None,
+                        )
+                    )
+                    if findings and findings.strip() and controller.config.enabled:
+                        payload["web_search_findings"] = findings
+                        payload["web_search_status"] = "grounded"
+                    else:
+                        if not controller.config.enabled:
+                            payload["web_search_status"] = "disabled"
+                        self.record("web_search_empty")
+                except Rejected as exc:
+                    if str(exc) in {
+                        "reply_invalidated",
+                        "batch_interrupted",
+                        "batch_recalled",
+                        "budget_reservation_exceeded",
+                    }:
+                        raise
+                    if str(exc) == "web_search_disabled":
+                        payload["web_search_status"] = "disabled"
+                    diagnostics = exc.provider_diagnostics
+                    self.record("web_search_failed", emit_audit=not diagnostics)
+                    if diagnostics:
+                        await self.store.runtime.event(
+                            "web_search_failed", "production", diagnostics=diagnostics
+                        )
+                        await self.store.runtime.filters.record_generation(
+                            audit_id, diagnostics=diagnostics
+                        )
+                await message_guard()
+
             query_name = getattr(intent, "module_query", None)
             if allow_lookup and query_name in module_queries and not explicit_web:
                 await message_guard()
@@ -2335,10 +2396,17 @@ class Service:
                 and (not aff_active or caps.allow_search)
                 and (explicit_web or getattr(intent, "need_external_lookup", False))
             ):
-                controller = self.store.runtime.web_search
                 if not controller.config.enabled:
                     payload["web_search_status"] = "disabled"
                     self.record("web_search_disabled")
+                elif (
+                    not explicit_web
+                    and (message.kind != "group" or bool(message.addressed))
+                    and not has_concrete_search_subject(raw_turn_text)
+                ):
+                    # Bare back-reference (e.g. "不信你自己查"): skip blind raw-text search
+                    # and let the main model formulate a concrete public query from context.
+                    defer_to_model_search = True
                 else:
                     try:
                         query = search_query(
@@ -2356,54 +2424,19 @@ class Service:
                         payload["web_search_status"] = "skipped_query"
                         self.record("web_search_skipped_query")
                     if query is not None:
-                        self.store.groups.phase(message, "generating")
-                        batch = self.store.groups.active.get(self.store.session_scope(message))
-                        payload["web_search_status"] = "unavailable"
-                        try:
-                            findings = (
-                                await controller.execute_search(
-                                    query,
-                                    job["subject"],
-                                    ai=self.ai,
-                                    before_call=message_guard,
-                                    cancel_event=batch.cancel if batch else None,
-                                    plugin_bus=self.plugin_bus,
-                                )
-                                if hasattr(controller, "execute_search")
-                                else await self.ai.search(
-                                    query,
-                                    job["subject"],
-                                    before_call=message_guard,
-                                    cancel_event=batch.cancel if batch else None,
-                                )
-                            )
-                            if findings and findings.strip() and controller.config.enabled:
-                                payload["web_search_findings"] = findings
-                                payload["web_search_status"] = "grounded"
-                            else:
-                                if not controller.config.enabled:
-                                    payload["web_search_status"] = "disabled"
-                                self.record("web_search_empty")
-                        except Rejected as exc:
-                            if str(exc) in {
-                                "reply_invalidated",
-                                "batch_interrupted",
-                                "batch_recalled",
-                                "budget_reservation_exceeded",
-                            }:
-                                raise
-                            if str(exc) == "web_search_disabled":
-                                payload["web_search_status"] = "disabled"
-                            diagnostics = exc.provider_diagnostics
-                            self.record("web_search_failed", emit_audit=not diagnostics)
-                            if diagnostics:
-                                await self.store.runtime.event(
-                                    "web_search_failed", "production", diagnostics=diagnostics
-                                )
-                                await self.store.runtime.filters.record_generation(
-                                    audit_id, diagnostics=diagnostics
-                                )
-                        await message_guard()
+                        await _execute_web_search(query)
+            can_model_search = (
+                allow_lookup
+                and (not aff_active or caps.allow_search)
+                and (message.kind != "group" or bool(message.addressed))
+                and "web_search_status" not in payload
+                and "module_query_result" not in payload
+                and controller.config.enabled
+            )
+            if can_model_search:
+                payload["web_search_available"] = True
+                if defer_to_model_search or natural_web_cue:
+                    payload["web_search_requested"] = True
             self.store.groups.phase(message, "generating")
             batch = self.store.groups.active.get(self.store.session_scope(message))
             chat_route = intent
@@ -2448,60 +2481,65 @@ class Service:
                     ]
                 )
             )
-            gen_trace = {}
-            try:
-                generated = await self.ai.generate(
-                    payload,
-                    job["subject"],
-                    scenario=Scenario.OWNER_PRIVATE
-                    if message.kind == "private" and is_persona_owner(message, self.s)
-                    else Scenario.FAST_CHAT,
-                    deep=deep,
-                    route=chat_route,
-                    message=message,
-                    before_call=message_guard,
-                    cancel_event=batch.cancel if batch else None,
-                    generation_trace=gen_trace,
-                    **({"images": images} if images else {}),
-                    **({"audios": audios} if audios else {}),
-                )
-            except BaseException:
-                if gen_trace.get("chain_invalidate"):
-                    await self.sessions.invalidate_chains(message)
-                raise
-            finally:
-                if gen_trace.get("thinking_level") or gen_trace.get("provider_diagnostics"):
-                    await self.store.runtime.filters.record_generation(
-                        audit_id,
-                        thinking_level=gen_trace.get("thinking_level"),
-                        model_lane=gen_trace.get("model_lane"),
-                        provider_incident=gen_trace.get("provider_incident"),
-                        diagnostics=gen_trace.get("provider_diagnostics"),
+            gen_scenario = (
+                Scenario.OWNER_PRIVATE
+                if message.kind == "private" and is_persona_owner(message, self.s)
+                else Scenario.FAST_CHAT
+            )
+
+            gen_trace: dict[str, Any] = {}
+
+            async def _generate_chat_once(active_route):
+                gen_trace.clear()
+                try:
+                    return await self.ai.generate(
+                        payload,
+                        job["subject"],
+                        scenario=gen_scenario,
+                        deep=deep,
+                        route=active_route,
+                        message=message,
+                        before_call=message_guard,
+                        cancel_event=batch.cancel if batch else None,
+                        generation_trace=gen_trace,
+                        **({"images": images} if images else {}),
+                        **({"audios": audios} if audios else {}),
                     )
+                except BaseException:
+                    if gen_trace.get("chain_invalidate"):
+                        await self.sessions.invalidate_chains(message)
+                    raise
+                finally:
+                    if gen_trace.get("thinking_level") or gen_trace.get("provider_diagnostics"):
+                        await self.store.runtime.filters.record_generation(
+                            audit_id,
+                            thinking_level=gen_trace.get("thinking_level"),
+                            model_lane=gen_trace.get("model_lane"),
+                            provider_incident=gen_trace.get("provider_incident"),
+                            diagnostics=gen_trace.get("provider_diagnostics"),
+                        )
+
+            generated = await _generate_chat_once(chat_route)
             await message_guard()
             allowed_reply = payload["allowed_reply_ids"]
-            payload.clear()
-            images.clear()
-            audios.clear()
-            if generated.lstrip().startswith("{"):
-                allowed_poke = (
-                    set()
-                    if sandbox
-                    else set(allowed_at)
-                    if message.kind == "group"
-                    else {message.user_id}
-                )
-                allowed_aff_targets = {
-                    m.user_id for m in (members or [message]) if not self.bot_guard.known_bot(m)
-                }
-                allow_owner_actions = not sandbox and verified_owner_turn
-                allowed_owner_action_names = (
-                    {a["action_name"] for a in owner_chat_actions} if allow_owner_actions else ()
-                )
-                parse_params = inspect.signature(parse_actions).parameters
-                has_varkw = any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD for p in parse_params.values()
-                )
+            allowed_poke = (
+                set()
+                if sandbox
+                else set(allowed_at)
+                if message.kind == "group"
+                else {message.user_id}
+            )
+            allowed_aff_targets = {
+                m.user_id for m in (members or [message]) if not self.bot_guard.known_bot(m)
+            }
+            allow_owner_actions = not sandbox and verified_owner_turn
+            allowed_owner_action_names = (
+                {a["action_name"] for a in owner_chat_actions} if allow_owner_actions else ()
+            )
+            parse_params = inspect.signature(parse_actions).parameters
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parse_params.values())
+
+            def _parse_chat_actions(raw_output: str, *, allow_search_req: bool):
                 extra_parse_kwargs: dict[str, Any] = {}
                 if has_varkw or "allowed_affection_targets" in parse_params:
                     extra_parse_kwargs["allowed_affection_targets"] = allowed_aff_targets
@@ -2517,8 +2555,10 @@ class Service:
                     extra_parse_kwargs["song_titles"] = self.songs.titles
                 if has_varkw or "allow_audio_gist" in parse_params:
                     extra_parse_kwargs["allow_audio_gist"] = audio_turn
-                actions, folded = parse_actions(
-                    generated,
+                if has_varkw or "allow_web_search" in parse_params:
+                    extra_parse_kwargs["allow_web_search"] = allow_search_req
+                return parse_actions(
+                    raw_output,
                     public=public,
                     allowed_at=allowed_at,
                     allowed_reply=allowed_reply,
@@ -2534,6 +2574,57 @@ class Service:
                     ),
                     **extra_parse_kwargs,
                 )
+
+            pre_parsed = None
+            if can_model_search and generated.lstrip().startswith("{"):
+                first_actions, first_folded = _parse_chat_actions(generated, allow_search_req=True)
+                if first_actions.search_query:
+                    payload.pop("web_search_available", None)
+                    payload.pop("web_search_requested", None)
+                    try:
+                        clean_model_query = sanitize_model_search_query(
+                            first_actions.search_query,
+                            message,
+                            self.s,
+                            batch_messages=members,
+                        )
+                    except Rejected:
+                        clean_model_query = None
+                        payload["web_search_status"] = "skipped_query"
+                        self.record("web_search_skipped_query")
+                    if clean_model_query is not None:
+                        await _execute_web_search(clean_model_query)
+                    if payload.get("web_search_findings") and tier < 2:
+                        tier = 2
+                        if aff_active:
+                            tier = min(tier, caps.max_tier)
+                            if not caps.allow_carbon and tier >= 4:
+                                tier = 3
+                        if isinstance(chat_route, RouteDecision):
+                            chat_route = RouteDecision(
+                                str(chat_route),
+                                tier=tier,
+                                sandbox_mode=chat_route.sandbox_mode,
+                                need_memory_recall=chat_route.need_memory_recall,
+                                need_external_lookup=True,
+                                module_query=chat_route.module_query,
+                                reply_score=getattr(chat_route, "reply_score", None),
+                                reply_threshold=getattr(chat_route, "reply_threshold", None),
+                            )
+                    # Clear pass-1 chain entry so pass-2 starts cleanly with search findings.
+                    await self.sessions.invalidate_chains(message)
+                    generated = await _generate_chat_once(chat_route)
+                    await message_guard()
+                else:
+                    pre_parsed = (first_actions, first_folded)
+            payload.clear()
+            images.clear()
+            audios.clear()
+            if generated.lstrip().startswith("{"):
+                if pre_parsed is not None:
+                    actions, folded = pre_parsed
+                else:
+                    actions, folded = _parse_chat_actions(generated, allow_search_req=False)
                 aff_targets = self._select_affection_targets(message, members, actions)
                 has_social_response = (not actions.abstain) or bool(
                     actions.emoji_like or actions.poke_qq

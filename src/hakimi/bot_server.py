@@ -430,6 +430,20 @@ def assemble_chat_input(
             "平时不唱歌时 sing_song 必须填 null。若对方点的歌不在歌单里，"
             "自然说明还没学会/还没录这首，可顺便推荐歌单里会唱的歌。"
         )
+    if not sandbox_mode and payload.get("web_search_available"):
+        ws_hint = (
+            "本轮支持按需联网核实：仅当对方要你去查证/搜索，或需要核实实时公开新闻、"
+            "价格、版本、公开事实时，在 search_query 填一条 2~100 字的纯公开检索词"
+            "（提炼事件/人物/产品/关键词，严禁包含 QQ 号、昵称、私聊内容、私人记忆或密钥）；"
+            '填了 search_query 后后台会先联网核实再让你基于事实重新作答（此时 bubbles 可填 [""]）。'
+            "无需联网核实的普通闲聊、已知常识或个人回忆，search_query 必须填 null。"
+        )
+        if payload.get("web_search_requested"):
+            ws_hint += (
+                "对方本轮已明确要求你联网核实（可能承接前文或前图话题）；"
+                "请结合上下文提炼纯公开检索词填入 search_query 以便后台立即查证。"
+            )
+        metadata["web_search_hint"] = ws_hint
     if not sandbox_mode and payload.get("module_context"):
         metadata["module_context"] = payload["module_context"]
     if not sandbox_mode and payload.get("unshared_world_news"):

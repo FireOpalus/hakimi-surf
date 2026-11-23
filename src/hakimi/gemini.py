@@ -52,7 +52,12 @@ from .streaming import StreamProgress, cancellable, consume_stream, upstream_htt
 from .thinking_policy import FLEX_MODELS, MODEL_LANES, preferences, supported_level
 from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import ModelVideo, VideoFiles, run_guard
-from .web_search import SEARCH_INSTRUCTION, execute_deepseek_search, parse_result
+from .web_search import (
+    SEARCH_INSTRUCTION,
+    execute_deepseek_search,
+    natural_search_cue,
+    parse_result,
+)
 from .work_usage import model_work
 from .world_experience import MAX_DAY_REST_MINUTES
 
@@ -340,9 +345,12 @@ def questions(purpose: str) -> dict:
         }
         result["need_external_lookup"] = {
             "type": "noul",
-            "instructions": "Does the current request need fresh public web facts, explicitly "
-            "ask to search/verify online, or ask to analyse a public Bilibili video/UP update? "
-            "Past personal conversations and casual banter do NOT need web search. "
+            "instructions": "Does the current request need fresh public web facts, current news/"
+            "prices/releases, explicitly ask the assistant to search, look up, or verify whether "
+            "something is true online (e.g. '不信你自己查', '帮我搜一下', '真的假的查一下'), "
+            "or ask to analyse a public Bilibili video/UP update? Score high even when the user "
+            "refers to a claim from prior context/images and asks to verify it online. "
+            "Past personal conversations and pure casual banter do NOT need web search. "
             "This is a relevance hint, never permission to export private history.",
         }
         result["reasoning_tier"] = {
@@ -1678,6 +1686,12 @@ class GeminiGateway:
                     if direct
                     else "relevant_group_conversation",
                 )
+            raw_lookup_text = (
+                (message.command_text or message.text)
+                if message is not None
+                else str(data_payload.get("current_message", ""))
+            )
+            lookup_threshold = 0.35 if natural_search_cue(raw_lookup_text) else 0.65
             return RouteDecision(
                 chosen,
                 tier=tier,
@@ -1685,7 +1699,7 @@ class GeminiGateway:
                 module_query=selected_query if chosen == "chat" else None,
                 need_memory_recall=recall >= 0.5,
                 need_external_lookup=not is_bot
-                and lookup >= 0.65
+                and lookup >= lookup_threshold
                 and (not is_group or bool(message and message.addressed)),
                 reply_score=reply,
                 reply_threshold=bounds["reply"],

@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from .memory_compressor import check_memory_text
 from .output_links import fact_text
-from .security import Rejected, configured_secrets, safe_output
+from .security import Rejected, clean_text, configured_secrets, safe_output
 from .streaming import cancellable
 
 log = logging.getLogger("hakimi")
@@ -79,8 +79,87 @@ class WebSearchConfig(BaseModel):
         )
 
 
+_NATURAL_SEARCH_CUE_RE = re.compile(
+    r"(?:不信你(?:自己)?(?:去)?(?:查|搜)|"
+    r"你自己(?:去)?(?:查一下|查一查|查查|查证|搜一下|搜一搜|搜搜|搜索|查|搜)|"
+    r"(?:帮我|帮忙|请你|去|快去|顺便)?(?:联网|上网|网上)?(?:搜一下|搜一搜|搜索一下|查一下|查一查|查证一下|核实一下|搜搜看|查查看)|"
+    r"(?:联网|上网|用\s*(?:google|谷歌|搜索|web\s*search))(?:查|搜|看看|核实))",
+    re.I,
+)
+_BACKREF_FILLER_RE = re.compile(
+    r"(?:^/(?:search|搜索)\s+|\[[^\]]*\]|"
+    r"这是真的|真的假的|我刚(?:刚)?查过了|我查过了|刚查过了|不信|你自己|自己去|自己|"
+    r"帮我|帮忙|请你|快去|顺便|去|联网|上网|网上|一下|一查|一搜|看看|"
+    r"查证|核实|搜索|查查|搜搜|查|搜|真的|假的|吗|啊|呀|吧|呢|了|的|哈+|嘛|"
+    r"google|web\s*search|[\s\W_]+)",
+    re.I,
+)
+MAX_MODEL_SEARCH_QUERY_CHARS = 120
+
+
 def explicit_search(text):
     return bool(re.search(r"^/(?:search|搜索)\s+\S", text.strip(), re.I))
+
+
+def natural_search_cue(text: str) -> bool:
+    """Return True when natural-language text clearly asks the bot to search/verify online."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_NATURAL_SEARCH_CUE_RE.search(text))
+
+
+def has_concrete_search_subject(text: str) -> bool:
+    """Return False when a lookup message is only a bare back-reference without topic keywords."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    remainder = _BACKREF_FILLER_RE.sub("", text).strip()
+    return len(remainder) >= 3
+
+
+def sanitize_model_search_query(
+    raw_query: str,
+    message,
+    settings,
+    *,
+    batch_messages=None,
+) -> str:
+    """Strictly scrub a model-proposed public search query before sending to search providers."""
+    if not isinstance(raw_query, str):
+        raise Rejected("search_query_length")
+    secrets = configured_secrets(settings) if settings else []
+    if any(s and len(s) >= 8 and s in raw_query for s in secrets):
+        raise Rejected("search_query_secret")
+    text = " ".join(clean_text(raw_query).split()).strip()
+    if any(s and len(s) >= 8 and s in text for s in secrets):
+        raise Rejected("search_query_secret")
+    check_memory_text(text, settings)
+    text = re.sub(r"https?://[^\s<>\"'，。！？；、（）]+", " ", text, flags=re.I)
+    text = re.sub(r"\[role=[^\]]*\]", " ", text, flags=re.I)
+    accounts = {
+        message.user_id,
+        message.conversation_id,
+        settings.owner_qq_id,
+        settings.onebot_self_id,
+        *settings.onebot_allowed_users,
+        *settings.onebot_allowed_groups,
+        *settings.bot_qq_ids,
+        *settings.muted_user_ids,
+    }
+    if batch_messages:
+        for item in batch_messages:
+            if getattr(item, "user_id", ""):
+                accounts.add(str(item.user_id))
+    for account in accounts - {""}:
+        pattern = (
+            r"(?<![0-9])" + re.escape(account) + r"(?![0-9])"
+            if account.isdigit()
+            else re.escape(account)
+        )
+        text = re.sub(pattern, " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not 2 <= len(text) <= MAX_MODEL_SEARCH_QUERY_CHARS:
+        raise Rejected("search_query_length")
+    return text
 
 
 def search_query(message, settings, *, batch_messages=None, link_titles=None):
