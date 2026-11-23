@@ -1171,7 +1171,34 @@ class GeminiGateway:
             await run_guard(before_call)
             return result
 
-    async def search(self, query, subject, *, before_call=None, cancel_event=None):
+    @staticmethod
+    def _is_transient_search_retryable(exc: Rejected, attempts: list[dict]) -> bool:
+        if str(exc) != "gemini_unavailable" or not attempts:
+            return False
+        last = attempts[-1]
+        cause = last.get("cause")
+        if cause == "http":
+            return last.get("http_status") in {429, 500, 502, 503, 504}
+        return cause in {
+            "connect_timeout",
+            "read_timeout",
+            "write_timeout",
+            "pool_timeout",
+            "sdk_timeout",
+            "timeout",
+            "connection",
+            "transport",
+        }
+
+    async def search(
+        self,
+        query,
+        subject,
+        *,
+        before_call=None,
+        cancel_event=None,
+        search_trace: dict | None = None,
+    ):
         controller = self.store.runtime.web_search
 
         async def guard():
@@ -1183,6 +1210,8 @@ class GeminiGateway:
         attempt = await controller.claim()
         provider = controller.provider_for(attempt)
         if provider == "deepseek":
+            if search_trace is not None:
+                search_trace["provider"] = "deepseek"
             api_key, base_url, model, _ = controller.deepseek_settings()
             ds_ok = False
             try:
@@ -1218,53 +1247,169 @@ class GeminiGateway:
                     )
                 )
         result = None
-        call_state = {"dispatched": False}
+        ds_fallback_ok = False
+        attempts: list[dict] = []
+        retried = False
         try:
             policy = preferences(self.s)
             search_level = supported_level(
                 policy.primary_model, policy.scene_levels.get("web.search", "medium")
             )
 
-            async def send_search():
-                call_state["dispatched"] = True
-                return await self.chat_client.aio.interactions.create(
-                    model="gemini-4-" + policy.primary_model,
-                    store=False,
-                    stream=False,
-                    background=False,
-                    automatic_continuation=False,
-                    system_instruction=SEARCH_INSTRUCTION,
-                    input=untrusted_input({"public_search_question": query}),
-                    tools=[{"type": "google_search", "search_types": ["web_search"]}],
-                    generation_config={
-                        "thinking_level": search_level,
-                        "max_output_tokens": 4096,
-                        "tool_choice": "auto",
-                        "thinking_summaries": "none",
-                    },
+            async def run_google_once():
+                call_state = {"dispatched": False}
+
+                async def send_search():
+                    call_state["dispatched"] = True
+                    return await self.chat_client.aio.interactions.create(
+                        model="gemini-4-" + policy.primary_model,
+                        store=False,
+                        stream=False,
+                        background=False,
+                        automatic_continuation=False,
+                        system_instruction=SEARCH_INSTRUCTION,
+                        input=untrusted_input({"public_search_question": query}),
+                        tools=[{"type": "google_search", "search_types": ["web_search"]}],
+                        generation_config={
+                            "thinking_level": search_level,
+                            "max_output_tokens": 4096,
+                            "tool_choice": "auto",
+                            "thinking_summaries": "none",
+                        },
+                    )
+
+                async def operation():
+                    return await cancellable(send_search, cancel_event)
+
+                return await self._call(
+                    subject,
+                    "search",
+                    policy.primary_model,
+                    {"system": SEARCH_INSTRUCTION, "query": query},
+                    4096,
+                    min(60, self.s.generation_timeout),
+                    operation,
+                    audit_stage="search",
+                    attempts=attempts,
+                    before_call=guard,
+                    image_tokens=16000,  # Grounding tool text reserve, not image upload.
+                    additional_reserve=Decimal(0),
+                    additional_actual=None,
+                    fallback_media_tokens=2048,
+                    fallback_additional=Decimal(0),
+                    call_state=call_state,
+                    thinking_level=search_level,
                 )
 
-            async def operation():
-                return await cancellable(send_search, cancel_event)
+            google_exc: Rejected | None = None
+            for attempt_idx in range(2):
+                try:
+                    result = await run_google_once()
+                    google_exc = None
+                    break
+                except Rejected as exc:
+                    google_exc = exc
+                    if attempt_idx == 0 and self._is_transient_search_retryable(exc, attempts):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise asyncio.CancelledError from None
+                        backoff = float(getattr(self, "_search_retry_backoff", 0.6))
+                        if backoff > 0:
+                            await cancellable(
+                                lambda delay=backoff: asyncio.sleep(delay), cancel_event
+                            )
+                        await guard()
+                        retried = True
+                        continue
+                    break
 
-            result = await self._call(
-                subject,
-                "search",
-                policy.primary_model,
-                {"system": SEARCH_INSTRUCTION, "query": query},
-                4096,
-                min(60, self.s.generation_timeout),
-                operation,
-                audit_stage="search",
-                before_call=guard,
-                image_tokens=16000,  # Grounding tool text reserve, not image upload.
-                additional_reserve=Decimal(0),
-                additional_actual=None,
-                fallback_media_tokens=2048,
-                fallback_additional=Decimal(0),
-                call_state=call_state,
-                thinking_level=search_level,
-            )
+            if google_exc is not None:
+                ds_api_key, ds_base_url, ds_model, _ = controller.deepseek_settings()
+                can_fallback_deepseek = (
+                    str(google_exc) in {"gemini_unavailable", "gemini_circuit_open"}
+                    and bool(ds_api_key)
+                    and (cancel_event is None or not cancel_event.is_set())
+                )
+                if can_fallback_deepseek:
+                    await guard()
+                    try:
+                        transport = getattr(self, "_deepseek_transport", None)
+                        parsed = await cancellable(
+                            lambda: execute_deepseek_search(
+                                query,
+                                self.s,
+                                api_key=ds_api_key,
+                                base_url=ds_base_url,
+                                model=ds_model,
+                                transport=transport,
+                            ),
+                            cancel_event,
+                        )
+                    except asyncio.CancelledError:
+                        if attempts:
+                            attempts[-1]["fallback"] = "cancelled"
+                        raise
+                    except Rejected as ds_exc:
+                        if str(ds_exc) in {
+                            "web_search_disabled",
+                            "reply_invalidated",
+                            "batch_interrupted",
+                            "batch_recalled",
+                            "budget_reservation_exceeded",
+                        }:
+                            raise
+                        if attempts:
+                            attempts[-1]["fallback"] = "failed"
+                        if attempts:
+                            google_exc.provider_diagnostics = list(attempts)
+                        if search_trace is not None:
+                            search_trace["provider"] = "google"
+                            if retried:
+                                search_trace["retried"] = True
+                            if attempts:
+                                search_trace["provider_diagnostics"] = list(attempts)
+                        raise google_exc from None
+                    ds_fallback_ok = True
+                    if attempts:
+                        attempts[-1]["fallback"] = "succeeded"
+                    if search_trace is not None:
+                        search_trace["provider"] = "deepseek"
+                        search_trace["fallback"] = "deepseek"
+                        if retried:
+                            search_trace["retried"] = True
+                        if attempts:
+                            search_trace["provider_diagnostics"] = list(attempts)
+                    rendered = parsed.render(self.s)
+                    await self.screen(
+                        {"untrusted_web_search_result": rendered},
+                        subject,
+                        purpose="source",
+                        budget_lane="search",
+                        before_call=guard,
+                    )
+                    await guard()
+                    return rendered
+                if (
+                    str(google_exc) in {"gemini_unavailable", "gemini_circuit_open"}
+                    and not ds_api_key
+                    and attempts
+                ):
+                    attempts[-1]["fallback"] = "disabled"
+                if attempts:
+                    google_exc.provider_diagnostics = list(attempts)
+                if search_trace is not None:
+                    search_trace["provider"] = "google"
+                    if retried:
+                        search_trace["retried"] = True
+                    if attempts:
+                        search_trace["provider_diagnostics"] = list(attempts)
+                raise google_exc
+
+            if search_trace is not None:
+                search_trace["provider"] = "google"
+                if retried:
+                    search_trace["retried"] = True
+                if attempts:
+                    search_trace["provider_diagnostics"] = list(attempts)
             parsed = parse_result(result)
             rendered = parsed.render(self.s)
             await self.screen(
@@ -1277,7 +1422,17 @@ class GeminiGateway:
             await guard()
             return rendered
         finally:
-            await asyncio.shield(controller.finish(attempt, result))
+            if ds_fallback_ok:
+                await asyncio.shield(
+                    controller.finish(
+                        attempt,
+                        {"completed": True},
+                        query_count_override=1,
+                        provider_override="deepseek",
+                    )
+                )
+            else:
+                await asyncio.shield(controller.finish(attempt, result))
 
     async def screen(
         self,

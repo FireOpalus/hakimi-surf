@@ -661,3 +661,250 @@ async def test_model_initiated_search_blocks_secret_query_and_unmentioned_group(
         assert "web_search_available" not in ai.gen_payloads[0]
     finally:
         await svc.stop()
+
+
+async def test_google_search_503_retries_once_and_records_trace(settings, store, sdk_pair):
+    await enable_search(store)
+    interaction_calls = 0
+
+    def handler(request):
+        nonlocal interaction_calls
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        interaction_calls += 1
+        if interaction_calls == 1:
+            return httpx.Response(503, json={"error": {"code": 503, "status": "UNAVAILABLE"}})
+        return httpx.Response(200, json=grounded_response())
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    gateway._search_retry_backoff = 0
+    trace = {}
+    output = await gateway.search("英伟达最新新闻", "subject", search_trace=trace)
+    assert "已核实的公开事实" in output
+    assert interaction_calls == 2
+    assert trace["provider"] == "google"
+    assert trace["retried"] is True
+    assert len(trace["provider_diagnostics"]) == 1
+    assert trace["provider_diagnostics"][0]["stage"] == "search"
+    assert trace["provider_diagnostics"][0]["http_status"] == 503
+    rows = await store.all("SELECT status, provider, query_count FROM web_search_attempts")
+    assert [tuple(r) for r in rows] == [("completed", "google", 2)]
+
+
+async def test_google_search_persistent_503_falls_back_to_deepseek_and_screens(
+    settings, store, sdk_pair
+):
+    await enable_search(store)
+    await store.runtime.web_search.save_deepseek(
+        api_key="sk-deepseek-fallback-test-key",
+        base_url="https://api.deepseek.com",
+        model="deepseek-flash",
+    )
+    google_calls = 0
+    decision_calls = 0
+    ds_calls = []
+
+    def gemini_handler(request):
+        nonlocal google_calls, decision_calls
+        if request.url.path.endswith("decisions"):
+            decision_calls += 1
+            return httpx.Response(200, json=decision_response())
+        google_calls += 1
+        return httpx.Response(503, json={"error": {"code": 503, "status": "UNAVAILABLE"}})
+
+    def ds_handler(request):
+        ds_calls.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "权威科技媒体",
+                        "url": "https://example.org/nvda",
+                        "summary": "DeepSeek 兜底查到的英伟达最新公开动态。",
+                        "rerank_score": 2.0,
+                    }
+                ]
+            },
+        )
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(gemini_handler))
+    gateway._search_retry_backoff = 0
+    gateway._deepseek_transport = httpx.MockTransport(ds_handler)
+    trace = {}
+    output = await gateway.search("英伟达最新新闻", "subject", search_trace=trace)
+    assert "DeepSeek 兜底查到的英伟达最新公开动态" in output
+    assert google_calls == 2
+    assert ds_calls == ["/v1/tools/search"]
+    assert decision_calls == 1
+    assert trace["provider"] == "deepseek"
+    assert trace["fallback"] == "deepseek"
+    assert trace["retried"] is True
+    assert len(trace["provider_diagnostics"]) == 2
+    assert trace["provider_diagnostics"][-1]["fallback"] == "succeeded"
+    rows = await store.all("SELECT status, provider, query_count FROM web_search_attempts")
+    assert [tuple(r) for r in rows] == [("completed", "deepseek", 1)]
+    st = await store.runtime.web_search.status()
+    assert st["monthly"]["google_queries"] == 0
+    assert st["monthly"]["deepseek_attempts"] == 1
+
+
+async def test_google_search_503_deepseek_network_error_preserves_diagnostics(
+    settings, store, sdk_pair
+):
+    await enable_search(store)
+    await store.runtime.web_search.save_deepseek(
+        api_key="sk-deepseek-fallback-test-key",
+        base_url="https://api.deepseek.com",
+        model="deepseek-flash",
+    )
+
+    def gemini_handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(503, json={"error": {"code": 503, "status": "UNAVAILABLE"}})
+
+    def ds_handler(request):
+        raise httpx.ConnectTimeout("simulated timeout")
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(gemini_handler))
+    gateway._search_retry_backoff = 0
+    gateway._deepseek_transport = httpx.MockTransport(ds_handler)
+    trace = {}
+    with pytest.raises(Rejected, match="gemini_unavailable") as exc_info:
+        await gateway.search("英伟达最新新闻", "subject", search_trace=trace)
+    diags = exc_info.value.provider_diagnostics
+    assert len(diags) == 2
+    assert all(d["stage"] == "search" and d["http_status"] == 503 for d in diags)
+    assert diags[-1]["fallback"] == "failed"
+    assert trace["provider"] == "google" and trace["retried"] is True
+    rows = await store.all("SELECT status, provider FROM web_search_attempts")
+    assert [tuple(r) for r in rows] == [("unknown", "google")]
+
+
+async def test_decision_audit_preserves_search_status_and_merges_diagnostics(
+    settings, store, sdk_pair, message
+):
+    from hakimi.service import Service
+    from tests.test_social_integration import group
+
+    await enable_search(store)
+
+    # Case 1: Google search 503 x2 (no DeepSeek key) + main generation succeeds on fallback/normal
+    def handler_fail_search(request):
+        if request.url.path.endswith("decisions"):
+            resp = decision_response()
+            resp["answers"]["need_external_lookup"].update(noul=0.72, confidence=0.85)
+            return httpx.Response(200, json=resp)
+        body = json.loads(request.content)
+        if body.get("tools"):
+            return httpx.Response(503, json={"error": {"code": 503, "status": "UNAVAILABLE"}})
+        return httpx.Response(200, json=interaction_response())
+
+    ai = GeminiGateway(settings, store, *sdk_pair(handler_fail_search))
+    ai._search_retry_backoff = 0
+    svc = Service(settings, store, ai, FakeBili(), ActionSender())
+    try:
+        m1 = group(
+            message,
+            event_id="audit-ws-1",
+            text="帮我查一下英伟达最新财报",
+            command_text="帮我查一下英伟达最新财报",
+            addressed=True,
+            attention_reason="mention",
+            mentioned_ids=[settings.onebot_self_id],
+        )
+        assert await svc.accept(m1) == "accepted"
+        await svc.process(await store.claim())
+        audit = (await store.runtime.filters.recent_audit(1))[0]
+        assert audit["web_search"] == {
+            "status": "unavailable",
+            "trigger": "gate",
+            "provider": "google",
+            "retried": True,
+            "reason": "gemini_unavailable",
+        }
+        # Search 503 diagnostics survive even after main generation records thinking_level
+        assert audit.get("thinking_level")
+        search_diags = [d for d in audit["provider_diagnostics"] if d["stage"] == "search"]
+        assert len(search_diags) == 2
+        assert search_diags[-1]["fallback"] == "disabled"
+        # Appending generation diagnostics later must preserve earlier search diagnostics
+        await store.runtime.filters.record_generation(
+            m1.event_id,  # non-matching id is a no-op
+            web_search={"status": "grounded", "query": "MUST_NOT_LEAK"},
+        )
+        # Direct unit check that untrusted fields in web_search audit are stripped
+        last_row = await store.one("SELECT id FROM decision_audit ORDER BY at DESC LIMIT 1")
+        await store.runtime.filters.record_generation(
+            last_row["id"],
+            diagnostics=[
+                {
+                    "stage": "generation",
+                    "provider": "vertex_paid",
+                    "model_lane": "hydrogen",
+                    "cause": "http",
+                    "http_status": 429,
+                }
+            ],
+            web_search={"status": "grounded", "trigger": "explicit", "secret": "LEAK_TEXT"},
+        )
+        merged = (await store.runtime.filters.recent_audit(1))[0]
+        assert "LEAK_TEXT" not in json.dumps(merged, ensure_ascii=False)
+        assert [d["stage"] for d in merged["provider_diagnostics"]] == [
+            "search",
+            "search",
+            "generation",
+        ]
+        assert merged["web_search"] == {"status": "grounded", "trigger": "explicit"}
+    finally:
+        await svc.stop()
+
+    # Case 2: Google search 503 x2 rescued by DeepSeek fallback -> decision_audit shows both
+    await store.runtime.web_search.save_deepseek(
+        api_key="sk-deepseek-audit-test-key",
+        base_url="https://api.deepseek.com",
+        model="deepseek-flash",
+    )
+
+    def ds_ok_handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "公开快讯",
+                        "url": "https://example.org/news",
+                        "summary": "英伟达发布最新季报亮点。",
+                        "rerank_score": 1.5,
+                    }
+                ]
+            },
+        )
+
+    ai2 = GeminiGateway(settings, store, *sdk_pair(handler_fail_search))
+    ai2._search_retry_backoff = 0
+    ai2._deepseek_transport = httpx.MockTransport(ds_ok_handler)
+    svc2 = Service(settings, store, ai2, FakeBili(), ActionSender())
+    try:
+        m2 = message.model_copy(
+            update={
+                "event_id": "audit-ws-2",
+                "text": "/search 英伟达最新季报",
+                "command_text": "/search 英伟达最新季报",
+            }
+        )
+        assert await svc2.accept(m2) == "accepted"
+        await svc2.process(await store.claim())
+        audit2 = (await store.runtime.filters.recent_audit(1))[0]
+        assert audit2["web_search"] == {
+            "status": "grounded",
+            "trigger": "explicit",
+            "provider": "deepseek",
+            "fallback": "deepseek",
+            "retried": True,
+        }
+        assert len(audit2["provider_diagnostics"]) == 2
+        assert audit2["provider_diagnostics"][-1]["fallback"] == "succeeded"
+    finally:
+        await svc2.stop()

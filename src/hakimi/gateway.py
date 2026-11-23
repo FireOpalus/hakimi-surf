@@ -4,7 +4,7 @@ import asyncio
 import re
 import time
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -79,6 +79,35 @@ def redact_excerpt(text, settings, *, limit=180):
 def _safe_detail(detail: str) -> str:
     text = str(detail or "").strip()
     return text if re.fullmatch(r"[a-z0-9_]{1,64}", text) else ""
+
+
+_WEB_SEARCH_STATUSES = {"grounded", "unavailable", "disabled", "skipped_query"}
+_WEB_SEARCH_TRIGGERS = {"explicit", "gate", "model"}
+_WEB_SEARCH_PROVIDERS = {"google", "deepseek", "remote", "searxng", "tavily", "brave", "duckduckgo"}
+_WEB_SEARCH_FALLBACKS = {"deepseek", "google"}
+
+
+def _safe_web_search_audit(value: dict | None) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    if status not in _WEB_SEARCH_STATUSES:
+        return None
+    clean: dict[str, Any] = {"status": status}
+    trigger = value.get("trigger")
+    if trigger in _WEB_SEARCH_TRIGGERS:
+        clean["trigger"] = trigger
+    provider = value.get("provider")
+    if provider in _WEB_SEARCH_PROVIDERS:
+        clean["provider"] = provider
+    fallback = value.get("fallback")
+    if fallback in _WEB_SEARCH_FALLBACKS:
+        clean["fallback"] = fallback
+    if value.get("retried") is True:
+        clean["retried"] = True
+    if reason := _safe_detail(value.get("reason", "")):
+        clean["reason"] = reason
+    return clean
 
 
 class FilterManager:
@@ -331,6 +360,7 @@ class FilterManager:
         model_lane: str | None = None,
         provider_incident: dict | None = None,
         diagnostics=None,
+        web_search: dict | None = None,
     ):
         if not audit_id:
             return
@@ -367,7 +397,8 @@ class FilterManager:
             if detail := _safe_detail(provider_incident.get("fallback_detail", "")):
                 incident["fallback_detail"] = detail
         attempts = safe_attempts(diagnostics)
-        if not valid_level and not valid_lane and not incident and not attempts:
+        ws = _safe_web_search_audit(web_search)
+        if not valid_level and not valid_lane and not incident and not attempts and not ws:
             return
         await self.initialize()
         async with self.store.transaction():
@@ -385,6 +416,8 @@ class FilterManager:
                 )
             if incident:
                 value["provider_incident"] = incident
+            if ws:
+                value["web_search"] = ws
             await self.store.db.execute(
                 "UPDATE decision_audit SET payload=? WHERE id=?",
                 (self.store.vault.seal("decision-audit:" + audit_id, value), audit_id),

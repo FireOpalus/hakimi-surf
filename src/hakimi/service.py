@@ -2329,35 +2329,67 @@ class Service:
             controller = self.store.runtime.web_search
             defer_to_model_search = False
 
-            async def _execute_web_search(clean_query: str) -> None:
+            async def _execute_web_search(clean_query: str, *, trigger: str) -> None:
                 self.store.groups.phase(message, "generating")
                 active_batch = self.store.groups.active.get(self.store.session_scope(message))
                 payload["web_search_status"] = "unavailable"
+                search_trace: dict[str, Any] = {}
                 try:
-                    findings = (
-                        await controller.execute_search(
+                    if hasattr(controller, "execute_search"):
+                        findings = await controller.execute_search(
                             clean_query,
                             job["subject"],
                             ai=self.ai,
                             before_call=message_guard,
                             cancel_event=active_batch.cancel if active_batch else None,
                             plugin_bus=self.plugin_bus,
+                            search_trace=search_trace,
                         )
-                        if hasattr(controller, "execute_search")
-                        else await self.ai.search(
+                    else:
+                        ai_search_kwargs: dict[str, Any] = {
+                            "before_call": message_guard,
+                            "cancel_event": active_batch.cancel if active_batch else None,
+                        }
+                        ai_search_sig = inspect.signature(self.ai.search)
+                        if "search_trace" in ai_search_sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in ai_search_sig.parameters.values()
+                        ):
+                            ai_search_kwargs["search_trace"] = search_trace
+                        findings = await self.ai.search(
                             clean_query,
                             job["subject"],
-                            before_call=message_guard,
-                            cancel_event=active_batch.cancel if active_batch else None,
+                            **ai_search_kwargs,
                         )
-                    )
                     if findings and findings.strip() and controller.config.enabled:
                         payload["web_search_findings"] = findings
                         payload["web_search_status"] = "grounded"
+                        ws_audit: dict[str, Any] = {"status": "grounded", "trigger": trigger}
+                        for key in ("provider", "fallback", "retried"):
+                            if search_trace.get(key):
+                                ws_audit[key] = search_trace[key]
+                        await self.store.runtime.filters.record_generation(
+                            audit_id,
+                            diagnostics=search_trace.get("provider_diagnostics"),
+                            web_search=ws_audit,
+                        )
                     else:
                         if not controller.config.enabled:
                             payload["web_search_status"] = "disabled"
                         self.record("web_search_empty")
+                        ws_audit = {
+                            "status": payload["web_search_status"],
+                            "trigger": trigger,
+                            "reason": "web_search_empty",
+                        }
+                        for key in ("provider", "fallback", "retried"):
+                            if search_trace.get(key):
+                                ws_audit[key] = search_trace[key]
+                        await self.store.runtime.filters.record_generation(
+                            audit_id,
+                            diagnostics=search_trace.get("provider_diagnostics"),
+                            web_search=ws_audit,
+                        )
                 except Rejected as exc:
                     if str(exc) in {
                         "reply_invalidated",
@@ -2368,15 +2400,27 @@ class Service:
                         raise
                     if str(exc) == "web_search_disabled":
                         payload["web_search_status"] = "disabled"
-                    diagnostics = exc.provider_diagnostics
+                    diagnostics = exc.provider_diagnostics or search_trace.get(
+                        "provider_diagnostics"
+                    )
                     self.record("web_search_failed", emit_audit=not diagnostics)
                     if diagnostics:
                         await self.store.runtime.event(
                             "web_search_failed", "production", diagnostics=diagnostics
                         )
-                        await self.store.runtime.filters.record_generation(
-                            audit_id, diagnostics=diagnostics
-                        )
+                    ws_audit = {
+                        "status": payload["web_search_status"],
+                        "trigger": trigger,
+                        "reason": str(exc),
+                    }
+                    for key in ("provider", "fallback", "retried"):
+                        if search_trace.get(key):
+                            ws_audit[key] = search_trace[key]
+                    await self.store.runtime.filters.record_generation(
+                        audit_id,
+                        diagnostics=diagnostics,
+                        web_search=ws_audit,
+                    )
                 await message_guard()
 
             query_name = getattr(intent, "module_query", None)
@@ -2396,9 +2440,14 @@ class Service:
                 and (not aff_active or caps.allow_search)
                 and (explicit_web or getattr(intent, "need_external_lookup", False))
             ):
+                pre_trigger = "explicit" if explicit_web else "gate"
                 if not controller.config.enabled:
                     payload["web_search_status"] = "disabled"
                     self.record("web_search_disabled")
+                    await self.store.runtime.filters.record_generation(
+                        audit_id,
+                        web_search={"status": "disabled", "trigger": pre_trigger},
+                    )
                 elif (
                     not explicit_web
                     and (message.kind != "group" or bool(message.addressed))
@@ -2419,12 +2468,20 @@ class Service:
                                 if isinstance(p, dict) and p.get("title")
                             ],
                         )
-                    except Rejected:
+                    except Rejected as exc:
                         query = None
                         payload["web_search_status"] = "skipped_query"
                         self.record("web_search_skipped_query")
+                        await self.store.runtime.filters.record_generation(
+                            audit_id,
+                            web_search={
+                                "status": "skipped_query",
+                                "trigger": pre_trigger,
+                                "reason": str(exc),
+                            },
+                        )
                     if query is not None:
-                        await _execute_web_search(query)
+                        await _execute_web_search(query, trigger=pre_trigger)
             can_model_search = (
                 allow_lookup
                 and (not aff_active or caps.allow_search)
@@ -2588,12 +2645,20 @@ class Service:
                             self.s,
                             batch_messages=members,
                         )
-                    except Rejected:
+                    except Rejected as exc:
                         clean_model_query = None
                         payload["web_search_status"] = "skipped_query"
                         self.record("web_search_skipped_query")
+                        await self.store.runtime.filters.record_generation(
+                            audit_id,
+                            web_search={
+                                "status": "skipped_query",
+                                "trigger": "model",
+                                "reason": str(exc),
+                            },
+                        )
                     if clean_model_query is not None:
-                        await _execute_web_search(clean_model_query)
+                        await _execute_web_search(clean_model_query, trigger="model")
                     if payload.get("web_search_findings") and tier < 2:
                         tier = 2
                         if aff_active:

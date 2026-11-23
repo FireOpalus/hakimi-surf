@@ -519,75 +519,78 @@ async def execute_deepseek_search(
         raise Rejected("deepseek_credentials_missing" if not api_key else "web_search_failed")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     short_query = (query.strip() or "search")[:128]
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(25.0),
-        trust_env=False,
-        follow_redirects=False,
-        transport=transport,
-    ) as client:
-        async with client.stream(
-            "POST",
-            clean_base + "/v1/tools/search",
-            headers=headers,
-            json={
-                "query": short_query,
-                "count": 6,
-                "ori_question": short_query,
-                "need_content": False,
-            },
-        ) as response:
-            if response.status_code == 200:
-                data = await _read_bounded_json(response)
-                raw_results = data.get("results")
-                if not isinstance(raw_results, list):
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(25.0),
+            trust_env=False,
+            follow_redirects=False,
+            transport=transport,
+        ) as client:
+            async with client.stream(
+                "POST",
+                clean_base + "/v1/tools/search",
+                headers=headers,
+                json={
+                    "query": short_query,
+                    "count": 6,
+                    "ori_question": short_query,
+                    "need_content": False,
+                },
+            ) as response:
+                if response.status_code == 200:
+                    data = await _read_bounded_json(response)
+                    raw_results = data.get("results")
+                    if not isinstance(raw_results, list):
+                        raise Rejected("web_search_failed")
+                    ranked = sorted(
+                        (r for r in raw_results if isinstance(r, dict)),
+                        key=lambda item: float(item.get("rerank_score") or 0),
+                        reverse=True,
+                    )
+                    lines: list[str] = []
+                    sources: list[tuple[str, str]] = []
+                    for item in ranked:
+                        snippet = str(item.get("summary") or item.get("snippet") or "").strip()
+                        if not snippet:
+                            continue
+                        title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:80]
+                        snippet = re.sub(r"\[(?:AT|MEME|CQ):[^\]\n]*\]?", "", snippet, flags=re.I)
+                        snippet = re.sub(r"\s+", " ", snippet).strip()[:220]
+                        label = title or "网页结果"
+                        candidate_line = f"{len(lines) + 1}. {label}：{snippet}"
+                        if len("\n".join([*lines, candidate_line])) > 1200 and lines:
+                            break
+                        lines.append(candidate_line)
+                        url = public_url(item.get("url"))
+                        if url:
+                            sources.append((title or (urlsplit(url).hostname or ""), url))
+                        if len(lines) >= 5:
+                            break
+                    text = "\n".join(lines).strip()
+                    if not text:
+                        raise Rejected("search_no_grounding")
+                    return SearchResult(text, tuple(sources[:5]))
+                if response.status_code not in {400, 404, 405}:
                     raise Rejected("web_search_failed")
-                ranked = sorted(
-                    (r for r in raw_results if isinstance(r, dict)),
-                    key=lambda item: float(item.get("rerank_score") or 0),
-                    reverse=True,
-                )
-                lines: list[str] = []
-                sources: list[tuple[str, str]] = []
-                for item in ranked:
-                    snippet = str(item.get("summary") or item.get("snippet") or "").strip()
-                    if not snippet:
-                        continue
-                    title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:80]
-                    snippet = re.sub(r"\[(?:AT|MEME|CQ):[^\]\n]*\]?", "", snippet, flags=re.I)
-                    snippet = re.sub(r"\s+", " ", snippet).strip()[:220]
-                    label = title or "网页结果"
-                    candidate_line = f"{len(lines) + 1}. {label}：{snippet}"
-                    if len("\n".join([*lines, candidate_line])) > 1200 and lines:
-                        break
-                    lines.append(candidate_line)
-                    url = public_url(item.get("url"))
-                    if url:
-                        sources.append((title or (urlsplit(url).hostname or ""), url))
-                    if len(lines) >= 5:
-                        break
-                text = "\n".join(lines).strip()
-                if not text:
-                    raise Rejected("search_no_grounding")
-                return SearchResult(text, tuple(sources[:5]))
-            if response.status_code not in {400, 404, 405}:
-                raise Rejected("web_search_failed")
-        async with client.stream(
-            "POST",
-            clean_base + "/chat/completions",
-            headers=headers,
-            json={
-                "model": model or "deepseek-flash",
-                "messages": [
-                    {"role": "system", "content": SEARCH_INSTRUCTION},
-                    {"role": "user", "content": query},
-                ],
-                "tools": [{"type": "deepseek_web_search", "name": "deepseek_web_search"}],
-                "max_tokens": 800,
-            },
-        ) as chat_response:
-            if chat_response.status_code != 200:
-                raise Rejected("web_search_failed")
-            chat_data = await _read_bounded_json(chat_response)
+            async with client.stream(
+                "POST",
+                clean_base + "/chat/completions",
+                headers=headers,
+                json={
+                    "model": model or "deepseek-flash",
+                    "messages": [
+                        {"role": "system", "content": SEARCH_INSTRUCTION},
+                        {"role": "user", "content": query},
+                    ],
+                    "tools": [{"type": "deepseek_web_search", "name": "deepseek_web_search"}],
+                    "max_tokens": 800,
+                },
+            ) as chat_response:
+                if chat_response.status_code != 200:
+                    raise Rejected("web_search_failed")
+                chat_data = await _read_bounded_json(chat_response)
+    except (httpx.HTTPError, TimeoutError):
+        raise Rejected("web_search_failed") from None
     choices = chat_data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise Rejected("web_search_failed")
@@ -886,6 +889,7 @@ class WebSearch:
         timeout_seconds: float = 20.0,
         plugin_bus: Any = None,
         remote_only: bool | None = None,
+        search_trace: dict[str, Any] | None = None,
     ) -> str:
         """Run remote `web_tools.search` under kernel budget/screening gates, or fall back."""
 
@@ -898,6 +902,19 @@ class WebSearch:
                     res = await res
                 if res is False:
                     raise Rejected("reply_invalidated")
+
+        def call_ai_search():
+            kwargs: dict[str, Any] = {
+                "before_call": before_call,
+                "cancel_event": cancel_event,
+            }
+            if search_trace is not None:
+                sig = inspect.signature(ai.search)
+                if "search_trace" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    kwargs["search_trace"] = search_trace
+            return ai.search(query, subject, **kwargs)
 
         bus = plugin_bus if plugin_bus is not None else self.plugin_bus
         strict_remote = self.remote_only_enabled(remote_only=remote_only)
@@ -937,12 +954,7 @@ class WebSearch:
                         await asyncio.shield(self._release_unused_attempt(attempt))
                         released_for_fallback = True
                         log.debug("event=web_search_remote_fallback reason=%s", code)
-                        return await ai.search(
-                            query,
-                            subject,
-                            before_call=before_call,
-                            cancel_event=cancel_event,
-                        )
+                        return await call_ai_search()
                     raise
                 rendered = parsed.render(self.store.s)
                 await ai.screen(
@@ -956,6 +968,8 @@ class WebSearch:
                 remote_ok = True
                 remote_qcount = qcount
                 remote_provider = used_provider
+                if search_trace is not None:
+                    search_trace["provider"] = used_provider
                 return rendered
             finally:
                 if not released_for_fallback:
@@ -972,9 +986,4 @@ class WebSearch:
             await guard()
             raise Rejected("web_tools_remote_unavailable")
 
-        return await ai.search(
-            query,
-            subject,
-            before_call=before_call,
-            cancel_event=cancel_event,
-        )
+        return await call_ai_search()

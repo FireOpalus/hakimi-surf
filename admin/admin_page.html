@@ -5828,7 +5828,9 @@ function diagnosticCell(row){
   }
   const tags=modelFailureLabels, box=el('details'),last=attempts[attempts.length-1];
   const capacity=last.model_lane==='memory_flex'&&last.http_status===503;
-  box.append(el('summary',capacity?'Flex 容量繁忙（HTTP 503）':tags.stage[last.stage]+' · '+tags.cause[last.cause]));
+  const stages=[...new Set(attempts.map(a=>tags.stage[a.stage]).filter(Boolean))];
+  const summaryText=capacity?'Flex 容量繁忙（HTTP 503）':(stages.length>1?stages.join(' + ')+'（'+attempts.length+' 条）':tags.stage[last.stage]+' · '+tags.cause[last.cause]+(attempts.length>1?'（'+attempts.length+' 次）':''));
+  box.append(el('summary',summaryText));
   const seconds=ms=>(ms/1000).toLocaleString('zh-CN',{maximumFractionDigits:3})+' 秒';
   for(const a of attempts){
     const parts=[tags.stage[a.stage],tags.provider[a.provider],tags.lane[a.model_lane],tags.cause[a.cause]];
@@ -5848,8 +5850,23 @@ function diagnosticCell(row){
   return box;
 }
 function auditOutcome(r){
-  const s=r.execution_status, raw=r.execution_detail||'', incident=r.provider_incident;
+  const s=r.execution_status, raw=r.execution_detail||'', incident=r.provider_incident, ws=r.web_search;
   const details=[], reason=rejectDetails[raw]||raw;
+  const lookupScore=r.scores?.need_external_lookup?.noul;
+  if(ws){
+    const trig={explicit:'指令',gate:'门卫',model:'模型主动'}[ws.trigger]||'';
+    const st={grounded:'已检索',unavailable:'检索失败',disabled:'检索已关',skipped_query:'跳过检索'}[ws.status]||ws.status;
+    const prov={google:'Google',deepseek:'DeepSeek',remote:'远程插件',searxng:'SearXNG',tavily:'Tavily',brave:'Brave',duckduckgo:'DuckDuckGo'}[ws.provider]||ws.provider||'';
+    const extra=[];
+    if(trig)extra.push(trig);
+    if(prov)extra.push(ws.fallback?'兜底 '+prov:prov);
+    if(ws.retried)extra.push(ws.status==='grounded'&&!ws.fallback?'重试成功':'已重试');
+    if(ws.reason&&ws.status!=='grounded')extra.push(ws.reason);
+    if(lookupScore!==null&&lookupScore!==undefined)extra.push('p='+Number(lookupScore).toFixed(3));
+    details.push('联网 '+st+(extra.length?'（'+extra.join(' / ')+'）':''));
+  }else if(lookupScore!==null&&lookupScore!==undefined&&Number(lookupScore)>=0.35){
+    details.push('联网分 p='+Number(lookupScore).toFixed(3));
+  }
   if(incident){
     const provider=incident.provider==='vertex_paid'?'Vertex AI':'Gemini Developer API';
     const code=incident.code==='unknown'?'上游未提供可识别错误码':incident.code;
