@@ -17,7 +17,7 @@ INTEREST_TTL = 9000
 SOCIAL_LOW = 30
 CHAT_SOCIAL_COST = 1.25
 OWNER_CHAT_SOCIAL_COST = 0.0
-CHAT_ENERGY_COST = 0.4
+CHAT_ENERGY_COST = 0.2
 CHAT_BOREDOM_DELTA = -2
 OWNER_CHAT_BOREDOM_DELTA = -3
 AWAKE_SECONDS_PER_POINT = 600
@@ -25,7 +25,7 @@ REST_SECONDS_PER_POINT = 120
 HOURLY_RATES = {
     "sleep": (15, -4),
     "day_rest": (10, -4),  # Energy uses piecewise DAY_REST_ENERGY_SEGMENTS; tail is 10/hr.
-    "idle": (-3, 24),
+    "idle": (-2, 24),
     "mc_work": (-8, -6),
     "mc_play": (-4, -10),
 }
@@ -35,6 +35,10 @@ DAY_REST_ENERGY_SEGMENTS: tuple[tuple[int, int | None, float], ...] = (
     (1800, None, 10.0),  # > 30 min: 1 pt / 6 min
 )
 MAX_DAY_REST_MINUTES = 90
+MAX_DAY_REST_PER_DAY = 2
+DAY_REST_COOLDOWN_SECONDS = 3 * 3600
+DAY_REST_PRE_SLEEP_MINUTES = 120
+NON_MILESTONE_MC_ACTIONS = frozenset({"chat", "observe", "goto", "follow", "shelter", "chest"})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS world_rhythm (
@@ -45,9 +49,10 @@ CREATE TABLE IF NOT EXISTS world_rhythm (
  interest_topic TEXT DEFAULT '', interest_until REAL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS world_day_rest (
- id INTEGER PRIMARY KEY CHECK(id=1), started REAL NOT NULL, ends REAL NOT NULL, source TEXT NOT NULL
+ id INTEGER PRIMARY KEY CHECK(id=1), started REAL NOT NULL, ends REAL NOT NULL,
+ source TEXT NOT NULL, day_key TEXT DEFAULT '', day_count INTEGER DEFAULT 0
 );
-INSERT OR IGNORE INTO world_day_rest VALUES (1,0,0,'');
+INSERT OR IGNORE INTO world_day_rest(id,started,ends,source) VALUES (1,0,0,'');
 CREATE TABLE IF NOT EXISTS world_changes (
  receipt TEXT PRIMARY KEY, at REAL NOT NULL, reason TEXT NOT NULL, energy_before REAL,
  energy_after REAL, boredom_before INTEGER, boredom_after INTEGER,
@@ -131,6 +136,16 @@ class WorldExperience:
             if "interest_until" not in cols:
                 await self.store.db.execute(
                     "ALTER TABLE world_rhythm ADD COLUMN interest_until REAL DEFAULT 0"
+                )
+        rest_cols = {row[1] for row in await self.store.all("PRAGMA table_info(world_day_rest)")}
+        if rest_cols:
+            if "day_key" not in rest_cols:
+                await self.store.db.execute(
+                    "ALTER TABLE world_day_rest ADD COLUMN day_key TEXT DEFAULT ''"
+                )
+            if "day_count" not in rest_cols:
+                await self.store.db.execute(
+                    "ALTER TABLE world_day_rest ADD COLUMN day_count INTEGER DEFAULT 0"
                 )
         first = await self.store.db.execute(
             "INSERT OR IGNORE INTO world_rhythm(id,settled,tired) "
@@ -237,7 +252,7 @@ class WorldExperience:
     async def _values(self):
         return await self.store.one(
             "SELECT r.*,w.energy,w.boredom,w.focus_level,w.mood,d.started,d.ends,d.source,"
-            "s.charge,s.last_reply_at,s.active_turns "
+            "d.day_key,d.day_count,s.charge,s.last_reply_at,s.active_turns "
             "FROM world_rhythm r JOIN world_state w ON w.singleton=r.id "
             "JOIN world_day_rest d ON d.id=r.id "
             "JOIN world_social_battery s ON s.id=r.id WHERE r.id=1"
@@ -329,6 +344,30 @@ class WorldExperience:
             await self.advance_tx(now)
         await self.world.refresh()
 
+    def _day_rest_usage(self, row, now: float) -> tuple[str, int, int]:
+        today_iso = datetime.fromtimestamp(now, self.zone).date().isoformat()
+        count_today = int(row["day_count"] or 0) if (row["day_key"] or "") == today_iso else 0
+        cooldown_remaining = 0
+        if row["source"] == "planner" and row["ends"] > 0 and row["ends"] <= now:
+            elapsed = now - row["ends"]
+            if 0 <= elapsed < DAY_REST_COOLDOWN_SECONDS:
+                cooldown_remaining = int(DAY_REST_COOLDOWN_SECONDS - elapsed)
+        return today_iso, count_today, cooldown_remaining
+
+    def _near_bedtime_for_day_rest(self, now: float) -> bool:
+        if DAY_REST_PRE_SLEEP_MINUTES <= 0:
+            return False
+        rest = self.store.runtime.rest_hours
+        if not rest.enabled:
+            return False
+        local_dt = datetime.fromtimestamp(now, self.zone)
+        if rest.active(local_dt):
+            return True
+        sleep_min, _ = hours_bounds(rest.rest_hours)
+        cur_min = local_dt.hour * 60 + local_dt.minute
+        mins_until_sleep = (sleep_min - cur_min) % 1440
+        return 0 < mins_until_sleep <= DAY_REST_PRE_SLEEP_MINUTES
+
     async def _can_rest_tx(self, row, now):
         if (
             now < row["settled"]
@@ -338,7 +377,11 @@ class WorldExperience:
             or row["focus_level"] == "HIGH"
             or not self.store.runtime.rest_hours.day_rest_enabled
             or self.store.runtime.is_resting(now)
+            or self._near_bedtime_for_day_rest(now)
         ):
+            return False
+        _, count_today, cooldown_sec = self._day_rest_usage(row, now)
+        if count_today >= MAX_DAY_REST_PER_DAY or cooldown_sec > 0:
             return False
         return not await self.store.one(
             "SELECT 1 FROM scheduled_intents WHERE status='executing' AND expire_at>? LIMIT 1",
@@ -351,8 +394,11 @@ class WorldExperience:
         row = await self._values()
         if until <= now or not await self._can_rest_tx(row, now):
             return False
+        today_iso, count_today, _ = self._day_rest_usage(row, now)
         await self.store.db.execute(
-            "UPDATE world_day_rest SET started=?,ends=?,source='planner' WHERE id=1", (now, until)
+            "UPDATE world_day_rest SET started=?,ends=?,source='planner',day_key=?,day_count=? "
+            "WHERE id=1",
+            (now, until, today_iso, count_today + 1),
         )
         await self.store.db.execute(
             "UPDATE world_state SET mood='resting' WHERE singleton=1 AND current_module='idle'"
@@ -434,6 +480,12 @@ class WorldExperience:
         }
         if not (video or mc):
             return
+        if (
+            mc
+            and event.event_type == "mc_goal_completed"
+            and str(data.get("action_type") or "").strip().lower() in NON_MILESTONE_MC_ACTIONS
+        ):
+            return
         now = event.created_at
         await self.advance_tx(now)
         seconds = max(0, min(3600, float(data.get("learning_seconds") or 0))) if video else 0
@@ -442,7 +494,7 @@ class WorldExperience:
             "event:" + event.id,
             now,
             reason,
-            -2 - seconds / 300 if video else -1,
+            -2 - seconds / 300 if video else 0,
             -7 - seconds / 600 if video else -6,
             seconds=seconds,
         ):
@@ -559,9 +611,9 @@ class WorldExperience:
             cur_min = local_dt.hour * 60 + local_dt.minute
             if 0 <= (cur_min - wake_min) % 1440 < 25:
                 return "just_woke_up"
-            if energy < 35 or 0 < (sleep_min - cur_min) % 1440 <= 30:
+            if energy < 25 or 0 < (sleep_min - cur_min) % 1440 <= 30:
                 return "bedtime_drowsy"
-        return "bedtime_drowsy" if energy < 35 else ""
+        return "bedtime_drowsy" if energy < 25 else ""
 
     async def touch_owner_tx(self, now: float) -> None:
         await self.store.db.execute(
@@ -724,8 +776,12 @@ class WorldExperience:
                 )
             )[0]
         interest = row["interest_topic"] if row["interest_until"] > now else ""
+        _, count_today, cooldown_sec = self._day_rest_usage(row, now)
         return {
             "day_rest_available": can_rest,
+            "day_rest_count_today": count_today,
+            "day_rest_remaining_today": max(0, MAX_DAY_REST_PER_DAY - count_today),
+            "day_rest_cooldown_minutes": (cooldown_sec + 59) // 60 if cooldown_sec > 0 else 0,
             "public_unshared_count": count,
             "social_battery": charge,
             "owner_longing": self._owner_longing(row["last_owner_at"], now),

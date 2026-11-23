@@ -1301,6 +1301,30 @@ function isSolidNonHazardWall(blk) {
   return blk.boundingBox !== "empty";
 }
 
+async function waitForShaftLanding(
+  bot,
+  targetFootY,
+  { signal = null, timeoutMs = 1400, pollMs = 40 } = {},
+) {
+  // Only poll gravity settlement when the runtime exposes real physics onGround state.
+  if (typeof bot.entity?.onGround !== "boolean") return true;
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() < deadline) {
+    if (signal?.aborted) return false;
+    const curY = Number(bot.entity?.position?.y);
+    if (Number.isFinite(curY) && curY <= targetFootY + 0.15 && bot.entity.onGround === true) {
+      if (pollMs > 0) {
+        await sleepAbortable(Math.min(120, pollMs * 3), signal);
+      }
+      return true;
+    }
+    const okWait = await sleepAbortable(Math.max(10, pollMs), signal);
+    if (!okWait) return false;
+  }
+  const finalY = Number(bot.entity?.position?.y);
+  return Number.isFinite(finalY) && finalY <= targetFootY + 0.25;
+}
+
 export async function executeShelterAction(
   bot,
   params,
@@ -1310,6 +1334,8 @@ export async function executeShelterAction(
     timeOfDay = "",
     gotoGoal = null,
     autoEquip = true,
+    settleTimeoutMs = 1400,
+    settlePollMs = 40,
   } = {},
 ) {
   const parsed = parseShelterParams(params);
@@ -1332,59 +1358,61 @@ export async function executeShelterAction(
   const by = Math.floor(origin.y);
   const bz = Math.floor(origin.z);
 
-  if (effectiveMode === "exit") {
-    const cap = Array.isArray(state.capPos) ? state.capPos : [bx, by + 2, bz];
-    const digBlockSafe = async (x, y, z) => {
-      if (signal?.aborted || typeof bot.dig !== "function") return;
-      const blk = bot.blockAt(vec3(x, y, z));
-      if (!blk) return;
-      const name = normalizeCanonicalItemId(blk.name);
-      if (!name || REPLACEABLE_BLOCKS.has(name) || isHazardousBlock(blk)) return;
-      if (!SHELTER_DIGGABLE_TERRAIN.has(name) && !SHELTER_CAP_BLOCKS.has(name)) return;
-      if (!checkHarvestToolTier(bot, name).ok) return;
-      if (autoEquip) {
-        await equipBestHarvestTool(bot, blk);
-      }
-      try {
-        await bot.dig(blk);
-      } catch {
-        // Best-effort exit dig
-      }
-    };
+  const digBlockSafe = async (x, y, z) => {
+    if (signal?.aborted || typeof bot.dig !== "function") return;
+    const blk = bot.blockAt(vec3(x, y, z));
+    if (!blk) return;
+    const name = normalizeCanonicalItemId(blk.name);
+    if (!name || REPLACEABLE_BLOCKS.has(name) || isHazardousBlock(blk)) return;
+    if (!SHELTER_DIGGABLE_TERRAIN.has(name) && !SHELTER_CAP_BLOCKS.has(name)) return;
+    if (!checkHarvestToolTier(bot, name).ok) return;
+    if (autoEquip) {
+      await equipBestHarvestTool(bot, blk);
+    }
+    try {
+      await bot.dig(blk);
+    } catch {
+      // Best-effort exit dig
+    }
+  };
 
-    // 1. Open roof cap above head
-    await digBlockSafe(cap[0], cap[1], cap[2]);
-    await digBlockSafe(cap[0], cap[1] + 1, cap[2]);
-
-    // 2. Carve a safe 2-step staircase out in the first hazard-free cardinal direction
+  const carveStaircaseOut = async (shaftX, footY, shaftZ, surfaceY) => {
     const dirs = [
       [1, 0],
       [-1, 0],
       [0, 1],
       [0, -1],
     ];
-    let exitTarget = [bx, cap[1] + 1, bz];
+    let exitTarget = [shaftX, surfaceY, shaftZ];
     for (const [dx, dz] of dirs) {
-      const s1a = bot.blockAt(vec3(bx + dx, by + 1, bz + dz));
-      const s1b = bot.blockAt(vec3(bx + dx, by + 2, bz + dz));
-      const s2a = bot.blockAt(vec3(bx + dx * 2, by + 2, bz + dz * 2));
+      const s1a = bot.blockAt(vec3(shaftX + dx, footY + 1, shaftZ + dz));
+      const s1b = bot.blockAt(vec3(shaftX + dx, footY + 2, shaftZ + dz));
+      const s2a = bot.blockAt(vec3(shaftX + dx * 2, footY + 2, shaftZ + dz * 2));
       if (isHazardousBlock(s1a) || isHazardousBlock(s1b) || isHazardousBlock(s2a)) continue;
-      await digBlockSafe(bx + dx, by + 1, bz + dz);
-      await digBlockSafe(bx + dx, by + 2, bz + dz);
-      await digBlockSafe(bx + dx, by + 3, bz + dz);
-      await digBlockSafe(bx + dx * 2, by + 2, bz + dz * 2);
-      await digBlockSafe(bx + dx * 2, by + 3, bz + dz * 2);
-      exitTarget = [bx + dx * 3, Math.max(by + 3, cap[1] + 1), bz + dz * 3];
+      await digBlockSafe(shaftX + dx, footY + 1, shaftZ + dz);
+      await digBlockSafe(shaftX + dx, footY + 2, shaftZ + dz);
+      await digBlockSafe(shaftX + dx, footY + 3, shaftZ + dz);
+      await digBlockSafe(shaftX + dx * 2, footY + 2, shaftZ + dz * 2);
+      await digBlockSafe(shaftX + dx * 2, footY + 3, shaftZ + dz * 2);
+      exitTarget = [shaftX + dx * 3, Math.max(footY + 3, surfaceY), shaftZ + dz * 3];
       break;
     }
-
     if (typeof gotoGoal === "function" && !signal?.aborted) {
       try {
         await gotoGoal(new GoalNear(exitTarget[0], exitTarget[1], exitTarget[2], 2), signal);
       } catch {
-        // Ignore exit walk errors; shelter roof is already open
+        // Best-effort exit walk
       }
     }
+  };
+
+  if (effectiveMode === "exit") {
+    const cap = Array.isArray(state.capPos) ? state.capPos : [bx, by + 2, bz];
+    // 1. Open roof cap above head
+    await digBlockSafe(cap[0], cap[1], cap[2]);
+    await digBlockSafe(cap[0], cap[1] + 1, cap[2]);
+    // 2. Carve a safe 2-step staircase out in the first hazard-free cardinal direction
+    await carveStaircaseOut(bx, by, bz, cap[1] + 1);
 
     state.active = false;
     state.capPos = null;
@@ -1510,18 +1538,15 @@ export async function executeShelterAction(
     }
   }
 
-  // Ensure at least one solid side wall at cap height (by - 1) to attach roof cap
-  let anchorWall = null;
-  let anchorFace = null;
+  // Collect all solid side wall candidates at cap height (by - 1) to attach roof cap
+  const anchorCandidates = [];
   for (const [dx, dz] of cardinalOffsets) {
     const wall = bot.blockAt(vec3(bx + dx, by - 1, bz + dz));
     if (isSolidNonHazardWall(wall)) {
-      anchorWall = wall;
-      anchorFace = vec3(-dx, 0, -dz);
-      break;
+      anchorCandidates.push({ dx, dz, face: vec3(-dx, 0, -dz) });
     }
   }
-  if (!anchorWall || !anchorFace) {
+  if (anchorCandidates.length === 0) {
     return {
       ok: false,
       mode: "enter",
@@ -1532,6 +1557,7 @@ export async function executeShelterAction(
   }
 
   // Dig 3 blocks straight down safely (zero fall damage: 3 blocks)
+  let dugCount = 0;
   for (const blk of digTargets) {
     if (signal?.aborted) {
       return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
@@ -1541,7 +1567,12 @@ export async function executeShelterAction(
     }
     try {
       await bot.dig(blk);
+      dugCount += 1;
     } catch {
+      if (dugCount >= 2) {
+        const curFootY = Math.min(by - dugCount, Math.floor(Number(bot.entity?.position?.y ?? by - dugCount)));
+        await carveStaircaseOut(bx, curFootY, bz, by);
+      }
       return {
         ok: false,
         mode: "enter",
@@ -1556,20 +1587,65 @@ export async function executeShelterAction(
     return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
   }
 
-  // Seal roof cap at (bx, by - 1, bz) — 1 full block above head (by - 2), zero suffocation
+  // Wait for gravity settlement to the bottom of the 3-block shaft (by - 3) before placing cap
+  // at (by - 1), otherwise the player's own head hitbox still overlaps (by - 1) and rejects placeBlock.
+  await waitForShaftLanding(bot, by - 3, {
+    signal,
+    timeoutMs: settleTimeoutMs,
+    pollMs: settlePollMs,
+  });
+
+  if (signal?.aborted) {
+    return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
+  }
+
+  // Seal roof cap at (bx, by - 1, bz) — try all valid solid side wall anchors
   const freshCapItem =
     getInventoryItems(bot).find((it) => SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it))) ||
     capItem;
+  let sealed = false;
   try {
     await bot.equip(freshCapItem, "hand");
-    await bot.placeBlock(anchorWall, anchorFace);
+    for (const { dx, dz, face } of anchorCandidates) {
+      const liveWall = bot.blockAt(vec3(bx + dx, by - 1, bz + dz));
+      if (!isSolidNonHazardWall(liveWall)) continue;
+      if (typeof bot.lookAt === "function" && liveWall.position) {
+        try {
+          await bot.lookAt(
+            vec3(
+              liveWall.position.x + 0.5 + face.x * 0.5,
+              liveWall.position.y + 0.5,
+              liveWall.position.z + 0.5 + face.z * 0.5,
+            ),
+            true,
+          );
+        } catch {
+          // Ignore lookAt errors
+        }
+      }
+      try {
+        await bot.placeBlock(liveWall, face);
+        sealed = true;
+        break;
+      } catch {
+        // Try next solid side wall anchor
+      }
+    }
   } catch {
+    sealed = false;
+  }
+
+  if (!sealed) {
+    // Never leave the bot trapped in an unsealed 3-deep open shaft: carve staircase out to surface.
+    const curFootY = Math.min(by - 3, Math.floor(Number(bot.entity?.position?.y ?? by - 3)));
+    await carveStaircaseOut(bx, curFootY, bz, by);
     return {
       ok: false,
       mode: "enter",
       sheltered: false,
+      escaped: true,
       reason: "shelter_seal_failed",
-      summary: "掩体封顶失败",
+      summary: "掩体封顶失败，已自动挖出逃生台阶返回地面",
     };
   }
 

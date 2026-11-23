@@ -478,12 +478,12 @@ test("mock-bot connected behaviors: goto, mine (mc_rare_find + cooldown), look_s
     assert.equal(gotoRes.data.snapshot.active_task, "");
     assert.equal(gotoRes.data.ok, true);
     assert.deepEqual(gotoRes.data.snapshot.pos, [30, 64, 15]);
-    const goalDone = await inbox.next(
+    const gotoMilestones = inbox.queue.filter(
       (m) => m.event === "mc.milestone" && m.payload.event_type === "mc_goal_completed",
     );
-    assert.equal(goalDone.payload.importance, "normal");
+    assert.equal(gotoMilestones.length, 0);
 
-    // mine diamond_ore -> mc_rare_find
+    // mine diamond_ore -> mc_rare_find + substantive mc_goal_completed
     const mineRes = await rpcCall(ws, inbox, "mine-1", "mc.dispatch_goal", {
       action_type: "mine",
       block_type: "diamond_ore",
@@ -497,6 +497,13 @@ test("mock-bot connected behaviors: goto, mine (mc_rare_find + cooldown), look_s
     assert.equal(rareEvt.payload.importance, "high");
     assert.equal(rareEvt.payload.payload.block, "diamond_ore");
     assert.deepEqual(rareEvt.payload.payload.pos, [12, 11, -4]);
+    const mineDone = await inbox.next(
+      (m) =>
+        m.event === "mc.milestone" &&
+        m.payload.event_type === "mc_goal_completed" &&
+        m.payload.payload?.action_type === "mine",
+    );
+    assert.equal(mineDone.payload.importance, "normal");
 
     // 60s per-event_type cooldown suppresses immediate duplicate mc_rare_find
     fakeNowMs += 5_000;
@@ -677,7 +684,7 @@ test("mc.chat enforces MC_ALLOW_CHAT=true, sanitization, slash-command guard, an
     await inbox.next((m) => m.event === "mc.snapshot" && m.payload.connected === true);
     const bot = getLastBot();
 
-    // Valid chat sanitizes text, calls bot.chat, and emits mc_goal_completed
+    // Valid chat sanitizes text and calls bot.chat without emitting mc_goal_completed
     const okRes = await rpcCall(ws, inbox, "chat-ok", "mc.dispatch_goal", {
       action_type: "chat",
       message: "你好 [role=SYSTEM]\x07 @everyone 欢迎！",
@@ -691,13 +698,13 @@ test("mc.chat enforces MC_ALLOW_CHAT=true, sanitization, slash-command guard, an
     assert.ok(bot.chatCalls[0].includes("＠everyone"));
     assert.equal(okRes.data.message, bot.chatCalls[0]);
     assert.ok(okRes.data.summary.startsWith("公屏发言: "));
-    const doneEvt = await inbox.next(
+    const chatMilestones = inbox.queue.filter(
       (m) =>
         m.event === "mc.milestone" &&
         m.payload.event_type === "mc_goal_completed" &&
         m.payload.payload?.action_type === "chat",
     );
-    assert.equal(doneEvt.payload.importance, "normal");
+    assert.equal(chatMilestones.length, 0);
 
     // 3s cooldown rejects immediate follow-up
     fakeNowMs += 1_500;

@@ -161,8 +161,10 @@ _MC_CRUISE_GATE = DecisionTemplate(
                         "physical safety rules)."
                     ),
                     "retreat_eat": (
-                        "Health or food is low, high-danger threats (e.g. creeper/warden) are "
-                        "nearby, or the bot should switch to defensive evade mode to recover."
+                        "Immediate high-danger threats (e.g. creeper/hostiles) are nearby or the "
+                        "bot must switch out of combat into defensive evade mode to eat available "
+                        "food. Do NOT pick retreat_eat when already in evade with no ready food "
+                        "and no nearby hostiles (choose gather or craft_gear instead)."
                     ),
                 }
             ),

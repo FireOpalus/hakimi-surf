@@ -2462,7 +2462,6 @@ export class McRuntime {
       const summary = `已到达(${Math.round(coords.x)},${Math.round(coords.y)},${Math.round(coords.z)})附近`;
       this.activity = this.paused ? "已暂停" : "原地待命";
       this._emitSnapshot();
-      this._emitMilestone("mc_goal_completed", "normal", { action_type: "goto", summary });
       return {
         ok: true,
         accepted: true,
@@ -2511,7 +2510,9 @@ export class McRuntime {
         };
       }
       const summary = `探索至(${targetX},${targetZ}) 发现稀有矿${rare.length}处 告示牌${signs.length}块`;
-      this._emitMilestone("mc_goal_completed", "normal", { action_type: "explore", summary });
+      if (rare.length > 0 || signs.length > 0) {
+        this._emitMilestone("mc_goal_completed", "normal", { action_type: "explore", summary });
+      }
       return {
         ok: true,
         accepted: true,
@@ -2810,7 +2811,6 @@ export class McRuntime {
         };
       }
       const summary = `已跟随${sanitizeMcText(matched.username, 24)}`;
-      this._emitMilestone("mc_goal_completed", "normal", { action_type: "follow", summary });
       return {
         ok: true,
         accepted: true,
@@ -2840,7 +2840,9 @@ export class McRuntime {
         signs.length > 0
           ? `查看${signs.length}块告示牌: ${signs[0].slice(0, 40)}`
           : `观察周围 发现实体${this.nearbyEntities.length}个 稀有矿${rare.length}处`;
-      this._emitMilestone("mc_goal_completed", "normal", { action_type: actionType, summary });
+      if (actionType === "read_sign" && signs.length > 0) {
+        this._emitMilestone("mc_goal_completed", "normal", { action_type: actionType, summary });
+      }
       return {
         ok: true,
         accepted: true,
@@ -2929,7 +2931,6 @@ export class McRuntime {
       this.activity = this.paused ? "已暂停" : "原地待命";
       this._emitSnapshot();
       const summary = "公屏发言: " + cleanMsg.slice(0, 40);
-      this._emitMilestone("mc_goal_completed", "normal", { action_type: "chat", summary });
       return {
         ok: true,
         accepted: true,
@@ -3335,14 +3336,6 @@ export class McRuntime {
           snapshot: this.getSnapshot(),
         };
       }
-      if (outcome?.ok) {
-        this._emitMilestone("mc_goal_completed", "normal", {
-          action_type: "chest",
-          mode: outcome.mode,
-          summary: outcome.summary,
-          chest_pos: outcome.chest_pos,
-        });
-      }
       return {
         ok: Boolean(outcome?.ok),
         accepted: true,
@@ -3501,14 +3494,6 @@ export class McRuntime {
           summary: outcome.timedOut ? "掩体操作超时" : "掩体操作已取消",
           snapshot: this.getSnapshot(),
         };
-      }
-      if (outcome?.ok) {
-        this._emitMilestone("mc_goal_completed", "normal", {
-          action_type: "shelter",
-          mode: outcome.mode,
-          sheltered: outcome.sheltered,
-          summary: outcome.summary,
-        });
       }
       return {
         ok: Boolean(outcome?.ok),

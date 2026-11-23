@@ -2647,3 +2647,98 @@ async def test_mc_initial_15s_cold_start_wood_shortfall_and_shelter_action() -> 
         assert plugin.brain.recent_turns[-1]["outcome"] == "shelter:entered"
     finally:
         await plugin.close()
+
+
+async def test_cruise_gate_retreat_eat_escalates_when_evading_with_zero_food():
+    clock_now = [1000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:12141/ws/plugin",
+        token="test-token",
+        clock=lambda: clock_now[0],
+        enable_brain=True,
+    )
+    dispatched: list[dict[str, Any]] = []
+    generate_calls = 0
+
+    async def fake_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+        if action == "mc.dispatch_goal":
+            dispatched.append(dict(params))
+        return {"ok": True, "accepted": True}
+
+    async def fake_budget(_lane: str = "proactive") -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "template": MC_CRUISE_GATE_TEMPLATE,
+            "decisions": {
+                "should_replan": {
+                    "type": "noul",
+                    "value": True,
+                    "noul": 0.9,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "retreat_eat",
+                    "confidence": 0.92,
+                    "probabilities": {"retreat_eat": 0.92},
+                    "confident": True,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, _payload: dict[str, Any], **_kw: Any) -> str:
+        nonlocal generate_calls
+        generate_calls += 1
+        return json.dumps(
+            {
+                "action": "gather",
+                "block_type": "oak_log",
+                "count": 3,
+                "reason": "没有食物且白天安全，先砍木头做工具",
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Daytime, already in evade, low HP, 0 food, no hostiles -> MUST escalate to Layer 2.
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                health=5.3,
+                food=17,
+                time_of_day="day",
+                combat_mode="evade",
+                inventory_summary=[],
+                nearby_entities=[],
+            )
+        )
+        await plugin.brain._execute_cycle("cruise")
+        assert generate_calls == 1
+        assert dispatched[-1]["action_type"] == "gather"
+
+        # 2. Same evade state WITH ready food -> Layer 1 handles retreat_eat without waking Layer 2.
+        dispatched.clear()
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                health=5.3,
+                food=14,
+                time_of_day="day",
+                combat_mode="evade",
+                inventory_summary=["bread:3"],
+                nearby_entities=[],
+            )
+        )
+        await plugin.brain._execute_cycle("cruise")
+        assert generate_calls == 1
+        assert plugin.status_dict()["brain_last_reason"] == "cruise_gate:retreat_eat"
+    finally:
+        await plugin.close()

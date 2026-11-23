@@ -3,10 +3,15 @@ import json
 
 import pytest
 
+from hakimi import world_experience
 from hakimi.bili_watcher import BiliPolicy
 from hakimi.modules.actions import Outcome
 from hakimi.rest_policy import RestHoursConfig
-from hakimi.world_experience import day_rest_energy_delta
+from hakimi.world_experience import (
+    DAY_REST_COOLDOWN_SECONDS,
+    MAX_DAY_REST_PER_DAY,
+    day_rest_energy_delta,
+)
 from hakimi.world_state import WorldStateManager
 from tests.test_proactive_dm import dm as dm
 from tests.test_proactive_dm import stamp
@@ -51,7 +56,7 @@ async def test_chosen_nap_recovers_fractional_energy_and_survives_restart(dm, me
     assert restarted.current.energy == 33 and dm.store.runtime.day_rest_end(dm.clock()) == end
     dm.time[0] = end + 600
     await restarted.experience.advance(dm.clock())
-    assert restarted.current.energy == 56.5
+    assert restarted.current.energy == 56.7
     assert dm.store.runtime.rest_kind(dm.clock()) == "awake"
 
 
@@ -74,7 +79,7 @@ async def test_planner_can_choose_daytime_rest_and_does_not_turn_idle_into_sleep
     await engine.set_rest_policy(RestHoursConfig(day_rest_enabled=True))
     dm.time[0] += 600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 90.5 and not dm.store.runtime.day_rest_end(dm.clock())
+    assert world.current.energy == 90.7 and not dm.store.runtime.day_rest_end(dm.clock())
 
 
 async def test_planner_can_choose_rest_with_all_platforms_disabled(dm):
@@ -86,12 +91,18 @@ async def test_planner_can_choose_rest_with_all_platforms_disabled(dm):
     assert fake.calls[0][1]["available_actions"] == []
     assert dm.store.runtime.day_rest_end(dm.clock()) == dm.clock() + 1800
     dm.time[0] += 1800
-    # At wake-up the next decision may start a new nap immediately.
+    # Immediately after wake-up, cooldown blocks a back-to-back nap.
+    blocked = await engine.trigger_plan_once()
+    assert blocked["status"] == "resting" and blocked["reason"] == "no_available_actions"
+    assert not dm.store.runtime.day_rest_end(dm.clock())
+    # Once the 3h cooldown expires, a second nap is permitted.
+    dm.time[0] += DAY_REST_COOLDOWN_SECONDS
     assert (await engine.trigger_plan_once())["planning_mode"] == "revision"
     assert dm.store.runtime.day_rest_end(dm.clock()) == dm.clock() + 1800
 
 
-async def test_nap_defers_discretionary_work_and_ends_before_daily_digest(dm):
+async def test_nap_defers_discretionary_work_and_ends_before_daily_digest(dm, monkeypatch):
+    monkeypatch.setattr(world_experience, "DAY_REST_PRE_SLEEP_MINUTES", 0)
     engine = dm.service.life_engine
     await engine.set_rest_policy(RestHoursConfig(rest_hours="22:30-09:00"))
     start = dm.time[0] = stamp("2026-11-14T22:04:00")
@@ -116,19 +127,19 @@ async def test_sleep_vs_quiet_time_and_confirmed_energy_charges(dm, message):
     await world.update_state(energy=50)
     dm.time[0] += 600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 49.5
+    assert world.current.energy == 49.7
     await engine.set_rest_policy(RestHoursConfig(rest_hours="12:10-13:00"))
     dm.time[0] += 239
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 50.4
-    dm.time[0] += 1
+    assert world.current.energy == 50.6
+    dm.time[0] += 9
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 50.5
+    assert world.current.energy == 50.7
     async with dm.store.transaction():
         for _ in range(2):
             await world.experience.confirmed_tx(message, "one-turn", dm.clock(), [])
     await world.refresh()
-    assert world.current.energy == 50.1
+    assert world.current.energy == 50.5
     await world.update_state(energy=99)
     dm.time[0] = now + 3500
     await world.experience.advance(dm.clock())
@@ -152,7 +163,7 @@ async def test_work_ends_nap_and_only_confirmed_mc_time_consumes_energy(dm):
     await world.experience.mc_snapshot("", dm.clock())
     dm.time[0] += 3600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 31
+    assert world.current.energy == 32
 
 
 async def test_legacy_forced_nap_ends_on_upgrade_after_settling_elapsed_time(dm):
@@ -257,9 +268,77 @@ async def test_day_rest_piecewise_recovery_is_tick_invariant_and_resets_per_nap(
         await world.experience.advance(dm.clock())
         assert world.current.energy == expected
 
-    # A fresh nap resets the piecewise curve back to 1 pt / 1 min for its first 10 minutes.
+    # After cooldown expires, a fresh nap resets the piecewise curve back to 1 pt / 1 min.
+    dm.time[0] += DAY_REST_COOLDOWN_SECONDS
+    await world.experience.advance(dm.clock())
+    await world.update_state(energy=50)
     choose_rest(dm, 10)
     await engine.trigger_plan_once()
     dm.time[0] += 600
     await world.experience.advance(dm.clock())
     assert world.current.energy == 60.0
+
+
+async def test_day_rest_enforces_cooldown_daily_cap_and_pre_sleep_cutoff(dm):
+    engine, world = dm.service.life_engine, dm.service.world_state
+    await engine.set_rest_policy(RestHoursConfig(rest_hours="23:00-08:00"))
+    dm.time[0] = stamp("2026-11-15T10:00:00")
+    await world.experience.advance(dm.clock())
+    await world.update_state(energy=25)
+
+    # Nap #1 at 10:00..10:20 succeeds
+    choose_rest(dm, 20)
+    await engine.trigger_plan_once()
+    assert dm.store.runtime.day_rest_end(dm.clock()) == stamp("2026-11-15T10:20:00")
+    prefs = await world.experience.preferences(dm.clock())
+    assert prefs["day_rest_count_today"] == 1
+    assert prefs["day_rest_remaining_today"] == MAX_DAY_REST_PER_DAY - 1
+
+    # Right after waking at 10:20 -> blocked by 3h cooldown
+    dm.time[0] = stamp("2026-11-15T10:20:00")
+    await world.experience.advance(dm.clock())
+    prefs_cd = await world.experience.preferences(dm.clock())
+    assert not prefs_cd["day_rest_available"]
+    assert prefs_cd["day_rest_cooldown_minutes"] == DAY_REST_COOLDOWN_SECONDS // 60
+
+    # Nap #2 at 13:20..13:40 succeeds once cooldown elapses
+    dm.time[0] = stamp("2026-11-15T13:20:00")
+    await world.experience.advance(dm.clock())
+    choose_rest(dm, 20)
+    await engine.trigger_plan_once()
+    assert dm.store.runtime.day_rest_end(dm.clock()) == stamp("2026-11-15T13:40:00")
+
+    # Even after 3h+ cooldown at 17:00, daily cap (2/day) blocks a 3rd nap
+    dm.time[0] = stamp("2026-11-15T17:00:00")
+    await world.experience.advance(dm.clock())
+    prefs_cap = await world.experience.preferences(dm.clock())
+    assert not prefs_cap["day_rest_available"]
+    assert prefs_cap["day_rest_count_today"] == MAX_DAY_REST_PER_DAY
+    assert prefs_cap["day_rest_remaining_today"] == 0
+
+    # Next day resets the daily counter; within 2h of 23:00 bedtime (21:00) is blocked
+    dm.time[0] = stamp("2026-11-16T20:59:00")
+    await world.experience.advance(dm.clock())
+    assert (await world.experience.preferences(dm.clock()))["day_rest_available"]
+    dm.time[0] = stamp("2026-11-16T21:00:00")
+    await world.experience.advance(dm.clock())
+    assert not (await world.experience.preferences(dm.clock()))["day_rest_available"]
+
+
+async def test_world_day_rest_legacy_table_auto_migrates_day_columns(settings, store):
+    now = stamp("2026-11-14T11:00:00")
+    async with store.transaction():
+        await store.db.execute("DROP TABLE IF EXISTS world_day_rest")
+        await store.db.execute(
+            "CREATE TABLE world_day_rest ("
+            "id INTEGER PRIMARY KEY CHECK(id=1), started REAL NOT NULL, ends REAL NOT NULL, "
+            "source TEXT NOT NULL)"
+        )
+        await store.db.execute("INSERT INTO world_day_rest VALUES (1,0,0,'')")
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    cols = {r[1] for r in await store.all("PRAGMA table_info(world_day_rest)")}
+    assert {"day_key", "day_count"} <= cols
+    prefs = await world.experience.preferences(now)
+    assert prefs["day_rest_count_today"] == 0
+    assert prefs["day_rest_remaining_today"] == MAX_DAY_REST_PER_DAY

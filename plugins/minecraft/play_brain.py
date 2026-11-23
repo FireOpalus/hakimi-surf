@@ -89,6 +89,62 @@ _CHAT_DETAIL_HINTS = (
 )
 _HUNTABLE_MOBS = frozenset({"cow", "pig", "sheep", "chicken", "rabbit", "mooshroom"})
 _COOKABLE_RAW_FOODS = frozenset({"beef", "porkchop", "mutton", "chicken", "rabbit", "potato"})
+_READY_SAFE_FOODS = frozenset(
+    {
+        "bread",
+        "cooked_beef",
+        "cooked_porkchop",
+        "cooked_mutton",
+        "cooked_chicken",
+        "cooked_rabbit",
+        "cooked_cod",
+        "cooked_salmon",
+        "baked_potato",
+        "apple",
+        "golden_apple",
+        "enchanted_golden_apple",
+        "carrot",
+        "golden_carrot",
+        "melon_slice",
+        "sweet_berries",
+        "glow_berries",
+        "pumpkin_pie",
+        "cookie",
+        "beetroot",
+        "beetroot_soup",
+        "mushroom_stew",
+        "rabbit_stew",
+        "dried_kelp",
+        "honey_bottle",
+    }
+)
+_HOSTILE_ENTITY_TOKENS = (
+    "zombie",
+    "skeleton",
+    "creeper",
+    "spider",
+    "enderman",
+    "witch",
+    "pillager",
+    "vindicator",
+    "evoker",
+    "ravager",
+    "drowned",
+    "husk",
+    "stray",
+    "phantom",
+    "blaze",
+    "ghast",
+    "hoglin",
+    "piglin_brute",
+    "slime",
+    "magma_cube",
+    "warden",
+    "breeze",
+    "bogged",
+    "silverfish",
+    "vex",
+)
 _CHAINABLE_ACTIONS = frozenset(
     {"gather", "mine", "craft", "smelt", "hunt", "place", "chest", "sleep", "goto"}
 )
@@ -1218,6 +1274,18 @@ class McPlayBrain:
             }
         )
 
+    def _has_ready_food(self, snap: Any) -> bool:
+        return any(self._inventory_count(snap, food_id) >= 1 for food_id in _READY_SAFE_FOODS)
+
+    @staticmethod
+    def _has_nearby_hostile(snap: Any) -> bool:
+        entities = getattr(snap, "nearby_entities", ()) or ()
+        for ent in entities:
+            lower = str(ent).lower()
+            if any(tok in lower for tok in _HOSTILE_ENTITY_TOKENS):
+                return True
+        return False
+
     def _has_actionable_food_option(self, snap: Any) -> bool:
         if (
             self._inventory_count(snap, "wheat") >= 3
@@ -1393,7 +1461,15 @@ class McPlayBrain:
 
         # 1. High-confidence emergency defensive retreat takes precedence over no-replan skip.
         if stance == "retreat_eat" and stance_conf >= direct_conf:
-            if cur_mode != "evade":
+            has_ready_food = self._has_ready_food(snap)
+            has_hostile = self._has_nearby_hostile(snap)
+            is_night = str(getattr(snap, "time_of_day", "") or "").lower() in {"night", "dusk"}
+            # Break low-HP + zero-food deadlock: when already in evade with no ready food
+            # and no active daytime threat (or at night needing shelter/bed), escalate to Layer 2
+            # so the bot can hunt/gather/craft food or build shelter instead of idling in evade.
+            if cur_mode == "evade" and not has_ready_food and (not has_hostile or is_night):
+                return "escalate", None
+            if cur_mode != "evade" or has_hostile:
                 res = await self._dispatch_goal_result({"action_type": "evade"})
                 if not self._receipt_ok(res):
                     reason = str((res or {}).get("reason") or "dispatch_rejected")

@@ -923,7 +923,7 @@ class WorldStateManager:
             hints.append("深夜睡眠时段被唤醒(可自然督促BOISER早点睡)")
         elif circadian == "just_woke_up":
             hints.append("刚睡醒还有点迷糊")
-        elif circadian == "bedtime_drowsy" or self.current.energy < 35:
+        elif circadian == "bedtime_drowsy" or self.current.energy < 25:
             hints.append("精力偏低有点犯困")
         if charge < 35 and not owner_dm:
             hints.append("社交电量偏低想简短接话")

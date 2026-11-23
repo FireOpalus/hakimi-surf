@@ -561,3 +561,84 @@ test("water float reflex, anti-underfoot dig guard, wood shortfall calculation, 
 
   shelterRuntime.stop();
 });
+
+test("mc.shelter waits for physical shaft landing before sealing and carves staircase escape on seal failure", async () => {
+  const buildBlocks = () => {
+    const map = new Map();
+    for (let y = 60; y <= 63; y += 1) {
+      for (let x = -3; x <= 3; x += 1) {
+        for (let z = -3; z <= 3; z += 1) {
+          map.set(`${x},${y},${z}`, { name: "dirt", position: vec3(x, y, z) });
+        }
+      }
+    }
+    return map;
+  };
+
+  // 1. Physics bot: dig leaves bot mid-fall; placeBlock rejects if bot hasn't landed at y=61 yet.
+  const physBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "dirt", type: 3, count: 6 }],
+    blocks: buildBlocks(),
+  });
+  physBot.entity.onGround = true;
+  const origDig = physBot.dig.bind(physBot);
+  physBot.dig = async (blk) => {
+    await origDig(blk);
+    if (blk.position.y === 61) {
+      // Simulate mid-fall at y=62.5 before landing on y=61 after 60ms
+      physBot.entity.position = vec3(0, 62.5, 0);
+      physBot.entity.onGround = false;
+      setTimeout(() => {
+        physBot.entity.position = vec3(0, 61, 0);
+        physBot.entity.onGround = true;
+      }, 60);
+    }
+  };
+  let placeY = null;
+  const origPlace = physBot.placeBlock.bind(physBot);
+  physBot.placeBlock = async (ref, face) => {
+    placeY = physBot.entity.position.y;
+    if (placeY > 61.15) {
+      throw new Error("hitbox_intersects_target_block");
+    }
+    return origPlace(ref, face);
+  };
+
+  const settledRes = await executeShelterAction(
+    physBot,
+    { mode: "enter" },
+    { settleTimeoutMs: 500, settlePollMs: 15 },
+  );
+  assert.equal(settledRes.ok, true);
+  assert.equal(settledRes.sheltered, true);
+  assert.equal(placeY, 61);
+
+  // 2. If all 4 side wall placeBlock attempts fail, bot carves staircase out instead of staying buried.
+  const stuckBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "dirt", type: 3, count: 6 }],
+    blocks: buildBlocks(),
+  });
+  stuckBot.placeBlock = async () => {
+    throw new Error("server_rejected_place");
+  };
+  let escapedGoal = null;
+  const failRes = await executeShelterAction(
+    stuckBot,
+    { mode: "enter" },
+    {
+      gotoGoal: async (goal) => {
+        escapedGoal = goal;
+      },
+      settleTimeoutMs: 50,
+      settlePollMs: 0,
+    },
+  );
+  assert.equal(failRes.ok, false);
+  assert.equal(failRes.reason, "shelter_seal_failed");
+  assert.equal(failRes.escaped, true);
+  // 3 shaft blocks + staircase blocks carved out
+  assert.ok(stuckBot._dug.length > 3);
+  assert.ok(escapedGoal);
+});

@@ -45,7 +45,7 @@ async def test_migration_elapsed_rest_and_restart(settings, store):
     restarted = WorldStateManager(settings, store, clock=lambda: end)
     await restarted.initialize()
     await asyncio.gather(*(restarted.experience.advance(end) for _ in range(4)))
-    assert (restarted.current.energy, restarted.current.boredom) == (80.5, 52)
+    assert (restarted.current.energy, restarted.current.boredom) == (81.0, 52)
     assert restarted.current.mood == "sleeping"
     rows = await store.all("SELECT reason,energy_after-energy_before AS d FROM world_changes")
     assert sum(r["d"] for r in rows if r["reason"] == "sleep") == 30
@@ -147,7 +147,7 @@ async def test_private_news_stays_scoped_with_one_shared_social_charge(settings,
         await x.confirmed_tx(friend, "reference", now, [secret])
     assert not await x.news(friend, now)
     assert await x.battery(friend, now) == await x.battery(grp, now) == 96.25
-    assert (await world.refresh()).energy == 74.8
+    assert (await world.refresh()).energy == 75.4
 
 
 async def test_shared_recharge_excludes_overlapping_chats_then_uses_actual_rest(
@@ -179,7 +179,7 @@ async def test_shared_recharge_excludes_overlapping_chats_then_uses_actual_rest(
     reopened = WorldStateManager(settings, store, clock=lambda: now)
     await reopened.initialize()
     assert await reopened.experience.battery(message, now) == 52.5
-    assert reopened.current.energy == 81.1  # -0.4 chat, -1.0 idle, +0.5 sleep, +2.0 nap (0-10m).
+    assert reopened.current.energy == 81.7  # -0.2 chat, -0.67 idle, +0.5 sleep, +2.0 nap (0-10m).
     now += 24 * 3600
     assert await reopened.experience.battery(message, now) == 100
 
@@ -224,7 +224,7 @@ async def test_interrupted_turn_recharges_offline_and_old_ack_stays_charged(
     async with store.transaction():
         await reopened.experience.confirmed_tx(message, "delivered", now - 600, ["收到"])
     assert await reopened.experience.battery(message, now) == 51.0
-    assert reopened.current.energy == 79.1
+    assert reopened.current.energy == 79.5
 
 
 async def test_low_energy_indicator_is_available_in_status(settings, store):
@@ -364,7 +364,8 @@ async def test_living_states_longing_interest_circadian_and_owner_zero_social_co
     # 5. Circadian tags at bedtime / sleep window
     assert x.circadian_tag(stamp(23, 0), energy=80.0) == "bedtime_drowsy"
     assert x.circadian_tag(stamp(23, 30), energy=80.0) == "late_night_catch"
-    assert x.circadian_tag(stamp(15, 0), energy=30.0) == "bedtime_drowsy"
+    assert x.circadian_tag(stamp(15, 0), energy=30.0) == ""
+    assert x.circadian_tag(stamp(15, 0), energy=20.0) == "bedtime_drowsy"
     assert x.circadian_tag(stamp(15, 0), energy=80.0) == ""
 
 
@@ -400,7 +401,7 @@ async def test_mc_online_companion_sets_medium_focus_and_releases(settings, stor
 async def test_boredom_deltas_idle_rate_and_owner_longing_slope(settings, store, message):
     assert CHAT_BOREDOM_DELTA == -2
     assert OWNER_CHAT_BOREDOM_DELTA == -3
-    assert HOURLY_RATES["idle"] == (-3, 24)
+    assert HOURLY_RATES["idle"] == (-2, 24)
     now = stamp(14)
     assert WorldExperience._owner_longing(now - 7200, now) == 0
     assert WorldExperience._owner_longing(now - 5 * 3600, now) == 30
@@ -419,3 +420,39 @@ async def test_boredom_deltas_idle_rate_and_owner_longing_slope(settings, store,
         await x.confirmed_tx(message, "owner-1", now, ["在呢"])
     await world.refresh()
     assert world.current.boredom == 15
+
+
+async def test_mc_goal_completed_ignores_non_substantive_actions_and_preserves_energy(
+    settings, store, message
+):
+    now = stamp(15)
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    await PlannerJournal(store).initialize(now)
+    x = world.experience
+    await world.update_state(energy=70, boredom=40)
+
+    # Non-substantive actions (chat/observe/goto/follow/shelter/chest) are ignored completely.
+    for action_type in ("chat", "observe", "goto", "follow", "shelter", "chest"):
+        await world.publish_event(
+            "minecraft",
+            "mc_goal_completed",
+            {"action_type": action_type, "summary": f"routine:{action_type}"},
+            business_key=f"skip-{action_type}",
+        )
+    assert world.current.energy == 70
+    assert world.current.boredom == 40
+    assert world.current.mood != "pleased"
+    assert await x.news(message, now) == []
+
+    # Substantive MC goal reduces boredom & posts news WITHOUT double-charging energy.
+    await world.publish_event(
+        "minecraft",
+        "mc_goal_completed",
+        {"action_type": "craft", "summary": "合成铁镐 x1"},
+        business_key="craft-iron-pick",
+    )
+    assert world.current.energy == 70
+    assert world.current.boredom == 34
+    assert world.current.mood == "pleased"
+    assert [n["title"] for n in await x.news(message, now)] == ["合成铁镐 x1"]

@@ -3282,8 +3282,8 @@ body:not(.authenticated) main {
       <div id="life-changes" class="table"></div>
     </details>
     <details><summary>精力与无聊度怎样结算</summary>
-      <p class="muted">定时睡眠每 4 分钟恢复 1 点精力，小憩前 10 分钟每 1 分钟恢复 1 点、10–30 分钟每 2 分钟恢复 1 点、30 分钟后每 6 分钟恢复 1 点。清醒空闲时精力持平。MC 任务每小时消耗 8 点精力。</p>
-      <p class="muted">每轮成功回复消耗 0.1 点精力。完成视频学习消耗 2 点，每学习 5 分钟再扣 1 点。MC 完成任务或发现稀有资源各扣 1 点。</p>
+      <p class="muted">定时睡眠每 4 分钟恢复 1 点精力，小憩前 10 分钟每 1 分钟恢复 1 点、10–30 分钟每 2 分钟恢复 1 点、30 分钟后每 6 分钟恢复 1 点（每日最多 2 次，冷却 3 小时，入睡前 2 小时不小憩）。清醒空闲每小时消耗 2 点精力。MC 任务每小时消耗 8 点精力（在线陪伴 4 点）。</p>
+      <p class="muted">每轮成功回复消耗 0.2 点精力。完成视频学习消耗 2 点，每学习 5 分钟再扣 1 点。MC 里程碑不再额外重复扣精力。</p>
     </details>
     <details><summary>社交电量与待分享见闻</summary>
       <p class="muted">群聊与私聊共享 100 点电量。每轮成功回复扣 0.25 点，多个气泡合计一次。聊天期间暂停恢复。没在聊天时，清醒每 5 分钟回 1 点，睡眠或小憩每 2 分钟回 1 点。</p>
@@ -3340,7 +3340,7 @@ body:not(.authenticated) main {
       <div class="grid"><label>入睡时间<input id="rest-start" type="time" required></label><label>起床时间<input id="rest-end" type="time" required></label></div>
       <p id="wake-window" class="rhythm-preview" aria-live="polite"></p>
       <div class="grid"><label for="life-max-daily">自主活动共用每日上限（0–30 次）<input id="life-max-daily" type="number" min="0" max="30" step="1" required></label></div>
-      <p class="muted">白天由哈基米结合精力、无聊度与挂念值自行安排活动或小憩。入睡–起床时段统一作为睡眠与主动消息免打扰时间；清醒每小时消耗 3 点精力并累积 12 点无聊度，睡眠每 4 分钟恢复 1 点，小憩前 10 分钟每 1 分钟恢复 1 点、10–30 分钟每 2 分钟恢复 1 点、30 分钟后每 6 分钟恢复 1 点。</p>
+      <p class="muted">白天由哈基米结合精力、无聊度与挂念值自行安排活动或小憩。入睡–起床时段统一作为睡眠与主动消息免打扰时间；清醒每小时消耗 2 点精力并累积 24 点无聊度，睡眠每 4 分钟恢复 1 点，小憩前 10 分钟每 1 分钟恢复 1 点、10–30 分钟每 2 分钟恢复 1 点、30 分钟后每 6 分钟恢复 1 点（每日最多 2 次，冷却 3 小时，入睡前 2 小时不小憩）。</p>
       <details>
         <summary>规划与休眠间隔</summary>
         <div class="grid">
