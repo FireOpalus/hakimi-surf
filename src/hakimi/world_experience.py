@@ -24,11 +24,16 @@ AWAKE_SECONDS_PER_POINT = 600
 REST_SECONDS_PER_POINT = 120
 HOURLY_RATES = {
     "sleep": (15, -4),
-    "day_rest": (10, -4),
+    "day_rest": (10, -4),  # Energy uses piecewise DAY_REST_ENERGY_SEGMENTS; tail is 10/hr.
     "idle": (-3, 24),
     "mc_work": (-8, -6),
     "mc_play": (-4, -10),
 }
+DAY_REST_ENERGY_SEGMENTS: tuple[tuple[int, int | None, float], ...] = (
+    (0, 600, 60.0),  # 0–10 min: 1 pt / 1 min
+    (600, 1800, 30.0),  # 10–30 min: 1 pt / 2 min
+    (1800, None, 10.0),  # > 30 min: 1 pt / 6 min
+)
 MAX_DAY_REST_MINUTES = 90
 
 SCHEMA = """
@@ -85,6 +90,21 @@ def energy_parts(points, remainder, delta):
     pending = (remainder + delta) * 10 - tenths
     visible = round(points + (tenths + trunc(round(pending, 8))) / 10, 1)
     return visible, round(total - visible, 12)
+
+
+def day_rest_energy_delta(started: float, left: float, right: float) -> float:
+    """Integrate piecewise daytime nap energy recovery over [left, right] since nap start."""
+    if right <= left:
+        return 0.0
+    t0 = max(0.0, left - started)
+    t1 = max(t0, right - started)
+    delta = 0.0
+    for seg_start, seg_end, hourly_rate in DAY_REST_ENERGY_SEGMENTS:
+        lo = max(t0, seg_start)
+        hi = t1 if seg_end is None else min(t1, seg_end)
+        if hi > lo:
+            delta += (hi - lo) * hourly_rate / 3600.0
+    return delta
 
 
 class WorldExperience:
@@ -275,10 +295,14 @@ class WorldExperience:
                 charge = self._recharge(charge, reason, seconds)
             if reason == "bili_read":
                 continue  # Debit reading time only on a confirmed learning receipt.
-            rates = HOURLY_RATES[reason]
-            await self._change_tx(
-                None, right, reason, *(r * seconds / 3600 for r in rates), seconds=seconds
+            energy_rate, boredom_rate = HOURLY_RATES[reason]
+            energy_delta = (
+                day_rest_energy_delta(row["started"], left, right)
+                if reason == "day_rest"
+                else energy_rate * seconds / 3600
             )
+            boredom_delta = boredom_rate * seconds / 3600
+            await self._change_tx(None, right, reason, energy_delta, boredom_delta, seconds=seconds)
         await self.store.db.execute("UPDATE world_rhythm SET settled=? WHERE id=1", (now,))
         if charge != row["charge"]:
             await self.store.db.execute(

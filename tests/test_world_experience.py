@@ -179,7 +179,7 @@ async def test_shared_recharge_excludes_overlapping_chats_then_uses_actual_rest(
     reopened = WorldStateManager(settings, store, clock=lambda: now)
     await reopened.initialize()
     assert await reopened.experience.battery(message, now) == 52.5
-    assert reopened.current.energy == 79.4  # -0.4 chat, -0.5 idle, +0.5 sleep, +0.3 nap.
+    assert reopened.current.energy == 81.1  # -0.4 chat, -1.0 idle, +0.5 sleep, +2.0 nap (0-10m).
     now += 24 * 3600
     assert await reopened.experience.battery(message, now) == 100
 

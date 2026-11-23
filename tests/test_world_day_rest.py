@@ -6,6 +6,7 @@ import pytest
 from hakimi.bili_watcher import BiliPolicy
 from hakimi.modules.actions import Outcome
 from hakimi.rest_policy import RestHoursConfig
+from hakimi.world_experience import day_rest_energy_delta
 from hakimi.world_state import WorldStateManager
 from tests.test_proactive_dm import dm as dm
 from tests.test_proactive_dm import stamp
@@ -43,14 +44,14 @@ async def test_chosen_nap_recovers_fractional_energy_and_survives_restart(dm, me
     assert len(fake.calls) == 1
     dm.time[0] = start + 359
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 27.9
+    assert world.current.energy == 32.9
     dm.time[0] += 1
     restarted = WorldStateManager(dm.s, dm.store, clock=dm.clock)
     await restarted.initialize()
-    assert restarted.current.energy == 28 and dm.store.runtime.day_rest_end(dm.clock()) == end
+    assert restarted.current.energy == 33 and dm.store.runtime.day_rest_end(dm.clock()) == end
     dm.time[0] = end + 600
     await restarted.experience.advance(dm.clock())
-    assert restarted.current.energy == 41.5
+    assert restarted.current.energy == 56.5
     assert dm.store.runtime.rest_kind(dm.clock()) == "awake"
 
 
@@ -69,11 +70,11 @@ async def test_planner_can_choose_daytime_rest_and_does_not_turn_idle_into_sleep
     dm.time[0] += 720
     await engine.set_rest_policy(RestHoursConfig(day_rest_enabled=False))
     assert not dm.store.runtime.day_rest_end(dm.clock())
-    assert world.current.energy == 82
+    assert world.current.energy == 91
     await engine.set_rest_policy(RestHoursConfig(day_rest_enabled=True))
     dm.time[0] += 600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 81.5 and not dm.store.runtime.day_rest_end(dm.clock())
+    assert world.current.energy == 90.5 and not dm.store.runtime.day_rest_end(dm.clock())
 
 
 async def test_planner_can_choose_rest_with_all_platforms_disabled(dm):
@@ -143,15 +144,15 @@ async def test_work_ends_nap_and_only_confirmed_mc_time_consumes_energy(dm):
     assert dm.store.runtime.day_rest_end(start) == start + 1800
     dm.time[0] += 360
     await world.experience.mc_snapshot("mine", dm.clock())
-    assert not dm.store.runtime.day_rest_end(dm.clock()) and world.current.energy == 30
+    assert not dm.store.runtime.day_rest_end(dm.clock()) and world.current.energy == 35
     for _ in range(15):
         dm.time[0] += 30
         await world.experience.mc_snapshot("mine", dm.clock())
-    assert world.current.energy == 29
+    assert world.current.energy == 34
     await world.experience.mc_snapshot("", dm.clock())
     dm.time[0] += 3600
     await world.experience.advance(dm.clock())
-    assert world.current.energy == 26
+    assert world.current.energy == 31
 
 
 async def test_legacy_forced_nap_ends_on_upgrade_after_settling_elapsed_time(dm):
@@ -167,7 +168,7 @@ async def test_legacy_forced_nap_ends_on_upgrade_after_settling_elapsed_time(dm)
     for _ in range(2):
         reopened = WorldStateManager(dm.s, dm.store, clock=dm.clock)
         await reopened.initialize()
-        assert reopened.current.energy == 22
+        assert reopened.current.energy == 31
         assert dm.store.runtime.rest_kind(dm.clock()) == "awake"
 
 
@@ -213,3 +214,52 @@ async def test_daytime_choices_can_include_exploration_and_a_later_activity(
     await engine.tick_gatekeeper_once()
     assert visited == [key]
     assert await state(dm, key) == ("done", "patrol_completed")
+
+
+def test_day_rest_energy_delta_piecewise_rates():
+    start = 1000.0
+    assert day_rest_energy_delta(start, start, start) == 0.0
+    assert day_rest_energy_delta(start, start + 10, start) == 0.0
+    # 0–10 min: 1 pt / 1 min
+    assert day_rest_energy_delta(start, start, start + 60) == pytest.approx(1.0)
+    assert day_rest_energy_delta(start, start, start + 600) == pytest.approx(10.0)
+    # 10–30 min: 1 pt / 2 min
+    assert day_rest_energy_delta(start, start + 600, start + 720) == pytest.approx(1.0)
+    assert day_rest_energy_delta(start, start + 600, start + 1800) == pytest.approx(10.0)
+    assert day_rest_energy_delta(start, start, start + 1800) == pytest.approx(20.0)
+    # > 30 min: 1 pt / 6 min
+    assert day_rest_energy_delta(start, start + 1800, start + 2160) == pytest.approx(1.0)
+    assert day_rest_energy_delta(start, start, start + 3600) == pytest.approx(25.0)
+    assert day_rest_energy_delta(start, start, start + 5400) == pytest.approx(30.0)
+    # Cross-boundary spans
+    assert day_rest_energy_delta(start, start + 480, start + 720) == pytest.approx(3.0)
+    assert day_rest_energy_delta(start, start + 1680, start + 2160) == pytest.approx(2.0)
+
+
+async def test_day_rest_piecewise_recovery_is_tick_invariant_and_resets_per_nap(dm):
+    engine, world = dm.service.life_engine, dm.service.world_state
+    await world.update_state(energy=20)
+    choose_rest(dm, 90)
+    await engine.trigger_plan_once()
+    start = dm.clock()
+
+    # Step across 10m and 30m boundaries with an uneven 37s cadence and verify exact milestones.
+    for target, expected in (
+        (start + 600, 30.0),
+        (start + 1800, 40.0),
+        (start + 3600, 45.0),
+        (start + 5400, 50.0),
+    ):
+        while dm.time[0] + 37 < target:
+            dm.time[0] += 37
+            await world.experience.advance(dm.clock())
+        dm.time[0] = target
+        await world.experience.advance(dm.clock())
+        assert world.current.energy == expected
+
+    # A fresh nap resets the piecewise curve back to 1 pt / 1 min for its first 10 minutes.
+    choose_rest(dm, 10)
+    await engine.trigger_plan_once()
+    dm.time[0] += 600
+    await world.experience.advance(dm.clock())
+    assert world.current.energy == 60.0

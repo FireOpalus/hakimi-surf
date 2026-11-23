@@ -224,8 +224,9 @@ LIFE_PLAN_INSTRUCTION = """你是「吉米奈喵」（咕咕噜·吉米尼·吉�
 - mood 用简短词表达真实心境（如 curious/cozy/playful/pleased/sleepy/calm）；
   mood_longnick 可选填 ≤30 字活人感纯文本心情个签（不含链接、编号、人名或
   Markdown），不想换填 ""。
-- 当 energy < 35 且 day_rest_available=true 时优先小憩 30～60 分钟
-  （rest_minutes 填分钟数且 current_module="idle"）；清醒不小憩时 rest_minutes 必须为 0。
+- 当 energy < 35 且 day_rest_available=true 时优先小憩（前 10 分钟每 1 分钟回 1 点，
+  10～30 分钟每 2 分钟回 1 点，30 分钟后每 6 分钟回 1 点，通常 10～30 分钟即可明显回神，
+  rest_minutes 填分钟数且 current_module="idle"）；清醒不小憩时 rest_minutes 必须为 0。
 - 当 boredom >= 60 时，主动从 available_actions 挑选合适活动排进 intents 找点事做；当
   owner_longing >= 50 且 owner_dm_available=true 时，可考虑温和地排一条 target_scope="owner"
   的社交动作找 BOISER 搭话；若有 interest_lingering，可用于触发心情签名 mood_longnick 或日常分享。
