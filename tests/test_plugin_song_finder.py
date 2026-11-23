@@ -1196,13 +1196,258 @@ def test_build_song_finder_plugin_from_env(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setenv("HAKIMI_PLUGIN_SONG_FINDER_TOKEN", "sf-test-token")
     monkeypatch.setenv("SONG_FINDER_PROVIDER_ORDER", "bilibili_public,youtube")
+    monkeypatch.setenv("SONG_FINDER_NODE_REGION", "CN")
     monkeypatch.setenv("SONG_FINDER_PROXY_URL", "http://127.0.0.1:7890")
     monkeypatch.setenv("SONG_FINDER_COOLDOWN_SECONDS", "900")
     plugin = build_song_finder_plugin_from_env()
     assert plugin.client.config.plugin_id == "song_finder"
+    assert plugin.client.config.node_region == "CN"
     assert plugin.client.config.scopes == ("actions",)
     assert plugin.client.config.admin_panel is None
     assert plugin.client.max_blob_bytes == SONG_FINDER_MAX_BLOB_BYTES
     assert plugin.engine.provider_order == ("bilibili_public", "youtube")
     assert plugin.engine.providers["youtube"].proxy_url == "http://127.0.0.1:7890"
     assert plugin.engine.circuit_breaker.base_cooldown_seconds == 900.0
+    assert plugin._status_payload()["node_region"] == "CN"
+
+
+async def test_bili_anon_spi_buvid_and_targeted_candidate_fetch_and_admin_routes(
+    settings, fake_media_bins, tmp_path: Path
+):
+    """Verify anonymous SPI buvid3/4, targeted candidate_id fetch, and Song Studio APIs."""
+    from pydantic import SecretStr
+
+    from hakimi.app import create_app
+    from hakimi_plugin_sdk import ToolCallResult
+
+    seen_cookies: dict[str, list[str]] = {}
+    spi_calls = 0
+
+    def spi_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal spi_calls
+        path = request.url.path
+        cookie = request.headers.get("cookie", "")
+        seen_cookies.setdefault(path, []).append(cookie)
+        assert "SESSDATA" not in cookie and "bili_jct" not in cookie
+        if path == "/x/frontend/finger/spi":
+            spi_calls += 1
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"b_3": "ANON_B3_TEST_1234", "b_4": "ANON_B4_TEST_5678"}},
+            )
+        if path == "/x/web-interface/nav":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "wbi_img": {
+                            "img_url": "https://i0.hdslb.com/bfs/wbi/" + "a" * 32 + ".png",
+                            "sub_url": "https://i0.hdslb.com/bfs/wbi/" + "b" * 32 + ".png",
+                        }
+                    },
+                },
+            )
+        if path == "/x/web-interface/wbi/search/type":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "result": [
+                            {
+                                "bvid": "BV1epqZBVEPY",
+                                "title": "反乌托邦Pt.2 官方版",
+                                "author": "亚细亚旷世奇才",
+                                "duration": "3:01",
+                            }
+                        ]
+                    },
+                },
+            )
+        if path == "/x/web-interface/view":
+            if "buvid3=ANON_B3_TEST_1234" not in cookie:
+                return httpx.Response(412, text="Precondition Failed")
+            return httpx.Response(
+                200, json={"code": 0, "data": {"cid": 34842478523, "duration": 181}}
+            )
+        if path == "/x/player/wbi/playurl":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "dash": {
+                            "audio": [
+                                {
+                                    "bandwidth": 202288,
+                                    "baseUrl": "https://edge.mountaintoys.cn/blocked.m4s",
+                                    "backupUrl": [
+                                        "https://upos-sz-estgoss.bilivideo.com/clean_audio.m4s"
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                },
+            )
+        if request.url.host == "upos-sz-estgoss.bilivideo.com":
+            return httpx.Response(206, content=b"M4S_CLEAN_AUDIO" * 1024)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(spi_handler), follow_redirects=False
+    ) as http:
+        bili = BilibiliPublicProvider(http=http)
+        engine = SongFinderEngine(
+            youtube=YouTubeProvider(yt_dlp_bin=fake_media_bins["yt_dlp"]),
+            bilibili_public=bili,
+            provider_order=("bilibili_public",),
+            ffmpeg_bin=fake_media_bins["ffmpeg"],
+            ffprobe_bin=fake_media_bins["ffprobe"],
+        )
+        sr = await engine.search("反乌托邦Pt.2", limit=5)
+        assert sr["provider_used"] == "bilibili_public"
+        assert len(sr["candidates"]) == 1
+        assert sr["candidates"][0]["candidate_id"] == "bilibili_public:BV1epqZBVEPY"
+        assert spi_calls == 1
+
+        # Direct targeted fetch by candidate_id bypasses search & skips non-allowlisted baseUrl
+        fetched = await engine.fetch_source(
+            query="反乌托邦Pt.2",
+            title="反乌托邦Pt.2",
+            candidate_id="bilibili_public:BV1epqZBVEPY",
+        )
+        assert fetched.provider == "bilibili_public"
+        assert fetched.source_id == "BV1epqZBVEPY"
+        assert spi_calls == 1
+        assert "buvid3=ANON_B3_TEST_1234" in seen_cookies["/x/web-interface/view"][0]
+
+        with pytest.raises(SongFinderError) as bad_cid:
+            await engine.fetch_source(candidate_id="bilibili_public:INVALID")
+        assert bad_cid.value.code == "invalid_query"
+
+    # Admin API E2E: /admin/api/songs exposes song_finder status + search-sources/fetch-to-inbox
+    admin_tok = "test-admin-token-song-finder-ui"
+    s = settings.model_copy(
+        update={
+            "data_dir": tmp_path / "sf_admin_data",
+            "admin_token": SecretStr(admin_tok),
+        }
+    )
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        compute = _FakeColabCompute(is_configured=True)
+        svc.songs.compute = compute
+        svc.colab_compute = compute
+        fetch_calls: list[dict[str, Any]] = []
+
+        class _MockFinderBus:
+            def has_tool(
+                self, plugin_id: str, action_name: str, *, require_enabled: bool = True
+            ) -> bool:
+                del require_enabled
+                return plugin_id == "song_finder" and action_name in {
+                    "song_finder.search",
+                    "song_finder.fetch_source",
+                }
+
+            def get_plugin_runtime_status(
+                self, plugin_id: str, *, require_enabled: bool = True
+            ) -> dict[str, Any] | None:
+                del require_enabled
+                if plugin_id != "song_finder":
+                    return None
+                return {
+                    "online": True,
+                    "node_region": "CN",
+                    "status": {
+                        "node_region": "CN",
+                        "provider_order": ["bilibili_public"],
+                        "providers": {
+                            "bilibili_public": {
+                                "cooling_down": False,
+                                "cooldown_remaining_sec": 0,
+                                "consecutive_risk_hits": 0,
+                                "last_error": "",
+                            }
+                        },
+                    },
+                }
+
+            async def invoke_tool(
+                self, _pid: str, action: str, arguments: dict[str, Any], **_kw: Any
+            ) -> ToolCallResult:
+                if action == "song_finder.search":
+                    return ToolCallResult(
+                        data={
+                            "provider_used": "bilibili_public",
+                            "skipped_providers": {},
+                            "candidates": [
+                                {
+                                    "candidate_id": "bilibili_public:BV1epqZBVEPY",
+                                    "provider": "bilibili_public",
+                                    "title": "反乌托邦Pt.2",
+                                    "uploader": "亚细亚旷世奇才",
+                                    "duration_sec": 181.0,
+                                    "url": "https://www.bilibili.com/video/BV1epqZBVEPY",
+                                    "score": 5.5,
+                                }
+                            ],
+                        }
+                    )
+                fetch_calls.append(dict(arguments))
+                raw = b"M4A_FETCHED_FOR_INBOX"
+                return ToolCallResult(
+                    data={
+                        "provider": "bilibili_public",
+                        "source_id": "BV1epqZBVEPY",
+                        "title": "反乌托邦Pt.2",
+                        "uploader": "亚细亚旷世奇才",
+                        "duration_sec": 181.0,
+                        "format": "m4a",
+                        "filename": "反乌托邦Pt_2.m4a",
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    },
+                    blob=raw,
+                    blob_mime_type="audio/mp4",
+                    blob_filename="反乌托邦Pt_2.m4a",
+                )
+
+        svc.songs.plugin_bus = _MockFinderBus()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        ) as client:
+            ov = await client.get("/admin/api/songs")
+            assert ov.status_code == 200
+            sf = ov.json()["song_finder"]
+            assert sf["online"] is True and sf["node_region"] == "CN"
+            assert sf["provider_order"] == ["bilibili_public"]
+
+            sr_resp = await client.post(
+                "/admin/api/songs/search-sources",
+                json={"query": "反乌托邦Pt.2", "strategy": "auto", "limit": 5},
+            )
+            assert sr_resp.status_code == 200
+            sr_data = sr_resp.json()
+            assert sr_data["provider_used"] == "bilibili_public"
+            assert sr_data["candidates"][0]["candidate_id"] == "bilibili_public:BV1epqZBVEPY"
+
+            dl_resp = await client.post(
+                "/admin/api/songs/fetch-to-inbox",
+                json={
+                    "query": "反乌托邦Pt.2",
+                    "title": "反乌托邦Pt.2",
+                    "candidate_id": "bilibili_public:BV1epqZBVEPY",
+                },
+            )
+            assert dl_resp.status_code == 200
+            dl_data = dl_resp.json()
+            assert dl_data["file_id"] == "inbox-id-1"
+            assert dl_data["provider"] == "bilibili_public"
+            assert fetch_calls[-1]["candidate_id"] == "bilibili_public:BV1epqZBVEPY"
+            # Crucial invariant: searching and saving to inbox creates ZERO Colab GPU jobs!
+            assert compute.submitted_jobs == []

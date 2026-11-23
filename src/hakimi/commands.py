@@ -703,6 +703,10 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
                 "独立音源检索插件（song_finder）当前离线或不可用（未创建 Colab 作业），"
                 "请检查插件状态或直接附带音频/上传到 Drive inbox/。"
             ),
+            "all_providers_in_cooldown": (
+                "独立找歌源触发风控正在冷却中（未创建 Colab 作业），"
+                "请稍后重试或手动上传原曲到 Drive inbox/。"
+            ),
             "download_too_large": (
                 "检索到的原曲文件超过体积上限（未创建 Colab 作业），请手动压缩后上传到 inbox/。"
             ),

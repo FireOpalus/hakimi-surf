@@ -3638,6 +3638,32 @@ body:not(.authenticated) main {
         <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
       </div>
     </div>
+    <div class="sub-card">
+      <div class="row between">
+        <strong>独立音源检索（先搜候选再挑一首下进 <code>inbox/</code>，不占用 Colab GPU）</strong>
+        <div id="song-finder-pills" class="pill-row"></div>
+      </div>
+      <p id="song-finder-status" class="muted" aria-live="polite">正在检测独立音源检索器状态…</p>
+      <form id="song-finder-form">
+        <div class="song-meta">
+          <label for="song-finder-query">歌名 / 关键词（必填）<input id="song-finder-query" maxlength="160" required placeholder="例如：反乌托邦Pt.2 或 晴天"></label>
+          <label for="song-finder-artist">原唱 / 作者（可选）<input id="song-finder-artist" maxlength="60" placeholder="例如：周杰伦"></label>
+          <label for="song-finder-strategy">检索源策略
+            <select id="song-finder-strategy">
+              <option value="auto" selected>自动（默认优先 B 站公开源）</option>
+              <option value="bilibili_public">仅 B 站公开源（匿名无登录）</option>
+              <option value="youtube">仅 YouTube</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <button id="song-finder-submit" type="submit" class="secondary">检索候选原曲</button>
+          <button id="song-finder-clear" type="button" class="secondary">清空结果</button>
+        </div>
+      </form>
+      <p id="song-finder-meta" class="muted" aria-live="polite"></p>
+      <div id="song-finder-results" class="table"></div>
+    </div>
     <h3>待学原曲收件箱（<code>inbox/</code>）</h3>
     <div id="song-inbox-table" class="table"></div>
   </div>
@@ -8057,6 +8083,11 @@ const songErrorLabels={
   drive_context_required:'缺少 Drive 短期授权上下文，请先检查歌单云盘配置',
   source_not_found:'独立找歌未检索到干净官方原曲（未提交 Colab 作业），可手动上传音频到收件箱或私聊发送原曲',
   song_finder_remote_unavailable:'独立音源检索插件（song_finder）当前离线或不可用（未提交 Colab 作业），请检查插件状态或手动上传原曲到收件箱',
+  all_providers_in_cooldown:'独立找歌源触发风控正在冷却中（未提交 Colab 作业），请稍后重试或手动上传原曲到收件箱',
+  invalid_query:'检索关键词、策略或候选标识无效，请检查后重试',
+  duration_out_of_range:'候选音频时长超出允许范围（60～600 秒）',
+  ssrf_blocked:'上游资源地址未通过安全域名白名单校验',
+  transcode_failed:'原曲转码封装失败，请尝试其他候选或手动上传',
   download_too_large:'检索到的原曲超过体积上限（未提交 Colab 作业），请手动压缩后上传到收件箱',
   colab_unconfigured:'Colab 云端算力 Worker 尚未配置，请先在「Colab 云端算力」检查配置',
   colab_disabled:'Colab 云端算力调度当前已关闭，请先开启后再试',
@@ -8570,6 +8601,114 @@ async function loadSongVoices(strict=false){
   renderSongVoices(data,errMsg);
   return data;
 }
+const songFinderProviderLabels={
+  bilibili_public:'B 站公开源',
+  youtube:'YouTube'
+};
+function formatSongDurationSec(sec){
+  const n=Math.max(0,Math.round(Number(sec||0)));
+  const m=Math.floor(n/60);
+  const s=n%60;
+  return m+':'+String(s).padStart(2,'0');
+}
+function renderSongFinderStatus(sf){
+  const box=$('song-finder-pills');
+  if(!box)return;
+  const isOnline=Boolean(sf?.online);
+  const region=String(sf?.node_region||'').trim();
+  const order=Array.isArray(sf?.provider_order)?sf.provider_order:[];
+  const providers=(sf&&typeof sf.providers==='object'&&sf.providers)?sf.providers:{};
+  const badges=[];
+  badges.push(pill(isOnline?('独立找歌在线'+(region?' · '+region:'')):'独立找歌离线',isOnline?'ok':'warn'));
+  const shownOrder=order.length?order:Object.keys(providers);
+  const detailParts=[];
+  for(const pname of shownOrder){
+    const label=songFinderProviderLabels[pname]||pname;
+    const pinfo=providers[pname];
+    if(pinfo&&pinfo.cooling_down){
+      const rem=Number(pinfo.cooldown_remaining_sec||0);
+      const err=String(pinfo.last_error||'风控').trim();
+      badges.push(pill(label+' 冷却 '+rem+'s','warn'));
+      detailParts.push(label+'：冷却中（剩余 '+rem+'s，原因 '+err+'）');
+    }else if(isOnline){
+      badges.push(pill(label+' 就绪','free'));
+      detailParts.push(label+'：就绪');
+    }
+  }
+  box.replaceChildren(...badges);
+  if(!isOnline){
+    text('song-finder-status','独立音源检索插件（song_finder）当前离线，可手动上传原曲到收件箱或检查插件连接状态。');
+  }else{
+    const regionLabel=region==='CN'?'境内节点（CN）':region==='KR'?'境外节点（KR）':'在线';
+    text('song-finder-status','独立音源检索器运行于 '+regionLabel+(detailParts.length?' · '+detailParts.join('；'):''));
+  }
+}
+function renderSongFinderResults(data,queryTitle,queryArtist){
+  const list=$('song-finder-results');
+  if(!list)return;
+  if(data?.song_finder)renderSongFinderStatus(data.song_finder);
+  const cands=Array.isArray(data?.candidates)?data.candidates:[];
+  const skipped=(data&&typeof data.skipped_providers==='object'&&data.skipped_providers)?data.skipped_providers:{};
+  const skipParts=Object.entries(skipped).map(([k,v])=>(songFinderProviderLabels[k]||k)+'：'+String(v));
+  const used=String(data?.provider_used||'').trim();
+  const metaParts=[];
+  if(used)metaParts.push('命中来源：'+(songFinderProviderLabels[used]||used));
+  metaParts.push('共 '+cands.length+' 条干净候选');
+  if(skipParts.length)metaParts.push('跳过/异常：'+skipParts.join('；'));
+  text('song-finder-meta',metaParts.join(' · '));
+  if(!cands.length){
+    list.replaceChildren(el('p','未检索到符合条件的干净原曲候选；可换关键词/作者，或手动上传原曲到收件箱。','muted'));
+    return;
+  }
+  const rows=cands.map(item=>{
+    const provLabel=songFinderProviderLabels[item.provider]||item.provider||'未知';
+    const cleanTitle=String(queryTitle||item.title||'').trim().slice(0,60);
+    const cleanArtist=String(queryArtist||item.uploader||'').trim().slice(0,40);
+    const fetchOne=async fillAfter=>{
+      const res=await api('songs/fetch-to-inbox','POST',{
+        query:String(queryTitle||item.title||'').trim(),
+        title:cleanTitle,
+        artist:cleanArtist,
+        candidate_id:String(item.candidate_id||''),
+        strategy:'auto'
+      });
+      if(res?.song_finder)renderSongFinderStatus(res.song_finder);
+      const savedName=String(res?.name||'');
+      await refreshSongInbox(false);
+      if(fillAfter&&savedName){
+        $('song-learn-title').value=cleanTitle||guessTitleFromFilename(savedName);
+        if(cleanArtist)$('song-learn-artist').value=cleanArtist;
+        setSongLearnInboxValue(savedName);
+        $('song-learn-auto-search').checked=false;
+        $('song-learn-heading')?.scrollIntoView({behavior:'smooth',block:'start'});
+        notice('已下载原曲「'+savedName+'」到收件箱并填入学歌表单（尚未消费 Colab 算力）');
+      }else{
+        notice('已下载原曲「'+savedName+'」（'+formatByteSize(res?.size||0)+'）到 Drive inbox/');
+      }
+    };
+    const dlBtn=button('下载到收件箱',async()=>{
+      try{await fetchOne(false);}
+      catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
+    },'secondary');
+    const fillBtn=button('下载并填入学歌',async()=>{
+      try{await fetchOne(true);}
+      catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
+    },'primary');
+    return el('div',[
+      el('div',[
+        el('strong',String(item.title||'未命名候选')),
+        el('div',[
+          pill(provLabel,item.provider==='bilibili_public'?'ok':'free'),
+          pill('时长 '+formatSongDurationSec(item.duration_sec),'muted'),
+          pill('评分 '+Number(item.score||0).toFixed(1),'muted'),
+          el('small','UP/作者：'+String(item.uploader||'—'),'muted')
+        ],'pill-row')
+      ]),
+      el('div',[dlBtn,fillBtn],'row')
+    ],'row between');
+  });
+  list.replaceChildren(...rows);
+}
 function renderSongStorageBar(d){
   const driveCount=Number(d.drive_backed_count??0);
   const cacheBytes=Number(d.cache_bytes??0);
@@ -8586,6 +8725,7 @@ function renderSongStorageBar(d){
   );
   text('song-cache-state','Drive 云盘（歌单工坊独立直连）：'+(driveOk?'已配置':'未配置')+' · Drive 主存 '+driveCount+' 首 · 本地 LRU 热缓存占用 '+formatByteSize(cacheBytes)+' / '+formatByteSize(cacheMax)+'（共 '+cachedCount+' 首缓存；纯本地上传曲目永不淘汰）· Colab GPU 算力（仅学歌推理）：'+(colabOk?'已配置':'未配置'));
   text('song-learn-colab-hint',(driveOk?'Drive 歌单主存与原曲收件箱已独立就绪；':'提示：Drive 歌单存储尚未配置，收件箱与云盘归档暂不可用；')+(colabOk?'Colab GPU 算力已就绪，默认共享分轨产出 YingMusic-SVC 与 Seed-VC 双版候选，由猫猫原声亲听自选入库并保留双版本可随时切换（亦保留 RVC 可选）。':'当前 Colab GPU Worker 尚未配置，仍可正常播放歌单、切换已存档版本、管理 Drive 收件箱或手动上传翻唱成品；如需自动学歌请在「Colab 云端算力」配置 Worker。'));
+  renderSongFinderStatus(d.song_finder||{online:Boolean(d.song_finder_online)});
 }
 function songStoragePills(item){
   const badges=[];
@@ -8999,6 +9139,30 @@ $('song-upload').addEventListener('submit',e=>{
   });
 });
 
+$('song-finder-clear')?.addEventListener('click',()=>{
+  if($('song-finder-query'))$('song-finder-query').value='';
+  if($('song-finder-artist'))$('song-finder-artist').value='';
+  text('song-finder-meta','');
+  $('song-finder-results')?.replaceChildren();
+});
+$('song-finder-form')?.addEventListener('submit',e=>{
+  e.preventDefault();
+  busy(e.submitter,async()=>{
+    const query=$('song-finder-query').value.trim();
+    if(!query)throw Error('请先输入歌名或关键词');
+    const artist=$('song-finder-artist').value.trim();
+    const strategy=$('song-finder-strategy').value||'auto';
+    let data;
+    try{
+      data=await api('songs/search-sources','POST',{query,artist,strategy,limit:6});
+    }catch(err){
+      if(err?.name==='AbortError')throw err;
+      throw Error(mapSongError(err));
+    }
+    renderSongFinderResults(data,query,artist);
+  });
+});
+
 syncSongLearnEngineFields();
 
 trackDirty('bili-policy','小号巡逻设置');
@@ -9027,6 +9191,13 @@ onLogout(()=>{
   $('song-learn-result').replaceChildren();
   $('song-drive-details').replaceChildren();
   $('song-inbox-table').replaceChildren();
+  $('song-finder-pills')?.replaceChildren();
+  $('song-finder-results')?.replaceChildren();
+  if($('song-finder-query'))$('song-finder-query').value='';
+  if($('song-finder-artist'))$('song-finder-artist').value='';
+  if($('song-finder-strategy'))$('song-finder-strategy').value='auto';
+  text('song-finder-status','');
+  text('song-finder-meta','');
   $('song-drive-folder-id').value='';
   $('song-storage-save').disabled=true;
   $('song-storage-reset').disabled=true;

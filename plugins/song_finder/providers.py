@@ -42,7 +42,7 @@ DEFAULT_MIN_INTERVAL_SECONDS = 1.0
 MAX_HTTP_JSON_BYTES = 512 * 1024
 
 VALID_PROVIDERS: tuple[str, ...] = ("youtube", "bilibili_public")
-DEFAULT_PROVIDER_ORDER: tuple[str, ...] = ("youtube", "bilibili_public")
+DEFAULT_PROVIDER_ORDER: tuple[str, ...] = ("bilibili_public", "youtube")
 SUPPORTED_OUTPUT_FORMATS: frozenset[str] = frozenset({"m4a", "mp3", "flac"})
 MIME_BY_FORMAT: dict[str, str] = {
     "m4a": "audio/mp4",
@@ -72,6 +72,9 @@ _LOCAL_PATH_RE = re.compile(r"(?:^|\s)(?:[/\\~]|\.{1,2}[/\\]|[A-Za-z]:[/\\])")
 _TRAVERSAL_RE = re.compile(r"(?:^|[/\\])\.\.(?:[/\\]|$)")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _BVID_RE = re.compile(r"^BV[1-9A-HJ-NP-Za-km-z]{10}\Z")
+_YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}\Z")
+_CANDIDATE_ID_RE = re.compile(r"^(youtube|bilibili_public):([A-Za-z0-9_-]{4,32})\Z")
+_ANON_BUVID_VAL_RE = re.compile(r"^[A-Za-z0-9_.%=-]{8,160}\Z")
 _YOUTUBE_HOSTS = frozenset(
     {
         "youtube.com",
@@ -442,6 +445,26 @@ def validate_bili_cdn_url(url: str) -> str:
     if not allowed:
         raise SongFinderError("ssrf_blocked", "CDN host outside strict allowlist")
     return cleaned
+
+
+def parse_candidate_id(raw: str | None) -> tuple[str, str]:
+    """Strictly parse a candidate identifier (`<provider>:<source_id>`) for targeted download."""
+    if not isinstance(raw, str):
+        raise SongFinderError("invalid_query", "candidate_id must be a string")
+    cleaned = raw.strip()
+    match = _CANDIDATE_ID_RE.fullmatch(cleaned)
+    if not match:
+        raise SongFinderError("invalid_query", "invalid candidate_id format")
+    provider, source_id = match.group(1), match.group(2)
+    if provider == "bilibili_public":
+        if not _BVID_RE.fullmatch(source_id):
+            raise SongFinderError("invalid_query", "invalid bilibili bvid")
+    elif provider == "youtube":
+        if not _YOUTUBE_ID_RE.fullmatch(source_id):
+            raise SongFinderError("invalid_query", "invalid youtube video id")
+    else:
+        raise SongFinderError("invalid_query", "unsupported candidate provider")
+    return provider, source_id
 
 
 def parse_provider_order(raw: str | Sequence[str] | None) -> tuple[str, ...]:
@@ -901,6 +924,7 @@ class YouTubeProvider:
         search_expr = f"ytsearch{self.search_pool}:{clean_query}"
         cmd = [
             *self._base_flags(),
+            "--flat-playlist",
             "--dump-json",
             "--skip-download",
             "--ignore-errors",
@@ -925,7 +949,11 @@ class YouTubeProvider:
                 max_duration_sec=max_d,
             ):
                 continue
+            raw_vid = str(item.get("id") or "").strip()
+            vid_id = re.sub(r"[^A-Za-z0-9_-]", "", raw_vid)[:24] or "yt"
             raw_url = str(item.get("webpage_url") or item.get("url") or "").strip()
+            if (not raw_url or "://" not in raw_url) and _YOUTUBE_ID_RE.fullmatch(raw_vid):
+                raw_url = f"https://www.youtube.com/watch?v={raw_vid}"
             try:
                 safe_url = validate_youtube_url(raw_url)
             except SongFinderError:
@@ -934,7 +962,6 @@ class YouTubeProvider:
             title = _strip_html(item.get("title") or "")
             uploader = _strip_html(item.get("uploader") or item.get("channel") or "")
             dur = parse_duration_seconds(item.get("duration")) or 0.0
-            vid_id = re.sub(r"[^A-Za-z0-9_-]", "", str(item.get("id") or ""))[:24] or "yt"
             candidates.append(
                 SongCandidate(
                     provider=self.provider_id,
@@ -1021,10 +1048,12 @@ class BilibiliPublicProvider:
 
     provider_id = "bilibili_public"
 
+    _SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
     _NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
     _SEARCH_URL = "https://api.bilibili.com/x/web-interface/wbi/search/type"
     _VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
     _PLAYURL_URL = "https://api.bilibili.com/x/player/wbi/playurl"
+    _ANON_BUVID_TTL_SEC = 21600.0
 
     def __init__(
         self,
@@ -1053,18 +1082,60 @@ class BilibiliPublicProvider:
         self._wbi_key: str = ""
         self._wbi_expires_at: float = 0.0
         self._wbi_lock = asyncio.Lock()
+        self._buvid_cookie: str = ""
+        self._buvid_expires_at: float = 0.0
+        self._buvid_lock = asyncio.Lock()
 
     async def close(self) -> None:
         if self._owns_http:
             await self.http.aclose()
 
-    def _public_headers(self, *, referer: str = "https://www.bilibili.com/") -> dict[str, str]:
-        return {
+    def _public_headers(
+        self,
+        *,
+        referer: str = "https://www.bilibili.com/",
+        send_buvid: bool = True,
+    ) -> dict[str, str]:
+        headers = {
             "User-Agent": _PUBLIC_USER_AGENT,
             "Referer": referer,
             "Origin": "https://www.bilibili.com",
             "Accept": "application/json, text/plain, */*",
         }
+        if send_buvid and self._buvid_cookie:
+            headers["Cookie"] = self._buvid_cookie
+        return headers
+
+    async def _ensure_anon_buvid(self) -> str:
+        """Fetch strictly anonymous public visitor `buvid3`/`buvid4` via `/x/frontend/finger/spi`.
+
+        Zero account credentials or login cookies are ever read, stored, or forwarded.
+        Fails gracefully if the endpoint is unreachable so tests/minimal mocks keep working.
+        """
+        now = self._clock()
+        if self._buvid_cookie and now < self._buvid_expires_at:
+            return self._buvid_cookie
+        async with self._buvid_lock:
+            now = self._clock()
+            if self._buvid_cookie and now < self._buvid_expires_at:
+                return self._buvid_cookie
+            try:
+                payload = await self._get_json(self._SPI_URL, send_buvid=False)
+            except (SongFinderError, ProviderRiskControlError):
+                return self._buvid_cookie
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+            if not isinstance(data, dict):
+                return self._buvid_cookie
+            b3 = str(data.get("b_3") or "").strip()
+            b4 = str(data.get("b_4") or "").strip()
+            if not b3 or not _ANON_BUVID_VAL_RE.fullmatch(b3):
+                return self._buvid_cookie
+            parts = [f"buvid3={b3}"]
+            if b4 and _ANON_BUVID_VAL_RE.fullmatch(b4):
+                parts.append(f"buvid4={b4}")
+            self._buvid_cookie = "; ".join(parts)
+            self._buvid_expires_at = now + self._ANON_BUVID_TTL_SEC
+            return self._buvid_cookie
 
     async def _get_json(
         self,
@@ -1072,6 +1143,7 @@ class BilibiliPublicProvider:
         *,
         params: dict[str, Any] | None = None,
         referer: str = "https://www.bilibili.com/",
+        send_buvid: bool = True,
     ) -> dict[str, Any]:
         if hasattr(self.http, "cookies"):
             self.http.cookies.clear()
@@ -1080,10 +1152,12 @@ class BilibiliPublicProvider:
                 "GET",
                 url,
                 params=params,
-                headers=self._public_headers(referer=referer),
+                headers=self._public_headers(referer=referer, send_buvid=send_buvid),
                 follow_redirects=False,
             ) as resp:
                 if resp.status_code in (403, 412, 429):
+                    if resp.status_code == 412:
+                        self._buvid_expires_at = 0.0
                     raise ProviderRiskControlError(self.provider_id, f"http_{resp.status_code}")
                 if 300 <= resp.status_code < 400:
                     raise SongFinderError("ssrf_blocked", provider=self.provider_id)
@@ -1172,6 +1246,7 @@ class BilibiliPublicProvider:
     ) -> list[SongCandidate]:
         min_d = self.min_duration_sec if min_duration_sec is None else float(min_duration_sec)
         max_d = self.max_duration_sec if max_duration_sec is None else float(max_duration_sec)
+        await self._ensure_anon_buvid()
         mixin_key = await self._ensure_wbi_key()
         params = self._sign_wbi(
             {
@@ -1254,6 +1329,7 @@ class BilibiliPublicProvider:
             raise SongFinderError("invalid_query", provider=self.provider_id)
         min_d = self.min_duration_sec if min_duration_sec is None else float(min_duration_sec)
         max_d = self.max_duration_sec if max_duration_sec is None else float(max_duration_sec)
+        await self._ensure_anon_buvid()
         referer = f"https://www.bilibili.com/video/{bvid}"
         view_data = await self._get_json(self._VIEW_URL, params={"bvid": bvid}, referer=referer)
         if view_data.get("code") != 0 or not isinstance(view_data.get("data"), dict):
@@ -1529,17 +1605,24 @@ class SongFinderEngine:
 
     async def fetch_source(
         self,
-        query: str,
+        query: str = "",
         *,
         title: str = "",
         artist: str = "",
+        candidate_id: str = "",
         strategy: str = "auto",
         preferred_format: str = "m4a",
         max_bytes: int | None = None,
         min_duration_sec: int | float | None = None,
         max_duration_sec: int | float | None = None,
     ) -> FetchedSongSource:
-        clean_query = sanitize_search_query(query, title=title, artist=artist)
+        clean_candidate = str(candidate_id or "").strip()
+        if clean_candidate:
+            clean_query = _validate_query_fragment(query, allow_empty=True)
+            clean_title = _validate_query_fragment(title, allow_empty=True)
+        else:
+            clean_query = sanitize_search_query(query, title=title, artist=artist)
+            clean_title = _validate_query_fragment(title, allow_empty=True)
         fmt = validate_output_format(preferred_format)
         min_d, max_d = validate_duration_bounds(
             min_duration_sec,
@@ -1555,6 +1638,65 @@ class SongFinderEngine:
             cap = max_bytes
         else:
             cap = self.max_output_bytes
+
+        if clean_candidate:
+            prov_name, source_id = parse_candidate_id(clean_candidate)
+            chain = self._resolve_chain(strategy)
+            if prov_name not in chain:
+                raise SongFinderError("invalid_query", "candidate_id does not match strategy")
+            if self.circuit_breaker.is_open(prov_name):
+                raise SongFinderError("all_providers_in_cooldown", provider=prov_name)
+            prov = self.providers[prov_name]
+            await self.circuit_breaker.pace(prov_name)
+            url = (
+                f"https://www.bilibili.com/video/{source_id}"
+                if prov_name == "bilibili_public"
+                else f"https://www.youtube.com/watch?v={source_id}"
+            )
+            cand = SongCandidate(
+                provider=prov_name,
+                source_id=source_id,
+                title=clean_title or clean_query or source_id,
+                uploader="",
+                duration_sec=0.0,
+                url=url,
+            )
+            with tempfile.TemporaryDirectory(prefix="hakimi-sf-") as tmpdir:
+                work_dir = Path(tmpdir)
+                try:
+                    dl_kwargs: dict[str, Any] = {"max_download_bytes": self.max_download_bytes}
+                    if prov_name == "bilibili_public":
+                        dl_kwargs["min_duration_sec"] = min_d
+                        dl_kwargs["max_duration_sec"] = max_d
+                    raw_path = await prov.download(cand, work_dir, **dl_kwargs)
+                    audio_bytes, probed_dur, digest = await transcode_clean_audio(
+                        raw_path,
+                        work_dir,
+                        output_format=fmt,
+                        min_duration_sec=min_d,
+                        max_duration_sec=max_d,
+                        max_output_bytes=cap,
+                        ffmpeg_bin=self.ffmpeg_bin,
+                        ffprobe_bin=self.ffprobe_bin,
+                    )
+                except ProviderRiskControlError as exc:
+                    self.circuit_breaker.trip(prov_name, exc.code)
+                    raise SongFinderError("all_providers_in_cooldown", provider=prov_name) from None
+            self.circuit_breaker.record_success(prov_name)
+            return FetchedSongSource(
+                provider=prov_name,
+                source_id=source_id,
+                title=cand.title,
+                uploader=cand.uploader,
+                duration_sec=probed_dur,
+                audio_format=fmt,
+                mime_type=MIME_BY_FORMAT[fmt],
+                filename=safe_audio_filename(clean_title or clean_query or source_id, fmt),
+                data=audio_bytes,
+                sha256=digest,
+                byte_size=len(audio_bytes),
+                skipped_providers={},
+            )
 
         chain = self._resolve_chain(strategy)
         skipped: dict[str, str] = {}

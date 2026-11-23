@@ -67,9 +67,10 @@ FETCH_SOURCE_ACTION_ARGS: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "query": {"type": "string", "min_length": 1, "max_length": MAX_QUERY_LEN},
+        "query": {"type": "string", "min_length": 0, "max_length": MAX_QUERY_LEN, "default": ""},
         "title": {"type": "string", "max_length": 80, "default": ""},
         "artist": {"type": "string", "max_length": 60, "default": ""},
+        "candidate_id": {"type": "string", "max_length": 64, "default": ""},
         "strategy": {
             "type": "string",
             "enum": ["auto", "youtube", "bilibili_public"],
@@ -99,7 +100,7 @@ FETCH_SOURCE_ACTION_ARGS: dict[str, Any] = {
             "default": 600,
         },
     },
-    "required": ["query"],
+    "required": [],
 }
 
 
@@ -120,9 +121,10 @@ class FetchSourceArgs(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    query: str = Field(min_length=1, max_length=MAX_QUERY_LEN)
+    query: str = Field(default="", max_length=MAX_QUERY_LEN)
     title: str = Field(default="", max_length=80)
     artist: str = Field(default="", max_length=60)
+    candidate_id: str = Field(default="", max_length=64)
     strategy: Literal["auto", "youtube", "bilibili_public"] = "auto"
     preferred_format: Literal["m4a", "mp3", "flac"] = "m4a"
     max_bytes: int = Field(
@@ -145,6 +147,7 @@ class SongFinderPlugin:
         engine: SongFinderEngine | None = None,
         provider_order: str | Sequence[str] | None = None,
         proxy_url: str | None = None,
+        node_region: Literal["KR", "CN"] = "KR",
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
         yt_dlp_bin: str = "",
@@ -156,6 +159,10 @@ class SongFinderPlugin:
         reconnect_min: float = 1.0,
         reconnect_max: float = 30.0,
     ) -> None:
+        clean_region: Literal["KR", "CN"] = (
+            "CN" if str(node_region).strip().upper() == "CN" else "KR"
+        )
+        self.node_region: Literal["KR", "CN"] = clean_region
         bounded_cap = min(
             max(MIN_OUTPUT_BYTES_LIMIT, int(max_download_bytes)), SONG_FINDER_MAX_BLOB_BYTES
         )
@@ -196,7 +203,7 @@ class SongFinderPlugin:
             display_name="音源检索器",
             description="独立多策略干净原曲检索与音频封装插件（风控与冷却完全隔离）",
             scopes=("actions",),
-            node_region="KR",
+            node_region=clean_region,
             admin_panel=None,
             attention_level="LOW",
             reconnect_min=reconnect_min,
@@ -222,11 +229,16 @@ class SongFinderPlugin:
                     handler=self._handle_fetch_source_action,
                 ),
             ),
-            initial_status=self.engine.status_snapshot(),
+            initial_status=self._status_payload(),
             connect_factory=connect_factory,
             max_blob_bytes=SONG_FINDER_MAX_BLOB_BYTES,
         )
         self.client.on_connect(self._on_connect)
+
+    def _status_payload(self) -> dict[str, Any]:
+        snap = self.engine.status_snapshot()
+        snap["node_region"] = self.node_region
+        return snap
 
     async def close(self) -> None:
         await self.client.stop()
@@ -236,7 +248,7 @@ class SongFinderPlugin:
         if not self.client.connected:
             return
         with contextlib.suppress(Exception):
-            await self.client.push_status(self.engine.status_snapshot())
+            await self.client.push_status(self._status_payload())
 
     async def _on_connect(self, _welcome: dict[str, Any]) -> None:
         await self._push_status_best_effort()
@@ -274,18 +286,23 @@ class SongFinderPlugin:
         except ValidationError:
             raise PluginRpcError("invalid_query", "invalid fetch_source arguments") from None
 
+        if not args.query.strip() and not args.candidate_id.strip():
+            raise PluginRpcError("invalid_query", "query or candidate_id is required")
+
         async with self._fetch_slots:
             try:
-                fetched = await self.engine.fetch_source(
-                    args.query,
-                    title=args.title,
-                    artist=args.artist,
-                    strategy=args.strategy,
-                    preferred_format=args.preferred_format,
-                    max_bytes=args.max_bytes,
-                    min_duration_sec=args.min_duration_sec,
-                    max_duration_sec=args.max_duration_sec,
-                )
+                fetch_kwargs: dict[str, Any] = {
+                    "title": args.title,
+                    "artist": args.artist,
+                    "strategy": args.strategy,
+                    "preferred_format": args.preferred_format,
+                    "max_bytes": args.max_bytes,
+                    "min_duration_sec": args.min_duration_sec,
+                    "max_duration_sec": args.max_duration_sec,
+                }
+                if args.candidate_id:
+                    fetch_kwargs["candidate_id"] = args.candidate_id
+                fetched = await self.engine.fetch_source(args.query, **fetch_kwargs)
             except SongFinderError as exc:
                 await self._push_status_best_effort()
                 raise PluginRpcError(exc.code, exc.message) from None
@@ -294,6 +311,7 @@ class SongFinderPlugin:
         return BlobResult(
             data={
                 "provider": fetched.provider,
+                "source_id": str(getattr(fetched, "source_id", "") or ""),
                 "title": fetched.title,
                 "uploader": fetched.uploader,
                 "duration_sec": round(fetched.duration_sec, 2),
@@ -340,11 +358,14 @@ def build_song_finder_plugin_from_env(**overrides: Any) -> SongFinderPlugin:
     ).strip()
     if not token and "token" not in overrides:
         raise RuntimeError("HAKIMI_PLUGIN_SONG_FINDER_TOKEN (or HAKIMI_PLUGIN_TOKEN) is required")
+    raw_region = (os.getenv("SONG_FINDER_NODE_REGION") or "KR").strip().upper()
+    node_region: Literal["KR", "CN"] = "CN" if raw_region == "CN" else "KR"
     kwargs: dict[str, Any] = {
         "ws_url": ws_url,
         "token": token,
         "provider_order": os.getenv("SONG_FINDER_PROVIDER_ORDER") or None,
         "proxy_url": os.getenv("SONG_FINDER_PROXY_URL") or None,
+        "node_region": node_region,
         "cooldown_seconds": _parse_positive_float_env(
             "SONG_FINDER_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS
         ),

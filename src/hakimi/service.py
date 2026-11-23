@@ -565,6 +565,10 @@ class Service:
                     f"独立找歌插件（song_finder）当前离线或不可用，暂时没法自动搜《{title}》"
                     "（未创建 Colab 作业），可以把原曲直接发给我或传到云盘 inbox/。"
                 ),
+                "all_providers_in_cooldown": (
+                    f"独立找歌源当前触发风控冷却中，暂时没法自动搜《{title}》"
+                    "（未创建 Colab 作业），请稍后再试或把原曲发给我。"
+                ),
                 "ref_voice_not_found": (
                     f"准备学《{title}》时没在云盘 models/ 里找到可用参考干声"
                     "（未创建 Colab 作业），请先在后台上传参考干声。"

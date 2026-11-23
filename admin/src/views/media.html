@@ -61,6 +61,32 @@
         <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
       </div>
     </div>
+    <div class="sub-card">
+      <div class="row between">
+        <strong>独立音源检索（先搜候选再挑一首下进 <code>inbox/</code>，不占用 Colab GPU）</strong>
+        <div id="song-finder-pills" class="pill-row"></div>
+      </div>
+      <p id="song-finder-status" class="muted" aria-live="polite">正在检测独立音源检索器状态…</p>
+      <form id="song-finder-form">
+        <div class="song-meta">
+          <label for="song-finder-query">歌名 / 关键词（必填）<input id="song-finder-query" maxlength="160" required placeholder="例如：反乌托邦Pt.2 或 晴天"></label>
+          <label for="song-finder-artist">原唱 / 作者（可选）<input id="song-finder-artist" maxlength="60" placeholder="例如：周杰伦"></label>
+          <label for="song-finder-strategy">检索源策略
+            <select id="song-finder-strategy">
+              <option value="auto" selected>自动（默认优先 B 站公开源）</option>
+              <option value="bilibili_public">仅 B 站公开源（匿名无登录）</option>
+              <option value="youtube">仅 YouTube</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <button id="song-finder-submit" type="submit" class="secondary">检索候选原曲</button>
+          <button id="song-finder-clear" type="button" class="secondary">清空结果</button>
+        </div>
+      </form>
+      <p id="song-finder-meta" class="muted" aria-live="polite"></p>
+      <div id="song-finder-results" class="table"></div>
+    </div>
     <h3>待学原曲收件箱（<code>inbox/</code>）</h3>
     <div id="song-inbox-table" class="table"></div>
   </div>

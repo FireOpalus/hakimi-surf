@@ -588,6 +588,21 @@ class PluginBus(
             return False
         return any(spec.name == action_name for spec in sess.proxy.actions())
 
+    def get_plugin_runtime_status(
+        self, plugin_id: str, *, require_enabled: bool = True
+    ) -> dict[str, Any] | None:
+        """Return sanitized runtime region and pushed status dict for an online plugin."""
+        if not self.is_plugin_online(plugin_id, require_enabled=require_enabled):
+            return None
+        sess = self._sessions.get(plugin_id)
+        if sess is None or sess.proxy is None:
+            return None
+        return {
+            "online": True,
+            "node_region": sess.node_region,
+            "status": sess.proxy.status_dict(),
+        }
+
     async def invoke_tool(
         self,
         plugin_id: str,

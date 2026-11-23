@@ -54,6 +54,9 @@ _BAD_REQUEST_CODES = frozenset(
         "song_drive_file_outside_scope",
         "song_drive_file_too_large",
         "invalid_admin_input",
+        "invalid_query",
+        "duration_out_of_range",
+        "ssrf_blocked",
     }
 )
 _PAYLOAD_TOO_LARGE_CODES = frozenset(
@@ -115,6 +118,8 @@ _UNAVAILABLE_CODES = frozenset(
         "song_drive_response_too_large",
         "song_drive_disallowed_endpoint",
         "song_finder_remote_unavailable",
+        "all_providers_in_cooldown",
+        "transcode_failed",
     }
 )
 
@@ -152,6 +157,25 @@ class SongStorageBody(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     drive_songs_folder_id: str = Field(default="", max_length=128)
+
+
+class SearchSourcesBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    query: str = Field(min_length=1, max_length=160)
+    artist: str = Field(default="", max_length=60)
+    strategy: str = Field(default="auto", max_length=32)
+    limit: int = Field(default=6, ge=1, le=10)
+
+
+class FetchToInboxBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    query: str = Field(default="", max_length=160)
+    title: str = Field(default="", max_length=64)
+    artist: str = Field(default="", max_length=60)
+    candidate_id: str = Field(default="", max_length=64)
+    strategy: str = Field(default="auto", max_length=32)
 
 
 def _map_song_rejected(exc: Rejected) -> HTTPException:
@@ -406,6 +430,36 @@ async def upload(request: Request):
         start_sec=start_sec,
         duration_sec=duration_sec,
     )
+
+
+@router.post("/search-sources")
+async def search_sources(request: Request):
+    payload = await body(request, SearchSourcesBody)
+    try:
+        return await library(request).search_remote_sources(
+            payload.query,
+            artist=payload.artist,
+            strategy=payload.strategy,
+            limit=payload.limit,
+        )
+    except Rejected as exc:
+        raise _map_song_rejected(exc) from None
+
+
+@router.post("/fetch-to-inbox")
+async def fetch_to_inbox(request: Request):
+    payload = await body(request, FetchToInboxBody)
+    async with domain_lock(request, "songs"):
+        try:
+            return await library(request).fetch_remote_source_to_inbox(
+                payload.query,
+                title=payload.title,
+                artist=payload.artist,
+                candidate_id=payload.candidate_id,
+                strategy=payload.strategy,
+            )
+        except Rejected as exc:
+            raise _map_song_rejected(exc) from None
 
 
 @router.post("/learn")
