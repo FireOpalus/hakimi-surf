@@ -2460,3 +2460,74 @@ async def test_mc_v29_world_actions_waypoints_active_plan_and_action_log() -> No
         assert len(status["waypoints"]) >= 4
     finally:
         await plugin.close()
+
+
+async def test_mc_evade_alerts_and_low_food_stay_zero_token_without_resetting_cruise_timer() -> (
+    None
+):
+    """0-Token survival alerts in evade mode skip Layer 2 and never reset _last_decision_at."""
+    clock_now = [3_000_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:12141/ws/plugin",
+        token="test-token",
+        clock=lambda: clock_now[0],
+        enable_brain=True,
+        brain_config=McBrainConfig(event_cooldown_seconds=0.01),
+    )
+    dispatched: list[dict[str, Any]] = []
+    screen_calls = 0
+    gen_calls = 0
+
+    async def fake_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+        if action == "mc.dispatch_goal":
+            dispatched.append(dict(params))
+        return {"ok": True, "accepted": True}
+
+    async def fake_screen(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        nonlocal screen_calls
+        screen_calls += 1
+        return {"passed": True}
+
+    async def fake_generate(*_a: Any, **_kw: Any) -> str:
+        nonlocal gen_calls
+        gen_calls += 1
+        return "{}"
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+    plugin.apply_snapshot(
+        _connected_snapshot(combat_mode="evade", nearby_players=[], inventory_summary=["dirt:4"])
+    )
+
+    try:
+        initial_decision_at = plugin.brain._last_decision_at
+
+        # Advance virtual time by 60s and fire mc_low_food, mc_health_alert, mc_death
+        clock_now[0] += 60.0
+        plugin.brain.on_milestone(
+            "mc_low_food", {"food": 20.0, "health": 20.0, "safe_food_count": 0}
+        )
+        await plugin.brain._execute_cycle("milestone_event")
+        assert plugin.brain._last_decision_at == initial_decision_at
+        assert screen_calls == 0
+        assert gen_calls == 0
+
+        clock_now[0] += 20.0
+        plugin.brain.on_milestone("mc_health_alert", {"health": 4.0, "dimension": "overworld"})
+        await plugin.brain._execute_cycle("milestone_event")
+        assert plugin.brain._last_decision_at == initial_decision_at
+        assert screen_calls == 0
+        assert gen_calls == 0
+        assert {"action_type": "evade"} in dispatched
+
+        clock_now[0] += 10.0
+        plugin.brain.on_milestone("mc_death", {"dimension": "overworld", "pos": [1.0, 70.0, 2.0]})
+        await plugin.brain._execute_cycle("milestone_event")
+        assert plugin.brain._last_decision_at == initial_decision_at
+        assert screen_calls == 0
+        assert gen_calls == 0
+        assert plugin.brain._waypoints["last_death"]["pos"] == [1, 70, 2]
+    finally:
+        await plugin.close()

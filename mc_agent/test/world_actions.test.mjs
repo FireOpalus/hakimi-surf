@@ -390,3 +390,46 @@ test("chest inspect/deposit/withdraw, safe place whitelist, and give to allowed 
   assert.equal(giveOk.given_count, 2);
   assert.equal(bot._tossed.length, 1);
 });
+
+test("ranged hostile (pillager at 14 blocks) triggers long-range sprint flee in evade action and companion tick", async () => {
+  const pillager = { id: 50, name: "pillager", type: "mob", position: vec3(14, 64, 0) };
+  const bot = makeBot({
+    pos: vec3(0, 64, 0),
+    entities: { 50: pillager },
+  });
+  let sprintEnabled = false;
+  let lastGoal = null;
+  bot.setSprinting = (v) => {
+    sprintEnabled = Boolean(v);
+  };
+  bot.pathfinder.setGoal = (g) => {
+    lastGoal = g;
+  };
+
+  const runtime = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "true" }),
+    createBotFn: () => bot,
+    snapshotIntervalMs: 0,
+    survivalTickMs: 0,
+    companionTickMs: 0,
+  });
+  runtime.connectBot();
+  bot.emit("spawn");
+
+  const evadeRes = await runtime.dispatchGoal({ action_type: "evade" });
+  assert.equal(evadeRes.ok, true);
+  assert.equal(evadeRes.combat_mode, "evade");
+  assert.ok(Array.isArray(evadeRes.fled_to));
+  assert.ok(evadeRes.fled_to[0] <= -20); // Flees ~26 blocks away from pillager at +14
+  assert.equal(sprintEnabled, true);
+  assert.ok(lastGoal);
+
+  // Companion tick also detects pillager at 14 blocks (beyond melee 8-block radius)
+  lastGoal = null;
+  await runtime._companionTick();
+  assert.equal(runtime.activity, "躲避怪物");
+  assert.ok(lastGoal);
+  assert.ok(lastGoal.x <= -20);
+
+  runtime.stop();
+});

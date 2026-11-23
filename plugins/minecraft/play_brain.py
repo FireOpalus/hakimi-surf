@@ -63,6 +63,7 @@ _HANDLED_MILESTONE_EVENTS = frozenset(
     }
 )
 _FAST_SURVIVAL_MILESTONES = frozenset({"mc_low_food", "mc_creeper_alert", "mc_combat_retreat"})
+_EVADE_FAST_MILESTONES = frozenset({"mc_health_alert", "mc_death"})
 _CHAT_DETAIL_HINTS = (
     "?",
     "？",
@@ -455,6 +456,8 @@ class McPlayBrain:
         self._last_creeper_alert_chat_at: float = -1e9
         self._last_low_food_chat_at: float = -1e9
         self._last_combat_retreat_chat_at: float = -1e9
+        self._last_evade_flee_at: float = -1e9
+        self._last_death_chat_at: float = -1e9
 
         self._last_mono: float = time.monotonic()
         self._last_clk: float = float(plugin.clock())
@@ -1217,15 +1220,43 @@ class McPlayBrain:
         if not event_batch:
             return False
         etypes = [str(ev.get("event_type") or "") for ev in event_batch]
-        if not all(et in _FAST_SURVIVAL_MILESTONES for et in etypes):
+        allowed_fast = _FAST_SURVIVAL_MILESTONES | _EVADE_FAST_MILESTONES
+        if not all(et in allowed_fast for et in etypes):
             return False
-        # Allow Layer 2 to craft bread, smelt raw meat, or hunt nearby animals on mc_low_food.
+        cur_mode = getattr(snap, "combat_mode", "evade")
+        has_players = bool(getattr(snap, "nearby_players", ()) or ())
+        if any(et in _EVADE_FAST_MILESTONES for et in etypes):
+            # When already in evade mode (or solo death), handle at 0-Token instead of waking
+            # Layer 2 repeatedly to emit no-op evade decisions.
+            if cur_mode != "evade" and (has_players or "mc_death" not in etypes):
+                return False
+        # Allow Layer 2 to craft bread or smelt raw meat on mc_low_food.
         if "mc_low_food" in etypes and self._has_actionable_food_option(snap):
             return False
 
         clean_say = ""
-        has_players = bool(getattr(snap, "nearby_players", ()) or ())
-        if "mc_creeper_alert" in etypes:
+        if "mc_death" in etypes:
+            primary = "mc_death"
+            self._chain_next_step = False
+            if cur_mode != "evade":
+                await self._dispatch_goal_safe({"action_type": "evade"})
+            if has_players and (now - self._last_death_chat_at) >= 60.0:
+                self._last_death_chat_at = now
+                clean_say = "呜哇不小心被怪打回重生点了，我先小心躲开喵~"
+        elif "mc_health_alert" in etypes:
+            primary = "mc_health_alert"
+            self._chain_next_step = False
+            if (now - self._last_evade_flee_at) >= 15.0:
+                self._last_evade_flee_at = now
+                await self._dispatch_goal_safe({"action_type": "evade"})
+            if (
+                has_players
+                and (now - self._last_combat_retreat_chat_at)
+                >= self.config.combat_retreat_cooldown_seconds
+            ):
+                self._last_combat_retreat_chat_at = now
+                clean_say = "血量告急！我先往远处拉开距离躲一下喵~"
+        elif "mc_creeper_alert" in etypes:
             primary = "mc_creeper_alert"
             if (
                 has_players
@@ -1605,11 +1636,12 @@ class McPlayBrain:
             if trigger == "milestone_event" and not event_batch:
                 return
 
-            self._last_decision_at = now
             if trigger == "milestone_event" and await self._try_fast_survival_milestone(
                 event_batch=event_batch, snap=snap, now=now
             ):
                 return
+
+            self._last_decision_at = now
 
             unavailable_reason = await self._check_budget_and_rate(now)
             if unavailable_reason is not None:

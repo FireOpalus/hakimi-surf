@@ -84,12 +84,26 @@ export const PROTECTED_ENTITIES = new Set([
 
 export const AVOID_ALWAYS_MOBS = new Set(["warden", "ravager", "piglin_brute"]);
 export const RANGED_SHIELD_MOBS = new Set(["skeleton", "stray", "bogged"]);
+export const RANGED_HOSTILE_MOBS = new Set([
+  "pillager",
+  "skeleton",
+  "stray",
+  "bogged",
+  "witch",
+  "evoker",
+  "blaze",
+  "breeze",
+]);
 
 export const GUARD_PLAYER_RADIUS = 10;
 export const SELF_DEFENSE_RADIUS = 7;
 export const MAX_LEASH_FROM_PLAYER = 14;
 export const CREEPER_SAFE_DISTANCE = 6;
 export const AVOID_HIGH_DANGER_RADIUS = 12;
+export const MELEE_EVADE_RADIUS = 8;
+export const RANGED_EVADE_RADIUS = 18;
+export const MELEE_FLEE_DISTANCE = 14;
+export const RANGED_FLEE_DISTANCE = 26;
 export const RETREAT_HEALTH_THRESHOLD = 7;
 export const RESUME_HEALTH_THRESHOLD = 12;
 export const MELEE_REACH = 3.2;

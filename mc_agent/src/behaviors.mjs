@@ -39,6 +39,11 @@ import {
 import {
   CREEPER_SAFE_DISTANCE,
   HOSTILE_MOBS,
+  MELEE_EVADE_RADIUS,
+  MELEE_FLEE_DISTANCE,
+  RANGED_EVADE_RADIUS,
+  RANGED_FLEE_DISTANCE,
+  RANGED_HOSTILE_MOBS,
   applyNoDigMovements,
   computeRetreatTarget,
   createCombatState,
@@ -912,7 +917,7 @@ export class McRuntime {
     return best;
   }
 
-  _findNearestHostile(bot, maxDist = 8) {
+  _findNearestHostile(bot, maxDist = MELEE_EVADE_RADIUS) {
     if (!bot?.entity?.position) return null;
     const origin = bot.entity.position;
     let best = null;
@@ -926,6 +931,66 @@ export class McRuntime {
       }
     }
     return best;
+  }
+
+  _findEvadeThreats(bot) {
+    if (!bot?.entity?.position) return null;
+    const origin = bot.entity.position;
+    const threats = [];
+    let nearest = null;
+    let hasRanged = false;
+
+    for (const ent of Object.values(bot.entities || {})) {
+      if (!ent || ent === bot.entity || !ent.position) continue;
+      const name = String(ent.name || "").toLowerCase();
+      if (!HOSTILE_MOBS.has(name)) continue;
+      const isRanged = RANGED_HOSTILE_MOBS.has(name);
+      const radius = isRanged ? RANGED_EVADE_RADIUS : MELEE_EVADE_RADIUS;
+      const dist = this._distanceBetween(origin, ent.position);
+      if (dist <= radius) {
+        const entry = { entity: ent, name, dist, isRanged };
+        threats.push(entry);
+        if (isRanged) hasRanged = true;
+        if (!nearest || dist < nearest.dist) {
+          nearest = entry;
+        }
+      }
+    }
+    if (threats.length === 0) return null;
+
+    let sumX = 0;
+    let sumZ = 0;
+    for (const t of threats) {
+      sumX += t.entity.position.x ?? 0;
+      sumZ += t.entity.position.z ?? 0;
+    }
+    return {
+      threats,
+      nearest,
+      hasRanged,
+      centroid: { x: sumX / threats.length, z: sumZ / threats.length },
+    };
+  }
+
+  _computeFleeTarget(origin, threatInfo, allowed = null) {
+    const fleeDist = threatInfo.hasRanged ? RANGED_FLEE_DISTANCE : MELEE_FLEE_DISTANCE;
+    const dx = (origin.x ?? 0) - (threatInfo.centroid.x ?? 0);
+    const dz = (origin.z ?? 0) - (threatInfo.centroid.z ?? 0);
+    const len = Math.hypot(dx, dz);
+    const dirX = len > 0.05 ? dx / len : 1;
+    const dirZ = len > 0.05 ? dz / len : 0;
+    let tx = Math.round((origin.x ?? 0) + dirX * fleeDist);
+    let tz = Math.round((origin.z ?? 0) + dirZ * fleeDist);
+    if (
+      allowed &&
+      allowed.dist <= 24 &&
+      this._distanceBetween(allowed.player.entity.position, threatInfo.nearest.entity.position) >
+        threatInfo.nearest.dist + 2
+    ) {
+      tx = Math.round(allowed.player.entity.position.x ?? tx);
+      tz = Math.round(allowed.player.entity.position.z ?? tz);
+    }
+    return { tx, tz, fleeDist };
   }
 
   _findGuardedPlayer(bot) {
@@ -1053,24 +1118,12 @@ export class McRuntime {
           this._handleCreeperAlert(creeper, allowed?.player ?? null);
           return;
         }
-        const hostile = this._findNearestHostile(bot, 8);
-        if (hostile) {
-          const dx = (origin.x ?? 0) - (hostile.entity.position.x ?? 0);
-          const dz = (origin.z ?? 0) - (hostile.entity.position.z ?? 0);
-          const len = Math.hypot(dx, dz) || 1;
-          let tx = Math.round((origin.x ?? 0) + (dx / len) * 10);
-          let tz = Math.round((origin.z ?? 0) + (dz / len) * 10);
-          if (
-            allowed &&
-            allowed.dist <= 24 &&
-            this._distanceBetween(allowed.player.entity.position, hostile.entity.position) >
-              hostile.dist + 2
-          ) {
-            tx = Math.round(allowed.player.entity.position.x ?? tx);
-            tz = Math.round(allowed.player.entity.position.z ?? tz);
-          }
+        const threatInfo = this._findEvadeThreats(bot);
+        if (threatInfo) {
+          const { tx, tz } = this._computeFleeTarget(origin, threatInfo, allowed);
           applyNoDigMovements(bot);
           try {
+            bot.setSprinting?.(true);
             bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
           } catch {
             // Ignore pathfinder errors
@@ -3044,8 +3097,23 @@ export class McRuntime {
       if (!this.config.mcCompanionMode) {
         this._stopCompanionLoop();
       }
+      let fledTo = null;
+      const origin = bot.entity?.position;
+      const threatInfo = origin ? this._findEvadeThreats(bot) : null;
+      if (origin && threatInfo) {
+        const allowed = this._findNearestAllowedPlayer(bot);
+        const { tx, tz } = this._computeFleeTarget(origin, threatInfo, allowed);
+        applyNoDigMovements(bot);
+        try {
+          bot.setSprinting?.(true);
+          bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
+        } catch {
+          // Ignore pathfinder errors
+        }
+        fledTo = [tx, tz];
+      }
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : "原地待命";
+      this.activity = this.paused ? "已暂停" : fledTo ? "远离威胁" : "原地待命";
       this._emitSnapshot();
       return {
         ok: true,
@@ -3054,7 +3122,8 @@ export class McRuntime {
         paused: false,
         combat_mode: "evade",
         guard_target: "",
-        summary: "已切换躲避模式",
+        ...(fledTo ? { fled_to: fledTo } : {}),
+        summary: fledTo ? `已切换躲避模式并向(${fledTo.join(",")})撤离` : "已切换躲避模式",
         snapshot: this.getSnapshot(),
       };
     }
