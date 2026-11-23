@@ -1385,9 +1385,11 @@ async def test_e2e_wave3_all_three_remote_plugins_over_real_ws_and_fallback(
         assert fallback_card.startswith("base64://")
         assert base64.b64decode(fallback_card[len("base64://") :]).startswith(b"\xff\xd8\xff")
 
-        fallback_job = await svc.songs.request_learn_song("离线回退曲", auto_search=True)
-        assert fallback_job["payload"]["auto_search"] is True
-        assert fallback_job["payload"]["query"] == "离线回退曲"
+        # Offline song_finder fails cleanly at resource-prep stage without polluting Colab queue
+        prev_jobs = len(submitted_jobs)
+        with pytest.raises(Rejected, match="song_finder_remote_unavailable"):
+            await svc.songs.request_learn_song("离线拒绝曲", auto_search=True)
+        assert len(submitted_jobs) == prev_jobs
 
     # After app lifespan stops (Service.stop), process-wide text_card bridge is cleanly unbound.
     assert text_card._get_bridge_state()[0] is None

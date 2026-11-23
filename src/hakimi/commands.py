@@ -691,7 +691,24 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
             "invalid_ref_voice": (
                 "参考干声文件名无效，仅支持 models/ 目录下的 .wav/.flac/.mp3/.m4a/.ogg/.opus。"
             ),
-            "ref_voice_not_found": "未在云盘 Hakimi_Songs/models/ 中找到指定的参考干声文件。",
+            "ref_voice_not_found": (
+                "未在云盘 Hakimi_Songs/models/ 中找到指定的参考干声文件（未创建 Colab 作业）。"
+            ),
+            "model_not_found": "未找到指定的 RVC 音色模型权重文件（未创建 Colab 作业）。",
+            "source_not_found": (
+                f"独立找歌未检索到《{raw_title}》的干净原版（未创建 Colab 作业），"
+                "可手动上传原曲到 Drive inbox/ 或私聊附带音频重试。"
+            ),
+            "song_finder_remote_unavailable": (
+                "独立音源检索插件（song_finder）当前离线或不可用（未创建 Colab 作业），"
+                "请检查插件状态或直接附带音频/上传到 Drive inbox/。"
+            ),
+            "download_too_large": (
+                "检索到的原曲文件超过体积上限（未创建 Colab 作业），请手动压缩后上传到 inbox/。"
+            ),
+            "song_drive_not_found": (
+                "未在云盘 Hakimi_Songs/inbox/ 中找到指定的原曲文件（未创建 Colab 作业）。"
+            ),
             "invalid_song_title": (
                 "歌名格式不太对，支持 1～60 字多语种文字、数字与常见标点"
                 '（不可含 / \\ < > " 等特殊符号）。'

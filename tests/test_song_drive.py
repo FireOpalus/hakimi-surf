@@ -1081,6 +1081,7 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
     class _RegisteringCompute:
         def __init__(self) -> None:
             self.registered: dict[str, dict[str, Any]] = {}
+            self.submitted: list[tuple[str, dict[str, Any]]] = []
 
         def configured(self) -> bool:
             return True
@@ -1098,6 +1099,14 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
                 "pre_dispatch": pre_dispatch,
                 "on_complete": on_complete,
             }
+
+        async def submit_job(
+            self, job_type: str, payload: dict[str, Any], *, requester: str = "owner"
+        ) -> dict[str, Any]:
+            del requester
+            validated = self.registered[job_type]["validator"](payload)
+            self.submitted.append((job_type, validated))
+            return {"id": f"job-{len(self.submitted)}", "job_type": job_type, "payload": validated}
 
     compute = _RegisteringCompute()
 
@@ -1129,11 +1138,12 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
         assert set(compute.registered) == {"rvc_cover", "rvc_train"}
         assert compute.registered["rvc_cover"]["on_complete"] == mod._on_rvc_cover_completed
 
-        # Validators match strict Pydantic schemas & defaults
+        # Validators match strict Pydantic schemas & defaults (Colab requires prepared inbox source)
         cover_val = compute.registered["rvc_cover"]["validator"]
         train_val = compute.registered["rvc_train"]["validator"]
-        norm_cover = cover_val({"title": "雨爱", "auto_search": True})
+        norm_cover = cover_val({"title": "雨爱", "inbox_filename": "rain.m4a"})
         assert norm_cover["engine"] == "dual"
+        assert norm_cover["auto_search"] is False
         assert (
             norm_cover["index_rate"],
             norm_cover["protect"],
@@ -1143,8 +1153,10 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
         ) == (0.15, 0.42, 0.25, True, False)
         with pytest.raises(Rejected, match="song_source_required"):
             cover_val({"title": "雨爱", "auto_search": False})
+        with pytest.raises(Rejected, match="song_source_required"):
+            cover_val({"title": "雨爱", "auto_search": True})
         with pytest.raises(Rejected, match="colab_invalid_job"):
-            cover_val({"title": "雨爱", "unknown_field": 1})
+            cover_val({"title": "雨爱", "inbox_filename": "rain.m4a", "unknown_field": 1})
 
         norm_train = train_val({})
         assert (
@@ -1193,7 +1205,12 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             "cache_weights_sha256": cover_sha,
         }
 
-        # pre_dispatch for dual/SVC raises ref_voice_not_found when models/ has no ref audio
+        # Missing ref_voice fails BEFORE Colab enqueue (zero bogus Colab jobs!)
+        with pytest.raises(Rejected, match="ref_voice_not_found"):
+            await mod.songs.request_learn_song("雨爱", engine="dual", inbox_filename="rain.m4a")
+        assert compute.submitted == []
+
+        # pre_dispatch for dual/SVC also raises ref_voice_not_found as defense-in-depth
         with pytest.raises(Rejected, match="ref_voice_not_found"):
             await compute.registered["rvc_cover"]["pre_dispatch"](
                 {
@@ -1203,10 +1220,20 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
                 }
             )
 
-        # Adding ref voice in models/ lets dual/SVC resolve ref_audio without needing pth/index
+        # Adding ref voice in models/ lets dual/SVC resolve both inbox & ref_audio before submit
         srv.add_file("ref_alt_1", name="other_voice.wav", parent_id=srv.models_id, data=b"WAV_A")
         srv.add_file("ref_22s_1", name="hakimi_ref_22s.wav", parent_id=srv.models_id, data=b"WAV_B")
         srv.add_file("ref_def_1", name="hakimi_ref.wav", parent_id=srv.models_id, data=b"WAV_C")
+
+        ok_dual = await mod.songs.request_learn_song(
+            "雨爱", engine="dual", inbox_filename="rain.m4a"
+        )
+        assert ok_dual["payload"]["inbox_file_id"] == "inbox_101"
+        assert ok_dual["payload"]["inbox_filename"] == "rain.m4a"
+        assert ok_dual["payload"]["ref_audio_file_id"] == "ref_def_1"
+        assert ok_dual["payload"]["ref_voice"] == "hakimi_ref.wav"
+        assert ok_dual["payload"]["auto_search"] is False
+        assert len(compute.submitted) == 1
 
         dual_ctx = await compute.registered["rvc_cover"]["pre_dispatch"](
             {
@@ -1226,13 +1253,27 @@ async def test_song_studio_dynamic_registration_and_pre_dispatch_contract(
             "cache_weights_sha256": cover_sha,
         }
 
-        # Missing inbox file raises source_not_found during pre_dispatch
+        # Missing inbox file or ref voice fails BEFORE Colab enqueue (zero bogus Colab jobs!)
+        prev_submit_count = len(getattr(compute, "submitted", []))
+        with pytest.raises(Rejected, match="source_not_found"):
+            await mod.songs.request_learn_song("雨爱", inbox_filename="nonexistent.m4a")
+        assert len(getattr(compute, "submitted", [])) == prev_submit_count
+
+        # Missing inbox file raises source_not_found during pre_dispatch as defense-in-depth
         with pytest.raises(Rejected, match="source_not_found"):
             await compute.registered["rvc_cover"]["pre_dispatch"](
                 {
                     "id": "job-cover-miss",
                     "job_type": "rvc_cover",
                     "payload": {"title": "雨爱", "inbox_filename": "nonexistent.m4a"},
+                }
+            )
+        with pytest.raises(Rejected, match="song_source_required"):
+            await compute.registered["rvc_cover"]["pre_dispatch"](
+                {
+                    "id": "job-cover-nosrc",
+                    "job_type": "rvc_cover",
+                    "payload": {"title": "雨爱"},
                 }
             )
 

@@ -62,6 +62,7 @@ _PAYLOAD_TOO_LARGE_CODES = frozenset(
         "song_inbox_upload_too_large",
         "song_ref_voice_too_large",
         "colab_inbox_upload_too_large",
+        "download_too_large",
     }
 )
 _NOT_FOUND_CODES = frozenset(
@@ -69,6 +70,7 @@ _NOT_FOUND_CODES = frozenset(
         "song_not_found",
         "song_take_not_found",
         "ref_voice_not_found",
+        "model_not_found",
         "song_drive_not_found",
         "source_not_found",
     }
@@ -112,6 +114,7 @@ _UNAVAILABLE_CODES = frozenset(
         "song_drive_invalid_response",
         "song_drive_response_too_large",
         "song_drive_disallowed_endpoint",
+        "song_finder_remote_unavailable",
     }
 )
 

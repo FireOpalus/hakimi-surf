@@ -736,7 +736,7 @@ class RvcCoverJobPayload(BaseModel):
     ref_audio_file_id: str = Field(default="", max_length=128)
     svc_steps: int | None = Field(default=None, ge=10, le=100)
     pitch: int = Field(default=0, ge=MIN_SONG_PITCH, le=MAX_SONG_PITCH)
-    auto_search: bool = True
+    auto_search: bool = False
     query: str = Field(default="", max_length=120)
     inbox_file_id: str = Field(default="", max_length=128)
     inbox_filename: str = Field(default="", max_length=160)
@@ -847,14 +847,18 @@ class RvcTrainJobPayload(BaseModel):
 
 
 def validate_rvc_cover_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Validate and normalize an `rvc_cover` job payload for ColabComputeHub."""
+    """Validate and normalize an `rvc_cover` job payload for ColabComputeHub.
+
+    Pre-GPU source retrieval belongs strictly in `song_finder` / `song_studio`;
+    Colab `rvc_cover` jobs only accept an already-prepared Drive inbox source.
+    """
     if not isinstance(payload, dict):
         raise Rejected("colab_invalid_job")
     try:
         parsed = RvcCoverJobPayload.model_validate(payload)
     except ValidationError:
         raise Rejected("colab_invalid_job") from None
-    if not parsed.inbox_file_id and not parsed.inbox_filename and not parsed.auto_search:
+    if parsed.auto_search or (not parsed.inbox_file_id and not parsed.inbox_filename):
         raise Rejected("song_source_required")
     return parsed.model_dump(mode="json")
 
@@ -1075,15 +1079,16 @@ class SongLibrary:
         self,
         clean_title: str,
         clean_artist: str,
-    ) -> tuple[bytes, str, str, str] | None:
-        """Fetch clean original audio from the isolated remote `song_finder` plugin when online."""
-        remote_only = self._song_finder_remote_only()
+    ) -> tuple[bytes, str, str, str]:
+        """Fetch clean original audio strictly from the isolated `song_finder` plugin.
+
+        Never falls back to delegating source search to Colab: resource preparation
+        must succeed before any GPU job is created in `colab_compute`.
+        """
         bus = self.plugin_bus
         invoke_tool = getattr(bus, "invoke_tool", None) if bus is not None else None
         if not self._song_finder_online() or not callable(invoke_tool):
-            if remote_only:
-                raise Rejected("song_finder_remote_unavailable")
-            return None
+            raise Rejected("song_finder_remote_unavailable")
 
         args: dict[str, Any] = {
             "query": clean_title,
@@ -1106,40 +1111,25 @@ class SongLibrary:
             raise
         except Rejected as exc:
             reason = str(exc) or "source_not_found"
-            if remote_only:
-                if reason in _SONG_FINDER_UNAVAILABLE_ERRORS:
-                    raise Rejected("song_finder_remote_unavailable") from None
-                raise Rejected(reason) from None
-            log.info("event=song_learn_source_fallback reason=%s", reason)
-            return None
-        except Exception as exc:
-            if remote_only:
+            if reason in _SONG_FINDER_UNAVAILABLE_ERRORS:
                 raise Rejected("song_finder_remote_unavailable") from None
-            log.info("event=song_learn_source_fallback reason=%s", type(exc).__name__)
-            return None
+            raise Rejected(reason) from None
+        except Exception:
+            raise Rejected("song_finder_remote_unavailable") from None
 
         raw_blob = getattr(tool_res, "blob", None)
         meta = getattr(tool_res, "data", None)
         meta_dict = meta if isinstance(meta, dict) else {}
         if not isinstance(raw_blob, (bytes, bytearray)) or not raw_blob:
-            if remote_only:
-                raise Rejected("source_not_found")
-            log.info("event=song_learn_source_fallback reason=empty_blob")
-            return None
+            raise Rejected("source_not_found")
 
         raw_bytes = bytes(raw_blob)
         if len(raw_bytes) > SONG_FINDER_MAX_AUDIO_BYTES or len(raw_bytes) > MAX_LEARN_UPLOAD_BYTES:
-            if remote_only:
-                raise Rejected("download_too_large")
-            log.info("event=song_learn_source_fallback reason=download_too_large")
-            return None
+            raise Rejected("download_too_large")
 
         expected_sha = str(meta_dict.get("sha256") or "").strip().lower()
         if expected_sha and hashlib.sha256(raw_bytes).hexdigest() != expected_sha:
-            if remote_only:
-                raise Rejected("song_finder_remote_unavailable")
-            log.info("event=song_learn_source_fallback reason=sha256_mismatch")
-            return None
+            raise Rejected("song_finder_remote_unavailable")
 
         fname_hint = str(
             getattr(tool_res, "blob_filename", "") or meta_dict.get("filename") or ""
@@ -1150,14 +1140,7 @@ class SongLibrary:
                 fmt_hint = "m4a"
             fname_hint = f"{clean_title}.{fmt_hint}"
 
-        try:
-            safe_name, mime_type = _safe_learn_upload_name(fname_hint, clean_title)
-        except Rejected as exc:
-            if remote_only:
-                raise Rejected(str(exc)) from None
-            log.info("event=song_learn_source_fallback reason=%s", str(exc))
-            return None
-
+        safe_name, mime_type = _safe_learn_upload_name(fname_hint, clean_title)
         provider_name = str(meta_dict.get("provider") or "remote").strip()[:32] or "remote"
         return raw_bytes, safe_name, mime_type, provider_name
 
@@ -1975,6 +1958,7 @@ class SongLibrary:
         payload.update(optional_floats)
         payload.update(optional_bools)
 
+        prepared_upload: tuple[bytes, str, str] | None = None
         if audio_bytes is not None:
             if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
                 raise Rejected("invalid_song_audio")
@@ -1982,6 +1966,35 @@ class SongLibrary:
             if len(raw) > MAX_LEARN_UPLOAD_BYTES:
                 raise Rejected("song_upload_too_large")
             safe_name, mime_type = _safe_learn_upload_name(audio_filename, clean_title)
+            prepared_upload = (raw, safe_name, mime_type)
+            clean_inbox_name = ""
+            clean_inbox_id = ""
+        else:
+            clean_inbox_name = _sanitize_inbox_filename(inbox_filename)
+            clean_inbox_id = _sanitize_drive_id(inbox_file_id)
+            if not clean_inbox_name and not clean_inbox_id and not auto_search:
+                raise Rejected("song_source_required")
+
+        # Pre-validate voice asset before downloading/uploading or enqueuing a Colab GPU job.
+        drive = self.drive
+        drive_ready = drive is not None and bool(getattr(drive, "configured", lambda: False)())
+        if drive_ready and clean_engine != "rvc":
+            resolve_ref_fn = getattr(drive, "resolve_ref_voice", None)
+            if callable(resolve_ref_fn):
+                ref_meta = await resolve_ref_fn(
+                    file_id=clean_ref_audio_id,
+                    filename=clean_ref_voice,
+                )
+                if isinstance(ref_meta, dict):
+                    resolved_ref_id = _sanitize_drive_id(ref_meta.get("id") or "")
+                    resolved_ref_name = str(ref_meta.get("name") or clean_ref_voice).strip()
+                    if resolved_ref_id:
+                        payload["ref_audio_file_id"] = resolved_ref_id
+                    if resolved_ref_name:
+                        payload["ref_voice"] = resolved_ref_name
+
+        if prepared_upload is not None:
+            raw, safe_name, mime_type = prepared_upload
             uploaded = await self._upload_inbox_bytes(safe_name, raw, mime_type=mime_type)
             raw_file_id = uploaded.get("file_id") if isinstance(uploaded, dict) else ""
             file_id = _sanitize_drive_id(raw_file_id)
@@ -1990,39 +2003,48 @@ class SongLibrary:
             payload["inbox_file_id"] = file_id
             payload["inbox_filename"] = str(uploaded.get("name") or safe_name)
             payload["auto_search"] = False
+        elif clean_inbox_name or clean_inbox_id:
+            resolved_inbox_id = clean_inbox_id
+            resolved_inbox_name = clean_inbox_name
+            if drive_ready:
+                resolve_inbox_fn = getattr(drive, "resolve_inbox_file", None)
+                if callable(resolve_inbox_fn):
+                    inbox_meta = await resolve_inbox_fn(
+                        file_id=clean_inbox_id,
+                        filename=clean_inbox_name,
+                    )
+                    if isinstance(inbox_meta, dict):
+                        resolved_inbox_id = _sanitize_drive_id(
+                            inbox_meta.get("id") or clean_inbox_id
+                        )
+                        resolved_inbox_name = str(
+                            inbox_meta.get("name") or clean_inbox_name
+                        ).strip()
+            if resolved_inbox_name:
+                payload["inbox_filename"] = resolved_inbox_name
+            if resolved_inbox_id:
+                payload["inbox_file_id"] = resolved_inbox_id
+            payload["auto_search"] = False
         else:
-            clean_inbox_name = _sanitize_inbox_filename(inbox_filename)
-            clean_inbox_id = _sanitize_drive_id(inbox_file_id)
-            if clean_inbox_name or clean_inbox_id:
-                if clean_inbox_name:
-                    payload["inbox_filename"] = clean_inbox_name
-                if clean_inbox_id:
-                    payload["inbox_file_id"] = clean_inbox_id
-                payload["auto_search"] = False
-            elif auto_search:
-                fetched = await self._fetch_remote_song_source(clean_title, clean_artist)
-                if fetched is not None:
-                    raw_source, safe_name, mime_type, source_provider = fetched
-                    uploaded = await self._upload_inbox_bytes(
-                        safe_name, raw_source, mime_type=mime_type
-                    )
-                    raw_file_id = uploaded.get("file_id") if isinstance(uploaded, dict) else ""
-                    file_id = _sanitize_drive_id(raw_file_id)
-                    if not file_id:
-                        raise Rejected("song_drive_invalid_file")
-                    payload["inbox_file_id"] = file_id
-                    payload["inbox_filename"] = str(uploaded.get("name") or safe_name)
-                    payload["auto_search"] = False
-                    log.info(
-                        "event=song_learn_source_resolved source=song_finder provider=%s bytes=%d",
-                        source_provider,
-                        len(raw_source),
-                    )
-                else:
-                    payload["query"] = clean_title
-                    payload["auto_search"] = True
-            else:
-                raise Rejected("song_source_required")
+            (
+                raw_source,
+                safe_name,
+                mime_type,
+                source_provider,
+            ) = await self._fetch_remote_song_source(clean_title, clean_artist)
+            uploaded = await self._upload_inbox_bytes(safe_name, raw_source, mime_type=mime_type)
+            raw_file_id = uploaded.get("file_id") if isinstance(uploaded, dict) else ""
+            file_id = _sanitize_drive_id(raw_file_id)
+            if not file_id:
+                raise Rejected("song_drive_invalid_file")
+            payload["inbox_file_id"] = file_id
+            payload["inbox_filename"] = str(uploaded.get("name") or safe_name)
+            payload["auto_search"] = False
+            log.info(
+                "event=song_learn_source_resolved source=song_finder provider=%s bytes=%d",
+                source_provider,
+                len(raw_source),
+            )
 
         submit_kwargs: dict[str, Any] = {"requester": requester}
         if clean_gpu is not None or _accepts_kwarg(self.compute.submit_job, "gpu"):

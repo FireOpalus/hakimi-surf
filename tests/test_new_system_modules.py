@@ -419,7 +419,39 @@ async def test_owner_chat_learn_song_command_and_action_e2e(
         assert submitted_jobs == []
         assert gw.calls == []
 
-        # Owner DM /学歌 (auto_search)
+        # Owner DM /学歌 (auto_search with offline song_finder stops cleanly, 0 Colab jobs)
+        offline_reply = await svc.command(
+            message.model_copy(update={"text": "/学歌 《晴天》 pitch=-2 artist=周杰伦 tags=抒情"})
+        )
+        assert offline_reply is not None and "song_finder" in offline_reply
+        assert submitted_jobs == []
+
+        # Owner DM /学歌 (auto_search via online song_finder -> inbox upload -> Colab enqueue)
+        import hashlib
+
+        from hakimi_plugin_sdk import ToolCallResult
+
+        class _FakeSongFinderBus:
+            def has_tool(
+                self, plugin_id: str, action_name: str, *, require_enabled: bool = True
+            ) -> bool:
+                del require_enabled
+                return plugin_id == "song_finder" and action_name == "song_finder.fetch_source"
+
+            async def invoke_tool(self, *_args, **_kwargs) -> ToolCallResult:
+                raw = b"FAKE_FOUND_ORIGINAL_M4A"
+                return ToolCallResult(
+                    data={
+                        "provider": "youtube",
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "filename": "晴天.m4a",
+                    },
+                    blob=raw,
+                    blob_mime_type="audio/mp4",
+                    blob_filename="晴天.m4a",
+                )
+
+        svc.songs.plugin_bus = _FakeSongFinderBus()
         reply = await svc.command(
             message.model_copy(update={"text": "/学歌 《晴天》 pitch=-2 artist=周杰伦 tags=抒情"})
         )
@@ -430,7 +462,8 @@ async def test_owner_chat_learn_song_command_and_action_e2e(
         assert submitted_jobs[0][1]["pitch"] == -2
         assert submitted_jobs[0][1]["artist"] == "周杰伦"
         assert submitted_jobs[0][1]["tags"] == "抒情"
-        assert submitted_jobs[0][1]["auto_search"] is True
+        assert submitted_jobs[0][1]["inbox_file_id"] == "inbox-id-1"
+        assert submitted_jobs[0][1]["auto_search"] is False
         assert gw.calls == []
 
         # Owner DM /learn-song with audio FileRef attachment
@@ -450,11 +483,11 @@ async def test_owner_chat_learn_song_command_and_action_e2e(
             )
         )
         assert reply2 is not None and "小幸运" in reply2 and "附带音频" in reply2
-        assert len(uploaded_inbox) == 1
-        assert uploaded_inbox[0] == ("demo.mp3", audio_bytes)
+        assert len(uploaded_inbox) == 2
+        assert uploaded_inbox[-1] == ("demo.mp3", audio_bytes)
         assert submitted_jobs[-1][1]["title"] == "小幸运"
         assert submitted_jobs[-1][1]["pitch"] == 3
-        assert submitted_jobs[-1][1]["inbox_file_id"] == "inbox-id-1"
+        assert submitted_jobs[-1][1]["inbox_file_id"] == "inbox-id-2"
 
         # Owner chat action (song_studio.learn_song) with audio attachment & replan
         replan_delays: list[float] = []
@@ -476,7 +509,7 @@ async def test_owner_chat_learn_song_command_and_action_e2e(
                     update={"files": [FileRef(name="demo.mp3", file_id="fid-daoxiang")]}
                 ),
             )
-        assert len(uploaded_inbox) == 2
+        assert len(uploaded_inbox) == 3
         assert submitted_jobs[-1][1]["title"] == "稻香"
         assert submitted_jobs[-1][1]["pitch"] == 1
         assert submitted_jobs[-1][2] == "owner_chat"

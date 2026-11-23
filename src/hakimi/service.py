@@ -550,11 +550,41 @@ class Service:
                 req_kwargs["ref_voice"] = args.ref_voice.strip()
             await songs.request_learn_song(title, **req_kwargs)
         except Rejected as exc:
+            reason = self._safe_action_reason(exc)
             log.info(
                 "event=owner_chat_action_done action=%s status=gated_skip reason=%s",
                 _LEARN_SONG_ACTION_NAME,
-                self._safe_action_reason(exc),
+                reason,
             )
+            prep_notices = {
+                "source_not_found": (
+                    f"刚刚帮 BOISER 找《{title}》的原曲没找到干净原版（未创建 Colab 作业），"
+                    "可以把原曲直接发给我或传到云盘 inbox/ 再开练喵~"
+                ),
+                "song_finder_remote_unavailable": (
+                    f"独立找歌插件（song_finder）当前离线或不可用，暂时没法自动搜《{title}》"
+                    "（未创建 Colab 作业），可以把原曲直接发给我或传到云盘 inbox/。"
+                ),
+                "ref_voice_not_found": (
+                    f"准备学《{title}》时没在云盘 models/ 里找到可用参考干声"
+                    "（未创建 Colab 作业），请先在后台上传参考干声。"
+                ),
+                "song_drive_not_found": (
+                    f"未在云盘 inbox/ 里找到《{title}》指定的原曲文件（未创建 Colab 作业）。"
+                ),
+                "download_too_large": (
+                    f"检索到的《{title}》原曲超过体积上限（未创建 Colab 作业），"
+                    "麻烦手动压缩后上传到 inbox/。"
+                ),
+            }
+            notice_text = prep_notices.get(reason)
+            proactive = getattr(self, "proactive", None)
+            alert_fn = getattr(proactive, "alert", None) if proactive is not None else None
+            if notice_text and callable(alert_fn):
+                try:
+                    await alert_fn(f"song_prep_{reason}", notice_text)
+                except Exception:
+                    pass
             return
         except asyncio.CancelledError:
             raise

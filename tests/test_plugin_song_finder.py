@@ -1048,23 +1048,22 @@ async def test_e2e_song_finder_plugin_chunked_blob_to_inbox_and_fallbacks(
             # Every single WS frame stayed strictly <= 256 KiB!
             assert frame_sizes and max(frame_sizes) <= 262_144
 
-            # 3) Graceful fallback when song_finder finds no clean track
+            # 3) Missing track stops at resource-prep stage with source_not_found (0 Colab jobs!)
             fake_media_bins["set_state"](yt_search_mode="empty")
             bili.http = httpx.AsyncClient(
                 transport=_make_bili_mock_transport(search_code=-412),
                 follow_redirects=False,
             )
+            prev_jobs = len(compute.submitted_jobs)
             try:
-                await songs.request_learn_song("非常冷门的歌", auto_search=True)
-                _, fallback_payload, _ = compute.submitted_jobs[-1]
-                assert fallback_payload["auto_search"] is True
-                assert fallback_payload["query"] == "非常冷门的歌"
-                assert "inbox_file_id" not in fallback_payload
+                with pytest.raises(Rejected, match="source_not_found"):
+                    await songs.request_learn_song("非常冷门的歌", auto_search=True)
+                assert len(compute.submitted_jobs) == prev_jobs
 
-                # 4) Strict SONG_FINDER_REMOTE_ONLY=1 prevents local fallback on miss
                 monkeypatch.setenv("SONG_FINDER_REMOTE_ONLY", "1")
                 with pytest.raises(Rejected, match="source_not_found"):
                     await songs.request_learn_song("非常冷门的歌", auto_search=True)
+                assert len(compute.submitted_jobs) == prev_jobs
             finally:
                 await bili.http.aclose()
         finally:
@@ -1074,17 +1073,18 @@ async def test_e2e_song_finder_plugin_chunked_blob_to_inbox_and_fallbacks(
                 await serve_task
             await bili_http.aclose()
 
-        # 5) Offline behavior: graceful fallback by default, Rejected when SONG_FINDER_REMOTE_ONLY=1
+        # 4) Offline song_finder NEVER leaks an auto_search job into Colab
         assert bus.has_tool("song_finder", "song_finder.fetch_source") is False
         monkeypatch.delenv("SONG_FINDER_REMOTE_ONLY", raising=False)
-        await songs.request_learn_song("离线回退曲", auto_search=True)
-        _, offline_payload, _ = compute.submitted_jobs[-1]
-        assert offline_payload["auto_search"] is True
-        assert offline_payload["query"] == "离线回退曲"
+        prev_jobs = len(compute.submitted_jobs)
+        with pytest.raises(Rejected, match="song_finder_remote_unavailable"):
+            await songs.request_learn_song("离线拒绝曲", auto_search=True)
+        assert len(compute.submitted_jobs) == prev_jobs
 
         monkeypatch.setenv("SONG_FINDER_REMOTE_ONLY", "true")
         with pytest.raises(Rejected, match="song_finder_remote_unavailable"):
             await songs.request_learn_song("严格远程曲", auto_search=True)
+        assert len(compute.submitted_jobs) == prev_jobs
 
 
 async def test_song_library_rejects_corrupt_or_disallowed_remote_blob(
@@ -1106,7 +1106,7 @@ async def test_song_library_rejects_corrupt_or_disallowed_remote_blob(
         async def invoke_tool(self, *_args: Any, **_kwargs: Any) -> ToolCallResult:
             return self._result
 
-    # 1) SHA-256 mismatch -> falls back safely in default mode, rejects in remote_only mode
+    # 1) SHA-256 mismatch -> rejected immediately before upload & before any Colab job
     bad_sha_bus = _TamperedBus(
         ToolCallResult(
             data={"provider": "youtube", "sha256": "0" * 64, "filename": "track.m4a"},
@@ -1117,15 +1117,17 @@ async def test_song_library_rejects_corrupt_or_disallowed_remote_blob(
     )
     lib = SongLibrary(store, compute=compute, plugin_bus=bad_sha_bus)
     await lib.initialize()
-    await lib.request_learn_song("校验失败曲", auto_search=True)
+    with pytest.raises(Rejected, match="song_finder_remote_unavailable"):
+        await lib.request_learn_song("校验失败曲", auto_search=True)
     assert len(compute.inbox_uploads) == 0
-    assert compute.submitted_jobs[-1][1]["auto_search"] is True
+    assert len(compute.submitted_jobs) == 0
 
     monkeypatch.setenv("SONG_FINDER_REMOTE_ONLY", "1")
     with pytest.raises(Rejected, match="song_finder_remote_unavailable"):
         await lib.request_learn_song("校验失败曲", auto_search=True)
+    assert len(compute.submitted_jobs) == 0
 
-    # 2) Disallowed file extension (.exe) blocked before upload_drive_inbox
+    # 2) Disallowed file extension (.exe) blocked before upload_drive_inbox & Colab submit
     monkeypatch.delenv("SONG_FINDER_REMOTE_ONLY", raising=False)
     bad_ext_bytes = b"NOT_AUDIO"
     bad_ext_bus = _TamperedBus(
@@ -1141,9 +1143,10 @@ async def test_song_library_rejects_corrupt_or_disallowed_remote_blob(
         )
     )
     lib.plugin_bus = bad_ext_bus
-    await lib.request_learn_song("坏后缀曲", auto_search=True)
+    with pytest.raises(Rejected, match="invalid_song_audio"):
+        await lib.request_learn_song("坏后缀曲", auto_search=True)
     assert len(compute.inbox_uploads) == 0
-    assert compute.submitted_jobs[-1][1]["auto_search"] is True
+    assert len(compute.submitted_jobs) == 0
 
 
 async def test_song_studio_module_wires_plugin_bus_without_changing_requires(settings, store):

@@ -984,13 +984,7 @@ def test_ephemeral_drive_client_scoping_resumable_and_token_guards(tmp_path: Pat
 
 
 async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) -> None:
-    def failing_search(*args, **kwargs):
-        del args, kwargs
-        raise colab_rvc.SourceNotFoundError("source_not_found", "no clean original")
-
-    app, cfg, drive_client, tree, usage_state, _ = _build_test_worker(
-        tmp_path, clean_search_fn=failing_search
-    )
+    app, cfg, drive_client, tree, usage_state, _ = _build_test_worker(tmp_path)
 
     # CLI parser accepts pure GPU worker args only (no --drive-cred-path or --songs-folder-id)
     parsed_args = colab_worker._build_parser().parse_args(
@@ -1079,6 +1073,20 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
             )
         ).status_code == 400
 
+        # Reject auto_search=True / source-less payloads at worker admission (pure GPU worker!)
+        bad_auto = await client.post(
+            "/v1/jobs",
+            headers=headers,
+            json={
+                "job_id": "a" * 32,
+                "job_type": "rvc_cover",
+                "payload": {"title": "禁找歌进Colab", "auto_search": True},
+                "dispatch_context": _make_drive_dispatch_context(tree),
+            },
+        )
+        assert bad_auto.status_code == 400
+        assert bad_auto.json()["detail"] == "song_source_required"
+
         # Missing dispatch_context for rvc_cover returns explicit drive_context_required error
         no_ctx_id = "d" * 32
         sub_no_ctx = await client.post(
@@ -1087,7 +1095,7 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
             json={
                 "job_id": no_ctx_id,
                 "job_type": "rvc_cover",
-                "payload": {"title": "缺上下文", "auto_search": True},
+                "payload": {"title": "缺上下文", "inbox_filename": "demo.m4a"},
             },
         )
         assert sub_no_ctx.status_code == 202
@@ -1165,7 +1173,7 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
         )
         assert dl_bytes == _fake_mp3_bytes(b"chorus-audio")
 
-        # source_not_found error propagation with valid Drive context
+        # source_not_found error propagation when dispatch_context lacks resolved inbox_file_id
         nf_id = "c" * 32
         sub2 = await client.post(
             "/v1/jobs",
@@ -1173,7 +1181,7 @@ async def test_worker_auth_whitelist_cover_and_source_not_found(tmp_path: Path) 
             json={
                 "job_id": nf_id,
                 "job_type": "rvc_cover",
-                "payload": {"title": "找不到原曲", "auto_search": True},
+                "payload": {"title": "找不到原曲", "inbox_filename": "missing.m4a"},
                 "dispatch_context": _make_drive_dispatch_context(tree),
             },
         )
@@ -1612,7 +1620,9 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
                 (job["id"],),
             )
         await hub.set_config(ColabConfig(job_timeout_seconds=120))
-        slow_job = await hub.submit_job("rvc_cover", {"title": "超时测试", "auto_search": True})
+        slow_job = await hub.submit_job(
+            "rvc_cover", {"title": "超时测试", "inbox_file_id": inbox_up["file_id"]}
+        )
         async with store.transaction():
             await store.db.execute(
                 "UPDATE colab_jobs SET status='running', started_at=? WHERE id=?",
@@ -1626,12 +1636,14 @@ async def test_system_module_status_is_non_blocking_and_hub_scheduler_lifecycle(
         queued_ids: list[str] = []
         for idx in range(20):
             q_job = await hub.submit_job(
-                "rvc_cover", {"title": f"队列测试-{idx}", "auto_search": True}
+                "rvc_cover", {"title": f"队列测试-{idx}", "inbox_file_id": inbox_up["file_id"]}
             )
             queued_ids.append(q_job["id"])
         assert len(queued_ids) == 20
         with pytest.raises(Rejected, match="colab_job_limit_reached"):
-            await hub.submit_job("rvc_cover", {"title": "超队列上限", "auto_search": True})
+            await hub.submit_job(
+                "rvc_cover", {"title": "超队列上限", "inbox_file_id": inbox_up["file_id"]}
+            )
 
         await hub.close()
 
@@ -1751,7 +1763,7 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                     "/admin/api/colab/jobs",
                     json={
                         "job_type": "rvc_cover",
-                        "payload": {"title": "禁G4", "auto_search": True},
+                        "payload": {"title": "禁G4", "inbox_filename": "demo.m4a"},
                         "gpu": "G4",
                     },
                 )
@@ -1762,13 +1774,24 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                     "/admin/api/colab/jobs",
                     json={
                         "job_type": "rvc_cover",
-                        "payload": {"title": "禁回退G4", "auto_search": True},
+                        "payload": {"title": "禁回退G4", "inbox_filename": "demo.m4a"},
                         "gpu": "L4",
                         "fallback_gpus": ["G4"],
                     },
                 )
                 assert bad_cover_fb.status_code == 400
                 assert bad_cover_fb.json()["detail"] == "colab_gpu_not_allowed"
+
+                # Source-less auto_search rvc_cover job rejected at Colab API boundary
+                bad_cover_nosrc = await client.post(
+                    "/admin/api/colab/jobs",
+                    json={
+                        "job_type": "rvc_cover",
+                        "payload": {"title": "无原曲", "auto_search": True},
+                    },
+                )
+                assert bad_cover_nosrc.status_code == 400
+                assert bad_cover_nosrc.json()["detail"] == "song_source_required"
 
                 for banned_train_gpu in ("T4", "L4", "G4"):
                     bad_train_gpu = await client.post(
@@ -1787,7 +1810,7 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                     "/admin/api/colab/jobs",
                     json={
                         "job_type": "rvc_cover",
-                        "payload": {"title": "晴天", "auto_search": True},
+                        "payload": {"title": "晴天", "inbox_filename": "qingtian.m4a"},
                     },
                 )
                 assert sub.status_code == 200
@@ -1801,7 +1824,7 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                     "/admin/api/colab/jobs",
                     json={
                         "job_type": "rvc_cover",
-                        "payload": {"title": "强指定A100", "auto_search": True},
+                        "payload": {"title": "强指定A100", "inbox_filename": "a100.m4a"},
                         "gpu": "A100",
                     },
                 )
@@ -2775,7 +2798,7 @@ async def test_colab_compute_cu_trend_gpu_breakdown_warm_status_and_token_scrub(
         # 4) No daily CU cap: dispatch succeeds regardless of today's CU usage,
         #    and allow_warm_keepalive follows config.enabled (worker enforces real CU balance).
         await hub.set_config(ColabConfig(enabled=True, job_timeout_seconds=1500))
-        await hub.submit_job("rvc_cover", {"title": "无日限额单", "auto_search": True})
+        await hub.submit_job("rvc_cover", {"title": "无日限额单", "inbox_filename": "demo.m4a"})
         await hub.scheduler_step()
         assert len(dispatched_bodies) == 1
         assert dispatched_bodies[0]["allow_warm_keepalive"] is True
@@ -2913,20 +2936,24 @@ async def test_colab_module_gpu_policies_overrides_fallbacks_and_timeouts(settin
 
         # 3) Disallowed GPU / invalid GPU rejections
         with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
-            await hub.submit_job("rvc_cover", {"title": "禁G4", "auto_search": True}, gpu="G4")
+            await hub.submit_job(
+                "rvc_cover", {"title": "禁G4", "inbox_filename": "d.m4a"}, gpu="G4"
+            )
         with pytest.raises(Rejected, match="colab_gpu_not_allowed"):
             await hub.submit_job(
                 "rvc_cover",
-                {"title": "禁回退G4", "auto_search": True},
+                {"title": "禁回退G4", "inbox_filename": "d.m4a"},
                 gpu="L4",
                 fallback_gpus=["T4", "G4"],
             )
         with pytest.raises(Rejected, match="colab_invalid_job"):
-            await hub.submit_job("rvc_cover", {"title": "假卡", "auto_search": True}, gpu="RTX4090")
+            await hub.submit_job(
+                "rvc_cover", {"title": "假卡", "inbox_filename": "d.m4a"}, gpu="RTX4090"
+            )
         with pytest.raises(Rejected, match="colab_invalid_job"):
             await hub.submit_job(
                 "rvc_cover",
-                {"title": "假回退卡", "auto_search": True},
+                {"title": "假回退卡", "inbox_filename": "d.m4a"},
                 fallback_gpus=["RTX4090"],
             )
         for banned in ("T4", "L4", "G4"):
@@ -2939,19 +2966,26 @@ async def test_colab_module_gpu_policies_overrides_fallbacks_and_timeouts(settin
 
         # 4) Dispatch gpu_candidates isolation + explicit override + explicit empty fallback_gpus=[]
         cases = [
-            ("rvc_cover", {"title": "c1", "auto_search": True}, None, None, ["L4", "T4"], 1800),
             (
                 "rvc_cover",
-                {"title": "c2", "auto_search": True},
+                {"title": "c1", "inbox_filename": "c1.m4a"},
+                None,
+                None,
+                ["L4", "T4"],
+                1800,
+            ),
+            (
+                "rvc_cover",
+                {"title": "c2", "inbox_filename": "c2.m4a"},
                 "A100",
                 None,
                 ["A100", "L4", "T4"],
                 1800,
             ),
-            ("rvc_cover", {"title": "c3", "auto_search": True}, "H100", [], ["H100"], 1800),
+            ("rvc_cover", {"title": "c3", "inbox_filename": "c3.m4a"}, "H100", [], ["H100"], 1800),
             (
                 "rvc_cover",
-                {"title": "c4", "auto_search": True},
+                {"title": "c4", "inbox_filename": "c4.m4a"},
                 "T4",
                 ["A100", "T4", "A100"],
                 ["T4", "A100"],
@@ -3061,6 +3095,13 @@ async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
     (model_dir / "hakimi" / "hakimi.pth").write_bytes(b"p")
     (model_dir / "hakimi" / "hakimi.index").write_bytes(b"i")
 
+    cred = tmp_path / "secrets" / "drive.json"
+    _write_fake_oauth(cred)
+    backend = FakeDriveBackend()
+    drive_client = colab_drive.ColabDriveClient(cred, transport=backend.transport)
+    tree = drive_client.ensure_folder_tree()
+    inbox_up = drive_client.upload_bytes("inbox", "src.m4a", b"RAW_M4A", mime_type="audio/mp4")
+
     cfg = colab_worker.WorkerConfig(
         token=secret_worker_tok,
         model_dir=model_dir,
@@ -3069,6 +3110,7 @@ async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
     )
     app = colab_worker.create_worker_app(
         cfg,
+        drive_transport=backend.transport,
         usage_fn=lambda: {
             "reachable": False,
             "compute_units": None,
@@ -3082,9 +3124,6 @@ async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
         },
         stop_session_fn=stopped.append,
         cover_runner=crashing_cover,
-        clean_search_fn=lambda _q, out_dir, artist="": (
-            (out_dir / "src.m4a").write_bytes(b"m4a") or (out_dir / "src.m4a")
-        ),
     )
     headers = {"Authorization": f"Bearer {secret_worker_tok}"}
 
@@ -3109,14 +3148,17 @@ async def test_worker_status_error_scrubs_secrets_and_cancel_removes_warm_entry(
             json={
                 "job_id": err_jid,
                 "job_type": "rvc_cover",
-                "payload": {"title": "脱敏测试", "auto_search": True},
-                "dispatch_context": {
-                    "drive": {
-                        "access_token": ephem_tok,
-                        "folders": {"songs": "drv_songs_0001"},
-                        "files": {},
-                    }
+                "payload": {
+                    "title": "脱敏测试",
+                    "engine": "rvc",
+                    "inbox_file_id": inbox_up["file_id"],
                 },
+                "dispatch_context": _make_drive_dispatch_context(
+                    tree,
+                    access_token=ephem_tok,
+                    inbox_file_id=inbox_up["file_id"],
+                    inbox_name="src.m4a",
+                ),
             },
         )
         assert sub_err.status_code == 202
@@ -3400,8 +3442,9 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
     await lib.initialize()
 
     # Default call normalizes defaults via RvcCoverJobPayload (engine=dual, universal RVC defaults)
-    await lib.request_learn_song("枝垂桜", auto_search=True)
+    await lib.request_learn_song("枝垂桜", inbox_filename="shidare.flac", auto_search=False)
     assert submitted[-1][1]["engine"] == "dual"
+    assert submitted[-1][1]["auto_search"] is False
     assert submitted[-1][1]["volume_envelope"] == 0.25
     assert submitted[-1][1]["backing_gain_db"] == -14.0
     assert submitted[-1][1]["skip_backing"] is True
@@ -3410,7 +3453,8 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
     # Explicit mixing & engine overrides pass through cleanly
     await lib.request_learn_song(
         "枝垂桜",
-        auto_search=True,
+        inbox_filename="shidare.flac",
+        auto_search=False,
         engine="rvc",
         volume_envelope=0.18,
         backing_gain_db=-16.0,
@@ -3428,18 +3472,21 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
         with pytest.raises(Rejected, match="colab_invalid_job"):
             await lib.request_learn_song(
                 "枝垂桜",
-                auto_search=True,
+                inbox_filename="shidare.flac",
+                auto_search=False,
                 backing_gain_db=bad_bg,  # type: ignore[arg-type]
             )
     with pytest.raises(Rejected, match="colab_invalid_job"):
         await lib.request_learn_song(
             "枝垂桜",
-            auto_search=True,
+            inbox_filename="shidare.flac",
+            auto_search=False,
             skip_backing="1",  # type: ignore[arg-type]
         )
     with pytest.raises(Rejected, match="colab_invalid_job"):
         await lib.request_learn_song(
             "枝垂桜",
-            auto_search=True,
+            inbox_filename="shidare.flac",
+            auto_search=False,
             skip_dereverb="1",  # type: ignore[arg-type]
         )

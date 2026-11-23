@@ -533,11 +533,42 @@ async def test_request_learn_song_dual_track_priority_and_validation(
     assert p2["auto_search"] is False
     assert "inbox_file_id" not in p2
 
-    # Track 3: Auto-search fallback
+    # Track 3: Auto-search requires online song_finder (never leaks to Colab on offline/miss)
+    prev_jobs = len(compute.submitted_jobs)
+    with pytest.raises(Rejected, match="song_finder_remote_unavailable"):
+        await lib.request_learn_song("夜曲", artist="周杰伦", auto_search=True)
+    assert len(compute.submitted_jobs) == prev_jobs
+
+    # When song_finder succeeds, source is uploaded to inbox before Colab submit (auto_search=False)
+    from hakimi_plugin_sdk import ToolCallResult
+
+    class _FakeFinderBus:
+        def has_tool(
+            self, plugin_id: str, action_name: str, *, require_enabled: bool = True
+        ) -> bool:
+            del require_enabled
+            return plugin_id == "song_finder" and action_name == "song_finder.fetch_source"
+
+        async def invoke_tool(self, *_args: Any, **_kwargs: Any) -> ToolCallResult:
+            raw = b"FOUND_ORIGINAL_AUDIO"
+            return ToolCallResult(
+                data={
+                    "provider": "youtube",
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "filename": "夜曲.m4a",
+                },
+                blob=raw,
+                blob_mime_type="audio/mp4",
+                blob_filename="夜曲.m4a",
+            )
+
+    lib.plugin_bus = _FakeFinderBus()
     await lib.request_learn_song("夜曲", artist="周杰伦", auto_search=True)
     _, p3, _ = compute.submitted_jobs[-1]
-    assert p3["query"] == "夜曲"
-    assert p3["auto_search"] is True
+    assert p3["inbox_file_id"] == "inbox-id-2"
+    assert p3["inbox_filename"] == "夜曲.m4a"
+    assert p3["auto_search"] is False
+    assert "query" not in p3
 
 
 async def test_multilingual_punctuation_song_titles_and_safe_upload_names(
@@ -658,12 +689,12 @@ async def test_multilingual_punctuation_song_titles_and_safe_upload_names(
         ) as client:
             ok_60 = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "夜" * 60, "auto_search": True},
+                json={"title": "夜" * 60, "inbox_filename": "y60.flac", "auto_search": False},
             )
             assert ok_60.status_code == 200
             bad_61 = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "夜" * 61, "auto_search": True},
+                json={"title": "夜" * 61, "inbox_filename": "y61.flac", "auto_search": False},
             )
             assert bad_61.status_code == 400
             assert bad_61.json()["detail"] == "invalid_song_title"
@@ -925,7 +956,12 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
             # Optional per-request GPU override (normalized) & blank treated as default
             gpu_learn = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "花海", "auto_search": True, "gpu": "A100"},
+                json={
+                    "title": "花海",
+                    "inbox_filename": "huahai.flac",
+                    "auto_search": False,
+                    "gpu": "A100",
+                },
             )
             assert gpu_learn.status_code == 200
             assert gpu_learn.json()["preferred_gpu"] == "A100"
@@ -933,17 +969,37 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
 
             blank_gpu_learn = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "枫", "auto_search": True, "gpu": "   "},
+                json={
+                    "title": "枫",
+                    "inbox_filename": "feng.flac",
+                    "auto_search": False,
+                    "gpu": "   ",
+                },
             )
             assert blank_gpu_learn.status_code == 200
             assert blank_gpu_learn.json()["preferred_gpu"] == "L4"
             assert compute.submitted_gpus[-1] is None
 
+            # Auto-search when song_finder is offline fails fast with 503 and creates 0 Colab jobs
+            prev_submits = len(compute.submitted_jobs)
+            finder_off = await client.post(
+                "/admin/api/songs/learn",
+                json={"title": "反乌托邦Pt.2", "auto_search": True},
+            )
+            assert finder_off.status_code == 503
+            assert finder_off.json()["detail"] == "song_finder_remote_unavailable"
+            assert len(compute.submitted_jobs) == prev_submits
+
             # Disallowed GPU (e.g. G4 excluded for RVC sm_120) rejected with 400 before submit
             prev_submits = len(compute.submitted_jobs)
             bad_gpu = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "晴天", "auto_search": True, "gpu": "G4"},
+                json={
+                    "title": "晴天",
+                    "inbox_filename": "qt.flac",
+                    "auto_search": False,
+                    "gpu": "G4",
+                },
             )
             assert bad_gpu.status_code == 400
             assert bad_gpu.json()["detail"] == "colab_gpu_not_allowed"
@@ -951,25 +1007,41 @@ async def test_song_admin_routes_learn_evict_and_extended_listing(settings, fake
             assert (
                 await client.post(
                     "/admin/api/songs/learn",
-                    json={"title": "晴天", "auto_search": True, "gpu": 123},
+                    json={
+                        "title": "晴天",
+                        "inbox_filename": "qt.flac",
+                        "auto_search": False,
+                        "gpu": 123,
+                    },
                 )
             ).status_code == 400
             assert (
                 await client.post(
                     "/admin/api/songs/learn",
-                    json={"title": "晴天", "auto_search": True, "gpu": "A" * 17},
+                    json={
+                        "title": "晴天",
+                        "inbox_filename": "qt.flac",
+                        "auto_search": False,
+                        "gpu": "A" * 17,
+                    },
                 )
             ).status_code == 400
 
             # Error mappings: 409 conflict & 503 unconfigured
             compute.submit_error = Rejected("colab_daily_job_limit")
             assert (
-                await client.post("/admin/api/songs/learn", json={"title": "晴天"})
+                await client.post(
+                    "/admin/api/songs/learn",
+                    json={"title": "晴天", "inbox_filename": "qt.flac", "auto_search": False},
+                )
             ).status_code == 409
             compute.submit_error = None
             compute.is_configured = False
             assert (
-                await client.post("/admin/api/songs/learn", json={"title": "晴天"})
+                await client.post(
+                    "/admin/api/songs/learn",
+                    json={"title": "晴天", "inbox_filename": "qt.flac", "auto_search": False},
+                )
             ).status_code == 503
             compute.is_configured = True
 
@@ -1368,7 +1440,7 @@ async def test_song_studio_real_colab_hub_registration_and_admin_learn_gpu_e2e(
 
             default_learn = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "晴天", "auto_search": True},
+                json={"title": "晴天", "inbox_filename": "qingtian.flac", "auto_search": False},
             )
             assert default_learn.status_code == 200
             assert default_learn.json()["preferred_gpu"] == "L4"
@@ -1376,7 +1448,12 @@ async def test_song_studio_real_colab_hub_registration_and_admin_learn_gpu_e2e(
 
             override_learn = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "夜曲", "auto_search": True, "gpu": "A100"},
+                json={
+                    "title": "夜曲",
+                    "inbox_filename": "yequ.flac",
+                    "auto_search": False,
+                    "gpu": "A100",
+                },
             )
             assert override_learn.status_code == 200
             assert override_learn.json()["preferred_gpu"] == "A100"
@@ -1384,7 +1461,12 @@ async def test_song_studio_real_colab_hub_registration_and_admin_learn_gpu_e2e(
 
             rejected_learn = await client.post(
                 "/admin/api/songs/learn",
-                json={"title": "稻香", "auto_search": True, "gpu": "G4"},
+                json={
+                    "title": "稻香",
+                    "inbox_filename": "daoxiang.flac",
+                    "auto_search": False,
+                    "gpu": "G4",
+                },
             )
             assert rejected_learn.status_code == 400
             assert rejected_learn.json()["detail"] == "colab_gpu_not_allowed"
@@ -2038,7 +2120,8 @@ async def test_song_multi_take_admin_api_commands_and_owner_chat_actions(
                     "engine": "dual",
                     "ref_voice": "hakimi_ref.wav",
                     "svc_steps": 40,
-                    "auto_search": True,
+                    "inbox_filename": "yoru.flac",
+                    "auto_search": False,
                 },
             )
             assert ok_dual.status_code == 200
@@ -2055,7 +2138,8 @@ async def test_song_multi_take_admin_api_commands_and_owner_chat_actions(
                     "model_name": "hakimi",
                     "volume_envelope": 0.2,
                     "skip_dereverb": True,
-                    "auto_search": True,
+                    "inbox_filename": "qingtian.flac",
+                    "auto_search": False,
                 },
             )
             assert ok_rvc.status_code == 200
@@ -2075,7 +2159,30 @@ async def test_song_multi_take_admin_api_commands_and_owner_chat_actions(
             )
             assert bad_ref.status_code == 400 and bad_ref.json()["detail"] == "invalid_ref_voice"
 
-        # Chat commands: /学歌 with engine & ref, /换歌版本 list & switch
+        # Chat commands: /学歌 with engine & ref (via online song_finder -> inbox -> Colab)
+        from hakimi_plugin_sdk import ToolCallResult
+
+        class _OkFinderBus:
+            def has_tool(
+                self, plugin_id: str, action_name: str, *, require_enabled: bool = True
+            ) -> bool:
+                del require_enabled
+                return plugin_id == "song_finder" and action_name == "song_finder.fetch_source"
+
+            async def invoke_tool(self, *_args: Any, **_kwargs: Any) -> ToolCallResult:
+                raw = b"FOUND_SONG_BYTES"
+                return ToolCallResult(
+                    data={
+                        "provider": "youtube",
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "filename": "qingtian.m4a",
+                    },
+                    blob=raw,
+                    blob_mime_type="audio/mp4",
+                    blob_filename="qingtian.m4a",
+                )
+
+        lib.plugin_bus = _OkFinderBus()
         owner_dm = Message(
             platform="onebot",
             bot_id="10000",
@@ -2091,6 +2198,8 @@ async def test_song_multi_take_admin_api_commands_and_owner_chat_actions(
         assert learn_reply is not None and "Seed-VC" in learn_reply
         assert compute.submitted_jobs[-1][1]["engine"] == "seed_vc"
         assert compute.submitted_jobs[-1][1]["ref_voice"] == "hakimi_ref.wav"
+        assert compute.submitted_jobs[-1][1]["inbox_file_id"] == "inbox-id-1"
+        assert compute.submitted_jobs[-1][1]["auto_search"] is False
         assert compute.submitted_gpus[-1] == "A100"
 
         list_reply = await svc.command(owner_dm.model_copy(update={"text": "/换歌版本 枝垂桜"}))

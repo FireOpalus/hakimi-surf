@@ -208,7 +208,7 @@ class RvcCoverPayload(BaseModel):
     ref_audio_file_id: str = Field(default="", max_length=128)
     svc_steps: int | None = Field(default=None, ge=10, le=100)
     pitch: int = Field(default=0, ge=-24, le=24)
-    auto_search: bool = True
+    auto_search: bool = False
     query: str = Field(default="", max_length=120)
     inbox_file_id: str = Field(default="", max_length=128)
     inbox_filename: str = Field(default="", max_length=160)
@@ -319,6 +319,7 @@ class RvcCoverHandler(JobHandler):
     allow_warm_keepalive = True
     allowed_error_codes = frozenset(
         {
+            "song_source_required",
             "source_not_found",
             "model_not_found",
             "ref_voice_not_found",
@@ -330,7 +331,7 @@ class RvcCoverHandler(JobHandler):
         if not isinstance(payload, dict):
             raise JobValidationError("colab_invalid_job", "payload must be an object")
         parsed = RvcCoverPayload.model_validate(payload)
-        if not parsed.inbox_file_id and not parsed.inbox_filename and not parsed.auto_search:
+        if parsed.auto_search or (not parsed.inbox_file_id and not parsed.inbox_filename):
             raise JobValidationError("song_source_required")
         return parsed
 
@@ -346,9 +347,6 @@ class RvcCoverHandler(JobHandler):
         slug = colab_rvc_mod._slugify(payload.title)
 
         cover_runner = ctx.overrides.get("cover_runner") or colab_rvc_mod.run_cover_pipeline
-        clean_search_fn = (
-            ctx.overrides.get("clean_search_fn") or colab_rvc_mod.search_and_download_clean_source
-        )
 
         # 0) Check warm session pool (Tier 2)
         warm_claim = ctx.claim_warm_session()
@@ -374,7 +372,8 @@ class RvcCoverHandler(JobHandler):
             source_dir.mkdir(parents=True, exist_ok=True)
             cover_dir.mkdir(parents=True, exist_ok=True)
 
-            # 2) Resolve input audio source from dispatch_context inbox or search
+            # 2) Resolve pre-prepared input audio source strictly from dispatch_context inbox
+            #    (source retrieval belongs in song_finder / song_studio before Colab enqueue)
             source_path: Path | None = None
             drive_source_file_id = ""
             drive_source_ext = ".m4a"
@@ -389,35 +388,29 @@ class RvcCoverHandler(JobHandler):
             resolved_inbox_id = ctx_inbox_id or payload.inbox_file_id
             resolved_inbox_name = drive_ctx.files.inbox_name or payload.inbox_filename
 
-            if resolved_inbox_id or payload.inbox_filename:
-                if not resolved_inbox_id:
-                    raise EphemeralDriveError(
-                        "source_not_found",
-                        "Inbox file ID was not resolved in dispatch_context",
-                    )
-                inbox_meta = drive.verify_file_in_folders(
-                    resolved_inbox_id, allowed_roles=("inbox",)
+            if not resolved_inbox_id:
+                raise EphemeralDriveError(
+                    "source_not_found",
+                    "Inbox file ID was not resolved in dispatch_context",
                 )
-                effective_inbox_name = (
-                    resolved_inbox_name or str(inbox_meta.get("name") or "") or "source.m4a"
+            inbox_meta = drive.verify_file_in_folders(resolved_inbox_id, allowed_roles=("inbox",))
+            effective_inbox_name = (
+                resolved_inbox_name or str(inbox_meta.get("name") or "") or "source.m4a"
+            )
+            drive_source_ext = Path(effective_inbox_name).suffix or ".m4a"
+
+            def _dl_inbox_local() -> Path:
+                return drive.download_file(
+                    resolved_inbox_id,
+                    source_dir / f"inbox_source{drive_source_ext}",
+                    allowed_roles=("inbox",),
                 )
-                drive_source_ext = Path(effective_inbox_name).suffix or ".m4a"
 
-                def _dl_inbox_local() -> Path:
-                    return drive.download_file(
-                        resolved_inbox_id,
-                        source_dir / f"inbox_source{drive_source_ext}",
-                        allowed_roles=("inbox",),
-                    )
-
-                if drive_token:
-                    drive_source_file_id = resolved_inbox_id
-                    ensure_local_source_fn = _dl_inbox_local
-                else:
-                    source_path = _dl_inbox_local()
+            if drive_token:
+                drive_source_file_id = resolved_inbox_id
+                ensure_local_source_fn = _dl_inbox_local
             else:
-                query = payload.query.strip() or payload.title
-                source_path = clean_search_fn(query, source_dir, artist=payload.artist)
+                source_path = _dl_inbox_local()
 
             if ctx.is_cancelled():
                 raise RuntimeError("cancelled")

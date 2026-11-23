@@ -303,6 +303,8 @@ class Module(SystemModule):
             )
             inbox_file_id = str(inbox_meta.get("id") or "")
             inbox_name = str(inbox_meta.get("name") or req_inbox_name)
+        else:
+            raise Rejected("song_source_required")
 
         pth_file_id = ""
         index_file_id = ""
