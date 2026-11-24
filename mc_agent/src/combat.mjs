@@ -83,7 +83,7 @@ export const PROTECTED_ENTITIES = new Set([
 ]);
 
 export const AVOID_ALWAYS_MOBS = new Set(["warden", "ravager", "piglin_brute"]);
-export const RANGED_SHIELD_MOBS = new Set(["skeleton", "stray", "bogged"]);
+export const RANGED_SHIELD_MOBS = new Set(["skeleton", "stray", "bogged", "pillager"]);
 export const RANGED_HOSTILE_MOBS = new Set([
   "pillager",
   "skeleton",
@@ -107,11 +107,17 @@ export const RANGED_FLEE_DISTANCE = 26;
 export const RETREAT_HEALTH_THRESHOLD = 7;
 export const RESUME_HEALTH_THRESHOLD = 12;
 export const MELEE_REACH = 3.2;
+export const SHIELD_BLOCK_CYCLE_MS = 2_400;
+export const SHIELD_BLOCK_WINDOW_MS = 1_000;
+export const SHIELD_POST_HIT_WINDOW_MS = 1_800;
+export const SHIELD_CLOSE_MELEE_ABORT_DIST = 5.0;
 
 export function createCombatState() {
   return {
     retreating: false,
     shieldRaised: false,
+    shieldWindowStartMs: -Infinity,
+    lastDamageAtMs: -Infinity,
     lastAttackAtMs: -Infinity,
     activeTargetId: null,
   };
@@ -258,6 +264,110 @@ export function lowerShield(bot, combatState) {
   return true;
 }
 
+export function findNearestRangedShieldMob(bot, maxDist = RANGED_EVADE_RADIUS) {
+  const origin = bot?.entity?.position;
+  if (!origin) return null;
+  let best = null;
+  for (const ent of Object.values(bot.entities || {})) {
+    if (!ent || ent === bot.entity || !ent.position) continue;
+    const name = normalizeCanonicalItemId(String(ent.name || ""));
+    if (!RANGED_SHIELD_MOBS.has(name)) continue;
+    const dist = distanceBetween(origin, ent.position);
+    if (dist <= maxDist && (!best || dist < best.dist)) {
+      best = { entity: ent, name, dist };
+    }
+  }
+  return best;
+}
+
+/**
+ * Pulse-raise the off-hand shield during evade/retreat when ranged arrow/crossbow
+ * mobs are nearby (and no close melee/creeper threat demands full-speed sprinting).
+ * Raises immediately for 1.8s after taking damage or on a 1.0s-block / 1.4s-sprint cycle
+ * so the bot blocks incoming arrows without getting stuck at crouch speed.
+ */
+export function updateEvadeShieldDefense({
+  bot,
+  combatState,
+  threats = null,
+  nowMs = Date.now(),
+  eating = false,
+  lookAtEntityFn = null,
+} = {}) {
+  if (!bot || !combatState) return { raised: false, reason: "no_bot" };
+  if (eating || !hasShieldEquipped(bot)) {
+    lowerShield(bot, combatState);
+    return { raised: false, reason: eating ? "eating" : "no_shield" };
+  }
+
+  let nearestRanged = null;
+  let hasCloseMeleeOrCreeper = false;
+
+  if (Array.isArray(threats) && threats.length > 0) {
+    for (const t of threats) {
+      if (!t) continue;
+      const name = normalizeCanonicalItemId(String(t.name || t.entity?.name || ""));
+      const dist = Number(t.dist ?? Infinity);
+      if (name === "creeper" && dist <= CREEPER_SAFE_DISTANCE + 1) {
+        hasCloseMeleeOrCreeper = true;
+      } else if (!RANGED_SHIELD_MOBS.has(name) && dist <= SHIELD_CLOSE_MELEE_ABORT_DIST) {
+        hasCloseMeleeOrCreeper = true;
+      }
+      if (RANGED_SHIELD_MOBS.has(name) && dist <= RANGED_EVADE_RADIUS) {
+        if (!nearestRanged || dist < nearestRanged.dist) {
+          nearestRanged = { entity: t.entity, name, dist };
+        }
+      }
+    }
+  } else {
+    nearestRanged = findNearestRangedShieldMob(bot, RANGED_EVADE_RADIUS);
+    const creeper = findNearestCreeper(bot, CREEPER_SAFE_DISTANCE + 1);
+    if (creeper) {
+      hasCloseMeleeOrCreeper = true;
+    } else {
+      const anyClose = findNearestAnyHostile(bot, SHIELD_CLOSE_MELEE_ABORT_DIST);
+      if (anyClose && !RANGED_SHIELD_MOBS.has(anyClose.name)) {
+        hasCloseMeleeOrCreeper = true;
+      }
+    }
+  }
+
+  if (!nearestRanged || hasCloseMeleeOrCreeper) {
+    lowerShield(bot, combatState);
+    combatState.shieldWindowStartMs = -Infinity;
+    return {
+      raised: false,
+      reason: hasCloseMeleeOrCreeper ? "close_melee_sprint" : "no_ranged_threat",
+    };
+  }
+
+  const recentlyHit =
+    Number.isFinite(combatState.lastDamageAtMs) &&
+    nowMs - combatState.lastDamageAtMs >= 0 &&
+    nowMs - combatState.lastDamageAtMs <= SHIELD_POST_HIT_WINDOW_MS;
+
+  if (!Number.isFinite(combatState.shieldWindowStartMs)) {
+    combatState.shieldWindowStartMs = nowMs;
+  }
+  const cycleElapsed = Math.max(0, nowMs - combatState.shieldWindowStartMs) % SHIELD_BLOCK_CYCLE_MS;
+  const inBlockWindow = recentlyHit || cycleElapsed < SHIELD_BLOCK_WINDOW_MS;
+
+  if (inBlockWindow) {
+    if (typeof lookAtEntityFn === "function" && nearestRanged.entity) {
+      lookAtEntityFn(bot, nearestRanged.entity);
+    }
+    const ok = combatState.shieldRaised || raiseShield(bot, combatState);
+    return {
+      raised: ok,
+      reason: recentlyHit ? "post_hit_block" : "ranged_cycle_block",
+      target: nearestRanged,
+    };
+  }
+
+  lowerShield(bot, combatState);
+  return { raised: false, reason: "sprint_window", target: nearestRanged };
+}
+
 export function computeRetreatTarget(origin, threatPos, stepDist = 10, safeAnchorPos = null) {
   const ox = origin.x ?? 0;
   const oz = origin.z ?? 0;
@@ -386,9 +496,15 @@ export async function runGuardCombatStep({
   }
 
   if (combatState.retreating) {
-    lowerShield(bot, combatState);
     combatState.activeTargetId = null;
     const nearestThreat = findNearestAnyHostile(bot, 12);
+    const shieldRes = updateEvadeShieldDefense({
+      bot,
+      combatState,
+      nowMs,
+      eating,
+      lookAtEntityFn,
+    });
     if (nearestThreat) {
       const dest = computeRetreatTarget(origin, nearestThreat.entity.position, 10, playerPos);
       applyNoDigMovements(bot);
@@ -404,7 +520,13 @@ export async function runGuardCombatStep({
     if (typeof onNeedHealEat === "function" && (food === null || food < 20)) {
       onNeedHealEat();
     }
-    return { handled: true, inCombat: false, action: "retreat_heal", activity: "残血撤退回血" };
+    return {
+      handled: true,
+      inCombat: false,
+      action: "retreat_heal",
+      shieldRaised: shieldRes.raised,
+      activity: shieldRes.raised ? "举盾撤退回血" : "残血撤退回血",
+    };
   }
 
   // 1. Creeper safe standoff (> 6 blocks, NEVER melee!)

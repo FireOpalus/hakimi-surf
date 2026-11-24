@@ -58,6 +58,20 @@ _PLAYER_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,16}\Z")
 _EQUIPMENT_SLOTS = ("main_hand", "off_hand", "head", "chest", "legs", "feet")
 _EMPTY_EQUIPMENT: dict[str, str] = {slot: "" for slot in _EQUIPMENT_SLOTS}
 _VALID_TIME_OF_DAY = frozenset({"day", "sunset", "night", "sunrise"})
+_VALID_REFLEX_MODES = frozenset(
+    {
+        "auto_eat",
+        "shield_ready",
+        "shield_raised",
+        "auto_torch",
+        "sheltered",
+        "combat_retreat",
+        "evade_active",
+        "hazard_fire",
+        "hazard_water",
+        "unstuck_blacklist",
+    }
+)
 _TACTICAL_MC_EVENTS = frozenset(
     {
         "mc_health_alert",
@@ -104,6 +118,7 @@ _SNAPSHOT_FIELD_KEYS = frozenset(
         "guard_target",
         "time_of_day",
         "nearby_resources",
+        "reflex_modes",
         "updated_at",
     }
 )
@@ -274,6 +289,23 @@ def _sanitize_nearby_resources(raw: Any, *, connected: bool) -> list[str]:
     return out
 
 
+def _sanitize_reflex_modes(raw: Any, *, connected: bool) -> list[str]:
+    if not connected or not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if len(out) >= 8:
+            break
+        if not isinstance(entry, str):
+            continue
+        clean = entry.strip().lower()
+        if clean in _VALID_REFLEX_MODES and clean not in seen:
+            seen.add(clean)
+            out.append(clean)
+    return out
+
+
 class MinecraftSnapshot(BaseModel):
     """Sanitized snapshot of the remote CN Mineflayer agent."""
 
@@ -296,6 +328,7 @@ class MinecraftSnapshot(BaseModel):
     guard_target: str = Field(default="", max_length=16)
     time_of_day: Literal["", "day", "sunset", "night", "sunrise"] = ""
     nearby_resources: list[str] = Field(default_factory=list, max_length=12)
+    reflex_modes: list[str] = Field(default_factory=list, max_length=8)
     updated_at: float = 0.0
 
     @field_validator("equipment")
@@ -349,6 +382,16 @@ class MinecraftSnapshot(BaseModel):
                 raise ValueError("invalid_nearby_resource")
         return value
 
+    @field_validator("reflex_modes")
+    @classmethod
+    def _validate_reflex_modes(cls, value: list[str]) -> list[str]:
+        if len(value) > 8:
+            raise ValueError("reflex_modes_too_long")
+        for entry in value:
+            if not isinstance(entry, str) or entry not in _VALID_REFLEX_MODES:
+                raise ValueError("invalid_reflex_mode")
+        return value
+
 
 class NoArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
@@ -378,6 +421,10 @@ class CraftArgs(NoArgs):
         if not cleaned:
             raise ValueError("invalid_item_name")
         return cleaned
+
+
+class AcquireArgs(CraftArgs):
+    """Arguments for 0-Token recursive resource gathering & crafting (`mc.acquire`)."""
 
 
 class SmeltArgs(NoArgs):
@@ -666,6 +713,12 @@ _ACTION_SPECS: dict[str, tuple[str, dict[str, Any], type[BaseModel]]] = {
         _CRAFT_SCHEMA,
         CraftArgs,
     ),
+    "acquire": (
+        "0-Token 自动递归筹料、烧炼并合成目标生存装备或道具"
+        "（木/石/铁器、熔炉、火把、盾牌、面包、熟肉、床等）",
+        _CRAFT_SCHEMA,
+        AcquireArgs,
+    ),
     "smelt": (
         "在游戏里用熔炉烧炼粗矿、生肉或原木等物品（自动寻炉或合成放置熔炉与燃料）",
         _SMELT_SCHEMA,
@@ -710,6 +763,7 @@ _MICRO_GAME_VERBS = frozenset(
         "mine",
         "gather",
         "craft",
+        "acquire",
         "smelt",
         "hunt",
         "sleep",
@@ -736,6 +790,7 @@ _EFFORTFUL_VERBS = frozenset(
         "mine",
         "gather",
         "craft",
+        "acquire",
         "smelt",
         "hunt",
         "sleep",
@@ -987,6 +1042,7 @@ class MinecraftPlugin:
         nearby_resources = _sanitize_nearby_resources(
             data.get("nearby_resources"), connected=connected
         )
+        reflex_modes = _sanitize_reflex_modes(data.get("reflex_modes"), connected=connected)
 
         return MinecraftSnapshot(
             connected=connected,
@@ -1006,6 +1062,7 @@ class MinecraftPlugin:
             guard_target=guard_target,
             time_of_day=time_of_day,
             nearby_resources=nearby_resources,
+            reflex_modes=reflex_modes,
             updated_at=updated_at,
         )
 
@@ -1192,6 +1249,7 @@ class MinecraftPlugin:
             "guard_target": snap.guard_target,
             "time_of_day": snap.time_of_day,
             "nearby_resources": list(snap.nearby_resources[:12]),
+            "reflex_modes": list(snap.reflex_modes[:8]),
             "updated_at": float(snap.updated_at),
             **self.brain.telemetry(),
         }
@@ -1570,10 +1628,14 @@ class MinecraftPlugin:
             artifacts["best_tool"] = clean_best_tool
         if clean_mob := _normalize_item_id(data.get("target_mob")):
             artifacts["target_mob"] = clean_mob
+        if clean_blocker := _normalize_item_id(data.get("blocker_item")):
+            artifacts["blocker_item"] = clean_blocker
         if data.get("mode") in ("deposit", "withdraw", "inspect", "auto", "enter", "exit"):
             artifacts["mode"] = data["mode"]
         for int_key in (
             "crafted_count",
+            "acquired_count",
+            "owned_count",
             "smelted_count",
             "collected_count",
             "requested_count",
@@ -1582,6 +1644,7 @@ class MinecraftPlugin:
             "given_count",
             "wood_shortfall_planks",
             "wood_shortfall_logs",
+            "blacklisted_skipped",
         ):
             raw_int = data.get(int_key)
             if isinstance(raw_int, int) and not isinstance(raw_int, bool) and raw_int >= 0:
@@ -1596,10 +1659,17 @@ class MinecraftPlugin:
             "sheltered",
             "shallow",
             "already_evading",
+            "already_owned",
             "threats_nearby",
         ):
             if isinstance(data.get(bool_key), bool):
                 artifacts[bool_key] = data[bool_key]
+        if isinstance(data.get("steps_completed"), (list, tuple)):
+            artifacts["steps_completed"] = [
+                _sanitize_text(str(step), max_tokens=10)[:36]
+                for step in data["steps_completed"][:8]
+                if str(step or "").strip()
+            ]
         for pos_key in ("bed_pos", "chest_pos", "furnace_pos", "placed_pos", "shelter_pos"):
             norm_p = _normalize_pos(data.get(pos_key))
             if isinstance(norm_p, tuple):

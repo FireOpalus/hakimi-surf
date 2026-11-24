@@ -1,3 +1,4 @@
+import vec3 from "vec3";
 import { normalizeCanonicalItemId } from "./protocol.mjs";
 
 export const EQUIPMENT_SLOTS = Object.freeze([
@@ -101,6 +102,77 @@ export const AXE_COOLDOWN_MS = 1000;
 export const DEFAULT_ATTACK_COOLDOWN_MS = 625;
 export const DEFAULT_EAT_TIMEOUT_MS = 4000;
 export const LOW_FOOD_THRESHOLD = 2;
+export const UNREACHABLE_BLOCK_TTL_MS = 180_000;
+export const UNREACHABLE_BLOCK_MAX_ENTRIES = 256;
+export const AUTO_TORCH_COOLDOWN_MS = 8_000;
+export const AUTO_TORCH_MIN_SPACING = 7;
+export const AUTO_TORCH_LIGHT_THRESHOLD = 5;
+
+const LIGHT_SOURCE_BLOCKS = new Set([
+  "torch",
+  "wall_torch",
+  "soul_torch",
+  "soul_wall_torch",
+  "lantern",
+  "soul_lantern",
+  "campfire",
+  "soul_campfire",
+  "glowstone",
+  "sea_lantern",
+  "shroomlight",
+  "jack_o_lantern",
+]);
+
+const TORCH_UNSAFE_GROUND_BLOCKS = new Set([
+  "air",
+  "cave_air",
+  "void_air",
+  "water",
+  "flowing_water",
+  "lava",
+  "flowing_lava",
+  "fire",
+  "soul_fire",
+  "cactus",
+  "magma_block",
+  "sweet_berry_bush",
+  "campfire",
+  "soul_campfire",
+  "powder_snow",
+  "lily_pad",
+  "scaffolding",
+  "short_grass",
+  "grass",
+  "tall_grass",
+  "fern",
+  "dead_bush",
+  "snow",
+  "crafting_table",
+  "furnace",
+  "blast_furnace",
+  "smoker",
+  "chest",
+  "trapped_chest",
+  "barrel",
+  "anvil",
+  "enchanting_table",
+  "glass",
+  "ice",
+  "packed_ice",
+  "blue_ice",
+]);
+
+const HAZARD_FIRE_BLOCKS = new Set([
+  "lava",
+  "flowing_lava",
+  "fire",
+  "soul_fire",
+  "magma_block",
+  "campfire",
+  "soul_campfire",
+]);
+
+const TORCH_AIR_BLOCKS = new Set(["air", "cave_air", "void_air"]);
 
 export function createEmptyEquipment() {
   return {
@@ -638,4 +710,362 @@ export async function equipBestWeapon(bot) {
     }
   }
   return bestName;
+}
+
+/**
+ * TTL-bounded memory of unreachable block coordinates so gather/mine/acquire
+ * skip stubborn cliff/wall-blocked trees and ore veins across turns.
+ */
+export class UnreachableBlockBlacklist {
+  constructor({
+    ttlMs = UNREACHABLE_BLOCK_TTL_MS,
+    maxEntries = UNREACHABLE_BLOCK_MAX_ENTRIES,
+  } = {}) {
+    this.ttlMs = Math.max(1_000, Number.isFinite(ttlMs) ? ttlMs : UNREACHABLE_BLOCK_TTL_MS);
+    this.maxEntries = Math.max(16, Number.isFinite(maxEntries) ? Math.floor(maxEntries) : UNREACHABLE_BLOCK_MAX_ENTRIES);
+    this._entries = new Map();
+  }
+
+  static keyOf(coords) {
+    if (!coords) return "";
+    if (Array.isArray(coords) && coords.length >= 3) {
+      const x = Math.floor(Number(coords[0]));
+      const y = Math.floor(Number(coords[1]));
+      const z = Math.floor(Number(coords[2]));
+      if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+        return `${x},${y},${z}`;
+      }
+      return "";
+    }
+    if (typeof coords === "object") {
+      const x = Math.floor(Number(coords.x));
+      const y = Math.floor(Number(coords.y));
+      const z = Math.floor(Number(coords.z));
+      if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+        return `${x},${y},${z}`;
+      }
+    }
+    return "";
+  }
+
+  prune(nowMs = Date.now()) {
+    for (const [key, expiresAt] of this._entries.entries()) {
+      if (expiresAt <= nowMs) {
+        this._entries.delete(key);
+      }
+    }
+    while (this._entries.size > this.maxEntries) {
+      const oldestKey = this._entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      this._entries.delete(oldestKey);
+    }
+  }
+
+  mark(coords, { nowMs = Date.now(), ttlMs = this.ttlMs } = {}) {
+    const key = UnreachableBlockBlacklist.keyOf(coords);
+    if (!key) return false;
+    const dur = Math.max(1_000, Number.isFinite(ttlMs) ? ttlMs : this.ttlMs);
+    this._entries.delete(key);
+    this._entries.set(key, nowMs + dur);
+    if (this._entries.size > this.maxEntries) {
+      this.prune(nowMs);
+    }
+    return true;
+  }
+
+  markColumn(coords, { nowMs = Date.now(), ttlMs = this.ttlMs, yMin = -2, yMax = 3 } = {}) {
+    const key = UnreachableBlockBlacklist.keyOf(coords);
+    if (!key) return 0;
+    const [cx, cy, cz] = key.split(",").map(Number);
+    let added = 0;
+    for (let dy = yMin; dy <= yMax; dy += 1) {
+      if (this.mark([cx, cy + dy, cz], { nowMs, ttlMs })) {
+        added += 1;
+      }
+    }
+    return added;
+  }
+
+  has(coords, nowMs = Date.now()) {
+    const key = UnreachableBlockBlacklist.keyOf(coords);
+    if (!key) return false;
+    const expiresAt = this._entries.get(key);
+    if (expiresAt === undefined) return false;
+    if (expiresAt <= nowMs) {
+      this._entries.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  size(nowMs = Date.now()) {
+    this.prune(nowMs);
+    return this._entries.size;
+  }
+
+  clear() {
+    this._entries.clear();
+  }
+}
+
+export function createAutoTorchState() {
+  return {
+    lastPlacedAtMs: -Infinity,
+    lastPlacedPos: null,
+  };
+}
+
+export function hasTorchInInventory(bot) {
+  for (const item of getInventoryItems(bot)) {
+    const name = extractCanonicalItemName(item);
+    if (name === "torch" || name === "soul_torch") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findNearbyLightSource(bot, origin, radius = 5) {
+  if (!bot || !origin) return false;
+  if (typeof bot.findBlock === "function") {
+    try {
+      const existing = bot.findBlock({
+        matching: (b) => Boolean(b && LIGHT_SOURCE_BLOCKS.has(normalizeCanonicalItemId(b.name))),
+        maxDistance: radius,
+      });
+      if (existing) return true;
+    } catch {
+      // Fall through to blockAt scan
+    }
+  }
+  if (typeof bot.blockAt === "function") {
+    const bx = Math.floor(origin.x ?? 0);
+    const by = Math.floor(origin.y ?? 0);
+    const bz = Math.floor(origin.z ?? 0);
+    for (let dx = -2; dx <= 2; dx += 1) {
+      for (let dz = -2; dz <= 2; dz += 1) {
+        for (let dy = -1; dy <= 2; dy += 1) {
+          const blk = bot.blockAt(vec3(bx + dx, by + dy, bz + dz));
+          if (blk && LIGHT_SOURCE_BLOCKS.has(normalizeCanonicalItemId(blk.name))) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function isSafeTorchGround(block) {
+  if (!block) return false;
+  const name = normalizeCanonicalItemId(block.name);
+  if (!name || TORCH_UNSAFE_GROUND_BLOCKS.has(name)) return false;
+  if (name.endsWith("_leaves") || name.endsWith("_bed") || name.endsWith("_door")) return false;
+  if (block.boundingBox && block.boundingBox !== "block") return false;
+  return true;
+}
+
+/**
+ * Automatically place a torch when exploring caves or walking in dark areas.
+ * Requires explicit numeric light readings from the block so bare mocks never
+ * accidentally trigger placements, and restores the previously held main-hand item.
+ */
+export async function tryAutoPlaceTorch(
+  bot,
+  torchState,
+  {
+    nowMs = Date.now(),
+    timeOfDay = "",
+    sheltered = false,
+    eating = false,
+    cooldownMs = AUTO_TORCH_COOLDOWN_MS,
+    minSpacing = AUTO_TORCH_MIN_SPACING,
+  } = {},
+) {
+  if (!bot || !torchState || sheltered || eating) {
+    return { placed: false, reason: "skipped" };
+  }
+  const origin = bot.entity?.position;
+  if (
+    !origin ||
+    typeof bot.blockAt !== "function" ||
+    typeof bot.placeBlock !== "function" ||
+    typeof bot.equip !== "function"
+  ) {
+    return { placed: false, reason: "unavailable" };
+  }
+  if (nowMs - torchState.lastPlacedAtMs < cooldownMs) {
+    return { placed: false, reason: "cooldown" };
+  }
+  const bx = Math.floor(origin.x ?? 0);
+  const by = Math.floor(origin.y ?? 0);
+  const bz = Math.floor(origin.z ?? 0);
+  if (Array.isArray(torchState.lastPlacedPos) && torchState.lastPlacedPos.length === 3) {
+    const distFromLast = Math.hypot(
+      bx - torchState.lastPlacedPos[0],
+      by - torchState.lastPlacedPos[1],
+      bz - torchState.lastPlacedPos[2],
+    );
+    if (distFromLast < minSpacing) {
+      return { placed: false, reason: "too_close_to_last" };
+    }
+  }
+
+  const torchItem = getInventoryItems(bot).find((it) => {
+    const name = extractCanonicalItemName(it);
+    return name === "torch" || name === "soul_torch";
+  });
+  if (!torchItem) {
+    return { placed: false, reason: "no_torch" };
+  }
+
+  const feetBlock = bot.blockAt(vec3(bx, by, bz));
+  const blockLight =
+    typeof feetBlock?.light === "number" && Number.isFinite(feetBlock.light)
+      ? feetBlock.light
+      : null;
+  const skyLight =
+    typeof feetBlock?.skyLight === "number" && Number.isFinite(feetBlock.skyLight)
+      ? feetBlock.skyLight
+      : null;
+
+  if (blockLight === null) {
+    return { placed: false, reason: "light_unknown" };
+  }
+  const isUndergroundDark =
+    skyLight !== null && skyLight <= 4 && blockLight <= AUTO_TORCH_LIGHT_THRESHOLD;
+  const isNightDark =
+    (timeOfDay === "night" || timeOfDay === "sunset") && blockLight <= AUTO_TORCH_LIGHT_THRESHOLD - 1;
+  const isGeneralDark = skyLight === null && blockLight <= AUTO_TORCH_LIGHT_THRESHOLD - 1;
+  if (!isUndergroundDark && !isNightDark && !isGeneralDark) {
+    return { placed: false, reason: "bright_enough" };
+  }
+
+  if (findNearbyLightSource(bot, origin, 5)) {
+    return { placed: false, reason: "nearby_light_exists" };
+  }
+
+  const offsets = [
+    [0, 0],
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ];
+  const prevHeldName = extractCanonicalItemName(bot.heldItem);
+  const prevQuickBarSlot = Number.isInteger(bot.quickBarSlot) ? bot.quickBarSlot : null;
+  const torchName = extractCanonicalItemName(torchItem);
+
+  for (const [dx, dz] of offsets) {
+    const tx = bx + dx;
+    const ty = by;
+    const tz = bz + dz;
+    const targetBlk = bot.blockAt(vec3(tx, ty, tz));
+    const groundBlk = bot.blockAt(vec3(tx, ty - 1, tz));
+    if (!targetBlk || !TORCH_AIR_BLOCKS.has(normalizeCanonicalItemId(targetBlk.name))) continue;
+    if (!isSafeTorchGround(groundBlk)) continue;
+
+    try {
+      await bot.equip(torchItem, "hand");
+      if (typeof bot.lookAt === "function") {
+        try {
+          await bot.lookAt(vec3(tx + 0.5, ty, tz + 0.5), true);
+        } catch {
+          // Ignore lookAt errors
+        }
+      }
+      await bot.placeBlock(groundBlk, vec3(0, 1, 0));
+      torchState.lastPlacedAtMs = nowMs;
+      torchState.lastPlacedPos = [tx, ty, tz];
+      return { placed: true, pos: [tx, ty, tz], item: torchName };
+    } catch {
+      // Try next offset
+    } finally {
+      try {
+        if (prevHeldName && prevHeldName !== torchName) {
+          const restorable = getInventoryItems(bot).find(
+            (it) => extractCanonicalItemName(it) === prevHeldName,
+          );
+          if (restorable) {
+            await bot.equip(restorable, "hand");
+          } else if (prevQuickBarSlot !== null && typeof bot.setQuickBarSlot === "function") {
+            bot.setQuickBarSlot(prevQuickBarSlot);
+          }
+        } else if (prevQuickBarSlot !== null && typeof bot.setQuickBarSlot === "function") {
+          bot.setQuickBarSlot(prevQuickBarSlot);
+        }
+      } catch {
+        // Best-effort main-hand restoration
+      }
+    }
+  }
+  return { placed: false, reason: "no_valid_spot" };
+}
+
+export function createHazardState() {
+  return {
+    activeHazard: "",
+    lastEscapeAtMs: -Infinity,
+  };
+}
+
+/**
+ * Inspect immediate life-threatening environmental hazards (lava/fire/magma or
+ * drowning/low oxygen) for the Layer 0 self-preservation priority stack.
+ */
+export function detectEnvironmentalHazard(bot) {
+  if (!bot) return { hazard: "", severity: 0 };
+  const origin = bot.entity?.position;
+  let feetName = "";
+  let headName = "";
+  let belowName = "";
+
+  if (origin && typeof bot.blockAt === "function") {
+    try {
+      const bx = Math.floor(origin.x ?? 0);
+      const by = Math.floor(origin.y ?? 0);
+      const bz = Math.floor(origin.z ?? 0);
+      feetName = normalizeCanonicalItemId(bot.blockAt(vec3(bx, by, bz))?.name);
+      headName = normalizeCanonicalItemId(bot.blockAt(vec3(bx, by + 1, bz))?.name);
+      belowName = normalizeCanonicalItemId(bot.blockAt(vec3(bx, by - 1, bz))?.name);
+    } catch {
+      // Ignore blockAt failures on partial mocks
+    }
+  }
+
+  const inLava =
+    feetName === "lava" ||
+    feetName === "flowing_lava" ||
+    headName === "lava" ||
+    headName === "flowing_lava" ||
+    Boolean(bot.entity?.isInLava);
+  if (inLava) {
+    return { hazard: "hazard_fire", detail: "in_lava", severity: 3 };
+  }
+
+  const onFireMeta =
+    Array.isArray(bot.entity?.metadata) &&
+    typeof bot.entity.metadata[0] === "number" &&
+    (bot.entity.metadata[0] & 0x01) !== 0;
+  const inFireBlock =
+    HAZARD_FIRE_BLOCKS.has(feetName) ||
+    HAZARD_FIRE_BLOCKS.has(headName) ||
+    belowName === "magma_block";
+  if (bot.entity?.isOnFire === true || onFireMeta || inFireBlock) {
+    return { hazard: "hazard_fire", detail: inFireBlock ? "fire_block" : "on_fire", severity: 2 };
+  }
+
+  const headInWater = headName === "water" || headName === "flowing_water";
+  const oxygen =
+    typeof bot.oxygenLevel === "number" && Number.isFinite(bot.oxygenLevel)
+      ? bot.oxygenLevel
+      : null;
+  if (
+    (oxygen !== null && oxygen <= 6) ||
+    (headInWater && oxygen !== null && oxygen <= 10)
+  ) {
+    return { hazard: "hazard_water", detail: "low_oxygen", severity: 2 };
+  }
+
+  return { hazard: "", severity: 0 };
 }

@@ -2859,3 +2859,187 @@ async def test_mc_play_brain_evade_feedback_and_bounded_recovery_cadence() -> No
         )
     finally:
         await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_reflex_modes_sanitization_and_acquire_brain_flow() -> None:
+    """Verify reflex_modes allowlist sanitization and end-to-end mc.acquire brain integration."""
+    now = [1_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+        brain_config=McBrainConfig(
+            solo_cruise_interval_seconds=150.0,
+            chained_step_interval_seconds=15.0,
+            recovery_step_interval_seconds=30.0,
+            initial_cruise_delay_seconds=15.0,
+        ),
+    )
+    dispatched: list[dict[str, Any]] = []
+    bridge_responses = [
+        {
+            "ok": True,
+            "accepted": True,
+            "item_name": "stone_pickaxe",
+            "requested_count": 1,
+            "acquired_count": 1,
+            "owned_count": 1,
+            "already_owned": False,
+            "steps_completed": [
+                "gather:oak_logx3",
+                "craft:wooden_pickaxex1",
+                "gather:stonex3",
+                "craft:stone_pickaxex1",
+            ],
+            "summary": "已自动筹料并获得 stone_pickaxe x1",
+        },
+        {
+            "ok": True,
+            "accepted": True,
+            "item_name": "stone_pickaxe",
+            "requested_count": 1,
+            "acquired_count": 0,
+            "owned_count": 1,
+            "already_owned": True,
+            "steps_completed": [],
+            "summary": "背包已有 stone_pickaxe x1",
+        },
+        {
+            "ok": False,
+            "accepted": True,
+            "reason": "block_not_found",
+            "item_name": "shield",
+            "requested_count": 1,
+            "acquired_count": 0,
+            "owned_count": 0,
+            "partial": True,
+            "blocker_item": "iron_ore",
+            "steps_completed": ["gather:oak_logx2"],
+            "summary": "自动筹料shield在 iron_ore 受阻(block_not_found)",
+        },
+    ]
+    decisions = [
+        {"item_name": "minecraft:stone_pickaxe", "count": 1, "next_goal": "继续造盾牌"},
+        {"item_name": "stone_pickaxe", "count": 1, "next_goal": "继续造盾牌"},
+        {"item_name": "shield", "count": 1, "next_goal": "去找铁矿"},
+    ]
+
+    async def fake_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+        dispatched.append({"action": action, **params})
+        return bridge_responses.pop(0)
+
+    async def fake_budget(_lane: str) -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "decisions": {
+                "should_replan": {
+                    "type": "binary",
+                    "noul": 0.9,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "craft_gear",
+                    "confidence": 0.9,
+                    "probabilities": {"craft_gear": 0.9},
+                    "confident": True,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, payload: dict[str, Any], **_kw: Any) -> str:
+        assert payload["state"]["reflex_modes"] == ["auto_eat", "shield_ready", "auto_torch"]
+        item = decisions.pop(0)
+        return json.dumps(
+            {
+                "say": "",
+                "action": "acquire",
+                "target_player": "",
+                "target_mob": "",
+                "mode": "",
+                "block_type": "",
+                "item_name": item["item_name"],
+                "count": item["count"],
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": "0-Token自动筹料",
+                "next_goal": item["next_goal"],
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    plugin.apply_snapshot(
+        _connected_snapshot(
+            reflex_modes=[
+                "auto_eat",
+                "SHIELD_READY",
+                "evil_injection_mode",
+                "auto_torch",
+                "auto_eat",
+            ]
+        )
+    )
+    assert plugin.snapshot.reflex_modes == ["auto_eat", "shield_ready", "auto_torch"]
+    assert plugin.status_dict()["reflex_modes"] == ["auto_eat", "shield_ready", "auto_torch"]
+
+    try:
+        # 1. Multi-step acquire succeeds & chains next step
+        await plugin.brain._execute_cycle("cruise")
+        assert dispatched[-1] == {
+            "action": "mc.dispatch_goal",
+            "action_type": "acquire",
+            "item_name": "stone_pickaxe",
+            "count": 1,
+        }
+        assert plugin.brain.recent_turns[-1]["outcome"] == "acquired:stone_pickaxex1(4steps)"
+        assert plugin.brain._chain_next_step is True
+
+        # 2. Idempotent already_owned acquire formats cleanly
+        await plugin.brain._execute_cycle("cruise")
+        assert plugin.brain.recent_turns[-1]["outcome"] == "acquire:stone_pickaxe:already_owned"
+
+        # 3. Partial acquire blocker triggers bounded recovery retry & records blocker_item
+        await plugin.brain._execute_cycle("cruise")
+        assert (
+            plugin.brain.recent_turns[-1]["outcome"]
+            == "acquire:block_not_found:iron_ore(partial:1steps)"
+        )
+        assert plugin.brain._recovery_retry_pending is True
+
+        # 4. Direct dispatch_goal surfaces acquire artifacts and clears reflex_modes on disconnect
+        bridge_responses.append(
+            {
+                "ok": False,
+                "accepted": True,
+                "reason": "all_candidates_unreachable",
+                "blocker_item": "oak_log",
+                "blacklisted_skipped": 4,
+                "steps_completed": ["gather:oak_logx1"],
+                "summary": "附近均不可达",
+            }
+        )
+        goal_res = await plugin.dispatch_goal(
+            {"action_type": "acquire", "item_name": "wooden_pickaxe", "count": 1}
+        )
+        assert goal_res["ok"] is False
+        assert goal_res["artifacts"]["blocker_item"] == "oak_log"
+        assert goal_res["artifacts"]["blacklisted_skipped"] == 4
+        assert goal_res["artifacts"]["steps_completed"] == ["gather:oak_logx1"]
+
+        plugin.apply_snapshot({"connected": False, "reflex_modes": ["auto_eat"]})
+        assert plugin.snapshot.reflex_modes == []
+    finally:
+        await plugin.close()

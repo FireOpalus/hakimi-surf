@@ -12,18 +12,26 @@ import {
 } from "./protocol.mjs";
 import {
   LOW_FOOD_THRESHOLD,
+  UNREACHABLE_BLOCK_TTL_MS,
+  UnreachableBlockBlacklist,
   autoEquipBestGear,
   collectInventorySnapshot,
   countSafeFood,
+  createAutoTorchState,
   createEmptyEquipment,
+  createHazardState,
   createWaterFloatState,
+  detectEnvironmentalHazard,
   equipBestHarvestTool,
+  hasTorchInInventory,
   performAutoEat,
   shouldTriggerAutoEat,
+  tryAutoPlaceTorch,
   updateWaterFloatControl,
 } from "./survival.mjs";
 import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
 import { executeSmeltAction, parseSmeltParams } from "./smelting.mjs";
+import { executeAcquireAction, parseAcquireParams } from "./acquire.mjs";
 import {
   applySafeMovements,
   checkHarvestToolTier,
@@ -57,6 +65,7 @@ import {
   findNearestCreeper,
   lowerShield,
   runGuardCombatStep,
+  updateEvadeShieldDefense,
 } from "./combat.mjs";
 
 export { HOSTILE_MOBS };
@@ -81,6 +90,7 @@ export const ALLOWED_GOAL_ACTIONS = new Set([
   "idle",
   "craft",
   "smelt",
+  "acquire",
   "guard",
   "evade",
   "hunt",
@@ -229,6 +239,8 @@ export class McRuntime {
     smeltPollIntervalMs = 350,
     stuckCheckIntervalMs = 2_500,
     huntAttackCooldownMs = null,
+    unreachableBlockTtlMs = UNREACHABLE_BLOCK_TTL_MS,
+    autoTorchCooldownMs = 8_000,
   }) {
     this.config = config;
     this.createBotFn = createBotFn;
@@ -323,6 +335,13 @@ export class McRuntime {
     this._milestoneCooldowns = new Map();
     this._waterFloatState = createWaterFloatState();
     this._shelterState = createShelterState();
+    this._unreachableBlocks = new UnreachableBlockBlacklist({ ttlMs: unreachableBlockTtlMs });
+    this._autoTorchState = createAutoTorchState();
+    this._hazardState = createHazardState();
+    this.autoTorchCooldownMs =
+      typeof autoTorchCooldownMs === "number" && Number.isFinite(autoTorchCooldownMs)
+        ? Math.max(0, autoTorchCooldownMs)
+        : 8_000;
     this.companionTickMs =
       typeof companionTickMs === "number" && Number.isFinite(companionTickMs)
         ? Math.max(25, companionTickMs)
@@ -423,6 +442,21 @@ export class McRuntime {
     return nearest ? normalizePlayerId(nearest.player.username) : "";
   }
 
+  _collectReflexModes() {
+    if (!this.connected) return [];
+    const modes = [];
+    if (this.config.mcAutoEat !== false) modes.push("auto_eat");
+    if (this.equipment.off_hand === "shield") modes.push("shield_ready");
+    if (this._combatState.shieldRaised) modes.push("shield_raised");
+    if (this.bot && hasTorchInInventory(this.bot)) modes.push("auto_torch");
+    if (this._shelterState.active) modes.push("sheltered");
+    if (this._combatState.retreating) modes.push("combat_retreat");
+    if (this._evadePlan) modes.push("evade_active");
+    if (this._hazardState.activeHazard) modes.push(this._hazardState.activeHazard);
+    if (this._unreachableBlocks.size(this.nowFn()) > 0) modes.push("unstuck_blacklist");
+    return modes.slice(0, 8);
+  }
+
   getSnapshot() {
     return {
       connected: this.connected,
@@ -441,6 +475,7 @@ export class McRuntime {
       guard_target: this._resolveGuardTargetName(),
       time_of_day: this.connected ? this.timeOfDay : "",
       nearby_resources: this.connected ? [...this.nearbyResources] : [],
+      reflex_modes: this.connected ? this._collectReflexModes() : [],
       active_task: this._activeGoalCancel && this.connected && !this.paused ? this.activeTask : "",
       activity: sanitizeMcText(this.activity, 64) || (this.connected ? "原地待命" : "待机"),
       nearby_entities: [...this.nearbyEntities],
@@ -508,6 +543,10 @@ export class McRuntime {
     const dimChanged = Boolean(this.dimension && newDim && newDim !== this.dimension);
     if (newDim) {
       this.dimension = newDim;
+    }
+    if (dimChanged) {
+      this._unreachableBlocks.clear();
+      this._autoTorchState = createAutoTorchState();
     }
     const nextPos = this._vecToTuple(bot.entity?.position);
     if (nextPos) {
@@ -632,10 +671,12 @@ export class McRuntime {
           maxDistance,
           count: 48,
         }) || [];
+      const nowMs = this.nowFn();
       const seen = new Set();
       const ordered = [];
       for (const p of positions) {
         if (ordered.length >= 12) break;
+        if (this._unreachableBlocks.has(p, nowMs)) continue;
         const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
         const name = blk?.name;
         if (!name || (!NEARBY_RESOURCE_BLOCKS.has(name) && !isBedName(name)) || seen.has(name)) {
@@ -741,6 +782,45 @@ export class McRuntime {
       if (nextFood !== null) this.food = nextFood;
       this.timeOfDay = this._computeTimeOfDay(bot);
 
+      // Priority 0: Immediate environmental self-preservation (lava/fire/low oxygen)
+      const hazard = detectEnvironmentalHazard(bot);
+      this._hazardState.activeHazard = hazard.hazard;
+      if (hazard.hazard === "hazard_water") {
+        try {
+          bot.setControlState?.("jump", true);
+          this._waterFloatState.floating = true;
+        } catch {
+          // Ignore jump errors
+        }
+      } else if (hazard.hazard === "hazard_fire") {
+        if (hazard.severity >= 3 && this._activeGoalCancel && this.activeTask !== "shelter") {
+          this._cancelActiveGoal();
+        }
+        const nowHazardMs = this.nowFn();
+        try {
+          bot.setControlState?.("jump", true);
+        } catch {
+          // Ignore jump errors
+        }
+        if (
+          !this._activeGoalCancel &&
+          bot.entity?.position &&
+          nowHazardMs - this._hazardState.lastEscapeAtMs >= 2_500
+        ) {
+          this._hazardState.lastEscapeAtMs = nowHazardMs;
+          const ox = Math.floor(bot.entity.position.x ?? 0);
+          const oz = Math.floor(bot.entity.position.z ?? 0);
+          applyNoDigMovements(bot);
+          try {
+            bot.setSprinting?.(true);
+            bot.pathfinder?.setGoal?.(new GoalNearXZ(ox + 4, oz + 4, 1), true);
+          } catch {
+            // Ignore pathfinder errors
+          }
+          this.activity = "脱离岩浆火焰";
+        }
+      }
+
       updateWaterFloatControl(bot, this._waterFloatState);
 
       if (
@@ -812,6 +892,26 @@ export class McRuntime {
         if (equipped.length > 0) {
           this._refreshFromBot();
           this._emitSnapshot();
+        }
+      }
+
+      if (
+        !this._activeGoalCancel &&
+        !this._eatingLock.eating &&
+        !this._shelterState.active &&
+        !this._hazardState.activeHazard &&
+        !this._evadePlan &&
+        !this._combatState.retreating
+      ) {
+        const torchRes = await tryAutoPlaceTorch(bot, this._autoTorchState, {
+          nowMs: this.nowFn(),
+          timeOfDay: this.timeOfDay,
+          sheltered: this._shelterState.active,
+          eating: this._eatingLock.eating,
+          cooldownMs: this.autoTorchCooldownMs,
+        });
+        if (torchRes.placed) {
+          this._refreshFromBot();
         }
       }
     } catch {
@@ -1156,9 +1256,9 @@ export class McRuntime {
         this._clearCombatMicroTimer();
       } else {
         this._clearCombatMicroTimer();
-        lowerShield(bot, this._combatState);
         const creeper = findNearestCreeper(bot, CREEPER_SAFE_DISTANCE);
         if (creeper) {
+          lowerShield(bot, this._combatState);
           const dest = computeRetreatTarget(
             origin,
             creeper.entity.position,
@@ -1178,6 +1278,14 @@ export class McRuntime {
         }
         const threatInfo = this._findEvadeThreats(bot);
         if (threatInfo) {
+          const shieldRes = updateEvadeShieldDefense({
+            bot,
+            combatState: this._combatState,
+            threats: threatInfo.threats,
+            nowMs,
+            eating: this._eatingLock.eating,
+            lookAtEntityFn: (b, e) => this._lookAtEntity(b, e),
+          });
           const fleeAngles = [0, 60, -60, 120, -120];
           const curPos = this._vecToTuple(origin) || [origin.x ?? 0, origin.y ?? 64, origin.z ?? 0];
           let plan = this._evadePlan;
@@ -1196,7 +1304,7 @@ export class McRuntime {
               (threatInfo.nearest.entity.position.x - curPos[0]) * (plan.tx - curPos[0]) +
                 (threatInfo.nearest.entity.position.z - curPos[2]) * (plan.tz - curPos[2]) >
                 0;
-            if (elapsedMs >= 2_500 && movedSincePlan < 0.5) {
+            if (elapsedMs >= 2_500 && movedSincePlan < 0.5 && !shieldRes.raised) {
               // Flee path appears blocked by terrain/trees; rotate angle and nudge jump.
               nextAngleIdx = (plan.angleIdx + 1) % fleeAngles.length;
               needNewGoal = true;
@@ -1222,7 +1330,9 @@ export class McRuntime {
             const { tx, tz } = this._computeFleeTarget(origin, threatInfo, allowed, angleDeg);
             applyNoDigMovements(bot);
             try {
-              bot.setSprinting?.(true);
+              if (!shieldRes.raised) {
+                bot.setSprinting?.(true);
+              }
               bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
             } catch {
               // Ignore pathfinder errors
@@ -1234,7 +1344,7 @@ export class McRuntime {
               lastPos: curPos,
               angleIdx: nextAngleIdx,
             };
-          } else {
+          } else if (!shieldRes.raised) {
             try {
               bot.setSprinting?.(true);
             } catch {
@@ -1242,7 +1352,7 @@ export class McRuntime {
             }
           }
           this._followingPlayer = null;
-          this.activity = "躲避怪物";
+          this.activity = shieldRes.raised ? "举盾躲避" : "躲避怪物";
           if (allowed && nowMs - this._lastHostileAlertAtMs >= this.hostileAlertCooldownMs) {
             if (this._tryCompanionChat("呀！旁边有怪物靠近我，快救救猫猫喵~")) {
               this._lastHostileAlertAtMs = nowMs;
@@ -1250,6 +1360,8 @@ export class McRuntime {
           }
           return;
         }
+        lowerShield(bot, this._combatState);
+        this._combatState.shieldWindowStartMs = -Infinity;
         this._evadePlan = null;
       }
 
@@ -1685,6 +1797,9 @@ export class McRuntime {
       this._shelterState.capPos = null;
       this._shelterState.holePos = null;
       this._shelterState.surfaceY = null;
+      this._unreachableBlocks.clear();
+      this._autoTorchState = createAutoTorchState();
+      this._hazardState = createHazardState();
       const newDim = sanitizeMcText(bot.game?.dimension || "", 24);
       const changed = newDim && newDim !== this.dimension;
       if (newDim) this.dimension = newDim;
@@ -1713,6 +1828,9 @@ export class McRuntime {
       if (this.bot !== bot || !this.connected) return;
       const newHealth = readNonNegativeFinite(bot.health);
       const prev = this._prevHealth;
+      if (newHealth !== null && prev !== null && newHealth < prev) {
+        this._combatState.lastDamageAtMs = this.nowFn();
+      }
       this._refreshFromBot();
       if (
         newHealth !== null &&
@@ -1738,12 +1856,16 @@ export class McRuntime {
       lowerShield(bot, this._combatState);
       this._combatState.retreating = false;
       this._combatState.activeTargetId = null;
+      this._combatState.shieldWindowStartMs = -Infinity;
       this._evadePlan = null;
       this._waterFloatState.floating = false;
       this._shelterState.active = false;
       this._shelterState.capPos = null;
       this._shelterState.holePos = null;
       this._shelterState.surfaceY = null;
+      this._unreachableBlocks.clear();
+      this._autoTorchState = createAutoTorchState();
+      this._hazardState = createHazardState();
       const prevActivity = sanitizeMcText(this.activity, 48) || "探索";
       this._refreshFromBot();
       this.health = 0;
@@ -1833,6 +1955,9 @@ export class McRuntime {
     this._combatState = createCombatState();
     this._waterFloatState = createWaterFloatState();
     this._shelterState = createShelterState();
+    this._unreachableBlocks.clear();
+    this._autoTorchState = createAutoTorchState();
+    this._hazardState = createHazardState();
     this._eatingLock.eating = false;
     this._followingPlayer = null;
     this._greetedPlayers.clear();
@@ -1873,6 +1998,9 @@ export class McRuntime {
     this._combatState = createCombatState();
     this._waterFloatState = createWaterFloatState();
     this._shelterState = createShelterState();
+    this._unreachableBlocks.clear();
+    this._autoTorchState = createAutoTorchState();
+    this._hazardState = createHazardState();
     this._eatingLock.eating = false;
     this._followingPlayer = null;
     this._greetedPlayers.clear();
@@ -2250,6 +2378,265 @@ export class McRuntime {
         await this._sleepAbortable(this.pickupSettleMs, signal);
       }
     }
+  }
+
+  async _gatherBlocksInternal(
+    bot,
+    {
+      targets,
+      rawBlock = "",
+      requestedCount = 1,
+      signal = null,
+      autoTorchAfterMine = false,
+      initialPositions = null,
+    },
+  ) {
+    const findCandidatePositions = () =>
+      typeof bot.findBlocks === "function"
+        ? bot.findBlocks({
+            matching: (b) => Boolean(b && targets.has(b.name)),
+            point: bot.entity?.position,
+            maxDistance: 32,
+            count: Math.max(8, requestedCount * 3),
+          }) || []
+        : [];
+
+    const firstPositions = initialPositions ?? findCandidatePositions();
+    if (firstPositions.length === 0) {
+      return {
+        ok: false,
+        reason: "block_not_found",
+        collected_count: 0,
+        block: rawBlock || "block",
+        pos: [0, 0, 0],
+      };
+    }
+
+    let collectedCount = 0;
+    let lastBlockName = rawBlock || "block";
+    let lastCoords = [0, 0, 0];
+    let blockedTierInfo = null;
+    let skippedUnderfoot = false;
+    let blacklistedSkipped = 0;
+    let stuckSkips = 0;
+    const visitedKeys = new Set();
+
+    for (let step = 0; step < requestedCount; step += 1) {
+      if (signal?.aborted) {
+        return {
+          ok: collectedCount > 0,
+          aborted: true,
+          collected_count: collectedCount,
+          block: lastBlockName,
+          pos: lastCoords,
+        };
+      }
+      if (
+        collectedCount > 0 &&
+        this.combatMode === "evade" &&
+        typeof bot.health === "number" &&
+        bot.health <= 6
+      ) {
+        break;
+      }
+      const nowMs = this.nowFn();
+      const positions = step === 0 && stuckSkips === 0 ? firstPositions : findCandidatePositions();
+      const exposedCandidates = [];
+      const buriedCandidates = [];
+      for (const p of positions) {
+        const c = this._vecToTuple(p) || [0, 0, 0];
+        const key = `${Math.floor(c[0])},${Math.floor(c[1])},${Math.floor(c[2])}`;
+        if (visitedKeys.has(key)) continue;
+        if (this._unreachableBlocks.has(c, nowMs)) {
+          blacklistedSkipped += 1;
+          continue;
+        }
+        if (isDirectlyUnderfoot(bot, c)) {
+          skippedUnderfoot = true;
+          continue;
+        }
+        const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
+        if (blk && !targets.has(blk.name)) continue;
+        const candName = blk?.name || rawBlock;
+        if (candName) {
+          const candTier = checkHarvestToolTier(bot, candName);
+          if (!candTier.ok) {
+            if (!blockedTierInfo) {
+              blockedTierInfo = { block: candName, ...candTier };
+            }
+            continue;
+          }
+        }
+        const entry = { blk, coords: c, key };
+        if (hasExposedFace(bot, c)) {
+          exposedCandidates.push(entry);
+        } else {
+          buriedCandidates.push(entry);
+        }
+      }
+      const chosen = exposedCandidates[0] || buriedCandidates[0] || null;
+      if (!chosen) {
+        if (collectedCount === 0 && stuckSkips > 0) {
+          return {
+            ok: false,
+            stuck: true,
+            reason: "path_stuck",
+            collected_count: 0,
+            block: lastBlockName,
+            pos: lastCoords,
+            blacklisted_skipped: blacklistedSkipped,
+          };
+        }
+        break;
+      }
+      const chosenBlock = chosen.blk;
+      const chosenCoords = chosen.coords;
+      visitedKeys.add(chosen.key);
+
+      const blockName = sanitizeMcText(chosenBlock?.name || rawBlock || "block", 48);
+      lastBlockName = blockName;
+      lastCoords = chosenCoords;
+
+      if (RARE_BLOCKS.has(blockName)) {
+        this._emitMilestone("mc_rare_find", "high", {
+          block: blockName,
+          pos: chosenCoords,
+          dimension: this.dimension || "overworld",
+        });
+      }
+
+      if (bot.pathfinder?.goto) {
+        try {
+          await this._gotoGoal(
+            new GoalNear(chosenCoords[0], chosenCoords[1], chosenCoords[2], 3),
+            signal,
+          );
+        } catch (err) {
+          if (signal?.aborted) {
+            return {
+              ok: collectedCount > 0,
+              aborted: true,
+              collected_count: collectedCount,
+              block: lastBlockName,
+              pos: lastCoords,
+            };
+          }
+          const isNavFail =
+            err?.code === "path_stuck" ||
+            /noPath|timeout|stopped/i.test(String(err?.name || err?.message || ""));
+          if (isNavFail) {
+            stuckSkips += 1;
+            // Persist unreachable column into TTL blacklist across turns so we stop retrying the same blocked tree/vein.
+            this._unreachableBlocks.markColumn(chosenCoords, { nowMs: this.nowFn() });
+            const cx = Math.floor(chosenCoords[0]);
+            const cy = Math.floor(chosenCoords[1]);
+            const cz = Math.floor(chosenCoords[2]);
+            for (let dy = -2; dy <= 3; dy += 1) {
+              visitedKeys.add(`${cx},${cy + dy},${cz}`);
+            }
+            if (stuckSkips < 3) {
+              step -= 1;
+              continue;
+            }
+            if (collectedCount === 0) {
+              return {
+                ok: false,
+                stuck: true,
+                reason: "path_stuck",
+                collected_count: 0,
+                block: lastBlockName,
+                pos: lastCoords,
+                blacklisted_skipped: blacklistedSkipped,
+              };
+            }
+            break;
+          }
+          throw err;
+        }
+      }
+      if (signal?.aborted) {
+        return {
+          ok: collectedCount > 0,
+          aborted: true,
+          collected_count: collectedCount,
+          block: lastBlockName,
+          pos: lastCoords,
+        };
+      }
+      if (chosenBlock && this.config.mcAutoEquip !== false && !this._eatingLock.eating) {
+        await equipBestHarvestTool(bot, chosenBlock);
+      }
+      if (signal?.aborted) {
+        return {
+          ok: collectedCount > 0,
+          aborted: true,
+          collected_count: collectedCount,
+          block: lastBlockName,
+          pos: lastCoords,
+        };
+      }
+      if (chosenBlock && typeof bot.dig === "function") {
+        await bot.dig(chosenBlock);
+      }
+      collectedCount += 1;
+      await this._collectNearbyDrops(bot, chosenCoords, signal);
+      if (autoTorchAfterMine && !signal?.aborted && !this._eatingLock.eating) {
+        await tryAutoPlaceTorch(bot, this._autoTorchState, {
+          nowMs: this.nowFn(),
+          timeOfDay: this.timeOfDay,
+          sheltered: this._shelterState.active,
+          eating: this._eatingLock.eating,
+          cooldownMs: this.autoTorchCooldownMs,
+        });
+      }
+    }
+
+    if (collectedCount === 0) {
+      if (blockedTierInfo) {
+        return {
+          ok: false,
+          reason: "tool_tier_too_low",
+          collected_count: 0,
+          blockedTierInfo,
+          block: blockedTierInfo.block,
+          pos: lastCoords,
+        };
+      }
+      if (skippedUnderfoot) {
+        return {
+          ok: false,
+          reason: "unsafe_underfoot_block",
+          collected_count: 0,
+          block: rawBlock || lastBlockName,
+          pos: lastCoords,
+        };
+      }
+      if (blacklistedSkipped > 0) {
+        return {
+          ok: false,
+          reason: "all_candidates_unreachable",
+          collected_count: 0,
+          block: rawBlock || lastBlockName,
+          pos: lastCoords,
+          blacklisted_skipped: blacklistedSkipped,
+        };
+      }
+      return {
+        ok: false,
+        reason: "block_not_found",
+        collected_count: 0,
+        block: rawBlock || lastBlockName,
+        pos: lastCoords,
+      };
+    }
+
+    return {
+      ok: true,
+      collected_count: collectedCount,
+      block: lastBlockName,
+      pos: lastCoords,
+      blacklisted_skipped: blacklistedSkipped,
+    };
   }
 
   _scanRareBlocks(bot, maxDistance = 24) {
@@ -2772,7 +3159,7 @@ export class McRuntime {
       this.activity = rawBlock ? `采集:${rawBlock}` : actionType === "gather" ? "采集资源" : "采矿中";
       this._emitSnapshot();
 
-      const findCandidatePositions = () =>
+      const initialPositions =
         typeof bot.findBlocks === "function"
           ? bot.findBlocks({
               matching: (b) => Boolean(b && targets.has(b.name)),
@@ -2781,8 +3168,6 @@ export class McRuntime {
               count: Math.max(8, requestedCount * 3),
             }) || []
           : [];
-
-      const initialPositions = findCandidatePositions();
       if (initialPositions.length === 0) {
         this._refreshFromBot();
         this.activity = this.paused ? "已暂停" : "原地待命";
@@ -2798,146 +3183,76 @@ export class McRuntime {
         };
       }
 
-      let collectedCount = 0;
-      let lastBlockName = rawBlock || "block";
-      let lastCoords = [0, 0, 0];
-      let blockedTierInfo = null;
-      let skippedUnderfoot = false;
-      let stuckSkips = 0;
-      const visitedKeys = new Set();
-
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
-        for (let step = 0; step < requestedCount; step += 1) {
-          if (signal.aborted) return { aborted: true };
-          if (
-            collectedCount > 0 &&
-            this.combatMode === "evade" &&
-            typeof bot.health === "number" &&
-            bot.health <= 6
-          ) {
-            break;
-          }
-          const positions = step === 0 && stuckSkips === 0 ? initialPositions : findCandidatePositions();
-          const exposedCandidates = [];
-          const buriedCandidates = [];
-          for (const p of positions) {
-            const c = this._vecToTuple(p) || [0, 0, 0];
-            const key = `${Math.floor(c[0])},${Math.floor(c[1])},${Math.floor(c[2])}`;
-            if (visitedKeys.has(key)) continue;
-            if (isDirectlyUnderfoot(bot, c)) {
-              skippedUnderfoot = true;
-              continue;
-            }
-            const blk = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
-            if (blk && !targets.has(blk.name)) continue;
-            const candName = blk?.name || rawBlock;
-            if (candName) {
-              const candTier = checkHarvestToolTier(bot, candName);
-              if (!candTier.ok) {
-                if (!blockedTierInfo) {
-                  blockedTierInfo = { block: candName, ...candTier };
-                }
-                continue;
-              }
-            }
-            const entry = { blk, coords: c, key };
-            if (hasExposedFace(bot, c)) {
-              exposedCandidates.push(entry);
-            } else {
-              buriedCandidates.push(entry);
-            }
-          }
-          const chosen = exposedCandidates[0] || buriedCandidates[0] || null;
-          if (!chosen) {
-            if (collectedCount === 0 && stuckSkips > 0) return { stuck: true };
-            break;
-          }
-          const chosenBlock = chosen.blk;
-          const chosenCoords = chosen.coords;
-          visitedKeys.add(chosen.key);
-
-          const blockName = sanitizeMcText(chosenBlock?.name || rawBlock || "block", 48);
-          lastBlockName = blockName;
-          lastCoords = chosenCoords;
-
-          if (RARE_BLOCKS.has(blockName)) {
-            this._emitMilestone("mc_rare_find", "high", {
-              block: blockName,
-              pos: chosenCoords,
-              dimension: this.dimension || "overworld",
-            });
-          }
-
-          if (bot.pathfinder?.goto) {
-            try {
-              await this._gotoGoal(
-                new GoalNear(chosenCoords[0], chosenCoords[1], chosenCoords[2], 3),
-                signal,
-              );
-            } catch (err) {
-              if (signal.aborted) return { aborted: true };
-              const isNavFail =
-                err?.code === "path_stuck" ||
-                /noPath|timeout|stopped/i.test(String(err?.name || err?.message || ""));
-              if (isNavFail) {
-                stuckSkips += 1;
-                // Mark the immediate column/cluster visited so we skip to a genuinely different tree/vein.
-                const cx = Math.floor(chosenCoords[0]);
-                const cy = Math.floor(chosenCoords[1]);
-                const cz = Math.floor(chosenCoords[2]);
-                for (let dy = -2; dy <= 3; dy += 1) {
-                  visitedKeys.add(`${cx},${cy + dy},${cz}`);
-                }
-                if (stuckSkips < 3) {
-                  step -= 1;
-                  continue;
-                }
-                if (collectedCount === 0) return { stuck: true };
-                break;
-              }
-              throw err;
-            }
-          }
-          if (signal.aborted) return { aborted: true };
-          if (chosenBlock && this.config.mcAutoEquip !== false && !this._eatingLock.eating) {
-            await equipBestHarvestTool(bot, chosenBlock);
-          }
-          if (signal.aborted) return { aborted: true };
-          if (chosenBlock && typeof bot.dig === "function") {
-            await bot.dig(chosenBlock);
-          }
-          collectedCount += 1;
-          await this._collectNearbyDrops(bot, chosenCoords, signal);
-        }
-        return { ok: collectedCount > 0 };
+        return await this._gatherBlocksInternal(bot, {
+          targets,
+          rawBlock,
+          requestedCount,
+          signal,
+          autoTorchAfterMine: actionType === "mine",
+          initialPositions,
+        });
       });
 
       this._refreshFromBot();
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
-      if (collectedCount === 0 && blockedTierInfo && !outcome?.stuck && !outcome?.timedOut && !outcome?.aborted) {
+      const collectedCount = outcome?.collected_count ?? 0;
+      const lastBlockName = outcome?.block || rawBlock || "block";
+      const lastCoords = outcome?.pos || [0, 0, 0];
+      if (
+        collectedCount === 0 &&
+        outcome?.blockedTierInfo &&
+        !outcome?.stuck &&
+        !outcome?.timedOut &&
+        !outcome?.aborted
+      ) {
         return {
           ok: false,
           accepted: true,
           bridge_ready: true,
           paused: false,
           reason: "tool_tier_too_low",
-          block: blockedTierInfo.block,
-          required_tool: blockedTierInfo.requiredTool,
-          best_tool: blockedTierInfo.bestTool,
-          summary: `挖掘${blockedTierInfo.block}需要至少${blockedTierInfo.requiredTool}`,
+          block: outcome.blockedTierInfo.block,
+          required_tool: outcome.blockedTierInfo.requiredTool,
+          best_tool: outcome.blockedTierInfo.bestTool,
+          summary: `挖掘${outcome.blockedTierInfo.block}需要至少${outcome.blockedTierInfo.requiredTool}`,
           snapshot: this.getSnapshot(),
         };
       }
-      if (collectedCount === 0 && skippedUnderfoot && !outcome?.stuck && !outcome?.timedOut && !outcome?.aborted) {
+      if (
+        collectedCount === 0 &&
+        outcome?.reason === "unsafe_underfoot_block" &&
+        !outcome?.stuck &&
+        !outcome?.timedOut &&
+        !outcome?.aborted
+      ) {
         return {
           ok: false,
           accepted: true,
           bridge_ready: true,
           paused: false,
           reason: "unsafe_underfoot_block",
-          block: rawBlock || lastBlockName,
+          block: lastBlockName,
           summary: "跳过脚下正下方方块以防坠落",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (
+        collectedCount === 0 &&
+        outcome?.reason === "all_candidates_unreachable" &&
+        !outcome?.timedOut &&
+        !outcome?.aborted
+      ) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: "all_candidates_unreachable",
+          block: lastBlockName,
+          blacklisted_skipped: outcome.blacklisted_skipped ?? 0,
+          summary: `附近${lastBlockName}均在不可达黑名单中，建议先探索换个方向`,
           snapshot: this.getSnapshot(),
         };
       }
@@ -2953,6 +3268,18 @@ export class McRuntime {
               ? "mc_goal_timeout"
               : "mc_goal_cancelled",
           summary: outcome.stuck ? "采集寻路卡住" : outcome.timedOut ? "采集超时" : "采集已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (collectedCount === 0) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome?.reason || "block_not_found",
+          block: lastBlockName,
+          summary: `附近未找到可采集的${lastBlockName}`,
           snapshot: this.getSnapshot(),
         };
       }
@@ -3336,6 +3663,107 @@ export class McRuntime {
         missing_materials: Array.isArray(outcome?.missing_materials)
           ? outcome.missing_materials
           : [],
+        snapshot: this.getSnapshot(),
+      };
+    }
+
+    if (actionType === "acquire") {
+      const parsed = parseAcquireParams(params);
+      if (parsed.error) {
+        return {
+          ok: false,
+          accepted: false,
+          bridge_ready: true,
+          paused: false,
+          reason: parsed.error,
+          item_name: parsed.itemName || "",
+          summary:
+            parsed.error === "acquire_item_not_supported"
+              ? `暂不支持自动筹料合成: ${parsed.itemName}`
+              : parsed.error === "invalid_item_name"
+                ? "目标物品ID无效"
+                : "筹料数量需为1到16的整数",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      this.activity = `筹料合成:${parsed.itemName}`;
+      this._emitSnapshot();
+      const acquireTimeoutMs =
+        typeof params.timeout_ms === "number" && Number.isFinite(params.timeout_ms)
+          ? Math.min(35_000, Math.max(100, params.timeout_ms))
+          : Math.min(32_000, Math.max(timeoutMs, 30_000));
+      const deadlineMs = this.nowFn() + Math.max(200, acquireTimeoutMs - 2_000);
+      const outcome = await this._runBoundedGoal(actionType, acquireTimeoutMs, async (signal) => {
+        return await executeAcquireAction(bot, params, {
+          gatherBlocksFn: (blockNames, count, sig) =>
+            this._gatherBlocksInternal(bot, {
+              targets: new Set(blockNames),
+              rawBlock: blockNames[0] || "",
+              requestedCount: count,
+              signal: sig,
+              autoTorchAfterMine: blockNames.some((n) => n.endsWith("_ore") || n === "stone"),
+            }),
+          gotoFn: (goal, sig) => this._gotoGoal(goal, sig),
+          collectDropsFn: (b, c, sig) => this._collectNearbyDrops(b, c, sig),
+          autoEquip: this.config.mcAutoEquip !== false,
+          combatMode: this.combatMode,
+          signal,
+          nowFn: () => this.nowFn(),
+          deadlineMs,
+          smeltPollIntervalMs: this.smeltPollIntervalMs,
+          huntAttackCooldownMs: this.huntAttackCooldownMs,
+        });
+      });
+      this._refreshFromBot();
+      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      if (this.connected) this._emitSnapshot();
+      if (outcome?.timedOut || outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: outcome.timedOut ? "mc_goal_timeout" : "mc_goal_cancelled",
+          summary: outcome.timedOut ? "自动筹料超时" : "自动筹料已取消",
+          item_name: parsed.itemName,
+          requested_count: parsed.count,
+          acquired_count: 0,
+          steps_completed: [],
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.ok) {
+        if (!outcome.already_owned) {
+          this._emitMilestone("mc_goal_completed", "normal", {
+            action_type: "acquire",
+            summary: outcome.summary,
+            item_name: outcome.item_name,
+            acquired_count: outcome.acquired_count,
+          });
+        }
+        return {
+          ok: true,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          ...outcome,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      return {
+        ok: false,
+        accepted: outcome?.accepted ?? true,
+        bridge_ready: true,
+        paused: false,
+        reason: outcome?.reason || "acquire_failed",
+        summary: outcome?.summary || `自动筹料${parsed.itemName}失败`,
+        item_name: outcome?.item_name ?? parsed.itemName,
+        requested_count: outcome?.requested_count ?? parsed.count,
+        acquired_count: outcome?.acquired_count ?? 0,
+        owned_count: outcome?.owned_count ?? 0,
+        partial: Boolean(outcome?.partial),
+        steps_completed: Array.isArray(outcome?.steps_completed) ? outcome.steps_completed : [],
+        ...(outcome?.blocker_item ? { blocker_item: outcome.blocker_item } : {}),
         snapshot: this.getSnapshot(),
       };
     }
