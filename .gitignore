@@ -30,10 +30,7 @@ htmlcov/
 /开发手册.md
 
 # Local deployment overrides; publish only their sanitized examples.
-docker-compose.napcat.official-node.yml
-cn/napcat/docker-compose.napcat.official-node.yml
 docker-compose.*.local.yml
 compose.*.local.yaml
-cn/mc-agent/node_modules/
 *.pem
 *.key

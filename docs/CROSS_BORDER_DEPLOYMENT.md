@@ -5,7 +5,7 @@
 ## 新增文件与变量
 
 - 境外：`docker-compose.yml`、`.env.example` 中的跨境段、`deploy/hakimi-ws.conf`。
-- 境内：`cn/napcat/docker-compose.napcat.yml`、`cn/napcat/.env.napcat.example`、`cn/napcat/napcat-onebot11.json.example`（所有境内独立组件与编排统一位于 `cn/`，参见 `cn/README.md`）。
+- 境内：已拆至独立仓库维护——NapCat 编排与模板见 `FireOpalus/hakimi-napcat`（`docker-compose.napcat.yml`、`.env.napcat.example`、`napcat-onebot11.json.example`），执行节点代理见 `FireOpalus/hakimi-node-agent`，MC 第 0 层侧车见 `FireOpalus/hakimi-mc-agent`，MC 服务端运维见 `FireOpalus/hakimi-mc-server`。
 - `ONEBOT_ACCESS_TOKEN`：至少 32 字符，用 `python -c 'import secrets; print(secrets.token_urlsafe(32))'` 在服务器本地生成。兼容现有 `HAKIMI_ONEBOT_WS_TOKEN`，新变量存在时优先；不要把密钥贴进聊天或 Git。
 - `ONEBOT_WS_PATH`：默认 `/ws/onebot` 兼容本地旧部署。跨境部署改成 `/ws/onebot/` 加至少 24 位随机后缀；建议用 `secrets.token_hex(24)`。Nginx 精确 location、FastAPI 变量与境内 wss URL 必须完全一致。
 - `ONEBOT_TRUSTED_PROXY_IPS`：仅允许列出的直接代理提供 `X-Real-IP`，默认回环地址。如果宿主机 Nginx 经 Docker 端口映射访问后端，请检查项目网络的网关 IP 后加入这一具体地址，不要信任所有私网地址。

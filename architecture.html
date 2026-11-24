@@ -377,7 +377,7 @@
           <header><h3><a href="plugins/minecraft/plugin_main.py">Minecraft 桥接</a></h3><code>minecraft</code></header>
           <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>mc.*</code></div>
           <p>三层游玩大脑与桥接控制：境内第 0 层 <code>mc_agent</code>（0 Token）负责背包/昼夜/周边资源快照、安全防拆家寻路与卡死脱困、落水浮水与防直挖脚下护栏、工具等级预检与露天优选、自动吃穿、连采拾取、2×2/3×3 合成（含上游原木缺口折算）、熔炉烧炼（<code>mc.smelt</code>）、受控打猎/过夜/箱子存取/白名单放置/递物/夜间掩体（<code>mc.hunt</code>/<code>sleep</code>/<code>chest</code>/<code>place</code>/<code>give</code>/<code>shelter</code>）与护卫打怪；境外第 1 层复用内核静态白名单 <code>gemini-decision-1</code> 做巡航门控与公屏意图搭车；第 2 层主模型支持进服 15s 冷启动、开荒科技树规范（<code>2048</code> 输出上限）、KV 持久化路标、<code>active_plan</code> 连贯加速步进与最近 30 步动作流水，协同 <code>mc-powerd</code> 调度目标与里程碑并降噪战术事件。</p>
-          <div class="plugin-links"><a href="plugins/minecraft/plugin_main.py">plugin_main.py</a><a href="plugins/minecraft/play_brain.py">play_brain.py</a><a href="src/hakimi/decision_templates.py">decision_templates.py</a><a href="cn/mc-agent/src/behaviors.mjs">behaviors.mjs</a><a href="cn/mc-agent/src/acquire.mjs">acquire.mjs</a><a href="cn/mc-server/mc-powerd.py">mc-powerd.py</a></div>
+          <div class="plugin-links"><a href="plugins/minecraft/plugin_main.py">plugin_main.py</a><a href="plugins/minecraft/play_brain.py">play_brain.py</a><a href="src/hakimi/decision_templates.py">decision_templates.py</a><a href="https://github.com/FireOpalus/hakimi-mc-agent" target="_blank" rel="noreferrer">hakimi-mc-agent</a><a href="https://github.com/FireOpalus/hakimi-mc-server" target="_blank" rel="noreferrer">hakimi-mc-server</a></div>
         </article>
         <article class="plugin-card">
           <header><h3><a href="plugins/bilibili/plugin_main.py">B 站冲浪巡逻</a></h3><code>bilibili_surf</code></header>
@@ -455,7 +455,7 @@
         <div class="lane"><h3>境内外 · 6 个远程插件容器</h3><span class="link-label">内部 WS / 锁定 WSS + 分块 Blob</span><div><strong>5 个境外只读容器 + 1 个境内只读容器 ↔ 境外 hakimi-bot /ws/plugin</strong><p>境外运行 <code>weather</code>、<code>minecraft</code>、<code>bilibili_surf</code>、<code>web_tools</code> 与 <code>doc_render</code>；<code>song_finder</code> 独占匿名音源镜像部署于境内节点（IP 白名单 + <code>X-Plugin-ID</code> 锁定 WSS 通道，零账号 Cookie），与 <code>bilibili_surf</code> 严格物理隔离。</p></div></div>
         <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求（<code>/admin/api/songs/inbox</code> 与 <code>/upload</code> 放行 100 MiB 无缓冲直传）。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
       </div>
-      <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="compose.plugins.yaml">远程插件编排</a><a href="scripts/deploy_plugins.sh">插件启停脚本</a><a href="cn/node-agent/compose.cn.yaml">境内执行节点</a><a href="cn/README.md">境内组件合集</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
+      <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="compose.plugins.yaml">远程插件编排</a><a href="scripts/deploy_plugins.sh">插件启停脚本</a><a href="https://github.com/FireOpalus/hakimi-node-agent" target="_blank" rel="noreferrer">hakimi-node-agent</a><a href="https://github.com/FireOpalus/hakimi-napcat" target="_blank" rel="noreferrer">hakimi-napcat</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
     </section>
 
     <section class="chapter" id="pipeline" aria-labelledby="conversation-title">

@@ -1,10 +1,10 @@
-# 境内找歌远程插件编排 (`cn/song-finder`)
+# 境内找歌远程插件编排 (`plugins/song_finder/deploy-cn`)
 
 本目录存放境内节点 `/opt/hakimi-song-finder/` 的容器编排与环境变量模板。
 
 ## 源码位置说明
 
-`song_finder` 的 Python 源码与镜像构建文件保留在主仓 [plugins/song_finder/](../../plugins/song_finder/)，与其余远程插件共用单一事实源 `src/hakimi_plugin_sdk`，避免 SDK 双份漂移。
+`song_finder` 的 Python 源码与镜像构建文件位于上一级目录 [plugins/song_finder/](../)，与其余远程插件共用单一事实源 `src/hakimi_plugin_sdk`，避免 SDK 双份漂移。
 
 ## 构建与部署
 

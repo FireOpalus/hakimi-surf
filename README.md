@@ -64,7 +64,7 @@ uv run uvicorn hakimi.app:create_app --factory \
 > 必须保持 **1 个 Uvicorn worker**：进程内维护了会话串行调度、WS 连接状态与事务锁定，不能靠加 worker 水平扩展。
 
 **跨境反向 WSS 拓扑**：
-- **境内节点（NapCat / 执行节点 / MC）**：统一收拢于 [`cn/`](cn/README.md) 目录；NapCat 使用 `cn/napcat/docker-compose.napcat.yml`，`network.websocketClients` 配置指向 `wss://你的域名/ws/onebot/<随机后缀>`，消息格式选 Array，开启 `enableLocalFile2Url`，25s 心跳 / 5s 重连。
+- **境内独立节点仓库**：NapCat（`FireOpalus/hakimi-napcat`）、执行节点代理（`FireOpalus/hakimi-node-agent`）、MC 第 0 层侧车（`FireOpalus/hakimi-mc-agent`）与 MC 服务端运维（`FireOpalus/hakimi-mc-server`）均独立建仓维护；NapCat `network.websocketClients` 配置指向 `wss://你的域名/ws/onebot/<随机后缀>`，消息格式选 Array，开启 `enableLocalFile2Url`，25s 心跳 / 5s 重连。
 - **境外主脑（Hakimi）**：引擎与管理台分别监听回环端口 `12141`、`12143`。公网 Nginx 精确放行 OneBot 和已启用的境内执行节点 WSS 路径，其余路径统一 404（模板见 [deploy/hakimi-ws.conf](deploy/hakimi-ws.conf)）；管理后台永不暴露公网。详见 [跨境部署说明](docs/CROSS_BORDER_DEPLOYMENT.md)。
 
 </details>

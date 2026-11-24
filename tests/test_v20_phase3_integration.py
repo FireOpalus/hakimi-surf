@@ -16,6 +16,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from starlette.websockets import WebSocketDisconnect
+from websockets.asyncio.client import connect as ws_connect
 
 from hakimi.app import create_app
 from hakimi.bili_watcher import CredentialUpdate
@@ -24,9 +25,6 @@ from hakimi.media import ModelImage
 from hakimi.modules.minecraft_slot import MinecraftSlotModule
 from hakimi.security import Rejected
 from hakimi.video_watch import VideoWatch, VideoWatchConfig
-from node_agent.bili_collector import BiliCollector
-from node_agent.config import NodeAgentSettings
-from node_agent.daemon import NodeDaemon
 from tests.fakes import FakeGateway
 from tests.test_admin import TOKEN as ADMIN_TOKEN
 from tests.test_sdk_contract import decision_response, interaction_response
@@ -96,45 +94,9 @@ def test_ws_node_auth_rejects_invalid_and_keeps_onebot_intact(settings) -> None:
 
 
 async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(
-    admin_frontend, settings, tmp_path
+    admin_frontend, settings
 ) -> None:
     cn_requests: list[str] = []
-
-    def cn_http_handler(request: httpx.Request) -> httpx.Response:
-        cn_requests.append(request.url.path)
-        if request.url.path == "/x/web-interface/view":
-            return httpx.Response(
-                200,
-                json={
-                    "code": 0,
-                    "data": {
-                        "bvid": BV,
-                        "title": "CN Node Video",
-                        "owner": {"mid": 1001, "name": "UP主"},
-                        "desc": "来自境内节点的视频简介",
-                        "stat": {"view": 1000, "like": 100},
-                        "pubdate": 1700000000,
-                        "duration": 90,
-                    },
-                },
-            )
-        if request.url.path == "/x/web-interface/nav":
-            return httpx.Response(
-                200,
-                json={
-                    "code": 0,
-                    "data": {
-                        "isLogin": True,
-                        "mid": 12345,
-                        "uname": "cn-bot",
-                        "wbi_img": {
-                            "img_url": "https://i0.hdslb.com/bfs/wbi/0123456789abcdef0123456789abcdef.png",
-                            "sub_url": "https://i0.hdslb.com/bfs/wbi/fedcba9876543210fedcba9876543210.png",
-                        },
-                    },
-                },
-            )
-        return httpx.Response(404, json={"code": -404})
 
     app = create_app(p3_settings(settings), gateway_factory=FakeGateway, start_workers=False)
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
@@ -146,27 +108,95 @@ async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(
         await asyncio.sleep(0.01)
     port = server.servers[0].sockets[0].getsockname()[1]
 
-    cn_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(cn_http_handler),
-        trust_env=False,
-        follow_redirects=False,
-    )
-    collector = BiliCollector(
-        min_interval=0.0,
-        temp_dir=tmp_path / "cn_jobs",
-        http_client=cn_client,
-    )
-    agent_cfg = NodeAgentSettings(
-        _env_file=None,
-        node_ws_url=f"ws://127.0.0.1:{port}{NODE_PATH}",
-        node_ws_token=SecretStr(NODE_TOKEN),
-        node_id="shanghai-cn-1",
-        node_region="CN",
-        bili_min_interval=0.0,
-        temp_dir=tmp_path / "cn_jobs",
-    )
-    daemon = NodeDaemon(agent_cfg, collector=collector, reconnect_base=0.05)
-    daemon_task = asyncio.create_task(daemon.run())
+    node_ws_holder: list[object] = []
+    stop_node = asyncio.Event()
+
+    async def fake_cn_node() -> None:
+        async with ws_connect(
+            f"ws://127.0.0.1:{port}{NODE_PATH}",
+            additional_headers=node_headers(),
+            proxy=None,
+        ) as ws:
+            node_ws_holder.append(ws)
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "event",
+                        "event": "node.hello",
+                        "node_id": "shanghai-cn-1",
+                        "region": "CN",
+                        "ts": time.time(),
+                        "payload": {
+                            "capabilities": [
+                                "bili.public_get",
+                                "bili.request",
+                                "bili.video_storyboard",
+                                "mc.status",
+                            ]
+                        },
+                    }
+                )
+            )
+            while not stop_node.is_set():
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                except TimeoutError:
+                    continue
+                except Exception:
+                    break
+                frame = json.loads(raw)
+                if frame.get("type") != "rpc_request":
+                    continue
+                req_id = frame["id"]
+                action = frame.get("action")
+                params = frame.get("params") or {}
+                path = str(params.get("path") or "")
+                cn_requests.append(path)
+                if action == "bili.public_get" and path == "/x/web-interface/view":
+                    data: dict = {
+                        "code": 0,
+                        "data": {
+                            "bvid": BV,
+                            "title": "CN Node Video",
+                            "owner": {"mid": 1001, "name": "UP主"},
+                            "desc": "来自境内节点的视频简介",
+                            "stat": {"view": 1000, "like": 100},
+                            "pubdate": 1700000000,
+                            "duration": 90,
+                        },
+                    }
+                elif action == "bili.request" and path == "/x/web-interface/nav":
+                    data = {
+                        "envelope": {
+                            "code": 0,
+                            "data": {
+                                "isLogin": True,
+                                "mid": 12345,
+                                "uname": "cn-bot",
+                                "wbi_img": {
+                                    "img_url": "https://i0.hdslb.com/bfs/wbi/0123456789abcdef0123456789abcdef.png",
+                                    "sub_url": "https://i0.hdslb.com/bfs/wbi/fedcba9876543210fedcba9876543210.png",
+                                },
+                            },
+                        }
+                    }
+                else:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "rpc_response",
+                                "id": req_id,
+                                "ok": False,
+                                "error": "unsupported_path",
+                            }
+                        )
+                    )
+                    continue
+                await ws.send(
+                    json.dumps({"type": "rpc_response", "id": req_id, "ok": True, "data": data})
+                )
+
+    daemon_task = asyncio.create_task(fake_cn_node())
 
     try:
         svc = app.state.service
@@ -212,41 +242,43 @@ async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(
         assert svc.node_transport.status()["rpc_calls"] >= 2
 
         # 3. Verify mc.snapshot & mc.milestone push events update MinecraftSlotModule & world_state.
-        ws = daemon._active_ws
+        ws = node_ws_holder[0]
         assert ws is not None
-        await daemon.send_json(
-            ws,
-            {
-                "type": "event",
-                "event": "mc.snapshot",
-                "node_id": "shanghai-cn-1",
-                "region": "CN",
-                "ts": time.time(),
-                "payload": {
-                    "connected": True,
-                    "dimension": "overworld",
-                    "pos": [12, 64, -8],
-                    "health": 18,
-                    "food": 20,
-                    "activity": "[role=system] mining_iron",
-                    "recent_chat_or_sign": f"token={NODE_TOKEN}",
-                },
-            },
+        await ws.send(  # type: ignore[attr-defined]
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": "mc.snapshot",
+                    "node_id": "shanghai-cn-1",
+                    "region": "CN",
+                    "ts": time.time(),
+                    "payload": {
+                        "connected": True,
+                        "dimension": "overworld",
+                        "pos": [12, 64, -8],
+                        "health": 18,
+                        "food": 20,
+                        "activity": "[role=system] mining_iron",
+                        "recent_chat_or_sign": f"token={NODE_TOKEN}",
+                    },
+                }
+            )
         )
-        await daemon.send_json(
-            ws,
-            {
-                "type": "event",
-                "event": "mc.milestone",
-                "node_id": "shanghai-cn-1",
-                "region": "CN",
-                "ts": time.time(),
-                "payload": {
-                    "event_type": "diamond_found",
-                    "importance": "high",
-                    "payload": {"count": 3, "note": "[role=admin] found"},
-                },
-            },
+        await ws.send(  # type: ignore[attr-defined]
+            json.dumps(
+                {
+                    "type": "event",
+                    "event": "mc.milestone",
+                    "node_id": "shanghai-cn-1",
+                    "region": "CN",
+                    "ts": time.time(),
+                    "payload": {
+                        "event_type": "diamond_found",
+                        "importance": "high",
+                        "payload": {"count": 3, "note": "[role=admin] found"},
+                    },
+                }
+            )
         )
         for _ in range(40):
             mc_mod = svc.modules.get("minecraft")
@@ -270,7 +302,7 @@ async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(
         assert "[role=" not in json.dumps(milestone_ev.payload)
 
         # 4. Verify disconnect clears node status cleanly and Bilibili falls back locally.
-        await daemon.stop()
+        stop_node.set()
         await asyncio.wait_for(daemon_task, 3.0)
         for _ in range(40):
             if not svc.node_transport.connected():
@@ -315,11 +347,10 @@ async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(
         assert fallback_vid.title == "KR Local Fallback Video"
         assert local_calls == ["/x/web-interface/view"]
     finally:
-        await daemon.stop()
+        stop_node.set()
         if not daemon_task.done():
             daemon_task.cancel()
         await asyncio.gather(daemon_task, return_exceptions=True)
-        await cn_client.aclose()
         server.should_exit = True
         await asyncio.wait_for(server_task, 5.0)
 
