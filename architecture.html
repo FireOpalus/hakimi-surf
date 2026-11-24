@@ -377,7 +377,7 @@
           <header><h3><a href="plugins/minecraft/plugin_main.py">Minecraft 桥接</a></h3><code>minecraft</code></header>
           <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>mc.*</code></div>
           <p>三层游玩大脑与桥接控制：境内第 0 层 <code>mc_agent</code>（0 Token）负责背包/昼夜/周边资源快照、安全防拆家寻路与卡死脱困、落水浮水与防直挖脚下护栏、工具等级预检与露天优选、自动吃穿、连采拾取、2×2/3×3 合成（含上游原木缺口折算）、熔炉烧炼（<code>mc.smelt</code>）、受控打猎/过夜/箱子存取/白名单放置/递物/夜间掩体（<code>mc.hunt</code>/<code>sleep</code>/<code>chest</code>/<code>place</code>/<code>give</code>/<code>shelter</code>）与护卫打怪；境外第 1 层复用内核静态白名单 <code>gemini-decision-1</code> 做巡航门控与公屏意图搭车；第 2 层主模型支持进服 15s 冷启动、开荒科技树规范（<code>2048</code> 输出上限）、KV 持久化路标、<code>active_plan</code> 连贯加速步进与最近 30 步动作流水，协同 <code>mc-powerd</code> 调度目标与里程碑并降噪战术事件。</p>
-          <div class="plugin-links"><a href="plugins/minecraft/plugin_main.py">plugin_main.py</a><a href="plugins/minecraft/play_brain.py">play_brain.py</a><a href="src/hakimi/decision_templates.py">decision_templates.py</a><a href="mc_agent/src/behaviors.mjs">behaviors.mjs</a><a href="mc_agent/src/smelting.mjs">smelting.mjs</a><a href="mc_agent/src/world_actions.mjs">world_actions.mjs</a></div>
+          <div class="plugin-links"><a href="plugins/minecraft/plugin_main.py">plugin_main.py</a><a href="plugins/minecraft/play_brain.py">play_brain.py</a><a href="src/hakimi/decision_templates.py">decision_templates.py</a><a href="https://github.com/FireOpalus/hakimi-mc-agent" target="_blank" rel="noreferrer">hakimi-mc-agent</a></div>
         </article>
         <article class="plugin-card">
           <header><h3><a href="plugins/bilibili/plugin_main.py">B 站冲浪巡逻</a></h3><code>bilibili_surf</code></header>
