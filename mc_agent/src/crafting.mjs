@@ -15,7 +15,7 @@ const { GoalNear } = goals;
 export const MIN_CRAFT_COUNT = 1;
 export const MAX_CRAFT_COUNT = 16;
 export const CRAFTING_TABLE_SEARCH_RADIUS = 16;
-export const CRAFTING_TABLE_PLACE_RADIUS = 2;
+export const CRAFTING_TABLE_PLACE_RADIUS = 3;
 export const MAX_WOOD_PREPROCESS_DEPTH = 2;
 
 const WOOD_SPECIES = [
@@ -55,9 +55,36 @@ const REPLACEABLE_BLOCKS = new Set([
   "short_grass",
   "grass",
   "tall_grass",
+  "short_dry_grass",
+  "tall_dry_grass",
   "fern",
+  "large_fern",
   "dead_bush",
+  "bush",
+  "leaf_litter",
+  "wildflowers",
+  "pink_petals",
   "snow",
+  "vine",
+  "glow_lichen",
+  "dandelion",
+  "poppy",
+  "blue_orchid",
+  "allium",
+  "azure_bluet",
+  "red_tulip",
+  "orange_tulip",
+  "white_tulip",
+  "pink_tulip",
+  "oxeye_daisy",
+  "cornflower",
+  "lily_of_the_valley",
+  "sunflower",
+  "lilac",
+  "rose_bush",
+  "peony",
+  "brown_mushroom",
+  "red_mushroom",
 ]);
 
 const UNSAFE_GROUND_BLOCKS = new Set([
@@ -97,6 +124,18 @@ const PLACE_OFFSETS_XZ = [
   [-2, 0],
   [0, 2],
   [0, -2],
+  [2, 1],
+  [2, -1],
+  [-2, 1],
+  [-2, -1],
+  [1, 2],
+  [-1, 2],
+  [1, -2],
+  [-1, -2],
+  [3, 0],
+  [-3, 0],
+  [0, 3],
+  [0, -3],
 ];
 
 export function parseCraftParams(params) {
@@ -564,7 +603,38 @@ export async function placeCraftingTableSafely(bot) {
 
       try {
         await bot.equip(tableInvItem, "hand");
-        await bot.placeBlock(groundBlock, vec3(0, 1, 0));
+        if (typeof bot.lookAt === "function") {
+          try {
+            await bot.lookAt(vec3(tx + 0.5, ty, tz + 0.5), true);
+          } catch {
+            // Ignore lookAt errors
+          }
+        }
+        try {
+          await bot.placeBlock(groundBlock, vec3(0, 1, 0));
+        } catch (firstErr) {
+          const targetName = normalizeCanonicalItemId(targetBlock?.name);
+          if (
+            targetName &&
+            targetName !== "air" &&
+            targetName !== "cave_air" &&
+            targetName !== "void_air" &&
+            typeof bot.dig === "function"
+          ) {
+            await bot.dig(targetBlock);
+            await bot.equip(tableInvItem, "hand");
+            if (typeof bot.lookAt === "function") {
+              try {
+                await bot.lookAt(vec3(tx + 0.5, ty, tz + 0.5), true);
+              } catch {
+                // Ignore lookAt errors
+              }
+            }
+            await bot.placeBlock(groundBlock, vec3(0, 1, 0));
+          } else {
+            throw firstErr;
+          }
+        }
         const placedBlock = bot.blockAt(targetPos);
         if (placedBlock && placedBlock.name === "crafting_table") {
           return { ok: true, tableBlock: placedBlock, placed: true };
@@ -602,7 +672,7 @@ function countPotentialPlanksFromLogs(countsMap) {
 export function computeWoodShortfall(
   missing,
   countsMap,
-  { needsTableCraft = false, recipePlanksForOne = 0 } = {},
+  { needsTableCraft = false, recipePlanksForOne = 0, recipeStickPlanksForOne = 0 } = {},
 ) {
   let extraPlanksNeed = 0;
   for (const entry of missing || []) {
@@ -617,7 +687,8 @@ export function computeWoodShortfall(
   }
   if (needsTableCraft && (countsMap.get("crafting_table") ?? 0) === 0) {
     const havePlanksNow = countAllPlanks(countsMap);
-    const tableAndRecipeNeed = 4 + Math.max(0, recipePlanksForOne);
+    const tableAndRecipeNeed =
+      4 + Math.max(0, recipePlanksForOne) + Math.max(0, recipeStickPlanksForOne);
     const tableGap = Math.max(0, tableAndRecipeNeed - havePlanksNow);
     extraPlanksNeed = Math.max(extraPlanksNeed, tableGap);
   }
@@ -627,6 +698,34 @@ export function computeWoodShortfall(
     wood_shortfall_planks: netPlanksShortfall,
     wood_shortfall_logs: netPlanksShortfall > 0 ? Math.ceil(netPlanksShortfall / 4) : 0,
   };
+}
+
+function pickTableRecipePreservingPlanks(tableRecipes, bot, curCounts, recipePlanksForOne) {
+  if (!Array.isArray(tableRecipes) || tableRecipes.length === 0) return null;
+  if (recipePlanksForOne <= 0) return tableRecipes[0];
+
+  const leavesEnoughSingleSpecies = (recipe) => {
+    const sim = new Map(curCounts);
+    const reqs = extractRecipeIngredients(recipe, bot);
+    for (const [ingName, qty] of reqs.entries()) {
+      const rem = (sim.get(ingName) ?? 0) - qty;
+      if (rem < 0) return false;
+      sim.set(ingName, rem);
+    }
+    for (const [name, cnt] of sim.entries()) {
+      if (isPlanksName(name) && cnt >= recipePlanksForOne) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (const recipe of tableRecipes) {
+    if (leavesEnoughSingleSpecies(recipe)) {
+      return recipe;
+    }
+  }
+  return null;
 }
 
 function formatMissingSummary(missing, woodInfo = null) {
@@ -740,14 +839,21 @@ export async function executeCraftAction(
       const bestMiss = pickBestRecipeAnalysis(allKnownRecipes, bot, requestedCount, countsNow);
       const missing = bestMiss?.missing ?? [];
       let recipePlanksForOne = 0;
+      let recipeStickPlanksForOne = 0;
       if (bestMiss) {
         for (const [ingName, qty] of bestMiss.reqs.entries()) {
           if (isPlanksName(ingName)) recipePlanksForOne += qty;
+        }
+        const sticksForOne = bestMiss.reqs.get("stick") ?? 0;
+        const haveSticks = countsNow.get("stick") ?? 0;
+        if (itemName !== "stick" && sticksForOne > haveSticks) {
+          recipeStickPlanksForOne = Math.ceil((sticksForOne - haveSticks) / 4) * 2;
         }
       }
       const woodInfo = computeWoodShortfall(missing, countsNow, {
         needsTableCraft,
         recipePlanksForOne,
+        recipeStickPlanksForOne,
       });
       return {
         ok: false,
@@ -762,7 +868,7 @@ export async function executeCraftAction(
       };
     }
 
-    // Locate existing crafting_table within 16 blocks or place one within 2 blocks
+    // Locate existing crafting_table within 16 blocks or place one within 3 blocks
     const nearby = findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS);
     if (nearby) {
       if (nearby.dist > 3.5 && typeof gotoFn === "function") {
@@ -785,9 +891,15 @@ export async function executeCraftAction(
           }
         }
         const totalPlanksNow = countAllPlanks(curCounts);
-        if (tableRecipes.length > 0 && totalPlanksNow >= 4 + recipePlanksForOne) {
+        const chosenTableRecipe = pickTableRecipePreservingPlanks(
+          tableRecipes,
+          bot,
+          curCounts,
+          recipePlanksForOne,
+        );
+        if (chosenTableRecipe && totalPlanksNow >= 4 + recipePlanksForOne) {
           try {
-            await bot.craft(tableRecipes[0], 1, null);
+            await bot.craft(chosenTableRecipe, 1, null);
           } catch {
             // Fall through to check below
           }
@@ -799,12 +911,18 @@ export async function executeCraftAction(
         const havePlanks = countAllPlanks(curCounts);
         const bestTarget3x3 = pickBestRecipeAnalysis(allKnownRecipes, bot, 1, curCounts);
         let recipePlanksForOne = 0;
+        let recipeStickPlanksForOne = 0;
         if (bestTarget3x3) {
           for (const [ingName, qty] of bestTarget3x3.reqs.entries()) {
             if (isPlanksName(ingName)) recipePlanksForOne += qty;
           }
+          const sticksForOne = bestTarget3x3.reqs.get("stick") ?? 0;
+          const haveSticks = curCounts.get("stick") ?? 0;
+          if (itemName !== "stick" && sticksForOne > haveSticks) {
+            recipeStickPlanksForOne = Math.ceil((sticksForOne - haveSticks) / 4) * 2;
+          }
         }
-        const needPlanks = 4 + recipePlanksForOne;
+        const needPlanks = 4 + recipePlanksForOne + recipeStickPlanksForOne;
         const missing =
           havePlanks < needPlanks
             ? [
@@ -819,6 +937,7 @@ export async function executeCraftAction(
         const woodInfo = computeWoodShortfall(missing, curCounts, {
           needsTableCraft: true,
           recipePlanksForOne,
+          recipeStickPlanksForOne,
         });
         return {
           ok: false,
@@ -846,7 +965,7 @@ export async function executeCraftAction(
           requested_count: requestedCount,
           crafted_count: 0,
           missing_materials: [],
-          summary: "周围2格内未找到安全实心地面放置工作台",
+          summary: "周围3格内未找到安全实心地面放置工作台",
         };
       }
       craftingTableBlock = placed.tableBlock;

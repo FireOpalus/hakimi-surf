@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
 from math import trunc
@@ -13,6 +14,29 @@ from .proactive_policy import hours_bounds
 MC_TASKS = frozenset({"goto", "explore", "mine", "gather", "follow"})
 MC_ONLINE_TASKS = frozenset({"online", "companion"})
 NEWS_TTL = 48 * 3600
+MC_ROUTINE_NEWS_TTL = 6 * 3600
+_MC_PROACTIVE_RE = re.compile(
+    r"方块世界|minecraft|\bmc\b|原木|木头|木板|木棍|木镐|石镐|铁镐|木剑|石剑|铁剑|"
+    r"挖矿|采矿|矿洞|工作台|熔炉|烤肉|苦力怕|骷髅|僵尸|末影人|蜘蛛|小木屋|掩体|出生点|重生点",
+    re.I,
+)
+_MC_TITLE_KEYWORDS: tuple[tuple[re.Pattern[str], re.Pattern[str]], ...] = (
+    (re.compile(r"_log|_planks|\blog\b", re.I), re.compile(r"木头|原木|木板|砍树|砍了")),
+    (re.compile(r"\bstick\b", re.I), re.compile(r"木棍")),
+    (re.compile(r"pickaxe", re.I), re.compile(r"木镐|石镐|铁镐|钻石镐|镐")),
+    (re.compile(r"sword", re.I), re.compile(r"木剑|石剑|铁剑|钻石剑|剑")),
+    (re.compile(r"cobblestone|\bstone\b", re.I), re.compile(r"石头|圆石")),
+    (re.compile(r"coal", re.I), re.compile(r"煤")),
+    (re.compile(r"iron", re.I), re.compile(r"铁")),
+    (re.compile(r"diamond", re.I), re.compile(r"钻")),
+    (re.compile(r"furnace", re.I), re.compile(r"熔炉")),
+    (re.compile(r"crafting_table", re.I), re.compile(r"工作台")),
+    (re.compile(r"bread|wheat|hay_block", re.I), re.compile(r"面包|小麦|干草")),
+    (
+        re.compile(r"beef|pork|mutton|chicken|steak", re.I),
+        re.compile(r"烤肉|牛排|猪排|羊肉|鸡肉|肉"),
+    ),
+)
 INTEREST_TTL = 9000
 SOCIAL_LOW = 30
 CHAT_SOCIAL_COST = 1.25
@@ -523,13 +547,14 @@ class WorldExperience:
             if private
             else str(data.get("title") or data.get("summary") or data.get("block") or "")[:100]
         )
+        news_ttl = MC_ROUTINE_NEWS_TTL if event.event_type == "mc_goal_completed" else NEWS_TTL
         await self.store.db.execute(
             "INSERT OR IGNORE INTO world_news(event_id,at,expires,audience,source,ref,title) "
             "VALUES (?,?,?,?,?,?,?)",
             (
                 event.id,
                 now,
-                now + NEWS_TTL,
+                now + news_ttl,
                 audience,
                 event.source_module,
                 str(data.get("bvid") or ""),
@@ -673,19 +698,33 @@ class WorldExperience:
             if owner_any:
                 await self.touch_owner_tx(now)
 
+    @staticmethod
+    def _news_item_mentioned(item, texts, *, proactive: bool) -> bool:
+        ref = item["ref"] or ""
+        title = item["title"] or ""
+        if any((ref and ref in text) or (len(title) >= 4 and title in text) for text in texts):
+            return True
+        if item["source"] != "minecraft":
+            return False
+        if proactive and any(_MC_PROACTIVE_RE.search(text) for text in texts):
+            return True
+        for title_pat, reply_pat in _MC_TITLE_KEYWORDS:
+            if title_pat.search(title) and any(reply_pat.search(text) for text in texts):
+                return True
+        return False
+
     async def confirmed_tx(self, message, reply, now, texts, *, dedicated=None):
         await self.spend_chat_tx(reply, now, message=message)
         audience = self.audience(message)
+        proactive = isinstance(reply, str) and reply.startswith("jit:")
         rows = await self.store.all(
-            "SELECT event_id,ref,title FROM world_news WHERE shared_at IS NULL AND expires>? "
-            "AND at<=? AND audience IN ('',?)",
+            "SELECT event_id,source,ref,title FROM world_news "
+            "WHERE shared_at IS NULL AND expires>? AND at<=? AND audience IN ('',?)",
             (now, now, audience),
         )
         for item in rows:
-            if item["event_id"] == dedicated or any(
-                (item["ref"] and item["ref"] in text)
-                or (len(item["title"]) >= 4 and item["title"] in text)
-                for text in texts
+            if item["event_id"] == dedicated or self._news_item_mentioned(
+                item, texts, proactive=proactive
             ):
                 await self.store.db.execute(
                     "UPDATE world_news SET shared_at=? WHERE event_id=?", (now, item["event_id"])

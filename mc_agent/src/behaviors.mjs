@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import vec3 from "vec3";
 import mineflayer from "mineflayer";
 import pathfinderPkg from "mineflayer-pathfinder";
 import {
@@ -360,6 +361,7 @@ export class McRuntime {
     this._lastLowFoodAtMs = -Infinity;
     this._eatingLock = { eating: false };
     this._combatState = createCombatState();
+    this._evadePlan = null;
     this._survivalTickRunning = false;
     this._companionTickRunning = false;
   }
@@ -775,7 +777,15 @@ export class McRuntime {
           const safeFoodCount = countSafeFood(bot);
           if (safeFoodCount <= LOW_FOOD_THRESHOLD) {
             const nowMs = this.nowFn();
-            if (nowMs - this._lastLowFoodAtMs >= this.lowFoodCooldownMs) {
+            const wellFed =
+              this.food !== null &&
+              this.food >= 18 &&
+              (this.health === null || this.health >= 18);
+            const effectiveCooldownMs =
+              wellFed && this._lastLowFoodAtMs > -Infinity
+                ? Math.max(this.lowFoodCooldownMs, 20 * 60_000)
+                : this.lowFoodCooldownMs;
+            if (nowMs - this._lastLowFoodAtMs >= effectiveCooldownMs) {
               const imp =
                 safeFoodCount === 0 && this.food !== null && this.food <= 10 ? "high" : "normal";
               const emitted = this._emitMilestone("mc_low_food", imp, {
@@ -1005,16 +1015,26 @@ export class McRuntime {
     };
   }
 
-  _computeFleeTarget(origin, threatInfo, allowed = null) {
+  _computeFleeTarget(origin, threatInfo, allowed = null, angleDeg = 0) {
     const fleeDist = threatInfo.hasRanged ? RANGED_FLEE_DISTANCE : MELEE_FLEE_DISTANCE;
     const dx = (origin.x ?? 0) - (threatInfo.centroid.x ?? 0);
     const dz = (origin.z ?? 0) - (threatInfo.centroid.z ?? 0);
     const len = Math.hypot(dx, dz);
-    const dirX = len > 0.05 ? dx / len : 1;
-    const dirZ = len > 0.05 ? dz / len : 0;
+    let dirX = len > 0.05 ? dx / len : 1;
+    let dirZ = len > 0.05 ? dz / len : 0;
+    if (angleDeg !== 0) {
+      const rad = (angleDeg * Math.PI) / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      const rx = dirX * cos - dirZ * sin;
+      const rz = dirX * sin + dirZ * cos;
+      dirX = rx;
+      dirZ = rz;
+    }
     let tx = Math.round((origin.x ?? 0) + dirX * fleeDist);
     let tz = Math.round((origin.z ?? 0) + dirZ * fleeDist);
     if (
+      angleDeg === 0 &&
       allowed &&
       allowed.dist <= 24 &&
       this._distanceBetween(allowed.player.entity.position, threatInfo.nearest.entity.position) >
@@ -1158,13 +1178,68 @@ export class McRuntime {
         }
         const threatInfo = this._findEvadeThreats(bot);
         if (threatInfo) {
-          const { tx, tz } = this._computeFleeTarget(origin, threatInfo, allowed);
-          applyNoDigMovements(bot);
-          try {
-            bot.setSprinting?.(true);
-            bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
-          } catch {
-            // Ignore pathfinder errors
+          const fleeAngles = [0, 60, -60, 120, -120];
+          const curPos = this._vecToTuple(origin) || [origin.x ?? 0, origin.y ?? 64, origin.z ?? 0];
+          let plan = this._evadePlan;
+          let needNewGoal = !plan;
+          let nextAngleIdx = plan ? plan.angleIdx : 0;
+          if (plan) {
+            const elapsedMs = nowMs - plan.setAtMs;
+            const distToGoal = Math.hypot(curPos[0] - plan.tx, curPos[2] - plan.tz);
+            const movedSincePlan = Math.hypot(
+              curPos[0] - plan.lastPos[0],
+              curPos[1] - plan.lastPos[1],
+              curPos[2] - plan.lastPos[2],
+            );
+            const threatAhead =
+              threatInfo.nearest.dist <= 5 &&
+              (threatInfo.nearest.entity.position.x - curPos[0]) * (plan.tx - curPos[0]) +
+                (threatInfo.nearest.entity.position.z - curPos[2]) * (plan.tz - curPos[2]) >
+                0;
+            if (elapsedMs >= 2_500 && movedSincePlan < 0.5) {
+              // Flee path appears blocked by terrain/trees; rotate angle and nudge jump.
+              nextAngleIdx = (plan.angleIdx + 1) % fleeAngles.length;
+              needNewGoal = true;
+              try {
+                bot.setControlState?.("jump", true);
+                setTimeout(() => {
+                  try {
+                    bot.setControlState?.("jump", false);
+                  } catch {
+                    // Ignore
+                  }
+                }, 220);
+              } catch {
+                // Ignore
+              }
+            } else if (distToGoal <= 3 || threatAhead || elapsedMs >= 4_500) {
+              nextAngleIdx = threatAhead ? (plan.angleIdx + 1) % fleeAngles.length : 0;
+              needNewGoal = true;
+            }
+          }
+          if (needNewGoal) {
+            const angleDeg = fleeAngles[nextAngleIdx] ?? 0;
+            const { tx, tz } = this._computeFleeTarget(origin, threatInfo, allowed, angleDeg);
+            applyNoDigMovements(bot);
+            try {
+              bot.setSprinting?.(true);
+              bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
+            } catch {
+              // Ignore pathfinder errors
+            }
+            this._evadePlan = {
+              tx,
+              tz,
+              setAtMs: nowMs,
+              lastPos: curPos,
+              angleIdx: nextAngleIdx,
+            };
+          } else {
+            try {
+              bot.setSprinting?.(true);
+            } catch {
+              // Ignore sprint errors
+            }
           }
           this._followingPlayer = null;
           this.activity = "躲避怪物";
@@ -1175,6 +1250,7 @@ export class McRuntime {
           }
           return;
         }
+        this._evadePlan = null;
       }
 
       // 2. Accompany nearest / guarded whitelisted player (look + continuous follow)
@@ -1662,6 +1738,7 @@ export class McRuntime {
       lowerShield(bot, this._combatState);
       this._combatState.retreating = false;
       this._combatState.activeTargetId = null;
+      this._evadePlan = null;
       this._waterFloatState.floating = false;
       this._shelterState.active = false;
       this._shelterState.capPos = null;
@@ -1882,6 +1959,98 @@ export class McRuntime {
     }
   }
 
+  async _tryNaturalUnstick(bot, signal) {
+    if (!bot?.entity?.position || typeof bot.blockAt !== "function" || typeof bot.dig !== "function") {
+      return false;
+    }
+    if (signal?.aborted) return false;
+    const pos = bot.entity.position;
+    const bx = Math.floor(pos.x);
+    const by = Math.floor(pos.y);
+    const bz = Math.floor(pos.z);
+
+    const isNaturalFoliage = (name) =>
+      typeof name === "string" &&
+      (name.endsWith("_leaves") ||
+        name === "vine" ||
+        name === "tall_grass" ||
+        name === "large_fern" ||
+        name === "bush" ||
+        name === "snow");
+    const naturalPitBlocks = new Set([
+      "dirt",
+      "grass_block",
+      "coarse_dirt",
+      "podzol",
+      "rooted_dirt",
+      "mud",
+      "sand",
+      "red_sand",
+      "gravel",
+      "clay",
+    ]);
+
+    const cardinal = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ];
+
+    // 1. Clear overhanging natural leaves/foliage blocking head movement (zero griefing).
+    let dug = 0;
+    const foliageCoords = [
+      [bx, by + 2, bz],
+      ...cardinal.map(([dx, dz]) => [bx + dx, by + 1, bz + dz]),
+      ...cardinal.map(([dx, dz]) => [bx + dx, by, bz + dz]),
+    ];
+    for (const [fx, fy, fz] of foliageCoords) {
+      if (dug >= 2 || signal?.aborted) break;
+      const blk = bot.blockAt(vec3(fx, fy, fz));
+      if (blk && isNaturalFoliage(blk.name)) {
+        try {
+          await bot.dig(blk);
+          dug += 1;
+        } catch {
+          // Best-effort foliage clear
+        }
+      }
+    }
+    if (dug > 0) return true;
+
+    // 2. If trapped inside a natural 2-deep hole/creeper crater (all 4 sides solid at foot or head),
+    // carve 1 natural dirt/grass step at head height so the bot can walk out.
+    let enclosedSides = 0;
+    let escapeStep = null;
+    for (const [dx, dz] of cardinal) {
+      const footSide = bot.blockAt(vec3(bx + dx, by, bz + dz));
+      const headSide = bot.blockAt(vec3(bx + dx, by + 1, bz + dz));
+      const aboveHead = bot.blockAt(vec3(bx + dx, by + 2, bz + dz));
+      const footSolid = Boolean(footSide && footSide.boundingBox !== "empty" && footSide.name !== "air");
+      const headSolid = Boolean(headSide && headSide.boundingBox !== "empty" && headSide.name !== "air");
+      if (footSolid && headSolid) {
+        enclosedSides += 1;
+        const aboveClear =
+          !aboveHead || aboveHead.boundingBox === "empty" || aboveHead.name === "air" || isNaturalFoliage(aboveHead.name);
+        if (!escapeStep && naturalPitBlocks.has(headSide.name) && aboveClear) {
+          escapeStep = { headSide, aboveHead };
+        }
+      }
+    }
+    if (enclosedSides >= 3 && escapeStep && !signal?.aborted) {
+      try {
+        if (escapeStep.aboveHead && isNaturalFoliage(escapeStep.aboveHead.name)) {
+          await bot.dig(escapeStep.aboveHead);
+        }
+        await bot.dig(escapeStep.headSide);
+        return true;
+      } catch {
+        // Best-effort natural pit unstick
+      }
+    }
+    return false;
+  }
+
   async _gotoGoal(goal, signal) {
     const bot = this.bot;
     if (!bot?.pathfinder || typeof bot.pathfinder.goto !== "function") {
@@ -1904,6 +2073,7 @@ export class McRuntime {
     let lastPos = startPos;
     let stuckStrikes = 0;
     let markedStuck = false;
+    let unsticking = false;
 
     const cleanup = () => {
       if (stuckTimer) {
@@ -1921,6 +2091,23 @@ export class McRuntime {
       }
     };
 
+    const triggerJump = (ms = 220) => {
+      try {
+        bot.setControlState?.("jump", true);
+        if (jumpTimer) clearTimeout(jumpTimer);
+        jumpTimer = setTimeout(() => {
+          jumpTimer = null;
+          try {
+            bot.setControlState?.("jump", false);
+          } catch {
+            // Ignore jump release errors
+          }
+        }, ms);
+      } catch {
+        // Ignore jump trigger errors
+      }
+    };
+
     const gotoPromise = Promise.resolve(bot.pathfinder.goto(goal)).catch((err) => {
       if (signal?.aborted || markedStuck) return;
       throw err;
@@ -1928,8 +2115,8 @@ export class McRuntime {
 
     const stuckPromise = new Promise((_, reject) => {
       stuckTimer = setInterval(() => {
-        if (signal?.aborted) {
-          cleanup();
+        if (signal?.aborted || unsticking) {
+          if (signal?.aborted) cleanup();
           return;
         }
         const curPos = this._vecToTuple(bot.entity?.position);
@@ -1946,19 +2133,19 @@ export class McRuntime {
         }
         stuckStrikes += 1;
         if (stuckStrikes === 1) {
-          try {
-            bot.setControlState?.("jump", true);
-            jumpTimer = setTimeout(() => {
-              jumpTimer = null;
-              try {
-                bot.setControlState?.("jump", false);
-              } catch {
-                // Ignore jump release errors
+          triggerJump(220);
+          return;
+        }
+        if (stuckStrikes === 2) {
+          unsticking = true;
+          void this._tryNaturalUnstick(bot, signal)
+            .catch(() => false)
+            .finally(() => {
+              unsticking = false;
+              if (!signal?.aborted && !markedStuck) {
+                triggerJump(250);
               }
-            }, 180);
-          } catch {
-            // Ignore jump trigger errors
-          }
+            });
           return;
         }
         markedStuck = true;
@@ -2473,21 +2660,46 @@ export class McRuntime {
     }
 
     if (actionType === "explore") {
-      const cur = this.pos || [0, 64, 0];
-      const dx = (Math.random() < 0.5 ? -1 : 1) * (12 + Math.floor(Math.random() * 12));
-      const dz = (Math.random() < 0.5 ? -1 : 1) * (12 + Math.floor(Math.random() * 12));
-      const targetX = Math.round(cur[0] + dx);
-      const targetZ = Math.round(cur[2] + dz);
+      const startPos = this._vecToTuple(bot.entity?.position) || this.pos || [0, 64, 0];
+      const baseAngle = Math.random() * Math.PI * 2;
+      const radii = [
+        15 + Math.floor(Math.random() * 8),
+        10 + Math.floor(Math.random() * 6),
+        7 + Math.floor(Math.random() * 5),
+      ];
+      const angleOffsets = [0, (2 * Math.PI) / 3, -(2 * Math.PI) / 3];
+      let targetX = Math.round(startPos[0] + Math.cos(baseAngle) * radii[0]);
+      let targetZ = Math.round(startPos[2] + Math.sin(baseAngle) * radii[0]);
       this.activity = `探索(${targetX},${targetZ})`;
       this._emitSnapshot();
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
-        try {
-          await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
-          return { ok: true };
-        } catch (err) {
-          if (err?.code === "path_stuck") return { stuck: true };
-          throw err;
+        for (let attempt = 0; attempt < angleOffsets.length; attempt += 1) {
+          if (signal.aborted) return { aborted: true };
+          const curNow = this._vecToTuple(bot.entity?.position) || startPos;
+          const angle = baseAngle + angleOffsets[attempt];
+          const r = radii[attempt];
+          targetX = Math.round(curNow[0] + Math.cos(angle) * r);
+          targetZ = Math.round(curNow[2] + Math.sin(angle) * r);
+          this.activity = `探索(${targetX},${targetZ})`;
+          try {
+            await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
+            return { ok: true };
+          } catch (err) {
+            if (signal.aborted) return { aborted: true };
+            const endNow = this._vecToTuple(bot.entity?.position) || curNow;
+            const movedTotal = Math.hypot(endNow[0] - startPos[0], endNow[2] - startPos[2]);
+            if (movedTotal >= 5) {
+              targetX = Math.round(endNow[0]);
+              targetZ = Math.round(endNow[2]);
+              return { ok: true, partial: true };
+            }
+            if (err?.code === "path_stuck" || attempt < angleOffsets.length - 1) {
+              continue;
+            }
+            throw err;
+          }
         }
+        return { stuck: true };
       });
       this._refreshFromBot();
       const rare = this.connected ? this._scanRareBlocks(bot, 24) : [];
@@ -2591,6 +2803,7 @@ export class McRuntime {
       let lastCoords = [0, 0, 0];
       let blockedTierInfo = null;
       let skippedUnderfoot = false;
+      let stuckSkips = 0;
       const visitedKeys = new Set();
 
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
@@ -2604,7 +2817,7 @@ export class McRuntime {
           ) {
             break;
           }
-          const positions = step === 0 ? initialPositions : findCandidatePositions();
+          const positions = step === 0 && stuckSkips === 0 ? initialPositions : findCandidatePositions();
           const exposedCandidates = [];
           const buriedCandidates = [];
           for (const p of positions) {
@@ -2635,7 +2848,10 @@ export class McRuntime {
             }
           }
           const chosen = exposedCandidates[0] || buriedCandidates[0] || null;
-          if (!chosen) break;
+          if (!chosen) {
+            if (collectedCount === 0 && stuckSkips > 0) return { stuck: true };
+            break;
+          }
           const chosenBlock = chosen.blk;
           const chosenCoords = chosen.coords;
           visitedKeys.add(chosen.key);
@@ -2659,7 +2875,23 @@ export class McRuntime {
                 signal,
               );
             } catch (err) {
-              if (err?.code === "path_stuck") {
+              if (signal.aborted) return { aborted: true };
+              const isNavFail =
+                err?.code === "path_stuck" ||
+                /noPath|timeout|stopped/i.test(String(err?.name || err?.message || ""));
+              if (isNavFail) {
+                stuckSkips += 1;
+                // Mark the immediate column/cluster visited so we skip to a genuinely different tree/vein.
+                const cx = Math.floor(chosenCoords[0]);
+                const cy = Math.floor(chosenCoords[1]);
+                const cz = Math.floor(chosenCoords[2]);
+                for (let dy = -2; dy <= 3; dy += 1) {
+                  visitedKeys.add(`${cx},${cy + dy},${cz}`);
+                }
+                if (stuckSkips < 3) {
+                  step -= 1;
+                  continue;
+                }
                 if (collectedCount === 0) return { stuck: true };
                 break;
               }
@@ -3011,6 +3243,12 @@ export class McRuntime {
         missing_materials: Array.isArray(outcome?.missing_materials)
           ? outcome.missing_materials
           : [],
+        ...(typeof outcome?.wood_shortfall_planks === "number" && outcome.wood_shortfall_planks > 0
+          ? { wood_shortfall_planks: outcome.wood_shortfall_planks }
+          : {}),
+        ...(typeof outcome?.wood_shortfall_logs === "number" && outcome.wood_shortfall_logs > 0
+          ? { wood_shortfall_logs: outcome.wood_shortfall_logs }
+          : {}),
         snapshot: this.getSnapshot(),
       };
     }
@@ -3166,12 +3404,14 @@ export class McRuntime {
     }
 
     if (actionType === "evade") {
+      const wasEvading = this.combatMode === "evade";
       this.combatMode = "evade";
       this.guardTarget = "";
       this._clearCombatMicroTimer();
       lowerShield(bot, this._combatState);
       this._combatState.retreating = false;
       this._combatState.activeTargetId = null;
+      this._evadePlan = null;
       if (!this.config.mcCompanionMode) {
         this._stopCompanionLoop();
       }
@@ -3200,6 +3440,8 @@ export class McRuntime {
         paused: false,
         combat_mode: "evade",
         guard_target: "",
+        already_evading: wasEvading,
+        threats_nearby: Boolean(threatInfo),
         ...(fledTo ? { fled_to: fledTo } : {}),
         summary: fledTo ? `已切换躲避模式并向(${fledTo.join(",")})撤离` : "已切换躲避模式",
         snapshot: this.getSnapshot(),

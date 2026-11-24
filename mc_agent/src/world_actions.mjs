@@ -154,9 +154,36 @@ const REPLACEABLE_BLOCKS = new Set([
   "short_grass",
   "grass",
   "tall_grass",
+  "short_dry_grass",
+  "tall_dry_grass",
   "fern",
+  "large_fern",
   "dead_bush",
+  "bush",
+  "leaf_litter",
+  "wildflowers",
+  "pink_petals",
   "snow",
+  "vine",
+  "glow_lichen",
+  "dandelion",
+  "poppy",
+  "blue_orchid",
+  "allium",
+  "azure_bluet",
+  "red_tulip",
+  "orange_tulip",
+  "white_tulip",
+  "pink_tulip",
+  "oxeye_daisy",
+  "cornflower",
+  "lily_of_the_valley",
+  "sunflower",
+  "lilac",
+  "rose_bush",
+  "peony",
+  "brown_mushroom",
+  "red_mushroom",
 ]);
 
 const EXPOSED_NEIGHBOR_BLOCKS = new Set([
@@ -257,6 +284,9 @@ export function applySafeMovements(bot, { allowDig = false } = {}) {
       movements.canDig = Boolean(allowDig);
       movements.allow1by1towers = false;
       movements.canPlaceOn = Boolean(allowDig);
+      if ("allowSprinting" in movements) movements.allowSprinting = true;
+      if ("allowParkour" in movements) movements.allowParkour = true;
+      if ("maxDropDown" in movements) movements.maxDropDown = 3;
       if ("canOpenDoors" in movements) movements.canOpenDoors = true;
       if ("dontMineUnderFallingBlock" in movements) movements.dontMineUnderFallingBlock = true;
       if (!allowDig && Array.isArray(movements.scafoldingBlocks)) {
@@ -1383,19 +1413,37 @@ export async function executeShelterAction(
       [0, 1],
       [0, -1],
     ];
-    let exitTarget = [shaftX, surfaceY, shaftZ];
+    const isClearOrHarvestable = (blk) => {
+      if (!blk) return true;
+      const name = normalizeCanonicalItemId(blk.name);
+      if (!name || REPLACEABLE_BLOCKS.has(name)) return true;
+      if (isHazardousBlock(blk)) return false;
+      if (!SHELTER_DIGGABLE_TERRAIN.has(name) && !SHELTER_CAP_BLOCKS.has(name)) return false;
+      return checkHarvestToolTier(bot, name).ok;
+    };
+    let chosenDir = null;
     for (const [dx, dz] of dirs) {
       const s1a = bot.blockAt(vec3(shaftX + dx, footY + 1, shaftZ + dz));
       const s1b = bot.blockAt(vec3(shaftX + dx, footY + 2, shaftZ + dz));
       const s2a = bot.blockAt(vec3(shaftX + dx * 2, footY + 2, shaftZ + dz * 2));
       if (isHazardousBlock(s1a) || isHazardousBlock(s1b) || isHazardousBlock(s2a)) continue;
+      if (isClearOrHarvestable(s1a) && isClearOrHarvestable(s1b)) {
+        chosenDir = [dx, dz];
+        break;
+      }
+      if (!chosenDir) {
+        chosenDir = [dx, dz];
+      }
+    }
+    let exitTarget = [shaftX, surfaceY, shaftZ];
+    if (chosenDir) {
+      const [dx, dz] = chosenDir;
       await digBlockSafe(shaftX + dx, footY + 1, shaftZ + dz);
       await digBlockSafe(shaftX + dx, footY + 2, shaftZ + dz);
       await digBlockSafe(shaftX + dx, footY + 3, shaftZ + dz);
       await digBlockSafe(shaftX + dx * 2, footY + 2, shaftZ + dz * 2);
       await digBlockSafe(shaftX + dx * 2, footY + 3, shaftZ + dz * 2);
       exitTarget = [shaftX + dx * 3, Math.max(footY + 3, surfaceY), shaftZ + dz * 3];
-      break;
     }
     if (typeof gotoGoal === "function" && !signal?.aborted) {
       try {
@@ -1411,7 +1459,7 @@ export async function executeShelterAction(
     // 1. Open roof cap above head
     await digBlockSafe(cap[0], cap[1], cap[2]);
     await digBlockSafe(cap[0], cap[1] + 1, cap[2]);
-    // 2. Carve a safe 2-step staircase out in the first hazard-free cardinal direction
+    // 2. Carve a safe 2-step staircase out in the first hazard-free, tool-diggable cardinal direction
     await carveStaircaseOut(bx, by, bz, cap[1] + 1);
 
     state.active = false;
@@ -1448,9 +1496,27 @@ export async function executeShelterAction(
     };
   }
 
-  const capItem = getInventoryItems(bot).find((it) =>
-    SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it)),
-  );
+  const pickBestCapItem = () => {
+    const items = getInventoryItems(bot).filter((it) =>
+      SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it)),
+    );
+    if (items.length === 0) return null;
+    // Prefer a cap block that can be dug back out with current tools (e.g. dirt/planks when barehanded).
+    const harvestable = items.find((it) => checkHarvestToolTier(bot, extractCanonicalItemName(it)).ok);
+    return harvestable || items[0];
+  };
+
+  const countCapBlocks = () => {
+    let total = 0;
+    for (const it of getInventoryItems(bot)) {
+      if (SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it))) {
+        total += Math.max(0, Math.floor(Number(it.count ?? 1)));
+      }
+    }
+    return total;
+  };
+
+  const capItem = pickBestCapItem();
   if (!capItem) {
     return {
       ok: false,
@@ -1475,90 +1541,257 @@ export async function executeShelterAction(
     };
   }
 
-  // Verify 3-deep vertical shaft is natural terrain with solid safe floor at by-4
-  // and no water/lava adjacent to any dug level.
-  const b1 = bot.blockAt(vec3(bx, by - 1, bz));
-  const b2 = bot.blockAt(vec3(bx, by - 2, bz));
-  const b3 = bot.blockAt(vec3(bx, by - 3, bz));
-  const floor4 = bot.blockAt(vec3(bx, by - 4, bz));
-  const digTargets = [b1, b2, b3];
-
-  for (const blk of digTargets) {
-    const name = normalizeCanonicalItemId(blk?.name);
-    if (!name || !SHELTER_DIGGABLE_TERRAIN.has(name)) {
-      return {
-        ok: false,
-        mode: "enter",
-        sheltered: false,
-        reason: "unsafe_shelter_ground",
-        summary: "脚下非自然泥土/石质地面，跳过挖坑以防破坏建筑",
-      };
-    }
-    const tierCheck = checkHarvestToolTier(bot, name);
-    if (!tierCheck.ok) {
-      return {
-        ok: false,
-        mode: "enter",
-        sheltered: false,
-        reason: "tool_tier_too_low",
-        required_tool: tierCheck.requiredTool,
-        summary: `脚下是${name}，需要至少${tierCheck.requiredTool}才能挖掩体`,
-      };
-    }
-  }
-
-  if (!isSolidNonHazardWall(floor4)) {
-    return {
-      ok: false,
-      mode: "enter",
-      sheltered: false,
-      reason: "unsafe_shelter_ground",
-      summary: "脚下可能中空或临近危险方块，放弃挖掩体",
-    };
-  }
-
   const cardinalOffsets = [
     [1, 0],
     [-1, 0],
     [0, 1],
     [0, -1],
   ];
-  for (const dy of [-1, -2, -3]) {
-    for (const [dx, dz] of cardinalOffsets) {
-      const sideBlk = bot.blockAt(vec3(bx + dx, by + dy, bz + dz));
-      if (isHazardousBlock(sideBlk)) {
+
+  const validateDeepShaft = (sx, sy, sz) => {
+    const b1 = bot.blockAt(vec3(sx, sy - 1, sz));
+    const b2 = bot.blockAt(vec3(sx, sy - 2, sz));
+    const b3 = bot.blockAt(vec3(sx, sy - 3, sz));
+    const floor4 = bot.blockAt(vec3(sx, sy - 4, sz));
+    const digTargets = [b1, b2, b3];
+    for (const blk of digTargets) {
+      const name = normalizeCanonicalItemId(blk?.name);
+      if (!name || !SHELTER_DIGGABLE_TERRAIN.has(name)) {
         return {
           ok: false,
-          mode: "enter",
-          sheltered: false,
           reason: "unsafe_shelter_ground",
-          summary: "周边存在水域或岩浆，放弃挖掩体",
+          summary: "脚下非自然泥土/石质地面，跳过挖坑以防破坏建筑",
         };
+      }
+      const tierCheck = checkHarvestToolTier(bot, name);
+      if (!tierCheck.ok) {
+        return {
+          ok: false,
+          reason: "tool_tier_too_low",
+          required_tool: tierCheck.requiredTool,
+          summary: `脚下是${name}，需要至少${tierCheck.requiredTool}才能挖掩体`,
+        };
+      }
+    }
+    if (!isSolidNonHazardWall(floor4)) {
+      return {
+        ok: false,
+        reason: "unsafe_shelter_ground",
+        summary: "脚下可能中空或临近危险方块，放弃挖掩体",
+      };
+    }
+    for (const dy of [-1, -2, -3]) {
+      for (const [dx, dz] of cardinalOffsets) {
+        const sideBlk = bot.blockAt(vec3(sx + dx, sy + dy, sz + dz));
+        if (isHazardousBlock(sideBlk)) {
+          return {
+            ok: false,
+            reason: "unsafe_shelter_ground",
+            summary: "周边存在水域或岩浆，放弃挖掩体",
+          };
+        }
+      }
+    }
+    const anchorCandidates = [];
+    for (const [dx, dz] of cardinalOffsets) {
+      const wall = bot.blockAt(vec3(sx + dx, sy - 1, sz + dz));
+      if (isSolidNonHazardWall(wall)) {
+        anchorCandidates.push({ dx, dz, face: vec3(-dx, 0, -dz) });
+      }
+    }
+    if (anchorCandidates.length === 0) {
+      return {
+        ok: false,
+        reason: "no_shelter_wall_anchor",
+        summary: "周围缺少可封顶的实体侧壁",
+      };
+    }
+    return {
+      ok: true,
+      depth: 3,
+      digTargets,
+      anchorCandidates,
+      rimCandidates: [],
+      capY: sy - 1,
+      footY: sy - 3,
+    };
+  };
+
+  const validateShallowShaft = (sx, sy, sz) => {
+    const b1 = bot.blockAt(vec3(sx, sy - 1, sz));
+    const b2 = bot.blockAt(vec3(sx, sy - 2, sz));
+    const floor3 = bot.blockAt(vec3(sx, sy - 3, sz));
+    const digTargets = [b1, b2];
+    for (const blk of digTargets) {
+      const name = normalizeCanonicalItemId(blk?.name);
+      if (!name || !SHELTER_DIGGABLE_TERRAIN.has(name)) {
+        return { ok: false, reason: "unsafe_shelter_ground" };
+      }
+      const tierCheck = checkHarvestToolTier(bot, name);
+      if (!tierCheck.ok) {
+        return {
+          ok: false,
+          reason: "tool_tier_too_low",
+          required_tool: tierCheck.requiredTool,
+        };
+      }
+    }
+    if (!isSolidNonHazardWall(floor3)) {
+      return { ok: false, reason: "unsafe_shelter_ground" };
+    }
+    for (const dy of [-1, -2]) {
+      for (const [dx, dz] of cardinalOffsets) {
+        const sideBlk = bot.blockAt(vec3(sx + dx, sy + dy, sz + dz));
+        if (isHazardousBlock(sideBlk) || !isSolidNonHazardWall(sideBlk)) {
+          return { ok: false, reason: "unsafe_shelter_ground" };
+        }
+      }
+    }
+    // Roof cap sits at (sx, sy, sz). Either attach directly to an existing solid wall at sy,
+    // or place 1 rim anchor block at (sx+dx, sy, sz+dz) on top of solid ground (sx+dx, sy-1, sz+dz).
+    const anchorCandidates = [];
+    const rimCandidates = [];
+    for (const [dx, dz] of cardinalOffsets) {
+      const wallAtSurface = bot.blockAt(vec3(sx + dx, sy, sz + dz));
+      if (isSolidNonHazardWall(wallAtSurface)) {
+        anchorCandidates.push({ dx, dz, face: vec3(-dx, 0, -dz) });
+      } else {
+        const wallName = normalizeCanonicalItemId(wallAtSurface?.name);
+        const rimGround = bot.blockAt(vec3(sx + dx, sy - 1, sz + dz));
+        if (
+          (!wallAtSurface || !wallName || REPLACEABLE_BLOCKS.has(wallName)) &&
+          isSolidNonHazardWall(rimGround)
+        ) {
+          rimCandidates.push({ dx, dz, face: vec3(-dx, 0, -dz) });
+        }
+      }
+    }
+    if (anchorCandidates.length === 0 && (rimCandidates.length === 0 || countCapBlocks() < 2)) {
+      return { ok: false, reason: "no_shelter_wall_anchor" };
+    }
+    return {
+      ok: true,
+      depth: 2,
+      digTargets,
+      anchorCandidates,
+      rimCandidates,
+      capY: sy,
+      footY: sy - 2,
+    };
+  };
+
+  const canStandAt = (cx, cy, cz) => {
+    const f = bot.blockAt(vec3(cx, cy, cz));
+    const h = bot.blockAt(vec3(cx, cy + 1, cz));
+    const g = bot.blockAt(vec3(cx, cy - 1, cz));
+    const fOk = !f || REPLACEABLE_BLOCKS.has(normalizeCanonicalItemId(f.name));
+    const hOk = !h || REPLACEABLE_BLOCKS.has(normalizeCanonicalItemId(h.name));
+    return fOk && hOk && !isHazardousBlock(f) && isSolidNonHazardWall(g);
+  };
+
+  const findNearbySpot = (validator) => {
+    let best = null;
+    for (let r = 1; r <= 4; r += 1) {
+      for (let dx = -r; dx <= r; dx += 1) {
+        for (let dz = -r; dz <= r; dz += 1) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+          for (const dy of [0, -1, 1]) {
+            const cx = bx + dx;
+            const cy = by + dy;
+            const cz = bz + dz;
+            if (!canStandAt(cx, cy, cz)) continue;
+            const check = validator(cx, cy, cz);
+            if (check.ok) {
+              const dist = Math.hypot(dx, dy, dz);
+              if (!best || dist < best.dist) {
+                best = { x: cx, y: cy, z: cz, dist, plan: check };
+              }
+            }
+          }
+        }
+      }
+      if (best) return best;
+    }
+    return null;
+  };
+
+  let sx = bx;
+  let sy = by;
+  let sz = bz;
+  let plan = validateDeepShaft(sx, sy, sz);
+  const initialFailure = plan;
+
+  if (!plan.ok && typeof gotoGoal === "function" && !signal?.aborted) {
+    const nearbyDeep = findNearbySpot(validateDeepShaft);
+    if (nearbyDeep) {
+      try {
+        await gotoGoal(new GoalNear(nearbyDeep.x, nearbyDeep.y, nearbyDeep.z, 0), signal);
+        const movedPos = bot.entity?.position;
+        if (movedPos && !signal?.aborted) {
+          const nx = Math.floor(movedPos.x);
+          const ny = Math.floor(movedPos.y);
+          const nz = Math.floor(movedPos.z);
+          const recheck = validateDeepShaft(nx, ny, nz);
+          if (recheck.ok) {
+            sx = nx;
+            sy = ny;
+            sz = nz;
+            plan = recheck;
+          }
+        }
+      } catch {
+        // Fall through to shallow shelter fallback
       }
     }
   }
 
-  // Collect all solid side wall candidates at cap height (by - 1) to attach roof cap
-  const anchorCandidates = [];
-  for (const [dx, dz] of cardinalOffsets) {
-    const wall = bot.blockAt(vec3(bx + dx, by - 1, bz + dz));
-    if (isSolidNonHazardWall(wall)) {
-      anchorCandidates.push({ dx, dz, face: vec3(-dx, 0, -dz) });
+  if (!plan.ok) {
+    const curPos = bot.entity?.position || origin;
+    sx = Math.floor(curPos.x);
+    sy = Math.floor(curPos.y);
+    sz = Math.floor(curPos.z);
+    const shallowHere = validateShallowShaft(sx, sy, sz);
+    if (shallowHere.ok) {
+      plan = shallowHere;
+    } else if (typeof gotoGoal === "function" && !signal?.aborted) {
+      const nearbyShallow = findNearbySpot(validateShallowShaft);
+      if (nearbyShallow) {
+        try {
+          await gotoGoal(new GoalNear(nearbyShallow.x, nearbyShallow.y, nearbyShallow.z, 0), signal);
+          const movedPos = bot.entity?.position;
+          if (movedPos && !signal?.aborted) {
+            const nx = Math.floor(movedPos.x);
+            const ny = Math.floor(movedPos.y);
+            const nz = Math.floor(movedPos.z);
+            const recheck = validateShallowShaft(nx, ny, nz);
+            if (recheck.ok) {
+              sx = nx;
+              sy = ny;
+              sz = nz;
+              plan = recheck;
+            }
+          }
+        } catch {
+          // Fall through to failure return
+        }
+      }
     }
   }
-  if (anchorCandidates.length === 0) {
+
+  if (!plan.ok) {
     return {
       ok: false,
       mode: "enter",
       sheltered: false,
-      reason: "no_shelter_wall_anchor",
-      summary: "周围缺少可封顶的实体侧壁",
+      reason: initialFailure.reason || "unsafe_shelter_ground",
+      ...(initialFailure.required_tool ? { required_tool: initialFailure.required_tool } : {}),
+      summary: initialFailure.summary || "当前地面不适合挖建掩体",
     };
   }
 
-  // Dig 3 blocks straight down safely (zero fall damage: 3 blocks)
+  // Dig vertical shaft (3-deep standard or 2-deep shallow fallback; zero fall damage)
   let dugCount = 0;
-  for (const blk of digTargets) {
+  for (const blk of plan.digTargets) {
     if (signal?.aborted) {
       return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
     }
@@ -1570,8 +1803,8 @@ export async function executeShelterAction(
       dugCount += 1;
     } catch {
       if (dugCount >= 2) {
-        const curFootY = Math.min(by - dugCount, Math.floor(Number(bot.entity?.position?.y ?? by - dugCount)));
-        await carveStaircaseOut(bx, curFootY, bz, by);
+        const curFootY = Math.min(sy - dugCount, Math.floor(Number(bot.entity?.position?.y ?? sy - dugCount)));
+        await carveStaircaseOut(sx, curFootY, sz, sy);
       }
       return {
         ok: false,
@@ -1587,9 +1820,9 @@ export async function executeShelterAction(
     return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
   }
 
-  // Wait for gravity settlement to the bottom of the 3-block shaft (by - 3) before placing cap
-  // at (by - 1), otherwise the player's own head hitbox still overlaps (by - 1) and rejects placeBlock.
-  await waitForShaftLanding(bot, by - 3, {
+  // Wait for gravity settlement to the bottom of the shaft before placing roof cap,
+  // otherwise the player's own head hitbox still overlaps the cap cell and rejects placeBlock.
+  await waitForShaftLanding(bot, plan.footY, {
     signal,
     timeoutMs: settleTimeoutMs,
     pollMs: settlePollMs,
@@ -1599,15 +1832,14 @@ export async function executeShelterAction(
     return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
   }
 
-  // Seal roof cap at (bx, by - 1, bz) — try all valid solid side wall anchors
-  const freshCapItem =
-    getInventoryItems(bot).find((it) => SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it))) ||
-    capItem;
+  // Seal roof cap at (sx, plan.capY, sz) — try existing solid side wall anchors first,
+  // and for shallow 2-deep shafts place 1 rim anchor block at surface height if needed.
+  const freshCapItem = pickBestCapItem() || capItem;
   let sealed = false;
   try {
     await bot.equip(freshCapItem, "hand");
-    for (const { dx, dz, face } of anchorCandidates) {
-      const liveWall = bot.blockAt(vec3(bx + dx, by - 1, bz + dz));
+    for (const { dx, dz, face } of plan.anchorCandidates) {
+      const liveWall = bot.blockAt(vec3(sx + dx, plan.capY, sz + dz));
       if (!isSolidNonHazardWall(liveWall)) continue;
       if (typeof bot.lookAt === "function" && liveWall.position) {
         try {
@@ -1631,14 +1863,55 @@ export async function executeShelterAction(
         // Try next solid side wall anchor
       }
     }
+
+    if (!sealed && plan.depth === 2 && plan.rimCandidates.length > 0) {
+      for (const { dx, dz, face } of plan.rimCandidates) {
+        const rimGround = bot.blockAt(vec3(sx + dx, sy - 1, sz + dz));
+        if (!isSolidNonHazardWall(rimGround)) continue;
+        try {
+          const rimItem = pickBestCapItem() || freshCapItem;
+          await bot.equip(rimItem, "hand");
+          if (typeof bot.lookAt === "function") {
+            try {
+              await bot.lookAt(vec3(sx + dx + 0.5, sy, sz + dz + 0.5), true);
+            } catch {
+              // Ignore lookAt errors
+            }
+          }
+          await bot.placeBlock(rimGround, vec3(0, 1, 0));
+          const liveRim = bot.blockAt(vec3(sx + dx, sy, sz + dz)) || {
+            name: extractCanonicalItemName(rimItem) || "dirt",
+            position: vec3(sx + dx, sy, sz + dz),
+            boundingBox: "block",
+          };
+          const capItem2 = pickBestCapItem() || freshCapItem;
+          await bot.equip(capItem2, "hand");
+          if (typeof bot.lookAt === "function") {
+            try {
+              await bot.lookAt(
+                vec3(sx + dx + 0.5 + face.x * 0.5, sy + 0.5, sz + dz + 0.5 + face.z * 0.5),
+                true,
+              );
+            } catch {
+              // Ignore lookAt errors
+            }
+          }
+          await bot.placeBlock(liveRim, face);
+          sealed = true;
+          break;
+        } catch {
+          // Try next rim anchor candidate
+        }
+      }
+    }
   } catch {
     sealed = false;
   }
 
   if (!sealed) {
-    // Never leave the bot trapped in an unsealed 3-deep open shaft: carve staircase out to surface.
-    const curFootY = Math.min(by - 3, Math.floor(Number(bot.entity?.position?.y ?? by - 3)));
-    await carveStaircaseOut(bx, curFootY, bz, by);
+    // Never leave the bot trapped in an unsealed open shaft: carve staircase out to surface.
+    const curFootY = Math.min(plan.footY, Math.floor(Number(bot.entity?.position?.y ?? plan.footY)));
+    await carveStaircaseOut(sx, curFootY, sz, sy);
     return {
       ok: false,
       mode: "enter",
@@ -1650,13 +1923,14 @@ export async function executeShelterAction(
   }
 
   state.active = true;
-  state.capPos = [bx, by - 1, bz];
-  state.holePos = [bx, by - 3, bz];
-  state.surfaceY = by;
+  state.capPos = [sx, plan.capY, sz];
+  state.holePos = [sx, plan.footY, sz];
+  state.surfaceY = sy;
   return {
     ok: true,
     mode: "enter",
     sheltered: true,
+    shallow: plan.depth === 2,
     shelter_pos: state.holePos,
     cap_pos: state.capPos,
     summary: `已就地挖好1x1x2应急掩体并封顶(${state.holePos.join(",")})，安全苟到天亮`,

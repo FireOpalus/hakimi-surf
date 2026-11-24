@@ -456,3 +456,49 @@ async def test_mc_goal_completed_ignores_non_substantive_actions_and_preserves_e
     assert world.current.boredom == 34
     assert world.current.mood == "pleased"
     assert [n["title"] for n in await x.news(message, now)] == ["合成铁镐 x1"]
+
+
+async def test_mc_world_news_marks_shared_on_paraphrased_or_proactive_reply_and_uses_6h_ttl(
+    settings, store, message
+):
+    now = stamp(8, 12)
+    world = WorldStateManager(settings, store, clock=lambda: now)
+    await world.initialize()
+    x = world.experience
+
+    await world.publish_event(
+        "minecraft",
+        "mc_goal_completed",
+        {"action_type": "gather", "summary": "已采集oak_log x2(16,72,11)"},
+        business_key="gather-oak-1",
+    )
+    await world.publish_event(
+        "minecraft",
+        "mc_goal_completed",
+        {"action_type": "craft", "summary": "已合成 stick x4"},
+        business_key="craft-stick-1",
+    )
+    assert len(await x.news(message, now)) == 2
+    # Routine mc_goal_completed news expires in 6h instead of lingering 48h.
+    assert await x.news(message, now + 6 * 3600 + 1) == []
+
+    # Paraphrased Chinese proactive DM ("刚砍了两块木头搓出四根木棍") marks MC news shared.
+    async with store.transaction():
+        await x.confirmed_tx(
+            message,
+            "jit:intent-1",
+            now + 60,
+            ["BOISER 救命，刚砍了两块木头搓出四根木棍，天一黑就被堵着送回家了"],
+        )
+    assert await x.news(message, now + 120) == []
+
+    # Rare finds still keep the 48h TTL and are NOT falsely cleared by unrelated non-MC DMs.
+    await world.publish_event(
+        "minecraft",
+        "mc_rare_find",
+        {"block": "diamond_ore", "summary": "发现钻石矿"},
+        business_key="rare-dia-1",
+    )
+    async with store.transaction():
+        await x.confirmed_tx(message, "jit:intent-2", now + 180, ["今天天气真不错呀"])
+    assert len(await x.news(message, now + 12 * 3600)) == 1

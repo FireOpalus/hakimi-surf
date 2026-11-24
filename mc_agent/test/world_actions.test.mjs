@@ -642,3 +642,136 @@ test("mc.shelter waits for physical shaft landing before sealing and carves stai
   assert.ok(stuckBot._dug.length > 3);
   assert.ok(escapedGoal);
 });
+
+test("shallow 2-deep shelter over stone, leaf unstick, gather/explore fallback, craft wood shortfall passthrough, evade commitment, and calm low_food", async () => {
+  // 1. Shallow 2-deep shelter succeeds barehanded when by-3 is stone and bot has >= 2 dirt
+  const shallowBlocks = new Map();
+  for (let x = -2; x <= 2; x += 1) {
+    for (let z = -2; z <= 2; z += 1) {
+      shallowBlocks.set(`${x},63,${z}`, { name: "grass_block", position: vec3(x, 63, z), boundingBox: "block" });
+      shallowBlocks.set(`${x},62,${z}`, { name: "dirt", position: vec3(x, 62, z), boundingBox: "block" });
+      shallowBlocks.set(`${x},61,${z}`, { name: "stone", position: vec3(x, 61, z), boundingBox: "block" });
+    }
+  }
+  const shallowBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "dirt", type: 3, count: 4 }],
+    blocks: shallowBlocks,
+  });
+  const shallowState = createShelterState();
+  const shallowEnter = await executeShelterAction(
+    shallowBot,
+    { mode: "enter" },
+    { shelterState: shallowState, timeOfDay: "night", settleTimeoutMs: 50, settlePollMs: 0 },
+  );
+  assert.equal(shallowEnter.ok, true);
+  assert.equal(shallowEnter.sheltered, true);
+  assert.equal(shallowEnter.shallow, true);
+  assert.deepEqual(shallowEnter.shelter_pos, [0, 62, 0]);
+  assert.deepEqual(shallowEnter.cap_pos, [0, 64, 0]);
+  assert.equal(shallowBot._dug.length, 2);
+  // Placed 1 rim anchor + 1 roof cap at surface y=64
+  assert.equal(shallowBot._placed.length, 2);
+
+  // 2. computeWoodShortfall accounts for crafting table + planks + sticks (2 logs = 8 planks < 9 needed -> 1 log short)
+  const nineGap = computeWoodShortfall(
+    [{ item: "stick", need: 2, have: 0, shortfall: 2 }],
+    new Map([["oak_log", 2]]),
+    { needsTableCraft: true, recipePlanksForOne: 3, recipeStickPlanksForOne: 2 },
+  );
+  assert.equal(nineGap.wood_shortfall_planks, 1);
+  assert.equal(nineGap.wood_shortfall_logs, 1);
+
+  // 3. gather skips an unreachable first tree (path_stuck) and chops the second candidate tree,
+  //    while _gotoGoal clears obstructing oak_leaves on strike 2
+  const treeBlocks = new Map();
+  treeBlocks.set("1,65,0", { name: "oak_leaves", position: vec3(1, 65, 0), boundingBox: "block" });
+  treeBlocks.set("2,64,0", { name: "oak_log", position: vec3(2, 64, 0), boundingBox: "block" });
+  treeBlocks.set("5,64,0", { name: "oak_log", position: vec3(5, 64, 0), boundingBox: "block" });
+  const gatherBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [],
+    blocks: treeBlocks,
+  });
+  let gotoCalls = 0;
+  gatherBot.pathfinder.goto = async (goal) => {
+    gotoCalls += 1;
+    if (gotoCalls === 1) {
+      // Simulate stuck on first log until stuck detector triggers
+      await new Promise(() => {});
+    }
+    gatherBot.entity.position = vec3(goal.x ?? 5, goal.y ?? 64, goal.z ?? 0);
+  };
+  const gatherRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => gatherBot,
+    stuckCheckIntervalMs: 25,
+    pickupSettleMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  gatherRt.connectBot();
+  gatherBot.emit("spawn");
+  const gatherRes = await gatherRt.dispatchGoal({ action_type: "gather", block_type: "oak_log", count: 1 });
+  assert.equal(gatherRes.ok, true);
+  assert.equal(gatherRes.collected_count, 1);
+  assert.deepEqual(gatherRes.pos, [5, 64, 0]);
+  assert.ok(gatherBot._dug.includes("oak_leaves"));
+
+  // 4. evade holds its committed flee goal across 1.5s ticks instead of resetting every tick,
+  //    and mc_low_food stretches repeat cooldown when well-fed (food=20, health=20)
+  let fakeNow = 100_000;
+  const emitted = [];
+  const evadeBot = makeBot({
+    pos: vec3(0, 64, 0),
+    items: [],
+    blocks: new Map(),
+    entities: {
+      skel: { id: 99, name: "skeleton", type: "mob", position: vec3(10, 64, 0) },
+    },
+  });
+  evadeBot.food = 20;
+  evadeBot.health = 20;
+  let setGoalCount = 0;
+  evadeBot.pathfinder.setGoal = () => {
+    setGoalCount += 1;
+  };
+  const evadeRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "true" }),
+    createBotFn: () => evadeBot,
+    onEvent: (ev, payload) => emitted.push({ ev, payload }),
+    nowFn: () => fakeNow,
+    lowFoodCooldownMs: 180_000,
+    milestoneCooldownMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  evadeRt.connectBot();
+  evadeBot.emit("spawn");
+  await evadeRt._companionTick();
+  assert.equal(setGoalCount, 1);
+  // 1.5s later without moving far enough to trigger stuck rotation -> keeps same flee goal
+  fakeNow += 1_500;
+  await evadeRt._companionTick();
+  assert.equal(setGoalCount, 1);
+  // 3.0s later still stuck at origin -> rotates flee angle and issues new goal
+  fakeNow += 1_500;
+  await evadeRt._companionTick();
+  assert.equal(setGoalCount, 2);
+
+  // First mc_low_food emits once; 3 minutes later at food=20/health=20 it is suppressed
+  await evadeRt._survivalTick();
+  assert.equal(emitted.filter((e) => e.payload?.event_type === "mc_low_food").length, 1);
+  fakeNow += 200_000;
+  await evadeRt._survivalTick();
+  assert.equal(emitted.filter((e) => e.payload?.event_type === "mc_low_food").length, 1);
+  // When actually hungry (food=14), 3-minute cooldown applies normally
+  evadeBot.food = 14;
+  await evadeRt._survivalTick();
+  assert.equal(emitted.filter((e) => e.payload?.event_type === "mc_low_food").length, 2);
+
+  gatherRt.stop();
+  evadeRt.stop();
+});

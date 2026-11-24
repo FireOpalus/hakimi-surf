@@ -2742,3 +2742,120 @@ async def test_cruise_gate_retreat_eat_escalates_when_evading_with_zero_food():
         assert plugin.status_dict()["brain_last_reason"] == "cruise_gate:retreat_eat"
     finally:
         await plugin.close()
+
+
+async def test_mc_play_brain_evade_feedback_and_bounded_recovery_cadence() -> None:
+    """Verify repeated evade surfaces guidance and failed actions use bounded 30s recovery."""
+    now = [1000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+        brain_config=McBrainConfig(
+            solo_cruise_interval_seconds=150.0,
+            chained_step_interval_seconds=15.0,
+            recovery_step_interval_seconds=30.0,
+            initial_cruise_delay_seconds=15.0,
+        ),
+    )
+
+    decisions: list[dict[str, Any]] = [
+        {"action": "explore", "reason": "找树砍木头"},
+        {"action": "explore", "reason": "换方向再找树"},
+        {"action": "explore", "reason": "第三次尝试找树"},
+        {"action": "evade", "reason": "躲怪"},
+        {"action": "evade", "reason": "继续躲怪"},
+    ]
+
+    async def fake_bridge(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if method == "mc.dispatch_goal":
+            act = (params or {}).get("action_type")
+            if act == "explore":
+                return {"ok": False, "accepted": True, "reason": "path_stuck"}
+            if act == "evade":
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "combat_mode": "evade",
+                    "already_evading": True,
+                    "threats_nearby": False,
+                }
+        return {"ok": True, "accepted": True}
+
+    async def fake_budget(_lane: str) -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "decisions": {
+                "should_replan": {
+                    "type": "binary",
+                    "noul": 0.9,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "gather",
+                    "confidence": 0.9,
+                    "probabilities": {"gather": 0.9},
+                    "confident": True,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, _payload: dict[str, Any], **_kw: Any) -> str:
+        item = decisions.pop(0)
+        return json.dumps(
+            {
+                "say": "",
+                "action": item["action"],
+                "target_player": "",
+                "target_mob": "",
+                "mode": "",
+                "block_type": "",
+                "item_name": "",
+                "count": 0,
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": item["reason"],
+                "next_goal": "砍树做木镐",
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+    plugin.apply_snapshot(_connected_snapshot(combat_mode="evade", time_of_day="day"))
+
+    try:
+        # 1st & 2nd failures schedule bounded 30s recovery; 3rd consecutive failure backs off.
+        await plugin.brain._execute_cycle("cruise")
+        assert plugin.brain._consecutive_failures == 1
+        assert plugin.brain._recovery_retry_pending is True
+
+        await plugin.brain._execute_cycle("cruise")
+        assert plugin.brain._consecutive_failures == 2
+        assert plugin.brain._recovery_retry_pending is True
+
+        await plugin.brain._execute_cycle("cruise")
+        assert plugin.brain._consecutive_failures == 3
+        assert plugin.brain._recovery_retry_pending is False
+
+        # First redundant evade records already_active_no_threat; second surfaces break-out hint.
+        await plugin.brain._execute_cycle("cruise")
+        assert plugin.brain._consecutive_failures == 0
+        assert plugin.brain.recent_turns[-1]["outcome"] == "evade:already_active_no_threat"
+
+        await plugin.brain._execute_cycle("cruise")
+        assert (
+            plugin.brain.recent_turns[-1]["outcome"] == "evade:already_active_try_shelter_or_gather"
+        )
+    finally:
+        await plugin.close()

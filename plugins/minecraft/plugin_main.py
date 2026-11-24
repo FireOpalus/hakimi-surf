@@ -1594,6 +1594,9 @@ class MinecraftPlugin:
             "placed_bed",
             "placed_chest",
             "sheltered",
+            "shallow",
+            "already_evading",
+            "threats_nearby",
         ):
             if isinstance(data.get(bool_key), bool):
                 artifacts[bool_key] = data[bool_key]
