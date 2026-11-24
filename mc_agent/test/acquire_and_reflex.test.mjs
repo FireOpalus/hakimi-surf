@@ -560,3 +560,89 @@ test("P0: mc.acquire crafts shield via iron ore + furnace + smelting and auto-eq
 
   rt.stop();
 });
+
+test("P0+P1 autonomy: low-health acquire proceeds safely when no hostiles nearby, and water explore heads to dry land", async () => {
+  // 1. Low health (3.3) with NO nearby hostiles -> acquire is NOT blocked by low-health guard
+  const safeLowHpBlocks = new Map([
+    ["2,64,0", { name: "oak_log", boundingBox: "block" }],
+    ["2,65,0", { name: "oak_log", boundingBox: "block" }],
+    ["2,66,0", { name: "oak_log", boundingBox: "block" }],
+  ]);
+  const safeLowHpBot = makeRichCraftBot({
+    health: 3.3,
+    food: 17,
+    initialItems: [{ name: "rotten_flesh", count: 7 }],
+    blocks: safeLowHpBlocks,
+  });
+  const safeRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => safeLowHpBot,
+    pickupSettleMs: 0,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  safeRt.connectBot();
+  safeLowHpBot.emit("spawn");
+
+  // Snapshot reports safe_food_count=0 (rotten_flesh excluded) and in_water=false
+  const snapBefore = safeRt.getSnapshot();
+  assert.equal(snapBefore.safe_food_count, 0);
+  assert.equal(snapBefore.in_water, false);
+
+  const acqRes = await safeRt.dispatchGoal({
+    action_type: "acquire",
+    item_name: "wooden_pickaxe",
+    count: 1,
+  });
+  assert.equal(acqRes.ok, true);
+  assert.equal(safeLowHpBot._invMap.get("wooden_pickaxe"), 1);
+
+  // 2. Same low health WITH a nearby zombie within 10 blocks -> still interrupts safely
+  const hostileBot = makeRichCraftBot({
+    health: 3.3,
+    entities: { 77: { id: 77, name: "zombie", position: vec3(8, 64, 0) } },
+  });
+  const hostileRes = await executeAcquireAction(
+    hostileBot,
+    { item_name: "wooden_pickaxe", count: 1 },
+    { gatherBlocksFn: async () => ({ ok: true, collected_count: 1, block: "oak_log" }) },
+  );
+  assert.equal(hostileRes.ok, false);
+  assert.equal(hostileRes.reason, "interrupted_by_low_health");
+
+  // 3. In-water explore picks nearby dry land first and reports in_water=true in snapshot
+  const waterBlocks = new Map([
+    ["0,62,0", { name: "water", boundingBox: "empty" }],
+    ["3,62,0", { name: "grass_block", boundingBox: "block" }],
+    ["3,63,0", { name: "air", boundingBox: "empty" }],
+    ["3,64,0", { name: "air", boundingBox: "empty" }],
+  ]);
+  const waterBot = makeRichCraftBot({
+    pos: vec3(0, 62.7, 0),
+    blocks: waterBlocks,
+  });
+  waterBot.entity.isInWater = true;
+  const exploreGoals = [];
+  waterBot.pathfinder.goto = async (goal) => {
+    exploreGoals.push([Math.round(goal.x), Math.round(goal.z)]);
+  };
+  const waterRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => waterBot,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  waterRt.connectBot();
+  waterBot.emit("spawn");
+  assert.equal(waterRt.getSnapshot().in_water, true);
+  const expRes = await waterRt.dispatchGoal({ action_type: "explore" });
+  assert.equal(expRes.ok, true);
+  assert.deepEqual(exploreGoals[0], [3, 0]);
+
+  safeRt.stop();
+  waterRt.stop();
+});

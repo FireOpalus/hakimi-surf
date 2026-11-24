@@ -1111,7 +1111,13 @@ async def test_mc_session_recap_unit_filters_trivial_and_blocked_sessions(
 
 
 def test_mc_brain_config_default_solo_cruise_interval() -> None:
-    assert McBrainConfig().solo_cruise_interval_seconds == 150.0
+    from hakimi.plugin_bus.protocol import _MAX_PLUGIN_TASK_INSTRUCTION_CHARS
+    from plugins.minecraft.play_brain import MC_PLAY_TASK_INSTRUCTION
+
+    cfg = McBrainConfig()
+    assert cfg.solo_cruise_interval_seconds == 60.0
+    assert cfg.max_calls_per_10m == 20
+    assert len(MC_PLAY_TASK_INSTRUCTION) <= _MAX_PLUGIN_TASK_INSTRUCTION_CHARS - 100
 
 
 def test_minecraft_snapshot_extra_forbid_and_survival_field_sanitization() -> None:
@@ -3041,5 +3047,126 @@ async def test_reflex_modes_sanitization_and_acquire_brain_flow() -> None:
 
         plugin.apply_snapshot({"connected": False, "reflex_modes": ["auto_eat"]})
         assert plugin.snapshot.reflex_modes == []
+    finally:
+        await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_model_autonomy_state_facts_action_delta_and_gate_delegation() -> None:
+    """Verify state facts, since_last_turn delta, and Layer 1 escalation when idle/stuck."""
+    now = [2_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+    )
+    seen_payloads: list[dict[str, Any]] = []
+
+    async def fake_bridge(_action: str, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "accepted": True}
+
+    async def fake_budget(_lane: str) -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        # Layer 1 always tries to keep_current
+        return {
+            "passed": True,
+            "decisions": {
+                "should_replan": {
+                    "type": "binary",
+                    "noul": 0.1,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "keep_current",
+                    "confidence": 0.9,
+                    "probabilities": {"keep_current": 0.9},
+                    "confident": True,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, payload: dict[str, Any], **_kw: Any) -> str:
+        seen_payloads.append(payload)
+        return json.dumps(
+            {
+                "say": "",
+                "action": "explore",
+                "target_player": "",
+                "target_mob": "",
+                "mode": "",
+                "block_type": "",
+                "item_name": "",
+                "count": 0,
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": "先上岸觅食",
+                "next_goal": "找动物或麦子",
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Low HP + food=17 (can_natural_regen=False) + 0 safe food -> Layer 1 MUST escalate
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                health=3.3,
+                food=17.0,
+                safe_food_count=0,
+                in_water=True,
+                pos=(18.5, 62.7, 40.6),
+                inventory_summary=["rotten_flesh:7"],
+            )
+        )
+        await plugin.brain._execute_cycle("cruise")
+        assert len(seen_payloads) == 1
+        st1 = seen_payloads[0]["state"]
+        assert st1["can_natural_regen"] is False
+        assert st1["safe_food_count"] == 0
+        assert st1["in_water"] is True
+        assert seen_payloads[0]["routing_hint"]["hint"] == "in_water_needs_land"
+
+        # 2. Next turn 60s later with unchanged HP surfaces since_last_turn delta
+        now[0] += 60.0
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                health=3.3,
+                food=17.0,
+                safe_food_count=0,
+                in_water=False,
+                pos=(18.5, 64.0, 40.6),
+            )
+        )
+        await plugin.brain._execute_cycle("cruise")
+        assert len(seen_payloads) == 2
+        st2 = seen_payloads[1]["state"]
+        assert "since_last_turn" in st2
+        assert "hp:3.3->3.3(unchanged)" in st2["since_last_turn"]
+        assert seen_payloads[1]["routing_hint"]["hint"] == "low_hp_cannot_regen_no_food"
+
+        # 3. When sheltered, Layer 1 keep_current still skips Layer 2 (0 main-model tokens)
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                health=3.3,
+                food=17.0,
+                safe_food_count=0,
+                in_water=False,
+                reflex_modes=["sheltered"],
+            )
+        )
+        await plugin.brain._execute_cycle("cruise")
+        assert len(seen_payloads) == 2
+        assert plugin.brain.cruise_skipped_count == 1
     finally:
         await plugin.close()

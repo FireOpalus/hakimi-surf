@@ -307,6 +307,8 @@ export class McRuntime {
     this.equipment = createEmptyEquipment();
     this.inventorySummary = [];
     this.freeSlots = null;
+    this.safeFoodCount = null;
+    this.inWater = false;
     this.combatMode = config.mcCombatMode === "guard" ? "guard" : "evade";
     this.guardTarget = "";
     this.timeOfDay = "";
@@ -471,6 +473,8 @@ export class McRuntime {
       equipment: this.connected ? { ...this.equipment } : createEmptyEquipment(),
       inventory_summary: this.connected ? [...this.inventorySummary] : [],
       free_slots: this.connected ? this.freeSlots : null,
+      safe_food_count: this.connected ? this.safeFoodCount : null,
+      in_water: this.connected ? Boolean(this.inWater) : false,
       combat_mode: this.combatMode,
       guard_target: this._resolveGuardTargetName(),
       time_of_day: this.connected ? this.timeOfDay : "",
@@ -564,6 +568,8 @@ export class McRuntime {
     this.equipment = invSnap.equipment;
     this.inventorySummary = invSnap.inventory_summary;
     this.freeSlots = invSnap.free_slots;
+    this.safeFoodCount = bot.inventory ? countSafeFood(bot) : null;
+    this.inWater = this._isBotInWater(bot);
     this.timeOfDay = this._computeTimeOfDay(bot);
     this.nearbyResources = this._collectNearbyResources(bot, 16);
     this.nearbyEntities = this._collectNearbyEntities(bot);
@@ -574,6 +580,66 @@ export class McRuntime {
     if (dimChanged) {
       this._emitSnapshot();
     }
+  }
+
+  _isBotInWater(bot) {
+    if (!bot) return false;
+    if (this._waterFloatState?.floating || bot.entity?.isInWater) return true;
+    const p = bot.entity?.position;
+    if (p && typeof bot.blockAt === "function") {
+      try {
+        const blk = bot.blockAt(vec3(Math.floor(p.x ?? 0), Math.floor(p.y ?? 0), Math.floor(p.z ?? 0)));
+        const name = String(blk?.name || "").toLowerCase();
+        if (name === "water" || name === "flowing_water" || name === "bubble_column") {
+          return true;
+        }
+      } catch {
+        // Ignore partial mock errors
+      }
+    }
+    return false;
+  }
+
+  _findNearestDryLand(bot, maxRadius = 20) {
+    const origin = bot?.entity?.position;
+    if (!origin || typeof bot.blockAt !== "function") return null;
+    const ox = Math.floor(origin.x ?? 0);
+    const oy = Math.floor(origin.y ?? 64);
+    const oz = Math.floor(origin.z ?? 0);
+    const waterNames = new Set(["water", "flowing_water", "bubble_column", "lava", "flowing_lava", "air", "cave_air", "void_air"]);
+    const airNames = new Set(["air", "cave_air", "void_air", "short_grass", "grass", "tall_grass", "snow", "leaf_litter"]);
+    let best = null;
+    for (let r = 3; r <= maxRadius; r += 3) {
+      for (let step = 0; step < 12; step += 1) {
+        const angle = (step * Math.PI * 2) / 12;
+        const tx = Math.round(ox + Math.cos(angle) * r);
+        const tz = Math.round(oz + Math.sin(angle) * r);
+        for (let dy = 3; dy >= -2; dy -= 1) {
+          const ty = oy + dy;
+          const ground = bot.blockAt(vec3(tx, ty - 1, tz));
+          const feet = bot.blockAt(vec3(tx, ty, tz));
+          const head = bot.blockAt(vec3(tx, ty + 1, tz));
+          const gName = String(ground?.name || "").toLowerCase();
+          const fName = String(feet?.name || "").toLowerCase();
+          const hName = String(head?.name || "").toLowerCase();
+          if (
+            gName &&
+            !waterNames.has(gName) &&
+            ground?.boundingBox !== "empty" &&
+            airNames.has(fName) &&
+            airNames.has(hName)
+          ) {
+            const dist = Math.hypot(tx - ox, tz - oz);
+            if (!best || dist < best.dist) {
+              best = { x: tx, y: ty, z: tz, dist };
+            }
+            break;
+          }
+        }
+      }
+      if (best) return best;
+    }
+    return best;
   }
 
   _syncSoloClock(bot = this.bot) {
@@ -1763,6 +1829,8 @@ export class McRuntime {
       this.equipment = invSnap.equipment;
       this.inventorySummary = invSnap.inventory_summary;
       this.freeSlots = invSnap.free_slots;
+      this.safeFoodCount = bot.inventory ? countSafeFood(bot) : null;
+      this.inWater = this._isBotInWater(bot);
       this.timeOfDay = this._computeTimeOfDay(bot);
       this.nearbyResources = this._collectNearbyResources(bot, 16);
       this.nearbyEntities = this._collectNearbyEntities(bot);
@@ -1813,6 +1881,8 @@ export class McRuntime {
       this.equipment = invSnap.equipment;
       this.inventorySummary = invSnap.inventory_summary;
       this.freeSlots = invSnap.free_slots;
+      this.safeFoodCount = bot.inventory ? countSafeFood(bot) : null;
+      this.inWater = this._isBotInWater(bot);
       this.timeOfDay = this._computeTimeOfDay(bot);
       this.nearbyResources = this._collectNearbyResources(bot, 16);
       this.nearbyEntities = this._collectNearbyEntities(bot);
@@ -1971,6 +2041,8 @@ export class McRuntime {
     this.equipment = createEmptyEquipment();
     this.inventorySummary = [];
     this.freeSlots = null;
+    this.safeFoodCount = null;
+    this.inWater = false;
     this.guardTarget = "";
     this.timeOfDay = "";
     this.nearbyResources = [];
@@ -2013,6 +2085,8 @@ export class McRuntime {
     this.equipment = createEmptyEquipment();
     this.inventorySummary = [];
     this.freeSlots = null;
+    this.safeFoodCount = null;
+    this.inWater = false;
     this.guardTarget = "";
     this.timeOfDay = "";
     this.nearbyResources = [];
@@ -3055,19 +3129,32 @@ export class McRuntime {
         7 + Math.floor(Math.random() * 5),
       ];
       const angleOffsets = [0, (2 * Math.PI) / 3, -(2 * Math.PI) / 3];
-      let targetX = Math.round(startPos[0] + Math.cos(baseAngle) * radii[0]);
-      let targetZ = Math.round(startPos[2] + Math.sin(baseAngle) * radii[0]);
-      this.activity = `探索(${targetX},${targetZ})`;
+      const candidates = [];
+      if (this._isBotInWater(bot)) {
+        const dryLand = this._findNearestDryLand(bot, 20);
+        if (dryLand) {
+          candidates.push({ tx: dryLand.x, tz: dryLand.z, label: "上岸探索" });
+        }
+      }
+      for (let i = 0; i < angleOffsets.length; i += 1) {
+        candidates.push({ angle: baseAngle + angleOffsets[i], r: radii[i], label: "探索" });
+      }
+      let targetX =
+        candidates[0]?.tx ?? Math.round(startPos[0] + Math.cos(baseAngle) * radii[0]);
+      let targetZ =
+        candidates[0]?.tz ?? Math.round(startPos[2] + Math.sin(baseAngle) * radii[0]);
+      this.activity = `${candidates[0]?.label || "探索"}(${targetX},${targetZ})`;
       this._emitSnapshot();
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
-        for (let attempt = 0; attempt < angleOffsets.length; attempt += 1) {
+        for (let attempt = 0; attempt < candidates.length; attempt += 1) {
           if (signal.aborted) return { aborted: true };
           const curNow = this._vecToTuple(bot.entity?.position) || startPos;
-          const angle = baseAngle + angleOffsets[attempt];
-          const r = radii[attempt];
-          targetX = Math.round(curNow[0] + Math.cos(angle) * r);
-          targetZ = Math.round(curNow[2] + Math.sin(angle) * r);
-          this.activity = `探索(${targetX},${targetZ})`;
+          const cand = candidates[attempt];
+          targetX =
+            cand.tx !== undefined ? cand.tx : Math.round(curNow[0] + Math.cos(cand.angle) * cand.r);
+          targetZ =
+            cand.tz !== undefined ? cand.tz : Math.round(curNow[2] + Math.sin(cand.angle) * cand.r);
+          this.activity = `${cand.label}(${targetX},${targetZ})`;
           try {
             await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
             return { ok: true };
@@ -3080,7 +3167,7 @@ export class McRuntime {
               targetZ = Math.round(endNow[2]);
               return { ok: true, partial: true };
             }
-            if (err?.code === "path_stuck" || attempt < angleOffsets.length - 1) {
+            if (err?.code === "path_stuck" || attempt < candidates.length - 1) {
               continue;
             }
             throw err;

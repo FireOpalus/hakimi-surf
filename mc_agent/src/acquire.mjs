@@ -22,7 +22,7 @@ import {
   executeHuntAction,
   isBedName,
 } from "./world_actions.mjs";
-import { CREEPER_SAFE_DISTANCE, findNearestCreeper } from "./combat.mjs";
+import { CREEPER_SAFE_DISTANCE, findNearestAnyHostile, findNearestCreeper } from "./combat.mjs";
 
 export const MIN_ACQUIRE_COUNT = 1;
 export const MAX_ACQUIRE_COUNT = 16;
@@ -378,7 +378,12 @@ export async function executeAcquireAction(
     if (findNearestCreeper(bot, CREEPER_SAFE_DISTANCE)) {
       return { stopped: true, reason: "interrupted_by_threat" };
     }
-    if (combatMode === "evade" && typeof bot.health === "number" && bot.health <= 7) {
+    if (
+      combatMode === "evade" &&
+      typeof bot.health === "number" &&
+      bot.health <= 7 &&
+      findNearestAnyHostile(bot, 12)
+    ) {
       return { stopped: true, reason: "interrupted_by_low_health" };
     }
     return null;

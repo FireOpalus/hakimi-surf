@@ -114,6 +114,8 @@ _SNAPSHOT_FIELD_KEYS = frozenset(
         "equipment",
         "inventory_summary",
         "free_slots",
+        "safe_food_count",
+        "in_water",
         "combat_mode",
         "guard_target",
         "time_of_day",
@@ -324,6 +326,8 @@ class MinecraftSnapshot(BaseModel):
     equipment: dict[str, str] = Field(default_factory=lambda: dict(_EMPTY_EQUIPMENT))
     inventory_summary: list[str] = Field(default_factory=list, max_length=16)
     free_slots: int | None = Field(default=None, ge=0, le=36)
+    safe_food_count: int | None = Field(default=None, ge=0, le=2304)
+    in_water: bool = False
     combat_mode: Literal["evade", "guard"] = "evade"
     guard_target: str = Field(default="", max_length=16)
     time_of_day: Literal["", "day", "sunset", "night", "sunrise"] = ""
@@ -358,7 +362,7 @@ class MinecraftSnapshot(BaseModel):
                 raise ValueError("invalid_inventory_entry")
         return value
 
-    @field_validator("free_slots", mode="before")
+    @field_validator("free_slots", "safe_food_count", mode="before")
     @classmethod
     def _reject_bool_free_slots(cls, value: Any) -> Any:
         if isinstance(value, bool):
@@ -1027,6 +1031,16 @@ class MinecraftPlugin:
             and 0 <= raw_free <= 36
             else None
         )
+        raw_safe_food = data.get("safe_food_count")
+        safe_food_count = (
+            raw_safe_food
+            if connected
+            and isinstance(raw_safe_food, int)
+            and not isinstance(raw_safe_food, bool)
+            and 0 <= raw_safe_food <= 2304
+            else None
+        )
+        in_water = bool(data.get("in_water")) if connected else False
         raw_mode = data.get("combat_mode")
         combat_mode: Literal["evade", "guard"] = "guard" if raw_mode == "guard" else "evade"
         raw_guard_target = data.get("guard_target")
@@ -1058,6 +1072,8 @@ class MinecraftPlugin:
             equipment=equipment,
             inventory_summary=inventory_summary,
             free_slots=free_slots,
+            safe_food_count=safe_food_count,
+            in_water=in_water,
             combat_mode=combat_mode,
             guard_target=guard_target,
             time_of_day=time_of_day,
@@ -1245,6 +1261,8 @@ class MinecraftPlugin:
             "equipment": dict(snap.equipment),
             "inventory_summary": list(snap.inventory_summary[:16]),
             "free_slots": snap.free_slots,
+            "safe_food_count": snap.safe_food_count,
+            "in_water": bool(snap.in_water),
             "combat_mode": snap.combat_mode,
             "guard_target": snap.guard_target,
             "time_of_day": snap.time_of_day,
