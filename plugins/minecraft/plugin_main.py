@@ -1659,6 +1659,7 @@ class MinecraftPlugin:
             "requested_count",
             "hunted_count",
             "moved_count",
+            "moved_blocks",
             "given_count",
             "wood_shortfall_planks",
             "wood_shortfall_logs",

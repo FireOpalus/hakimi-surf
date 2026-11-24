@@ -503,7 +503,11 @@ async function preprocessWoodMaterials(
   }
 }
 
-export function findNearbyCraftingTable(bot, maxDistance = CRAFTING_TABLE_SEARCH_RADIUS) {
+export function findNearbyCraftingTable(
+  bot,
+  maxDistance = CRAFTING_TABLE_SEARCH_RADIUS,
+  { isUnreachableFn = null } = {},
+) {
   const origin = bot?.entity?.position;
   if (!origin) return null;
 
@@ -524,9 +528,11 @@ export function findNearbyCraftingTable(bot, maxDistance = CRAFTING_TABLE_SEARCH
     for (const p of positions) {
       const block = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
       if (!block || block.name !== "crafting_table") continue;
-      const dist = distOf(block.position ?? p);
+      const pos = block.position ?? p;
+      if (typeof isUnreachableFn === "function" && isUnreachableFn(pos)) continue;
+      const dist = distOf(pos);
       if (Number.isFinite(dist) && dist <= maxDistance && (!best || dist < best.dist)) {
-        best = { block, pos: block.position ?? p, dist };
+        best = { block, pos, dist };
       }
     }
     if (best) return best;
@@ -538,6 +544,9 @@ export function findNearbyCraftingTable(bot, maxDistance = CRAFTING_TABLE_SEARCH
       maxDistance,
     });
     if (block && block.name === "crafting_table" && block.position) {
+      if (typeof isUnreachableFn === "function" && isUnreachableFn(block.position)) {
+        return null;
+      }
       const dist = distOf(block.position);
       if (Number.isFinite(dist) && dist <= maxDistance) {
         return { block, pos: block.position, dist };
@@ -745,7 +754,13 @@ function formatMissingSummary(missing, woodInfo = null) {
 export async function executeCraftAction(
   bot,
   params,
-  { gotoFn = null, autoEquip = true, signal = null } = {},
+  {
+    gotoFn = null,
+    autoEquip = true,
+    signal = null,
+    isUnreachableFn = null,
+    markUnreachableFn = null,
+  } = {},
 ) {
   const parsed = parseCraftParams(params);
   if (parsed.error) {
@@ -806,7 +821,9 @@ export async function executeCraftAction(
   }
 
   const has2x2Recipe = handAllRecipes.length > 0;
-  const nearbyTableBefore = has2x2Recipe ? null : findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS);
+  const nearbyTableBefore = has2x2Recipe
+    ? null
+    : findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS, { isUnreachableFn });
   const countsInitial = countInventoryByName(bot);
   const hasTableInInventory = (countsInitial.get("crafting_table") ?? 0) > 0;
   const needsTableCraft = !has2x2Recipe && !nearbyTableBefore && !hasTableInInventory;
@@ -868,16 +885,28 @@ export async function executeCraftAction(
       };
     }
 
-    // Locate existing crafting_table within 16 blocks or place one within 3 blocks
-    const nearby = findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS);
+    // Locate existing reachable crafting_table within 16 blocks, or fall back to placing one nearby
+    const nearby = findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS, { isUnreachableFn });
     if (nearby) {
+      let reachedNearby = true;
       if (nearby.dist > 3.5 && typeof gotoFn === "function") {
-        await gotoFn(new GoalNear(nearby.pos.x, nearby.pos.y, nearby.pos.z, 2), signal);
-        if (signal?.aborted) return { aborted: true };
+        try {
+          await gotoFn(new GoalNear(nearby.pos.x, nearby.pos.y, nearby.pos.z, 2), signal);
+          if (signal?.aborted) return { aborted: true };
+        } catch {
+          if (signal?.aborted) return { aborted: true };
+          reachedNearby = false;
+          if (typeof markUnreachableFn === "function") {
+            markUnreachableFn(nearby.pos);
+          }
+        }
       }
-      craftingTableBlock = nearby.block;
-      usedTable = true;
-    } else {
+      if (reachedNearby) {
+        craftingTableBlock = nearby.block;
+        usedTable = true;
+      }
+    }
+    if (!usedTable) {
       // Use crafting_table from inventory or craft one from >= 4 planks
       let curCounts = countInventoryByName(bot);
       if ((curCounts.get("crafting_table") ?? 0) === 0) {

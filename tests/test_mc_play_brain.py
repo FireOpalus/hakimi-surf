@@ -3170,3 +3170,73 @@ async def test_model_autonomy_state_facts_action_delta_and_gate_delegation() -> 
         assert plugin.brain.cruise_skipped_count == 1
     finally:
         await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_mc_explore_progress_neutral_enderman_and_moved_blocks_artifact() -> None:
+    """Verify neutral enderman filtering, explore distance outcomes, and moved_blocks artifact."""
+    from plugins.minecraft.play_brain import MC_PLAY_TASK_INSTRUCTION, McBrainDecision
+
+    assert len(MC_PLAY_TASK_INSTRUCTION) <= 2300
+    assert "enderman(neutral)" in MC_PLAY_TASK_INSTRUCTION
+
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+    )
+    bridge_queue: list[dict[str, Any]] = [
+        {"ok": True, "accepted": True, "moved_blocks": 14, "summary": "探索至(14,0) 移动14格"},
+        {
+            "ok": False,
+            "accepted": True,
+            "reason": "no_movement_progress",
+            "moved_blocks": 0,
+            "summary": "探索未能产生有效位移",
+        },
+        {"ok": True, "accepted": True, "moved_blocks": 9, "summary": "探索至(9,0) 移动9格"},
+    ]
+
+    async def fake_bridge(_action: str, _params: dict[str, Any]) -> dict[str, Any]:
+        return bridge_queue.pop(0)
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. enderman(neutral) is not treated as an active hostile; provoked enderman is
+        neutral_snap = _connected_snapshot(nearby_entities=["enderman(neutral)", "cow"])
+        plugin.apply_snapshot(neutral_snap)
+        assert plugin.snapshot.nearby_entities == ["enderman(neutral)", "cow"]
+        assert plugin.brain._has_nearby_hostile(plugin.snapshot) is False
+
+        provoked_snap = _connected_snapshot(nearby_entities=["enderman"])
+        plugin.apply_snapshot(provoked_snap)
+        assert plugin.brain._has_nearby_hostile(plugin.snapshot) is True
+
+        # 2. explore outcomes surface real distance and no_movement_progress failure
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="explore", reason="向平原探索", next_goal="找树林"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "explored:14m"
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="explore", reason="继续探索", next_goal="找树林"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "explore:no_movement_progress"
+        assert plugin.brain._recovery_retry_pending is True
+
+        # 3. dispatch_goal exposes moved_blocks in artifacts
+        goal_res = await plugin.dispatch_goal({"action_type": "explore"})
+        assert goal_res["ok"] is True
+        assert goal_res["artifacts"]["moved_blocks"] == 9
+    finally:
+        await plugin.close()

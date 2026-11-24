@@ -310,6 +310,8 @@ export async function executeAcquireAction(
     maxDepth = MAX_ACQUIRE_DEPTH,
     smeltPollIntervalMs = 350,
     huntAttackCooldownMs = null,
+    isUnreachableFn = null,
+    markUnreachableFn = null,
   } = {},
 ) {
   const parsed = parseAcquireParams(params);
@@ -404,7 +406,12 @@ export async function executeAcquireAction(
     }
     ctx.stepCount += 1;
     const boundedCount = Math.max(1, Math.min(8, Math.ceil(count)));
-    const res = await gatherBlocksFn(blockNames, boundedCount, signal);
+    let res;
+    try {
+      res = await gatherBlocksFn(blockNames, boundedCount, signal);
+    } catch {
+      return { ok: false, reason: "gather_failed", item: labelItem || blockNames[0] || "" };
+    }
     if (res?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: labelItem };
     if (res?.ok && (res.collected_count ?? 0) > 0) {
       const blk = res.block || blockNames[0] || labelItem;
@@ -681,7 +688,12 @@ export async function executeAcquireAction(
         }
 
         // Ensure furnace exists nearby or in inventory
-        const nearbyFurnace = findNearbyFurnace(bot, target === "iron_ingot" ? "ore" : "food", FURNACE_SEARCH_RADIUS);
+        const nearbyFurnace = findNearbyFurnace(
+          bot,
+          target === "iron_ingot" ? "ore" : "food",
+          FURNACE_SEARCH_RADIUS,
+          { isUnreachableFn },
+        );
         if (!nearbyFurnace && countOwnedItem(bot, "furnace") === 0) {
           const furnRes = await ensureItem("furnace", 1, depth + 1);
           if (!furnRes.ok) return furnRes;
@@ -696,16 +708,23 @@ export async function executeAcquireAction(
 
         const remainingMs = Math.max(500, ctx.deadlineMs - nowFn() - 1_000);
         ctx.stepCount += 1;
-        const smeltRes = await executeSmeltAction(
-          bot,
-          { item_name: smeltInput, count: Math.min(16, need) },
-          {
-            gotoFn,
-            signal,
-            pollIntervalMs: smeltPollIntervalMs,
-            maxSmeltWaitMs: remainingMs,
-          },
-        );
+        let smeltRes;
+        try {
+          smeltRes = await executeSmeltAction(
+            bot,
+            { item_name: smeltInput, count: Math.min(16, need) },
+            {
+              gotoFn,
+              signal,
+              pollIntervalMs: smeltPollIntervalMs,
+              maxSmeltWaitMs: remainingMs,
+              isUnreachableFn,
+              markUnreachableFn,
+            },
+          );
+        } catch {
+          smeltRes = { ok: false, reason: "smelt_failed" };
+        }
         if (smeltRes?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
         if (smeltRes?.ok) {
           ctx.steps.push(`smelt:${target}x${smeltRes.smelted_count ?? 1}`);
@@ -745,7 +764,7 @@ export async function executeAcquireAction(
           }
         }
         const needTable =
-          !findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS) &&
+          !findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS, { isUnreachableFn }) &&
           countOwnedItem(bot, "crafting_table") === 0;
         const woodRes = await ensureWoodPlanks(
           3 + (needTable ? 4 : 0),
@@ -755,11 +774,16 @@ export async function executeAcquireAction(
         if (!woodRes.ok) return woodRes;
 
         ctx.stepCount += 1;
-        const craftBed = await executeCraftAction(
-          bot,
-          { item_name: target, count: 1 },
-          { gotoFn, autoEquip: false, signal },
-        );
+        let craftBed;
+        try {
+          craftBed = await executeCraftAction(
+            bot,
+            { item_name: target, count: 1 },
+            { gotoFn, autoEquip: false, signal, isUnreachableFn, markUnreachableFn },
+          );
+        } catch {
+          craftBed = { ok: false, reason: "craft_failed" };
+        }
         if (craftBed?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
         if (craftBed?.ok) {
           ctx.steps.push(`craft:${target}x${craftBed.crafted_count}`);
@@ -811,7 +835,7 @@ export async function executeAcquireAction(
       const recipePlanks = (recipe.planks ?? 0) * batches;
       const needTableWood =
         Boolean(recipe.needsTable) &&
-        !findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS) &&
+        !findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS, { isUnreachableFn }) &&
         (countsBeforeWood.get("crafting_table") ?? 0) === 0
           ? 4
           : 0;
@@ -829,11 +853,22 @@ export async function executeAcquireAction(
       if (intrCraft) return { ok: false, reason: intrCraft.reason, item: target };
 
       ctx.stepCount += 1;
-      const craftRes = await executeCraftAction(
-        bot,
-        { item_name: target, count: Math.min(16, need) },
-        { gotoFn, autoEquip: autoEquip && depth === 0, signal },
-      );
+      let craftRes;
+      try {
+        craftRes = await executeCraftAction(
+          bot,
+          { item_name: target, count: Math.min(16, need) },
+          {
+            gotoFn,
+            autoEquip: autoEquip && depth === 0,
+            signal,
+            isUnreachableFn,
+            markUnreachableFn,
+          },
+        );
+      } catch {
+        craftRes = { ok: false, reason: "craft_failed" };
+      }
       if (craftRes?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
       if (craftRes?.ok) {
         ctx.steps.push(`craft:${target}x${craftRes.crafted_count}`);

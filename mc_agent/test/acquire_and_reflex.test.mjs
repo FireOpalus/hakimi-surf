@@ -627,6 +627,7 @@ test("P0+P1 autonomy: low-health acquire proceeds safely when no hostiles nearby
   const exploreGoals = [];
   waterBot.pathfinder.goto = async (goal) => {
     exploreGoals.push([Math.round(goal.x), Math.round(goal.z)]);
+    waterBot.entity.position = vec3(goal.x, 63, goal.z);
   };
   const waterRt = new McRuntime({
     config: makeConfig(),
@@ -641,8 +642,143 @@ test("P0+P1 autonomy: low-health acquire proceeds safely when no hostiles nearby
   assert.equal(waterRt.getSnapshot().in_water, true);
   const expRes = await waterRt.dispatchGoal({ action_type: "explore" });
   assert.equal(expRes.ok, true);
+  assert.equal(expRes.moved_blocks, 3);
   assert.deepEqual(exploreGoals[0], [3, 0]);
 
   safeRt.stop();
   waterRt.stop();
+});
+
+test("live-log fixes: unreachable remote crafting_table falls back locally, explore verifies displacement, stone-pit pillar unstick, neutral enderman", async () => {
+  // 1. Unreachable remote crafting_table at (10,64,0) throws NoPath -> blacklisted, falls back to local table craft/place without crashing
+  const remoteTableBlocks = new Map([
+    ["10,64,0", { name: "crafting_table", boundingBox: "block" }],
+    ["1,63,0", { name: "grass_block", boundingBox: "block" }],
+    ["1,64,0", { name: "air", boundingBox: "empty" }],
+    ["0,63,0", { name: "grass_block", boundingBox: "block" }],
+  ]);
+  const craftBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    initialItems: [
+      { name: "oak_planks", count: 8 },
+      { name: "stick", count: 2 },
+    ],
+    blocks: remoteTableBlocks,
+  });
+  craftBot.pathfinder.goto = async (goal) => {
+    if (Math.round(goal.x) === 10) {
+      throw new Error("NoPath: cannot reach remote table");
+    }
+  };
+  const craftRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => craftBot,
+    pickupSettleMs: 0,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  craftRt.connectBot();
+  craftBot.emit("spawn");
+
+  const acqRes = await craftRt.dispatchGoal({
+    action_type: "acquire",
+    item_name: "wooden_pickaxe",
+    count: 1,
+  });
+  assert.equal(acqRes.ok, true);
+  assert.equal(craftBot._invMap.get("wooden_pickaxe"), 1);
+  assert.equal(craftRt._unreachableBlocks.has([10, 64, 0], craftRt.nowFn()), true);
+
+  // 2. explore rejects silent zero-displacement goto resolves and succeeds when actually displaced
+  const stuckExpBot = makeRichCraftBot({ pos: vec3(0, 64, 0), blocks: new Map() });
+  stuckExpBot.pathfinder.goto = async () => {
+    // Resolves immediately without changing bot.entity.position
+  };
+  const stuckExpRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => stuckExpBot,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  stuckExpRt.connectBot();
+  stuckExpBot.emit("spawn");
+
+  const zeroExp = await stuckExpRt.dispatchGoal({ action_type: "explore" });
+  assert.equal(zeroExp.ok, false);
+  assert.equal(zeroExp.reason, "no_movement_progress");
+  assert.equal(zeroExp.moved_blocks, 0);
+
+  stuckExpBot.pathfinder.goto = async () => {
+    stuckExpBot.entity.position = vec3(6, 64, 0);
+  };
+  const movedExp = await stuckExpRt.dispatchGoal({ action_type: "explore" });
+  assert.equal(movedExp.ok, true);
+  assert.equal(movedExp.moved_blocks, 6);
+
+  // 3. _tryNaturalUnstick places 1 dirt underfoot when trapped in a 2-high stone pit with headroom
+  const pitBlocks = new Map([["0,63,0", { name: "stone", boundingBox: "block" }]]);
+  for (const [dx, dz] of [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ]) {
+    pitBlocks.set(`${dx},64,${dz}`, { name: "stone", boundingBox: "block" });
+    pitBlocks.set(`${dx},65,${dz}`, { name: "stone", boundingBox: "block" });
+  }
+  const pitBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    initialItems: [{ name: "dirt", count: 4 }],
+    blocks: pitBlocks,
+  });
+  const placedOn = [];
+  pitBot.placeBlock = async (ref, face) => {
+    placedOn.push([ref.position.x, ref.position.y, ref.position.z, face.y]);
+  };
+  const pitRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => pitBot,
+    stuckCheckIntervalMs: 25,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  pitRt.connectBot();
+  pitBot.emit("spawn");
+  const unstuck = await pitRt._tryNaturalUnstick(pitBot, null);
+  assert.equal(unstuck, true);
+  assert.deepEqual(placedOn, [[0, 63, 0, 1]]);
+
+  // 4. Unprovoked enderman is labeled enderman(neutral) and ignored by evade threats; screaming enderman stays hostile
+  const enderBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    entities: {
+      10: { id: 10, name: "enderman", type: "mob", position: vec3(5, 64, 0), isScreaming: false },
+    },
+  });
+  const enderRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => enderBot,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  enderRt.connectBot();
+  enderBot.emit("spawn");
+  assert.deepEqual(enderRt.getSnapshot().nearby_entities, ["enderman(neutral)"]);
+  assert.equal(enderRt._findEvadeThreats(enderBot), null);
+
+  enderBot.entities[10].isScreaming = true;
+  enderRt._refreshFromBot();
+  assert.deepEqual(enderRt.getSnapshot().nearby_entities, ["enderman"]);
+  assert.ok(enderRt._findEvadeThreats(enderBot) !== null);
+
+  craftRt.stop();
+  stuckExpRt.stop();
+  pitRt.stop();
+  enderRt.stop();
 });

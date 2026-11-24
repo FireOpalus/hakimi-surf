@@ -9,6 +9,7 @@ import {
   ProtocolError,
   loadConfig,
   parseStrictJsonObject,
+  sanitizeMcText,
   verifyBearerToken,
 } from "./protocol.mjs";
 
@@ -206,7 +207,9 @@ export function createMcBridgeServer(options = {}) {
           });
           return;
         }
-        console.warn(`event=mc_rpc_internal_error action=${action}`);
+        const errCode = sanitizeMcText(String(err?.code || err?.name || "error"), 32) || "error";
+        const errMsg = sanitizeMcText(String(err?.message || ""), 80);
+        console.warn(`event=mc_rpc_internal_error action=${action} err=${errCode} msg=${errMsg}`);
         sendJson(ws, {
           type: "rpc_response",
           id: reqId,

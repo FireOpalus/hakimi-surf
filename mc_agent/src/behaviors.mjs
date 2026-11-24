@@ -23,6 +23,8 @@ import {
   createWaterFloatState,
   detectEnvironmentalHazard,
   equipBestHarvestTool,
+  extractCanonicalItemName,
+  getInventoryItems,
   hasTorchInInventory,
   performAutoEat,
   shouldTriggerAutoEat,
@@ -63,6 +65,7 @@ import {
   computeRetreatTarget,
   createCombatState,
   findNearestCreeper,
+  isEndermanProvoked,
   lowerShield,
   runGuardCombatStep,
   updateEvadeShieldDefense,
@@ -699,10 +702,13 @@ export class McRuntime {
         dist = Math.hypot(dx, dy, dz);
         if (!Number.isFinite(dist) || dist > 24) continue;
       }
+      const entNameLower = String(ent.name || "").toLowerCase();
       const rawName =
         ent.type === "player" && ent.username
           ? ent.username
-          : ent.name || ent.displayName || ent.type || "";
+          : entNameLower === "enderman" && !isEndermanProvoked(ent)
+            ? "enderman(neutral)"
+            : ent.name || ent.displayName || ent.type || "";
       const cleanName = sanitizeMcText(rawName, 24);
       if (cleanName) {
         withDist.push({ dist, label: cleanName });
@@ -1134,6 +1140,7 @@ export class McRuntime {
       if (!ent || ent === bot.entity || !ent.position) continue;
       const name = String(ent.name || "").toLowerCase();
       if (!HOSTILE_MOBS.has(name)) continue;
+      if (name === "enderman" && !isEndermanProvoked(ent)) continue;
       const dist = this._distanceBetween(origin, ent.position);
       if (dist <= maxDist && (!best || dist < best.dist)) {
         best = { entity: ent, name, dist };
@@ -1153,6 +1160,7 @@ export class McRuntime {
       if (!ent || ent === bot.entity || !ent.position) continue;
       const name = String(ent.name || "").toLowerCase();
       if (!HOSTILE_MOBS.has(name)) continue;
+      if (name === "enderman" && !isEndermanProvoked(ent)) continue;
       const isRanged = RANGED_HOSTILE_MOBS.has(name);
       const radius = isRanged ? RANGED_EVADE_RADIUS : MELEE_EVADE_RADIUS;
       const dist = this._distanceBetween(origin, ent.position);
@@ -1630,21 +1638,21 @@ export class McRuntime {
     }
   }
 
-  _sleepAbortable(ms, signal) {
-    if (signal.aborted) return Promise.resolve(false);
+  _sleepAbortable(ms, signal, { unref = false } = {}) {
+    if (signal?.aborted) return Promise.resolve(false);
     return new Promise((resolve) => {
       const onAbort = () => {
         clearTimeout(timer);
         resolve(false);
       };
       const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
+        signal?.removeEventListener?.("abort", onAbort);
         resolve(true);
       }, ms);
-      if (typeof timer.unref === "function") {
+      if (unref && typeof timer.unref === "function") {
         timer.unref();
       }
-      signal.addEventListener("abort", onAbort, { once: true });
+      signal?.addEventListener?.("abort", onAbort, { once: true });
     });
   }
 
@@ -1659,7 +1667,9 @@ export class McRuntime {
     (async () => {
       try {
         while (!signal.aborted && !this._stopped && this._desiredConnected && !this.paused) {
-          const waited = await this._sleepAbortable(this.powerPollIntervalMs, signal);
+          const waited = await this._sleepAbortable(this.powerPollIntervalMs, signal, {
+            unref: true,
+          });
           if (!waited || signal.aborted || this._stopped || !this._desiredConnected || this.paused) {
             return;
           }
@@ -2162,7 +2172,7 @@ export class McRuntime {
   }
 
   async _tryNaturalUnstick(bot, signal) {
-    if (!bot?.entity?.position || typeof bot.blockAt !== "function" || typeof bot.dig !== "function") {
+    if (!bot?.entity?.position || typeof bot.blockAt !== "function") {
       return false;
     }
     if (signal?.aborted) return false;
@@ -2191,6 +2201,27 @@ export class McRuntime {
       "gravel",
       "clay",
     ]);
+    const safePillarBlocks = new Set([
+      "dirt",
+      "coarse_dirt",
+      "cobblestone",
+      "cobbled_deepslate",
+      "oak_planks",
+      "birch_planks",
+      "spruce_planks",
+      "jungle_planks",
+      "acacia_planks",
+      "dark_oak_planks",
+      "mangrove_planks",
+      "cherry_planks",
+      "pale_oak_planks",
+      "netherrack",
+      "sandstone",
+      "andesite",
+      "diorite",
+      "granite",
+      "tuff",
+    ]);
 
     const cardinal = [
       [1, 0],
@@ -2201,26 +2232,28 @@ export class McRuntime {
 
     // 1. Clear overhanging natural leaves/foliage blocking head movement (zero griefing).
     let dug = 0;
-    const foliageCoords = [
-      [bx, by + 2, bz],
-      ...cardinal.map(([dx, dz]) => [bx + dx, by + 1, bz + dz]),
-      ...cardinal.map(([dx, dz]) => [bx + dx, by, bz + dz]),
-    ];
-    for (const [fx, fy, fz] of foliageCoords) {
-      if (dug >= 2 || signal?.aborted) break;
-      const blk = bot.blockAt(vec3(fx, fy, fz));
-      if (blk && isNaturalFoliage(blk.name)) {
-        try {
-          await bot.dig(blk);
-          dug += 1;
-        } catch {
-          // Best-effort foliage clear
+    if (typeof bot.dig === "function") {
+      const foliageCoords = [
+        [bx, by + 2, bz],
+        ...cardinal.map(([dx, dz]) => [bx + dx, by + 1, bz + dz]),
+        ...cardinal.map(([dx, dz]) => [bx + dx, by, bz + dz]),
+      ];
+      for (const [fx, fy, fz] of foliageCoords) {
+        if (dug >= 2 || signal?.aborted) break;
+        const blk = bot.blockAt(vec3(fx, fy, fz));
+        if (blk && isNaturalFoliage(blk.name)) {
+          try {
+            await bot.dig(blk);
+            dug += 1;
+          } catch {
+            // Best-effort foliage clear
+          }
         }
       }
     }
     if (dug > 0) return true;
 
-    // 2. If trapped inside a natural 2-deep hole/creeper crater (all 4 sides solid at foot or head),
+    // 2. If trapped inside a natural 2-deep hole/creeper crater (3-4 sides solid at foot and head),
     // carve 1 natural dirt/grass step at head height so the bot can walk out.
     let enclosedSides = 0;
     let escapeStep = null;
@@ -2239,7 +2272,7 @@ export class McRuntime {
         }
       }
     }
-    if (enclosedSides >= 3 && escapeStep && !signal?.aborted) {
+    if (enclosedSides >= 3 && escapeStep && typeof bot.dig === "function" && !signal?.aborted) {
       try {
         if (escapeStep.aboveHead && isNaturalFoliage(escapeStep.aboveHead.name)) {
           await bot.dig(escapeStep.aboveHead);
@@ -2248,6 +2281,52 @@ export class McRuntime {
         return true;
       } catch {
         // Best-effort natural pit unstick
+      }
+    }
+
+    // 3. If trapped in a stone/hard pit (3-4 sides solid, cannot carve barehanded),
+    // safely jump and place 1 filler block underfoot to step up (zero griefing).
+    if (
+      enclosedSides >= 3 &&
+      !signal?.aborted &&
+      typeof bot.placeBlock === "function" &&
+      typeof bot.equip === "function"
+    ) {
+      const headroom = bot.blockAt(vec3(bx, by + 2, bz));
+      const headroomClear =
+        !headroom ||
+        headroom.boundingBox === "empty" ||
+        headroom.name === "air" ||
+        headroom.name === "cave_air" ||
+        headroom.name === "void_air";
+      const underfoot = bot.blockAt(vec3(bx, by - 1, bz));
+      const underfootSolid = Boolean(
+        underfoot && underfoot.boundingBox !== "empty" && underfoot.name !== "air",
+      );
+      if (headroomClear && underfootSolid) {
+        const pillarItem = getInventoryItems(bot).find((it) =>
+          safePillarBlocks.has(extractCanonicalItemName(it)),
+        );
+        if (pillarItem) {
+          try {
+            await bot.equip(pillarItem, "hand");
+            if (signal?.aborted) return false;
+            bot.setControlState?.("jump", true);
+            const jumpWaitMs = this.stuckCheckIntervalMs >= 200 ? 160 : 10;
+            const waited = await this._sleepAbortable(jumpWaitMs, signal);
+            if (!waited || signal?.aborted) return false;
+            await bot.placeBlock(underfoot, vec3(0, 1, 0));
+            return true;
+          } catch {
+            // Best-effort pillar-up unstick
+          } finally {
+            try {
+              bot.setControlState?.("jump", false);
+            } catch {
+              // Ignore control reset errors
+            }
+          }
+        }
       }
     }
     return false;
@@ -2585,7 +2664,7 @@ export class McRuntime {
             new GoalNear(chosenCoords[0], chosenCoords[1], chosenCoords[2], 3),
             signal,
           );
-        } catch (err) {
+        } catch {
           if (signal?.aborted) {
             return {
               ok: collectedCount > 0,
@@ -2595,37 +2674,31 @@ export class McRuntime {
               pos: lastCoords,
             };
           }
-          const isNavFail =
-            err?.code === "path_stuck" ||
-            /noPath|timeout|stopped/i.test(String(err?.name || err?.message || ""));
-          if (isNavFail) {
-            stuckSkips += 1;
-            // Persist unreachable column into TTL blacklist across turns so we stop retrying the same blocked tree/vein.
-            this._unreachableBlocks.markColumn(chosenCoords, { nowMs: this.nowFn() });
-            const cx = Math.floor(chosenCoords[0]);
-            const cy = Math.floor(chosenCoords[1]);
-            const cz = Math.floor(chosenCoords[2]);
-            for (let dy = -2; dy <= 3; dy += 1) {
-              visitedKeys.add(`${cx},${cy + dy},${cz}`);
-            }
-            if (stuckSkips < 3) {
-              step -= 1;
-              continue;
-            }
-            if (collectedCount === 0) {
-              return {
-                ok: false,
-                stuck: true,
-                reason: "path_stuck",
-                collected_count: 0,
-                block: lastBlockName,
-                pos: lastCoords,
-                blacklisted_skipped: blacklistedSkipped,
-              };
-            }
-            break;
+          stuckSkips += 1;
+          // Persist unreachable column into TTL blacklist across turns so we stop retrying the same blocked tree/vein.
+          this._unreachableBlocks.markColumn(chosenCoords, { nowMs: this.nowFn() });
+          const cx = Math.floor(chosenCoords[0]);
+          const cy = Math.floor(chosenCoords[1]);
+          const cz = Math.floor(chosenCoords[2]);
+          for (let dy = -2; dy <= 3; dy += 1) {
+            visitedKeys.add(`${cx},${cy + dy},${cz}`);
           }
-          throw err;
+          if (stuckSkips < 3) {
+            step -= 1;
+            continue;
+          }
+          if (collectedCount === 0) {
+            return {
+              ok: false,
+              stuck: true,
+              reason: "path_stuck",
+              collected_count: 0,
+              block: lastBlockName,
+              pos: lastCoords,
+              blacklisted_skipped: blacklistedSkipped,
+            };
+          }
+          break;
         }
       }
       if (signal?.aborted) {
@@ -2650,7 +2723,36 @@ export class McRuntime {
         };
       }
       if (chosenBlock && typeof bot.dig === "function") {
-        await bot.dig(chosenBlock);
+        try {
+          await bot.dig(chosenBlock);
+        } catch {
+          if (signal?.aborted) {
+            return {
+              ok: collectedCount > 0,
+              aborted: true,
+              collected_count: collectedCount,
+              block: lastBlockName,
+              pos: lastCoords,
+            };
+          }
+          stuckSkips += 1;
+          this._unreachableBlocks.mark(chosenCoords, { nowMs: this.nowFn() });
+          if (stuckSkips < 3) {
+            step -= 1;
+            continue;
+          }
+          if (collectedCount === 0) {
+            return {
+              ok: false,
+              reason: "dig_failed",
+              collected_count: 0,
+              block: lastBlockName,
+              pos: lastCoords,
+              blacklisted_skipped: blacklistedSkipped,
+            };
+          }
+          break;
+        }
       }
       collectedCount += 1;
       await this._collectNearbyDrops(bot, chosenCoords, signal);
@@ -3084,9 +3186,9 @@ export class McRuntime {
         try {
           await this._gotoGoal(new GoalNear(coords.x, coords.y, coords.z, 1), signal);
           return { ok: true };
-        } catch (err) {
-          if (err?.code === "path_stuck") return { stuck: true };
-          throw err;
+        } catch {
+          if (signal.aborted) return { aborted: true };
+          return { stuck: true };
         }
       });
       this._refreshFromBot();
@@ -3145,7 +3247,10 @@ export class McRuntime {
         candidates[0]?.tz ?? Math.round(startPos[2] + Math.sin(baseAngle) * radii[0]);
       this.activity = `${candidates[0]?.label || "探索"}(${targetX},${targetZ})`;
       this._emitSnapshot();
+      let unstickTried = false;
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        let lastMoved = 0;
+        let sawStuck = false;
         for (let attempt = 0; attempt < candidates.length; attempt += 1) {
           if (signal.aborted) return { aborted: true };
           const curNow = this._vecToTuple(bot.entity?.position) || startPos;
@@ -3157,45 +3262,73 @@ export class McRuntime {
           this.activity = `${cand.label}(${targetX},${targetZ})`;
           try {
             await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
-            return { ok: true };
+            if (signal.aborted) return { aborted: true };
+            const endNow = this._vecToTuple(bot.entity?.position) || curNow;
+            const movedTotal = Math.hypot(endNow[0] - startPos[0], endNow[2] - startPos[2]);
+            lastMoved = Math.max(lastMoved, movedTotal);
+            if (movedTotal >= 2.5) {
+              targetX = Math.round(endNow[0]);
+              targetZ = Math.round(endNow[2]);
+              return { ok: true, movedBlocks: Math.round(movedTotal) };
+            }
+            if (!unstickTried) {
+              unstickTried = true;
+              await this._tryNaturalUnstick(bot, signal).catch(() => false);
+            }
           } catch (err) {
             if (signal.aborted) return { aborted: true };
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
             const movedTotal = Math.hypot(endNow[0] - startPos[0], endNow[2] - startPos[2]);
-            if (movedTotal >= 5) {
+            lastMoved = Math.max(lastMoved, movedTotal);
+            if (movedTotal >= 2.5) {
               targetX = Math.round(endNow[0]);
               targetZ = Math.round(endNow[2]);
-              return { ok: true, partial: true };
+              return { ok: true, partial: true, movedBlocks: Math.round(movedTotal) };
             }
-            if (err?.code === "path_stuck" || attempt < candidates.length - 1) {
-              continue;
+            if (err?.code === "path_stuck") {
+              sawStuck = true;
             }
-            throw err;
+            if (!unstickTried) {
+              unstickTried = true;
+              await this._tryNaturalUnstick(bot, signal).catch(() => false);
+            }
           }
         }
-        return { stuck: true };
+        return sawStuck
+          ? { stuck: true, movedBlocks: Math.round(lastMoved) }
+          : { noProgress: true, movedBlocks: Math.round(lastMoved) };
       });
       this._refreshFromBot();
       const rare = this.connected ? this._scanRareBlocks(bot, 24) : [];
       const signs = this.connected ? this._scanSigns(bot, 24) : [];
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
-      if (outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
+      const movedBlocks = typeof outcome?.movedBlocks === "number" ? outcome.movedBlocks : 0;
+      if (outcome?.noProgress || outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
           accepted: true,
           bridge_ready: true,
           paused: false,
-          reason: outcome.stuck
-            ? "path_stuck"
-            : outcome.timedOut
-              ? "mc_goal_timeout"
-              : "mc_goal_cancelled",
-          summary: outcome.stuck ? "探索寻路卡住" : outcome.timedOut ? "探索超时" : "探索已取消",
+          reason: outcome.noProgress
+            ? "no_movement_progress"
+            : outcome.stuck
+              ? "path_stuck"
+              : outcome.timedOut
+                ? "mc_goal_timeout"
+                : "mc_goal_cancelled",
+          moved_blocks: movedBlocks,
+          summary: outcome.noProgress
+            ? "探索未能产生有效位移（可能被地形阻挡）"
+            : outcome.stuck
+              ? "探索寻路卡住"
+              : outcome.timedOut
+                ? "探索超时"
+                : "探索已取消",
           snapshot: this.getSnapshot(),
         };
       }
-      const summary = `探索至(${targetX},${targetZ}) 发现稀有矿${rare.length}处 告示牌${signs.length}块`;
+      const summary = `探索至(${targetX},${targetZ}) 移动${movedBlocks}格 发现稀有矿${rare.length}处 告示牌${signs.length}块`;
       if (rare.length > 0 || signs.length > 0) {
         this._emitMilestone("mc_goal_completed", "normal", { action_type: "explore", summary });
       }
@@ -3205,6 +3338,7 @@ export class McRuntime {
         bridge_ready: true,
         paused: false,
         summary,
+        moved_blocks: movedBlocks,
         rare_blocks: rare,
         signs,
         snapshot: this.getSnapshot(),
@@ -3366,7 +3500,10 @@ export class McRuntime {
           paused: false,
           reason: outcome?.reason || "block_not_found",
           block: lastBlockName,
-          summary: `附近未找到可采集的${lastBlockName}`,
+          summary:
+            outcome?.reason === "dig_failed"
+              ? `挖掘${lastBlockName}失败（可能被遮挡或距离过远）`
+              : `附近未找到可采集的${lastBlockName}`,
           snapshot: this.getSnapshot(),
         };
       }
@@ -3439,8 +3576,13 @@ export class McRuntime {
       this._emitSnapshot();
       const followTimeout = Math.min(15_000, timeoutMs);
       const outcome = await this._runBoundedGoal(actionType, followTimeout, async (signal) => {
-        await this._gotoGoal(new GoalFollow(matched.entity, 2), signal);
-        return { ok: true };
+        try {
+          await this._gotoGoal(new GoalFollow(matched.entity, 2), signal);
+          return { ok: true };
+        } catch {
+          if (signal.aborted) return { aborted: true };
+          return { stuck: true };
+        }
       });
       this._refreshFromBot();
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
@@ -3453,6 +3595,17 @@ export class McRuntime {
           paused: false,
           reason: "mc_goal_cancelled",
           summary: "跟随已取消",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (outcome?.stuck) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: "path_stuck",
+          summary: "跟随寻路卡住",
           snapshot: this.getSnapshot(),
         };
       }
@@ -3608,6 +3761,8 @@ export class McRuntime {
           gotoFn: (goal, sig) => this._gotoGoal(goal, sig),
           autoEquip: this.config.mcAutoEquip !== false,
           signal,
+          isUnreachableFn: (pos) => this._unreachableBlocks.has(pos, this.nowFn()),
+          markUnreachableFn: (pos) => this._unreachableBlocks.mark(pos, { nowMs: this.nowFn() }),
         });
       });
       this._refreshFromBot();
@@ -3698,6 +3853,8 @@ export class McRuntime {
           signal,
           pollIntervalMs: this.smeltPollIntervalMs,
           maxSmeltWaitMs,
+          isUnreachableFn: (pos) => this._unreachableBlocks.has(pos, this.nowFn()),
+          markUnreachableFn: (pos) => this._unreachableBlocks.mark(pos, { nowMs: this.nowFn() }),
         });
       });
       this._refreshFromBot();
@@ -3799,6 +3956,8 @@ export class McRuntime {
           deadlineMs,
           smeltPollIntervalMs: this.smeltPollIntervalMs,
           huntAttackCooldownMs: this.huntAttackCooldownMs,
+          isUnreachableFn: (pos) => this._unreachableBlocks.has(pos, this.nowFn()),
+          markUnreachableFn: (pos) => this._unreachableBlocks.mark(pos, { nowMs: this.nowFn() }),
         });
       });
       this._refreshFromBot();

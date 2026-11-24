@@ -207,7 +207,12 @@ function allowedFurnaceNames(category) {
   return new Set(["furnace"]);
 }
 
-export function findNearbyFurnace(bot, category = "block", maxDistance = FURNACE_SEARCH_RADIUS) {
+export function findNearbyFurnace(
+  bot,
+  category = "block",
+  maxDistance = FURNACE_SEARCH_RADIUS,
+  { isUnreachableFn = null } = {},
+) {
   const origin = bot?.entity?.position;
   if (!origin) return null;
   const allowed = allowedFurnaceNames(category);
@@ -229,9 +234,11 @@ export function findNearbyFurnace(bot, category = "block", maxDistance = FURNACE
     for (const p of positions) {
       const block = typeof bot.blockAt === "function" ? bot.blockAt(p) : null;
       if (!block || !allowed.has(block.name)) continue;
-      const dist = distOf(block.position ?? p);
+      const pos = block.position ?? p;
+      if (typeof isUnreachableFn === "function" && isUnreachableFn(pos)) continue;
+      const dist = distOf(pos);
       if (Number.isFinite(dist) && dist <= maxDistance && (!best || dist < best.dist)) {
-        best = { block, pos: block.position ?? p, dist };
+        best = { block, pos, dist };
       }
     }
     if (best) return best;
@@ -243,6 +250,9 @@ export function findNearbyFurnace(bot, category = "block", maxDistance = FURNACE
       maxDistance,
     });
     if (block && allowed.has(block.name) && block.position) {
+      if (typeof isUnreachableFn === "function" && isUnreachableFn(block.position)) {
+        return null;
+      }
       const dist = distOf(block.position);
       if (Number.isFinite(dist) && dist <= maxDistance) {
         return { block, pos: block.position, dist };
@@ -356,6 +366,8 @@ export async function executeSmeltAction(
     signal = null,
     pollIntervalMs = 350,
     maxSmeltWaitMs = 24_000,
+    isUnreachableFn = null,
+    markUnreachableFn = null,
   } = {},
 ) {
   const parsed = parseSmeltParams(params);
@@ -463,22 +475,34 @@ export async function executeSmeltAction(
 
   if (signal?.aborted) return { aborted: true };
 
-  // Locate existing furnace within 16 blocks or craft/place one safely within 2 blocks
+  // Locate existing reachable furnace within 16 blocks or craft/place one safely within 2 blocks
   let furnaceBlock = null;
-  const nearby = findNearbyFurnace(bot, spec.category, FURNACE_SEARCH_RADIUS);
+  const nearby = findNearbyFurnace(bot, spec.category, FURNACE_SEARCH_RADIUS, { isUnreachableFn });
   if (nearby) {
+    let reachedNearby = true;
     if (nearby.dist > 3.5 && typeof gotoFn === "function") {
-      await gotoFn(new GoalNear(nearby.pos.x, nearby.pos.y, nearby.pos.z, 2), signal);
-      if (signal?.aborted) return { aborted: true };
+      try {
+        await gotoFn(new GoalNear(nearby.pos.x, nearby.pos.y, nearby.pos.z, 2), signal);
+        if (signal?.aborted) return { aborted: true };
+      } catch {
+        if (signal?.aborted) return { aborted: true };
+        reachedNearby = false;
+        if (typeof markUnreachableFn === "function") {
+          markUnreachableFn(nearby.pos);
+        }
+      }
     }
-    furnaceBlock = nearby.block;
-  } else {
+    if (reachedNearby) {
+      furnaceBlock = nearby.block;
+    }
+  }
+  if (!furnaceBlock) {
     let curCounts = countInventoryByName(bot);
     if ((curCounts.get("furnace") ?? 0) === 0) {
       const craftRes = await executeCraftAction(
         bot,
         { item_name: "furnace", count: 1 },
-        { gotoFn, autoEquip: false, signal },
+        { gotoFn, autoEquip: false, signal, isUnreachableFn, markUnreachableFn },
       );
       if (craftRes?.aborted || signal?.aborted) return { aborted: true };
       curCounts = countInventoryByName(bot);
