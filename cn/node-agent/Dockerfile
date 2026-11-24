@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
     rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-COPY node_agent ./node_agent
+COPY cn/node-agent/node_agent ./node_agent
 RUN groupadd --gid 10001 hakimi && useradd --uid 10001 --gid 10001 --no-create-home hakimi && \
     mkdir -p /tmp/node_bili_jobs && \
     chown 10001:10001 /tmp/node_bili_jobs && \

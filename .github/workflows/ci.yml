@@ -85,3 +85,19 @@ jobs:
             sudo apt-get install -y --no-install-recommends nginx
           fi
       - run: uv run pytest -q
+
+  cn-mc-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cn/mc-agent/package-lock.json
+      - working-directory: cn/mc-agent
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - working-directory: cn/mc-agent
+        run: npm test

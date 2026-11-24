@@ -1010,14 +1010,14 @@ def test_compute_backoff_progression_and_frame_decoder() -> None:
 def test_packaging_hardening_invariants() -> None:
     repo = Path(__file__).resolve().parents[1]
     root_df = (repo / "Dockerfile").read_text(encoding="utf-8").splitlines()
-    node_df = (repo / "node_agent/Dockerfile").read_text(encoding="utf-8").splitlines()
+    node_df = (repo / "cn/node-agent/Dockerfile").read_text(encoding="utf-8").splitlines()
     assert root_df[0] == node_df[0]
     assert root_df[1] == node_df[1]
     assert "USER 10001:10001" in node_df
     assert 'CMD ["python", "-m", "node_agent.daemon"]' in node_df
-    assert "COPY node_agent ./node_agent" in node_df
+    assert "COPY cn/node-agent/node_agent ./node_agent" in node_df
 
-    compose_text = (repo / "node_agent/compose.cn.yaml").read_text(encoding="utf-8")
+    compose_text = (repo / "cn/node-agent/compose.cn.yaml").read_text(encoding="utf-8")
     for expected in (
         "image: hakimi-node-agent:v2.1.0",
         "env_file: .env.node",
@@ -1033,13 +1033,13 @@ def test_packaging_hardening_invariants() -> None:
     ):
         assert expected in compose_text
 
-    env_example = (repo / "node_agent/.env.node.example").read_text(encoding="utf-8")
+    env_example = (repo / "cn/node-agent/.env.node.example").read_text(encoding="utf-8")
     assert "REPLACE_WITH_48_RANDOM_HEX_CHARS" in env_example
     assert "GENERATE_32+_CHAR_RANDOM_SECRET_TOKEN_BEFORE_ENABLE" in env_example
     if live_tok := os.environ.get("NODE_WS_TOKEN"):
         assert live_tok not in env_example
     with pytest.raises(ValidationError):
-        NodeAgentSettings(_env_file=repo / "node_agent/.env.node.example")
+        NodeAgentSettings(_env_file=repo / "cn/node-agent/.env.node.example")
 
 
 async def test_bili_collector_subtitle_invalid_port_rejected_cleanly(tmp_path: Path) -> None:

@@ -20,7 +20,7 @@ files = [
     root / name
     for name in (
         ".env.example",
-        ".env.napcat.example",
+        "cn/napcat/.env.napcat.example",
         ".gitignore",
         ".dockerignore",
         "README.md",
@@ -28,11 +28,11 @@ files = [
         "Dockerfile",
         "compose.yaml",
         "docker-compose.yml",
-        "docker-compose.napcat.yml",
-        "docker-compose.napcat.official-node.yml.example",
+        "cn/napcat/docker-compose.napcat.yml",
+        "cn/napcat/docker-compose.napcat.official-node.yml.example",
         "compose.roaming.yaml",
         "compose.roaming-oauth.yaml",
-        "compose.napcat.yml",
+        "cn/napcat/compose.napcat.yml",
         "pyproject.toml",
         "requirements.txt",
         "uv.lock",
@@ -46,9 +46,23 @@ for directory, pattern in (
     ("scripts", "*.sh"),
     ("deploy", "*.conf"),
     ("deploy", "*.json.example"),
+    ("cn", "*.py"),
+    ("cn", "*.mjs"),
+    ("cn", "*.sh"),
+    ("cn", "*.yaml"),
+    ("cn", "*.yml"),
+    ("cn", "*.md"),
+    ("cn", "*.example"),
+    ("cn", "Dockerfile"),
+    ("cn", "package.json"),
+    ("cn", "package-lock.json"),
     ("docs", "*.md"),
 ):
-    files.extend(p for p in (root / directory).rglob(pattern) if ".git" not in p.parts)
+    files.extend(
+        p
+        for p in (root / directory).rglob(pattern)
+        if ".git" not in p.parts and "node_modules" not in p.parts
+    )
 files.append(CATALOG / ".gitmodules")
 platforms = CATALOG / "platforms"
 files = sorted(

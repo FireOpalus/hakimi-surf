@@ -101,7 +101,7 @@ def test_mc_bridge_config_validation_ssrf_and_aliases(
 
 def test_compose_and_env_example_mc_hardening() -> None:
     repo = Path(__file__).resolve().parents[1]
-    compose_text = (repo / "node_agent/compose.cn.yaml").read_text(encoding="utf-8")
+    compose_text = (repo / "cn/node-agent/compose.cn.yaml").read_text(encoding="utf-8")
     for expected in (
         "hakimi_cn_net:",
         "hakimi-mc-agent:",
@@ -116,7 +116,7 @@ def test_compose_and_env_example_mc_hardening() -> None:
         assert expected in compose_text
     assert not re.search(r"(?m)^\s+ports:\s*$", compose_text)
 
-    env_example = (repo / "node_agent/.env.node.example").read_text(encoding="utf-8")
+    env_example = (repo / "cn/node-agent/.env.node.example").read_text(encoding="utf-8")
     for key in (
         "MC_BRIDGE_ENABLED=false",
         "MC_BRIDGE_URL=ws://hakimi-mc-agent:8791/ws",

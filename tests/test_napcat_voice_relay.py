@@ -17,7 +17,7 @@ from hakimi.config import Settings
 from hakimi.modules.adapters import onebot_message
 
 ROOT = Path(__file__).resolve().parents[1]
-RELAY_DIR = ROOT / "deploy" / "napcat_voice_relay"
+RELAY_DIR = ROOT / "cn" / "legacy" / "napcat_voice_relay"
 if str(RELAY_DIR) not in sys.path:
     sys.path.insert(0, str(RELAY_DIR))
 

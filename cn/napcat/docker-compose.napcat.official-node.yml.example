@@ -23,7 +23,7 @@ services:
     tmpfs: ['/tmp:size=256m,mode=1777']
 
   # Optional transparent OneBot voice-to-text edge relay (uses native NapCat fetch_ptt_text).
-  # Build locally: docker build -t hakimi-napcat-voice-relay:v1 ./deploy/napcat_voice_relay
+  # Build locally: docker build -t hakimi-napcat-voice-relay:v1 ../legacy/napcat_voice_relay
   # napcat-voice-relay:
   #   image: hakimi-napcat-voice-relay:v1
   #   pull_policy: never

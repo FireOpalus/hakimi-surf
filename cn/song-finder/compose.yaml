@@ -1,0 +1,29 @@
+services:
+  hakimi-plugin-song-finder:
+    image: hakimi-plugin-song-finder:v1.0.0
+    command: ["python", "-m", "plugins.song_finder.plugin_main"]
+    env_file:
+      - .env.song_finder
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,uid=10001,gid=10001,mode=700,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 64
+    restart: unless-stopped
+    networks:
+      - hakimi_song_finder_net
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+networks:
+  hakimi_song_finder_net:
+    driver: bridge
