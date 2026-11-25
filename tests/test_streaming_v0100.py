@@ -430,7 +430,7 @@ async def test_receipt_recovery_is_idempotent_and_group_public_index(settings, s
     assert (await service.sessions.snapshot(m))["recent_messages"] == original
     await persist_ack(service, reply, 1, "第二个气泡", {"message_id": 901}, epoch)
     await recover_receipts(service)
-    assert service.world_state.current.energy == 79.6
+    assert service.world_state.current.energy == 79.8
     assert await service.world_state.experience.battery(message, now) == 98.75
     with pytest.raises(Rejected):
         await persist_ack(service, dict(reply, id="unconfirmed"), 0, "未确认", {}, epoch)

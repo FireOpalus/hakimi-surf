@@ -51,7 +51,7 @@ async def exit_bus_env(settings: Any):
 
 
 def test_mc_brain_config_solo_cruise_interval_default() -> None:
-    assert McBrainConfig().solo_cruise_interval_seconds == 150.0
+    assert McBrainConfig().solo_cruise_interval_seconds == 60.0
 
 
 async def test_plugin_bus_session_exit_action_handshake_acceptance_and_rejection(

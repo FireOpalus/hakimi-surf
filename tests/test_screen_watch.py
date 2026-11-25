@@ -331,6 +331,7 @@ async def test_screen_watch_standalone_overlay_qq_fallback_silent_and_privacy_ga
         svc = app.state.service
         sw = svc.screen_watch
         sw.clock = lambda: now[0]
+        svc.proactive.clock = lambda: now[0]
 
         # Real GeminiGateway guard blocks scenario="screen.watch" outside Owner private scope
         real_gw = GeminiGateway(s, svc.store)

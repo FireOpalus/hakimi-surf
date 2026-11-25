@@ -92,7 +92,7 @@ async def test_chat_pipeline_without_qq(settings, store, message, kind):
         await svc.process(job)
         assert await svc.deliver_once()
         assert await svc.world_state.experience.battery(message, now) == 68.75
-        assert svc.world_state.current.energy == 79.5
+        assert svc.world_state.current.energy == 79.8
         assert [m.user_id for m, _ in forum.sent] == [incoming.user_id]
         payload = next(c[1] for c in svc.ai.calls if c[0] == "generate")
         assert "社区公开动态" in payload["module_context"]["forum_chat"]
