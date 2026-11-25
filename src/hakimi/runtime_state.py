@@ -25,6 +25,7 @@ from .limits_policy import (
     RateLimitConfig,
 )
 from .models import Message
+from .policy_registry import SIMPLE_LIMIT_BY_KEY, SIMPLE_LIMIT_SPECS, build_env_policy
 from .provider_diagnostics import safe_attempts
 from .provider_routing import ProviderRoutingManager
 from .rest_policy import RestHoursConfig
@@ -163,31 +164,12 @@ class RuntimeState:
         self.env_debounce = DebounceConfig.from_settings(self.s)
         self.debounce_override = None
         self.debounce_lock = asyncio.Lock()
-        self.env_rate_limits = RateLimitConfig.from_settings(self.s)
-        self.rate_limits = self.env_rate_limits
-        self.rate_limits_overridden = False
-        self.rate_limits_lock = asyncio.Lock()
-        self.env_generation_caps = GenerationCapsConfig.from_settings(self.s)
-        self.generation_caps = self.env_generation_caps
-        self.generation_caps_overridden = False
-        self.generation_caps_lock = asyncio.Lock()
-        self.env_patrol_limits = PatrolLimitConfig.from_settings(self.s)
-        self.patrol_limits = self.env_patrol_limits
-        self.patrol_limits_overridden = False
-        self.patrol_limits_lock = asyncio.Lock()
-        self.env_image_limits = ImageLimitsConfig(
-            image_max_bytes=max(1_048_576, self.s.image_max_bytes),
-            image_max_pixels=self.s.image_max_pixels,
-            image_standard_max_edge=self.s.image_standard_max_edge,
-            image_tall_max_edge=self.s.image_tall_max_edge,
-        )
-        self.image_limits = self.env_image_limits
-        self.image_limits_overridden = False
-        self.image_limits_lock = asyncio.Lock()
-        self.env_content_tools = ContentToolsConfig.from_settings(self.s)
-        self.content_tools = self.env_content_tools
-        self.content_tools_overridden = False
-        self.content_tools_lock = asyncio.Lock()
+        for spec in SIMPLE_LIMIT_SPECS:
+            env_val = build_env_policy(spec, self.s)
+            setattr(self, f"env_{spec.attr}", env_val)
+            setattr(self, spec.attr, env_val)
+            setattr(self, f"{spec.attr}_overridden", False)
+            setattr(self, f"{spec.attr}_lock", asyncio.Lock())
         self.clock = time.time
         self.env_rest_hours = RestHoursConfig.from_settings(self.s)
         self.rest_hours = self.env_rest_hours
@@ -253,21 +235,11 @@ class RuntimeState:
         self.compression = self.env_compression
         self.compression_overridden = False
         self.s.history_high_tokens = self.env_compression.history_high_tokens
-        self.rate_limits = self.env_rate_limits
-        self.rate_limits_overridden = False
-        self._apply_fields(self.env_rate_limits)
-        self.generation_caps = self.env_generation_caps
-        self.generation_caps_overridden = False
-        self._apply_fields(self.env_generation_caps)
-        self.patrol_limits = self.env_patrol_limits
-        self.patrol_limits_overridden = False
-        self._apply_fields(self.env_patrol_limits)
-        self.image_limits = self.env_image_limits
-        self.image_limits_overridden = False
-        self._apply_fields(self.env_image_limits)
-        self.content_tools = self.env_content_tools
-        self.content_tools_overridden = False
-        self._apply_fields(self.env_content_tools)
+        for spec in SIMPLE_LIMIT_SPECS:
+            env_val = getattr(self, f"env_{spec.attr}")
+            setattr(self, spec.attr, env_val)
+            setattr(self, f"{spec.attr}_overridden", False)
+            self._apply_fields(env_val)
         self._apply_rest_hours(self.env_rest_hours)
         self.rest_hours_overridden = False
         admission = self.env_admission
@@ -312,26 +284,11 @@ class RuntimeState:
                 model_values.update(value)
             elif row["key"] == "debounce":
                 self.debounce_override = DebounceConfig.model_validate(value)
-            elif row["key"] == "rate_limits":
-                self.rate_limits = self._validate_loaded(self.env_rate_limits, value)
-                self.rate_limits_overridden = True
-                self._apply_fields(self.rate_limits)
-            elif row["key"] == "generation_caps":
-                self.generation_caps = self._validate_loaded(self.env_generation_caps, value)
-                self.generation_caps_overridden = True
-                self._apply_fields(self.generation_caps)
-            elif row["key"] == "patrol_limits":
-                self.patrol_limits = self._validate_loaded(self.env_patrol_limits, value)
-                self.patrol_limits_overridden = True
-                self._apply_fields(self.patrol_limits)
-            elif row["key"] == "image_limits":
-                self.image_limits = self._validate_loaded(self.env_image_limits, value)
-                self.image_limits_overridden = True
-                self._apply_fields(self.image_limits)
-            elif row["key"] == "content_tools":
-                self.content_tools = self._validate_loaded(self.env_content_tools, value)
-                self.content_tools_overridden = True
-                self._apply_fields(self.content_tools)
+            elif (spec := SIMPLE_LIMIT_BY_KEY.get(row["key"])) is not None:
+                loaded = self._validate_loaded(getattr(self, f"env_{spec.attr}"), value)
+                setattr(self, spec.attr, loaded)
+                setattr(self, f"{spec.attr}_overridden", True)
+                self._apply_fields(loaded)
             elif row["key"] == "rest_hours":
                 self._apply_rest_hours(self._validate_loaded(self.env_rest_hours, value))
                 self.rest_hours_overridden = True
@@ -600,89 +557,62 @@ class RuntimeState:
             setattr(self, attr + "_overridden", value is not None)
             return self._limits_status(effective, env_model, value is not None)
 
-    def rate_limits_status(self):
-        return self._limits_status(
-            self.rate_limits, self.env_rate_limits, self.rate_limits_overridden
-        )
-
-    async def set_rate_limits(self, value: RateLimitConfig | None):
-        return await self._save_limits(
-            "rate_limits",
-            value,
-            RateLimitConfig,
-            self.rate_limits_lock,
-            self.env_rate_limits,
-            "rate_limits",
-        )
-
-    def generation_caps_status(self):
+    def policy_status(self, key: str):
+        spec = SIMPLE_LIMIT_BY_KEY[key]
         status = self._limits_status(
-            self.generation_caps, self.env_generation_caps, self.generation_caps_overridden
+            getattr(self, spec.attr),
+            getattr(self, f"env_{spec.attr}"),
+            getattr(self, f"{spec.attr}_overridden"),
         )
-        used = {scene.output_cap for scene in self.s._thinking_scenes.values()} | {
-            "high_output_tokens"
-        }
-        status["fields"] = {
-            k: v
-            for k, v in GenerationCapsConfig.model_json_schema()["properties"].items()
-            if k in used
-        }
+        if key == "generation_caps":
+            used = {scene.output_cap for scene in self.s._thinking_scenes.values()} | {
+                "high_output_tokens"
+            }
+            status["fields"] = {
+                k: v for k, v in spec.model.model_json_schema()["properties"].items() if k in used
+            }
         return status
 
-    async def set_generation_caps(self, value: GenerationCapsConfig | None):
+    async def set_policy(self, key: str, value):
+        spec = SIMPLE_LIMIT_BY_KEY[key]
         return await self._save_limits(
-            "generation_caps",
+            spec.key,
             value,
-            GenerationCapsConfig,
-            self.generation_caps_lock,
-            self.env_generation_caps,
-            "generation_caps",
+            spec.model,
+            getattr(self, f"{spec.attr}_lock"),
+            getattr(self, f"env_{spec.attr}"),
+            spec.attr,
         )
+
+    def rate_limits_status(self):
+        return self.policy_status("rate_limits")
+
+    async def set_rate_limits(self, value: RateLimitConfig | None):
+        return await self.set_policy("rate_limits", value)
+
+    def generation_caps_status(self):
+        return self.policy_status("generation_caps")
+
+    async def set_generation_caps(self, value: GenerationCapsConfig | None):
+        return await self.set_policy("generation_caps", value)
 
     def patrol_limits_status(self):
-        return self._limits_status(
-            self.patrol_limits, self.env_patrol_limits, self.patrol_limits_overridden
-        )
+        return self.policy_status("patrol_limits")
 
     async def set_patrol_limits(self, value: PatrolLimitConfig | None):
-        return await self._save_limits(
-            "patrol_limits",
-            value,
-            PatrolLimitConfig,
-            self.patrol_limits_lock,
-            self.env_patrol_limits,
-            "patrol_limits",
-        )
+        return await self.set_policy("patrol_limits", value)
 
     def image_limits_status(self):
-        return self._limits_status(
-            self.image_limits, self.env_image_limits, self.image_limits_overridden
-        )
+        return self.policy_status("image_limits")
 
     async def set_image_limits(self, value: ImageLimitsConfig | None):
-        return await self._save_limits(
-            "image_limits",
-            value,
-            ImageLimitsConfig,
-            self.image_limits_lock,
-            self.env_image_limits,
-            "image_limits",
-        )
+        return await self.set_policy("image_limits", value)
 
     def content_tools_status(self):
-        return self._limits_status(
-            self.content_tools, self.env_content_tools, self.content_tools_overridden
-        )
+        return self.policy_status("content_tools")
 
     async def set_content_tools(self, value: ContentToolsConfig | None):
-        return await self._save_limits(
-            "content_tools",
-            value,
-            ContentToolsConfig,
-            self.content_tools_lock,
-            self.env_content_tools,
-            "content_tools",
-        )
+        return await self.set_policy("content_tools", value)
 
     def _apply_rest_hours(self, value: RestHoursConfig):
         # Synchronous update: readers never observe partial rest-hour settings.

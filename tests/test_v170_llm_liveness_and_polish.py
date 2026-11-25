@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import hakimi
+from admin.build import build_html
 from hakimi.adapters import Sender
 from hakimi.bot_server import prompt_context
 from hakimi.context_budget import estimate_tokens
@@ -189,6 +190,6 @@ def test_version_170_consistent_across_repo():
     assert 'version = "2.1.0"' in (root / "pyproject.toml").read_text()
     lock_text = (root / "uv.lock").read_text()
     assert re.search(r'name = "hakimi-surf"\nversion = "2\.1\.0"', lock_text)
-    admin_html = (root / "admin/admin_page.html").read_text()
+    admin_html = build_html()
     assert admin_html.count("v2.1.0") >= 2
     assert "**当前版本：v2.1.0**" in (root / "README.md").read_text()

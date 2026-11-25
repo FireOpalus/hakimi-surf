@@ -29,7 +29,9 @@ deploy() {
     fi
 
     candidate="$image:rev-${revision:0:12}"
-    scripts/archive_release.sh "$revision" "$context" | docker build --label "org.opencontainers.image.revision=$revision" \
+    scripts/archive_release.sh "$revision" "$context" | docker build \
+        --build-arg "HAKIMI_VERSION=$version" \
+        --label "org.opencontainers.image.revision=$revision" \
         --label "org.opencontainers.image.version=$version" -t "$candidate" -
     if [[ $service == hakimi-admin ]]; then
         docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL "$candidate" -t
@@ -50,5 +52,5 @@ deploy() {
     fi
 }
 
-if [[ $mode != engine ]]; then deploy hakimi-admin admin 12143 admin; fi
+if [[ $mode != engine ]]; then deploy hakimi-admin admin 12143 admin pyproject.toml src/hakimi/__init__.py; fi
 if [[ $mode != admin ]]; then deploy hakimi-bot . 12141 src Dockerfile pyproject.toml uv.lock .dockerignore; fi

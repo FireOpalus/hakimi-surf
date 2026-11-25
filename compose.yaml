@@ -29,7 +29,10 @@ services:
         max-size: 10m
         max-file: '3'
   hakimi-admin:
-    build: ./admin
+    build:
+      context: ./admin
+      args:
+        HAKIMI_VERSION: ${HAKIMI_VERSION:-2.1.0}
     ports:
       - '127.0.0.1:12143:8080'
     environment:

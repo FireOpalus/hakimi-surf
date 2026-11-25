@@ -34,3 +34,6 @@ docker-compose.*.local.yml
 compose.*.local.yaml
 *.pem
 *.key
+
+# Assembled dynamically at Docker/test time via admin/build.py
+admin/admin_page.html

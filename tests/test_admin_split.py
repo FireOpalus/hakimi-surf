@@ -15,6 +15,7 @@ import uvicorn
 from pydantic import SecretStr
 from websockets.asyncio.client import connect
 
+from admin.build import build_html
 from admin.csp import content_security_policy
 from hakimi import admin_routes
 from hakimi.app import create_app
@@ -108,7 +109,7 @@ async def test_ui_release_preserves_inflight_onebot_reply(settings, tmp_path, mo
                 "X-Self-ID": "10000",
                 "X-Client-Role": "Universal",
             }
-            original = (ASSETS / "admin_page.html").read_text()
+            original = build_html()
             previous = original.replace("<style>", "<style>\n/* Previous UI */\n", 1)
             auth = {"Authorization": "Bearer " + settings.admin_token.get_secret_value()}
             async with connect(

@@ -2,17 +2,17 @@
 
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 import pytest
 
+from admin.build import build_html
 from admin.csp import content_security_policy
 from hakimi import admin_routes
 
 
 @pytest.fixture(scope="session")
 def console_endpoint():
-    data = (Path(__file__).resolve().parents[1] / "admin/admin_page.html").read_bytes()
+    data = build_html().encode("utf-8")
     policy = content_security_policy(data.decode())
 
     class Document(BaseHTTPRequestHandler):

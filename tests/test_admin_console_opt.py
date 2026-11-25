@@ -45,11 +45,10 @@ from voice_gateway.app import create_gateway_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ADMIN_DIR = REPO_ROOT / "admin"
-ADMIN_HTML = ADMIN_DIR / "admin_page.html"
 NGINX_CONF = ADMIN_DIR / "nginx.conf"
 
 
-def test_admin_build_check_and_version_sync():
+def test_admin_build_check_and_version_sync(tmp_path):
     assert read_version() == __version__
     proc = subprocess.run(
         [sys.executable, str(ADMIN_DIR / "build.py"), "--check"],
@@ -60,13 +59,49 @@ def test_admin_build_check_and_version_sync():
     )
     assert proc.returncode == 0, proc.stderr or proc.stdout
     built = build_html()
-    assert ADMIN_HTML.read_text(encoding="utf-8") == built
     assert f"v{__version__}" in built
     assert "{{VERSION}}" not in built
 
+    override = build_html(version_override="9.9.9")
+    assert "v9.9.9" in override
+    assert audit_html(override, version_override="9.9.9") == []
+
+    out_path = tmp_path / "admin_page.html"
+    proc_write = subprocess.run(
+        [
+            sys.executable,
+            str(ADMIN_DIR / "build.py"),
+            "--version",
+            __version__,
+            "--output",
+            str(out_path),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_write.returncode == 0, proc_write.stderr or proc_write.stdout
+    assert out_path.read_text(encoding="utf-8") == built
+    proc_verify = subprocess.run(
+        [
+            sys.executable,
+            str(ADMIN_DIR / "build.py"),
+            "--check",
+            "--verify-file",
+            "--output",
+            str(out_path),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_verify.returncode == 0, proc_verify.stderr or proc_verify.stdout
+
 
 def test_admin_html_static_security_and_dom_integrity():
-    html = ADMIN_HTML.read_text(encoding="utf-8")
+    html = build_html()
     assert audit_html(html) == []
 
     styles = re.findall(r"<style>(.*?)</style>", html, re.S)
@@ -503,7 +538,7 @@ async def test_admin_common_domain_lock_partial_body_and_binary_upload(settings)
 
 def test_unified_cloud_resource_view_dom_contract_and_csp():
     """Verify Unified Cloud Resource View DOM IDs, #6 Colab schema hooks, SVG chart, and CSP."""
-    html = ADMIN_HTML.read_text(encoding="utf-8")
+    html = build_html()
     assert audit_html(html) == []
 
     collector = _IdCollector()
@@ -608,7 +643,7 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
     colab_view_js = shell_js[colab_start:colab_end]
 
     # Collect every static HTML ID so the mock document returns a valid MockElement for all of them.
-    html = ADMIN_HTML.read_text(encoding="utf-8")
+    html = build_html()
     collector = _IdCollector()
     collector.feed(html)
     all_ids_json = json.dumps(sorted(set(collector.ids)))
@@ -1055,7 +1090,7 @@ def test_colab_and_songs_ui_physical_decoupling():
     import json
     import shutil
 
-    html = ADMIN_HTML.read_text(encoding="utf-8")
+    html = build_html()
     assert audit_html(html) == []
 
     collector = _IdCollector()
@@ -1531,7 +1566,7 @@ def test_colab_config_and_song_learn_form_submit_payloads():
     if runner is None:
         pytest.skip("No local JS engine (node/jsc) available for form submit payload test")
 
-    html = ADMIN_HTML.read_text(encoding="utf-8")
+    html = build_html()
     collector = _IdCollector()
     collector.feed(html)
     all_ids_json = json.dumps(sorted(set(collector.ids)))

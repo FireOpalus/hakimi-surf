@@ -8,7 +8,6 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
@@ -16,6 +15,7 @@ import httpx
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from admin.build import build_html
 from hakimi.app import create_app
 from hakimi.config import Settings
 from hakimi.file_reader import FileReader
@@ -695,9 +695,7 @@ async def test_owner_chat_learn_song_handle_message_passes_context_message_e2e(
 
 
 def _valid_admin_tabs() -> set[str]:
-    html = (Path(__file__).resolve().parents[1] / "admin" / "admin_page.html").read_text(
-        encoding="utf-8"
-    )
+    html = build_html()
     return set(re.findall(r'data-tab="([^"]+)"', html))
 
 

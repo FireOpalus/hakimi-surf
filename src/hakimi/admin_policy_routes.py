@@ -18,14 +18,8 @@ from .admission_policy import (
 from .budget_policy import BudgetConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterConfig
-from .limits_policy import (
-    ContentToolsConfig,
-    GenerationCapsConfig,
-    ImageLimitsConfig,
-    PatrolLimitConfig,
-    RateLimitConfig,
-)
 from .models import Message
+from .policy_registry import SIMPLE_LIMIT_SPECS, PolicySpec, export_policy_schemas
 from .rest_policy import RestHoursConfig
 from .security import Rejected
 from .thinking_policy import ModelSettingsUpdate, ThinkingConfig
@@ -133,96 +127,42 @@ async def account_balance_clear(request: Request):
         return await service(request).store.clear_account_balance()
 
 
-@router.get("/rate-limits")
-async def rate_limits_status(request: Request):
-    return service(request).store.runtime.rate_limits_status()
+@router.get("/policies/schema")
+async def policies_schema(request: Request):
+    return export_policy_schemas(service(request).store.s)
 
 
-@router.put("/rate-limits")
-async def rate_limits_save(request: Request):
-    value = await body(request, RateLimitConfig)
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_rate_limits(value)
+def _mount_simple_limit_routes(spec: PolicySpec) -> None:
+    async def get_status(request: Request):
+        return service(request).store.runtime.policy_status(spec.key)
+
+    async def save_policy(request: Request):
+        value = await body(request, spec.model)
+        async with domain_lock(request, spec.lock):
+            runtime = service(request).store.runtime
+            if spec.partial_update:
+                current = getattr(runtime, spec.attr)
+                merged = current.model_dump() | value.model_dump(exclude_unset=True)
+                value = spec.model.model_validate(merged)
+            return await runtime.set_policy(spec.key, value)
+
+    async def reset_policy(request: Request):
+        async with domain_lock(request, spec.lock):
+            return await service(request).store.runtime.set_policy(spec.key, None)
+
+    get_status.__name__ = f"{spec.key}_status"
+    save_policy.__name__ = f"{spec.key}_save"
+    reset_policy.__name__ = f"{spec.key}_reset"
+    globals()[get_status.__name__] = get_status
+    globals()[save_policy.__name__] = save_policy
+    globals()[reset_policy.__name__] = reset_policy
+    router.get(spec.route)(get_status)
+    router.put(spec.route)(save_policy)
+    router.delete(spec.route)(reset_policy)
 
 
-@router.delete("/rate-limits")
-async def rate_limits_reset(request: Request):
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_rate_limits(None)
-
-
-@router.get("/image-limits")
-async def image_limits_status(request: Request):
-    return service(request).store.runtime.image_limits_status()
-
-
-@router.put("/image-limits")
-async def image_limits_save(request: Request):
-    value = await body(request, ImageLimitsConfig)
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_image_limits(value)
-
-
-@router.delete("/image-limits")
-async def image_limits_reset(request: Request):
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_image_limits(None)
-
-
-@router.get("/content-tools")
-async def content_tools_status(request: Request):
-    return service(request).store.runtime.content_tools_status()
-
-
-@router.put("/content-tools")
-async def content_tools_save(request: Request):
-    value = await body(request, ContentToolsConfig)
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_content_tools(value)
-
-
-@router.delete("/content-tools")
-async def content_tools_reset(request: Request):
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_content_tools(None)
-
-
-@router.get("/generation-caps")
-async def generation_caps_status(request: Request):
-    return service(request).store.runtime.generation_caps_status()
-
-
-@router.put("/generation-caps")
-async def generation_caps_save(request: Request):
-    value = await body(request, GenerationCapsConfig)
-    async with domain_lock(request, "limits"):
-        runtime = service(request).store.runtime
-        merged = runtime.generation_caps.model_dump() | value.model_dump(exclude_unset=True)
-        return await runtime.set_generation_caps(GenerationCapsConfig.model_validate(merged))
-
-
-@router.delete("/generation-caps")
-async def generation_caps_reset(request: Request):
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_generation_caps(None)
-
-
-@router.get("/patrol-limits")
-async def patrol_limits_status(request: Request):
-    return service(request).store.runtime.patrol_limits_status()
-
-
-@router.put("/patrol-limits")
-async def patrol_limits_save(request: Request):
-    value = await body(request, PatrolLimitConfig)
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_patrol_limits(value)
-
-
-@router.delete("/patrol-limits")
-async def patrol_limits_reset(request: Request):
-    async with domain_lock(request, "limits"):
-        return await service(request).store.runtime.set_patrol_limits(None)
+for _spec in SIMPLE_LIMIT_SPECS:
+    _mount_simple_limit_routes(_spec)
 
 
 @router.get("/rest-hours")

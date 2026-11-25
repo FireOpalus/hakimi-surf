@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import re
 import sys
 from html.parser import HTMLParser
@@ -75,7 +76,14 @@ class _IdCollector(HTMLParser):
             self._in_raw_tag = None
 
 
-def read_version() -> str:
+def read_version(version_override: str | None = None) -> str:
+    raw = (
+        version_override if version_override is not None else os.environ.get("HAKIMI_VERSION", "")
+    ).strip()
+    if raw:
+        if any(ch.isspace() or ch in "<>&\"'" for ch in raw):
+            raise ValueError(f"Invalid version override: {raw!r}")
+        return raw
     text = INIT_FILE.read_text(encoding="utf-8")
     match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
     if not match:
@@ -92,8 +100,8 @@ def _load_csp_module():
     return mod
 
 
-def build_html() -> str:
-    version = read_version()
+def build_html(version_override: str | None = None) -> str:
+    version = read_version(version_override)
 
     css_files = sorted(CSS_DIR.glob("*.css"))
     if not css_files:
@@ -176,9 +184,9 @@ def _extract_js_id_refs(script: str) -> list[str]:
     return refs
 
 
-def audit_html(html: str) -> list[str]:
+def audit_html(html: str, version_override: str | None = None) -> list[str]:
     errors: list[str] = []
-    version = read_version()
+    version = read_version(version_override)
 
     lines = html.splitlines()
     if not lines or lines[0].strip() != "<!doctype html>":
@@ -269,34 +277,52 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Verify admin/admin_page.html matches admin/src/ without writing",
+        help="Assemble and audit in memory without writing to disk",
+    )
+    parser.add_argument(
+        "--verify-file",
+        action="store_true",
+        help="With --check, also verify that --output on disk matches the assembled HTML",
+    )
+    parser.add_argument(
+        "--version",
+        default=None,
+        help="Override version string instead of reading src/hakimi/__init__.py",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(OUT_FILE),
+        help="Target output path when writing assembled HTML",
     )
     args = parser.parse_args(argv)
 
-    html = build_html()
-    errors = audit_html(html)
+    html = build_html(version_override=args.version)
+    errors = audit_html(html, version_override=args.version)
     if errors:
         for err in errors:
             print(f"[build.py ERROR] {err}", file=sys.stderr)
         return 1
 
+    target = Path(args.output)
     if args.check:
-        if not OUT_FILE.is_file():
-            print(f"[build.py ERROR] Missing output file: {OUT_FILE}", file=sys.stderr)
-            return 1
-        existing = OUT_FILE.read_text(encoding="utf-8")
-        if existing != html:
-            print(
-                f"[build.py ERROR] {OUT_FILE} is out of date; run 'python3 admin/build.py'",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"[build.py OK] {OUT_FILE} matches admin/src/ and passed all audits.")
+        if args.verify_file:
+            if not target.is_file():
+                print(f"[build.py ERROR] Missing output file: {target}", file=sys.stderr)
+                return 1
+            existing = target.read_text(encoding="utf-8")
+            if existing != html:
+                print(
+                    f"[build.py ERROR] {target} is out of date; run 'python3 admin/build.py'",
+                    file=sys.stderr,
+                )
+                return 1
+        size = len(html.encode("utf-8"))
+        print(f"[build.py OK] Assembled in memory ({size} bytes) and passed all audits.")
         return 0
 
-    OUT_FILE.write_text(html, encoding="utf-8")
+    target.write_text(html, encoding="utf-8")
     size = len(html.encode("utf-8"))
-    print(f"[build.py OK] Wrote {OUT_FILE} ({size} bytes), all audits passed.")
+    print(f"[build.py OK] Wrote {target} ({size} bytes), all audits passed.")
     return 0
 
 
