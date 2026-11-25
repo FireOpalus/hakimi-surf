@@ -198,8 +198,14 @@ class _PlayBrainActionsMixin:
         reason = str(res.get("reason") or "failed").strip()[:28]
         blocker = str(res.get("blocker_item") or "").strip()
         blocker_part = f":{blocker}" if _ITEM_NAME_RE.fullmatch(blocker) else ""
+        wood_logs = res.get("wood_shortfall_logs")
+        logs_suffix = (
+            f",need_logs:{wood_logs}"
+            if isinstance(wood_logs, int) and not isinstance(wood_logs, bool) and wood_logs > 0
+            else ""
+        )
         partial_part = f"(partial:{step_cnt}steps)" if step_cnt > 0 else ""
-        return f"acquire:{reason}{blocker_part}{partial_part}"[:80]
+        return f"acquire:{reason}{blocker_part}{logs_suffix}{partial_part}"[:80]
 
     @staticmethod
     def _format_craft_outcome(res: dict[str, Any] | None, item_name: str) -> str:

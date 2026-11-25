@@ -3521,5 +3521,19 @@ async def test_mc_action_log_not_truncated_by_plugin_bus_and_evade_shelter_backo
         )
         plugin.apply_snapshot(snap_shelter_day)
         assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(15.0)
+
+        # 7. _format_acquire_outcome surfaces wood_shortfall_logs so Layer 2 stops looping acquire.
+        acq_note = plugin.brain._format_acquire_outcome(
+            {
+                "ok": False,
+                "reason": "no_crafting_table",
+                "item_name": "stone_pickaxe",
+                "blocker_item": "stone_pickaxe",
+                "wood_shortfall_logs": 1,
+                "wood_shortfall_planks": 3,
+            },
+            "stone_pickaxe",
+        )
+        assert acq_note == "acquire:no_crafting_table:stone_pickaxe,need_logs:1"
     finally:
         await plugin.close()
