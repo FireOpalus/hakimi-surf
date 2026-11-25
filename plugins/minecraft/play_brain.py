@@ -519,6 +519,9 @@ class McPlayBrain:
         self._last_combat_retreat_chat_at: float = -1e9
         self._last_evade_flee_at: float = -1e9
         self._last_death_chat_at: float = -1e9
+        self._last_death_escalate_at: float = -1e9
+        self._recent_death_times: deque[float] = deque(maxlen=8)
+        self._consecutive_cruise_skips: int = 0
 
         self._last_mono: float = time.monotonic()
         self._last_clk: float = float(plugin.clock())
@@ -759,6 +762,8 @@ class McPlayBrain:
         self._chain_next_step = False
         self._recovery_retry_pending = False
         self._consecutive_failures = 0
+        self._consecutive_cruise_skips = 0
+        self._recent_death_times.clear()
         self._first_cruise_pending = True
         self._last_turn_snapshot = None
         self._chat_first_at = None
@@ -1362,6 +1367,24 @@ class McPlayBrain:
             return True
         return any(self._inventory_count(snap, food_id) >= 1 for food_id in _COOKABLE_RAW_FOODS)
 
+    def _has_basic_tool(self, snap: Any) -> bool:
+        equip = getattr(snap, "equipment", None)
+        main_hand = str(equip.get("main_hand") or "").lower() if isinstance(equip, dict) else ""
+        if main_hand.endswith(("_pickaxe", "_sword", "_axe")):
+            return True
+        inv = getattr(snap, "inventory_summary", ()) or ()
+        for entry in inv:
+            item_id = str(entry).split(":", 1)[0].strip().lower()
+            if item_id.endswith(("_pickaxe", "_sword", "_axe")):
+                return True
+        return False
+
+    def _recent_death_count(self, now: float, *, window_seconds: float = 300.0) -> int:
+        cutoff = now - window_seconds
+        while self._recent_death_times and self._recent_death_times[0] < cutoff:
+            self._recent_death_times.popleft()
+        return len(self._recent_death_times)
+
     async def _try_fast_survival_milestone(
         self,
         *,
@@ -1391,6 +1414,15 @@ class McPlayBrain:
             primary = "mc_death"
             self._chain_next_step = False
             self._recovery_retry_pending = False
+            self._recent_death_times.append(now)
+            reflex = set(getattr(snap, "reflex_modes", ()) or ())
+            if (
+                "sheltered" not in reflex
+                and self._recent_death_count(now, window_seconds=180.0) >= 2
+                and (now - self._last_death_escalate_at) >= 90.0
+            ):
+                self._last_death_escalate_at = now
+                return False
             if cur_mode != "evade":
                 await self._dispatch_goal_safe({"action_type": "evade"})
             if has_players and (now - self._last_death_chat_at) >= 60.0:
@@ -1541,6 +1573,20 @@ class McPlayBrain:
             t.get("action") in ("stay", "idle", "observe") for t in self.recent_turns[-2:]
         ):
             return "stalled_idle_turns"
+        if not getattr(snap, "nearby_players", ()):
+            now = self._now()
+            if (
+                self._recent_death_count(now, window_seconds=300.0) >= 2
+                and (now - self._last_death_escalate_at) >= 90.0
+            ):
+                self._last_death_escalate_at = now
+                return "recent_deaths_need_shelter_or_gear"
+            if self._consecutive_cruise_skips >= 2 and (
+                not self._has_basic_tool(snap)
+                or bool(self._active_plan)
+                or bool(self.plugin.session_intent)
+            ):
+                return "solo_progression_after_skips"
         return ""
 
     async def _route_cruise_decision(
@@ -1618,6 +1664,7 @@ class McPlayBrain:
                 )
             self._chain_next_step = False
             self._recovery_retry_pending = False
+            self._consecutive_cruise_skips += 1
             self.cruise_skipped_count += 1
             self._last_reason = (
                 "cruise_gate:keep_current" if stance == "keep_current" else "cruise_gate:no_replan"
@@ -1701,6 +1748,23 @@ class McPlayBrain:
             and cur_mode == "guard"
         ):
             await self._dispatch_goal_safe({"action_type": "evade"})
+            self._consecutive_cruise_skips += 1
+            self.cruise_skipped_count += 1
+            self._last_reason = "cruise_gate:low_confidence_conservative"
+            await self._push_status_safe()
+            return "skip", None
+        escalate_hint = self._needs_model_judgment_on_idle(snap)
+        if escalate_hint:
+            return (
+                "escalate",
+                {
+                    "template": _MC_CRUISE_GATE_TEMPLATE,
+                    "stance": "uncertain",
+                    "confidence": round(stance_conf, 3),
+                    "hint": escalate_hint,
+                },
+            )
+        self._consecutive_cruise_skips += 1
         self.cruise_skipped_count += 1
         self._last_reason = "cruise_gate:low_confidence_conservative"
         await self._push_status_safe()
@@ -1925,6 +1989,7 @@ class McPlayBrain:
                 event_batch=event_batch,
                 routing_hint=routing_hint,
             )
+            self._consecutive_cruise_skips = 0
             self._call_times.append(now)
             try:
                 raw_out = await self.plugin.client.ai_generate(

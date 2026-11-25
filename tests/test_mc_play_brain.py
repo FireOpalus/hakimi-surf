@@ -3240,3 +3240,112 @@ async def test_mc_explore_progress_neutral_enderman_and_moved_blocks_artifact() 
         assert goal_res["artifacts"]["moved_blocks"] == 9
     finally:
         await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_mc_low_confidence_solo_progression_and_repeated_death_escalation() -> None:
+    """Break solo low-confidence skip loops and escalate repeated rapid deaths with cooldown."""
+    now = [5_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+        brain_config=McBrainConfig(event_cooldown_seconds=0.01),
+    )
+    gen_payloads: list[dict[str, Any]] = []
+
+    async def fake_bridge(_action: str, _params: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "accepted": True}
+
+    async def fake_budget(_lane: str) -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        # Low-confidence uncertain cruise gate response
+        return {
+            "passed": True,
+            "decisions": {
+                "should_replan": {
+                    "type": "noul",
+                    "value": False,
+                    "noul": 0.45,
+                    "confidence": 0.52,
+                    "confident": False,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "keep_current",
+                    "confidence": 0.42,
+                    "probabilities": {"keep_current": 0.42},
+                    "confident": False,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, payload: dict[str, Any], **_kw: Any) -> str:
+        gen_payloads.append(payload)
+        return json.dumps(
+            {
+                "say": "",
+                "action": "acquire",
+                "target_player": "",
+                "target_mob": "",
+                "mode": "",
+                "block_type": "",
+                "item_name": "wooden_pickaxe",
+                "count": 1,
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": "空手先做木镐开荒",
+                "next_goal": "挖石头做石镐",
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Solo barehanded bot: first 2 low-confidence skips stay 0-Token; 3rd escalates!
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                health=20.0,
+                food=20.0,
+                nearby_players=[],
+                inventory_summary=["dirt:20", "stick:4"],
+            )
+        )
+        await plugin.brain._execute_cycle("cruise")
+        await plugin.brain._execute_cycle("cruise")
+        assert len(gen_payloads) == 0
+        assert plugin.brain.cruise_skipped_count == 2
+        assert plugin.brain._last_reason == "cruise_gate:low_confidence_conservative"
+
+        await plugin.brain._execute_cycle("cruise")
+        assert len(gen_payloads) == 1
+        assert gen_payloads[-1]["routing_hint"]["hint"] == "solo_progression_after_skips"
+        assert plugin.brain._consecutive_cruise_skips == 0
+
+        # 2. Repeated mc_death within 3 min: 1st is 0-Token, 2nd wakes Layer 2, 3rd obeys 90s cap
+        plugin.brain.on_milestone("mc_death", {"dimension": "overworld", "pos": [1.0, 71.0, 2.0]})
+        await plugin.brain._execute_cycle("milestone_event")
+        assert len(gen_payloads) == 1
+        assert plugin.brain._last_reason == "fast_milestone:mc_death"
+
+        now[0] += 30.0
+        plugin.brain.on_milestone("mc_death", {"dimension": "overworld", "pos": [2.0, 71.0, 3.0]})
+        await plugin.brain._execute_cycle("milestone_event")
+        assert len(gen_payloads) == 2
+
+        now[0] += 20.0
+        plugin.brain.on_milestone("mc_death", {"dimension": "overworld", "pos": [3.0, 71.0, 4.0]})
+        await plugin.brain._execute_cycle("milestone_event")
+        assert len(gen_payloads) == 2
+        assert plugin.brain._last_reason == "fast_milestone:mc_death"
+    finally:
+        await plugin.close()
