@@ -3349,3 +3349,177 @@ async def test_mc_low_confidence_solo_progression_and_repeated_death_escalation(
         assert plugin.brain._last_reason == "fast_milestone:mc_death"
     finally:
         await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_mc_action_log_not_truncated_by_plugin_bus_and_evade_shelter_backoff() -> None:
+    """Verify plugin_bus keeps 30 action_log entries & status keys, and evade/shelter back off."""
+    from hakimi.plugin_bus.protocol import _sanitize_payload
+
+    now = [1000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+        brain_config=McBrainConfig(
+            cruise_interval_seconds=45.0,
+            solo_cruise_interval_seconds=60.0,
+            evade_cruise_multiplier=2.5,
+            sheltered_cruise_multiplier=3.0,
+            chained_step_interval_seconds=15.0,
+            recovery_step_interval_seconds=30.0,
+        ),
+    )
+
+    decisions: list[dict[str, Any]] = [
+        {"action": "evade", "reason": "附近怪物太多先躲开"},
+        {"action": "mine", "block_type": "stone", "count": 4, "reason": "安全了继续挖石头"},
+    ]
+
+    async def fake_bridge(_method: str, _params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"ok": True, "accepted": True, "combat_mode": "evade", "fled_to": [10, 10]}
+
+    async def fake_budget(_lane: str) -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "decisions": {
+                "should_replan": {
+                    "type": "binary",
+                    "noul": 0.9,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "gather",
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, _payload: dict[str, Any], **_kw: Any) -> str:
+        item = decisions.pop(0)
+        return json.dumps(
+            {
+                "say": "",
+                "action": item["action"],
+                "target_player": "",
+                "target_mob": "",
+                "mode": "",
+                "block_type": item.get("block_type", ""),
+                "item_name": "",
+                "count": item.get("count", 0),
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": item["reason"],
+                "next_goal": "寻找树木和食物",
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Populate 30 action_log entries; verify _sanitize_payload preserves all 30 & all keys.
+        for idx in range(30):
+            now[0] = 1000.0 + idx * 10.0
+            plugin.brain._append_recent_turn(
+                trigger="cruise",
+                input_summary="cruise",
+                say="",
+                action="mine",
+                reason=f"step_{idx}",
+                outcome="mine:stonex4",
+            )
+        raw_status = plugin.status_dict()
+        sanitized = _sanitize_payload(raw_status, None)
+        assert len(sanitized["action_log"]) == 30
+        assert sanitized["action_log"][-1]["ts"] == 1290.0
+        assert sanitized["action_log"][-1]["reason"] == "step_29"
+        assert "brain_screen_blocked_count" in sanitized
+        assert "brain_cruise_skipped_count" in sanitized
+        assert "brain_layer1_routed_count" in sanitized
+
+        # 2. Normal peaceful state (default combat_mode="evade") keeps standard 60s solo interval.
+        plugin.brain._first_cruise_pending = False
+        snap_peaceful = _connected_snapshot(
+            combat_mode="evade",
+            nearby_players=[],
+            activity="原地待命",
+            time_of_day="day",
+            reflex_modes=(),
+        )
+        plugin.apply_snapshot(snap_peaceful)
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(60.0)
+
+        # 3. Choosing action="evade" enables evade backoff (2.5x = 150s solo, 112.5s with players).
+        await plugin.brain._execute_cycle("cruise")
+        assert plugin.brain._evade_backoff_active is True
+        interval_evade_solo = plugin.brain._compute_cruise_interval(plugin.snapshot, now[0])
+        assert interval_evade_solo == pytest.approx(150.0)
+
+        snap_with_player = _connected_snapshot(
+            combat_mode="evade", nearby_players=("BOISER",), activity="原地待命", time_of_day="day"
+        )
+        plugin.apply_snapshot(snap_with_player)
+        interval_evade_player = plugin.brain._compute_cruise_interval(plugin.snapshot, now[0])
+        assert interval_evade_player == pytest.approx(112.5)
+
+        # 4. Choosing a non-evade action ("mine") clears evade backoff and restores 15s chaining.
+        plugin.apply_snapshot(snap_peaceful)
+        await plugin.brain._execute_cycle("cruise")
+        assert plugin.brain._evade_backoff_active is False
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(15.0)
+
+        # 5. Layer 0 active evade reflex backs off to 2.5x even when _chain_next_step was set.
+        snap_evade_reflex = _connected_snapshot(
+            combat_mode="evade",
+            nearby_players=[],
+            activity="躲避怪物",
+            time_of_day="day",
+            reflex_modes=("auto_eat", "evade_active"),
+        )
+        plugin.apply_snapshot(snap_evade_reflex)
+        interval_reflex = plugin.brain._compute_cruise_interval(plugin.snapshot, now[0])
+        assert interval_reflex == pytest.approx(150.0)
+
+        # 6. Sheltered at night backs off to 3.0x (180s) & keeps mc_low_food 0-Token; day resumes.
+        snap_shelter_night = _connected_snapshot(
+            combat_mode="evade",
+            nearby_players=[],
+            activity="掩体避险",
+            time_of_day="night",
+            reflex_modes=("sheltered",),
+            inventory_summary=["raw_beef:2"],
+        )
+        plugin.apply_snapshot(snap_shelter_night)
+        interval_shelter = plugin.brain._compute_cruise_interval(plugin.snapshot, now[0])
+        assert interval_shelter == pytest.approx(180.0)
+        handled_fast = await plugin.brain._try_fast_survival_milestone(
+            event_batch=[{"event_type": "mc_low_food", "safe_food_count": 0}],
+            snap=plugin.snapshot,
+            now=now[0],
+        )
+        assert handled_fast is True
+
+        snap_shelter_day = _connected_snapshot(
+            combat_mode="evade",
+            nearby_players=[],
+            activity="掩体避险",
+            time_of_day="day",
+            reflex_modes=("sheltered",),
+        )
+        plugin.apply_snapshot(snap_shelter_day)
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(15.0)
+    finally:
+        await plugin.close()

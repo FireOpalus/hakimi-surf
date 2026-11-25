@@ -248,6 +248,8 @@ def _sanitize_payload(
     *,
     key_limit: int = 24,
     val_limit: int = 90,
+    dict_limit: int = 48,
+    list_limit: int = 32,
     depth: int = 0,
 ) -> Any:
     if depth > 6:
@@ -260,19 +262,31 @@ def _sanitize_payload(
         return value if math.isfinite(value) else 0.0
     if isinstance(value, dict):
         out: dict[str, Any] = {}
-        for k, v in list(value.items())[:32]:
+        for k, v in list(value.items())[:dict_limit]:
             ck = sanitize_sensor_text(str(k), settings, max_tokens=key_limit)
             if ck:
                 out[ck] = _sanitize_payload(
-                    v, settings, key_limit=key_limit, val_limit=val_limit, depth=depth + 1
+                    v,
+                    settings,
+                    key_limit=key_limit,
+                    val_limit=val_limit,
+                    dict_limit=dict_limit,
+                    list_limit=list_limit,
+                    depth=depth + 1,
                 )
         return out
     if isinstance(value, list | tuple):
         return [
             _sanitize_payload(
-                item, settings, key_limit=key_limit, val_limit=val_limit, depth=depth + 1
+                item,
+                settings,
+                key_limit=key_limit,
+                val_limit=val_limit,
+                dict_limit=dict_limit,
+                list_limit=list_limit,
+                depth=depth + 1,
             )
-            for item in list(value)[:24]
+            for item in list(value)[:list_limit]
         ]
     return sanitize_sensor_text(str(value), settings, max_tokens=val_limit)
 

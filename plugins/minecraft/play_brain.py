@@ -381,6 +381,8 @@ class McBrainConfig:
     event_cooldown_seconds: float = 8.0
     cruise_interval_seconds: float = 45.0
     solo_cruise_interval_seconds: float = 60.0
+    evade_cruise_multiplier: float = 2.5
+    sheltered_cruise_multiplier: float = 3.0
     initial_cruise_delay_seconds: float = 15.0
     chained_step_interval_seconds: float = 15.0
     recovery_step_interval_seconds: float = 30.0
@@ -522,6 +524,7 @@ class McPlayBrain:
         self._last_death_escalate_at: float = -1e9
         self._recent_death_times: deque[float] = deque(maxlen=8)
         self._consecutive_cruise_skips: int = 0
+        self._evade_backoff_active: bool = False
 
         self._last_mono: float = time.monotonic()
         self._last_clk: float = float(plugin.clock())
@@ -763,6 +766,7 @@ class McPlayBrain:
         self._recovery_retry_pending = False
         self._consecutive_failures = 0
         self._consecutive_cruise_skips = 0
+        self._evade_backoff_active = False
         self._recent_death_times.clear()
         self._first_cruise_pending = True
         self._last_turn_snapshot = None
@@ -978,6 +982,8 @@ class McPlayBrain:
             self.on_disconnect()
             return
         self._prev_connected = connected
+        if getattr(snap, "combat_mode", "evade") == "guard":
+            self._evade_backoff_active = False
         now_ready = self.is_ready()
         if not self._prev_ready and now_ready:
             self._last_decision_at = self._now()
@@ -1078,6 +1084,52 @@ class McPlayBrain:
                 self._pending_events = self._pending_events[-5:]
             self._wake()
 
+    def _compute_cruise_interval(self, snap: Any, now: float) -> float:
+        base_interval = (
+            self.config.cruise_interval_seconds
+            if snap.nearby_players
+            else self.config.solo_cruise_interval_seconds
+        )
+        self._prune_calls(now)
+        if self._first_cruise_pending:
+            return min(
+                base_interval,
+                max(0.01, self.config.initial_cruise_delay_seconds),
+            )
+        reflex = set(getattr(snap, "reflex_modes", ()) or ())
+        activity = str(getattr(snap, "activity", "") or "").strip()
+        tod = str(getattr(snap, "time_of_day", "") or "").strip().lower()
+        is_sheltered_hold = ("sheltered" in reflex or activity == "掩体避险") and tod in (
+            "night",
+            "sunset",
+            "dusk",
+            "",
+        )
+        if is_sheltered_hold:
+            return base_interval * max(1.0, float(self.config.sheltered_cruise_multiplier))
+        is_evade_hold = (
+            self._evade_backoff_active
+            or "evade_active" in reflex
+            or activity in ("躲避怪物", "举盾躲避", "远离苦力怕", "远离威胁")
+        )
+        if is_evade_hold:
+            return base_interval * max(1.0, float(self.config.evade_cruise_multiplier))
+        if self._chain_next_step and len(self._call_times) < max(
+            1, self.config.max_calls_per_10m - 2
+        ):
+            return min(
+                base_interval,
+                max(0.01, self.config.chained_step_interval_seconds),
+            )
+        if self._recovery_retry_pending and len(self._call_times) < max(
+            1, self.config.max_calls_per_10m - 2
+        ):
+            return min(
+                base_interval,
+                max(0.01, self.config.recovery_step_interval_seconds),
+            )
+        return base_interval
+
     async def _run_loop(self) -> None:
         try:
             while not self._stop_requested:
@@ -1111,33 +1163,7 @@ class McPlayBrain:
                         wait_seconds = max(0.0, target_at - now)
                 else:
                     snap = self.plugin.snapshot
-                    base_interval = (
-                        self.config.cruise_interval_seconds
-                        if snap.nearby_players
-                        else self.config.solo_cruise_interval_seconds
-                    )
-                    self._prune_calls(now)
-                    if self._first_cruise_pending:
-                        interval = min(
-                            base_interval,
-                            max(0.01, self.config.initial_cruise_delay_seconds),
-                        )
-                    elif self._chain_next_step and len(self._call_times) < max(
-                        1, self.config.max_calls_per_10m - 2
-                    ):
-                        interval = min(
-                            base_interval,
-                            max(0.01, self.config.chained_step_interval_seconds),
-                        )
-                    elif self._recovery_retry_pending and len(self._call_times) < max(
-                        1, self.config.max_calls_per_10m - 2
-                    ):
-                        interval = min(
-                            base_interval,
-                            max(0.01, self.config.recovery_step_interval_seconds),
-                        )
-                    else:
-                        interval = base_interval
+                    interval = self._compute_cruise_interval(snap, now)
                     target_at = self._last_decision_at + max(0.01, interval)
                     if now >= target_at:
                         trigger = "cruise"
@@ -1405,9 +1431,19 @@ class McPlayBrain:
             # Layer 2 repeatedly to emit no-op evade decisions.
             if cur_mode != "evade" and (has_players or "mc_death" not in etypes):
                 return False
-        # Allow Layer 2 to craft bread or smelt raw meat on mc_low_food.
+        # Allow Layer 2 to craft bread or smelt raw meat on mc_low_food unless currently
+        # sheltering at night or actively evading threats.
         if "mc_low_food" in etypes and self._has_actionable_food_option(snap):
-            return False
+            reflex_now = set(getattr(snap, "reflex_modes", ()) or ())
+            tod_now = str(getattr(snap, "time_of_day", "") or "").strip().lower()
+            in_shelter_night = "sheltered" in reflex_now and tod_now in (
+                "night",
+                "sunset",
+                "dusk",
+                "",
+            )
+            if not (in_shelter_night or "evade_active" in reflex_now or self._evade_backoff_active):
+                return False
 
         clean_say = ""
         if "mc_death" in etypes:
@@ -1639,6 +1675,9 @@ class McPlayBrain:
                     await self._push_status_safe()
                     return "handled", None
             self.layer1_routed_count += 1
+            self._evade_backoff_active = True
+            self._chain_next_step = False
+            self._recovery_retry_pending = False
             self._last_reason = "cruise_gate:retreat_eat"
             self._append_recent_turn(
                 trigger="cruise",
@@ -1679,6 +1718,9 @@ class McPlayBrain:
                 if cur_mode == "guard":
                     await self._dispatch_goal_result({"action_type": "evade"})
                 self.layer1_routed_count += 1
+                self._evade_backoff_active = True
+                self._chain_next_step = False
+                self._recovery_retry_pending = False
                 self._last_reason = "cruise_gate:safety_conservative_evade"
                 await self._push_status_safe()
                 return "handled", None
@@ -1706,6 +1748,7 @@ class McPlayBrain:
                 await self._push_status_safe()
                 return "handled", None
             self.layer1_routed_count += 1
+            self._evade_backoff_active = False
             self._last_reason = f"cruise_gate:{stance}"
             self._append_recent_turn(
                 trigger="cruise",
@@ -1808,6 +1851,9 @@ class McPlayBrain:
             clean_say = "好哒，我先切到躲避模式注意安全喵~"
             await self._dispatch_goal_safe({"action_type": "chat", "message": clean_say})
             self.layer1_routed_count += 1
+            self._evade_backoff_active = True
+            self._chain_next_step = False
+            self._recovery_retry_pending = False
             self._last_reason = "chat_intent:evade_retreat"
             self._append_recent_turn(
                 trigger="player_chat",
@@ -1845,6 +1891,7 @@ class McPlayBrain:
             clean_say = "收到，猫猫切到护卫模式护着你喵~"
             await self._dispatch_goal_safe({"action_type": "chat", "message": clean_say})
             self.layer1_routed_count += 1
+            self._evade_backoff_active = False
             self._last_reason = "chat_intent:guard_player"
             self._append_recent_turn(
                 trigger="player_chat",
@@ -2509,6 +2556,7 @@ class McPlayBrain:
             self._consecutive_failures = 0
         elif action not in ("none", "idle", "stay", "observe"):
             self._consecutive_failures += 1
+        self._evade_backoff_active = action == "evade"
         self._chain_next_step = bool(
             action_ok and action in _CHAINABLE_ACTIONS and bool(self._active_plan)
         )
@@ -2555,6 +2603,9 @@ class McPlayBrain:
             self._last_reason = f"fallback_stop:{reason}"[:60]
         elif any(kw in combined for kw in _LOCAL_EVADE_KEYWORDS):
             await self._dispatch_goal_safe({"action_type": "evade"})
+            self._evade_backoff_active = True
+            self._chain_next_step = False
+            self._recovery_retry_pending = False
             clean_say = "好哒，我先切到躲避模式注意安全喵~"
             await self._dispatch_goal_safe({"action_type": "chat", "message": clean_say})
             self._last_reason = f"fallback_evade:{reason}"[:60]
