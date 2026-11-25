@@ -16,7 +16,7 @@ import tempfile
 import time
 import wave
 from array import array
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -406,6 +406,88 @@ def _audio_bytes_for_file(audio_bytes: bytes, fmt: str) -> tuple[bytes, str]:
 
 
 @dataclass
+class _TurnPlayCursor:
+    started_seq: int = 0
+    completed_seq: int = 0
+    active_started_at: float = 0.0
+    played_ms: int = 0
+
+
+class _PlaybackCursorTracker:
+    """Bounded per-turn playout cursor tracking started/completed chunk sequence and ms."""
+
+    def __init__(self, max_turns: int = 64) -> None:
+        self._max_turns = max_turns
+        self._turns: OrderedDict[str, _TurnPlayCursor] = OrderedDict()
+        self._last_turn_id: str = ""
+
+    def ensure_turn(self, turn_id: str) -> _TurnPlayCursor:
+        clean = str(turn_id or "").strip()
+        cur = self._turns.get(clean)
+        if cur is None:
+            cur = _TurnPlayCursor()
+            self._turns[clean] = cur
+            while len(self._turns) > self._max_turns:
+                self._turns.popitem(last=False)
+        else:
+            self._turns.move_to_end(clean)
+        if clean:
+            self._last_turn_id = clean
+        return cur
+
+    def mark_started(self, turn_id: str | None, seq: int | None) -> None:
+        if not turn_id:
+            return
+        cur = self.ensure_turn(turn_id)
+        if seq is not None and seq > cur.started_seq:
+            cur.started_seq = int(seq)
+        cur.active_started_at = time.perf_counter()
+
+    def mark_completed(self, turn_id: str | None, seq: int | None) -> None:
+        if not turn_id:
+            return
+        cur = self.ensure_turn(turn_id)
+        if cur.active_started_at > 0.0:
+            cur.played_ms += max(0, int((time.perf_counter() - cur.active_started_at) * 1000.0))
+            cur.active_started_at = 0.0
+        if seq is not None and seq > cur.completed_seq:
+            cur.completed_seq = int(seq)
+
+    def mark_stopped(self, turn_id: str | None) -> None:
+        if not turn_id:
+            return
+        cur = self._turns.get(turn_id)
+        if cur is not None and cur.active_started_at > 0.0:
+            cur.played_ms += max(0, int((time.perf_counter() - cur.active_started_at) * 1000.0))
+            cur.active_started_at = 0.0
+
+    def snapshot(
+        self,
+        turn_id: str | None = None,
+        *,
+        active_turn_id: str = "",
+        is_playing: bool = False,
+    ) -> dict[str, Any]:
+        tid = (turn_id or "").strip() or active_turn_id or self._last_turn_id
+        cur = self._turns.get(tid) if tid else None
+        if cur is None:
+            return {"turn_id": tid, "played_seq": 0, "completed_seq": 0, "played_ms": 0}
+        played_ms = cur.played_ms
+        if (
+            is_playing
+            and cur.active_started_at > 0.0
+            and (not active_turn_id or active_turn_id == tid)
+        ):
+            played_ms += max(0, int((time.perf_counter() - cur.active_started_at) * 1000.0))
+        return {
+            "turn_id": tid,
+            "played_seq": cur.started_seq,
+            "completed_seq": cur.completed_seq,
+            "played_ms": played_ms,
+        }
+
+
+@dataclass
 class _QueuedChunk:
     turn_id: str
     seq: int
@@ -451,6 +533,14 @@ class AfplayAudioPlayer:
         self._is_playing = False
         self._stop_requested = False
         self._file_seq = 0
+        self._cursor = _PlaybackCursorTracker()
+
+    def playback_cursor(self, turn_id: str | None = None) -> dict[str, Any]:
+        """Return playout cursor (played_seq, completed_seq, played_ms) for turn_id."""
+        active_tid = self._active_item.turn_id if self._active_item is not None else ""
+        return self._cursor.snapshot(
+            turn_id, active_turn_id=active_tid, is_playing=self._is_playing
+        )
 
     @property
     def streaming_active(self) -> bool:
@@ -494,6 +584,7 @@ class AfplayAudioPlayer:
         else:
             task = asyncio.create_task(self._tts.synthesize(text))
             task.add_done_callback(_consume_task_exception)
+        self._cursor.ensure_turn(turn_id)
         self._queue.append(_QueuedChunk(turn_id=turn_id, seq=seq, text=text, synth_task=task))
         self._idle_event.clear()
         self._wake_event.set()
@@ -608,6 +699,7 @@ class AfplayAudioPlayer:
                 await _terminate_process(proc)
                 return
             self._is_playing = True
+            self._cursor.mark_started(item.turn_id, item.seq)
             self._fire_first_audio(
                 item.turn_id,
                 (time.perf_counter() - item.enqueued_at) * 1000.0,
@@ -620,6 +712,13 @@ class AfplayAudioPlayer:
             ):
                 err = stderr.decode("utf-8", errors="replace").strip()
                 log.warning("Playback exited non-zero (%s): %s", proc.returncode, err)
+            elif (
+                proc.returncode == 0
+                and not self._active_cancelled
+                and not self._stop_requested
+                and item.turn_id not in self._cancelled_turns
+            ):
+                self._cursor.mark_completed(item.turn_id, item.seq)
         except FileNotFoundError:
             log.warning("Playback command not found: %s", cmd[0])
         except asyncio.CancelledError:
@@ -628,6 +727,7 @@ class AfplayAudioPlayer:
             raise
         finally:
             self._is_playing = False
+            self._cursor.mark_stopped(item.turn_id)
             self._active_proc = None
             out_path.unlink(missing_ok=True)
 
@@ -709,6 +809,7 @@ class AfplayAudioPlayer:
         await self._stream_to_player(
             item.text,
             turn_id=item.turn_id,
+            seq=item.seq,
             enqueued_at=item.enqueued_at,
             raise_on_error=False,
         )
@@ -718,6 +819,7 @@ class AfplayAudioPlayer:
         text: str,
         *,
         turn_id: str | None,
+        seq: int | None = None,
         enqueued_at: float | None = None,
         raise_on_error: bool,
     ) -> tuple[float, float, int, str]:
@@ -769,6 +871,7 @@ class AfplayAudioPlayer:
 
             self._is_playing = True
             if turn_id is not None:
+                self._cursor.mark_started(turn_id, seq)
                 self._fire_first_audio(turn_id, ttfb_ms)
 
             assert proc.stdin is not None
@@ -801,9 +904,13 @@ class AfplayAudioPlayer:
                 if raise_on_error:
                     raise RuntimeError(f"流式音频播放失败 (exit={proc.returncode}): {err}")
                 log.warning("Streaming playback exited non-zero (%s): %s", proc.returncode, err)
+            elif proc.returncode == 0 and not _is_aborted() and turn_id is not None:
+                self._cursor.mark_completed(turn_id, seq)
             return ttfb_ms, (time.perf_counter() - t0) * 1000.0, total_bytes, fmt
         finally:
             self._is_playing = False
+            if turn_id is not None:
+                self._cursor.mark_stopped(turn_id)
             if proc is not None:
                 self._active_proc = None
                 if proc.returncode is None:
@@ -861,6 +968,14 @@ class RawStreamAudioPlayer:
         self._is_playing = False
         self._stop_requested = False
         self._file_seq = 0
+        self._cursor = _PlaybackCursorTracker()
+
+    def playback_cursor(self, turn_id: str | None = None) -> dict[str, Any]:
+        """Return playout cursor (played_seq, completed_seq, played_ms) for turn_id."""
+        active_tid = self._active_item.turn_id if self._active_item is not None else ""
+        return self._cursor.snapshot(
+            turn_id, active_turn_id=active_tid, is_playing=self._is_playing
+        )
 
     @property
     def streaming_active(self) -> bool:
@@ -899,6 +1014,7 @@ class RawStreamAudioPlayer:
             prev.chunks.put_nowait(None)
         clean_fmt = (fmt or "mp3").strip().lower() or "mp3"
         item = _RawStreamItem(turn_id=turn_id, seq=seq, fmt=clean_fmt)
+        self._cursor.ensure_turn(turn_id)
         self._open_streams[turn_id] = item
         self._queue.append(item)
         self._idle_event.clear()
@@ -1173,6 +1289,7 @@ class RawStreamAudioPlayer:
                 await _terminate_process(proc)
                 return
             self._is_playing = True
+            self._cursor.mark_started(item.turn_id, item.seq)
             self._fire_first_audio(
                 item.turn_id,
                 (time.perf_counter() - item.enqueued_at) * 1000.0,
@@ -1181,6 +1298,8 @@ class RawStreamAudioPlayer:
             if proc.returncode not in (0, None) and not self._is_item_aborted(item):
                 err = stderr.decode("utf-8", errors="replace").strip()
                 log.warning("Playback exited non-zero (%s): %s", proc.returncode, err)
+            elif proc.returncode == 0 and not self._is_item_aborted(item):
+                self._cursor.mark_completed(item.turn_id, item.seq)
         except FileNotFoundError:
             log.warning("Playback command not found: %s", cmd[0])
         except asyncio.CancelledError:
@@ -1189,6 +1308,7 @@ class RawStreamAudioPlayer:
             raise
         finally:
             self._is_playing = False
+            self._cursor.mark_stopped(item.turn_id)
             if self._active_proc is proc:
                 self._active_proc = None
             out_path.unlink(missing_ok=True)
@@ -1237,6 +1357,7 @@ class RawStreamAudioPlayer:
                 await _terminate_process(proc)
                 return
             self._is_playing = True
+            self._cursor.mark_started(item.turn_id, item.seq)
             self._fire_first_audio(item.turn_id, ttfb_ms)
             assert proc.stdin is not None
             try:
@@ -1265,11 +1386,14 @@ class RawStreamAudioPlayer:
             if proc.returncode not in (0, None) and not self._is_item_aborted(item):
                 err = stderr_data.decode("utf-8", errors="replace").strip()
                 log.warning("Streaming playback exited non-zero (%s): %s", proc.returncode, err)
+            elif proc.returncode == 0 and not self._is_item_aborted(item):
+                self._cursor.mark_completed(item.turn_id, item.seq)
         except asyncio.CancelledError:
             await _terminate_process(proc)
             raise
         finally:
             self._is_playing = False
+            self._cursor.mark_stopped(item.turn_id)
             if self._active_proc is proc:
                 self._active_proc = None
             if proc.returncode is None:

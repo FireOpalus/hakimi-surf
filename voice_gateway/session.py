@@ -7,6 +7,7 @@ import base64
 import binascii
 import contextlib
 import dataclasses
+import inspect
 import json
 import logging
 import time
@@ -28,6 +29,7 @@ from .protocol import (
     decode_json_frame,
     generate_id,
     validate_id,
+    validate_optional_nonneg_int,
 )
 
 log = logging.getLogger("voice_gateway.session")
@@ -109,6 +111,7 @@ class _TurnState:
     stt_ms: float | None = None
     text_parts: list[str] = field(default_factory=list)
     first_tts_ttfb_ms: float | None = None
+    upstream_max_seq: int = 0
     cancelled: bool = False
     ended: bool = False
 
@@ -847,6 +850,16 @@ class VoiceGatewaySession:
     async def _handle_turn_cancel(self, frame: dict[str, Any]) -> None:
         raw_tid = frame.get("turn_id")
         target_id = validate_id(raw_tid, field_name="turn_id", allow_empty=True)
+        played_seq = validate_optional_nonneg_int(frame.get("played_seq"), field_name="played_seq")
+        played_ms = validate_optional_nonneg_int(
+            frame.get("played_ms"), field_name="played_ms", max_value=86_400_000
+        )
+
+        if not target_id:
+            if self._active_tts_job is not None and self._active_tts_job.turn_id:
+                target_id = self._active_tts_job.turn_id
+            elif self._turns:
+                target_id = next(reversed(self._turns))
 
         if target_id:
             audio_task = self._audio_turn_tasks.get(target_id)
@@ -859,8 +872,27 @@ class VoiceGatewaySession:
 
         await self._cancel_local_tts(target_turn_id=target_id or None)
         if self._upstream is not None and self._upstream.connected:
+            upstream_played_seq = played_seq
+            if played_seq is not None and self._tts_buffer_mode == "turn":
+                if played_seq == 0:
+                    upstream_played_seq = 0
+                else:
+                    tstate = self._turns.get(target_id) if target_id else None
+                    if tstate is not None and tstate.upstream_max_seq > 0:
+                        upstream_played_seq = tstate.upstream_max_seq
             with contextlib.suppress(Exception):
-                await self._upstream.cancel_turn(target_id)
+                sig = inspect.signature(self._upstream.cancel_turn)
+                supports_cursor = "played_seq" in sig.parameters or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if supports_cursor and (upstream_played_seq is not None or played_ms is not None):
+                    await self._upstream.cancel_turn(
+                        target_id,
+                        played_seq=upstream_played_seq,
+                        played_ms=played_ms,
+                    )
+                else:
+                    await self._upstream.cancel_turn(target_id)
 
     def _register_turn(self, turn_id: str, *, stt_ms: float | None = None) -> _TurnState:
         state = self._turns.get(turn_id)
@@ -936,6 +968,8 @@ class VoiceGatewaySession:
         state = self._register_turn(turn_id)
         if state.cancelled or state.ended:
             return
+        if seq > state.upstream_max_seq:
+            state.upstream_max_seq = seq
 
         await self._send_json(
             {

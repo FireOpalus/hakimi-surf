@@ -290,11 +290,22 @@ class CompanionWsClient:
         await self._send_frame(payload)
         return tid
 
-    async def cancel_turn(self, turn_id: str = "") -> None:
-        """Send turn.cancel for a specific turn_id or whichever turn is currently active."""
+    async def cancel_turn(
+        self,
+        turn_id: str = "",
+        *,
+        played_seq: int | None = None,
+        played_ms: int | None = None,
+    ) -> None:
+        """Send turn.cancel for a specific turn_id or active turn with optional playout cursor."""
         if not self.connected:
             return
-        await self._send_frame({"type": "turn.cancel", "turn_id": turn_id.strip()})
+        frame: dict[str, Any] = {"type": "turn.cancel", "turn_id": turn_id.strip()}
+        if isinstance(played_seq, int) and not isinstance(played_seq, bool) and played_seq >= 0:
+            frame["played_seq"] = played_seq
+        if isinstance(played_ms, int) and not isinstance(played_ms, bool) and played_ms >= 0:
+            frame["played_ms"] = played_ms
+        await self._send_frame(frame)
 
     async def stop_session(self, timeout: float = 5.0) -> dict[str, Any]:  # noqa: ASYNC109
         """Send session.stop and wait for session.ended."""

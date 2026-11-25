@@ -691,3 +691,79 @@ async def test_voice_companion_room_public_and_save_recap_to_dual_memory_disable
         assert len(ledger_after) == 1 and "星铁" in ledger_after[0].summary
         assert len(svc.identity.owner_other_surface_recent("onebot", now=now[0])) == 1
         assert not svc.sessions.path(owner_msg).exists()
+
+
+async def test_barge_in_playout_cursor_clips_recent_turns_accurately(settings):
+    now = [1_795_100_000.0]
+    s = _companion_settings(settings)
+    gw = _StreamMockGateway(deltas=["第一句。", "第二句！", "第三句不会播。"])
+    app = create_app(s, gateway_factory=lambda *_: gw, start_workers=False)
+
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        svc.voice_companion.clock = lambda: now[0]
+
+        sock = _SocketDouble()
+        runner = asyncio.create_task(
+            svc.voice_companion.serve(
+                sock.receive,
+                sock.send,
+                sock.close,
+                source_ip="127.0.0.1",
+                adapter_id="windows_desktop",
+                client_id="pc-cursor",
+            )
+        )
+        await sock.push({"type": "session.start", "mode": "owner_private", "game_title": "MC"})
+        await sock.recv_until(lambda m: m["type"] == "session.ready")
+
+        # 1. Late turn.cancel after turn.end clips recent_turns to played_seq=1
+        await sock.push({"type": "speech.turn", "turn_id": "t-clip", "text": "说说看"})
+        await sock.recv_until(lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-clip")
+        await sock.push({"type": "turn.cancel", "turn_id": "t-clip", "played_seq": 1})
+        await asyncio.sleep(0.03)
+
+        # 2. played_seq=0 removes unheard assistant text while keeping user utterance
+        await sock.push({"type": "speech.turn", "turn_id": "t-zero", "text": "这句没听到"})
+        await sock.recv_until(lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-zero")
+        await sock.push({"type": "turn.cancel", "turn_id": "t-zero", "played_seq": 0})
+        await asyncio.sleep(0.03)
+
+        # 3. Streaming cancellation with played_seq=1 preserves the heard chunk
+        gw.delay = 0.15
+        await sock.push({"type": "speech.turn", "turn_id": "t-stream", "text": "边说边打断"})
+        await sock.recv_until(
+            lambda m: (
+                m.get("type") == "speak.chunk"
+                and m.get("turn_id") == "t-stream"
+                and m.get("seq") == 1
+            )
+        )
+        await sock.push({"type": "turn.cancel", "turn_id": "t-stream", "played_seq": 1})
+        ev_stream = await sock.recv_until(
+            lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-stream"
+        )
+        assert ev_stream[-1]["status"] == "cancelled"
+
+        # 4. Next turn receives accurately clipped recent_voice_turns
+        gw.delay = 0.0
+        gw.deltas = ["收到。"]
+        await sock.push({"type": "speech.turn", "turn_id": "t-next", "text": "继续吧"})
+        await sock.recv_until(lambda m: m.get("type") == "turn.end" and m["turn_id"] == "t-next")
+
+        recent = gw.calls[-1][0]["recent_voice_turns"]
+        assert recent[0]["user"] == "说说看"
+        assert "第一句" in recent[0]["assistant"]
+        assert "第二句" not in recent[0]["assistant"]
+        assert "被打断" in recent[0]["assistant"]
+
+        assert recent[1] == {"at": round(now[0]), "user": "这句没听到"}
+
+        assert recent[2]["user"] == "边说边打断"
+        assert "第一句" in recent[2]["assistant"]
+        assert "被打断" in recent[2]["assistant"]
+
+        await sock.push({"type": "session.stop"})
+        await sock.recv_until(lambda m: m.get("type") == "session.ended")
+        await sock.close()
+        await asyncio.wait_for(runner, 2.0)

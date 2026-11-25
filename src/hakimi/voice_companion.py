@@ -8,7 +8,7 @@ import logging
 import re
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -160,6 +160,27 @@ def _decode_frames(raw_frames: Any, max_frames: int, settings: Any) -> list[Mode
     return decode_b64_frames(raw_frames, max_frames, settings, error_prefix="companion")
 
 
+def _parse_optional_nonneg_int(raw: Any, *, max_value: int = 10_000_000) -> int | None:
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    if raw < 0 or raw > max_value:
+        return None
+    return raw
+
+
+@dataclass
+class _TurnRecord:
+    turn_id: str
+    at: int
+    event_kind: Literal["speech", "screen_pulse"]
+    user_text: str = ""
+    chunks: list[tuple[int, str]] = field(default_factory=list)
+    entry_ref: dict[str, Any] | None = None
+    emitted_max_seq: int = 0
+    played_seq: int | None = None
+    interrupted: bool = False
+
+
 @dataclass
 class _CompanionSession:
     id: str
@@ -173,6 +194,7 @@ class _CompanionSession:
     frames_analyzed: int = 0
     finalized: bool = False
     recent_turns: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=16))
+    turn_records: OrderedDict[str, _TurnRecord] = field(default_factory=OrderedDict)
     highlights: deque[str] = field(default_factory=lambda: deque(maxlen=8))
 
 
@@ -701,6 +723,58 @@ class VoiceCompanion:
             sender_nickname=sanitize_sensor_text(speaker_name, self.s, max_tokens=16),
         )
 
+    def _register_turn_record(self, session: _CompanionSession, rec: _TurnRecord) -> None:
+        session.turn_records[rec.turn_id] = rec
+        session.turn_records.move_to_end(rec.turn_id)
+        while len(session.turn_records) > 16:
+            session.turn_records.popitem(last=False)
+
+    def _apply_playout_cursor(
+        self,
+        session: _CompanionSession,
+        rec: _TurnRecord,
+        played_seq: int,
+        secrets: list[str],
+    ) -> None:
+        if played_seq <= 0:
+            if rec.entry_ref is not None and rec.entry_ref in session.recent_turns:
+                if "user" in rec.entry_ref:
+                    rec.entry_ref.pop("assistant", None)
+                else:
+                    session.recent_turns.remove(rec.entry_ref)
+                    rec.entry_ref = None
+            elif rec.entry_ref is None and rec.event_kind == "speech" and rec.user_text:
+                entry: dict[str, Any] = {"at": rec.at, "user": rec.user_text[:120]}
+                session.recent_turns.append(entry)
+                rec.entry_ref = entry
+            return
+
+        kept = [txt for s, txt in rec.chunks if s <= played_seq]
+        if not kept:
+            if rec.entry_ref is not None and rec.entry_ref in session.recent_turns:
+                if "user" in rec.entry_ref:
+                    rec.entry_ref.pop("assistant", None)
+                else:
+                    session.recent_turns.remove(rec.entry_ref)
+                    rec.entry_ref = None
+            return
+
+        joined = " ".join(clean_text(strip_markdown_noise("".join(kept))).split())
+        partial = played_seq < rec.emitted_max_seq or rec.interrupted
+        clipped = safe_output(joined, secrets, limit=234 if partial else 240)
+        if partial and clipped and not clipped.endswith("…（被打断）"):
+            clipped = f"{clipped}…（被打断）"
+
+        if rec.entry_ref is not None and rec.entry_ref in session.recent_turns:
+            rec.entry_ref["assistant"] = clipped
+        else:
+            entry = {"at": rec.at}
+            if rec.user_text:
+                entry["user"] = rec.user_text[:120]
+            entry["assistant"] = clipped
+            session.recent_turns.append(entry)
+            rec.entry_ref = entry
+
     async def _run_turn(
         self,
         peer: _CompanionPeer,
@@ -725,6 +799,13 @@ class VoiceCompanion:
         now = self.clock()
         session.turns += 1
         session.frames_analyzed += len(frames)
+        turn_rec = _TurnRecord(
+            turn_id=turn_id,
+            at=round(now),
+            event_kind=event_kind,
+            user_text=speech_text,
+        )
+        self._register_turn_record(session, turn_rec)
 
         effective_game = session.game_title or (
             sanitize_sensor_text(game_title_override, self.s, max_tokens=16) if is_owner else ""
@@ -760,6 +841,8 @@ class VoiceCompanion:
             if cancel_event.is_set():
                 return
             seq += 1
+            turn_rec.chunks.append((seq, chunk_text))
+            turn_rec.emitted_max_seq = seq
             await self._send_frame(
                 peer,
                 {
@@ -824,6 +907,9 @@ class VoiceCompanion:
                     entry["user"] = speech_text[:120]
                 entry["assistant"] = clean_reply
                 session.recent_turns.append(entry)
+                turn_rec.entry_ref = entry
+                if turn_rec.played_seq is not None:
+                    self._apply_playout_cursor(session, turn_rec, turn_rec.played_seq, secrets)
                 recap = ""
                 if event_kind == "speech" and speech_text:
                     recap = f"{speech_text[:40]} -> {clean_reply[:60]}"
@@ -854,7 +940,9 @@ class VoiceCompanion:
                 )
             else:
                 if event_kind == "speech" and speech_text:
-                    session.recent_turns.append({"at": round(now), "user": speech_text[:120]})
+                    entry = {"at": round(now), "user": speech_text[:120]}
+                    session.recent_turns.append(entry)
+                    turn_rec.entry_ref = entry
                 await self._send_frame(
                     peer,
                     {
@@ -865,6 +953,9 @@ class VoiceCompanion:
                     },
                 )
         except asyncio.CancelledError:
+            turn_rec.interrupted = True
+            if turn_rec.played_seq is not None:
+                self._apply_playout_cursor(session, turn_rec, turn_rec.played_seq, secrets)
             with anyio.CancelScope(shield=True):
                 await self._send_frame(
                     peer,
@@ -1052,8 +1143,33 @@ class VoiceCompanion:
                             sync_task.add_done_callback(bg.discard)
                 elif typ == "turn.cancel":
                     target_id = str(frame.get("turn_id") or "").strip()
+                    played_seq = _parse_optional_nonneg_int(frame.get("played_seq"))
+                    sess = peer.session
+                    target_rec: _TurnRecord | None = None
+                    if sess is not None:
+                        lookup_id = target_id or peer.active_turn_id
+                        if lookup_id:
+                            target_rec = sess.turn_records.get(lookup_id)
+                        elif sess.turn_records:
+                            target_rec = next(reversed(sess.turn_records.values()))
+                        if target_rec is not None:
+                            target_rec.interrupted = True
+                            if played_seq is not None:
+                                target_rec.played_seq = played_seq
                     if not target_id or target_id == peer.active_turn_id:
                         await self._cancel_active_turn(peer)
+                    if (
+                        sess is not None
+                        and target_rec is not None
+                        and played_seq is not None
+                        and target_rec.entry_ref is not None
+                    ):
+                        secrets = (
+                            list(self.service.secrets)
+                            if getattr(self.service, "secrets", None)
+                            else configured_secrets(self.s)
+                        )
+                        self._apply_playout_cursor(sess, target_rec, played_seq, secrets)
                 elif typ == "speech.turn":
                     sess = peer.session
                     if sess is None or sess.finalized:

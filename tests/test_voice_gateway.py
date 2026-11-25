@@ -1399,3 +1399,104 @@ def test_gateway_admin_config_hot_swap_reset_and_voices(monkeypatch):
         assert rst.json()["overridden"] is False
         assert rst.json()["tts_provider"] == "siliconflow"
         assert client.get("/healthz").json()["tts_provider"] == "siliconflow"
+
+
+async def test_gateway_turn_cancel_forwards_playout_cursor_and_validates(tmp_path):
+    from voice_gateway.protocol import ProtocolError, validate_optional_nonneg_int
+    from voice_gateway.session import VoiceGatewaySession
+
+    assert validate_optional_nonneg_int(None, field_name="played_seq") is None
+    assert validate_optional_nonneg_int(0, field_name="played_seq") == 0
+    assert validate_optional_nonneg_int(3, field_name="played_seq") == 3
+    for bad in (True, -1, 1.5, "2"):
+        with pytest.raises(ProtocolError) as exc_info:
+            validate_optional_nonneg_int(bad, field_name="played_seq")
+        assert exc_info.value.reason == "invalid_played_seq"
+
+    sent_upstream: list[tuple[str, int | None, int | None]] = []
+    out_frames: list[dict] = []
+
+    class FakeUpstream:
+        connected = True
+
+        async def cancel_turn(
+            self,
+            turn_id: str = "",
+            *,
+            played_seq: int | None = None,
+            played_ms: int | None = None,
+        ) -> None:
+            sent_upstream.append((turn_id, played_seq, played_ms))
+
+        async def close(self) -> None:
+            pass
+
+    class DummyStt:
+        async def transcribe(self, audio_bytes: bytes) -> str:
+            return ""
+
+    class DummyTts:
+        async def synthesize(self, text: str) -> tuple[bytes, str]:
+            return b"", "mp3"
+
+    async def send_text(raw: str) -> None:
+        out_frames.append(json.loads(raw))
+
+    async def send_bytes(data: bytes) -> None:
+        pass
+
+    cfg = load_gateway_config(
+        env={
+            "VOICE_GATEWAY_TOKEN": GATEWAY_TOKEN,
+            "VOICE_GATEWAY_WS_PATH": GATEWAY_PATH,
+            "FFMPEG_BIN": _write_fake_ffmpeg_script(tmp_path / "fake_ffmpeg.py"),
+            "STT_PROVIDER": "fish",
+            "FISH_API_KEY": "fish-stt-key-123",
+            "TTS_PROVIDER": "siliconflow",
+            "SILICONFLOW_API_KEY": "sf-key-123",
+        }
+    )
+    sess = VoiceGatewaySession(
+        cfg,
+        stt_provider=DummyStt(),
+        tts_provider=DummyTts(),
+        send_text=send_text,
+        send_bytes=send_bytes,
+    )
+    sess._upstream = FakeUpstream()  # type: ignore[assignment]
+    sess._session_active = True
+
+    try:
+        # chunk mode: 1:1 passthrough
+        sess._tts_buffer_mode = "chunk"
+        await sess._on_upstream_speak_chunk({"turn_id": "tc-1", "seq": 1, "text": "一"})
+        await sess._on_upstream_speak_chunk({"turn_id": "tc-1", "seq": 2, "text": "二"})
+        await sess.handle_text_frame(
+            json.dumps(
+                {"type": "turn.cancel", "turn_id": "tc-1", "played_seq": 1, "played_ms": 420}
+            )
+        )
+        assert sent_upstream[-1] == ("tc-1", 1, 420)
+
+        # turn mode: played_seq >= 1 maps to upstream_max_seq; 0 stays 0
+        sess._tts_buffer_mode = "turn"
+        await sess._on_upstream_speak_chunk({"turn_id": "tc-2", "seq": 1, "text": "一"})
+        await sess._on_upstream_speak_chunk({"turn_id": "tc-2", "seq": 3, "text": "三"})
+        await sess.handle_text_frame(
+            json.dumps({"type": "turn.cancel", "turn_id": "tc-2", "played_seq": 1, "played_ms": 99})
+        )
+        assert sent_upstream[-1] == ("tc-2", 3, 99)
+
+        await sess.handle_text_frame(
+            json.dumps({"type": "turn.cancel", "turn_id": "tc-3", "played_seq": 0})
+        )
+        assert sent_upstream[-1] == ("tc-3", 0, None)
+
+        # invalid played_seq sends protocol error frame cleanly
+        await sess.handle_text_frame(
+            json.dumps({"type": "turn.cancel", "turn_id": "tc-3", "played_seq": -2})
+        )
+        assert out_frames[-1]["type"] == "error"
+        assert out_frames[-1]["reason"] == "invalid_played_seq"
+    finally:
+        await sess.close()

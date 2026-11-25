@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import os
 import signal
 import sys
@@ -699,11 +700,31 @@ async def run_interactive_session(
             print(f"🎤 你: {text}  (STT {stt_ms:.0f}ms)", flush=True)
             await send_text_turn(text, stt_ms=stt_ms)
 
+    def _supports_cancel_cursor(fn: Any) -> bool:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        return "played_seq" in sig.parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+
     async def interrupt_now() -> None:
+        cursor: dict[str, Any] = {}
+        if callable(getattr(player, "playback_cursor", None)):
+            cursor = player.playback_cursor() or {}
+        target_tid = str(cursor.get("turn_id") or ws.active_turn_id or "")
         turn_buffers.clear()
         turn_metrics.clear()
         await player.cancel_turn()
-        await ws.cancel_turn()
+        if target_tid and _supports_cancel_cursor(ws.cancel_turn):
+            await ws.cancel_turn(
+                target_tid,
+                played_seq=cursor.get("played_seq"),
+                played_ms=cursor.get("played_ms"),
+            )
+        else:
+            await ws.cancel_turn()
 
     def toggle_mode() -> None:
         nonlocal voice_mode, ptt_recording

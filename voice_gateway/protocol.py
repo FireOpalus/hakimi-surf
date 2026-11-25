@@ -70,6 +70,22 @@ def validate_id(
     return clean
 
 
+def validate_optional_nonneg_int(
+    value: Any,
+    *,
+    field_name: str,
+    max_value: int = 10_000_000,
+) -> int | None:
+    """Validate an optional non-negative integer field, rejecting booleans and floats."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProtocolError(f"invalid_{field_name}", f"{field_name} must be a non-negative integer")
+    if value < 0 or value > max_value:
+        raise ProtocolError(f"invalid_{field_name}", f"{field_name} is out of range")
+    return value
+
+
 def generate_id(prefix: str = "id") -> str:
     """Generate a compact protocol-compliant identifier."""
     return f"{prefix}-{uuid.uuid4().hex[:12]}"

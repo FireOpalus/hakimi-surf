@@ -2547,3 +2547,89 @@ async def test_breezeblue_config_provider_streaming_and_redaction(tmp_path):
         assert "brz_secret_key_abcdef12" not in err_msg
         assert "brz_another_leaked_key" not in err_msg
         assert "brz_[REDACTED]" in err_msg or "[REDACTED]" in err_msg
+
+
+async def test_playback_cursor_tracking_and_cancel_turn_cursor_payload(tmp_path):
+    from voice_client.audio import AfplayAudioPlayer, RawStreamAudioPlayer
+
+    fake_player = tmp_path / "fake_play.py"
+    fake_player.write_text(
+        "import sys, time\npath = sys.argv[1]\nif '2.' in path:\n    time.sleep(0.5)\n",
+        encoding="utf-8",
+    )
+
+    second_started = asyncio.Event()
+
+    class SlowTts:
+        async def synthesize(self, text: str) -> tuple[bytes, str]:
+            if text == "second":
+                await asyncio.sleep(0.02)
+            return b"ID3-DATA", "mp3"
+
+    def on_first(tid: str, _ms: float) -> None:
+        if tid == "t-cur" and player.playback_cursor("t-cur")["played_seq"] >= 2:
+            second_started.set()
+
+    player = AfplayAudioPlayer(
+        SlowTts(),
+        play_cmd_factory=lambda p: [sys.executable, str(fake_player), str(p)],
+        enable_streaming=False,
+        on_first_audio=on_first,
+    )
+    await player.start()
+    try:
+        player.enqueue_chunk("t-cur", 1, "first")
+        player.enqueue_chunk("t-cur", 2, "second")
+        assert player.playback_cursor("t-cur")["played_seq"] == 0
+        await asyncio.wait_for(second_started.wait(), timeout=2.0)
+        cur = player.playback_cursor("t-cur")
+        assert cur["played_seq"] == 2
+        assert cur["completed_seq"] >= 1
+        await player.cancel_turn("t-cur")
+    finally:
+        await player.stop()
+
+    raw_player = RawStreamAudioPlayer(
+        play_cmd_factory=lambda p: [sys.executable, str(fake_player), str(p)],
+        enable_streaming=False,
+    )
+    await raw_player.start()
+    try:
+        raw_player.begin_stream("t-raw", 1, "mp3")
+        raw_player.push_chunk("t-raw", b"ID3-1")
+        raw_player.end_stream("t-raw", 1)
+        await raw_player.wait_idle()
+        cur_raw = raw_player.playback_cursor("t-raw")
+        assert cur_raw["played_seq"] == 1
+        assert cur_raw["completed_seq"] == 1
+    finally:
+        await raw_player.stop()
+
+    sent_frames: list[dict[str, Any]] = []
+
+    class DummyWs:
+        async def send(self, raw: str) -> None:
+            sent_frames.append(json.loads(raw))
+
+        async def recv(self) -> str:
+            await asyncio.sleep(10)
+            return "{}"
+
+        async def close(self) -> None:
+            pass
+
+    cfg = VoiceClientConfig(ws_url="wss://example.com/ws", ws_token="tok")
+    cws = CompanionWsClient(cfg, connect_factory=lambda *a, **kw: DummyWs())
+    await cws.connect()
+    try:
+        await cws.cancel_turn("t-1")
+        assert sent_frames[-1] == {"type": "turn.cancel", "turn_id": "t-1"}
+        await cws.cancel_turn("t-2", played_seq=2, played_ms=850)
+        assert sent_frames[-1] == {
+            "type": "turn.cancel",
+            "turn_id": "t-2",
+            "played_seq": 2,
+            "played_ms": 850,
+        }
+    finally:
+        await cws.close()
