@@ -98,6 +98,7 @@ async def module_detail(request: Request, module_id: str):
     modes = engine.config.action_modes if engine else {}
     actions = svc.modules.catalog.view(modes, module_id=module_id)
     options = module.scheduling(engine.config)
+    fields = module.schedule_options.model_json_schema()["properties"]
     return {
         "id": module_id,
         "title": module.display_name or module_id,
@@ -111,8 +112,19 @@ async def module_detail(request: Request, module_id: str):
         "actions": actions,
         "status": module.admin_status(request),
         "scheduling": {
-            "fields": module.schedule_options.model_json_schema()["properties"],
+            "fields": fields,
             "values": options.model_dump(),
+            **(
+                {
+                    "source": (
+                        ("admin" if getattr(engine, "overridden", False) else "env")
+                        if engine
+                        else "env"
+                    )
+                }
+                if fields
+                else {}
+            ),
             "timers": [
                 {
                     "action": slot.name,

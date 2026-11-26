@@ -97,26 +97,28 @@ class SocialPresenceModule(BaseModule):
             ),
         )
 
+    def event_rules(self) -> tuple[Any, ...]:
+        if self.settings is None:
+            return ()
+        from .life_rules import milestone_sharing
+
+        return (milestone_sharing(self.settings),)
+
     def unavailable(self) -> str | None:
         registry = getattr(self._service, "modules", None)
         if registry is None:
             return "no_chat_platform_connected"
-        active_chat_mods: list[BaseModule] = []
-        seen_ids: set[str] = set()
+        offline_reasons: set[str] = set()
         for plat, mod in registry.chat_platforms.items():
             if mod.inactive_reason is not None:
                 continue
             if mod.chat_connected(plat):
                 return None
-            if mod.module_id not in seen_ids:
-                seen_ids.add(mod.module_id)
-                active_chat_mods.append(mod)
-        if not active_chat_mods:
+            offline_reasons.add(mod.offline_reason(plat))
+        if not offline_reasons:
             return "no_chat_platform_connected"
-        if all(mod.module_id == "qq_social" for mod in active_chat_mods):
-            return "onebot_offline"
-        if all(mod.module_id != "qq_social" for mod in active_chat_mods):
-            return "plugin_disconnected"
+        if len(offline_reasons) == 1:
+            return next(iter(offline_reasons))
         return "no_chat_platform_connected"
 
     async def preflight(self, ticket: dict[str, Any], now: float, cfg: Any) -> GateDecision:
@@ -139,14 +141,13 @@ class SocialPresenceModule(BaseModule):
             )
             return GateDecision(reason)
         if not mod.chat_connected(target_msg.platform):
-            reason = "onebot_offline" if target_msg.platform == "onebot" else "plugin_disconnected"
-            return GateDecision(reason, delay=120)
+            return GateDecision(mod.offline_reason(target_msg.platform), delay=120)
         policy = SocialProactivePolicy(
             self._service,
             target_msg.platform,
             lambda m=target_msg: m.bot_id,
         )
-        return await policy.evaluate(ticket, now, cfg)
+        return await policy.evaluate(ticket, now, cfg, target_msg=target_msg)
 
     async def speak(self, call: ActionCall) -> Outcome:
         target_scope = str(call.ticket.get("target_scope") or "")
@@ -168,8 +169,7 @@ class SocialPresenceModule(BaseModule):
             )
             return Outcome("gated_skip", reason)
         if not mod.chat_connected(target_msg.platform):
-            reason = "onebot_offline" if target_msg.platform == "onebot" else "plugin_disconnected"
-            return Outcome("not_dispatched", reason)
+            return Outcome("not_dispatched", mod.offline_reason(target_msg.platform))
         return await speak_proactive(self._service, target_msg, call)
 
     async def planning_context(self, service: Any, config: Any, now: float) -> dict[str, Any]:

@@ -239,7 +239,11 @@ class RemoteModuleProxy(BaseModule):
             and platform in self.chat_platforms
             and self._session.ready
             and not self._session.closed
+            and self._remote_status.get("connected", True) is not False
         )
+
+    def bot_id_for(self, platform: str) -> str:
+        return self._bot_id() if platform in self.chat_platforms else ""
 
     def _bot_id(self) -> str:
         raw_bot_id = self._remote_status.get("bot_id")
@@ -339,14 +343,21 @@ class RemoteModuleProxy(BaseModule):
             or not self.enabled
             or not self._session.ready
             or self._session.closed
+            or self._remote_status.get("connected", True) is False
         ):
             return {}
         groups = self._proactive_groups()
-        proactive = getattr(service, "proactive", None)
+        reg = getattr(self, "_registry", None) or getattr(service, "modules", None)
+        engine = getattr(service, "life_engine", None)
+        delivery_enabled = (
+            reg.owner_delivery_enabled(config, settings=self.settings, engine=engine)
+            if reg is not None
+            else bool(getattr(getattr(service, "proactive", None), "delivery_enabled", False))
+        )
         owner_dm = bool(
-            proactive is not None
-            and getattr(proactive, "platform", None) in self.chat_platforms
-            and getattr(proactive, "delivery_enabled", False)
+            delivery_enabled
+            and self.settings is not None
+            and any(owner_binding(self.settings, plat) is not None for plat in self.chat_platforms)
         )
         ctx: dict[str, Any] = {}
         if groups:

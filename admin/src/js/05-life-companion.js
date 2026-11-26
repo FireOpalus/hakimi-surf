@@ -118,8 +118,9 @@ function renderSocialSchedule(values,spMeta){
   const parts=['托管模块：social_presence（社交主动）'];
   parts.push(meta.enabled===false?'模块已停用':'模块已启用');
   if(meta.proactive_paused)parts.push('高专注已暂停主动');
-  if(meta.source){
-    const srcLabel=(meta.source==='admin'||meta.source==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
+  const src=meta.source||meta.scheduling?.source;
+  if(src){
+    const srcLabel=(src==='admin'||src==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
     parts.push('配置来源：'+srcLabel);
   }
   text('social-schedule-status',parts.join(' · '));
@@ -216,7 +217,7 @@ function renderLife(d){
   text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+zoneLabel(tz)+(eng.next_plan_at?' · 下次行程规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
   for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
   const spMod=(ws.modules||[]).find(m=>m.module_id==='social_presence');
-  renderSocialSchedule({...(c.module_settings?.social_presence||{}),...c},spMod?{...spMod,source:d.source}:{source:d.source});
+  renderSocialSchedule({...c,...(c.module_settings?.social_presence||{})},spMod?{...spMod,source:d.source}:{source:d.source});
   table('life-digests',['日期','进度','已生成','已排队','平台已确认'],(d.digest_history||[]).map(r=>[
     r.day,deliveryStages[r.stage]||r.stage,lifeFmt(r.generated_at,tz),lifeFmt(r.queued_at,tz),lifeFmt(r.confirmed_at,tz)
   ]));

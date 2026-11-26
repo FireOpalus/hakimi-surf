@@ -58,11 +58,8 @@ def resolve_social_message(
     policies = getattr(service.s, "group_policies", {}) or {}
     if policies.get(scope, "at_only") == "muted":
         return None
-    if plat == "onebot":
-        bot_id = str(getattr(service.s, "onebot_self_id", "") or "").strip()
-    elif hasattr(mod, "_bot_id"):
-        bot_id = str(mod._bot_id() or "").strip()
-    else:
+    bot_id = str(mod.bot_id_for(plat) or "").strip()
+    if not bot_id:
         binding = owner_binding(service.s, plat)
         bot_id = binding.bot_id if binding is not None else mod.module_id
     if not bot_id:

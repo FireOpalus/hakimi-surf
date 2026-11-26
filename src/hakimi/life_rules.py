@@ -188,12 +188,7 @@ class RuleDispatcher:
         if spec is None:
             return False
         return bool(
-            spec.social
-            and (
-                spec.proactive_speak
-                or spec.name in {"social.speak", "qq.speak"}
-                or spec.name.endswith(".speak")
-            )
+            spec.social and (spec.proactive_speak or spec.name in {"social.speak", "qq.speak"})
         )
 
     async def initialize(self, *, before_event=None) -> None:

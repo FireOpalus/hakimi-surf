@@ -258,7 +258,14 @@ body:not(.authenticated) main {
 .module-icon svg { width: 23px; height: 23px; }
 .module-card[data-module-id=bilibili_surf] .module-icon { color: var(--vertex-ink); background: var(--vertex-bg); }
 .module-card[data-module-id=minecraft] .module-icon { color: var(--good); background: var(--good-bg); }
+.module-card[data-module-id=social_presence] .module-icon { color: var(--warn); background: var(--warn-bg); }
+.module-card[data-module-id=telegram] .module-icon { color: var(--vertex-ink); background: var(--vertex-bg); }
+.module-card[data-module-id=song_finder] .module-icon { color: var(--bad); background: var(--bad-bg); }
+.module-card[data-module-id=web_tools] .module-icon { color: var(--free-ink); background: var(--free-bg); }
+.module-card[data-module-id=doc_render] .module-icon { color: var(--warn); background: var(--warn-bg); }
 .module-card[data-system-module=drive_sync] .module-icon { color: var(--vertex-ink); background: var(--vertex-bg); }
+.module-card[data-system-module=memory_hub] .module-icon { color: var(--paid-ink); background: var(--paid-bg); }
+.module-card[data-system-module=voice_gateway] .module-icon { color: var(--free-ink); background: var(--free-bg); }
 
 .module-name-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-width: 0; }
 .module-name-row .module-switch { flex: none; white-space: nowrap; }

@@ -88,14 +88,13 @@ class OwnerProactive:
         engine = getattr(self.service, "life_engine", None)
         if engine is None:
             return False
+        registry = getattr(self.service, "modules", None)
+        if registry is not None:
+            return registry.owner_delivery_enabled(engine.config, settings=self.s, engine=engine)
         if not getattr(engine, "overridden", False) and engine.config.module_settings == getattr(
             getattr(engine, "env_config", None), "module_settings", None
         ):
             return bool(self.s.proactive_dm_enabled)
-        registry = getattr(self.service, "modules", None)
-        social_mod = registry.get("social_presence") if registry is not None else None
-        if social_mod is not None:
-            return bool(social_mod.scheduling(engine.config).owner_delivery_enabled)
         defaults = SocialScheduleOptions.from_settings(self.s).model_dump()
         raw = engine.config.module_settings.get("social_presence", {})
         return bool(
@@ -300,13 +299,19 @@ class OwnerProactive:
             await self._repair_confirmed()
 
     async def note_activity(self, message):
-        if not self.matches(message):
+        if self.matches(message):
+            scope = self.scope
+        elif message is not None and message.kind == "private" and bound_owner(message, self.s):
+            scope = owner_dm_scope(self.s, message.platform)
+            if not scope:
+                return
+        else:
             return
         async with self.store.transaction():
             await self.store.db.execute(
                 "INSERT INTO owner_dm_state(scope,last_private_at) VALUES (?,?) "
                 "ON CONFLICT(scope) DO UPDATE SET last_private_at=excluded.last_private_at",
-                (self.scope, self.clock()),
+                (scope, self.clock()),
             )
 
     async def on_connection(self, online: bool, *, platform: str | None = None):

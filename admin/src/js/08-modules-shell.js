@@ -301,6 +301,8 @@ function registerPluginPage(m){
   const navBtn=$('nav-modules').cloneNode(true);
   navBtn.id='nav-'+key;navBtn.dataset.tab=key;navBtn.dataset.description=m.description||'';
   navBtn.setAttribute('aria-controls',key);navBtn.setAttribute('aria-selected','false');navBtn.tabIndex=-1;
+  const tplIcon=$('catalog-icon-'+m.id)?.content.firstElementChild;
+  if(tplIcon)navBtn.querySelector('svg')?.replaceWith(tplIcon.cloneNode(true));
   navBtn.querySelector('span').textContent=m.title||m.id;
   navBtn.addEventListener('click',()=>navigate(key));
   group.append(navBtn);$('platform-nav-group').append(group);

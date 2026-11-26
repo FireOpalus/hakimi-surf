@@ -1488,6 +1488,7 @@ class LifeEngine:
                     names = {
                         n for n, owner in self.catalog.owners.items() if owner == module.module_id
                     }
+                    chat_plats = set(getattr(module, "chat_platforms", ()) or ())
                     cur = await self.store.db.execute(
                         "SELECT id, action_name, target_module, source_module, action_type, "
                         "target_scope FROM scheduled_intents WHERE status='pending'"
@@ -1514,6 +1515,20 @@ class LifeEngine:
                         canon = self.catalog.canonical_name(raw_name) if raw_name else None
                         if canon in names:
                             cancel_ids.append(intent_id)
+                            continue
+                        if chat_plats and target_scope:
+                            scope_str = str(target_scope).strip()
+                            if scope_str.startswith(("owner:", "boundowner:")):
+                                matched = resolve_owner_scope(
+                                    scope_str, self.s, include_inactive=True
+                                )
+                                target_plat = matched[0] if matched is not None else ""
+                            else:
+                                target_plat = (
+                                    scope_str.partition(":")[0] if ":" in scope_str else ""
+                                )
+                            if target_plat in chat_plats:
+                                cancel_ids.append(intent_id)
                     if cancel_ids:
                         await self.store.db.execute(
                             "UPDATE scheduled_intents SET status='gated_skip',"
@@ -1676,9 +1691,22 @@ class LifeEngine:
                 saved = self.store.vault.open("admin:life_engine", row[0]) if row else {}
                 saved = migrate_flat(saved)
                 merged = {**self.env_config.model_dump(), **saved}
-                merged["module_settings"] = self.env_config.module_settings | saved.get(
-                    "module_settings", {}
-                )
+                env_mods = self.env_config.module_settings
+                saved_mods = saved.get("module_settings", {})
+                if isinstance(saved_mods, dict):
+                    merged["module_settings"] = {
+                        mid: (
+                            {**env_mods[mid], **saved_mods[mid]}
+                            if isinstance(env_mods.get(mid), dict)
+                            and isinstance(saved_mods.get(mid), dict)
+                            else saved_mods[mid]
+                            if mid in saved_mods
+                            else env_mods[mid]
+                        )
+                        for mid in env_mods.keys() | saved_mods.keys()
+                    }
+                else:
+                    merged["module_settings"] = dict(env_mods)
                 merged["action_modes"] = self.env_config.action_modes | saved.get(
                     "action_modes", {}
                 )

@@ -15,6 +15,7 @@ from hakimi.app import create_app
 from hakimi.life_engine import LifeEngine
 from hakimi.models import Message
 from hakimi.modules.actions import ActionCall, NoArgs
+from hakimi.modules.base import BaseModule
 from hakimi.modules.qq_social import QQSocialModule
 from hakimi.modules.scheduling import ScheduleOptions, SocialScheduleOptions
 from hakimi.plugin_bus.protocol import RESERVED_PLUGIN_IDS
@@ -785,12 +786,25 @@ async def test_admin_life_status_resolves_executor_module_for_historical_speak_a
         assert by_id["hist-admin-tg"]["executor_module"] == "social_presence"
 
 
+class _FakeDiscordChatModule(BaseModule):
+    """Minimal registered third-party chat adapter used to verify dynamic platform hooks."""
+
+    module_id = "discord"
+    display_name = "Discord 社交"
+    chat_platforms = ("discord",)
+    recipient_namespaces = ("discord",)
+
+    async def _raw_sensor_summary(self) -> str:
+        return "Discord:在线"
+
+
 async def test_disabling_social_presence_cancels_all_legacy_speak_and_null_action_intents(
     settings: Any, store: Any
 ) -> None:
     """Warning 4: set_module_enabled('social_presence', False) cancels qq/tg/dc/NULL speak rows."""
     s = _dual_platform_settings(settings, primary="onebot")
     svc = Service(s, store, FakeGateway(), FakeBili(), FakeSender())
+    svc.modules.register(_FakeDiscordChatModule(s))
     try:
         await svc.life_engine.initialize()
         rows = [
@@ -848,7 +862,7 @@ async def test_disabling_social_presence_cancels_all_legacy_speak_and_null_actio
 async def test_catalog_compatibility_resolve_for_social_presence_and_plat_speak(
     settings: Any, store: Any
 ) -> None:
-    """compatibility=True resolves ('social_presence', 'speak', True) & ('<plat>','speak',True)."""
+    """compatibility=True resolves registered chat platforms and rejects unregistered *.speak."""
     s = _dual_platform_settings(settings, primary="onebot")
     svc = Service(s, store, FakeGateway(), FakeBili(), FakeSender())
     try:
@@ -866,6 +880,31 @@ async def test_catalog_compatibility_resolve_for_social_presence_and_plat_speak(
         )
         assert spec_sp.name == "social.speak"
 
+        # Unregistered platform *.speak must NOT silently fold to social.speak
+        with pytest.raises(ValueError, match="unknown_action"):
+            cat.resolve(
+                {
+                    "action_name": "garbage.speak",
+                    "target_module": "garbage",
+                    "action_type": "speak",
+                    "target_scope": "garbage:123",
+                    "origin": "planner",
+                }
+            )
+        with pytest.raises(ValueError, match="unknown_action"):
+            cat.resolve(
+                {
+                    "action_name": "discord.speak",
+                    "target_module": "discord",
+                    "action_type": "speak",
+                    "target_scope": "discord:123",
+                    "origin": "planner",
+                },
+                compatibility=True,
+            )
+
+        # Registering a chat platform enables dynamic <platform>.speak -> social.speak folding
+        svc.modules.register(_FakeDiscordChatModule(s))
         spec_dc = cat.resolve(
             {
                 "action_name": "discord.speak",
@@ -891,3 +930,216 @@ async def test_catalog_compatibility_resolve_for_social_presence_and_plat_speak(
             )
     finally:
         await svc.stop()
+
+
+async def test_disabling_chat_platform_cancels_only_its_pending_social_speak_intents(
+    settings: Any,
+) -> None:
+    """Disabling qq_social or telegram cancels only pending social.speak rows for its platform."""
+    s = _dual_platform_settings(settings, primary="onebot")
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": "Bearer " + TOKEN},
+        ) as client,
+    ):
+        svc = app.state.service
+        svc.kernel = PluginKernel()
+        svc.life_engine = LifeEngine(svc, clock=lambda: NOW)
+        await svc.life_engine.initialize()
+
+        # Verify unregistered *.speak is rejected by admin action mode endpoint
+        r_bad = await client.put("/admin/api/life/actions/garbage.speak", json={"mode": "off"})
+        assert r_bad.status_code == 400
+
+        fake_api = _FakeTelegramApi()
+        plugin, bridge, runner = await _start_connected_plugin(
+            svc, svc.plugin_bus, fake_api, allowed_groups={GROUP_ID}, proactive_groups={GROUP_ID}
+        )
+        try:
+            tg_owner = owner_target_scope(s, "telegram")
+            assert tg_owner and tg_owner.startswith("boundowner:")
+            rows = [
+                ("sp-qq-owner", "social_presence", "speak", "social.speak", "owner:20000"),
+                ("sp-qq-group", "social_presence", "speak", "social.speak", "onebot:40000"),
+                ("sp-tg-owner", "social_presence", "speak", "social.speak", tg_owner),
+                ("sp-tg-group", "social_presence", "speak", "social.speak", f"telegram:{GROUP_ID}"),
+                ("sp-mc", "minecraft", "explore", "mc.explore", ""),
+            ]
+            async with svc.store.transaction():
+                for row_id, mod, verb, act_name, scope in rows:
+                    await svc.store.db.execute(
+                        "INSERT INTO scheduled_intents("
+                        "id,created_at,updated_at,execute_after,expire_at,target_module,"
+                        "action_type,action_name,target_scope,status,mood,"
+                        "intent_note_json,gate_condition_json"
+                        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            row_id,
+                            NOW,
+                            NOW,
+                            NOW + 60,
+                            NOW + 3600,
+                            mod,
+                            verb,
+                            act_name,
+                            scope,
+                            "pending",
+                            "curious",
+                            "{}",
+                            "{}",
+                        ),
+                    )
+
+            qq_mod = svc.modules.get("qq_social")
+            tg_mod = svc.modules.get("telegram")
+            assert qq_mod is not None and tg_mod is not None
+
+            await svc.life_engine.set_module_enabled(qq_mod, False)
+            for row_id in ("sp-qq-owner", "sp-qq-group"):
+                got = await svc.store.one(
+                    "SELECT status, result_reason FROM scheduled_intents WHERE id=?", (row_id,)
+                )
+                assert (got["status"], got["result_reason"]) == ("gated_skip", "module_disabled")
+            for row_id in ("sp-tg-owner", "sp-tg-group", "sp-mc"):
+                got = await svc.store.one(
+                    "SELECT status, result_reason FROM scheduled_intents WHERE id=?", (row_id,)
+                )
+                assert got["status"] == "pending"
+
+            await svc.life_engine.set_module_enabled(tg_mod, False)
+            for row_id in ("sp-tg-owner", "sp-tg-group"):
+                got = await svc.store.one(
+                    "SELECT status, result_reason FROM scheduled_intents WHERE id=?", (row_id,)
+                )
+                assert (got["status"], got["result_reason"]) == ("gated_skip", "module_disabled")
+            keep = await svc.store.one("SELECT status FROM scheduled_intents WHERE id='sp-mc'")
+            assert keep["status"] == "pending"
+        finally:
+            await _stop_connected_plugin(plugin, bridge, runner)
+
+
+async def test_disabling_social_presence_suppresses_milestone_without_receipt(
+    settings: Any, store: Any
+) -> None:
+    """social.milestone is owned by social_presence and writes no receipt while disabled."""
+    s = _dual_platform_settings(settings, primary="onebot")
+    svc = Service(s, store, FakeGateway(), FakeBili(), FakeSender())
+    try:
+        assert svc.modules.rule_owners.get("social.milestone") == "social_presence"
+        svc.world_state.clock = lambda: NOW
+        svc.life_engine = LifeEngine(svc, clock=lambda: NOW)
+        await svc.life_engine.initialize()
+
+        sp = svc.modules.get("social_presence")
+        assert sp is not None
+        await svc.life_engine.set_module_enabled(sp, False)
+
+        ev1 = await svc.world_state.publish_event(
+            "bilibili_surf",
+            "bili_video_watched",
+            {"bvid": "BV1xx411c7mD"},
+            importance="high",
+            now=NOW,
+        )
+        assert (
+            await store.one(
+                "SELECT COUNT(*) FROM life_rule_receipts WHERE rule_id='social.milestone' "
+                "AND event_id=?",
+                (ev1.id,),
+            )
+        )[0] == 0
+        assert (
+            await store.one(
+                "SELECT COUNT(*) FROM scheduled_intents WHERE source_event_id=?", (ev1.id,)
+            )
+        )[0] == 0
+
+        await svc.life_engine.set_module_enabled(sp, True)
+        ev2 = await svc.world_state.publish_event(
+            "bilibili_surf",
+            "bili_video_watched",
+            {"bvid": "BV1yy411c7mD"},
+            importance="high",
+            now=NOW + 700,
+        )
+        assert (
+            await store.one(
+                "SELECT COUNT(*) FROM scheduled_intents WHERE source_event_id=?", (ev2.id,)
+            )
+        )[0] == 1
+    finally:
+        await svc.stop()
+
+
+async def test_secondary_bound_owner_note_activity_and_partial_settings_and_proxy_connected(
+    settings: Any,
+) -> None:
+    """Secondary Owner chat updates cooldown; partial saved dict preserves .env; proxy connected."""
+    s = _dual_platform_settings(settings, primary="onebot").model_copy(
+        update={"proactive_dm_enabled": False}
+    )
+    app = create_app(s, gateway_factory=lambda *_: FakeGateway(), start_workers=False)
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        svc.kernel = PluginKernel()
+        svc.proactive.clock = lambda: NOW - 600
+        await svc.proactive.initialize()
+
+        # 1. Partial saved module_settings preserves .env owner_delivery_enabled=False
+        await svc.store.runtime.save_config(
+            "life_engine",
+            {"module_settings": {"social_presence": {"group_cooldown_seconds": 1200}}},
+        )
+        engine = LifeEngine(svc, clock=lambda: NOW)
+        await engine.initialize()
+        assert engine.config.module_settings["social_presence"]["group_cooldown_seconds"] == 1200
+        assert engine.config.module_settings["social_presence"]["owner_delivery_enabled"] is False
+        assert engine.config.owner_delivery_enabled is False
+
+        # Re-enable owner_delivery_enabled for preflight test
+        await engine.set_config({"owner_delivery_enabled": True})
+        svc.life_engine = engine
+
+        fake_api = _FakeTelegramApi()
+        plugin, bridge, runner = await _start_connected_plugin(
+            svc, svc.plugin_bus, fake_api, allowed_groups={GROUP_ID}, proactive_groups={GROUP_ID}
+        )
+        try:
+            tg_proxy = svc.modules.get("telegram")
+            assert tg_proxy is not None
+            assert tg_proxy.chat_connected("telegram") is True
+            assert tg_proxy.bot_id_for("telegram") == BOT_ID
+
+            # 2. Secondary bound Owner private chat records last_private_at -> blocks preflight
+            tg_owner_msg = Message(
+                platform="telegram",
+                bot_id=BOT_ID,
+                event_id="tg-priv-1",
+                user_id=OWNER_UID,
+                conversation_id=OWNER_UID,
+                kind="private",
+                text="刚聊完",
+                addressed=True,
+                created_at=NOW - 600,
+            )
+            await svc.proactive.note_activity(tg_owner_msg)
+            spec = svc.modules.catalog.actions["social.speak"]
+            tg_scope = owner_target_scope(s, "telegram")
+            cfg = svc.modules.get("social_presence").scheduling(engine.config)
+            dec = await spec.preflight(
+                {"id": "tg-recent-1", "target_scope": tg_scope, "action_type": "speak"},
+                NOW,
+                cfg,
+            )
+            assert dec.reason == "owner_recent_activity"
+
+            # 3. Remote plugin reporting connected=False fails chat_connected & planning_context
+            tg_proxy._remote_status["connected"] = False
+            assert tg_proxy.chat_connected("telegram") is False
+            assert await tg_proxy.planning_context(svc, engine.config, NOW) == {}
+        finally:
+            await _stop_connected_plugin(plugin, bridge, runner)

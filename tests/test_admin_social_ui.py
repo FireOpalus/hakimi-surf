@@ -154,6 +154,20 @@ def test_admin_social_ui_build_and_markup(tmp_path: Path) -> None:
     assert "'尚未配置 Owner 投递目标'" in script
     assert "'QQ 已确认'" not in script
     assert "'尚未配置 Owner QQ'" not in script
+    assert "{...c,...(c.module_settings?.social_presence||{})}" in script
+
+    # Dedicated SVG icon templates for platform/plugin & system modules (cards + sidebar)
+    for icon_id in (
+        "social_presence",
+        "telegram",
+        "song_finder",
+        "web_tools",
+        "doc_render",
+        "memory_hub",
+        "voice_gateway",
+    ):
+        assert f'id="catalog-icon-{icon_id}"' in panels["modules"]
+    assert "catalog-icon-'+m.id" in script
 
 
 def test_admin_social_ui_js_runtime() -> None:
@@ -600,6 +614,7 @@ async def test_admin_social_schedule_api_and_flat_compat(settings: Any) -> None:
         assert r_detail.status_code == 200
         detail = r_detail.json()
         assert detail["id"] == "social_presence"
+        assert detail["scheduling"]["source"] == "env"
         assert set(detail["scheduling"]["fields"]) == {
             "owner_delivery_enabled",
             "owner_dms_unlimited",
@@ -622,6 +637,7 @@ async def test_admin_social_schedule_api_and_flat_compat(settings: Any) -> None:
         r_put = await client.put("/admin/api/life/modules/social_presence/schedule", json=updated)
         assert r_put.status_code == 200
         assert r_put.json()["scheduling"]["values"] == updated
+        assert r_put.json()["scheduling"]["source"] == "admin"
 
         r_life = await client.get("/admin/api/life")
         assert r_life.status_code == 200

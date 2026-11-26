@@ -140,17 +140,25 @@ class SocialProactivePolicy:
         except (TypeError, ValueError):
             return default
 
-    async def evaluate(self, ticket: dict[str, Any], now: float, cfg: Any = None) -> GateDecision:
+    async def evaluate(
+        self,
+        ticket: dict[str, Any],
+        now: float,
+        cfg: Any = None,
+        *,
+        target_msg: Message | None = None,
+    ) -> GateDecision:
         intent_id = ticket["id"]
         ws = self.service.world_state
-        target_msg = resolve_social_target(
-            self.service,
-            self.platform,
-            self._bot_id(),
-            str(ticket.get("target_scope", "") or ""),
-            event_id=f"gate:{intent_id}",
-            created_at=now,
-        )
+        if target_msg is None:
+            target_msg = resolve_social_target(
+                self.service,
+                self.platform,
+                self._bot_id(),
+                str(ticket.get("target_scope", "") or ""),
+                event_id=f"gate:{intent_id}",
+                created_at=now,
+            )
         if target_msg is None:
             return GateDecision("unauthorized_scope")
 
@@ -319,31 +327,17 @@ class SocialProactivePolicy:
             if owner_binding(self.s, target_msg.platform) is None:
                 return False, None
             engine = getattr(self.service, "life_engine", None)
+            modules = getattr(self.service, "modules", None)
             if engine is None:
                 if not getattr(self.s, "proactive_dm_enabled", True):
                     return False, None
-            elif not getattr(
-                engine, "overridden", False
-            ) and engine.config.module_settings == getattr(
-                getattr(engine, "env_config", None), "module_settings", None
-            ):
-                if not getattr(self.s, "proactive_dm_enabled", True):
+            elif modules is not None:
+                if not modules.owner_delivery_enabled(
+                    engine.config, settings=self.s, engine=engine
+                ):
                     return False, None
-            else:
-                modules = getattr(self.service, "modules", None)
-                social_mod = modules.get("social_presence") if modules is not None else None
-                if social_mod is not None:
-                    if not social_mod.scheduling(engine.config).owner_delivery_enabled:
-                        return False, None
-                else:
-                    from .modules.scheduling import SocialScheduleOptions
-
-                    defaults = SocialScheduleOptions.from_settings(self.s).model_dump()
-                    raw = engine.config.module_settings.get("social_presence", {})
-                    if not SocialScheduleOptions.model_validate(
-                        {**defaults, **raw}
-                    ).owner_delivery_enabled:
-                        return False, None
+            elif not getattr(self.s, "proactive_dm_enabled", True):
+                return False, None
         if getattr(cfg, "owner_delivery_enabled", None) is False:
             return False, None
         if await self.owner_recently_active(ticket, now, platform=target_msg.platform):
