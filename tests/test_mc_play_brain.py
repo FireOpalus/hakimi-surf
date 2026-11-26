@@ -189,7 +189,7 @@ async def test_mc_play_scene_registration_macro_origins_and_session_intent(
         assert scene.label == "MC 实时游玩"
         assert scene.default == "low"
         assert tuple(scene.levels) == ("low", "medium", "high")
-        assert scene.output_tokens == 1280
+        assert scene.output_tokens == 2048
 
         # Macro-only planner origins
         for verb in ("connect", "disconnect", "build_plan"):
@@ -3605,25 +3605,23 @@ async def test_mc_action_log_not_truncated_by_plugin_bus_and_evade_shelter_backo
 
 
 @pytest.mark.asyncio
-async def test_mc_play_lean_prompt_recent_chats_and_recap_no_immediate_wake(
+async def test_mc_play_recent_chats_compact_state_and_recap_no_immediate_wake(
     brain_bus_env: Any, sdk_pair: Any
 ) -> None:
-    """Verify lean mc.play system prompt, bounded recent_chats, and calm recap ledger posting."""
-    from hakimi.gemini_generate import MC_PLAY_SYSTEM_INSTRUCTION
-    from hakimi.persona import PUBLIC_PERSONA_PROMPT
+    """Verify decoupled mc.play output cap (2048), bounded recent_chats, and calm recap ledger."""
     from hakimi.thinking_policy import ThinkingScene
     from plugins.minecraft.play_brain import MC_PLAY_TASK_INSTRUCTION
     from tests.test_sdk_contract import decision_response
 
     _, svc, bus, _ = brain_bus_env
 
-    # 1. mc.play uses lean MC_PLAY_SYSTEM_INSTRUCTION instead of verbose QQ persona charter.
+    # 1. mc.play keeps decoupled kernel prompt + full 2048 output cap to avoid truncation.
     svc.s._thinking_scenes["mc.play"] = ThinkingScene(
         "mc.play",
         "MC 实时游玩",
         default="low",
         levels=("low", "medium", "high"),
-        output_tokens=1280,
+        output_tokens=2048,
     )
     captured_bodies: list[dict[str, Any]] = []
 
@@ -3667,10 +3665,8 @@ async def test_mc_play_lean_prompt_recent_chats_and_recap_no_immediate_wake(
     )
     gen_body = next(b for b in captured_bodies if "system_instruction" in b)
     sys_prompt = gen_body["system_instruction"]
-    assert MC_PLAY_SYSTEM_INSTRUCTION in sys_prompt
-    assert PUBLIC_PERSONA_PROMPT not in sys_prompt
     assert "【已授权插件任务规范】" in sys_prompt
-    assert gen_body["generation_config"]["max_output_tokens"] == 1280
+    assert gen_body["generation_config"]["max_output_tokens"] == 2048
 
     # 2. _build_generate_payload carries bounded recent_chats (<=3) and compacts empty state fields.
     plugin = MinecraftPlugin(

@@ -855,7 +855,7 @@ class MinecraftPlugin:
                     label="MC 实时游玩",
                     default="low",
                     levels=("low", "medium", "high"),
-                    output_tokens=1280,
+                    output_tokens=2048,
                 ),
             )
         else:
