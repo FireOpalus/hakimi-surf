@@ -249,7 +249,16 @@ class RuntimeState:
         model_values = {}
         rows = await self.store.all("SELECT * FROM admin_config")
         for row in rows:
-            value = self.store.vault.open("admin:" + row["key"], row["payload"])
+            try:
+                value = self.store.vault.open("admin:" + row["key"], row["payload"])
+            except Rejected as exc:
+                if (
+                    row["key"] == "voice_gateway_override"
+                    and str(exc) == "ciphertext_context_mismatch"
+                ):
+                    value = self.store.vault.open("voice-gateway-override:v1", row["payload"])
+                else:
+                    raise
             if row["key"] == "life_engine" and isinstance(value, dict):
                 old_schedule = value
             elif row["key"] == "bot_ids":

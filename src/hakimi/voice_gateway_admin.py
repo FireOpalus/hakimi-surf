@@ -11,10 +11,18 @@ import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .security import Rejected, configured_secrets
+from .security import Rejected, configured_secrets, set_runtime_secret_bucket
 
 _CONFIG_KEY = "voice_gateway_override"
-_VAULT_CTX = "voice-gateway-override:v1"
+_VAULT_CTX = "admin:voice_gateway_override"
+_LEGACY_VAULT_CTX = "voice-gateway-override:v1"
+_OVERRIDE_SECRET_KEYS = (
+    "siliconflow_api_key",
+    "fish_api_key",
+    "breezeblue_api_key",
+    "openai_stt_api_key",
+)
+_UNSET: Any = object()
 
 
 class VoiceGatewayConfigUpdate(BaseModel):
@@ -91,17 +99,17 @@ class VoiceGatewayAdminManager:
         tok = self.s.voice_gateway_token.get_secret_value().strip()
         return {"Authorization": f"Bearer {tok}"}
 
+    def _sync_runtime_secrets(self) -> None:
+        ov = self._override if isinstance(self._override, dict) else {}
+        extras = [val for key in _OVERRIDE_SECRET_KEYS if (val := str(ov.get(key) or "").strip())]
+        set_runtime_secret_bucket(self.s, "voice_gateway", extras)
+
     def _scrub(self, text: Any, *extra_secrets: str) -> str:
         out = " ".join(str(text or "").split())
         secrets = list(configured_secrets(self.s))
         secrets.extend(s for s in extra_secrets if isinstance(s, str) and s.strip())
         if isinstance(self._override, dict):
-            for k in (
-                "siliconflow_api_key",
-                "fish_api_key",
-                "breezeblue_api_key",
-                "openai_stt_api_key",
-            ):
+            for k in _OVERRIDE_SECRET_KEYS:
                 val = str(self._override.get(k) or "").strip()
                 if val:
                     secrets.append(val)
@@ -109,8 +117,9 @@ class VoiceGatewayAdminManager:
             out = out.replace(sec, "[REDACTED]")
         return out[:220]
 
-    def _saved_keys(self) -> dict[str, bool]:
-        ov = self._override or {}
+    def _saved_keys(self, override: Any = _UNSET) -> dict[str, bool]:
+        raw = self._override if override is _UNSET else override
+        ov = raw if isinstance(raw, dict) else {}
         return {
             "siliconflow": bool(str(ov.get("siliconflow_api_key") or "").strip()),
             "fish": bool(str(ov.get("fish_api_key") or "").strip()),
@@ -158,12 +167,33 @@ class VoiceGatewayAdminManager:
                     "SELECT payload FROM admin_config WHERE key=?", (_CONFIG_KEY,)
                 )
             if row and row[0]:
+                migrated_legacy = False
+                data: Any = None
                 try:
                     data = self.store.vault.open(_VAULT_CTX, row[0])
-                    if isinstance(data, dict):
-                        self._override = data
+                except Rejected as exc:
+                    if str(exc) == "ciphertext_context_mismatch":
+                        try:
+                            data = self.store.vault.open(_LEGACY_VAULT_CTX, row[0])
+                            migrated_legacy = isinstance(data, dict)
+                        except Exception:
+                            data = None
+                    else:
+                        data = None
                 except Exception:
+                    data = None
+                if isinstance(data, dict):
+                    self._override = data
+                    if migrated_legacy:
+                        sealed = self.store.vault.seal(_VAULT_CTX, data)
+                        async with self.store.transaction():
+                            await self.store.db.execute(
+                                "INSERT OR REPLACE INTO admin_config VALUES (?, ?)",
+                                (_CONFIG_KEY, sealed),
+                            )
+                else:
                     self._override = None
+            self._sync_runtime_secrets()
             self.initialized = True
 
     async def sync_to_gateway(self) -> bool:
@@ -187,39 +217,53 @@ class VoiceGatewayAdminManager:
                 "saved_keys": self._saved_keys(),
                 "gateway": None,
             }
-        source = "sqlite" if self._override is not None else "env"
         try:
             resp = await self._request("GET", "/v1/admin/config")
             if resp.status_code != 200:
+                ov = self._override
                 return {
                     "configured": True,
                     "reachable": False,
                     "error": f"gateway_http_{resp.status_code}",
-                    "source": source,
-                    "saved_keys": self._saved_keys(),
+                    "source": "sqlite" if ov is not None else "env",
+                    "saved_keys": self._saved_keys(ov),
                     "gateway": None,
                 }
             gw = resp.json()
-            if isinstance(self._override, dict) and not gw.get("overridden"):
-                sync_resp = await self._request(
-                    "POST", "/v1/admin/config", json_body=self._override
-                )
-                if sync_resp.status_code == 200:
-                    gw = sync_resp.json()
+            ov = self._override
+            if isinstance(ov, dict) and isinstance(gw, dict) and not gw.get("overridden"):
+                async with self._op_lock:
+                    ov = self._override
+                    recheck_resp = await self._request("GET", "/v1/admin/config")
+                    if recheck_resp.status_code != 200:
+                        return {
+                            "configured": True,
+                            "reachable": False,
+                            "error": f"gateway_http_{recheck_resp.status_code}",
+                            "source": "sqlite" if ov is not None else "env",
+                            "saved_keys": self._saved_keys(ov),
+                            "gateway": None,
+                        }
+                    gw = recheck_resp.json()
+                    if isinstance(ov, dict) and isinstance(gw, dict) and not gw.get("overridden"):
+                        sync_resp = await self._request("POST", "/v1/admin/config", json_body=ov)
+                        if sync_resp.status_code == 200:
+                            gw = sync_resp.json()
             return {
                 "configured": True,
                 "reachable": True,
-                "source": source,
-                "saved_keys": self._saved_keys(),
+                "source": "sqlite" if ov is not None else "env",
+                "saved_keys": self._saved_keys(ov),
                 "gateway": gw,
             }
         except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+            ov = self._override
             return {
                 "configured": True,
                 "reachable": False,
                 "error": self._scrub(type(exc).__name__),
-                "source": source,
-                "saved_keys": self._saved_keys(),
+                "source": "sqlite" if ov is not None else "env",
+                "saved_keys": self._saved_keys(ov),
                 "gateway": None,
             }
 
@@ -228,33 +272,33 @@ class VoiceGatewayAdminManager:
         if not self.configured():
             raise Rejected("voice_gateway_not_configured")
 
-        merged = payload.model_dump()
         key_pairs = (
             ("siliconflow_api_key", "clear_siliconflow_api_key"),
             ("fish_api_key", "clear_fish_api_key"),
             ("breezeblue_api_key", "clear_breezeblue_api_key"),
             ("openai_stt_api_key", "clear_openai_stt_api_key"),
         )
-        submitted_secrets: list[str] = []
-        prev = self._override if isinstance(self._override, dict) else {}
-        for key_field, clear_field in key_pairs:
-            raw_val = str(merged.get(key_field) or "").strip()
-            if raw_val:
-                submitted_secrets.append(raw_val)
-            if merged.get(clear_field) is True:
-                merged[key_field] = ""
-                merged[clear_field] = True
-            elif raw_val:
-                merged[key_field] = raw_val
-                merged[clear_field] = False
-            elif str(prev.get(key_field) or "").strip() and not bool(prev.get(clear_field)):
-                merged[key_field] = str(prev[key_field]).strip()
-                merged[clear_field] = False
-            else:
-                merged[key_field] = ""
-                merged[clear_field] = False
-
         async with self._op_lock:
+            merged = payload.model_dump()
+            submitted_secrets: list[str] = []
+            prev = self._override if isinstance(self._override, dict) else {}
+            for key_field, clear_field in key_pairs:
+                raw_val = str(merged.get(key_field) or "").strip()
+                if raw_val:
+                    submitted_secrets.append(raw_val)
+                if merged.get(clear_field) is True:
+                    merged[key_field] = ""
+                    merged[clear_field] = True
+                elif raw_val:
+                    merged[key_field] = raw_val
+                    merged[clear_field] = False
+                elif str(prev.get(key_field) or "").strip() and not bool(prev.get(clear_field)):
+                    merged[key_field] = str(prev[key_field]).strip()
+                    merged[clear_field] = False
+                else:
+                    merged[key_field] = ""
+                    merged[clear_field] = False
+
             try:
                 resp = await self._request("POST", "/v1/admin/config", json_body=merged)
             except (httpx.HTTPError, TimeoutError, ValueError):
@@ -282,6 +326,7 @@ class VoiceGatewayAdminManager:
                     "INSERT OR REPLACE INTO admin_config VALUES (?, ?)", (_CONFIG_KEY, sealed)
                 )
             self._override = merged
+            self._sync_runtime_secrets()
             return {
                 "configured": True,
                 "reachable": True,
@@ -296,6 +341,7 @@ class VoiceGatewayAdminManager:
             async with self.store.transaction():
                 await self.store.db.execute("DELETE FROM admin_config WHERE key=?", (_CONFIG_KEY,))
             self._override = None
+            self._sync_runtime_secrets()
             if self.configured():
                 try:
                     await self._request("DELETE", "/v1/admin/config")

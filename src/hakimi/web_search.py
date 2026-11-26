@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import re
+import socket
 import uuid
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -116,6 +118,99 @@ def has_concrete_search_subject(text: str) -> bool:
     return len(remainder) >= 3
 
 
+def _add_account_id(target: set[str], value: Any, *, split_platform: bool = False) -> None:
+    if value is None or isinstance(value, (bool, bytes, bytearray)):
+        return
+    raw = str(value).strip()
+    if not raw:
+        return
+    target.add(raw)
+    if split_platform and ":" in raw:
+        _, _, suffix = raw.partition(":")
+        suffix = suffix.strip()
+        if suffix:
+            target.add(suffix)
+
+
+def _add_account_ids(target: set[str], values: Any, *, split_platform: bool = False) -> None:
+    if values is None or isinstance(values, (bool, bytes, bytearray)):
+        return
+    if isinstance(values, str):
+        _add_account_id(target, values, split_platform=split_platform)
+        return
+    if isinstance(values, Mapping):
+        for key in values:
+            _add_account_id(target, key, split_platform=split_platform)
+        return
+    if isinstance(values, Iterable):
+        for item in values:
+            _add_account_id(target, item, split_platform=split_platform)
+
+
+def _configured_account_ids(message, settings, *, batch_messages=None) -> set[str]:
+    """Collect active message and configured platform account/group IDs for query scrubbing."""
+    accounts: set[str] = set()
+    if message is not None:
+        _add_account_id(accounts, getattr(message, "user_id", None))
+        _add_account_id(accounts, getattr(message, "conversation_id", None))
+    if batch_messages:
+        for item in batch_messages:
+            _add_account_id(accounts, getattr(item, "user_id", None))
+            _add_account_id(accounts, getattr(item, "conversation_id", None))
+    if settings is None:
+        return accounts
+
+    for attr in ("owner_qq_id", "onebot_self_id", "qq_app_id"):
+        _add_account_id(accounts, getattr(settings, attr, None))
+
+    for attr in (
+        "onebot_owner_ids",
+        "onebot_allowed_users",
+        "onebot_allowed_groups",
+        "bot_qq_ids",
+        "muted_user_ids",
+        "qq_owner_ids",
+        "qq_allowed_users",
+        "qq_allowed_groups",
+    ):
+        _add_account_ids(accounts, getattr(settings, attr, None))
+
+    for attr in ("voice_reply_allowed_groups", "roaming_group_ids", "group_policies"):
+        _add_account_ids(accounts, getattr(settings, attr, None), split_platform=True)
+
+    thresholds = getattr(settings, "bot_reply_thresholds", None)
+    if isinstance(thresholds, Mapping):
+        for key in thresholds:
+            _add_account_id(accounts, key)
+
+    bindings = getattr(settings, "social_owner_bindings", None)
+    if isinstance(bindings, Mapping):
+        binding_values: Iterable[Any] = bindings.values()
+    elif isinstance(bindings, Iterable) and not isinstance(bindings, (str, bytes, bytearray)):
+        binding_values = bindings
+    else:
+        binding_values = ()
+    for binding in binding_values:
+        if isinstance(binding, Mapping):
+            _add_account_id(accounts, binding.get("user_id"))
+        elif binding is not None:
+            _add_account_id(accounts, getattr(binding, "user_id", None))
+
+    return accounts
+
+
+def _scrub_account_ids(text: str, message, settings, *, batch_messages=None) -> str:
+    accounts = _configured_account_ids(message, settings, batch_messages=batch_messages)
+    for account in sorted(accounts, key=lambda item: (-len(item), item)):
+        pattern = (
+            r"(?<![0-9])" + re.escape(account) + r"(?![0-9])"
+            if account.isdigit()
+            else re.escape(account)
+        )
+        text = re.sub(pattern, " ", text)
+    return text
+
+
 def sanitize_model_search_query(
     raw_query: str,
     message,
@@ -135,27 +230,7 @@ def sanitize_model_search_query(
     check_memory_text(text, settings)
     text = re.sub(r"https?://[^\s<>\"'，。！？；、（）]+", " ", text, flags=re.I)
     text = re.sub(r"\[role=[^\]]*\]", " ", text, flags=re.I)
-    accounts = {
-        message.user_id,
-        message.conversation_id,
-        settings.owner_qq_id,
-        settings.onebot_self_id,
-        *settings.onebot_allowed_users,
-        *settings.onebot_allowed_groups,
-        *settings.bot_qq_ids,
-        *settings.muted_user_ids,
-    }
-    if batch_messages:
-        for item in batch_messages:
-            if getattr(item, "user_id", ""):
-                accounts.add(str(item.user_id))
-    for account in accounts - {""}:
-        pattern = (
-            r"(?<![0-9])" + re.escape(account) + r"(?![0-9])"
-            if account.isdigit()
-            else re.escape(account)
-        )
-        text = re.sub(pattern, " ", text)
+    text = _scrub_account_ids(text, message, settings, batch_messages=batch_messages)
     text = re.sub(r"\s+", " ", text).strip()
     if not 2 <= len(text) <= MAX_MODEL_SEARCH_QUERY_CHARS:
         raise Rejected("search_query_length")
@@ -198,23 +273,7 @@ def search_query(message, settings, *, batch_messages=None, link_titles=None):
             check_memory_text(title, settings)
             if len(text) + len(title) + 1 <= 480:
                 text = f"{text} {title}".strip()
-    accounts = {
-        message.user_id,
-        message.conversation_id,
-        settings.owner_qq_id,
-        settings.onebot_self_id,
-        *settings.onebot_allowed_users,
-        *settings.onebot_allowed_groups,
-        *settings.bot_qq_ids,
-        *settings.muted_user_ids,
-    }
-    for account in accounts - {""}:
-        pattern = (
-            r"(?<![0-9])" + re.escape(account) + r"(?![0-9])"
-            if account.isdigit()
-            else re.escape(account)
-        )
-        text = re.sub(pattern, " ", text)
+    text = _scrub_account_ids(text, message, settings, batch_messages=batch_messages)
     text = re.sub(r"\s+", " ", text).strip()
     if not 2 <= len(text) <= 500:
         raise Rejected("search_query_length")
@@ -473,6 +532,197 @@ async def execute_remote_web_search(
     return parsed
 
 
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_BENCHMARK_NET = ipaddress.ip_network("198.18.0.0/15")
+_6TO4_RELAY_NET = ipaddress.ip_network("192.88.99.0/24")
+_BLOCKED_DNS_HOSTS = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "metadata",
+        "metadata.goog",
+        "metadata.google.internal",
+        "instance-data",
+    }
+)
+_BLOCKED_DNS_SUFFIXES = (
+    ".local",
+    ".localhost",
+    ".internal",
+    ".invalid",
+    ".arpa",
+    ".localdomain",
+)
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+DnsResolver = Callable[[str, int], Awaitable[Sequence[Any]]]
+
+
+def _is_public_ip(ip: IPAddress) -> bool:
+    """Return True only for globally routable unicast public IPv4/IPv6 addresses."""
+    if (
+        not ip.is_global
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return False
+    if isinstance(ip, ipaddress.IPv4Address):
+        return ip not in _CGNAT_NET and ip not in _BENCHMARK_NET and ip not in _6TO4_RELAY_NET
+    return not (
+        ip.is_site_local
+        or ip.ipv4_mapped is not None
+        or ip.sixtofour is not None
+        or ip.teredo is not None
+    )
+
+
+def _extract_resolved_ip(entry: Any) -> IPAddress:
+    if isinstance(entry, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return entry
+    if isinstance(entry, str):
+        raw = entry.strip()
+        if not raw or "%" in raw:
+            raise Rejected("web_search_failed")
+        return ipaddress.ip_address(raw)
+    if isinstance(entry, tuple) and len(entry) >= 5 and isinstance(entry[4], tuple) and entry[4]:
+        raw = str(entry[4][0]).strip()
+        if not raw or "%" in raw:
+            raise Rejected("web_search_failed")
+        return ipaddress.ip_address(raw)
+    raise Rejected("web_search_failed")
+
+
+async def _resolve_public_ips(
+    host: str,
+    port: int,
+    *,
+    resolver: DnsResolver | None = None,
+) -> tuple[IPAddress, ...]:
+    """Resolve `host` at connect time and require every returned IP to be globally public."""
+    clean_host = (host or "").strip().lower().rstrip(".")
+    if (
+        not clean_host
+        or "%" in clean_host
+        or clean_host in _BLOCKED_DNS_HOSTS
+        or clean_host.endswith(_BLOCKED_DNS_SUFFIXES)
+    ):
+        raise Rejected("web_search_failed")
+
+    try:
+        literal = ipaddress.ip_address(clean_host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not _is_public_ip(literal):
+            raise Rejected("web_search_failed")
+        return (literal,)
+
+    try:
+        if resolver is not None:
+            entries = await resolver(clean_host, port)
+        else:
+            entries = await asyncio.get_running_loop().getaddrinfo(
+                clean_host, port, type=socket.SOCK_STREAM
+            )
+    except Rejected:
+        raise
+    except OSError:
+        raise Rejected("web_search_failed") from None
+
+    seen: dict[IPAddress, None] = {}
+    for entry in entries or ():
+        try:
+            ip = _extract_resolved_ip(entry)
+        except (ValueError, Rejected):
+            raise Rejected("web_search_failed") from None
+        if not _is_public_ip(ip):
+            raise Rejected("web_search_failed")
+        seen[ip] = None
+
+    if not seen:
+        raise Rejected("web_search_failed")
+    return tuple(seen)
+
+
+class _PinnedPublicTransport(httpx.AsyncBaseTransport):
+    """httpx transport pinning every HTTPS socket to validated public IPs with Host + TLS SNI."""
+
+    def __init__(
+        self,
+        *,
+        inner: httpx.AsyncBaseTransport | None = None,
+        dns_resolver: DnsResolver | None = None,
+    ) -> None:
+        self._owns_inner = inner is None
+        self._inner = (
+            inner
+            if inner is not None
+            else httpx.AsyncHTTPTransport(
+                verify=True,
+                trust_env=False,
+                http1=True,
+                http2=False,
+                limits=httpx.Limits(
+                    max_connections=4,
+                    max_keepalive_connections=0,
+                    keepalive_expiry=0.0,
+                ),
+                retries=0,
+            )
+        )
+        self._dns_resolver = dns_resolver
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.scheme.lower() != "https" or request.url.port not in (None, 443):
+            raise Rejected("web_search_failed")
+        original_host = (request.url.host or "").strip().lower().rstrip(".")
+        if not original_host:
+            raise Rejected("web_search_failed")
+
+        timeouts = request.extensions.get("timeout")
+        connect_timeout = timeouts.get("connect") if isinstance(timeouts, Mapping) else None
+        if isinstance(connect_timeout, (int, float)) and connect_timeout > 0:
+            async with asyncio.timeout(float(connect_timeout)):
+                ips = await _resolve_public_ips(original_host, 443, resolver=self._dns_resolver)
+        else:
+            ips = await _resolve_public_ips(original_host, 443, resolver=self._dns_resolver)
+        replayable = isinstance(request.stream, httpx.ByteStream)
+        candidates = ips if replayable else ips[:1]
+        last_exc: Exception | None = None
+        for ip in candidates:
+            pinned_url = request.url.copy_with(host=str(ip), port=None)
+            headers = httpx.Headers(request.headers)
+            headers["Host"] = (
+                f"[{original_host}]"
+                if ":" in original_host and not original_host.startswith("[")
+                else original_host
+            )
+            headers["Connection"] = "close"
+            extensions = dict(request.extensions)
+            extensions["sni_hostname"] = original_host
+            pinned = httpx.Request(
+                method=request.method,
+                url=pinned_url,
+                headers=headers,
+                stream=request.stream,
+                extensions=extensions,
+            )
+            try:
+                return await self._inner.handle_async_request(pinned)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+        raise Rejected("web_search_failed")
+
+    async def aclose(self) -> None:
+        if self._owns_inner:
+            await self._inner.aclose()
+
+
 async def execute_deepseek_search(
     query: str,
     settings,
@@ -519,12 +769,14 @@ async def execute_deepseek_search(
         raise Rejected("deepseek_credentials_missing" if not api_key else "web_search_failed")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     short_query = (query.strip() or "search")[:128]
+    effective_transport = transport if transport is not None else _PinnedPublicTransport()
+    effective_timeout = min(max(float(timeout_seconds), 1.0), 60.0)
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(25.0),
+            timeout=httpx.Timeout(effective_timeout),
             trust_env=False,
             follow_redirects=False,
-            transport=transport,
+            transport=effective_transport,
         ) as client:
             async with client.stream(
                 "POST",
@@ -589,7 +841,7 @@ async def execute_deepseek_search(
                 if chat_response.status_code != 200:
                     raise Rejected("web_search_failed")
                 chat_data = await _read_bounded_json(chat_response)
-    except (httpx.HTTPError, TimeoutError):
+    except (httpx.HTTPError, TimeoutError, OSError):
         raise Rejected("web_search_failed") from None
     choices = chat_data.get("choices")
     if not isinstance(choices, list) or not choices:

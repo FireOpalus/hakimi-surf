@@ -68,7 +68,9 @@ async def life_voice_companion_gateway_update(request: Request):
     if gw is None:
         raise HTTPException(503, "voice_gateway_admin_unavailable")
     async with domain_lock(request, "voice_gateway"):
-        return await gw.update(value)
+        result = await gw.update(value)
+        svc.refresh_secrets()
+        return result
 
 
 @router.delete("/voice-companion/gateway")
@@ -78,7 +80,9 @@ async def life_voice_companion_gateway_reset(request: Request):
     if gw is None:
         raise HTTPException(503, "voice_gateway_admin_unavailable")
     async with domain_lock(request, "voice_gateway"):
-        return await gw.reset()
+        result = await gw.reset()
+        svc.refresh_secrets()
+        return result
 
 
 @router.get("/voice-companion/gateway/voices")

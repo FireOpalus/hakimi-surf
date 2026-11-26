@@ -31,7 +31,13 @@ from hakimi_plugin_sdk.bili_common import (
 from .models import Message, Video
 from .plugin_bus import RemoteModuleProxy
 from .roaming_logger import redact_public_summary
-from .security import Rejected, clean_text, configured_secrets, safe_output
+from .security import (
+    Rejected,
+    clean_text,
+    configured_secrets,
+    safe_output,
+    set_runtime_secret_bucket,
+)
 
 log = logging.getLogger("hakimi")
 
@@ -268,10 +274,11 @@ class RemoteBiliWatcher:
             for k in CREDENTIAL_KEYS
             if isinstance(creds.get(k), str) and creds.get(k)
         ]
-        if not cookie_vals:
+        set_runtime_secret_bucket(self.s, "bilibili", cookie_vals)
+        refresh = getattr(self.svc, "refresh_secrets", None)
+        if callable(refresh):
+            refresh()
             return
-        existing_extra = tuple(getattr(self.s, "_runtime_extra_secrets", ()) or ())
-        self.s._runtime_extra_secrets = tuple(dict.fromkeys([*existing_extra, *cookie_vals]))
         svc_secrets = getattr(self.svc, "secrets", None)
         if isinstance(svc_secrets, list):
             for val in cookie_vals:
@@ -1263,15 +1270,13 @@ class RemoteBiliWatcher:
         self._cred_update_seq += 1
         self.credentials_epoch += 1
         creds, _ = await self._load_credentials_from_store()
-        self._protect_secrets(creds)
+        merged_creds = dict(creds)
         if isinstance(payload, dict) and not payload.get("clear"):
-            submitted = {
-                k: str(payload[k])
-                for k in CREDENTIAL_KEYS
-                if isinstance(payload.get(k), str) and payload.get(k)
-            }
-            if submitted:
-                self._protect_secrets(submitted)
+            for k in CREDENTIAL_KEYS:
+                raw_val = payload.get(k)
+                if isinstance(raw_val, str) and raw_val:
+                    merged_creds[k] = raw_val
+        self._protect_secrets(merged_creds)
         if isinstance(res, dict):
             out = dict(res)
             if isinstance(out.get("credentials"), dict):

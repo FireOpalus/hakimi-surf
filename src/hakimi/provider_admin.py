@@ -16,7 +16,7 @@ from .provider_routing import (
     ProviderView,
     SessionPrivacyUpdate,
 )
-from .security import Rejected, configured_secrets
+from .security import Rejected
 
 router = APIRouter(prefix="/admin/api")
 
@@ -118,7 +118,7 @@ async def _save_credentials(request: Request, view: ProviderView):
     routing = _routing_manager(svc)
     async with domain_lock(request, "providers"):
         result = await routing.update_credentials(value, view=view)
-        svc.secrets = configured_secrets(svc.s)
+        svc.refresh_secrets()
         await _reload_ai_clients(svc)
         return result
 

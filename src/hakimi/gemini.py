@@ -8,6 +8,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import version
@@ -57,7 +58,7 @@ from .provider_diagnostics import MAX_ATTEMPTS, error_facts
 from .provider_routing import ProviderRoutingManager
 from .security import Rejected
 from .store import DigestReviewCredit, Store
-from .streaming import StreamProgress
+from .streaming import StreamProgress, upstream_http_status
 from .thinking_policy import FLEX_MODELS, MODEL_LANES
 from .usage_accounting import VALID_THINKING_LEVELS, TokenUsage
 from .video_files import VideoFiles, run_guard
@@ -94,6 +95,21 @@ __all__ = [
 ]
 
 
+_CLIENT_NO_TRIP_HTTP_STATUSES = frozenset({400, 404, 409, 413, 422})
+_AUTH_GLOBAL_TRIP_HTTP_STATUSES = frozenset({401, 403})
+_DEFAULT_CIRCUIT_COOLDOWN_SECONDS = 60.0
+_DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 3
+
+
+@dataclass
+class _RetiredProviderClient:
+    client: Any
+    transport: httpx.AsyncClient | None
+    client_closed: bool = False
+    transport_closed: bool = False
+    scheduled: bool = False
+
+
 class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
     def __init__(
         self,
@@ -119,7 +135,14 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         self.carbon_slots = asyncio.Semaphore(1)
         self.prefixes = StaticPrefixes()
         self.prefix_runtime = PrefixRuntime()
-        self.blocked_until = 0.0
+        self._global_blocked_until: float = 0.0
+        self._channel_blocked_until: dict[str, float] = {}
+        self._channel_failures: dict[str, list[float]] = {}
+        self._circuit_cooldown_seconds: float = _DEFAULT_CIRCUIT_COOLDOWN_SECONDS
+        self._circuit_failure_threshold: int = _DEFAULT_CIRCUIT_FAILURE_THRESHOLD
+        self._circuit_failure_window_seconds: float = max(
+            120.0, float(settings.generation_timeout) * 3.0
+        )
         self.vertex_blocked_until = 0.0
         self.files_client = files_client
         self._owned_files = files_client is None
@@ -135,12 +158,106 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         self._injected_free_decision_client = free_decision_client
         self._injected_vertex_chat_client = vertex_chat_client
         self._owned_free_decision_client: Any = None
+        self._owned_free_decision_transport: httpx.AsyncClient | None = None
         self._owned_vertex_chat_client: Any = None
-        self._retired_provider_clients: list[Any] = []
+        self._owned_vertex_chat_transport: httpx.AsyncClient | None = None
+        self._retired_provider_clients: list[_RetiredProviderClient] = []
+        self._retire_tasks: set[asyncio.Task[None]] = set()
+        self._retire_delay_seconds: float = (
+            max(float(settings.decision_timeout), float(settings.generation_timeout)) + 5.0
+        )
+        self._closed = False
+        self._startup_closed = False
         self._routing_generation = -1
         self.free_decision_client: Any = free_decision_client
         self.vertex_chat_client: Any = vertex_chat_client
         self.reload_provider_clients()
+
+    @property
+    def blocked_until(self) -> float:
+        """Global `gemini_paid` circuit cooldown timestamp (monotonic seconds)."""
+        return self._global_blocked_until
+
+    @blocked_until.setter
+    def blocked_until(self, value: float) -> None:
+        ts = float(value)
+        self._global_blocked_until = ts
+        if ts <= time.monotonic():
+            self._channel_blocked_until.clear()
+
+    @staticmethod
+    def _circuit_channel(model_lane: str) -> str | None:
+        if model_lane in FLEX_MODELS:
+            return None
+        if model_lane == "decision":
+            return "decision"
+        if model_lane in {"hydrogen", "neon", "carbon"}:
+            return model_lane
+        return model_lane or None
+
+    def _paid_circuit_remaining(self, model_lane: str) -> float:
+        now = time.monotonic()
+        until = self._global_blocked_until
+        channel = self._circuit_channel(model_lane)
+        if channel is not None:
+            ch_until = self._channel_blocked_until.get(channel, 0.0)
+            if ch_until <= now:
+                self._channel_blocked_until.pop(channel, None)
+            elif ch_until > until:
+                until = ch_until
+        return max(0.0, until - now)
+
+    def _record_paid_success(self, model_lane: str, budget_lane: str) -> None:
+        if model_lane in FLEX_MODELS or budget_lane == "search":
+            return
+        channel = self._circuit_channel(model_lane)
+        if channel is not None:
+            self._channel_failures.pop(channel, None)
+            self._channel_blocked_until.pop(channel, None)
+
+    def _record_paid_failure(
+        self,
+        model_lane: str,
+        budget_lane: str,
+        *,
+        status: int | None = None,
+    ) -> None:
+        if model_lane in FLEX_MODELS or budget_lane == "search":
+            return
+        if status is not None and (
+            status in _CLIENT_NO_TRIP_HTTP_STATUSES
+            or (
+                400 <= status < 500
+                and status not in _AUTH_GLOBAL_TRIP_HTTP_STATUSES
+                and status not in {408, 429}
+            )
+        ):
+            return
+        now = time.monotonic()
+        cooldown = max(0.0, float(self._circuit_cooldown_seconds))
+        if status in _AUTH_GLOBAL_TRIP_HTTP_STATUSES:
+            self._global_blocked_until = max(self._global_blocked_until, now + cooldown)
+            return
+        channel = self._circuit_channel(model_lane)
+        if channel is None:
+            return
+        if status == 429:
+            self._channel_blocked_until[channel] = max(
+                self._channel_blocked_until.get(channel, 0.0), now + cooldown
+            )
+            return
+        # 5xx, 408, timeouts, and network/transport errors: require consecutive failures
+        # within the sliding window before opening this channel's breaker.
+        window = max(0.0, float(self._circuit_failure_window_seconds))
+        threshold = max(1, int(self._circuit_failure_threshold))
+        cutoff = now - window
+        recent = [ts for ts in self._channel_failures.get(channel, ()) if ts >= cutoff]
+        recent.append(now)
+        self._channel_failures[channel] = recent[-threshold:]
+        if len(recent) >= threshold:
+            self._channel_blocked_until[channel] = max(
+                self._channel_blocked_until.get(channel, 0.0), now + cooldown
+            )
 
     def _max_chain_turns(self) -> int:
         return MAX_CHAIN_TURNS
@@ -157,15 +274,16 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
             self._owned_flex = True
         return self.flex_client
 
-    def _client(self, api_version: str, timeout: float, *, api_key: str | None = None):
+    def _build_developer_client(
+        self, api_version: str, timeout: float, *, api_key: str | None = None
+    ) -> tuple[Any, httpx.AsyncClient]:
         transport = httpx.AsyncClient(
             timeout=timeout,
             trust_env=False,
             follow_redirects=False,
             limits=httpx.Limits(max_connections=self.s.workers + 2),
         )
-        self._transports.append(transport)
-        return genai.Client(
+        client = genai.Client(
             enterprise=False,
             vertexai=False,
             api_key=api_key if api_key is not None else self.s.gemini_api_key.get_secret_value(),
@@ -179,32 +297,24 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 "async_client_args": {"trust_env": False},
             },
         )
+        return client, transport
 
-    def _build_free_decision_client(self) -> Any:
+    def _client(self, api_version: str, timeout: float, *, api_key: str | None = None):
+        client, transport = self._build_developer_client(api_version, timeout, api_key=api_key)
+        self._transports.append(transport)
+        return client
+
+    def _build_free_decision_client(self) -> tuple[Any, httpx.AsyncClient] | None:
         key = self.routing.gemini_free_api_key()
         if not key:
             return None
-        return self._client("v1beta", self.s.decision_timeout, api_key=key)
+        return self._build_developer_client("v1beta", self.s.decision_timeout, api_key=key)
 
-    def _build_vertex_chat_client(self) -> Any:
+    def _build_vertex_chat_client(self) -> tuple[Any, httpx.AsyncClient] | None:
         if not self.routing.has_vertex_credentials():
             return None
         cfg = self.routing.config
         timeout = self.s.generation_timeout
-        transport = httpx.AsyncClient(
-            timeout=timeout,
-            trust_env=False,
-            follow_redirects=False,
-            limits=httpx.Limits(max_connections=self.s.workers + 2),
-        )
-        self._transports.append(transport)
-        http_options = {
-            "timeout": int(timeout * 1000),
-            "retry_options": {"attempts": 1},
-            "httpx_async_client": transport,
-            "client_args": {"trust_env": False},
-            "async_client_args": {"trust_env": False},
-        }
         if cfg.vertex_auth_mode == "service_account":
             sa_info, _ = self.routing.service_account_info()
             project = self.routing.effective_vertex_project()
@@ -213,7 +323,20 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
             creds = service_account.Credentials.from_service_account_info(
                 sa_info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
-            return genai.Client(
+            transport = httpx.AsyncClient(
+                timeout=timeout,
+                trust_env=False,
+                follow_redirects=False,
+                limits=httpx.Limits(max_connections=self.s.workers + 2),
+            )
+            http_options = {
+                "timeout": int(timeout * 1000),
+                "retry_options": {"attempts": 1},
+                "httpx_async_client": transport,
+                "client_args": {"trust_env": False},
+                "async_client_args": {"trust_env": False},
+            }
+            client = genai.Client(
                 enterprise=True,
                 vertexai=True,
                 credentials=creds,
@@ -221,12 +344,26 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 location=cfg.vertex_location or "global",
                 http_options=http_options,
             )
+            return client, transport
         vkey = self.routing.vertex_api_key()
         if not vkey:
             return None
         project = cfg.vertex_project.strip() or None
         location = (cfg.vertex_location or "global").strip() if project else None
-        return genai.Client(
+        transport = httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=False,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=self.s.workers + 2),
+        )
+        http_options = {
+            "timeout": int(timeout * 1000),
+            "retry_options": {"attempts": 1},
+            "httpx_async_client": transport,
+            "client_args": {"trust_env": False},
+            "async_client_args": {"trust_env": False},
+        }
+        client = genai.Client(
             enterprise=True,
             vertexai=True,
             api_key=vkey,
@@ -234,19 +371,31 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
             location=location,
             http_options=http_options,
         )
+        return client, transport
 
     def reload_provider_clients(self) -> None:
         """Rebuild runtime-owned Free Tier and Vertex clients after config/credential changes."""
-        for old in (self._owned_free_decision_client, self._owned_vertex_chat_client):
-            if old is not None:
-                self._retired_provider_clients.append(old)
-        self._owned_free_decision_client = (
+        new_free = (
             self._build_free_decision_client()
             if self._injected_free_decision_client is None
             else None
         )
-        self._owned_vertex_chat_client = (
+        new_vertex = (
             self._build_vertex_chat_client() if self._injected_vertex_chat_client is None else None
+        )
+        for old_client, old_transport in (
+            (self._owned_free_decision_client, self._owned_free_decision_transport),
+            (self._owned_vertex_chat_client, self._owned_vertex_chat_transport),
+        ):
+            if old_client is not None or old_transport is not None:
+                self._retired_provider_clients.append(
+                    _RetiredProviderClient(client=old_client, transport=old_transport)
+                )
+        self._owned_free_decision_client, self._owned_free_decision_transport = (
+            new_free if new_free is not None else (None, None)
+        )
+        self._owned_vertex_chat_client, self._owned_vertex_chat_transport = (
+            new_vertex if new_vertex is not None else (None, None)
         )
         self.free_decision_client = (
             self._injected_free_decision_client or self._owned_free_decision_client
@@ -256,6 +405,57 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         )
         self.vertex_blocked_until = 0.0
         self._routing_generation = self.routing.generation
+        self._schedule_retired_cleanup()
+
+    def _schedule_retired_cleanup(self) -> None:
+        if self._closed:
+            return
+        unscheduled = [entry for entry in self._retired_provider_clients if not entry.scheduled]
+        if not unscheduled:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for entry in unscheduled:
+            entry.scheduled = True
+        task = loop.create_task(self._retire_provider_entries(unscheduled))
+        self._retire_tasks.add(task)
+        task.add_done_callback(self._retire_tasks.discard)
+
+    @staticmethod
+    async def _close_retired_entry(entry: _RetiredProviderClient) -> None:
+        try:
+            if entry.client is not None and not entry.client_closed:
+                try:
+                    aio_client = getattr(entry.client, "aio", None)
+                    aclose = getattr(aio_client, "aclose", None)
+                    if callable(aclose):
+                        await aclose()
+                finally:
+                    close_sync = getattr(entry.client, "close", None)
+                    if callable(close_sync):
+                        close_sync()
+                entry.client_closed = True
+        finally:
+            if entry.transport is not None and not entry.transport_closed:
+                if not getattr(entry.transport, "is_closed", False):
+                    await entry.transport.aclose()
+                entry.transport_closed = True
+
+    async def _retire_provider_entries(self, entries: list[_RetiredProviderClient]) -> None:
+        delay = max(0.0, float(self._retire_delay_seconds))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        for entry in entries:
+            if entry not in self._retired_provider_clients:
+                continue
+            try:
+                await self._close_retired_entry(entry)
+            except Exception:
+                pass
+            if entry in self._retired_provider_clients:
+                self._retired_provider_clients.remove(entry)
 
     async def _ensure_routing_ready(self) -> None:
         await self.routing.initialize()
@@ -270,26 +470,64 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         )
 
     async def close(self):
-        if self._owned:
-            for client in (self.decision_client, self.chat_client):
-                await client.aio.aclose()
-                client.close()
-        if self._owned_files and self.files_client is not None:
-            await self.files_client.aio.aclose()
-            self.files_client.close()
-        if self._owned_flex and self.flex_client is not None:
-            await self.flex_client.aio.aclose()
-            self.flex_client.close()
-        for client in (
-            *self._retired_provider_clients,
-            self._owned_free_decision_client,
-            self._owned_vertex_chat_client,
+        self._closed = True
+        pending = list(self._retire_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._retire_tasks.clear()
+
+        if not self._startup_closed:
+            self._startup_closed = True
+            if self._owned:
+                for client in (self.decision_client, self.chat_client):
+                    await client.aio.aclose()
+                    client.close()
+            if self._owned_files and self.files_client is not None:
+                await self.files_client.aio.aclose()
+                self.files_client.close()
+            if self._owned_flex and self.flex_client is not None:
+                await self.flex_client.aio.aclose()
+                self.flex_client.close()
+            for transport in self._transports:
+                if not getattr(transport, "is_closed", False):
+                    await transport.aclose()
+
+        active_entries: list[_RetiredProviderClient] = []
+        if (
+            self._owned_free_decision_client is not None
+            or self._owned_free_decision_transport is not None
         ):
-            if client is not None:
-                await client.aio.aclose()
-                client.close()
-        for transport in self._transports:
-            await transport.aclose()
+            active_entries.append(
+                _RetiredProviderClient(
+                    client=self._owned_free_decision_client,
+                    transport=self._owned_free_decision_transport,
+                )
+            )
+            if self.free_decision_client is self._owned_free_decision_client:
+                self.free_decision_client = self._injected_free_decision_client
+            self._owned_free_decision_client = None
+            self._owned_free_decision_transport = None
+        if (
+            self._owned_vertex_chat_client is not None
+            or self._owned_vertex_chat_transport is not None
+        ):
+            active_entries.append(
+                _RetiredProviderClient(
+                    client=self._owned_vertex_chat_client,
+                    transport=self._owned_vertex_chat_transport,
+                )
+            )
+            if self.vertex_chat_client is self._owned_vertex_chat_client:
+                self.vertex_chat_client = self._injected_vertex_chat_client
+            self._owned_vertex_chat_client = None
+            self._owned_vertex_chat_transport = None
+
+        retired = list(self._retired_provider_clients)
+        self._retired_provider_clients.clear()
+        for entry in (*retired, *active_entries):
+            await self._close_retired_entry(entry)
 
     def _price(self, lane: str, *, at=None) -> tuple[Decimal, Decimal]:
         if lane == "decision":
@@ -497,10 +735,14 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
             exc.provider_diagnostics = list(attempts)
             return exc
 
-        remaining = self.blocked_until - time.monotonic()
-        if provider == "gemini_paid" and remaining > 0:
-            observe({"cause": "circuit_open", "cooldown_ms": round(remaining * 1000)}, 0)
-            raise rejected("gemini_circuit_open")
+        if provider == "gemini_paid":
+            remaining = self._paid_circuit_remaining(model_lane)
+            if remaining > 0:
+                observe(
+                    {"cause": "circuit_open", "cooldown_ms": max(1, round(remaining * 1000))},
+                    0,
+                )
+                raise rejected("gemini_circuit_open")
         # Count text bytes and separately reserve bounded image tokens, never base64 as text.
         serialized = json.dumps(input_payload, ensure_ascii=False)
         byte_count = len(serialized.encode("utf-8"))
@@ -660,8 +902,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                     )
                     if stream_retryable:
                         raise GenerationTimeout() from None
-                    if model_lane not in FLEX_MODELS and budget_lane != "search":
-                        self.blocked_until = time.monotonic() + 60
+                    self._record_paid_failure(model_lane, budget_lane, status=None)
                 elif provider == "gemini_free":
                     if free_fallback_eligible:
                         raise _FreeTierFallback() from None
@@ -675,18 +916,21 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
             except Rejected as exc:
                 elapsed = max(0.0, time.monotonic() - started_at)
                 if str(exc) == "stream_provider_error":
+                    stream_code = stream_progress.error_code if stream_progress else "unknown"
                     observe(
                         error_facts(
                             exc,
                             expired=False,
                             http_status=None,
-                            stream_code=stream_progress.error_code
-                            if stream_progress
-                            else "unknown",
+                            stream_code=stream_code,
                         ),
                         elapsed,
                     )
                     exc.provider_diagnostics = list(attempts)
+                    if provider == "gemini_paid":
+                        stream_status = upstream_http_status(stream_code)
+                        if stream_status is not None:
+                            self._record_paid_failure(model_lane, budget_lane, status=stream_status)
                 await asyncio.shield(
                     self.store.settle(
                         reservation,
@@ -748,8 +992,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                         else "gemini_chat",
                         True,
                     )
-                    if model_lane not in FLEX_MODELS and budget_lane != "search":
-                        self.blocked_until = time.monotonic() + 60
+                    self._record_paid_failure(model_lane, budget_lane, status=status)
                 elif provider == "gemini_free":
                     if (
                         free_fallback_eligible
@@ -768,6 +1011,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 raise rejected("gemini_unavailable") from None
             elapsed = max(0.0, time.monotonic() - started_at)
             if provider == "gemini_paid":
+                self._record_paid_success(model_lane, budget_lane)
                 await self.store.runtime.provider_result(
                     "gemini_memory"
                     if model_lane in FLEX_MODELS

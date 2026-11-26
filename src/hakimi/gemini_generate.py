@@ -948,12 +948,16 @@ class _GeminiGenerateMixin:
                 if generation_trace is not None:
                     generation_trace["chain_invalidate"] = True
 
+        attempt1_paid_timeout = False
+        attempt1_lane = used_lane
         try:
             try:
                 result = await dispatch(plan)
             except GenerationTimeout:
                 allow_chain = False
                 mark_chain_invalid()
+                attempt1_paid_timeout = used_provider == "gemini_paid"
+                attempt1_lane = used_lane
                 result = None
             except BaseException:
                 mark_chain_invalid()
@@ -970,18 +974,24 @@ class _GeminiGenerateMixin:
                     "medium": "low",
                 }.get(plan.thinking_level)
                 if not level:
+                    if attempt1_paid_timeout:
+                        self._record_paid_failure(attempt1_lane, budget_lane, status=None)
                     raise Rejected("generation_incomplete")
                 plan = GenerationPlan(level, min(plan.output_tokens, 4096), selected_model)
                 try:
                     result = await dispatch(plan)
                 except GenerationTimeout:
                     mark_chain_invalid()
+                    if attempt1_paid_timeout:
+                        self._record_paid_failure(attempt1_lane, budget_lane, status=None)
                     if used_provider == "gemini_paid":
-                        self.blocked_until = time.monotonic() + 60
+                        self._record_paid_failure(used_lane, budget_lane, status=None)
                     raise Rejected("generation_incomplete") from None
                 except BaseException:
                     mark_chain_invalid()
                     raise
+            elif attempt1_paid_timeout and result is None:
+                self._record_paid_failure(attempt1_lane, budget_lane, status=None)
         except BaseException as exc:
             if review is not None:
                 await asyncio.shield(self.store.release_digest_review(review))
@@ -1123,7 +1133,11 @@ class _GeminiGenerateMixin:
         await run_guard(before_call)
         if (await self.store.budget_status())["hard_stop"]:
             raise Rejected("budget_hard_stop")
-        if self.blocked_until > time.monotonic():
+        summary_lane = preferences(self.s).primary_model
+        if (
+            self._paid_circuit_remaining("decision") > 0
+            or self._paid_circuit_remaining(summary_lane) > 0
+        ):
             raise Rejected("gemini_circuit_open")
         async with self.video_files.uploaded(path, duration, before_call) as video:
             await self.screen(

@@ -137,12 +137,14 @@ def create_app(
                     ):
                         await service.voice_gateway_admin.initialize()
                         await service.voice_gateway_admin.sync_to_gateway()
+                    service.refresh_secrets()
                     if (cc := getattr(service, "colab_compute", None)) is not None:
                         resources.push_async_callback(cc.close)
                     await service.sessions.index_existing()
                     await service.moderation.initialize()
                     await service.longnick.initialize()
                     await service.bili_watcher.initialize()
+                    service.refresh_secrets()
                     if "video_watch" not in service.modules.systems and hasattr(
                         service, "video_watch"
                     ):

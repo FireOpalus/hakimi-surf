@@ -246,13 +246,16 @@ async def web_search_reset(request: Request):
 @router.post("/web-search/deepseek")
 async def web_search_deepseek_save(request: Request):
     value = await body(request, DeepSeekCredentialsBody)
+    svc = service(request)
     async with domain_lock(request, "web_search"):
-        return await service(request).store.runtime.web_search.save_deepseek(
+        result = await svc.store.runtime.web_search.save_deepseek(
             api_key=value.api_key,
             base_url=value.base_url,
             model=value.model,
             clear=value.clear,
         )
+        svc.refresh_secrets()
+        return result
 
 
 @router.put("/debounce")

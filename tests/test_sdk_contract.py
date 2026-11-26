@@ -206,9 +206,13 @@ async def test_real_sdk_does_not_retry_and_retains_reservation(settings, store, 
 
     usage = await store.usage()
     assert usage["lanes"][0]["amount"] > 0
+    for expected_calls in range(2, gateway._circuit_failure_threshold + 1):
+        with pytest.raises(Rejected, match="gemini_unavailable"):
+            await gateway.screen({}, "subject", purpose="message")
+        assert len(calls) == expected_calls
     with pytest.raises(Rejected, match="gemini_circuit_open"):
         await gateway.screen({}, "subject", purpose="message")
-    assert len(calls) == 1
+    assert len(calls) == gateway._circuit_failure_threshold
 
 
 @pytest.mark.parametrize(

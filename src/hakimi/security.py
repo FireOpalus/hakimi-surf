@@ -6,6 +6,7 @@ import re
 import time
 import unicodedata
 import weakref
+from collections.abc import Iterable
 from typing import Any
 
 from cryptography.fernet import Fernet
@@ -49,34 +50,70 @@ class Rejected(Exception):
         return f"{self}_{self.detail}" if self.detail else str(self)
 
 
+def set_runtime_secret_bucket(
+    settings: Settings, source: str, secrets: Iterable[str]
+) -> tuple[str, ...]:
+    """Replace one named runtime-secret bucket without clobbering other sources."""
+    bucket = str(source or "").strip()
+    if not bucket:
+        raise ValueError("runtime secret bucket source must be non-empty")
+    cleaned = tuple(
+        dict.fromkeys(val for raw in secrets if isinstance(raw, str) and (val := raw.strip()))
+    )
+    existing = getattr(settings, "_runtime_secret_buckets", None)
+    next_buckets = dict(existing) if isinstance(existing, dict) else {}
+    if cleaned:
+        next_buckets[bucket] = cleaned
+    else:
+        next_buckets.pop(bucket, None)
+    settings._runtime_secret_buckets = next_buckets
+    return cleaned
+
+
 def configured_secrets(settings: Settings) -> list[str]:
-    return [
-        *(
-            token.get_secret_value()
-            for token in (
-                settings.gemini_api_key,
-                settings.gemini_free_api_key,
-                settings.vertex_api_key,
-                settings.encryption_key,
-                settings.onebot_secret,
-                settings.onebot_access_token,
-                settings.onebot_ws_token,
-                settings.node_ws_token,
-                settings.companion_ws_token,
-                settings.screen_ws_token,
-                settings.qq_app_secret,
-                settings.admin_token,
-                settings.bili_sessdata,
-                settings.bili_bili_jct,
-                settings.bili_buvid3,
-                settings.bili_buvid4,
-                settings.bili_proxy,
-                settings.deepseek_api_key,
-                settings.voice_gateway_token,
-            )
-        ),
-        *(getattr(settings, "_runtime_extra_secrets", ()) or ()),
+    fixed = [
+        token.get_secret_value()
+        for token in (
+            settings.gemini_api_key,
+            settings.gemini_free_api_key,
+            settings.vertex_api_key,
+            settings.encryption_key,
+            settings.onebot_secret,
+            settings.onebot_access_token,
+            settings.onebot_ws_token,
+            settings.node_ws_token,
+            settings.companion_ws_token,
+            settings.screen_ws_token,
+            settings.qq_app_secret,
+            settings.admin_token,
+            settings.bili_sessdata,
+            settings.bili_bili_jct,
+            settings.bili_buvid3,
+            settings.bili_buvid4,
+            settings.bili_proxy,
+            settings.deepseek_api_key,
+            settings.voice_gateway_token,
+            settings.colab_worker_token,
+        )
     ]
+    buckets = getattr(settings, "_runtime_secret_buckets", None)
+    bucket_values: list[str] = []
+    if isinstance(buckets, dict):
+        for items in buckets.values():
+            if items:
+                bucket_values.extend(val for val in items if isinstance(val, str) and val)
+    legacy_extra = [
+        val
+        for val in (getattr(settings, "_runtime_extra_secrets", ()) or ())
+        if isinstance(val, str) and val
+    ]
+    seen = {val for val in fixed if val}
+    extras: list[str] = []
+    for val in (*bucket_values, *legacy_extra):
+        if val not in seen:
+            seen.add(val)
+            extras.append(val)
+    return [*fixed, *extras]
 
 
 class Vault:

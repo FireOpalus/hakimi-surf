@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .bot_server import is_persona_owner
 from .config import Settings
 from .models import Message
-from .security import Rejected
+from .security import Rejected, set_runtime_secret_bucket
 
 SESSION_KEY_RE = re.compile(r"^(?:onebot:[1-9][0-9]{0,19}|qq:[A-Za-z0-9_-]{1,128})$")
 ONEBOT_TARGET_RE = re.compile(r"^[1-9][0-9]{0,19}$")
@@ -287,7 +287,7 @@ class ProviderRoutingManager:
             pk = str(self._sa_info.get("private_key") or "").strip()
             if pk:
                 extras.append(pk)
-        self.s._runtime_extra_secrets = tuple(dict.fromkeys(extras))
+        set_runtime_secret_bucket(self.s, "provider_routing", extras)
 
     def gemini_free_api_key(self) -> str:
         return self.credentials_override.get("gemini_free_api_key") or self.env_gemini_free_api_key

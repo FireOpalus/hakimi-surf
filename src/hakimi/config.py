@@ -650,6 +650,7 @@ class Settings(BaseSettings):
     # Only the authenticated control plane may replace this immutable policy snapshot.
     _thinking_override: ThinkingConfig | None = PrivateAttr(default=None)
     _runtime_extra_secrets: tuple[str, ...] = PrivateAttr(default=())
+    _runtime_secret_buckets: dict[str, tuple[str, ...]] = PrivateAttr(default_factory=dict)
     fast_chat_thinking_level: ChatThinkingLevel = "auto"
     owner_thinking_level: ChatThinkingLevel = Field(
         default="auto",

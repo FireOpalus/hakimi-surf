@@ -865,7 +865,8 @@ async def test_decision_deadline_and_subsequent_local_circuit_are_recorded(
 
     settings.decision_timeout = 1
     gateway = GeminiGateway(settings, store, *sdk_pair(stall))
-    for cause in ("deadline", "circuit_open"):
+    threshold = gateway._circuit_failure_threshold
+    for cause in (*(["deadline"] * threshold), "circuit_open"):
         with pytest.raises(Rejected) as failure:
             await gateway.screen(
                 {"current_message": "hi"}, "subject", purpose="message", message=message
@@ -883,7 +884,7 @@ async def test_decision_deadline_and_subsequent_local_circuit_are_recorded(
         assert audit["provider_diagnostics"] == [attempt]
         logged = await store.one("SELECT diagnostics FROM audit_events ORDER BY id DESC LIMIT 1")
         assert json.loads(logged[0]) == [attempt]
-    assert calls == 1
+    assert calls == threshold
 
 
 async def test_output_review_http_error_reaches_both_audits_without_provider_text(

@@ -294,8 +294,12 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         if pb := getattr(self, "plugin_bus", None):
             await pb.relay_node_state(connected)
 
-    def refresh_secrets(self):
-        self.secrets = configured_secrets(self.s)
+    def refresh_secrets(self) -> None:
+        refreshed = configured_secrets(self.s)
+        if isinstance(getattr(self, "secrets", None), list):
+            self.secrets[:] = refreshed
+        else:
+            self.secrets = refreshed
 
     def record(self, event: str, *, emit_audit: bool = True):
         # Only internal constant labels. Never log exception repr, payloads, URLs or IDs.
