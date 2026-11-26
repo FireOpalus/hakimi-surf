@@ -12,10 +12,15 @@ from .bot_server import is_persona_owner
 from .memes import explicit_meme_request
 from .models import Message
 from .modules.adapters import farewell_send_bypass
-from .outgoing import PRE_DISPATCH_REJECTED, is_affection_muted_only, safe_delivery_detail
+from .outgoing import (
+    PRE_DISPATCH_REJECTED,
+    is_affection_muted_only,
+    safe_delivery_detail,
+    send_module_chat,
+)
 from .security import Rejected
 from .session_manager import session_epoch
-from .social import chat_module, confirmed_message_id
+from .social import chat_module
 
 
 class _ServiceDeliveryMixin:
@@ -381,10 +386,20 @@ class _ServiceDeliveryMixin:
                         await self.store.finish_reply(reply["id"], "cancelled")
                         await self._finish_delivery_audit(reply, "cancelled", "unauthorized")
                         return True
-                    ident = await module.send_chat(
-                        message, self.output(reply["text"]), before_send=valid_after_delay
+                    reply_to = (
+                        message.event_id
+                        if message.kind == "group"
+                        and isinstance(message.event_id, str)
+                        and re.fullmatch(r"-?[0-9]{1,30}", message.event_id)
+                        else None
                     )
-                    receipt = {"message_id": confirmed_message_id(ident)}
+                    receipt = await send_module_chat(
+                        module,
+                        message,
+                        self.output(reply["text"]),
+                        reply_to=reply_to,
+                        before_send=valid_after_delay,
+                    )
                 elif (
                     reply.get("segments")
                     and any(s["type"] == "at" for s in reply["segments"])

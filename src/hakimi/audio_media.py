@@ -34,6 +34,16 @@ from .security import Rejected
 
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MAX_INLINE_AUDIO_BYTES = 20 * 1024 * 1024
+_DIRECT_AUDIO_ORIGINS = frozenset(
+    {"", "当前消息", "telegram_voice", "telegram_audio", "telegram_doc_audio"}
+)
+
+
+def is_direct_audio(ref: Any) -> bool:
+    """Return True when an AudioRef came directly from the current message (not quote/forward)."""
+    return str(getattr(ref, "origin", "") or "") in _DIRECT_AUDIO_ORIGINS
+
+
 HTTP_AUDIO_TIMEOUT = 15
 RPC_AUDIO_TIMEOUT = 15
 FFPROBE_TIMEOUT = 10

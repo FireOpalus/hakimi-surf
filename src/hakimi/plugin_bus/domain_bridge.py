@@ -20,6 +20,7 @@ from ..config import Settings
 from ..models import AudioRef, FileRef, ImageRef, Message
 from ..modules.actions import reject_reason
 from ..modules.base import sanitize_sensor_text
+from ..rich_message_parser import extract_bili_links
 from ..roaming_logger import redact_public_summary
 from ..security import Rejected, clean_text, safe_output
 from ..social import owner_target, permits_chat_export
@@ -397,6 +398,7 @@ class PluginBusDomainBridgeMixin:
                 AudioRef.model_validate(_rewrite_media_item(item, "file"))
                 for item in raw_audios[:4]
             ]
+            video_ids, short_urls = extract_bili_links(text, limit=5)
             msg = Message(
                 platform=platform,
                 bot_id=bot_id,
@@ -415,6 +417,8 @@ class PluginBusDomainBridgeMixin:
                 images=images,
                 files=files,
                 audios=audios,
+                video_ids=video_ids,
+                short_urls=short_urls,
             )
         except ValidationError:
             raise Rejected("plugin_invalid_schema") from None

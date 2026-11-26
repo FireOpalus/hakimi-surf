@@ -414,11 +414,23 @@ class RemoteModuleProxy(BaseModule):
         msg_id = res.get("message_id") if isinstance(res, dict) else res
         return confirmed_message_id(msg_id)
 
-    async def send_chat(self, message: Message, text: str, *, before_send=None) -> str:
+    async def send_chat(
+        self,
+        message: Message,
+        text: str,
+        *,
+        reply_to: str | None = None,
+        before_send=None,
+    ) -> str:
         if "chat" not in self._scopes or message.platform not in self.chat_platforms:
             raise Rejected("delivery_not_authorized")
         if not self.enabled:
             raise Rejected("module_disabled")
+        effective_reply_to = (
+            reply_to.strip()
+            if self.supports_reply_anchor and isinstance(reply_to, str) and reply_to.strip()
+            else None
+        )
         return await self._deliver_rpc(
             "delivery.send",
             {
@@ -428,7 +440,7 @@ class RemoteModuleProxy(BaseModule):
                 "conversation_id": message.conversation_id,
                 "user_id": message.user_id,
                 "text": text,
-                "reply_to": message.reply_ids[0] if message.reply_ids else None,
+                "reply_to": effective_reply_to,
             },
             before_send=before_send,
         )
@@ -442,6 +454,7 @@ class RemoteModuleProxy(BaseModule):
         mime_type: str,
         duration_ms: int | None = None,
         title: str | None = None,
+        reply_to: str | None = None,
         before_send=None,
     ) -> str:
         if "chat" not in self._scopes or message.platform not in self.chat_platforms:
@@ -465,6 +478,11 @@ class RemoteModuleProxy(BaseModule):
             if isinstance(title, str) and title.strip()
             else None
         )
+        effective_reply_to = (
+            reply_to.strip()
+            if self.supports_reply_anchor and isinstance(reply_to, str) and reply_to.strip()
+            else None
+        )
         base_payload: dict[str, Any] = {
             "platform": message.platform,
             "bot_id": message.bot_id,
@@ -474,7 +492,7 @@ class RemoteModuleProxy(BaseModule):
             "format": fmt,
             "mime_type": mime_type,
             "duration_ms": duration_ms,
-            "reply_to": message.reply_ids[0] if message.reply_ids else None,
+            "reply_to": effective_reply_to,
             "kind_hint": "song" if clean_title is not None else "voice",
         }
         if clean_title is not None:

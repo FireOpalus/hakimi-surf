@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .affection import _validate_platform_user
+from .audio_media import is_direct_audio
 from .bot_server import is_persona_owner
 from .memes import MAX_UPLOAD_BYTES, validate_meme_label
 from .models import Message
@@ -216,7 +217,7 @@ class CommandRegistry:
     async def dispatch(self, service: Any, message: Message) -> str | None:
         if service.bot_guard.known_bot(message):
             return None
-        if any(a.origin in {"", "当前消息"} for a in getattr(message, "audios", ())):
+        if any(is_direct_audio(a) for a in getattr(message, "audios", ())):
             return None
         prefix = service.s.command_prefix
         direct = message.command_text if message.command_text is not None else message.text

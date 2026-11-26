@@ -14,6 +14,7 @@ from typing import Any
 from hakimi_plugin_sdk.bili_common import extract_bvid
 
 from .attention import can_watch_video
+from .audio_media import is_direct_audio
 from .bot_server import is_persona_owner
 from .gateway import redact_excerpt
 from .generation_policy import Scenario
@@ -101,8 +102,8 @@ class _ServiceTurnMixin:
         direct_chat = message.kind == "private" or message.addressed
         if direct_chat:
             await turn.enter_async_context(self.world_state.experience.chatting())
-        has_direct_audio = any(a.origin in {"", "当前消息"} for a in message.audios) or any(
-            a.origin in {"", "当前消息"} for m in members for a in m.audios
+        has_direct_audio = any(is_direct_audio(a) for a in message.audios) or any(
+            is_direct_audio(a) for m in members for a in m.audios
         )
         fixed = None if has_direct_audio else await self.command(message)
         if fixed is not None:

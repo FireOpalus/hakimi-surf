@@ -156,41 +156,58 @@ def cq_segments(raw: str) -> list[dict]:
 _extract_bili_url_bvid = extract_url_bvid
 
 
+def extract_bili_links(value: str, *, limit: int = 5) -> tuple[list[str], list[str]]:
+    """Extract canonical BV IDs and validated `https://b23.tv/<id>` short URLs from text."""
+    video_ids: list[str] = []
+    short_urls: list[str] = []
+    if not isinstance(value, str) or not value:
+        return video_ids, short_urls
+    candidates = BV.findall(URL.sub(" ", value))
+    unescaped = html.unescape(value)
+    for raw in URL.findall(unescaped):
+        cleaned_url = raw.rstrip("。，）)】]》")
+        bvid = _extract_bili_url_bvid(cleaned_url)
+        if bvid:
+            candidates.append(bvid)
+    for bvid in candidates:
+        if bvid not in video_ids and len(video_ids) < limit:
+            video_ids.append(bvid)
+    for raw in URL.findall(unescaped):
+        try:
+            parsed = urlsplit(raw.rstrip("。，）)】]》"))
+            port = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme in {"https", "http"}
+            and (parsed.hostname or "").lower() == "b23.tv"
+            and not parsed.username
+            and not parsed.password
+            and (
+                (parsed.scheme == "https" and port in {None, 443})
+                or (parsed.scheme == "http" and port in {None, 80})
+            )
+            and re.fullmatch(r"/[A-Za-z0-9]{1,32}", parsed.path)
+        ):
+            url = "https://b23.tv" + parsed.path
+            if url not in short_urls and len(short_urls) < limit:
+                short_urls.append(url)
+    return video_ids, short_urls
+
+
 def parse_message(message: list | str, bot_id: str, *, max_chars: int = 8000) -> RichMessage:
     result = RichMessage()
     pieces, direct = [], []
     remaining = 300
 
     def links(value: str):
-        candidates = BV.findall(URL.sub(" ", value))
-        for raw in URL.findall(html.unescape(value)):
-            cleaned_url = raw.rstrip("。，）)")
-            bvid = _extract_bili_url_bvid(cleaned_url)
-            if bvid:
-                candidates.append(bvid)
-        for bvid in candidates:
+        found_bvids, found_shorts = extract_bili_links(value, limit=5)
+        for bvid in found_bvids:
             if bvid not in result.video_ids and len(result.video_ids) < 5:
                 result.video_ids.append(bvid)
-        for raw in URL.findall(html.unescape(value)):
-            try:
-                parsed = urlsplit(raw.rstrip("。，）)"))
-                port = parsed.port
-            except ValueError:
-                continue
-            if (
-                parsed.scheme in {"https", "http"}
-                and (parsed.hostname or "").lower() == "b23.tv"
-                and not parsed.username
-                and not parsed.password
-                and (
-                    (parsed.scheme == "https" and port in {None, 443})
-                    or (parsed.scheme == "http" and port in {None, 80})
-                )
-                and re.fullmatch(r"/[A-Za-z0-9]{1,32}", parsed.path)
-            ):
-                url = "https://b23.tv" + parsed.path
-                if url not in result.short_urls and len(result.short_urls) < 5:
-                    result.short_urls.append(url)
+        for url in found_shorts:
+            if url not in result.short_urls and len(result.short_urls) < 5:
+                result.short_urls.append(url)
 
     def add(value: str):
         if not isinstance(value, str):

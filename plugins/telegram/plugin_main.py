@@ -15,6 +15,7 @@ import time
 from collections import OrderedDict
 from pathlib import PurePosixPath
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -24,6 +25,7 @@ from hakimi_plugin_sdk import (
     PluginRpcError,
     PluginRuntimeConfig,
 )
+from hakimi_plugin_sdk.bili_common import extract_url_bvid
 
 from .tg_api import DEFAULT_TG_API_BASE, TelegramApiError, TelegramBotApi
 
@@ -32,11 +34,17 @@ log = logging.getLogger("hakimi_plugin_telegram")
 _MAX_SEEN_MEDIA_IDS = 512
 _MAX_FETCH_BYTES = 20 * 1024 * 1024
 _MAX_PHOTO_FILE_BYTES = 20 * 1024 * 1024
+_MAX_TEXT_CHARS = 24000
+_MAX_QUOTED_TEXT_CHARS = 2000
+_MAX_INBOUND_IMAGES = 2
+_MAX_INBOUND_FILES = 2
+_MAX_INBOUND_AUDIOS = 4
 _AUDIO_CMD_PREFIXES = ("/学歌", "/learn-song")
 _ALLOWED_AUDIO_EXTENSIONS = frozenset(
     {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".webm"}
 )
 _NUMERIC_ID_RE = re.compile(r"^-?[0-9]{1,24}\Z")
+_B23_PATH_RE = re.compile(r"^/[A-Za-z0-9]{1,32}\Z")
 
 
 def _parse_id_set(raw: str | None) -> set[str]:
@@ -106,6 +114,65 @@ def _is_learn_song_caption(text: str) -> bool:
         ):
             return True
     return False
+
+
+def _format_sender_name(sender: dict[str, Any] | None, fallback_id: str = "") -> str:
+    if not isinstance(sender, dict):
+        cleaned = re.sub(r"[\r\n\[\]]", " ", str(fallback_id or "")).strip()
+        return cleaned[:80] or "群友"
+    first_name = str(sender.get("first_name") or "").strip()
+    last_name = str(sender.get("last_name") or "").strip()
+    raw = (
+        f"{first_name} {last_name}".strip()
+        if first_name or last_name
+        else str(sender.get("username") or fallback_id or "群友")
+    )
+    return re.sub(r"[\r\n\[\]]", " ", raw).strip()[:80] or "群友"
+
+
+def _extract_bili_entity_urls(entities: list[dict[str, Any]], existing_text: str) -> list[str]:
+    """Extract canonical Bilibili video or b23.tv URLs hidden inside Telegram text_link entities."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for ent in entities:
+        if not isinstance(ent, dict) or ent.get("type") != "text_link":
+            continue
+        raw_url = ent.get("url")
+        if not isinstance(raw_url, str):
+            continue
+        cleaned = raw_url.strip()
+        if not cleaned or len(cleaned) > 1024:
+            continue
+        bvid = extract_url_bvid(cleaned)
+        if bvid:
+            canonical = f"https://www.bilibili.com/video/{bvid}"
+            if bvid not in existing_text and canonical not in seen:
+                seen.add(canonical)
+                out.append(canonical)
+        else:
+            try:
+                parsed = urlsplit(cleaned)
+                port = parsed.port
+            except ValueError:
+                continue
+            if (
+                parsed.scheme in {"https", "http"}
+                and (parsed.hostname or "").lower() == "b23.tv"
+                and not parsed.username
+                and not parsed.password
+                and (
+                    (parsed.scheme == "https" and port in {None, 443})
+                    or (parsed.scheme == "http" and port in {None, 80})
+                )
+                and _B23_PATH_RE.fullmatch(parsed.path)
+            ):
+                canonical = f"https://b23.tv{parsed.path}"
+                if canonical not in existing_text and canonical not in seen:
+                    seen.add(canonical)
+                    out.append(canonical)
+        if len(out) >= 3:
+            break
+    return out
 
 
 class TelegramPlugin:
@@ -380,13 +447,223 @@ class TelegramPlugin:
         # Group / supergroup addressing rules
         if explicit_other_bot_cmd:
             return raw_text, None, False, ""
-        if cmd_addressed_us or (command_text is not None and command_text.startswith("/哈基米")):
+        if cmd_addressed_us or (
+            command_text is not None
+            and (
+                command_text.startswith("/哈基米")
+                or re.match(r"^/(?:存表情|偷表情|save-meme)(?:\s|$)", command_text)
+            )
+        ):
             return normalized_text, command_text, True, "command"
         if mentioned_bot:
             return normalized_text, command_text, True, "mention"
         if reply_to_bot:
             return normalized_text, command_text, True, "reply"
         return normalized_text, command_text, False, ""
+
+    def _extract_media_from_message(
+        self,
+        msg: dict[str, Any],
+        *,
+        sender_id: str,
+        sender_nickname: str,
+        is_learn_song: bool,
+        is_reply: bool,
+        images: list[dict[str, Any]],
+        files: list[dict[str, Any]],
+        audios: list[dict[str, Any]],
+    ) -> list[str]:
+        """Extract bounded photo/sticker/voice/audio/document refs and return placeholder tags."""
+        tags: list[str] = []
+        seen_images = {str(item.get("file") or "") for item in images}
+        seen_files = {str(item.get("file_id") or "") for item in files}
+        seen_audios = {str(item.get("file") or "") for item in audios}
+
+        def _origin(direct_label: str) -> str:
+            return "引用消息" if is_reply else direct_label
+
+        # 1. Photos (pick largest <= 20 MiB)
+        photos = msg.get("photo")
+        if isinstance(photos, list) and photos:
+            tags.append("[图片]")
+            if len(images) < _MAX_INBOUND_IMAGES:
+                candidates = [
+                    p for p in photos if isinstance(p, dict) and isinstance(p.get("file_id"), str)
+                ]
+                eligible = [
+                    p
+                    for p in candidates
+                    if not isinstance(p.get("file_size"), int)
+                    or p["file_size"] <= _MAX_PHOTO_FILE_BYTES
+                ]
+                chosen = eligible[-1] if eligible else (candidates[-1] if candidates else None)
+                if chosen is not None:
+                    fid = chosen["file_id"].strip()
+                    if fid and fid not in seen_images:
+                        seen_images.add(fid)
+                        self._remember_media(fid, "image", "photo.jpg")
+                        images.append(
+                            {
+                                "file": fid,
+                                "file_size": chosen.get("file_size"),
+                                "sender_id": sender_id,
+                                "sender_nickname": sender_nickname,
+                                "origin": _origin("telegram_photo"),
+                                "is_sticker": False,
+                            }
+                        )
+
+        # 2. Stickers (static or thumbnail fallback)
+        sticker = msg.get("sticker")
+        if isinstance(sticker, dict):
+            tags.append("[贴纸]")
+            if len(images) < _MAX_INBOUND_IMAGES:
+                if not sticker.get("is_animated") and not sticker.get("is_video"):
+                    fid = str(sticker.get("file_id") or "").strip()
+                    fsize = sticker.get("file_size")
+                else:
+                    thumb = sticker.get("thumbnail") or sticker.get("thumb")
+                    fid = str(thumb.get("file_id") or "").strip() if isinstance(thumb, dict) else ""
+                    fsize = thumb.get("file_size") if isinstance(thumb, dict) else None
+                if fid and fid not in seen_images:
+                    seen_images.add(fid)
+                    self._remember_media(fid, "image", "sticker.webp")
+                    images.append(
+                        {
+                            "file": fid,
+                            "file_size": fsize,
+                            "sender_id": sender_id,
+                            "sender_nickname": sender_nickname,
+                            "origin": _origin("telegram_sticker"),
+                            "is_sticker": True,
+                        }
+                    )
+
+        # 3. Voice notes -> Gemini native audio listening
+        voice = msg.get("voice")
+        if isinstance(voice, dict):
+            tags.append("[语音]")
+            fid = str(voice.get("file_id") or "").strip()
+            if fid and fid not in seen_audios and len(audios) < _MAX_INBOUND_AUDIOS:
+                seen_audios.add(fid)
+                self._remember_media(fid, "audio", "voice.ogg")
+                raw_dur = voice.get("duration")
+                audios.append(
+                    {
+                        "file": fid,
+                        "file_size": voice.get("file_size"),
+                        "duration": float(raw_dur)
+                        if isinstance(raw_dur, int | float) and raw_dur >= 0
+                        else None,
+                        "sender_id": sender_id,
+                        "sender_nickname": sender_nickname,
+                        "origin": _origin("telegram_voice"),
+                    }
+                )
+
+        # 4. Audio files (route to `files` for `/学歌` command, else `audios` for Gemini listening)
+        audio_obj = msg.get("audio")
+        if isinstance(audio_obj, dict):
+            mime = str(audio_obj.get("mime_type") or "")
+            fname = str(audio_obj.get("file_name") or "").strip()
+            if not fname:
+                title = str(audio_obj.get("title") or "audio").strip()[:80]
+                ext = _guess_audio_ext(mime, "mp3")
+                fname = f"{title}.{ext}"
+            tags.append(f"[音频：{fname[:60]}]")
+            fid = str(audio_obj.get("file_id") or "").strip()
+            if fid:
+                suffix = PurePosixPath(fname.lower()).suffix
+                if is_learn_song and suffix in _ALLOWED_AUDIO_EXTENSIONS:
+                    if fid not in seen_files and len(files) < _MAX_INBOUND_FILES:
+                        seen_files.add(fid)
+                        self._remember_media(fid, "file", fname)
+                        files.append(
+                            {
+                                "name": fname[:255],
+                                "file_id": fid,
+                                "file_size": audio_obj.get("file_size"),
+                                "sender_id": sender_id,
+                                "sender_nickname": sender_nickname,
+                                "origin": _origin("telegram_audio_cmd"),
+                            }
+                        )
+                elif fid not in seen_audios and len(audios) < _MAX_INBOUND_AUDIOS:
+                    seen_audios.add(fid)
+                    self._remember_media(fid, "audio", fname)
+                    raw_dur = audio_obj.get("duration")
+                    audios.append(
+                        {
+                            "file": fid,
+                            "file_size": audio_obj.get("file_size"),
+                            "duration": (
+                                float(raw_dur)
+                                if isinstance(raw_dur, int | float) and raw_dur >= 0
+                                else None
+                            ),
+                            "sender_id": sender_id,
+                            "sender_nickname": sender_nickname,
+                            "origin": _origin("telegram_audio"),
+                        }
+                    )
+
+        # 5. Documents: image -> images, `/学歌` audio -> files, audio -> audios, else -> files
+        doc = msg.get("document")
+        if isinstance(doc, dict):
+            mime = str(doc.get("mime_type") or "").lower()
+            fname = str(doc.get("file_name") or "").strip() or "attachment.bin"
+            suffix = PurePosixPath(fname.lower()).suffix
+            if mime.startswith("image/"):
+                tags.append("[图片]")
+            elif mime.startswith("audio/") or suffix in _ALLOWED_AUDIO_EXTENSIONS:
+                tags.append(f"[音频：{fname[:60]}]")
+            else:
+                tags.append(f"[文件：{fname[:60]}]")
+            fid = str(doc.get("file_id") or "").strip()
+            if fid:
+                if mime.startswith("image/"):
+                    if fid not in seen_images and len(images) < _MAX_INBOUND_IMAGES:
+                        seen_images.add(fid)
+                        self._remember_media(fid, "image", fname)
+                        images.append(
+                            {
+                                "file": fid,
+                                "file_size": doc.get("file_size"),
+                                "sender_id": sender_id,
+                                "sender_nickname": sender_nickname,
+                                "origin": _origin("telegram_doc_image"),
+                                "is_sticker": False,
+                            }
+                        )
+                elif (
+                    mime.startswith("audio/") or suffix in _ALLOWED_AUDIO_EXTENSIONS
+                ) and not is_learn_song:
+                    if fid not in seen_audios and len(audios) < _MAX_INBOUND_AUDIOS:
+                        seen_audios.add(fid)
+                        self._remember_media(fid, "audio", fname)
+                        audios.append(
+                            {
+                                "file": fid,
+                                "file_size": doc.get("file_size"),
+                                "sender_id": sender_id,
+                                "sender_nickname": sender_nickname,
+                                "origin": _origin("telegram_doc_audio"),
+                            }
+                        )
+                elif fid not in seen_files and len(files) < _MAX_INBOUND_FILES:
+                    seen_files.add(fid)
+                    self._remember_media(fid, "file", fname)
+                    files.append(
+                        {
+                            "name": fname[:255],
+                            "file_id": fid,
+                            "file_size": doc.get("file_size"),
+                            "sender_id": sender_id,
+                            "sender_nickname": sender_nickname,
+                            "origin": _origin("telegram_document"),
+                        }
+                    )
+        return tags
 
     def parse_update(self, update: dict[str, Any]) -> dict[str, Any] | None:
         """Convert one Telegram Update dict into `chat.inbound` kwargs, or None if dropped."""
@@ -424,24 +701,26 @@ class TelegramPlugin:
                 log.info("event=tg_inbound_dropped kind=group chat_id=%s", chat_id)
                 return None
 
-        first_name = str(sender.get("first_name") or "").strip()
-        last_name = str(sender.get("last_name") or "").strip()
-        sender_nickname = (
-            f"{first_name} {last_name}".strip()
-            if first_name or last_name
-            else str(sender.get("username") or user_id)
-        )[:80]
+        sender_nickname = _format_sender_name(sender, user_id)
         group_name = str(chat.get("title") or "").strip()[:100] if kind == "group" else ""
 
         reply_msg = msg.get("reply_to_message")
         reply_ids: list[str] = []
         reply_to_bot = False
+        reply_same_chat = False
         if isinstance(reply_msg, dict):
-            if reply_msg.get("message_id") is not None:
+            reply_chat = reply_msg.get("chat")
+            reply_same_chat = (
+                not isinstance(reply_chat, dict)
+                or reply_chat.get("id") is None
+                or str(reply_chat.get("id")).strip() == chat_id
+            )
+            if reply_same_chat and reply_msg.get("message_id") is not None:
                 reply_ids.append(str(reply_msg["message_id"]))
             reply_from = reply_msg.get("from")
             if (
-                isinstance(reply_from, dict)
+                reply_same_chat
+                and isinstance(reply_from, dict)
                 and self.bot_id
                 and str(reply_from.get("id") or "") == self.bot_id
             ):
@@ -461,171 +740,100 @@ class TelegramPlugin:
             kind=kind,
             reply_to_bot=reply_to_bot,
         )
+        direct_text_before_extra = text
+        hidden_bili_urls = _extract_bili_entity_urls(ent_list, text)
+        if hidden_bili_urls:
+            extra_links = " ".join(hidden_bili_urls)
+            text = f"{text} {extra_links}".strip() if text else extra_links
 
         images: list[dict[str, Any]] = []
         files: list[dict[str, Any]] = []
         audios: list[dict[str, Any]] = []
+        is_learn_song = _is_learn_song_caption(command_text or direct_text_before_extra)
 
-        # 1. Photos (pick largest <= 20 MiB)
-        photos = msg.get("photo")
-        if isinstance(photos, list) and photos:
-            candidates = [
-                p for p in photos if isinstance(p, dict) and isinstance(p.get("file_id"), str)
-            ]
-            eligible = [
-                p
-                for p in candidates
-                if not isinstance(p.get("file_size"), int)
-                or p["file_size"] <= _MAX_PHOTO_FILE_BYTES
-            ]
-            chosen = eligible[-1] if eligible else (candidates[-1] if candidates else None)
-            if chosen is not None:
-                fid = chosen["file_id"].strip()
-                if fid:
-                    self._remember_media(fid, "image", "photo.jpg")
-                    images.append(
-                        {
-                            "file": fid,
-                            "file_size": chosen.get("file_size"),
-                            "sender_id": user_id,
-                            "sender_nickname": sender_nickname,
-                            "origin": "telegram_photo",
-                            "is_sticker": False,
-                        }
-                    )
+        self._extract_media_from_message(
+            msg,
+            sender_id=user_id,
+            sender_nickname=sender_nickname,
+            is_learn_song=is_learn_song,
+            is_reply=False,
+            images=images,
+            files=files,
+            audios=audios,
+        )
 
-        # 2. Stickers (static or thumbnail fallback)
-        sticker = msg.get("sticker")
-        if isinstance(sticker, dict) and len(images) < 2:
-            if not sticker.get("is_animated") and not sticker.get("is_video"):
-                fid = str(sticker.get("file_id") or "").strip()
-                fsize = sticker.get("file_size")
+        # Expand single-level reply_to_message (text + media); never grant command authority.
+        if isinstance(reply_msg, dict) and reply_same_chat:
+            reply_from = reply_msg.get("from")
+            reply_sender_chat = reply_msg.get("sender_chat")
+            if isinstance(reply_from, dict):
+                reply_uid = str(reply_from.get("id") or "").strip()
+                reply_name = _format_sender_name(reply_from, reply_uid)
+            elif isinstance(reply_sender_chat, dict):
+                reply_uid = str(reply_sender_chat.get("id") or "").strip()
+                reply_name = (
+                    re.sub(
+                        r"[\r\n\[\]]",
+                        " ",
+                        str(
+                            reply_sender_chat.get("title")
+                            or reply_sender_chat.get("username")
+                            or reply_uid
+                            or "频道"
+                        ),
+                    ).strip()[:80]
+                    or "频道"
+                )
             else:
-                thumb = sticker.get("thumbnail") or sticker.get("thumb")
-                fid = str(thumb.get("file_id") or "").strip() if isinstance(thumb, dict) else ""
-                fsize = thumb.get("file_size") if isinstance(thumb, dict) else None
-            if fid:
-                self._remember_media(fid, "image", "sticker.webp")
-                images.append(
-                    {
-                        "file": fid,
-                        "file_size": fsize,
-                        "sender_id": user_id,
-                        "sender_nickname": sender_nickname,
-                        "origin": "telegram_sticker",
-                        "is_sticker": True,
-                    }
-                )
+                reply_uid = ""
+                reply_name = "群友"
 
-        # 3. Voice notes -> Gemini native audio listening
-        voice = msg.get("voice")
-        if isinstance(voice, dict):
-            fid = str(voice.get("file_id") or "").strip()
-            if fid:
-                self._remember_media(fid, "audio", "voice.ogg")
-                raw_dur = voice.get("duration")
-                audios.append(
-                    {
-                        "file": fid,
-                        "file_size": voice.get("file_size"),
-                        "duration": float(raw_dur)
-                        if isinstance(raw_dur, int | float) and raw_dur >= 0
-                        else None,
-                        "sender_id": user_id,
-                        "sender_nickname": sender_nickname,
-                        "origin": "telegram_voice",
-                    }
-                )
+            reply_tags = self._extract_media_from_message(
+                reply_msg,
+                sender_id=reply_uid,
+                sender_nickname=reply_name,
+                is_learn_song=is_learn_song,
+                is_reply=True,
+                images=images,
+                files=files,
+                audios=audios,
+            )
+            q_raw_text = str(
+                reply_msg.get("text")
+                if reply_msg.get("text") is not None
+                else (reply_msg.get("caption") or "")
+            ).strip()
+            q_entities = (
+                reply_msg.get("entities")
+                if reply_msg.get("text") is not None
+                else reply_msg.get("caption_entities")
+            )
+            q_ent_list = q_entities if isinstance(q_entities, list) else []
+            q_hidden_urls = _extract_bili_entity_urls(q_ent_list, q_raw_text)
+            if q_hidden_urls:
+                q_extra = " ".join(q_hidden_urls)
+                q_raw_text = f"{q_raw_text} {q_extra}".strip() if q_raw_text else q_extra
 
-        # 4. Audio files (route to `files` for `/学歌` command, else `audios` for Gemini listening)
-        audio_obj = msg.get("audio")
-        if isinstance(audio_obj, dict):
-            fid = str(audio_obj.get("file_id") or "").strip()
-            if fid:
-                mime = str(audio_obj.get("mime_type") or "")
-                fname = str(audio_obj.get("file_name") or "").strip()
-                if not fname:
-                    title = str(audio_obj.get("title") or "audio").strip()[:80]
-                    ext = _guess_audio_ext(mime, "mp3")
-                    fname = f"{title}.{ext}"
-                suffix = PurePosixPath(fname.lower()).suffix
-                if (
-                    _is_learn_song_caption(command_text or text)
-                    and suffix in _ALLOWED_AUDIO_EXTENSIONS
-                ):
-                    self._remember_media(fid, "file", fname)
-                    files.append(
-                        {
-                            "name": fname[:255],
-                            "file_id": fid,
-                            "file_size": audio_obj.get("file_size"),
-                            "sender_id": user_id,
-                            "sender_nickname": sender_nickname,
-                            "origin": "telegram_audio_cmd",
-                        }
-                    )
+            q_parts = [part for part in (q_raw_text, " ".join(reply_tags)) if part]
+            if q_parts:
+                q_body = " ".join(q_parts)[:_MAX_QUOTED_TEXT_CHARS]
+                if self.bot_id and reply_uid == self.bot_id:
+                    author = "我自己(吉米奈喵)"
+                elif reply_uid:
+                    author = f"{reply_name}(telegram:{reply_uid})"
                 else:
-                    self._remember_media(fid, "audio", fname)
-                    raw_dur = audio_obj.get("duration")
-                    audios.append(
-                        {
-                            "file": fid,
-                            "file_size": audio_obj.get("file_size"),
-                            "duration": (
-                                float(raw_dur)
-                                if isinstance(raw_dur, int | float) and raw_dur >= 0
-                                else None
-                            ),
-                            "sender_id": user_id,
-                            "sender_nickname": sender_nickname,
-                            "origin": "telegram_audio",
-                        }
-                    )
-
-        # 5. Documents: image -> images, `/学歌` audio -> files, audio -> audios, else -> files
-        doc = msg.get("document")
-        if isinstance(doc, dict):
-            fid = str(doc.get("file_id") or "").strip()
-            if fid:
-                mime = str(doc.get("mime_type") or "").lower()
-                fname = str(doc.get("file_name") or "").strip() or "attachment.bin"
-                suffix = PurePosixPath(fname.lower()).suffix
-                if mime.startswith("image/") and len(images) < 2:
-                    self._remember_media(fid, "image", fname)
-                    images.append(
-                        {
-                            "file": fid,
-                            "file_size": doc.get("file_size"),
-                            "sender_id": user_id,
-                            "sender_nickname": sender_nickname,
-                            "origin": "telegram_doc_image",
-                            "is_sticker": False,
-                        }
-                    )
-                elif (
-                    mime.startswith("audio/") or suffix in _ALLOWED_AUDIO_EXTENSIONS
-                ) and not _is_learn_song_caption(command_text or text):
-                    self._remember_media(fid, "audio", fname)
-                    audios.append(
-                        {
-                            "file": fid,
-                            "file_size": doc.get("file_size"),
-                            "sender_id": user_id,
-                            "sender_nickname": sender_nickname,
-                            "origin": "telegram_doc_audio",
-                        }
-                    )
-                elif len(files) < 2:
-                    self._remember_media(fid, "file", fname)
-                    files.append(
-                        {
-                            "name": fname[:255],
-                            "file_id": fid,
-                            "file_size": doc.get("file_size"),
-                            "sender_id": user_id,
-                            "sender_nickname": sender_nickname,
-                            "origin": "telegram_document",
-                        }
+                    author = reply_name
+                quote_line = f'[引用 {author} 的消息: "{q_body}"]'
+                if text:
+                    available = _MAX_TEXT_CHARS - len(text) - 1
+                    if available > 0:
+                        text = f"{text}\n{quote_line[:available]}"
+                else:
+                    text = quote_line[:_MAX_TEXT_CHARS]
+                # Lock command_text strictly to direct top-level text so quotes never invoke cmds.
+                if command_text is None:
+                    command_text = (
+                        "" if direct_text_before_extra.startswith("/") else direct_text_before_extra
                     )
 
         if not text and not images and not files and not audios:

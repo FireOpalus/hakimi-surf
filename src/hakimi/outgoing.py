@@ -7,6 +7,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
+from typing import Any
 
 from .bot_server import is_persona_owner
 from .memes import explicit_meme_request
@@ -57,6 +58,47 @@ def _resolve_platform_voice_capability(service, message: Message) -> tuple[bool,
     )
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return name in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
+def _anchor_reply_to(module: Any, anchor: dict | None, *, include_anchor: bool) -> str | None:
+    if not include_anchor or not isinstance(anchor, dict):
+        return None
+    if not getattr(module, "supports_reply_anchor", False):
+        return None
+    raw = anchor.get("reply_id")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+async def send_module_chat(
+    module: Any,
+    message: Message,
+    text: str,
+    *,
+    reply_to: str | None = None,
+    before_send=None,
+) -> dict:
+    send_kwargs: dict[str, Any] = {"before_send": before_send}
+    if (
+        isinstance(reply_to, str)
+        and reply_to.strip()
+        and getattr(module, "supports_reply_anchor", False)
+        and _accepts_kwarg(module.send_chat, "reply_to")
+    ):
+        send_kwargs["reply_to"] = reply_to.strip()
+    ident = await module.send_chat(message, text, **send_kwargs)
+    return {"message_id": confirmed_message_id(ident)}
+
+
 async def _send_text_bubble(
     service,
     message: Message,
@@ -79,8 +121,14 @@ async def _send_text_bubble(
     if message.platform not in {"onebot", "qq"}:
         module = chat_module(service.s, message.platform)
         if module is not None:
-            ident = await module.send_chat(message, rendered, before_send=before_send)
-            return {"message_id": confirmed_message_id(ident)}
+            reply_to = _anchor_reply_to(module, anchor, include_anchor=include_anchor)
+            return await send_module_chat(
+                module,
+                message,
+                rendered,
+                reply_to=reply_to,
+                before_send=before_send,
+            )
     return await service.sender.send(message, rendered, before_send=before_send)
 
 
@@ -149,13 +197,19 @@ async def _deliver_voice_or_fallback(
                     if module is None or not getattr(module, "supports_voice", False):
                         fallback_to_text = True
                     else:
+                        voice_kwargs: dict[str, Any] = {
+                            "fmt": synth.fmt,
+                            "mime_type": synth.mime_type,
+                            "duration_ms": synth.duration_ms,
+                            "before_send": voice_gate,
+                        }
+                        reply_to = _anchor_reply_to(module, anchor, include_anchor=include_anchor)
+                        if reply_to is not None and _accepts_kwarg(module.send_voice, "reply_to"):
+                            voice_kwargs["reply_to"] = reply_to
                         ident = await module.send_voice(
                             message,
                             synth.audio_bytes,
-                            fmt=synth.fmt,
-                            mime_type=synth.mime_type,
-                            duration_ms=synth.duration_ms,
-                            before_send=voice_gate,
+                            **voice_kwargs,
                         )
                         receipt = {"message_id": confirmed_message_id(ident)}
             except Rejected as exc:
@@ -257,21 +311,17 @@ async def _deliver_song(
                     if module is None or not getattr(module, "supports_voice", False):
                         fallback_needed = True
                     else:
-                        voice_kwargs: dict = {
+                        voice_kwargs: dict[str, Any] = {
                             "fmt": fmt,
                             "mime_type": mime_type,
                             "duration_ms": duration_ms,
                             "before_send": voice_gate,
                         }
-                        try:
-                            sig = inspect.signature(module.send_voice)
-                            if "title" in sig.parameters or any(
-                                p.kind == inspect.Parameter.VAR_KEYWORD
-                                for p in sig.parameters.values()
-                            ):
-                                voice_kwargs["title"] = canonical_title
-                        except (TypeError, ValueError):
-                            pass
+                        if _accepts_kwarg(module.send_voice, "title"):
+                            voice_kwargs["title"] = canonical_title
+                        reply_to = _anchor_reply_to(module, anchor, include_anchor=include_anchor)
+                        if reply_to is not None and _accepts_kwarg(module.send_voice, "reply_to"):
+                            voice_kwargs["reply_to"] = reply_to
                         ident = await module.send_voice(
                             message,
                             audio_bytes,
@@ -681,13 +731,14 @@ async def deliver_actions(service, reply):
                         message, card_source, before_send=valid
                     )
                     await acknowledge(card_source, receipt)
-                elif folded:
+                elif folded and message.platform == "onebot":
                     receipt = await service.sender.send_folded(message, folded, before_send=valid)
                     await acknowledge(folded, receipt)
                 else:
-                    for text in actions.get("bubbles", [])[:3]:
-                        if not text.strip():
-                            continue
+                    text_bubbles = [b for b in actions.get("bubbles", [])[:3] if b.strip()]
+                    if not text_bubbles and folded and str(folded).strip():
+                        text_bubbles = [str(folded).strip()]
+                    for text in text_bubbles:
                         if confirmed:
                             if hasattr(service.sender, "typing"):
                                 await service.sender.typing(message)

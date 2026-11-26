@@ -886,3 +886,475 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
                 )
         finally:
             await _stop_connected_plugin(plugin, bridge, runner)
+
+
+# ---------------------------------------------------------------------------
+# 5. P0: Group long replies, reply_to anchor routing, quote expansion & b23.tv
+# ---------------------------------------------------------------------------
+
+
+async def test_tg_plugin_quote_expansion_security_and_bili_links() -> None:
+    fake_api = _FakeTelegramApi()
+    plugin = TelegramPlugin(
+        ws_url="ws://127.0.0.1:12141/ws/plugin",
+        token="tok",
+        bot_token=BOT_TOKEN,
+        owner_user_id=OWNER_UID,
+        allowed_users={FRIEND_UID},
+        allowed_groups={GROUP_ID},
+        api=fake_api,
+        enable_polling=False,
+    )
+    plugin.bot_id = BOT_ID
+    plugin.bot_username = "HakimiBot"
+
+    # 5a. Group reply to friend's photo + caption with `/存表情` -> addressed, quote + media
+    parsed_save = plugin.parse_update(
+        {
+            "update_id": 201,
+            "message": {
+                "message_id": 901,
+                "date": 1700000100,
+                "chat": {"id": int(GROUP_ID), "type": "supergroup", "title": "猫窝群"},
+                "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                "text": "/存表情 震撼猫猫",
+                "reply_to_message": {
+                    "message_id": 890,
+                    "chat": {"id": int(GROUP_ID), "type": "supergroup"},
+                    "from": {"id": int(FRIEND_UID), "is_bot": False, "first_name": "小明"},
+                    "caption": "快看这张图",
+                    "photo": [{"file_id": "PH_QUOTED_1", "file_size": 4096}],
+                },
+            },
+        }
+    )
+    assert parsed_save is not None
+    assert parsed_save["addressed"] is True
+    assert parsed_save["attention_reason"] == "command"
+    assert parsed_save["command_text"] == "/存表情 震撼猫猫"
+    assert parsed_save["reply_ids"] == ["890"]
+    assert '[引用 小明(telegram:555000222) 的消息: "快看这张图 [图片]"]' in parsed_save["text"]
+    assert len(parsed_save["images"]) == 1
+    assert parsed_save["images"][0]["file"] == "PH_QUOTED_1"
+    assert parsed_save["images"][0]["origin"] == "引用消息"
+
+    # 5b. Quoted slash command CANNOT spoof command_text; text_link Bilibili URL is surfaced
+    parsed_spoof = plugin.parse_update(
+        {
+            "update_id": 202,
+            "message": {
+                "message_id": 902,
+                "date": 1700000101,
+                "chat": {"id": int(OWNER_UID), "type": "private"},
+                "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                "text": "帮我看看这个",
+                "reply_to_message": {
+                    "message_id": 891,
+                    "chat": {"id": int(OWNER_UID), "type": "private"},
+                    "from": {"id": int(BOT_ID), "is_bot": True, "first_name": "哈基米"},
+                    "text": "/watch-video 点这里看视频",
+                    "entities": [
+                        {
+                            "type": "text_link",
+                            "offset": 13,
+                            "length": 6,
+                            "url": "https://b23.tv/TgShort9?share_source=copy",
+                        }
+                    ],
+                },
+            },
+        }
+    )
+    assert parsed_spoof is not None
+    assert parsed_spoof["command_text"] == "帮我看看这个"
+    assert "我自己(吉米奈喵)" in parsed_spoof["text"]
+    assert "https://b23.tv/TgShort9" in parsed_spoof["text"]
+
+    # 5c. Owner replying `/学歌 夜曲` to an audio message routes quoted audio into `files`
+    parsed_learn_quote = plugin.parse_update(
+        {
+            "update_id": 203,
+            "message": {
+                "message_id": 903,
+                "date": 1700000102,
+                "chat": {"id": int(OWNER_UID), "type": "private"},
+                "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                "text": "/学歌 夜曲",
+                "reply_to_message": {
+                    "message_id": 892,
+                    "chat": {"id": int(OWNER_UID), "type": "private"},
+                    "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                    "audio": {
+                        "file_id": "AU_QUOTED_SONG",
+                        "file_name": "yequ.mp3",
+                        "mime_type": "audio/mpeg",
+                        "file_size": 2048,
+                        "duration": 200,
+                    },
+                },
+            },
+        }
+    )
+    assert parsed_learn_quote is not None
+    assert parsed_learn_quote["command_text"] == "/学歌 夜曲"
+    assert len(parsed_learn_quote["files"]) == 1
+    assert parsed_learn_quote["files"][0]["file_id"] == "AU_QUOTED_SONG"
+    assert parsed_learn_quote["files"][0]["origin"] == "引用消息"
+    assert parsed_learn_quote["audios"] == []
+
+    # 5d. Cross-chat reply_to_message is NOT expanded (fail-closed scope guard)
+    parsed_cross = plugin.parse_update(
+        {
+            "update_id": 204,
+            "message": {
+                "message_id": 904,
+                "date": 1700000103,
+                "chat": {"id": int(GROUP_ID), "type": "supergroup", "title": "猫窝群"},
+                "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                "text": "@HakimiBot 看看",
+                "entities": [{"type": "mention", "offset": 0, "length": 10}],
+                "reply_to_message": {
+                    "message_id": 777,
+                    "chat": {"id": int(OTHER_GROUP_ID), "type": "supergroup"},
+                    "from": {"id": int(STRANGER_UID), "is_bot": False, "first_name": "外人"},
+                    "text": "跨群机密",
+                    "photo": [{"file_id": "PH_CROSS_CHAT", "file_size": 1000}],
+                },
+            },
+        }
+    )
+    assert parsed_cross is not None
+    assert parsed_cross["reply_ids"] == []
+    assert "跨群机密" not in parsed_cross["text"]
+    assert parsed_cross["images"] == []
+
+
+async def test_telegram_p0_group_long_reply_anchor_quote_meme_and_b23_e2e(settings: Any) -> None:
+    png_bytes = _make_png_bytes((220, 80, 120))
+    voice_bytes = b"OggS" + b"\x22" * 512
+    fake_api = _FakeTelegramApi(
+        files={
+            "TG_QUOTE_PH": (png_bytes, "meme.png"),
+            "TG_DIRECT_VO": (voice_bytes, "voice.ogg"),
+            "TG_QUOTE_VO": (voice_bytes, "quoted.ogg"),
+        }
+    )
+    s = settings.model_copy(
+        update={
+            "admin_token": SecretStr(TOKEN),
+            "onebot_enabled": False,
+            "qq_enabled": False,
+            "bilibili_enabled": True,
+            "owner_delivery_platform": "telegram",
+            "social_owner_bindings": {
+                "telegram": OwnerBinding(
+                    bot_id=BOT_ID,
+                    user_id=OWNER_UID,
+                    notebook=True,
+                    mirror=True,
+                )
+            },
+            "group_policies": {f"telegram:{GROUP_ID}": "at_only"},
+        }
+    )
+
+    long_bubble_1 = "这是一段超过一百八十字的群聊长回复第一段内容，" * 7
+    long_bubble_2 = "这是第二段补充说明，不该重复引用原消息。"
+    assert len(long_bubble_1) + len(long_bubble_2) > 180
+
+    class _P0Gateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.next_json_reply: dict[str, Any] | None = None
+
+        async def generate(self, payload, subject, **kwargs):
+            self.calls.append(("generate", payload, kwargs))
+            if self.next_json_reply is not None:
+                raw = json.dumps(self.next_json_reply, ensure_ascii=False)
+                self.next_json_reply = None
+                return raw
+            return "视频真不错喵~"
+
+    gw = _P0Gateway()
+    app = create_app(s, gateway_factory=lambda *_: gw, start_workers=False)
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        if getattr(svc, "kernel", None) is None:
+            svc.kernel = PluginKernel()
+        bus = svc.plugin_bus
+        plugin, bridge, runner = await _start_connected_plugin(svc, bus, fake_api)
+
+        async def _claim_next() -> dict[str, Any]:
+            async with asyncio.timeout(3.0):
+                while True:
+                    claimed = await svc.store.claim()
+                    if claimed is not None:
+                        return claimed
+                    await asyncio.sleep(0.02)
+
+        try:
+            now_ts = int(time.time())
+
+            # 1. Private chat replying to bot msg #400 -> reply_to MUST be None (not 400!)
+            gw.next_json_reply = {
+                "abstain": False,
+                "bubbles": ["收到啦，私聊不用一直引用旧消息~"],
+                "anchor": {"reply_id": None, "mentions": []},
+                "sticker": {"label": None, "timing": "after_text"},
+                "image_digest": None,
+                "emoji_like": None,
+                "poke_qq": None,
+                "save_meme_label": None,
+                "set_longnick": None,
+                "affection_delta": 0,
+                "affection_deltas": None,
+                "trigger_action": None,
+                "voice_text": None,
+                "sing_song": None,
+                "audio_gist": None,
+                "search_query": None,
+            }
+            assert await plugin.process_update(
+                {
+                    "update_id": 301,
+                    "message": {
+                        "message_id": 601,
+                        "date": now_ts,
+                        "chat": {"id": int(OWNER_UID), "type": "private"},
+                        "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                        "text": "展开讲讲",
+                        "reply_to_message": {
+                            "message_id": 400,
+                            "chat": {"id": int(OWNER_UID), "type": "private"},
+                            "from": {"id": int(BOT_ID), "is_bot": True, "first_name": "哈基米"},
+                            "text": "之前说的那件事",
+                        },
+                    },
+                }
+            )
+            job1 = await _claim_next()
+            await svc.process(job1)
+            assert await svc.deliver_once()
+            assert len(fake_api.sent_messages) == 1
+            assert fake_api.sent_messages[0]["reply_to"] is None
+
+            # 2. Group long reply (>180 chars, triggers `folded`) + intervening drift ->
+            #    must not fail with forward_group_only; bubble 1 replies to 602, bubble 2 is None
+            gw.next_json_reply = {
+                "abstain": False,
+                "bubbles": [long_bubble_1, long_bubble_2],
+                "anchor": {"reply_id": "602", "mentions": []},
+                "sticker": {"label": None, "timing": "after_text"},
+                "image_digest": None,
+                "emoji_like": None,
+                "poke_qq": None,
+                "save_meme_label": None,
+                "set_longnick": None,
+                "affection_delta": 0,
+                "affection_deltas": None,
+                "trigger_action": None,
+                "voice_text": None,
+                "sing_song": None,
+                "audio_gist": None,
+                "search_query": None,
+            }
+            assert await plugin.process_update(
+                {
+                    "update_id": 302,
+                    "message": {
+                        "message_id": 602,
+                        "date": now_ts + 1,
+                        "chat": {"id": int(GROUP_ID), "type": "supergroup", "title": "猫窝群"},
+                        "from": {"id": int(FRIEND_UID), "is_bot": False, "first_name": "友友"},
+                        "text": "@hakimi_test_bot 详细讲一下原理",
+                        "entities": [{"type": "mention", "offset": 0, "length": 16}],
+                        "reply_to_message": {
+                            "message_id": 401,
+                            "chat": {"id": int(GROUP_ID), "type": "supergroup"},
+                            "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                            "text": "前置问题",
+                        },
+                    },
+                }
+            )
+            job2 = await _claim_next()
+            await svc.process(job2)
+            # Simulate intervening speaker so drift == 1 and anchor.reply_id ("602") is preserved
+            svc.hot.observe(
+                Message(
+                    platform="telegram",
+                    bot_id=BOT_ID,
+                    event_id="603",
+                    user_id=OWNER_UID,
+                    conversation_id=GROUP_ID,
+                    kind="group",
+                    text="插一句",
+                    addressed=False,
+                    created_at=float(now_ts + 2),
+                )
+            )
+            assert await svc.deliver_once()
+            grp_sent = [m for m in fake_api.sent_messages if m["chat_id"] == GROUP_ID]
+            assert len(grp_sent) == 2
+            assert "这是一段超过一百八十字的群聊长回复第一段内容" in grp_sent[0]["text"]
+            assert len(grp_sent[0]["text"]) > 140
+            assert grp_sent[0]["reply_to"] == 602
+            assert "第二段补充说明" in grp_sent[1]["text"]
+            assert grp_sent[1]["reply_to"] is None
+
+            # 3. Group quote-to-save-meme (`/存表情`) pulls quoted photo via bus and saves to memes
+            assert await plugin.process_update(
+                {
+                    "update_id": 303,
+                    "message": {
+                        "message_id": 604,
+                        "date": now_ts + 3,
+                        "chat": {"id": int(GROUP_ID), "type": "supergroup", "title": "猫窝群"},
+                        "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                        "text": "/存表情 贴贴猫",
+                        "reply_to_message": {
+                            "message_id": 599,
+                            "chat": {"id": int(GROUP_ID), "type": "supergroup"},
+                            "from": {"id": int(FRIEND_UID), "is_bot": False, "first_name": "友友"},
+                            "photo": [{"file_id": "TG_QUOTE_PH", "file_size": len(png_bytes)}],
+                        },
+                    },
+                }
+            )
+            job3 = await _claim_next()
+            await svc.process(job3)
+            assert await svc.deliver_once()
+            assert "贴贴猫" in svc.memes.labels
+            assert fake_api.sent_messages[-1]["reply_to"] == 604
+            assert "表情已存好啦" in fake_api.sent_messages[-1]["text"]
+
+            # 4. Quoted b23.tv short link populates short_urls and calls svc.bili.resolve_short
+            resolved_shorts: list[str] = []
+
+            async def _fake_resolve_short(url: str) -> str:
+                resolved_shorts.append(url)
+                return "BV1xx411c7mD"
+
+            async def _fake_video(bvid: str) -> Any:
+                from hakimi.models import Video
+
+                return Video(
+                    bvid=bvid,
+                    mid="12345",
+                    title="测试视频标题",
+                    description="测试简介",
+                    author="测试UP",
+                    published_at=now_ts,
+                )
+
+            async def _fake_material(video: Any, guard=None) -> dict[str, Any]:
+                return {
+                    "bvid": video.bvid,
+                    "title": video.title,
+                    "author": video.author,
+                    "material_scope": "metadata_only",
+                }
+
+            svc.bili.resolve_short = _fake_resolve_short  # type: ignore[method-assign]
+            svc.bili.video = _fake_video  # type: ignore[method-assign]
+            svc.bili_watcher.public_material = _fake_material  # type: ignore[method-assign]
+
+            assert await plugin.process_update(
+                {
+                    "update_id": 304,
+                    "message": {
+                        "message_id": 605,
+                        "date": now_ts + 4,
+                        "chat": {"id": int(OWNER_UID), "type": "private"},
+                        "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                        "text": "帮我看看这个视频讲啥",
+                        "reply_to_message": {
+                            "message_id": 600,
+                            "chat": {"id": int(OWNER_UID), "type": "private"},
+                            "from": {"id": int(OWNER_UID), "is_bot": False, "first_name": "BOISER"},
+                            "text": "【分享】 https://b23.tv/Demo888?share_source=copy",
+                        },
+                    },
+                }
+            )
+            job4 = await _claim_next()
+            msg4 = Message.model_validate(job4["payload"])
+            assert msg4.short_urls == ["https://b23.tv/Demo888"]
+            await svc.process(job4)
+            assert resolved_shorts == ["https://b23.tv/Demo888"]
+            assert await svc.deliver_once()
+            assert fake_api.sent_messages[-1]["chat_id"] == OWNER_UID
+            assert fake_api.sent_messages[-1]["reply_to"] is None
+
+            # 5. Direct TG audio with slash caption NEVER triggers slash command,
+            #    while replying with slash command to a quoted voice DOES work
+            direct_audio_msg = Message(
+                platform="telegram",
+                bot_id=BOT_ID,
+                event_id="606",
+                user_id=OWNER_UID,
+                conversation_id=OWNER_UID,
+                kind="private",
+                text="/哈基米 帮助",
+                command_text="/哈基米 帮助",
+                addressed=True,
+                created_at=float(now_ts + 5),
+                audios=[
+                    AudioRef(
+                        file="plugin_media:telegram:TG_DIRECT_VO",
+                        origin="telegram_voice",
+                    )
+                ],
+            )
+            assert await svc.command(direct_audio_msg) is None
+
+            quoted_audio_msg = Message(
+                platform="telegram",
+                bot_id=BOT_ID,
+                event_id="607",
+                user_id=OWNER_UID,
+                conversation_id=OWNER_UID,
+                kind="private",
+                text='/哈基米 帮助\n[引用 友友(telegram:555000222) 的消息: "[语音]"]',
+                command_text="/哈基米 帮助",
+                addressed=True,
+                created_at=float(now_ts + 6),
+                audios=[AudioRef(file="plugin_media:telegram:TG_QUOTE_VO", origin="引用消息")],
+            )
+            help_reply = await svc.command(quoted_audio_msg)
+            assert help_reply is not None and "哈基米在这里" in help_reply
+
+            # 6. send_voice uses explicit reply_to anchor and never falls back to inbound reply_ids
+            proxy = svc.modules.get("telegram")
+            assert proxy is not None
+            msg_with_inbound_reply = Message(
+                platform="telegram",
+                bot_id=BOT_ID,
+                event_id="608",
+                user_id=OWNER_UID,
+                conversation_id=GROUP_ID,
+                kind="group",
+                text="唱一句",
+                addressed=True,
+                reply_ids=["400"],
+                created_at=float(now_ts + 7),
+            )
+            await proxy.send_voice(
+                msg_with_inbound_reply,
+                b"OggS-no-anchor",
+                fmt="ogg_opus",
+                mime_type="audio/ogg",
+                duration_ms=2000,
+            )
+            assert fake_api.sent_voices[-1]["reply_to"] is None
+            await proxy.send_voice(
+                msg_with_inbound_reply,
+                b"OggS-with-anchor",
+                fmt="ogg_opus",
+                mime_type="audio/ogg",
+                duration_ms=2000,
+                reply_to="608",
+            )
+            assert fake_api.sent_voices[-1]["reply_to"] == 608
+        finally:
+            await _stop_connected_plugin(plugin, bridge, runner)
