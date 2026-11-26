@@ -3535,5 +3535,53 @@ async def test_mc_action_log_not_truncated_by_plugin_bus_and_evade_shelter_backo
             "stone_pickaxe",
         )
         assert acq_note == "acquire:no_crafting_table:stone_pickaxe,need_logs:1"
+
+        # 8. goto always records non-empty outcome in action_log.
+        from plugins.minecraft.play_brain_models import McBrainDecision
+
+        plugin.apply_snapshot(_connected_snapshot(pos=(0.0, 64.0, 0.0)))
+
+        async def goto_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+            if action == "mc.dispatch_goal" and int(params.get("x", 0)) == 20:
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "bridge_ready": True,
+                    "partial": True,
+                    "moved_blocks": 12,
+                    "summary": "向目标推进12格",
+                }
+            return {"ok": True, "accepted": True, "bridge_ready": True, "summary": "已到达"}
+
+        plugin._call_bridge = goto_bridge  # type: ignore[method-assign]
+        now[0] += 1.0
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=10, y=64, z=5, reason="go_home"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.action_log[-1]["outcome"] == "goto:(10,64,5)"
+
+        now[0] += 1.0
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=20, y=64, z=0, reason="go_partial"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.action_log[-1]["outcome"] == "goto:partial(12m)"
+
+        now[0] += 1.0
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=999, y=64, z=0, reason="too_far"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.action_log[-1]["outcome"] == "goto:distance_exceeded(999m)"
     finally:
         await plugin.close()

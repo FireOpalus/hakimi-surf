@@ -482,14 +482,28 @@ class _PlayBrainActionsMixin:
                         }
                     )
                     action_ok = self._receipt_ok(goto_res)
-                    if not action_ok and isinstance(goto_res, dict) and goto_res.get("reason"):
+                    coords = f"{int(decision.x)},{int(decision.y)},{int(decision.z)}"
+                    if action_ok:
+                        if isinstance(goto_res, dict) and goto_res.get("partial"):
+                            raw_moved = goto_res.get("moved_blocks")
+                            if isinstance(raw_moved, int) and not isinstance(raw_moved, bool):
+                                outcome_note = f"goto:partial({raw_moved}m)"
+                            else:
+                                outcome_note = f"goto:partial({coords})"
+                        else:
+                            outcome_note = f"goto:({coords})"
+                    elif isinstance(goto_res, dict) and goto_res.get("reason"):
                         outcome_note = f"goto:{str(goto_res['reason'])[:32]}"
+                    else:
+                        outcome_note = "goto:failed"
                 else:
+                    outcome_note = f"goto:distance_exceeded({int(round(dist))}m)"
                     log.warning(
                         "event=mc_brain_goto_rejected reason=distance_exceeded dist=%.1f",
                         dist,
                     )
             else:
+                outcome_note = "goto:invalid_pos_or_bounds"
                 log.warning("event=mc_brain_goto_rejected reason=invalid_pos_or_bounds")
         elif action in ("explore", "look_signs", "observe", "idle"):
             res = await self._dispatch_goal_result({"action_type": action})
