@@ -408,7 +408,7 @@ async def test_sing_song_schema_prefix_lock_and_parse_actions(settings, store, m
     assert set(CHAT_RESPONSE_FORMAT["required"]) == set(ChatActions.model_fields)
     assert (
         hashlib.sha256(ACTION_INSTRUCTION.encode("utf-8")).hexdigest()
-        == "545814e140335920327aff073021c72cf9a3a1f4abed9d8ad5a638b054879f14"
+        == "e3ecdd1d2ec6054cea31d59efdeeb2a4bac8d5897862013c4958a63d6c4ec98d"
     )
     assert "sing_song" not in ACTION_INSTRUCTION
 

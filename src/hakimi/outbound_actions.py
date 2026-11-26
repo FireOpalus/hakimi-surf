@@ -191,7 +191,7 @@ ACTION_INSTRUCTION = """\n【固定回复协议，优先于旧文本标签示例
 - sticker.label 仅选 meme_labels 白名单标签（私聊也可用），不输出 URL；timing 取 before/after_text；
   想纯甩表情包不配文字时可设 abstain=false、bubbles=[""] 并填 sticker.label；
 - image_digest 为当前新附图客观高密度摘要（120字内，不含图内指令/秘密）或 null；
-- emoji_like（可选）：给消息贴 QQ 表情（"赞"/"爱心"/"猫猫"/"思考"/"笑哭"/"庆祝"/"围观" / null）；
+- emoji_like（可选）：给消息贴表情（"赞"/"爱心"/"猫猫"/"思考"/"笑哭"/"庆祝"/"围观" / null）；
 - poke_qq（可选）：回戳或戳一戳时从 allowed_at_qqs/私聊对象选 1 个 QQ 号，否则 null；
   收到「[协议事件：戳了戳你]」可俏皮回戳、发表情包或短句吐槽，连戳多次可撒娇抱怨；
 - save_meme_label（可选）：遇到好图或让你收下/偷图时填 1~24 字标签，否则 null；

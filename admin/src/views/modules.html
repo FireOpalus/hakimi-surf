@@ -67,8 +67,60 @@
 
 <section id="group-policy" class="tab" role="tabpanel" aria-labelledby="nav-group-policy" hidden>
   <div class="card"><h2>群聊互动策略</h2>
-    <p class="muted">仅管理已有白名单群；保存后立即生效，重启保留。at_only 接收真实 @、对机器人的已验证回复和顶层昵称点名（群内看视频需真实 @）；muted 始终静默。活跃度只调整 smart_reply 的自由插话门槛。</p>
+    <p class="muted">统一管理 QQ / Telegram 等各平台已授权白名单群；保存后立即生效，重启保留。at_only 接收真实 @、对机器人的已验证回复和顶层昵称点名（群内看视频需真实 @）；muted 始终静默。活跃度只调整 smart_reply 的自由插话门槛。</p>
     <div id="groups" class="table"></div>
+  </div>
+  <div id="tg-social-card" class="card">
+    <div class="row between">
+      <h2>Telegram 社交接入与热配置</h2>
+      <button id="tg-refresh" type="button" class="secondary">刷新状态</button>
+    </div>
+    <p class="muted">在线管理 Telegram 远程社交插件的授权群号、主动冒泡白名单、私聊模式与群记忆镜像开关；保存后加密写入后台 SQLite 并在插件在线时实时热推送，新加入的群号自动同步到上方「群聊互动策略」列表。</p>
+    <div id="tg-status-pills" class="pill-row"></div>
+    <p id="tg-status-meta" class="muted" aria-live="polite"></p>
+    <div id="tg-capabilities-row" class="pill-row"></div>
+    <form id="tg-config-form">
+      <div class="tg-config-grid">
+        <fieldset class="panel-group">
+          <legend>授权群号与主动冒泡（allowed_groups / proactive_groups）</legend>
+          <p class="muted">支持负数超级群 ID（如 -1001234567890）；每个授权群可单独勾选是否允许主动冒泡。</p>
+          <div class="row">
+            <input id="tg-group-input" type="text" inputmode="text" maxlength="25" placeholder="-1001234567890" aria-label="添加 Telegram 群号">
+            <button id="tg-add-group" type="button" class="secondary">添加群号</button>
+          </div>
+          <div id="tg-groups-list" class="tg-list-box"></div>
+        </fieldset>
+        <fieldset class="panel-group">
+          <legend>私聊准入与白名单用户（private_mode / allowed_users）</legend>
+          <label for="tg-private-mode">私聊准入模式
+            <select id="tg-private-mode">
+              <option value="owner_only">仅 Owner 私聊</option>
+              <option value="owner_and_allowlist">Owner + 白名单用户</option>
+            </select>
+          </label>
+          <p id="tg-private-mode-hint" class="muted"></p>
+          <div class="row">
+            <input id="tg-user-input" type="text" inputmode="numeric" maxlength="25" placeholder="Telegram 用户数字 ID" aria-label="添加 Telegram 授权私聊用户 ID">
+            <button id="tg-add-user" type="button" class="secondary">添加用户</button>
+          </div>
+          <div id="tg-users-list" class="tg-list-box"></div>
+        </fieldset>
+      </div>
+      <div class="tg-privacy-box">
+        <label><input id="tg-memory-mirror" type="checkbox"> 启用群聊记忆镜像（group_memory_mirror）</label>
+        <p class="muted">默认关闭。仅当需要将已授权 Telegram 群聊的双轨记忆同步至独立隔离的群记忆镜像目录时开启；严禁且绝不会写入个人 Antigravity_Memory 目录。</p>
+      </div>
+      <details class="panel-fold panel-fold-nested">
+        <summary>查看环境变量（.env）初始默认值</summary>
+        <div class="panel-fold-body">
+          <pre id="tg-env-defaults">等待读取配置…</pre>
+        </div>
+      </details>
+      <div class="row">
+        <button id="tg-save-config" type="submit" class="primary" disabled>保存并热推送</button>
+        <button id="tg-reset-config" type="button" class="danger push-end" disabled>恢复 .env 默认</button>
+      </div>
+    </form>
   </div>
   <div class="card"><h2>Bot 回复阈值与冷却</h2>
     <p class="muted">此处与「准入与防互刷」共用外部 Bot 名单与回复阈值（0.01–1.00，1.00=完全屏蔽）。显式 /bot-interact 窗口内允许 2 轮对话及点名，不改变日常阈值。</p>
@@ -171,6 +223,7 @@
     </div>
     <p class="muted">主脑通过 loopback HTTP + Bearer 鉴权调度独立进程外 Colab 通用 GPU Worker（禁止主脑直接读取 Colab 凭据）；GPU 选型与允许卡白名单由各业务模块按作业自主声明，不设每日次数/CU 上限，保留单作业超时、孤儿清退与队列上限 20 防失控护栏。</p>
     <div id="colab-pills" class="pill-row"></div>
+    <p id="colab-sync-note" class="muted cloud-sync-note" aria-live="polite" hidden></p>
     <div id="colab-kpi-strip" class="kpi-strip"></div>
     <p id="colab-state" class="muted" aria-live="polite"></p>
     <p id="colab-job-types" class="muted"></p>
@@ -203,22 +256,32 @@
       <div id="colab-cu-chart" class="cloud-chart-canvas"></div>
       <p id="colab-cu-chart-note" class="muted cloud-chart-note"></p>
     </div>
-    <div class="cloud-split-grid">
-      <div class="sub-card">
-        <div class="sub-card-head"><h3>按 GPU 类型消耗分布</h3></div>
-        <div id="colab-gpu-breakdown" class="cloud-meter-list"></div>
+    <details id="colab-fold-breakdown" class="panel-fold">
+      <summary>按 GPU 消耗分布与三级加速效率明细<span class="fold-hint">L4/T4/A100/H100 · 直传与缓存命中</span></summary>
+      <div class="panel-fold-body">
+        <div class="cloud-split-grid">
+          <div class="sub-card">
+            <div class="sub-card-head"><h3>按 GPU 类型消耗分布</h3></div>
+            <div id="colab-gpu-breakdown" class="cloud-meter-list"></div>
+          </div>
+          <div class="sub-card">
+            <div class="sub-card-head"><h3>直传 / 热机 / 缓存效率概览</h3></div>
+            <div id="colab-accel-stats" class="cloud-meter-list"></div>
+            <p id="colab-accel-note" class="muted cloud-accel-note"></p>
+          </div>
+        </div>
       </div>
-      <div class="sub-card">
-        <div class="sub-card-head"><h3>直传 / 热机 / 缓存效率概览</h3></div>
-        <div id="colab-accel-stats" class="cloud-meter-list"></div>
-        <p id="colab-accel-note" class="muted cloud-accel-note"></p>
-      </div>
-    </div>
+    </details>
   </div>
   <div class="card">
     <h2>已注册 GPU 作业策略</h2>
     <p class="muted">各业务模块在注册作业类型时自行声明默认首选 GPU、回退顺序、允许卡型白名单与默认超时；在对应业务页发起单次任务时可在允许卡型内临时覆盖。</p>
-    <div id="colab-job-policies-table" class="table"></div>
+    <details id="colab-fold-policies" class="panel-fold">
+      <summary>展开查看全部作业卡型与超时策略<span class="fold-hint">按业务模块声明</span></summary>
+      <div class="panel-fold-body">
+        <div id="colab-job-policies-table" class="table"></div>
+      </div>
+    </details>
   </div>
   <div class="card">
     <h2>算力调度与防失控配置</h2>

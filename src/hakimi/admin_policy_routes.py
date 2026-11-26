@@ -2,7 +2,7 @@
 
 import time
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -18,10 +18,20 @@ from .admission_policy import (
 from .budget_policy import BudgetConfig
 from .debounce_policy import DebounceConfig
 from .gateway import FilterConfig
-from .models import Message
+from .models import Message, PlatformId
 from .policy_registry import SIMPLE_LIMIT_SPECS, PolicySpec, export_policy_schemas
 from .rest_policy import RestHoursConfig
 from .security import Rejected
+from .social import chat_module
+from .social_chat_config import (
+    RemoteChatConfig,
+    cached_remote_chat_config,
+    delete_remote_chat_config,
+    load_all_remote_chat_configs,
+    load_remote_chat_config,
+    save_remote_chat_config,
+    validate_remote_chat_platform,
+)
 from .thinking_policy import ModelSettingsUpdate, ThinkingConfig
 from .web_search import WebSearchConfig
 
@@ -29,13 +39,13 @@ router = APIRouter(prefix="/admin/api")
 
 
 class GroupPolicy(Input):
-    platform: Literal["onebot", "qq"] = "onebot"
+    platform: PlatformId = "onebot"
     group_id: str = Field(min_length=1, max_length=128)
     mode: Literal["at_only", "smart_reply", "muted"]
 
 
 class GroupActivity(Input):
-    platform: Literal["onebot", "qq"] = "onebot"
+    platform: PlatformId = "onebot"
     group_id: str = Field(min_length=1, max_length=128)
     preset: Literal["quiet", "natural", "active"] | None = None
 
@@ -284,10 +294,164 @@ async def thinking_reset(request: Request):
         return await service(request).store.runtime.set_thinking(None)
 
 
-def allowed_activity_group(settings, platform, group_id):
-    allowed = settings.onebot_allowed_groups if platform == "onebot" else settings.qq_allowed_groups
+def _plugin_bus(svc: Any) -> Any:
+    bus = getattr(svc, "plugin_bus", None)
+    if bus is not None:
+        return bus
+    modules = getattr(svc, "modules", None)
+    systems = getattr(modules, "systems", None) or {}
+    sys_mod = systems.get("plugin_bus")
+    return getattr(sys_mod, "plugin_bus", None) if sys_mod is not None else None
+
+
+def _validate_social_platform_param(platform: str) -> str:
+    try:
+        return validate_remote_chat_platform(platform)
+    except Rejected:
+        raise HTTPException(400, "invalid_platform") from None
+
+
+def _remote_allowed_groups_sync(
+    settings: Any, platform: str, *, remote_config: RemoteChatConfig | None = None
+) -> set[str]:
+    cfg = (
+        remote_config
+        if remote_config is not None
+        else cached_remote_chat_config(settings, platform)
+    )
+    if cfg is not None:
+        return set(cfg.allowed_groups)
+    mod = chat_module(settings, platform)
+    if mod is not None and hasattr(mod, "allowed_groups"):
+        return set(mod.allowed_groups())
+    return set()
+
+
+def allowed_activity_group(
+    settings, platform, group_id, *, remote_config: RemoteChatConfig | None = None
+):
+    if platform == "onebot":
+        allowed = settings.onebot_allowed_groups
+    elif platform == "qq":
+        allowed = settings.qq_allowed_groups
+    else:
+        allowed = _remote_allowed_groups_sync(settings, platform, remote_config=remote_config)
     if group_id not in allowed:
         raise Rejected("group_not_allowlisted")
+
+
+async def _social_chat_config_payload(
+    svc: Any,
+    platform: str,
+    *,
+    saved: RemoteChatConfig | None = None,
+    saved_loaded: bool = False,
+) -> dict[str, Any]:
+    bus = _plugin_bus(svc)
+    proxy = bus.get_chat_proxy(platform) if bus is not None else None
+    if proxy is None:
+        modules = getattr(svc, "modules", None)
+        chat_plats = getattr(modules, "chat_platforms", None) or {}
+        candidate = chat_plats.get(platform)
+        if candidate is not None and platform not in {"onebot", "qq"}:
+            proxy = candidate
+    online = False
+    if proxy is not None:
+        if bus is not None and hasattr(bus, "is_plugin_online"):
+            online = bool(bus.is_plugin_online(proxy.module_id, require_enabled=False))
+        elif hasattr(proxy, "admin_status"):
+            online = bool(proxy.admin_status().get("online", False))
+        elif hasattr(proxy, "chat_connected"):
+            online = bool(proxy.chat_connected(platform))
+
+    plugin_id = str(getattr(proxy, "module_id", "") or platform)
+    status = proxy.status_dict() if proxy is not None and hasattr(proxy, "status_dict") else {}
+    binding = (getattr(svc.s, "social_owner_bindings", None) or {}).get(platform)
+    bot_id = str(status.get("bot_id") or "").strip() or (
+        binding.bot_id if binding is not None else ""
+    )
+    bot_username = str(status.get("bot_username") or "").strip()
+    owner_configured = bool(status.get("owner_configured") or binding is not None)
+    caps = list(getattr(proxy, "capabilities", ()) or ()) if proxy is not None else []
+    if not caps and isinstance(status.get("capabilities"), list):
+        caps = [c for c in status["capabilities"] if isinstance(c, str)]
+
+    effective_saved = (
+        saved
+        if saved_loaded
+        else await load_remote_chat_config(svc.store, platform, settings=svc.s)
+    )
+    env_raw = status.get("env_defaults")
+    if isinstance(env_raw, dict):
+        env_cfg = RemoteChatConfig.from_untrusted(env_raw, platform=platform)
+    elif proxy is not None and effective_saved is None:
+        env_cfg = RemoteChatConfig.from_untrusted(status, platform=platform)
+    else:
+        env_cfg = RemoteChatConfig()
+
+    if effective_saved is not None:
+        active_cfg = effective_saved
+        source = "admin"
+    else:
+        active_cfg = env_cfg
+        source = "env"
+
+    return {
+        "platform": platform,
+        "plugin_id": plugin_id,
+        "online": online,
+        "bot_id": bot_id,
+        "bot_username": bot_username,
+        "owner_configured": owner_configured,
+        "source": source,
+        "capabilities": caps,
+        "config": active_cfg.to_dict(),
+        "environment": env_cfg.to_dict(),
+    }
+
+
+@router.get("/social-chat/{platform}/config")
+async def social_chat_config_get(request: Request, platform: str):
+    plat = _validate_social_platform_param(platform)
+    svc = service(request)
+    return await _social_chat_config_payload(svc, plat)
+
+
+@router.put("/social-chat/{platform}/config")
+async def social_chat_config_save(request: Request, platform: str):
+    plat = _validate_social_platform_param(platform)
+    value = await body(request, RemoteChatConfig)
+    svc = service(request)
+    async with domain_lock(request, "groups"):
+        saved = await save_remote_chat_config(svc.store, plat, value, settings=svc.s)
+        bus = _plugin_bus(svc)
+        pushed = False
+        if bus is not None and hasattr(bus, "push_remote_chat_config"):
+            pushed = await bus.push_remote_chat_config(plat, saved)
+        else:
+            mod = chat_module(svc.s, plat)
+            if mod is not None and hasattr(mod, "push_config"):
+                pushed = await mod.push_config(saved, platform=plat)
+        payload = await _social_chat_config_payload(svc, plat, saved=saved, saved_loaded=True)
+        return {**payload, "pushed": bool(pushed)}
+
+
+@router.delete("/social-chat/{platform}/config")
+async def social_chat_config_reset(request: Request, platform: str):
+    plat = _validate_social_platform_param(platform)
+    svc = service(request)
+    async with domain_lock(request, "groups"):
+        await delete_remote_chat_config(svc.store, plat, settings=svc.s)
+        bus = _plugin_bus(svc)
+        pushed = False
+        if bus is not None and hasattr(bus, "push_remote_chat_config"):
+            pushed = await bus.push_remote_chat_config(plat, None, reset_to_env=True)
+        else:
+            mod = chat_module(svc.s, plat)
+            if mod is not None and hasattr(mod, "push_config"):
+                pushed = await mod.push_config(None, platform=plat, reset_to_env=True)
+        payload = await _social_chat_config_payload(svc, plat, saved=None, saved_loaded=True)
+        return {**payload, "pushed": bool(pushed)}
 
 
 @router.put("/filter")
@@ -299,9 +463,17 @@ async def filter_save(request: Request):
         if "group_activity" not in value.model_fields_set:
             value = value.model_copy(update={"group_activity": dict(manager.config.group_activity)})
         else:
+            loaded_remote: dict[str, RemoteChatConfig | None] = {}
             for key in value.group_activity:
                 platform, group_id = key.split(":", 1)
-                allowed_activity_group(svc.s, platform, group_id)
+                remote_cfg = None
+                if platform not in {"onebot", "qq"}:
+                    if platform not in loaded_remote:
+                        loaded_remote[platform] = await load_remote_chat_config(
+                            svc.store, platform, settings=svc.s
+                        )
+                    remote_cfg = loaded_remote[platform]
+                allowed_activity_group(svc.s, platform, group_id, remote_config=remote_cfg)
         return await manager.set_config(value)
 
 
@@ -315,7 +487,12 @@ async def filter_reset(request: Request):
 async def group_activity(request: Request):
     value = await body(request, GroupActivity)
     svc = service(request)
-    allowed_activity_group(svc.s, value.platform, value.group_id)
+    remote_cfg = (
+        await load_remote_chat_config(svc.store, value.platform, settings=svc.s)
+        if value.platform not in {"onebot", "qq"}
+        else None
+    )
+    allowed_activity_group(svc.s, value.platform, value.group_id, remote_config=remote_cfg)
     async with domain_lock(request, "filter"):
         return await svc.store.runtime.filters.set_group_activity(
             value.platform, value.group_id, value.preset
@@ -329,14 +506,37 @@ async def decision_audit(request: Request):
 
 @router.get("/groups")
 async def groups(request: Request):
-    s = service(request).s
+    svc = service(request)
+    s = svc.s
+    platform_groups: list[tuple[str, set[str]]] = [
+        ("onebot", set(s.onebot_allowed_groups)),
+        ("qq", set(s.qq_allowed_groups)),
+    ]
+    persisted = await load_all_remote_chat_configs(svc.store, settings=s)
+    remote_platforms: set[str] = set(persisted)
+    modules = getattr(svc, "modules", None)
+    chat_plats = getattr(modules, "chat_platforms", None) or {}
+    for plat in chat_plats:
+        if plat not in {"onebot", "qq"}:
+            remote_platforms.add(plat)
+    for plat in sorted(remote_platforms):
+        if plat in persisted:
+            gids = set(persisted[plat].allowed_groups)
+        else:
+            mod = chat_plats.get(plat)
+            gids = (
+                set(mod.allowed_groups())
+                if mod is not None and hasattr(mod, "allowed_groups")
+                else set()
+            )
+        platform_groups.append((plat, gids))
     return [
         {
             "platform": platform,
             "group_id": gid,
             "mode": s.group_policies.get(f"{platform}:{gid}", "at_only"),
         }
-        for platform, ids in [("onebot", s.onebot_allowed_groups), ("qq", s.qq_allowed_groups)]
+        for platform, ids in platform_groups
         for gid in sorted(ids)
     ]
 
@@ -389,11 +589,12 @@ async def policy(request: Request):
     data = await body(request, GroupPolicy)
     svc = service(request)
     async with domain_lock(request, "groups"):
-        allowed = (
-            svc.s.onebot_allowed_groups if data.platform == "onebot" else svc.s.qq_allowed_groups
+        remote_cfg = (
+            await load_remote_chat_config(svc.store, data.platform, settings=svc.s)
+            if data.platform not in {"onebot", "qq"}
+            else None
         )
-        if data.group_id not in allowed:
-            raise Rejected("group_not_allowlisted")
+        allowed_activity_group(svc.s, data.platform, data.group_id, remote_config=remote_cfg)
         key = f"{data.platform}:{data.group_id}"
         await svc.store.runtime.save_config("policy:" + key, data.mode)
         svc.s.group_policies[key] = data.mode

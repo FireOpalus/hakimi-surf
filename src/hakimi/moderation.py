@@ -7,7 +7,10 @@ import time
 import uuid
 
 from .bot_server import is_persona_owner
+from .identity import PLATFORM_ID_RE, validate_platform_user
+from .platform_hooks import get_platform_hooks
 from .security import Rejected, clean_text, configured_secrets, owner
+from .social import chat_module, chat_registry
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS muted_users (
@@ -52,6 +55,85 @@ class Moderation:
 
     def key(self, uid):
         return self.store.vault.digest(self.scope, uid)
+
+    def platform_key(self, platform: str, uid: str) -> str:
+        if platform == "onebot":
+            return self.key(uid)
+        return self.store.vault.digest(self.scope, "platform", platform, uid)
+
+    def _identity(self):
+        ident = getattr(self.service, "identity", None)
+        if ident is None:
+            ident = getattr(getattr(self.store, "runtime", None), "identity", None)
+        return ident
+
+    def _is_protected_platform_account(self, platform: str, user_id: str) -> bool:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return True
+        if platform == "onebot":
+            protected = {
+                self.s.owner_qq_id,
+                self.s.onebot_self_id,
+                *getattr(self.s, "onebot_owner_ids", ()),
+            } - {""}
+            if uid in protected:
+                return True
+        elif platform == "qq":
+            protected = {
+                getattr(self.s, "qq_app_id", ""),
+                *getattr(self.s, "qq_owner_ids", ()),
+            } - {""}
+            if uid in protected:
+                return True
+        binding = (getattr(self.s, "social_owner_bindings", None) or {}).get(platform)
+        if binding is not None and uid in {binding.user_id, binding.bot_id}:
+            return True
+        reg = chat_registry(self.s)
+        mod = reg.chat_platforms.get(platform) if reg is not None else None
+        if mod is not None:
+            if hasattr(mod, "bot_id_for"):
+                bot_id = str(mod.bot_id_for(platform) or "").strip()
+                if bot_id and uid == bot_id:
+                    return True
+            if hasattr(mod, "status_dict"):
+                raw_bid = mod.status_dict().get("bot_id")
+                if isinstance(raw_bid, str) and raw_bid.strip() and uid == raw_bid.strip():
+                    return True
+        ident = self._identity()
+        if ident is not None:
+            if hasattr(ident, "is_owner_account") and ident.is_owner_account(platform, uid):
+                return True
+            if hasattr(ident, "_is_known_bot") and ident._is_known_bot(platform, uid):
+                return True
+        return False
+
+    def parse_target(self, target) -> tuple[str, str]:
+        """Parse `<qq>` (default onebot) or `<platform>:<user_id>` with Owner/Bot guards."""
+        if isinstance(target, bool) or not isinstance(target, (str, int)):
+            raise Rejected("invalid_target")
+        raw = str(target).strip()
+        if not raw:
+            raise Rejected("invalid_target")
+        if ":" in raw:
+            platform, _, uid = raw.partition(":")
+            platform = platform.strip()
+            uid = uid.strip()
+            if not PLATFORM_ID_RE.fullmatch(platform):
+                raise Rejected("invalid_platform")
+            if platform == "onebot":
+                uid = self.target_id(uid)
+                if self._is_protected_platform_account("onebot", uid):
+                    raise Rejected("protected_identity")
+                return "onebot", uid
+            uid = validate_platform_user(platform, uid)
+            if self._is_protected_platform_account(platform, uid):
+                raise Rejected("protected_identity")
+            return platform, uid
+        uid = self.target_id(raw)
+        if self._is_protected_platform_account("onebot", uid):
+            raise Rejected("protected_identity")
+        return "onebot", uid
 
     def nickname(self, value):
         text = clean_text(str(value))[:80]
@@ -107,21 +189,53 @@ class Moderation:
     async def record_strike(self, message, reason, nickname=""):
         # Only evidence about this CURRENT authenticated group message belongs here.
         # The caller must not pass a failed check of history, sources or generated output.
-        if (
-            message.platform != "onebot"
-            or message.bot_id != self.s.onebot_self_id
-            or message.kind != "group"
-            or reason not in REASONS
-        ):
+        if message.kind != "group" or reason not in REASONS:
             return None
-        try:
-            uid = self.target_id(message.user_id)
-        except Rejected:
-            return None
-        if uid in self.s.muted_user_ids:
-            return None
+        platform = message.platform
+        if platform == "onebot":
+            if message.bot_id != self.s.onebot_self_id:
+                return None
+            try:
+                uid = self.target_id(message.user_id)
+            except Rejected:
+                return None
+            if uid in self.s.muted_user_ids or self._is_protected_platform_account("onebot", uid):
+                return None
+            user_key = self.key(uid)
+        else:
+            if not PLATFORM_ID_RE.fullmatch(platform):
+                return None
+            if message.user_id == message.bot_id:
+                return None
+            reg = chat_registry(self.s)
+            if reg is not None:
+                mod = chat_module(self.s, platform)
+                if mod is None:
+                    return None
+                expected_bot = str(mod.bot_id_for(platform) or "").strip()
+                if expected_bot and message.bot_id != expected_bot:
+                    return None
+                if not mod.authorize_chat(message.model_copy(update={"addressed": True}), self.s):
+                    return None
+            else:
+                hooks = get_platform_hooks(platform)
+                if hooks is None or not hooks.authorize(
+                    message.model_copy(update={"addressed": True}), self.s
+                ):
+                    return None
+            try:
+                uid = validate_platform_user(platform, message.user_id)
+            except Rejected:
+                return None
+            if self._is_protected_platform_account(platform, uid):
+                return None
+            ident = self._identity()
+            if ident is not None and hasattr(ident, "is_muted") and ident.is_muted(platform, uid):
+                return None
+            user_key = self.platform_key(platform, uid)
+
         await self.initialize()
-        now, user_key = self.clock(), self.key(uid)
+        now = self.clock()
         nickname = self.nickname(nickname or getattr(message, "sender_nickname", ""))
         proposal = None
         async with self.lock, self.store.transaction():
@@ -145,14 +259,18 @@ class Moderation:
             )
             if count >= 3 and not recent:
                 proposal = uuid.uuid4().hex[:12]
-                identity = {"user_id": uid, "nickname": nickname}
+                identity_doc = {
+                    "user_id": uid,
+                    "nickname": nickname,
+                    **({"platform": platform} if platform != "onebot" else {}),
+                }
                 await self.store.db.execute(
                     "INSERT INTO pending_mute_proposals VALUES (?,?,?,?,?,?,?,'pending',NULL)",
                     (
                         proposal,
                         self.scope,
                         user_key,
-                        self.store.vault.seal(proposal, identity),
+                        self.store.vault.seal(proposal, identity_doc),
                         reason,
                         now,
                         now + 172800,
@@ -162,19 +280,32 @@ class Moderation:
             proactive = getattr(self.service, "proactive", None)
             alert_fn = getattr(proactive, "alert", None) if proactive is not None else None
             if callable(alert_fn):
-                delete_hint = (
-                    "如需同时移除好友，请明确在批准命令末尾加 --delete-friend。"
-                    if self.s.owner_delivery_platform == "onebot"
-                    else "如需同时移除 QQ 好友，请在 QQ 私聊中使用 --delete-friend 或前往后台操作。"
-                )
-                text = (
-                    f"BOISER，哈基米想请你评评理喵。{nickname}，QQ {uid}，"
-                    f"在 24 小时内至少 3 次触发安全拦截，最近类别：{REASONS[reason]}。"
-                    "目前还没有屏蔽，也没有删除好友。\n"
-                    f"申请编号：{proposal}\n/mute-approve {proposal} 批准应用层屏蔽\n"
-                    f"/mute-reject {proposal} 驳回\n"
-                    f"{delete_hint}"
-                )
+                if platform == "onebot":
+                    delete_hint = (
+                        "如需同时移除好友，请明确在批准命令末尾加 --delete-friend。"
+                        if self.s.owner_delivery_platform == "onebot"
+                        else (
+                            "如需同时移除 QQ 好友，请在 QQ 私聊中使用 --delete-friend "
+                            "或前往后台操作。"
+                        )
+                    )
+                    text = (
+                        f"BOISER，哈基米想请你评评理喵。{nickname}，QQ {uid}，"
+                        f"在 24 小时内至少 3 次触发安全拦截，最近类别：{REASONS[reason]}。"
+                        "目前还没有屏蔽，也没有删除好友。\n"
+                        f"申请编号：{proposal}\n/mute-approve {proposal} 批准应用层屏蔽\n"
+                        f"/mute-reject {proposal} 驳回\n"
+                        f"{delete_hint}"
+                    )
+                else:
+                    text = (
+                        f"BOISER，哈基米想请你评评理喵。{nickname}（{platform}:{uid}），"
+                        f"在 24 小时内至少 3 次触发安全拦截，最近类别：{REASONS[reason]}。"
+                        "目前还没有屏蔽。\n"
+                        f"申请编号：{proposal}\n/mute-approve {proposal} 批准应用层屏蔽\n"
+                        f"/mute-reject {proposal} 驳回\n"
+                        f"也可直接发送 /mute {platform}:{uid} 立即应用层屏蔽。"
+                    )
                 try:
                     await alert_fn("mute_proposal_" + proposal, text)
                 except Exception:
@@ -271,12 +402,54 @@ class Moderation:
                 await aff.on_unmute(uid)
         return {"user_id": uid, "muted": muted, "delete_status": deletion}
 
+    async def set_platform_muted(
+        self,
+        platform: str,
+        user_id: str,
+        muted: bool = True,
+        *,
+        delete_friend: bool = False,
+        source: str = "owner_manual",
+    ):
+        if platform == "onebot":
+            return await self.set_muted(user_id, muted, delete_friend=delete_friend)
+        plat, uid = self.parse_target(f"{platform}:{user_id}")
+        if delete_friend:
+            raise Rejected("delete_friend_onebot_only")
+        ident = self._identity()
+        if ident is None or not hasattr(ident, "set_account_muted"):
+            raise Rejected("identity_unavailable")
+        await ident.set_account_muted(plat, uid, bool(muted), source=source)
+        return {
+            "platform": plat,
+            "user_id": uid,
+            "muted": bool(muted),
+            "delete_status": "not_supported",
+        }
+
+    async def _proposal_platform(self, proposal: str) -> str | None:
+        if not re.fullmatch(r"[a-f0-9]{12}", proposal):
+            return None
+        await self.initialize()
+        async with self.store.lock:
+            row = await self.store.one(
+                "SELECT identity FROM pending_mute_proposals WHERE id=? AND scope=?",
+                (proposal, self.scope),
+            )
+        if not row:
+            return None
+        identity = self.store.vault.open(proposal, row["identity"])
+        return str(identity.get("platform") or "onebot")
+
     async def review(self, proposal, approve, *, delete_friend=False):
         await self.initialize()
         if not re.fullmatch(r"[a-f0-9]{12}", proposal):
             raise Rejected("invalid_proposal_id")
         if delete_friend and not approve:
             raise Rejected("invalid_mute_action")
+        target_platform = "onebot"
+        uid = ""
+        ident = None
         async with self.lock:
             async with self.store.transaction():
                 row = await self.store.one(
@@ -286,26 +459,50 @@ class Moderation:
                 if not row:
                     raise Rejected("proposal_not_found")
                 identity = self.store.vault.open(proposal, row["identity"])
-                uid = self.target_id(identity["user_id"])
+                target_platform = str(identity.get("platform") or "onebot")
+                if target_platform == "onebot":
+                    uid = self.target_id(identity["user_id"])
+                    if self._is_protected_platform_account("onebot", uid):
+                        raise Rejected("protected_identity")
+                else:
+                    if delete_friend:
+                        raise Rejected("delete_friend_onebot_only")
+                    uid = validate_platform_user(target_platform, str(identity["user_id"]))
+                    if self._is_protected_platform_account(target_platform, uid):
+                        raise Rejected("protected_identity")
                 if row["status"] != "pending" or row["expires"] <= self.clock():
                     raise Rejected("proposal_already_resolved_or_expired")
+                if approve and target_platform != "onebot":
+                    ident = self._identity()
+                    if ident is None or not hasattr(ident, "set_account_muted"):
+                        raise Rejected("identity_unavailable")
                 await self.store.db.execute(
                     "UPDATE pending_mute_proposals SET status=?,reviewed=? WHERE id=?",
                     ("approved" if approve else "rejected", self.clock(), proposal),
                 )
-                if approve:
+                if approve and target_platform == "onebot":
                     await self._mute(uid, "proposal")
-            if approve:
+            if approve and target_platform == "onebot":
                 self.s.muted_user_ids = set(self.s.muted_user_ids) | {uid}
-            deletion = await self._delete_friend(uid) if delete_friend else "not_requested"
+            deletion = (
+                await self._delete_friend(uid)
+                if (delete_friend and target_platform == "onebot")
+                else ("not_supported" if target_platform != "onebot" else "not_requested")
+            )
         if approve:
-            identity = getattr(self.store.runtime, "identity", None)
-            if identity is not None:
-                await identity.sync_account_muted(
-                    "onebot", uid, True, source="proposal", moderation=self
-                )
+            if ident is None:
+                ident = self._identity()
+            if target_platform == "onebot":
+                if ident is not None:
+                    await ident.sync_account_muted(
+                        "onebot", uid, True, source="proposal", moderation=self
+                    )
+            else:
+                await ident.set_account_muted(target_platform, uid, True, source="proposal")
         return {
             "id": proposal,
+            "platform": target_platform,
+            "user_id": uid,
             "status": "approved" if approve else "rejected",
             "delete_status": deletion,
         }
@@ -365,31 +562,72 @@ class Moderation:
         if message.kind != "private" or not is_persona_owner(message, self.s):
             raise Rejected("owner_private_only")
         match = re.fullmatch(
-            r"/(mute-approve|mute-reject|mute|unmute) ([a-f0-9]+)( --delete-friend)?", direct
+            r"/(mute-approve|mute-reject|mute|unmute)\s+([^\s]+)(?:\s+(--delete-friend))?",
+            direct.strip(),
         )
         if not match:
             return (
-                "用法：/mute <QQ>、/unmute <QQ>、/mute-approve <编号> 或 /mute-reject <编号>。"
-                "仅批准或屏蔽可加 --delete-friend。"
+                "用法：/mute <QQ 或 平台:账号>、/unmute <QQ 或 平台:账号>、"
+                "/mute-approve <编号> 或 /mute-reject <编号>。"
+                "仅 QQ（OneBot）批准或屏蔽可加 --delete-friend。"
             )
         action, target, option = match.groups()
-        if option and not owner(message, self.s):
-            raise Rejected("owner_private_only")
         if action in {"mute-approve", "mute-reject"}:
+            if option:
+                prop_plat = await self._proposal_platform(target)
+                if prop_plat is not None and prop_plat != "onebot":
+                    return (
+                        "仅 QQ（OneBot）账号支持 --delete-friend 移除好友操作，"
+                        "其他平台请去掉该参数重试。"
+                    )
+                if not owner(message, self.s):
+                    raise Rejected("owner_private_only")
             result = await self.review(target, action == "mute-approve", delete_friend=bool(option))
             text = (
                 "已批准应用层屏蔽。" if result["status"] == "approved" else "已驳回，本次不屏蔽。"
             )
-        else:
-            result = await self.set_muted(target, action == "mute", delete_friend=bool(option))
+            if option:
+                text += "好友移除状态：" + result["delete_status"] + "。"
+            return text
+
+        try:
+            target_platform, target_uid = self.parse_target(target)
+        except Rejected as exc:
+            if str(exc) == "protected_identity":
+                raise
+            return "用法：/mute <QQ 或 平台:账号>、/unmute <QQ 或 平台:账号>；目标账号格式不正确。"
+
+        if option:
+            if target_platform != "onebot":
+                return (
+                    "仅 QQ（OneBot）账号支持 --delete-friend 移除好友操作，"
+                    "其他平台请去掉该参数重试。"
+                )
+            if not owner(message, self.s):
+                raise Rejected("owner_private_only")
+
+        if target_platform == "onebot":
+            result = await self.set_muted(target_uid, action == "mute", delete_friend=bool(option))
             text = (
                 "已在应用层屏蔽该 QQ。"
                 if result["muted"]
                 else "已解除应用层屏蔽，仍需满足准入白名单。"
             )
-        if option:
-            text += "好友移除状态：" + result["delete_status"] + "。"
-        return text
+            if option:
+                text += "好友移除状态：" + result["delete_status"] + "。"
+            return text
+
+        result = await self.set_platform_muted(
+            target_platform,
+            target_uid,
+            action == "mute",
+            source="owner_manual",
+        )
+        return (
+            f"已在应用层屏蔽 {target_platform}:{target_uid}。"
+            if result["muted"]
+            else f"已解除 {target_platform}:{target_uid} 的应用层屏蔽。"
+        )
 
     async def status(self):
         await self.prune()

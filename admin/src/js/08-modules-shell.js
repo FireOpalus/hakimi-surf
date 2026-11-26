@@ -312,6 +312,13 @@ function registerPluginPage(m){
   if(protocols.length){
     const card=el('section',undefined,'card');card.append(el('h2','会话隐私'),privacy);panel.append(card);
   }
+  if(m.id==='telegram'||protocols.includes('telegram')){
+    const tgCard=el('section',undefined,'card');
+    const tgBtn=el('button','前往 Telegram 授权群与私聊热配置 →','secondary');
+    tgBtn.type='button';tgBtn.dataset.openTab='group-policy';
+    tgCard.append(el('h2','群聊与私聊热配置'),el('p','可在「群聊互动策略」页直接增删授权群、勾选主动冒泡、切换私聊白名单与群聊记忆镜像。','muted'),tgBtn);
+    panel.append(tgCard);
+  }
   $('modules').after(panel);
   const section={button:navBtn,workspace:'modules',module:m.id,title:m.title||m.id,group:'平台模块'};
   sections.set(key,section);tabButtons.push(navBtn);modulePage.set(m.id,key);
@@ -426,20 +433,26 @@ function renderColabOverview(d){
   cachedColabOverview=d;
   colabUnavailableReason='';
   const w=d.worker||{},c=d.config||{},t=d.today||{};
+  const refreshing=typeof isColabWorkerRefreshing==='function'?isColabWorkerRefreshing(d):Boolean(d.worker_refreshing||w.refreshing);
+  if(typeof setColabSyncNote==='function')setColabSyncNote('colab-sync-note',d);
   const warmSessions=Array.isArray(d.warm_sessions)?d.warm_sessions:(Array.isArray(w.warm_sessions)?w.warm_sessions:[]);
   const warmLead=warmSessions[0]||null;
   $('colab-pills').replaceChildren(...[
     d.configured?pill('Worker 已配置','ok'):pill('未配置 COLAB_WORKER_URL','muted'),
-    w.reachable?pill('Worker 在线','ok'):pill(d.configured?'Worker 离线':'未连接',d.configured?'err':'muted'),
+    w.reachable?pill('Worker 在线','ok'):refreshing?pill('正在连接 Worker…','warn'):pill(d.configured?'Worker 离线':'未连接',d.configured?'err':'muted'),
     c.enabled?pill('调度开启 · 按模块自选 GPU','vertex'):pill('调度已暂停','warn'),
+    refreshing?pill('正在后台同步最新 CU 余额…','warn'):null,
     ((w.active_sessions||0)>0||w.running_job_id)?pill('活跃会话 '+(w.active_sessions||0)+(w.running_job_id?' · 作业 '+String(w.running_job_id).slice(0,8):''),'paid'):pill('当前无活跃会话','muted'),
     warmLead?pill('热机保活 '+warmSessions.length+' · '+String(warmLead.gpu||'L4')+' 剩余 '+formatTtlCompact(warmLead.remaining_ttl_seconds),'ok'):null
   ].filter(Boolean));
   const cuAvail=w.compute_units!=null?Number(w.compute_units):null;
   const jobsCount=Number(t.jobs_count??0);
   const cuUsed=Number(t.cu_used??0);
+  const cuBalanceNote=refreshing
+    ?(cuAvail!=null?'正在后台同步最新 CU 余额…（当前为缓存值）':'正在后台同步最新 CU 余额…')
+    :(w.reachable?'Colab 账号实时可用算力余额':'Worker 离线时暂不可查询');
   $('colab-kpi-strip').replaceChildren(
-    kpiCard('Compute Units 余额',cuAvail!=null?cuAvail.toFixed(2)+' CU':'未知',w.reachable?'Colab 账号实时可用算力余额':'Worker 离线时暂不可查询',cuAvail!=null?(cuAvail<2?'warn':'ok'):''),
+    kpiCard('Compute Units 余额',cuAvail!=null?cuAvail.toFixed(2)+' CU':(refreshing?'同步中…':'未知'),cuBalanceNote,cuAvail!=null?(cuAvail<2?'warn':'ok'):''),
     kpiCard('运行中会话 / 作业',String(w.active_sessions??0)+' 会话',w.running_job_id?'运行作业 '+String(w.running_job_id).slice(0,12):'暂无运行中作业',(w.active_sessions||0)>0?'accent':''),
     kpiCard('今日作业次数',jobsCount+' 次','不设每日次数上限 · 排队上限 20',''),
     kpiCard('今日 CU 消耗',cuUsed.toFixed(2)+' CU','不设每日 CU 上限 · 仅实时统计','')
@@ -524,21 +537,25 @@ function renderColabOverview(d){
     ];
   }));
 }
-async function colabCompute(){
+async function colabCompute({force=false}={}){
   let d;
-  try{d=await api('colab');}
+  try{d=await fetchColabOverview(force);}
   catch(err){throwColabError(err);}
   if(!token)return;
   renderColabOverview(d);
+  if(!force&&isColabWorkerRefreshing(d)){
+    scheduleColabFollowUp(++colabFetchGen);
+  }
 }
 $('refresh-colab').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('colab-compute','刷新 Colab 状态')))return;
-  await colabCompute();
+  await colabCompute({force:true});
+  notice('已同步最新 Colab Worker 状态与 CU 余额');
 }));
 $('colab-refresh-jobs').addEventListener('click',e=>busy(e.target,async()=>{
-  try{renderColabOverview(await api('colab'));}
+  try{renderColabOverview(await fetchColabOverview(true));}
   catch(err){throwColabError(err);}
-  notice('已刷新 Colab 作业队列');
+  notice('已刷新 Colab 作业队列与实时余额');
 }));
 $('colab-terminate-sessions').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDialog('确认紧急清退全部活跃 Colab GPU 会话？正在运行的云端 GPU 作业将被立即中止。',{danger:true,confirmLabel:'紧急清退全部会话'})))return;
@@ -581,7 +598,7 @@ const tabLoaders={
   thinking:()=>Promise.all([thinking(),generationCaps()]),filter:filters,admission,
   modules:()=>Promise.all([moduleDirectory(),systemDirectory()]),journal:diaries,'drive-sync':driveSync,'event-ledger':eventLedger,'voice-companion':voiceCompanion,'screen-watch':screenWatch,'colab-compute':colabCompute,'identity-center':identityCenter,'plugin-bus':pluginBus,
   qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy(),longnick()]),bili:()=>loadModule('bilibili_surf'),
-  weather:()=>loadModule('weather'),minecraft:()=>loadModule('minecraft'),'group-policy':()=>Promise.all([groups(),bots()]),
+  weather:()=>loadModule('weather'),minecraft:()=>loadModule('minecraft'),'group-policy':()=>Promise.all([groups(),bots(),telegramSocialConfig()]),
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount,community:async()=>{
     const [moderation,profiles]=await Promise.allSettled([community(),affection()]);
@@ -932,6 +949,7 @@ onLogout(()=>{
   text('weather-current','正在读取地点…');
   for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=false;
   for(const id of ['bili-module-backend','bili-module-autonomous'])text(id,'—');
-  for(const id of ['colab-state','colab-job-types','colab-config-source'])text(id,'');
+  for(const id of ['colab-state','colab-job-types','colab-config-source','colab-sync-note'])text(id,'');
+  $('colab-sync-note').hidden=true;
   for(const id of ['colab-terminate-sessions','colab-save','colab-reset'])$(id).disabled=true;
 });

@@ -24,6 +24,12 @@ from ..modules.scheduling import LocalActivity
 from ..plugin_kernel import PluginContext, PluginFiber
 from ..security import Rejected
 from ..social import bound_owner, confirmed_message_id, owner_binding
+from ..social_chat_config import (
+    RemoteChatConfig,
+    cache_remote_chat_config,
+    cached_remote_chat_config,
+    normalize_remote_chat_ids,
+)
 from ..thinking_policy import ThinkingScene
 from .protocol import (
     _CODE_RE,
@@ -31,9 +37,12 @@ from .protocol import (
     _MAX_MEDIA_IMAGE_BYTES,
     _MAX_PLUGIN_AUDIO_BLOB_BYTES,
     _MAX_VOICE_AUDIO_BYTES,
+    _RESERVED_CONTROL_RPCS,
     _SENSOR_RPC_TIMEOUT_SECONDS,
     _VALID_MEDIA_KINDS,
     _VALID_VOICE_FORMATS,
+    CONFIG_UPDATE_RPC,
+    RESERVED_CHAT_PLATFORMS,
     _sanitize_payload,
     _scrub_json_secrets,
 )
@@ -41,15 +50,7 @@ from .protocol import (
 if TYPE_CHECKING:
     from .bus import PluginBus
 
-_RESERVED_DELIVERY_RPCS = frozenset(
-    {
-        "delivery.send",
-        "delivery.send_voice",
-        "delivery.send_media",
-        "delivery.react",
-        "delivery.typing",
-    }
-)
+_RESERVED_DELIVERY_RPCS = _RESERVED_CONTROL_RPCS
 
 
 def _is_valid_image_magic(raw: bytes) -> bool:
@@ -184,6 +185,7 @@ class RemoteModuleProxy(BaseModule):
         self._remote_status: dict[str, Any] = (
             _sanitize_payload(initial_status, settings) if isinstance(initial_status, dict) else {}
         )
+        self._remote_configs: dict[str, RemoteChatConfig] = {}
         self._last_sensor_summary: str = ""
         self._action_unavailable: dict[str, str] = {}
         self._current_activity: str | None = None
@@ -230,6 +232,137 @@ class RemoteModuleProxy(BaseModule):
         except Exception:
             return self._last_sensor_summary
 
+    def _resolve_chat_platform(self, platform: str | None = None) -> str:
+        if not self.chat_platforms:
+            return ""
+        if platform is None:
+            return self.chat_platforms[0]
+        return platform if platform in self.chat_platforms else ""
+
+    def _effective_remote_config(
+        self, platform: str, settings: Any = None
+    ) -> RemoteChatConfig | None:
+        cfg = self._remote_configs.get(platform)
+        if cfg is not None:
+            return cfg
+        return cached_remote_chat_config(
+            settings if settings is not None else self.settings, platform
+        )
+
+    def _configured_allowed_groups(self, platform: str, settings: Any = None) -> set[str] | None:
+        cfg = self._effective_remote_config(platform, settings)
+        if cfg is not None:
+            return set(cfg.allowed_groups)
+        if "allowed_groups" in self._remote_status:
+            raw = self._remote_status.get("allowed_groups")
+            return set(normalize_remote_chat_ids(raw, strict=False, platform=platform))
+        return None
+
+    def allowed_groups(self, platform: str | None = None) -> list[str]:
+        if "chat" not in self._scopes or not self.chat_platforms:
+            return []
+        plat = self._resolve_chat_platform(platform)
+        if not plat:
+            return []
+        configured = self._configured_allowed_groups(plat)
+        if configured is not None:
+            return sorted(configured)
+        raw_pro = self._remote_status.get("proactive_groups")
+        if isinstance(raw_pro, list):
+            return list(normalize_remote_chat_ids(raw_pro, strict=False, platform=plat))
+        return []
+
+    def apply_remote_config(
+        self,
+        config: RemoteChatConfig | dict[str, Any] | None,
+        *,
+        platform: str | None = None,
+    ) -> None:
+        """Apply or clear a server-side RemoteChatConfig override in proxy memory."""
+        plat = self._resolve_chat_platform(platform)
+        if not plat:
+            return
+        if config is None:
+            self._remote_configs.pop(plat, None)
+            cache_remote_chat_config(self.settings, plat, None)
+            env_raw = self._remote_status.get("env_defaults")
+            if isinstance(env_raw, dict):
+                env_cfg = RemoteChatConfig.from_untrusted(env_raw, platform=plat)
+                self._remote_status["allowed_groups"] = list(env_cfg.allowed_groups)
+                self._remote_status["proactive_groups"] = list(env_cfg.proactive_groups)
+                self._remote_status["allowed_users"] = list(env_cfg.allowed_users)
+                self._remote_status["private_mode"] = env_cfg.private_mode
+                self._remote_status["allowed_groups_count"] = len(env_cfg.allowed_groups)
+            self._remote_status["memory_mirror_enabled"] = False
+            self._remote_status["config_source"] = "env"
+            return
+
+        cfg = (
+            config
+            if isinstance(config, RemoteChatConfig)
+            else RemoteChatConfig.model_validate(config)
+        )
+        self._remote_configs[plat] = cfg
+        cache_remote_chat_config(self.settings, plat, cfg)
+        self._remote_status["allowed_groups"] = list(cfg.allowed_groups)
+        self._remote_status["proactive_groups"] = list(cfg.proactive_groups)
+        self._remote_status["allowed_users"] = list(cfg.allowed_users)
+        self._remote_status["private_mode"] = cfg.private_mode
+        self._remote_status["memory_mirror_enabled"] = bool(cfg.memory_mirror_enabled)
+        self._remote_status["allowed_groups_count"] = len(cfg.allowed_groups)
+        self._remote_status["config_source"] = "admin"
+
+    async def push_config(
+        self,
+        config: RemoteChatConfig | dict[str, Any] | None,
+        *,
+        platform: str | None = None,
+        reset_to_env: bool = False,
+    ) -> bool:
+        """Apply config locally and hot-push via `config.update` RPC when plugin is online."""
+        plat = self._resolve_chat_platform(platform)
+        if reset_to_env or config is None:
+            self.apply_remote_config(None, platform=plat or None)
+            params: dict[str, Any] = {"reset_to_env": True}
+            if plat:
+                params["platform"] = plat
+        else:
+            cfg = (
+                config
+                if isinstance(config, RemoteChatConfig)
+                else RemoteChatConfig.model_validate(config)
+            )
+            self.apply_remote_config(cfg, platform=plat or None)
+            params = cfg.to_rpc_params(platform=plat or None)
+
+        if not self._session.ready or self._session.closed:
+            return False
+        try:
+            resp = await self._bus._rpc(
+                self._session,
+                CONFIG_UPDATE_RPC,
+                params,
+                timeout=min(self._bus.rpc_timeout, 8.0),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        if not isinstance(resp, dict) or not resp.get("ok", False):
+            return False
+        raw_res = resp.get("result") if "result" in resp else resp.get("data")
+        if isinstance(raw_res, dict) and isinstance(raw_res.get("status"), dict):
+            self._remote_status = _sanitize_payload(raw_res["status"], self.settings)
+        return True
+
+    def channel_prompt(self, self_id: str, platform: str) -> str:
+        """Build a channel identity and capability prompt block from declared flags."""
+        plat = str(platform or "").strip() or (
+            self.chat_platforms[0] if self.chat_platforms else self.module_id
+        )
+        ident = str(self_id or "").strip() or self._bot_id()
+        return super().channel_prompt(ident, plat)
+
     def authorize_chat(self, message: Message, settings: Any, *, bot_exempt: bool = False) -> bool:
         if (
             "chat" not in self._scopes
@@ -257,10 +390,20 @@ class RemoteModuleProxy(BaseModule):
         if policy == "muted":
             return False
         if message.kind == "group":
+            known_groups = self._configured_allowed_groups(message.platform, settings)
+            if known_groups is not None and message.conversation_id not in known_groups:
+                return False
             return bool(
                 message.invites_group_review
                 or message.attention_reason == "possible_alias"
                 or policy == "smart_reply"
+            )
+        cfg = self._effective_remote_config(message.platform, settings)
+        if cfg is not None:
+            if bound_owner(message, settings):
+                return True
+            return (
+                cfg.private_mode == "owner_and_allowlist" and message.user_id in cfg.allowed_users
             )
         return True
 
@@ -291,11 +434,15 @@ class RemoteModuleProxy(BaseModule):
     def _proactive_groups(self) -> list[str]:
         if "chat" not in self._scopes or not self.chat_platforms:
             return []
-        raw_groups = self._remote_status.get("proactive_groups")
+        primary = self.chat_platforms[0]
+        cfg = self._effective_remote_config(primary)
+        if cfg is not None:
+            raw_groups: Any = list(cfg.proactive_groups)
+        else:
+            raw_groups = self._remote_status.get("proactive_groups")
         if not isinstance(raw_groups, list):
             return []
         policies = getattr(self.settings, "group_policies", {}) or {}
-        primary = self.chat_platforms[0]
         allowed_plats = set(self.chat_platforms)
         out: list[str] = []
         seen: set[str] = set()
@@ -318,7 +465,7 @@ class RemoteModuleProxy(BaseModule):
             if scope not in seen:
                 seen.add(scope)
                 out.append(scope)
-                if len(out) >= 20:
+                if len(out) >= 100:
                     break
         return out
 
@@ -366,7 +513,19 @@ class RemoteModuleProxy(BaseModule):
         }
 
     def permits_memory_mirror(self, message: Message, settings: Any) -> bool:
-        return False
+        if (
+            message is None
+            or message.kind != "group"
+            or message.platform not in self.chat_platforms
+            or message.platform in RESERVED_CHAT_PLATFORMS
+        ):
+            return False
+        cfg = self._effective_remote_config(message.platform, settings)
+        if cfg is None or cfg.memory_mirror_enabled is not True:
+            return False
+        if message.conversation_id not in set(self.allowed_groups(message.platform)):
+            return False
+        return bool(self.authorize_chat(message.model_copy(update={"addressed": True}), settings))
 
     async def planning_context(self, service: Any, config: Any, now: float) -> dict[str, Any]:
         if (
@@ -378,7 +537,7 @@ class RemoteModuleProxy(BaseModule):
             or self._remote_status.get("connected", True) is False
         ):
             return {}
-        groups = self._proactive_groups()
+        groups = self._proactive_groups()[:20]
         reg = getattr(self, "_registry", None) or getattr(service, "modules", None)
         engine = getattr(service, "life_engine", None)
         delivery_enabled = (

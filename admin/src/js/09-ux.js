@@ -117,6 +117,7 @@ function renderSaveBar(){
     const b=el('button',entries.length===1?'保存修改':'保存「'+entry.label+'」','primary');
     b.type='button';
     b.addEventListener('click',()=>{
+      openEnclosingDetails(entry.form);
       if(submit&&!submit.disabled&&typeof entry.form.requestSubmit==='function'){
         entry.form.requestSubmit(submit);
       }else{
@@ -215,7 +216,7 @@ function enhanceLabels(root){
 /* ---------- 说明折叠：长段说明只保留首句，其余收进「展开说明」 ---------- */
 function foldLongHelp(root){
   for(const p of root.querySelectorAll('section.tab p.muted:not([id])')){
-    if(p.children.length||p.closest('.help-fold, .table, td'))continue;
+    if(p.children.length||p.closest('.help-fold, .table, td, .tg-privacy-box'))continue;
     const raw=p.textContent.trim();
     if(raw.length<110)continue;
     const boundary=[...raw.matchAll(/[。；]/g)].map(m=>m.index).find(index=>index>=24);

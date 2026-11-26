@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import contextlib
 import importlib.util
 import io
 import json
@@ -1682,12 +1684,30 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
             ) as client:
                 unauth = await client.get("/admin/api/colab", headers={"Authorization": ""})
                 assert unauth.status_code == 401
+                assert (
+                    await client.post("/admin/api/colab/refresh", headers={"Authorization": ""})
+                ).status_code == 401
                 assert (await client.get("/admin/api/colab?foo=1")).status_code == 400
+                assert (await client.get("/admin/api/colab?refresh=1")).status_code == 400
 
-                ov = await client.get("/admin/api/colab")
+                # Cold-start GET returns immediately without blocking and queues refresh
+                cold_ov = await client.get("/admin/api/colab")
+                assert cold_ov.status_code == 200
+                cold_json = cold_ov.json()
+                assert cold_json["configured"] is True
+                assert cold_json["worker_cached"] is True
+                assert cold_json["worker_refreshing"] is True
+                assert cold_json["worker"]["refreshing"] is True
+                assert cfg_w.token not in cold_ov.text
+
+                # Explicit POST /admin/api/colab/refresh performs synchronous live poll
+                ov = await client.post("/admin/api/colab/refresh")
                 assert ov.status_code == 200
                 ov_json = ov.json()
                 assert ov_json["configured"] is True
+                assert ov_json["worker_cached"] is False
+                assert ov_json["worker_cache_age_seconds"] == 0.0
+                assert ov_json["worker_refreshing"] is False
                 assert set(ov_json["config"]) == {
                     "enabled",
                     "job_timeout_seconds",
@@ -1717,6 +1737,16 @@ async def test_colab_admin_routes_and_non_blocking_module_status(settings, tmp_p
                 assert "drive_folders" not in ov_json["worker"]
                 assert ov_json["worker"]["supported_job_types"] == ["rvc_cover", "rvc_train"]
                 assert cfg_w.token not in ov.text
+
+                # Subsequent GET serves the warmed cache immediately
+                warm_ov = await client.get("/admin/api/colab")
+                assert warm_ov.status_code == 200
+                warm_json = warm_ov.json()
+                assert warm_json["worker_cached"] is True
+                assert warm_json["worker_refreshing"] is False
+                assert warm_json["worker"]["reachable"] is True
+                assert warm_json["worker"]["compute_units"] == 100.0
+                assert warm_json["worker"]["supported_job_types"] == ["rvc_cover", "rvc_train"]
 
                 # Update & reset config; removed legacy fields rejected by extra="forbid"
                 for legacy_body in (
@@ -3490,3 +3520,281 @@ async def test_song_library_request_learn_song_mixing_params(store) -> None:
             auto_search=False,
             skip_dereverb="1",  # type: ignore[arg-type]
         )
+
+
+async def test_colab_overview_cache_background_refresh_and_shutdown(
+    settings, store, tmp_path: Path
+) -> None:
+    clock_now = [1_700_000_000.0]
+    worker_state: dict[str, Any] = {
+        "cu": 88.5,
+        "fail": False,
+        "polls": 0,
+        "gate": None,  # Optional asyncio.Event to hold /v1/status in flight
+        "started": None,  # Optional asyncio.Event set when /v1/status enters handler
+    }
+
+    async def slow_worker_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/status":
+            worker_state["polls"] += 1
+            cu_snapshot = worker_state["cu"]
+            if (started := worker_state["started"]) is not None:
+                started.set()
+            if (gate := worker_state["gate"]) is not None:
+                await gate.wait()
+            if worker_state["fail"]:
+                return httpx.Response(502, json={"detail": "upstream_colab_error"})
+            return httpx.Response(
+                200,
+                json={
+                    "reachable": True,
+                    "compute_units": cu_snapshot,
+                    "active_sessions": 0,
+                    "running_job_id": None,
+                    "warm_sessions": [],
+                    "supported_job_types": ["rvc_cover", "rvc_train"],
+                    "error": None,
+                },
+            )
+        return httpx.Response(404)
+
+    # 1) Unconfigured hub never issues HTTP on force_refresh=False
+    unconf_hub = ColabComputeHub(settings, store, None, clock=lambda: clock_now[0])
+    unconf_ov = await unconf_hub.admin_overview(force_refresh=False)
+    assert unconf_ov["configured"] is False
+    assert unconf_ov["worker_cached"] is False
+    assert unconf_ov["worker_refreshing"] is False
+    assert unconf_ov["worker"]["error"] == "colab_unconfigured"
+    await unconf_hub.close()
+
+    # 2) Full admin HTTP integration: cold-start non-blocking, cache hit, TTL stale, POST refresh,
+    #    PUT/DELETE fast path, failure 15s cooldown, and clean shutdown cancellation.
+    s = _worker_settings(
+        settings,
+        "http://127.0.0.1:19998",
+        "worker-secret-token-cache-test",
+        admin_token=SecretStr(ADMIN_TOKEN),
+        data_dir=tmp_path / "app_data",
+    )
+    app = create_app(s, gateway_factory=FakeGateway, start_workers=False)
+    async with app.router.lifespan_context(app):
+        hub = app.state.service.modules.systems["colab_compute"].compute
+        hub._clock = lambda: clock_now[0]
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(slow_worker_handler),
+            base_url="http://127.0.0.1:19998",
+        ) as mock_worker_http:
+            hub._injected_http = mock_worker_http
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1:12141",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            ) as client:
+                # 2a) Cold start with blocked slow worker: GET must NOT block and must deduplicate
+                gate = asyncio.Event()
+                started = asyncio.Event()
+                worker_state["gate"] = gate
+                worker_state["started"] = started
+
+                r_cold1 = await asyncio.wait_for(client.get("/admin/api/colab"), timeout=1.0)
+                assert r_cold1.status_code == 200
+                j_cold1 = r_cold1.json()
+                assert j_cold1["worker_cached"] is True
+                assert j_cold1["worker_cache_age_seconds"] is None
+                assert j_cold1["worker_refreshing"] is True
+                assert j_cold1["worker"]["reachable"] is None
+                assert j_cold1["worker"]["refreshing"] is True
+
+                await asyncio.wait_for(started.wait(), timeout=1.0)
+                assert worker_state["polls"] == 1
+
+                # Second GET while refresh is in flight reuses the same task (no duplicate HTTP)
+                r_cold2 = await asyncio.wait_for(client.get("/admin/api/colab"), timeout=1.0)
+                assert r_cold2.status_code == 200
+                assert r_cold2.json()["worker_refreshing"] is True
+                assert worker_state["polls"] == 1
+
+                # Release slow worker -> background task finishes and warms cache
+                bg_task = hub._status_refresh_task
+                assert bg_task is not None
+                gate.set()
+                await asyncio.wait_for(bg_task, timeout=1.0)
+                worker_state["gate"] = None
+                worker_state["started"] = None
+
+                # 2b) Fresh cache hit: <5ms, ZERO worker HTTP calls
+                clock_now[0] += 10.0
+                r_hit = await client.get("/admin/api/colab")
+                assert r_hit.status_code == 200
+                j_hit = r_hit.json()
+                assert j_hit["worker_cached"] is True
+                assert j_hit["worker_cache_age_seconds"] == 10.0
+                assert j_hit["worker_refreshing"] is False
+                assert j_hit["worker"]["reachable"] is True
+                assert j_hit["worker"]["compute_units"] == 88.5
+                assert worker_state["polls"] == 1
+
+                # 2c) PUT & DELETE config return immediately from warm cache (0 extra worker polls)
+                r_put = await client.put("/admin/api/colab", json={"job_timeout_seconds": 2100})
+                assert r_put.status_code == 200
+                assert r_put.json()["config"]["job_timeout_seconds"] == 2100
+                assert r_put.json()["worker_cached"] is True
+                r_del = await client.delete("/admin/api/colab")
+                assert r_del.status_code == 200
+                assert r_del.json()["source"] == "default"
+                assert r_del.json()["worker_cached"] is True
+                assert worker_state["polls"] == 1
+
+                # 2d) TTL expiry (60s): returns stale cache immediately & refreshes in background
+                clock_now[0] += 55.0  # age = 65s >= 60s
+                worker_state["cu"] = 77.25
+                gate2 = asyncio.Event()
+                started2 = asyncio.Event()
+                worker_state["gate"] = gate2
+                worker_state["started"] = started2
+
+                r_stale = await asyncio.wait_for(client.get("/admin/api/colab"), timeout=1.0)
+                assert r_stale.status_code == 200
+                j_stale = r_stale.json()
+                assert j_stale["worker_cached"] is True
+                assert j_stale["worker_cache_age_seconds"] == 65.0
+                assert j_stale["worker_refreshing"] is True
+                assert j_stale["worker"]["compute_units"] == 88.5  # old cached value immediately
+
+                await asyncio.wait_for(started2.wait(), timeout=1.0)
+                bg_task2 = hub._status_refresh_task
+                assert bg_task2 is not None
+                gate2.set()
+                await asyncio.wait_for(bg_task2, timeout=1.0)
+                worker_state["gate"] = None
+                worker_state["started"] = None
+                assert worker_state["polls"] == 2
+
+                r_updated = await client.get("/admin/api/colab")
+                assert r_updated.status_code == 200
+                assert r_updated.json()["worker"]["compute_units"] == 77.25
+                assert r_updated.json()["worker_refreshing"] is False
+                assert worker_state["polls"] == 2
+
+                # 2e) POST /admin/api/colab/refresh forces live synchronous query & updates cache
+                worker_state["cu"] = 66.0
+                r_force = await client.post("/admin/api/colab/refresh")
+                assert r_force.status_code == 200
+                j_force = r_force.json()
+                assert j_force["worker_cached"] is False
+                assert j_force["worker_cache_age_seconds"] == 0.0
+                assert j_force["worker_refreshing"] is False
+                assert j_force["worker"]["compute_units"] == 66.0
+                assert worker_state["polls"] == 3
+
+                r_after_force = await client.get("/admin/api/colab")
+                assert r_after_force.json()["worker"]["compute_units"] == 66.0
+                assert r_after_force.json()["worker_cached"] is True
+                assert worker_state["polls"] == 3
+
+                # 2e-2) Stale background poll finishing after a newer live refresh cannot clobber
+                clock_now[0] += 65.0
+                race_gate = asyncio.Event()
+                race_started = asyncio.Event()
+                worker_state["cu"] = 12.0  # stale value for background poll
+                worker_state["gate"] = race_gate
+                worker_state["started"] = race_started
+
+                r_race_bg = await asyncio.wait_for(client.get("/admin/api/colab"), timeout=1.0)
+                assert r_race_bg.json()["worker_refreshing"] is True
+                await asyncio.wait_for(race_started.wait(), timeout=1.0)
+                bg_race_task = hub._status_refresh_task
+                assert bg_race_task is not None
+
+                # Newer live refresh runs without gate and finishes first with 70.0
+                worker_state["gate"] = None
+                worker_state["started"] = None
+                worker_state["cu"] = 70.0
+                r_race_live = await client.post("/admin/api/colab/refresh")
+                assert r_race_live.json()["worker"]["compute_units"] == 70.0
+
+                # Now release older background poll; cache must keep 70.0 (not 12.0)
+                race_gate.set()
+                await asyncio.wait_for(bg_race_task, timeout=1.0)
+                r_after_race = await client.get("/admin/api/colab")
+                assert r_after_race.json()["worker"]["compute_units"] == 70.0
+                assert worker_state["polls"] == 5
+
+                # 2f) Worker failure preserves last CU balance and enforces 15s cooldown
+                worker_state["fail"] = True
+                r_fail = await client.post("/admin/api/colab/refresh")
+                assert r_fail.status_code == 200
+                j_fail = r_fail.json()
+                assert j_fail["worker"]["reachable"] is False
+                assert j_fail["worker"]["compute_units"] == 70.0
+                assert j_fail["worker"]["error"] == "worker_http_502"
+                assert worker_state["polls"] == 6
+
+                # Within 15s cooldown: cached failure returned without triggering retry storm
+                clock_now[0] += 5.0
+                r_cool = await client.get("/admin/api/colab")
+                j_cool = r_cool.json()
+                assert j_cool["worker_cached"] is True
+                assert j_cool["worker_refreshing"] is False
+                assert j_cool["worker"]["compute_units"] == 70.0
+                assert j_cool["worker"]["stale"] is True
+                assert j_cool["worker"]["error"] == "worker_http_502"
+                assert worker_state["polls"] == 6
+
+                # After 15s cooldown: triggers background recovery
+                clock_now[0] += 12.0  # 17s since failure
+                worker_state["fail"] = False
+                worker_state["cu"] = 65.5
+                r_retry = await client.get("/admin/api/colab")
+                assert r_retry.json()["worker_refreshing"] is True
+                if (retry_task := hub._status_refresh_task) is not None:
+                    await asyncio.wait_for(retry_task, timeout=1.0)
+                assert worker_state["polls"] == 7
+
+                r_recovered = await client.get("/admin/api/colab")
+                assert r_recovered.json()["worker"]["reachable"] is True
+                assert r_recovered.json()["worker"]["compute_units"] == 65.5
+                assert "stale" not in r_recovered.json()["worker"]
+
+                # 2g) In-flight background refresh is cancelled cleanly on hub.close()
+                clock_now[0] += 120.0
+                stuck_gate = asyncio.Event()
+                stuck_started = asyncio.Event()
+                worker_state["gate"] = stuck_gate
+                worker_state["started"] = stuck_started
+                r_stuck = await asyncio.wait_for(client.get("/admin/api/colab"), timeout=1.0)
+                assert r_stuck.json()["worker_refreshing"] is True
+                await asyncio.wait_for(stuck_started.wait(), timeout=1.0)
+                inflight_task = hub._status_refresh_task
+                assert inflight_task is not None and not inflight_task.done()
+
+                await hub.close()
+                assert inflight_task.done()
+                assert hub._status_refresh_task is None
+                assert hub._schedule_worker_status_refresh() is False
+
+    # 3) run_scheduler() pre-warms worker status cache on startup without duplicate /v1/status polls
+    worker_state["polls"] = 0
+    worker_state["fail"] = False
+    worker_state["gate"] = None
+    worker_state["started"] = None
+    worker_state["cu"] = 91.0
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(slow_worker_handler),
+        base_url="http://127.0.0.1:19998",
+    ) as sched_http:
+        sched_hub = ColabComputeHub(s, store, None, http=sched_http, clock=lambda: clock_now[0])
+        sched_task = asyncio.create_task(sched_hub.run_scheduler())
+        try:
+            for _ in range(50):
+                if sched_hub._last_worker_status is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert sched_hub._last_worker_status is not None
+            assert sched_hub._last_worker_status["compute_units"] == 91.0
+            assert worker_state["polls"] == 1
+        finally:
+            await sched_hub.close()
+            sched_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sched_task

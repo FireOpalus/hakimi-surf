@@ -27,17 +27,23 @@ class StaticPrefixes:
     def __init__(self):
         self.pool = {}
 
-    def get(self, context, self_id, meme_prompt="", *, platform="onebot"):
+    def get(self, context, self_id, meme_prompt="", *, platform="onebot", channel_prompt=""):
         social = context.surface in {"group", "private"}
+        resolved_channel = (
+            channel_prompt
+            if isinstance(channel_prompt, str) and channel_prompt.strip()
+            else identity_anchor(self_id, platform)
+        )
         key = (
             platform,
             context.private_owner,
             context.surface,
             self_id,
             "" if context.private_owner or not social else meme_prompt,
+            resolved_channel,
         )
         if key not in self.pool:
-            base = SYSTEM_INSTRUCTION + context.persona + identity_anchor(self_id, platform)
+            base = SYSTEM_INSTRUCTION + context.persona + resolved_channel
             if context.private_owner:
                 base += OWNER_BACKGROUND_RULE
             elif social:
@@ -64,7 +70,7 @@ class StaticPrefixes:
             while foundation and estimate_tokens(base + "".join(foundation) + suffix) > 5200:
                 foundation.pop()
             self.pool[key] = base + "".join(foundation) + suffix
-            if len(self.pool) > 8:
+            if len(self.pool) > 16:
                 self.pool.pop(next(iter(self.pool)))
         return self.pool[key]
 

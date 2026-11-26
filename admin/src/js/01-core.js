@@ -191,6 +191,11 @@ function promptDialog(title,opts={}){
 const dirtyRegistry=new Map();
 const dirtyListeners=[];
 function onDirtyChange(fn){dirtyListeners.push(fn);}
+function openEnclosingDetails(node){
+  for(let p=node?.parentElement;p;p=p.parentElement){
+    if(p.tagName==='DETAILS')p.open=true;
+  }
+}
 function updatePageDirtyBadge(){
   const dirtyLabels=[];
   for(const entry of dirtyRegistry.values()){
@@ -233,6 +238,7 @@ function trackDirty(formOrId,label){
     if(e.target&&e.target.type==='search')return;
     entry.dirty=true;
     entry.badge.hidden=false;
+    openEnclosingDetails(entry.form);
     updatePageDirtyBadge();
   };
   form.addEventListener('input',handleEdit);
@@ -244,6 +250,7 @@ function markDirty(formOrId){
   if(!entry)return;
   entry.dirty=true;
   entry.badge.hidden=false;
+  openEnclosingDetails(entry.form);
   updatePageDirtyBadge();
 }
 function clearDirty(formOrId){

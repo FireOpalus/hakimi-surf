@@ -1,7 +1,17 @@
+function formatPlatformBadge(platform){
+  const p=String(platform||'onebot').toLowerCase();
+  if(p==='onebot')return pill('QQ','paid');
+  if(p==='qq')return pill('QQ 官方','vertex');
+  if(p==='telegram')return pill('Telegram','tg');
+  if(p==='discord')return pill('Discord','vertex');
+  return pill(p,'muted');
+}
 async function groups(){
   const [items,filterData]=await Promise.all([api('groups'),api('filter')]);
   if(!token)return;
-  table('groups',['平台 / 群','触发策略','自由插话活跃度'],items.map(g=>{
+  table('groups',['平台 / 群号','触发策略','自由插话活跃度'],items.map(g=>{
+    const cell=el('div',undefined,'platform-cell');
+    cell.append(formatPlatformBadge(g.platform),el('code',g.group_id,'code-mono'));
     const select=el('select',undefined,'table-select');
     for(const [value,label] of Object.entries({at_only:'点名 / 回复 / 视频',smart_reply:'智能插话',muted:'静默'})){const o=el('option',label);o.value=value;select.append(o);}
     select.value=g.mode;
@@ -10,12 +20,231 @@ async function groups(){
     for(const [value,label] of Object.entries({'':'跟随全局 '+filterData.config.reply_threshold,quiet:'安静 '+filterData.presets.quiet,natural:'自然 '+filterData.presets.natural,active:'活跃 '+filterData.presets.active})){const o=el('option',label);o.value=value;activity.append(o);}
     activity.value=filterData.config.group_activity[g.platform+':'+g.group_id]||'';
     activity.addEventListener('change',()=>busy(activity,async()=>{await api('filter/group-activity','POST',{platform:g.platform,group_id:g.group_id,preset:activity.value||null});notice('群活跃度已保存并立即生效');}));
-    return[g.platform+':'+g.group_id,select,activity];
+    return[cell,select,activity];
   }));
   $('sim-group').replaceChildren(el('option','默认群策略'));
   $('sim-group').firstChild.value='';
   items.filter(g=>g.platform==='onebot').forEach(g=>{const o=el('option',g.group_id+' · '+g.mode);o.value=g.group_id;$('sim-group').append(o);});
 }
+
+let tgSocialState=null;
+let tgSocialDraft=null;
+const TG_ID_RE=/^-?[0-9]{1,24}$/;
+const TG_CAP_LABELS={
+  voice:'语音',
+  voice_blob:'语音直传',
+  sticker:'表情包',
+  media_blob:'图片/贴图',
+  emoji_like:'贴表情',
+  reply_anchor:'引用回复',
+  rich_card:'代码卡片',
+  typing:'输入状态',
+  quick_ack:'快捷确认',
+  poke:'戳一戳'
+};
+function normalizeTgDraft(raw){
+  const src=raw&&typeof raw==='object'?raw:{};
+  const groups=[...new Set((Array.isArray(src.allowed_groups)?src.allowed_groups:[]).map(v=>String(v).trim()).filter(v=>TG_ID_RE.test(v)))];
+  const groupSet=new Set(groups);
+  const proactive=[...new Set((Array.isArray(src.proactive_groups)?src.proactive_groups:[]).map(v=>String(v).trim()).filter(v=>groupSet.has(v)))];
+  const users=[...new Set((Array.isArray(src.allowed_users)?src.allowed_users:[]).map(v=>String(v).trim()).filter(v=>TG_ID_RE.test(v)))];
+  const mode=src.private_mode==='owner_and_allowlist'?'owner_and_allowlist':'owner_only';
+  return{
+    allowed_groups:groups,
+    proactive_groups:proactive,
+    private_mode:mode,
+    allowed_users:users,
+    memory_mirror_enabled:Boolean(src.memory_mirror_enabled)
+  };
+}
+function updateTgPrivateModeHint(){
+  const mode=$('tg-private-mode').value;
+  text('tg-private-mode-hint',mode==='owner_and_allowlist'
+    ?'Owner 与下方白名单用户均可私聊（普通白名单用户仅使用公开人设与独立会话）。'
+    :'仅已绑定的 Owner 可私聊；下方白名单用户列表会保留，但暂不生效。');
+}
+function renderTelegramSocialLists(){
+  const draft=tgSocialDraft||normalizeTgDraft(null);
+  const groupsBox=$('tg-groups-list');
+  if(!draft.allowed_groups.length){
+    groupsBox.replaceChildren(el('p','暂未授权 Telegram 群号，可在上方输入群 ID（如 -1001234567890）添加。','empty-state'));
+  }else{
+    const proactiveSet=new Set(draft.proactive_groups);
+    groupsBox.replaceChildren(...draft.allowed_groups.map(gid=>{
+      const row=el('div',undefined,'tg-item-row');
+      const main=el('div',undefined,'tg-item-main');
+      main.append(pill('Telegram','tg'),el('code',gid,'code-mono'));
+      const proLabel=el('label');
+      const proCb=el('input');
+      proCb.type='checkbox';
+      proCb.checked=proactiveSet.has(gid);
+      proCb.addEventListener('change',()=>{
+        const nextSet=new Set(tgSocialDraft.proactive_groups);
+        if(proCb.checked)nextSet.add(gid);else nextSet.delete(gid);
+        tgSocialDraft.proactive_groups=[...nextSet].filter(id=>tgSocialDraft.allowed_groups.includes(id));
+        markDirty('tg-config-form');
+      });
+      proLabel.append(proCb,'允许主动冒泡');
+      main.append(proLabel);
+      const rmBtn=el('button','删除','danger');
+      rmBtn.type='button';
+      rmBtn.addEventListener('click',()=>{
+        tgSocialDraft.allowed_groups=tgSocialDraft.allowed_groups.filter(id=>id!==gid);
+        tgSocialDraft.proactive_groups=tgSocialDraft.proactive_groups.filter(id=>id!==gid);
+        renderTelegramSocialLists();
+        markDirty('tg-config-form');
+      });
+      row.append(main,rmBtn);
+      return row;
+    }));
+  }
+
+  const usersBox=$('tg-users-list');
+  if(!draft.allowed_users.length){
+    usersBox.replaceChildren(el('p','暂未添加 Telegram 白名单私聊用户。','empty-state'));
+  }else{
+    usersBox.replaceChildren(...draft.allowed_users.map(uid=>{
+      const row=el('div',undefined,'tg-item-row');
+      const main=el('div',undefined,'tg-item-main');
+      main.append(pill('私聊白名单','muted'),el('code',uid,'code-mono'));
+      const rmBtn=el('button','删除','danger');
+      rmBtn.type='button';
+      rmBtn.addEventListener('click',()=>{
+        tgSocialDraft.allowed_users=tgSocialDraft.allowed_users.filter(id=>id!==uid);
+        renderTelegramSocialLists();
+        markDirty('tg-config-form');
+      });
+      row.append(main,rmBtn);
+      return row;
+    }));
+  }
+  updateTgPrivateModeHint();
+}
+function renderTelegramSocialConfig(d){
+  if(!d||typeof d!=='object')return;
+  tgSocialState=d;
+  tgSocialDraft=normalizeTgDraft(d.config);
+  const botHandle=d.bot_username?('@'+String(d.bot_username).replace(/^@+/,'')):(d.bot_id?('Bot '+d.bot_id):'Bot 未上报');
+  const isAdminSource=d.source==='admin';
+  $('tg-status-pills').replaceChildren(
+    d.online?pill('在线','ok'):pill('离线','warn'),
+    pill(botHandle,'tg'),
+    d.owner_configured?pill('Owner 已绑定','ok'):pill('Owner 未绑定','warn'),
+    pill(isAdminSource?'控制台覆盖':'环境变量',isAdminSource?'paid':'muted')
+  );
+  const metaParts=[
+    '插件：'+(d.plugin_id||'telegram'),
+    d.bot_id?('Bot ID：'+d.bot_id):'',
+    '授权群 '+tgSocialDraft.allowed_groups.length+' 个（主动冒泡 '+tgSocialDraft.proactive_groups.length+' 个）',
+    d.online?'保存后将实时热推送至在线插件':'插件当前离线，保存后将于下次重连自动下发'
+  ].filter(Boolean);
+  text('tg-status-meta',metaParts.join(' · '));
+
+  const caps=Array.isArray(d.capabilities)?d.capabilities.filter(Boolean):[];
+  if(caps.length){
+    $('tg-capabilities-row').replaceChildren(
+      el('small','已启用能力：','muted'),
+      ...caps.map(cap=>pill(TG_CAP_LABELS[cap]||String(cap),'free'))
+    );
+  }else{
+    $('tg-capabilities-row').replaceChildren(el('small','已启用能力：暂未上报（插件连线后自动刷新）','muted'));
+  }
+
+  $('tg-private-mode').value=tgSocialDraft.private_mode;
+  $('tg-memory-mirror').checked=tgSocialDraft.memory_mirror_enabled;
+  text('tg-env-defaults',JSON.stringify(d.environment||{},null,2));
+  renderTelegramSocialLists();
+  $('tg-save-config').disabled=false;
+  $('tg-reset-config').disabled=false;
+  clearDirty('tg-config-form');
+}
+async function telegramSocialConfig(){
+  try{
+    const d=await api('social-chat/telegram/config');
+    if(!token)return;
+    renderTelegramSocialConfig(d);
+  }catch(err){
+    if(err?.name==='AbortError'||!token)return;
+    tgSocialState=null;
+    tgSocialDraft=normalizeTgDraft(null);
+    $('tg-status-pills').replaceChildren(pill('暂不可用','muted'));
+    text('tg-status-meta','无法读取 Telegram 热配置：'+(err?.message||'后端暂未启用接口'));
+    $('tg-capabilities-row').replaceChildren();
+    $('tg-save-config').disabled=true;
+    $('tg-reset-config').disabled=true;
+  }
+}
+function addTgGroupFromInput(){
+  if(!tgSocialDraft)tgSocialDraft=normalizeTgDraft(null);
+  const gid=$('tg-group-input').value.trim();
+  if(!TG_ID_RE.test(gid))throw Error('Telegram 群号须为纯数字或负数 ID（最多 24 位，例如 -1001234567890）');
+  if(tgSocialDraft.allowed_groups.includes(gid))throw Error('该 Telegram 群号已在列表中');
+  if(tgSocialDraft.allowed_groups.length>=100)throw Error('授权群号最多配置 100 项');
+  tgSocialDraft.allowed_groups=[...tgSocialDraft.allowed_groups,gid];
+  $('tg-group-input').value='';
+  renderTelegramSocialLists();
+  markDirty('tg-config-form');
+}
+function addTgUserFromInput(){
+  if(!tgSocialDraft)tgSocialDraft=normalizeTgDraft(null);
+  const uid=$('tg-user-input').value.trim();
+  if(!TG_ID_RE.test(uid))throw Error('Telegram 用户 ID 须为 1–24 位数字');
+  if(tgSocialDraft.allowed_users.includes(uid))throw Error('该 Telegram 用户 ID 已在列表中');
+  if(tgSocialDraft.allowed_users.length>=100)throw Error('白名单私聊用户最多配置 100 项');
+  tgSocialDraft.allowed_users=[...tgSocialDraft.allowed_users,uid];
+  $('tg-user-input').value='';
+  renderTelegramSocialLists();
+  markDirty('tg-config-form');
+}
+$('tg-add-group').addEventListener('click',()=>{try{addTgGroupFromInput();}catch(err){notice(err.message,true);}});
+$('tg-add-user').addEventListener('click',()=>{try{addTgUserFromInput();}catch(err){notice(err.message,true);}});
+$('tg-group-input').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){e.preventDefault();try{addTgGroupFromInput();}catch(err){notice(err.message,true);}}
+});
+$('tg-user-input').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){e.preventDefault();try{addTgUserFromInput();}catch(err){notice(err.message,true);}}
+});
+$('tg-private-mode').addEventListener('change',()=>{
+  if(!tgSocialDraft)tgSocialDraft=normalizeTgDraft(null);
+  tgSocialDraft.private_mode=$('tg-private-mode').value==='owner_and_allowlist'?'owner_and_allowlist':'owner_only';
+  updateTgPrivateModeHint();
+});
+$('tg-memory-mirror').addEventListener('change',()=>{
+  if(!tgSocialDraft)tgSocialDraft=normalizeTgDraft(null);
+  tgSocialDraft.memory_mirror_enabled=$('tg-memory-mirror').checked;
+});
+$('tg-refresh').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!(await confirmDiscardTabChanges('group-policy','刷新 Telegram 配置')))return;
+  await Promise.all([telegramSocialConfig(),groups()]);
+  notice('已刷新 Telegram 渠道状态与群策略');
+}));
+$('tg-config-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('tg-save-config'),async()=>{
+    const draft=normalizeTgDraft({
+      ...(tgSocialDraft||{}),
+      private_mode:$('tg-private-mode').value,
+      memory_mirror_enabled:$('tg-memory-mirror').checked
+    });
+    const res=await api('social-chat/telegram/config','PUT',draft);
+    renderTelegramSocialConfig(res);
+    await groups();
+    notice(res?.pushed
+      ?'Telegram 配置已保存并实时热推送至在线插件，群策略列表已更新'
+      :(res?.online===false
+        ?'Telegram 配置已保存至后台（插件离线，重连后自动下发），群策略列表已更新'
+        :'Telegram 配置已保存，群策略列表已更新'));
+  });
+});
+$('tg-reset-config').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!(await confirmDialog('移除后台保存的 Telegram 渠道覆盖配置，恢复为环境变量（.env）默认值？',{danger:true,confirmLabel:'恢复 .env 默认'})))return;
+  const res=await api('social-chat/telegram/config','DELETE');
+  renderTelegramSocialConfig(res);
+  await groups();
+  notice(res?.pushed
+    ?'已恢复 Telegram .env 默认配置并实时热推送至在线插件'
+    :'已恢复 Telegram .env 默认配置（插件重连后自动同步）');
+}));
 
 function parseBotThreshold(raw,optional=false){const s=String(raw??'').trim();if(!s&&optional)return null;const n=Number(s);if(!Number.isFinite(n)||n<.01||n>1)throw Error('Bot 回复阈值须为 0.01～1.00');return n;}
 function botThresholdLabel(custom,effective){const val=Number(effective??0.85);return (val>=1?'1.00（完全屏蔽）':val.toFixed(2))+(custom!=null?' · 专属覆盖':' · 跟随全局');}
@@ -300,15 +529,17 @@ async function logs(){
 $('refresh-logs').addEventListener('click',e=>busy(e.target,logs));
 
 trackDirty('bot-default-threshold-form','全局默认 Bot 阈值');
+trackDirty('tg-config-form','Telegram 社交热配置');
 trackDirty('admission-bot-threshold-form','默认 Bot 回复阈值');
 trackDirty('compression-form','滚动压缩参数');
 trackDirty('patrol-limits-form','订阅配额与轮询间隔');
 
 onLogout(()=>{
-  admissionState=null;memoryView=null;
-  for(const id of ['bot-id','bot-custom-threshold','sub-uid'])$(id).value='';
-  for(const id of ['groups','bots','admission-groups','admission-users','admission-bots','sessions','memory-entries','subs','drive-consumers','diaries','log-list'])$(id).replaceChildren();
-  for(const id of ['admission-source','admission-owner','admission-group-scope','admission-environment','compression-source','compression-summary','patrol-limits-source','drive-connection','journal-drive-status','notebook-state','notebook-action-note','memory-state','memory-mirror-state'])text(id,'');
+  admissionState=null;memoryView=null;tgSocialState=null;tgSocialDraft=null;
+  for(const id of ['bot-id','bot-custom-threshold','sub-uid','tg-group-input','tg-user-input'])$(id).value='';
+  for(const id of ['groups','bots','admission-groups','admission-users','admission-bots','sessions','memory-entries','subs','drive-consumers','diaries','log-list','tg-status-pills','tg-capabilities-row','tg-groups-list','tg-users-list'])$(id).replaceChildren();
+  for(const id of ['admission-source','admission-owner','admission-group-scope','admission-environment','compression-source','compression-summary','patrol-limits-source','drive-connection','journal-drive-status','notebook-state','notebook-action-note','memory-state','memory-mirror-state','tg-status-meta','tg-private-mode-hint'])text(id,'');
+  text('tg-env-defaults','等待读取配置…');
   text('diary-preview','选择日期即可阅读日记。');
-  for(const id of ['save-patrol-limits','reset-patrol-limits'])$(id).disabled=true;
+  for(const id of ['save-patrol-limits','reset-patrol-limits','tg-save-config','tg-reset-config'])$(id).disabled=true;
 });

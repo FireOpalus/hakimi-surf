@@ -792,3 +792,362 @@ def test_architecture_html_topology_and_links() -> None:
         "QQ 的分享规则",
     ):
         assert stale not in html, f"Stale string still present in architecture.html: {stale}"
+
+
+def test_admin_telegram_social_hot_config_ui_and_platform_badges() -> None:
+    """Verify Telegram hot-config card markup, API contract, and cross-platform group badges."""
+    html = build_html()
+    assert audit_html(html) == []
+    policy = content_security_policy(html)
+    assert "script-src 'sha256-" in policy
+    assert "style-src 'sha256-" in policy
+
+    collector = _IdCollector()
+    collector.feed(html)
+    id_set = set(collector.ids)
+    assert len(collector.ids) == len(id_set)
+
+    panels = dict(re.findall(r'<section id="([^"]+)" class="tab"[^>]*>(.*?)</section>', html, re.S))
+    gp_html = panels["group-policy"]
+    for expected_id in (
+        "tg-social-card",
+        "tg-refresh",
+        "tg-status-pills",
+        "tg-status-meta",
+        "tg-capabilities-row",
+        "tg-config-form",
+        "tg-group-input",
+        "tg-add-group",
+        "tg-groups-list",
+        "tg-private-mode",
+        "tg-private-mode-hint",
+        "tg-user-input",
+        "tg-add-user",
+        "tg-users-list",
+        "tg-memory-mirror",
+        "tg-env-defaults",
+        "tg-save-config",
+        "tg-reset-config",
+    ):
+        assert f'id="{expected_id}"' in gp_html, f"Missing Telegram UI id: {expected_id}"
+    assert "group_memory_mirror" in gp_html
+    assert "Antigravity_Memory" in gp_html
+
+    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+    runner: list[str] | None = None
+    if shutil.which("node"):
+        runner = ["node", "-e"]
+    elif jsc_path.is_file():
+        runner = [str(jsc_path), "-e"]
+    if runner is None:
+        pytest.skip("No local JS engine (node/jsc) available for Telegram UI runtime test")
+
+    core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
+    adm_js = (ADMIN_DIR / "src" / "js" / "04-admission-memory.js").read_text(encoding="utf-8")
+    all_ids_json = json.dumps(sorted(id_set))
+
+    harness = f"""
+    const ALL_IDS = {all_ids_json};
+    class MockNode {{
+      constructor(tag) {{
+        this.tagName = String(tag || 'div').toUpperCase();
+        this.children = [];
+        this.parentElement = null;
+        this.attrs = {{}};
+        this.dataset = {{}};
+        this.listeners = {{}};
+        this._text = '';
+        this.hidden = false;
+        this.disabled = false;
+        this.checked = false;
+        this.open = false;
+        this.value = '';
+        this.className = '';
+        this.options = [];
+        this.classList = {{ add(){{}}, remove(){{}}, toggle(){{}}, contains(){{ return false; }} }};
+      }}
+      get firstChild() {{ return this.children[0] || null; }}
+      get textContent() {{
+        return this.children.length
+          ? this._text + this.children.map(c => c.textContent).join('')
+          : this._text;
+      }}
+      set textContent(v) {{ this._text = String(v ?? ''); this.children = []; }}
+      setAttribute(k, v) {{
+        if (k === 'class') this.className = String(v);
+        this.attrs[k] = String(v);
+      }}
+      getAttribute(k) {{ return this.attrs[k] ?? null; }}
+      removeAttribute(k) {{ delete this.attrs[k]; }}
+      append(...nodes) {{
+        for (const n of nodes) {{
+          if (n instanceof MockNode) {{
+            n.parentElement = this;
+            this.children.push(n);
+            if (n.tagName === 'OPTION') this.options.push(n);
+          }} else {{
+            const t = new MockNode('#text'); t._text = String(n); this.children.push(t);
+          }}
+        }}
+      }}
+      replaceChildren(...nodes) {{
+        this.children = []; this.options = []; this._text = ''; this.append(...nodes);
+      }}
+      addEventListener(evt, fn) {{ (this.listeners[evt] ||= []).push(fn); }}
+      dispatch(evt, extra={{}}) {{
+        for (const fn of (this.listeners[evt] || [])) {{
+          fn({{ target: this, preventDefault(){{}}, ...extra }});
+        }}
+      }}
+      querySelector() {{ return null; }}
+      querySelectorAll() {{ return []; }}
+      closest(sel) {{
+        if (sel === 'section.tab') return {{ id: 'group-policy' }};
+        return null;
+      }}
+      focus() {{}}
+      select() {{}}
+      remove() {{}}
+    }}
+    const Node = MockNode;
+    const byId = new Map();
+    for (const id of ALL_IDS) {{
+      const n = new MockNode('div');
+      n.id = id;
+      byId.set(id, n);
+    }}
+    const document = {{
+      body: new MockNode('body'),
+      documentElement: new MockNode('html'),
+      hidden: false,
+      activeElement: null,
+      title: '',
+      getElementById(id) {{ return byId.get(id) || null; }},
+      createElement(tag) {{ return new MockNode(tag); }},
+      createTextNode(t) {{ const n = new MockNode('#text'); n._text = String(t); return n; }},
+      addEventListener() {{}},
+      querySelectorAll() {{ return []; }}
+    }};
+    class AbortController {{
+      constructor() {{ this.signal = {{ aborted: false }}; }}
+      abort() {{ this.signal.aborted = true; }}
+    }}
+    function setTimeout(){{ return 0; }}
+    function clearTimeout(){{}}
+    function clearInterval(){{}}
+    const location = {{ hash: '', pathname: '/admin' }};
+    const history = {{ replaceState(){{}}, pushState(){{}} }};
+    function diagnosticCell(v){{ return String(v||''); }}
+
+    {core_js}
+    token = 'test-token';
+    const pendingTasks = [];
+    const origBusy = busy;
+    busy = (btn, fn) => {{
+      const p = origBusy(btn, fn);
+      pendingTasks.push(p);
+      return p;
+    }};
+    let nextConfirm = true;
+    confirmDialog = async () => nextConfirm;
+
+    const calls = [];
+    let currentGroups = [
+      {{ platform: 'onebot', group_id: '40000', mode: 'at_only' }},
+      {{ platform: 'telegram', group_id: '-1001234567890', mode: 'smart_reply' }}
+    ];
+    let currentTgCfg = {{
+      platform: 'telegram',
+      plugin_id: 'telegram',
+      online: true,
+      bot_id: '9101002957',
+      bot_username: 'gemini_nyan_bot',
+      owner_configured: true,
+      source: 'admin',
+      capabilities: ['voice', 'sticker', 'emoji_like', 'reply_anchor', 'rich_card'],
+      config: {{
+        allowed_groups: ['-1001234567890'],
+        proactive_groups: ['-1001234567890'],
+        private_mode: 'owner_only',
+        allowed_users: [],
+        memory_mirror_enabled: false
+      }},
+      environment: {{
+        allowed_groups: [],
+        proactive_groups: [],
+        private_mode: 'owner_only',
+        allowed_users: [],
+        memory_mirror_enabled: false
+      }}
+    }};
+
+    api = async (path, method='GET', data) => {{
+      calls.push({{ path, method, data }});
+      if (path === 'groups' && method === 'GET') return currentGroups;
+      if (path === 'filter' && method === 'GET') {{
+        return {{
+          config: {{ reply_threshold: 0.6, group_activity: {{}} }},
+          presets: {{ quiet: 0.75, natural: 0.55, active: 0.35 }}
+        }};
+      }}
+      if (path === 'social-chat/telegram/config' && method === 'GET') return currentTgCfg;
+      if (path === 'social-chat/telegram/config' && method === 'PUT') {{
+        currentTgCfg = {{ ...currentTgCfg, source: 'admin', config: data, pushed: true }};
+        currentGroups = [
+          {{ platform: 'onebot', group_id: '40000', mode: 'at_only' }},
+          ...data.allowed_groups.map(gid => ({{
+            platform: 'telegram', group_id: gid, mode: 'at_only'
+          }}))
+        ];
+        return currentTgCfg;
+      }}
+      if (path === 'social-chat/telegram/config' && method === 'DELETE') {{
+        currentTgCfg = {{
+          ...currentTgCfg,
+          source: 'env',
+          config: {{ ...currentTgCfg.environment }},
+          pushed: true
+        }};
+        currentGroups = [{{ platform: 'onebot', group_id: '40000', mode: 'at_only' }}];
+        return currentTgCfg;
+      }}
+      return {{}};
+    }};
+
+    {adm_js}
+
+    function walk(node, acc=[]) {{
+      acc.push(node);
+      for (const c of (node.children || [])) walk(c, acc);
+      return acc;
+    }}
+    function assert(cond, msg) {{ if (!cond) throw new Error('ASSERT FAILED: ' + msg); }}
+
+    (async () => {{
+      // 1. groups() renders QQ and Telegram platform badges cleanly
+      await groups();
+      const grpTxt = $('groups').textContent;
+      assert(grpTxt.includes('QQ') && grpTxt.includes('40000'), 'QQ group badge missing');
+      assert(
+        grpTxt.includes('Telegram') && grpTxt.includes('-1001234567890'),
+        'Telegram group badge missing'
+      );
+
+      // 2. telegramSocialConfig() loads and populates status, caps, lists
+      await telegramSocialConfig();
+      const pillsTxt = $('tg-status-pills').textContent;
+      assert(
+        pillsTxt.includes('在线')
+          && pillsTxt.includes('@gemini_nyan_bot')
+          && pillsTxt.includes('Owner 已绑定')
+          && pillsTxt.includes('控制台覆盖'),
+        'tg-status-pills mismatch: ' + pillsTxt
+      );
+      const capsTxt = $('tg-capabilities-row').textContent;
+      assert(
+        capsTxt.includes('语音')
+          && capsTxt.includes('表情包')
+          && capsTxt.includes('贴表情')
+          && capsTxt.includes('代码卡片'),
+        'tg-capabilities-row mismatch: ' + capsTxt
+      );
+      assert($('tg-memory-mirror').checked === false, 'memory mirror defaults false');
+      assert($('tg-groups-list').textContent.includes('-1001234567890'), 'initial group missing');
+
+      // 3. Reject invalid group ID without mutating draft
+      $('tg-group-input').value = 'not-a-number';
+      $('tg-add-group').dispatch('click');
+      assert($('notice-text').textContent.includes('Telegram 群号'), 'invalid group notice');
+      assert(tgSocialDraft.allowed_groups.length === 1, 'invalid group must not be added');
+
+      // 4. Add a new TG group, toggle proactive, add private user, enable mirror, submit PUT
+      $('tg-group-input').value = '-1009988776655';
+      $('tg-add-group').dispatch('click');
+      assert(tgSocialDraft.allowed_groups.includes('-1009988776655'), 'new group not added');
+      const proCheckboxes = walk($('tg-groups-list')).filter(
+        n => n.tagName === 'INPUT' && n.type === 'checkbox'
+      );
+      assert(proCheckboxes.length === 2, 'expected 2 proactive checkboxes');
+      proCheckboxes[1].checked = true;
+      proCheckboxes[1].dispatch('change');
+
+      $('tg-private-mode').value = 'owner_and_allowlist';
+      $('tg-private-mode').dispatch('change');
+      $('tg-user-input').value = '555666777';
+      $('tg-add-user').dispatch('click');
+      $('tg-memory-mirror').checked = true;
+      $('tg-memory-mirror').dispatch('change');
+
+      calls.length = 0;
+      $('tg-config-form').dispatch('submit');
+      await Promise.all(pendingTasks.splice(0));
+      const putCall = calls.find(
+        c => c.path === 'social-chat/telegram/config' && c.method === 'PUT'
+      );
+      assert(Boolean(putCall), 'expected PUT social-chat/telegram/config');
+      assert(
+        JSON.stringify(putCall.data.allowed_groups)
+          === JSON.stringify(['-1001234567890', '-1009988776655']),
+        'PUT allowed_groups mismatch'
+      );
+      assert(
+        JSON.stringify(putCall.data.proactive_groups)
+          === JSON.stringify(['-1001234567890', '-1009988776655']),
+        'PUT proactive_groups mismatch'
+      );
+      assert(putCall.data.private_mode === 'owner_and_allowlist', 'PUT private_mode mismatch');
+      assert(
+        JSON.stringify(putCall.data.allowed_users) === JSON.stringify(['555666777']),
+        'PUT allowed_users mismatch'
+      );
+      assert(putCall.data.memory_mirror_enabled === true, 'PUT memory_mirror_enabled mismatch');
+      assert(
+        calls.some(c => c.path === 'groups' && c.method === 'GET'),
+        'PUT must automatically refresh groups table'
+      );
+      assert($('groups').textContent.includes('-1009988776655'), 'new TG group must appear');
+      assert($('notice-text').textContent.includes('实时热推送'), 'pushed notice mismatch');
+
+      // 5. Reset to .env respects confirmDialog cancel and confirm -> DELETE + refresh groups
+      calls.length = 0;
+      nextConfirm = false;
+      $('tg-reset-config').dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(calls.length === 0, 'cancelled reset must not invoke api()');
+
+      nextConfirm = true;
+      $('tg-reset-config').dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        calls.some(c => c.path === 'social-chat/telegram/config' && c.method === 'DELETE'),
+        'expected DELETE social-chat/telegram/config'
+      );
+      assert($('tg-status-pills').textContent.includes('环境变量'), 'source must switch to env');
+      assert($('tg-memory-mirror').checked === false, 'reset must turn mirror off');
+
+      // 6. Logout clears Telegram UI state and disables buttons
+      for (const fn of logoutHooks) fn();
+      assert($('tg-save-config').disabled === true, 'logout must disable tg-save-config');
+      assert($('tg-reset-config').disabled === true, 'logout must disable tg-reset-config');
+      assert($('tg-groups-list').children.length === 0, 'logout must clear tg-groups-list');
+
+      if (typeof print === 'function') print('TG_SOCIAL_UI_OK');
+      else console.log('TG_SOCIAL_UI_OK');
+    }})().catch(err => {{
+      console.error(err && err.stack ? err.stack : err);
+      if (typeof process !== 'undefined' && process.exit) process.exit(1);
+      throw err;
+    }});
+    """
+
+    proc = subprocess.run(
+        [*runner, harness],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Telegram UI JS test failed:\n{proc.stderr}\n{proc.stdout}"
+    assert "TG_SOCIAL_UI_OK" in proc.stdout, (
+        f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"
+    )

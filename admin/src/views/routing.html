@@ -195,7 +195,7 @@
 </section>
 
 <section id="admission" class="tab" role="tabpanel" aria-labelledby="nav-admission" hidden>
-  <div class="card"><div class="row between"><h2>准入与防互刷名单管理</h2><button id="refresh-admission" type="button" class="secondary">刷新名单</button></div>
+  <div class="card"><div class="row between"><h2>准入与防互刷名单管理</h2><div class="row"><button type="button" class="secondary" data-open-tab="group-policy">Telegram 渠道热配置与群策略 →</button><button id="refresh-admission" type="button" class="secondary">刷新名单</button></div></div>
     <p id="admission-source" class="muted"></p>
     <p id="admission-owner" class="muted"></p>
     <p class="muted">变更立即生效，无需重启；SQLite 保存的名单与阈值优先于启动时的 .env。非准入消息和设为 1.00 的 Bot 在模型调用前直接忽略。</p>

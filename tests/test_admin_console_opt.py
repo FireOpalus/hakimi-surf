@@ -1877,3 +1877,411 @@ def test_colab_config_and_song_learn_form_submit_payloads():
     assert "FORM_AND_TAKES_OK" in proc.stdout, (
         f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"
     )
+
+
+def test_overview_ledger_non_blocking_colab_and_panel_fold():
+    """Verify non-blocking Colab fetch, one-shot refresh retry, and .panel-fold structure."""
+    import json
+    import shutil
+
+    html = build_html()
+    assert audit_html(html) == []
+    policy = content_security_policy(html)
+    assert "script-src 'sha256-" in policy
+    assert "style-src 'sha256-" in policy
+
+    collector = _IdCollector()
+    collector.feed(html)
+    id_set = set(collector.ids)
+    assert len(collector.ids) == len(id_set)
+
+    for required_id in (
+        "overview-colab-sync-note",
+        "overview-cloud-details",
+        "cloud-colab-sync-note",
+        "cloud-fold-breakdown",
+        "ledger-fold-breakdown",
+        "ledger-fold-work-cache",
+        "ledger-fold-bq-config",
+        "ledger-fold-gcp-sa",
+        "ledger-fold-mon-detail",
+        "community-fold-tiers",
+        "community-fold-history",
+        "colab-sync-note",
+        "colab-fold-breakdown",
+        "colab-fold-policies",
+    ):
+        assert required_id in id_set, f"Missing panel-fold / sync DOM id: {required_id}"
+
+    # Verify ledger heavy tables/forms sit inside .panel-fold while core summary stays open.
+    panels = dict(re.findall(r'<section id="([^"]+)" class="tab"[^>]*>(.*?)</section>', html, re.S))
+    ledger_html = panels["ledger"]
+    assert "panel-fold" in ledger_html
+    assert 'id="token-ledger"' in ledger_html.split('id="ledger-fold-breakdown"')[0]
+    breakdown_block = ledger_html.split('id="ledger-fold-breakdown"')[1].split(
+        'id="ledger-fold-work-cache"'
+    )[0]
+    for elem_id in ("provider-ledger", "model-ledger", "thinking-ledger"):
+        assert f'id="{elem_id}"' in breakdown_block
+
+    work_cache_block = ledger_html.split('id="ledger-fold-work-cache"')[1].split(
+        'data-section-group="billing"'
+    )[0]
+    for elem_id in ("work-ledger", "cost-ledger", "effective-cache", "cache-alert"):
+        assert f'id="{elem_id}"' in work_cache_block
+
+    bq_fold_block = ledger_html.split('id="ledger-fold-bq-config"')[1].split(
+        'id="gcp-sync-monitoring"'
+    )[0]
+    for elem_id in ("gcp-credits-table", "gcp-bq-sql", "gcp-bq-form", "gcp-sa-form"):
+        assert f'id="{elem_id}"' in bq_fold_block
+
+    mon_fold_block = ledger_html.split('id="ledger-fold-mon-detail"')[1].split(
+        'data-section-group="budget"'
+    )[0]
+    for elem_id in ("gcp-mon-compare-table", "gcp-mon-models-table", "gcp-mon-form"):
+        assert f'id="{elem_id}"' in mon_fold_block
+
+    # Zero query parameters in API calls.
+    scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert len(scripts) == 1
+    script = scripts[0]
+    assert not re.search(r"api\(\s*['\"][^'\"\n]*\?", script)
+    assert "api('colab/refresh','POST')" in script
+
+    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+    runner: list[str] | None = None
+    if shutil.which("node"):
+        runner = ["node", "-e"]
+    elif jsc_path.is_file():
+        runner = [str(jsc_path), "-e"]
+    if runner is None:
+        pytest.skip("No local JS engine (node/jsc) available for non-blocking Colab runtime test")
+
+    core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
+    ledger_js = (ADMIN_DIR / "src" / "js" / "02-overview-ledger.js").read_text(encoding="utf-8")
+    all_ids_json = json.dumps(sorted(id_set))
+
+    harness = f"""
+    const ALL_IDS = {all_ids_json};
+    class MockNode {{
+      constructor(tag, ns) {{
+        this.tagName = String(tag || 'div').toUpperCase();
+        this.namespaceURI = ns || null;
+        this.children = [];
+        this.parentElement = null;
+        this.attrs = {{}};
+        this.dataset = {{}};
+        this.listeners = {{}};
+        this._text = '';
+        this.hidden = false;
+        this.disabled = false;
+        this.checked = false;
+        this.value = '';
+        this.className = '';
+        this.open = false;
+        this.classList = {{ add(){{}}, remove(){{}}, toggle(){{}}, contains(){{ return false; }} }};
+      }}
+      get textContent() {{
+        return this.children.length
+          ? this._text + this.children.map(c => c.textContent).join('')
+          : this._text;
+      }}
+      set textContent(v) {{ this._text = String(v ?? ''); this.children = []; }}
+      setAttribute(k, v) {{
+        if (k === 'class') this.className = String(v);
+        this.attrs[k] = String(v);
+      }}
+      getAttribute(k) {{ return this.attrs[k] ?? null; }}
+      removeAttribute(k) {{ delete this.attrs[k]; }}
+      append(...nodes) {{
+        for (const n of nodes) {{
+          if (n instanceof MockNode) {{
+            n.parentElement = this;
+            this.children.push(n);
+          }} else {{
+            const t = new MockNode('#text'); t._text = String(n); this.children.push(t);
+          }}
+        }}
+      }}
+      replaceChildren(...nodes) {{
+        this.children = []; this._text = ''; this.append(...nodes);
+      }}
+      addEventListener(evt, fn) {{ (this.listeners[evt] ||= []).push(fn); }}
+      dispatch(evt) {{
+        for (const fn of (this.listeners[evt] || [])) fn({{ target: this, preventDefault(){{}} }});
+      }}
+      querySelector() {{ return null; }}
+      querySelectorAll() {{ return []; }}
+      closest() {{ return null; }}
+      focus() {{}}
+      select() {{}}
+      remove() {{}}
+    }}
+    const Node = MockNode;
+    const byId = new Map();
+    for (const id of ALL_IDS) {{
+      const n = new MockNode('div');
+      n.id = id;
+      byId.set(id, n);
+    }}
+    // Wire gcp-bq-form inside a closed <details> ancestor to verify dirty auto-expand.
+    const bqFold = byId.get('ledger-fold-bq-config');
+    bqFold.tagName = 'DETAILS';
+    bqFold.open = false;
+    byId.get('gcp-bq-form').parentElement = bqFold;
+
+    const document = {{
+      body: new MockNode('body'),
+      documentElement: new MockNode('html'),
+      hidden: false,
+      activeElement: null,
+      title: '',
+      getElementById(id) {{ return byId.get(id) || null; }},
+      createElement(tag) {{ return new MockNode(tag); }},
+      createElementNS(ns, tag) {{ return new MockNode(tag, ns); }},
+      createTextNode(t) {{ const n = new MockNode('#text'); n._text = String(t); return n; }},
+      addEventListener() {{}},
+      querySelectorAll() {{ return []; }}
+    }};
+    class AbortController {{
+      constructor() {{ this.signal = {{ aborted: false }}; }}
+      abort() {{ this.signal.aborted = true; }}
+    }}
+    const scheduledTimers = [];
+    let nextTimerId = 1;
+    function setTimeout(fn, ms) {{
+      const id = nextTimerId++;
+      scheduledTimers.push({{ id, fn, ms, cleared: false }});
+      return id;
+    }}
+    function clearTimeout(id) {{
+      const item = scheduledTimers.find(t => t.id === id);
+      if (item) item.cleared = true;
+    }}
+    function clearInterval() {{}}
+    const location = {{ hash: '', pathname: '/admin' }};
+    const history = {{ replaceState(){{}}, pushState(){{}} }};
+    function previewWakeWindow(){{}}
+    function lifeFmt(v){{ return String(v||''); }}
+    function showNotebookAvailability(){{}}
+    function stampDashboard(){{}}
+    function providerBadge(p){{ return String(p||''); }}
+
+    {core_js}
+    token = 'test-token';
+    confirmDialog = async () => true;
+    const pendingTasks = [];
+    const origBusy = busy;
+    busy = (btn, fn) => {{
+      const p = origBusy(btn, fn);
+      pendingTasks.push(p);
+      return p;
+    }};
+
+    const apiCalls = [];
+    let colabResolvers = [];
+    const sampleOverview = {{
+      primary_model: 'hydrogen',
+      uptime_seconds: 3720,
+      minute_requests: 2,
+      minute_limit: 30,
+      daily_limit_usd: 5,
+      metrics: [],
+      pipeline: {{ gate: 0, generating: 0, image_cache_bytes: 0 }},
+      usage: {{
+        timezone: 'Asia/Shanghai',
+        day_local: '2026-11-26',
+        lanes: [{{ lane: 'chat', amount: 120000, calls: 4 }}],
+        categories: [{{ category: 'chat', amount: 120000, calls: 4 }}],
+        token_usage: {{
+          today: {{ calls: 4, known_usage_calls: 4, input_tokens: 1000, cached_tokens: 500,
+                    output_tokens: 200, thought_tokens: 50, cache_known_calls: 4,
+                    interaction_calls: 4, cache_hit_ratio: 0.5, by_provider: [], by_model: [],
+                    by_thinking: [], effective_cache_calls: 4, effective_cache_hit_ratio: 0.9 }},
+          month: {{ calls: 4, known_usage_calls: 4, input_tokens: 1000, cached_tokens: 500,
+                    output_tokens: 200, thought_tokens: 50, cache_known_calls: 4,
+                    interaction_calls: 4, cache_hit_ratio: 0.5, by_provider: [], by_model: [],
+                    by_thinking: [], effective_cache_calls: 4, effective_cache_hit_ratio: 0.9 }},
+          lifetime: {{ calls: 4, known_usage_calls: 4, input_tokens: 1000, cached_tokens: 500,
+                       output_tokens: 200, thought_tokens: 50, cache_known_calls: 4,
+                       interaction_calls: 4, cache_hit_ratio: 0.5, by_provider: [], by_model: [],
+                       by_thinking: [], effective_cache_calls: 4, effective_cache_hit_ratio: 0.9 }}
+        }},
+        cost_estimates: {{}},
+        cache_health: {{ prefix_busts_today: 0 }},
+        recent_work: [],
+        history: {{ since_utc: '2026-11-01' }}
+      }},
+      budget_status: {{
+        daily: 120000, daily_limit: 5000000, monthly: 120000, monthly_limit: 50000000,
+        total: 120000, total_limit: 0, sub_budgets: {{}}
+      }},
+      rest_hours: null,
+      notebook: {{ enabled: false }}
+    }};
+
+    api = (path, method='GET', data) => {{
+      apiCalls.push({{ path, method, data }});
+      if (path === 'colab' || path === 'colab/refresh') {{
+        return new Promise(resolve => colabResolvers.push({{ path, method, resolve }}));
+      }}
+      if (path === 'global/overview' || path === 'global/dashboard') {{
+        return Promise.resolve(sampleOverview);
+      }}
+      if (path === 'budget') {{
+        return Promise.resolve({{
+          source: 'env',
+          config: {{
+            daily_usd: 5, monthly_usd: 50, user_daily_usd: 1, patrol_daily_usd: 1,
+            memory_daily_usd: 1, proactive_daily_usd: 1, admin_daily_usd: 1
+          }}
+        }});
+      }}
+      if (path === 'global/providers') {{
+        return Promise.resolve({{ config: {{ vertex_enabled: true }}, credentials: {{}} }});
+      }}
+      if (path === 'gcp-billing') {{
+        return Promise.resolve({{
+          source: 'env',
+          config: {{
+            bigquery_enabled: false, enforce_credit_hard_stop: false, initial_credits_usd: 0,
+            bigquery_sync_interval_seconds: 1800, monitoring_enabled: false,
+            monitoring_sync_interval_seconds: 300, credit_grants: []
+          }},
+          credentials: {{}},
+          bigquery: {{ synced: false }},
+          monitoring: {{ status: 'not_synced' }}
+        }});
+      }}
+      if (path === 'account-balance') {{
+        return Promise.resolve({{ mode: 'none' }});
+      }}
+      return Promise.resolve({{}});
+    }};
+
+    {ledger_js}
+
+    function assert(cond, msg) {{ if (!cond) throw new Error('ASSERT FAILED: ' + msg); }}
+    async function flushMicrotasks() {{
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    }}
+
+    (async () => {{
+      // 1. dashboard() renders immediately WITHOUT waiting for api('colab')
+      await dashboard();
+      assert(colabResolvers.length === 1 && colabResolvers[0].path === 'colab',
+        'colab should be in-flight');
+      assert($('stat-calls').textContent === '4',
+        'overview must render immediately before colab resolves');
+
+      // Resolve colab with worker_refreshing=true -> shows hint & schedules ONE 3000ms timer
+      colabResolvers.shift().resolve({{
+        configured: true,
+        worker_cached: true,
+        worker_refreshing: true,
+        config: {{ enabled: true }},
+        worker: {{ reachable: true, compute_units: null, refreshing: true }},
+        today: {{ jobs_count: 1, cu_used: 0.2 }}
+      }});
+      await flushMicrotasks();
+      assert($('overview-colab-sync-note').hidden === false,
+        'overview sync note must be visible when refreshing');
+      assert($('overview-colab-sync-note').textContent.includes('正在后台同步最新 CU 余额'),
+        'overview sync note text mismatch');
+      const retryTimers1 = scheduledTimers.filter(t => t.ms === 3000 && !t.cleared);
+      assert(retryTimers1.length === 1, 'must schedule exactly one 3000ms follow-up timer');
+
+      // Fire the one-shot follow-up; even if still refreshing, must NOT schedule a loop timer
+      retryTimers1[0].fn();
+      assert(colabResolvers.length === 1 && colabResolvers[0].path === 'colab',
+        'follow-up should call api(colab)');
+      colabResolvers.shift().resolve({{
+        configured: true,
+        worker_cached: true,
+        worker_refreshing: true,
+        config: {{ enabled: true }},
+        worker: {{ reachable: true, compute_units: 18.5, refreshing: true }},
+        today: {{ jobs_count: 1, cu_used: 0.2 }}
+      }});
+      await flushMicrotasks();
+      assert(
+        scheduledTimers.filter(t => t.ms === 3000).length === 1,
+        'follow-up must NEVER loop-schedule another 3000ms timer'
+      );
+
+      // 2. ledger() renders immediately WITHOUT waiting for api('colab')
+      cachedColabOverview = null;
+      await ledger();
+      assert(colabResolvers.length === 1 && colabResolvers[0].path === 'colab',
+        'ledger colab should be in-flight');
+      assert($('token-ledger').textContent.includes('1000'),
+        'ledger must render main tables before colab resolves');
+      assert($('cloud-colab-pills').textContent.includes('正在同步'),
+        'cloud colab card should show non-blocking syncing pill');
+
+      // Resolve ledger colab with fresh cached balance
+      colabResolvers.shift().resolve({{
+        configured: true,
+        worker_cached: true,
+        worker_cache_age_seconds: 12,
+        worker_refreshing: false,
+        config: {{ enabled: true }},
+        worker: {{ reachable: true, compute_units: 35.5 }},
+        today: {{ jobs_count: 2, cu_used: 0.5 }},
+        warm_sessions: []
+      }});
+      await flushMicrotasks();
+      assert($('cloud-colab-kpis').textContent.includes('35.50 CU'),
+        'ledger colab card must update locally after async resolve');
+      assert($('cloud-colab-sync-note').textContent.includes('12 秒前'),
+        'cache age hint mismatch');
+
+      // 3. Manual cloud-refresh triggers POST colab/refresh (zero query params)
+      $('cloud-refresh').dispatch('click');
+      await flushMicrotasks();
+      assert(
+        colabResolvers.length === 1
+          && colabResolvers[0].path === 'colab/refresh'
+          && colabResolvers[0].method === 'POST',
+        'cloud-refresh must POST colab/refresh'
+      );
+      colabResolvers.shift().resolve({{
+        configured: true,
+        worker_cached: false,
+        worker_cache_age_seconds: 0,
+        worker_refreshing: false,
+        config: {{ enabled: true }},
+        worker: {{ reachable: true, compute_units: 34.25 }},
+        today: {{ jobs_count: 2, cu_used: 0.5 }},
+        warm_sessions: []
+      }});
+      await Promise.all(pendingTasks.splice(0));
+      assert($('cloud-colab-kpis').textContent.includes('34.25 CU'),
+        'manual refresh must render updated live balance');
+
+      // 4. Dirty form inside collapsed <details> automatically opens enclosing <details>
+      assert(bqFold.open === false, 'bqFold should start collapsed');
+      markDirty('gcp-bq-form');
+      assert(bqFold.open === true, 'marking dirty form must auto-open enclosing <details>');
+
+      if (typeof print === 'function') print('NON_BLOCKING_COLAB_FOLD_OK');
+      else console.log('NON_BLOCKING_COLAB_FOLD_OK');
+    }})().catch(err => {{
+      console.error(err && err.stack ? err.stack : err);
+      if (typeof process !== 'undefined' && process.exit) process.exit(1);
+      throw err;
+    }});
+    """
+
+    proc = subprocess.run(
+        [*runner, harness],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Non-blocking Colab JS test failed:\n{proc.stderr}\n{proc.stdout}"
+    assert "NON_BLOCKING_COLAB_FOLD_OK" in proc.stdout, (
+        f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"
+    )

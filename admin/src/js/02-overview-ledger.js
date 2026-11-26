@@ -4,8 +4,89 @@ let cachedProvidersOverview=null;
 let cachedGcpOverview=null;
 let cachedColabOverview=null;
 let colabUnavailableReason='';
+let lastOverviewDash=null;
 let lastLedgerDash=null;
 let cloudTrendDays=14;
+let colabFetchGen=0;
+let colabAutoRefreshTimer=null;
+let colabLoading=false;
+
+function clearColabAutoRefresh(){
+  if(colabAutoRefreshTimer){clearTimeout(colabAutoRefreshTimer);colabAutoRefreshTimer=null;}
+}
+function isColabWorkerRefreshing(colab){
+  return Boolean(colab&&(colab.worker_refreshing||colab.worker?.refreshing));
+}
+function colabSyncNoteText(colab){
+  if(!colab)return '';
+  if(isColabWorkerRefreshing(colab))return '正在后台同步最新 CU 余额…';
+  if(colab.worker_cached&&colab.worker_cache_age_seconds!=null&&Number.isFinite(Number(colab.worker_cache_age_seconds))){
+    const age=Math.max(0,Math.round(Number(colab.worker_cache_age_seconds)));
+    return age<=1?'刚刚同步 · 缓存命中':'缓存快照（约 '+age+' 秒前）· 点击刷新可现查最新 CU 余额';
+  }
+  return '';
+}
+function setColabSyncNote(id,colab,overrideText=''){
+  const node=$(id);
+  if(!node)return;
+  const msg=overrideText||colabSyncNoteText(colab);
+  node.textContent=msg;
+  node.hidden=!msg;
+}
+async function fetchColabOverview(force=false){
+  if(force){
+    try{
+      return await api('colab/refresh','POST');
+    }catch(err){
+      if(err?.name==='AbortError'||!token)throw err;
+      if(/HTTP (?:404|405)|not found/i.test(String(err?.message||'')))return api('colab');
+      throw err;
+    }
+  }
+  return api('colab');
+}
+function applyColabOverviewUpdate(colab,unavailReason=''){
+  cachedColabOverview=colab;
+  colabUnavailableReason=unavailReason;
+  renderUnifiedCloudColab(colab,unavailReason);
+  if(lastOverviewDash){
+    renderOverviewRoutingGcp(lastOverviewDash,cachedProvidersOverview,cachedGcpOverview,colab);
+  }
+  if(colab&&tab==='colab-compute'&&typeof renderColabOverview==='function'){
+    renderColabOverview(colab);
+  }
+}
+function scheduleColabFollowUp(gen){
+  clearColabAutoRefresh();
+  colabAutoRefreshTimer=setTimeout(()=>{
+    colabAutoRefreshTimer=null;
+    if(!token||document.hidden||gen!==colabFetchGen)return;
+    refreshColabAsync({force:false,allowAutoRetry:false});
+  },3000);
+}
+function refreshColabAsync({force=false,allowAutoRetry=true}={}){
+  const signal=sessionRequests.signal;
+  const gen=++colabFetchGen;
+  clearColabAutoRefresh();
+  colabLoading=true;
+  return fetchColabOverview(force).then(data=>{
+    if(!token||signal.aborted||gen!==colabFetchGen)return null;
+    colabLoading=false;
+    applyColabOverviewUpdate(data,'');
+    if(allowAutoRetry&&isColabWorkerRefreshing(data)){
+      scheduleColabFollowUp(gen);
+    }
+    return data;
+  }).catch(err=>{
+    if(!token||signal.aborted||gen!==colabFetchGen||err?.name==='AbortError')return null;
+    colabLoading=false;
+    const rawMsg=err?.message||'colab_unconfigured';
+    const labels=typeof colabErrorLabels!=='undefined'?colabErrorLabels:null;
+    const reason=labels?.[rawMsg]||rawMsg;
+    applyColabOverviewUpdate(null,reason);
+    return null;
+  });
+}
 
 const SVG_NS='http://www.w3.org/2000/svg';
 function svgEl(tag,attrs={},cls=''){
@@ -466,6 +547,18 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
   const pillsBox=$('cloud-colab-pills'),kpiBox=$('cloud-colab-kpis');
   if(!pillsBox||!kpiBox)return;
   if(!colab){
+    if(colabLoading&&!unavailReason){
+      setColabSyncNote('cloud-colab-sync-note',null,'正在后台同步最新 CU 余额…');
+      pillsBox.replaceChildren(pill('正在同步 Colab 状态…','muted'));
+      kpiBox.replaceChildren(
+        kpiCard('Colab CU 余额','同步中…','正在后台同步最新 CU 余额…',''),
+        kpiCard('今日作业','同步中…','非阻塞加载中',''),
+        kpiCard('近 '+cloudTrendDays+' 天 CU 消耗','同步中…','非阻塞加载中',''),
+        kpiCard('热会话保活','同步中…','仅 L4/T4 支持短时热保活','')
+      );
+      return;
+    }
+    setColabSyncNote('cloud-colab-sync-note',null,'');
     pillsBox.replaceChildren(...[
       pill('Colab 算力暂不可用','muted'),
       unavailReason?pill(unavailReason,'warn'):null
@@ -480,6 +573,8 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
     return;
   }
   const w=colab.worker||{},c=colab.config||{},t=colab.today||{};
+  const refreshing=isColabWorkerRefreshing(colab);
+  setColabSyncNote('cloud-colab-sync-note',colab);
   const norm=normalizeColabAnalytics(colab);
   const sum=norm.summary;
   const warm=norm.warmSessions;
@@ -491,14 +586,17 @@ function renderUnifiedCloudColab(colab,unavailReason=''){
   const windowJobs=cloudTrendDays===14?(sum.last_14d_jobs??null):(sum.last_30d_jobs??null);
   const warmHead=warm[0]||null;
 
-  pillsBox.replaceChildren(
-    colab.configured?(w.reachable?pill('Worker 在线','ok'):pill('Worker 离线','err')):pill('未配置 COLAB_WORKER_URL','muted'),
+  pillsBox.replaceChildren(...[
+    colab.configured?(w.reachable?pill('Worker 在线','ok'):refreshing?pill('正在连接 Worker…','warn'):pill('Worker 离线','err')):pill('未配置 COLAB_WORKER_URL','muted'),
     c.enabled?pill('调度开启 · 按模块自选 GPU','vertex'):pill('算力调度已暂停','warn'),
+    refreshing?pill('正在后台同步最新 CU 余额…','warn'):null,
     warm.length>0?pill('热机保活中 · '+warm.length+' 会话（'+String(warmHead.gpu||'L4')+' 剩余 '+formatTtlCompact(warmHead.remaining_ttl_seconds)+'）','ok'):(accel?.warm_pool_enabled?pill('热保活待命（'+((accel.warm_allowed_gpus||['L4','T4']).join('/'))+'）','muted'):pill('热保活未启用','muted'))
-  );
-  const cuNote=w.reachable?'账号实时 Compute Units 余额':(w.error?('Worker 离线：'+(colabErrorLabels?.[w.error]||w.error)):'Worker 离线时暂不可查询');
+  ].filter(Boolean));
+  const cuNote=refreshing
+    ?(cuAvail!=null?'正在后台同步最新 CU 余额…（当前为缓存值）':'正在后台同步最新 CU 余额…')
+    :(w.reachable?'账号实时 Compute Units 余额':(w.error?('Worker 离线：'+(colabErrorLabels?.[w.error]||w.error)):'Worker 离线时暂不可查询'));
   kpiBox.replaceChildren(
-    kpiCard('Colab CU 余额',cuAvail!=null?cuAvail.toFixed(2)+' CU':'未知',cuNote,cuAvail!=null?(cuAvail<2?'warn':'ok'):''),
+    kpiCard('Colab CU 余额',cuAvail!=null?cuAvail.toFixed(2)+' CU':(refreshing?'同步中…':'未知'),cuNote,cuAvail!=null?(cuAvail<2?'warn':'ok'):''),
     kpiCard('今日作业',jobsCount+' 次','累计 '+Number(sum.total_jobs??0)+' 次 · 成功率 '+(sum.success_rate!=null?pctText(sum.success_rate):'—')+(sum.derived_legacy?'（近 30 条估算）':''),''),
     kpiCard('近 '+cloudTrendDays+' 天 CU 消耗',windowCu!=null?Number(windowCu).toFixed(3)+' CU':todayCu.toFixed(2)+' CU（今日）',windowCu!=null?('近 '+cloudTrendDays+' 天 '+Number(windowJobs??0)+' 次作业 · 累计 '+Number(sum.total_cu_used??0).toFixed(3)+' CU'):'旧版引擎暂未返回周期聚合','accent'),
     kpiCard('热会话保活',warm.length>0?(warm.length+' 活跃 · '+String(warmHead.gpu||'L4')):'0 活跃',warm.length>0?('剩余 TTL '+formatTtlCompact(warmHead.remaining_ttl_seconds)+' · 复用 '+Number(warmHead.reuse_count||0)+' 次'):(accel?.warm_pool_enabled?'L4/T4 完工后短时保活':'H100/A100/G4 不保活'),warm.length>0?'ok':'')
@@ -590,10 +688,13 @@ function renderOverviewRoutingGcp(d,prov,gcp,colab){
   if(gCfg?.monitoring_enabled||gSummary?.monitoring_enabled||(monStatus&&monStatus!=='not_synced'))pills.append(monStatusPill(monStatus));
   const colabNorm=colabConfigured?normalizeColabAnalytics(colab):null;
   const colabWorker=colab?.worker||{};
+  const colabRefreshing=colabConfigured&&isColabWorkerRefreshing(colab);
   const warmList=colabNorm?.warmSessions||[];
+  setColabSyncNote('overview-colab-sync-note',colabConfigured?colab:null,colabRefreshing?'正在后台同步最新 CU 余额…':'');
   if(colabConfigured){
     const cuVal=colabWorker.compute_units!=null?Number(colabWorker.compute_units):null;
-    pills.append(colabWorker.reachable?pill('Colab 在线'+(cuVal!=null?' · '+cuVal.toFixed(2)+' CU':''),'ok'):pill('Colab Worker 离线','warn'));
+    pills.append(colabWorker.reachable?pill('Colab 在线'+(cuVal!=null?' · '+cuVal.toFixed(2)+' CU':''),'ok'):colabRefreshing?pill('Colab 正在后台同步…','warn'):pill('Colab Worker 离线','warn'));
+    if(colabRefreshing)pills.append(pill('正在后台同步最新 CU 余额…','warn'));
     if(warmList.length>0)pills.append(pill('热机保活 '+warmList.length+' · '+String(warmList[0].gpu||'L4'),'vertex'));
   }
   if(balActive||(bqActive&&bqView)||colabConfigured){
@@ -620,10 +721,14 @@ function renderOverviewRoutingGcp(d,prov,gcp,colab){
     if(colabConfigured){
       const cuVal=colabWorker.compute_units!=null?Number(colabWorker.compute_units):null;
       const tToday=colab.today||{};
-      const warmNote=warmList.length>0?('热机 '+String(warmList[0].gpu||'L4')+' 剩余 '+formatTtlCompact(warmList[0].remaining_ttl_seconds)):('今日 '+Number(tToday.jobs_count??0)+' 次作业 · '+Number(tToday.cu_used??0).toFixed(2)+' CU');
-      strip.append(kpiCard('Colab CU 余额',cuVal!=null?cuVal.toFixed(2)+' CU':(colabWorker.reachable?'未知':'离线'),warmNote,warmList.length>0?'ok':(cuVal!=null&&cuVal<2?'warn':'')));
+      const warmNote=colabRefreshing
+        ?'正在后台同步最新 CU 余额…'
+        :(warmList.length>0?('热机 '+String(warmList[0].gpu||'L4')+' 剩余 '+formatTtlCompact(warmList[0].remaining_ttl_seconds)):('今日 '+Number(tToday.jobs_count??0)+' 次作业 · '+Number(tToday.cu_used??0).toFixed(2)+' CU'));
+      strip.append(kpiCard('Colab CU 余额',cuVal!=null?cuVal.toFixed(2)+' CU':(colabRefreshing?'同步中…':colabWorker.reachable?'未知':'离线'),warmNote,warmList.length>0?'ok':(cuVal!=null&&cuVal<2?'warn':'')));
     }
   }
+  const detailsFold=$('overview-cloud-details');
+  if(detailsFold&&(strip.hidden||u.exhausted||d.budget_status?.hard_stop))detailsFold.open=true;
 }
 
 const laneNames={chat:'主对话',patrol:'B 站巡逻',memory:'记忆',memory_flex:'记忆 Flex',admin:'管理测试',proactive:'世界引擎与主动生成',search:'联网检索'};
@@ -659,25 +764,25 @@ async function fetchOverviewPayload(){
 
 async function dashboard(initial,{lightweight=false}={}){
   const signal=sessionRequests.signal;
-  let d,prov=cachedProvidersOverview,gcp=cachedGcpOverview,colab=cachedColabOverview;
+  let d,prov=cachedProvidersOverview,gcp=cachedGcpOverview;
   if(lightweight){
     d=initial??await fetchOverviewPayload();
     if(!token||signal.aborted)return;
   }else{
-    const [dashRes,provRes,gcpRes,colabRes]=await Promise.allSettled([
+    // Colab 算力状态独立并发拉取，绝不阻塞主总览首屏渲染。
+    refreshColabAsync({force:false,allowAutoRetry:true});
+    const [dashRes,provRes,gcpRes]=await Promise.allSettled([
       initial??fetchOverviewPayload(),
       api('global/providers'),
-      api('gcp-billing'),
-      api('colab')
+      api('gcp-billing')
     ]);
     if(dashRes.status!=='fulfilled')throw dashRes.reason;
     if(!token||signal.aborted)return;
     d=dashRes.value;
     if(provRes.status==='fulfilled'){prov=provRes.value;cachedProvidersOverview=prov;}
     if(gcpRes.status==='fulfilled'){gcp=gcpRes.value;cachedGcpOverview=gcp;}
-    if(colabRes.status==='fulfilled'){colab=colabRes.value;cachedColabOverview=colab;colabUnavailableReason='';}
-    else{colab=null;}
   }
+  lastOverviewDash=d;
   displayZone=d.usage.timezone||d.usage.budget_timezone||'Asia/Shanghai';
   text('sidebar-zone',zoneLabel(displayZone));
   stampDashboard();
@@ -720,7 +825,7 @@ async function dashboard(initial,{lightweight=false}={}){
   text('budget-left',usd(Math.max(0,limit-spent)));
   text('rate-label',d.minute_requests+' / '+d.minute_limit);
   renderLanes(breakdown,breakdownTotal);
-  renderOverviewRoutingGcp(d,prov,gcp,colab);
+  renderOverviewRoutingGcp(d,prov,gcp,cachedColabOverview);
 }
 
 function appendGrantRow(g){
@@ -906,7 +1011,11 @@ $('cloud-sync-mon').addEventListener('click',e=>busy(e.target,async()=>{
 }));
 $('cloud-refresh').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('ledger','刷新统一云资源')))return;
-  const [gcpRes,balRes,colabRes]=await Promise.allSettled([api('gcp-billing'),api('account-balance'),api('colab')]);
+  const [gcpRes,balRes]=await Promise.allSettled([
+    api('gcp-billing'),
+    api('account-balance'),
+    refreshColabAsync({force:true,allowAutoRetry:false})
+  ]);
   if(!token)return;
   if(balRes.status==='fulfilled')accountBalanceState=balRes.value;
   if(gcpRes.status==='fulfilled'){
@@ -916,17 +1025,7 @@ $('cloud-refresh').addEventListener('click',e=>busy(e.target,async()=>{
   }else{
     renderUnifiedCloudGcp(gcpBillingState,accountBalanceState,lastLedgerDash?.usage);
   }
-  if(colabRes.status==='fulfilled'){
-    cachedColabOverview=colabRes.value;
-    colabUnavailableReason='';
-    renderUnifiedCloudColab(cachedColabOverview,'');
-  }else{
-    cachedColabOverview=null;
-    const rawMsg=colabRes.reason?.message||'colab_unconfigured';
-    colabUnavailableReason=colabErrorLabels?.[rawMsg]||rawMsg;
-    renderUnifiedCloudColab(null,colabUnavailableReason);
-  }
-  notice('已刷新统一云资源总览');
+  notice('已刷新统一云资源总览（含 Colab 实时余额）');
 }));
 $('refresh-gcp-billing').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('ledger','刷新账单状态')))return;
@@ -960,8 +1059,10 @@ $('gcp-clear-sa').addEventListener('click',e=>busy(e.target,async()=>{
   renderGcpBilling(g);notice('已清除独立 Service Account 覆盖');
 }));
 
-async function ledger(){
-  const [dashRes,polRes,gcpRes,balRes,colabRes]=await Promise.allSettled([api('global/dashboard'),api('budget'),api('gcp-billing'),api('account-balance'),api('colab')]);
+async function ledger({forceColabRefresh=false}={}){
+  // Colab 算力与余额独立并发拉取，主账本返回后立刻完成整页渲染。
+  refreshColabAsync({force:forceColabRefresh,allowAutoRetry:!forceColabRefresh});
+  const [dashRes,polRes,gcpRes,balRes]=await Promise.allSettled([api('global/dashboard'),api('budget'),api('gcp-billing'),api('account-balance')]);
   if(dashRes.status!=='fulfilled')throw dashRes.reason;
   if(polRes.status!=='fulfilled')throw polRes.reason;
   const d=dashRes.value,policy=polRes.value;
@@ -987,6 +1088,7 @@ async function ledger(){
   const cacheHealth=usage.cache_health||{};
   text('cache-alert',cacheHealth.prefix_busts_today?'⚠ 今日前缀异常击穿 '+cacheHealth.prefix_busts_today+' 次，请查看安全日志及截断、配置变更时间':'今日未记录前缀异常击穿；有效覆盖率稳态目标 ≥90%');
   $('cache-alert').className=cacheHealth.prefix_busts_today?'error':'muted';
+  if(cacheHealth.prefix_busts_today&&$('ledger-fold-work-cache'))$('ledger-fold-work-cache').open=true;
   const h=usage.history||{};
   text('ledger-coverage','观测记录起点 '+(h.since_utc||'尚无记录')+(h.lifetime_call_count_complete===false?' · 旧累计调用明细不完整':'')+(h.legacy_unattributed_microdollars?' · 旧累计中 '+money(h.legacy_unattributed_microdollars)+' 无可追溯用量明细':''));
   for(const [k,id] of [['daily_usd','budget-daily'],['monthly_usd','budget-monthly'],['user_daily_usd','budget-user'],['patrol_daily_usd','budget-patrol'],['memory_daily_usd','budget-memory'],['proactive_daily_usd','budget-proactive'],['admin_daily_usd','budget-admin']])$(id).value=policy.config[k];
@@ -997,16 +1099,7 @@ async function ledger(){
   table('budget-periods',['范围','账单扣账额','上限'],[['今日 '+(b.day_local||b.day||b.day_utc||''),money(b.daily),money(b.daily_limit)],['本月 '+(b.month_local||b.month||b.month_utc||''),money(b.monthly),money(b.monthly_limit)],['累计总上限（.env）',money(b.total),Number(b.total_limit)===0?'未设累计上限':money(b.total_limit)],['单用户今日最高',money(b.user_top_daily||0),money(b.user_daily_limit??0)],['B 站巡逻今日',money(sb.patrol?.used||0),money(sb.patrol?.limit??0)],['记忆提炼今日',money(sb.memory?.used||0),money(sb.memory?.limit??0)],['世界引擎与主动生成今日',money(sb.proactive?.used||0),money(sb.proactive?.limit??0)],['管理沙盒今日',money(sb.admin?.used||0),money(sb.admin?.limit??0)]]);
   if(gcpVal)renderGcpBilling(gcpVal);
   else renderUnifiedCloudGcp(null,balVal,usage);
-  if(colabRes.status==='fulfilled'){
-    cachedColabOverview=colabRes.value;
-    colabUnavailableReason='';
-    renderUnifiedCloudColab(cachedColabOverview,'');
-  }else{
-    cachedColabOverview=null;
-    const rawReason=colabRes.reason?.message||'colab_unconfigured';
-    colabUnavailableReason=colabErrorLabels?.[rawReason]||rawReason;
-    renderUnifiedCloudColab(null,colabUnavailableReason);
-  }
+  renderUnifiedCloudColab(cachedColabOverview,colabUnavailableReason);
 }
 $('budget-policy').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('budget','PUT',{daily_usd:$('budget-daily').value,monthly_usd:$('budget-monthly').value,user_daily_usd:$('budget-user').value,patrol_daily_usd:$('budget-patrol').value,memory_daily_usd:$('budget-memory').value,proactive_daily_usd:$('budget-proactive').value,admin_daily_usd:$('budget-admin').value});notice('全局与分项预算已保存并立即生效');await ledger();});});
 $('reset-budget').addEventListener('click',e=>busy(e.target,async()=>{
@@ -1035,7 +1128,7 @@ $('clear-balance').addEventListener('click',e=>busy(e.target,async()=>{
 }));
 $('refresh-ledger').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('ledger','刷新账本')))return;
-  await ledger();
+  await ledger({forceColabRefresh:true});
 }));
 
 trackDirty('balance-form','手动余额校准');
@@ -1045,17 +1138,23 @@ trackDirty('gcp-sa-form','独立 Service Account');
 trackDirty('budget-policy','全局与分项预算');
 
 onLogout(()=>{
+  clearColabAutoRefresh();
+  colabFetchGen++;
+  colabLoading=false;
   gcpBillingState=null;
   accountBalanceState=null;
   cachedProvidersOverview=null;
   cachedGcpOverview=null;
   cachedColabOverview=null;
   colabUnavailableReason='';
+  lastOverviewDash=null;
   lastLedgerDash=null;
   cloudTrendDays=14;
   syncTrendButtons();
   for(const id of ['stat-calls','stat-injection','stat-noise','stat-uptime','budget-spend','budget-left','pipeline-state','image-cache'])text(id,'—');
-  for(const id of ['overview-day','budget-limit','budget-label','budget-percent','rate-label','overview-gcp-note','unified-balance-note','balance-status','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','budget-source','ledger-coverage','cache-alert','cloud-gcp-sync-meta','cloud-cu-chart-note','cloud-accel-note','colab-cu-chart-note','colab-accel-note'])text(id,'');
+  for(const id of ['overview-day','budget-limit','budget-label','budget-percent','rate-label','overview-gcp-note','overview-colab-sync-note','cloud-colab-sync-note','unified-balance-note','balance-status','gcp-bq-status','gcp-bq-lag-info','gcp-sa-status','gcp-mon-status','budget-source','ledger-coverage','cache-alert','cloud-gcp-sync-meta','cloud-cu-chart-note','cloud-accel-note','colab-cu-chart-note','colab-accel-note'])text(id,'');
+  $('overview-colab-sync-note').hidden=true;
+  $('cloud-colab-sync-note').hidden=true;
   for(const id of ['cloud-trend-readout','colab-trend-readout'])text(id,'悬停或选中柱条查看单日明细');
   text('cloud-gcp-credit-label','等待同步');
   $('cloud-gcp-credit-bar').value=0;

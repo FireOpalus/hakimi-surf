@@ -57,6 +57,22 @@ class _GeminiGenerateMixin:
     """Mixin implementing `generate()`, `cleanup_video_files()`, and `watch_video()`."""
 
     @staticmethod
+    def _resolve_channel_prompt(platform: str, self_id: str, platform_mod: Any) -> str:
+        if platform_mod is not None:
+            fn = getattr(platform_mod, "channel_prompt", None)
+            if callable(fn):
+                prompt = fn(self_id, platform)
+                if isinstance(prompt, str) and prompt.strip():
+                    return prompt
+        if platform in {"onebot", "qq"}:
+            try:
+                from .modules import QQSocialModule
+            except ImportError:
+                return ""
+            return QQSocialModule.qq_channel_prompt(self_id)
+        return ""
+
+    @staticmethod
     def _normalize_generate_content(chunks: list[Any]) -> Any:
         text_parts: list[str] = []
         finish_reason: Any = None
@@ -318,12 +334,17 @@ class _GeminiGenerateMixin:
             raise Rejected("owner_private_only")
         platform = message.platform if message else "onebot"
         qq_surface = platform in {"onebot", "qq"}
-        platform_mod = None if qq_surface else chat_module(self.s, platform)
+        platform_mod = chat_module(self.s, platform)
         sticker_surface = qq_surface or bool(
             platform_mod and getattr(platform_mod, "supports_sticker", False)
         )
-        self_id = self.s.onebot_self_id if qq_surface else message.bot_id
-        system = SYSTEM_INSTRUCTION + context.persona + identity_anchor(self_id, platform)
+        self_id = self.s.onebot_self_id if qq_surface else (message.bot_id if message else "")
+        channel_prompt = self._resolve_channel_prompt(platform, self_id, platform_mod)
+        system = (
+            SYSTEM_INSTRUCTION
+            + context.persona
+            + identity_anchor(self_id, platform, channel_prompt=channel_prompt)
+        )
         if context.private_owner:
             system += (
                 "\n【单向公开背景规则】近期群聊巡逻记忆只来自已参与过的公开互动，"
@@ -437,6 +458,7 @@ class _GeminiGenerateMixin:
                 self_id,
                 memes.protocol_prompt if memes and allow_memes else "",
                 platform=platform,
+                channel_prompt=channel_prompt,
             )
         elif scenario != Scenario.MEMORY_COMPRESSION:
             system += context.instruction

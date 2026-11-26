@@ -33,6 +33,7 @@ from ..platform_hooks import (
 from ..plugin_kernel import PluginContext, PluginKernel
 from ..screen_watch import decode_ws_json_frame
 from ..security import Rejected, clean_text, configured_secrets
+from ..social_chat_config import RemoteChatConfig, load_remote_chat_config
 from ..thinking_policy import ThinkingScene
 from .ai_gateway import PluginBusAIGatewayMixin
 from .blob import PluginBusBlobMixin
@@ -646,6 +647,69 @@ class PluginBus(
             "status": sess.proxy.status_dict(),
         }
 
+    def get_chat_proxy(self, platform: str) -> RemoteModuleProxy | None:
+        """Return the active online RemoteModuleProxy serving `platform`, if connected."""
+        if not isinstance(platform, str) or not platform:
+            return None
+        for sess in self._sessions.values():
+            if (
+                sess.ready
+                and not sess.closed
+                and "chat" in sess.scopes
+                and sess.proxy is not None
+                and platform in sess.proxy.chat_platforms
+            ):
+                return sess.proxy
+        return None
+
+    async def push_remote_chat_config(
+        self,
+        platform: str,
+        config: RemoteChatConfig | dict[str, Any] | None,
+        *,
+        reset_to_env: bool = False,
+    ) -> bool:
+        """Hot-push a remote social chat config (or env reset) to the online plugin."""
+        proxy = self.get_chat_proxy(platform)
+        if proxy is None:
+            return False
+        return await proxy.push_config(config, platform=platform, reset_to_env=reset_to_env)
+
+    async def _push_persisted_chat_configs(
+        self,
+        session: _PluginSession,
+        configs: list[tuple[str, RemoteChatConfig]],
+    ) -> None:
+        proxy = session.proxy
+        if proxy is None:
+            return
+        for plat, cfg in configs:
+            if session.closed or not session.ready:
+                return
+            try:
+                pushed = await proxy.push_config(cfg, platform=plat)
+                if pushed:
+                    log.info(
+                        "event=plugin_chat_config_pushed plugin=%s platform=%s groups=%d",
+                        session.plugin_id,
+                        plat,
+                        len(cfg.allowed_groups),
+                    )
+                else:
+                    log.warning(
+                        "event=plugin_chat_config_push_failed plugin=%s platform=%s",
+                        session.plugin_id,
+                        plat,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning(
+                    "event=plugin_chat_config_push_failed plugin=%s platform=%s",
+                    session.plugin_id,
+                    plat,
+                )
+
     async def invoke_tool(
         self,
         plugin_id: str,
@@ -1233,6 +1297,7 @@ class PluginBus(
             )
 
             became_ready = False
+            persisted_chat_configs: list[tuple[str, RemoteChatConfig]] = []
 
             # Register LIFO cleanup effects (reverse execution order:
             # 3rd registered -> runs 1st: cancel pending RPCs + mark in-flight deliveries uncertain
@@ -1342,6 +1407,19 @@ class PluginBus(
                     modules.register(proxy)
                     self.s._thinking_scenes = modules.thinking_scenes
                 if "chat" in scope_set and chat_platforms:
+                    for plat in chat_platforms:
+                        try:
+                            saved_cfg = await load_remote_chat_config(
+                                self.store, plat, settings=self.s
+                            )
+                        except Exception:
+                            saved_cfg = None
+                        if saved_cfg is not None:
+                            proxy.apply_remote_config(saved_cfg, platform=plat)
+                            if isinstance(getattr(self.s, "group_policies", None), dict):
+                                for gid in saved_cfg.allowed_groups:
+                                    self.s.group_policies.setdefault(f"{plat}:{gid}", "at_only")
+                            persisted_chat_configs.append((plat, saved_cfg))
                     hooks = PlatformPolicyHooks(
                         authorize=lambda msg, settings, *, _bot_exempt=False, p=proxy: (
                             p.authorize_chat(msg, settings, bot_exempt=_bot_exempt)
@@ -1483,6 +1561,11 @@ class PluginBus(
 
         reader_task = ctx.spawn(_reader(), name=f"plugin-reader:{pid}")
         heartbeat_task = ctx.spawn(_heartbeat(), name=f"plugin-heartbeat:{pid}")
+        if persisted_chat_configs:
+            ctx.spawn(
+                self._push_persisted_chat_configs(session, persisted_chat_configs),
+                name=f"plugin-config-sync:{pid}",
+            )
         try:
             done, _ = await asyncio.wait(
                 [reader_task, heartbeat_task], return_when=asyncio.FIRST_COMPLETED

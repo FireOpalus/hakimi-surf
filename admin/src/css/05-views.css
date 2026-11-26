@@ -670,3 +670,75 @@ body:not(.authenticated) main {
 .cloud-meter-row progress[data-tone=vertex] { --fill: var(--vertex-ink); }
 .cloud-meter-row progress[data-tone=warn] { --fill: var(--warn); }
 .cloud-accel-note { margin: 12px 0 0; font-size: var(--fs-sm); }
+.cloud-sync-note { margin: 4px 0 10px; font-size: var(--fs-sm); }
+
+/* Telegram 社交接入与热配置 + 跨平台群徽标 */
+.tg-config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr));
+  gap: 14px;
+  margin: 12px 0 14px;
+}
+.tg-list-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.tg-item-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+.tg-item-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+}
+.tg-item-main label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  cursor: pointer;
+}
+.tg-privacy-box {
+  margin: 12px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--warn-line);
+  border-left-width: 3px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--warn-bg) 52%, var(--card));
+}
+.tg-privacy-box label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 4px;
+  color: var(--ink);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  cursor: pointer;
+}
+.tg-privacy-box p { margin: 4px 0 0; font-size: var(--fs-xs); line-height: 1.55; }
+.platform-cell {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+.pill-tg {
+  background: color-mix(in srgb, var(--vertex-bg) 78%, var(--free-bg));
+  color: var(--vertex-ink);
+  border-color: var(--vertex-line);
+}

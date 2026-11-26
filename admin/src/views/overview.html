@@ -48,8 +48,14 @@
         <button id="overview-go-ledger" type="button" class="secondary" data-open-tab="ledger">统一云资源与账本</button>
       </div>
     </div>
-    <div id="overview-routing-pills" class="pill-row"></div>
+    <p id="overview-colab-sync-note" class="muted cloud-sync-note" aria-live="polite" hidden></p>
     <div id="overview-gcp-strip" class="kpi-strip" hidden></div>
-    <p id="overview-gcp-note" class="muted"></p>
+    <details id="overview-cloud-details" class="panel-fold">
+      <summary>通道路由与云账单诊断详情<span class="fold-hint">通道状态 · 对账水印</span></summary>
+      <div class="panel-fold-body">
+        <div id="overview-routing-pills" class="pill-row"></div>
+        <p id="overview-gcp-note" class="muted"></p>
+      </div>
+    </details>
   </div>
 </section>

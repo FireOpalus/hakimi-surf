@@ -39,9 +39,9 @@ HELP = """哈基米在这里。私聊可直接提问或发 B 站视频；群聊�
 以下功能仅限配置中的主人私聊使用：
 /deep <问题或视频链接>：本次启用 high 档深度分析
 /set-sign <签名>：手动设置 50 字以内纯文本 QQ 个签
-/mute <QQ> 或 /unmute <QQ>：应用层屏蔽或解除（默认不删好友）
+/mute <QQ 或 平台:账号> 或 /unmute <QQ 或 平台:账号>：应用层屏蔽或解除（默认不删好友）
 /mute-approve <编号> 或 /mute-reject <编号>：批准或驳回屏蔽申请
-（如需同时删除好友，须在 /mute 或 /mute-approve 末尾加 --delete-friend）
+（仅 QQ（OneBot）账号支持在 /mute 或 /mute-approve 末尾加 --delete-friend 同时删除好友）
 /affection [QQ] [分数]（或 /好感度）：查看或调整指定用户好感度档案（仅主人私聊）
 /学歌 <歌名> [engine=dual|yingmusic_svc|seed_vc|rvc] [ref=干声] [pitch=-24..24]（或 /learn-song）：
   提交 Colab 学歌任务（可附带音频）

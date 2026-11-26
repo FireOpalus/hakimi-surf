@@ -579,6 +579,55 @@ details[open] > summary::before { transform: rotate(45deg) translate(-1px, -1px)
 .table-details[open] > summary { margin-bottom: 0; }
 .table-details > .table, .table-details > p { margin: 0 16px 16px; }
 
+/* 分层折叠面板（低频明细与高级配置减负） */
+details.panel-fold {
+  margin: 14px 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--card-2) 86%, transparent);
+  overflow: hidden;
+  transition: border-color .18s ease, box-shadow .2s ease;
+}
+details.panel-fold:hover { border-color: var(--line-strong); }
+details.panel-fold[open] {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--line-strong));
+  box-shadow: 0 4px 16px var(--glow-1);
+}
+details.panel-fold > summary {
+  padding: 13px 16px;
+  font-size: var(--fs-md);
+  font-weight: 660;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--soft-2) 55%, transparent);
+  user-select: none;
+}
+details.panel-fold[open] > summary {
+  margin-bottom: 0;
+  border-bottom: 1px dashed var(--line);
+}
+details.panel-fold > summary .fold-hint {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  font-weight: 550;
+  color: var(--muted);
+}
+.panel-fold-body {
+  padding: 14px 16px 16px;
+}
+.panel-fold-body > :first-child { margin-top: 0; }
+.panel-fold-body > :last-child { margin-bottom: 0; }
+details.panel-fold-nested {
+  margin: 12px 0;
+  border-radius: 12px;
+  background: var(--card);
+}
+details.panel-fold-nested > summary {
+  padding: 10px 14px;
+  font-size: var(--fs-sm);
+  background: transparent;
+}
+
 /* 语音网关 Provider 折叠卡 */
 details.provider-fold {
   margin: 12px 0;

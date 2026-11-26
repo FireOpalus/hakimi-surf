@@ -1599,7 +1599,7 @@ def test_p2_chat_actions_response_format_and_static_prefix_integrity(settings, m
     # ACTION_INSTRUCTION and static prompt prefixes remain byte-identical (KV cache stability).
     assert (
         hashlib.sha256(ACTION_INSTRUCTION.encode("utf-8")).hexdigest()
-        == "545814e140335920327aff073021c72cf9a3a1f4abed9d8ad5a638b054879f14"
+        == "e3ecdd1d2ec6054cea31d59efdeeb2a4bac8d5897862013c4958a63d6c4ec98d"
     )
     pool = StaticPrefixes()
     buckets = {

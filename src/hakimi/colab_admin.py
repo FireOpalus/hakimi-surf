@@ -56,7 +56,13 @@ def _raise_http(exc: Rejected) -> NoReturn:
 @router.get("")
 async def colab_overview(request: Request):
     compute = _compute(request)
-    return await compute.admin_overview()
+    return await compute.admin_overview(force_refresh=False)
+
+
+@router.post("/refresh")
+async def colab_refresh_overview(request: Request):
+    compute = _compute(request)
+    return await compute.admin_overview(force_refresh=True)
 
 
 @router.put("")
@@ -67,7 +73,7 @@ async def colab_update_config(request: Request):
         current = compute.config.model_dump(mode="json")
         cfg = await partial_body(request, current, ColabConfig)
         await compute.set_config(cfg)
-        return await compute.admin_overview()
+        return await compute.admin_overview(force_refresh=False)
 
 
 @router.delete("")
@@ -75,7 +81,7 @@ async def colab_reset_config(request: Request):
     compute = _compute(request)
     async with domain_lock(request, "colab_compute"):
         await compute.set_config(None)
-        return await compute.admin_overview()
+        return await compute.admin_overview(force_refresh=False)
 
 
 @router.post("/jobs")

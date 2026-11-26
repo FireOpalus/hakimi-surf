@@ -46,6 +46,19 @@ _ALLOWED_AUDIO_EXTENSIONS = frozenset(
     {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".webm"}
 )
 _NUMERIC_ID_RE = re.compile(r"^-?[0-9]{1,24}\Z")
+_MAX_CONFIG_IDS = 100
+_TELEGRAM_CAPABILITIES: tuple[str, ...] = (
+    "voice",
+    "voice_blob",
+    "reply_anchor",
+    "proactive_speak",
+    "sticker",
+    "rich_card",
+    "emoji_like",
+    "typing",
+    "quick_ack",
+    "media_blob",
+)
 _B23_PATH_RE = re.compile(r"^/[A-Za-z0-9]{1,32}\Z")
 _TG_REACTION_EMOJI_MAP: dict[str, str] = {
     "👍": "👍",
@@ -293,6 +306,16 @@ class TelegramPlugin:
         self.private_mode: Literal["owner_only", "owner_and_allowlist"] = (
             "owner_and_allowlist" if private_mode == "owner_and_allowlist" else "owner_only"
         )
+        self.memory_mirror_enabled: bool = False
+        self._config_source: Literal["env", "admin"] = "env"
+        self._env_defaults: dict[str, Any] = {
+            "allowed_groups": sorted(self.allowed_groups),
+            "proactive_groups": sorted(self.proactive_groups),
+            "private_mode": self.private_mode,
+            "allowed_users": sorted(self.allowed_users),
+            "memory_mirror_enabled": False,
+        }
+        self._tg_connected: bool = False
         self.poll_timeout = max(5, min(int(poll_timeout), 50))
         self.enable_polling = bool(enable_polling)
         self.clock = clock if clock is not None else time.time
@@ -321,18 +344,7 @@ class TelegramPlugin:
             scopes=("chat", "media", "sensors"),
             node_region="KR",
             chat_platforms=("telegram",),
-            capabilities=(
-                "voice",
-                "voice_blob",
-                "reply_anchor",
-                "proactive_speak",
-                "sticker",
-                "rich_card",
-                "emoji_like",
-                "typing",
-                "quick_ack",
-                "media_blob",
-            ),
+            capabilities=_TELEGRAM_CAPABILITIES,
             voice_format="ogg_opus",
             attention_level="LOW",
             reconnect_min=reconnect_min,
@@ -355,6 +367,7 @@ class TelegramPlugin:
         self.client.on_react_delivery(self._handle_react_delivery)
         self.client.on_typing_delivery(self._handle_typing_delivery)
         self.client.on_media_fetch(self._handle_media_fetch)
+        self.client.on_config_update(self._handle_config_update)
 
     def _status_snapshot(self, *, connected: bool) -> dict[str, Any]:
         return {
@@ -363,8 +376,20 @@ class TelegramPlugin:
             "bot_username": self.bot_username,
             "owner_configured": bool(self.owner_user_id),
             "private_mode": self.private_mode,
+            "allowed_groups": sorted(self.allowed_groups),
+            "allowed_users": sorted(self.allowed_users),
             "allowed_groups_count": len(self.allowed_groups),
             "proactive_groups": sorted(self.proactive_groups),
+            "memory_mirror_enabled": bool(self.memory_mirror_enabled),
+            "config_source": self._config_source,
+            "capabilities": list(_TELEGRAM_CAPABILITIES),
+            "env_defaults": {
+                "allowed_groups": list(self._env_defaults["allowed_groups"]),
+                "proactive_groups": list(self._env_defaults["proactive_groups"]),
+                "private_mode": self._env_defaults["private_mode"],
+                "allowed_users": list(self._env_defaults["allowed_users"]),
+                "memory_mirror_enabled": bool(self._env_defaults["memory_mirror_enabled"]),
+            },
             "rx_count": self._rx_count,
             "tx_count": self._tx_count,
             "last_error": self._last_error,
@@ -430,8 +455,10 @@ class TelegramPlugin:
             self.bot_id = str(me["id"])
             self.bot_username = str(me.get("username") or "").strip()
             self._last_error = ""
+            self._tg_connected = True
         except TelegramApiError as exc:
             self._last_error = exc.code
+            self._tg_connected = False
             log.warning("event=tg_get_me_failed code=%s", exc.code)
             await self.client.push_status(
                 self._status_snapshot(connected=False),
@@ -1200,6 +1227,101 @@ class TelegramPlugin:
             mime_type=guessed_mime,
             filename=fname,
         )
+
+    @staticmethod
+    def _validate_config_id_list(raw: Any, *, field_name: str) -> set[str]:
+        if not isinstance(raw, list | tuple):
+            raise PluginRpcError("invalid_config", f"{field_name} must be a list")
+        if len(raw) > _MAX_CONFIG_IDS:
+            raise PluginRpcError("invalid_config", f"{field_name} exceeds limit")
+        out: set[str] = set()
+        for item in raw:
+            if not isinstance(item, str) or not _NUMERIC_ID_RE.fullmatch(item):
+                raise PluginRpcError("invalid_config", f"invalid id in {field_name}")
+            out.add(item)
+        return out
+
+    async def _handle_config_update(self, params: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(params, dict):
+            raise PluginRpcError("invalid_config", "params must be an object")
+        platform = params.get("platform")
+        if platform is not None and str(platform) != "telegram":
+            raise PluginRpcError("invalid_config", "platform mismatch")
+
+        if params.get("reset_to_env") is True:
+            self.allowed_groups = set(self._env_defaults["allowed_groups"])
+            self.proactive_groups = set(self._env_defaults["proactive_groups"])
+            self.allowed_users = set(self._env_defaults["allowed_users"])
+            self.private_mode = self._env_defaults["private_mode"]
+            self.memory_mirror_enabled = bool(self._env_defaults["memory_mirror_enabled"])
+            self._config_source = "env"
+        else:
+            new_groups = (
+                self._validate_config_id_list(params["allowed_groups"], field_name="allowed_groups")
+                if "allowed_groups" in params
+                else set(self.allowed_groups)
+            )
+            new_users = (
+                self._validate_config_id_list(params["allowed_users"], field_name="allowed_users")
+                if "allowed_users" in params
+                else set(self.allowed_users)
+            )
+            if "proactive_groups" in params:
+                raw_proactive = self._validate_config_id_list(
+                    params["proactive_groups"], field_name="proactive_groups"
+                )
+                new_proactive = raw_proactive & new_groups
+            else:
+                new_proactive = set(self.proactive_groups) & new_groups
+
+            if "private_mode" in params:
+                raw_mode = params["private_mode"]
+                if raw_mode not in {"owner_only", "owner_and_allowlist"}:
+                    raise PluginRpcError("invalid_config", "invalid private_mode")
+                new_mode: Literal["owner_only", "owner_and_allowlist"] = raw_mode
+            else:
+                new_mode = self.private_mode
+
+            if "memory_mirror_enabled" in params:
+                raw_mirror = params["memory_mirror_enabled"]
+                if not isinstance(raw_mirror, bool):
+                    raise PluginRpcError("invalid_config", "memory_mirror_enabled must be bool")
+                new_mirror = raw_mirror
+            else:
+                new_mirror = self.memory_mirror_enabled
+
+            self.allowed_groups = new_groups
+            self.proactive_groups = new_proactive
+            self.allowed_users = new_users
+            self.private_mode = new_mode
+            self.memory_mirror_enabled = new_mirror
+            self._config_source = "admin"
+
+        snapshot = self._status_snapshot(connected=self._tg_connected)
+        if self.client.connected:
+            with contextlib.suppress(Exception):
+                await self.client.push_status(
+                    snapshot,
+                    configuration_issue=self.client._configuration_issue,
+                )
+        else:
+            self.client.set_status_cache(
+                snapshot,
+                configuration_issue=self.client._configuration_issue,
+            )
+        log.info(
+            "event=tg_config_updated source=%s groups=%d proactive=%d users=%d private_mode=%s",
+            self._config_source,
+            len(self.allowed_groups),
+            len(self.proactive_groups),
+            len(self.allowed_users),
+            self.private_mode,
+        )
+        return {
+            "applied": True,
+            "source": self._config_source,
+            "status": snapshot,
+        }
 
 
 def build_telegram_plugin_from_env(**overrides: Any) -> TelegramPlugin:

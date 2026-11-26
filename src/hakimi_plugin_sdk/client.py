@@ -601,6 +601,15 @@ class HakimiPluginClient:
 
         return _decorator(fn) if fn is not None else _decorator
 
+    def on_config_update(self, fn: Callable[..., Any] | None = None) -> Any:
+        """Decorator registering the `config.update` RPC handler."""
+
+        def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_rpc("config.update", target)
+            return target
+
+        return _decorator(fn) if fn is not None else _decorator
+
     def on_switch(self, fn: Callable[..., Any] | None = None) -> Any:
         """Decorator registering a handler for `module.switch` (`enabled: bool`)."""
 

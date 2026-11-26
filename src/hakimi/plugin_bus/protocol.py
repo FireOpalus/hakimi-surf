@@ -264,6 +264,17 @@ _VALID_VOICE_FORMATS = frozenset({"ogg_opus", "mp3", "wav"})
 _MAX_VOICE_AUDIO_BYTES = 2 * 1024 * 1024
 _MAX_MEDIA_IMAGE_BYTES = 5 * 1024 * 1024
 _VALID_MEDIA_KINDS = frozenset({"sticker", "card", "image"})
+CONFIG_UPDATE_RPC = "config.update"
+_RESERVED_CONTROL_RPCS = frozenset(
+    {
+        "delivery.send",
+        "delivery.send_voice",
+        "delivery.send_media",
+        "delivery.react",
+        "delivery.typing",
+        CONFIG_UPDATE_RPC,
+    }
+)
 
 
 def _hash_token(index_key: bytes, salt: str, token: str) -> str:
@@ -277,7 +288,7 @@ def _sanitize_payload(
     key_limit: int = 24,
     val_limit: int = 90,
     dict_limit: int = 48,
-    list_limit: int = 32,
+    list_limit: int = 100,
     depth: int = 0,
 ) -> Any:
     if depth > 6:

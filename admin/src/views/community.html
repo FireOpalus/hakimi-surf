@@ -31,9 +31,13 @@
         <button id="aff-reset-config" type="button" class="secondary" disabled>恢复默认策略</button>
       </div>
     </form>
-    <h3>7 阶好感度能力阶梯一览（Lv.0～Lv.6）</h3>
-    <p class="muted">全天下唯一 BOISER（Owner）最低保底 100 / 最高 120，Lv.6 独享 Carbon 深度推理（Tier 4）、2.50x 单日预算与群聊合批绝对优先护航；非 Owner 封顶 100（Lv.5 仅解锁至 Tier 3 与看原片），且禁止非 Owner 在对话中查询自己或他人的好感度分值与阶梯。</p>
-    <div id="aff-tiers-table" class="table"></div>
+    <details id="community-fold-tiers" class="panel-fold">
+      <summary>7 阶好感度能力阶梯一览（Lv.0～Lv.6）<span class="fold-hint">分值门槛 · 预算倍率 · 解锁能力</span></summary>
+      <div class="panel-fold-body">
+        <p class="muted">全天下唯一 BOISER（Owner）最低保底 100 / 最高 120，Lv.6 独享 Carbon 深度推理（Tier 4）、2.50x 单日预算与群聊合批绝对优先护航；非 Owner 封顶 100（Lv.5 仅解锁至 Tier 3 与看原片），且禁止非 Owner 在对话中查询自己或他人的好感度分值与阶梯。</p>
+        <div id="aff-tiers-table" class="table"></div>
+      </div>
+    </details>
   </div>
   <div class="card">
     <div class="row between">
@@ -65,15 +69,19 @@
       <label for="aff-search" class="aff-search-label">筛选档案 <input id="aff-search" class="aff-search-input" type="search" maxlength="128" placeholder="搜索 user_id / 昵称 / 阶梯 / 原因…"></label>
     </div>
     <div id="aff-users-table" class="table"></div>
-    <div class="row between aff-history-head">
-      <h3>好感度变动审计流水</h3>
-      <div class="row">
-        <span id="aff-history-scope" class="muted">最近全局 50 条加密审计流水</span>
-        <button id="aff-history-all" type="button" class="secondary">查看全部流水</button>
-        <button id="aff-history-refresh" type="button" class="secondary">刷新流水</button>
+    <details id="community-fold-history" class="panel-fold">
+      <summary>好感度变动审计流水<span class="fold-hint">加密审计 · 按需展开</span></summary>
+      <div class="panel-fold-body">
+        <div class="row between aff-history-head">
+          <span id="aff-history-scope" class="muted">最近全局 50 条加密审计流水</span>
+          <div class="row">
+            <button id="aff-history-all" type="button" class="secondary">查看全部流水</button>
+            <button id="aff-history-refresh" type="button" class="secondary">刷新流水</button>
+          </div>
+        </div>
+        <div id="aff-history-table" class="table"></div>
       </div>
-    </div>
-    <div id="aff-history-table" class="table"></div>
+    </details>
   </div>
   <div class="card"><div class="row between"><h2>讨厌鬼小黑屋</h2><button id="refresh-community" type="button" class="secondary">刷新</button></div>
     <p class="muted">应用层屏蔽，群聊与私聊都直接忽略。Owner 与机器人自身受保护。只有明确勾选并确认，才会顺带从好友列表移除。</p>

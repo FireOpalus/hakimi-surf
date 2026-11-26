@@ -453,6 +453,11 @@ class TelegramBotApi:
             )
         except TelegramApiError as exc:
             if exc.code == "tg_bad_request":
+                log.warning(
+                    "event=tg_set_reaction_rejected code=%s desc=%s",
+                    exc.code,
+                    self._scrub(exc.description)[:120],
+                )
                 return False
             log.warning("event=tg_set_reaction_failed code=%s", exc.code)
             return False

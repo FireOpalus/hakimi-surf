@@ -33,9 +33,9 @@ from hakimi.world_state import (
 )
 
 V181_STATIC_PREFIX_DIGESTS = {
-    "owner_dm": "b2a2ac3aa572a22516d0817153a0d50cb7fd6d8d198f0f1ab9746f737233cbd7",
-    "friend_dm": "982e902028421a942c0cd48c55012add6a204692622efa7e6a21aaa0632f6229",
-    "group": "97a1b158e05d29251ffc02920b4d69f84460f67cd7f9ccff6639cea0ce44a19e",
+    "owner_dm": "4ed6b93391f6cf09c22890320df78210f8f7cacd48c4777f2ec273336a055240",
+    "friend_dm": "06b96fd42adbe2db1307c4b45b062a7c29890da5302389b898c370fd5bbef51d",
+    "group": "bf5cf3c7ec09c190d2bbcdb0077c470dde5c2427713b3698fa86309c3070d9af",
 }
 
 

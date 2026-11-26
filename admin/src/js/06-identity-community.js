@@ -556,6 +556,8 @@ function renderAffectionUsers(){
       await saveAffectionUser(u.user_id,plat,target,u.nickname||'','admin_custom');
     });
     const histBtn=button('流水',async()=>{
+      const fold=$('community-fold-history');
+      if(fold)fold.open=true;
       await loadAffectionHistory({mode:'user',user_id:u.user_id,platform:plat,nickname:u.nickname||''});
       $('aff-history-scope')?.scrollIntoView({behavior:'smooth',block:'nearest'});
     },'secondary');

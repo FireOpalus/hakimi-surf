@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -290,6 +291,14 @@ class ColabComputeHub:
         self._last_error: str | None = None
         self._worker_reachable = False
         self._last_status_poll_at = 0.0
+        self._last_status_failed_at = 0.0
+        self._last_worker_status: dict[str, Any] | None = None
+        self._last_worker_status_ok = False
+        self._status_poll_seq = 0
+        self._status_applied_seq = 0
+        self._status_refresh_task: asyncio.Task[dict[str, Any]] | None = None
+        self._status_cache_ttl_seconds: float = 60.0
+        self._status_error_cooldown_seconds: float = 15.0
         self._orphan_seen_since: float | None = None
         self._last_warm_sessions: list[dict[str, Any]] = []
         self._last_warm_pool: dict[str, Any] = _default_warm_pool()
@@ -697,36 +706,130 @@ class ColabComputeHub:
             "warm_sessions": warm_sessions,
         }
 
+    @staticmethod
+    def _unconfigured_worker_status() -> dict[str, Any]:
+        return {
+            "reachable": False,
+            "compute_units": None,
+            "active_sessions": 0,
+            "running_job_id": None,
+            "warm_sessions": [],
+            "supported_job_types": [],
+            "error": "colab_unconfigured",
+        }
+
+    def _copy_worker_status(
+        self,
+        raw: dict[str, Any],
+        *,
+        now: float | None = None,
+        refresh_warm_ttl: bool = False,
+    ) -> dict[str, Any]:
+        copy = dict(raw)
+        if refresh_warm_ttl:
+            live_warm = self._live_warm_sessions(now=now)
+            copy["warm_sessions"] = [dict(item) for item in live_warm]
+        else:
+            copy["warm_sessions"] = [
+                dict(item) for item in (raw.get("warm_sessions") or ()) if isinstance(item, dict)
+            ]
+        copy["supported_job_types"] = list(raw.get("supported_job_types") or ())
+        return copy
+
+    def _record_worker_poll_failure(
+        self, err: str, *, poll_seq: int | None = None
+    ) -> dict[str, Any]:
+        now = self._clock()
+        result = {
+            "reachable": False,
+            "compute_units": self._last_cu_balance,
+            "active_sessions": 0,
+            "running_job_id": None,
+            "warm_sessions": [],
+            "supported_job_types": [],
+            "error": err,
+        }
+        if poll_seq is None or poll_seq > self._status_applied_seq:
+            had_prev = self._last_worker_status is not None
+            prev_types = (
+                list(self._last_worker_status.get("supported_job_types") or ())
+                if isinstance(self._last_worker_status, dict)
+                else []
+            )
+            self._worker_reachable = False
+            self._last_error = err
+            self._last_warm_sessions = []
+            self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
+            self._last_worker_status = {
+                **result,
+                "supported_job_types": prev_types,
+                "stale": had_prev,
+            }
+            self._last_worker_status_ok = False
+            self._last_status_failed_at = now
+            if poll_seq is not None:
+                self._status_applied_seq = poll_seq
+        return result
+
+    def _cold_start_worker_placeholder(self, now: float) -> dict[str, Any]:
+        warm = self._live_warm_sessions(now=now)
+        return {
+            "reachable": None,
+            "compute_units": self._last_cu_balance,
+            "active_sessions": len(warm),
+            "running_job_id": None,
+            "warm_sessions": [dict(item) for item in warm],
+            "supported_job_types": list(self.registered_job_types()),
+            "error": self._last_error,
+            "refreshing": True,
+        }
+
+    def _schedule_worker_status_refresh(self) -> bool:
+        """Start a deduplicated background poll of Colab worker status without blocking callers."""
+        if self._closed or not self.configured():
+            return False
+        existing = self._status_refresh_task
+        if existing is not None and not existing.done():
+            return True
+
+        async def _runner() -> dict[str, Any]:
+            try:
+                return await self._poll_worker_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                err = self._scrub(type(exc).__name__)
+                self._last_error = err
+                return self._record_worker_poll_failure(err)
+
+        task = asyncio.create_task(_runner(), name="colab-worker-status-refresh")
+        self._status_refresh_task = task
+
+        def _cleanup(done: asyncio.Task[dict[str, Any]]) -> None:
+            if self._status_refresh_task is done:
+                self._status_refresh_task = None
+            if not done.cancelled():
+                with contextlib.suppress(Exception):
+                    done.exception()
+
+        task.add_done_callback(_cleanup)
+        return True
+
     async def _poll_worker_status(self) -> dict[str, Any]:
         if not self.configured():
             self._last_warm_sessions = []
             self._last_warm_pool = _default_warm_pool()
-            return {
-                "reachable": False,
-                "compute_units": None,
-                "active_sessions": 0,
-                "running_job_id": None,
-                "warm_sessions": [],
-                "supported_job_types": [],
-                "error": "colab_unconfigured",
-            }
+            self._last_worker_status = None
+            self._last_worker_status_ok = False
+            return self._unconfigured_worker_status()
+        self._status_poll_seq += 1
+        poll_seq = self._status_poll_seq
         try:
             resp = await self._request("GET", "/v1/status", timeout_sec=5.0)
             if resp.status_code != 200:
-                self._worker_reachable = False
-                err = f"worker_http_{resp.status_code}"
-                self._last_error = err
-                self._last_warm_sessions = []
-                self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
-                return {
-                    "reachable": False,
-                    "compute_units": self._last_cu_balance,
-                    "active_sessions": 0,
-                    "running_job_id": None,
-                    "warm_sessions": [],
-                    "supported_job_types": [],
-                    "error": err,
-                }
+                return self._record_worker_poll_failure(
+                    f"worker_http_{resp.status_code}", poll_seq=poll_seq
+                )
             data = resp.json()
             if not isinstance(data, dict):
                 data = {}
@@ -734,8 +837,6 @@ class ColabComputeHub:
             reachable = bool(data.get("reachable", True))
             cu = data.get("compute_units")
             has_cu = isinstance(cu, (int, float)) and not isinstance(cu, bool)
-            if has_cu:
-                self._last_cu_balance = float(cu)
             raw_err = data.get("error")
             clean_err = self._scrub(raw_err) if raw_err else None
             warm_sessions = _normalize_warm_sessions(data.get("warm_sessions"), now=now)
@@ -747,12 +848,7 @@ class ColabComputeHub:
                     cleaned = str(item or "").strip()
                     if _JOB_TYPE_RE.fullmatch(cleaned) and cleaned not in supported_types:
                         supported_types.append(cleaned)
-            self._worker_reachable = reachable
-            self._last_error = clean_err
-            self._last_status_poll_at = now
-            self._last_warm_sessions = warm_sessions
-            self._last_warm_pool = warm_pool
-            return {
+            result = {
                 "reachable": reachable,
                 "compute_units": float(cu) if has_cu else None,
                 "active_sessions": max(0, _safe_int(data.get("active_sessions"), 0)),
@@ -761,32 +857,30 @@ class ColabComputeHub:
                 "supported_job_types": supported_types,
                 "error": clean_err,
             }
+            if poll_seq > self._status_applied_seq:
+                if has_cu:
+                    self._last_cu_balance = float(cu)
+                self._worker_reachable = reachable
+                self._last_error = clean_err
+                self._last_status_poll_at = now
+                self._last_warm_sessions = warm_sessions
+                self._last_warm_pool = warm_pool
+                cached_snapshot = self._copy_worker_status(result)
+                if not reachable:
+                    if not has_cu and self._last_cu_balance is not None:
+                        cached_snapshot["compute_units"] = self._last_cu_balance
+                        cached_snapshot["stale"] = True
+                    self._last_status_failed_at = now
+                self._last_worker_status = cached_snapshot
+                self._last_worker_status_ok = reachable
+                self._status_applied_seq = poll_seq
+            return result
         except Rejected as exc:
-            self._last_warm_sessions = []
-            self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
-            return {
-                "reachable": False,
-                "compute_units": self._last_cu_balance,
-                "active_sessions": 0,
-                "running_job_id": None,
-                "warm_sessions": [],
-                "supported_job_types": [],
-                "error": str(exc),
-            }
+            return self._record_worker_poll_failure(str(exc), poll_seq=poll_seq)
         except Exception as exc:
-            err = self._scrub(type(exc).__name__)
-            self._last_error = err
-            self._last_warm_sessions = []
-            self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
-            return {
-                "reachable": False,
-                "compute_units": self._last_cu_balance,
-                "active_sessions": 0,
-                "running_job_id": None,
-                "warm_sessions": [],
-                "supported_job_types": [],
-                "error": err,
-            }
+            return self._record_worker_poll_failure(
+                self._scrub(type(exc).__name__), poll_seq=poll_seq
+            )
 
     async def _today_usage(self) -> dict[str, Any]:
         today = self._local_day()
@@ -981,20 +1075,71 @@ class ColabComputeHub:
             "acceleration_stats": acceleration_stats,
         }
 
-    async def admin_overview(self) -> dict[str, Any]:
+    async def admin_overview(self, *, force_refresh: bool = True) -> dict[str, Any]:
         await self.initialize()
-        worker = await self._poll_worker_status()
+        is_cfg = self.configured()
+        worker_cached = False
+        worker_cache_age_seconds: float | None = None
+        worker_refreshing = False
+
+        if not is_cfg:
+            self._last_warm_sessions = []
+            self._last_warm_pool = _default_warm_pool()
+            self._last_worker_status = None
+            self._last_worker_status_ok = False
+            worker = self._unconfigured_worker_status()
+        elif force_refresh:
+            worker = await self._poll_worker_status()
+            worker_cached = False
+            worker_cache_age_seconds = 0.0
+            worker_refreshing = False
+        else:
+            now = self._clock()
+            cached = self._last_worker_status
+            if cached is not None:
+                cached_at = (
+                    self._last_status_poll_at
+                    if self._last_worker_status_ok
+                    else self._last_status_failed_at
+                )
+                ttl = (
+                    self._status_cache_ttl_seconds
+                    if self._last_worker_status_ok
+                    else self._status_error_cooldown_seconds
+                )
+                age = max(0.0, now - cached_at)
+                worker = self._copy_worker_status(cached, now=now, refresh_warm_ttl=True)
+                worker_cached = True
+                worker_cache_age_seconds = round(age, 1)
+                if age < ttl:
+                    worker_refreshing = bool(
+                        self._status_refresh_task is not None
+                        and not self._status_refresh_task.done()
+                    )
+                else:
+                    worker_refreshing = self._schedule_worker_status_refresh()
+            else:
+                worker = self._cold_start_worker_placeholder(now)
+                worker_cached = True
+                worker_cache_age_seconds = None
+                worker_refreshing = self._schedule_worker_status_refresh()
+                if not worker_refreshing:
+                    worker["refreshing"] = False
+
         today = await self._today_usage()
         jobs = await self.list_jobs(limit=30)
         warm_sessions = list(worker.get("warm_sessions") or [])
         analytics = await self._compute_analytics(warm_sessions, self._last_warm_pool)
         return {
-            "configured": self.configured(),
+            "configured": is_cfg,
             "source": "sqlite" if self._overridden else "default",
             "config": self.config.model_dump(mode="json"),
             "supported_job_types": list(self.registered_job_types()),
             "job_types": self.job_type_specs(),
             "worker": worker,
+            "worker_cached": worker_cached,
+            "worker_cache_age_seconds": worker_cache_age_seconds,
+            "worker_refreshing": worker_refreshing,
             "today": today,
             "jobs": jobs,
             **analytics,
@@ -1235,6 +1380,15 @@ class ColabComputeHub:
         self._orphan_seen_since = None
         self._last_warm_sessions = []
         self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
+        self._status_poll_seq += 1
+        self._status_applied_seq = self._status_poll_seq
+        if isinstance(self._last_worker_status, dict):
+            self._last_worker_status = {
+                **self._last_worker_status,
+                "active_sessions": 0,
+                "running_job_id": None,
+                "warm_sessions": [],
+            }
         return {
             "terminated_sessions": int(worker_data.get("terminated_sessions") or 0),
             "cancelled_jobs": cancelled_jobs or int(worker_data.get("cancelled_jobs") or 0),
@@ -1376,7 +1530,11 @@ class ColabComputeHub:
             else:
                 # Orphan Colab session watchdog when no job is running.
                 if self._orphan_seen_since is not None or now - self._last_status_poll_at >= 60.0:
-                    worker = await self._poll_worker_status()
+                    in_flight = self._status_refresh_task
+                    if in_flight is not None and not in_flight.done():
+                        worker = await asyncio.shield(in_flight)
+                    else:
+                        worker = await self._poll_worker_status()
                     if (
                         worker.get("reachable")
                         and int(worker.get("active_sessions") or 0) > 0
@@ -1394,6 +1552,13 @@ class ColabComputeHub:
                                 )
                                 self._last_warm_sessions = []
                                 self._last_warm_pool = {**self._last_warm_pool, "active_count": 0}
+                                if isinstance(self._last_worker_status, dict):
+                                    self._last_worker_status = {
+                                        **self._last_worker_status,
+                                        "active_sessions": 0,
+                                        "running_job_id": None,
+                                        "warm_sessions": [],
+                                    }
                             except Rejected:
                                 pass
                             self._orphan_seen_since = None
@@ -1530,6 +1695,8 @@ class ColabComputeHub:
 
     async def run_scheduler(self) -> None:
         await self.initialize()
+        if self.configured() and not self._closed:
+            self._schedule_worker_status_refresh()
         while not self._closed:
             try:
                 await self.scheduler_step()
@@ -1551,6 +1718,12 @@ class ColabComputeHub:
     async def close(self) -> None:
         self._closed = True
         self._wake.set()
+        task = self._status_refresh_task
+        self._status_refresh_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         if self._owned_http is not None and not self._owned_http.is_closed:
             await self._owned_http.aclose()
             self._owned_http = None
