@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from ..attention import classify_attention
 from ..bot_server import is_persona_owner
 from ..config import Settings
 from ..models import AudioRef, FileRef, ImageRef, Message
@@ -371,6 +372,17 @@ class PluginBusDomainBridgeMixin:
             or raw_attention not in _VALID_INBOUND_ATTENTION_REASONS
         ):
             raw_attention = ""
+
+        if kind == "group" and not addressed and not raw_attention:
+            direct_text = command_text if command_text is not None else text
+            cls_reason, cls_addressed = classify_attention(
+                "group", mentioned=False, text=direct_text
+            )
+            if direct_text.lstrip().startswith("/") and cls_reason != "command":
+                cls_reason, cls_addressed = "", False
+            if cls_reason in {"alias", "possible_alias", "command"}:
+                addressed = cls_addressed
+                raw_attention = cls_reason
 
         def _rewrite_media_item(item: Any, id_field: str) -> dict[str, Any]:
             if not isinstance(item, dict):

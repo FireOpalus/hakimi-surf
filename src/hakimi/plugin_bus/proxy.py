@@ -10,9 +10,9 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from hakimi_plugin_sdk.protocol import BLOB_FIELD
+from hakimi_plugin_sdk.protocol import BLOB_FIELD, sanitize_blob_meta_str
 
 from ..config import Settings
 from ..models import Message
@@ -28,9 +28,11 @@ from ..thinking_policy import ThinkingScene
 from .protocol import (
     _CODE_RE,
     _CUSTOM_RPC_RE,
+    _MAX_MEDIA_IMAGE_BYTES,
     _MAX_PLUGIN_AUDIO_BLOB_BYTES,
     _MAX_VOICE_AUDIO_BYTES,
     _SENSOR_RPC_TIMEOUT_SECONDS,
+    _VALID_MEDIA_KINDS,
     _VALID_VOICE_FORMATS,
     _sanitize_payload,
     _scrub_json_secrets,
@@ -38,6 +40,26 @@ from .protocol import (
 
 if TYPE_CHECKING:
     from .bus import PluginBus
+
+_RESERVED_DELIVERY_RPCS = frozenset(
+    {
+        "delivery.send",
+        "delivery.send_voice",
+        "delivery.send_media",
+        "delivery.react",
+        "delivery.typing",
+    }
+)
+
+
+def _is_valid_image_magic(raw: bytes) -> bool:
+    if raw.startswith(b"\xff\xd8\xff"):
+        return True
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    return len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
 
 
 async def _call_before_send(before_send: Callable[..., Any], delivery_id: str) -> bool:
@@ -145,11 +167,17 @@ class RemoteModuleProxy(BaseModule):
         self.capabilities = capabilities
         cap_set = set(capabilities)
         self.supports_sticker = bool({"sticker", "supports_sticker"} & cap_set)
+        self.supports_rich_card = bool({"rich_card", "supports_rich_card"} & cap_set)
         self.supports_emoji_like = bool({"emoji_like", "supports_emoji_like"} & cap_set)
         self.supports_poke = bool({"poke", "supports_poke"} & cap_set)
         self.supports_reply_anchor = bool({"reply_anchor", "supports_reply_anchor"} & cap_set)
         self.supports_voice = bool({"voice", "supports_voice"} & cap_set)
         self.supports_voice_blob = bool({"voice_blob", "supports_voice_blob"} & cap_set)
+        self.supports_media_blob = bool(
+            {"media_blob", "supports_media_blob", "voice_blob", "supports_voice_blob"} & cap_set
+        )
+        self.supports_typing = bool({"typing", "supports_typing"} & cap_set)
+        self.supports_quick_ack = bool({"quick_ack", "supports_quick_ack"} & cap_set)
         self.preferred_voice_format = voice_format or "ogg_opus"
         self.enabled = enabled
         self._configuration_issue: str | None = configuration_issue
@@ -229,7 +257,11 @@ class RemoteModuleProxy(BaseModule):
         if policy == "muted":
             return False
         if message.kind == "group":
-            return bool(message.addressed or policy == "smart_reply")
+            return bool(
+                message.invites_group_review
+                or message.attention_reason == "possible_alias"
+                or policy == "smart_reply"
+            )
         return True
 
     def chat_connected(self, platform: str) -> bool:
@@ -555,6 +587,199 @@ class RemoteModuleProxy(BaseModule):
                 )
             raise
 
+    async def send_media(
+        self,
+        message: Message,
+        media_bytes: bytes,
+        *,
+        kind: Literal["sticker", "card", "image"] = "image",
+        mime_type: str = "image/png",
+        filename: str = "media.png",
+        reply_to: str | None = None,
+        before_send=None,
+    ) -> str:
+        if "chat" not in self._scopes or message.platform not in self.chat_platforms:
+            raise Rejected("delivery_not_authorized")
+        if not self.enabled:
+            raise Rejected("module_disabled")
+        if kind not in _VALID_MEDIA_KINDS:
+            raise Rejected("invalid_media_kind")
+        if kind == "sticker" and not self.supports_sticker:
+            raise Rejected("media_not_supported")
+        if kind == "card" and not self.supports_rich_card:
+            raise Rejected("media_not_supported")
+        if kind == "image" and not (self.supports_sticker or self.supports_rich_card):
+            raise Rejected("media_not_supported")
+        if not isinstance(media_bytes, (bytes, bytearray)) or len(media_bytes) <= 0:
+            raise Rejected("invalid_media_image")
+        raw_media = bytes(media_bytes)
+        if len(raw_media) > _MAX_MEDIA_IMAGE_BYTES:
+            raise Rejected("media_payload_too_large")
+        if not _is_valid_image_magic(raw_media):
+            raise Rejected("invalid_media_image")
+
+        clean_mime = sanitize_blob_meta_str(mime_type, max_len=96, default="image/png")
+        clean_filename = sanitize_blob_meta_str(
+            filename, max_len=160, default="media.png", is_filename=True
+        )
+        effective_reply_to = (
+            reply_to.strip()
+            if self.supports_reply_anchor and isinstance(reply_to, str) and reply_to.strip()
+            else None
+        )
+        base_payload: dict[str, Any] = {
+            "platform": message.platform,
+            "bot_id": message.bot_id,
+            "kind": message.kind,
+            "conversation_id": message.conversation_id,
+            "user_id": message.user_id,
+            "media_kind": kind,
+            "mime_type": clean_mime,
+            "filename": clean_filename,
+            "reply_to": effective_reply_to,
+        }
+
+        inline_payload = {
+            **base_payload,
+            "media_b64": base64.b64encode(raw_media).decode("ascii"),
+        }
+        probe = json.dumps(
+            {
+                "type": "rpc.request",
+                "id": "0" * 32,
+                "method": "delivery.send_media",
+                "params": {"delivery_id": "0" * 32, **inline_payload},
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if len(probe.encode("utf-8")) <= self._bus._max_frame_bytes():
+            return await self._deliver_rpc(
+                "delivery.send_media",
+                inline_payload,
+                before_send=before_send,
+            )
+
+        if not self.supports_media_blob:
+            raise Rejected("media_payload_too_large")
+        if not self._session.ready or self._session.closed:
+            raise Rejected("plugin_disconnected")
+
+        upload_timeout = max(self._bus.rpc_timeout, 60.0 if len(raw_media) > 512_000 else 30.0)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + upload_timeout
+        blob_desc, uploaded_transfer_id = await self._bus._prepare_request_blob(
+            self._session,
+            raw_media,
+            rpc_params={"delivery_id": "0" * 32, **base_payload},
+            blob_mime_type=clean_mime,
+            blob_filename=clean_filename,
+            req_cap=_MAX_MEDIA_IMAGE_BYTES,
+            deadline=deadline,
+        )
+        blob_payload = {**base_payload, BLOB_FIELD: blob_desc}
+        try:
+            rem = max(5.0, deadline - loop.time())
+            return await self._deliver_rpc(
+                "delivery.send_media",
+                blob_payload,
+                before_send=before_send,
+                timeout=rem,
+            )
+        except Exception:
+            if uploaded_transfer_id is not None:
+                await self._bus._best_effort_release_blob(
+                    self._session, transfer_id=uploaded_transfer_id
+                )
+            raise
+
+    async def send_emoji_like(
+        self,
+        message: Message,
+        target_message_id: str,
+        emoji_id: str,
+        *,
+        emoji: str | None = None,
+        before_send=None,
+    ) -> bool:
+        if (
+            "chat" not in self._scopes
+            or message.platform not in self.chat_platforms
+            or not self.enabled
+            or not self.supports_emoji_like
+            or not self._session.ready
+            or self._session.closed
+        ):
+            return False
+        target_id = str(target_message_id or "").strip()
+        if not target_id or len(target_id) > 128:
+            return False
+        clean_emoji_id = str(emoji_id or "").strip()
+        clean_emoji = str(emoji or "").strip()
+        if not clean_emoji_id and not clean_emoji:
+            return False
+        if before_send is not None:
+            allowed = await _call_before_send(before_send, uuid.uuid4().hex)
+            if not allowed:
+                raise Rejected("reply_invalidated")
+        if not self._session.ready or self._session.closed:
+            return False
+        try:
+            resp = await self._bus._rpc(
+                self._session,
+                "delivery.react",
+                {
+                    "platform": message.platform,
+                    "bot_id": message.bot_id,
+                    "kind": message.kind,
+                    "conversation_id": message.conversation_id,
+                    "user_id": message.user_id,
+                    "message_id": target_id,
+                    "emoji_id": clean_emoji_id,
+                    "emoji": clean_emoji,
+                },
+                timeout=min(self._bus.rpc_timeout, 8.0),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        if not isinstance(resp, dict) or not resp.get("ok", False):
+            return False
+        res = resp.get("result") if "result" in resp else resp.get("data")
+        if isinstance(res, dict):
+            return bool(res.get("applied", True))
+        return True
+
+    async def send_typing(self, message: Message) -> None:
+        if (
+            "chat" not in self._scopes
+            or message.platform not in self.chat_platforms
+            or not self.enabled
+            or not self.supports_typing
+            or not self._session.ready
+            or self._session.closed
+        ):
+            return None
+        try:
+            await self._bus._rpc(
+                self._session,
+                "delivery.typing",
+                {
+                    "platform": message.platform,
+                    "bot_id": message.bot_id,
+                    "kind": message.kind,
+                    "conversation_id": message.conversation_id,
+                    "user_id": message.user_id,
+                },
+                timeout=min(self._bus.rpc_timeout, 2.0),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        return None
+
     async def call_custom_rpc(
         self,
         method: str,
@@ -564,7 +789,7 @@ class RemoteModuleProxy(BaseModule):
         if (
             not isinstance(method, str)
             or not _CUSTOM_RPC_RE.fullmatch(method)
-            or method in {"delivery.send", "delivery.send_voice"}
+            or method in _RESERVED_DELIVERY_RPCS
         ):
             raise Rejected("plugin_invalid_method")
         if params is None:
@@ -593,7 +818,7 @@ class RemoteModuleProxy(BaseModule):
         if (
             not isinstance(method, str)
             or not _CUSTOM_RPC_RE.fullmatch(method)
-            or method in {"delivery.send", "delivery.send_voice"}
+            or method in _RESERVED_DELIVERY_RPCS
         ):
             raise Rejected("plugin_invalid_method")
         if params is None:
@@ -937,10 +1162,13 @@ class RemoteModuleProxy(BaseModule):
             "scopes": sorted(self._scopes),
             "capabilities": list(self.capabilities),
             "supports_sticker": self.supports_sticker,
+            "supports_rich_card": self.supports_rich_card,
             "supports_emoji_like": self.supports_emoji_like,
             "supports_poke": self.supports_poke,
             "supports_reply_anchor": self.supports_reply_anchor,
             "supports_voice": self.supports_voice,
+            "supports_typing": self.supports_typing,
+            "supports_quick_ack": self.supports_quick_ack,
             "preferred_voice_format": self.preferred_voice_format,
         }
         return {**self.status_dict(), **base}

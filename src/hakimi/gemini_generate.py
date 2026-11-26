@@ -46,6 +46,7 @@ from .outbound_actions import (
 from .persona import SYSTEM_INSTRUCTION, identity_anchor
 from .routing import RouteDecision
 from .security import Rejected, clean_text
+from .social import chat_module
 from .store import DigestReviewCredit
 from .streaming import StreamProgress, cancellable, consume_stream, upstream_http_status
 from .thinking_policy import preferences, supported_level
@@ -317,6 +318,10 @@ class _GeminiGenerateMixin:
             raise Rejected("owner_private_only")
         platform = message.platform if message else "onebot"
         qq_surface = platform in {"onebot", "qq"}
+        platform_mod = None if qq_surface else chat_module(self.s, platform)
+        sticker_surface = qq_surface or bool(
+            platform_mod and getattr(platform_mod, "supports_sticker", False)
+        )
         self_id = self.s.onebot_self_id if qq_surface else message.bot_id
         system = SYSTEM_INSTRUCTION + context.persona + identity_anchor(self_id, platform)
         if context.private_owner:
@@ -329,12 +334,13 @@ class _GeminiGenerateMixin:
             not context.private_owner
             and context.surface in {"group", "private"}
             and scenario == Scenario.FAST_CHAT
-            and qq_surface
         ):
-            system += AT_INSTRUCTION
-            memes = getattr(self.store.runtime, "memes", None)
-            if memes is not None:
-                system += memes.protocol_prompt
+            if qq_surface:
+                system += AT_INSTRUCTION
+            if sticker_surface:
+                memes = getattr(self.store.runtime, "memes", None)
+                if memes is not None:
+                    system += memes.protocol_prompt
         if scenario == Scenario.DAILY_DIARY:
             system += DIARY_INSTRUCTION
         if scenario == Scenario.MEMORY_COMPRESSION:
@@ -422,7 +428,7 @@ class _GeminiGenerateMixin:
         chat = (not life_plan) and scenario in {Scenario.FAST_CHAT, Scenario.OWNER_PRIVATE}
         use_stream = chat or is_voice_companion
         memes = getattr(self.store.runtime, "memes", None)
-        allow_memes = qq_surface and chat and context.surface in {"group", "private"}
+        allow_memes = sticker_surface and chat and context.surface in {"group", "private"}
         if life_plan:
             system = LIFE_PLAN_INSTRUCTION
         elif chat:

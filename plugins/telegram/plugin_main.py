@@ -34,6 +34,8 @@ log = logging.getLogger("hakimi_plugin_telegram")
 _MAX_SEEN_MEDIA_IDS = 512
 _MAX_FETCH_BYTES = 20 * 1024 * 1024
 _MAX_PHOTO_FILE_BYTES = 20 * 1024 * 1024
+_MAX_OUTBOUND_MEDIA_BYTES = 5 * 1024 * 1024
+_MAX_OUTBOUND_MEDIA_B64_CHARS = ((_MAX_OUTBOUND_MEDIA_BYTES + 2) // 3) * 4 + 64
 _MAX_TEXT_CHARS = 24000
 _MAX_QUOTED_TEXT_CHARS = 2000
 _MAX_INBOUND_IMAGES = 2
@@ -45,6 +47,77 @@ _ALLOWED_AUDIO_EXTENSIONS = frozenset(
 )
 _NUMERIC_ID_RE = re.compile(r"^-?[0-9]{1,24}\Z")
 _B23_PATH_RE = re.compile(r"^/[A-Za-z0-9]{1,32}\Z")
+_TG_REACTION_EMOJI_MAP: dict[str, str] = {
+    "👍": "👍",
+    "❤": "❤",
+    "🔥": "🔥",
+    "👏": "👏",
+    "🎉": "🎉",
+    "🤔": "🤔",
+    "👀": "👀",
+    "😭": "😭",
+    "💯": "💯",
+    "🤣": "🤣",
+    "🥰": "🥰",
+    "🤩": "🤩",
+    "😴": "😴",
+    "😂": "🤣",
+    "🐱": "🥰",
+    "✨": "🤩",
+    "💤": "😴",
+}
+_TG_EMOJI_ID_FALLBACK: dict[str, str] = {
+    "76": "👍",
+    "128077": "👍",
+    "66": "❤",
+    "128514": "🤣",
+    "128079": "👏",
+    "128293": "🔥",
+    "127881": "🎉",
+    "129300": "🤔",
+    "128064": "👀",
+    "128557": "😭",
+    "128175": "💯",
+    "128049": "🥰",
+    "10024": "🤩",
+    "128164": "😴",
+}
+
+
+def _detect_image_magic(raw: bytes) -> tuple[str, str] | None:
+    """Detect supported outbound image magic bytes and return (mime_type, ext)."""
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", "gif"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None
+
+
+def _sanitize_media_filename(raw_name: Any, *, default_stem: str, ext: str) -> str:
+    candidate = PurePosixPath(str(raw_name or "").replace("\\", "/")).name.strip()
+    candidate = re.sub(r"[\r\n\x00-\x1f/\\]", "", candidate)[:120].strip(".")
+    if not candidate:
+        return f"{default_stem}.{ext}"
+    suffix = PurePosixPath(candidate.lower()).suffix.lstrip(".")
+    valid_exts = {ext, "jpeg"} if ext == "jpg" else {ext}
+    if suffix in valid_exts:
+        return candidate
+    stem = PurePosixPath(candidate).stem[:100].strip(".") or default_stem
+    return f"{stem}.{ext}"
+
+
+def _map_tg_reaction_emoji(emoji: Any, emoji_id: Any) -> str | None:
+    """Map inbound emoji / emoji_id onto Telegram's free reaction emoji allowlist."""
+    raw_emoji = emoji.replace("\ufe0f", "").strip() if isinstance(emoji, str) else ""
+    if raw_emoji:
+        return _TG_REACTION_EMOJI_MAP.get(raw_emoji)
+    if emoji_id is not None:
+        return _TG_EMOJI_ID_FALLBACK.get(str(emoji_id).strip())
+    return None
 
 
 def _parse_id_set(raw: str | None) -> set[str]:
@@ -248,7 +321,18 @@ class TelegramPlugin:
             scopes=("chat", "media", "sensors"),
             node_region="KR",
             chat_platforms=("telegram",),
-            capabilities=("voice", "voice_blob", "reply_anchor", "proactive_speak"),
+            capabilities=(
+                "voice",
+                "voice_blob",
+                "reply_anchor",
+                "proactive_speak",
+                "sticker",
+                "rich_card",
+                "emoji_like",
+                "typing",
+                "quick_ack",
+                "media_blob",
+            ),
             voice_format="ogg_opus",
             attention_level="LOW",
             reconnect_min=reconnect_min,
@@ -267,6 +351,9 @@ class TelegramPlugin:
         self.client.sensor(self._sensor_summary)
         self.client.on_chat_delivery(self._handle_chat_delivery)
         self.client.on_voice_delivery(self._handle_voice_delivery)
+        self.client.on_media_delivery(self._handle_media_delivery)
+        self.client.on_react_delivery(self._handle_react_delivery)
+        self.client.on_typing_delivery(self._handle_typing_delivery)
         self.client.on_media_fetch(self._handle_media_fetch)
 
     def _status_snapshot(self, *, connected: bool) -> dict[str, Any]:
@@ -1010,6 +1097,83 @@ class TelegramPlugin:
             raise PluginRpcError(exc.code, exc.description) from None
         self._tx_count += 1
         return {"message_id": msg_id}
+
+    async def _handle_media_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
+        _kind, chat_id = self._delivery_allowed(params)
+        raw_media: bytes | None = None
+        if isinstance(params.get("blob"), (bytes, bytearray)):
+            raw_media = bytes(params["blob"])
+        elif isinstance(params.get("media_b64"), str) and params["media_b64"]:
+            raw_b64 = params["media_b64"]
+            if len(raw_b64) > _MAX_OUTBOUND_MEDIA_B64_CHARS:
+                raise PluginRpcError("media_payload_too_large", "media exceeds 5 MiB limit")
+            try:
+                raw_media = base64.b64decode(raw_b64, validate=True)
+            except (ValueError, binascii.Error):
+                raise PluginRpcError("invalid_media_payload", "invalid base64 media") from None
+        if not raw_media:
+            raise PluginRpcError("invalid_media_payload", "empty media payload")
+        if len(raw_media) > _MAX_OUTBOUND_MEDIA_BYTES:
+            raise PluginRpcError("media_payload_too_large", "media exceeds 5 MiB limit")
+
+        detected = _detect_image_magic(raw_media)
+        if detected is None:
+            raise PluginRpcError("unsupported_media_format", "unsupported image format")
+        detected_mime, detected_ext = detected
+
+        reply_to = _parse_reply_id(params.get("reply_to"))
+        raw_media_kind = (
+            str(params.get("media_kind") or params.get("kind_hint") or "").strip().lower()
+        )
+        default_stem = (
+            "meme"
+            if detected_ext == "gif"
+            else (raw_media_kind if raw_media_kind in {"sticker", "card", "image"} else "image")
+        )
+        blob_meta = params.get("blob_meta")
+        blob_meta_fname = blob_meta.get("filename") if isinstance(blob_meta, dict) else None
+        fname = _sanitize_media_filename(
+            params.get("filename") or params.get("blob_filename") or blob_meta_fname,
+            default_stem=default_stem,
+            ext=detected_ext,
+        )
+        try:
+            if detected_ext == "gif":
+                msg_id = await self.api.send_animation(
+                    chat_id,
+                    raw_media,
+                    filename=fname,
+                    mime_type=detected_mime,
+                    reply_to_message_id=reply_to,
+                )
+            else:
+                msg_id = await self.api.send_photo(
+                    chat_id,
+                    raw_media,
+                    filename=fname,
+                    mime_type=detected_mime,
+                    reply_to_message_id=reply_to,
+                )
+        except TelegramApiError as exc:
+            raise PluginRpcError(exc.code, exc.description) from None
+        self._tx_count += 1
+        return {"message_id": msg_id}
+
+    async def _handle_react_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
+        _kind, chat_id = self._delivery_allowed(params)
+        msg_id = _parse_reply_id(params.get("message_id"))
+        if msg_id is None or msg_id <= 0:
+            return {"applied": False}
+        tg_emoji = _map_tg_reaction_emoji(params.get("emoji"), params.get("emoji_id"))
+        if not tg_emoji:
+            return {"applied": False}
+        applied = await self.api.set_message_reaction(chat_id, msg_id, tg_emoji)
+        return {"applied": bool(applied)}
+
+    async def _handle_typing_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
+        _kind, chat_id = self._delivery_allowed(params)
+        await self.api.send_chat_action(chat_id, "typing")
+        return {"ok": True}
 
     async def _handle_media_fetch(self, params: dict[str, Any]) -> BlobResult:
         media_id = str(params.get("media_id") or "").strip()

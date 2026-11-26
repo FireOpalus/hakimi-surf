@@ -1018,3 +1018,462 @@ async def test_remote_chat_farewell_bypass_vs_manual_mute(plugin_env):
 
     await sock.close(1000)
     await asyncio.wait_for(runner, 2.0)
+
+
+async def test_base_module_and_qq_social_media_react_typing_capabilities(settings):
+    import base64
+    from types import SimpleNamespace
+
+    from hakimi.modules.base import BaseModule
+    from hakimi.modules.qq_social import QQSocialModule
+
+    assert BaseModule.supports_reply_anchor is False
+    assert BaseModule.supports_voice is False
+    assert BaseModule.supports_sticker is False
+    assert BaseModule.supports_rich_card is False
+    assert BaseModule.supports_emoji_like is False
+    assert BaseModule.supports_typing is False
+    assert BaseModule.supports_quick_ack is False
+
+    class _DummyMod(BaseModule):
+        module_id = "dummy_social"
+
+        async def _raw_sensor_summary(self) -> str:
+            return ""
+
+    dummy = _DummyMod(settings)
+    onebot_msg = Message(
+        platform="onebot",
+        bot_id="10000",
+        event_id="101",
+        user_id="20000",
+        kind="group",
+        conversation_id="30000",
+        text="hi",
+        addressed=True,
+        created_at=100.0,
+    )
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    with pytest.raises(NotImplementedError):
+        await dummy.send_media(onebot_msg, png_bytes)
+    assert await dummy.send_emoji_like(onebot_msg, "101", "76") is False
+    assert await dummy.send_typing(onebot_msg) is None
+
+    calls: list[tuple[str, tuple, dict]] = []
+
+    class _SenderStub:
+        async def send_meme(self, message, data, *, before_send=None, as_sticker=True):
+            calls.append(("send_meme", (message, data), {"as_sticker": as_sticker}))
+            if before_send is not None and not await before_send():
+                raise Rejected("reply_invalidated")
+            return {"message_id": 778899}
+
+        async def send_emoji_like(self, message, target_id, emoji_id, *, before_send=None):
+            calls.append(("send_emoji_like", (message, target_id, emoji_id), {}))
+            if before_send is not None and not await before_send():
+                raise Rejected("reply_invalidated")
+            return True
+
+        async def typing(self, message):
+            calls.append(("typing", (message,), {}))
+
+    qq = QQSocialModule(
+        settings, service=SimpleNamespace(sender=_SenderStub()), connected=lambda: True
+    )
+    assert qq.supports_reply_anchor is True
+    assert qq.supports_voice is True
+    assert qq.supports_sticker is True
+    assert qq.supports_rich_card is True
+    assert qq.supports_emoji_like is True
+    assert qq.supports_typing is True
+    assert qq.supports_quick_ack is True
+
+    mid1 = await qq.send_media(onebot_msg, png_bytes, kind="sticker")
+    assert mid1 == "778899"
+    assert calls[-1][0] == "send_meme"
+    assert calls[-1][1][1] == "base64://" + base64.b64encode(png_bytes).decode("ascii")
+    assert calls[-1][2]["as_sticker"] is True
+
+    mid2 = await qq.send_media(onebot_msg, png_bytes, kind="card")
+    assert mid2 == "778899"
+    assert calls[-1][2]["as_sticker"] is False
+
+    assert await qq.send_emoji_like(onebot_msg, "101", "76", emoji="👍") is True
+    assert calls[-1][0] == "send_emoji_like"
+    await qq.send_typing(onebot_msg)
+    assert calls[-1][0] == "typing"
+
+    non_onebot = onebot_msg.model_copy(update={"platform": "qq"})
+    with pytest.raises(Rejected, match="delivery_not_authorized"):
+        await qq.send_media(non_onebot, png_bytes)
+    assert await qq.send_emoji_like(non_onebot, "101", "76") is False
+    await qq.send_typing(non_onebot)
+
+    with pytest.raises(Rejected, match="invalid_meme_image"):
+        await qq.send_media(onebot_msg, b"")
+
+    qq.enabled = False
+    with pytest.raises(Rejected, match="module_disabled"):
+        await qq.send_media(onebot_msg, png_bytes)
+    assert await qq.send_emoji_like(onebot_msg, "101", "76") is False
+
+
+async def test_remote_proxy_media_react_typing_and_blob_delivery(plugin_env):
+    import base64
+
+    from hakimi.plugin_bus import BLOB_FIELD, BLOB_RPC_PUT, BLOB_RPC_RELEASE
+
+    _, svc, bus, _, _ = plugin_env
+    await bus.create_plugin("tg_rich", "Telegram Rich", ["chat", "media", "sensors"])
+
+    sock = _PluginSocket()
+    runner = asyncio.create_task(
+        bus.serve(
+            sock.receive,
+            sock.send,
+            sock.close,
+            source_ip="127.0.0.1",
+            plugin_id="tg_rich",
+        )
+    )
+    await sock.push(
+        {
+            "type": "plugin.hello",
+            "protocol_version": 1,
+            "display_name": "Telegram Rich",
+            "scopes": ["chat", "media", "sensors"],
+            "chat_platforms": ["telegram"],
+            "capabilities": [
+                "sticker",
+                "rich_card",
+                "emoji_like",
+                "typing",
+                "quick_ack",
+                "reply_anchor",
+                "media_blob",
+            ],
+        }
+    )
+    await sock.recv_until(lambda m: m["type"] == "plugin.ready")
+    proxy = svc.modules.get("tg_rich")
+    assert isinstance(proxy, RemoteModuleProxy)
+    assert proxy.supports_sticker is True
+    assert proxy.supports_rich_card is True
+    assert proxy.supports_emoji_like is True
+    assert proxy.supports_typing is True
+    assert proxy.supports_quick_ack is True
+    assert proxy.supports_media_blob is True
+    admin_st = proxy.admin_status()
+    assert admin_st["supports_rich_card"] is True
+    assert admin_st["supports_typing"] is True
+    assert admin_st["supports_quick_ack"] is True
+
+    # Reserved delivery RPCs are blocked on custom/raw RPC paths
+    for reserved_method in ("delivery.send_media", "delivery.react", "delivery.typing"):
+        with pytest.raises(Rejected, match="plugin_invalid_method"):
+            await proxy.call_custom_rpc(reserved_method, {})
+        with pytest.raises(Rejected, match="plugin_invalid_method"):
+            await proxy.call_raw_rpc(reserved_method, {})
+
+    msg = Message(
+        platform="telegram",
+        bot_id="tg_rich",
+        event_id="9001",
+        user_id="42",
+        kind="group",
+        conversation_id="-100123",
+        text="hello",
+        addressed=True,
+        created_at=time.time(),
+    )
+
+    # 1. Inline send_media accepts PNG/JPEG/GIF/WEBP and sanitizes filename
+    samples = [
+        ("sticker", "image/png", "../evil/cat.png", b"\x89PNG\r\n\x1a\n" + b"\x01" * 16, "cat.png"),
+        ("card", "image/jpeg", "card.jpg", b"\xff\xd8\xff\xe0" + b"\x02" * 16, "card.jpg"),
+        ("sticker", "image/gif", "anim.gif", b"GIF89a" + b"\x03" * 16, "anim.gif"),
+        ("image", "image/webp", "pic.webp", b"RIFF\x10\x00\x00\x00WEBP" + b"\x04" * 8, "pic.webp"),
+    ]
+    for idx, (mkind, mime, raw_fname, raw_bytes, clean_fname) in enumerate(samples):
+        task = asyncio.create_task(
+            proxy.send_media(
+                msg,
+                raw_bytes,
+                kind=mkind,  # type: ignore[arg-type]
+                mime_type=mime,
+                filename=raw_fname,
+                reply_to="9001",
+                before_send=lambda _did: True,
+            )
+        )
+        req = (await sock.recv_until(lambda m: m.get("method") == "delivery.send_media"))[-1]
+        params = req["params"]
+        assert params["platform"] == "telegram"
+        assert params["kind"] == "group"
+        assert params["conversation_id"] == "-100123"
+        assert params["media_kind"] == mkind
+        assert params["mime_type"] == mime
+        assert params["filename"] == clean_fname
+        assert params["reply_to"] == "9001"
+        assert base64.b64decode(params["media_b64"]) == raw_bytes
+        await sock.push(
+            {
+                "type": "rpc.result",
+                "id": req["id"],
+                "ok": True,
+                "result": {"message_id": f"tg-media-{idx}"},
+            }
+        )
+        assert await task == f"tg-media-{idx}"
+
+    # 2. Validation errors on send_media
+    with pytest.raises(Rejected, match="invalid_media_image"):
+        await proxy.send_media(msg, b"", kind="sticker")
+    with pytest.raises(Rejected, match="invalid_media_image"):
+        await proxy.send_media(msg, b"<html>not-an-image</html>", kind="sticker")
+    with pytest.raises(Rejected, match="media_payload_too_large"):
+        await proxy.send_media(msg, b"\x89PNG\r\n\x1a\n" + b"\x00" * (5 * 1024 * 1024), kind="card")
+    with pytest.raises(Rejected, match="invalid_media_kind"):
+        await proxy.send_media(
+            msg,
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+            kind="video",  # type: ignore[arg-type]
+        )
+    with pytest.raises(Rejected, match="reply_invalidated"):
+        await proxy.send_media(
+            msg,
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+            kind="sticker",
+            before_send=lambda _did: False,
+        )
+    assert sock.outgoing.empty()
+
+    # Missing capability rejected
+    proxy.supports_rich_card = False
+    with pytest.raises(Rejected, match="media_not_supported"):
+        await proxy.send_media(msg, b"\x89PNG\r\n\x1a\n" + b"\x00" * 8, kind="card")
+    proxy.supports_rich_card = True
+
+    # 3. Oversized frame uses chunked blob upload and releases blob if before_send returns False
+    orig_frame_bytes = svc.s.plugin_bus_ws_max_frame_bytes
+    svc.s.plugin_bus_ws_max_frame_bytes = 16_384
+    big_png = b"\x89PNG\r\n\x1a\n" + (b"\xab" * 20_000)
+    try:
+        # Without supports_media_blob -> rejected cleanly
+        proxy.supports_media_blob = False
+        with pytest.raises(Rejected, match="media_payload_too_large"):
+            await proxy.send_media(msg, big_png, kind="card")
+        proxy.supports_media_blob = True
+
+        # With supports_media_blob -> chunked upload + delivery.send_media with BLOB_FIELD
+        send_big = asyncio.create_task(
+            proxy.send_media(msg, big_png, kind="card", mime_type="image/png", filename="big.png")
+        )
+        chunks_seen = 0
+        while True:
+            frame = await sock.outgoing.get()
+            if frame.get("method") == BLOB_RPC_PUT:
+                chunks_seen += 1
+                await sock.push(
+                    {
+                        "type": "rpc.result",
+                        "id": frame["id"],
+                        "ok": True,
+                        "result": {"ok": True},
+                    }
+                )
+            elif frame.get("method") == "delivery.send_media":
+                assert chunks_seen >= 2
+                assert BLOB_FIELD in frame["params"]
+                assert "media_b64" not in frame["params"]
+                assert frame["params"]["media_kind"] == "card"
+                assert frame["params"]["filename"] == "big.png"
+                await sock.push(
+                    {
+                        "type": "rpc.result",
+                        "id": frame["id"],
+                        "ok": True,
+                        "result": {"message_id": "tg-big-1"},
+                    }
+                )
+                break
+        assert await send_big == "tg-big-1"
+
+        # before_send=False after chunk upload triggers blob.release
+        aborted = asyncio.create_task(
+            proxy.send_media(msg, big_png, kind="card", before_send=lambda _did: False)
+        )
+        released = False
+        while True:
+            frame = await sock.outgoing.get()
+            if frame.get("method") == BLOB_RPC_PUT:
+                await sock.push(
+                    {"type": "rpc.result", "id": frame["id"], "ok": True, "result": {"ok": True}}
+                )
+            elif frame.get("method") == BLOB_RPC_RELEASE:
+                released = True
+                await sock.push(
+                    {
+                        "type": "rpc.result",
+                        "id": frame["id"],
+                        "ok": True,
+                        "result": {"released": True},
+                    }
+                )
+                break
+        with pytest.raises(Rejected, match="reply_invalidated"):
+            await aborted
+        assert released is True
+    finally:
+        svc.s.plugin_bus_ws_max_frame_bytes = orig_frame_bytes
+
+    # 4. send_emoji_like: success, applied=False, error (no uncertain_deliveries), before_send gate
+    react_task = asyncio.create_task(
+        proxy.send_emoji_like(msg, "9001", "128077", emoji="👍", before_send=lambda: True)
+    )
+    r_req = (await sock.recv_until(lambda m: m.get("method") == "delivery.react"))[-1]
+    assert r_req["params"] == {
+        "platform": "telegram",
+        "bot_id": "tg_rich",
+        "kind": "group",
+        "conversation_id": "-100123",
+        "user_id": "42",
+        "message_id": "9001",
+        "emoji_id": "128077",
+        "emoji": "👍",
+    }
+    await sock.push(
+        {"type": "rpc.result", "id": r_req["id"], "ok": True, "result": {"applied": True}}
+    )
+    assert await react_task is True
+
+    react_fail = asyncio.create_task(proxy.send_emoji_like(msg, "9001", "128049", emoji="🐱"))
+    r_req2 = (await sock.recv_until(lambda m: m.get("method") == "delivery.react"))[-1]
+    await sock.push(
+        {"type": "rpc.result", "id": r_req2["id"], "ok": False, "error": "tg_bad_request"}
+    )
+    assert await react_fail is False
+    assert len(bus.uncertain_deliveries) == 0
+
+    with pytest.raises(Rejected, match="reply_invalidated"):
+        await proxy.send_emoji_like(msg, "9001", "76", emoji="👍", before_send=lambda: False)
+    assert await proxy.send_emoji_like(msg, "", "76", emoji="👍") is False
+
+    # 5. send_typing: best-effort success & error swallow
+    typing_task = asyncio.create_task(proxy.send_typing(msg))
+    t_req = (await sock.recv_until(lambda m: m.get("method") == "delivery.typing"))[-1]
+    assert t_req["params"] == {
+        "platform": "telegram",
+        "bot_id": "tg_rich",
+        "kind": "group",
+        "conversation_id": "-100123",
+        "user_id": "42",
+    }
+    await sock.push({"type": "rpc.result", "id": t_req["id"], "ok": True, "result": {"ok": True}})
+    await typing_task
+
+    typing_err = asyncio.create_task(proxy.send_typing(msg))
+    t_req2 = (await sock.recv_until(lambda m: m.get("method") == "delivery.typing"))[-1]
+    await sock.push({"type": "rpc.result", "id": t_req2["id"], "ok": False, "error": "tg_err"})
+    await typing_err
+
+    await sock.close(1000)
+    await asyncio.wait_for(runner, 2.0)
+
+
+async def test_domain_bridge_group_alias_classification_and_authorize_chat(plugin_env):
+    _, svc, bus, _, _ = plugin_env
+    await bus.create_plugin("tg_alias", "Telegram Alias", ["chat"])
+
+    captured: list[Message] = []
+
+    async def _capture_accept(_proxy, msg: Message) -> str:
+        captured.append(msg)
+        return "accepted"
+
+    svc.accept_from = _capture_accept
+
+    sock = _PluginSocket()
+    runner = asyncio.create_task(
+        bus.serve(
+            sock.receive,
+            sock.send,
+            sock.close,
+            source_ip="127.0.0.1",
+            plugin_id="tg_alias",
+        )
+    )
+    await sock.push(
+        {
+            "type": "plugin.hello",
+            "protocol_version": 1,
+            "display_name": "Telegram Alias",
+            "scopes": ["chat"],
+            "chat_platforms": ["telegram"],
+        }
+    )
+    await sock.recv_until(lambda m: m["type"] == "plugin.ready")
+    proxy = svc.modules.get("tg_alias")
+    assert isinstance(proxy, RemoteModuleProxy)
+
+    cases = [
+        ("ev-alias", "哈基米在吗", None, False, ""),
+        ("ev-possible", "猫猫觉得呢", None, False, ""),
+        ("ev-other-cmd", "/othercmd@otherbot 哈基米", None, False, ""),
+        ("ev-save-cmd", "/存表情 开心", None, False, ""),
+        ("ev-quote-only", '哈哈\n[引用 Alice(telegram:9) 的消息: "哈基米"]', "哈哈", False, ""),
+        ("ev-explicit-possible", "随便说说", None, False, "possible_alias"),
+    ]
+    for ev_id, text, cmd_text, addressed, reason in cases:
+        frame: dict = {
+            "type": "chat.inbound",
+            "id": f"in-{ev_id}",
+            "platform": "telegram",
+            "kind": "group",
+            "conversation_id": "-100888",
+            "user_id": "555",
+            "event_id": ev_id,
+            "text": text,
+            "addressed": addressed,
+        }
+        if cmd_text is not None:
+            frame["command_text"] = cmd_text
+        if reason:
+            frame["attention_reason"] = reason
+        await sock.push(frame)
+        await sock.recv_until(lambda m, fid=f"in-{ev_id}": m.get("id") == fid)
+
+    by_id = {m.event_id: m for m in captured}
+
+    # Wake word -> alias + addressed=True -> authorized in at_only group
+    assert by_id["ev-alias"].addressed is True
+    assert by_id["ev-alias"].attention_reason == "alias"
+    assert proxy.authorize_chat(by_id["ev-alias"], svc.s) is True
+
+    # Possible alias -> addressed=False + attention_reason="possible_alias" -> authorized for review
+    assert by_id["ev-possible"].addressed is False
+    assert by_id["ev-possible"].attention_reason == "possible_alias"
+    assert proxy.authorize_chat(by_id["ev-possible"], svc.s) is True
+
+    # Muted group still blocks possible_alias
+    muted_s = svc.s.model_copy(update={"group_policies": {"telegram:-100888": "muted"}})
+    assert proxy.authorize_chat(by_id["ev-possible"], muted_s) is False
+
+    # /othercmd@otherbot 哈基米 MUST NOT trigger alias wake
+    assert by_id["ev-other-cmd"].addressed is False
+    assert by_id["ev-other-cmd"].attention_reason == ""
+    assert proxy.authorize_chat(by_id["ev-other-cmd"], svc.s) is False
+
+    # /存表情 direct command triggers command attention
+    assert by_id["ev-save-cmd"].addressed is True
+    assert by_id["ev-save-cmd"].attention_reason == "command"
+
+    # Quoted wake word does NOT wake when direct command_text has no alias
+    assert by_id["ev-quote-only"].addressed is False
+    assert by_id["ev-quote-only"].attention_reason == ""
+
+    # Explicit possible_alias passes _VALID_INBOUND_ATTENTION_REASONS
+    assert by_id["ev-explicit-possible"].attention_reason == "possible_alias"
+
+    await sock.close(1000)
+    await asyncio.wait_for(runner, 2.0)

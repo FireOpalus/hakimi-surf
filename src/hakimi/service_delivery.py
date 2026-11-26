@@ -15,10 +15,12 @@ from .modules.adapters import farewell_send_bypass
 from .outgoing import (
     PRE_DISPATCH_REJECTED,
     is_affection_muted_only,
+    platform_supports_quick_ack,
     safe_delivery_detail,
     send_module_chat,
+    send_platform_meme,
 )
-from .security import Rejected
+from .security import Rejected, authorize
 from .session_manager import session_epoch
 from .social import chat_module
 
@@ -228,6 +230,8 @@ class _ServiceDeliveryMixin:
             await self.store.runtime.filters.update_audit(audit_id, "queued")
 
     async def quick_ack(self, job, message, guard):
+        if not platform_supports_quick_ack(self, message):
+            return
         try:
             async with self.store.transaction():
                 row = await self.store.one(
@@ -257,9 +261,34 @@ class _ServiceDeliveryMixin:
                 if message.kind == "private" and is_persona_owner(message, self.s)
                 else ("稍等我捋一下", "等下，我看眼细节", "让我想想怎么讲", "稍等，我看下上下文")
             )
-            receipt = await self.sender.quick_ack(
-                message, random.choice(phrases), before_send=valid
-            )
+            phrase = random.choice(phrases)
+            if message.platform == "onebot":
+                receipt = await self.sender.quick_ack(message, phrase, before_send=valid)
+            else:
+                module = chat_module(self.s, message.platform)
+                if module is None or not getattr(module, "supports_quick_ack", False):
+                    return
+                reply_to = (
+                    message.event_id
+                    if message.kind == "group"
+                    and isinstance(message.event_id, str)
+                    and re.fullmatch(r"-?[0-9]{1,30}", message.event_id)
+                    else None
+                )
+
+                async def still_valid():
+                    return await valid() and authorize(message, self.s)
+
+                async with asyncio.timeout(0.9):
+                    if not await still_valid():
+                        return
+                    receipt = await send_module_chat(
+                        module,
+                        message,
+                        self.output(phrase),
+                        reply_to=reply_to,
+                        before_send=still_valid,
+                    )
             if receipt:
                 await self.store.runtime.attention.record_sent(message, receipt)
         except Exception:
@@ -380,26 +409,30 @@ class _ServiceDeliveryMixin:
                     if (
                         reply["proactive"]
                         or not module
-                        or not reply["text"]
+                        or (
+                            not reply["text"]
+                            and not (reply.get("meme_eligible") and reply.get("meme_tag"))
+                        )
                         or not await valid_after_delay()
                     ):
                         await self.store.finish_reply(reply["id"], "cancelled")
                         await self._finish_delivery_audit(reply, "cancelled", "unauthorized")
                         return True
-                    reply_to = (
-                        message.event_id
-                        if message.kind == "group"
-                        and isinstance(message.event_id, str)
-                        and re.fullmatch(r"-?[0-9]{1,30}", message.event_id)
-                        else None
-                    )
-                    receipt = await send_module_chat(
-                        module,
-                        message,
-                        self.output(reply["text"]),
-                        reply_to=reply_to,
-                        before_send=valid_after_delay,
-                    )
+                    if reply["text"]:
+                        reply_to = (
+                            message.event_id
+                            if message.kind == "group"
+                            and isinstance(message.event_id, str)
+                            and re.fullmatch(r"-?[0-9]{1,30}", message.event_id)
+                            else None
+                        )
+                        receipt = await send_module_chat(
+                            module,
+                            message,
+                            self.output(reply["text"]),
+                            reply_to=reply_to,
+                            before_send=valid_after_delay,
+                        )
                 elif (
                     reply.get("segments")
                     and any(s["type"] == "at" for s in reply["segments"])
@@ -479,8 +512,8 @@ class _ServiceDeliveryMixin:
                             )
 
                         if data and await image_still_allowed():
-                            image_receipt = await self.sender.send_meme(
-                                message, data, before_send=image_still_allowed
+                            image_receipt = await send_platform_meme(
+                                self, message, data, before_send=image_still_allowed
                             )
                             image_confirmed = True  # Sender requires a valid OneBot message_id.
                             if not text_confirmed and self.world_state.experience.ready:

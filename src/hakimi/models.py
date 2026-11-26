@@ -88,16 +88,16 @@ class Message(BaseModel):
     short_urls: list[str] = Field(default_factory=list, max_length=5)
 
     @property
+    def has_possible_alias(self) -> bool:
+        return self.kind == "group" and self.attention_reason == "possible_alias"
+
+    @property
     def has_possible_qq_alias(self) -> bool:
-        return (
-            self.platform == "onebot"
-            and self.kind == "group"
-            and self.attention_reason == "possible_alias"
-        )
+        return self.platform == "onebot" and self.has_possible_alias
 
     @property
     def invites_group_review(self) -> bool:
-        return self.addressed or self.has_possible_qq_alias
+        return self.addressed or self.has_possible_alias
 
     def session_parts(self, namespace: str) -> list[str]:
         return [namespace, self.platform, self.bot_id, self.kind, self.conversation_id]

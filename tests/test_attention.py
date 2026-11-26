@@ -70,8 +70,11 @@ def test_incidental_sources_cannot_start_a_name_review(settings, segment):
 
 def test_qq_nickname_does_not_invite_review_for_another_transport(settings):
     msg = onebot_message(event([{"type": "text", "data": {"text": "小小姐"}}]), settings)
-    assert msg.invites_group_review
-    assert not msg.model_copy(update={"platform": "forum"}).invites_group_review
+    assert msg.has_possible_qq_alias and msg.has_possible_alias and msg.invites_group_review
+    other = msg.model_copy(update={"platform": "forum"})
+    assert not other.has_possible_qq_alias
+    assert other.has_possible_alias and other.invites_group_review
+    assert not authorize(other, settings)
 
 
 async def test_possible_alias_rejected_by_gate_stays_silent(settings, store):

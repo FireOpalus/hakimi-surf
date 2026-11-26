@@ -24,6 +24,13 @@ from .memory_compressor import check_memory_text
 from .mentions import parse_reply, valid_at_targets
 from .models import Message
 from .outbound_actions import parse_actions
+from .outgoing import (
+    platform_supports_emoji_like,
+    platform_supports_quick_ack,
+    platform_supports_sticker,
+    platform_supports_typing,
+    send_platform_typing,
+)
 from .output_links import filter_reply_links
 from .routing import RouteDecision
 from .security import Rejected, authorize, owner
@@ -143,12 +150,8 @@ class _ServiceTurnMixin:
             if self._random() > caps.direct_reply_prob:
                 self.counters["affection_prob_ignored"] += 1
                 return
-        if (
-            message.platform == "onebot"
-            and message.kind == "private"
-            and hasattr(self.sender, "typing")
-        ):
-            await self.sender.typing(message)
+        if direct_chat and platform_supports_typing(self, message):
+            await send_platform_typing(self, message)
         if not message.context_expanded:
             message = await self.expand_forwards(message)
         img_limit = (
@@ -194,10 +197,18 @@ class _ServiceTurnMixin:
                 }
                 for m in members
             ],
-            "current_sender": {
-                "nickname": message.sender_nickname or "群友",
-                "qq": message.user_id,
-            },
+            "current_sender": (
+                {
+                    "nickname": message.sender_nickname or "群友",
+                    "qq": message.user_id,
+                }
+                if message.platform in {"onebot", "qq"}
+                else {
+                    "nickname": message.sender_nickname or "群友",
+                    "platform": message.platform,
+                    "user_id": message.user_id,
+                }
+            ),
             "surface": message.kind,
             "directly_addressed": message.addressed,
             "recent_messages": history,
@@ -920,15 +931,10 @@ class _ServiceTurnMixin:
                     reply_score=getattr(intent, "reply_score", None),
                     reply_threshold=getattr(intent, "reply_threshold", None),
                 )
-            if tier >= 3 and message.platform == "onebot" and hasattr(self.sender, "quick_ack"):
+            if tier >= 3 and not sandbox and platform_supports_quick_ack(self, message):
                 self.background(self.quick_ack(job, message, message_guard))
-            if (
-                not sandbox
-                and message.platform == "onebot"
-                and message.kind == "private"
-                and hasattr(self.sender, "typing")
-            ):
-                await self.sender.typing(message)
+            if not sandbox and platform_supports_typing(self, message):
+                await send_platform_typing(self, message)
             audio_turn = bool(audios)
             audio_event_ids = list(
                 dict.fromkeys(
@@ -1151,7 +1157,7 @@ class _ServiceTurnMixin:
             self.output(result) if result else "",
             session_epoch=session["epoch"],
             meme_tag=meme_tag,
-            meme_eligible=public and message.platform == "onebot",
+            meme_eligible=public and platform_supports_sticker(self, message),
             participants=members if len(members) > 1 else None,
             segments=parsed.segments,
             allowed_at_qqs=allowed_at,
@@ -1179,7 +1185,7 @@ class _ServiceTurnMixin:
     ) -> None:
         if (
             sandbox
-            or message.platform != "onebot"
+            or not platform_supports_emoji_like(self, message)
             or message.kind != "group"
             or message.invites_group_review
             or self.bot_guard.known_bot(message)
@@ -1391,7 +1397,7 @@ class _ServiceTurnMixin:
                 folded = None
         if not sandbox and not actions.abstain and not farewell_bypass:
             if (
-                message.platform == "onebot"
+                platform_supports_sticker(self, message)
                 and actions.save_meme_label
                 and not self.bot_guard.known_bot(message)
             ):
@@ -1420,10 +1426,9 @@ class _ServiceTurnMixin:
                 self._spawn_owner_chat_action(actions.trigger_action, context_message=message)
         allow_text_card = not aff_active or caps.allow_text_card
         if actions.abstain:
-            if (
-                not sandbox
-                and message.platform == "onebot"
-                and (actions.emoji_like or actions.poke_qq)
+            if not sandbox and (
+                (actions.emoji_like and platform_supports_emoji_like(self, message))
+                or (actions.poke_qq and message.platform == "onebot")
             ):
                 await self.store.enqueue_reply(
                     job["id"],

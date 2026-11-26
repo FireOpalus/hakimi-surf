@@ -61,6 +61,22 @@ EMOJI_LIKE_MAP = {
     "晚安": "128164",
     "💤": "128164",
 }
+EMOJI_ID_TO_UNICODE: dict[str, str] = {
+    "76": "👍",
+    "66": "❤",
+    "128077": "👍",
+    "128514": "😂",
+    "128079": "👏",
+    "128293": "🔥",
+    "127881": "🎉",
+    "129300": "🤔",
+    "128064": "👀",
+    "128557": "😭",
+    "128175": "💯",
+    "128049": "🐱",
+    "10024": "✨",
+    "128164": "💤",
+}
 
 
 def normalize_emoji_like(raw: str | None) -> str | None:
@@ -74,6 +90,13 @@ def normalize_emoji_like(raw: str | None) -> str | None:
     if cleaned in ALLOWED_EMOJI_IDS:
         return cleaned
     return None
+
+
+def emoji_like_to_unicode(emoji_id: str | None) -> str | None:
+    normalized = normalize_emoji_like(emoji_id)
+    if normalized is None:
+        return None
+    return EMOJI_ID_TO_UNICODE.get(normalized)
 
 
 def _normalize_longnick(raw: str | None, settings=None) -> str | None:

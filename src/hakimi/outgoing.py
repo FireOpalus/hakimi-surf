@@ -1,6 +1,8 @@
 """ACK-only multi-bubble delivery, with conservative ambiguity and recall semantics."""
 
 import asyncio
+import base64
+import binascii
 import inspect
 import random
 import re
@@ -13,13 +15,21 @@ from .bot_server import is_persona_owner
 from .memes import explicit_meme_request
 from .models import Message
 from .modules.adapters import farewell_send_bypass
-from .outbound_actions import bubble_segments, parse_actions, valid_receipt
+from .outbound_actions import (
+    bubble_segments,
+    emoji_like_to_unicode,
+    parse_actions,
+    valid_receipt,
+)
 from .output_links import filter_reply_links
 from .platform_hooks import get_platform_hooks
 from .security import Rejected, authorize, configured_secrets, safe_output
 from .session_manager import session_epoch
 from .social import chat_module, confirmed_message_id
-from .text_card import should_render_rich_card
+from .text_card import render_card, should_render_rich_card
+
+_MAX_MEDIA_IMAGE_BYTES = 5 * 1024 * 1024
+_MAX_MEDIA_B64_CHARS = 7 * 1024 * 1024
 
 PRE_DISPATCH_REJECTED = frozenset(
     {
@@ -55,6 +65,229 @@ def _resolve_platform_voice_capability(service, message: Message) -> tuple[bool,
     return (
         bool(module and getattr(module, "supports_voice", False)),
         str(getattr(module, "preferred_voice_format", "ogg_opus") or "ogg_opus"),
+    )
+
+
+def platform_supports_sticker(service, message: Message) -> bool:
+    if message.platform == "onebot":
+        return hasattr(getattr(service, "sender", None), "send_meme")
+    if message.platform == "qq":
+        return False
+    module = chat_module(service.s, message.platform)
+    return bool(module and getattr(module, "supports_sticker", False))
+
+
+def platform_supports_rich_card(service, message: Message) -> bool:
+    if message.platform == "onebot":
+        return hasattr(getattr(service, "sender", None), "send_card")
+    if message.platform == "qq":
+        return False
+    module = chat_module(service.s, message.platform)
+    return bool(module and getattr(module, "supports_rich_card", False))
+
+
+def platform_supports_emoji_like(service, message: Message) -> bool:
+    if message.platform == "onebot":
+        return hasattr(getattr(service, "sender", None), "send_emoji_like")
+    if message.platform == "qq":
+        return False
+    module = chat_module(service.s, message.platform)
+    return bool(module and getattr(module, "supports_emoji_like", False))
+
+
+def platform_supports_typing(service, message: Message) -> bool:
+    if message.platform == "onebot":
+        return message.kind == "private" and hasattr(getattr(service, "sender", None), "typing")
+    if message.platform == "qq":
+        return False
+    module = chat_module(service.s, message.platform)
+    return bool(module and getattr(module, "supports_typing", False))
+
+
+def platform_supports_quick_ack(service, message: Message) -> bool:
+    if message.platform == "onebot":
+        return hasattr(getattr(service, "sender", None), "quick_ack")
+    if message.platform == "qq":
+        return False
+    module = chat_module(service.s, message.platform)
+    return bool(module and getattr(module, "supports_quick_ack", False))
+
+
+def _detect_media_image_info(raw: bytes, *, as_sticker: bool) -> tuple[str, str] | None:
+    prefix = "sticker" if as_sticker else "card"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return ("image/jpeg", f"{prefix}.jpg")
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ("image/png", f"{prefix}.png")
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return ("image/gif", f"{prefix}.gif")
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return ("image/webp", f"{prefix}.webp")
+    return None
+
+
+async def send_platform_typing(service, message: Message) -> None:
+    if not platform_supports_typing(service, message):
+        return
+    if not authorize(message, service.s):
+        return
+    if message.platform == "onebot":
+        await service.sender.typing(message)
+        return
+    module = chat_module(service.s, message.platform)
+    if module is None:
+        return
+    send_fn = getattr(module, "send_typing", None)
+    if not callable(send_fn):
+        return
+    try:
+        await send_fn(message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
+async def send_platform_emoji_like(
+    service,
+    message: Message,
+    target_message_id: str,
+    emoji_id: str,
+    *,
+    before_send=None,
+) -> bool:
+    if not target_message_id or not emoji_id or not platform_supports_emoji_like(service, message):
+        return False
+    if message.platform == "onebot":
+        return bool(
+            await service.sender.send_emoji_like(
+                message, target_message_id, emoji_id, before_send=before_send
+            )
+        )
+    module = chat_module(service.s, message.platform)
+    if module is None:
+        return False
+    send_fn = getattr(module, "send_emoji_like", None)
+    if not callable(send_fn):
+        return False
+    emoji = emoji_like_to_unicode(emoji_id)
+    if emoji is None:
+        return False
+
+    async def still_valid() -> bool:
+        return (
+            (before_send is None or await before_send())
+            and authorize(message, service.s)
+            and time.time() - message.created_at <= service.s.event_ttl_seconds
+        )
+
+    if not await still_valid():
+        raise Rejected("reply_invalidated")
+    kwargs: dict[str, Any] = {"before_send": still_valid}
+    if _accepts_kwarg(send_fn, "emoji"):
+        kwargs["emoji"] = emoji
+    return bool(await send_fn(message, str(target_message_id), str(emoji_id), **kwargs))
+
+
+async def send_platform_meme(
+    service,
+    message: Message,
+    data_b64_uri: str,
+    *,
+    before_send=None,
+    as_sticker: bool = True,
+    reply_to: str | None = None,
+) -> dict:
+    if message.platform == "onebot":
+        if not hasattr(getattr(service, "sender", None), "send_meme"):
+            raise Rejected("meme_delivery_forbidden")
+        kwargs: dict[str, Any] = {"before_send": before_send}
+        if _accepts_kwarg(service.sender.send_meme, "as_sticker"):
+            kwargs["as_sticker"] = as_sticker
+        return await service.sender.send_meme(message, data_b64_uri, **kwargs)
+    if message.platform == "qq":
+        raise Rejected("meme_delivery_forbidden")
+    module = chat_module(service.s, message.platform)
+    cap_attr = "supports_sticker" if as_sticker else "supports_rich_card"
+    if (
+        module is None
+        or not getattr(module, cap_attr, False)
+        or not callable(getattr(module, "send_media", None))
+    ):
+        raise Rejected("meme_delivery_forbidden")
+    if (
+        not isinstance(data_b64_uri, str)
+        or not data_b64_uri.startswith("base64://")
+        or len(data_b64_uri) > _MAX_MEDIA_B64_CHARS
+    ):
+        raise Rejected("meme_delivery_forbidden")
+    try:
+        raw = base64.b64decode(data_b64_uri[9:], validate=True)
+    except (ValueError, binascii.Error):
+        raise Rejected("invalid_meme_image") from None
+    if not raw or len(raw) > _MAX_MEDIA_IMAGE_BYTES:
+        raise Rejected("invalid_meme_image")
+    media_info = _detect_media_image_info(raw, as_sticker=as_sticker)
+    if media_info is None:
+        raise Rejected("invalid_meme_image")
+    mime_type, filename = media_info
+
+    async def still_valid() -> bool:
+        return (
+            (before_send is None or await before_send())
+            and authorize(message, service.s)
+            and time.time() - message.created_at <= service.s.event_ttl_seconds
+        )
+
+    if not await still_valid():
+        raise Rejected("reply_invalidated")
+    send_kwargs: dict[str, Any] = {
+        "kind": "sticker" if as_sticker else "card",
+        "mime_type": mime_type,
+        "filename": filename,
+        "before_send": still_valid,
+    }
+    if (
+        isinstance(reply_to, str)
+        and reply_to.strip()
+        and getattr(module, "supports_reply_anchor", False)
+        and _accepts_kwarg(module.send_media, "reply_to")
+    ):
+        send_kwargs["reply_to"] = reply_to.strip()
+    ident = await module.send_media(message, raw, **send_kwargs)
+    return {"message_id": confirmed_message_id(ident)}
+
+
+async def send_platform_card(
+    service,
+    message: Message,
+    text: str,
+    *,
+    before_send=None,
+    reply_to: str | None = None,
+) -> dict:
+    if message.platform == "onebot":
+        if not hasattr(getattr(service, "sender", None), "send_card"):
+            raise Rejected("card_delivery_forbidden")
+        return await service.sender.send_card(message, text, before_send=before_send)
+    if message.kind != "group":
+        raise Rejected("card_group_only")
+    if not platform_supports_rich_card(service, message):
+        raise Rejected("card_delivery_forbidden")
+    secrets = getattr(service, "secrets", None) or configured_secrets(service.s)
+    rendered_text = safe_output(text, secrets, limit=8000)
+    if before_send is not None and not await before_send():
+        raise Rejected("reply_invalidated")
+    if not authorize(message, service.s):
+        raise Rejected("reply_invalidated")
+    image_b64 = await asyncio.to_thread(render_card, rendered_text)
+    return await send_platform_meme(
+        service,
+        message,
+        image_b64,
+        before_send=before_send,
+        as_sticker=False,
+        reply_to=reply_to,
     )
 
 
@@ -149,8 +382,7 @@ async def _deliver_voice_or_fallback(
     apply_output: bool = True,
 ) -> None:
     if delay_before:
-        if hasattr(service.sender, "typing"):
-            await service.sender.typing(message)
+        await send_platform_typing(service, message)
         await asyncio.sleep(
             _pacing_delay(
                 service,
@@ -258,8 +490,7 @@ async def _deliver_song(
     apply_output: bool = True,
 ) -> None:
     if delay_before:
-        if hasattr(service.sender, "typing"):
-            await service.sender.typing(message)
+        await send_platform_typing(service, message)
         await asyncio.sleep(_pacing_delay(service, 1.0))
 
     song_lib = getattr(service, "songs", None)
@@ -594,7 +825,7 @@ async def deliver_actions(service, reply):
         confirmed.append(data)
         position += 1
 
-    async def sticker():
+    async def sticker(*, reply_to: str | None = None):
         nonlocal sticker_choice
         if not sticker_choice:
             return
@@ -604,8 +835,13 @@ async def deliver_actions(service, reply):
 
         if not await image_valid():
             raise Rejected("reply_invalidated")
-        receipt = await service.sender.send_meme(
-            message, sticker_choice["data"], before_send=image_valid
+        receipt = await send_platform_meme(
+            service,
+            message,
+            sticker_choice["data"],
+            before_send=image_valid,
+            as_sticker=True,
+            reply_to=reply_to,
         )
         await acknowledge("[本地表情：" + actions["sticker"]["label"] + "]", receipt)
         await service.memes.confirm_choice(store.session_scope(message), sticker_choice["digest"])
@@ -629,12 +865,11 @@ async def deliver_actions(service, reply):
                 if (
                     emoji_like
                     and reaction_target_id
-                    and message.platform == "onebot"
-                    and hasattr(service.sender, "send_emoji_like")
+                    and platform_supports_emoji_like(service, message)
                 ):
                     try:
-                        if await service.sender.send_emoji_like(
-                            message, reaction_target_id, emoji_like, before_send=valid
+                        if await send_platform_emoji_like(
+                            service, message, reaction_target_id, emoji_like, before_send=valid
                         ):
                             did_any = True
                     except asyncio.CancelledError:
@@ -674,7 +909,7 @@ async def deliver_actions(service, reply):
                 voice_text = str(actions.get("voice_text") or "").strip()
                 sing_song = str(actions.get("sing_song") or "").strip()
                 has_reply_body = has_text_bubbles or bool(voice_text) or bool(sing_song)
-                if message.platform == "onebot":
+                if platform_supports_sticker(service, message):
                     force_sticker = (not has_reply_body and bool(label)) or explicit_meme_request(
                         *(m.text for m in members), message.text
                     )
@@ -688,10 +923,6 @@ async def deliver_actions(service, reply):
                         sticker_choice = await service.memes.choose(
                             label, store.session_scope(message)
                         )
-                if actions["sticker"].get("timing") == "before_text":
-                    await sticker()
-                    if sticker_choice and has_reply_body:
-                        await asyncio.sleep(_pacing_delay(service, 0.6))
                 if message.kind != "group" or (
                     service.bot_guard.known_bot(message)
                     and not service.bot_guard.is_owner_invited(message)
@@ -716,19 +947,26 @@ async def deliver_actions(service, reply):
                             ),
                             None,
                         )
+                if actions["sticker"].get("timing") == "before_text":
+                    await sticker(reply_to=anchor.get("reply_id") if not confirmed else None)
+                    if sticker_choice and has_reply_body:
+                        await asyncio.sleep(_pacing_delay(service, 0.6))
                 folded = actions.get("folded") if message.kind == "group" else None
                 combined_bubbles = "\n".join(b for b in actions.get("bubbles", [])[:3] if b.strip())
                 card_source = folded or combined_bubbles
                 if (
                     actions.get("allow_text_card", True)
                     and message.kind == "group"
-                    and message.platform == "onebot"
+                    and platform_supports_rich_card(service, message)
                     and card_source
-                    and hasattr(service.sender, "send_card")
                     and should_render_rich_card(card_source, service.s.text_card_mode)
                 ):
-                    receipt = await service.sender.send_card(
-                        message, card_source, before_send=valid
+                    receipt = await send_platform_card(
+                        service,
+                        message,
+                        card_source,
+                        before_send=valid,
+                        reply_to=anchor.get("reply_id") if not confirmed else None,
                     )
                     await acknowledge(card_source, receipt)
                 elif folded and message.platform == "onebot":
@@ -740,8 +978,7 @@ async def deliver_actions(service, reply):
                         text_bubbles = [str(folded).strip()]
                     for text in text_bubbles:
                         if confirmed:
-                            if hasattr(service.sender, "typing"):
-                                await service.sender.typing(message)
+                            await send_platform_typing(service, message)
                             await asyncio.sleep(
                                 _pacing_delay(
                                     service,
@@ -793,7 +1030,7 @@ async def deliver_actions(service, reply):
                 if actions["sticker"].get("timing") != "before_text" and sticker_choice:
                     if confirmed:
                         await asyncio.sleep(_pacing_delay(service, 0.6))
-                    await sticker()
+                    await sticker(reply_to=anchor.get("reply_id") if not confirmed else None)
                 did_reaction = await _try_react_and_poke()
                 if not confirmed and not did_reaction:
                     status, detail = "cancelled", "empty_reply"
@@ -945,10 +1182,7 @@ async def deliver_proactive_jit(
         str(message.event_id) if re.fullmatch(r"-?[0-9]{1,30}", str(message.event_id)) else None
     )
     can_emoji = bool(
-        emoji_like
-        and reaction_target_id
-        and message.platform == "onebot"
-        and hasattr(service.sender, "send_emoji_like")
+        emoji_like and reaction_target_id and platform_supports_emoji_like(service, message)
     )
     can_poke = bool(
         poke_qq
@@ -1036,8 +1270,7 @@ async def deliver_proactive_jit(
     try:
         for index, text in enumerate(bubbles[:3]):
             if index:
-                if hasattr(service.sender, "typing"):
-                    await service.sender.typing(message)
+                await send_platform_typing(service, message)
                 await asyncio.sleep(
                     _pacing_delay(
                         service,
@@ -1117,8 +1350,8 @@ async def deliver_proactive_jit(
 
         if can_emoji:
             try:
-                if await service.sender.send_emoji_like(
-                    message, reaction_target_id, emoji_like, before_send=valid
+                if await send_platform_emoji_like(
+                    service, message, reaction_target_id, emoji_like, before_send=valid
                 ):
                     did_reaction = True
             except asyncio.CancelledError:

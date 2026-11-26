@@ -1490,3 +1490,95 @@ async def test_sdk_bidirectional_chunked_blob_and_backpressure():
         assert "3" * 32 not in client._inbound_blobs
     finally:
         await client.stop()
+
+
+async def test_sdk_media_react_typing_delivery_decorators():
+    from hakimi_plugin_sdk.protocol import BLOB_FIELD, encode_blob_chunk, sha256_hex
+
+    sock = _FakeSocket()
+    client = HakimiPluginClient(
+        _make_config(plugin_id="tg_sdk", scopes=("chat", "media")),
+        connect_factory=lambda *_: sock,
+    )
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    @client.on_media_delivery
+    async def handle_media(params: dict[str, Any]) -> dict[str, Any]:
+        seen.append(("media", params))
+        return {"message_id": "m-1"}
+
+    @client.on_react_delivery
+    async def handle_react(params: dict[str, Any]) -> dict[str, Any]:
+        seen.append(("react", params))
+        return {"applied": True}
+
+    async def handle_typing(params: dict[str, Any]) -> dict[str, Any]:
+        seen.append(("typing", params))
+        return {"ok": True}
+
+    client.on_typing_delivery(handle_typing)
+
+    await client.start()
+    try:
+        await sock.wait_sent(lambda m: m.get("type") == "plugin.hello")
+        await sock.push({"type": "plugin.welcome", "plugin_id": "tg_sdk", "enabled": True})
+        assert await client.wait_connected(timeout=2.0)
+
+        png_raw = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        await sock.push(
+            {
+                "type": "rpc.request",
+                "id": "m1",
+                "method": "delivery.send_media",
+                "params": {
+                    "platform": "telegram",
+                    "kind": "group",
+                    "conversation_id": "-1001",
+                    "media_kind": "sticker",
+                    BLOB_FIELD: {
+                        "encoding": "inline_b64",
+                        "data_b64": encode_blob_chunk(png_raw),
+                        "byte_size": len(png_raw),
+                        "sha256": sha256_hex(png_raw),
+                        "mime_type": "image/png",
+                        "filename": "cat.png",
+                    },
+                },
+            }
+        )
+        m1 = await sock.wait_sent(lambda m: m.get("id") == "m1")
+        assert m1 == {"type": "rpc.result", "id": "m1", "ok": True, "result": {"message_id": "m-1"}}
+        assert seen[-1][0] == "media"
+        assert seen[-1][1]["blob"] == png_raw
+
+        await sock.push(
+            {
+                "type": "rpc.request",
+                "id": "r1",
+                "method": "delivery.react",
+                "params": {
+                    "platform": "telegram",
+                    "conversation_id": "-1001",
+                    "message_id": "99",
+                    "emoji_id": "128077",
+                    "emoji": "👍",
+                },
+            }
+        )
+        r1 = await sock.wait_sent(lambda m: m.get("id") == "r1")
+        assert r1 == {"type": "rpc.result", "id": "r1", "ok": True, "result": {"applied": True}}
+        assert seen[-1][0] == "react"
+
+        await sock.push(
+            {
+                "type": "rpc.request",
+                "id": "t1",
+                "method": "delivery.typing",
+                "params": {"platform": "telegram", "conversation_id": "-1001"},
+            }
+        )
+        t1 = await sock.wait_sent(lambda m: m.get("id") == "t1")
+        assert t1 == {"type": "rpc.result", "id": "t1", "ok": True, "result": {"ok": True}}
+        assert seen[-1][0] == "typing"
+    finally:
+        await client.stop()

@@ -105,8 +105,9 @@ async def load_message_images(
     images, sources = [], []
     valid_loaded = sum(1 for item in results if item is not None)
     for (ref, member, origin), loaded in zip(selected, results, strict=True):
+        sender_channel = "QQ" if member.platform in {"onebot", "qq"} else member.platform
         data: dict[str, Any] = {
-            "sender": f"{ref.sender_nickname or '群友'}(QQ:{ref.sender_id})"
+            "sender": f"{ref.sender_nickname or '群友'}({sender_channel}:{ref.sender_id})"
             if ref.sender_id
             else service.image_sender(member),
             "origin": origin if ref.origin in {"", "当前消息"} else origin + " / " + ref.origin,
@@ -204,8 +205,9 @@ async def load_message_audios(
     sources: list[dict[str, Any]] = []
     durations_by_event: dict[str, list[float]] = {}
     for (ref, member, origin), loaded in zip(selected, results, strict=True):
+        sender_channel = "QQ" if member.platform in {"onebot", "qq"} else member.platform
         data: dict[str, Any] = {
-            "sender": f"{ref.sender_nickname or '群友'}(QQ:{ref.sender_id})"
+            "sender": f"{ref.sender_nickname or '群友'}({sender_channel}:{ref.sender_id})"
             if ref.sender_id
             else service.image_sender(member),
             "origin": origin if ref.origin in {"", "当前消息"} else origin + " / " + ref.origin,

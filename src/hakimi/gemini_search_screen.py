@@ -358,7 +358,7 @@ class _GeminiSearchScreenMixin:
             if message and message.kind == "group"
             else "at_only"
         )
-        if inbound and not direct and message and message.has_possible_qq_alias:
+        if inbound and not direct and message and message.has_possible_alias:
             if group_policy != "smart_reply":
                 query["should_reply"]["instructions"] = (
                     "This group is in mention-only mode. Decide whether the sender is calling "

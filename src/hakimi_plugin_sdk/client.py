@@ -565,6 +565,33 @@ class HakimiPluginClient:
 
         return _decorator(fn) if fn is not None else _decorator
 
+    def on_media_delivery(self, fn: Callable[..., Any] | None = None) -> Any:
+        """Decorator registering the `delivery.send_media` RPC handler."""
+
+        def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_rpc("delivery.send_media", target)
+            return target
+
+        return _decorator(fn) if fn is not None else _decorator
+
+    def on_react_delivery(self, fn: Callable[..., Any] | None = None) -> Any:
+        """Decorator registering the `delivery.react` RPC handler."""
+
+        def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_rpc("delivery.react", target)
+            return target
+
+        return _decorator(fn) if fn is not None else _decorator
+
+    def on_typing_delivery(self, fn: Callable[..., Any] | None = None) -> Any:
+        """Decorator registering the `delivery.typing` RPC handler."""
+
+        def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_rpc("delivery.typing", target)
+            return target
+
+        return _decorator(fn) if fn is not None else _decorator
+
     def on_media_fetch(self, fn: Callable[..., Any] | None = None) -> Any:
         """Decorator registering the `media.fetch` RPC handler (returns `BlobResult`)."""
 

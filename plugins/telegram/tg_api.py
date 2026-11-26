@@ -385,6 +385,79 @@ class TelegramBotApi:
         )
         return str(res["message_id"])
 
+    async def send_photo(
+        self,
+        chat_id: str,
+        photo_bytes: bytes,
+        *,
+        filename: str = "image.png",
+        mime_type: str = "image/png",
+        reply_to_message_id: int | None = None,
+    ) -> str:
+        data: dict[str, Any] = {"chat_id": str(chat_id)}
+        if reply_to_message_id is not None:
+            data["reply_parameters"] = json.dumps(
+                {
+                    "message_id": int(reply_to_message_id),
+                    "allow_sending_without_reply": True,
+                },
+                separators=(",", ":"),
+            )
+        res = await self._send_with_reply_fallback(
+            "sendPhoto",
+            data=data,
+            files={"photo": (filename, photo_bytes, mime_type)},
+            timeout=30.0,
+        )
+        return str(res["message_id"])
+
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_bytes: bytes,
+        *,
+        filename: str = "meme.gif",
+        mime_type: str = "image/gif",
+        reply_to_message_id: int | None = None,
+    ) -> str:
+        data: dict[str, Any] = {"chat_id": str(chat_id)}
+        if reply_to_message_id is not None:
+            data["reply_parameters"] = json.dumps(
+                {
+                    "message_id": int(reply_to_message_id),
+                    "allow_sending_without_reply": True,
+                },
+                separators=(",", ":"),
+            )
+        res = await self._send_with_reply_fallback(
+            "sendAnimation",
+            data=data,
+            files={"animation": (filename, animation_bytes, mime_type)},
+            timeout=30.0,
+        )
+        return str(res["message_id"])
+
+    async def set_message_reaction(self, chat_id: str, message_id: int, emoji: str) -> bool:
+        clean_emoji = str(emoji or "").strip()
+        if not clean_emoji:
+            return False
+        try:
+            res = await self._request(
+                "setMessageReaction",
+                json_body={
+                    "chat_id": str(chat_id),
+                    "message_id": int(message_id),
+                    "reaction": [{"type": "emoji", "emoji": clean_emoji}],
+                },
+                timeout=10.0,
+            )
+        except TelegramApiError as exc:
+            if exc.code == "tg_bad_request":
+                return False
+            log.warning("event=tg_set_reaction_failed code=%s", exc.code)
+            return False
+        return bool(res) if res is not None else True
+
     async def send_chat_action(self, chat_id: str, action: str = "typing") -> None:
         try:
             await self._request(

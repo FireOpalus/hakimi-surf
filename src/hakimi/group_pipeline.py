@@ -408,7 +408,7 @@ class GroupPipeline:
                 (m for m in messages if m.attention_reason == "mention"), None
             ) or next((m for m in messages if m.addressed), None)
             attention_reason = addressed.attention_reason if addressed else ""
-            if not addressed and any(m.has_possible_qq_alias for m in messages):
+            if not addressed and any(m.has_possible_alias for m in messages):
                 attention_reason = "possible_alias"
 
             def unique(field, limit):
