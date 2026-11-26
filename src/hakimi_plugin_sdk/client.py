@@ -547,11 +547,29 @@ class HakimiPluginClient:
 
         return _decorator(fn) if fn is not None else _decorator
 
+    def on_chat_delivery(self, fn: Callable[..., Any] | None = None) -> Any:
+        """Decorator registering the `delivery.send` RPC handler."""
+
+        def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_rpc("delivery.send", target)
+            return target
+
+        return _decorator(fn) if fn is not None else _decorator
+
     def on_voice_delivery(self, fn: Callable[..., Any] | None = None) -> Any:
         """Decorator registering the `delivery.send_voice` RPC handler."""
 
         def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
             self.register_rpc("delivery.send_voice", target)
+            return target
+
+        return _decorator(fn) if fn is not None else _decorator
+
+    def on_media_fetch(self, fn: Callable[..., Any] | None = None) -> Any:
+        """Decorator registering the `media.fetch` RPC handler (returns `BlobResult`)."""
+
+        def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_rpc("media.fetch", target)
             return target
 
         return _decorator(fn) if fn is not None else _decorator
@@ -943,6 +961,62 @@ class HakimiPluginClient:
             frame["kind"] = kind
         if active is not None:
             frame["active"] = bool(active)
+        await self._send_live_frame(frame)
+
+    async def emit_chat_inbound(
+        self,
+        *,
+        platform: str,
+        user_id: str,
+        text: str = "",
+        kind: Literal["private", "group"] = "private",
+        conversation_id: str = "",
+        bot_id: str = "",
+        event_id: str = "",
+        addressed: bool | None = None,
+        created_at: float | None = None,
+        sender_nickname: str = "",
+        group_name: str = "",
+        command_text: str | None = None,
+        reply_ids: Sequence[str] | None = None,
+        attention_reason: str = "",
+        images: Sequence[dict[str, Any]] | None = None,
+        files: Sequence[dict[str, Any]] | None = None,
+        audios: Sequence[dict[str, Any]] | None = None,
+    ) -> None:
+        """Emit an authenticated `chat.inbound` message frame (`chat` scope)."""
+        frame: dict[str, Any] = {
+            "type": "chat.inbound",
+            "id": uuid.uuid4().hex,
+            "platform": platform,
+            "kind": kind,
+            "user_id": user_id,
+            "conversation_id": conversation_id or user_id,
+            "text": text,
+            "created_at": time.time() if created_at is None else float(created_at),
+        }
+        if bot_id:
+            frame["bot_id"] = bot_id
+        if event_id:
+            frame["event_id"] = event_id
+        if addressed is not None:
+            frame["addressed"] = bool(addressed)
+        if sender_nickname:
+            frame["sender_nickname"] = sender_nickname
+        if group_name:
+            frame["group_name"] = group_name
+        if command_text is not None:
+            frame["command_text"] = command_text
+        if reply_ids:
+            frame["reply_ids"] = list(reply_ids)
+        if attention_reason:
+            frame["attention_reason"] = attention_reason
+        if images:
+            frame["images"] = [dict(item) for item in images]
+        if files:
+            frame["files"] = [dict(item) for item in files]
+        if audios:
+            frame["audios"] = [dict(item) for item in audios]
         await self._send_live_frame(frame)
 
     async def enqueue_reaction(

@@ -449,12 +449,22 @@ class FileReader:
         if limit_per_user == 0 or used >= limit_per_user:
             raise Rejected("daily_limit")
 
-        raw, urls = await self._via_transport(ref, context_msg, maximum)
-        if raw is None:
-            url = next(iter(urls), _public_download_url(ref.url) if ref.url else None)
-            if not url:
+        if ref.file_id.startswith("plugin_media:"):
+            if self.plugin_bus is None or not hasattr(self.plugin_bus, "fetch_plugin_media"):
                 raise Rejected("unavailable")
-            raw = await self._download_http(url, maximum)
+            try:
+                raw = await self.plugin_bus.fetch_plugin_media(
+                    ref.file_id, kind="file", max_bytes=maximum
+                )
+            except Rejected as exc:
+                raise Rejected("oversized" if "too_large" in str(exc) else "unavailable") from None
+        else:
+            raw, urls = await self._via_transport(ref, context_msg, maximum)
+            if raw is None:
+                url = next(iter(urls), _public_download_url(ref.url) if ref.url else None)
+                if not url:
+                    raise Rejected("unavailable")
+                raw = await self._download_http(url, maximum)
         if not raw:
             raise Rejected("unavailable")
         if len(raw) > maximum:
@@ -592,17 +602,27 @@ class FileReader:
         if ref.file_size is not None and ref.file_size > maximum:
             raise Rejected("oversized")
 
-        raw, urls = await self._via_transport(ref, context_msg, maximum)
-        if raw is None:
-            url = next(iter(urls), _public_download_url(ref.url) if ref.url else None)
-            if not url:
+        if ref.file_id.startswith("plugin_media:"):
+            if self.plugin_bus is None or not hasattr(self.plugin_bus, "fetch_plugin_media"):
                 raise Rejected("unavailable")
             try:
-                raw = await self._download_http(url, maximum)
-            except Rejected:
-                raise
-            except (TimeoutError, aiohttp.ClientError, OSError, ValueError):
-                raise Rejected("unavailable") from None
+                raw = await self.plugin_bus.fetch_plugin_media(
+                    ref.file_id, kind="file", max_bytes=maximum
+                )
+            except Rejected as exc:
+                raise Rejected("oversized" if "too_large" in str(exc) else "unavailable") from None
+        else:
+            raw, urls = await self._via_transport(ref, context_msg, maximum)
+            if raw is None:
+                url = next(iter(urls), _public_download_url(ref.url) if ref.url else None)
+                if not url:
+                    raise Rejected("unavailable")
+                try:
+                    raw = await self._download_http(url, maximum)
+                except Rejected:
+                    raise
+                except (TimeoutError, aiohttp.ClientError, OSError, ValueError):
+                    raise Rejected("unavailable") from None
         if not raw:
             raise Rejected("unavailable")
         if len(raw) > maximum:

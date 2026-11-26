@@ -210,6 +210,8 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         self.compressor = self.modules.systems["memory_compressor"].compressor
         self.memes = self.modules.systems["meme_library"].library
         self.plugin_bus = self.modules.systems["plugin_bus"].plugin_bus
+        self.images.plugin_bus = self.plugin_bus
+        self.audios.plugin_bus = self.plugin_bus
         self.files.plugin_bus = self.plugin_bus
         self.songs.plugin_bus = self.plugin_bus
         if getattr(store.runtime, "web_search", None) is not None:
@@ -442,12 +444,28 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
             self.counters["ignored"] += 1
             return "ignored"
         if message.platform not in {"onebot", "qq"}:
-            # Replies and media references from other transports may never invoke OneBot RPCs.
+            # Replies and media references from other transports may never invoke OneBot RPCs
+            # or arbitrary outbound URLs; preserve only bus-namespaced plugin_media refs.
+            plugin_images = [
+                ref
+                for ref in message.images
+                if not ref.url and ref.file.startswith("plugin_media:")
+            ]
+            plugin_files = [
+                ref
+                for ref in message.files
+                if not ref.url and ref.file_id.startswith("plugin_media:")
+            ]
+            plugin_audios = [
+                ref
+                for ref in message.audios
+                if not ref.url and ref.file.startswith("plugin_media:")
+            ]
             message = message.model_copy(
                 update={
-                    "images": [],
-                    "files": [],
-                    "audios": [],
+                    "images": plugin_images,
+                    "files": plugin_files,
+                    "audios": plugin_audios,
                     "forward_ids": [],
                     "context_expanded": True,
                 }

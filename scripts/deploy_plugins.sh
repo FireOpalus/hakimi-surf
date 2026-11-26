@@ -8,7 +8,7 @@ target=${2:-}
 compose=(docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml -f compose.plugins.yaml)
 
 usage() {
-    echo "Usage: $0 {up|restart|down|status} [weather|minecraft|bilibili|web_tools|doc_render|song_finder|wave3|all]" >&2
+    echo "Usage: $0 {up|restart|down|status} [weather|minecraft|bilibili|web_tools|doc_render|song_finder|telegram|wave3|all]" >&2
     exit 2
 }
 
@@ -18,7 +18,7 @@ resolve_services() {
             echo "hakimi-plugin-weather hakimi-plugin-minecraft hakimi-plugin-bilibili"
             ;;
         all)
-            echo "hakimi-plugin-weather hakimi-plugin-minecraft hakimi-plugin-bilibili hakimi-plugin-web-tools hakimi-plugin-doc-render hakimi-plugin-song-finder"
+            echo "hakimi-plugin-weather hakimi-plugin-minecraft hakimi-plugin-bilibili hakimi-plugin-web-tools hakimi-plugin-doc-render hakimi-plugin-song-finder hakimi-plugin-telegram"
             ;;
         wave3)
             echo "hakimi-plugin-web-tools hakimi-plugin-doc-render hakimi-plugin-song-finder"
@@ -40,6 +40,9 @@ resolve_services() {
             ;;
         song_finder|song-finder|hakimi-plugin-song-finder)
             echo "hakimi-plugin-song-finder"
+            ;;
+        telegram|tg|hakimi-plugin-telegram)
+            echo "hakimi-plugin-telegram"
             ;;
         *)
             usage

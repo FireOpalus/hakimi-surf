@@ -6,10 +6,13 @@ import asyncio
 import base64
 import inspect
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from hakimi_plugin_sdk.protocol import BLOB_FIELD
 
 from ..config import Settings
 from ..models import Message
@@ -20,11 +23,12 @@ from ..modules.bili_schedule import BiliScheduleOptions
 from ..modules.scheduling import LocalActivity
 from ..plugin_kernel import PluginContext, PluginFiber
 from ..security import Rejected
-from ..social import confirmed_message_id
+from ..social import bound_owner, confirmed_message_id, owner_binding
 from ..thinking_policy import ThinkingScene
 from .protocol import (
     _CODE_RE,
     _CUSTOM_RPC_RE,
+    _MAX_PLUGIN_AUDIO_BLOB_BYTES,
     _MAX_VOICE_AUDIO_BYTES,
     _SENSOR_RPC_TIMEOUT_SECONDS,
     _VALID_VOICE_FORMATS,
@@ -126,6 +130,15 @@ class RemoteModuleProxy(BaseModule):
         self._session = session
         self._scopes = scopes
         self.chat_platforms = chat_platforms
+        self.recipient_namespaces = (
+            tuple(
+                plat
+                for plat in chat_platforms
+                if plat not in {"boundowner", "owner"} and re.fullmatch(r"[a-z][a-z0-9_]*", plat)
+            )
+            if ("chat" in scopes and chat_platforms)
+            else ()
+        )
         self.thinking_scenes = thinking_scenes
         self.thinking_scene_keys = frozenset(scene.key for scene in thinking_scenes)
         self._actions = actions
@@ -136,6 +149,7 @@ class RemoteModuleProxy(BaseModule):
         self.supports_poke = bool({"poke", "supports_poke"} & cap_set)
         self.supports_reply_anchor = bool({"reply_anchor", "supports_reply_anchor"} & cap_set)
         self.supports_voice = bool({"voice", "supports_voice"} & cap_set)
+        self.supports_voice_blob = bool({"voice_blob", "supports_voice_blob"} & cap_set)
         self.preferred_voice_format = voice_format or "ogg_opus"
         self.enabled = enabled
         self._configuration_issue: str | None = configuration_issue
@@ -227,12 +241,122 @@ class RemoteModuleProxy(BaseModule):
             and not self._session.closed
         )
 
+    def _bot_id(self) -> str:
+        raw_bot_id = self._remote_status.get("bot_id")
+        if isinstance(raw_bot_id, str) and raw_bot_id.strip():
+            return raw_bot_id.strip()[:64]
+        if self.settings is not None:
+            for plat in self.chat_platforms:
+                binding = owner_binding(self.settings, plat)
+                if binding is not None and binding.bot_id:
+                    return binding.bot_id
+        return self.module_id
+
+    def _proactive_groups(self) -> list[str]:
+        if "chat" not in self._scopes or not self.chat_platforms:
+            return []
+        raw_groups = self._remote_status.get("proactive_groups")
+        if not isinstance(raw_groups, list):
+            return []
+        policies = getattr(self.settings, "group_policies", {}) or {}
+        primary = self.chat_platforms[0]
+        allowed_plats = set(self.chat_platforms)
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw_groups:
+            if not isinstance(item, str):
+                continue
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            if ":" in cleaned:
+                plat, _, gid = cleaned.partition(":")
+                gid = gid.strip()
+                if plat not in allowed_plats or not gid:
+                    continue
+                scope = f"{plat}:{gid}"
+            else:
+                scope = f"{primary}:{cleaned}"
+            if policies.get(scope, "at_only") == "muted":
+                continue
+            if scope not in seen:
+                seen.add(scope)
+                out.append(scope)
+                if len(out) >= 20:
+                    break
+        return out
+
+    def normalize_recipient(self, scope: str) -> str | None:
+        raw = str(scope or "").strip()
+        if not raw or ":" not in raw:
+            return None
+        plat, _, gid = raw.partition(":")
+        gid = gid.strip()
+        if plat not in self.chat_platforms or not gid:
+            return None
+        canonical = f"{plat}:{gid}"
+        return canonical if canonical in self._proactive_groups() else None
+
+    def permits_recipient(self, scope: str, config: Any) -> bool:
+        if not self.enabled or not self._session.ready or self._session.closed:
+            return False
+        plat, sep, gid = str(scope or "").partition(":")
+        if not sep or plat not in self.chat_platforms or not gid:
+            return False
+        return scope in self._proactive_groups()
+
+    def allowed_proactive(self, message: Message, settings: Any) -> bool:
+        if not self.chat_connected(message.platform):
+            return False
+        if message.kind == "private":
+            return bound_owner(message, settings)
+        if message.kind == "group":
+            scope = f"{message.platform}:{message.conversation_id}"
+            policies = getattr(settings, "group_policies", {}) or {}
+            if policies.get(scope, "at_only") == "muted":
+                return False
+            return scope in self._proactive_groups()
+        return False
+
+    def permits_chat_export(self, message: Message, consumer: str) -> bool:
+        return message.platform in self.chat_platforms and consumer in {
+            "bilibili_surf",
+            "patrol_diary",
+        }
+
+    def permits_memory_mirror(self, message: Message, settings: Any) -> bool:
+        return False
+
+    async def planning_context(self, service: Any, config: Any, now: float) -> dict[str, Any]:
+        if (
+            "chat" not in self._scopes
+            or not self.chat_platforms
+            or not self.enabled
+            or not self._session.ready
+            or self._session.closed
+        ):
+            return {}
+        groups = self._proactive_groups()
+        proactive = getattr(service, "proactive", None)
+        owner_dm = bool(
+            proactive is not None
+            and getattr(proactive, "platform", None) in self.chat_platforms
+            and getattr(proactive, "delivery_enabled", False)
+        )
+        ctx: dict[str, Any] = {}
+        if groups:
+            ctx["available_groups"] = groups
+        if owner_dm:
+            ctx["owner_dm_available"] = True
+        return ctx
+
     async def _deliver_rpc(
         self,
         method: str,
         payload: dict[str, Any],
         *,
         before_send=None,
+        timeout: float | None = None,  # noqa: ASYNC109
     ) -> str:
         delivery_id = uuid.uuid4().hex
         if before_send is not None:
@@ -247,6 +371,7 @@ class RemoteModuleProxy(BaseModule):
                 self._session,
                 method,
                 params,
+                timeout=timeout,
                 delivery_id=delivery_id,
             )
         except asyncio.CancelledError:
@@ -300,6 +425,7 @@ class RemoteModuleProxy(BaseModule):
         fmt: str,
         mime_type: str,
         duration_ms: int | None = None,
+        title: str | None = None,
         before_send=None,
     ) -> str:
         if "chat" not in self._scopes or message.platform not in self.chat_platforms:
@@ -311,39 +437,89 @@ class RemoteModuleProxy(BaseModule):
         if (
             fmt not in _VALID_VOICE_FORMATS
             or not isinstance(audio_bytes, (bytes, bytearray))
-            or not (0 < len(audio_bytes) <= _MAX_VOICE_AUDIO_BYTES)
+            or len(audio_bytes) <= 0
         ):
             raise Rejected("invalid_voice_audio")
-        audio_b64 = base64.b64encode(bytes(audio_bytes)).decode("ascii")
-        payload = {
+        raw_audio = bytes(audio_bytes)
+        if len(raw_audio) > _MAX_PLUGIN_AUDIO_BLOB_BYTES:
+            raise Rejected("voice_payload_too_large")
+
+        clean_title = (
+            sanitize_sensor_text(str(title), self.settings, max_tokens=24)[:120].strip()
+            if isinstance(title, str) and title.strip()
+            else None
+        )
+        base_payload: dict[str, Any] = {
             "platform": message.platform,
             "bot_id": message.bot_id,
             "kind": message.kind,
             "conversation_id": message.conversation_id,
             "user_id": message.user_id,
-            "audio_b64": audio_b64,
             "format": fmt,
             "mime_type": mime_type,
             "duration_ms": duration_ms,
             "reply_to": message.reply_ids[0] if message.reply_ids else None,
+            "kind_hint": "song" if clean_title is not None else "voice",
         }
-        probe = json.dumps(
-            {
-                "type": "rpc.request",
-                "id": "0" * 32,
-                "method": "delivery.send_voice",
-                "params": {"delivery_id": "0" * 32, **payload},
-            },
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-        if len(probe.encode("utf-8")) > self._bus._max_frame_bytes():
+        if clean_title is not None:
+            base_payload["title"] = clean_title
+
+        if len(raw_audio) <= _MAX_VOICE_AUDIO_BYTES:
+            inline_payload = {
+                **base_payload,
+                "audio_b64": base64.b64encode(raw_audio).decode("ascii"),
+            }
+            probe = json.dumps(
+                {
+                    "type": "rpc.request",
+                    "id": "0" * 32,
+                    "method": "delivery.send_voice",
+                    "params": {"delivery_id": "0" * 32, **inline_payload},
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            if len(probe.encode("utf-8")) <= self._bus._max_frame_bytes():
+                return await self._deliver_rpc(
+                    "delivery.send_voice",
+                    inline_payload,
+                    before_send=before_send,
+                )
+
+        if not self.supports_voice_blob:
             raise Rejected("voice_payload_too_large")
-        return await self._deliver_rpc(
-            "delivery.send_voice",
-            payload,
-            before_send=before_send,
+        if not self._session.ready or self._session.closed:
+            raise Rejected("plugin_disconnected")
+
+        upload_timeout = max(self._bus.rpc_timeout, 60.0 if len(raw_audio) > 512_000 else 30.0)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + upload_timeout
+        ext = "ogg" if fmt == "ogg_opus" else fmt
+        blob_filename = f"{clean_title}.{ext}" if clean_title else f"voice.{ext}"
+        blob_desc, uploaded_transfer_id = await self._bus._prepare_request_blob(
+            self._session,
+            raw_audio,
+            rpc_params={"delivery_id": "0" * 32, **base_payload},
+            blob_mime_type=mime_type,
+            blob_filename=blob_filename,
+            req_cap=_MAX_PLUGIN_AUDIO_BLOB_BYTES,
+            deadline=deadline,
         )
+        blob_payload = {**base_payload, BLOB_FIELD: blob_desc}
+        try:
+            rem = max(5.0, deadline - loop.time())
+            return await self._deliver_rpc(
+                "delivery.send_voice",
+                blob_payload,
+                before_send=before_send,
+                timeout=rem,
+            )
+        except Exception:
+            if uploaded_transfer_id is not None:
+                await self._bus._best_effort_release_blob(
+                    self._session, transfer_id=uploaded_transfer_id
+                )
+            raise
 
     async def call_custom_rpc(
         self,

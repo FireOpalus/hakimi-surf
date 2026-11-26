@@ -1,6 +1,7 @@
 """ACK-only multi-bubble delivery, with conservative ambiguity and recall semantics."""
 
 import asyncio
+import inspect
 import random
 import re
 import time
@@ -255,13 +256,25 @@ async def _deliver_song(
                     if module is None or not getattr(module, "supports_voice", False):
                         fallback_needed = True
                     else:
+                        voice_kwargs: dict = {
+                            "fmt": fmt,
+                            "mime_type": mime_type,
+                            "duration_ms": duration_ms,
+                            "before_send": voice_gate,
+                        }
+                        try:
+                            sig = inspect.signature(module.send_voice)
+                            if "title" in sig.parameters or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in sig.parameters.values()
+                            ):
+                                voice_kwargs["title"] = canonical_title
+                        except (TypeError, ValueError):
+                            pass
                         ident = await module.send_voice(
                             message,
                             audio_bytes,
-                            fmt=fmt,
-                            mime_type=mime_type,
-                            duration_ms=duration_ms,
-                            before_send=voice_gate,
+                            **voice_kwargs,
                         )
                         receipt = {"message_id": confirmed_message_id(ident)}
             except Rejected as exc:

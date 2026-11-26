@@ -278,8 +278,9 @@ class ImageHTTPFailure(Rejected):
 
 
 class ImageLoader:
-    def __init__(self, settings: Settings, transport=None):
+    def __init__(self, settings: Settings, transport=None, *, plugin_bus=None):
         self.s, self.transport = settings, transport
+        self.plugin_bus = plugin_bus
         # Shared by all sessions; only one image transfer can occupy the domestic uplink.
         self.ws_images = asyncio.Semaphore(1)
         self.decode_slots = asyncio.Semaphore(1)
@@ -403,6 +404,15 @@ class ImageLoader:
     async def _fetch_raw_with_client(self, client, ref, *, maximum: int) -> bytes:
         if ref.file_size and ref.file_size > maximum:
             raise Rejected("image_too_large")
+        if ref.file.startswith("plugin_media:"):
+            if self.plugin_bus is None or not hasattr(self.plugin_bus, "fetch_plugin_media"):
+                raise Rejected("image_url_unavailable")
+            raw = await self.plugin_bus.fetch_plugin_media(
+                ref.file, kind="image", max_bytes=maximum
+            )
+            if not raw or len(raw) > maximum:
+                raise Rejected("image_too_large" if raw else "image_download_failed")
+            return raw
         raw, refreshed = await self._napcat(ref)
         if raw is not None:
             if len(raw) > maximum:

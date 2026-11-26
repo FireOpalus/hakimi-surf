@@ -366,7 +366,18 @@ class LifeBlockPlanner:
         planning_context = {}
         module_fingerprints: dict[str, str] = {}
         for module in modules_reg.active():
-            planning_context.update(await module.planning_context(self.service, cfg, ts))
+            ctx_chunk = await module.planning_context(self.service, cfg, ts)
+            for k, v in ctx_chunk.items():
+                if k == "available_groups" and isinstance(v, list):
+                    existing = list(planning_context.get(k) or [])
+                    for item in v:
+                        if item not in existing:
+                            existing.append(item)
+                    planning_context[k] = existing[:32]
+                elif k in {"owner_dm_available", "desktop_active_recently"} and isinstance(v, bool):
+                    planning_context[k] = bool(planning_context.get(k, False)) or v
+                else:
+                    planning_context[k] = v
             fp = sanitize_sensor_text(module.planning_fingerprint(), self.s, max_tokens=32)
             if fp:
                 module_fingerprints[module.module_id] = fp
@@ -640,7 +651,16 @@ class LifeBlockPlanner:
                 continue
             bounded_note = trim_complete_text(raw_note, 120)
             raw_scope = item.target_scope.strip()
-            resolved_scope = modules_reg.normalize_recipient(raw_scope) if raw_scope else ""
+            selected_proactive = getattr(self.service, "proactive", None)
+            if (
+                raw_scope in {"owner", "owner_dm"}
+                and selected_proactive is not None
+                and selected_proactive.platform != "onebot"
+                and selected_proactive.configured
+            ):
+                resolved_scope = selected_proactive.target_scope
+            else:
+                resolved_scope = modules_reg.normalize_recipient(raw_scope) if raw_scope else ""
             if resolved_scope is None:
                 skip("recipient_unavailable")
                 continue
@@ -1020,7 +1040,11 @@ class GatekeeperWorker:
             return int(cur.rowcount or 0)
 
     def quota_for(self, spec, scope):
-        owner = bool(self.s.owner_qq_id and scope == f"owner:{self.s.owner_qq_id}")
+        selected = getattr(self.service, "proactive", None)
+        owner = bool(
+            (self.s.owner_qq_id and scope == f"owner:{self.s.owner_qq_id}")
+            or (selected is not None and selected.external_scope(scope))
+        )
         return next((rule for rule in spec.quota_rules() if not rule.owner_only or owner), None)
 
     def is_unlimited(self, spec, rule, cfg):
@@ -1518,10 +1542,23 @@ class LifeEngine:
             spec = self.catalog.resolve(ticket, compatibility=True)
         recipient = ticket.get("target_scope", "")
         selected = getattr(self.service, "proactive", None)
-        if recipient.startswith("boundowner:") and (
-            not selected or spec.name != selected.action_name
-        ):
-            raise ValueError("unauthorized_scope")
+        if recipient.startswith("boundowner:"):
+            owner_mod = self.catalog.owners.get(spec.name)
+            mod_obj = self.service.modules.get(owner_mod) if owner_mod else None
+            serves_selected = bool(
+                selected is not None
+                and selected.external_scope(recipient)
+                and (
+                    spec.name == selected.action_name
+                    or (
+                        spec.social
+                        and mod_obj is not None
+                        and selected.platform in getattr(mod_obj, "chat_platforms", ())
+                    )
+                )
+            )
+            if not serves_selected:
+                raise ValueError("unauthorized_scope")
         if spec.owner_only and recipient != (
             selected.target_scope
             if selected and spec.name == selected.action_name

@@ -726,12 +726,14 @@ def test_packaging_and_deploy_script_conventions():
         "hakimi-plugin-web-tools:",
         "hakimi-plugin-doc-render:",
         "hakimi-plugin-song-finder:",
+        "hakimi-plugin-telegram:",
         "plugins.weather.plugin_main",
         "plugins.minecraft.plugin_main",
         "plugins.bilibili.plugin_main",
         "plugins.web_tools.plugin_main",
         "plugins.doc_render.plugin_main",
         "plugins.song_finder.plugin_main",
+        "plugins.telegram.plugin_main",
         "dockerfile: plugins/doc_render/Dockerfile",
         "dockerfile: plugins/song_finder/Dockerfile",
         "secrets/plugins.env",
@@ -743,7 +745,7 @@ def test_packaging_and_deploy_script_conventions():
         "pids_limit: 32",
     ):
         assert required in compose_text
-    for forbidden in ("colab-adc.json", "BILI_COOKIE", "SESSDATA"):
+    for forbidden in ("colab-adc.json", "BILI_COOKIE", "SESSDATA", "TG_BOT_TOKEN"):
         assert forbidden not in compose_text
 
     # Verify every service block in compose.plugins.yaml enforces hardened security defaults.
@@ -762,6 +764,7 @@ def test_packaging_and_deploy_script_conventions():
         "hakimi-plugin-web-tools",
         "hakimi-plugin-doc-render",
         "hakimi-plugin-song-finder",
+        "hakimi-plugin-telegram",
     }
     for svc_name, block in blocks.items():
         assert "read_only: true" in block, svc_name
@@ -788,6 +791,7 @@ def test_packaging_and_deploy_script_conventions():
         "web_tools|web-tools|hakimi-plugin-web-tools",
         "doc_render|doc-render|hakimi-plugin-doc-render",
         "song_finder|song-finder|hakimi-plugin-song-finder",
+        "telegram|tg|hakimi-plugin-telegram",
         "wave3)",
     ):
         assert wave3_pattern in deploy_text

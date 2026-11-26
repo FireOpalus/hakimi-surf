@@ -19,14 +19,20 @@ from pydantic import ValidationError
 
 from hakimi_plugin_sdk.protocol import BLOB_FIELD, BLOB_HARD_MAX_BYTES, ToolCallResult
 
-from ..budget_policy import PATROL_LANE
+from ..budget_policy import PATROL_LANE, PROACTIVE_LANE
 from ..config import Settings
 from ..modules.actions import Action, ActionCall, NoArgs, Outcome
 from ..modules.base import sanitize_sensor_text
 from ..modules.scheduling import ActivityQuota
+from ..platform_hooks import (
+    PlatformPolicyHooks,
+    register_platform_hooks,
+    unregister_platform_hooks,
+)
 from ..plugin_kernel import PluginContext, PluginKernel
 from ..screen_watch import decode_ws_json_frame
 from ..security import Rejected, clean_text, configured_secrets
+from ..social_speak import resolve_social_target, speak_proactive
 from ..thinking_policy import ThinkingScene
 from .ai_gateway import PluginBusAIGatewayMixin
 from .blob import PluginBusBlobMixin
@@ -70,6 +76,7 @@ from .protocol import (
     _validate_node_region,
     _validate_plugin_id,
     _validate_scopes,
+    parse_plugin_media_ref,
 )
 from .proxy import RemoteModuleProxy, _PendingRpc, _PluginSession
 
@@ -709,6 +716,53 @@ class PluginBus(
             blob_filename=resp_filename,
         )
 
+    async def fetch_plugin_media(
+        self,
+        ref_id: str,
+        *,
+        kind: Literal["image", "audio", "file"],
+        max_bytes: int,
+        timeout: float = 20.0,  # noqa: ASYNC109
+    ) -> bytes:
+        """Pull opaque media bytes on demand from an authenticated plugin via `media.fetch`."""
+        parsed = parse_plugin_media_ref(ref_id)
+        if parsed is None:
+            raise Rejected("invalid_plugin_media_ref")
+        plugin_id, media_id = parsed
+        sess = self._sessions.get(plugin_id)
+        if sess is None or not sess.ready or sess.closed:
+            raise Rejected("plugin_offline")
+        if "media" not in sess.scopes:
+            raise Rejected("plugin_scope_rejected")
+        proxy = sess.proxy
+        if proxy is None or not proxy.enabled:
+            raise Rejected("plugin_disabled")
+        cap = min(max(1, int(max_bytes)), BLOB_HARD_MAX_BYTES)
+        eff_timeout = float(timeout) if math.isfinite(timeout) and timeout > 0 else 20.0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + eff_timeout
+        resp = await self._rpc(
+            sess,
+            "media.fetch",
+            {"kind": kind, "media_id": media_id, "max_bytes": cap},
+            timeout=eff_timeout,
+        )
+        if not resp.get("ok", False):
+            raw_err = str(resp.get("error") or "")
+            code = raw_err if _CODE_RE.fullmatch(raw_err) else "plugin_media_fetch_failed"
+            raise Rejected(code)
+        raw_res = resp.get("result") if "result" in resp else resp.get("data")
+        res_dict = dict(raw_res) if isinstance(raw_res, dict) else {}
+        blob_bytes, _mime, _fname = await self._extract_response_blob(
+            sess,
+            res_dict,
+            resp_cap=cap,
+            deadline=deadline,
+        )
+        if blob_bytes is None:
+            raise Rejected("plugin_media_empty")
+        return blob_bytes
+
     def _build_actions(
         self,
         session: _PluginSession,
@@ -1164,6 +1218,9 @@ class PluginBus(
 
             def _unregister_proxy(sess: _PluginSession = session) -> None:
                 modules = getattr(self.service, "modules", None)
+                if sess.proxy is not None:
+                    for plat in sess.proxy.chat_platforms:
+                        unregister_platform_hooks(plat)
                 if modules is not None and sess.proxy is not None:
                     try:
                         if modules.get(sess.plugin_id) is sess.proxy:
@@ -1210,6 +1267,57 @@ class PluginBus(
                 clean_desc = sanitize_sensor_text(
                     clean_text(hello.description), self.s, max_tokens=80
                 )[:240]
+                modules = getattr(self.service, "modules", None)
+                if "chat" in scope_set and chat_platforms and "proactive_speak" in capabilities:
+                    primary_plat = chat_platforms[0]
+                    speak_name = f"{primary_plat}.speak"
+                    existing_actions = (
+                        set(modules.catalog.actions) if modules is not None else set()
+                    )
+                    if (
+                        not any(spec.name == speak_name for spec in actions)
+                        and speak_name not in existing_actions
+                    ):
+
+                        async def _run_proactive_speak(
+                            call: ActionCall,
+                            sess: _PluginSession = session,
+                            plat: str = primary_plat,
+                        ) -> Outcome:
+                            proxy_now = sess.proxy
+                            if proxy_now is None or not proxy_now.chat_connected(plat):
+                                return Outcome("not_dispatched", "plugin_disconnected")
+                            target = resolve_social_target(
+                                self.service,
+                                plat,
+                                proxy_now._bot_id(),
+                                str(call.ticket.get("target_scope") or ""),
+                                event_id=f"jit:{call.ticket['id']}",
+                                created_at=call.now,
+                            )
+                            return await speak_proactive(self.service, target, call)
+
+                        speak_action = Action(
+                            name=speak_name,
+                            description=(
+                                f"结合近期见闻、B 站冲浪收获或当前会话，通过 {clean_disp or pid} "
+                                "去获准的群聊冒泡接话，或给 BOISER 发条日常私聊"
+                            ),
+                            social=True,
+                            budget_lane=PROACTIVE_LANE,
+                            window="active",
+                            quotas=(
+                                ActivityQuota("owner_dms", owner_only=True),
+                                ActivityQuota(),
+                            ),
+                            run=_run_proactive_speak,
+                            unavailable=lambda s=session, p=primary_plat: (
+                                None
+                                if (s.proxy is not None and s.proxy.chat_connected(p))
+                                else "plugin_disconnected"
+                            ),
+                        )
+                        actions = (*actions, speak_action)
                 proxy = RemoteModuleProxy(
                     self.s,
                     self,
@@ -1233,12 +1341,33 @@ class PluginBus(
                     voice_format=hello.voice_format,
                 )
                 session.proxy = proxy
-                modules = getattr(self.service, "modules", None)
                 if modules is not None:
                     modules.register(proxy)
                     self.s._thinking_scenes = modules.thinking_scenes
+                if "chat" in scope_set and chat_platforms:
+                    hooks = PlatformPolicyHooks(
+                        authorize=lambda msg, settings, *, _bot_exempt=False, p=proxy: (
+                            p.authorize_chat(msg, settings, bot_exempt=_bot_exempt)
+                        ),
+                        permits_export=lambda msg, consumer, p=proxy: p.permits_chat_export(
+                            msg, consumer
+                        ),
+                        permits_memory_mirror=lambda msg, settings, p=proxy: (
+                            p.permits_memory_mirror(msg, settings)
+                        ),
+                        allowed_proactive=lambda msg, settings, p=proxy: p.allowed_proactive(
+                            msg, settings
+                        ),
+                    )
+                    for plat in chat_platforms:
+                        register_platform_hooks(plat, hooks)
                 self._sessions[pid] = session
                 session.ready = True
+                proactive = getattr(self.service, "proactive", None)
+                if proactive is not None and getattr(proactive, "platform", None) in chat_platforms:
+                    wakeup = getattr(proactive, "wakeup", None)
+                    if wakeup is not None and hasattr(wakeup, "set"):
+                        wakeup.set()
                 await self._touch_last_seen(pid, now)
             except (Rejected, ValueError) as exc:
                 reason = str(exc) if isinstance(exc, Rejected) else "plugin_registration_conflict"

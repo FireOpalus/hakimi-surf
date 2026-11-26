@@ -802,7 +802,7 @@ class Settings(BaseSettings):
             if self.node_ws_path == self.onebot_ws_path:
                 raise ValueError("node_ws_path must differ from onebot_ws_path")
         if any(
-            not re.fullmatch(r"(onebot|qq):[A-Za-z0-9_-]{1,128}", key)
+            not re.fullmatch(r"[a-z][a-z0-9_]{0,47}:[A-Za-z0-9_-]{1,128}", key)
             for key in self.group_policies | dict.fromkeys(self.roaming_group_ids)
         ):
             raise ValueError("Group keys must use platform:group_id")

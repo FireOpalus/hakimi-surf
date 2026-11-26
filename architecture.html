@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="Hakimi Surf v2.1.0 模块架构图。查看四个平台插件、二十一个常驻系统模块与六个进程外远程插件容器，以及动作、事件与跨日待办如何连接世界引擎。">
+  <meta name="description" content="Hakimi Surf v2.1.0 模块架构图。查看四个平台插件、二十一个常驻系统模块与七个进程外远程插件容器，以及动作、事件与跨日待办如何连接世界引擎。">
   <title>万物皆模块 · Hakimi Surf 项目架构图</title>
   <style>
     :root {
@@ -286,7 +286,7 @@
           <li><a href="src/hakimi/modules/.gitmodules">hakimi-modules</a></li>
           <li>4 个平台仓</li>
         </ol>
-        <small>主仓固定目录仓提交，目录仓再固定各平台提交。常驻模块与 6 个远程插件源码随主仓发布。</small>
+        <small>主仓固定目录仓提交，目录仓再固定各平台提交。常驻模块与 7 个远程插件源码随主仓发布。</small>
       </aside>
     </div>
 
@@ -362,9 +362,9 @@
     </figure>
 
     <section class="chapter" id="remote-plugins" aria-labelledby="remote-title">
-      <div class="section-head"><h2 id="remote-title">进程外远程插件 × 6</h2><p>独立容器经 <code>plugin_bus</code> 内部 WebSocket 与双向有界分块 Blob 总线接入引擎</p></div>
+      <div class="section-head"><h2 id="remote-title">进程外远程插件 × 7</h2><p>独立容器经 <code>plugin_bus</code> 内部 WebSocket 与双向有界分块 Blob 总线接入引擎</p></div>
       <div class="bus-bar">
-        <strong>统一隔离与分层总线契约：</strong>引擎侧 <code>src/hakimi/plugin_bus/</code> 拆分为无环分层子包（<code>protocol</code> / <code>blob</code> / <code>proxy</code> / <code>ai_gateway</code> / <code>domain_bridge</code> / <code>bus</code>）；全部 6 个远程容器执行只读根文件系统（<code>read_only</code>）、<code>cap_drop: [ALL]</code>、<code>no-new-privileges</code>、非 root（<code>10001:10001</code>）与零宿主机卷挂载，经 <code>ws://hakimi-bot:12141/ws/plugin</code> 令牌鉴权连接。控制面维持 256 KiB WS 帧上限；大载荷经 <code>invoke_tool</code> 走双向有界分块 Blob 协议（128 KiB 分片 / 40 MiB 硬限 / SHA-256 校验 / 60s TTL）。外置工具容器离线时默认平滑回退主引擎，支持按需启用严格仅远程模式。
+        <strong>统一隔离与分层总线契约：</strong>引擎侧 <code>src/hakimi/plugin_bus/</code> 拆分为无环分层子包（<code>protocol</code> / <code>blob</code> / <code>proxy</code> / <code>ai_gateway</code> / <code>domain_bridge</code> / <code>bus</code>）；全部 7 个远程容器执行只读根文件系统（<code>read_only</code>）、<code>cap_drop: [ALL]</code>、<code>no-new-privileges</code>、非 root（<code>10001:10001</code>）与零宿主机卷挂载，经 <code>ws://hakimi-bot:12141/ws/plugin</code> 令牌鉴权连接。控制面维持 256 KiB WS 帧上限；大载荷（工具结果、入站媒体 <code>media.fetch</code> 与翻唱歌曲 <code>delivery.send_voice</code>）经双向有界分块 Blob 协议（128 KiB 分片 / 40 MiB 硬限 / SHA-256 校验 / 60s TTL）传输。外置工具容器离线时默认平滑回退主引擎，支持按需启用严格仅远程模式。
       </div>
       <div class="plugin-grid">
         <article class="plugin-card">
@@ -403,8 +403,14 @@
           <p>与 <code>bilibili_surf</code> 严格物理隔离：零导入、零共用 B 站巡逻小号 Cookie 与冷却状态；独占 <code>yt-dlp</code> + <code>ffmpeg</code> 镜像（<code>-protocol_whitelist file</code>、按源独立熔断、公开匿名 <code>spi</code> 访客标识），部署于境内节点经独立锁定 WSS 连回境外插件总线，支持后台候选挑选与定向抓取，产出干净原曲经 Blob 交给 <code>song_studio</code> 直写 <code>Hakimi_Songs/inbox/</code>（未备齐绝不入 Colab 队列）。</p>
           <div class="plugin-links"><a href="plugins/song_finder/providers.py">providers.py</a><a href="plugins/song_finder/Dockerfile">Dockerfile</a><a href="src/hakimi/songs.py">songs.py</a><a href="src/hakimi/song_drive.py">song_drive.py</a><a href="src/hakimi/system_modules/song_studio.py">song_studio.py</a></div>
         </article>
+        <article class="plugin-card">
+          <header><h3><a href="plugins/telegram/plugin_main.py">Telegram 社交</a></h3><code>telegram</code></header>
+          <div class="plugin-meta"><a class="plugin-badge" href="plugins/Dockerfile">轻量公共镜像</a><code>telegram.speak</code> · <code>media.fetch</code></div>
+          <p>境外长轮询接入 Telegram Bot API（Bot Token 严格留存容器内、入出站双白名单 fail-closed），通过通用插件总线支持文本、图片/贴纸、语音（直传 Gemini 原生听觉）、文档与 <code>/学歌</code> 音频附件，出站支持 <code>sendVoice</code> 短语音泡泡与分块 Blob <code>sendAudio</code> 完整翻唱投递，并经 <code>social_speak.py</code> 接入世界引擎主动冒泡与 Owner 每日汇报。</p>
+          <div class="plugin-links"><a href="plugins/telegram/plugin_main.py">plugin_main.py</a><a href="plugins/telegram/tg_api.py">tg_api.py</a><a href="src/hakimi/social_speak.py">social_speak.py</a><a href="compose.plugins.yaml">hakimi-plugin-telegram</a></div>
+        </article>
       </div>
-      <div class="refs"><a href="src/hakimi/plugin_bus/bus.py">插件总线核心</a><a href="src/hakimi/plugin_bus/protocol.py">协议与校验</a><a href="src/hakimi/plugin_bus/blob.py">分块 Blob 传输</a><a href="src/hakimi/plugin_bus/ai_gateway.py">AI 网关代理</a><a href="src/hakimi/plugin_bus/domain_bridge.py">领域桥接</a><a href="src/hakimi/plugin_bus/proxy.py">远端模块代理</a><a href="src/hakimi_plugin_sdk/bili_common.py">B 站单一事实源</a><a href="src/hakimi_plugin_sdk/protocol.py">SDK Blob 协议</a><a href="src/hakimi_plugin_sdk/client.py">插件 SDK 客户端</a><a href="compose.plugins.yaml">6 容器编排</a><a href="scripts/deploy_plugins.sh">启停脚本</a><a href="plugins/Dockerfile">轻量公共镜像</a></div>
+      <div class="refs"><a href="src/hakimi/plugin_bus/bus.py">插件总线核心</a><a href="src/hakimi/plugin_bus/protocol.py">协议与校验</a><a href="src/hakimi/plugin_bus/blob.py">分块 Blob 传输</a><a href="src/hakimi/plugin_bus/ai_gateway.py">AI 网关代理</a><a href="src/hakimi/plugin_bus/domain_bridge.py">领域桥接</a><a href="src/hakimi/plugin_bus/proxy.py">远端模块代理</a><a href="src/hakimi_plugin_sdk/bili_common.py">B 站单一事实源</a><a href="src/hakimi_plugin_sdk/protocol.py">SDK Blob 协议</a><a href="src/hakimi_plugin_sdk/client.py">插件 SDK 客户端</a><a href="compose.plugins.yaml">7 容器编排</a><a href="scripts/deploy_plugins.sh">启停脚本</a><a href="plugins/Dockerfile">轻量公共镜像</a></div>
     </section>
 
     <section class="chapter" id="fieldwork" aria-labelledby="contracts-title">
@@ -452,7 +458,7 @@
         <div class="lane"><h3>桌面 · 语音与看屏适配端</h3><span class="link-label">两条可选 WS</span><div><strong>境外 FastAPI → 对应常驻服务</strong><p>语音与看屏分别配置入口、校验适配端身份。屏幕隐私开关与会话模式控制帧的使用范围。</p></div></div>
         <div class="lane"><h3>境外宿主机 · Colab Worker</h3><span class="link-label">Docker 网桥回环</span><div><strong>境外 hakimi-bot → 172.19.0.1:12146（Bearer 隔离）</strong><p>宿主机独立守护进程 <code>hakimi-colab-worker.service</code>（<code>scripts/colab_worker.py</code> + <code>scripts/colab_jobs/</code> 插件式 GPU 作业包）纯化为通用 GPU 作业控制面与执行层：凭据与 Colab CLI 不进只读容器，剥离全部 Drive OAuth 与 <code>/v1/drive/*</code> 代理，严格按作业级 GPU 候选链派发（<code>L4</code>/<code>T4</code> 满足余额门槛时短时热保活），仅凭瞬态 <code>dispatch_context</code> 短效令牌访问授权对象。</p></div></div>
         <div class="lane"><h3>Google Drive · Hakimi_Songs/</h3><span class="link-label">主引擎直连 HTTPS</span><div><strong>境外 hakimi-bot（SongDriveStore）→ Google Drive v3 API</strong><p><code>song_studio</code> 复用只读 <code>/run/secrets/roaming-oauth.json</code> 独立管理双版本翻唱主存、参考干声与 RVC 模型（<code>models/</code>）及原曲收件箱（2 MiB 分块 Resumable 流式上传 ≤ 100 MiB，播放与版本切换不依赖 Colab Worker 在线）。</p></div></div>
-        <div class="lane"><h3>境内外 · 6 个远程插件容器</h3><span class="link-label">内部 WS / 锁定 WSS + 分块 Blob</span><div><strong>5 个境外只读容器 + 1 个境内只读容器 ↔ 境外 hakimi-bot /ws/plugin</strong><p>境外运行 <code>weather</code>、<code>minecraft</code>、<code>bilibili_surf</code>、<code>web_tools</code> 与 <code>doc_render</code>；<code>song_finder</code> 独占匿名音源镜像部署于境内节点（IP 白名单 + <code>X-Plugin-ID</code> 锁定 WSS 通道，零账号 Cookie），与 <code>bilibili_surf</code> 严格物理隔离。</p></div></div>
+        <div class="lane"><h3>境内外 · 7 个远程插件容器</h3><span class="link-label">内部 WS / 锁定 WSS + 分块 Blob</span><div><strong>6 个境外只读容器 + 1 个境内只读容器 ↔ 境外 hakimi-bot /ws/plugin</strong><p>境外运行 <code>weather</code>、<code>minecraft</code>、<code>bilibili_surf</code>、<code>web_tools</code>、<code>doc_render</code> 与 <code>telegram</code>（直连 Telegram Bot API，无需境内代理）；<code>song_finder</code> 独占匿名音源镜像部署于境内节点（IP 白名单 + <code>X-Plugin-ID</code> 锁定 WSS 通道，零账号 Cookie），与 <code>bilibili_surf</code> 严格物理隔离。</p></div></div>
         <div class="lane"><h3>管理员浏览器</h3><span class="link-label">SSH 隧道</span><div><strong>境外 hakimi-admin → 引擎管理 API</strong><p>管理台监听回环 <code>12143</code>，代理同源请求（<code>/admin/api/songs/inbox</code> 与 <code>/upload</code> 放行 100 MiB 无缓冲直传）。单进程引擎监听回环 <code>12141</code>，持有 SQLite、模型凭据与长连接。</p></div></div>
       </div>
       <div class="refs"><a href="compose.yaml">引擎与管理台</a><a href="compose.plugins.yaml">远程插件编排</a><a href="scripts/deploy_plugins.sh">插件启停脚本</a><a href="https://github.com/FireOpalus/hakimi-node-agent" target="_blank" rel="noreferrer">hakimi-node-agent</a><a href="https://github.com/FireOpalus/hakimi-napcat" target="_blank" rel="noreferrer">hakimi-napcat</a><a href="src/hakimi/app.py">协议入口</a><a href="admin/nginx.conf">管理代理</a></div>
@@ -479,6 +485,6 @@
       <div class="refs footrefs" id="sources"><a href="src/hakimi/service.py">消息编排</a><a href="src/hakimi/commands.py">指令注册表</a><a href="src/hakimi/media_turn.py">轮次富媒体</a><a href="src/hakimi/audio_media.py">原生音频转码</a><a href="src/hakimi/decision_templates.py">Decisions 静态模板</a><a href="src/hakimi/platform_hooks.py">平台策略钩子</a><a href="src/hakimi/gemini.py">模型网关</a><a href="src/hakimi/outgoing.py">出站回执</a><a href="src/hakimi/store.py">账本与用量归类</a><a href="src/hakimi/dual_memory.py">双轨记忆</a><a href="src/hakimi/world_state.py">世界状态</a><a href="src/hakimi/plugin_bus/__init__.py">插件总线子包</a></div>
     </section>
   </main>
-  <footer><span>Hakimi Surf · v2.1.0 · 4 个平台插件 + 21 个常驻系统模块 + 6 个远程插件容器 · 2026-11-23</span><a href="#top">回到图首 ↑</a></footer>
+  <footer><span>Hakimi Surf · v2.1.0 · 4 个平台插件 + 21 个常驻系统模块 + 7 个远程插件容器 · 2026-11-26</span><a href="#top">回到图首 ↑</a></footer>
 </body>
 </html>

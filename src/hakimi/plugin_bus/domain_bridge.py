@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from ..bot_server import is_persona_owner
 from ..config import Settings
-from ..models import FileRef, ImageRef, Message
+from ..models import AudioRef, FileRef, ImageRef, Message
 from ..modules.actions import reject_reason
 from ..modules.base import sanitize_sensor_text
 from ..roaming_logger import redact_public_summary
@@ -33,8 +33,11 @@ from .protocol import (
     _MAX_KV_VALUE_BYTES,
     _MAX_NODE_BRIDGE_INFLIGHT,
     _NODE_BRIDGE_PLUGIN_ACTIONS,
+    _PLUGIN_MEDIA_TOKEN_RE,
     _STATE_KEY_RE,
+    _VALID_INBOUND_ATTENTION_REASONS,
     _VAULT_KV_PREFIX,
+    PLUGIN_MEDIA_PREFIX,
     RESERVED_CHAT_PLATFORMS,
     _sanitize_payload,
     _scrub_json_secrets,
@@ -303,9 +306,14 @@ class PluginBusDomainBridgeMixin:
 
         raw_images = frame.get("images") or []
         raw_files = frame.get("files") or []
-        if (raw_images or raw_files) and "media" not in session.scopes:
+        raw_audios = frame.get("audios") or []
+        if (raw_images or raw_files or raw_audios) and "media" not in session.scopes:
             raise Rejected("plugin_scope_rejected")
-        if not isinstance(raw_images, list) or not isinstance(raw_files, list):
+        if (
+            not isinstance(raw_images, list)
+            or not isinstance(raw_files, list)
+            or not isinstance(raw_audios, list)
+        ):
             raise Rejected("plugin_invalid_schema")
 
         kind = frame.get("kind", "private")
@@ -340,10 +348,53 @@ class PluginBusDomainBridgeMixin:
         group_name = sanitize_sensor_text(
             str(frame.get("group_name") or ""), self.s, max_tokens=24
         )[:100]
+        raw_reply_ids = frame.get("reply_ids") or []
+        if not isinstance(raw_reply_ids, list):
+            raise Rejected("plugin_invalid_schema")
+        reply_ids = [
+            clean_text(str(item)).strip()[:128]
+            for item in raw_reply_ids[:2]
+            if isinstance(item, str | int) and clean_text(str(item)).strip()
+        ]
+        raw_cmd_text = frame.get("command_text")
+        command_text: str | None = None
+        if raw_cmd_text is not None:
+            if not isinstance(raw_cmd_text, str):
+                raise Rejected("plugin_invalid_schema")
+            command_text = clean_text(raw_cmd_text)[:24000]
+        raw_attention = frame.get("attention_reason", "")
+        if (
+            not isinstance(raw_attention, str)
+            or raw_attention not in _VALID_INBOUND_ATTENTION_REASONS
+        ):
+            raw_attention = ""
+
+        def _rewrite_media_item(item: Any, id_field: str) -> dict[str, Any]:
+            if not isinstance(item, dict):
+                raise Rejected("plugin_invalid_schema")
+            cloned = dict(item)
+            raw_id = cloned.get(id_field)
+            if isinstance(raw_id, str) and raw_id.strip():
+                tok = raw_id.strip()
+                if not _PLUGIN_MEDIA_TOKEN_RE.fullmatch(tok) or tok in {".", ".."} or ".." in tok:
+                    raise Rejected("plugin_invalid_schema")
+                cloned[id_field] = f"{PLUGIN_MEDIA_PREFIX}{session.plugin_id}:{tok}"
+                cloned["url"] = ""
+            return cloned
 
         try:
-            images = [ImageRef.model_validate(item) for item in raw_images[:2]]
-            files = [FileRef.model_validate(item) for item in raw_files[:2]]
+            images = [
+                ImageRef.model_validate(_rewrite_media_item(item, "file"))
+                for item in raw_images[:2]
+            ]
+            files = [
+                FileRef.model_validate(_rewrite_media_item(item, "file_id"))
+                for item in raw_files[:2]
+            ]
+            audios = [
+                AudioRef.model_validate(_rewrite_media_item(item, "file"))
+                for item in raw_audios[:4]
+            ]
             msg = Message(
                 platform=platform,
                 bot_id=bot_id,
@@ -356,8 +407,12 @@ class PluginBusDomainBridgeMixin:
                 created_at=created_at,
                 sender_nickname=sender_nickname,
                 group_name=group_name,
+                command_text=command_text,
+                reply_ids=reply_ids,
+                attention_reason=raw_attention,  # type: ignore[arg-type]
                 images=images,
                 files=files,
+                audios=audios,
             )
         except ValidationError:
             raise Rejected("plugin_invalid_schema") from None

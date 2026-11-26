@@ -89,6 +89,7 @@ _SCOPED_ACTION_PREFIX_OWNERS: dict[str, str] = {
     "web_tools": "web_tools",
     "doc_render": "doc_render",
     "song_finder": "song_finder",
+    "telegram": "telegram",
 }
 _SCOPED_SCENE_OWNERS: dict[str, str] = {
     "bilibili_summary": "bilibili_surf",
@@ -179,6 +180,28 @@ _ADMIN_PANEL_RE = re.compile(r"^[a-z][a-z0-9_-]{1,47}\Z")
 _ALIAS_VERB_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
 _STATE_KEY_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}\Z")
 _CUSTOM_RPC_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,63}\Z")
+PLUGIN_MEDIA_PREFIX = "plugin_media:"
+_PLUGIN_MEDIA_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.=+\-]{1,512}\Z")
+_MAX_PLUGIN_AUDIO_BLOB_BYTES = 15 * 1024 * 1024
+_VALID_INBOUND_ATTENTION_REASONS = frozenset({"", "private", "mention", "reply", "command"})
+
+
+def parse_plugin_media_ref(raw: Any) -> tuple[str, str] | None:
+    """Parse a bus-minted `plugin_media:<plugin_id>:<opaque_id>` reference."""
+    if not isinstance(raw, str) or not raw.startswith(PLUGIN_MEDIA_PREFIX):
+        return None
+    rest = raw[len(PLUGIN_MEDIA_PREFIX) :]
+    plugin_id, sep, media_id = rest.partition(":")
+    if (
+        not sep
+        or not PLUGIN_ID_RE.fullmatch(plugin_id)
+        or not _PLUGIN_MEDIA_TOKEN_RE.fullmatch(media_id)
+    ):
+        return None
+    if media_id in {".", ".."} or ".." in media_id:
+        return None
+    return plugin_id, media_id
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS plugin_credentials (

@@ -468,10 +468,12 @@ class AudioLoader:
         settings: Settings,
         transport: Any = None,
         *,
+        plugin_bus: Any = None,
         ffmpeg_bin: str | None = None,
         ffprobe_bin: str | None = None,
     ):
         self.s, self.transport = settings, transport
+        self.plugin_bus = plugin_bus
         self.ffmpeg_bin = ffmpeg_bin
         self.ffprobe_bin = ffprobe_bin
         # Serializes OneBot WS audio transfers so domestic uplink stays responsive.
@@ -596,6 +598,15 @@ class AudioLoader:
     ) -> bytes:
         if ref.file_size and ref.file_size > maximum:
             raise Rejected("audio_too_large")
+        if ref.file.startswith("plugin_media:"):
+            if self.plugin_bus is None or not hasattr(self.plugin_bus, "fetch_plugin_media"):
+                raise Rejected("audio_url_unavailable")
+            raw = await self.plugin_bus.fetch_plugin_media(
+                ref.file, kind="audio", max_bytes=maximum
+            )
+            if not raw or len(raw) > maximum:
+                raise Rejected("audio_too_large" if raw else "audio_download_failed")
+            return raw
         raw, refreshed = await self._napcat(ref)
         if raw is not None:
             if len(raw) > maximum:
