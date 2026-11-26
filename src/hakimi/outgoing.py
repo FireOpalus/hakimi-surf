@@ -434,7 +434,8 @@ async def apply_receipts(service, reply_id):
                 ticket = await service.store.one(
                     "SELECT n.event_id FROM scheduled_intents t JOIN world_news n "
                     "ON n.intent_id=t.id WHERE t.id=? "
-                    "AND action_name='qq.speak' AND expected_bubbles>0 AND expected_bubbles="
+                    "AND (action_name='qq.speak' OR action_name LIKE '%.speak') "
+                    "AND expected_bubbles>0 AND expected_bubbles="
                     "(SELECT COUNT(*) FROM outbox_bubble_receipts WHERE reply_id=?)",
                     (reply_id[4:], reply_id),
                 )

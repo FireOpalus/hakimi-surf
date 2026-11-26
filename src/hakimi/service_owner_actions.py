@@ -10,10 +10,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .bot_server import is_persona_owner
 from .models import Message
 from .modules.actions import ActionCall, reject_reason
 from .outbound_actions import ChatActionTrigger
-from .security import Rejected, owner
+from .security import Rejected
 
 log = logging.getLogger("hakimi")
 
@@ -155,7 +156,7 @@ class _ServiceOwnerActionsMixin:
         *,
         context_message: Message | None = None,
     ) -> None:
-        if context_message is not None and not owner(context_message, self.s):
+        if context_message is not None and not is_persona_owner(context_message, self.s):
             log.info(
                 "event=owner_chat_action_done action=%s status=gated_skip reason=owner_only",
                 _LEARN_SONG_ACTION_NAME,
@@ -319,7 +320,7 @@ class _ServiceOwnerActionsMixin:
         *,
         context_message: Message | None = None,
     ) -> None:
-        if context_message is not None and not owner(context_message, self.s):
+        if context_message is not None and not is_persona_owner(context_message, self.s):
             log.info(
                 "event=owner_chat_action_done action=%s status=gated_skip reason=owner_only",
                 _SWITCH_SONG_VERSION_ACTION_NAME,

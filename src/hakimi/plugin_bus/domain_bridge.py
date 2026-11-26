@@ -167,7 +167,9 @@ class PluginBusDomainBridgeMixin:
                 except ValueError:
                     pass
 
-            if frame.get("owner_recap") is True and self.s.owner_qq_id:
+            if frame.get("owner_recap") is True and bool(
+                self.s.owner_qq_id or getattr(self.s, "social_owner_bindings", None)
+            ):
                 now = self.clock()
                 raw_topic = frame.get("chronicle_topic")
                 topic_arg = raw_topic if isinstance(raw_topic, str) and raw_topic.strip() else None

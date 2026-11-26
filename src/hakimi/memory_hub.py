@@ -78,6 +78,9 @@ class MemoryHub:
                 seen[raw] = None
         return list(seen)
 
+    def _has_configured_owner(self) -> bool:
+        return bool(self.s.owner_qq_id or getattr(self.s, "social_owner_bindings", None))
+
     def _is_verified_private_owner(self, message: Message | None) -> bool:
         return bool(
             message is not None and message.kind == "private" and is_persona_owner(message, self.s)
@@ -147,7 +150,7 @@ class MemoryHub:
         if message is not None:
             if not self._is_verified_private_owner(message):
                 return False
-        elif not self.s.owner_qq_id:
+        elif not self._has_configured_owner():
             return False
         if not isinstance(platform, str) or not _PLATFORM_ID_RE.fullmatch(platform):
             return False
@@ -274,7 +277,7 @@ class MemoryHub:
         # or non-owner targets. Antigravity_Memory / owner_cloud_memory is strictly read-only.
         allow_owner_private = (
             visibility == "owner_private"
-            and bool(self.s.owner_qq_id)
+            and self._has_configured_owner()
             and (owner_message is None or self._is_verified_private_owner(owner_message))
         )
         if allow_owner_private:
@@ -625,7 +628,12 @@ class MemoryHub:
             return out
 
         if mode == "planner":
-            owner_msg = audience or owner_target(self.s, "onebot", ts, "planner-owner-ctx")
+            owner_msg = audience or owner_target(
+                self.s,
+                getattr(self.s, "owner_delivery_platform", "onebot") or "onebot",
+                ts,
+                "planner-owner-ctx",
+            )
             if not self._is_verified_private_owner(owner_msg):
                 return {}
             snap = await self._read_owner_recent_session(

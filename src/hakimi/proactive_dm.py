@@ -283,8 +283,8 @@ class OwnerProactive:
                 (self.scope, self.clock()),
             )
 
-    async def on_connection(self, online):
-        if self.platform != "onebot":
+    async def on_connection(self, online: bool, *, platform: str | None = None):
+        if platform is not None and platform != self.platform:
             return
         now, lost = self.clock(), 0
         async with self.store.transaction():
@@ -301,9 +301,15 @@ class OwnerProactive:
             )
         if online:
             if lost >= self.s.proactive_ws_alert_after_seconds:
+                if self.platform == "onebot":
+                    channel_label = "NapCat"
+                else:
+                    module = chat_module(self.s, self.platform)
+                    raw_name = getattr(module, "display_name", "") if module is not None else ""
+                    channel_label = " ".join(str(raw_name or "").split())[:48] or self.platform
                 await self.alert(
                     "ws_recovered",
-                    f"BOISER，NapCat 连接已恢复喵。刚才中断约 {int(lost // 60)} 分钟，"
+                    f"BOISER，{channel_label} 连接已恢复喵。刚才中断约 {int(lost // 60)} 分钟，"
                     "仅补发尚未过期的待发消息。",
                 )
             self.wakeup.set()

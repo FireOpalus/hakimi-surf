@@ -140,9 +140,9 @@ def _classify_usage_category(lane: str, work_kind: str, subject: str) -> str:
             or subject == "plugin:minecraft"
         ):
             return "minecraft"
-        if kind.startswith("qq.speak"):
+        if kind.startswith("qq.speak") or kind.endswith(".speak"):
             return "qq_proactive"
-        if kind.startswith("qq.owner_digest"):
+        if kind.startswith(("qq.owner_digest", "social.owner_digest")):
             return "owner_digest"
         if kind.startswith("screen.watch"):
             return "screen_watch"

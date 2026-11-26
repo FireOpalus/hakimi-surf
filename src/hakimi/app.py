@@ -166,7 +166,11 @@ def create_app(
                     if hasattr(ai, "cleanup_video_files"):
                         await ai.cleanup_video_files()
                     if isinstance(onebot, WebSocketTransport):
-                        onebot.on_state = service.proactive.on_connection
+
+                        async def _onebot_on_state(online: bool) -> None:
+                            await service.proactive.on_connection(online, platform="onebot")
+
+                        onebot.on_state = _onebot_on_state
                     app.state.settings, app.state.service = s, service
                     app.state.onebot = onebot
                     app.state.admin_auth = AdminAuth(s)

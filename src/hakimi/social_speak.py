@@ -206,13 +206,22 @@ async def speak_proactive(
             related_user_ids=[target_msg.user_id],
         )
     else:
-        dual_data = await service.sessions.dual.prefetch(target_msg, "", recall=True)
+        dual_data = await service.sessions.dual.prefetch(
+            target_msg,
+            "",
+            recall=False,
+            related_user_ids=list(batch_affection.keys()),
+        )
     if dual_data:
         payload["dual_memory_data"] = dual_data
 
     route = RouteDecision("chat", tier=1, need_memory_recall=private_owner)
     scenario = Scenario.OWNER_PRIVATE if private_owner else Scenario.FAST_CHAT
     subject = service.store.subject(target_msg)
+    if not authorize(target_msg, service.s):
+        return Outcome("gated_skip", "unauthorized_scope")
+    if not call.still_allowed():
+        return Outcome("gated_skip", "action_no_longer_eligible")
     try:
         raw_reply = await service.ai.generate(
             payload,
@@ -227,6 +236,20 @@ async def speak_proactive(
     except Exception as exc:
         return Outcome("not_dispatched", f"gen_failed:{type(exc).__name__}"[:48])
 
+    def _life_clock() -> float:
+        engine = getattr(service, "life_engine", None)
+        clock_fn = getattr(engine, "clock", None) if engine is not None else None
+        return float(clock_fn()) if callable(clock_fn) else float(ts)
+
+    async def owner_available() -> bool:
+        from .social_policy import SocialProactivePolicy
+
+        return not await SocialProactivePolicy(
+            service,
+            target_msg.platform,
+            lambda: target_msg.bot_id,
+        ).owner_recently_active(ticket, max(ts, _life_clock()))
+
     res = await deliver_proactive_jit(
         service,
         target_msg,
@@ -234,11 +257,10 @@ async def speak_proactive(
         reply_id=f"jit:{intent_id}",
         intent_id=intent_id,
         still_allowed=call.still_allowed,
+        before_delivery=owner_available if private_owner else None,
     )
     status = str(res.get("status", "not_dispatched"))
     if status == "sent":
-        if selected_news and selected_news.get("id"):
-            await ws.experience.mark_news_shared(selected_news["id"], ts)
         return Outcome("done", "proactive_sent", {"delivery": res})
     if status in ("not_dispatched", "uncertain"):
         return Outcome(status, status, {"delivery": res})

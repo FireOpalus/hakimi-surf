@@ -226,7 +226,8 @@ class LifeBlockPlanner:
                 "SELECT COALESCE(NULLIF(action_name,''), action_type) AS action, "
                 "updated_at, intent_note_json FROM scheduled_intents "
                 "WHERE status='done' AND updated_at>=? "
-                "AND (target_scope='' OR target_scope LIKE 'owner:%') "
+                "AND (target_scope='' OR target_scope LIKE 'owner:%' "
+                "OR target_scope LIKE 'boundowner:%') "
                 "ORDER BY updated_at DESC LIMIT 5",
                 (ts - 86400.0,),
             )

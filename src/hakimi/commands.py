@@ -1,7 +1,8 @@
 """Registry-driven chat command router and built-in command handlers.
 
-Enforces protocol-layer Owner identity checks (OWNER_QQ_ID via `owner()`) before
-executing any privileged command or reaching the model pipeline.
+Enforces protocol-layer Owner identity checks (verified OneBot OWNER_QQ_ID or bound
+social owner via `is_persona_owner()`) before executing any privileged command or
+reaching the model pipeline.
 """
 
 from __future__ import annotations
@@ -13,9 +14,10 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .affection import _validate_platform_user
+from .bot_server import is_persona_owner
 from .memes import MAX_UPLOAD_BYTES, validate_meme_label
 from .models import Message
-from .security import Rejected, owner
+from .security import Rejected
 from .songs import DEFAULT_COVER_ENGINE, normalize_cover_engine, normalize_take_key
 
 PermissionMode = Literal["public", "group_owner", "owner", "owner_private"]
@@ -52,15 +54,15 @@ def _enforce_permission(service: Any, message: Message, permission: PermissionMo
     if permission == "public":
         return
     if permission == "group_owner":
-        if message.kind == "group" and not owner(message, service.s):
+        if message.kind == "group" and not is_persona_owner(message, service.s):
             raise Rejected("group_owner_only")
         return
     if permission == "owner":
-        if not owner(message, service.s):
+        if not is_persona_owner(message, service.s):
             raise Rejected("group_owner_only" if message.kind == "group" else "owner_private_only")
         return
     if permission == "owner_private":
-        if message.kind != "private" or not owner(message, service.s):
+        if message.kind != "private" or not is_persona_owner(message, service.s):
             raise Rejected("owner_private_only")
         return
     raise ValueError(f"Unknown command permission mode: {permission}")
@@ -373,21 +375,20 @@ async def handle_affection_command(service: Any, message: Message, raw_args: str
             f"BOISER 当前羁绊：{owner_prof['score']} 分"
             f"（{owner_prof['lv']} {owner_prof['tier_label']}）。\n"
             f"已建档用户：{len(users)} 人；拉黑(0分)：{len(blacklisted)} 人（{bl_text}）。\n"
-            "用法：/affection <QQ> 查看档案，或 /affection <QQ> <0..120> 调整分数。"
+            "用法：/affection <账号或平台:账号> 查看档案，"
+            "或 /affection <账号或平台:账号> <0..120> 调整分数。"
         )
     if len(args) > 2:
-        return "用法：/affection [QQ] [0..120]"
+        return "用法：/affection [平台:账号 或 账号] [0..120]"
     raw_target = args[0].strip()
-    if raw_target.startswith("qq:"):
-        target_platform, target_uid = "qq", raw_target[3:]
-    elif raw_target.startswith("onebot:"):
-        target_platform, target_uid = "onebot", raw_target[7:]
+    if ":" in raw_target:
+        target_platform, target_uid = raw_target.split(":", 1)
     else:
-        target_platform, target_uid = "onebot", raw_target
+        target_platform, target_uid = message.platform, raw_target
     try:
         target_uid = _validate_platform_user(target_platform, target_uid)
     except Rejected:
-        return "用法：/affection [QQ] [0..120]，目标账号格式不正确。"
+        return "用法：/affection [平台:账号 或 账号] [0..120]，目标账号格式不正确。"
     if len(args) == 1:
         prof = await aff.profile(target_platform, target_uid)
         safety_tag = ""
@@ -442,7 +443,12 @@ async def handle_save_meme_command(service: Any, message: Message, raw_label: st
         label = validate_meme_label(raw_label)
     except Rejected:
         return "标签格式不对，请用 1～24 个汉字、字母、数字、下划线或短横线。"
-    if not message.images and message.forward_ids and not message.context_expanded:
+    if (
+        message.platform == "onebot"
+        and not message.images
+        and message.forward_ids
+        and not message.context_expanded
+    ):
         try:
             message = await service.expand_forwards(message)
         except Rejected:
@@ -611,7 +617,12 @@ async def handle_learn_song_command(service: Any, message: Message, raw_args: st
     if not raw_title:
         return "请提供歌名，例如：/学歌 晴天 pitch=-2"
 
-    if not message.files and message.forward_ids and not message.context_expanded:
+    if (
+        message.platform == "onebot"
+        and not message.files
+        and message.forward_ids
+        and not message.context_expanded
+    ):
         try:
             message = await service.expand_forwards(message)
         except Rejected:

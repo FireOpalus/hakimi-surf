@@ -713,7 +713,9 @@ class WorldStateManager:
                 "WHEN EXISTS(SELECT 1 FROM outbox_bubble_receipts b "
                 "WHERE b.reply_id='jit:'||scheduled_intents.id)"
                 " THEN 'recovered_partial_receipt' ELSE 'interrupted_without_final_receipt' END "
-                "WHERE status='executing' AND NOT (action_name IS 'qq.owner_digest' "
+                "WHERE status='executing' AND NOT ("
+                "action_name IS NOT NULL "
+                "AND action_name IN ('qq.owner_digest', 'social.owner_digest') "
                 "AND result_reason='owner_digest_awaiting_delivery' AND EXISTS ("
                 "SELECT 1 FROM owner_digest_intents i JOIN pending_owner_dms p ON p.id=i.digest_id "
                 "WHERE i.intent_id=scheduled_intents.id AND p.status='pending'))",

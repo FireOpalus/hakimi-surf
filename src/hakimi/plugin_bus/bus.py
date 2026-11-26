@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import inspect
 import json
 import logging
 import math
@@ -21,7 +22,7 @@ from hakimi_plugin_sdk.protocol import BLOB_FIELD, BLOB_HARD_MAX_BYTES, ToolCall
 
 from ..budget_policy import PATROL_LANE, PROACTIVE_LANE
 from ..config import Settings
-from ..modules.actions import Action, ActionCall, NoArgs, Outcome
+from ..modules.actions import Action, ActionCall, GateDecision, NoArgs, Outcome
 from ..modules.base import sanitize_sensor_text
 from ..modules.scheduling import ActivityQuota
 from ..platform_hooks import (
@@ -32,6 +33,7 @@ from ..platform_hooks import (
 from ..plugin_kernel import PluginContext, PluginKernel
 from ..screen_watch import decode_ws_json_frame
 from ..security import Rejected, clean_text, configured_secrets
+from ..social_policy import SocialProactivePolicy
 from ..social_speak import resolve_social_target, speak_proactive
 from ..thinking_policy import ThinkingScene
 from .ai_gateway import PluginBusAIGatewayMixin
@@ -495,6 +497,42 @@ class PluginBus(
     async def close(self) -> None:
         for pid in list(self._sessions):
             await self._dispose_session(pid, close_code=1012)
+
+    async def _notify_proactive_connection(
+        self, chat_platforms: tuple[str, ...], online: bool
+    ) -> None:
+        if not chat_platforms:
+            return
+        proactive = getattr(self.service, "proactive", None)
+        if proactive is None:
+            return
+        plat = getattr(proactive, "platform", None)
+        if plat not in chat_platforms:
+            return
+        on_conn = getattr(proactive, "on_connection", None)
+        if not callable(on_conn):
+            return
+        try:
+            accepts_platform = False
+            try:
+                sig = inspect.signature(on_conn)
+                accepts_platform = "platform" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_platform = False
+            res = on_conn(online, platform=plat) if accepts_platform else on_conn(online)
+            if inspect.isawaitable(res):
+                await res
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "event=plugin_proactive_connection_notify_failed platform=%s online=%s",
+                plat,
+                online,
+                exc_info=True,
+            )
 
     async def _send_raw(
         self,
@@ -1196,13 +1234,17 @@ class PluginBus(
                 event_subscriptions=frozenset(hello.event_subscriptions),
             )
 
+            became_ready = False
+
             # Register LIFO cleanup effects (reverse execution order:
             # 3rd registered -> runs 1st: cancel pending RPCs + mark in-flight deliveries uncertain
             # 2nd registered -> runs 2nd: unregister proxy & refresh _thinking_scenes
             # 1st registered -> runs 3rd: clear session entry, close WS, log disconnected)
             async def _cleanup_session_and_close(sess: _PluginSession = session) -> None:
-                if self._sessions.get(sess.plugin_id) is sess:
+                was_current = self._sessions.get(sess.plugin_id) is sess
+                if was_current:
                     self._sessions.pop(sess.plugin_id, None)
+                was_ready = became_ready or sess.ready
                 sess._bili_private_handles.clear()
                 sess.ready = False
                 if not sess.closed:
@@ -1212,6 +1254,13 @@ class PluginBus(
                             await sess.close(sess.close_code)
                     except Exception:
                         pass
+                if (
+                    was_current
+                    and was_ready
+                    and sess.proxy is not None
+                    and sess.proxy.chat_platforms
+                ):
+                    await self._notify_proactive_connection(sess.proxy.chat_platforms, False)
                 log.info("event=plugin_disconnected plugin=%s", sess.plugin_id)
                 if hasattr(self.service, "record"):
                     self.service.record("plugin_disconnected", emit_audit=False)
@@ -1297,6 +1346,23 @@ class PluginBus(
                             )
                             return await speak_proactive(self.service, target, call)
 
+                        async def _preflight_proactive_speak(
+                            ticket: dict[str, Any],
+                            now_ts: float,
+                            cfg: Any,
+                            sess: _PluginSession = session,
+                            plat: str = primary_plat,
+                        ) -> GateDecision:
+                            proxy_now = sess.proxy
+                            if proxy_now is None or not proxy_now.chat_connected(plat):
+                                return GateDecision("plugin_disconnected", delay=120)
+                            policy = SocialProactivePolicy(
+                                self.service,
+                                plat,
+                                proxy_now._bot_id,
+                            )
+                            return await policy.evaluate(ticket, now_ts, cfg)
+
                         speak_action = Action(
                             name=speak_name,
                             description=(
@@ -1311,6 +1377,7 @@ class PluginBus(
                                 ActivityQuota(),
                             ),
                             run=_run_proactive_speak,
+                            preflight=_preflight_proactive_speak,
                             unavailable=lambda s=session, p=primary_plat: (
                                 None
                                 if (s.proxy is not None and s.proxy.chat_connected(p))
@@ -1363,11 +1430,14 @@ class PluginBus(
                         register_platform_hooks(plat, hooks)
                 self._sessions[pid] = session
                 session.ready = True
+                became_ready = True
                 proactive = getattr(self.service, "proactive", None)
                 if proactive is not None and getattr(proactive, "platform", None) in chat_platforms:
                     wakeup = getattr(proactive, "wakeup", None)
                     if wakeup is not None and hasattr(wakeup, "set"):
                         wakeup.set()
+                if chat_platforms:
+                    await self._notify_proactive_connection(chat_platforms, True)
                 await self._touch_last_seen(pid, now)
             except (Rejected, ValueError) as exc:
                 reason = str(exc) if isinstance(exc, Rejected) else "plugin_registration_conflict"

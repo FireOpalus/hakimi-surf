@@ -155,7 +155,9 @@ class _ServiceDeliveryMixin:
 
     async def _alert_affection_blacklisted(self, message: Message, update) -> None:
         self.record("affection_blacklisted")
-        if self.s.owner_delivery_platform != "onebot":
+        proactive = getattr(self, "proactive", None)
+        alert_fn = getattr(proactive, "alert", None) if proactive is not None else None
+        if not callable(alert_fn):
             return
         nick = self.moderation.nickname(message.sender_nickname or getattr(update, "nickname", ""))
         code = f"affection_zero_{message.platform}_{message.user_id}"
@@ -171,7 +173,7 @@ class _ServiceDeliveryMixin:
             f"好感度已降至 0 分，哈基米已发告别语并在应用层静音（绝不删好友）。\n{hint}"
         )
         try:
-            await self.proactive.alert(code, text)
+            await alert_fn(code, text)
         except Exception:
             pass
 

@@ -116,7 +116,7 @@ class _ServiceTurnMixin:
             and not self.bot_guard.known_bot(message)
         )
         if deep:
-            if message.kind != "private" or not owner(message, self.s):
+            if message.kind != "private" or not is_persona_owner(message, self.s):
                 raise Rejected("owner_private_only")
             if not deep_match[1] or not deep_match[1].strip():
                 await self.store.enqueue_reply(job["id"], message, "用法：/deep <问题或视频链接>")
@@ -300,7 +300,7 @@ class _ServiceTurnMixin:
             await self.store.runtime.filters.update_audit(audit_id, "cancelled", "unauthorized")
             return
         sandbox = getattr(intent, "sandbox_mode", False)
-        if not sandbox and owner(message, self.s) and hasattr(self, "world_state"):
+        if not sandbox and is_persona_owner(message, self.s) and hasattr(self, "world_state"):
             await self.world_state.experience.touch_owner(self.world_state.clock())
         if self.diary and not sandbox:
             await self.diary.group(job["id"], message, members=members)
@@ -551,7 +551,9 @@ class _ServiceTurnMixin:
         allow_sing_song = False
         explicit_voice = False
         explicit_voice_bypass = False
-        verified_owner_turn = owner(message, self.s) and all(owner(m, self.s) for m in members)
+        verified_owner_turn = is_persona_owner(message, self.s) and all(
+            is_persona_owner(m, self.s) for m in members
+        )
         if not sandbox:
             related_user_ids = [
                 *(m.user_id for m in members),

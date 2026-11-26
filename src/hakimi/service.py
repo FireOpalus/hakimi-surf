@@ -73,7 +73,7 @@ from .output_links import filter_reply_links
 from .plugin_kernel import PluginKernel
 from .public_memory import PublicMemory
 from .roaming_logger import PatrolDiary, redact_public_summary
-from .security import Rejected, authorize, configured_secrets, owner, safe_output
+from .security import Rejected, authorize, configured_secrets, safe_output
 from .service_delivery import _ServiceDeliveryMixin
 from .service_owner_actions import (
     _LearnSongArgs as _LearnSongArgs,
@@ -844,7 +844,11 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         if not sub:
             return
         target = Message.model_validate(sub["target"])
-        if not authorize(target, self.s) or not owner(target, self.s) or target.kind != "private":
+        if (
+            not authorize(target, self.s)
+            or not is_persona_owner(target, self.s)
+            or target.kind != "private"
+        ):
             return
         videos = [Video.model_validate(v) for v in job["payload"]["videos"]]
         result = await self.summarize(
@@ -958,7 +962,7 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
             if not force and sub["next_poll"] > time.time():
                 continue
             target = Message.model_validate(sub["target"])
-            if not authorize(target, self.s) or not owner(target, self.s):
+            if not authorize(target, self.s) or not is_persona_owner(target, self.s):
                 continue
             await self.store.poll_started(
                 sub["id"], time.time() + self.s.patrol_interval_seconds + random.uniform(0, 60)
@@ -978,7 +982,7 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
             target = Message.model_validate(
                 self.store.vault.open("live:" + room["room_id"], room["target"])
             )
-            if not authorize(target, self.s) or not owner(target, self.s):
+            if not authorize(target, self.s) or not is_persona_owner(target, self.s):
                 continue
             async with self.store.transaction():
                 await self.store.db.execute(

@@ -7,7 +7,7 @@ import time
 import uuid
 
 from .bot_server import is_persona_owner
-from .security import Rejected, clean_text, configured_secrets
+from .security import Rejected, clean_text, configured_secrets, owner
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS muted_users (
@@ -158,19 +158,27 @@ class Moderation:
                         now + 172800,
                     ),
                 )
-        if proposal and self.s.owner_delivery_platform == "onebot":
-            text = (
-                f"BOISER，哈基米想请你评评理喵。{nickname}，QQ {uid}，"
-                f"在 24 小时内至少 3 次触发安全拦截，最近类别：{REASONS[reason]}。"
-                "目前还没有屏蔽，也没有删除好友。\n"
-                f"申请编号：{proposal}\n/mute-approve {proposal} 批准应用层屏蔽\n"
-                f"/mute-reject {proposal} 驳回\n"
-                "如需同时移除好友，请明确在批准命令末尾加 --delete-friend。"
-            )
-            try:
-                await self.service.proactive.alert("mute_proposal_" + proposal, text)
-            except Exception:
-                log.info("event=moderation_notice_failed")
+        if proposal:
+            proactive = getattr(self.service, "proactive", None)
+            alert_fn = getattr(proactive, "alert", None) if proactive is not None else None
+            if callable(alert_fn):
+                delete_hint = (
+                    "如需同时移除好友，请明确在批准命令末尾加 --delete-friend。"
+                    if self.s.owner_delivery_platform == "onebot"
+                    else "如需同时移除 QQ 好友，请在 QQ 私聊中使用 --delete-friend 或前往后台操作。"
+                )
+                text = (
+                    f"BOISER，哈基米想请你评评理喵。{nickname}，QQ {uid}，"
+                    f"在 24 小时内至少 3 次触发安全拦截，最近类别：{REASONS[reason]}。"
+                    "目前还没有屏蔽，也没有删除好友。\n"
+                    f"申请编号：{proposal}\n/mute-approve {proposal} 批准应用层屏蔽\n"
+                    f"/mute-reject {proposal} 驳回\n"
+                    f"{delete_hint}"
+                )
+                try:
+                    await alert_fn("mute_proposal_" + proposal, text)
+                except Exception:
+                    log.info("event=moderation_notice_failed")
         return proposal
 
     async def _mute(self, uid, source):
@@ -354,11 +362,7 @@ class Moderation:
         direct = message.command_text if message.command_text is not None else message.text
         if not re.match(r"^/(?:mute-approve|mute-reject|mute|unmute)(?:\s|$)", direct):
             return None
-        if (
-            message.platform != "onebot"
-            or message.kind != "private"
-            or not is_persona_owner(message, self.s)
-        ):
+        if message.kind != "private" or not is_persona_owner(message, self.s):
             raise Rejected("owner_private_only")
         match = re.fullmatch(
             r"/(mute-approve|mute-reject|mute|unmute) ([a-f0-9]+)( --delete-friend)?", direct
@@ -369,6 +373,8 @@ class Moderation:
                 "仅批准或屏蔽可加 --delete-friend。"
             )
         action, target, option = match.groups()
+        if option and not owner(message, self.s):
+            raise Rejected("owner_private_only")
         if action in {"mute-approve", "mute-reject"}:
             result = await self.review(target, action == "mute-approve", delete_friend=bool(option))
             text = (
