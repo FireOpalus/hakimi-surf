@@ -301,6 +301,13 @@ class TelegramPlugin:
             self._status_snapshot(connected=True),
             configuration_issue=None,
         )
+        log.info(
+            "event=tg_connected bot_id=%s bot_username=%s owner_configured=%s groups=%d",
+            self.bot_id,
+            self.bot_username,
+            bool(self.owner_user_id),
+            len(self.allowed_groups),
+        )
         if self.enable_polling and (self._poll_task is None or self._poll_task.done()):
             self._poll_task = asyncio.create_task(self._poll_loop(), name="tg-poll-loop")
 
@@ -874,6 +881,9 @@ async def main() -> None:
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Never let httpx/httpcore log Telegram Bot API request URLs (which embed TG_BOT_TOKEN).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     plugin = build_telegram_plugin_from_env()
     loop = asyncio.get_running_loop()
 
