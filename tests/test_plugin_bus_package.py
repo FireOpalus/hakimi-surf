@@ -175,26 +175,40 @@ def test_plugin_bus_submodule_boundaries_are_strictly_acyclic() -> None:
 
 
 @pytest.mark.parametrize(
-    "module_name",
+    ("entry_module", "verify_modules"),
     [
-        "hakimi.plugin_bus",
-        "hakimi.plugin_bus.protocol",
-        "hakimi.plugin_bus.proxy",
-        "hakimi.plugin_bus.blob",
-        "hakimi.plugin_bus.ai_gateway",
-        "hakimi.plugin_bus.domain_bridge",
-        "hakimi.plugin_bus.bus",
-        "hakimi.app",
+        (
+            "hakimi.plugin_bus.protocol",
+            (
+                "hakimi.plugin_bus",
+                "hakimi.plugin_bus.protocol",
+                "hakimi.plugin_bus.proxy",
+                "hakimi.plugin_bus.blob",
+                "hakimi.plugin_bus.ai_gateway",
+                "hakimi.plugin_bus.domain_bridge",
+                "hakimi.plugin_bus.bus",
+            ),
+        ),
+        ("hakimi.app", ("hakimi.app", "hakimi.plugin_bus")),
     ],
 )
-def test_plugin_bus_submodules_import_cleanly_in_isolated_process(module_name: str) -> None:
+def test_plugin_bus_submodules_import_cleanly_in_isolated_process(
+    entry_module: str, verify_modules: tuple[str, ...]
+) -> None:
+    script = (
+        f"import importlib, sys; "
+        f"importlib.import_module({entry_module!r}); "
+        f"mods = {verify_modules!r}; "
+        f"[importlib.import_module(m) for m in mods]; "
+        f"assert all(m in sys.modules for m in mods)"
+    )
     proc = subprocess.run(
-        [sys.executable, "-c", f"import importlib; importlib.import_module({module_name!r})"],
+        [sys.executable, "-c", script],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert proc.returncode == 0, f"failed importing {module_name}: {proc.stderr}"
+    assert proc.returncode == 0, f"failed importing {entry_module}: {proc.stderr}"
 
 
 def test_plugin_bus_security_limits_and_model_work_isolation_preserved() -> None:

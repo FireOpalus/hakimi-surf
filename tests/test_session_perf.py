@@ -56,6 +56,7 @@ class _SQLSpyConnect:
         return _Ctx()
 
 
+@pytest.mark.sqlite_durable
 async def test_initialized_session_skips_schema_migrations_lock_glob_and_registry_writes(
     settings, store, message, monkeypatch
 ):

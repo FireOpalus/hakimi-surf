@@ -863,7 +863,7 @@ async def test_decision_deadline_and_subsequent_local_circuit_are_recorded(
         calls += 1
         await asyncio.Event().wait()
 
-    settings.decision_timeout = 1
+    settings.decision_timeout = 0.05
     gateway = GeminiGateway(settings, store, *sdk_pair(stall))
     threshold = gateway._circuit_failure_threshold
     for cause in (*(["deadline"] * threshold), "circuit_open"):
@@ -875,9 +875,9 @@ async def test_decision_deadline_and_subsequent_local_circuit_are_recorded(
         assert attempt["cause"] == cause
         assert attempt["stage"] == "decision_message"
         assert attempt["provider"] == "gemini_paid" and attempt["model_lane"] == "decision"
-        assert attempt["timeout_ms"] == 1000 and "http_status" not in attempt
+        assert attempt["timeout_ms"] == 50 and "http_status" not in attempt
         if cause == "deadline":
-            assert attempt["elapsed_ms"] >= 990
+            assert attempt["elapsed_ms"] >= 40
         else:
             assert attempt["elapsed_ms"] == 0 and 0 < attempt["cooldown_ms"] <= 60000
         [audit] = await gateway.filters.recent_audit(1)

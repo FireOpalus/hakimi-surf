@@ -8,6 +8,7 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+import hakimi.session_manager as hakimi_session_manager
 import hakimi.store as hakimi_store
 from hakimi.config import Settings
 from hakimi.models import Message
@@ -77,10 +78,11 @@ _FAST_AIOSQLITE_PROXY = _FastAiosqliteProxy()
 
 @pytest.fixture(autouse=True)
 def sqlite_test_fast_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Disable fsync/zero-fill on Store DB for regular unit tests unless marked sqlite_durable."""
+    """Disable fsync/zero-fill on Store and Session DBs unless marked sqlite_durable."""
     if request.node.get_closest_marker("sqlite_durable") is not None:
         return
-    monkeypatch.setattr(hakimi_store, "aiosqlite", _FAST_AIOSQLITE_PROXY)
+    monkeypatch.setattr(hakimi_store, "aiosqlite", _FastAiosqliteProxy())
+    monkeypatch.setattr(hakimi_session_manager, "aiosqlite", _FastAiosqliteProxy())
     orig_open = Store.open
 
     async def _fast_open(self: Store) -> None:

@@ -533,17 +533,17 @@ async def test_semaphore_released_on_aclose_timeout_cancel_and_file_not_found(tm
 def test_default_semaphore_is_scoped_per_event_loop():
     """Calling codec helpers without an explicit semaphore across distinct loops never fails."""
 
-    async def _get_default() -> tuple[int, int]:
+    async def _get_default() -> tuple[asyncio.Semaphore, int]:
         sem = audio_codec._resolve_ffmpeg_semaphore(None)
         sem_again = audio_codec._resolve_ffmpeg_semaphore(None)
         assert sem is sem_again
-        return id(sem), sem._value  # noqa: SLF001
+        return sem, sem._value  # noqa: SLF001
 
-    id1, val1 = asyncio.run(_get_default())
-    id2, val2 = asyncio.run(_get_default())
+    sem1, val1 = asyncio.run(_get_default())
+    sem2, val2 = asyncio.run(_get_default())
     assert val1 == DEFAULT_MAX_FFMPEG_CONCURRENCY
     assert val2 == DEFAULT_MAX_FFMPEG_CONCURRENCY
-    assert id1 != id2
+    assert sem1 is not sem2
 
 
 def test_http_tts_max_chars_enforced_before_provider():

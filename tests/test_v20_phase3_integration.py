@@ -71,7 +71,9 @@ def onebot_headers():
 
 
 def test_ws_node_auth_rejects_invalid_and_keeps_onebot_intact(settings) -> None:
-    app = create_app(p3_settings(settings), gateway_factory=FakeGateway, start_workers=False)
+    p3 = p3_settings(settings)
+    p3.bilibili_min_interval_seconds = 0.0
+    app = create_app(p3, gateway_factory=FakeGateway, start_workers=False)
     with TestClient(app) as client:
         for path, hdrs in [
             ("/ws/node", node_headers()),
@@ -98,7 +100,9 @@ async def test_loopback_node_daemon_to_app_delegation_mc_and_fallback(
 ) -> None:
     cn_requests: list[str] = []
 
-    app = create_app(p3_settings(settings), gateway_factory=FakeGateway, start_workers=False)
+    p3 = p3_settings(settings)
+    p3.bilibili_min_interval_seconds = 0.0
+    app = create_app(p3, gateway_factory=FakeGateway, start_workers=False)
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())

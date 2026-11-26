@@ -746,10 +746,13 @@ async def test_ai_generate_rejects_foreign_scene_and_heartbeat_idle_timeout(sett
 
 
 async def test_rpc_timeout_delivery_uncertain_rate_limit_budget_and_fallback_kernel(
-    settings,
+    settings, monkeypatch
 ):
+    from hakimi.plugin_bus import proxy as plugin_bus_proxy
     from hakimi.service import Service
     from hakimi.store import Store
+
+    monkeypatch.setattr(plugin_bus_proxy, "_SENSOR_RPC_TIMEOUT_SECONDS", 0.06)
 
     # Budget hard-stop via daily_usd=0 + short RPC timeout + owner_notify rate limit + no svc.kernel
     s = _plugin_settings(settings, daily_usd=Decimal("0"))
