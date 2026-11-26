@@ -181,7 +181,17 @@ function renderLife(d){
   $('life-node-pills').replaceChildren(...nodePills);
   text('life-world-status','世界状态更新于：'+lifeFmt(ws.updated_at,tz)+' · 最近主动触发：'+lifeFmt(ws.last_proactive_at,tz)+' · 境内节点说明：'+(sh.phase_note||'CN 反向 WSS 躯干专线'));
   const caps=Array.isArray(sh.capabilities)&&sh.capabilities.length?sh.capabilities.join(', '):'—';
-  text('life-node-status','境内节点 '+(sh.node_id||'—')+' ('+(sh.region||'CN')+')：'+(sh.connected?'在线':sh.configured?'等待连接':'未配置')+' · 来源 IP '+(sh.source_ip||'—')+' · 建连 '+lifeFmt(sh.connected_at,tz)+' · 心跳 '+lifeFmt(sh.last_heartbeat_at,tz)+' · RPC 成功/失败 '+(sh.rpc_calls??0)+'/'+(sh.rpc_errors??0)+' · B站托管 '+(sh.bili_delegate_active?'开启':'未激活')+' · 能力 '+caps);
+  const nodeHead='境内节点'+(sh.node_id?' '+sh.node_id:'')+'（'+(sh.region||'CN')+'）：'+(sh.connected?'在线':sh.configured?'等待连接':'未配置');
+  text('life-node-status',!sh.connected&&!sh.connected_at&&!sh.last_heartbeat_at
+    ?nodeHead+' · 尚未建立过连接'
+    :[nodeHead,
+      sh.source_ip&&'来源 IP '+sh.source_ip,
+      sh.connected_at&&'建连 '+lifeFmt(sh.connected_at,tz),
+      sh.last_heartbeat_at&&'心跳 '+lifeFmt(sh.last_heartbeat_at,tz),
+      'RPC 成功/失败 '+(sh.rpc_calls??0)+'/'+(sh.rpc_errors??0),
+      'B站托管 '+(sh.bili_delegate_active?'开启':'未激活'),
+      caps!=='—'&&'能力 '+caps
+    ].filter(Boolean).join(' · '));
   text('life-desktop-status',dm.enabled?('桌面端 Antigravity_Memory 最近活跃：'+(dm.latest_iso||lifeFmt(dm.latest_timestamp,tz))+(dm.latest_tag?' · 标签 '+dm.latest_tag:'')):'桌面端 Antigravity_Memory 协同当前未启用。');
   $('life-world-module').value=ws.current_module||'idle';
   const moduleIds=new Set(['idle',...(ws.modules||[]).map(m=>m.module_id)]);
@@ -507,8 +517,7 @@ function renderVoiceCompanion(d){
   $('vc-pills').replaceChildren(...vcPills);
   text('vc-state',
     '配置来源：'+(d.source==='sqlite'?'后台 SQLite':'默认配置')+
-    ' · 客户端 '+(d.client_id||'—')+
-    ' · 来源 IP '+(d.source_ip||'—')+
+    (d.client_id||d.source_ip?(d.client_id?' · 客户端 '+d.client_id:'')+(d.source_ip?' · 来源 IP '+d.source_ip:''):' · 暂无客户端连接')+
     (d.connected_at?' · 建连 '+lifeFmt(d.connected_at,tz):'')+
     (active?' · 正在游玩 '+(active.game_title||'未命名游戏')+'（已对话 '+active.spoken_turns+'/'+active.turns+' 轮 · 看图 '+active.frames_analyzed+' 帧）':'')
   );
@@ -718,8 +727,7 @@ function renderScreenWatch(d){
   $('sw-pills').replaceChildren(...swPills);
   text('sw-state',
     '配置来源：'+(d.source==='sqlite'?'后台 SQLite':'默认配置')+
-    ' · 客户端 '+(d.client_id||'—')+
-    ' · 来源 IP '+(d.source_ip||'—')+
+    (d.client_id||d.source_ip?(d.client_id?' · 客户端 '+d.client_id:'')+(d.source_ip?' · 来源 IP '+d.source_ip:''):' · 暂无客户端连接')+
     (d.connected_at?' · 建连 '+lifeFmt(d.connected_at,tz):'')+
     (d.game_title?' · 当前窗口 '+(d.game_title+(d.window_title?' / '+d.window_title:'')):'')+
     ' · 累计收帧 '+d.frames_received+' · 语音口播 '+d.routed_voice_count+' · 独立吐槽 '+d.standalone_commentary_count

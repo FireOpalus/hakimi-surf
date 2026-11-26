@@ -80,6 +80,12 @@ $('refresh-providers').addEventListener('click',e=>busy(e.target,async()=>{
   await providers();
 }));
 $('prov-sa-file').addEventListener('change',e=>busy($('prov-save-creds'),()=>loadJsonFileInto(e.target,$('prov-sa-json'))));
+function syncCredentialClearState(){
+  const clearing=['prov-clear-free','prov-clear-vertex','prov-clear-sa'].some(id=>$(id).checked);
+  $('prov-save-creds').className=clearing?'danger':'primary';
+  $('prov-save-creds').textContent=clearing?'保存并清除所选凭据':'加密保存凭据';
+}
+for(const id of ['prov-clear-free','prov-clear-vertex','prov-clear-sa'])$(id).addEventListener('change',syncCredentialClearState);
 $('prov-cred-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy($('prov-save-creds'),async()=>{
@@ -95,12 +101,19 @@ $('prov-cred-form').addEventListener('submit',e=>{
     if(!payload.gemini_free_api_key&&!payload.vertex_api_key&&!payload.gcp_service_account_json&&!payload.clear_gemini_free_api_key&&!payload.clear_vertex_api_key&&!payload.clear_gcp_service_account_json){
       throw Error('请先输入需要更新的凭据，或勾选要清除的项目');
     }
+    const clearing=[
+      payload.clear_gemini_free_api_key&&'Free Tier Gemini Key',
+      payload.clear_vertex_api_key&&'Vertex AI API Key',
+      payload.clear_gcp_service_account_json&&'GCP Service Account JSON'
+    ].filter(Boolean);
+    if(clearing.length&&!(await confirmDialog('将永久清除后台保存的：'+clearing.join('、')+'。相关通道会立即回退或停用。',{title:'清除已保存的凭据？',danger:true,confirmLabel:'确认清除并保存'})))return;
     if(payload.gcp_service_account_json){
       try{const parsed=JSON.parse(payload.gcp_service_account_json);if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw 0;}catch{throw Error('Service Account JSON 格式无效，请检查内容');}
     }
     const next=await api('global/providers/credentials','POST',payload);
     $('prov-free-key').value='';$('prov-vertex-key').value='';$('prov-sa-json').value='';$('prov-sa-file').value='';
     $('prov-clear-free').checked=false;$('prov-clear-vertex').checked=false;$('prov-clear-sa').checked=false;
+    syncCredentialClearState();
     clearDirty('prov-cred-form');
     renderProviders(next);
     notice('API 凭据与服务账号已加密更新');

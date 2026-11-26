@@ -916,7 +916,7 @@ function renderSongStorageBar(d){
     pill('本地热缓存 '+formatByteSize(cacheBytes)+' / '+formatByteSize(cacheMax)+'（'+cachedCount+' 首）',ratio>=0.9?'warn':cachedCount>0?'paid':'muted'),
     pill(colabOk?'Colab GPU 算力就绪':'Colab GPU 算力未配置',colabOk?'vertex':'muted')
   );
-  text('song-cache-state','Drive 云盘（歌单工坊独立直连）：'+(driveOk?'已配置':'未配置')+' · Drive 主存 '+driveCount+' 首 · 本地 LRU 热缓存占用 '+formatByteSize(cacheBytes)+' / '+formatByteSize(cacheMax)+'（共 '+cachedCount+' 首缓存；纯本地上传曲目永不淘汰）· Colab GPU 算力（仅学歌推理）：'+(colabOk?'已配置':'未配置'));
+  text('song-cache-state','Drive 由歌单工坊独立直连；本地热缓存按 LRU 淘汰，纯本地上传的曲目永不淘汰；Colab GPU 仅用于学歌推理。');
   text('song-learn-colab-hint',(driveOk?'Drive 歌单主存与原曲收件箱已独立就绪；':'提示：Drive 歌单存储尚未配置，收件箱与云盘归档暂不可用；')+(colabOk?'Colab GPU 算力已就绪，默认共享分轨产出 YingMusic-SVC 与 Seed-VC 双版候选，由猫猫原声亲听自选入库并保留双版本可随时切换（亦保留 RVC 可选）。':'当前 Colab GPU Worker 尚未配置，仍可正常播放歌单、切换已存档版本、管理 Drive 收件箱或手动上传翻唱成品；如需自动学歌请在「Colab 云端算力」配置 Worker。'));
   renderSongFinderStatus(d.song_finder||{online:Boolean(d.song_finder_online)});
 }
@@ -1085,7 +1085,7 @@ function renderSongList(items,generation){
   const listEl=$('song-list');
   listEl.replaceChildren();
   if(!items||!items.length){
-    listEl.append(el('p','还没有录入翻唱曲目。可以通过上方「Colab 学一首新歌」或下方本地上传音频切片加入歌单。','muted'));
+    listEl.append(el('p','还没有录入翻唱曲目。可以通过下方「Colab 学一首新歌」或「手动上传本地翻唱成品」加入歌单。','muted'));
     return;
   }
   for(const item of items){

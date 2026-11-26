@@ -45,12 +45,38 @@ function debounceFn(fn,ms=150){
 }
 
 let noticeTimer=null;
+const NOTICE_STACK_MAX=2;
 function hideNotice(){
   clearTimeout(noticeTimer);
   noticeTimer=null;
   $('notice').hidden=true;
 }
+function clearNoticeStack(){
+  const stack=$('notice-stack');
+  if(stack)stack.replaceChildren();
+}
+// 新通知到来时，把仍在显示的上一条移入下方的历史栈（最多保留 2 条），避免连续操作时互相覆盖。
+function stashNotice(){
+  const stack=$('notice-stack');
+  const previous=$('notice-text').textContent;
+  if(!stack||$('notice').hidden||!previous)return;
+  const failed=$('notice').className==='error';
+  const item=el('div',undefined,'notice-item'+(failed?' error':''));
+  const close=el('button','×','notice-close');
+  close.type='button';
+  close.setAttribute('aria-label','关闭通知');
+  close.addEventListener('click',()=>item.remove?.());
+  item.append(el('span',previous,'notice-item-text'),close);
+  if(typeof stack.prepend==='function')stack.prepend(item);else stack.append(item);
+  while(stack.children.length>NOTICE_STACK_MAX){
+    const last=stack.lastElementChild;
+    if(!last?.remove)break;
+    last.remove();
+  }
+  if(!failed)setTimeout(()=>item.remove?.(),6000);
+}
 function notice(value,error=false){
+  stashNotice();
   clearTimeout(noticeTimer);
   noticeTimer=null;
   text('notice-text',value);
@@ -163,10 +189,15 @@ function promptDialog(title,opts={}){
 }
 
 const dirtyRegistry=new Map();
+const dirtyListeners=[];
+function onDirtyChange(fn){dirtyListeners.push(fn);}
 function updatePageDirtyBadge(){
   const dirtyLabels=[];
   for(const entry of dirtyRegistry.values()){
     if(entry.dirty&&entry.tabId===tab)dirtyLabels.push(entry.label);
+  }
+  for(const fn of dirtyListeners){
+    try{fn(dirtyLabels);}catch{}
   }
   const badge=$('page-dirty-badge');
   if(!badge)return;
@@ -374,6 +405,7 @@ function logout(){
   text('login-error','');
   document.title='洁米奈星夜';
   hideNotice();
+  clearNoticeStack();
   text('last-updated','尚未刷新');
   $('last-updated').removeAttribute('datetime');
 

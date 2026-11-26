@@ -2,9 +2,9 @@
   <div class="card"><div class="row between"><h2>本地白名单表情包</h2><button id="meme-refresh" type="button" class="secondary">刷新列表</button></div>
     <p class="muted">只有本页或 Owner 用 /存表情 收录的图片可用于公开聊天；模型只能选标签。标签支持 1～24 个汉字、英文字母、数字、下划线或短横线；同名标签可上传多张并在发送时轮换；相同图片不会重复入库。</p>
     <form id="meme-upload">
-      <div class="row"><label for="meme-file">选择或拖拽上传 jpg / png / gif / webp（单张 ≤ 5 MiB，支持多选）</label><input id="meme-file" type="file" accept=".jpg,.jpeg,.png,.gif,.webp" multiple></div>
-      <div id="meme-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把多张表情拖到这里（支持从文件名自动识别标签，也可加入队列后逐张改名）</div>
-      <div class="row"><input id="meme-batch-label" maxlength="24" placeholder="统一标签（可选，适合同情绪多图轮换）" aria-label="统一标签"><button id="meme-apply-batch" type="button" class="secondary">应用到全部待传项</button><button id="meme-clear-queue" type="button" class="secondary">清空待传</button><button type="submit" class="primary">批量上传并立即生效</button></div>
+      <label for="meme-file" class="visually-hidden">选择表情图片文件</label><input id="meme-file" class="visually-hidden" type="file" accept=".jpg,.jpeg,.png,.gif,.webp" multiple tabindex="-1">
+      <div id="meme-dropzone" class="meme-drop" role="button" tabindex="0"><strong>点击选择或把多张表情拖到这里</strong><small>jpg / png / gif / webp，单张 ≤ 5 MiB，可多选；文件名会自动识别为标签，加入队列后也能逐张改名</small></div>
+      <div class="row"><input id="meme-batch-label" class="grow-input" maxlength="24" placeholder="统一标签（可选，同情绪多图轮换）" aria-label="统一标签"><button id="meme-apply-batch" type="button" class="secondary">应用到全部待传项</button><button id="meme-clear-queue" type="button" class="secondary">清空待传</button><button type="submit" class="primary">批量上传并立即生效</button></div>
       <div id="meme-pending" class="meme-queue"></div>
     </form>
     <p class="muted">最多 100 张、合计 50 MiB。上传自动清除元数据：GIF / 动态 WebP 保留重编码动图（≤60 帧、512px），透明底 PNG / WebP 保留透明 PNG，普通静图转 JPEG（≤1024px）。以 OneBot 动画表情子类型（sub_type=1）跨容器 base64 发送；公开会话每 4 次回复最多附一张（Owner 私聊不限频），同名多图优先轮换不重复。</p>
@@ -35,7 +35,7 @@
   </div>
   <div class="card">
     <div class="row between">
-      <h2>Drive <code>Hakimi_Songs/</code> 云盘目录与待学原曲收件箱</h2>
+      <h2 data-nav-label="Drive 云盘与收件箱">Drive <code>Hakimi_Songs/</code> 云盘目录与待学原曲收件箱</h2>
       <div class="row">
         <button id="song-refresh-inbox" type="button" class="secondary">刷新收件箱</button>
       </div>
@@ -205,8 +205,9 @@
     <h2>手动上传本地翻唱成品</h2>
     <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 100 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台。</p>
     <form id="song-upload">
-      <div class="row"><label for="song-file">选择音频文件</label><input id="song-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac"><small id="song-file-name" class="muted">未选择音频文件</small></div>
-      <div id="song-dropzone" class="meme-drop" role="button" tabindex="0">点击选择或把翻唱音频拖到这里（自动识别文件名作为歌名）</div>
+      <label for="song-file" class="visually-hidden">选择音频文件</label><input id="song-file" class="visually-hidden" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac" tabindex="-1">
+      <div id="song-dropzone" class="meme-drop" role="button" tabindex="0"><strong>点击选择或把翻唱音频拖到这里</strong><small>mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 100 MiB；文件名自动识别为歌名</small></div>
+      <p class="muted file-picked">已选择：<span id="song-file-name">未选择音频文件</span></p>
       <div class="song-meta">
         <label for="song-title">歌名（必填，1～60字）<input id="song-title" maxlength="60" required placeholder="例如：小星星"></label>
         <label for="song-artist">原唱（可选）<input id="song-artist" maxlength="40" placeholder="例如：传统儿歌"></label>
@@ -233,7 +234,7 @@
       </div>
       <p id="bili-credential-state" class="muted"></p>
       <p class="muted">后台不回显 Cookie；留空表示保持原值，单独粘贴值，不粘贴完整 Cookie 请求头。</p>
-      <div class="row"><button type="submit" class="primary">加密保存凭证</button><button type="button" id="bili-clear" class="danger">清除保存的凭证</button><button type="button" id="bili-test" class="secondary">测试凭证有效性（nav）</button></div>
+      <div class="row"><button type="submit" class="primary">加密保存凭证</button><button type="button" id="bili-test" class="secondary">测试凭证有效性（nav）</button><button type="button" id="bili-clear" class="danger push-end">清除保存的凭证</button></div>
     </form>
   </div>
   <div class="card"><h2>低频自主巡逻与互动</h2>

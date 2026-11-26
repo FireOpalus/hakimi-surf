@@ -246,7 +246,7 @@ function renderPluginBus(d){
     pill('接入路径 '+(d.ws_path||'/ws/plugin'),'paid'),
     pill('在线 '+connectedCount+' / 已签发 '+plugins.length,connectedCount>0?'ok':'muted')
   );
-  text('pb-state','WS 路径：'+(d.ws_path||'/ws/plugin')+' · 已注册插件 '+plugins.length+' 个（在线 '+connectedCount+' 个）· 可选权限 '+catalog.join(', '));
+  text('pb-state',catalog.length?'可签发的权限范围：'+catalog.join('、'):'');
   const createChecked=[...$('pb-create-scopes').querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);
   renderScopeCheckboxes($('pb-create-scopes'),catalog,createChecked);
   $('pb-create-submit').disabled=false;

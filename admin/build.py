@@ -16,6 +16,7 @@ SRC_DIR = ADMIN_DIR / "src"
 CSS_DIR = SRC_DIR / "css"
 VIEWS_DIR = SRC_DIR / "views"
 JS_DIR = SRC_DIR / "js"
+PRELOAD_FILE = SRC_DIR / "preload.js"
 OUT_FILE = ADMIN_DIR / "admin_page.html"
 INIT_FILE = REPO_ROOT / "src" / "hakimi" / "__init__.py"
 CSP_FILE = ADMIN_DIR / "csp.py"
@@ -129,8 +130,19 @@ def build_html(version_override: str | None = None) -> str:
     js_files = sorted(JS_DIR.glob("*.js"))
     if not js_files:
         raise FileNotFoundError(f"No JS files found in {JS_DIR}")
+    if not PRELOAD_FILE.is_file():
+        raise FileNotFoundError(f"Missing head preload script: {PRELOAD_FILE}")
+    preload = PRELOAD_FILE.read_text(encoding="utf-8").strip()
     js_inner = "\n\n".join(f.read_text(encoding="utf-8").strip() for f in js_files)
-    js_bundle = "'use strict';\n(()=>{\n" + js_inner + "\n})();"
+    # The single inline <script> lives in <head>: the theme preload runs before first paint,
+    # and the console itself starts once the DOM has been parsed.
+    js_bundle = (
+        "'use strict';\n"
+        + preload
+        + "\ndocument.addEventListener('DOMContentLoaded',()=>{\n"
+        + js_inner
+        + "\n},{once:true});"
+    )
 
     html = (
         shell.replace("{{STYLE}}", css_bundle)

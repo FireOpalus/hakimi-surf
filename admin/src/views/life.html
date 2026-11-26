@@ -138,7 +138,7 @@
     <p class="muted">各能力模块、私聊约定与规划器写入的跨时段待办事项（Fernet 加密落盘，显式核销或到期前持续保留）。</p>
     <p id="event-ledger-state" class="muted" aria-live="polite"></p>
     <form id="life-ledger-form" class="quick-bar">
-      <label for="life-ledger-summary">待办摘要<input id="life-ledger-summary" type="text" maxlength="160" required placeholder="如：明天下午收农场西边草莓 / 约好两点进MC挖铁矿"></label>
+      <label for="life-ledger-summary" class="field-wide">待办摘要<input id="life-ledger-summary" type="text" maxlength="160" required placeholder="如：明天下午收农场西边草莓"></label>
       <label for="life-ledger-target">目标模块（可选）<input id="life-ledger-target" list="ledger-module-options" type="text" maxlength="32" placeholder="minecraft / 留空"></label>
       <datalist id="ledger-module-options"></datalist>
       <label for="life-ledger-due">延后生效（分钟）<input id="life-ledger-due" type="number" min="0" max="43200" step="1" value="0" required></label>
@@ -160,12 +160,15 @@
       <h2>语音伴随中枢（Voice Companion）</h2>
       <div class="row">
         <button id="refresh-vc" class="secondary" type="button">刷新状态</button>
-        <button id="vc-disconnect" class="danger" type="button" disabled>断开当前连接</button>
       </div>
     </div>
     <p class="muted">桌面专属伴随客户端与 Discord / OOPZ 等外部语音桥统一接入本中枢；Owner 私有连麦时自动读取「屏幕伴看」内存近期画面，多人语音房（room_public）严格隔离一切私有记忆与画面。</p>
     <div id="vc-pills" class="pill-row"></div>
     <p id="vc-state" class="muted" aria-live="polite"></p>
+    <div class="danger-zone">
+      <div class="danger-zone-copy"><strong>危险操作</strong><small>立即断开当前语音伴随端；客户端需要重新连接才能恢复陪伴。</small></div>
+      <div class="row"><button id="vc-disconnect" class="danger" type="button" disabled>断开当前连接</button></div>
+    </div>
   </div>
   <div class="card">
     <h2>语音伴随设置</h2>
@@ -313,13 +316,15 @@
       <h2>屏幕伴看感知中枢（Screen Watch）</h2>
       <div class="row">
         <button id="refresh-sw" class="secondary" type="button">刷新状态</button>
-        <button id="sw-clear" class="secondary" type="button" disabled>立即清空画面缓存</button>
-        <button id="sw-disconnect" class="danger" type="button" disabled>断开看屏连接</button>
       </div>
     </div>
     <p class="muted">严格限定 Owner 私有；桌面端推送的关键帧仅在服务端内存中以超短 TTL 环形缓存、到期或暂停/断连即刻销毁，绝不写入磁盘或数据库，也绝不暴露给多人语音房或群聊。</p>
     <div id="sw-pills" class="pill-row"></div>
     <p id="sw-state" class="muted" aria-live="polite"></p>
+    <div class="danger-zone">
+      <div class="danger-zone-copy"><strong>危险操作</strong><small>清空会立刻销毁内存中的近期画面；断开后看屏端需重新连接。</small></div>
+      <div class="row"><button id="sw-clear" class="danger" type="button" disabled>立即清空画面缓存</button><button id="sw-disconnect" class="danger" type="button" disabled>断开看屏连接</button></div>
+    </div>
   </div>
   <div class="card">
     <h2>看屏隐私与主动吐槽策略</h2>

@@ -32,12 +32,13 @@
         </div>
       </form>
     </div>
-    <div class="card">
+    <div class="card card-danger">
       <h2>合并身份档案</h2>
-      <p class="muted">将源身份的所有账号与画像并入目标身份（管理员可合并至 Owner）。防小号规则：任一方被屏蔽或好感归零时，合并结果将强制全平台屏蔽并归零；否则取两方最低好感，L2 标签去重后最多保留 8 个。</p>
+      <p class="callout callout-danger"><strong>不可撤销：</strong>源身份会被删除，其账号与画像全部并入目标身份。</p>
+      <p class="muted">管理员可合并至 Owner。防小号规则：任一方被屏蔽或好感归零时，合并结果将强制全平台屏蔽并归零；否则取两方最低好感，L2 标签去重后最多保留 8 个。</p>
       <form id="id-merge-form">
-        <label for="id-merge-source">源身份 source_person_id（将被并入并移除）<input id="id-merge-source" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入源 person_id"></label>
-        <label for="id-merge-target">目标身份 target_person_id（保留）<input id="id-merge-target" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入目标 person_id"></label>
+        <label for="id-merge-source">源身份（将被并入并移除） source_person_id<input id="id-merge-source" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入源 person_id"></label>
+        <label for="id-merge-target">目标身份（保留） target_person_id<input id="id-merge-target" list="id-person-options" type="text" maxlength="64" required placeholder="选择或输入目标 person_id"></label>
         <div class="row">
           <button id="id-merge-submit" type="submit" class="danger" disabled>合并身份</button>
         </div>

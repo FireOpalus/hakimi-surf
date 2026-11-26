@@ -14,7 +14,7 @@ body {
   min-height: 100dvh;
   background: transparent;
   color: var(--ink);
-  font: 14px/1.55 var(--sans);
+  font: var(--fs-base)/1.55 var(--sans);
   letter-spacing: .005em;
   -webkit-font-smoothing: antialiased;
 }

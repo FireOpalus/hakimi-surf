@@ -64,7 +64,7 @@ async function admission(){
   clearDirty('admission-bot-threshold-form');
   text('admission-source',d.source==='admin'?'当前名单来自 SQLite 后台配置':'当前名单来自本次启动时的 .env');
   text('admission-owner','Owner（固定保留）：'+(d.owner_qq_id||'尚未配置')+' · 机器人自身：'+d.onebot_self_id);
-  text('admission-group-scope','群白名单仅决定群准入：该群所有非黑名单成员均可按群互动策略交流，不受私聊用户白名单限制。私聊仍单独按右侧模式与好友名单判断。');
+  text('admission-group-scope','群白名单仅决定群准入：该群所有非黑名单成员均可按群互动策略交流，不受私聊用户白名单限制。私聊仍单独按下方「私聊准入」的模式与好友名单判断。');
   text('admission-environment',JSON.stringify(d.environment,null,2));
   for(const [key,id,label] of admissionLists){
     table(id,[label,'操作'],c[key].map(value=>[value,button('移除',async()=>{

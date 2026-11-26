@@ -1,12 +1,12 @@
 <section id="ledger" class="tab" role="tabpanel" aria-labelledby="nav-ledger" hidden>
-  <div id="cloud-resources-card" class="card cloud-hub">
+  <div id="cloud-resources-card" class="card cloud-hub" data-section-group="cloud">
     <div class="row between">
       <h2>统一云资源总览</h2>
       <div class="row">
         <button id="cloud-sync-bq" type="button" class="primary" disabled>同步 BigQuery</button>
         <button id="cloud-sync-mon" type="button" class="secondary" disabled>拉取 Monitoring</button>
         <button id="cloud-refresh" type="button" class="secondary">刷新云资源</button>
-        <button type="button" class="secondary" data-open-tab="colab-compute">Colab 算力详情 →</button>
+        <button type="button" class="link-button" data-open-tab="colab-compute">Colab 算力详情 →</button>
       </div>
     </div>
     <p class="muted">统一汇总 GCP Cloud Billing 赠金余额对账（实花 vs 本地估算差额）与 Colab GPU 算力状态、热会话保活、14/30 天 CU 消耗趋势及三级加速效率。</p>
@@ -64,7 +64,7 @@
     </div>
   </div>
 
-  <div class="card">
+  <div class="card" data-section-group="calls">
     <div class="row between">
       <h2>Token 与费用账本</h2>
       <button id="refresh-ledger" type="button" class="secondary">刷新账本</button>
@@ -97,7 +97,7 @@
     </details>
   </div>
 
-  <div class="card">
+  <div class="card" data-section-group="billing">
     <div class="row between">
       <h2>统一账户余额与 GCP BigQuery 账单中心</h2>
       <div class="row">
@@ -117,7 +117,7 @@
         <div class="row">
           <label for="balance-input">设置手动校准 / 补充余额（USD） <input id="balance-input" type="number" min="0" max="100000" step="0.01" required placeholder="例如 45.00"></label>
           <button id="save-balance" type="submit" class="primary" disabled>保存校准余额</button>
-          <button id="clear-balance" type="button" class="secondary" disabled>清除余额记录</button>
+          <button id="clear-balance" type="button" class="danger" disabled>清除余额记录</button>
         </div>
       </form>
     </fieldset>
@@ -164,7 +164,7 @@
       <p id="gcp-sa-status" class="muted"></p>
       <form id="gcp-sa-form">
         <label for="gcp-sa-file">从本地 .json 文件加载 Service Account 密钥<input id="gcp-sa-file" type="file" accept=".json,application/json"></label>
-        <label for="gcp-sa-json">独立 Service Account JSON（留空则继续共享「全局模型通道」凭据）<textarea id="gcp-sa-json" maxlength="65536" placeholder='粘贴 Service Account JSON（包含 "type": "service_account"）...'></textarea></label>
+        <label for="gcp-sa-json">独立 Service Account JSON（留空则继续共享「全局模型通道」凭据）<textarea id="gcp-sa-json" maxlength="65536" placeholder='粘贴 Service Account JSON，或用上方按钮选择 .json 文件'></textarea></label>
         <div class="row">
           <button id="gcp-save-sa" type="submit" class="primary">加密保存独立 Service Account</button>
           <button id="gcp-clear-sa" type="button" class="danger">清除独立覆盖（回退共享凭据）</button>
@@ -173,7 +173,7 @@
     </details>
   </div>
 
-  <div class="card">
+  <div class="card" data-section-group="billing">
     <div class="row between">
       <h2>准实时本地 usage_metadata + Cloud Monitoring API 对账校准</h2>
       <button id="gcp-sync-monitoring" type="button" class="primary">立即拉取 Monitoring 对账</button>
@@ -201,7 +201,7 @@
     </form>
   </div>
 
-  <div class="card">
+  <div class="card" data-section-group="budget">
     <h2>全局与分项预算</h2>
     <p class="muted">按 BOT_TIMEZONE 自然日和自然月统计，默认北京时间。单用户与各分项日预算同样按本地自然日生效；设置任一上限为 0 会暂停对应付费调用，0 Token 本地指令和告警不受影响。既有累计总上限（total_usd）仅由 .env 独立生效。</p>
     <p id="budget-source" class="muted"></p>

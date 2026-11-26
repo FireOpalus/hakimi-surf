@@ -7,6 +7,9 @@
 <style>
 {{STYLE}}
 </style>
+<script>
+{{SCRIPT}}
+</script>
 </head>
 <body>
 <a href="#workspace" class="skip">跳到主要内容</a>
@@ -31,7 +34,11 @@
   </div>
 </header>
 <main id="workspace" tabindex="-1">
-<div id="notice" role="status" aria-live="polite" hidden><span id="notice-text"></span><button id="notice-close" type="button" class="notice-close" aria-label="关闭通知">×</button></div>
+<div id="load-bar" class="load-bar" aria-hidden="true"></div>
+<div class="toast-region">
+  <div id="notice" role="status" aria-live="polite" hidden><span id="notice-text"></span><button id="notice-close" type="button" class="notice-close" aria-label="关闭通知">×</button></div>
+  <div id="notice-stack" class="notice-stack"></div>
+</div>
 <section id="login" class="login" aria-labelledby="login-title">
   <div class="login-sky">
     <div class="sky-map" aria-hidden="true"><i class="orbit outer"></i><i class="orbit"></i><i class="sky-star"></i></div>
@@ -132,6 +139,11 @@
     </div>
 
 {{VIEWS}}
+    <div id="save-bar" class="save-bar" role="region" aria-label="未保存的修改" hidden>
+      <span class="save-bar-dot" aria-hidden="true"></span>
+      <span id="save-bar-text" class="save-bar-text"></span>
+      <div id="save-bar-actions" class="save-bar-actions"></div>
+    </div>
   </div>
 </div>
 
@@ -139,7 +151,11 @@
   <h2 id="session-title">会话摘要</h2>
   <p id="session-info" class="muted"></p>
   <textarea id="summary-text" maxlength="800" rows="9" aria-label="滚动摘要"></textarea>
-  <div class="row"><button id="save-summary" type="button" class="primary">筛查并保存摘要</button><button id="compress-session" type="button" class="secondary">立即压缩</button><button id="reset-session" type="button" class="danger">彻底重置</button><button id="close-dialog" type="button" class="secondary">关闭</button></div>
+  <div class="row"><button id="save-summary" type="button" class="primary">筛查并保存摘要</button><button id="compress-session" type="button" class="secondary">立即压缩</button><button id="close-dialog" type="button" class="secondary push-end">关闭</button></div>
+  <div class="danger-zone">
+    <div class="danger-zone-copy"><strong>危险操作</strong><small>彻底重置会清空本会话的滚动摘要与上下文，无法撤销。</small></div>
+    <div class="row"><button id="reset-session" type="button" class="danger">彻底重置</button></div>
+  </div>
   <hr>
   <h3>双轨记忆治理</h3>
   <p class="muted">编辑会经 source 安全筛查并锁定；删除保留保护墓碑，解锁后允许后续提炼更新。默认不展开原始聊天。Flex 手动提炼可能等待数分钟；双轨提炼固定 medium，不受通用思考档位覆盖。</p>
@@ -181,8 +197,5 @@
 
 <footer>洁米奈星夜 &nbsp; / &nbsp; v{{VERSION}}</footer>
 </main>
-<script>
-{{SCRIPT}}
-</script>
 </body>
 </html>

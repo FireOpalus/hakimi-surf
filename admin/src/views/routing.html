@@ -13,19 +13,25 @@
         <div class="grid">
           <div>
             <label for="prov-free-key">Free Tier Gemini API Key（低隐私 Decisions 门卫）<input id="prov-free-key" type="password" autocomplete="off" maxlength="512" placeholder="AIza... 留空保持已存密钥"></label>
-            <label><input id="prov-clear-free" type="checkbox"> 清除后台保存的 Free Tier Gemini Key</label>
           </div>
           <div>
             <label for="prov-vertex-key">Vertex AI API Key（api_key 认证模式）<input id="prov-vertex-key" type="password" autocomplete="off" maxlength="512" placeholder="AQ... / AIza... 留空保持已存密钥"></label>
-            <label><input id="prov-clear-vertex" type="checkbox"> 清除后台保存的 Vertex AI API Key</label>
           </div>
         </div>
       </fieldset>
       <fieldset class="panel-group">
         <legend>GCP Service Account JSON（与 BigQuery 账单 &amp; Cloud Monitoring 共享）</legend>
         <label for="prov-sa-file">选择本地 .json 密钥文件自动填充<input id="prov-sa-file" type="file" accept=".json,application/json"></label>
-        <label for="prov-sa-json">Service Account JSON 原文（仅写不回显，留空保持已存凭据）<textarea id="prov-sa-json" maxlength="65536" placeholder='粘贴包含 "type": "service_account"、"client_email"、"private_key" 的 JSON；也可通过上方文件选择导入'></textarea></label>
-        <label><input id="prov-clear-sa" type="checkbox"> 清除后台保存的 GCP Service Account JSON</label>
+        <label for="prov-sa-json">Service Account JSON 原文（仅写不回显，留空保持已存凭据）<textarea id="prov-sa-json" maxlength="65536" placeholder='粘贴 Service Account JSON，或用上方按钮选择 .json 文件'></textarea></label>
+      </fieldset>
+      <fieldset class="danger-zone">
+        <legend>清除已保存的凭据</legend>
+        <p class="danger-zone-note">勾选后点击保存才会生效，清除后相关通道会立即回退或停用，且无法撤销。</p>
+        <div class="row">
+          <label><input id="prov-clear-free" type="checkbox"> Free Tier Gemini Key</label>
+          <label><input id="prov-clear-vertex" type="checkbox"> Vertex AI API Key</label>
+          <label><input id="prov-clear-sa" type="checkbox"> GCP Service Account JSON</label>
+        </div>
       </fieldset>
       <div class="row">
         <button id="prov-save-creds" type="submit" class="primary">加密保存凭据</button>
@@ -113,10 +119,10 @@
     <p id="deepseek-status" class="muted"></p>
     <form id="deepseek-form">
       <div class="grid"><label for="deepseek-key">DeepSeek API Key（留空保持已存密钥）<input id="deepseek-key" type="password" autocomplete="off" maxlength="512" placeholder="sk-..."></label><label for="deepseek-base-url">Base URL（HTTPS 公网地址）<input id="deepseek-base-url" type="url" maxlength="256" placeholder="https://api.deepseek.com"></label><label for="deepseek-model">备选对话搜索模型<input id="deepseek-model" maxlength="80" placeholder="deepseek-flash"></label></div>
-      <div class="row"><button id="save-deepseek" type="submit" class="primary" disabled>加密保存 DeepSeek 配置</button><button id="clear-deepseek" type="button" class="danger" disabled>清除密钥</button></div>
+      <div class="row"><button id="save-deepseek" type="submit" class="primary" disabled>加密保存 DeepSeek 配置</button><button id="clear-deepseek" type="button" class="danger push-end" disabled>清除密钥</button></div>
     </form>
   </div>
-  <div class="card"><div class="row between"><h2>文本文件阅读与代码表格卡片</h2><button id="refresh-content-tools" type="button" class="secondary">刷新配置</button></div>
+  <div class="card"><div class="row between"><h2 data-nav-label="文件阅读与卡片">文本文件阅读与代码表格卡片</h2><button id="refresh-content-tools" type="button" class="secondary">刷新配置</button></div>
     <p class="muted">开放给白名单群与获准私聊：安全读取群聊或私聊分享的小体积纯文本 / 代码 / 报错日志（严格白名单扩展名，拒绝二进制与含敏感凭据文件）；以及群聊回复含多行代码块或 Markdown 表格时自动渲染高清排版卡片图。</p>
     <p id="content-tools-source" class="muted"></p>
     <form id="content-tools-form">
@@ -151,6 +157,7 @@
     <p class="muted">提高注入／违规阈值会减少拦截，降低回应阈值会增加自由插话。外部来源与模型输出继续独立执行严格筛查；这些设置不改变白名单、身份或工具权限。</p>
     <p id="filter-source" class="muted"></p>
     <form id="filter-policy">
+      <details class="help-fold"><summary>阈值如何作用于私聊、点名与外部 Bot</summary><p class="muted">私聊与明确点名、回复机器人通过安全检查后可直接回应（群聊仅在明确 @ 机器人时解析视频）；外部 Bot 即使主动 @ 或引用回复也不会跳过门槛（默认 0.85，设为 1.00 为 0 Token 完全屏蔽；仅 Owner 发起 /bot-interact 时临时豁免 2 轮）。群内自由插话仍看 should_reply，每个群可在 QQ 的「群聊互动策略」中选择安静、自然或活跃预设；Owner 普通群聊的插话门槛最高为 0.28。</p></details>
       <div class="grid">
         <label for="filter-injection">来信注入拦截阈值 <input id="filter-injection" type="number" min="0.01" max="0.99" step="0.01" required></label>
         <label for="filter-unsafe">来信违规拦截阈值 <input id="filter-unsafe" type="number" min="0.01" max="0.99" step="0.01" required></label>
@@ -159,7 +166,6 @@
         <label for="filter-owner-injection">真实 Owner 来信注入阈值 <input id="filter-owner-injection" type="number" min="0.01" max="0.99" step="0.01" required></label>
         <label for="filter-owner-unsafe">真实 Owner 来信违规阈值 <input id="filter-owner-unsafe" type="number" min="0.01" max="0.99" step="0.01" required></label>
       </div>
-      <p class="muted">私聊与明确点名、回复机器人通过安全检查后可直接回应（群聊仅在明确 @ 机器人时解析视频）；外部 Bot 即使主动 @ 或引用回复也不会跳过门槛（默认 0.85，设为 1.00 为 0 Token 完全屏蔽；仅 Owner 发起 /bot-interact 时临时豁免 2 轮）。群内自由插话仍看 should_reply，每个群可在 QQ 的「群聊互动策略」中选择安静、自然或活跃预设；Owner 普通群聊的插话门槛最高为 0.28。</p>
       <div class="row"><button type="submit" class="primary">保存网关阈值</button><button id="reset-filter" type="button" class="secondary">恢复 .env 阈值与群预设</button></div>
     </form>
   </div>
@@ -171,7 +177,8 @@
 
 <section id="sandbox" class="tab" role="tabpanel" aria-labelledby="nav-sandbox" hidden>
   <div class="card"><h2>沙盒模拟测试台</h2>
-    <p class="muted">调用真实模型并计入管理预算。不会发送 QQ、读取真实记忆或写入生产 Session。Bot 处于 1.00 完全屏蔽、私聊或群策略不放行时不调用模型；阈值低于 1.00 时按 Bot 回复门槛实测。</p>
+    <p class="callout callout-warn"><strong>会产生费用：</strong>每次测试都调用真实模型并计入管理预算。</p>
+    <p class="muted">不会发送 QQ、读取真实记忆或写入生产 Session。Bot 处于 1.00 完全屏蔽、私聊或群策略不放行时不调用模型；阈值低于 1.00 时按 Bot 回复门槛实测。</p>
     <div class="row">
       <select id="sim-identity" aria-label="身份"><option value="OWNER">OWNER</option><option value="MEMBER">普通群友</option><option value="BOT">已知 Bot</option></select>
       <select id="sim-scene" aria-label="场景"><option value="group_at">群聊 @</option><option value="group_plain">群聊普通发言</option><option value="private">私聊</option></select>
@@ -192,8 +199,11 @@
     <p id="admission-source" class="muted"></p>
     <p id="admission-owner" class="muted"></p>
     <p class="muted">变更立即生效，无需重启；SQLite 保存的名单与阈值优先于启动时的 .env。非准入消息和设为 1.00 的 Bot 在模型调用前直接忽略。</p>
-    <button id="reset-admission" type="button" class="secondary">重置回 .env 初始值</button>
     <details><summary>查看启动时的初始名单</summary><pre id="admission-environment"></pre></details>
+    <div class="danger-zone">
+      <div class="danger-zone-copy"><strong>危险操作</strong><small>丢弃后台保存的全部群、好友与 Bot 名单和阈值，恢复为启动时的 .env 初始值。</small></div>
+      <div class="row"><button id="reset-admission" type="button" class="danger">重置回 .env 初始值</button></div>
+    </div>
   </div>
   <div class="card"><h2>群聊白名单</h2>
     <p class="muted">空名单拒绝全部群聊。新增群默认由点名或回复触发（群内看视频需明确 @），并立即加入 QQ 的「群聊互动策略」列表。</p>

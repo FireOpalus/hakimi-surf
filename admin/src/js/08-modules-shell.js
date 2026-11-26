@@ -281,6 +281,8 @@ function catalogCard(m,{page,indicator,meta,note}){
   if(page){
     const open=el('button','打开模块 →','module-open');open.type='button';
     open.setAttribute('aria-label','打开'+title);open.dataset.openTab=page;foot.append(open);
+  }else{
+    foot.append(el('span','后台常驻 · 无独立页面','module-open-none'));
   }
   card.append(foot);
   return card;
@@ -656,6 +658,17 @@ function selectTab(key){
 }
 
 const panelLoads=new WeakMap();
+// 已成功加载过的面板再次进入时保留旧数据直接显示（仅在刷新期间锁定交互），不再整页变暗。
+const loadedPanels=new Set();
+onLogout(()=>loadedPanels.clear());
+let activeLoads=0;
+function trackLoad(promise){
+  activeLoads++;$('load-bar').classList.add('active');
+  return promise.finally(()=>{
+    activeLoads=Math.max(0,activeLoads-1);
+    if(!activeLoads)$('load-bar').classList.remove('active');
+  });
+}
 let lastVisit=0;
 let navPromptPending=false;
 async function navigate(key,{focusContent=false,heading=null,fromHash=false,replaceHash=false}={}){
@@ -683,14 +696,17 @@ async function navigate(key,{focusContent=false,heading=null,fromHash=false,repl
   let loading=panelLoads.get(panel);
   if(!loading){
     panel.inert=true;panel.setAttribute('aria-busy','true');
-    loading=refreshTab(key).finally(()=>{
-      panel.inert=false;panel.removeAttribute('aria-busy');panelLoads.delete(panel);
+    if(loadedPanels.has(key))panel.dataset.refreshing='1';
+    loading=trackLoad(refreshTab(key).then(()=>{loadedPanels.add(key);})).finally(()=>{
+      panel.inert=false;panel.removeAttribute('aria-busy');delete panel.dataset.refreshing;panelLoads.delete(panel);
     });
     panelLoads.set(panel,loading);
   }
   try{await loading;}
   catch(e){if(visit===lastVisit&&token&&e.name!=='AbortError')notice(e.message,true);return;}
-  if(!heading||visit!==lastVisit||!token||heading.closest('[hidden]'))return;
+  if(!heading||visit!==lastVisit||!token)return;
+  revealSectionFor(heading);
+  if(heading.closest('[hidden]'))return;
   for(let parent=heading.parentElement;parent&&parent!==panel;parent=parent.parentElement){
     if(parent.tagName==='DETAILS')parent.open=true;
   }
@@ -746,7 +762,7 @@ function updateConnection(d){
   $('connection-dot').className='status-dot '+(d.onebot==='online'?'online':d.onebot==='reconnecting'?'offline':'');
   const ws=d.onebot_detail||{};
   text('ws-heartbeat',ws.last_heartbeat_at?dateTime(ws.last_heartbeat_at):'暂无心跳');
-  text('ws-source',ws.source_ip||'—');
+  text('ws-source',ws.source_ip||'暂无连接');
 }
 function stampDashboard(){
   const now=new Date();$('last-updated').dateTime=now.toISOString();
@@ -875,8 +891,8 @@ function setTheme(dark){
   $('theme-toggle').setAttribute('aria-pressed',String(dark));
   $('theme-toggle').setAttribute('aria-label',dark?'切换浅色主题':'切换深色主题');
 }
-let preferredTheme;try{preferredTheme=localStorage.getItem('hakimi-theme');}catch{}
-setTheme(preferredTheme?preferredTheme==='dark':matchMedia('(prefers-color-scheme:dark)').matches);
+// 主题已由 <head> 预载脚本在首帧前写入 data-theme，这里只同步按钮状态。
+setTheme(document.documentElement.dataset.theme==='dark');
 $('theme-toggle').addEventListener('click',()=>{const dark=document.documentElement.dataset.theme!=='dark';setTheme(dark);try{localStorage.setItem('hakimi-theme',dark?'dark':'light');}catch{}});
 
 tabButtons.forEach(tabBtn=>tabBtn.addEventListener('click',()=>navigate(tabBtn.dataset.tab)));
