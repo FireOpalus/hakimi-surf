@@ -189,7 +189,7 @@ async def test_mc_play_scene_registration_macro_origins_and_session_intent(
         assert scene.label == "MC 实时游玩"
         assert scene.default == "low"
         assert tuple(scene.levels) == ("low", "medium", "high")
-        assert scene.output_tokens == 2048
+        assert scene.output_tokens == 1280
 
         # Macro-only planner origins
         for verb in ("connect", "disconnect", "build_plan"):
@@ -1115,8 +1115,12 @@ def test_mc_brain_config_default_solo_cruise_interval() -> None:
     from plugins.minecraft.play_brain import MC_PLAY_TASK_INSTRUCTION
 
     cfg = McBrainConfig()
-    assert cfg.solo_cruise_interval_seconds == 60.0
-    assert cfg.max_calls_per_10m == 20
+    assert cfg.solo_cruise_interval_seconds == 105.0
+    assert cfg.solo_chained_step_interval_seconds == 40.0
+    assert cfg.solo_recovery_step_interval_seconds == 55.0
+    assert cfg.max_calls_per_10m == 12
+    assert cfg.max_history_turns == 3
+    assert cfg.max_recent_chats == 3
     assert len(MC_PLAY_TASK_INSTRUCTION) <= _MAX_PLUGIN_TASK_INSTRUCTION_CHARS - 100
 
 
@@ -2158,7 +2162,7 @@ async def test_mc_plugin_tactical_event_downgrade_cooldown_and_smelt_gather_coun
         assert emitted[-1][0] == "mc_creeper_alert"
         assert emitted[-1][1] == "normal"
 
-        # 3. mc_death emits high once per 10 minutes, subsequent rapid deaths downgrade to normal
+        # 3. mc_death downgrades to macro importance="normal" so Layer 1 never thrashes mid-game
         await plugin._on_node_event(
             {
                 "event": "mc.milestone",
@@ -2181,7 +2185,7 @@ async def test_mc_plugin_tactical_event_downgrade_cooldown_and_smelt_gather_coun
             }
         )
         death_emits = [e for e in emitted if e[0] == "mc_death"]
-        assert [imp for _, imp, _ in death_emits] == ["high", "normal"]
+        assert [imp for _, imp, _ in death_emits] == ["normal", "normal"]
 
         # 4. Brain dispatches gather with count and smelt with 40s RPC timeout & structured outcomes
         gather_dec = McBrainDecision(
@@ -3311,7 +3315,7 @@ async def test_mc_low_confidence_solo_progression_and_repeated_death_escalation(
     plugin.bridge_ready = True
 
     try:
-        # 1. Solo barehanded bot: first 2 low-confidence skips stay 0-Token; 3rd escalates!
+        # 1. Solo barehanded bot: first 3 low-confidence skips stay 0-Token; 4th escalates!
         plugin.apply_snapshot(
             _connected_snapshot(
                 health=20.0,
@@ -3322,8 +3326,9 @@ async def test_mc_low_confidence_solo_progression_and_repeated_death_escalation(
         )
         await plugin.brain._execute_cycle("cruise")
         await plugin.brain._execute_cycle("cruise")
+        await plugin.brain._execute_cycle("cruise")
         assert len(gen_payloads) == 0
-        assert plugin.brain.cruise_skipped_count == 2
+        assert plugin.brain.cruise_skipped_count == 3
         assert plugin.brain._last_reason == "cruise_gate:low_confidence_conservative"
 
         await plugin.brain._execute_cycle("cruise")
@@ -3475,10 +3480,12 @@ async def test_mc_action_log_not_truncated_by_plugin_bus_and_evade_shelter_backo
         interval_evade_player = plugin.brain._compute_cruise_interval(plugin.snapshot, now[0])
         assert interval_evade_player == pytest.approx(112.5)
 
-        # 4. Choosing a non-evade action ("mine") clears evade backoff and restores 15s chaining.
+        # 4. Choosing a non-evade action ("mine") clears evade backoff and restores chaining.
         plugin.apply_snapshot(snap_peaceful)
         await plugin.brain._execute_cycle("cruise")
         assert plugin.brain._evade_backoff_active is False
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(40.0)
+        plugin.apply_snapshot(snap_with_player)
         assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(15.0)
 
         # 5. Layer 0 active evade reflex backs off to 2.5x even when _chain_next_step was set.
@@ -3520,6 +3527,16 @@ async def test_mc_action_log_not_truncated_by_plugin_bus_and_evade_shelter_backo
             reflex_modes=("sheltered",),
         )
         plugin.apply_snapshot(snap_shelter_day)
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(40.0)
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                combat_mode="evade",
+                nearby_players=["BOISER"],
+                activity="掩体避险",
+                time_of_day="day",
+                reflex_modes=("sheltered",),
+            )
+        )
         assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(15.0)
 
         # 7. _format_acquire_outcome surfaces wood_shortfall_logs so Layer 2 stops looping acquire.
@@ -3585,3 +3602,126 @@ async def test_mc_action_log_not_truncated_by_plugin_bus_and_evade_shelter_backo
         assert plugin.brain.action_log[-1]["outcome"] == "goto:distance_exceeded(999m)"
     finally:
         await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_mc_play_lean_prompt_recent_chats_and_recap_no_immediate_wake(
+    brain_bus_env: Any, sdk_pair: Any
+) -> None:
+    """Verify lean mc.play system prompt, bounded recent_chats, and calm recap ledger posting."""
+    from hakimi.gemini_generate import MC_PLAY_SYSTEM_INSTRUCTION
+    from hakimi.persona import PUBLIC_PERSONA_PROMPT
+    from hakimi.thinking_policy import ThinkingScene
+    from plugins.minecraft.play_brain import MC_PLAY_TASK_INSTRUCTION
+    from tests.test_sdk_contract import decision_response
+
+    _, svc, bus, _ = brain_bus_env
+
+    # 1. mc.play uses lean MC_PLAY_SYSTEM_INSTRUCTION instead of verbose QQ persona charter.
+    svc.s._thinking_scenes["mc.play"] = ThinkingScene(
+        "mc.play",
+        "MC 实时游玩",
+        default="low",
+        levels=("low", "medium", "high"),
+        output_tokens=1280,
+    )
+    captured_bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured_bodies.append(body)
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        decision_text = json.dumps(
+            {
+                "say": "",
+                "action": "explore",
+                "target_player": "",
+                "target_mob": "",
+                "mode": "",
+                "block_type": "",
+                "item_name": "",
+                "count": 0,
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": "出门看看",
+                "next_goal": "找木头",
+            },
+            ensure_ascii=False,
+        )
+        resp_body = interaction_response()
+        resp_body["steps"] = [
+            {"type": "model_output", "content": [{"type": "text", "text": decision_text}]}
+        ]
+        return httpx.Response(200, json=resp_body)
+
+    gw = GeminiGateway(svc.s, svc.store, *sdk_pair(handler))
+    await gw.generate(
+        {"trigger": "cruise", "state": {"health": 20}},
+        "plugin:minecraft",
+        scenario="mc.play",
+        budget_lane="proactive",
+        plugin_instruction=MC_PLAY_TASK_INSTRUCTION,
+        response_schema=MC_PLAY_RESPONSE_SCHEMA,
+    )
+    gen_body = next(b for b in captured_bodies if "system_instruction" in b)
+    sys_prompt = gen_body["system_instruction"]
+    assert MC_PLAY_SYSTEM_INSTRUCTION in sys_prompt
+    assert PUBLIC_PERSONA_PROMPT not in sys_prompt
+    assert "【已授权插件任务规范】" in sys_prompt
+    assert gen_body["generation_config"]["max_output_tokens"] == 1280
+
+    # 2. _build_generate_payload carries bounded recent_chats (<=3) and compacts empty state fields.
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: NOW,
+    )
+    try:
+        snap_solo = plugin.apply_snapshot(
+            _connected_snapshot(
+                nearby_players=[],
+                nearby_entities=[],
+                recent_chat_or_sign="",
+                equipment={"main_hand": "", "off_hand": "shield"},
+            )
+        )
+        p_empty = plugin.brain._build_generate_payload(
+            trigger="cruise", snap=snap_solo, chat_batch=[], event_batch=[]
+        )
+        assert "recent_chats" not in p_empty
+        assert p_empty["state"]["equipment"] == {"off_hand": "shield"}
+        assert "nearby_players" not in p_empty["state"]
+
+        for idx in range(5):
+            plugin.brain._append_chat_highlight(f"BOISER:消息{idx}->收到{idx}")
+        p_chats = plugin.brain._build_generate_payload(
+            trigger="cruise", snap=snap_solo, chat_batch=[], event_batch=[]
+        )
+        assert p_chats["recent_chats"] == [
+            "BOISER:消息2->收到2",
+            "BOISER:消息3->收到3",
+            "BOISER:消息4->收到4",
+        ]
+    finally:
+        await plugin.close()
+
+    # 3. Normal-importance world event with summary & no due_at stores without urgent wake.
+    planner = svc.life_engine.planner
+    planner.clock = lambda: NOW  # type: ignore[method-assign]
+    future_wake = NOW + 7200.0
+    planner.next_plan_at = future_wake
+    await planner.journal.initialize(NOW, initial_interval=7200)
+    await svc.event_ledger.post(
+        "minecraft",
+        "mc_session_recap",
+        "MC游玩小记（10分钟）",
+        visibility="public",
+        wake_planner=False,
+        now=NOW,
+    )
+    assert planner.next_plan_at == future_wake
+    items = await svc.event_ledger.read(source_module="minecraft", now=NOW)
+    assert any(it.event_type == "mc_session_recap" for it in items)

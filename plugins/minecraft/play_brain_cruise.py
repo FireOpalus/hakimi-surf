@@ -30,9 +30,10 @@ class _PlayBrainCruiseMixin:
     """Mixin providing Layer 1 gate screening, cruise scheduling, and state snapshots."""
 
     def _compute_cruise_interval(self, snap: Any, now: float) -> float:
+        has_players = bool(snap.nearby_players)
         base_interval = (
             self.config.cruise_interval_seconds
-            if snap.nearby_players
+            if has_players
             else self.config.solo_cruise_interval_seconds
         )
         self._prune_calls(now)
@@ -59,19 +60,29 @@ class _PlayBrainCruiseMixin:
         )
         if is_evade_hold:
             return base_interval * max(1.0, float(self.config.evade_cruise_multiplier))
+        chained_interval = (
+            self.config.chained_step_interval_seconds
+            if has_players
+            else self.config.solo_chained_step_interval_seconds
+        )
         if self._chain_next_step and len(self._call_times) < max(
             1, self.config.max_calls_per_10m - 2
         ):
             return min(
                 base_interval,
-                max(0.01, self.config.chained_step_interval_seconds),
+                max(0.01, chained_interval),
             )
+        recovery_interval = (
+            self.config.recovery_step_interval_seconds
+            if has_players
+            else self.config.solo_recovery_step_interval_seconds
+        )
         if self._recovery_retry_pending and len(self._call_times) < max(
             1, self.config.max_calls_per_10m - 2
         ):
             return min(
                 base_interval,
-                max(0.01, self.config.recovery_step_interval_seconds),
+                max(0.01, recovery_interval),
             )
         return base_interval
 
@@ -158,13 +169,16 @@ class _PlayBrainCruiseMixin:
 
     def _state_payload(self, snap: Any) -> dict[str, Any]:
         raw_eq = getattr(snap, "equipment", None)
-        equipment = dict(raw_eq) if isinstance(raw_eq, dict) else {}
+        equipment = {k: v for k, v in raw_eq.items() if v} if isinstance(raw_eq, dict) else {}
         raw_inv = getattr(snap, "inventory_summary", None)
         inv = list(raw_inv[:16]) if isinstance(raw_inv, (list, tuple)) else []
         raw_res = getattr(snap, "nearby_resources", None)
         resources = list(raw_res[:12]) if isinstance(raw_res, (list, tuple)) else []
         raw_reflex = getattr(snap, "reflex_modes", None)
         reflex_modes = list(raw_reflex[:8]) if isinstance(raw_reflex, (list, tuple)) else []
+        nearby_entities = list(snap.nearby_entities[:5])
+        nearby_players = list(snap.nearby_players[:6])
+        guard_target = getattr(snap, "guard_target", "")
         payload: dict[str, Any] = {
             "dimension": snap.dimension,
             "pos": list(snap.pos) if isinstance(snap.pos, tuple) else snap.pos,
@@ -172,17 +186,24 @@ class _PlayBrainCruiseMixin:
             "food": snap.food,
             "time_of_day": getattr(snap, "time_of_day", ""),
             "activity": snap.activity,
-            "active_task": snap.active_task,
-            "equipment": equipment,
             "inventory_summary": inv,
             "free_slots": getattr(snap, "free_slots", None),
             "combat_mode": getattr(snap, "combat_mode", "evade"),
-            "guard_target": getattr(snap, "guard_target", ""),
-            "nearby_resources": resources,
-            "nearby_entities": list(snap.nearby_entities[:5]),
-            "nearby_players": list(snap.nearby_players[:6]),
-            "recent_chat_or_sign": snap.recent_chat_or_sign,
         }
+        if snap.active_task:
+            payload["active_task"] = snap.active_task
+        if equipment:
+            payload["equipment"] = equipment
+        if guard_target:
+            payload["guard_target"] = guard_target
+        if resources:
+            payload["nearby_resources"] = resources
+        if nearby_entities:
+            payload["nearby_entities"] = nearby_entities
+        if nearby_players:
+            payload["nearby_players"] = nearby_players
+        if snap.recent_chat_or_sign:
+            payload["recent_chat_or_sign"] = snap.recent_chat_or_sign
         if snap.food is not None:
             payload["can_natural_regen"] = bool(snap.food >= 18)
         raw_safe_food = getattr(snap, "safe_food_count", None)
@@ -481,7 +502,7 @@ class _PlayBrainCruiseMixin:
             ):
                 self._last_death_escalate_at = now
                 return "recent_deaths_need_shelter_or_gear"
-            if self._consecutive_cruise_skips >= 2 and (
+            if self._consecutive_cruise_skips >= 3 and (
                 not self._has_basic_tool(snap)
                 or bool(self._active_plan)
                 or bool(self.plugin.session_intent)
@@ -787,6 +808,9 @@ class _PlayBrainCruiseMixin:
             "state": self._state_payload(snap),
             "recent_turns": list(self.recent_turns[-self.config.max_history_turns :]),
         }
+        max_chats = max(0, int(getattr(self.config, "max_recent_chats", 3)))
+        if max_chats and self._session_chat_highlights:
+            payload["recent_chats"] = list(self._session_chat_highlights[-max_chats:])
         if self._active_plan:
             payload["active_plan"] = self._active_plan
         if chat_batch:

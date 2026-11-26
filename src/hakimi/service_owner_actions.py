@@ -531,7 +531,7 @@ class _ServiceOwnerActionsMixin:
                 status_code,
                 reason_code,
             )
-            if status_code == "done":
+            if status_code == "done" and resolved_spec.name != "mc.connect":
                 planner = getattr(engine, "planner", None)
                 replan = getattr(planner, "request_replan", None)
                 if callable(replan):

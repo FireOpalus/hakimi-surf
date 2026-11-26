@@ -150,6 +150,7 @@ class PluginBusDomainBridgeMixin:
                     "dedupe_key": clean_key,
                     "due_at": float(due_at) if due_at is not None else None,
                     "visibility": visibility,
+                    "wake_planner": importance == "high" or due_at is not None,
                 }
                 if ttl_seconds is not None:
                     post_kwargs["ttl_seconds"] = ttl_seconds

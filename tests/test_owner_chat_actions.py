@@ -731,6 +731,36 @@ async def test_owner_chat_action_requests_planner_replan(settings, store):
         assert dummy.calls[0].args.mode == "turbo"
         assert called == [35.0]
 
+        # mc.connect enters an active MC session and must NOT fire a 35s macro replan.
+        class _FakeMcConnectMod(BaseModule):
+            module_id = "minecraft"
+            display_name = "MC"
+
+            async def _raw_sensor_summary(self) -> str:
+                return ""
+
+            def actions(self) -> tuple[Action, ...]:
+                async def _conn(_call: ActionCall) -> Outcome:
+                    return Outcome("done", "connected")
+
+                return (
+                    Action(
+                        name="mc.connect",
+                        description="连接MC",
+                        run=_conn,
+                        arguments=NoArgs,
+                        origins=frozenset({"planner", "owner_chat"}),
+                    ),
+                )
+
+        svc.modules.unregister("minecraft")
+        svc.modules.register(_FakeMcConnectMod(settings))
+        called.clear()
+        await svc._run_owner_chat_action(
+            ChatActionTrigger(action_name="mc.connect", arguments_json="{}")
+        )
+        assert called == []
+
         # Also verify real LifeBlockPlanner.request_replan schedules an early wake.
         svc.life_engine.planner.request_replan = orig_replan  # type: ignore[method-assign]
         from datetime import datetime

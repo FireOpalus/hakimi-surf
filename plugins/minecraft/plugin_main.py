@@ -75,13 +75,13 @@ _VALID_REFLEX_MODES = frozenset(
 _TACTICAL_MC_EVENTS = frozenset(
     {
         "mc_health_alert",
+        "mc_death",
         "mc_creeper_alert",
         "mc_combat_retreat",
         "mc_low_food",
     }
 )
 _HEALTH_ALERT_COOLDOWN_SECONDS = 60.0
-_DEATH_HIGH_COOLDOWN_SECONDS = 600.0
 _DISPATCH_GOAL_RPC_TIMEOUT = 40.0
 
 _BRIDGE_FLAG_KEYS = ("bridge_ready", "mc_enabled", "mc_configured", "paused")
@@ -845,7 +845,6 @@ class MinecraftPlugin:
         self._sync_lock = asyncio.Lock()
         self._snapshot_seq: int = 0
         self._last_health_alert_at: float = -1e9
-        self._last_death_high_at: float = -1e9
         self.brain = McPlayBrain(self, config=brain_config)
 
         if self.enable_brain:
@@ -856,7 +855,7 @@ class MinecraftPlugin:
                     label="MC 实时游玩",
                     default="low",
                     levels=("low", "medium", "high"),
-                    output_tokens=2048,
+                    output_tokens=1280,
                 ),
             )
         else:
@@ -1122,11 +1121,6 @@ class MinecraftPlugin:
         """Downgrade tactical survival reflexes so they never wake the macro LifeBlockPlanner."""
         if event_type in _TACTICAL_MC_EVENTS:
             return "normal"
-        if event_type == "mc_death" and raw_importance == "high":
-            now = float(self.clock())
-            if now - self._last_death_high_at < _DEATH_HIGH_COOLDOWN_SECONDS:
-                return "normal"
-            self._last_death_high_at = now
         return raw_importance
 
     async def _emit_milestone(

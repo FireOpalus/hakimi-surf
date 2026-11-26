@@ -186,6 +186,7 @@ class EventLedger:
         due_at: float | None = None,
         ttl_seconds: float = 3 * 86400.0,
         visibility: Literal["public", "owner_private"] = "public",
+        wake_planner: bool = True,
         now: float | None = None,
     ) -> LedgerEvent:
         """Create or update a stateful commitment event sealed at rest with Fernet."""
@@ -307,7 +308,11 @@ class EventLedger:
                     (ts, row_id, excess),
                 )
 
-        if self._due_listener is not None and (clean_source != "planner" or effective_due > ts):
+        if (
+            wake_planner
+            and self._due_listener is not None
+            and (clean_source != "planner" or effective_due > ts)
+        ):
             try:
                 res = self._due_listener(effective_due)
                 if inspect.isawaitable(res):

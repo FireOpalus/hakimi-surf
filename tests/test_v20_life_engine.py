@@ -580,9 +580,9 @@ async def test_life_engine_config_and_planner_circadian_and_fallback(settings, s
         view = await svc.world_state.experience.view(day_now)
         assert view["plan"]["plan_module"] == "minecraft" and view["actual"]["state"] == "idle"
         assert await svc.world_state.unconsumed_events() == []
-        assert LifeEngineConfig().planner_min_minutes == 60
+        assert LifeEngineConfig().planner_min_minutes == 90
         assert LifeEngineConfig().planner_max_minutes == 120
-        assert 1 * 3600 <= (plan_res["next_plan_at"] - day_now) <= 2 * 3600
+        assert 90 * 60 <= (plan_res["next_plan_at"] - day_now) <= 2 * 3600
         assert len(diary.world_events) == 1
 
         # Milestone high-importance impulse subscriber (0 LLM calls + 10m per-source dedup)

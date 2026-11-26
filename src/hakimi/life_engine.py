@@ -56,8 +56,8 @@ JIT_TRIGGER_MESSAGE = (
 DESKTOP_CONTEXT_HINT = "BOISER 近期刚在电脑端忙正事，默契关心一句注意休息喝水，绝不问怎么没回消息"
 GROUP_SCRUBBED_INTENT_NOTE = "去群里看看大家在聊什么，顺势自然接话或结合公开见闻互动"
 NEAR_HORIZON_SECONDS = 3 * 3600
-ACTIVE_SESSION_REVIEW_SECONDS = 60 * 60
-ACTIVE_SESSION_EVENT_COOLDOWN_SECONDS = 15 * 60
+ACTIVE_SESSION_REVIEW_SECONDS = 90 * 60
+ACTIVE_SESSION_EVENT_COOLDOWN_SECONDS = 45 * 60
 SESSION_EXIT_COOLDOWN_SECONDS = 120.0
 
 
@@ -92,7 +92,7 @@ class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
     quiet_hours: str = "23:30-08:30"
     active_hours: str = Field(default="09:00-01:00", exclude=True)
     morning_thinking_level: Literal["medium", "high"] = Field(default="medium", exclude=True)
-    planner_min_minutes: int = Field(default=60, ge=30, le=720)
+    planner_min_minutes: int = Field(default=90, ge=30, le=720)
     planner_max_minutes: int = Field(default=120, ge=60, le=720)
     sleep_min_minutes: int = Field(default=360, ge=120, le=960)
     sleep_max_minutes: int = Field(default=480, ge=180, le=960)
