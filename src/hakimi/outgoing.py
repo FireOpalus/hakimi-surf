@@ -16,6 +16,7 @@ from .outbound_actions import bubble_segments, parse_actions, valid_receipt
 from .output_links import filter_reply_links
 from .platform_hooks import get_platform_hooks
 from .security import Rejected, authorize, configured_secrets, safe_output
+from .session_manager import session_epoch
 from .social import chat_module, confirmed_message_id
 from .text_card import should_render_rich_card
 
@@ -519,9 +520,7 @@ async def deliver_actions(service, reply):
         async with store.lock:
             row = await store.one("SELECT status FROM outbox WHERE id=?", (reply["id"],))
         return bool(
-            row
-            and row[0] == "sending"
-            and (await service.sessions.snapshot(message))["epoch"] == epoch
+            row and row[0] == "sending" and await session_epoch(service.sessions, message) == epoch
         )
 
     async def targets():
@@ -929,7 +928,7 @@ async def deliver_proactive_jit(
     if not permitted():
         return {"status": "cancelled", "bubbles_sent": 0}
 
-    epoch = (await service.sessions.snapshot(message))["epoch"]
+    epoch = await session_epoch(service.sessions, message)
     synthetic_reply = {
         "id": reply_id,
         "message": message.model_dump(),
@@ -958,7 +957,7 @@ async def deliver_proactive_jit(
     applied_done = False
 
     async def valid() -> bool:
-        current_epoch = (await service.sessions.snapshot(message))["epoch"]
+        current_epoch = await session_epoch(service.sessions, message)
         return (
             current_epoch == epoch
             and permitted()

@@ -180,6 +180,7 @@ class RuntimeState:
         self.provider_routing = ProviderRoutingManager(store)
         self.gcp_billing = GcpBillingManager(store)
         self.affection = AffectionManager(store)
+        self._registered_sessions: set[str] = set()
 
     async def event(self, code, source="system", *, diagnostics=None):
         if code not in CODES or source not in {"system", "production", "sandbox", "memory"}:
@@ -228,6 +229,7 @@ class RuntimeState:
             )
 
     async def load_config(self):
+        self._registered_sessions.clear()
         self.provider_routing.initialized = False
         self.affection.initialized = False
         self.debounce_override = None
@@ -828,6 +830,8 @@ class RuntimeState:
 
     async def register(self, message):
         key = self.store.session_scope(message)
+        if key in self._registered_sessions:
+            return key
         # Registry holds only an encrypted delivery/session identity, never message content.
         identity = message.model_copy(
             update={
@@ -848,6 +852,9 @@ class RuntimeState:
                 "INSERT OR IGNORE INTO session_registry VALUES (?,?)",
                 (key, self.store.vault.seal(key, identity.model_dump())),
             )
+        if len(self._registered_sessions) >= 4096:
+            self._registered_sessions.clear()
+        self._registered_sessions.add(key)
         return key
 
     async def session(self, key):

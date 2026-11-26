@@ -149,6 +149,7 @@ class VoiceGatewaySession:
         adapter_id: str = DEFAULT_ADAPTER_ID,
         client_id: str = DEFAULT_CLIENT_ID,
         upstream_connect_factory: ConnectFactory | None = None,
+        ffmpeg_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self._config = config
         self._stt = stt_provider
@@ -159,6 +160,7 @@ class VoiceGatewaySession:
         self._adapter_id = adapter_id
         self._client_id = client_id
         self._upstream_connect_factory = upstream_connect_factory
+        self._ffmpeg_semaphore = ffmpeg_semaphore
 
         self._ws_send_lock = asyncio.Lock()
         self._upstream: CompanionWsClient | None = None
@@ -515,6 +517,7 @@ class VoiceGatewaySession:
                     sample_rate=sample_rate,
                     channels=channels,
                     ffmpeg_bin=self._config.ffmpeg_bin,
+                    ffmpeg_semaphore=self._ffmpeg_semaphore,
                 )
                 text = (await self._stt.transcribe(wav_bytes)).strip()
             except Exception as exc:
@@ -537,6 +540,14 @@ class VoiceGatewaySession:
         if not isinstance(raw_text, str) or not raw_text.strip():
             await self._send_error("empty_text", "TTS text must not be empty", req_id=req_id)
             return
+        text = raw_text.strip()
+        if len(text) > self._config.max_tts_chars:
+            await self._send_error(
+                "text_too_long",
+                f"TTS text exceeds max_tts_chars ({self._config.max_tts_chars})",
+                req_id=req_id,
+            )
+            return
         fmt = str(frame.get("output_format") or self._output_format).strip().lower()
         try:
             output_format_meta(fmt)
@@ -548,7 +559,7 @@ class VoiceGatewaySession:
             _TtsJob(
                 turn_id="",
                 seq=1,
-                text=raw_text.strip(),
+                text=text,
                 output_format=fmt,
                 req_id=req_id,
             )
@@ -714,6 +725,7 @@ class VoiceGatewaySession:
                     sample_rate=sample_rate,
                     channels=channels,
                     ffmpeg_bin=self._config.ffmpeg_bin,
+                    ffmpeg_semaphore=self._ffmpeg_semaphore,
                 )
                 raw_text = await self._stt.transcribe(wav_bytes)
             except asyncio.CancelledError:
@@ -1273,6 +1285,7 @@ class VoiceGatewaySession:
             src_fmt=src_fmt,
             dst_fmt=job.output_format,
             ffmpeg_bin=self._config.ffmpeg_bin,
+            ffmpeg_semaphore=self._ffmpeg_semaphore,
         )
         try:
             try:

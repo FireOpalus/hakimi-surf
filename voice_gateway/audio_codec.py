@@ -9,12 +9,34 @@ import math
 import os
 import tempfile
 import wave
+import weakref
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
 from pathlib import Path
 
 from voice_client.audio import pcm16_to_wav_bytes
 
+from .config import DEFAULT_MAX_FFMPEG_CONCURRENCY
+
 OUTPUT_FORMATS: tuple[str, ...] = ("mp3", "wav", "ogg_opus", "pcm_16k", "pcm_48k_stereo")
+
+_DEFAULT_FFMPEG_SEMAPHORES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _resolve_ffmpeg_semaphore(
+    ffmpeg_semaphore: asyncio.Semaphore | None,
+) -> asyncio.Semaphore:
+    """Return caller semaphore or a per-event-loop default concurrency semaphore."""
+    if ffmpeg_semaphore is not None:
+        return ffmpeg_semaphore
+    loop = asyncio.get_running_loop()
+    sem = _DEFAULT_FFMPEG_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(DEFAULT_MAX_FFMPEG_CONCURRENCY)
+        _DEFAULT_FFMPEG_SEMAPHORES[loop] = sem
+    return sem
+
 
 _OUTPUT_FORMAT_META: dict[str, tuple[str, int, int]] = {
     "mp3": ("audio/mpeg", 44100, 1),
@@ -97,20 +119,23 @@ async def _run_ffmpeg_bytes(
     raw_bytes: bytes,
     *,
     timeout: float,  # noqa: ASYNC109
+    ffmpeg_semaphore: asyncio.Semaphore | None = None,
 ) -> bytes:
     """Run an ffmpeg conversion piping raw_bytes to stdin and returning stdout bytes."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        async with asyncio.timeout(timeout):
-            stdout, stderr = await proc.communicate(raw_bytes)
-    except (TimeoutError, asyncio.CancelledError):
-        await _terminate_process(proc)
-        raise
+    sem = _resolve_ffmpeg_semaphore(ffmpeg_semaphore)
+    async with sem:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            async with asyncio.timeout(timeout):
+                stdout, stderr = await proc.communicate(raw_bytes)
+        except (TimeoutError, asyncio.CancelledError):
+            await _terminate_process(proc)
+            raise
 
     if proc.returncode != 0:
         err = stderr.decode("utf-8", errors="replace").strip()
@@ -129,6 +154,7 @@ async def normalize_input_to_wav(
     channels: int = 1,
     ffmpeg_bin: str = "ffmpeg",
     timeout: float = 15.0,  # noqa: ASYNC109
+    ffmpeg_semaphore: asyncio.Semaphore | None = None,
 ) -> bytes:
     """Normalize supported client audio bytes into 16kHz mono WAV bytes for STT."""
     if not raw_bytes:
@@ -174,7 +200,9 @@ async def normalize_input_to_wav(
             "pipe:1",
         ]
         try:
-            return await _run_ffmpeg_bytes(cmd, raw_bytes, timeout=timeout)
+            return await _run_ffmpeg_bytes(
+                cmd, raw_bytes, timeout=timeout, ffmpeg_semaphore=ffmpeg_semaphore
+            )
         except FileNotFoundError:
             # Allow unit tests without ffmpeg installed to proceed with PCM header wrapping.
             return pcm16_to_wav_bytes(raw_bytes, sample_rate=sr, channels=ch)
@@ -203,7 +231,9 @@ async def normalize_input_to_wav(
             "pipe:1",
         ]
         try:
-            return await _run_ffmpeg_bytes(cmd, raw_bytes, timeout=timeout)
+            return await _run_ffmpeg_bytes(
+                cmd, raw_bytes, timeout=timeout, ffmpeg_semaphore=ffmpeg_semaphore
+            )
         except FileNotFoundError:
             raise RuntimeError(f"ffmpeg binary not found: {ffmpeg_bin!r}") from None
 
@@ -214,9 +244,15 @@ async def _iter_chunks(
     source_iter: AsyncIterable[bytes] | Iterable[bytes],
 ) -> AsyncIterator[bytes]:
     if hasattr(source_iter, "__aiter__"):
-        async for chunk in source_iter:  # type: ignore[union-attr]
-            if chunk:
-                yield bytes(chunk)
+        try:
+            async for chunk in source_iter:  # type: ignore[union-attr]
+                if chunk:
+                    yield bytes(chunk)
+        finally:
+            aclose = getattr(source_iter, "aclose", None)
+            if callable(aclose):
+                with contextlib.suppress(Exception):
+                    await aclose()
         return
     for chunk in source_iter:  # type: ignore[union-attr]
         if chunk:
@@ -230,6 +266,7 @@ async def transcode_audio_stream(
     dst_fmt: str,
     ffmpeg_bin: str = "ffmpeg",
     chunk_size: int = 16384,
+    ffmpeg_semaphore: asyncio.Semaphore | None = None,
 ) -> AsyncIterator[bytes]:
     """Stream-transcode audio chunks via ffmpeg, or pass through zero-copy when formats match."""
     src = src_fmt.strip().lower().lstrip(".")
@@ -237,8 +274,13 @@ async def transcode_audio_stream(
     output_format_meta(dst)
 
     if dst == src:
-        async for chunk in _iter_chunks(source_iter):
-            yield chunk
+        chunks = _iter_chunks(source_iter)
+        try:
+            async for chunk in chunks:
+                yield chunk
+        finally:
+            with contextlib.suppress(Exception):
+                await chunks.aclose()
         return
 
     in_args = _FFMPEG_INPUT_ARGS.get(src)
@@ -248,83 +290,87 @@ async def transcode_audio_stream(
 
     chunks = _iter_chunks(source_iter)
     try:
-        first_chunk = await anext(chunks)
-    except StopAsyncIteration:
-        return
-
-    cmd = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        *in_args,
-        "-i",
-        "pipe:0",
-        *out_args,
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        with contextlib.suppress(Exception):
-            await chunks.aclose()
-        raise RuntimeError(f"ffmpeg binary not found: {ffmpeg_bin!r}") from None
-
-    feeder_error: BaseException | None = None
-
-    async def _feed_stdin() -> None:
-        nonlocal feeder_error
-        assert proc.stdin is not None
         try:
-            proc.stdin.write(first_chunk)
-            await proc.stdin.drain()
-            async for chunk in chunks:
-                proc.stdin.write(chunk)
-                await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except asyncio.CancelledError:
-            raise
-        except BaseException as exc:
-            feeder_error = exc
-        finally:
-            with contextlib.suppress(Exception):
-                proc.stdin.close()
-                await proc.stdin.wait_closed()
+            first_chunk = await anext(chunks)
+        except StopAsyncIteration:
+            return
 
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-    feeder_task = asyncio.create_task(_feed_stdin())
-    stderr_task = asyncio.create_task(proc.stderr.read())
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *in_args,
+            "-i",
+            "pipe:0",
+            *out_args,
+        ]
+        sem = _resolve_ffmpeg_semaphore(ffmpeg_semaphore)
+        async with sem:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except FileNotFoundError:
+                raise RuntimeError(f"ffmpeg binary not found: {ffmpeg_bin!r}") from None
 
-    try:
-        while True:
-            data = await proc.stdout.read(chunk_size)
-            if not data:
-                break
-            yield data
+            feeder_error: BaseException | None = None
 
-        await feeder_task
-        stderr_bytes = await stderr_task
-        rc = await proc.wait()
+            async def _feed_stdin() -> None:
+                nonlocal feeder_error
+                assert proc.stdin is not None
+                try:
+                    proc.stdin.write(first_chunk)
+                    await proc.stdin.drain()
+                    async for chunk in chunks:
+                        proc.stdin.write(chunk)
+                        await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    feeder_error = exc
+                finally:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+                        await proc.stdin.wait_closed()
 
-        if feeder_error is not None:
-            raise feeder_error
-        if rc != 0:
-            err = stderr_bytes.decode("utf-8", errors="replace").strip()
-            summary = " ".join(err.split())[:200] or "unknown ffmpeg error"
-            raise RuntimeError(f"ffmpeg transcode failed (exit={rc}): {summary}")
+            assert proc.stdout is not None
+            assert proc.stderr is not None
+            feeder_task = asyncio.create_task(_feed_stdin())
+            stderr_task = asyncio.create_task(proc.stderr.read())
+
+            try:
+                while True:
+                    data = await proc.stdout.read(chunk_size)
+                    if not data:
+                        break
+                    yield data
+
+                await feeder_task
+                stderr_bytes = await stderr_task
+                rc = await proc.wait()
+
+                if feeder_error is not None:
+                    raise feeder_error
+                if rc != 0:
+                    err = stderr_bytes.decode("utf-8", errors="replace").strip()
+                    summary = " ".join(err.split())[:200] or "unknown ffmpeg error"
+                    raise RuntimeError(f"ffmpeg transcode failed (exit={rc}): {summary}")
+            finally:
+                for task in (feeder_task, stderr_task):
+                    if not task.done():
+                        task.cancel()
+                try:
+                    await asyncio.gather(feeder_task, stderr_task, return_exceptions=True)
+                finally:
+                    if proc.returncode is None:
+                        await _terminate_process(proc)
     finally:
-        for task in (feeder_task, stderr_task):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(feeder_task, stderr_task, return_exceptions=True)
-        if proc.returncode is None:
-            await _terminate_process(proc)
         with contextlib.suppress(Exception):
             await chunks.aclose()
 
@@ -357,6 +403,7 @@ async def probe_audio_duration_ms(
     *,
     ffmpeg_bin: str = "ffmpeg",
     timeout: float = 5.0,  # noqa: ASYNC109
+    ffmpeg_semaphore: asyncio.Semaphore | None = None,
 ) -> int | None:
     """Return positive audio duration in milliseconds, or None when unavailable."""
     if not audio_bytes:
@@ -385,29 +432,31 @@ async def probe_audio_duration_ms(
     suffix = ".ogg" if fmt_norm == "ogg_opus" else f".{fmt_norm}" if fmt_norm.isalnum() else ".bin"
     temp_path: str | None = None
     try:
-        temp_path = await asyncio.to_thread(_write_temp_audio, audio_bytes, suffix)
-        proc = await asyncio.create_subprocess_exec(
-            ffprobe_bin,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            temp_path,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            async with asyncio.timeout(timeout):
-                stdout, _ = await proc.communicate()
-        except TimeoutError:
-            await _terminate_process(proc)
-            return None
-        except asyncio.CancelledError:
-            await _terminate_process(proc)
-            raise
+        sem = _resolve_ffmpeg_semaphore(ffmpeg_semaphore)
+        async with sem:
+            temp_path = await asyncio.to_thread(_write_temp_audio, audio_bytes, suffix)
+            proc = await asyncio.create_subprocess_exec(
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                temp_path,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                async with asyncio.timeout(timeout):
+                    stdout, _ = await proc.communicate()
+            except TimeoutError:
+                await _terminate_process(proc)
+                return None
+            except asyncio.CancelledError:
+                await _terminate_process(proc)
+                raise
         if proc.returncode != 0:
             return None
         raw_val = stdout.decode("utf-8", errors="replace").strip().splitlines()

@@ -312,6 +312,9 @@ def create_gateway_app(
         app.state.stt = stt
         app.state.tts = tts
         app.state.upstream_connect_factory = upstream_connect_factory
+        app.state.ffmpeg_semaphore = asyncio.Semaphore(
+            max(1, resolved_config.max_ffmpeg_concurrency)
+        )
         try:
             yield
         finally:
@@ -464,6 +467,7 @@ def create_gateway_app(
                 sample_rate=sample_rate,
                 channels=channels,
                 ffmpeg_bin=cfg.ffmpeg_bin,
+                ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=safe_error_detail(exc, cfg)) from None
@@ -499,6 +503,11 @@ def create_gateway_app(
         if not isinstance(raw_text, str) or not raw_text.strip():
             raise HTTPException(status_code=400, detail="text must not be empty")
         text = raw_text.strip()
+        if len(text) > cfg.max_tts_chars:
+            raise HTTPException(
+                status_code=400,
+                detail=f"text exceeds max_tts_chars ({cfg.max_tts_chars})",
+            )
 
         raw_fmt = body.get("output_format")
         output_fmt = (
@@ -533,8 +542,14 @@ def create_gateway_app(
                 src_fmt=src_fmt,
                 dst_fmt=output_fmt,
                 ffmpeg_bin=cfg.ffmpeg_bin,
+                ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
             )
-            first_chunk = await anext(transcoded)
+            try:
+                first_chunk = await anext(transcoded)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await transcoded.aclose()
+                raise
         except StopAsyncIteration:
             raise HTTPException(
                 status_code=502,
@@ -557,10 +572,23 @@ def create_gateway_app(
                 headers=headers,
             )
 
-        buf = bytearray(first_chunk)
+        buf = bytearray()
         try:
+            if len(first_chunk) > cfg.max_tts_audio_bytes:
+                raise HTTPException(
+                    status_code=502,
+                    detail="TTS audio exceeds max_tts_audio_bytes",
+                )
+            buf.extend(first_chunk)
             async for chunk in transcoded:
+                if len(buf) + len(chunk) > cfg.max_tts_audio_bytes:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="TTS audio exceeds max_tts_audio_bytes",
+                    )
                 buf.extend(chunk)
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
         finally:
@@ -569,7 +597,10 @@ def create_gateway_app(
 
         audio_bytes = bytes(buf)
         duration_ms = await probe_audio_duration_ms(
-            audio_bytes, output_fmt, ffmpeg_bin=cfg.ffmpeg_bin
+            audio_bytes,
+            output_fmt,
+            ffmpeg_bin=cfg.ffmpeg_bin,
+            ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
         )
         if duration_ms is not None and duration_ms > 0:
             headers["X-Audio-Duration-Ms"] = str(duration_ms)
@@ -611,6 +642,7 @@ def create_gateway_app(
             adapter_id=adapter_id,
             client_id=client_id,
             upstream_connect_factory=websocket.app.state.upstream_connect_factory,
+            ffmpeg_semaphore=websocket.app.state.ffmpeg_semaphore,
         )
         await session.start()
         try:

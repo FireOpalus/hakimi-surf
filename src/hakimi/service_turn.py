@@ -26,7 +26,7 @@ from .outbound_actions import parse_actions
 from .output_links import filter_reply_links
 from .routing import RouteDecision
 from .security import Rejected, authorize, owner
-from .session_manager import apply_audio_memory_tags
+from .session_manager import apply_audio_memory_tags, session_epoch
 from .streaming import cancellable
 from .voice_reply import explicit_voice_request
 from .web_search import (
@@ -257,7 +257,7 @@ class _ServiceTurnMixin:
                 )
             ):
                 raise Rejected("reply_invalidated")
-            if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
+            if await session_epoch(self.sessions, message) != session["epoch"]:
                 raise Rejected("reply_invalidated")
 
         audit_id = uuid.uuid4().hex
@@ -1118,7 +1118,7 @@ class _ServiceTurnMixin:
             parsed = parse_reply(generated, message, self.s, allowed_at_qqs=allowed_at)
             generated, meme_tag = parsed.text, parsed.meme_tag
             result = self.output(generated) if generated else ""
-        if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
+        if await session_epoch(self.sessions, message) != session["epoch"]:
             await self.store.runtime.filters.update_audit(audit_id, "cancelled", "epoch_changed")
             return
         if parsed is None:
@@ -1257,7 +1257,7 @@ class _ServiceTurnMixin:
                 raise Rejected("module_disabled")
             if not self.batch_authorized(message, members) or time.time() >= deadline:
                 raise Rejected("video_watch_invalidated")
-            if (await self.sessions.snapshot(message))["epoch"] != session["epoch"]:
+            if await session_epoch(self.sessions, message) != session["epoch"]:
                 raise Rejected("video_watch_invalidated")
 
         await video_guard()

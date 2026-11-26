@@ -14,6 +14,7 @@ from .models import Message
 from .modules.adapters import farewell_send_bypass
 from .outgoing import PRE_DISPATCH_REJECTED, is_affection_muted_only, safe_delivery_detail
 from .security import Rejected
+from .session_manager import session_epoch
 from .social import chat_module, confirmed_message_id
 
 
@@ -177,8 +178,9 @@ class _ServiceDeliveryMixin:
     async def _enqueue_affection_farewell(
         self, job, message: Message, members: list[Message], session, watermark, audit_id, update
     ) -> None:
-        if session is None:
-            session = await self.sessions.snapshot(message)
+        epoch = (
+            session["epoch"] if session is not None else await session_epoch(self.sessions, message)
+        )
         aff = self.store.runtime.affection
         farewell = self.output(update.farewell_message or aff.config.farewell_message)
         public = not (message.kind == "private" and is_persona_owner(message, self.s))
@@ -190,7 +192,7 @@ class _ServiceDeliveryMixin:
             job["id"],
             message,
             farewell,
-            session_epoch=session["epoch"],
+            session_epoch=epoch,
             participants=members,
             allowed_at_qqs=set(),
             audit_id=audit_id,
@@ -299,7 +301,7 @@ class _ServiceDeliveryMixin:
         for original in participants or [message]:
             if self.bot_guard.known_bot(original):
                 await self.bot_guard.prepare(original)
-        delivery_epoch = (await self.sessions.snapshot(message))["epoch"]
+        delivery_epoch = await session_epoch(self.sessions, message)
         if "session_epoch" in reply and delivery_epoch != reply["session_epoch"]:
             await self.store.finish_reply(reply["id"], "cancelled")
             await self._finish_delivery_audit(reply, "cancelled", "epoch_changed")
@@ -344,7 +346,7 @@ class _ServiceDeliveryMixin:
                             ):
                                 bypass_uids.add(candidate.user_id)
                     return (
-                        (await self.sessions.snapshot(message))["epoch"] == delivery_epoch
+                        await session_epoch(self.sessions, message) == delivery_epoch
                     ) and self.batch_authorized(
                         message,
                         participants or [message],

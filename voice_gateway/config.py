@@ -27,6 +27,7 @@ OutputFormat = Literal["mp3", "wav", "ogg_opus", "pcm_16k", "pcm_48k_stereo"]
 _VALID_OUTPUT_FORMATS: frozenset[str] = frozenset(
     {"mp3", "wav", "ogg_opus", "pcm_16k", "pcm_48k_stereo"}
 )
+DEFAULT_MAX_FFMPEG_CONCURRENCY = 3
 _WS_PATH_RE = re.compile(r"^/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
@@ -77,6 +78,9 @@ class VoiceGatewayConfig:
     gateway_token: str = ""
     max_audio_bytes: int = 10_485_760
     max_ws_frame_bytes: int = 16_777_216
+    max_ffmpeg_concurrency: int = DEFAULT_MAX_FFMPEG_CONCURRENCY
+    max_tts_chars: int = 2000
+    max_tts_audio_bytes: int = 16_777_216
     default_output_format: OutputFormat = "mp3"
     ffmpeg_bin: str = "ffmpeg"
 
@@ -256,6 +260,39 @@ def load_gateway_config(
             "VOICE_GATEWAY_MAX_WS_FRAME_BYTES",
         ),
     )
+    max_ffmpeg_concurrency = max(
+        1,
+        min(
+            16,
+            _parse_int(
+                merged.get("VOICE_GATEWAY_MAX_FFMPEG_CONCURRENCY"),
+                DEFAULT_MAX_FFMPEG_CONCURRENCY,
+                "VOICE_GATEWAY_MAX_FFMPEG_CONCURRENCY",
+            ),
+        ),
+    )
+    max_tts_chars = max(
+        100,
+        min(
+            10000,
+            _parse_int(
+                merged.get("VOICE_GATEWAY_MAX_TTS_CHARS"),
+                2000,
+                "VOICE_GATEWAY_MAX_TTS_CHARS",
+            ),
+        ),
+    )
+    max_tts_audio_bytes = max(
+        262_144,
+        min(
+            67_108_864,
+            _parse_int(
+                merged.get("VOICE_GATEWAY_MAX_TTS_AUDIO_BYTES"),
+                16_777_216,
+                "VOICE_GATEWAY_MAX_TTS_AUDIO_BYTES",
+            ),
+        ),
+    )
     raw_output_fmt = _non_empty_or_default(
         merged, "VOICE_GATEWAY_DEFAULT_OUTPUT_FORMAT", "mp3"
     ).lower()
@@ -327,6 +364,9 @@ def load_gateway_config(
         gateway_token=gateway_token,
         max_audio_bytes=max_audio_bytes,
         max_ws_frame_bytes=max_ws_frame_bytes,
+        max_ffmpeg_concurrency=max_ffmpeg_concurrency,
+        max_tts_chars=max_tts_chars,
+        max_tts_audio_bytes=max_tts_audio_bytes,
         default_output_format=default_output_format,
         ffmpeg_bin=_non_empty_or_default(merged, "FFMPEG_BIN", "ffmpeg"),
         ws_url=merged.get("COMPANION_WS_URL", "").strip(),

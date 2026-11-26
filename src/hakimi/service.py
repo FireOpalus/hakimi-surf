@@ -315,16 +315,28 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         )
 
     async def recalled(self, members):
+        events: list[str] = []
+        seen: set[str] = set()
         for member in members:
             for ref in [member.event_id, *member.reply_ids]:
                 if self.hot.recalled(member, ref):
                     return True
                 event = self.store.event_key(member.model_copy(update={"event_id": ref}))
-                async with self.store.lock:
-                    if await self.store.one(
-                        "SELECT 1 FROM message_recalls WHERE event=?", (event,)
-                    ):
-                        return True
+                if event not in seen:
+                    seen.add(event)
+                    events.append(event)
+        if not events:
+            return False
+        chunk_size = 500
+        async with self.store.lock:
+            for offset in range(0, len(events), chunk_size):
+                chunk = events[offset : offset + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                if await self.store.one(
+                    f"SELECT 1 FROM message_recalls WHERE event IN ({placeholders}) LIMIT 1",
+                    tuple(chunk),
+                ):
+                    return True
         return False
 
     def background(self, awaitable):
