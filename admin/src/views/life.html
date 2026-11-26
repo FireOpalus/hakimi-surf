@@ -7,7 +7,7 @@
     <div id="proactive-queue" class="table"></div>
   </div>
   <div class="card"><h2>手动验收</h2>
-    <p class="muted">测试消息会直接发给 Owner，消耗 0 Token。手动与定时汇报每天共用一份。预算熔断会暂停新生成，已通过审核的日报仍可在有效时段投递。QQ 断线时排队，回执待核实的消息不会自动重发。</p>
+    <p class="muted">测试消息会直接发给 Owner，消耗 0 Token。手动与定时汇报每天共用一份。预算熔断会暂停新生成，已通过审核的日报仍可在有效时段投递。投递通道断线时排队，回执待核实的消息不会自动重发。</p>
     <div class="row"><button id="dm-test" type="button" class="primary">发送测试私信（0 Token）</button><button id="dm-now" type="button" class="primary">立即生成并发送今日汇报</button></div>
   </div>
   <div class="card"><h2>最近运维告警</h2><div id="proactive-alerts" class="table"></div></div>
@@ -93,6 +93,33 @@
     </form>
     <p id="life-source" class="muted"></p>
     <div class="row"><button id="life-plan-now" type="button" class="secondary" disabled>立即规划或调整行程</button><button id="life-gatekeeper-now" type="button" class="secondary" disabled>执行零 Token 门控扫描</button></div>
+  </div>
+  <div class="card" id="social-schedule-card">
+    <div class="row between">
+      <h2>共享社交主动排程（所有平台）</h2>
+      <div class="row">
+        <button id="refresh-social-schedule" type="button" class="secondary">刷新社交排程</button>
+        <button type="button" class="secondary" data-open-tab="modules">打开模块目录</button>
+      </div>
+    </div>
+    <p id="social-schedule-status" class="muted" role="status"></p>
+    <form id="social-schedule-form">
+      <div class="row">
+        <label><input id="social-owner-delivery" type="checkbox"> 允许向 Owner 投递私信与运维告警</label>
+        <label><input id="social-owner-unlimited" type="checkbox"> Owner 主动私信不限次数</label>
+      </div>
+      <div class="grid">
+        <label for="social-group-cooldown">群聊主动冷却（秒，300–86400）<input id="social-group-cooldown" type="number" min="300" max="86400" step="1" required></label>
+        <label for="social-group-window">群聊活跃观察窗口（秒，60–7200）<input id="social-group-window" type="number" min="60" max="7200" step="1" required></label>
+        <label for="social-group-min-msgs">群聊最少有效消息数（1–50）<input id="social-group-min-msgs" type="number" min="1" max="50" step="1" required></label>
+        <label for="social-desktop-suppress">桌面活跃抑制窗口（秒，300–86400）<input id="social-desktop-suppress" type="number" min="300" max="86400" step="1" required></label>
+      </div>
+      <p class="muted">由内置能力模块 social_presence 统一托管，对 QQ、Telegram 等所有已接入社交平台生效；其中 Owner 主动私信不限次数与桌面活跃抑制同样作用于绑定后的非 QQ 平台。</p>
+      <div class="row">
+        <button id="social-schedule-save" type="submit" class="primary" disabled>保存共享社交排程</button>
+        <button id="social-schedule-reset" type="button" class="secondary" disabled>恢复默认社交排程</button>
+      </div>
+    </form>
   </div>
   <div class="card"><h2>意图队列（最近 40 条）</h2>
     <p class="muted">只记录触发时间窗、门控条件与模糊动机，绝不预写台词；状态为 pending 时可手动取消。</p>

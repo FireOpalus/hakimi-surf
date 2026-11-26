@@ -759,15 +759,16 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
             assert res["receipt"]["stage"] == "confirmed"
             assert any(m["chat_id"] == OWNER_UID for m in fake_api.sent_messages)
 
-            # 4b. `telegram.speak` action registered automatically & planning_context populated
-            assert "telegram.speak" in svc.modules.catalog.actions
+            # 4b. Unified `social.speak` action available & Telegram planning_context populated
+            assert "social.speak" in svc.modules.catalog.actions
+            assert "telegram.speak" not in svc.modules.catalog.actions
             proxy = svc.modules.get("telegram")
             assert proxy is not None
             ctx = await proxy.planning_context(svc, svc.life_engine.config, now)
             assert ctx["available_groups"] == [f"telegram:{GROUP_ID}"]
             assert ctx["owner_dm_available"] is True
 
-            # 4c. LifeEngine resolves `"owner"` -> boundowner scope AND `telegram:<gid>`
+            # 4c. LifeEngine resolves social.speak (and alias telegram.speak) for boundowner/group
             spec_owner, _ = svc.life_engine.resolve(
                 {
                     "action_name": "telegram.speak",
@@ -775,17 +776,17 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
                     "origin": "planner",
                 }
             )
-            assert spec_owner.name == "telegram.speak"
+            assert spec_owner.name == "social.speak"
             spec_group, _ = svc.life_engine.resolve(
                 {
-                    "action_name": "telegram.speak",
+                    "action_name": "social.speak",
                     "target_scope": f"telegram:{GROUP_ID}",
                     "origin": "planner",
                 }
             )
-            assert spec_group.name == "telegram.speak"
+            assert spec_group.name == "social.speak"
 
-            # Execute proactive Owner DM via `telegram.speak`
+            # Execute proactive Owner DM via `social.speak`
             async with svc.store.transaction():
                 await svc.store.db.execute(
                     "INSERT INTO scheduled_intents("
@@ -799,9 +800,9 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
                         now,
                         now,
                         now + 3600,
-                        "telegram",
+                        "social_presence",
                         "speak",
-                        "telegram.speak",
+                        "social.speak",
                         svc.proactive.target_scope,
                         "executing",
                         "happy",
@@ -813,9 +814,9 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
                 ActionCall(
                     ticket={
                         "id": "tg-dm-1",
-                        "target_module": "telegram",
+                        "target_module": "social_presence",
                         "action_type": "speak",
-                        "action_name": "telegram.speak",
+                        "action_name": "social.speak",
                         "target_scope": svc.proactive.target_scope,
                         "mood": "happy",
                         "intent_note": {"note": "打个招呼"},
@@ -828,7 +829,7 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
             )
             assert dm_outcome.status == "done"
 
-            # Execute proactive group speak via `telegram.speak`
+            # Execute proactive group speak via `social.speak`
             async with svc.store.transaction():
                 await svc.store.db.execute(
                     "INSERT INTO scheduled_intents("
@@ -842,9 +843,9 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
                         now,
                         now,
                         now + 3600,
-                        "telegram",
+                        "social_presence",
                         "speak",
-                        "telegram.speak",
+                        "social.speak",
                         f"telegram:{GROUP_ID}",
                         "executing",
                         "curious",
@@ -856,9 +857,9 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
                 ActionCall(
                     ticket={
                         "id": "tg-grp-1",
-                        "target_module": "telegram",
+                        "target_module": "social_presence",
                         "action_type": "speak",
-                        "action_name": "telegram.speak",
+                        "action_name": "social.speak",
                         "target_scope": f"telegram:{GROUP_ID}",
                         "mood": "curious",
                         "intent_note": {"note": "群里冒泡"},
@@ -878,7 +879,7 @@ async def test_telegram_owner_digest_and_proactive_speak(settings: Any) -> None:
             with pytest.raises(ValueError):
                 svc.life_engine.resolve(
                     {
-                        "action_name": "telegram.speak",
+                        "action_name": "social.speak",
                         "target_scope": f"telegram:{GROUP_ID}",
                         "origin": "planner",
                     }

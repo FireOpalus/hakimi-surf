@@ -29,11 +29,20 @@ from .life_config_compat import (
 from .life_defaults import fallback_plan
 from .life_rules import RuleDispatcher
 from .life_workers import ActionWorkers
-from .modules.actions import ActionCall, GateDecision, HourlyAction, Mode, Outcome, reject_reason
+from .modules.actions import (
+    ActionCall,
+    ActionCatalog,
+    GateDecision,
+    HourlyAction,
+    Mode,
+    Outcome,
+    reject_reason,
+)
 from .modules.base import sanitize_sensor_text
 from .planning_journal import PlannerJournal
 from .proactive_policy import hours_bounds, within_hours
 from .reply_style import trim_complete_text
+from .social import RecipientResolver, is_verified_owner_scope, resolve_owner_scope
 from .thinking_policy import preferences as model_preferences
 from .thinking_policy import supported_level
 from .work_usage import model_work
@@ -80,6 +89,19 @@ def _parse_local_due(raw: str, local_now: datetime, zone: ZoneInfo) -> float:
         except ValueError:
             pass
     return local_now.timestamp()
+
+
+def _normalize_action_modes(raw_modes: dict[str, Mode], catalog: ActionCatalog) -> dict[str, Mode]:
+    normalized: dict[str, Mode] = {}
+    for name, mode in raw_modes.items():
+        canon = catalog.canonical_name(name) or name
+        if canon != name:
+            normalized[canon] = mode
+    for name, mode in raw_modes.items():
+        canon = catalog.canonical_name(name) or name
+        if canon == name:
+            normalized[canon] = mode
+    return normalized
 
 
 class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
@@ -652,34 +674,30 @@ class LifeBlockPlanner:
                 continue
             bounded_note = trim_complete_text(raw_note, 120)
             raw_scope = item.target_scope.strip()
-            selected_proactive = getattr(self.service, "proactive", None)
-            if (
-                raw_scope in {"owner", "owner_dm"}
-                and selected_proactive is not None
-                and selected_proactive.platform != "onebot"
-                and selected_proactive.configured
-            ):
-                resolved_scope = selected_proactive.target_scope
-            else:
-                resolved_scope = modules_reg.normalize_recipient(raw_scope) if raw_scope else ""
+            resolved_scope = (
+                RecipientResolver(self.s, modules_reg).normalize(raw_scope) if raw_scope else ""
+            )
             if resolved_scope is None:
                 skip("recipient_unavailable")
                 continue
             catalog = self.engine.catalog
             target_module, action_type = item.target_module, item.action_type
+            resolved_action_name = item.action_name
             if item.action_name:
-                target_module = catalog.owners.get(item.action_name, "")
-                spec = catalog.actions.get(item.action_name)
+                canon_name = catalog.canonical_name(item.action_name) or item.action_name
+                spec = catalog.actions.get(canon_name)
                 if not spec:
                     skip("unknown_action")
                     continue
+                target_module = catalog.owners.get(canon_name, "")
                 alias = next((a for a in spec.aliases if a[0] == target_module), None)
-                action_type = alias[1] if alias else item.action_name
+                action_type = alias[1] if alias else canon_name
+                resolved_action_name = canon_name
             try:
                 arguments = json.loads(item.arguments_json)
                 spec, args = self.engine.resolve(
                     {
-                        "action_name": item.action_name,
+                        "action_name": resolved_action_name,
                         "origin": "planner",
                         "arguments": arguments,
                         "target_module": target_module,
@@ -696,10 +714,7 @@ class LifeBlockPlanner:
                 continue
 
             is_owner_scope = bool(
-                resolved_scope
-                and (
-                    resolved_scope.startswith("owner:") or resolved_scope.startswith("boundowner:")
-                )
+                resolved_scope and is_verified_owner_scope(resolved_scope, self.s)
             )
             if spec.social and not is_owner_scope and tainted_by_owner_memory:
                 bounded_note = GROUP_SCRUBBED_INTENT_NOTE
@@ -764,7 +779,7 @@ class LifeBlockPlanner:
                     continue
                 window = None
                 if change.operation == "move":
-                    spec = self.engine.catalog.actions.get(item["action_name"])
+                    spec = self.engine.catalog.get(item["action_name"])
                     if spec is None:
                         skip("unavailable_action")
                         continue
@@ -864,7 +879,7 @@ class LifeBlockPlanner:
                     consume_ref,
                     consumer="planner",
                     allow_owner_private=True,
-                    allowed_sources={"planner", "qq_owner"},
+                    allowed_sources={"planner", "owner_chat", "qq_owner"},
                     now=ts,
                 )
         await self.sync_wake(applied_at)
@@ -874,12 +889,9 @@ class LifeBlockPlanner:
             start <= applied_at < end
             for start, end in self.calendar(calendar.day, social=True).windows
         ):
-            longnick = getattr(self.service, "longnick", None)
-            if longnick is not None:
-                if hasattr(longnick, "apply_life_block"):
-                    await longnick.apply_life_block(longnick_text)
-                elif hasattr(longnick, "apply_patrol"):
-                    await longnick.apply_patrol(longnick_text)
+            modules_reg = getattr(self.service, "modules", None)
+            if modules_reg is not None and hasattr(modules_reg, "apply_presence"):
+                await modules_reg.apply_presence(longnick_text, kind="life_block")
 
         diary = getattr(self.service, "diary", None)
         if diary is not None and hasattr(diary, "world_event"):
@@ -1042,9 +1054,8 @@ class GatekeeperWorker:
 
     def quota_for(self, spec, scope):
         selected = getattr(self.service, "proactive", None)
-        owner = bool(
-            (self.s.owner_qq_id and scope == f"owner:{self.s.owner_qq_id}")
-            or (selected is not None and selected.external_scope(scope))
+        owner = is_verified_owner_scope(scope, self.s) or bool(
+            selected is not None and selected.external_scope(scope)
         )
         return next((rule for rule in spec.quota_rules() if not rule.owner_only or owner), None)
 
@@ -1081,7 +1092,7 @@ class GatekeeperWorker:
         )
         for row in rows:
             name = row["action_name"] or catalog.old_name(row)
-            spec = catalog.actions.get(name)
+            spec = catalog.get(name)
             settled = row["n"] - row["held"]
             if not spec:
                 # Preserve historical deliveries from actions no longer registered.
@@ -1104,7 +1115,9 @@ class GatekeeperWorker:
     async def daily_limit_allows(
         self, action: str, scope: str, now: float, cfg: LifeEngineConfig, *, settled_only=False
     ) -> bool:
-        spec = self.engine.catalog.actions[action]
+        spec = self.engine.catalog.get(action)
+        if spec is None:
+            raise KeyError(action)
         rule = self.quota_for(spec, scope)
         if rule is None or self.is_unlimited(spec, rule, cfg):
             return True
@@ -1472,16 +1485,42 @@ class LifeEngine:
                     (module.module_id, int(enabled)),
                 )
                 if not enabled:
-                    names = [
+                    names = {
                         n for n, owner in self.catalog.owners.items() if owner == module.module_id
-                    ]
-                    await self.store.db.execute(
-                        "UPDATE scheduled_intents SET status='gated_skip',"
-                        "result_reason='module_disabled',updated_at=? WHERE status='pending' AND "
-                        "(target_module=? OR source_module=? OR action_name IN "
-                        "(SELECT value FROM json_each(?)))",
-                        (self.clock(), module.module_id, module.module_id, json.dumps(names)),
+                    }
+                    cur = await self.store.db.execute(
+                        "SELECT id, action_name, target_module, source_module, action_type, "
+                        "target_scope FROM scheduled_intents WHERE status='pending'"
                     )
+                    cancel_ids: list[str] = []
+                    for (
+                        intent_id,
+                        action_name,
+                        target_module,
+                        source_module,
+                        action_type,
+                        target_scope,
+                    ) in await cur.fetchall():
+                        if target_module == module.module_id or source_module == module.module_id:
+                            cancel_ids.append(intent_id)
+                            continue
+                        raw_name = action_name or self.catalog.old_name(
+                            {
+                                "target_module": target_module,
+                                "action_type": action_type,
+                                "target_scope": target_scope,
+                            }
+                        )
+                        canon = self.catalog.canonical_name(raw_name) if raw_name else None
+                        if canon in names:
+                            cancel_ids.append(intent_id)
+                    if cancel_ids:
+                        await self.store.db.execute(
+                            "UPDATE scheduled_intents SET status='gated_skip',"
+                            "result_reason='module_disabled',updated_at=? WHERE status='pending' "
+                            "AND id IN (SELECT value FROM json_each(?))",
+                            (self.clock(), json.dumps(cancel_ids)),
+                        )
                     await self.store.db.execute(
                         "UPDATE world_state SET current_module='idle',focus_level='LOW' "
                         "WHERE singleton=1 AND current_module=?",
@@ -1513,7 +1552,7 @@ class LifeEngine:
 
     async def query(self, name: str) -> Outcome:
         """Serve an immediate read for chat, an installed module or the admin console."""
-        spec = self.catalog.actions.get(name)
+        spec = self.catalog.get(name)
         if not spec or "query" not in spec.origins:
             return Outcome("gated_skip", "unknown_query")
         if reason := self._query_issue(spec):
@@ -1543,28 +1582,20 @@ class LifeEngine:
             spec = self.catalog.resolve(ticket, compatibility=True)
         recipient = ticket.get("target_scope", "")
         selected = getattr(self.service, "proactive", None)
-        if recipient.startswith("boundowner:"):
+        if recipient.startswith(("owner:", "boundowner:")):
+            matched = resolve_owner_scope(recipient, self.s)
+            if matched is None:
+                raise ValueError("unauthorized_scope")
+            plat, _ = matched
             owner_mod = self.catalog.owners.get(spec.name)
             mod_obj = self.service.modules.get(owner_mod) if owner_mod else None
-            serves_selected = bool(
-                selected is not None
-                and selected.external_scope(recipient)
-                and (
-                    spec.name == selected.action_name
-                    or (
-                        spec.social
-                        and mod_obj is not None
-                        and selected.platform in getattr(mod_obj, "chat_platforms", ())
-                    )
-                )
-            )
-            if not serves_selected:
+            chat_plats = getattr(mod_obj, "chat_platforms", ()) if mod_obj is not None else ()
+            if spec.social and chat_plats and plat not in chat_plats:
                 raise ValueError("unauthorized_scope")
-        if spec.owner_only and recipient != (
-            selected.target_scope
-            if selected and spec.name == selected.action_name
-            else "owner:" + self.s.owner_qq_id
-        ):
+            if spec.owner_only and selected is not None and spec.name == selected.action_name:
+                if recipient != selected.target_scope or not selected.configured:
+                    raise ValueError("unauthorized_scope")
+        elif spec.owner_only:
             raise ValueError("unauthorized_scope")
         if spec.social:
             scope = ticket["target_scope"]
@@ -1575,7 +1606,8 @@ class LifeEngine:
         return spec, spec.arguments.model_validate(ticket.get("arguments", {}))
 
     async def compare_shadow(self, ticket: dict):
-        name = ticket.get("action_name") or self.catalog.old_name(ticket)
+        raw_name = ticket.get("action_name") or self.catalog.old_name(ticket)
+        name = self.catalog.canonical_name(raw_name) or raw_name
         if self.config.action_modes.get(name) != "shadow":
             return
         results = []
@@ -1656,7 +1688,9 @@ class LifeEngine:
                     )
                 merged["action_modes"] = {
                     name: mode
-                    for name, mode in merged["action_modes"].items()
+                    for name, mode in _normalize_action_modes(
+                        merged["action_modes"], self.catalog
+                    ).items()
                     if name in self.catalog.actions
                 }
                 self.config = LifeEngineConfig.model_validate(merged)
@@ -1726,10 +1760,13 @@ class LifeEngine:
                             raise ValueError("unknown_module_settings")
                     else:
                         module.scheduling(cfg)
-                for name, mode in cfg.action_modes.items():
+                normalized_modes = _normalize_action_modes(cfg.action_modes, self.catalog)
+                for name, mode in normalized_modes.items():
                     spec = self.catalog.actions.get(name)
                     if not spec or (mode in {"legacy", "shadow"} and not spec.aliases):
                         raise ValueError("unsupported_action_mode")
+                if normalized_modes != cfg.action_modes:
+                    cfg = cfg.model_copy(update={"action_modes": normalized_modes})
                 await self.store.runtime.save_config("life_engine", cfg.model_dump())
                 self.config = cfg
                 self.overridden = True

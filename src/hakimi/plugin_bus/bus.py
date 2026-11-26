@@ -20,9 +20,9 @@ from pydantic import ValidationError
 
 from hakimi_plugin_sdk.protocol import BLOB_FIELD, BLOB_HARD_MAX_BYTES, ToolCallResult
 
-from ..budget_policy import PATROL_LANE, PROACTIVE_LANE
+from ..budget_policy import PATROL_LANE
 from ..config import Settings
-from ..modules.actions import Action, ActionCall, GateDecision, NoArgs, Outcome
+from ..modules.actions import Action, ActionCall, NoArgs, Outcome
 from ..modules.base import sanitize_sensor_text
 from ..modules.scheduling import ActivityQuota
 from ..platform_hooks import (
@@ -33,8 +33,6 @@ from ..platform_hooks import (
 from ..plugin_kernel import PluginContext, PluginKernel
 from ..screen_watch import decode_ws_json_frame
 from ..security import Rejected, clean_text, configured_secrets
-from ..social_policy import SocialProactivePolicy
-from ..social_speak import resolve_social_target, speak_proactive
 from ..thinking_policy import ThinkingScene
 from .ai_gateway import PluginBusAIGatewayMixin
 from .blob import PluginBusBlobMixin
@@ -1317,74 +1315,6 @@ class PluginBus(
                     clean_text(hello.description), self.s, max_tokens=80
                 )[:240]
                 modules = getattr(self.service, "modules", None)
-                if "chat" in scope_set and chat_platforms and "proactive_speak" in capabilities:
-                    primary_plat = chat_platforms[0]
-                    speak_name = f"{primary_plat}.speak"
-                    existing_actions = (
-                        set(modules.catalog.actions) if modules is not None else set()
-                    )
-                    if (
-                        not any(spec.name == speak_name for spec in actions)
-                        and speak_name not in existing_actions
-                    ):
-
-                        async def _run_proactive_speak(
-                            call: ActionCall,
-                            sess: _PluginSession = session,
-                            plat: str = primary_plat,
-                        ) -> Outcome:
-                            proxy_now = sess.proxy
-                            if proxy_now is None or not proxy_now.chat_connected(plat):
-                                return Outcome("not_dispatched", "plugin_disconnected")
-                            target = resolve_social_target(
-                                self.service,
-                                plat,
-                                proxy_now._bot_id(),
-                                str(call.ticket.get("target_scope") or ""),
-                                event_id=f"jit:{call.ticket['id']}",
-                                created_at=call.now,
-                            )
-                            return await speak_proactive(self.service, target, call)
-
-                        async def _preflight_proactive_speak(
-                            ticket: dict[str, Any],
-                            now_ts: float,
-                            cfg: Any,
-                            sess: _PluginSession = session,
-                            plat: str = primary_plat,
-                        ) -> GateDecision:
-                            proxy_now = sess.proxy
-                            if proxy_now is None or not proxy_now.chat_connected(plat):
-                                return GateDecision("plugin_disconnected", delay=120)
-                            policy = SocialProactivePolicy(
-                                self.service,
-                                plat,
-                                proxy_now._bot_id,
-                            )
-                            return await policy.evaluate(ticket, now_ts, cfg)
-
-                        speak_action = Action(
-                            name=speak_name,
-                            description=(
-                                f"结合近期见闻、B 站冲浪收获或当前会话，通过 {clean_disp or pid} "
-                                "去获准的群聊冒泡接话，或给 BOISER 发条日常私聊"
-                            ),
-                            social=True,
-                            budget_lane=PROACTIVE_LANE,
-                            window="active",
-                            quotas=(
-                                ActivityQuota("owner_dms", owner_only=True),
-                                ActivityQuota(),
-                            ),
-                            run=_run_proactive_speak,
-                            preflight=_preflight_proactive_speak,
-                            unavailable=lambda s=session, p=primary_plat: (
-                                None
-                                if (s.proxy is not None and s.proxy.chat_connected(p))
-                                else "plugin_disconnected"
-                            ),
-                        )
-                        actions = (*actions, speak_action)
                 proxy = RemoteModuleProxy(
                     self.s,
                     self,

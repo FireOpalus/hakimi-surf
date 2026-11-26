@@ -179,13 +179,13 @@ async def test_flat_production_settings_migrate_and_survive_independent_edits(li
     async def settings_for(module):
         return (await client.get(f"{root}/modules/{module}")).json()["scheduling"]["values"]
 
-    assert (await settings_for("qq_social"))["owner_dms_unlimited"]
+    assert (await settings_for("social_presence"))["owner_dms_unlimited"]
     assert (await settings_for("bilibili_surf"))["bili_patrols_unlimited"]
     assert not svc.proactive.delivery_enabled
     assert (await client.put(root, json={"max_proactive_per_day": 12})).is_success
     assert (
         await client.put(
-            root + "/modules/qq_social/schedule", json={"group_cooldown_seconds": 1200}
+            root + "/modules/social_presence/schedule", json={"group_cooldown_seconds": 1200}
         )
     ).is_success
     await client.delete(root + "/modules/bilibili_surf/schedule")
@@ -196,11 +196,11 @@ async def test_flat_production_settings_migrate_and_survive_independent_edits(li
         and "active_hours" not in restarted.config.model_dump()
     )
     assert not (await settings_for("bilibili_surf"))["bili_patrols_unlimited"]
-    qq = await settings_for("qq_social")
+    sp = await settings_for("social_presence")
     assert (
-        qq["owner_dms_unlimited"]
-        and not qq["owner_delivery_enabled"]
-        and qq["group_cooldown_seconds"] == 1200
+        sp["owner_dms_unlimited"]
+        and not sp["owner_delivery_enabled"]
+        and sp["group_cooldown_seconds"] == 1200
     )
     row = await svc.store.one("SELECT payload FROM admin_config WHERE key='life_engine'")
     stored = svc.store.vault.open("admin:life_engine", row[0])

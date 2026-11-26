@@ -167,7 +167,10 @@ async def test_recover_prepared_and_submitted_reservations_on_their_local_day(dm
 async def test_two_simultaneous_claims_compete_for_one_daily_slot(dm):
     engine, ws, now = dm.service.life_engine, dm.service.world_state, dm.clock()
     await engine.set_config({"max_proactive_per_day": 1})
-    keys = [await enqueue(dm, "bili.patrol"), await enqueue(dm, "qq.speak", scope="owner:20000")]
+    keys = [
+        await enqueue(dm, "bili.patrol"),
+        await enqueue(dm, "social.speak", scope="owner:20000"),
+    ]
 
     async def gated_claim(key):
         return await ws.claim(
@@ -201,9 +204,9 @@ async def test_manual_and_clock_serialize_audience_and_cancel_running_only(dm, m
         finally:
             active[scope] -= 1
 
-    handler(dm, monkeypatch, "qq.speak", speak, preflight=None)
+    handler(dm, monkeypatch, "social.speak", speak, preflight=None)
     ids = [
-        await enqueue(dm, "qq.speak", scope=s)
+        await enqueue(dm, "social.speak", scope=s)
         for s in ("owner:20000", "owner:20000", "onebot:40000")
     ]
     runner = asyncio.create_task(engine.run())

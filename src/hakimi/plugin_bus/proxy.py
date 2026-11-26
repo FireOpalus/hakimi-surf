@@ -286,6 +286,11 @@ class RemoteModuleProxy(BaseModule):
                     break
         return out
 
+    def proactive_groups(self) -> list[str]:
+        if not self.enabled or not self._session.ready or self._session.closed:
+            return []
+        return self._proactive_groups()
+
     def normalize_recipient(self, scope: str) -> str | None:
         raw = str(scope or "").strip()
         if not raw or ":" not in raw:
@@ -298,7 +303,7 @@ class RemoteModuleProxy(BaseModule):
         return canonical if canonical in self._proactive_groups() else None
 
     def permits_recipient(self, scope: str, config: Any) -> bool:
-        if not self.enabled or not self._session.ready or self._session.closed:
+        if not self.enabled:
             return False
         plat, sep, gid = str(scope or "").partition(":")
         if not sep or plat not in self.chat_platforms or not gid:

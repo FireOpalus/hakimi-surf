@@ -308,7 +308,7 @@ async def test_owner_commitments_into_planner_and_group_intent_scrubbing(setting
         assert len(ledger_all) == 1
         chronicle_key = ledger_all[0].dedupe_key
         assert ledger_all[0].visibility == "owner_private"
-        assert ledger_all[0].source_module == "qq_owner"
+        assert ledger_all[0].source_module == "owner_chat"
 
         # Fake LLM tries to emit an owner ticket, an internal ticket, a leaked group ticket,
         # AND a planner self-memo marked visibility="public" while tainted by Owner context
@@ -442,3 +442,70 @@ async def test_ledger_system_module_and_admin_endpoints(settings):
             assert consumed.status_code == 200
             assert consumed.json()["ledger_events"][0]["status"] == "consumed"
             assert (await client.delete(f"/admin/api/life/ledger/{item_id}")).status_code == 404
+
+
+async def test_planner_consumes_legacy_qq_owner_and_new_owner_chat_ledger_entries(settings, store):
+    settings.owner_qq_id = "20000"
+    settings.onebot_enabled = True
+    settings.onebot_self_id = "10000"
+    settings.onebot_mode = "ws_reverse"
+    now = _ts("2026-11-19T14:00:00")
+
+    async with httpx.AsyncClient() as http:
+        svc = Service(settings, store, LifeGateway(), FakeBili(), Sender(settings, http, Wire()))
+        farm = _FarmModule(settings)
+        svc.modules.register(farm)
+        svc.world_state.clock = lambda: now
+        await svc.proactive.initialize()
+        await svc.proactive.on_connection(True)
+        engine = LifeEngine(svc, clock=lambda: now)
+        await engine.initialize()
+
+        legacy_item = await svc.event_ledger.post(
+            "qq_owner",
+            "owner_commitment",
+            "历史QQ私聊约定：明天一起看B站新番",
+            dedupe_key="chronicle:legacy1",
+            ttl_seconds=5 * 86400.0,
+            visibility="owner_private",
+            now=now - 600,
+        )
+        new_item = await svc.event_ledger.post(
+            "owner_chat",
+            "owner_commitment",
+            "跨平台私聊约定：晚点收草莓",
+            dedupe_key="chronicle:new1",
+            ttl_seconds=5 * 86400.0,
+            visibility="owner_private",
+            now=now - 300,
+        )
+        assert legacy_item.dedupe_key == "qq_owner:chronicle:legacy1"
+        assert new_item.dedupe_key == "owner_chat:chronicle:new1"
+
+        svc.ai.plan_json = json.dumps(
+            {
+                "current_module": "farm",
+                "focus_level": "LOW",
+                "mood": "calm",
+                "mood_longnick": "",
+                "rest_minutes": 0,
+                "intents": [],
+                "agenda_changes": [],
+                "ledger_posts": [],
+                "ledger_consumes": [legacy_item.dedupe_key, "chronicle:new1"],
+            },
+            ensure_ascii=False,
+        )
+        await engine.trigger_plan_once(now=now)
+        prompt_payload = svc.ai.calls[0][1]
+        keys_seen = {item["key"] for item in prompt_payload["pending_ledger_events"]}
+        assert legacy_item.dedupe_key in keys_seen
+        assert new_item.dedupe_key in keys_seen
+
+        remaining = await svc.event_ledger.read(include_owner_private=True, now=now)
+        assert remaining == []
+        all_rows = await store.all("SELECT dedupe_key, status FROM event_ledger")
+        assert {row["dedupe_key"]: row["status"] for row in all_rows} == {
+            "qq_owner:chronicle:legacy1": "consumed",
+            "owner_chat:chronicle:new1": "consumed",
+        }

@@ -876,8 +876,9 @@ async def test_plugin_bus_preflight_and_proactive_on_connection_lifecycle(settin
             assert svc.proactive.wakeup.is_set() is True
             assert conn_events == [(True, "telegram")]
 
-            # 6b. Synthesized telegram.speak has preflight backed by SocialProactivePolicy
-            spec = svc.modules.catalog.actions["telegram.speak"]
+            # 6b. Unified social.speak has preflight backed by SocialProactivePolicy
+            assert "telegram.speak" not in svc.modules.catalog.actions
+            spec = svc.modules.catalog.actions["social.speak"]
             assert spec.preflight is not None
 
             # Inactive group rejected by preflight

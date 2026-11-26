@@ -1,11 +1,11 @@
 """Compatibility at the storage/API boundary for the original flat 2.1 settings."""
 
 from .modules.bili_schedule import BiliScheduleOptions
-from .modules.qq_schedule import QQScheduleOptions
+from .modules.scheduling import SocialScheduleOptions
 
 OLD_MODULES = {
-    "qq_social": (
-        QQScheduleOptions,
+    "social_presence": (
+        SocialScheduleOptions,
         (
             "owner_delivery_enabled",
             "owner_dms_unlimited",
@@ -42,6 +42,16 @@ def migrate_flat(raw):
         modules["weather"] = {
             k: v for k, v in modules["weather"].items() if k != "observation_time"
         }
+    legacy_qq = modules.pop("qq_social", None)
+    if legacy_qq is not None:
+        if not isinstance(legacy_qq, dict):
+            raise ValueError("invalid_module_settings")
+        existing_sp = modules.get("social_presence", {})
+        if not isinstance(existing_sp, dict):
+            raise ValueError("invalid_module_settings")
+        if legacy_qq:
+            options = SocialScheduleOptions.model_validate({**legacy_qq, **existing_sp})
+            modules["social_presence"] = options.model_dump(exclude_unset=True)
     for name, (schema, fields) in OLD_MODULES.items():
         flat = {k: result.pop(k) for k in fields if k in result}
         if flat:
@@ -50,7 +60,7 @@ def migrate_flat(raw):
                 raise ValueError("invalid_module_settings")
             options = schema.model_validate({**existing, **flat})
             modules[name] = options.model_dump(exclude_unset=True)
-    if modules:
+    if modules or "module_settings" in result:
         result["module_settings"] = modules
     return result
 
@@ -69,9 +79,12 @@ def legacy_view(config, registry=None):
 
 
 def import_old_proactive(old, saved, merged):
-    if "owner_delivery_enabled" not in saved and "owner_delivery_enabled" not in saved.get(
-        "module_settings", {}
-    ).get("qq_social", {}):
+    saved_modules = saved.get("module_settings", {})
+    if (
+        "owner_delivery_enabled" not in saved
+        and "owner_delivery_enabled" not in saved_modules.get("social_presence", {})
+        and "owner_delivery_enabled" not in saved_modules.get("qq_social", {})
+    ):
         if "enabled" in old:
             merged["owner_delivery_enabled"] = old["enabled"]
     if "quiet_hours" not in saved and "quiet_hours" in old:

@@ -411,7 +411,8 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
     if catalog is not None:
         for item in intents:
             name = item["action_name"] or catalog.old_name(item)
-            item.update(action_name=name, executor_module=catalog.owners.get(name))
+            canon = catalog.canonical_name(name) or name
+            item.update(action_name=name, executor_module=catalog.owners.get(canon))
     events = await _read_events(svc.store)
     async with svc.store.lock:
         receipts = (
@@ -534,14 +535,17 @@ async def life_action_mode(request: Request, name: str):
     async with domain_lock(request, "life"):
         engine = svc.life_engine
         await engine.initialize()
+        canonical = engine.catalog.canonical_name(name) or name
         config = engine.config.model_dump()
-        config["action_modes"][name] = value.mode
+        if canonical != name:
+            config["action_modes"].pop(name, None)
+        config["action_modes"][canonical] = value.mode
         try:
             await engine.set_config(config)
         except ValueError:
             raise HTTPException(400, "unsupported_action_mode") from None
         if value.view == "module":
-            return await module_detail(request, engine.catalog.owners[name])
+            return await module_detail(request, engine.catalog.owners[canonical])
         return await _build_life_status(svc)
 
 

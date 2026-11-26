@@ -35,6 +35,7 @@ _VALID_SCOPES_SET = frozenset(VALID_SCOPES)
 RESERVED_PLUGIN_IDS = frozenset(
     {
         "qq_social",
+        "social_presence",
         "identity",
         "memory_hub",
         "plugin_bus",

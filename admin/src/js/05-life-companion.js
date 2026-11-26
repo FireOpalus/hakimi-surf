@@ -12,9 +12,10 @@ async function proactive(){
     return;
   }
   const fmt=t=>t?lifeFmt(t,d.timezone):'—';
-  const stats=[['NapCat',d.connected?'在线':'等待连接'],['下次日报',fmt(d.next_digest_at)]];
+  const chanLabel=d.platform==='onebot'?'NapCat (QQ)':(d.platform||'投递通道');
+  const stats=[[chanLabel,d.connected?'在线':'等待连接'],['下次日报',fmt(d.next_digest_at)]];
   $('proactive-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
-  text('proactive-state',d.day+' · '+zoneLabel(d.timezone)+' · '+(!d.configured?'尚未配置 Owner QQ':d.delivery_enabled?'允许投递':'已停用投递'));
+  text('proactive-state',d.day+' · '+zoneLabel(d.timezone)+' · '+(!d.configured?'尚未配置 Owner 投递目标':d.delivery_enabled?'允许投递':'已停用投递'));
   text('proactive-budget','主动生成日预算 '+usd(d.proactive_daily_limit_usd,2)+' · 本地累计 '+usd(d.budget.total/1e6,4)+' / '+(d.budget.total_limit>0?usd(d.budget.total_limit/1e6,2):'未设累计上限')+(d.budget.hard_stop?' · 付费生成已熔断':'')+'（含预留，不代表 Google 赠金余额）');
   table('proactive-queue',['类型','状态','数量'],d.queue.map(v=>[dmKindLabels[v.kind]||v.kind,dmStatus[v.status]||v.status,v.n]));
   table('proactive-alerts',['告警','入队时间','状态','冷却截止'],d.alerts.map(v=>[v.alert_key,fmt(v.queued_at),dmStatus[v.status]||v.status,fmt(v.cooldown_until)]));
@@ -105,11 +106,31 @@ function renderWorldObservation(o,eng,tz){
     !w.closed?'时段进行中':w.successful?'已达标':w.within_90s===false?'启动超过 90 秒':w.delivery_confirmed?'启动或窗口待核实':'尚无达标回执'
   ]));
 }
+function renderSocialSchedule(values,spMeta){
+  const v=values||{};
+  const meta=spMeta||{};
+  $('social-owner-delivery').checked=v.owner_delivery_enabled!==undefined?Boolean(v.owner_delivery_enabled):true;
+  $('social-owner-unlimited').checked=Boolean(v.owner_dms_unlimited);
+  $('social-group-cooldown').value=v.group_cooldown_seconds??1500;
+  $('social-group-window').value=v.group_active_window_seconds??1800;
+  $('social-group-min-msgs').value=v.group_min_recent_messages??2;
+  $('social-desktop-suppress').value=v.desktop_active_suppress_seconds??7200;
+  const parts=['托管模块：social_presence（社交主动）'];
+  parts.push(meta.enabled===false?'模块已停用':'模块已启用');
+  if(meta.proactive_paused)parts.push('高专注已暂停主动');
+  if(meta.source){
+    const srcLabel=(meta.source==='admin'||meta.source==='sqlite')?'后台 SQLite（重启保留）':'.env / 默认值';
+    parts.push('配置来源：'+srcLabel);
+  }
+  text('social-schedule-status',parts.join(' · '));
+  for(const id of ['social-schedule-save','social-schedule-reset'])$(id).disabled=false;
+  clearDirty('social-schedule-form');
+}
 function renderLife(d){
   const c=d.config||{},ws=d.world_state||{},nodes=d.nodes||{},dm=d.desktop_memory||{},eng=d.engine||{},tz=d.timezone||'Asia/Shanghai';
   renderWorldObservation(d.observation,eng,tz);
   const exp=ws.experience||{},plan=exp.plan,actual=exp.actual||{};
-  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',mc_play:'MC 游玩',online:'在线游玩',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',chatting:'正在聊天',chat_delivered:'聊天回复已送达',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',sleepy:'困倦',playful:'活泼',cozy:'惬意',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
+  const labels={bilibili_surf:'B站',minecraft:'Minecraft',qq_social:'QQ',social_presence:'社交主动',idle:'清醒空闲',rest:'休息（旧记录）',sleep:'定时睡眠',day_rest:'白天小憩',resting:'小憩',bili_patrol:'B站巡逻中',bili_read:'正在学习视频',mc_work:'MC 任务',mc_play:'MC 游玩',online:'在线游玩',video_learned:'完成视频学习',mc_goal_completed:'完成 MC 任务',mc_rare_find:'MC 发现稀有资源',qq_delivered:'QQ 消息已送达',chatting:'正在聊天',chat_delivered:'聊天回复已送达',baseline:'沿用升级前数值',manual:'后台手动调整',sleeping:'休息',calm:'平静',curious:'好奇',pleased:'得意',focused:'专注',sleepy:'困倦',playful:'活泼',cozy:'惬意',mine:'采矿',gather:'采集',explore:'探索',goto:'赶路',follow:'跟随'};
   const circadianLabels={just_woke_up:'刚醒迷糊',bedtime_drowsy:'睡前犯困',late_night_catch:'深夜值守'};
   const name=k=>labels[k]||k||'—';
   const battery=exp.social_battery;
@@ -184,7 +205,9 @@ function renderLife(d){
   const planSrcText=eng.last_plan_source?('（'+(planSrcLabels[eng.last_plan_source]||eng.last_plan_source)+'）'):'';
   text('life-source','配置来源：'+srcLabel+' · '+(eng.running?'引擎运行中':'引擎待机')+' · 时区 '+zoneLabel(tz)+(eng.next_plan_at?' · 下次行程规划 '+lifeFmt(eng.next_plan_at,tz):'')+(eng.last_plan_at?' · 上次规划 '+lifeFmt(eng.last_plan_at,tz)+planSrcText:'')+(eng.last_error?' · 最近提示：'+eng.last_error:''));
   for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now'])$(id).disabled=false;
-  table('life-digests',['日期','进度','已生成','已排队','QQ 已确认'],(d.digest_history||[]).map(r=>[
+  const spMod=(ws.modules||[]).find(m=>m.module_id==='social_presence');
+  renderSocialSchedule({...(c.module_settings?.social_presence||{}),...c},spMod?{...spMod,source:d.source}:{source:d.source});
+  table('life-digests',['日期','进度','已生成','已排队','平台已确认'],(d.digest_history||[]).map(r=>[
     r.day,deliveryStages[r.stage]||r.stage,lifeFmt(r.generated_at,tz),lifeFmt(r.queued_at,tz),lifeFmt(r.confirmed_at,tz)
   ]));
   table('life-intents-table',['ID','动作 / 接收人','来源 / 事件','执行窗口','门控与模糊动机','状态 / 结果','操作'],(d.intents||[]).map(it=>[
@@ -277,6 +300,40 @@ $('life-gatekeeper-now').addEventListener('click',e=>busy(e.target,async()=>{
   const r=await api('life/gatekeeper','POST');
   await life();
   notice('门控扫描完成：'+(r.status||'ok'));
+}));
+$('refresh-social-schedule').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!(await confirmDiscardTabChanges('life','刷新共享社交排程')))return;
+  const detail=await api('life/modules/social_presence');
+  renderSocialSchedule(detail.scheduling?.values||{},detail);
+}));
+$('social-schedule-form').addEventListener('submit',e=>{
+  e.preventDefault();
+  busy($('social-schedule-save'),async()=>{
+    const intVal=(id,min,max,label)=>{
+      const raw=String($(id).value??'').trim();
+      if(!raw)throw Error(label+'须为 '+min+'～'+max+' 的整数');
+      const v=Number(raw);
+      if(!Number.isInteger(v)||v<min||v>max)throw Error(label+'须为 '+min+'～'+max+' 的整数');
+      return v;
+    };
+    const payload={
+      owner_delivery_enabled:$('social-owner-delivery').checked,
+      owner_dms_unlimited:$('social-owner-unlimited').checked,
+      group_cooldown_seconds:intVal('social-group-cooldown',300,86400,'群聊主动冷却（秒）'),
+      group_active_window_seconds:intVal('social-group-window',60,7200,'群聊活跃观察窗口（秒）'),
+      group_min_recent_messages:intVal('social-group-min-msgs',1,50,'群聊最少有效消息数'),
+      desktop_active_suppress_seconds:intVal('social-desktop-suppress',300,86400,'桌面活跃抑制窗口（秒）'),
+    };
+    const next=await api('life/modules/social_presence/schedule','PUT',payload);
+    renderSocialSchedule(next.scheduling?.values||{},next);
+    notice('共享社交主动排程已保存');
+  });
+});
+$('social-schedule-reset').addEventListener('click',e=>busy(e.target,async()=>{
+  if(!(await confirmDialog('恢复默认共享社交主动排程？',{danger:true,confirmLabel:'恢复默认'})))return;
+  const next=await api('life/modules/social_presence/schedule','DELETE');
+  renderSocialSchedule(next.scheduling?.values||{},next);
+  notice('已恢复默认共享社交主动排程');
 }));
 
 const mcControls=['life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume'];
@@ -732,6 +789,7 @@ $('sw-reset').addEventListener('click',e=>busy(e.target,async()=>{
 
 trackDirty('life-world-form','世界状态');
 trackDirty('life-config-form','世界作息与调度');
+trackDirty('social-schedule-form','共享社交主动排程');
 trackDirty('vc-config-form','语音伴随设置');
 trackDirty('vc-gw-form','语音网关 API 配置');
 trackDirty('sw-config-form','屏幕伴看策略');
@@ -741,7 +799,7 @@ onLogout(()=>{
   $('world-observation-card').hidden=true;
   for(const id of ['proactive-stats','proactive-queue','proactive-alerts','world-day-stats','world-agenda','world-daily-actions','world-plans','world-days','world-evenings','life-digests','life-stats','life-changes','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table','mc-overview','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table','vc-gw-pills','vc-gw-brz-voice-select','sw-pills','sw-commentary-table'])$(id).replaceChildren();
   $('vc-gw-brz-voice-select').hidden=true;
-  for(const id of ['proactive-state','proactive-budget','world-morning','world-next','world-quiet','world-day-coverage','world-evening-coverage','rest-hours-status','wake-window','life-battery-status','life-world-status','life-node-status','life-desktop-status','life-source','life-mc-status','event-ledger-state','vc-state','vc-gw-state','sw-state'])text(id,'');
+  for(const id of ['proactive-state','proactive-budget','world-morning','world-next','world-quiet','world-day-coverage','world-evening-coverage','rest-hours-status','wake-window','life-battery-status','life-world-status','life-node-status','life-desktop-status','life-source','social-schedule-status','life-mc-status','event-ledger-state','vc-state','vc-gw-state','sw-state'])text(id,'');
   ['vc-gw-brz-key-state','vc-gw-fish-key-state','vc-gw-sf-key-state','vc-gw-oai-key-state'].forEach(id=>text(id,'未读取'));
-  for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','vc-disconnect','vc-save','vc-reset','vc-gw-save','vc-gw-reset','vc-gw-test','vc-gw-brz-fetch-voices','sw-clear','sw-disconnect','sw-save','sw-reset'])$(id).disabled=true;
+  for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','social-schedule-save','social-schedule-reset','life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','vc-disconnect','vc-save','vc-reset','vc-gw-save','vc-gw-reset','vc-gw-test','vc-gw-brz-fetch-voices','sw-clear','sw-disconnect','sw-save','sw-reset'])$(id).disabled=true;
 });

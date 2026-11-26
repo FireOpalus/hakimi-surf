@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import inspect
 import json
 import logging
@@ -24,6 +25,7 @@ from .modules.base import (
     sanitize_sensor_text,
 )
 from .security import Vault
+from .social import resolve_owner_scope
 from .store import Store
 from .world_experience import SCHEMA as EXPERIENCE_SCHEMA
 from .world_experience import WorldExperience
@@ -155,12 +157,28 @@ def private_event_audience(
 
 
 def private_event_for_owner(payload: dict, recipient: str, settings: Settings) -> bool:
-    return bool(
-        settings.owner_qq_id
-        and payload.get("owner_private") is True
-        and payload.get("audience") == private_event_audience(settings, settings.owner_qq_id)
-        and recipient == "owner:" + settings.owner_qq_id
+    if not isinstance(payload, dict) or payload.get("owner_private") is not True:
+        return False
+    audience = payload.get("audience")
+    if not isinstance(audience, str) or not audience:
+        return False
+    if not isinstance(recipient, str) or not recipient:
+        return False
+    matched = resolve_owner_scope(recipient, settings)
+    if matched is None:
+        return False
+    platform, binding = matched
+    expected_audience = private_event_audience(
+        settings,
+        binding.user_id,
+        platform=platform,
+        bot_id=binding.bot_id,
     )
+    try:
+        audience_bytes = audience.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(audience_bytes, expected_audience.encode("utf-8"))
 
 
 def _check_no_prewritten_speech(text: str) -> None:

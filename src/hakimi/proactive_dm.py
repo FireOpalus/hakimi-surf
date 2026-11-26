@@ -21,11 +21,21 @@ from .digest_receipts import DigestReceipts, world_outcome
 from .generation_policy import Scenario
 from .models import Message
 from .modules.actions import Action, ActionCall, DailyAction, DailyReceipt, Outcome
+from .modules.scheduling import SocialScheduleOptions
 from .output_links import filter_reply_links
 from .reply_style import trim_complete_text
 from .roaming_logger import redact_public_summary
 from .security import Rejected, configured_secrets, safe_output
-from .social import bound_owner, chat_module, confirmed_message_id, owner_binding, owner_target
+from .social import (
+    bound_owner,
+    chat_module,
+    confirmed_message_id,
+    owner_binding,
+    owner_dm_digest,
+    owner_dm_scope,
+    owner_target,
+    owner_target_scope,
+)
 from .work_usage import model_work
 
 log = logging.getLogger("hakimi")
@@ -46,12 +56,11 @@ class OwnerProactive:
             if binding
             else (self.s.owner_qq_id, self.s.onebot_self_id)
         )
-        identity = (self.s.namespace, self.bot, self.owner)
-        if self.platform != "onebot":
-            identity = (self.s.namespace, self.platform, self.bot, self.owner)
-        self.scope = self.store.vault.digest("owner-dm", *identity)
+        self.scope = owner_dm_scope(
+            self.s, self.platform, include_inactive=True
+        ) or owner_dm_digest(self.s, self.platform, self.bot, self.owner)
         self.action_name = "qq.owner_digest" if self.platform == "onebot" else "social.owner_digest"
-        self.target_scope = (
+        self.target_scope = owner_target_scope(self.s, self.platform, include_inactive=True) or (
             "owner:" + self.owner if self.platform == "onebot" else "boundowner:" + self.scope
         )
         self.digests = DigestReceipts(
@@ -74,14 +83,24 @@ class OwnerProactive:
     @property
     def delivery_enabled(self):
         module = chat_module(self.s, self.platform)
-        if module is None:
+        if module is None or not self.configured:
             return False
-        if self.platform == "onebot":
-            engine = getattr(self.service, "life_engine", None)
-            if engine is None:
-                return False
-            return module.scheduling(engine.config).owner_delivery_enabled
-        return self.s.proactive_dm_enabled and self.configured
+        engine = getattr(self.service, "life_engine", None)
+        if engine is None:
+            return False
+        if not getattr(engine, "overridden", False) and engine.config.module_settings == getattr(
+            getattr(engine, "env_config", None), "module_settings", None
+        ):
+            return bool(self.s.proactive_dm_enabled)
+        registry = getattr(self.service, "modules", None)
+        social_mod = registry.get("social_presence") if registry is not None else None
+        if social_mod is not None:
+            return bool(social_mod.scheduling(engine.config).owner_delivery_enabled)
+        defaults = SocialScheduleOptions.from_settings(self.s).model_dump()
+        raw = engine.config.module_settings.get("social_presence", {})
+        return bool(
+            SocialScheduleOptions.model_validate({**defaults, **raw}).owner_delivery_enabled
+        )
 
     @property
     def configured(self):
@@ -119,7 +138,7 @@ class OwnerProactive:
         return self.platform != "onebot" and scope == self.target_scope and self.configured
 
     def module_timer(self, module):
-        if self.platform == "onebot" or self.platform not in module.chat_platforms:
+        if self.platform not in module.chat_platforms:
             return None
         action = Action(
             name=self.action_name,
@@ -151,8 +170,15 @@ class OwnerProactive:
             DailyReceipt(
                 day=row["day"],
                 stage=row["stage"],
-                started=row.get("generation_started_at"),
-                confirmed=row.get("confirmed_at"),
+                started=next(
+                    (
+                        row[k]
+                        for k in ("generation_started_at", "generated_at", "queued_at")
+                        if row.get(k) is not None
+                    ),
+                    None,
+                ),
+                confirmed=row.get("confirmed_at") if row["stage"] == "confirmed" else None,
             )
             for row in await self.digest_history()
         ]
@@ -694,7 +720,12 @@ class OwnerProactive:
             payload = await self._public_digest(now)
             owner_message = self.target()
             subject = self.store.subject(owner_message)
-            requested_longnick = self.platform == "onebot" and self.service.longnick.config.enabled
+            registry = getattr(self.service, "modules", None)
+            requested_longnick = bool(
+                registry is not None
+                and hasattr(registry, "presence_enabled_for")
+                and registry.presence_enabled_for(self.platform)
+            )
             with model_work(self.action_name, key):
                 await self.service.ai.screen(
                     payload, subject, purpose="source", budget_lane=PROACTIVE_LANE
@@ -777,10 +808,16 @@ class OwnerProactive:
             await self.digests.enqueue_generated_tx(self.clock(), key)
         self.wakeup.set()
         if daily_longnick is not None:
-            try:
-                await self.service.longnick.apply_digest(daily_longnick)
-            except Exception:
-                log.warning("event=owner_digest_longnick_failed")
+            registry = getattr(self.service, "modules", None)
+            if registry is not None and hasattr(registry, "apply_presence"):
+                try:
+                    await registry.apply_presence(
+                        daily_longnick, kind="digest", platform=self.platform
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.warning("event=owner_digest_longnick_failed")
         return {"status": "queued", "id": key}
 
     async def world_digest(self, call: ActionCall) -> Outcome:

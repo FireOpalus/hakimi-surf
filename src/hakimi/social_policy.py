@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .bot_server import is_persona_owner
 from .models import Message
 from .modules.actions import GateDecision
-from .social import bound_owner
+from .social import bound_owner, owner_binding, owner_dm_scope
 from .social_speak import resolve_social_target
 from .world_experience import SOCIAL_LOW
 
@@ -312,11 +312,41 @@ class SocialProactivePolicy:
         cfg: Any,
     ) -> tuple[bool, str | None]:
         proactive = getattr(self.service, "proactive", None)
-        if proactive is None or not proactive.configured or not proactive.delivery_enabled:
-            return False, None
+        if target_msg.platform == getattr(proactive, "platform", None):
+            if proactive is None or not proactive.configured or not proactive.delivery_enabled:
+                return False, None
+        else:
+            if owner_binding(self.s, target_msg.platform) is None:
+                return False, None
+            engine = getattr(self.service, "life_engine", None)
+            if engine is None:
+                if not getattr(self.s, "proactive_dm_enabled", True):
+                    return False, None
+            elif not getattr(
+                engine, "overridden", False
+            ) and engine.config.module_settings == getattr(
+                getattr(engine, "env_config", None), "module_settings", None
+            ):
+                if not getattr(self.s, "proactive_dm_enabled", True):
+                    return False, None
+            else:
+                modules = getattr(self.service, "modules", None)
+                social_mod = modules.get("social_presence") if modules is not None else None
+                if social_mod is not None:
+                    if not social_mod.scheduling(engine.config).owner_delivery_enabled:
+                        return False, None
+                else:
+                    from .modules.scheduling import SocialScheduleOptions
+
+                    defaults = SocialScheduleOptions.from_settings(self.s).model_dump()
+                    raw = engine.config.module_settings.get("social_presence", {})
+                    if not SocialScheduleOptions.model_validate(
+                        {**defaults, **raw}
+                    ).owner_delivery_enabled:
+                        return False, None
         if getattr(cfg, "owner_delivery_enabled", None) is False:
             return False, None
-        if await self.owner_recently_active(ticket, now):
+        if await self.owner_recently_active(ticket, now, platform=target_msg.platform):
             return False, None
         # Desktop Antigravity_Memory synergy gate is strictly gated by notebook grant.
         if not bound_owner(target_msg, self.s, "notebook"):
@@ -343,13 +373,24 @@ class SocialProactivePolicy:
                 return True, DESKTOP_CONTEXT_HINT
         return True, None
 
-    async def owner_recently_active(self, ticket: dict[str, Any], now: float) -> bool:
+    async def owner_recently_active(
+        self,
+        ticket: dict[str, Any],
+        now: float,
+        *,
+        platform: str | None = None,
+    ) -> bool:
         if ticket.get("origin") != "planner" and str(ticket.get("action_type", "")).endswith(
             "_milestone_share"
         ):
             return False
+        plat = platform or self.platform
         proactive = getattr(self.service, "proactive", None)
-        scope = getattr(proactive, "scope", None)
+        scope = owner_dm_scope(self.s, plat) or (
+            getattr(proactive, "scope", None)
+            if plat == getattr(proactive, "platform", None)
+            else None
+        )
         if not scope:
             return False
         async with self.store.lock:

@@ -784,7 +784,7 @@ class DualMemory:
             for ident, summary, created_ts in owner_commitments:
                 try:
                     await ledger.post(
-                        "qq_owner",
+                        "owner_chat",
                         "owner_commitment",
                         summary,
                         dedupe_key=f"chronicle:{ident}",

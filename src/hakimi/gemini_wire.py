@@ -197,8 +197,8 @@ LIFE_PLAN_INSTRUCTION = """你是「吉米奈喵」（咕咕噜·吉米尼·吉�
   在今日则直接排入 intents，在明日及以后则写入 ledger_posts。
 - ledger_posts：需跨时段/跨天记住的主观打算、未完事项或远期约定可写入账本，
   due_at_local 填 ""、"HH:MM" 或 "YYYY-MM-DD HH:MM"；无新增时填 []。
-- ledger_consumes：仅当 source 为 "planner" 或 "qq_owner" 的待办已被你落实排妥或完成时
-  填其 key 或 id 核销；外部能力模块事件由模块自己执行后核销，勿提前填。
+- ledger_consumes：仅当 source 为 "planner"、"owner_chat"（或历史 "qq_owner"）的
+  待办已被你落实排妥或完成时填其 key 或 id 核销；外部能力模块事件由模块自己执行后核销，勿提前填。
 - 隐私铁律：visibility="owner_private" 事件与 owner_recent_context 严禁用于公开群聊
   意图，也严禁写入 mood_longnick。
 

@@ -373,7 +373,7 @@ async def test_world_patrol_share_intent_and_mood_longnick(settings, store, mess
             ]
             assert not await store.all("SELECT id FROM pending_owner_dms")
             tickets = await store.all(
-                "SELECT target_scope FROM scheduled_intents WHERE action_name='qq.speak'"
+                "SELECT target_scope FROM scheduled_intents WHERE action_name='social.speak'"
             )
             assert [r[0] for r in tickets] == ["owner:20000"]
 

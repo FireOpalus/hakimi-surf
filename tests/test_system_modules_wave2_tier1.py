@@ -460,7 +460,7 @@ async def test_proactive_delivery_event_ledger_enqueue_deliver_and_drain(setting
                 update={
                     "module_settings": {
                         **orig_cfg.module_settings,
-                        "qq_social": {"owner_delivery_enabled": False},
+                        "social_presence": {"owner_delivery_enabled": False},
                     }
                 }
             )
@@ -511,7 +511,7 @@ async def test_proactive_delivery_event_ledger_enqueue_deliver_and_drain(setting
                 update={
                     "module_settings": {
                         **orig_cfg.module_settings,
-                        "qq_social": {"owner_delivery_enabled": False},
+                        "social_presence": {"owner_delivery_enabled": False},
                     }
                 }
             )

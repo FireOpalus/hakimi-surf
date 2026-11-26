@@ -174,8 +174,10 @@ async def test_module_browsing_reads_local_registry_and_scopes_actions(life_api,
         "/admin/api/life/actions/qq.speak", json={"mode": "off", "view": "module"}
     )
     assert response.status_code == 200
-    assert response.json()["id"] == "qq_social"
-    assert any(a["name"] == "qq.speak" and a["mode"] == "off" for a in response.json()["actions"])
+    assert response.json()["id"] == "social_presence"
+    assert any(
+        a["name"] == "social.speak" and a["mode"] == "off" for a in response.json()["actions"]
+    )
     assert "world_state" not in response.json()
     core = await client.get("/admin/api/life/overview")
     assert core.status_code == 200
@@ -781,7 +783,7 @@ async def test_catalog_action_hot_switch_is_persisted_and_restricts_admin(life_a
     path = "/admin/api/life/actions/"
     info = (await client.get("/admin/api/life")).json()
     names = {r["name"] for r in info["engine"]["actions"]}
-    assert {"mc.status", "mc.build_plan", "qq.speak", "bili.patrol"} <= names
+    assert {"mc.status", "mc.build_plan", "social.speak", "bili.patrol"} <= names
     assert next(r for r in info["engine"]["actions"] if r["name"] == "weather.read")["reason"] == (
         "module_disabled"
     )
@@ -857,7 +859,8 @@ async def test_module_master_switch_blocks_ingress_actions_and_preserves_setting
     }
     after = (await client.put(qq + "/enabled", json={"enabled": True})).json()
     assert after["enabled"] and after["scheduling"]["values"] == before["scheduling"]["values"]
-    assert next(a for a in after["actions"] if a["name"] == "qq.speak")["mode"] == "off"
+    sp_after = (await client.get(root + "/social_presence")).json()
+    assert next(a for a in sp_after["actions"] if a["name"] == "social.speak")["mode"] == "off"
     assert svc.batch_authorized(message, [message])
     assert not gateway.calls
 

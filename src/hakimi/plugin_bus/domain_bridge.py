@@ -285,10 +285,10 @@ class PluginBusDomainBridgeMixin:
                 isinstance(raw_longnick, str)
                 and raw_longnick.strip()
                 and not raw_payload.get("private_first")
-                and (longnick := getattr(self.service, "longnick", None)) is not None
-                and hasattr(longnick, "apply_patrol")
+                and (registry := getattr(self.service, "modules", None)) is not None
+                and hasattr(registry, "apply_presence")
             ):
-                await longnick.apply_patrol(raw_longnick[:80])
+                await registry.apply_presence(raw_longnick[:80], kind="patrol")
 
         if isinstance(frame.get("id"), str) and frame["id"]:
             await self._send_frame(

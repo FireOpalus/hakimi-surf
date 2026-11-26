@@ -22,7 +22,8 @@ class ActionWorkers:
         if scope := ticket["target_scope"]:
             return "recipient", scope
         catalog = self.engine.catalog
-        name = ticket["action_name"] or catalog.old_name(ticket)
+        raw_name = ticket["action_name"] or catalog.old_name(ticket)
+        name = catalog.canonical_name(raw_name) or raw_name
         return "module", catalog.owners.get(name, ticket["target_module"])
 
     async def _run(self, ticket, now):
@@ -37,7 +38,7 @@ class ActionWorkers:
         lane = self.lane(ticket)
         if busy := self.active.get(lane):
             return busy[1] if busy[0] == ticket["id"] else None
-        spec = self.engine.catalog.actions.get(ticket["action_name"])
+        spec = self.engine.catalog.get(ticket["action_name"])
         closing = ticket["origin"] == "timer" and spec is not None and spec.window == "closing"
         if self.stopping or len(self.active) >= self.capacity + int(closing):
             return None

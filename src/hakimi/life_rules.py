@@ -11,6 +11,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 from .modules.actions import reject_reason
+from .social import chat_module, chat_registry, owner_binding, owner_target_scope
 from .world_state import IntentTicketCreate, MilestoneEvent, private_event_for_owner
 
 if TYPE_CHECKING:
@@ -70,13 +71,100 @@ def _resolve_compat_rule_provider(name: str) -> Callable[..., Any]:
     raise LookupError(f"rule_provider_not_found:{name}")
 
 
-# Compatibility wrappers for callers of the pre-module rule API.
+def _allowlisted_groups_for_settings(settings) -> list[str]:
+    registry = chat_registry(settings)
+    if registry is not None:
+        groups: list[str] = []
+        for module in registry.active():
+            for scope in module.proactive_groups():
+                if scope and scope not in groups:
+                    groups.append(scope)
+        return groups
+    if not getattr(settings, "onebot_enabled", False):
+        return []
+    policies = getattr(settings, "group_policies", {}) or {}
+    return [
+        f"onebot:{gid}"
+        for gid in sorted(getattr(settings, "onebot_allowed_groups", ()) or ())
+        if policies.get(f"onebot:{gid}", "at_only") != "muted"
+    ]
+
+
+def _owner_candidates_for_settings(settings) -> list[tuple[str, str]]:
+    registry = chat_registry(settings)
+    order: list[str] = []
+    preferred = getattr(settings, "owner_delivery_platform", "") or ""
+    for plat in (preferred, "onebot", *(getattr(settings, "social_owner_bindings", {}) or {})):
+        if not plat or plat == "qq" or plat in order:
+            continue
+        order.append(plat)
+    candidates: list[tuple[str, str]] = []
+    for plat in order:
+        if registry is not None:
+            if chat_module(settings, plat) is None or owner_binding(settings, plat) is None:
+                continue
+        scope = owner_target_scope(settings, plat, include_inactive=(registry is None))
+        if scope:
+            candidates.append((plat, scope))
+    return candidates
+
+
+def _speak_action_for_platform(settings, platform: str) -> str:
+    registry = chat_registry(settings)
+    if registry is not None:
+        if "social.speak" in registry.catalog.actions:
+            return "social.speak"
+        mod = chat_module(settings, platform)
+        if mod is not None:
+            for name, spec in registry.catalog.actions.items():
+                if registry.catalog.owners.get(name) == mod.module_id and spec.proactive_speak:
+                    return name
+    return "qq.speak" if platform == "onebot" else f"{platform}.speak"
+
+
+# Compatibility wrapper for callers of the pre-module rule API.
 def build_from_video(event):
     return _resolve_compat_rule_provider("build_from_video")(event)
 
 
-def milestone_sharing(settings):
-    return _resolve_compat_rule_provider("milestone_sharing")(settings)
+def milestone_sharing(settings) -> Rule:
+    def match(ev):
+        if ev.importance != "high" or ev.event_type == "bili_mc_inspiration":
+            return None
+        owner_candidates = _owner_candidates_for_settings(settings)
+        if ev.payload.get("private_first"):
+            chosen = next(
+                (
+                    (plat, scope)
+                    for plat, scope in owner_candidates
+                    if private_event_for_owner(ev.payload, scope, settings)
+                ),
+                None,
+            )
+            if chosen is None:
+                return None
+            plat, recipient = chosen
+        elif owner_candidates:
+            plat, recipient = owner_candidates[0]
+        else:
+            if ev.event_type == "bili_video_watched":
+                return None
+            groups = _allowlisted_groups_for_settings(settings)
+            if not groups:
+                return None
+            recipient = groups[0]
+            plat = recipient.partition(":")[0]
+        action_name = _speak_action_for_platform(settings, plat)
+        return Reaction(
+            action_name,
+            "刚遇到一件挺有意思的新动态，看气氛顺嘴跟群友或 BOISER 唠两句",
+            recipient,
+            delay=90,
+            legacy_module=ev.source_module,
+            legacy_verb=ev.source_module + "_milestone_share",
+        )
+
+    return Rule("social.milestone", match)
 
 
 class RuleDispatcher:
@@ -85,19 +173,42 @@ class RuleDispatcher:
         self.world = engine.service.world_state
         self.store = engine.store
         self.registry = registry
+        self.kernel_rules: dict[str, Rule] = {
+            "social.milestone": milestone_sharing(engine.s),
+        }
         self.subscriptions = {}
         self.observer_lock = asyncio.Lock()
         self.registration_lock = asyncio.Lock()
 
+    def _combined_rules(self) -> dict[str, Rule]:
+        return {**self.kernel_rules, **self.registry.rules}
+
+    def _is_proactive_speak_action(self, action_name: str) -> bool:
+        spec = self.engine.catalog.get(action_name)
+        if spec is None:
+            return False
+        return bool(
+            spec.social
+            and (
+                spec.proactive_speak
+                or spec.name in {"social.speak", "qq.speak"}
+                or spec.name.endswith(".speak")
+            )
+        )
+
     async def initialize(self, *, before_event=None) -> None:
-        if len(self.subscriptions) == len(self.registry.rules) + len(
-            self.registry.public_event_observers
-        ):
+        combined_rules = self._combined_rules()
+        expected_keys = combined_rules.keys() | self.registry.public_event_observers.keys()
+        if set(self.subscriptions) == expected_keys:
             return
         async with self.registration_lock:
+            combined_rules = self._combined_rules()
+            expected_keys = combined_rules.keys() | self.registry.public_event_observers.keys()
+            for stale in set(self.subscriptions) - expected_keys:
+                self.subscriptions.pop(stale, None)
             new = {
                 name: partial(self.apply, rule)
-                for name, rule in self.registry.rules.items()
+                for name, rule in combined_rules.items()
                 if name not in self.subscriptions
             }
             new.update(
@@ -121,7 +232,8 @@ class RuleDispatcher:
     async def apply(self, rule: Rule, row, now: float) -> str | None:
         ev = self.world.event_from_row(row)
         source = self.registry.get(ev.source_module)
-        if self.registry.inactive_reason(self.registry.rule_owners[rule.name]) or (
+        owner = self.registry.rule_owners.get(rule.name)
+        if (owner is not None and self.registry.inactive_reason(owner)) or (
             source and source.inactive_reason
         ):
             return None
@@ -129,7 +241,7 @@ class RuleDispatcher:
         if not reaction or (
             ev.payload.get("private_first")
             and (
-                reaction.action != "qq.speak"
+                not self._is_proactive_speak_action(reaction.action)
                 or not private_event_for_owner(ev.payload, reaction.recipient, self.engine.s)
             )
         ):
@@ -159,14 +271,15 @@ class RuleDispatcher:
                 reason = "cooldown"
             else:
                 catalog = self.engine.catalog
-                module = catalog.owners.get(reaction.action, "")
+                canon_action = catalog.canonical_name(reaction.action) or reaction.action
+                module = catalog.owners.get(canon_action, "")
                 try:
                     ticket = IntentTicketCreate(
-                        action_name=reaction.action,
+                        action_name=canon_action,
                         target_scope=reaction.recipient,
                         origin="rule",
                         target_module=reaction.legacy_module or module,
-                        action_type=reaction.legacy_verb or reaction.action,
+                        action_type=reaction.legacy_verb or canon_action,
                         source_event_id=ev.id,
                         source_module=ev.source_module,
                         arguments=reaction.arguments,

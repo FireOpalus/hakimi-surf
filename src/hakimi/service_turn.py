@@ -1022,7 +1022,13 @@ class _ServiceTurnMixin:
                     settings=self.s,
                     tier=tier,
                     allowed_poke=allowed_poke,
-                    allow_longnick=(not sandbox and owner(message, self.s)),
+                    allow_longnick=(
+                        not sandbox
+                        and verified_owner_turn
+                        and (registry := getattr(self, "modules", None)) is not None
+                        and hasattr(registry, "supports_presence_for")
+                        and registry.supports_presence_for(message.platform)
+                    ),
                     allow_sticker=(not aff_active or caps.allow_sticker),
                     allow_emoji_like=(not aff_active or caps.allow_emoji_like),
                     allow_poke_action=(
@@ -1391,9 +1397,20 @@ class _ServiceTurnMixin:
                 await self._auto_save_meme(
                     message, [*neighbour_members, *members], actions.save_meme_label
                 )
-            if actions.set_longnick and owner(message, self.s):
+            if (
+                actions.set_longnick
+                and verified_owner_turn
+                and (registry := getattr(self, "modules", None)) is not None
+                and hasattr(registry, "supports_presence_for")
+                and registry.supports_presence_for(message.platform)
+                and hasattr(registry, "apply_presence")
+            ):
                 try:
-                    await self.longnick.update(actions.set_longnick, automatic=False)
+                    await registry.apply_presence(
+                        actions.set_longnick,
+                        kind="chat",
+                        platform=message.platform,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:

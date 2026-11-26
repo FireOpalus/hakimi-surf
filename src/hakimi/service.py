@@ -88,6 +88,7 @@ from .service_turn import _ServiceTurnMixin
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
 from .social import chat_module
+from .social_presence import SocialPresenceModule
 from .store import Store
 from .system_modules import SystemResources, install_system_modules
 from .work_usage import model_work
@@ -229,6 +230,7 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         self.world_state = WorldStateManager(settings, store, self.modules)
         self.world_state.subscribe(self._broadcast_world_event)
         install_modules(self)
+        self.modules.register(SocialPresenceModule(self))
         if (
             is_external_plugin(self.s, "minecraft")
             or is_external_plugin(self.s, "bilibili_surf")

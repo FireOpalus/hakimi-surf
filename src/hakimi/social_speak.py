@@ -15,13 +15,69 @@ from .modules.base import sanitize_sensor_text
 from .outgoing import deliver_proactive_jit
 from .routing import RouteDecision
 from .security import authorize
-from .social import owner_target
+from .social import RecipientResolver, owner_binding, owner_target
 
 JIT_TRIGGER_MESSAGE = (
     "[系统主动意图触发：这是你自己先前排定的主动发言时刻。请结合 "
     "jit_proactive_intent、待分享见闻与近期上下文，用自然松弛的口语开口；"
     "私聊可自然开启新话头或挂念日常，群聊若正逢严肃争执或完全插不上嘴可将 abstain 设为 true]"
 )
+
+
+def resolve_social_message(
+    service: Any,
+    target_scope: str,
+    *,
+    event_id: str,
+    created_at: float,
+) -> Message | None:
+    """Resolve any active verified Owner scope or `<platform>:<gid>` group scope to Message."""
+    scope = str(target_scope or "").strip()
+    if not scope or scope.startswith("channel:"):
+        return None
+    modules = getattr(service, "modules", None)
+    owner_hit = RecipientResolver(service.s, modules).resolve_owner(scope)
+    if owner_hit is not None:
+        plat, _binding, _canonical = owner_hit
+        if modules is not None:
+            mod = modules.chat_platforms.get(plat)
+            if mod is None or mod.inactive_reason is not None:
+                return None
+        return owner_target(service.s, plat, created_at, event_id)
+    if scope in {"owner", "owner_dm"} or scope.startswith(("owner:", "boundowner:", "private:")):
+        return None
+    plat, sep, gid = scope.partition(":")
+    gid = gid.strip()
+    if not sep or not gid or modules is None:
+        return None
+    mod = modules.chat_platforms.get(plat)
+    if mod is None or mod.inactive_reason is not None:
+        return None
+    if mod.normalize_recipient(scope) != scope:
+        return None
+    policies = getattr(service.s, "group_policies", {}) or {}
+    if policies.get(scope, "at_only") == "muted":
+        return None
+    if plat == "onebot":
+        bot_id = str(getattr(service.s, "onebot_self_id", "") or "").strip()
+    elif hasattr(mod, "_bot_id"):
+        bot_id = str(mod._bot_id() or "").strip()
+    else:
+        binding = owner_binding(service.s, plat)
+        bot_id = binding.bot_id if binding is not None else mod.module_id
+    if not bot_id:
+        return None
+    return Message(
+        platform=plat,
+        bot_id=bot_id,
+        event_id=event_id,
+        user_id="0",
+        conversation_id=gid,
+        kind="group",
+        text="",
+        addressed=True,
+        created_at=created_at,
+    )
 
 
 def resolve_social_target(
@@ -35,15 +91,20 @@ def resolve_social_target(
 ) -> Message | None:
     """Resolve a canonical proactive scope (`boundowner:...` or `<plat>:<gid>`) to Message."""
     scope = str(target_scope or "").strip()
-    if not scope:
+    if not scope or scope.startswith("channel:"):
         return None
-    proactive = getattr(service, "proactive", None)
-    if (
-        proactive is not None
-        and proactive.platform == platform
-        and scope in {proactive.target_scope, "owner", "owner_dm"}
-        and proactive.configured
-    ):
+    modules = getattr(service, "modules", None)
+    if scope in {"owner", "owner_dm"} or scope.startswith(("owner:", "boundowner:", "private:")):
+        owner_hit = RecipientResolver(service.s, modules).resolve_owner(scope)
+        if owner_hit is None:
+            return None
+        hit_plat, _, _ = owner_hit
+        if hit_plat != platform:
+            return None
+        if modules is not None:
+            mod = modules.chat_platforms.get(platform)
+            if mod is None or mod.inactive_reason is not None:
+                return None
         return owner_target(service.s, platform, created_at, event_id)
     prefix = f"{platform}:"
     if scope.startswith(prefix):
@@ -52,6 +113,12 @@ def resolve_social_target(
             return None
         if service.s.group_policies.get(scope, "at_only") == "muted":
             return None
+        if modules is not None:
+            mod = modules.chat_platforms.get(platform)
+            if mod is not None and (
+                mod.inactive_reason is not None or mod.normalize_recipient(scope) != scope
+            ):
+                return None
         return Message(
             platform=platform,
             bot_id=bot_id,
@@ -128,9 +195,12 @@ async def speak_proactive(
     aff = getattr(service.store.runtime, "affection", None)
     if aff is not None and aff.config.enabled:
         seen_uids: set[str] = set()
+        excluded_bots = {"0", target_msg.bot_id}
+        if target_msg.platform in {"onebot", "qq"}:
+            excluded_bots.update(getattr(service.s, "bot_qq_ids", ()))
         for item in reversed(recent):
             uid = str(item.get("user_id", "")).strip()
-            if not uid or uid in seen_uids or uid in {"0", target_msg.bot_id}:
+            if not uid or uid in seen_uids or uid in excluded_bots:
                 continue
             seen_uids.add(uid)
             try:
