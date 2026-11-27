@@ -349,6 +349,7 @@ async def test_stream_completion_usage_and_cancellation():
     stream = Stream()
     result = await consume_stream(stream)
     assert result.usage.total_input_tokens == 5 and stream.closed
+    assert result.service_tier is None and result.usage_metadata is None
     event = asyncio.Event()
     stopped = asyncio.Event()
 
@@ -592,3 +593,89 @@ def test_outgoing_pacing_delay_respects_send_delay_max(settings):
     )
     assert _pacing_delay(svc_zero, 1.5) == 0.0
     assert _pacing_delay(svc_live, 1.5) == pytest.approx(1.5)
+
+
+async def test_consume_stream_and_normalize_generate_content_preserve_service_tier():
+    from hakimi.gemini import GeminiGateway
+
+    class TierStream:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+        async def __aiter__(self):
+            yield NS(
+                event_type="interaction.start",
+                interaction=NS(service_tier="priority"),
+            )
+            yield NS(event_type="step.start", index=0, step=NS(type="model_output"))
+            yield NS(event_type="step.delta", index=0, delta=NS(type="text", text="ok"))
+            yield NS(
+                event_type="interaction.completed",
+                interaction=NS(
+                    id="int-1",
+                    status="completed",
+                    usage=NS(total_input_tokens=10),
+                    service_tier="standard",
+                    usage_metadata=NS(traffic_type="ON_DEMAND"),
+                ),
+            )
+
+    stream = TierStream()
+    res = await consume_stream(stream)
+    assert stream.closed
+    assert res.service_tier == "standard"
+    assert res.usage_metadata.traffic_type == "ON_DEMAND"
+    assert GeminiGateway._vertex_downgraded_to_standard(res) is True
+
+    # Also verify fallback to interaction.start service_tier when completed omits it.
+    class StartOnlyTierStream:
+        async def __aiter__(self):
+            yield NS(event_type="interaction.start", interaction=NS(service_tier="standard"))
+            yield NS(event_type="step.start", index=0, step=NS(type="model_output"))
+            yield NS(event_type="step.delta", index=0, delta=NS(type="text", text="ok"))
+            yield NS(
+                event_type="interaction.completed",
+                interaction=NS(id="int-2", status="completed", usage=NS(total_input_tokens=10)),
+            )
+
+    start_res = await consume_stream(StartOnlyTierStream())
+    assert start_res.service_tier == "standard"
+    assert GeminiGateway._vertex_downgraded_to_standard(start_res) is True
+
+    # Verify _normalize_generate_content preserves service_tier across chunks.
+    chunks = [
+        NS(
+            candidates=[
+                NS(
+                    content=NS(parts=[NS(text="hello", thought=False)]),
+                    finish_reason=None,
+                )
+            ],
+            usage_metadata=None,
+            service_tier="standard",
+        ),
+        NS(
+            candidates=[NS(content=NS(parts=[]), finish_reason="STOP")],
+            usage_metadata=NS(
+                prompt_token_count=10,
+                candidates_token_count=5,
+                total_token_count=15,
+            ),
+        ),
+    ]
+    gc_res = GeminiGateway._normalize_generate_content(chunks)
+    assert gc_res.service_tier == "standard"
+    assert gc_res.usage_metadata.total_token_count == 15
+    assert GeminiGateway._vertex_downgraded_to_standard(gc_res) is True
+
+    chunks_prio = [
+        NS(
+            candidates=[NS(content=NS(parts=[NS(text="hi", thought=False)]), finish_reason="STOP")],
+            service_tier="priority",
+        )
+    ]
+    gc_prio = GeminiGateway._normalize_generate_content(chunks_prio)
+    assert gc_prio.service_tier == "priority"
+    assert GeminiGateway._vertex_downgraded_to_standard(gc_prio) is False

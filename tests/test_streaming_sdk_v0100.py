@@ -144,3 +144,104 @@ async def test_pre_dispatch_cancel_refunds_zero_vs_mid_stream_fallback(settings,
         assert row["status"] == "settled" and row["amount"] == 0 and row["reserved"] > 0
     finally:
         await gateway.close()
+
+
+@pytest.mark.parametrize(
+    "code,emit_partial,expect_refund",
+    [
+        ("429", False, True),
+        ("rate_limit_exceeded", False, True),
+        ("RESOURCE_EXHAUSTED", False, True),
+        ("400", False, True),
+        ("401", False, True),
+        ("403", False, True),
+        ("404", False, True),
+        ("409", False, True),
+        ("413", False, True),
+        ("422", False, True),
+        ("INVALID_ARGUMENT", False, True),
+        ("PERMISSION_DENIED", False, True),
+        ("429", True, False),
+        ("400", True, False),
+        ("500", False, False),
+        ("502", False, False),
+        ("503", False, False),
+        ("api_error", False, False),
+        ("unknown", False, False),
+    ],
+)
+async def test_sse_stream_provider_error_billing_zero_output_vs_partial_and_5xx(
+    settings, store, sdk_pair, code, emit_partial, expect_refund
+):
+    events = [
+        {"event_type": "step.start", "index": 0, "step": {"type": "thought"}},
+        {"event_type": "step.stop", "index": 0},
+        {"event_type": "step.start", "index": 1, "step": {"type": "model_output"}},
+    ]
+    if emit_partial:
+        events.append(
+            {"event_type": "step.delta", "index": 1, "delta": {"type": "text", "text": "{"}}
+        )
+    else:
+        events.append(
+            {"event_type": "step.delta", "index": 1, "delta": {"type": "text", "text": ""}}
+        )
+    events.append({"event_type": "error", "error": {"code": code, "message": "provider detail"}})
+    payload = b"".join(line(ev) for ev in events)
+
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=payload)
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    try:
+        with pytest.raises(Rejected, match="stream_provider_error"):
+            await gateway.generate({"current_message": "测试流式计费边界的中文提示词"}, "s")
+        row = await store.one(
+            "SELECT l.status,l.amount,l.reserved,u.estimated_amount "
+            "FROM ledger l JOIN ledger_usage u ON u.id=l.id WHERE u.model_lane='hydrogen'"
+        )
+        if expect_refund:
+            assert row["status"] == "settled"
+            assert row["amount"] == 0 and row["estimated_amount"] == 0
+        else:
+            assert row["status"] == "unknown"
+            assert 0 < row["amount"] < row["reserved"]
+            assert row["estimated_amount"] is None
+    finally:
+        await gateway.close()
+
+
+async def test_sse_stream_timeout_error_keeps_conservative_fallback_billing(
+    settings, store, sdk_pair
+):
+    payload = b"".join(
+        [
+            line({"event_type": "step.start", "index": 0, "step": {"type": "thought"}}),
+            line({"event_type": "error", "error": {"code": "deadline_exceeded", "message": "t"}}),
+        ]
+    )
+
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=payload)
+
+    gateway = GeminiGateway(settings, store, *sdk_pair(handler))
+    try:
+        # Medium thinking downgrades once to low on GenerationTimeout;
+        # both attempts hit SSE deadline_exceeded.
+        with pytest.raises(Rejected, match="generation_incomplete"):
+            await gateway.generate({"current_message": "测试流式超时保守计费"}, "s")
+        rows = await store.all(
+            "SELECT l.status,l.amount,l.reserved,u.estimated_amount "
+            "FROM ledger l JOIN ledger_usage u ON u.id=l.id WHERE u.model_lane='hydrogen'"
+        )
+        assert len(rows) == 2
+        for row in rows:
+            assert row["status"] == "unknown"
+            assert 0 < row["amount"] < row["reserved"]
+            assert row["estimated_amount"] is None
+    finally:
+        await gateway.close()

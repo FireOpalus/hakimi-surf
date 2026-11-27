@@ -128,14 +128,17 @@ async def test_thought_only_429_retries_priority_paygo_before_developer(
         assert failure["stream_phase"] == "started" and "http_status" not in failure
         assert "private text" not in json.dumps(audit)
         rows = await store.all(
-            "SELECT p.provider,l.status FROM ledger l JOIN ledger_usage u ON u.id=l.id "
+            "SELECT p.provider,l.status,l.amount,u.estimated_amount "
+            "FROM ledger l JOIN ledger_usage u ON u.id=l.id "
             "JOIN ledger_provider p ON p.id=l.id "
             "WHERE u.model_lane='hydrogen' ORDER BY l.rowid"
         )
-        assert [tuple(row) for row in rows] == [
-            ("vertex_paid", "unknown"),
+        assert [(r[0], r[1]) for r in rows] == [
+            ("vertex_paid", "settled"),
             ("vertex_paid", "settled"),
         ]
+        assert rows[0]["amount"] == 0 and rows[0]["estimated_amount"] == 0
+        assert rows[1]["amount"] > 0 and rows[1]["estimated_amount"] == rows[1]["amount"]
     finally:
         await svc.stop()
 
@@ -185,15 +188,19 @@ async def test_thought_only_429_falls_back_to_developer_after_priority_429(
         assert (std_fail["service_tier"], std_fail["fallback"]) == ("standard", "failed")
         assert (prio_fail["service_tier"], prio_fail["fallback"]) == ("priority", "succeeded")
         rows = await store.all(
-            "SELECT p.provider,l.status FROM ledger l JOIN ledger_usage u ON u.id=l.id "
+            "SELECT p.provider,l.status,l.amount,u.estimated_amount "
+            "FROM ledger l JOIN ledger_usage u ON u.id=l.id "
             "JOIN ledger_provider p ON p.id=l.id "
             "WHERE u.model_lane='hydrogen' ORDER BY l.rowid"
         )
-        assert [tuple(row) for row in rows] == [
-            ("vertex_paid", "unknown"),
-            ("vertex_paid", "unknown"),
+        assert [(r[0], r[1]) for r in rows] == [
+            ("vertex_paid", "settled"),
+            ("vertex_paid", "settled"),
             ("gemini_paid", "settled"),
         ]
+        assert rows[0]["amount"] == 0 and rows[0]["estimated_amount"] == 0
+        assert rows[1]["amount"] == 0 and rows[1]["estimated_amount"] == 0
+        assert rows[2]["amount"] > 0 and rows[2]["estimated_amount"] == rows[2]["amount"]
     finally:
         await svc.stop()
 
@@ -427,11 +434,13 @@ async def test_fallback_rechecks_budget_before_dispatch(routes, message, store, 
         )
     assert len(calls["vertex"]) == 1 and not calls["developer"]
     assert (await store.one("SELECT COUNT(*) FROM ledger"))[0] == 1
+    row = await store.one("SELECT status,amount FROM ledger")
+    assert tuple(row) == ("settled", 0)
     assert trace["provider_incident"] == {
         "provider": "vertex_paid",
         "code": "429",
         "fallback": "not_dispatched",
-        "fallback_target": "vertex_priority",
+        "fallback_target": "gemini_paid",
         "fallback_detail": "budget_exhausted_daily",
     }
 
@@ -478,12 +487,28 @@ async def test_vertex_generate_content_stream_429_respects_output_boundary(
             "fallback": "succeeded",
             "fallback_target": "gemini_paid",
         }
+        rows = await gate.store.all(
+            "SELECT p.provider,l.status,l.amount FROM ledger l "
+            "JOIN ledger_usage u ON u.id=l.id JOIN ledger_provider p ON p.id=l.id "
+            "WHERE u.model_lane='hydrogen' ORDER BY l.rowid"
+        )
+        assert [(r[0], r[1]) for r in rows] == [
+            ("vertex_paid", "settled"),
+            ("vertex_paid", "settled"),
+            ("gemini_paid", "settled"),
+        ]
+        assert rows[0]["amount"] == 0 and rows[1]["amount"] == 0 and rows[2]["amount"] > 0
     else:
         assert trace["provider_incident"] == {
             "provider": "vertex_paid",
             "code": "429",
             "fallback": "partial_output",
         }
+        row = await gate.store.one(
+            "SELECT l.status,l.amount FROM ledger l "
+            "JOIN ledger_usage u ON u.id=l.id WHERE u.model_lane='hydrogen'"
+        )
+        assert row["status"] == "unknown" and row["amount"] > 0
 
 
 async def test_vertex_429_sets_cooldown_skipping_doomed_vertex_calls_when_fallback_enabled(
@@ -805,3 +830,261 @@ if (typeof print === 'function') print(out); else console.log(out);
     assert "Gemini Developer API 回退成功" in result["devOutcome"]
     assert "Standard PayGo" in result["diag"]
     assert "Priority PayGo" in result["diag"]
+
+
+@pytest.mark.parametrize("reported_tier,expected_micro", [("standard", 411), ("priority", 740)])
+async def test_streaming_interactions_priority_service_tier_billing(
+    routes, message, reported_tier, expected_micro
+):
+    gate, calls, replies = routes
+    resp = interaction_response()
+    resp["service_tier"] = reported_tier
+    resp["usage"] = {
+        "total_input_tokens": 100,
+        "total_output_tokens": 20,
+        "total_thought_tokens": 30,
+        "total_cached_tokens": 80,
+        "total_tokens": 150,
+    }
+    replies["vertex"].extend(
+        [
+            sse(stream_error("rate_limit_exceeded")),
+            httpx.Response(200, json=resp),
+        ]
+    )
+    out = await gate.generate({"current_message": "你好"}, "subject", message=message)
+    assert json.loads(out)["bubbles"]
+    assert len(calls["vertex"]) == 2 and not calls["developer"]
+    rows = await gate.store.all(
+        "SELECT l.status,l.amount,u.estimated_amount "
+        "FROM ledger l JOIN ledger_usage u ON u.id=l.id "
+        "WHERE u.model_lane='hydrogen' ORDER BY l.rowid"
+    )
+    assert [tuple(r) for r in rows] == [
+        ("settled", 0, 0),
+        ("settled", expected_micro, expected_micro),
+    ]
+
+
+@pytest.mark.parametrize("fallback_enabled", [True, False])
+async def test_stage2_priority_budget_exhausted_falls_back_to_developer_when_enabled(
+    routes, message, store, settings, fallback_enabled
+):
+    gate, calls, replies = routes
+    await gate.routing.set_config(
+        ProviderRoutingConfig(vertex_enabled=True, vertex_fallback_to_gemini=fallback_enabled)
+    )
+    # Measure exact 1.0x reserve on Stage 1, then tighten daily_usd to sit strictly between
+    # 1.0x (Standard / Gemini Developer API) and 1.8x (Vertex Priority).
+    orig_reserve = store.reserve
+    seen_reserves: list[Decimal] = []
+
+    async def spy_reserve(*args, **kwargs):
+        seen_reserves.append(args[2])
+        if len(seen_reserves) == 1:
+            settings.daily_usd = args[2] * Decimal("1.4")
+        return await orig_reserve(*args, **kwargs)
+
+    store.reserve = spy_reserve
+    replies["vertex"].append(sse(stream_error("429")))
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+
+    trace = {}
+    if fallback_enabled:
+        out = await gate.generate(
+            {"current_message": "预算夹心测试"}, "subject", message=message, generation_trace=trace
+        )
+        assert json.loads(out)["bubbles"]
+        assert len(calls["vertex"]) == 1 and len(calls["developer"]) == 1
+        assert trace["provider"] == "gemini_paid"
+        assert "vertex_service_tier" not in trace
+        assert trace["provider_incident"] == {
+            "provider": "vertex_paid",
+            "code": "429",
+            "fallback": "succeeded",
+            "fallback_target": "gemini_paid",
+        }
+        assert trace["provider_diagnostics"][0]["fallback"] == "succeeded"
+        rows = await store.all(
+            "SELECT p.provider,l.status,l.amount FROM ledger l "
+            "JOIN ledger_usage u ON u.id=l.id JOIN ledger_provider p ON p.id=l.id "
+            "WHERE u.model_lane='hydrogen' ORDER BY l.rowid"
+        )
+        assert [(r[0], r[1]) for r in rows] == [
+            ("vertex_paid", "settled"),
+            ("gemini_paid", "settled"),
+        ]
+        assert rows[0]["amount"] == 0 and rows[1]["amount"] > 0
+    else:
+        with pytest.raises(Rejected, match="budget_exhausted"):
+            await gate.generate(
+                {"current_message": "预算夹心测试"},
+                "subject",
+                message=message,
+                generation_trace=trace,
+            )
+        assert len(calls["vertex"]) == 1 and not calls["developer"]
+        assert trace["provider_incident"] == {
+            "provider": "vertex_paid",
+            "code": "429",
+            "fallback": "not_dispatched",
+            "fallback_target": "vertex_priority",
+            "fallback_detail": "budget_exhausted_daily",
+        }
+
+
+@pytest.mark.parametrize("fallback_enabled", [True, False])
+async def test_stage2_priority_http_400_falls_back_to_developer_when_enabled(
+    routes, message, store, fallback_enabled
+):
+    gate, calls, replies = routes
+    await gate.routing.set_config(
+        ProviderRoutingConfig(vertex_enabled=True, vertex_fallback_to_gemini=fallback_enabled)
+    )
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "message": "std 429"}}),
+            httpx.Response(400, json={"error": {"code": 400, "message": "priority unsupported"}}),
+        ]
+    )
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    trace = {}
+    if fallback_enabled:
+        out = await gate.generate(
+            {"current_message": "Priority 400 回退测试"},
+            "subject",
+            message=message,
+            generation_trace=trace,
+        )
+        assert json.loads(out)["bubbles"]
+        assert len(calls["vertex"]) == 2 and len(calls["developer"]) == 1
+        assert gate.vertex_blocked_until == 0.0
+        assert trace["provider"] == "gemini_paid"
+        assert "vertex_service_tier" not in trace
+        assert trace["provider_incident"] == {
+            "provider": "vertex_paid",
+            "code": "429",
+            "fallback": "succeeded",
+            "fallback_target": "gemini_paid",
+        }
+        assert len(trace["provider_diagnostics"]) == 2
+        std_diag, prio_diag = trace["provider_diagnostics"]
+        assert (std_diag["service_tier"], std_diag["http_status"], std_diag["fallback"]) == (
+            "standard",
+            429,
+            "failed",
+        )
+        assert (prio_diag["service_tier"], prio_diag["http_status"], prio_diag["fallback"]) == (
+            "priority",
+            400,
+            "succeeded",
+        )
+        rows = await store.all(
+            "SELECT p.provider,l.status,l.amount FROM ledger l "
+            "JOIN ledger_usage u ON u.id=l.id JOIN ledger_provider p ON p.id=l.id "
+            "WHERE u.model_lane='hydrogen' ORDER BY l.rowid"
+        )
+        assert [(r[0], r[1]) for r in rows] == [
+            ("vertex_paid", "settled"),
+            ("vertex_paid", "settled"),
+            ("gemini_paid", "settled"),
+        ]
+        assert rows[0]["amount"] == 0 and rows[1]["amount"] == 0 and rows[2]["amount"] > 0
+    else:
+        with pytest.raises(Rejected, match="gemini_unavailable"):
+            await gate.generate(
+                {"current_message": "Priority 400 禁用回退"},
+                "subject",
+                message=message,
+                generation_trace=trace,
+            )
+        assert len(calls["vertex"]) == 2 and not calls["developer"]
+        assert gate.vertex_blocked_until == 0.0
+        assert trace["provider_incident"] == {
+            "provider": "vertex_paid",
+            "code": "429",
+            "fallback": "disabled",
+        }
+        assert trace["provider_diagnostics"][-1]["fallback"] == "disabled"
+
+
+@pytest.mark.parametrize("vertex_enabled", [False, True])
+async def test_memory_archive_allow_flex_false_uses_standard_routing_and_extraction_contract(
+    routes, store, vertex_enabled
+):
+    from hakimi.dual_memory import EXTRACTION_INSTRUCTION, EXTRACTION_RESPONSE_FORMAT
+
+    gate, calls, replies = routes
+    await gate.routing.set_config(ProviderRoutingConfig(vertex_enabled=vertex_enabled))
+    archive_json = '{"profiles":[],"chronicles":[]}'
+
+    def _archive_ok():
+        resp = interaction_response()
+        resp["steps"][0]["content"][0]["text"] = archive_json
+        return httpx.Response(200, json=resp)
+
+    # 1. Default allow_flex=True: always uses Developer API with service_tier="flex" & 0.5x rate.
+    replies["developer"].append(_archive_ok())
+    trace_flex = {}
+    out_flex = await gate.generate(
+        {"task": "dual_memory", "recent_messages": []},
+        "mem-sub",
+        scenario=Scenario.MEMORY_COMPRESSION,
+        budget_lane="memory",
+        audit_source="memory",
+        memory_archive=True,
+        generation_trace=trace_flex,
+    )
+    assert out_flex == archive_json
+    assert len(calls["developer"]) == 1 and len(calls["vertex"]) == 0
+    flex_body = calls["developer"][0]
+    assert flex_body["service_tier"] == "flex"
+    assert flex_body["store"] is False
+    assert EXTRACTION_INSTRUCTION in flex_body["system_instruction"]
+    assert flex_body["response_format"]["schema"] == EXTRACTION_RESPONSE_FORMAT
+    assert trace_flex["model_lane"] == "memory_flex"
+    assert trace_flex["provider"] == "gemini_paid"
+
+    # 2. allow_flex=False: uses 1.0x selected_model, normal Vertex/Gemini routing, no flex tier.
+    if vertex_enabled:
+        replies["vertex"].append(_archive_ok())
+    else:
+        replies["developer"].append(_archive_ok())
+    trace_std = {}
+    out_std = await gate.generate(
+        {"task": "dual_memory", "recent_messages": []},
+        "mem-sub",
+        scenario=Scenario.MEMORY_COMPRESSION,
+        budget_lane="memory",
+        audit_source="memory",
+        memory_archive=True,
+        allow_flex=False,
+        generation_trace=trace_std,
+    )
+    assert out_std == archive_json
+    if vertex_enabled:
+        assert len(calls["vertex"]) == 1 and len(calls["developer"]) == 1
+        std_body = calls["vertex"][0]
+        assert trace_std["provider"] == "vertex_paid"
+    else:
+        assert len(calls["developer"]) == 2 and len(calls["vertex"]) == 0
+        std_body = calls["developer"][1]
+        assert trace_std["provider"] == "gemini_paid"
+    assert "service_tier" not in std_body
+    assert std_body["store"] is False
+    assert std_body["model"] == "gemini-4-hydrogen"
+    assert EXTRACTION_INSTRUCTION in std_body["system_instruction"]
+    assert std_body["response_format"]["schema"] == EXTRACTION_RESPONSE_FORMAT
+    assert trace_std["model_lane"] == "hydrogen"
+
+    # Verify memory budget lane + 0.5x vs 1.0x billing:
+    # 100*1.50 + 50*7.50 = 525 microdollars (1.0x); 0.5x = 262.5 -> ceil 263 microdollars.
+    rows = await store.all(
+        "SELECT l.lane,u.model_lane,l.amount,p.provider FROM ledger l "
+        "JOIN ledger_usage u ON u.id=l.id JOIN ledger_provider p ON p.id=l.id "
+        "WHERE u.model_lane IN ('memory_flex','hydrogen') ORDER BY l.rowid"
+    )
+    assert [tuple(r) for r in rows] == [
+        ("memory", "memory_flex", 263, "gemini_paid"),
+        ("memory", "hydrogen", 525, "vertex_paid" if vertex_enabled else "gemini_paid"),
+    ]

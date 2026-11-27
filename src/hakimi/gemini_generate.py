@@ -79,11 +79,15 @@ class _GeminiGenerateMixin:
         text_parts: list[str] = []
         finish_reason: Any = None
         usage_metadata: Any = None
+        service_tier: Any = None
         length = 0
         for chunk in chunks:
             um = getattr(chunk, "usage_metadata", None)
             if um is not None:
                 usage_metadata = um
+            tier = getattr(chunk, "service_tier", None)
+            if tier is not None:
+                service_tier = tier
             candidates = getattr(chunk, "candidates", None) or []
             if not candidates:
                 feedback = getattr(chunk, "prompt_feedback", None)
@@ -156,6 +160,7 @@ class _GeminiGenerateMixin:
             status=status,
             usage=None,
             usage_metadata=usage_metadata,
+            service_tier=service_tier,
             steps=[
                 SimpleNamespace(
                     type="model_output",
@@ -183,6 +188,22 @@ class _GeminiGenerateMixin:
                         if getattr(part, "thought", False):
                             if progress is not None:
                                 progress.thought_steps += 1
+                            continue
+                        if (
+                            getattr(part, "function_call", None) is not None
+                            or getattr(part, "executable_code", None) is not None
+                            or any(
+                                getattr(part, bad_field, None) is not None
+                                for bad_field in (
+                                    "inline_data",
+                                    "file_data",
+                                    "function_response",
+                                    "code_execution_result",
+                                )
+                            )
+                        ):
+                            if progress is not None:
+                                progress.has_non_text_output = True
                             continue
                         part_text = getattr(part, "text", None)
                         if isinstance(part_text, str) and part_text:
@@ -220,6 +241,7 @@ class _GeminiGenerateMixin:
         generation_trace: dict | None = None,
         cancel_event=None,
         memory_archive=False,
+        allow_flex: bool = True,
         life_plan: bool = False,
         morning_thinking: Literal["medium", "high"] | None = None,
         on_text=None,
@@ -279,7 +301,9 @@ class _GeminiGenerateMixin:
             raise Rejected("invalid_life_plan")
         policy = preferences(self.s)
         selected_model = policy.primary_model
+        use_flex_archive = bool(memory_archive and allow_flex)
         flex_lane = "memory_flex" if selected_model == "hydrogen" else selected_model + "_flex"
+        archive_lane = flex_lane if use_flex_archive else selected_model
         plan = (
             GenerationPlan(
                 supported_level(
@@ -291,7 +315,7 @@ class _GeminiGenerateMixin:
             )
             if life_plan
             else GenerationPlan(
-                supported_level(selected_model, policy.memory_compression), 4096, flex_lane
+                supported_level(selected_model, policy.memory_compression), 4096, archive_lane
             )
             if memory_archive
             else generation_plan(self.s, scenario, deep=deep, route=route)
@@ -524,7 +548,7 @@ class _GeminiGenerateMixin:
 
             use_vertex = (
                 not developer_fallback
-                and not memory_archive
+                and not use_flex_archive
                 and video is None
                 and self._should_use_vertex()
             )
@@ -701,7 +725,7 @@ class _GeminiGenerateMixin:
             long_audio = sum(a.duration_sec for a in audio_items) > 60
             deadline_seconds = (
                 self.s.memory_flex_timeout
-                if memory_archive
+                if use_flex_archive
                 else max(self.s.generation_timeout, 120)
                 if video
                 else max(self.s.generation_timeout, 90)
@@ -819,7 +843,7 @@ class _GeminiGenerateMixin:
                             vertex_interactions_404 = True
                             return await _call_vertex_generate_content()
                         raise
-                client = self._flex_chat_client() if memory_archive else self.chat_client
+                client = self._flex_chat_client() if use_flex_archive else self.chat_client
                 response = await client.aio.interactions.create(
                     model=model,
                     system_instruction=system,
@@ -843,7 +867,7 @@ class _GeminiGenerateMixin:
                     automatic_continuation=False,
                     **(
                         {"timeout": self.s.memory_flex_timeout, "service_tier": "flex"}
-                        if memory_archive
+                        if use_flex_archive
                         else {"timeout": 120}
                         if video is not None
                         else {"timeout": max(int(self.s.generation_timeout), 90)}
@@ -1017,7 +1041,7 @@ class _GeminiGenerateMixin:
                     )
                     if not priority_dispatched:
                         if (
-                            str(priority_exc) == "vertex_unavailable"
+                            str(priority_exc) in {"vertex_unavailable", "budget_exhausted"}
                             and self.routing.config.vertex_fallback_to_gemini
                         ):
                             if primary_detail is not None:
@@ -1191,7 +1215,7 @@ class _GeminiGenerateMixin:
             if attempts and isinstance(exc, Rejected):
                 exc.provider_diagnostics = list(attempts)
                 archive_will_audit = (
-                    memory_archive
+                    use_flex_archive
                     and audit_source == "memory"
                     and exc.detail == "flex_capacity_busy"
                 )

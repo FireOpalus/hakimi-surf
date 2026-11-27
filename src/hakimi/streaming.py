@@ -17,20 +17,36 @@ def upstream_error_code(value: object) -> str:
     return "unknown"
 
 
+_UPSTREAM_ERROR_HTTP_STATUSES = {
+    "bad_request": 400,
+    "invalid_argument": 400,
+    "failed_precondition": 400,
+    "out_of_range": 400,
+    "unauthenticated": 401,
+    "unauthorized": 401,
+    "permission_denied": 403,
+    "forbidden": 403,
+    "not_found": 404,
+    "already_exists": 409,
+    "aborted": 409,
+    "conflict": 409,
+    "payload_too_large": 413,
+    "request_entity_too_large": 413,
+    "unprocessable_entity": 422,
+    "rate_limit_exceeded": 429,
+    "quota_exceeded": 429,
+    "too_many_requests": 429,
+    "resource_exhausted": 429,
+    "rate_limited": 429,
+}
+
+
 def upstream_http_status(code: str | None) -> int | None:
     if not code:
         return None
     if re.fullmatch(r"[45][0-9]{2}", code):
         return int(code)
-    if code.lower() in {
-        "rate_limit_exceeded",
-        "quota_exceeded",
-        "too_many_requests",
-        "resource_exhausted",
-        "rate_limited",
-    }:
-        return 429
-    return None
+    return _UPSTREAM_ERROR_HTTP_STATUSES.get(code.lower())
 
 
 class StreamProgress:
@@ -41,6 +57,7 @@ class StreamProgress:
         self.started = False
         self.text_parts: list[str] = []
         self.thought_steps = 0
+        self.has_non_text_output = False
         self.error_code: str | None = None
         self._on_text = on_text
 
@@ -57,14 +74,28 @@ class StreamProgress:
     def output_text(self) -> str:
         return "".join(self.text_parts)
 
+    @property
+    def has_emitted_output(self) -> bool:
+        return bool(self.output_text or self.has_non_text_output)
+
 
 async def consume_stream(stream, progress: StreamProgress | None = None):
     steps = {}
     length = 0
+    service_tier = None
+    usage_metadata = None
     try:
         async for event in stream:
             if progress is not None:
                 progress.started = True
+            ev_interaction = getattr(event, "interaction", None)
+            if ev_interaction is not None:
+                ev_tier = getattr(ev_interaction, "service_tier", None)
+                if ev_tier is not None:
+                    service_tier = ev_tier
+                ev_um = getattr(ev_interaction, "usage_metadata", None)
+                if ev_um is not None:
+                    usage_metadata = ev_um
             kind = event.event_type
             if kind == "step.start":
                 step = event.step
@@ -111,6 +142,8 @@ async def consume_stream(stream, progress: StreamProgress | None = None):
                     id=getattr(interaction, "id", None),
                     status=interaction.status,
                     usage=interaction.usage,
+                    usage_metadata=getattr(interaction, "usage_metadata", None) or usage_metadata,
+                    service_tier=getattr(interaction, "service_tier", None) or service_tier,
                     steps=[
                         SimpleNamespace(
                             type="model_output",

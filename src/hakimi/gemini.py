@@ -103,6 +103,7 @@ __all__ = [
 
 _CLIENT_NO_TRIP_HTTP_STATUSES = frozenset({400, 404, 409, 413, 422})
 _AUTH_GLOBAL_TRIP_HTTP_STATUSES = frozenset({401, 403})
+_NON_BILLABLE_HTTP_STATUSES = frozenset({400, 401, 403, 404, 409, 413, 422, 429})
 _DEFAULT_CIRCUIT_COOLDOWN_SECONDS = 60.0
 _DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 3
 
@@ -671,11 +672,11 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         return None
 
     @classmethod
-    def _non_billable_http_error(cls, exc: BaseException, stream_started: bool) -> bool:
-        if stream_started:
+    def _non_billable_http_error(cls, exc: BaseException, emitted_output: bool) -> bool:
+        if emitted_output:
             return False
         status = cls._http_status(exc)
-        return status in {400, 401, 403, 404, 409, 413, 422, 429}
+        return status in _NON_BILLABLE_HTTP_STATUSES
 
     def _reserve_kwargs(
         self, model_lane: str | None, thinking_level: str | None, provider: str | None
@@ -983,8 +984,10 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 raise rejected("gemini_unavailable") from None
             except Rejected as exc:
                 elapsed = max(0.0, time.monotonic() - started_at)
+                stream_non_billable = False
                 if str(exc) == "stream_provider_error":
                     stream_code = stream_progress.error_code if stream_progress else "unknown"
+                    stream_status = upstream_http_status(stream_code)
                     observe(
                         error_facts(
                             exc,
@@ -995,25 +998,43 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                         elapsed,
                     )
                     exc.provider_diagnostics = list(attempts)
-                    if provider == "gemini_paid":
-                        stream_status = upstream_http_status(stream_code)
-                        if stream_status is not None:
-                            self._record_paid_failure(model_lane, budget_lane, status=stream_status)
-                await asyncio.shield(
-                    self.store.settle(
-                        reservation,
-                        None,
-                        **self._settle_kwargs(
-                            fallback_actual=fallback_cost(elapsed),
-                            model_lane=model_lane,
-                            thinking_level=thinking_level,
-                            provider=provider,
-                        ),
+                    if provider == "gemini_paid" and stream_status is not None:
+                        self._record_paid_failure(model_lane, budget_lane, status=stream_status)
+                    stream_non_billable = (
+                        stream_progress is not None
+                        and not stream_progress.has_emitted_output
+                        and stream_status in _NON_BILLABLE_HTTP_STATUSES
                     )
-                )
+                if stream_non_billable:
+                    await asyncio.shield(
+                        self.store.settle(
+                            reservation,
+                            Decimal(0),
+                            **self._settle_kwargs(
+                                discounted_actual=Decimal(0),
+                                model_lane=model_lane,
+                                thinking_level=thinking_level,
+                                provider=provider,
+                            ),
+                        )
+                    )
+                else:
+                    await asyncio.shield(
+                        self.store.settle(
+                            reservation,
+                            None,
+                            **self._settle_kwargs(
+                                fallback_actual=fallback_cost(elapsed),
+                                model_lane=model_lane,
+                                thinking_level=thinking_level,
+                                provider=provider,
+                            ),
+                        )
+                    )
                 raise
             except Exception as exc:
                 stream_started = bool(stream_progress and stream_progress.started)
+                has_emitted_output = bool(stream_progress and stream_progress.has_emitted_output)
                 status = self._http_status(exc)
                 observe(
                     error_facts(exc, expired=False, http_status=status, stream_code=None),
@@ -1021,7 +1042,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 )
                 if stream_progress is not None and status is not None and 400 <= status <= 599:
                     stream_progress.error_code = str(status)
-                non_billable = self._non_billable_http_error(exc, stream_started) or (
+                non_billable = self._non_billable_http_error(exc, has_emitted_output) or (
                     model_lane in FLEX_MODELS and not stream_started and status == 503
                 )
                 if non_billable:
