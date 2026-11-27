@@ -6,11 +6,11 @@ import time
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import Field
+from pydantic import ConfigDict, Field, ValidationError
 
 from hakimi_plugin_sdk.bili_common import extract_bvid
 
-from .admin_common import body, domain_lock, service
+from .admin_common import body, domain_lock, invalid_input_http_error, service
 from .admin_dashboard_routes import Input
 from .admission_policy import is_bot_hard_blocked
 from .attention import can_watch_video, classify_attention
@@ -58,6 +58,36 @@ class MemoryMirrorConfig(Input):
 
 class MemoryQuery(Input):
     query: str = Field(default="", max_length=200)
+
+
+class SessionCompressOptions(Input):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    retry_failed: bool = False
+
+
+async def _optional_compress_options(request: Request) -> SessionCompressOptions:
+    if request.headers.get("content-encoding", "identity") != "identity":
+        raise HTTPException(415, "compressed requests are not supported")
+    raw = bytearray()
+    max_bytes = request.app.state.settings.max_body_bytes
+    try:
+        async with asyncio.timeout(5):
+            async for chunk in request.stream():
+                raw.extend(chunk)
+                if len(raw) > max_bytes:
+                    raise HTTPException(413, "request too large")
+    except TimeoutError:
+        raise HTTPException(408, "request timed out") from None
+    if not raw or not raw.strip():
+        return SessionCompressOptions()
+    if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+        raise HTTPException(415, "application/json required")
+    from .app import json_object
+
+    try:
+        return SessionCompressOptions.model_validate(json_object(bytes(raw)))
+    except ValidationError as exc:
+        raise invalid_input_http_error(exc) from None
 
 
 async def _dual_stats(svc, msg, enabled: bool) -> dict:
@@ -184,9 +214,19 @@ async def reset_session(request: Request, key: str):
 
 @router.post("/sessions/{key}/compress")
 async def compress_session(request: Request, key: str):
+    options = await _optional_compress_options(request)
+    msg = await session_message(request, key)
     request.app.state.admin_auth.costly()
     svc = service(request)
-    return await svc.compressor.compress(await session_message(request, key), force=True)
+    requeued = 0
+    if options.retry_failed:
+        dual = getattr(svc.sessions, "dual", None)
+        if dual is not None and hasattr(dual, "requeue_failed"):
+            requeued = await dual.requeue_failed(msg)
+    result = await svc.compressor.compress(msg, force=True)
+    if options.retry_failed and isinstance(result, dict):
+        return {**result, "requeued_failed": requeued}
+    return result
 
 
 @router.post("/sandbox")

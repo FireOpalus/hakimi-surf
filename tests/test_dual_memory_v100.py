@@ -128,6 +128,9 @@ async def test_old_database_migrates_twice_without_changing_ciphertext(settings,
                 assert (await cur.fetchone())[0] == "wal"
             async with db.execute("PRAGMA secure_delete") as cur:
                 assert (await cur.fetchone())[0] == 1
+            async with db.execute("PRAGMA table_info(memory_slice_jobs)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+                assert "screened" in cols
     assert path.stat().st_mode & 0o777 == 0o600
     assert "旧内容".encode() not in path.read_bytes()
 
@@ -829,11 +832,14 @@ async def test_flex_dedicated_timeout_and_rate_limit_zero_cost_backoff_requeue(
     r_wait = await comp.extract(msg, background=True)
     assert r_wait["status"] == "provider_backoff" and len(calls) == before_calls
 
-    # After backoff expires and 429 clears -> slice compresses cleanly to done.
+    # After backoff expires and 429 clears -> slice compresses cleanly to done without re-screening.
     now[0] += 70.0
     mode[0] = "ok"
+    decisions_before_retry = sum(1 for p in calls if p.endswith("decisions"))
     r2 = await comp.extract(msg, background=True)
     assert r2["status"] == "compressed"
+    # Only 1 additional decision call (output screen); source screen was skipped via screened=1.
+    assert sum(1 for p in calls if p.endswith("decisions")) == decisions_before_retry + 1
     assert [
         row[0]
         for row in await store.all(
@@ -853,3 +859,43 @@ async def test_flex_dedicated_timeout_and_rate_limit_zero_cost_backoff_requeue(
         )
     )[0] == 2
     assert (await sessions.dual.view(msg))["jobs"]["failed"] == 1
+
+
+async def test_coalesced_batch_rescreens_when_unscreened_slice_joins(settings, store, message):
+    sessions, msg = SessionManager(settings, store), group(message)
+    await seed(sessions, msg, text="第一批已审", count=1)
+    s1 = await sessions.dual.snapshot_cold(msg, force=True)
+    j1 = await sessions.dual.claim(msg)
+    await sessions.dual.mark_screened(msg, j1)
+    await sessions.dual.requeue(msg, j1)
+
+    # Slice 1 alone is already screened.
+    assert (await sessions.dual.peek(msg))["screened"] is True
+
+    # A brand-new unscreened slice joins the pending batch -> combined batch must screen.
+    await seed(sessions, msg, text="第二批未审", count=1)
+    s2 = await sessions.dual.snapshot_cold(msg, force=True)
+    combined = await sessions.dual.peek(msg)
+    assert combined["ids"] == [s1, s2]
+    assert combined["screened"] is False
+
+    ai = FakeGateway()
+    screen_count = 0
+
+    async def fake_screen(payload, subject, **kwargs):
+        nonlocal screen_count
+        if kwargs.get("purpose") == "source":
+            screen_count += 1
+        return "safe"
+
+    async def fake_generate(payload, subject, **kwargs):
+        return '{"profiles":[],"chronicles":[]}'
+
+    ai.screen = fake_screen
+    ai.generate = fake_generate
+    worker = MemoryCompressor(settings, sessions, ai, store)
+    assert (await worker.extract(msg, force=True))["status"] == "compressed"
+    assert screen_count == 1
+    async with sessions.database(msg, preserve_history=True) as (db, _):
+        async with db.execute("SELECT id,screened FROM memory_slice_jobs") as cur:
+            assert dict(await cur.fetchall()) == {s1: 1, s2: 1}

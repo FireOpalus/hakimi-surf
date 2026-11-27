@@ -1,6 +1,7 @@
 """Background, bounded compression with persisted attempts and optimistic commits."""
 
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -10,13 +11,29 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from .bot_server import is_persona_owner, untrusted_input
-from .dual_memory import EXTRACTION_INSTRUCTION, parse_extraction
+from .dual_memory import EXTRACTION_INSTRUCTION, FLEX_CAPACITY_DELAYS, parse_extraction
 from .generation_policy import Scenario
 from .security import Rejected, configured_secrets
 from .work_usage import model_work
 
 MAX_RATE_LIMIT_RETRIES = 2
 RATE_LIMIT_BACKOFF_SECONDS = 60.0
+
+
+def _supports_kwarg(fn, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            param.name == name
+            and param.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for param in sig.parameters.values()
+    )
 
 
 def check_memory_text(text, settings):
@@ -163,12 +180,14 @@ class MemoryCompressor:
                 await self.store.runtime.event("compression_failed", "memory")
                 return {"status": "failed"}
 
-    def _estimate_extract_reserve(self, payload_bytes: int) -> Decimal:
+    def _estimate_extract_reserve(self, payload_bytes: int, *, screened: bool = False) -> Decimal:
         decision_in = self.s.decision_input_usd_per_m
         flex_in = self.s.chat_input_usd_per_m / 2
         flex_out = self.s.chat_output_usd_per_m / 2
         system_bytes = len(EXTRACTION_INSTRUCTION.encode("utf-8"))
-        source_reserve = ((payload_bytes + 4096) * decision_in) / 1_000_000
+        source_reserve = (
+            Decimal(0) if screened else ((payload_bytes + 4096) * decision_in) / 1_000_000
+        )
         flex_reserve = (
             (payload_bytes + system_bytes + 4096) * flex_in + 4096 * flex_out
         ) / 1_000_000
@@ -217,7 +236,11 @@ class MemoryCompressor:
             }
             payload_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
             if not await self.store.can_reserve(
-                subject, "memory", self._estimate_extract_reserve(payload_bytes)
+                subject,
+                "memory",
+                self._estimate_extract_reserve(
+                    payload_bytes, screened=bool(candidate.get("screened"))
+                ),
             ):
                 return {"status": "budget_hard_stop"}
             snapshot = await self.sessions.dual.claim(
@@ -248,22 +271,63 @@ class MemoryCompressor:
             try:
                 check_memory_text(str(payload), self.s)
                 with model_work("memory.extract", snapshot["batch_id"], independent=True):
-                    await self.ai.screen(
-                        payload,
-                        subject,
-                        purpose="source",
-                        budget_lane="memory",
-                        audit_source="memory",
-                    )
-                    result = await self.ai.generate(
-                        payload,
-                        subject,
-                        scenario=Scenario.MEMORY_COMPRESSION,
-                        budget_lane="memory",
-                        audit_source="memory",
-                        memory_archive=True,
-                        before_call=guard,
-                    )
+                    if not snapshot.get("screened"):
+                        await self.ai.screen(
+                            payload,
+                            subject,
+                            purpose="source",
+                            budget_lane="memory",
+                            audit_source="memory",
+                        )
+                        if hasattr(self.sessions.dual, "mark_screened"):
+                            await self.sessions.dual.mark_screened(message, snapshot)
+                        snapshot["screened"] = True
+                    try:
+                        result = await self.ai.generate(
+                            payload,
+                            subject,
+                            scenario=Scenario.MEMORY_COMPRESSION,
+                            budget_lane="memory",
+                            audit_source="memory",
+                            memory_archive=True,
+                            before_call=guard,
+                        )
+                    except Rejected as flex_exc:
+                        if (
+                            flex_exc.detail != "flex_capacity_busy"
+                            or snapshot["flex_failures"] < len(FLEX_CAPACITY_DELAYS)
+                            or not _supports_kwarg(self.ai.generate, "allow_flex")
+                        ):
+                            raise
+                        try:
+                            result = await self.ai.generate(
+                                payload,
+                                subject,
+                                scenario=Scenario.MEMORY_COMPRESSION,
+                                budget_lane="memory",
+                                audit_source="memory",
+                                memory_archive=True,
+                                allow_flex=False,
+                                before_call=guard,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as fallback_exc:
+                            if (
+                                isinstance(fallback_exc, Rejected)
+                                and str(fallback_exc) == "compression_stale"
+                            ):
+                                raise
+                            fallback_diags = (
+                                list(fallback_exc.provider_diagnostics)
+                                if isinstance(fallback_exc, Rejected)
+                                else []
+                            )
+                            if fallback_diags:
+                                flex_exc.provider_diagnostics = (
+                                    list(flex_exc.provider_diagnostics) + fallback_diags
+                                )
+                            raise flex_exc from fallback_exc
                 check_memory_text(result, self.s)
                 extraction = parse_extraction(result)
                 committed = await self.sessions.dual.commit(message, snapshot, extraction)

@@ -260,3 +260,37 @@ async def test_reset_during_send_delay_prevents_legacy_reply(settings, store, me
         await store.enqueue_reply(store.event_key(message), message, "legacy reply")
         assert await svc.deliver_once()
     assert not requests
+
+
+async def test_legacy_admin_compress_accepts_empty_body_and_opt_in_retry_failed(settings, message):
+    import httpx
+    from pydantic import SecretStr
+
+    from hakimi.app import create_app
+
+    token = "legacy-compress-route-token-123456"
+    settings.admin_token = SecretStr(token)
+    settings.owner_qq_id = "20000"
+    app = create_app(settings, gateway_factory=FakeGateway, start_workers=False)
+    async with app.router.lifespan_context(app):
+        svc = app.state.service
+        await fill(svc.sessions, message)
+        key = svc.sessions.key(message)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:12141",
+            headers={"Authorization": "Bearer " + token},
+        ) as client:
+            r1 = await client.post(f"/admin/api/sessions/{key}/compress")
+            assert r1.status_code == 200
+            assert r1.json()["status"] == "compressed"
+            assert "requeued_failed" not in r1.json()
+
+            await fill(svc.sessions, message, rounds=5, text="第二批话题")
+            r2 = await client.post(
+                f"/admin/api/sessions/{key}/compress",
+                json={"retry_failed": True},
+            )
+            assert r2.status_code == 200
+            assert r2.json()["status"] == "compressed"
+            assert r2.json()["requeued_failed"] == 0
