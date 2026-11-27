@@ -397,7 +397,10 @@ class MemoryHub:
             return {}
         try:
             if hasattr(sessions, "database") and hasattr(sessions, "vault"):
-                async with sessions.database(owner_msg, preserve_history=True) as (db, key):
+                async with sessions.database(owner_msg, preserve_history=True, readonly=True) as (
+                    db,
+                    key,
+                ):
                     async with db.execute("SELECT enabled FROM session_meta") as cur:
                         row_en = await cur.fetchone()
                     enabled = bool(row_en and row_en[0])

@@ -48,6 +48,10 @@ CREATE INDEX IF NOT EXISTS idx_event_ledger_active
     ON event_ledger(status, visibility, due_at, expires_at);
 CREATE INDEX IF NOT EXISTS idx_event_ledger_target
     ON event_ledger(status, target_module, due_at);
+CREATE INDEX IF NOT EXISTS idx_event_ledger_status_expires
+    ON event_ledger(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_event_ledger_status_updated
+    ON event_ledger(status, updated_at);
 """
 
 
@@ -151,11 +155,15 @@ class EventLedger:
                         await self.store.db.execute(sql)
             self._initialized = True
 
-    def _decode_row(self, row: Any) -> LedgerEvent:
+    def _decode_row(self, row: Any, *, now: float | None = None) -> LedgerEvent:
         body = self.store.vault.open(f"event-ledger:{row['id']}", row["body_blob"])
         if not isinstance(body, dict):
             body = {}
         payload = body.get("payload")
+        expires_at = float(row["expires_at"])
+        status = row["status"]
+        if now is not None and status == "pending" and expires_at <= now:
+            status = "expired"
         return LedgerEvent(
             id=row["id"],
             dedupe_key=row["dedupe_key"],
@@ -163,10 +171,10 @@ class EventLedger:
             target_module=row["target_module"],
             event_type=row["event_type"],
             visibility=row["visibility"],
-            status=row["status"],
+            status=status,
             created_at=float(row["created_at"]),
             due_at=float(row["due_at"]),
-            expires_at=float(row["expires_at"]),
+            expires_at=expires_at,
             updated_at=float(row["updated_at"]),
             consumed_at=float(row["consumed_at"]) if row["consumed_at"] is not None else None,
             consumed_by=row["consumed_by"] or "",
@@ -342,6 +350,13 @@ class EventLedger:
         """Transition expired pending entries so stale dead commitments never linger."""
         await self.initialize()
         ts = self.clock() if now is None else float(now)
+        async with self.store.lock:
+            has_expired = await self.store.one(
+                "SELECT 1 FROM event_ledger WHERE status='pending' AND expires_at<=? LIMIT 1",
+                (ts,),
+            )
+        if not has_expired:
+            return 0
         async with self.store.transaction():
             cur = await self.store.db.execute(
                 "UPDATE event_ledger SET status='expired', updated_at=? "
@@ -362,10 +377,9 @@ class EventLedger:
         limit: int = 20,
         now: float | None = None,
     ) -> list[LedgerEvent]:
-        """Read matching ledger entries without consuming them."""
+        """Read matching ledger entries without consuming them or opening write locks."""
         await self.initialize()
         ts = self.clock() if now is None else float(now)
-        await self.expire_due(ts)
 
         clauses: list[str] = []
         params: list[Any] = []
@@ -392,12 +406,12 @@ class EventLedger:
         async with self.store.lock:
             rows = await self.store.all(
                 f"SELECT * FROM event_ledger {where} "
-                "ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, "
+                "ORDER BY CASE WHEN status='pending' AND expires_at>? THEN 0 ELSE 1 END, "
                 "CASE WHEN due_at<=? THEN 0 ELSE 1 END, "
                 "due_at ASC, created_at ASC LIMIT ?",
-                (*params, ts, bounded_limit),
+                (*params, ts, ts, bounded_limit),
             )
-        return [self._decode_row(row) for row in rows]
+        return [self._decode_row(row, now=ts) for row in rows]
 
     async def consume(
         self,
@@ -426,11 +440,11 @@ class EventLedger:
         placeholders = ",".join("?" for _ in candidate_keys)
         async with self.store.transaction():
             row = await self.store.one(
-                "SELECT id, source_module, visibility, status FROM event_ledger "
+                "SELECT id, source_module, visibility, status, expires_at FROM event_ledger "
                 f"WHERE id=? OR dedupe_key IN ({placeholders}) LIMIT 1",
                 (target, *candidate_keys),
             )
-            if row is None or row["status"] != "pending":
+            if row is None or row["status"] != "pending" or float(row["expires_at"]) <= ts:
                 return False
             if row["visibility"] == "owner_private" and not allow_owner_private:
                 return False
@@ -438,15 +452,14 @@ class EventLedger:
                 return False
             cur = await self.store.db.execute(
                 "UPDATE event_ledger SET status='consumed', consumed_at=?, consumed_by=?, "
-                "updated_at=? WHERE id=? AND status='pending'",
-                (ts, clean_consumer, ts, row["id"]),
+                "updated_at=? WHERE id=? AND status='pending' AND expires_at>?",
+                (ts, clean_consumer, ts, row["id"], ts),
             )
             return cur.rowcount == 1
 
     async def planner_state(self, now: float) -> tuple[list[LedgerEvent], str, float | None]:
         """Return bounded active items, due digest for idle suppression, and next due timestamp."""
         await self.initialize()
-        await self.expire_due(now)
         async with self.store.lock:
             rows = await self.store.all(
                 "SELECT * FROM event_ledger WHERE status='pending' AND expires_at>? "
@@ -462,7 +475,7 @@ class EventLedger:
         next_upcoming = min(
             (float(r["due_at"]) for r in rows if float(r["due_at"]) > now), default=None
         )
-        items = [self._decode_row(row) for row in rows[:10]]
+        items = [self._decode_row(row, now=now) for row in rows[:10]]
         return items, due_digest, next_upcoming
 
     async def status_counts(self, now: float | None = None) -> tuple[int, int]:
@@ -498,12 +511,19 @@ class EventLedger:
                 now = self.clock()
                 await self.expire_due(now)
                 cutoff = now - SETTLED_RETENTION_SECONDS
-                async with self.store.transaction():
-                    await self.store.db.execute(
-                        "DELETE FROM event_ledger "
-                        "WHERE status IN ('consumed', 'expired') AND updated_at<?",
+                async with self.store.lock:
+                    has_prunable = await self.store.one(
+                        "SELECT 1 FROM event_ledger "
+                        "WHERE status IN ('consumed', 'expired') AND updated_at<? LIMIT 1",
                         (cutoff,),
                     )
+                if has_prunable:
+                    async with self.store.transaction():
+                        await self.store.db.execute(
+                            "DELETE FROM event_ledger "
+                            "WHERE status IN ('consumed', 'expired') AND updated_at<?",
+                            (cutoff,),
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:

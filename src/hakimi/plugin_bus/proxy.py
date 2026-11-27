@@ -705,10 +705,15 @@ class RemoteModuleProxy(BaseModule):
                 allow_nan=False,
             )
             if len(probe.encode("utf-8")) <= self._bus._max_frame_bytes():
+                inline_timeout = max(
+                    self._bus.rpc_timeout,
+                    60.0 if clean_title is not None else 30.0,
+                )
                 return await self._deliver_rpc(
                     "delivery.send_voice",
                     inline_payload,
                     before_send=before_send,
+                    timeout=inline_timeout,
                 )
 
         if not self.supports_voice_blob:
@@ -817,6 +822,7 @@ class RemoteModuleProxy(BaseModule):
                 "delivery.send_media",
                 inline_payload,
                 before_send=before_send,
+                timeout=max(self._bus.rpc_timeout, 30.0),
             )
 
         if not self.supports_media_blob:

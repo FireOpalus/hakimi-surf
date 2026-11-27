@@ -221,6 +221,12 @@ class DualMemory:
         self.s, self.vault = sessions.s, sessions.vault
         self.index = RecallIndex()
         self._stats_cache: OrderedDict[str, tuple[int, int, int, int]] = OrderedDict()
+        self.dirty_sessions: set[str] = set()
+        self.deferred_until: dict[str, float] = {}
+
+    def mark_dirty(self, key: str) -> None:
+        self.dirty_sessions.add(key)
+        self.deferred_until.pop(key, None)
 
     async def migrate(self, db, key):
         # Runs within the session transaction; preserves every legacy payload byte.
@@ -298,6 +304,8 @@ class DualMemory:
         await db.executemany(
             "INSERT OR IGNORE INTO memory_covered VALUES (?)", [(r["seq"],) for r in fresh]
         )
+        if fresh:
+            self.mark_dirty(key)
         return ident
 
     async def snapshot_cold(self, message, *, before=None, force=False):
@@ -351,6 +359,7 @@ class DualMemory:
         ) as cur:
             pending = await cur.fetchall()
         if not pending:
+            self.deferred_until.pop(key, None)
             return None
         if expected_ids is not None:
             wanted = list(expected_ids)
@@ -391,6 +400,8 @@ class DualMemory:
         if not retry and background and expected_ids is None and all(k == "expiry" for k in kinds):
             combined_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
             if len(messages) < 24 and combined_bytes < 4096 and time.time() - min_created < 1800:
+                self.dirty_sessions.discard(key)
+                self.deferred_until[key] = float(min_created + 1800)
                 return None
         return {
             "id": ids[0],
@@ -402,18 +413,37 @@ class DualMemory:
         }
 
     async def peek(self, message, *, background=False, now=None):
-        async with self.sessions.database(message, preserve_history=True) as (db, key):
+        key = self.sessions.key(message)
+        path = self.sessions.path(message)
+        self.sessions._check_not_symlink(path)
+        if not path.exists():
+            self.dirty_sessions.discard(key)
+            self.deferred_until.pop(key, None)
+            return None
+        async with self.sessions.database(message, preserve_history=True, readonly=True) as (
+            db,
+            key,
+        ):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 if not (await cur.fetchone())[0]:
+                    self.dirty_sessions.discard(key)
+                    self.deferred_until.pop(key, None)
                     return None
             async with db.execute(
                 "SELECT epoch,version,summary,(SELECT ready FROM memory_control) FROM rolling_state"
             ) as cur:
                 epoch, version, summary, ready = await cur.fetchone()
+            check_now = time.time() if now is None else now
             selected = await self._select_pending(
-                db, key, epoch, background=background, now=time.time() if now is None else now
+                db, key, epoch, background=background, now=check_now
             )
-            if not selected or selected.get("status") == "provider_backoff":
+            if selected is None:
+                if key not in self.deferred_until:
+                    self.dirty_sessions.discard(key)
+                return None
+            if selected.get("status") == "provider_backoff":
+                self.dirty_sessions.discard(key)
+                self.deferred_until[key] = float(selected["next_retry_at"])
                 return selected
             return {
                 **selected,
@@ -478,8 +508,12 @@ class DualMemory:
                 "WHERE batch_id=? AND status='attempted'",
                 ("failed" if exhausted else "pending", reason, failures, retry_at, batch),
             )
+        key = self.sessions.key(message)
         if exhausted:
+            self.deferred_until.pop(key, None)
             return {"status": "failed", "reason": reason}
+        self.dirty_sessions.discard(key)
+        self.deferred_until[key] = float(retry_at)
         return {
             "status": "provider_backoff",
             "reason": reason,
@@ -489,7 +523,7 @@ class DualMemory:
 
     async def requeue(self, message, snapshot):
         ids = snapshot.get("ids") or [snapshot["id"]]
-        async with self.sessions.database(message, preserve_history=True) as (db, _):
+        async with self.sessions.database(message, preserve_history=True) as (db, key):
             await db.executemany(
                 "UPDATE memory_slice_jobs SET "
                 "status='pending',attempt=NULL,"
@@ -498,6 +532,7 @@ class DualMemory:
                 "WHERE id=? AND status='attempted' AND batch_id=?",
                 [(ident, snapshot["batch_id"]) for ident in ids],
             )
+            self.mark_dirty(key)
 
     async def finish(self, message, snapshot, status, *, error=None):
         ids = snapshot.get("ids") or [snapshot["id"]]
@@ -568,13 +603,43 @@ class DualMemory:
         }
 
     async def stats(self, message) -> dict:
-        async with self.sessions.database(message, preserve_history=True) as (db, key):
+        path = self.sessions.path(message)
+        self.sessions._check_not_symlink(path)
+        if not path.exists():
+            return {
+                "dual_entries_count": 0,
+                "dual_chars": 0,
+                "flex_retry": None,
+                "archive_failed_slices": 0,
+                "archive_unconfirmed_slices": 0,
+            }
+        async with self.sessions.database(message, preserve_history=True, readonly=True) as (
+            db,
+            key,
+        ):
             async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
                 epoch, version = await cur.fetchone()
             return await self.stats_in_db(db, key, epoch, version)
 
     async def view(self, message, query=""):
-        async with self.sessions.database(message, preserve_history=True) as (db, key):
+        path = self.sessions.path(message)
+        self.sessions._check_not_symlink(path)
+        if not path.exists():
+            return {
+                "epoch": 0,
+                "version": 0,
+                "ready": False,
+                "entries": [],
+                "jobs": {},
+                "flex_retry": None,
+                "mirror_enabled": f"{message.platform}:{message.conversation_id}"
+                in self.s.roaming_group_ids,
+                "mirror": {"last_success": None, "last_error": None, "digest": None},
+            }
+        async with self.sessions.database(message, preserve_history=True, readonly=True) as (
+            db,
+            key,
+        ):
             async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
                 epoch, version = await cur.fetchone()
             async with db.execute(
@@ -722,6 +787,9 @@ class DualMemory:
                 "SELECT id,payload,locked,deleted,vector FROM chronicle_events"
             ) as cur:
                 existing = await cur.fetchall()
+            existing_ids = {r[0] for r in existing}
+            locked_rows = [r for r in existing if r[2]]
+            tombstone_cache: dict[str, tuple[set[int], bytes]] = {}
             for fact in extraction.chronicles:
                 if any(seq not in rows for seq in fact.evidence_seqs) or any(
                     len(t) > 40 for t in fact.tags
@@ -730,24 +798,37 @@ class DualMemory:
                 ident = self.vault.digest(
                     "chronicle-topic", key, fact.category, fact.topic.strip().lower()
                 )[:24]
+                fact_vec: bytes | None = None
+                fact_seqs = set(fact.evidence_seqs)
                 blocked = False
-                for old_id, blob, locked, deleted, old_vector in existing:
-                    old = self.vault.open(key + ":e:" + old_id, blob)
-                    # Locked deletion also blocks a paraphrased version of the same source/event.
-                    same_source = bool(set(old.get("evidence_seqs", [])) & set(fact.evidence_seqs))
-                    similar = (
-                        similarity(
-                            base64.b64decode(self.vault.open(key + ":v:" + old_id, old_vector)),
-                            vector(fact.text),
-                        )
-                        >= 0.78
-                    )
-                    if locked and (old_id == ident or (deleted and (same_source or similar))):
+                for old_id, blob, locked, deleted, old_vector in locked_rows:
+                    if not locked:
+                        continue
+                    if old_id == ident:
                         blocked = True
                         break
-                if blocked or (
-                    len(existing) >= MAX_ENTRIES and ident not in {r[0] for r in existing}
-                ):
+                    if not deleted:
+                        continue
+                    # Locked deletion also blocks a paraphrased version of the same source/event.
+                    cached_tombstone = tombstone_cache.get(old_id)
+                    if cached_tombstone is None:
+                        old = self.vault.open(key + ":e:" + old_id, blob)
+                        old_seqs = set(old.get("evidence_seqs", []))
+                        old_vec = base64.b64decode(
+                            self.vault.open(key + ":v:" + old_id, old_vector)
+                        )
+                        cached_tombstone = (old_seqs, old_vec)
+                        tombstone_cache[old_id] = cached_tombstone
+                    old_seqs, old_vec = cached_tombstone
+                    if old_seqs & fact_seqs:
+                        blocked = True
+                        break
+                    if fact_vec is None:
+                        fact_vec = vector(fact.text)
+                    if similarity(old_vec, fact_vec) >= 0.78:
+                        blocked = True
+                        break
+                if blocked or (len(existing) >= MAX_ENTRIES and ident not in existing_ids):
                     continue
                 data = fact.model_dump()
                 packed = vector(fact.text + " " + " ".join(fact.tags))
@@ -990,8 +1071,19 @@ class DualMemory:
                 peers.append(candidate)
             if len(peers) >= 24:
                 break
+        path = self.sessions.path(message)
+        self.sessions._check_not_symlink(path)
+        if not path.exists():
+            return (
+                {"speaker_profile": {}, "chronicle_recall": []}
+                if self.s.session_default_enabled
+                else {}
+            )
         mentioned_profiles = {}
-        async with self.sessions.database(message, preserve_history=True) as (db, key):
+        async with self.sessions.database(message, preserve_history=True, readonly=True) as (
+            db,
+            key,
+        ):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 if not (await cur.fetchone())[0]:
                     return {}

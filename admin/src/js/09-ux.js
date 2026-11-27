@@ -180,7 +180,9 @@ function appendHintContent(hint,parts){
   });
 }
 function enhanceLabel(label){
+  if(label.dataset.hintEnhanced==='1')return;
   if(label.closest('.login, .finder, .weather-methods, .scope-checks'))return;
+  label.dataset.hintEnhanced='1';
   let control=label.querySelector('input,select,textarea');
   const external=!control&&label.htmlFor?document.getElementById(label.htmlFor):null;
   const toggle=Boolean(control&&(control.type==='checkbox'||control.type==='radio'));
@@ -208,7 +210,7 @@ function enhanceLabel(label){
   }
 }
 function enhanceLabels(root){
-  if(root.nodeType!==1)return;
+  if(!root||root.nodeType!==1)return;
   if(root.matches('label'))enhanceLabel(root);
   root.querySelectorAll('label').forEach(enhanceLabel);
 }
@@ -233,9 +235,12 @@ function foldLongHelp(root){
 /* ---------- 启动 ---------- */
 document.querySelectorAll('#app section.tab').forEach(buildSectionNav);
 foldLongHelp($('app'));
-enhanceLabels(document.body);
+enhanceLabels($('app'));
 if('MutationObserver' in window){
-  new MutationObserver(records=>{
+  const labelObserver=new MutationObserver(records=>{
     for(const record of records)for(const node of record.addedNodes)enhanceLabels(node);
-  }).observe(document.body,{childList:true,subtree:true});
+  });
+  for(const form of document.querySelectorAll('#app form')){
+    labelObserver.observe(form,{childList:true,subtree:true});
+  }
 }

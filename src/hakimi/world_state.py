@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS scheduled_intents (
   updated_at REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_intents_due ON scheduled_intents(status, execute_after);
+CREATE INDEX IF NOT EXISTS idx_scheduled_intents_created ON scheduled_intents(created_at);
 CREATE TABLE IF NOT EXISTS global_events (
   id TEXT PRIMARY KEY,
   created_at REAL NOT NULL,
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS global_events (
   payload_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_global_events_unconsumed ON global_events(consumed, created_at);
+CREATE INDEX IF NOT EXISTS idx_global_events_created ON global_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_global_events_source_type_at
   ON global_events(source_module,event_type,created_at);
 CREATE TABLE IF NOT EXISTS group_proactive_cooldown (

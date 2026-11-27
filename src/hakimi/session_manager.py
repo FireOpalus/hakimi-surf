@@ -202,9 +202,61 @@ class SessionManager:
             row = await cur.fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
+    def _needs_expiry_sweep(self, key: str, current_fp: tuple[int, ...] | None, now: float) -> bool:
+        if current_fp is None:
+            return True
+        cached_expiry = self._expiry_cache.get(key)
+        return not (
+            cached_expiry is not None
+            and cached_expiry[2] == current_fp
+            and 0.0 <= now - cached_expiry[1] < self._EXPIRY_SWEEP_INTERVAL
+            and (cached_expiry[0] is None or now < cached_expiry[0])
+        )
+
+    def _needs_fold(self, texts: list[dict]) -> bool:
+        if not self.s.prefix_history_enabled or len(texts) < 2:
+            return False
+        rendered = history_lines(texts, self.s.onebot_self_id)
+        high_tokens = (
+            self.store.runtime.compression.history_high_tokens
+            if self.store.runtime.compression_overridden
+            else self.s.history_high_tokens
+        )
+        return (
+            estimate_tokens(rendered) >= high_tokens
+            or len(rendered.encode()) > self.s.history_max_bytes
+        )
+
     @asynccontextmanager
-    async def database(self, message: Message, *, preserve_history=False):
+    async def database(self, message: Message, *, preserve_history=False, readonly=False):
         key, path = self.key(message), self.path(message)
+        if readonly:
+            async with self.locks[int(key[:8], 16) % len(self.locks)]:
+                self._check_not_symlink(path)
+                if self._is_initialized_file(path, key) is not None:
+                    async with aiosqlite.connect(path, isolation_level=None) as db:
+                        await db.execute("PRAGMA busy_timeout=5000")
+                        await db.execute("BEGIN")
+                        try:
+                            try:
+                                async with db.execute("SELECT identity FROM session_meta") as cur:
+                                    row = await cur.fetchone()
+                            except sqlite3.OperationalError:
+                                self._evict_initialized(path, key)
+                                raise
+                            if not row or self.vault.open(key, row[0]) != message.session_parts(
+                                self.s.namespace
+                            ):
+                                if not row:
+                                    self._evict_initialized(path, key)
+                                raise Rejected("session_identity_mismatch")
+                            yield db, key
+                            await db.commit()
+                        except BaseException:
+                            await db.rollback()
+                            raise
+                    return
+            preserve_history = True
         await self.store.runtime.register(message)
         async with self.locks[int(key[:8], 16) % len(self.locks)]:
             self._check_not_symlink(path)
@@ -367,7 +419,9 @@ class SessionManager:
                     changes_before_yield = db.total_changes
                     yield db, key
                     caller_wrote = db.total_changes != changes_before_yield
-                    if not preserve_history and (need_sweep or caller_wrote):
+                    if (not preserve_history and (need_sweep or caller_wrote)) or (
+                        not fast_path and not caller_wrote
+                    ):
                         next_expiry = await self._min_expiry(db)
                     await db.commit()
                     committed = True
@@ -383,6 +437,8 @@ class SessionManager:
                     if preserve_history:
                         if caller_wrote:
                             self._expiry_cache.pop(key, None)
+                        elif not fast_path:
+                            self._expiry_cache[key] = (next_expiry, time.time(), post_fp)
                         elif cached_expiry is not None:
                             self._expiry_cache[key] = (
                                 cached_expiry[0],
@@ -471,7 +527,7 @@ class SessionManager:
         """Six recent entries in one consenting private session, without opening summaries."""
         if message.kind != "private":
             raise Rejected("invalid_private_scope")
-        async with self.database(message, preserve_history=True) as (db, key):
+        async with self.database(message, preserve_history=True, readonly=True) as (db, key):
             async with db.execute("SELECT epoch,enabled FROM rolling_state,session_meta") as cur:
                 epoch, enabled = await cur.fetchone()
             if not enabled:
@@ -485,6 +541,52 @@ class SessionManager:
                 ]
 
     async def snapshot(self, message: Message) -> dict:
+        key, path = self.key(message), self.path(message)
+        self._check_not_symlink(path)
+        now = time.time()
+        current_fp = self._is_initialized_file(path, key)
+        if (
+            current_fp is not None
+            and not self._needs_expiry_sweep(key, current_fp, now)
+            and getattr(self.database, "__func__", None) is SessionManager.database
+        ):
+            async with self.database(message, readonly=True) as (db, key):
+                async with db.execute("SELECT enabled FROM session_meta") as cur:
+                    enabled = bool((await cur.fetchone())[0])
+                async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id") as cur:
+                    rows = await cur.fetchall()
+                decoded = [{**self.vault.open(key, row[1]), "seq": row[0]} for row in rows]
+                if not self._needs_fold(decoded):
+                    async with db.execute(
+                        "SELECT summary,epoch,version,retry_after,trim_version FROM rolling_state"
+                    ) as cur:
+                        state = await cur.fetchone()
+                    async with db.execute("SELECT ready FROM memory_control") as cur:
+                        dual_ready = bool((await cur.fetchone())[0])
+                    chains = {}
+                    if enabled:
+                        async with db.execute(
+                            "SELECT lane,payload,expires FROM interaction_chains WHERE expires>?",
+                            (now,),
+                        ) as cur:
+                            for lane, blob, exp in await cur.fetchall():
+                                chains[lane] = {
+                                    **self.vault.open(f"{key}:chain:{lane}", blob),
+                                    "expires": exp,
+                                }
+                    return {
+                        "dual_ready": dual_ready,
+                        "rolling_summary": self.vault.open(key, state[0])
+                        if enabled and state[0] and not dual_ready
+                        else "",
+                        "recent_messages": decoded if enabled else [],
+                        "interaction_chains": chains,
+                        "epoch": state[1],
+                        "version": state[2],
+                        "retry_after": state[3],
+                        "history_revision": state[4],
+                        "enabled": enabled,
+                    }
         async with self.database(message) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 enabled = bool((await cur.fetchone())[0])
@@ -628,9 +730,13 @@ class SessionManager:
 
     async def lookup_received(self, message, reply_id):
         # Reference identifiers cannot select another session's physical database.
+        path = self.path(message)
+        self._check_not_symlink(path)
+        if not path.exists():
+            return None
         reference = message.model_copy(update={"event_id": str(reply_id)})
         event = self.store.event_key(reference)
-        async with self.database(message) as (db, key):
+        async with self.database(message, preserve_history=True, readonly=True) as (db, key):
             async with db.execute(
                 "SELECT payload FROM received_messages WHERE event=? AND expires>?",
                 (event, time.time()),
@@ -922,6 +1028,8 @@ class SessionManager:
             session_key = self.key(message)
             self.dual.index.discard(session_key)
             self.dual._stats_cache.pop(session_key, None)
+            self.dual.dirty_sessions.discard(session_key)
+            self.dual.deferred_until.pop(session_key, None)
             await db.execute("DELETE FROM turns")
             await db.execute("DELETE FROM recent_messages")
             await db.execute("DELETE FROM received_messages")
@@ -1290,15 +1398,25 @@ class SessionManager:
     async def prune(self):
         for cached_path in list(self._initialized_paths):
             if not cached_path.is_file() or cached_path.is_symlink():
-                self._initialized_paths.discard(cached_path)
-                self._initialized_inodes.pop(cached_path, None)
+                self._evict_initialized(cached_path, cached_path.stem)
         self._file_count = None
-        self._expiry_cache.clear()
+        now = time.time()
         if self.s.prefix_history_enabled:
             # The same transactional expiry path preserves a cold slice before pruning.
             for _, message in await self.store.runtime.sessions():
                 path = self.path(message)
+                key = self.key(message)
                 if path.is_symlink() or not path.is_file():
+                    self._evict_initialized(path, key)
+                    continue
+                fp = self._is_initialized_file(path, key)
+                cached = self._expiry_cache.get(key) if fp is not None else None
+                if (
+                    fp is not None
+                    and cached is not None
+                    and cached[2] == fp
+                    and (cached[0] is None or now < cached[0])
+                ):
                     continue
                 async with self.database(message):
                     pass
@@ -1307,16 +1425,26 @@ class SessionManager:
         for path in self.root.glob("*/*.sqlite3"):
             if path.is_symlink() or len(path.stem) != 64:
                 continue
-            async with self.locks[int(path.stem[:8], 16) % len(self.locks)]:
+            key = path.stem
+            fp = self._is_initialized_file(path, key)
+            cached = self._expiry_cache.get(key) if fp is not None else None
+            if (
+                fp is not None
+                and cached is not None
+                and cached[2] == fp
+                and (cached[0] is None or now < cached[0])
+            ):
+                continue
+            async with self.locks[int(key[:8], 16) % len(self.locks)]:
                 async with aiosqlite.connect(path) as db:
                     await db.execute("PRAGMA secure_delete=ON")
-                    await db.execute("DELETE FROM turns WHERE expires<=?", (time.time(),))
+                    await db.execute("DELETE FROM turns WHERE expires<=?", (now,))
                     async with db.execute(
                         "SELECT name FROM sqlite_master WHERE name='rolling_state'"
                     ) as cur:
                         if await cur.fetchone():
                             deleted = await db.execute(
-                                "DELETE FROM recent_messages WHERE expires<=?", (time.time(),)
+                                "DELETE FROM recent_messages WHERE expires<=?", (now,)
                             )
                             if deleted.rowcount:
                                 await db.execute(
@@ -1326,7 +1454,7 @@ class SessionManager:
                                 "UPDATE rolling_state SET "
                                 "summary=NULL,version=version+1 "
                                 "WHERE summary IS NOT NULL AND expires<=?",
-                                (time.time(),),
+                                (now,),
                             )
                             async with db.execute(
                                 "SELECT name FROM sqlite_master WHERE name='interaction_chains'"
@@ -1337,6 +1465,7 @@ class SessionManager:
                                     else:
                                         await db.execute(
                                             "DELETE FROM interaction_chains WHERE expires<=?",
-                                            (time.time(),),
+                                            (now,),
                                         )
                     await db.commit()
+                self._expiry_cache.pop(key, None)

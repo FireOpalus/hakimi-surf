@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -40,6 +41,8 @@ MAX_SONG_LIBRARY_BYTES = 500 * 1024 * 1024
 MAX_PROMPT_SONGS = 40
 DEFAULT_SONG_CACHE_MAX_BYTES = 30 * 1024 * 1024
 CACHE_EVICT_INTERVAL_SECONDS = 1800.0
+LAST_USED_PERSIST_INTERVAL_SECONDS = 300.0
+DRIVE_PROBE_CACHE_TTL_SECONDS = 45.0
 MIN_SONG_PITCH = -24
 MAX_SONG_PITCH = 24
 CoverEngine = Literal["dual", "yingmusic_svc", "seed_vc", "rvc"]
@@ -910,6 +913,33 @@ class SongLibrary:
         self._entries: dict[str, dict[str, Any]] = {}
         self._download_locks: dict[str, asyncio.Lock] = {}
         self.titles: tuple[str, ...] = ()
+        self._probe_cache: dict[str, tuple[float, tuple[Any, ...], Any]] = {}
+        self._probe_cache_gen: dict[str, int] = {"storage": 0, "inbox": 0, "voices": 0}
+        self._probe_cache_locks: dict[str, asyncio.Lock] = {
+            "storage": asyncio.Lock(),
+            "inbox": asyncio.Lock(),
+            "voices": asyncio.Lock(),
+        }
+        self._probe_cache_ttl_seconds: float = DRIVE_PROBE_CACHE_TTL_SECONDS
+
+    def _probe_cache_context(self) -> tuple[Any, ...]:
+        drive = self.drive
+        if drive is None:
+            return (0, False, "", "none")
+        return (
+            id(drive),
+            self._drive_configured(),
+            str(getattr(drive, "drive_songs_folder_id", "") or ""),
+            str(getattr(drive, "config_source", "") or ""),
+        )
+
+    def invalidate_drive_probe_cache(self, *keys: str) -> None:
+        """Immediately invalidate cached Drive probe snapshots (`storage`, `inbox`, `voices`)."""
+        targets = keys if keys else ("storage", "inbox", "voices")
+        for key in targets:
+            self._probe_cache.pop(key, None)
+            if key in self._probe_cache_gen:
+                self._probe_cache_gen[key] += 1
 
     @contextmanager
     def _directory(self):
@@ -951,10 +981,14 @@ class SongLibrary:
         self, filename: str, raw: bytes, *, mime_type: str
     ) -> dict[str, Any]:
         if self._use_direct_drive("upload_drive_inbox"):
-            return await self.drive.upload_inbox_bytes(filename, raw, mime_type=mime_type)
+            res = await self.drive.upload_inbox_bytes(filename, raw, mime_type=mime_type)
+            self.invalidate_drive_probe_cache("inbox", "storage")
+            return res
         legacy_fn = getattr(self.compute, "upload_drive_inbox", None)
         if callable(legacy_fn):
-            return await legacy_fn(filename, raw, mime_type=mime_type)
+            res = await legacy_fn(filename, raw, mime_type=mime_type)
+            self.invalidate_drive_probe_cache("inbox", "storage")
+            return res
         raise Rejected("song_drive_not_configured")
 
     async def _download_drive_song(self, file_id: str) -> bytes:
@@ -965,13 +999,34 @@ class SongLibrary:
             return await legacy_fn(file_id)
         raise Rejected("song_unavailable")
 
-    async def list_inbox(self) -> dict[str, Any]:
+    async def list_inbox(self, *, force_refresh: bool = False) -> dict[str, Any]:
         """List pending original tracks in `Hakimi_Songs/inbox/` directly via SongDriveStore."""
         if self.drive is None:
             raise Rejected("song_drive_not_configured")
-        tree = await self.drive.ensure_folder_tree()
-        items = await self.drive.list_inbox()
-        return {"items": items, "folders": tree.as_dict()}
+        now = time.monotonic()
+        ctx = self._probe_cache_context()
+        if not force_refresh:
+            cached = self._probe_cache.get("inbox")
+            if cached is not None and cached[1] == ctx and now < cached[0]:
+                return copy.deepcopy(cached[2])
+        async with self._probe_cache_locks["inbox"]:
+            now = time.monotonic()
+            ctx = self._probe_cache_context()
+            if not force_refresh:
+                cached = self._probe_cache.get("inbox")
+                if cached is not None and cached[1] == ctx and now < cached[0]:
+                    return copy.deepcopy(cached[2])
+            gen = self._probe_cache_gen["inbox"]
+            tree = await self.drive.ensure_folder_tree()
+            items = await self.drive.list_inbox()
+            result = {"items": items, "folders": tree.as_dict()}
+            if self._probe_cache_gen["inbox"] == gen:
+                self._probe_cache["inbox"] = (
+                    time.monotonic() + self._probe_cache_ttl_seconds,
+                    self._probe_cache_context(),
+                    copy.deepcopy(result),
+                )
+            return result
 
     async def upload_inbox_stream(
         self,
@@ -985,19 +1040,42 @@ class SongLibrary:
         """Stream an original track into `Hakimi_Songs/inbox/` directly via SongDriveStore."""
         if self.drive is None:
             raise Rejected("song_drive_not_configured")
-        return await self.drive.upload_inbox_stream(
+        res = await self.drive.upload_inbox_stream(
             filename,
             stream,
             mime_type=mime_type,
             content_length=content_length,
             max_bytes=max_bytes,
         )
+        self.invalidate_drive_probe_cache("inbox", "storage")
+        return res
 
-    async def list_voices(self) -> dict[str, Any]:
+    async def list_voices(self, *, force_refresh: bool = False) -> dict[str, Any]:
         """List Zero-shot reference voice audio files and RVC models in `Hakimi_Songs/models/`."""
         if self.drive is None:
             raise Rejected("song_drive_not_configured")
-        return await self.drive.list_models_assets()
+        now = time.monotonic()
+        ctx = self._probe_cache_context()
+        if not force_refresh:
+            cached = self._probe_cache.get("voices")
+            if cached is not None and cached[1] == ctx and now < cached[0]:
+                return copy.deepcopy(cached[2])
+        async with self._probe_cache_locks["voices"]:
+            now = time.monotonic()
+            ctx = self._probe_cache_context()
+            if not force_refresh:
+                cached = self._probe_cache.get("voices")
+                if cached is not None and cached[1] == ctx and now < cached[0]:
+                    return copy.deepcopy(cached[2])
+            gen = self._probe_cache_gen["voices"]
+            result = await self.drive.list_models_assets()
+            if self._probe_cache_gen["voices"] == gen:
+                self._probe_cache["voices"] = (
+                    time.monotonic() + self._probe_cache_ttl_seconds,
+                    self._probe_cache_context(),
+                    copy.deepcopy(result),
+                )
+            return result
 
     async def upload_ref_voice_stream(
         self,
@@ -1011,20 +1089,24 @@ class SongLibrary:
         """Stream a Zero-shot reference voice audio file into `Hakimi_Songs/models/` (<= 20 MiB)."""
         if self.drive is None:
             raise Rejected("song_drive_not_configured")
-        return await self.drive.upload_ref_voice_stream(
+        res = await self.drive.upload_ref_voice_stream(
             filename,
             stream,
             mime_type=mime_type,
             content_length=content_length,
             max_bytes=max_bytes,
         )
+        self.invalidate_drive_probe_cache("voices", "storage")
+        return res
 
     @staticmethod
     def rvc_defaults() -> dict[str, Any]:
         """Return single-source universal RVC cover defaults."""
         return dict(RVC_DEFAULT_PARAMS)
 
-    async def drive_storage_status(self, *, probe: bool = False) -> dict[str, Any]:
+    async def drive_storage_status(
+        self, *, probe: bool = False, force_refresh: bool = False
+    ) -> dict[str, Any]:
         """Return Drive storage configuration and resolved folder tree independent of Colab."""
         if self.drive is None:
             return {
@@ -1034,13 +1116,42 @@ class SongLibrary:
                 "folders": None,
                 "error": None,
             }
-        return await self.drive.status_overview(probe=probe)
+        if not probe:
+            return await self.drive.status_overview(probe=False)
+        now = time.monotonic()
+        ctx = self._probe_cache_context()
+        if not force_refresh:
+            cached = self._probe_cache.get("storage")
+            if cached is not None and cached[1] == ctx and now < cached[0]:
+                return copy.deepcopy(cached[2])
+        async with self._probe_cache_locks["storage"]:
+            now = time.monotonic()
+            ctx = self._probe_cache_context()
+            if not force_refresh:
+                cached = self._probe_cache.get("storage")
+                if cached is not None and cached[1] == ctx and now < cached[0]:
+                    return copy.deepcopy(cached[2])
+            gen = self._probe_cache_gen["storage"]
+            if force_refresh and _accepts_kwarg(self.drive.status_overview, "force_refresh"):
+                result = await self.drive.status_overview(probe=True, force_refresh=True)
+            else:
+                result = await self.drive.status_overview(probe=True)
+            if self._probe_cache_gen["storage"] == gen and not result.get("error"):
+                self._probe_cache["storage"] = (
+                    time.monotonic() + self._probe_cache_ttl_seconds,
+                    self._probe_cache_context(),
+                    copy.deepcopy(result),
+                )
+            return result
 
     async def set_drive_folder_id(self, folder_id: str | None) -> dict[str, Any]:
         """Persist or reset the `Hakimi_Songs/` root folder ID override via SongDriveStore."""
         if self.drive is None:
             raise Rejected("song_drive_not_configured")
-        return await self.drive.set_folder_id(folder_id)
+        self.invalidate_drive_probe_cache()
+        res = await self.drive.set_folder_id(folder_id)
+        self.invalidate_drive_probe_cache()
+        return res
 
     def _song_finder_remote_only(self) -> bool:
         if self._song_finder_remote_only_override is not None:
@@ -1590,7 +1701,9 @@ class SongLibrary:
             raise Rejected("invalid_admin_input")
         await self.initialize()
         async with self.lock:
-            return await self._evict_cache_locked(target_bytes=target_bytes)
+            res = await self._evict_cache_locked(target_bytes=target_bytes)
+        self.invalidate_drive_probe_cache("storage")
+        return res
 
     async def run_cache_evictor(
         self, *, interval_seconds: float = CACHE_EVICT_INTERVAL_SECONDS
@@ -1636,6 +1749,7 @@ class SongLibrary:
                     item["last_used_at"] = float(item.get("last_used_at") or 0.0)
                 except (TypeError, ValueError):
                     item["last_used_at"] = 0.0
+                item["_last_used_persisted_at"] = item["last_used_at"]
                 item["active_engine"] = str(item.get("active_engine") or "").strip()
                 item["active_take"] = str(item.get("active_take") or "").strip()
                 raw_audition_status = str(item.get("audition_status") or "none").strip()
@@ -1669,9 +1783,17 @@ class SongLibrary:
                     continue
                 try:
                     await asyncio.to_thread(self._read, item)
+                except FileNotFoundError:
+                    if item["drive_chorus_id"]:
+                        # Evicted/absent local cache file: keep indexed without redundant unlink.
+                        item["cached_local"] = False
+                        valid[item["id"]] = item
+                    else:
+                        stale_ids.append(item["id"])
+                    continue
                 except (OSError, Rejected):
                     if item["drive_chorus_id"]:
-                        # Keep Drive-backed entries indexed even when local cache is absent/evicted.
+                        # Corrupt/unreadable local cache file: remove it while keeping Drive entry.
                         await asyncio.to_thread(self._unlink, item["filename"])
                         item["cached_local"] = False
                         valid[item["id"]] = item
@@ -1846,6 +1968,7 @@ class SongLibrary:
                 "drive_full_id": "",
                 "source_origin": "local",
                 "last_used_at": now,
+                "_last_used_persisted_at": now,
                 "cached_local": True,
                 "active_engine": "local",
                 "active_take": "",
@@ -1854,15 +1977,16 @@ class SongLibrary:
                 "review_note": "",
                 "audition_meta": {},
             }
-            self._write(stored_filename, normalized.data)
+            await asyncio.to_thread(self._write, stored_filename, normalized.data)
             try:
                 async with self.store.transaction():
                     await self._insert_entry_tx(entry)
             except BaseException:
-                self._unlink(stored_filename)
+                await asyncio.to_thread(self._unlink, stored_filename)
                 raise
             self._entries[song_id] = entry
             self._refresh_titles()
+            self.invalidate_drive_probe_cache("storage")
             return self._public(entry)
 
     async def register_colab_cover(
@@ -1988,6 +2112,7 @@ class SongLibrary:
                 "drive_full_id": clean_full_id,
                 "source_origin": "colab",
                 "last_used_at": now if validated_bytes is not None else 0.0,
+                "_last_used_persisted_at": now if validated_bytes is not None else 0.0,
                 "cached_local": validated_bytes is not None,
                 "active_engine": clean_active_engine,
                 "active_take": clean_active_take,
@@ -2021,6 +2146,7 @@ class SongLibrary:
             self._refresh_titles()
             if validated_bytes is not None:
                 await self._evict_cache_locked(keep_ids={song_id})
+            self.invalidate_drive_probe_cache("storage", "inbox")
             return self._public(entry)
 
     def learn_gpu_policy(self) -> dict[str, Any]:
@@ -2269,20 +2395,30 @@ class SongLibrary:
         if clean_gpu is not None or _accepts_kwarg(self.compute.submit_job, "gpu"):
             submit_kwargs["gpu"] = clean_gpu
         job = await self.compute.submit_job("rvc_cover", payload, **submit_kwargs)
+        self.invalidate_drive_probe_cache("storage", "inbox", "voices")
         if isinstance(job, dict) and "engine" not in job:
             return {**job, "engine": clean_engine}
         return job
 
-    async def _touch_last_used(self, entry: dict[str, Any], now: float) -> None:
+    def _mark_used_locked(self, entry: dict[str, Any], now: float) -> float | None:
         entry["cached_local"] = True
         entry["last_used_at"] = now
+        last_persisted = float(entry.get("_last_used_persisted_at") or 0.0)
+        if last_persisted <= 0.0 or (now - last_persisted) >= LAST_USED_PERSIST_INTERVAL_SECONDS:
+            entry["_last_used_persisted_at"] = now
+            return now
+        return None
+
+    async def _persist_last_used(self, entry_id: str, now: float) -> None:
         async with self.store.transaction():
             await self.store.db.execute(
                 "UPDATE song_library SET last_used_at=? WHERE id=?",
-                (now, entry["id"]),
+                (now, entry_id),
             )
 
-    async def _try_read_cached_locked(self, entry_id: str) -> tuple[bytes | None, dict[str, Any]]:
+    async def _try_read_cached_locked(
+        self, entry_id: str
+    ) -> tuple[bytes | None, dict[str, Any], float | None]:
         entry = self._entries.get(entry_id)
         if entry is None:
             raise Rejected("song_unavailable")
@@ -2292,26 +2428,31 @@ class SongLibrary:
             entry["cached_local"] = False
             if not entry["drive_chorus_id"] or not self._can_download_drive_song():
                 raise Rejected("song_unavailable") from None
-            return None, dict(entry)
-        await self._touch_last_used(entry, time.time())
-        return raw, dict(entry)
+            return None, dict(entry), None
+        persist_ts = self._mark_used_locked(entry, time.time())
+        return raw, dict(entry), persist_ts
 
     async def _load_entry_audio(self, entry_id: str) -> tuple[bytes, dict[str, Any]]:
         async with self.lock:
-            raw, snapshot = await self._try_read_cached_locked(entry_id)
-            if raw is not None:
-                return raw, snapshot
+            raw, snapshot, persist_ts = await self._try_read_cached_locked(entry_id)
+        if raw is not None:
+            if persist_ts is not None:
+                await self._persist_last_used(entry_id, persist_ts)
+            return raw, snapshot
 
         dl_lock = self._download_locks.setdefault(entry_id, asyncio.Lock())
         async with dl_lock:
             async with self.lock:
-                raw, snapshot = await self._try_read_cached_locked(entry_id)
-                if raw is not None:
-                    return raw, snapshot
-                drive_chorus_id = snapshot["drive_chorus_id"]
-                expected_digest = snapshot["digest"]
-                expected_size = int(snapshot["byte_size"])
-                filename = snapshot["filename"]
+                raw, snapshot, persist_ts = await self._try_read_cached_locked(entry_id)
+                if raw is None:
+                    drive_chorus_id = snapshot["drive_chorus_id"]
+                    expected_digest = snapshot["digest"]
+                    expected_size = int(snapshot["byte_size"])
+                    filename = snapshot["filename"]
+            if raw is not None:
+                if persist_ts is not None:
+                    await self._persist_last_used(entry_id, persist_ts)
+                return raw, snapshot
 
             # Download from Google Drive outside self.lock.
             try:
@@ -2338,9 +2479,12 @@ class SongLibrary:
                 if entry is None or entry["digest"] != expected_digest:
                     raise Rejected("song_unavailable")
                 await asyncio.to_thread(self._write_atomic, filename, raw)
-                await self._touch_last_used(entry, time.time())
+                persist_ts = self._mark_used_locked(entry, time.time())
                 await self._evict_cache_locked(keep_ids={entry_id})
-                return raw, dict(entry)
+                snapshot = dict(entry)
+            if persist_ts is not None:
+                await self._persist_last_used(entry_id, persist_ts)
+            return raw, snapshot
 
     async def audio_bytes(self, song_id: str) -> tuple[bytes, str]:
         await self.initialize()
@@ -2475,12 +2619,14 @@ class SongLibrary:
             entry["drive_chorus_id"] = target["drive_chorus_id"]
             entry["drive_full_id"] = target.get("drive_full_id", "")
             entry["last_used_at"] = 0.0
+            entry["_last_used_persisted_at"] = 0.0
             entry["cached_local"] = False
             entry["active_engine"] = target["engine"]
             entry["active_take"] = target["key"]
             entry["audition_status"] = new_audition_status
             entry["audition_meta"] = new_meta
             await asyncio.to_thread(self._unlink, entry["filename"])
+            self.invalidate_drive_probe_cache("storage")
             return self._public(entry)
 
     async def load_for_delivery(
@@ -2527,4 +2673,5 @@ class SongLibrary:
             del self._entries[song_id]
             self._download_locks.pop(song_id, None)
             self._refresh_titles()
-            self._unlink(entry["filename"])
+            await asyncio.to_thread(self._unlink, entry["filename"])
+            self.invalidate_drive_probe_cache("storage")

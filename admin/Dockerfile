@@ -3,12 +3,15 @@ ARG HAKIMI_VERSION=2.1.0
 WORKDIR /build
 COPY build.py csp.py ./
 COPY src ./src
-RUN python build.py --version "${HAKIMI_VERSION}" --output admin_page.html && python csp.py > admin-csp.conf
+RUN python build.py --version "${HAKIMI_VERSION}" --output admin_page.html \
+    && gzip -9 -n -k admin_page.html \
+    && python csp.py > admin-csp.conf
 
 FROM nginx:stable-alpine@sha256:901e593c95dc85f5a729f5765516321366ef4ac401821431d408897e95287d0a
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY --from=page /build/admin-csp.conf /etc/nginx/admin-csp.conf
 COPY --from=page /build/admin_page.html /srv/admin/admin_page.html
+COPY --from=page /build/admin_page.html.gz /srv/admin/admin_page.html.gz
 USER nginx
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1

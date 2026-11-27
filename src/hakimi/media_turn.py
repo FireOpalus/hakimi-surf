@@ -363,15 +363,20 @@ async def auto_save_meme(
         (img for item in reversed(candidates) for img in reversed(item.images)),
         None,
     )
-    if ref is None and message.reply_ids:
-        for reply_id in reversed(message.reply_ids):
-            replied = await service.lookup_received(message, reply_id)
-            if replied and replied.images:
-                ref = replied.images[-1]
-                break
-    if ref is None:
-        return False
     try:
+        if ref is None and message.reply_ids:
+            for reply_id in reversed(message.reply_ids):
+                try:
+                    replied = await service.lookup_received(message, reply_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
+                if replied and replied.images:
+                    ref = replied.images[-1]
+                    break
+        if ref is None:
+            return False
         raw = await service.images.fetch_raw(ref, max_bytes=MAX_UPLOAD_BYTES)
         await service.memes.upload_bytes(label, raw)
         return True

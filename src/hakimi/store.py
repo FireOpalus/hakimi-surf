@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   payload BLOB, status TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status, created);
+CREATE INDEX IF NOT EXISTS jobs_scope_status ON jobs(scope, status);
+CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created);
 CREATE TABLE IF NOT EXISTS counters (
   key TEXT PRIMARY KEY, n INTEGER NOT NULL, expires REAL NOT NULL
 );
@@ -91,6 +93,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, payload BLOB, status TEXT NOT NULL,
   created REAL NOT NULL, expires REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS outbox_status_created ON outbox(status, created);
+CREATE INDEX IF NOT EXISTS outbox_status_expires ON outbox(status, expires);
+CREATE INDEX IF NOT EXISTS outbox_created ON outbox(created);
 CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY, subject TEXT NOT NULL, mid TEXT NOT NULL, target BLOB NOT NULL,
   initialized INTEGER NOT NULL DEFAULT 0, next_poll REAL NOT NULL DEFAULT 0,
@@ -185,6 +190,8 @@ class Store:
         self.env_budget = BudgetConfig.from_settings(settings)
         self.budget_overridden = False
         self.budget_zone = ZoneInfo(settings.bot_timezone)
+        self.job_wakeup = asyncio.Event()
+        self.reply_wakeup = asyncio.Event()
 
     def local_now(self):
         return datetime.now(UTC).astimezone(self.budget_zone)
@@ -798,9 +805,83 @@ class Store:
                 ),
             )
             await self.groups.register_in_transaction(message, job_id, now)
+        self.job_wakeup.set()
         return "accepted"
 
+    async def _next_job_delay(self, *, max_wait: float = 10.0) -> float:
+        now = time.time()
+        async with self.lock:
+            if not await self.one("SELECT 1 FROM jobs WHERE status='pending' LIMIT 1"):
+                return max_wait
+            deadlines: list[float] = []
+            debounce_row = await self.one(
+                "SELECT MIN(b.ready_at) FROM group_debounce_batches b "
+                "JOIN group_debounce_items i ON i.batch_id=b.id "
+                "JOIN jobs j ON j.id=i.job_id "
+                "WHERE j.status='pending' AND b.ready_at>?",
+                (now,),
+            )
+            if debounce_row and debounce_row[0] is not None:
+                deadlines.append(float(debounce_row[0]))
+            outbox_row = await self.one(
+                "SELECT MIN(o.expires) FROM outbox o JOIN jobs prev ON prev.id=o.id "
+                "WHERE o.status IN ('pending','sending') AND o.expires>=? "
+                "AND EXISTS (SELECT 1 FROM jobs j WHERE j.scope=prev.scope AND j.status='pending')",
+                (now,),
+            )
+            if outbox_row and outbox_row[0] is not None:
+                deadlines.append(float(outbox_row[0]))
+            exp_row = await self.one("SELECT MIN(expires) FROM jobs WHERE status='pending'")
+            if exp_row and exp_row[0] is not None:
+                deadlines.append(float(exp_row[0]))
+        if not deadlines:
+            return max_wait
+        return min(max_wait, max(0.01, min(deadlines) - now))
+
+    async def wait_for_job(self, *, max_wait: float = 10.0) -> None:
+        if self.job_wakeup.is_set():
+            return
+        delay = await self._next_job_delay(max_wait=max_wait)
+        if self.job_wakeup.is_set():
+            return
+        try:
+            await asyncio.wait_for(self.job_wakeup.wait(), timeout=delay)
+        except TimeoutError:
+            pass
+
+    async def wait_for_reply(self, *, max_wait: float = 10.0) -> None:
+        if self.reply_wakeup.is_set():
+            return
+        try:
+            await asyncio.wait_for(self.reply_wakeup.wait(), timeout=max_wait)
+        except TimeoutError:
+            pass
+
     async def claim(self) -> dict[str, Any] | None:
+        now = time.time()
+        async with self.lock:
+            if not await self.one("SELECT 1 FROM jobs WHERE status='pending' LIMIT 1"):
+                return None
+            has_expired = await self.one(
+                "SELECT 1 FROM jobs WHERE status='pending' AND expires<? LIMIT 1",
+                (now,),
+            )
+            if not has_expired:
+                candidate = await self.one(
+                    "SELECT 1 FROM jobs j WHERE status='pending' AND NOT EXISTS "
+                    "(SELECT 1 FROM jobs active WHERE active.scope=j.scope "
+                    "AND active.status='working') "
+                    "AND NOT EXISTS (SELECT 1 FROM outbox o JOIN jobs prev ON prev.id=o.id "
+                    "WHERE prev.scope=j.scope AND o.status IN ('pending','sending') "
+                    "AND o.expires>=?) "
+                    "AND NOT EXISTS (SELECT 1 FROM group_debounce_items i "
+                    "JOIN group_debounce_batches b ON b.id=i.batch_id "
+                    "WHERE i.job_id=j.id AND b.ready_at>?) "
+                    "ORDER BY created, rowid LIMIT 1",
+                    (now, now),
+                )
+                if not candidate:
+                    return None
         async with self.transaction():
             now = time.time()
             await self.db.execute(
@@ -830,6 +911,7 @@ class Store:
             await self.db.execute(
                 "UPDATE jobs SET status=?,payload=NULL WHERE id=?", (status, job_id)
             )
+        self.job_wakeup.set()
 
     async def memory_enabled(self, scope: str) -> bool:
         async with self.lock:
@@ -1634,8 +1716,10 @@ class Store:
                 "INSERT OR IGNORE INTO outbox VALUES (?,?,'pending',?,?)",
                 (job_id, self.vault.seal(job_id, payload), now, expires),
             )
+        self.reply_wakeup.set()
 
     async def cancel_platform_work(self, platforms):
+        cancelled_any = False
         async with self.transaction():
             for table, predicate in (("jobs", "kind='message' AND "), ("outbox", "")):
                 pending = await self.all(
@@ -1647,11 +1731,18 @@ class Store:
                     message = payload["message"] if table == "outbox" else payload
                     if message["platform"] in platforms:
                         ids.append((row["id"],))
-                await self.db.executemany(
-                    f"UPDATE {table} SET status='cancelled',payload=NULL WHERE id=?", ids
-                )
+                if ids:
+                    cancelled_any = True
+                    await self.db.executemany(
+                        f"UPDATE {table} SET status='cancelled',payload=NULL WHERE id=?", ids
+                    )
+        if cancelled_any:
+            self.job_wakeup.set()
 
     async def claim_reply(self) -> dict | None:
+        async with self.lock:
+            if not await self.one("SELECT 1 FROM outbox WHERE status='pending' LIMIT 1"):
+                return None
         async with self.transaction():
             await self.db.execute(
                 "UPDATE outbox SET status='expired',payload=NULL "
@@ -1672,17 +1763,23 @@ class Store:
                 "UPDATE outbox SET status=?,payload=NULL WHERE id=? AND status='sending'",
                 (status, reply_id),
             )
-            return cursor.rowcount == 1
+            updated = cursor.rowcount == 1
+        if updated:
+            self.job_wakeup.set()
+        return updated
 
     async def cancel_session_replies(self, message: Message):
         # Jobs already carry a HMAC session scope. Never decrypt other sessions' outboxes.
         async with self.transaction():
-            await self.db.execute(
+            cursor = await self.db.execute(
                 "UPDATE outbox SET status='cancelled',payload=NULL "
                 "WHERE status IN ('pending','sending') AND id IN "
                 "(SELECT id FROM jobs WHERE kind='message' AND scope=?)",
                 (self.session_scope(message),),
             )
+            changed = cursor.rowcount > 0
+        if changed:
+            self.job_wakeup.set()
 
     async def add_subscription(self, message: Message, mid: str) -> None:
         subject = self.subject(message)
@@ -1764,7 +1861,10 @@ class Store:
                     "INSERT OR IGNORE INTO seen VALUES (?,?,?)", (sub_id, video.bvid, now)
                 )
             await self.db.execute("UPDATE subscriptions SET initialized=1 WHERE id=?", (sub_id,))
-            return len(fresh) if sub["initialized"] else 0
+            ingested = len(fresh) if sub["initialized"] else 0
+        if ingested:
+            self.job_wakeup.set()
+        return ingested
 
     async def save_report(self, subject: str, text: str, *, public: bool = False) -> None:
         async with self.transaction():
@@ -1821,20 +1921,23 @@ class Store:
                     (row[0], row[0]),
                 )
             cutoff = datetime.fromtimestamp(now - 32 * 86400, UTC).date().isoformat()
-            await self.db.execute("DELETE FROM ledger WHERE day<?", (cutoff,))
-            await self.db.execute(
-                "DELETE FROM ledger_attribution WHERE id NOT IN (SELECT id FROM ledger)"
-            )
-            await self.db.execute("DELETE FROM ledger_work WHERE id NOT IN (SELECT id FROM ledger)")
-            await self.db.execute(
-                "DELETE FROM ledger_usage WHERE id NOT IN (SELECT id FROM ledger)"
-            )
-            await self.db.execute(
-                "DELETE FROM ledger_thinking WHERE id NOT IN (SELECT id FROM ledger)"
-            )
-            await self.db.execute(
-                "DELETE FROM ledger_times WHERE id NOT IN (SELECT id FROM ledger)"
-            )
-            await self.db.execute(
-                "DELETE FROM ledger_provider WHERE id NOT IN (SELECT id FROM ledger)"
-            )
+            ledger_cur = await self.db.execute("DELETE FROM ledger WHERE day<?", (cutoff,))
+            if ledger_cur.rowcount:
+                await self.db.execute(
+                    "DELETE FROM ledger_attribution WHERE id NOT IN (SELECT id FROM ledger)"
+                )
+                await self.db.execute(
+                    "DELETE FROM ledger_work WHERE id NOT IN (SELECT id FROM ledger)"
+                )
+                await self.db.execute(
+                    "DELETE FROM ledger_usage WHERE id NOT IN (SELECT id FROM ledger)"
+                )
+                await self.db.execute(
+                    "DELETE FROM ledger_thinking WHERE id NOT IN (SELECT id FROM ledger)"
+                )
+                await self.db.execute(
+                    "DELETE FROM ledger_times WHERE id NOT IN (SELECT id FROM ledger)"
+                )
+                await self.db.execute(
+                    "DELETE FROM ledger_provider WHERE id NOT IN (SELECT id FROM ledger)"
+                )

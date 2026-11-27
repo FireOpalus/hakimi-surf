@@ -137,14 +137,21 @@ async def test_initialized_session_skips_schema_migrations_lock_glob_and_registr
     assert glob_calls == 1
     assert registry_writes == 1
 
-    # Fast path skipped schema, migrations, journal_mode, and redundant expiry sweeps.
+    # Fast read-only snapshot skips schema, migrations, journal_mode, BEGIN IMMEDIATE, and sweeps.
     assert not any(kind == "executescript" for kind, _ in sql_log)
     assert not any("PRAGMA table_info" in sql for _, sql in sql_log)
     assert not any("PRAGMA journal_mode=WAL" in sql for _, sql in sql_log)
+    assert not any("BEGIN IMMEDIATE" in sql for _, sql in sql_log)
+    assert any(sql == "BEGIN" for _, sql in sql_log)
     assert not any("DELETE FROM recent_messages WHERE expires<=" in sql for _, sql in sql_log)
     assert not any("DELETE FROM history_folds WHERE expires<=" in sql for _, sql in sql_log)
     assert not any("DELETE FROM interaction_chains WHERE expires<=" in sql for _, sql in sql_log)
+    assert any("PRAGMA busy_timeout=5000" in sql for _, sql in sql_log)
+
     # Durability PRAGMAs remain enforced on write-capable database() opens.
+    sql_log.clear()
+    assert await sessions.remember(message, "hello2", "world2")
+    assert any("BEGIN IMMEDIATE" in sql for _, sql in sql_log)
     assert any("PRAGMA synchronous=FULL" in sql for _, sql in sql_log)
     assert any("PRAGMA secure_delete=ON" in sql for _, sql in sql_log)
     assert any("PRAGMA busy_timeout=5000" in sql for _, sql in sql_log)

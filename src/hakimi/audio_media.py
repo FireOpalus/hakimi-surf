@@ -196,15 +196,26 @@ class ModelAudio:
             raise Rejected("invalid_audio")
         if len(self.data) > 4 * ((MAX_AUDIO_BYTES + 2) // 3):
             raise Rejected("audio_too_large")
+        cached_data = self.__dict__.get("_validated_data")
+        cached_len = self.__dict__.get("_validated_byte_len")
+        if (
+            cached_data is self.data
+            and isinstance(cached_len, int)
+            and 0 < cached_len <= MAX_AUDIO_BYTES
+        ):
+            return cached_len
         try:
             raw = base64.b64decode(self.data, validate=True)
         except (ValueError, binascii.Error):
             raise Rejected("invalid_audio") from None
         if not raw:
             raise Rejected("invalid_audio")
-        if len(raw) > MAX_AUDIO_BYTES:
+        raw_len = len(raw)
+        if raw_len > MAX_AUDIO_BYTES:
             raise Rejected("audio_too_large")
-        return len(raw)
+        object.__setattr__(self, "_validated_data", self.data)
+        object.__setattr__(self, "_validated_byte_len", raw_len)
+        return raw_len
 
     @property
     def tokens(self) -> int:

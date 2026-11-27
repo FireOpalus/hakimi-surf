@@ -505,7 +505,7 @@ async def test_monitoring_sync_parsing_and_drift_detection(store):
         assert request.url.path == "/v3/projects/mon-proj-1/timeSeries"
         assert request.headers["authorization"] == "Bearer mon-token-1"
         assert "token_count" in request.url.params["filter"]
-        assert request.url.params["aggregation.alignmentPeriod"] == "60s"
+        assert request.url.params["aggregation.alignmentPeriod"] == "3600s"
         assert request.url.params["aggregation.perSeriesAligner"] == "ALIGN_SUM"
         assert request.url.params["aggregation.crossSeriesReducer"] == "REDUCE_SUM"
         assert request.url.params.get_list("aggregation.groupByFields") == [

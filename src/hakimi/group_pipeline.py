@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS group_recent_messages (
  event_at REAL NOT NULL, payload BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS group_recent_scope ON group_recent_messages(scope,at);
+CREATE INDEX IF NOT EXISTS group_recent_at ON group_recent_messages(at);
 CREATE TABLE IF NOT EXISTS group_consumed_images (
  scope TEXT NOT NULL, event_id TEXT NOT NULL, at REAL NOT NULL,
  PRIMARY KEY(scope,event_id)
@@ -157,6 +158,10 @@ class GroupPipeline:
             await self.store.db.execute(
                 "UPDATE group_debounce_batches SET ready_at=? WHERE id=?", (ready, batch["id"])
             )
+        if batches:
+            wakeup = getattr(self.store, "job_wakeup", None)
+            if wakeup is not None:
+                wakeup.set()
 
     def begin(self, job):
         members = [Message.model_validate(m) for m in job.get("batch_messages", [])]
@@ -246,6 +251,9 @@ class GroupPipeline:
                     "INSERT OR REPLACE INTO group_debounce_items VALUES (?,?)",
                     (row["id"], batch_id),
                 )
+        wakeup = getattr(self.store, "job_wakeup", None)
+        if wakeup is not None:
+            wakeup.set()
 
     async def initialize(self):
         await self.store.db.executescript(SCHEMA)

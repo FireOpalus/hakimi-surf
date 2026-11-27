@@ -65,12 +65,15 @@ function scheduleColabFollowUp(gen){
   },3000);
 }
 function refreshColabAsync({force=false,allowAutoRetry=true}={}){
-  const signal=sessionRequests.signal;
+  const signal=force?sessionRequests.signal:tabRequests.signal;
   const gen=++colabFetchGen;
   clearColabAutoRefresh();
   colabLoading=true;
   return fetchColabOverview(force).then(data=>{
-    if(!token||signal.aborted||gen!==colabFetchGen)return null;
+    if(!token||signal.aborted||gen!==colabFetchGen){
+      if(gen===colabFetchGen)colabLoading=false;
+      return null;
+    }
     colabLoading=false;
     applyColabOverviewUpdate(data,'');
     if(allowAutoRetry&&isColabWorkerRefreshing(data)){
@@ -78,7 +81,10 @@ function refreshColabAsync({force=false,allowAutoRetry=true}={}){
     }
     return data;
   }).catch(err=>{
-    if(!token||signal.aborted||gen!==colabFetchGen||err?.name==='AbortError')return null;
+    if(!token||signal.aborted||gen!==colabFetchGen||err?.name==='AbortError'){
+      if(gen===colabFetchGen)colabLoading=false;
+      return null;
+    }
     colabLoading=false;
     const rawMsg=err?.message||'colab_unconfigured';
     const labels=typeof colabErrorLabels!=='undefined'?colabErrorLabels:null;
@@ -763,7 +769,7 @@ async function fetchOverviewPayload(){
 }
 
 async function dashboard(initial,{lightweight=false}={}){
-  const signal=sessionRequests.signal;
+  const signal=tabRequests.signal;
   let d,prov=cachedProvidersOverview,gcp=cachedGcpOverview;
   if(lightweight){
     d=initial??await fetchOverviewPayload();
@@ -1059,17 +1065,24 @@ $('gcp-clear-sa').addEventListener('click',e=>busy(e.target,async()=>{
   renderGcpBilling(g);notice('已清除独立 Service Account 覆盖');
 }));
 
-async function ledger({forceColabRefresh=false}={}){
+async function ledger({forceColabRefresh=false,refreshColab=true}={}){
   // Colab 算力与余额独立并发拉取，主账本返回后立刻完成整页渲染。
-  refreshColabAsync({force:forceColabRefresh,allowAutoRetry:!forceColabRefresh});
-  const [dashRes,polRes,gcpRes,balRes]=await Promise.allSettled([api('global/dashboard'),api('budget'),api('gcp-billing'),api('account-balance')]);
+  if(refreshColab)refreshColabAsync({force:forceColabRefresh,allowAutoRetry:!forceColabRefresh});
+  const [dashRes,polRes,gcpRes]=await Promise.allSettled([api('global/dashboard'),api('budget'),api('gcp-billing')]);
   if(dashRes.status!=='fulfilled')throw dashRes.reason;
   if(polRes.status!=='fulfilled')throw polRes.reason;
   const d=dashRes.value,policy=polRes.value;
   if(!token)return;
   lastLedgerDash=d;
   const gcpVal=gcpRes.status==='fulfilled'?gcpRes.value:null;
-  const balVal=balRes.status==='fulfilled'?balRes.value:(d.budget_status?.account_balance||null);
+  let balVal=d.budget_status?.account_balance??null;
+  if(!balVal){
+    balVal=await api('account-balance').catch(err=>{
+      if(err?.name==='AbortError')throw err;
+      return accountBalanceState;
+    });
+    if(!token)return;
+  }
   if(gcpVal)gcpBillingState=gcpVal;
   if(balVal)accountBalanceState=balVal;
   const usage=d.usage,periods=[['today','今日 '+zoneLabel(usage.timezone||usage.budget_timezone||'Asia/Shanghai')],['month','本月 '+zoneLabel(usage.timezone||usage.budget_timezone||'Asia/Shanghai')],['lifetime','累计可追溯']];
@@ -1101,12 +1114,12 @@ async function ledger({forceColabRefresh=false}={}){
   else renderUnifiedCloudGcp(null,balVal,usage);
   renderUnifiedCloudColab(cachedColabOverview,colabUnavailableReason);
 }
-$('budget-policy').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('budget','PUT',{daily_usd:$('budget-daily').value,monthly_usd:$('budget-monthly').value,user_daily_usd:$('budget-user').value,patrol_daily_usd:$('budget-patrol').value,memory_daily_usd:$('budget-memory').value,proactive_daily_usd:$('budget-proactive').value,admin_daily_usd:$('budget-admin').value});notice('全局与分项预算已保存并立即生效');await ledger();});});
+$('budget-policy').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('budget','PUT',{daily_usd:$('budget-daily').value,monthly_usd:$('budget-monthly').value,user_daily_usd:$('budget-user').value,patrol_daily_usd:$('budget-patrol').value,memory_daily_usd:$('budget-memory').value,proactive_daily_usd:$('budget-proactive').value,admin_daily_usd:$('budget-admin').value});notice('全局与分项预算已保存并立即生效');await ledger({refreshColab:false});});});
 $('reset-budget').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDialog('移除后台覆盖值，恢复 .env 中的全局与分项预算？',{danger:true,confirmLabel:'恢复 .env 预算'})))return;
   await api('budget','DELETE');
   notice('已恢复 .env 全局与分项预算');
-  await ledger();
+  await ledger({refreshColab:false});
 }));
 $('balance-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-balance'),async()=>{
   const val=Number($('balance-input').value);
@@ -1117,14 +1130,14 @@ $('balance-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-
   if(inputVal!=null)$('balance-input').value=Number(inputVal).toFixed(2);
   clearDirty('balance-form');
   notice(res.mode==='merged'?('手动补充余额已设为 '+usd(res.set_usd??val,2)+' · 当前统一可用余额 '+usd(res.remaining_usd,4)):('账户余额已校准为 '+usd(res.remaining_usd,4)));
-  await ledger();
+  await ledger({refreshColab:false});
 });});
 $('clear-balance').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDialog('清除当前手动账户余额记录？',{danger:true,confirmLabel:'清除记录'})))return;
   const res=await api('account-balance','DELETE');
   accountBalanceState=res;$('balance-input').value='';clearDirty('balance-form');
   notice('已清除手动账户余额记录'+(res.gcp_synced?'，当前由 GCP 赠金实时余额独立驱动':''));
-  await ledger();
+  await ledger({refreshColab:false});
 }));
 $('refresh-ledger').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('ledger','刷新账本')))return;

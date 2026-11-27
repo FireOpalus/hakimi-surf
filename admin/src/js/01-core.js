@@ -1,12 +1,29 @@
 let token='',tab='overview',session=null,timer=null;
 let sessionRequests=new AbortController();
+let tabRequests=new AbortController();
+function abortTabRequests(){
+  tabRequests.abort();
+  tabRequests=new AbortController();
+}
+function activeRequestSignal(method='GET'){
+  return String(method||'GET').toUpperCase()==='GET'?tabRequests.signal:sessionRequests.signal;
+}
 let displayZone='Asia/Shanghai';
 const zoneLabel=zone=>zone==='Asia/Shanghai'?'北京时间':zone;
 const $=id=>document.getElementById(id);
 const text=(id,value)=>{$(id).textContent=String(value??'');};
 const el=(tag,value,cls)=>{
   const n=document.createElement(tag);
-  if(value!==undefined)n.textContent=String(value);
+  if(Array.isArray(value)){
+    for(const child of value){
+      if(child===null||child===undefined||child===false)continue;
+      n.append(child instanceof Node?child:document.createTextNode(String(child)));
+    }
+  }else if(value instanceof Node){
+    n.append(value);
+  }else if(value!==undefined){
+    n.textContent=String(value);
+  }
   if(cls)n.className=cls;
   return n;
 };
@@ -302,7 +319,7 @@ const logoutHooks=[];
 function onLogout(fn){logoutHooks.push(fn);}
 
 async function api(path,method='GET',data){
-  const signal=sessionRequests.signal;
+  const signal=activeRequestSignal(method);
   const r=await fetch('/admin/api/'+path,{
     method,signal,
     headers:{Authorization:'Bearer '+token,...(data===undefined?{}:{'Content-Type':'application/json'})},
@@ -395,6 +412,7 @@ async function loadJsonFileInto(fileInput,textarea){
 function logout(){
   sessionRequests.abort();
   sessionRequests=new AbortController();
+  abortTabRequests();
   if(timer){clearInterval(timer);timer=null;}
   if(modalResolver)closeModalWith(modalMode==='prompt'?null:false);
   if($('module-finder').open)$('module-finder').close();

@@ -860,6 +860,29 @@ class OwnerProactive:
 
     async def _expire_and_disable(self):
         now = self.clock()
+        async with self.store.lock:
+            has_generated = await self.store.one(
+                "SELECT 1 FROM proactive_schedule s "
+                "JOIN owner_digest_receipts r ON r.id=s.id "
+                "WHERE s.scope=? AND s.kind='digest' AND s.status='generated' "
+                "AND r.payload IS NOT NULL LIMIT 1",
+                (self.scope,),
+            )
+            if not has_generated:
+                if not self.configured or not self.delivery_enabled:
+                    has_work = await self.store.one(
+                        "SELECT 1 FROM pending_owner_dms WHERE scope=? AND status='pending' "
+                        "LIMIT 1",
+                        (self.scope,),
+                    )
+                else:
+                    has_work = await self.store.one(
+                        "SELECT 1 FROM pending_owner_dms "
+                        "WHERE scope=? AND status='pending' AND expires_at<=? LIMIT 1",
+                        (self.scope, now),
+                    )
+                if not has_work:
+                    return
         async with self.store.transaction():
             await self.digests.enqueue_generated_tx(now)
             changed = await self.store.all(
@@ -907,12 +930,18 @@ class OwnerProactive:
             await self._finish_memory(row)
 
     async def deliver_once(self):
-        async with (
-            self.delivery_lock,
-            self._dialogue_lock(),
-            AsyncExitStack() as activity,
-        ):
-            await self._repair_confirmed()
+        async with self.delivery_lock:
+            async with self.store.lock:
+                has_delivered = bool(
+                    await self.store.one(
+                        "SELECT 1 FROM pending_owner_dms WHERE scope=? AND status='delivered' "
+                        "LIMIT 1",
+                        (self.scope,),
+                    )
+                )
+            if has_delivered:
+                async with self._dialogue_lock():
+                    await self._repair_confirmed()
             async with self.policy_lock:
                 await self._expire_and_disable()
                 if not self.connected():
@@ -923,61 +952,63 @@ class OwnerProactive:
                         "ORDER BY created,rowid LIMIT 1",
                         (self.scope,),
                     )
-                if not row:
-                    return False
-                key = row["id"]
-                payload = self.store.vault.open(key, row["payload"])
-                if not self.matches_payload(payload):
-                    raise Rejected("owner_dm_target_forbidden")
-                world = getattr(self.service, "world_state", None)
+            if not row:
+                return False
+            key = row["id"]
+            payload = self.store.vault.open(key, row["payload"])
+            if not self.matches_payload(payload):
+                raise Rejected("owner_dm_target_forbidden")
+            world = getattr(self.service, "world_state", None)
+            async with self._dialogue_lock(), AsyncExitStack() as activity:
                 if row["kind"] == "digest" and world:
                     await activity.enter_async_context(world.experience.chatting())
                 submitted = False
 
                 async def before_send():
                     nonlocal submitted
-                    if (
-                        not self.configured
-                        or not self.connected()
-                        or (
-                            self.platform != "onebot"
-                            and not chat_module(self.s, self.platform).authorize_chat(
-                                self.target(), self.s
+                    async with self.policy_lock:
+                        if (
+                            not self.configured
+                            or not self.connected()
+                            or (
+                                self.platform != "onebot"
+                                and not chat_module(self.s, self.platform).authorize_chat(
+                                    self.target(), self.s
+                                )
                             )
-                        )
-                    ):
-                        return False
-                    epoch = await self.service.sessions.current_epoch(self.target())
-                    async with self.store.transaction():
-                        now = self.clock()
-                        reason = self._delivery_reason(
-                            row["kind"], now, automatic=payload.get("world_digest", False)
-                        )
-                        if row["expires_at"] <= now:
-                            reason = "expired"
-                        if reason:
-                            await self.store.db.execute(
-                                "UPDATE pending_owner_dms SET "
-                                "status='skipped',payload=NULL,reason=? WHERE id=?",
-                                (reason, key),
+                        ):
+                            return False
+                        epoch = await self.service.sessions.current_epoch(self.target())
+                        async with self.store.transaction():
+                            now = self.clock()
+                            reason = self._delivery_reason(
+                                row["kind"], now, automatic=payload.get("world_digest", False)
                             )
+                            if row["expires_at"] <= now:
+                                reason = "expired"
+                            if reason:
+                                await self.store.db.execute(
+                                    "UPDATE pending_owner_dms SET "
+                                    "status='skipped',payload=NULL,reason=? WHERE id=?",
+                                    (reason, key),
+                                )
+                                if row["kind"] == "digest":
+                                    await self.digests.sync_intents_tx(key, now)
+                                return False
+                            if not self.connected():
+                                return False
+                            cur = await self.store.db.execute(
+                                "UPDATE pending_owner_dms SET status='sending',session_epoch=? "
+                                "WHERE id=? AND status='pending'",
+                                (epoch, key),
+                            )
+                            if cur.rowcount != 1:
+                                return False
                             if row["kind"] == "digest":
-                                await self.digests.sync_intents_tx(key, now)
-                            return False
-                        if not self.connected():
-                            return False
-                        cur = await self.store.db.execute(
-                            "UPDATE pending_owner_dms SET status='sending',session_epoch=? "
-                            "WHERE id=? AND status='pending'",
-                            (epoch, key),
-                        )
-                        if cur.rowcount != 1:
-                            return False
-                        if row["kind"] == "digest":
-                            await self.store.db.execute(
-                                "UPDATE owner_digest_receipts SET submitted_at=? WHERE id=?",
-                                (now, key),
-                            )
+                                await self.store.db.execute(
+                                    "UPDATE owner_digest_receipts SET submitted_at=? WHERE id=?",
+                                    (now, key),
+                                )
                     submitted = True
                     return True
 
@@ -1004,11 +1035,10 @@ class OwnerProactive:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    if (
-                        self.platform == "onebot"
-                        and isinstance(exc, Rejected)
-                        and str(exc) == "onebot_not_dispatched"
-                    ):
+                    if isinstance(exc, Rejected) and str(exc) in {
+                        "onebot_not_dispatched",
+                        "plugin_not_dispatched",
+                    }:
                         # The transport proves nothing was submitted; retain the durable message.
                         async with self.store.transaction():
                             await self.store.db.execute(
@@ -1050,16 +1080,16 @@ class OwnerProactive:
                         "SELECT * FROM pending_owner_dms WHERE id=?", (key,)
                     )
                 await self._finish_memory(confirmed)
-                ws = getattr(self.service, "world_state", None)
-                if ws is not None and hasattr(ws, "update_state"):
-                    async with self.store.lock:
-                        has_ws = await self.store.one(
-                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_state'"
-                        )
-                    if has_ws:
-                        await ws.update_state(last_proactive_at=self.clock())
-                # No compression here: alert/test delivery must remain strictly zero-token.
-                return True
+            ws = getattr(self.service, "world_state", None)
+            if ws is not None and hasattr(ws, "update_state"):
+                async with self.store.lock:
+                    has_ws = await self.store.one(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_state'"
+                    )
+                if has_ws:
+                    await ws.update_state(last_proactive_at=self.clock())
+            # No compression here: alert/test delivery must remain strictly zero-token.
+            return True
 
     async def tick(self):
         await self.check_alerts()

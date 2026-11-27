@@ -143,6 +143,7 @@ def test_admin_html_static_security_and_dom_integrity():
 def test_nginx_conf_enables_gzip_safely_and_preserves_security():
     conf = NGINX_CONF.read_text(encoding="utf-8")
     assert re.search(r"^\s*gzip\s+on;", conf, re.M)
+    assert re.search(r"^\s*gzip_static\s+on;", conf, re.M)
     assert re.search(r"^\s*gzip_vary\s+on;", conf, re.M)
     gzip_types_match = re.search(r"^\s*gzip_types\s+([^;]+);", conf, re.M)
     assert gzip_types_match is not None
@@ -165,9 +166,10 @@ def test_nginx_conf_enables_gzip_safely_and_preserves_security():
         assert required in conf
 
     assert "colab/drive/inbox" not in conf
-    for exact_loc in (
-        "location = /admin/api/songs/inbox",
-        "location = /admin/api/songs/upload",
+    for exact_loc, expected_size in (
+        ("location = /admin/api/songs/inbox", "client_max_body_size 100m;"),
+        ("location = /admin/api/songs/upload", "client_max_body_size 100m;"),
+        ("location = /admin/api/songs/ref-voices", "client_max_body_size 25m;"),
     ):
         m = re.search(
             re.escape(exact_loc) + r"\s*\{([^}]*)\}",
@@ -176,7 +178,7 @@ def test_nginx_conf_enables_gzip_safely_and_preserves_security():
         )
         assert m is not None, f"missing {exact_loc} block"
         block = m.group(1)
-        assert "client_max_body_size 100m;" in block
+        assert expected_size in block
         assert "proxy_request_buffering off;" in block
         assert conf.index(exact_loc) < conf.index("location /admin/api/")
 
@@ -2268,7 +2270,9 @@ def test_overview_ledger_non_blocking_colab_and_panel_fold():
       if (typeof print === 'function') print('NON_BLOCKING_COLAB_FOLD_OK');
       else console.log('NON_BLOCKING_COLAB_FOLD_OK');
     }})().catch(err => {{
-      console.error(err && err.stack ? err.stack : err);
+      const detail = String(err) + '\\n' + (err && err.stack ? err.stack : '');
+      if (typeof print === 'function') print('ERR: ' + detail);
+      else console.error(detail);
       if (typeof process !== 'undefined' && process.exit) process.exit(1);
       throw err;
     }});
@@ -2284,4 +2288,275 @@ def test_overview_ledger_non_blocking_colab_and_panel_fold():
     assert proc.returncode == 0, f"Non-blocking Colab JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "NON_BLOCKING_COLAB_FOLD_OK" in proc.stdout, (
         f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"
+    )
+
+
+def test_song_finder_ui_rendering_and_fetch_prefill_runtime():
+    """Verify renderSongFinderResults() builds valid DOM nodes and fetchOne() prefills cleanly."""
+    import json
+    import shutil
+
+    media_js = (ADMIN_DIR / "src" / "js" / "07-media-bili.js").read_text(encoding="utf-8")
+    for stale_fn in ("refreshSongInbox", "guessTitleFromFilename", "setSongLearnInboxValue"):
+        assert stale_fn not in media_js, f"Undefined helper {stale_fn!r} still in 07-media-bili.js"
+
+    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
+    runner: list[str] | None = None
+    if shutil.which("node"):
+        runner = ["node", "-e"]
+    elif jsc_path.is_file():
+        runner = [str(jsc_path), "-e"]
+    if runner is None:
+        pytest.skip("No local JS engine (node/jsc) available for Song Finder JS runtime test")
+
+    html = build_html()
+    assert audit_html(html) == []
+    collector = _IdCollector()
+    collector.feed(html)
+    all_ids_json = json.dumps(sorted(set(collector.ids)))
+    core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
+    song_start = media_js.index("let songGeneration=0")
+    song_end = media_js.index("async function songs()")
+    song_helpers_js = media_js[song_start:song_end]
+
+    harness = f"""
+    const ALL_IDS = {all_ids_json};
+    const cfgSourceLabels = {{}};
+    class MockNode {{
+      constructor(tag) {{
+        this.tagName = String(tag || 'div').toUpperCase();
+        this.children = [];
+        this.attrs = {{}};
+        this.dataset = {{}};
+        this.listeners = {{}};
+        this._text = '';
+        this.hidden = false;
+        this.disabled = false;
+        this.checked = false;
+        this.value = '';
+        this.className = '';
+        this.options = [];
+        this.classList = {{ add(){{}}, remove(){{}}, toggle(){{}}, contains(){{ return false; }} }};
+      }}
+      get textContent() {{
+        return this.children.length
+          ? this._text + this.children.map(c => c.textContent).join('')
+          : this._text;
+      }}
+      set textContent(v) {{ this._text = String(v ?? ''); this.children = []; }}
+      setAttribute(k, v) {{
+        if (k === 'class') this.className = String(v);
+        this.attrs[k] = String(v);
+      }}
+      getAttribute(k) {{ return this.attrs[k] ?? null; }}
+      removeAttribute(k) {{ delete this.attrs[k]; }}
+      append(...nodes) {{
+        for (const n of nodes) {{
+          if (n instanceof MockNode) {{
+            this.children.push(n);
+            if (n.tagName === 'OPTION') this.options.push(n);
+          }} else {{
+            const t = new MockNode('#text'); t._text = String(n); this.children.push(t);
+          }}
+        }}
+      }}
+      replaceChildren(...nodes) {{
+        this.children = []; this.options = []; this._text = ''; this.append(...nodes);
+      }}
+      addEventListener(evt, fn) {{ (this.listeners[evt] ||= []).push(fn); }}
+      dispatch(evt) {{
+        for (const fn of (this.listeners[evt] || [])) fn({{ target: this, preventDefault(){{}} }});
+      }}
+      querySelector() {{ return null; }}
+      querySelectorAll() {{ return []; }}
+      closest() {{ return null; }}
+      focus() {{ this._focused = true; }}
+      scrollIntoView() {{ this._scrolled = true; }}
+    }}
+    const Node = MockNode;
+    const byId = new Map();
+    for (const id of ALL_IDS) {{
+      const n = new MockNode('div');
+      n.id = id;
+      byId.set(id, n);
+    }}
+    const document = {{
+      body: new MockNode('body'),
+      documentElement: new MockNode('html'),
+      hidden: false,
+      activeElement: null,
+      title: '',
+      getElementById(id) {{ return byId.get(id) || null; }},
+      createElement(tag) {{ return new MockNode(tag); }},
+      createTextNode(t) {{ const n = new MockNode('#text'); n._text = String(t); return n; }},
+      addEventListener() {{}},
+      querySelectorAll() {{ return []; }}
+    }};
+    class AbortController {{
+      constructor() {{ this.signal = {{ aborted: false }}; }}
+      abort() {{ this.signal.aborted = true; }}
+    }}
+    function setTimeout(){{ return 0; }}
+    function clearTimeout(){{}}
+    function clearInterval(){{}}
+    const location = {{ hash: '', pathname: '/admin' }};
+    const history = {{ replaceState(){{}}, pushState(){{}} }};
+
+    {core_js}
+    token = 'test-token';
+    const pendingTasks = [];
+    const origBusy = busy;
+    busy = (btn, fn) => {{
+      const p = origBusy(btn, fn);
+      pendingTasks.push(p);
+      return p;
+    }};
+    const apiCalls = [];
+    let inboxItems = [];
+    api = async (path, method='GET', data) => {{
+      apiCalls.push({{ path, method, data }});
+      if (path === 'songs/fetch-to-inbox' && method === 'POST') {{
+        const saved = {{
+          id: 'drive_file_88',
+          file_id: 'drive_file_88',
+          name: (data.title || 'fallback_stem') + ' - ' + (data.artist || 'Artist') + '.mp3',
+          size: 3145728,
+          song_finder: {{ online: true, node_region: 'CN', provider_order: ['bilibili_public'] }}
+        }};
+        inboxItems = [{{ id: saved.file_id, name: saved.name, size: saved.size }}];
+        return saved;
+      }}
+      if (path === 'songs/inbox' && method === 'GET') {{
+        return {{ items: inboxItems }};
+      }}
+      return {{}};
+    }};
+
+    {song_helpers_js}
+
+    function walk(node, acc=[]) {{
+      acc.push(node);
+      for (const c of (node.children || [])) walk(c, acc);
+      return acc;
+    }}
+    function assert(cond, msg) {{ if (!cond) throw new Error('ASSERT FAILED: ' + msg); }}
+
+    (async () => {{
+      // 1. el() array child support stays XSS-safe
+      const xss = '<img src=x onerror=alert(1)>';
+      const arrNode = el('div', [el('span', 'safe', 'pill'), xss, null, false], 'wrap');
+      assert(arrNode.className === 'wrap', 'el array cls mismatch');
+      assert(arrNode.children.length === 2, 'el array should skip null/false');
+      assert(!walk(arrNode).some(n => n.tagName === 'IMG'), 'el array must escape strings');
+      assert(arrNode.textContent.includes(xss), 'el array text node missing');
+
+      // 2. renderSongFinderResults produces valid pills/buttons with zero [object ...]
+      renderSongFinderResults({{
+        provider_used: 'bilibili_public',
+        song_finder: {{
+          online: true,
+          node_region: 'CN',
+          provider_order: ['bilibili_public', 'youtube'],
+          providers: {{ bilibili_public: {{}}, youtube: {{}} }}
+        }},
+        candidates: [
+          {{
+            candidate_id: 'bili:BV1xx',
+            provider: 'bilibili_public',
+            title: '晴天 Official ' + xss,
+            uploader: '周杰伦',
+            duration_sec: 269,
+            score: 9.6
+          }},
+          {{
+            candidate_id: 'yt:abc',
+            provider: 'youtube',
+            title: '夜曲 MV',
+            uploader: 'Jay',
+            duration_sec: 226,
+            score: 8.8
+          }}
+        ]
+      }}, '晴天', '周杰伦');
+
+      const box = $('song-finder-results');
+      assert(!box.textContent.includes('[object '), 'must not stringify DOM nodes');
+      assert(!walk(box).some(n => n.tagName === 'IMG'), 'XSS must never create IMG');
+      const allNodes = walk(box);
+      const buttons = allNodes.filter(n => n.tagName === 'BUTTON');
+      const pills = allNodes.filter(
+        n => n.tagName === 'SPAN' && n.className && n.className.includes('pill-')
+      );
+      assert(buttons.length === 4, 'expected 4 action buttons across 2 candidates');
+      assert(pills.length === 6, 'expected 6 pills across 2 candidates, got ' + pills.length);
+      assert(box.textContent.includes('B 站公开源'), 'provider pill missing');
+      assert(box.textContent.includes('时长 4:29'), 'duration pill missing');
+      assert(box.textContent.includes('评分 9.6'), 'score pill missing');
+
+      // 3. Click 「下载到收件箱」 (fillAfter=false)
+      const dlBtns = buttons.filter(b => b.textContent === '下载到收件箱');
+      const fillBtns = buttons.filter(b => b.textContent === '下载并填入学歌');
+      assert(dlBtns.length === 2 && fillBtns.length === 2, 'button labels mismatch');
+      dlBtns[0].dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(apiCalls[0].path === 'songs/fetch-to-inbox', 'first call must fetch-to-inbox');
+      assert(apiCalls[0].data.candidate_id === 'bili:BV1xx', 'candidate_id mismatch');
+      assert(apiCalls[1].path === 'songs/inbox', 'must refresh inbox via loadSongInbox');
+      assert($('notice-text').textContent.includes('Drive inbox/'), 'download-only notice');
+
+      // 4. Click 「下载并填入学歌」 (fillAfter=true) prefills title/artist/inbox/auto-search
+      $('song-learn-auto-search').checked = true;
+      $('song-learn-heading')._scrolled = false;
+      fillBtns[0].dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert($('song-learn-title').value === '晴天', 'prefill title mismatch');
+      assert($('song-learn-artist').value === '周杰伦', 'prefill artist mismatch');
+      assert(
+        $('song-learn-inbox').value === '晴天 - 周杰伦.mp3',
+        'prefill inbox select mismatch: ' + $('song-learn-inbox').value
+      );
+      const chosenOpt = $('song-learn-inbox').options.find(o => o.value === '晴天 - 周杰伦.mp3');
+      assert(chosenOpt && chosenOpt.dataset.fileId === 'drive_file_88', 'inbox fileId missing');
+      assert($('song-learn-auto-search').checked === false, 'auto-search must uncheck');
+      assert($('song-learn-heading')._scrolled === true, 'must scroll to learn heading');
+
+      // 5. Fallback title stem when queryTitle & item.title are empty
+      apiCalls.length = 0;
+      renderSongFinderResults({{
+        candidates: [{{
+          candidate_id: 'bili:BV2yy', provider: 'bilibili_public',
+          title: '', uploader: '', duration_sec: 180, score: 7.5
+        }}]
+      }}, '', '');
+      const fallbackFill = walk($('song-finder-results')).find(
+        n => n.tagName === 'BUTTON' && n.textContent === '下载并填入学歌'
+      );
+      fallbackFill.dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        $('song-learn-title').value === 'fallback_stem - Artist',
+        'stem fallback title mismatch: ' + $('song-learn-title').value
+      );
+
+      if (typeof print === 'function') print('SONG_FINDER_UI_OK');
+      else console.log('SONG_FINDER_UI_OK');
+    }})().catch(err => {{
+      const detail = String(err) + '\\n' + (err && err.stack ? err.stack : '');
+      if (typeof print === 'function') print('ERR: ' + detail);
+      else console.error(detail);
+      if (typeof process !== 'undefined' && process.exit) process.exit(1);
+      throw err;
+    }});
+    """
+
+    proc = subprocess.run(
+        [*runner, harness],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Song Finder JS test failed:\n{proc.stderr}\n{proc.stdout}"
+    assert "SONG_FINDER_UI_OK" in proc.stdout, (
+        f"Song Finder async JS test did not complete:\n{proc.stderr}\n{proc.stdout}"
     )

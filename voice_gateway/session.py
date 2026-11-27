@@ -13,6 +13,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -150,10 +151,17 @@ class VoiceGatewaySession:
         client_id: str = DEFAULT_CLIENT_ID,
         upstream_connect_factory: ConnectFactory | None = None,
         ffmpeg_semaphore: asyncio.Semaphore | None = None,
+        provider_lease: Callable[
+            [], AbstractAsyncContextManager[tuple[VoiceGatewayConfig, STTProvider, TTSProvider]]
+        ]
+        | None = None,
+        config_getter: Callable[[], VoiceGatewayConfig] | None = None,
     ) -> None:
         self._config = config
         self._stt = stt_provider
         self._tts = tts_provider
+        self._provider_lease = provider_lease
+        self._config_getter = config_getter
         self._send_text = send_text
         self._send_bytes = send_bytes
         self._close_ws = close_ws
@@ -188,6 +196,21 @@ class VoiceGatewaySession:
     def session_active(self) -> bool:
         """Whether an upstream /ws/companion session has been started and is ready."""
         return self._session_active and self._upstream is not None and self._upstream.connected
+
+    def _current_config(self) -> VoiceGatewayConfig:
+        if self._config_getter is not None:
+            return self._config_getter()
+        return self._config
+
+    @contextlib.asynccontextmanager
+    async def _lease_providers(
+        self,
+    ) -> AsyncIterator[tuple[VoiceGatewayConfig, STTProvider, TTSProvider]]:
+        if self._provider_lease is not None:
+            async with self._provider_lease() as leased:
+                yield leased
+        else:
+            yield self._config, self._stt, self._tts
 
     async def start(self) -> None:
         """Start the serialized TTS worker loop for this client connection."""
@@ -259,7 +282,7 @@ class VoiceGatewaySession:
                 if exc is not None:
                     log.warning(
                         "Gateway background task error: %s",
-                        self._config.redact_secrets(f"{type(exc).__name__}: {exc}"),
+                        self._current_config().redact_secrets(f"{type(exc).__name__}: {exc}"),
                     )
 
         task.add_done_callback(_done)
@@ -295,7 +318,7 @@ class VoiceGatewaySession:
             build_error_frame(
                 reason,
                 detail,
-                config=self._config,
+                config=self._current_config(),
                 req_id=req_id,
                 turn_id=turn_id,
                 stream_id=stream_id,
@@ -378,21 +401,22 @@ class VoiceGatewaySession:
         await self._send_json(pong)
 
     async def _handle_session_start(self, frame: dict[str, Any]) -> None:
+        cfg = self._current_config()
         raw_mode = frame.get("mode")
-        mode = str(raw_mode).strip() if raw_mode is not None else self._config.session_mode
+        mode = str(raw_mode).strip() if raw_mode is not None else cfg.session_mode
         if mode not in {"owner_private", "room_public"}:
             raise ProtocolError("invalid_mode", "mode must be owner_private or room_public")
 
         raw_game = frame.get("game_title")
         if raw_game is not None and not isinstance(raw_game, str):
             raise ProtocolError("invalid_game_title", "game_title must be a string")
-        game_title = raw_game.strip() if raw_game is not None else self._config.game_title
+        game_title = raw_game.strip() if raw_game is not None else cfg.game_title
 
         raw_fmt = frame.get("output_format")
         output_format = (
             str(raw_fmt).strip().lower()
             if raw_fmt is not None and str(raw_fmt).strip()
-            else self._config.default_output_format
+            else cfg.default_output_format
         )
         try:
             output_format_meta(output_format)
@@ -403,7 +427,7 @@ class VoiceGatewaySession:
         tts_buffer_mode = (
             str(raw_buf).strip().lower()
             if raw_buf is not None and str(raw_buf).strip()
-            else self._config.tts_buffer_mode
+            else cfg.tts_buffer_mode
         )
         if tts_buffer_mode not in {"turn", "chunk"}:
             raise ProtocolError(
@@ -414,7 +438,7 @@ class VoiceGatewaySession:
         self._upload_stream = None
         await self._close_upstream()
 
-        base_cfg = self._config.to_client_config(
+        base_cfg = cfg.to_client_config(
             adapter_id=self._adapter_id,
             client_id=self._client_id,
         )
@@ -452,6 +476,7 @@ class VoiceGatewaySession:
         self._output_format = output_format
         self._tts_buffer_mode = tts_buffer_mode
 
+        latest_cfg = self._current_config()
         upstream_config = ready.get("config")
         await self._send_json(
             {
@@ -460,9 +485,9 @@ class VoiceGatewaySession:
                 "mode": self._session_mode,
                 "output_format": self._output_format,
                 "tts_buffer_mode": self._tts_buffer_mode,
-                "stt_provider": self._config.stt_provider,
-                "tts_provider": self._config.tts_provider,
-                "tts_model": self._config.resolved_tts_model(),
+                "stt_provider": latest_cfg.stt_provider,
+                "tts_provider": latest_cfg.tts_provider,
+                "tts_model": latest_cfg.resolved_tts_model(),
                 "upstream_config": upstream_config if isinstance(upstream_config, dict) else {},
             }
         )
@@ -511,15 +536,16 @@ class VoiceGatewaySession:
         async def _run_stt() -> None:
             t0 = time.perf_counter()
             try:
-                wav_bytes = await normalize_input_to_wav(
-                    raw_audio,
-                    fmt,
-                    sample_rate=sample_rate,
-                    channels=channels,
-                    ffmpeg_bin=self._config.ffmpeg_bin,
-                    ffmpeg_semaphore=self._ffmpeg_semaphore,
-                )
-                text = (await self._stt.transcribe(wav_bytes)).strip()
+                async with self._lease_providers() as (cfg, stt, _tts):
+                    wav_bytes = await normalize_input_to_wav(
+                        raw_audio,
+                        fmt,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        ffmpeg_bin=cfg.ffmpeg_bin,
+                        ffmpeg_semaphore=self._ffmpeg_semaphore,
+                    )
+                    text = (await stt.transcribe(wav_bytes)).strip()
             except Exception as exc:
                 await self._send_error("stt_failed", f"{type(exc).__name__}: {exc}", req_id=req_id)
                 return
@@ -719,15 +745,16 @@ class VoiceGatewaySession:
         async def _runner() -> None:
             t0 = time.perf_counter()
             try:
-                wav_bytes = await normalize_input_to_wav(
-                    raw_audio,
-                    fmt,
-                    sample_rate=sample_rate,
-                    channels=channels,
-                    ffmpeg_bin=self._config.ffmpeg_bin,
-                    ffmpeg_semaphore=self._ffmpeg_semaphore,
-                )
-                raw_text = await self._stt.transcribe(wav_bytes)
+                async with self._lease_providers() as (cfg, stt, _tts):
+                    wav_bytes = await normalize_input_to_wav(
+                        raw_audio,
+                        fmt,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                        ffmpeg_bin=cfg.ffmpeg_bin,
+                        ffmpeg_semaphore=self._ffmpeg_semaphore,
+                    )
+                    raw_text = await stt.transcribe(wav_bytes)
             except asyncio.CancelledError:
                 await self._emit_turn_end(
                     turn_id,
@@ -1268,35 +1295,103 @@ class VoiceGatewaySession:
 
     async def _execute_tts_job(self, job: _TtsJob, state: _TtsExecutionState) -> None:
         t0 = time.perf_counter()
-        synth_stream = getattr(self._tts, "synthesize_stream", None)
-        has_synth = callable(getattr(self._tts, "synthesize", None))
-        if (self._config.tts_streaming and callable(synth_stream)) or not has_synth:
-            assert callable(synth_stream)
-            raw_fmt = getattr(self._tts, "response_format", "mp3") or "mp3"
-            src_fmt = str(raw_fmt).lstrip(".").lower()
-            raw_iter = synth_stream(job.text)
-        else:
-            audio_bytes, raw_ext = await self._tts.synthesize(job.text)
-            src_fmt = raw_ext.lstrip(".").lower() or "mp3"
-            raw_iter = _chunk_bytes(audio_bytes)
+        async with self._lease_providers() as (cfg, _stt, tts):
+            synth_stream = getattr(tts, "synthesize_stream", None)
+            has_synth = callable(getattr(tts, "synthesize", None))
+            if (cfg.tts_streaming and callable(synth_stream)) or not has_synth:
+                assert callable(synth_stream)
+                raw_fmt = getattr(tts, "response_format", "mp3") or "mp3"
+                src_fmt = str(raw_fmt).lstrip(".").lower()
+                raw_iter = synth_stream(job.text)
+            else:
+                audio_bytes, raw_ext = await tts.synthesize(job.text)
+                src_fmt = raw_ext.lstrip(".").lower() or "mp3"
+                raw_iter = _chunk_bytes(audio_bytes)
 
-        transcoded = transcode_audio_stream(
-            raw_iter,
-            src_fmt=src_fmt,
-            dst_fmt=job.output_format,
-            ffmpeg_bin=self._config.ffmpeg_bin,
-            ffmpeg_semaphore=self._ffmpeg_semaphore,
-        )
-        try:
+            transcoded = transcode_audio_stream(
+                raw_iter,
+                src_fmt=src_fmt,
+                dst_fmt=job.output_format,
+                ffmpeg_bin=cfg.ffmpeg_bin,
+                ffmpeg_semaphore=self._ffmpeg_semaphore,
+            )
             try:
-                first_chunk = await anext(transcoded)
-            except StopAsyncIteration:
-                if job.req_id:
-                    await self._send_error(
-                        "tts_empty_audio",
-                        "TTS provider returned empty audio",
-                        req_id=job.req_id,
-                    )
+                try:
+                    first_chunk = await anext(transcoded)
+                except StopAsyncIteration:
+                    if job.req_id:
+                        await self._send_error(
+                            "tts_empty_audio",
+                            "TTS provider returned empty audio",
+                            req_id=job.req_id,
+                        )
+                    if job.final_turn_payload is not None and job.turn_id:
+                        tstate = self._turns.get(job.turn_id)
+                        await self._emit_turn_end(
+                            job.turn_id,
+                            status=str(job.final_turn_payload["status"]),
+                            reason=str(job.final_turn_payload["reason"]),
+                            metrics=self._build_turn_metrics(
+                                tstate,
+                                llm_ms=job.final_turn_payload.get("llm_ms"),
+                            ),
+                        )
+                    return
+
+                if (
+                    job.cancelled
+                    or self._closing
+                    or (job.turn_id and job.turn_id in self._cancelled_turns)
+                ):
+                    raise asyncio.CancelledError
+
+                state.ttfb_ms = (time.perf_counter() - t0) * 1000.0
+                if job.turn_id:
+                    tstate = self._turns.get(job.turn_id)
+                    if tstate is not None and tstate.first_tts_ttfb_ms is None:
+                        tstate.first_tts_ttfb_ms = state.ttfb_ms
+
+                mime_type, sample_rate, channels = output_format_meta(job.output_format)
+                await self._send_json(
+                    {
+                        "type": "tts.start",
+                        "req_id": job.req_id,
+                        "turn_id": job.turn_id,
+                        "seq": job.seq,
+                        "format": job.output_format,
+                        "mime_type": mime_type,
+                        "sample_rate": sample_rate,
+                        "channels": channels,
+                    }
+                )
+                state.started_wire = True
+
+                await self._send_raw_bytes(first_chunk)
+                state.total_bytes += len(first_chunk)
+
+                async for chunk in transcoded:
+                    if (
+                        job.cancelled
+                        or self._closing
+                        or (job.turn_id and job.turn_id in self._cancelled_turns)
+                    ):
+                        raise asyncio.CancelledError
+                    await self._send_raw_bytes(chunk)
+                    state.total_bytes += len(chunk)
+
+                await self._send_json(
+                    {
+                        "type": "tts.end",
+                        "req_id": job.req_id,
+                        "turn_id": job.turn_id,
+                        "seq": job.seq,
+                        "bytes": state.total_bytes,
+                        "status": "ok",
+                        "reason": "",
+                        "tts_ttfb_ms": round(state.ttfb_ms, 2),
+                    }
+                )
+
                 if job.final_turn_payload is not None and job.turn_id:
                     tstate = self._turns.get(job.turn_id)
                     await self._emit_turn_end(
@@ -1306,76 +1401,9 @@ class VoiceGatewaySession:
                         metrics=self._build_turn_metrics(
                             tstate,
                             llm_ms=job.final_turn_payload.get("llm_ms"),
+                            tts_ttfb_ms=state.ttfb_ms,
                         ),
                     )
-                return
-
-            if (
-                job.cancelled
-                or self._closing
-                or (job.turn_id and job.turn_id in self._cancelled_turns)
-            ):
-                raise asyncio.CancelledError
-
-            state.ttfb_ms = (time.perf_counter() - t0) * 1000.0
-            if job.turn_id:
-                tstate = self._turns.get(job.turn_id)
-                if tstate is not None and tstate.first_tts_ttfb_ms is None:
-                    tstate.first_tts_ttfb_ms = state.ttfb_ms
-
-            mime_type, sample_rate, channels = output_format_meta(job.output_format)
-            await self._send_json(
-                {
-                    "type": "tts.start",
-                    "req_id": job.req_id,
-                    "turn_id": job.turn_id,
-                    "seq": job.seq,
-                    "format": job.output_format,
-                    "mime_type": mime_type,
-                    "sample_rate": sample_rate,
-                    "channels": channels,
-                }
-            )
-            state.started_wire = True
-
-            await self._send_raw_bytes(first_chunk)
-            state.total_bytes += len(first_chunk)
-
-            async for chunk in transcoded:
-                if (
-                    job.cancelled
-                    or self._closing
-                    or (job.turn_id and job.turn_id in self._cancelled_turns)
-                ):
-                    raise asyncio.CancelledError
-                await self._send_raw_bytes(chunk)
-                state.total_bytes += len(chunk)
-
-            await self._send_json(
-                {
-                    "type": "tts.end",
-                    "req_id": job.req_id,
-                    "turn_id": job.turn_id,
-                    "seq": job.seq,
-                    "bytes": state.total_bytes,
-                    "status": "ok",
-                    "reason": "",
-                    "tts_ttfb_ms": round(state.ttfb_ms, 2),
-                }
-            )
-
-            if job.final_turn_payload is not None and job.turn_id:
-                tstate = self._turns.get(job.turn_id)
-                await self._emit_turn_end(
-                    job.turn_id,
-                    status=str(job.final_turn_payload["status"]),
-                    reason=str(job.final_turn_payload["reason"]),
-                    metrics=self._build_turn_metrics(
-                        tstate,
-                        llm_ms=job.final_turn_payload.get("llm_ms"),
-                        tts_ttfb_ms=state.ttfb_ms,
-                    ),
-                )
-        finally:
-            with contextlib.suppress(Exception):
-                await transcoded.aclose()
+            finally:
+                with contextlib.suppress(Exception):
+                    await transcoded.aclose()

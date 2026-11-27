@@ -61,4 +61,5 @@ CREATE TABLE IF NOT EXISTS budget_totals (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), amount INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ledger_times (id TEXT PRIMARY KEY, created REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS ledger_times_created ON ledger_times(created);
 """

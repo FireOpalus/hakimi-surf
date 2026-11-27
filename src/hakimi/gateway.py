@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS gateway_group_context (
  payload BLOB NOT NULL,
  PRIMARY KEY(scope,event)
 );
+CREATE INDEX IF NOT EXISTS gateway_group_context_scope_at ON gateway_group_context(scope, at);
+CREATE INDEX IF NOT EXISTS gateway_group_context_at ON gateway_group_context(at);
 """
 
 

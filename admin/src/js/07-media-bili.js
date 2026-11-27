@@ -82,7 +82,7 @@ function clearMemePreviews(revokeAll=false){
   text('meme-state','');
 }
 async function memeRequest(path,method='GET',body){
-  const signal=sessionRequests.signal;
+  const signal=activeRequestSignal(method);
   const r=await fetch('/admin/api/memes'+path,{method,signal,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':body.type||'application/octet-stream'}:{})},body,cache:'no-store',credentials:'omit',redirect:'error'});
   if(!r.ok){
     let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}
@@ -197,7 +197,7 @@ $('meme-apply-batch').addEventListener('click',()=>{const batch=$('meme-batch-la
 $('meme-clear-queue').addEventListener('click',clearMemeQueue);
 $('meme-upload').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{if(!memeQueue.length&&$('meme-file').files.length)queueMemeFiles($('meme-file').files);if(!memeQueue.length)throw Error('请先选择或拖入图片');const bad=memeQueue.find(item=>!memeLabelOk(item.label));if(bad)throw Error('请为「'+bad.file.name+'」填写 1～24 字有效标签（汉字/字母/数字/_/-）');let ok=0,anim=0;while(memeQueue.length){const item=memeQueue[0];const r=await memeRequest('/upload/'+encodeURIComponent(item.label+'.'+item.ext),'POST',item.file),d=await r.json();if(!token)return;if(item.url)URL.revokeObjectURL(item.url);memeQueue.shift();ok++;if(d.first_frame_only)anim++;renderMemeQueue();}notice('已批量上传 '+ok+' 张表情，白名单立即更新'+(anim?'（其中 '+anim+' 张动画保留第一帧）':''));await memes();});});
 
-let songGeneration=0,selectedSongFile=null,pendingSongLearn=null,pendingRefVoice=null,lastSongStorageState=null,defaultSongEngine='dual',rvcParamsTouched=false;
+let songGeneration=0,songStorageGen=0,selectedSongFile=null,pendingSongLearn=null,pendingRefVoice=null,lastSongStorageState=null,defaultSongEngine='dual',rvcParamsTouched=false;
 const songBlobCache=new Map();
 
 const defaultRvcParams={
@@ -515,7 +515,7 @@ function showSongLearnResult(job,title,inboxFilename,pitch,opts={}){
 }
 function prefillSongLearn(item){
   const name=String(item?.name||'');
-  const title=sanitizeSongTitleStem(name);
+  const title=String(item?.title||'').trim()||sanitizeSongTitleStem(name);
   pendingSongLearn={title,inboxFilename:name,inboxFileId:String(item?.id||''),autoSearch:false};
   if(title)$('song-learn-title').value=title;
   const sel=$('song-learn-inbox');
@@ -542,7 +542,7 @@ function clearSongPreviews(revokeAll=false){
   text('song-state','');
 }
 async function songRequest(path,method='GET',body,extraHeaders={}){
-  const signal=sessionRequests.signal;
+  const signal=activeRequestSignal(method);
   const r=await fetch('/admin/api/songs'+path,{method,signal,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':body.type||'application/octet-stream'}:{}),...extraHeaders},body,cache:'no-store',credentials:'omit',redirect:'error'});
   if(!r.ok){
     let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}
@@ -744,29 +744,33 @@ function renderSongInboxTable(items,errMsg=''){
     ];
   }));
 }
-async function loadSongStorage(strict=false){
+async function loadSongStorage(strict=false,expectedGen=null){
+  const storageGen=++songStorageGen;
   try{
     const st=await api('songs/storage');
-    if(!token)return null;
-    renderSongStorageDetails(st);
+    if(!token||storageGen!==songStorageGen||(expectedGen!==null&&expectedGen!==songGeneration))return null;
+    const preserveInput=expectedGen!==null&&Boolean(dirtyRegistry.get($('song-storage-form'))?.dirty);
+    renderSongStorageDetails(st,{preserveInput});
     return st;
   }catch(err){
     if(err?.name==='AbortError')throw err;
+    if(storageGen!==songStorageGen||(expectedGen!==null&&expectedGen!==songGeneration))return null;
     if(strict)throw Error(mapSongError(err));
     return null;
   }
 }
-async function loadSongInbox(strict=false){
+async function loadSongInbox(strict=false,expectedGen=null){
   let items=[],errMsg='';
   try{
     const res=await api('songs/inbox');
-    if(!token)return 0;
+    if(!token||(expectedGen!==null&&expectedGen!==songGeneration))return 0;
     items=Array.isArray(res)?res:(Array.isArray(res?.items)?res.items:[]);
     if(res&&res.folders&&typeof res.folders==='object'&&lastSongStorageState&&!lastSongStorageState.folders){
       renderSongStorageDetails({...lastSongStorageState,folders:res.folders},{preserveInput:true});
     }
   }catch(err){
     if(err?.name==='AbortError')throw err;
+    if(expectedGen!==null&&expectedGen!==songGeneration)return 0;
     errMsg=mapSongError(err);
     if(strict){
       renderSongInboxTable([],errMsg);
@@ -774,23 +778,26 @@ async function loadSongInbox(strict=false){
       throw Error(errMsg);
     }
   }
+  if(!token||(expectedGen!==null&&expectedGen!==songGeneration))return 0;
   renderSongInboxTable(items,errMsg);
   renderSongInboxSelect(items,errMsg);
   return items.length;
 }
-async function loadSongVoices(strict=false){
+async function loadSongVoices(strict=false,expectedGen=null){
   let data=null,errMsg='';
   try{
     data=await api('songs/voices');
-    if(!token)return null;
+    if(!token||(expectedGen!==null&&expectedGen!==songGeneration))return null;
   }catch(err){
     if(err?.name==='AbortError')throw err;
+    if(expectedGen!==null&&expectedGen!==songGeneration)return null;
     errMsg=mapSongError(err);
     if(strict){
       renderSongVoices(null,errMsg);
       throw Error(errMsg);
     }
   }
+  if(!token||(expectedGen!==null&&expectedGen!==songGeneration))return null;
   renderSongVoices(data,errMsg);
   return data;
 }
@@ -867,11 +874,18 @@ function renderSongFinderResults(data,queryTitle,queryArtist){
       });
       if(res?.song_finder)renderSongFinderStatus(res.song_finder);
       const savedName=String(res?.name||'');
-      await refreshSongInbox(false);
+      const savedId=String(res?.file_id||res?.id||'');
+      const chosenTitle=cleanTitle||sanitizeSongTitleStem(savedName);
       if(fillAfter&&savedName){
-        $('song-learn-title').value=cleanTitle||guessTitleFromFilename(savedName);
+        prefillSongLearn({id:savedId,name:savedName,size:res?.size,title:chosenTitle});
         if(cleanArtist)$('song-learn-artist').value=cleanArtist;
-        setSongLearnInboxValue(savedName);
+      }
+      await loadSongInbox(false);
+      if(!token)return;
+      if(fillAfter&&savedName){
+        pendingSongLearn=null;
+        if(chosenTitle)$('song-learn-title').value=chosenTitle;
+        if(cleanArtist)$('song-learn-artist').value=cleanArtist;
         $('song-learn-auto-search').checked=false;
         $('song-learn-heading')?.scrollIntoView({behavior:'smooth',block:'start'});
         notice('已下载原曲「'+savedName+'」到收件箱并填入学歌表单（尚未消费 Colab 算力）');
@@ -887,18 +901,19 @@ function renderSongFinderResults(data,queryTitle,queryArtist){
       try{await fetchOne(true);}
       catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
     },'primary');
-    return el('div',[
-      el('div',[
-        el('strong',String(item.title||'未命名候选')),
-        el('div',[
-          pill(provLabel,item.provider==='bilibili_public'?'ok':'free'),
-          pill('时长 '+formatSongDurationSec(item.duration_sec),'muted'),
-          pill('评分 '+Number(item.score||0).toFixed(1),'muted'),
-          el('small','UP/作者：'+String(item.uploader||'—'),'muted')
-        ],'pill-row')
-      ]),
-      el('div',[dlBtn,fillBtn],'row')
-    ],'row between');
+    const row=el('div',undefined,'row between');
+    const info=el('div');
+    const metaRow=pillRow(
+      pill(provLabel,item.provider==='bilibili_public'?'ok':'free'),
+      pill('时长 '+formatSongDurationSec(item.duration_sec),'muted'),
+      pill('评分 '+Number(item.score||0).toFixed(1),'muted'),
+      el('small','UP/作者：'+String(item.uploader||'—'),'muted')
+    );
+    info.append(el('strong',String(item.title||'未命名候选')),metaRow);
+    const acts=el('div',undefined,'row');
+    acts.append(dlBtn,fillBtn);
+    row.append(info,acts);
+    return row;
   });
   list.replaceChildren(...rows);
 }
@@ -1095,18 +1110,34 @@ function renderSongList(items,generation){
 async function songs(){
   songGeneration++;
   const generation=songGeneration;
-  const [songsRes,storageRes]=await Promise.allSettled([api('songs'),loadSongStorage(false),loadSongInbox(false),loadSongVoices(false)]);
-  if(songsRes.status==='rejected')throw songsRes.reason;
-  const d=songsRes.value;
+  let storageResolved=false;
+  if($('song-inbox-table')&&!$('song-inbox-table').children.length){
+    $('song-inbox-table').replaceChildren(el('p','正在异步加载 Drive 收件箱…','muted'));
+  }
+  // Drive 存储详情、收件箱与音色列表异步并发拉取，不阻塞主歌单首屏渲染。
+  const storageGenAtStart=songStorageGen+1;
+  loadSongStorage(false,generation).then(st=>{
+    if(st&&generation===songGeneration&&songStorageGen===storageGenAtStart)storageResolved=true;
+  }).catch(err=>{
+    if(err?.name!=='AbortError'&&token&&generation===songGeneration)return null;
+  });
+  loadSongInbox(false,generation).catch(err=>{
+    if(err?.name!=='AbortError'&&token&&generation===songGeneration)return 0;
+  });
+  loadSongVoices(false,generation).catch(err=>{
+    if(err?.name!=='AbortError'&&token&&generation===songGeneration)return null;
+  });
+  const d=await api('songs');
   if(!token||generation!==songGeneration)return;
-  if(storageRes.status!=='fulfilled'||!storageRes.value){
+  if(!storageResolved&&songStorageGen===storageGenAtStart){
+    const preserveInput=Boolean(dirtyRegistry.get($('song-storage-form'))?.dirty);
     renderSongStorageDetails({
       configured:Boolean(d.drive_configured),
       source:d.drive_config_source||'default',
       drive_songs_folder_id:d.drive_songs_folder_id||'',
       folders:d.drive_folders||null,
       error:d.drive_error||''
-    });
+    },{preserveInput});
   }
   if(d.default_engine){
     const prevDefault=defaultSongEngine;
@@ -1184,6 +1215,7 @@ $('song-storage-form').addEventListener('submit',e=>{
   busy($('song-storage-save'),async()=>{
     const folderId=$('song-drive-folder-id').value.trim();
     if(folderId.toLowerCase()==='root')throw Error(songErrorLabels.song_drive_invalid_folder_id);
+    songStorageGen++;
     let next;
     try{next=await api('songs/storage','PUT',{drive_songs_folder_id:folderId});}
     catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
@@ -1195,6 +1227,7 @@ $('song-storage-form').addEventListener('submit',e=>{
 });
 $('song-storage-reset').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDialog('移除后台覆盖值，恢复默认 Hakimi_Songs/ 云盘目录配置？',{danger:true,confirmLabel:'恢复默认配置'})))return;
+  songStorageGen++;
   let next;
   try{next=await api('songs/storage','DELETE');}
   catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
@@ -1363,6 +1396,7 @@ trackDirty('video-watch-policy','原片分析设置');
 trackDirty('song-storage-form','歌单云盘目录');
 
 onLogout(()=>{
+  songStorageGen++;
   clearMemePreviews(true);
   clearMemeQueue();
   clearSongPreviews(true);

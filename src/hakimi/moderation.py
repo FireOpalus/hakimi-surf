@@ -41,6 +41,8 @@ class Moderation:
         self.init_lock = asyncio.Lock()
         self.initialized = False
         self.scope = self.store.vault.digest("moderation", self.s.namespace, self.s.onebot_self_id)
+        self._last_prune_mono: float = float("-inf")
+        self._prune_interval: float = 300.0
 
     def target_id(self, value):
         if isinstance(value, bool) or not isinstance(value, (str, int)):
@@ -629,8 +631,13 @@ class Moderation:
             else f"已解除 {target_platform}:{target_uid} 的应用层屏蔽。"
         )
 
-    async def status(self):
-        await self.prune()
+    async def status(self, *, force_prune: bool = False):
+        now_mono = time.monotonic()
+        if force_prune or (now_mono - self._last_prune_mono) >= self._prune_interval:
+            await self.prune()
+        else:
+            await self.initialize()
+        now_wall = self.clock()
         async with self.store.lock:
             muted = await self.store.all(
                 "SELECT * FROM muted_users WHERE scope=? ORDER BY created DESC LIMIT 1000",
@@ -658,7 +665,9 @@ class Moderation:
                     "reason": REASONS[r["reason"]],
                     "created": r["created"],
                     "expires": r["expires"],
-                    "status": r["status"],
+                    "status": "expired"
+                    if (r["status"] == "pending" and r["expires"] <= now_wall)
+                    else r["status"],
                 }
                 for r in proposals
             ],
@@ -667,13 +676,28 @@ class Moderation:
     async def prune(self):
         await self.initialize()
         now = self.clock()
-        async with self.store.transaction():
-            await self.store.db.execute("DELETE FROM user_strikes WHERE created<?", (now - 86400,))
-            await self.store.db.execute(
-                "UPDATE pending_mute_proposals SET status='expired' "
-                "WHERE status='pending' AND expires<=?",
-                (now,),
+        async with self.store.lock:
+            has_work = bool(
+                await self.store.one(
+                    "SELECT 1 FROM user_strikes WHERE created<? LIMIT 1", (now - 86400,)
+                )
+                or await self.store.one(
+                    "SELECT 1 FROM pending_mute_proposals "
+                    "WHERE (status='pending' AND expires<=?) OR created<? LIMIT 1",
+                    (now, now - 8 * 86400),
+                )
             )
-            await self.store.db.execute(
-                "DELETE FROM pending_mute_proposals WHERE created<?", (now - 8 * 86400,)
-            )
+        if has_work:
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "DELETE FROM user_strikes WHERE created<?", (now - 86400,)
+                )
+                await self.store.db.execute(
+                    "UPDATE pending_mute_proposals SET status='expired' "
+                    "WHERE status='pending' AND expires<=?",
+                    (now,),
+                )
+                await self.store.db.execute(
+                    "DELETE FROM pending_mute_proposals WHERE created<?", (now - 8 * 86400,)
+                )
+        self._last_prune_mono = time.monotonic()

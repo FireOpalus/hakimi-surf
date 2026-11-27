@@ -302,6 +302,12 @@ class ColabComputeHub:
         self._orphan_seen_since: float | None = None
         self._last_warm_sessions: list[dict[str, Any]] = []
         self._last_warm_pool: dict[str, Any] = _default_warm_pool()
+        self._analytics_cache: tuple[str, dict[str, Any]] | None = None
+        self._analytics_version: int = 0
+
+    def _invalidate_analytics_cache(self) -> None:
+        self._analytics_cache = None
+        self._analytics_version += 1
 
     def _default_config(self) -> ColabConfig:
         return ColabConfig()
@@ -545,6 +551,7 @@ class ColabComputeHub:
             self.initialized = True
 
     async def _refresh_cached_counts(self) -> None:
+        self._invalidate_analytics_cache()
         async with self.store.lock:
             row_active = await self.store.one(
                 "SELECT COUNT(*) FROM colab_jobs WHERE status='running'"
@@ -905,156 +912,177 @@ class ColabComputeHub:
         self,
         warm_sessions: list[dict[str, Any]],
         warm_pool: dict[str, Any],
+        *,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         tz = ZoneInfo(self.s.bot_timezone)
         today_date = datetime.fromtimestamp(self._clock(), tz).date()
-        days_30 = [
-            (today_date - timedelta(days=offset)).isoformat() for offset in range(29, -1, -1)
-        ]
-        start_day, end_day = days_30[0], days_30[-1]
+        today_iso = today_date.isoformat()
 
-        async with self.store.lock:
-            summary_row = await self.store.one(
-                "SELECT "
-                "COUNT(*) AS total_jobs, "
-                "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) "
-                "AS succeeded_jobs, "
-                "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) "
-                "AS failed_jobs, "
-                "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) "
-                "AS cancelled_jobs, "
-                "COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) "
-                "AS running_jobs, "
-                "COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) "
-                "AS queued_jobs, "
-                "COALESCE(SUM(cu_used), 0.0) AS total_cu_used "
-                "FROM colab_jobs"
-            )
-            trend_rows = await self.store.all(
-                "SELECT "
-                "day, "
-                "COUNT(*) AS jobs, "
-                "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded, "
-                "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed, "
-                "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled, "
-                "COALESCE(SUM(cu_used), 0.0) AS cu_used "
-                "FROM colab_jobs "
-                "WHERE day >= ? AND day <= ? "
-                "GROUP BY day",
-                (start_day, end_day),
-            )
-            gpu_rows = await self.store.all(
-                "SELECT "
-                "COALESCE(NULLIF(assigned_gpu, ''), preferred_gpu) AS gpu, "
-                "COUNT(*) AS jobs, "
-                "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded, "
-                "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed, "
-                "COALESCE(SUM(cu_used), 0.0) AS cu_used "
-                "FROM colab_jobs "
-                "WHERE status != 'cancelled' OR started_at IS NOT NULL "
-                "GROUP BY COALESCE(NULLIF(assigned_gpu, ''), preferred_gpu) "
-                "ORDER BY cu_used DESC, jobs DESC, gpu ASC"
-            )
-            acc_rows = await self.store.all(
-                "SELECT id, result FROM colab_jobs "
-                "WHERE status NOT IN ('queued', 'running') "
-                "ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, created_at DESC "
-                "LIMIT ?",
-                (_ACCELERATION_SAMPLE_LIMIT,),
-            )
+        cached = None if force_refresh else self._analytics_cache
+        if cached is not None and cached[0] == today_iso:
+            base = cached[1]
+        else:
+            cache_ver = self._analytics_version
+            days_30 = [
+                (today_date - timedelta(days=offset)).isoformat() for offset in range(29, -1, -1)
+            ]
+            start_day, end_day = days_30[0], days_30[-1]
 
-        trend_map: dict[str, Any] = {str(r["day"]): r for r in trend_rows}
-        cu_trend: list[dict[str, Any]] = []
-        raw_cu_by_day: list[float] = []
-        for day_str in days_30:
-            row = trend_map.get(day_str)
-            if row is None:
-                raw_cu_by_day.append(0.0)
-                cu_trend.append(
-                    {
-                        "date": day_str,
-                        "jobs": 0,
-                        "succeeded": 0,
-                        "failed": 0,
-                        "cancelled": 0,
-                        "cu_used": 0.0,
-                    }
+            async with self.store.lock:
+                summary_row = await self.store.one(
+                    "SELECT "
+                    "COUNT(*) AS total_jobs, "
+                    "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) "
+                    "AS succeeded_jobs, "
+                    "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) "
+                    "AS failed_jobs, "
+                    "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) "
+                    "AS cancelled_jobs, "
+                    "COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) "
+                    "AS running_jobs, "
+                    "COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) "
+                    "AS queued_jobs, "
+                    "COALESCE(SUM(cu_used), 0.0) AS total_cu_used "
+                    "FROM colab_jobs"
                 )
-            else:
+                trend_rows = await self.store.all(
+                    "SELECT "
+                    "day, "
+                    "COUNT(*) AS jobs, "
+                    "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) "
+                    "AS succeeded, "
+                    "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed, "
+                    "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) "
+                    "AS cancelled, "
+                    "COALESCE(SUM(cu_used), 0.0) AS cu_used "
+                    "FROM colab_jobs "
+                    "WHERE day >= ? AND day <= ? "
+                    "GROUP BY day",
+                    (start_day, end_day),
+                )
+                gpu_rows = await self.store.all(
+                    "SELECT "
+                    "COALESCE(NULLIF(assigned_gpu, ''), preferred_gpu) AS gpu, "
+                    "COUNT(*) AS jobs, "
+                    "COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) "
+                    "AS succeeded, "
+                    "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed, "
+                    "COALESCE(SUM(cu_used), 0.0) AS cu_used "
+                    "FROM colab_jobs "
+                    "WHERE status != 'cancelled' OR started_at IS NOT NULL "
+                    "GROUP BY COALESCE(NULLIF(assigned_gpu, ''), preferred_gpu) "
+                    "ORDER BY cu_used DESC, jobs DESC, gpu ASC"
+                )
+                acc_rows = await self.store.all(
+                    "SELECT id, result FROM colab_jobs "
+                    "WHERE status NOT IN ('queued', 'running') "
+                    "ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, created_at DESC "
+                    "LIMIT ?",
+                    (_ACCELERATION_SAMPLE_LIMIT,),
+                )
+
+            trend_map: dict[str, Any] = {str(r["day"]): r for r in trend_rows}
+            cu_trend: list[dict[str, Any]] = []
+            raw_cu_by_day: list[float] = []
+            for day_str in days_30:
+                row = trend_map.get(day_str)
+                if row is None:
+                    raw_cu_by_day.append(0.0)
+                    cu_trend.append(
+                        {
+                            "date": day_str,
+                            "jobs": 0,
+                            "succeeded": 0,
+                            "failed": 0,
+                            "cancelled": 0,
+                            "cu_used": 0.0,
+                        }
+                    )
+                else:
+                    raw_cu = float(row["cu_used"] or 0.0)
+                    raw_cu_by_day.append(raw_cu)
+                    cu_trend.append(
+                        {
+                            "date": day_str,
+                            "jobs": int(row["jobs"] or 0),
+                            "succeeded": int(row["succeeded"] or 0),
+                            "failed": int(row["failed"] or 0),
+                            "cancelled": int(row["cancelled"] or 0),
+                            "cu_used": round(raw_cu, 4),
+                        }
+                    )
+
+            total_jobs = int(summary_row["total_jobs"] or 0) if summary_row else 0
+            succeeded_jobs = int(summary_row["succeeded_jobs"] or 0) if summary_row else 0
+            failed_jobs = int(summary_row["failed_jobs"] or 0) if summary_row else 0
+            cancelled_jobs = int(summary_row["cancelled_jobs"] or 0) if summary_row else 0
+            running_jobs = int(summary_row["running_jobs"] or 0) if summary_row else 0
+            queued_jobs = int(summary_row["queued_jobs"] or 0) if summary_row else 0
+            total_cu_used = float(summary_row["total_cu_used"] or 0.0) if summary_row else 0.0
+            terminal_denom = succeeded_jobs + failed_jobs
+            success_rate = round(succeeded_jobs / terminal_denom, 4) if terminal_denom > 0 else None
+
+            summary = {
+                "total_jobs": total_jobs,
+                "succeeded_jobs": succeeded_jobs,
+                "failed_jobs": failed_jobs,
+                "cancelled_jobs": cancelled_jobs,
+                "running_jobs": running_jobs,
+                "queued_jobs": queued_jobs,
+                "success_rate": success_rate,
+                "total_cu_used": round(total_cu_used, 4),
+                "last_14d_cu_used": round(sum(raw_cu_by_day[-14:]), 4),
+                "last_30d_cu_used": round(sum(raw_cu_by_day), 4),
+                "last_14d_jobs": sum(item["jobs"] for item in cu_trend[-14:]),
+                "last_30d_jobs": sum(item["jobs"] for item in cu_trend),
+            }
+
+            total_gpu_cu = sum(float(r["cu_used"] or 0.0) for r in gpu_rows)
+            gpu_breakdown: list[dict[str, Any]] = []
+            for row in gpu_rows:
                 raw_cu = float(row["cu_used"] or 0.0)
-                raw_cu_by_day.append(raw_cu)
-                cu_trend.append(
+                gpu_breakdown.append(
                     {
-                        "date": day_str,
+                        "gpu": str(row["gpu"] or ""),
                         "jobs": int(row["jobs"] or 0),
                         "succeeded": int(row["succeeded"] or 0),
                         "failed": int(row["failed"] or 0),
-                        "cancelled": int(row["cancelled"] or 0),
                         "cu_used": round(raw_cu, 4),
+                        "cu_share": round(raw_cu / total_gpu_cu, 4) if total_gpu_cu > 0.0 else 0.0,
                     }
                 )
 
-        total_jobs = int(summary_row["total_jobs"] or 0) if summary_row else 0
-        succeeded_jobs = int(summary_row["succeeded_jobs"] or 0) if summary_row else 0
-        failed_jobs = int(summary_row["failed_jobs"] or 0) if summary_row else 0
-        cancelled_jobs = int(summary_row["cancelled_jobs"] or 0) if summary_row else 0
-        running_jobs = int(summary_row["running_jobs"] or 0) if summary_row else 0
-        queued_jobs = int(summary_row["queued_jobs"] or 0) if summary_row else 0
-        total_cu_used = float(summary_row["total_cu_used"] or 0.0) if summary_row else 0.0
-        terminal_denom = succeeded_jobs + failed_jobs
-        success_rate = round(succeeded_jobs / terminal_denom, 4) if terminal_denom > 0 else None
+            counters = {
+                "drive_direct_jobs": 0,
+                "drive_direct_fallbacks": 0,
+                "warm_reuse_hits": 0,
+                "warm_cold_starts": 0,
+                "cache_weight_hits": 0,
+                "cache_weight_misses": 0,
+                "cache_venv_hits": 0,
+                "cache_venv_misses": 0,
+                "measured_jobs": 0,
+            }
+            for row in acc_rows:
+                blob = row["result"]
+                if not blob:
+                    continue
+                opened = self._open_blob(str(row["id"]), "result", blob)
+                if not isinstance(opened, dict):
+                    continue
+                acc = opened.get("acceleration")
+                if isinstance(acc, dict) and acc:
+                    _accumulate_acceleration(counters, acc)
 
-        summary = {
-            "total_jobs": total_jobs,
-            "succeeded_jobs": succeeded_jobs,
-            "failed_jobs": failed_jobs,
-            "cancelled_jobs": cancelled_jobs,
-            "running_jobs": running_jobs,
-            "queued_jobs": queued_jobs,
-            "success_rate": success_rate,
-            "total_cu_used": round(total_cu_used, 4),
-            "last_14d_cu_used": round(sum(raw_cu_by_day[-14:]), 4),
-            "last_30d_cu_used": round(sum(raw_cu_by_day), 4),
-            "last_14d_jobs": sum(item["jobs"] for item in cu_trend[-14:]),
-            "last_30d_jobs": sum(item["jobs"] for item in cu_trend),
-        }
-
-        total_gpu_cu = sum(float(r["cu_used"] or 0.0) for r in gpu_rows)
-        gpu_breakdown: list[dict[str, Any]] = []
-        for row in gpu_rows:
-            raw_cu = float(row["cu_used"] or 0.0)
-            gpu_breakdown.append(
-                {
-                    "gpu": str(row["gpu"] or ""),
-                    "jobs": int(row["jobs"] or 0),
-                    "succeeded": int(row["succeeded"] or 0),
-                    "failed": int(row["failed"] or 0),
-                    "cu_used": round(raw_cu, 4),
-                    "cu_share": round(raw_cu / total_gpu_cu, 4) if total_gpu_cu > 0.0 else 0.0,
-                }
-            )
-
-        counters = {
-            "drive_direct_jobs": 0,
-            "drive_direct_fallbacks": 0,
-            "warm_reuse_hits": 0,
-            "warm_cold_starts": 0,
-            "cache_weight_hits": 0,
-            "cache_weight_misses": 0,
-            "cache_venv_hits": 0,
-            "cache_venv_misses": 0,
-            "measured_jobs": 0,
-        }
-        for row in acc_rows:
-            blob = row["result"]
-            if not blob:
-                continue
-            opened = self._open_blob(str(row["id"]), "result", blob)
-            if not isinstance(opened, dict):
-                continue
-            acc = opened.get("acceleration")
-            if isinstance(acc, dict) and acc:
-                _accumulate_acceleration(counters, acc)
+            base = {
+                "summary": summary,
+                "cu_trend": cu_trend,
+                "gpu_breakdown": gpu_breakdown,
+                "counters": counters,
+            }
+            if self._analytics_version == cache_ver:
+                self._analytics_cache = (today_iso, base)
 
         acceleration_stats = {
             "warm_pool_enabled": bool(warm_pool.get("enabled", False)),
@@ -1064,13 +1092,13 @@ class ColabComputeHub:
             "warm_idle_ttl_seconds": int(warm_pool.get("idle_ttl_seconds", 360)),
             "warm_max_ttl_seconds": int(warm_pool.get("max_ttl_seconds", 900)),
             "warm_active_count": len(warm_sessions),
-            **counters,
+            **base["counters"],
         }
 
         return {
-            "summary": summary,
-            "cu_trend": cu_trend,
-            "gpu_breakdown": gpu_breakdown,
+            "summary": dict(base["summary"]),
+            "cu_trend": [dict(item) for item in base["cu_trend"]],
+            "gpu_breakdown": [dict(item) for item in base["gpu_breakdown"]],
             "warm_sessions": [dict(item) for item in warm_sessions],
             "acceleration_stats": acceleration_stats,
         }
@@ -1129,7 +1157,9 @@ class ColabComputeHub:
         today = await self._today_usage()
         jobs = await self.list_jobs(limit=30)
         warm_sessions = list(worker.get("warm_sessions") or [])
-        analytics = await self._compute_analytics(warm_sessions, self._last_warm_pool)
+        analytics = await self._compute_analytics(
+            warm_sessions, self._last_warm_pool, force_refresh=force_refresh
+        )
         return {
             "configured": is_cfg,
             "source": "sqlite" if self._overridden else "default",

@@ -142,6 +142,7 @@ class _FakeTelegramApi:
         self.sent_audios: list[dict[str, Any]] = []
         self.sent_photos: list[dict[str, Any]] = []
         self.sent_animations: list[dict[str, Any]] = []
+        self.sent_stickers: list[dict[str, Any]] = []
         self.sent_reactions: list[dict[str, Any]] = []
         self.sent_chat_actions: list[dict[str, Any]] = []
         self.reaction_result: bool = True
@@ -261,6 +262,27 @@ class _FakeTelegramApi:
             {
                 "chat_id": chat_id,
                 "bytes": animation_bytes,
+                "filename": filename,
+                "mime_type": mime_type,
+                "reply_to": reply_to_message_id,
+            }
+        )
+        return str(self._msg_seq)
+
+    async def send_sticker(
+        self,
+        chat_id: str,
+        sticker_bytes: bytes,
+        *,
+        filename: str = "sticker.webp",
+        mime_type: str = "image/webp",
+        reply_to_message_id: int | None = None,
+    ) -> str:
+        self._msg_seq += 1
+        self.sent_stickers.append(
+            {
+                "chat_id": chat_id,
+                "bytes": sticker_bytes,
                 "filename": filename,
                 "mime_type": mime_type,
                 "reply_to": reply_to_message_id,
@@ -1567,7 +1589,7 @@ async def test_tg_plugin_media_react_typing_handlers() -> None:
     assert parsed_alias["addressed"] is False
     assert parsed_alias["attention_reason"] == ""
 
-    # _handle_media_delivery: PNG (media_b64), JPEG/WEBP (blob) -> send_photo; GIF -> send_animation
+    # _handle_media_delivery: PNG/JPEG -> send_photo; WEBP -> send_sticker; GIF -> send_animation
     png_bytes = _make_png_bytes()
     gif_bytes = _make_gif_bytes()
     jpg_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 32
@@ -1615,7 +1637,8 @@ async def test_tg_plugin_media_react_typing_handlers() -> None:
             "blob": webp_bytes,
         }
     )
-    assert fake_api.sent_photos[-1]["mime_type"] == "image/webp"
+    assert len(fake_api.sent_stickers) == 1
+    assert fake_api.sent_stickers[-1]["mime_type"] == "image/webp"
 
     res_gif = await plugin._handle_media_delivery(
         {

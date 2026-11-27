@@ -45,9 +45,13 @@ class MemoryCompressor:
         self.clock = clock
         self.wall_clock = wall_clock
         self.slice_backoff: OrderedDict[str, tuple[int, float]] = OrderedDict()
+        self._dirty_seeded: bool = False
 
     def schedule(self, message):
         if self.s.prefix_history_enabled:
+            dual = getattr(self.sessions, "dual", None)
+            if dual is not None and hasattr(dual, "mark_dirty"):
+                dual.mark_dirty(self.sessions.key(message))
             self.wakeup.set()
             return
         key = self.sessions.key(message)
@@ -171,7 +175,7 @@ class MemoryCompressor:
         output_reserve = (20098 * decision_in) / 1_000_000
         return source_reserve + flex_reserve + output_reserve
 
-    async def extract(self, message, *, force=False, background=False):
+    async def extract(self, message, *, force=False, background=False, budget_status=None):
         lock = self.locks[int(self.sessions.key(message)[:8], 16) % len(self.locks)]
         if lock.locked():
             return {"status": "busy"}
@@ -180,7 +184,10 @@ class MemoryCompressor:
                 return {"status": "disabled"}
             subject = self.store.vault.digest("compression-budget", self.sessions.key(message))
             # Do not snapshot/claim a slice or spend decision calls unless memory lane can pay.
-            if (await self.store.budget_status())["hard_stop"] or not await self.store.can_reserve(
+            budget = (
+                budget_status if budget_status is not None else await self.store.budget_status()
+            )
+            if budget["hard_stop"] or not await self.store.can_reserve(
                 subject, "memory", self._estimate_extract_reserve(0)
             ):
                 return {"status": "budget_hard_stop"}
@@ -225,7 +232,9 @@ class MemoryCompressor:
 
             async def guard():
                 nonlocal call_stage
-                async with self.sessions.database(message, preserve_history=True) as (db, _):
+                async with self.sessions.database(
+                    message, preserve_history=True, readonly=True
+                ) as (db, _):
                     async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
                         if await cur.fetchone() != (snapshot["epoch"], snapshot["version"]):
                             raise Rejected("compression_stale")
@@ -348,7 +357,12 @@ class MemoryCompressor:
             return
         day = now.date().isoformat()
         for _, message in await self.store.runtime.sessions():
-            async with self.sessions.database(message, preserve_history=True) as (db, _):
+            if not self.sessions.path(message).exists():
+                continue
+            async with self.sessions.database(message, preserve_history=True, readonly=True) as (
+                db,
+                _,
+            ):
                 async with db.execute("SELECT last_nightly FROM memory_control") as cur:
                     done = (await cur.fetchone())[0] == day
             if done:
@@ -372,6 +386,44 @@ class MemoryCompressor:
             "archive_time": str(self.s.memory_archive_time),
         }
 
+    async def run_pass(self):
+        """Run one background extraction pass across dirty sessions, checking budget once."""
+        dual = self.sessions.dual
+        now_wall = self.wall_clock()
+        for deferred_key in [
+            k for k, due_at in list(dual.deferred_until.items()) if due_at <= now_wall
+        ]:
+            dual.deferred_until.pop(deferred_key, None)
+            dual.dirty_sessions.add(deferred_key)
+        all_sessions: list[tuple[str, object]] | None = None
+        if not self._dirty_seeded:
+            all_sessions = await self.store.runtime.sessions()
+            for session_key, _ in all_sessions:
+                dual.dirty_sessions.add(session_key)
+            self._dirty_seeded = True
+        if not dual.dirty_sessions:
+            return
+        budget = await self.store.budget_status()
+        if budget["hard_stop"]:
+            return
+        if all_sessions is None:
+            all_sessions = await self.store.runtime.sessions()
+        by_key = {session_key: message for session_key, message in all_sessions}
+        for stale_key in list(dual.dirty_sessions - set(by_key)):
+            dual.dirty_sessions.discard(stale_key)
+            dual.deferred_until.pop(stale_key, None)
+        for session_key, message in all_sessions:
+            if session_key not in dual.dirty_sessions:
+                continue
+            res = await self.extract(message, background=True, budget_status=budget)
+            status = res.get("status") if isinstance(res, dict) else None
+            if status == "budget_hard_stop":
+                break
+            if status not in {"not_due_or_cooling_down", "provider_backoff", "busy", "disabled"}:
+                budget = await self.store.budget_status()
+                if budget["hard_stop"]:
+                    break
+
     async def run(self):
         # This worker polls local SQLite only. The LLM runs only for a durable unattempted slice.
         last_scan = float("-inf")
@@ -383,8 +435,7 @@ class MemoryCompressor:
                     if time.monotonic() - last_scan >= 3600:
                         await self.nightly()
                         last_scan = time.monotonic()
-                    for _, message in await self.store.runtime.sessions():
-                        await self.extract(message, background=True)
+                    await self.run_pass()
             except asyncio.CancelledError:
                 raise
             except Exception:

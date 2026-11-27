@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS roaming_events (
 );
 CREATE INDEX IF NOT EXISTS roaming_events_day ON roaming_events(day);
 CREATE TABLE IF NOT EXISTS roaming_receipts (id TEXT PRIMARY KEY, day TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS roaming_receipts_day ON roaming_receipts(day);
 CREATE TABLE IF NOT EXISTS roaming_counts (
   day TEXT NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY(day,kind)
 );
@@ -89,6 +90,14 @@ class PatrolDiary:
         self.zone = ZoneInfo(settings.roaming_timezone)
         self.summary_lock = asyncio.Lock()
         self._initialized = False
+        self._ensured_days: set[str] = set()
+        self._day_versions: dict[str, int] = {}
+
+    def _mark_day_dirty(self, day: str) -> None:
+        self._day_versions[day] = self._day_versions.get(day, 0) + 1
+
+    def day_version(self, day: str) -> int:
+        return self._day_versions.get(day, 0)
 
     async def initialize(self):
         if self._initialized:
@@ -163,6 +172,8 @@ class PatrolDiary:
             await self.store.db.execute(
                 "INSERT OR IGNORE INTO roaming_days(day) VALUES (?)", (day,)
             )
+        self._ensured_days.add(day)
+        self._mark_day_dirty(day)
 
     async def injection(self, event_id: str, *, now=None):
         # No attempted prompt, user ID, group ID or private text enters the diary.
@@ -348,6 +359,7 @@ class PatrolDiary:
                 await self.store.db.execute(
                     "INSERT OR IGNORE INTO roaming_public_summaries(day) VALUES (?)", (day,)
                 )
+        self._mark_day_dirty(day)
         subject = self.store.vault.digest("diary-budget", self.s.namespace)
         try:
             with model_work("diary.daily_summary", key):
@@ -364,6 +376,7 @@ class PatrolDiary:
                 await self.store.db.execute(
                     "UPDATE roaming_summaries SET status='failed' WHERE day=?", (day,)
                 )
+            self._mark_day_dirty(day)
             if isinstance(exc, Rejected) and str(exc) == "prompt_injection":
                 await self.injection("daily-summary:" + day, now=now)
             logging.getLogger("hakimi").info("event=diary_summary_unavailable")
@@ -373,6 +386,7 @@ class PatrolDiary:
                     "UPDATE roaming_summaries SET status='done',payload=? WHERE day=?",
                     (self.store.vault.seal(key, summary), day),
                 )
+            self._mark_day_dirty(day)
 
     async def public_digest(self, day):
         await self.initialize()
@@ -483,18 +497,22 @@ class PatrolDiary:
         local = self.local(now)
         today = local.date().isoformat()
         async with self.summary_lock:
-            async with self.store.transaction():
-                await self.store.db.execute(
-                    "INSERT OR IGNORE INTO roaming_days(day) VALUES (?)", (today,)
-                )
-                if force:
-                    days = [(today,)]
-                else:
-                    end = (
-                        today
-                        if (local.hour, local.minute) >= (23, 55)
-                        else (local.date() - timedelta(days=1)).isoformat()
+            if today not in self._ensured_days:
+                async with self.store.transaction():
+                    await self.store.db.execute(
+                        "INSERT OR IGNORE INTO roaming_days(day) VALUES (?)", (today,)
                     )
+                self._ensured_days.add(today)
+                self._mark_day_dirty(today)
+            if force:
+                days = [(today,)]
+            else:
+                end = (
+                    today
+                    if (local.hour, local.minute) >= (23, 55)
+                    else (local.date() - timedelta(days=1)).isoformat()
+                )
+                async with self.store.lock:
                     days = await self.store.all(
                         "SELECT DISTINCT day FROM roaming_counts WHERE day BETWEEN ? AND ? "
                         f"AND {VISIBLE_COUNTS} AND day NOT IN "
@@ -546,6 +564,9 @@ class PatrolDiary:
                 "roaming_summaries",
             ):
                 await self.store.db.execute(f"DELETE FROM {table} WHERE day<?", (cutoff,))
+        self._ensured_days = {d for d in self._ensured_days if d >= cutoff}
+        for stale in [d for d in self._day_versions if d < cutoff]:
+            self._day_versions.pop(stale, None)
 
 
 class RoamingLogger(PatrolDiary):

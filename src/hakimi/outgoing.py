@@ -26,7 +26,7 @@ from .platform_hooks import get_platform_hooks
 from .security import Rejected, authorize, configured_secrets, safe_output
 from .session_manager import session_epoch
 from .social import chat_module, confirmed_message_id
-from .text_card import render_card, should_render_rich_card
+from .text_card import render_card_async, should_render_rich_card
 
 _MAX_MEDIA_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_MEDIA_B64_CHARS = 7 * 1024 * 1024
@@ -280,7 +280,7 @@ async def send_platform_card(
         raise Rejected("reply_invalidated")
     if not authorize(message, service.s):
         raise Rejected("reply_invalidated")
-    image_b64 = await asyncio.to_thread(render_card, rendered_text)
+    image_b64 = await render_card_async(rendered_text)
     return await send_platform_meme(
         service,
         message,
@@ -615,7 +615,7 @@ async def is_affection_muted_only(service, message: Message) -> bool:
         if pid is None:
             return False
         return (await identity.person_mute_source(pid)) == "ai_affection_zero"
-    return True
+    return False
 
 
 async def persist_ack(service, reply, position, text, receipt, epoch, digest=None):
@@ -1389,7 +1389,7 @@ async def deliver_proactive_jit(
             await apply_confirmed()
         raise
     except Rejected as exc:
-        if str(exc) == "onebot_not_dispatched" and not confirmed:
+        if str(exc) in {"onebot_not_dispatched", "plugin_not_dispatched"} and not confirmed:
             return {"status": "not_dispatched", "bubbles_sent": 0}
         if str(exc) == "reply_invalidated" and not confirmed and not dispatched:
             return {"status": "cancelled", "bubbles_sent": 0}

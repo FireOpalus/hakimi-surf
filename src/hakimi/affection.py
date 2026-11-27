@@ -15,7 +15,6 @@ from .affection_rules import (
     ONEBOT_USER_RE,
     PLATFORM_ID_RE,
     QQ_USER_RE,
-    SCHEMA,
     TIER_CAPS,
     TIER_SPECS,
     VIOLATION_DELTAS,
@@ -31,10 +30,17 @@ from .affection_rules import (
     level_for_score,
     tier_matrix_rows,
 )
+from .affection_rules import SCHEMA as _RULES_SCHEMA
 from .affection_storage import _AffectionStorageMixin
 from .config import Settings
 from .models import Message
 from .security import Rejected
+
+_EXTRA_HISTORY_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS affection_history_scope_created "
+    "ON affection_history(scope, created DESC, id DESC);\n"
+)
+SCHEMA = _RULES_SCHEMA + _EXTRA_HISTORY_INDEX_DDL
 
 __all__ = [
     "ANNOYANCE_COOLDOWN_SECONDS",
@@ -1381,6 +1387,66 @@ class AffectionManager(_AffectionStorageMixin):
             self.overridden = value is not None
         return await self.status()
 
+    def _check_cooldown_candidate(
+        self,
+        opened: Any,
+        *,
+        today: str,
+        ref_now: float,
+        target: int,
+        days_sec: float,
+        muted_uids: set[str],
+        identity: Any,
+    ) -> tuple[str, str, str | None, dict[str, Any], int, int] | None:
+        if not isinstance(opened, dict):
+            return None
+        plat = str(opened.get("platform", "onebot"))
+        uid = str(opened.get("user_id", ""))
+        if not uid:
+            return None
+        pid = str(opened["person_id"]) if opened.get("person_id") else None
+        is_owner = (pid == "owner") or self.is_owner_id(plat, uid)
+        if is_owner or self._is_known_bot(plat, uid) or uid == self._bot_id(plat):
+            return None
+        record = self._normalize_record(opened, plat, uid, "", today, is_owner=False, person_id=pid)
+        score = int(record["score"])
+        if score == 0 or score >= target:
+            return None
+        is_muted = (plat == "onebot" and uid in muted_uids) or (
+            identity is not None
+            and (
+                identity.is_muted(plat, uid)
+                or (
+                    pid is not None
+                    and any(
+                        (p == "onebot" and u in muted_uids) or identity.is_muted(p, u)
+                        for p, u in identity.linked_accounts_cached(pid)
+                    )
+                )
+            )
+        )
+        if is_muted:
+            return None
+
+        last_neg = float(record.get("last_negative_at", 0.0) or 0.0)
+        last_rec_day = str(record.get("last_recovery_day", "") or "")
+        updated_at = float(record.get("updated_at", 0.0) or 0.0)
+        if last_rec_day == today:
+            return None
+        if last_neg > 0:
+            if (ref_now - last_neg) < days_sec:
+                return None
+        elif last_rec_day:
+            pass
+        elif updated_at <= 0 or (ref_now - updated_at) < days_sec:
+            return None
+
+        new_score = min(target, score + 1)
+        delta = new_score - score
+        if delta <= 0:
+            return None
+        return plat, uid, pid, record, score, new_score
+
     async def run_cooldown_recovery(self, *, now: float | None = None) -> int:
         await self.initialize()
         if not self.config.enabled or self.config.cooldown_recovery_days <= 0:
@@ -1391,66 +1457,73 @@ class AffectionManager(_AffectionStorageMixin):
         ref_now = float(self.clock() if now is None else now)
         today = self._today_str(ref_now)
         muted_uids = set(self.s.muted_user_ids)
-        recovered_count = 0
 
-        async with self._lock:
-            async with self.store.transaction():
-                rows = await self.store.all(
-                    "SELECT user_key, payload FROM user_affection WHERE scope=?",
-                    (self.scope,),
+        # Phase 1: snapshot candidate rows under read lock, then decrypt & filter without holding
+        # either self._lock or a SQLite BEGIN IMMEDIATE write transaction.
+        async with self.store.lock:
+            rows = await self.store.all(
+                "SELECT user_key, payload FROM user_affection WHERE scope=?",
+                (self.scope,),
+            )
+
+        candidates: list[tuple[str, Any, dict[str, Any]]] = []
+        for row in rows:
+            user_key = str(row["user_key"])
+            payload = row["payload"]
+            opened = self.store.vault.open("affection:" + user_key, payload)
+            if (
+                self._check_cooldown_candidate(
+                    opened,
+                    today=today,
+                    ref_now=ref_now,
+                    target=target,
+                    days_sec=days_sec,
+                    muted_uids=muted_uids,
+                    identity=identity,
                 )
-                for row in rows:
-                    user_key = str(row["user_key"])
-                    opened = self.store.vault.open("affection:" + user_key, row["payload"])
-                    if not isinstance(opened, dict):
-                        continue
-                    plat = str(opened.get("platform", "onebot"))
-                    uid = str(opened.get("user_id", ""))
-                    if not uid:
-                        continue
-                    pid = str(opened["person_id"]) if opened.get("person_id") else None
-                    is_owner = (pid == "owner") or self.is_owner_id(plat, uid)
-                    if is_owner or self._is_known_bot(plat, uid) or uid == self._bot_id(plat):
-                        continue
-                    record = self._normalize_record(
-                        opened, plat, uid, "", today, is_owner=False, person_id=pid
-                    )
-                    score = int(record["score"])
-                    if score == 0 or score >= target:
-                        continue
-                    is_muted = (plat == "onebot" and uid in muted_uids) or (
-                        identity is not None
-                        and (
-                            identity.is_muted(plat, uid)
-                            or (
-                                pid is not None
-                                and any(
-                                    (p == "onebot" and u in muted_uids) or identity.is_muted(p, u)
-                                    for p, u in identity.linked_accounts_cached(pid)
-                                )
-                            )
-                        )
-                    )
-                    if is_muted:
-                        continue
+                is not None
+            ):
+                candidates.append((user_key, payload, opened))
 
-                    last_neg = float(record.get("last_negative_at", 0.0) or 0.0)
-                    last_rec_day = str(record.get("last_recovery_day", "") or "")
-                    updated_at = float(record.get("updated_at", 0.0) or 0.0)
-                    if last_rec_day == today:
-                        continue
-                    if last_neg > 0:
-                        if (ref_now - last_neg) < days_sec:
-                            continue
-                    elif last_rec_day:
-                        pass
-                    elif updated_at <= 0 or (ref_now - updated_at) < days_sec:
-                        continue
+        if not candidates:
+            return 0
 
-                    new_score = min(target, score + 1)
+        # Phase 2: open write tx only for rows qualifying for recovery, re-verifying against
+        # concurrent updates before writing.
+        recovered_count = 0
+        async with self._lock:
+            if not self.config.enabled or self.config.cooldown_recovery_days <= 0:
+                return 0
+            cur_target = int(self.config.cooldown_recovery_target)
+            cur_days_sec = self.config.cooldown_recovery_days * 86400.0
+            cur_muted_uids = set(self.s.muted_user_ids)
+            async with self.store.transaction():
+                for user_key, orig_payload, orig_opened in candidates:
+                    fresh = await self.store.one(
+                        "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+                        (user_key, self.scope),
+                    )
+                    if not fresh:
+                        continue
+                    fresh_payload = fresh["payload"]
+                    opened = (
+                        orig_opened
+                        if fresh_payload == orig_payload
+                        else self.store.vault.open("affection:" + user_key, fresh_payload)
+                    )
+                    checked = self._check_cooldown_candidate(
+                        opened,
+                        today=today,
+                        ref_now=ref_now,
+                        target=cur_target,
+                        days_sec=cur_days_sec,
+                        muted_uids=cur_muted_uids,
+                        identity=identity,
+                    )
+                    if checked is None:
+                        continue
+                    plat, uid, pid, record, score, new_score = checked
                     delta = new_score - score
-                    if delta <= 0:
-                        continue
                     record.update(
                         score=new_score,
                         last_recovery_day=today,

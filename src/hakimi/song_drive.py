@@ -1766,7 +1766,9 @@ class SongDriveStore:
             app_properties=props,
         )
 
-    async def status_overview(self, probe: bool = False) -> dict[str, Any]:
+    async def status_overview(
+        self, probe: bool = False, *, force_refresh: bool = False
+    ) -> dict[str, Any]:
         """Return safe Drive configuration and folder status overview."""
         await self.initialize()
         is_cfg = self.configured()
@@ -1779,7 +1781,7 @@ class SongDriveStore:
                 error = None
             else:
                 try:
-                    tree = await self.ensure_folder_tree()
+                    tree = await self.ensure_folder_tree(force_refresh=force_refresh)
                     folders = tree.as_dict()
                     error = None
                     self._last_error = None

@@ -22,6 +22,7 @@ class DiaryDriveSync:
         self.write_day = write_day
         self.sync_lock = asyncio.Lock()
         self._initialized = False
+        self._clean_closed_days: dict[str, tuple[int, bool, int]] = {}
 
     async def initialize(self):
         if self._initialized:
@@ -60,16 +61,34 @@ class DiaryDriveSync:
             )
         )
         outcome = "unchanged"
+        window_start = (local.date() - timedelta(days=7)).isoformat()
+        for stale in [d for d in self._clean_closed_days if d < window_start]:
+            self._clean_closed_days.pop(stale, None)
         async with self.sync_lock:
-            async with self.store.transaction():
-                await self.store.db.execute(
-                    "INSERT OR IGNORE INTO roaming_sync(day) SELECT day FROM roaming_days "
-                    "WHERE day BETWEEN ? AND ?",
-                    ((local.date() - timedelta(days=7)).isoformat(), day),
+            async with self.store.lock:
+                needs_sync_rows = bool(
+                    await self.store.one(
+                        "SELECT 1 FROM roaming_days d WHERE d.day BETWEEN ? AND ? "
+                        "AND NOT EXISTS (SELECT 1 FROM roaming_sync s WHERE s.day=d.day) LIMIT 1",
+                        (window_start, day),
+                    )
+                ) or bool(
+                    await self.store.one(
+                        "SELECT 1 FROM roaming_sync s "
+                        "WHERE NOT EXISTS (SELECT 1 FROM roaming_days d WHERE d.day=s.day) LIMIT 1"
+                    )
                 )
-                await self.store.db.execute(
-                    "DELETE FROM roaming_sync WHERE day NOT IN (SELECT day FROM roaming_days)"
-                )
+            if needs_sync_rows:
+                async with self.store.transaction():
+                    await self.store.db.execute(
+                        "INSERT OR IGNORE INTO roaming_sync(day) SELECT day FROM roaming_days "
+                        "WHERE day BETWEEN ? AND ?",
+                        (window_start, day),
+                    )
+                    await self.store.db.execute(
+                        "DELETE FROM roaming_sync WHERE day NOT IN (SELECT day FROM roaming_days)"
+                    )
+            async with self.store.lock:
                 rows = await self.store.all(
                     "SELECT * FROM roaming_sync WHERE day=?"
                     if force
@@ -77,34 +96,65 @@ class DiaryDriveSync:
                         "SELECT * FROM roaming_sync WHERE day BETWEEN ? AND ? "
                         "AND next_attempt<=? ORDER BY day"
                     ),
-                    (day,) if force else ((local.date() - timedelta(days=7)).isoformat(), day, now),
+                    (day,) if force else (window_start, day, now),
                 )
+            roaming_enabled = bool(getattr(self.diary.s, "roaming_enabled", False))
+            roaming_max_bytes = int(getattr(self.diary.s, "roaming_max_bytes", 0))
             for row in rows:
-                current_slot = slot if row["day"] == day else "closed"
-                # Finished days are rechecked: events can arrive after the final flush.
-                if not force and row["day"] == day and row["slot"] == current_slot:
-                    continue
+                row_day = row["day"]
+                current_slot = slot if row_day == day else "closed"
+                diary_ver = (
+                    self.diary.day_version(row_day) if hasattr(self.diary, "day_version") else None
+                )
+                render_sig = (
+                    (diary_ver, roaming_enabled, roaming_max_bytes)
+                    if diary_ver is not None
+                    else None
+                )
+                # Finished days are rechecked only when dirty, failed, or not yet confirmed closed.
+                if not force:
+                    if row_day == day and row["slot"] == current_slot:
+                        continue
+                    if (
+                        current_slot == "closed"
+                        and row["slot"] == "closed"
+                        and row["digest"] is not None
+                        and row["failures"] == 0
+                        and row["last_error"] is None
+                        and render_sig is not None
+                        and self._clean_closed_days.get(row_day) == render_sig
+                    ):
+                        continue
                 markdown = await self.diary.markdown_for_sync(
-                    row["day"], final=force or current_slot in {"final", "closed"}
+                    row_day, final=force or current_slot in {"final", "closed"}
                 )
                 if markdown is None:
                     outcome = "pending"
                     continue
                 digest = hashlib.sha256(markdown.encode()).hexdigest()
                 if digest == row["digest"]:
-                    async with self.store.transaction():
-                        await self.store.db.execute(
-                            "UPDATE roaming_sync SET slot=?,next_attempt=0,failures=0,"
-                            "last_error=NULL WHERE day=?",
-                            (current_slot, row["day"]),
-                        )
+                    if (
+                        row["slot"] != current_slot
+                        or row["failures"] != 0
+                        or row["last_error"] is not None
+                        or row["next_attempt"] != 0
+                    ):
+                        async with self.store.transaction():
+                            await self.store.db.execute(
+                                "UPDATE roaming_sync SET slot=?,next_attempt=0,failures=0,"
+                                "last_error=NULL WHERE day=?",
+                                (current_slot, row_day),
+                            )
+                    if current_slot == "closed" and render_sig is not None:
+                        self._clean_closed_days[row_day] = render_sig
                     continue
                 try:
                     write = self.write_day or self.drive.sync_day
-                    file_id = await write(row["day"], markdown)
+                    file_id = await write(row_day, markdown)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    self._clean_closed_days.pop(row_day, None)
                     delay = min(7200, 60 * 2 ** min(row["failures"], 7))
                     reason = (
                         str(exc)
@@ -131,7 +181,7 @@ class DiaryDriveSync:
                             "UPDATE roaming_sync SET "
                             "next_attempt=?,failures=failures+1,last_error=? "
                             "WHERE day=?",
-                            (now + delay, reason, row["day"]),
+                            (now + delay, reason, row_day),
                         )
                     outcome = "pending"
                     logging.getLogger("hakimi").info("event=diary_sync_pending")
@@ -141,8 +191,10 @@ class DiaryDriveSync:
                         await self.store.db.execute(
                             "UPDATE roaming_sync SET digest=?,file_id=?,slot=?,"
                             "next_attempt=0,failures=0,last_error=NULL,last_success=? WHERE day=?",
-                            (digest, file_id, current_slot, now, row["day"]),
+                            (digest, file_id, current_slot, now, row_day),
                         )
+                    if current_slot == "closed" and render_sig is not None:
+                        self._clean_closed_days[row_day] = render_sig
 
         return outcome
 

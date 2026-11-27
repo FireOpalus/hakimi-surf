@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import time
+from collections.abc import Callable
 from typing import Any, Literal
 
 import httpx
@@ -23,6 +25,7 @@ _OVERRIDE_SECRET_KEYS = (
     "openai_stt_api_key",
 )
 _UNSET: Any = object()
+DEFAULT_STATUS_CACHE_TTL = 20.0
 
 
 class VoiceGatewayConfigUpdate(BaseModel):
@@ -77,7 +80,15 @@ class VoiceGatewayConfigUpdate(BaseModel):
 class VoiceGatewayAdminManager:
     """Manages sealed gateway API overrides in SQLite and syncs them with hakimi-voice-gateway."""
 
-    def __init__(self, settings: Any, store: Any, *, http: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Any,
+        store: Any,
+        *,
+        http: httpx.AsyncClient | None = None,
+        status_cache_ttl: float = DEFAULT_STATUS_CACHE_TTL,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.s = settings
         self.store = store
         self.http = http
@@ -85,6 +96,15 @@ class VoiceGatewayAdminManager:
         self._init_lock = asyncio.Lock()
         self._op_lock = asyncio.Lock()
         self._override: dict[str, Any] | None = None
+        self._status_cache_ttl = max(0.0, float(status_cache_ttl))
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
+        self._status_cache: tuple[float, str, dict[str, Any]] | None = None
+        self._cache_generation: int = 0
+
+    def invalidate_status_cache(self) -> None:
+        """Drop cached gateway status so the next status() call performs a live probe."""
+        self._cache_generation += 1
+        self._status_cache = None
 
     def configured(self) -> bool:
         return bool(
@@ -194,6 +214,7 @@ class VoiceGatewayAdminManager:
                 else:
                     self._override = None
             self._sync_runtime_secrets()
+            self.invalidate_status_cache()
             self.initialized = True
 
     async def sync_to_gateway(self) -> bool:
@@ -201,13 +222,14 @@ class VoiceGatewayAdminManager:
         async with self._op_lock:
             if not self.configured() or not isinstance(self._override, dict):
                 return False
+            self.invalidate_status_cache()
             try:
                 resp = await self._request("POST", "/v1/admin/config", json_body=self._override)
                 return resp.status_code == 200
             except (httpx.HTTPError, TimeoutError, ValueError):
                 return False
 
-    async def status(self) -> dict[str, Any]:
+    async def status(self, *, refresh: bool = False) -> dict[str, Any]:
         await self.initialize()
         if not self.configured():
             return {
@@ -217,11 +239,18 @@ class VoiceGatewayAdminManager:
                 "saved_keys": self._saved_keys(),
                 "gateway": None,
             }
+        base_url = self._base_url()
+        if not refresh and self._status_cache_ttl > 0.0 and self._status_cache is not None:
+            cached_at, cached_url, cached_payload = self._status_cache
+            if cached_url == base_url and (self._clock() - cached_at) < self._status_cache_ttl:
+                return copy.deepcopy(cached_payload)
+
+        gen = self._cache_generation
         try:
             resp = await self._request("GET", "/v1/admin/config")
             if resp.status_code != 200:
                 ov = self._override
-                return {
+                result: dict[str, Any] = {
                     "configured": True,
                     "reachable": False,
                     "error": f"gateway_http_{resp.status_code}",
@@ -229,36 +258,52 @@ class VoiceGatewayAdminManager:
                     "saved_keys": self._saved_keys(ov),
                     "gateway": None,
                 }
-            gw = resp.json()
-            ov = self._override
-            if isinstance(ov, dict) and isinstance(gw, dict) and not gw.get("overridden"):
-                async with self._op_lock:
-                    ov = self._override
-                    recheck_resp = await self._request("GET", "/v1/admin/config")
-                    if recheck_resp.status_code != 200:
-                        return {
-                            "configured": True,
-                            "reachable": False,
-                            "error": f"gateway_http_{recheck_resp.status_code}",
-                            "source": "sqlite" if ov is not None else "env",
-                            "saved_keys": self._saved_keys(ov),
-                            "gateway": None,
-                        }
-                    gw = recheck_resp.json()
-                    if isinstance(ov, dict) and isinstance(gw, dict) and not gw.get("overridden"):
-                        sync_resp = await self._request("POST", "/v1/admin/config", json_body=ov)
-                        if sync_resp.status_code == 200:
-                            gw = sync_resp.json()
-            return {
-                "configured": True,
-                "reachable": True,
-                "source": "sqlite" if ov is not None else "env",
-                "saved_keys": self._saved_keys(ov),
-                "gateway": gw,
-            }
+            else:
+                gw = resp.json()
+                ov = self._override
+                if isinstance(ov, dict) and isinstance(gw, dict) and not gw.get("overridden"):
+                    async with self._op_lock:
+                        ov = self._override
+                        recheck_resp = await self._request("GET", "/v1/admin/config")
+                        if recheck_resp.status_code != 200:
+                            result = {
+                                "configured": True,
+                                "reachable": False,
+                                "error": f"gateway_http_{recheck_resp.status_code}",
+                                "source": "sqlite" if ov is not None else "env",
+                                "saved_keys": self._saved_keys(ov),
+                                "gateway": None,
+                            }
+                        else:
+                            gw = recheck_resp.json()
+                            if (
+                                isinstance(ov, dict)
+                                and isinstance(gw, dict)
+                                and not gw.get("overridden")
+                            ):
+                                sync_resp = await self._request(
+                                    "POST", "/v1/admin/config", json_body=ov
+                                )
+                                if sync_resp.status_code == 200:
+                                    gw = sync_resp.json()
+                            result = {
+                                "configured": True,
+                                "reachable": True,
+                                "source": "sqlite" if ov is not None else "env",
+                                "saved_keys": self._saved_keys(ov),
+                                "gateway": gw,
+                            }
+                else:
+                    result = {
+                        "configured": True,
+                        "reachable": True,
+                        "source": "sqlite" if ov is not None else "env",
+                        "saved_keys": self._saved_keys(ov),
+                        "gateway": gw,
+                    }
         except (httpx.HTTPError, TimeoutError, ValueError) as exc:
             ov = self._override
-            return {
+            result = {
                 "configured": True,
                 "reachable": False,
                 "error": self._scrub(type(exc).__name__),
@@ -266,6 +311,10 @@ class VoiceGatewayAdminManager:
                 "saved_keys": self._saved_keys(ov),
                 "gateway": None,
             }
+
+        if self._status_cache_ttl > 0.0 and self._cache_generation == gen:
+            self._status_cache = (self._clock(), base_url, copy.deepcopy(result))
+        return result
 
     async def update(self, payload: VoiceGatewayConfigUpdate) -> dict[str, Any]:
         await self.initialize()
@@ -327,6 +376,7 @@ class VoiceGatewayAdminManager:
                 )
             self._override = merged
             self._sync_runtime_secrets()
+            self.invalidate_status_cache()
             return {
                 "configured": True,
                 "reachable": True,
@@ -342,12 +392,13 @@ class VoiceGatewayAdminManager:
                 await self.store.db.execute("DELETE FROM admin_config WHERE key=?", (_CONFIG_KEY,))
             self._override = None
             self._sync_runtime_secrets()
+            self.invalidate_status_cache()
             if self.configured():
                 try:
                     await self._request("DELETE", "/v1/admin/config")
                 except (httpx.HTTPError, TimeoutError, ValueError):
                     pass
-        return await self.status()
+        return await self.status(refresh=True)
 
     async def _needs_gateway_resync(self) -> bool:
         if not isinstance(self._override, dict):

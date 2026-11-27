@@ -7,7 +7,7 @@ import hmac
 import logging
 import math
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from email.parser import BytesParser
@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from starlette.websockets import WebSocketDisconnect
 
 from voice_client.companion_ws import ConnectFactory
@@ -259,6 +260,68 @@ async def _close_if_owned(provider: Any, owned: bool) -> None:
             await provider.aclose()
 
 
+class ProviderBundle:
+    """Ref-counted owner of a (config, stt, tts) snapshot with deferred provider closing."""
+
+    def __init__(
+        self,
+        config: VoiceGatewayConfig,
+        stt: STTProvider,
+        tts: TTSProvider,
+        *,
+        owns_stt: bool,
+        owns_tts: bool,
+        closing_tasks: set[asyncio.Task[None]] | None = None,
+    ) -> None:
+        self.config = config
+        self.stt = stt
+        self.tts = tts
+        self.owns_stt = owns_stt
+        self.owns_tts = owns_tts
+        self._closing_tasks = closing_tasks
+        self._refs: int = 0
+        self._retired: bool = False
+        self._close_task: asyncio.Task[None] | None = None
+
+    @property
+    def active_refs(self) -> int:
+        return self._refs
+
+    @property
+    def retired(self) -> bool:
+        return self._retired
+
+    def acquire(self) -> "ProviderBundle":
+        self._refs += 1
+        return self
+
+    def _ensure_close_task(self) -> asyncio.Task[None]:
+        if self._close_task is None:
+            task = asyncio.create_task(self._close_providers())
+            self._close_task = task
+            if self._closing_tasks is not None:
+                self._closing_tasks.add(task)
+                task.add_done_callback(self._closing_tasks.discard)
+        return self._close_task
+
+    async def release(self) -> None:
+        if self._refs > 0:
+            self._refs -= 1
+        if self._retired and self._refs == 0:
+            task = self._ensure_close_task()
+            await asyncio.shield(task)
+
+    async def retire(self) -> None:
+        self._retired = True
+        if self._refs == 0:
+            task = self._ensure_close_task()
+            await asyncio.shield(task)
+
+    async def _close_providers(self) -> None:
+        await _close_if_owned(self.tts, self.owns_tts)
+        await _close_if_owned(self.stt, self.owns_stt)
+
+
 async def _chunk_bytes(data: bytes, chunk_size: int = 16384) -> AsyncIterator[bytes]:
     for idx in range(0, len(data), chunk_size):
         chunk = data[idx : idx + chunk_size]
@@ -269,14 +332,20 @@ async def _chunk_bytes(data: bytes, chunk_size: int = 16384) -> AsyncIterator[by
 async def _prepend_first(
     first_chunk: bytes,
     rest: AsyncIterator[bytes],
+    *,
+    on_close: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
     try:
         yield first_chunk
         async for chunk in rest:
             yield chunk
     finally:
-        with contextlib.suppress(Exception):
-            await rest.aclose()
+        try:
+            with contextlib.suppress(Exception):
+                await rest.aclose()
+        finally:
+            if on_close is not None:
+                await on_close()
 
 
 def create_gateway_app(
@@ -303,10 +372,21 @@ def create_gateway_app(
             await _close_if_owned(stt, stt_provider is None)
             raise
 
+        closing_tasks: set[asyncio.Task[None]] = set()
+        initial_bundle = ProviderBundle(
+            resolved_config,
+            stt,
+            tts,
+            owns_stt=stt_provider is None,
+            owns_tts=tts_provider is None,
+            closing_tasks=closing_tasks,
+        )
         app.state.base_config = resolved_config
         app.state.config = resolved_config
         app.state.overridden = False
         app.state.config_lock = asyncio.Lock()
+        app.state.closing_tasks = closing_tasks
+        app.state.provider_bundle = initial_bundle
         app.state.owns_stt = stt_provider is None
         app.state.owns_tts = tts_provider is None
         app.state.stt = stt
@@ -318,8 +398,10 @@ def create_gateway_app(
         try:
             yield
         finally:
-            await _close_if_owned(app.state.tts, app.state.owns_tts)
-            await _close_if_owned(app.state.stt, app.state.owns_stt)
+            await app.state.provider_bundle.retire()
+            pending_close = list(app.state.closing_tasks)
+            if pending_close:
+                await asyncio.gather(*pending_close, return_exceptions=True)
 
     app = FastAPI(
         title="hakimi-voice-gateway",
@@ -358,54 +440,104 @@ def create_gateway_app(
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
         new_cfg = base_cfg
+        old_bundle: ProviderBundle | None = None
+        failed_stt: STTProvider | None = None
         try:
             new_cfg = _apply_gateway_override(base_cfg, body)
-            client_cfg = new_cfg.to_client_config()
-            new_stt = build_stt_provider(client_cfg)
-            try:
-                new_tts = build_tts_provider(client_cfg)
-            except Exception:
-                await _close_if_owned(new_stt, True)
-                raise
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=safe_error_detail(exc, new_cfg)) from None
+            async with request.app.state.config_lock:
+                if new_cfg == request.app.state.config and (
+                    request.app.state.overridden
+                    or (request.app.state.owns_stt and request.app.state.owns_tts)
+                ):
+                    request.app.state.overridden = True
+                    return _public_gateway_config(request.app.state.config, overridden=True)
 
-        async with request.app.state.config_lock:
-            old_stt, old_owns_stt = request.app.state.stt, request.app.state.owns_stt
-            old_tts, old_owns_tts = request.app.state.tts, request.app.state.owns_tts
-            request.app.state.config = new_cfg
-            request.app.state.stt = new_stt
-            request.app.state.tts = new_tts
-            request.app.state.owns_stt = True
-            request.app.state.owns_tts = True
-            request.app.state.overridden = True
-        await _close_if_owned(old_tts, old_owns_tts)
-        await _close_if_owned(old_stt, old_owns_stt)
+                client_cfg = new_cfg.to_client_config()
+                new_stt = build_stt_provider(client_cfg)
+                try:
+                    new_tts = build_tts_provider(client_cfg)
+                except Exception:
+                    failed_stt = new_stt
+                    raise
+
+                new_bundle = ProviderBundle(
+                    new_cfg,
+                    new_stt,
+                    new_tts,
+                    owns_stt=True,
+                    owns_tts=True,
+                    closing_tasks=request.app.state.closing_tasks,
+                )
+                old_bundle = request.app.state.provider_bundle
+                request.app.state.provider_bundle = new_bundle
+                request.app.state.config = new_cfg
+                request.app.state.stt = new_stt
+                request.app.state.tts = new_tts
+                request.app.state.owns_stt = True
+                request.app.state.owns_tts = True
+                request.app.state.overridden = True
+        except ValueError as exc:
+            if failed_stt is not None:
+                await _close_if_owned(failed_stt, True)
+            raise HTTPException(status_code=400, detail=safe_error_detail(exc, new_cfg)) from None
+        except Exception:
+            if failed_stt is not None:
+                await _close_if_owned(failed_stt, True)
+            raise
+
+        if old_bundle is not None:
+            await old_bundle.retire()
         return _public_gateway_config(new_cfg, overridden=True)
 
     @app.delete("/v1/admin/config")
     async def delete_admin_config(request: Request) -> dict[str, Any]:
         base_cfg: VoiceGatewayConfig = request.app.state.base_config
         _require_bearer_http(request, base_cfg)
-        client_cfg = base_cfg.to_client_config()
-        new_stt = build_stt_provider(client_cfg)
+        old_bundle: ProviderBundle | None = None
+        failed_stt: STTProvider | None = None
         try:
-            new_tts = build_tts_provider(client_cfg)
+            async with request.app.state.config_lock:
+                if not request.app.state.overridden and request.app.state.config == base_cfg:
+                    return _public_gateway_config(request.app.state.config, overridden=False)
+                if (
+                    request.app.state.config == base_cfg
+                    and request.app.state.owns_stt
+                    and request.app.state.owns_tts
+                ):
+                    request.app.state.overridden = False
+                    return _public_gateway_config(request.app.state.config, overridden=False)
+
+                client_cfg = base_cfg.to_client_config()
+                new_stt = build_stt_provider(client_cfg)
+                try:
+                    new_tts = build_tts_provider(client_cfg)
+                except Exception:
+                    failed_stt = new_stt
+                    raise
+
+                new_bundle = ProviderBundle(
+                    base_cfg,
+                    new_stt,
+                    new_tts,
+                    owns_stt=True,
+                    owns_tts=True,
+                    closing_tasks=request.app.state.closing_tasks,
+                )
+                old_bundle = request.app.state.provider_bundle
+                request.app.state.provider_bundle = new_bundle
+                request.app.state.config = base_cfg
+                request.app.state.stt = new_stt
+                request.app.state.tts = new_tts
+                request.app.state.owns_stt = True
+                request.app.state.owns_tts = True
+                request.app.state.overridden = False
         except Exception:
-            await _close_if_owned(new_stt, True)
+            if failed_stt is not None:
+                await _close_if_owned(failed_stt, True)
             raise
 
-        async with request.app.state.config_lock:
-            old_stt, old_owns_stt = request.app.state.stt, request.app.state.owns_stt
-            old_tts, old_owns_tts = request.app.state.tts, request.app.state.owns_tts
-            request.app.state.config = base_cfg
-            request.app.state.stt = new_stt
-            request.app.state.tts = new_tts
-            request.app.state.owns_stt = True
-            request.app.state.owns_tts = True
-            request.app.state.overridden = False
-        await _close_if_owned(old_tts, old_owns_tts)
-        await _close_if_owned(old_stt, old_owns_stt)
+        if old_bundle is not None:
+            await old_bundle.retire()
         return _public_gateway_config(base_cfg, overridden=False)
 
     @app.get("/v1/admin/voices")
@@ -451,160 +583,180 @@ def create_gateway_app(
 
     @app.post("/v1/stt")
     async def post_stt(request: Request) -> dict[str, Any]:
-        cfg: VoiceGatewayConfig = request.app.state.config
-        _require_bearer_http(request, cfg)
-
-        raw_audio, fmt, sample_rate, channels = await _parse_stt_multipart(
-            request,
-            max_audio_bytes=cfg.max_audio_bytes,
-        )
-
-        t0 = time.perf_counter()
+        _require_bearer_http(request, request.app.state.base_config)
+        bundle: ProviderBundle = request.app.state.provider_bundle.acquire()
         try:
-            wav_bytes = await normalize_input_to_wav(
-                raw_audio,
-                fmt,
-                sample_rate=sample_rate,
-                channels=channels,
-                ffmpeg_bin=cfg.ffmpeg_bin,
-                ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
+            cfg = bundle.config
+            raw_audio, fmt, sample_rate, channels = await _parse_stt_multipart(
+                request,
+                max_audio_bytes=cfg.max_audio_bytes,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=safe_error_detail(exc, cfg)) from None
-        except (RuntimeError, TimeoutError) as exc:
-            raise HTTPException(status_code=500, detail=safe_error_detail(exc, cfg)) from None
 
-        stt: STTProvider = request.app.state.stt
-        try:
-            text = (await stt.transcribe(wav_bytes)).strip()
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
+            t0 = time.perf_counter()
+            try:
+                wav_bytes = await normalize_input_to_wav(
+                    raw_audio,
+                    fmt,
+                    sample_rate=sample_rate,
+                    channels=channels,
+                    ffmpeg_bin=cfg.ffmpeg_bin,
+                    ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=safe_error_detail(exc, cfg)) from None
+            except (RuntimeError, TimeoutError) as exc:
+                raise HTTPException(status_code=500, detail=safe_error_detail(exc, cfg)) from None
 
-        stt_ms = (time.perf_counter() - t0) * 1000.0
-        return {
-            "text": text,
-            "stt_ms": round(stt_ms, 2),
-            "provider": cfg.stt_provider,
-        }
+            stt = bundle.stt
+            try:
+                text = (await stt.transcribe(wav_bytes)).strip()
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
+
+            stt_ms = (time.perf_counter() - t0) * 1000.0
+            return {
+                "text": text,
+                "stt_ms": round(stt_ms, 2),
+                "provider": cfg.stt_provider,
+            }
+        finally:
+            await bundle.release()
 
     @app.post("/v1/tts")
     async def post_tts(request: Request) -> Response:
-        cfg: VoiceGatewayConfig = request.app.state.config
-        _require_bearer_http(request, cfg)
+        _require_bearer_http(request, request.app.state.base_config)
+        bundle: ProviderBundle = request.app.state.provider_bundle.acquire()
+        released = False
 
+        async def _release_once() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                await bundle.release()
+
+        handed_off = False
         try:
-            body = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON request body") from None
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+            cfg = bundle.config
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid JSON request body") from None
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
-        raw_text = body.get("text")
-        if not isinstance(raw_text, str) or not raw_text.strip():
-            raise HTTPException(status_code=400, detail="text must not be empty")
-        text = raw_text.strip()
-        if len(text) > cfg.max_tts_chars:
-            raise HTTPException(
-                status_code=400,
-                detail=f"text exceeds max_tts_chars ({cfg.max_tts_chars})",
-            )
+            raw_text = body.get("text")
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                raise HTTPException(status_code=400, detail="text must not be empty")
+            text = raw_text.strip()
+            if len(text) > cfg.max_tts_chars:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"text exceeds max_tts_chars ({cfg.max_tts_chars})",
+                )
 
-        raw_fmt = body.get("output_format")
-        output_fmt = (
-            str(raw_fmt).strip().lower()
-            if raw_fmt is not None and str(raw_fmt).strip()
-            else cfg.default_output_format
-        )
-        try:
-            mime_type, sample_rate, channels = output_format_meta(output_fmt)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=safe_error_detail(exc, cfg)) from None
-
-        stream_flag = body.get("stream", True)
-        if not isinstance(stream_flag, bool):
-            raise HTTPException(status_code=400, detail="stream must be a boolean")
-
-        tts: TTSProvider = request.app.state.tts
-        synth_stream = getattr(tts, "synthesize_stream", None)
-        has_synth = callable(getattr(tts, "synthesize", None))
-        try:
-            if (cfg.tts_streaming and callable(synth_stream)) or not has_synth:
-                assert callable(synth_stream)
-                src_fmt = str(getattr(tts, "response_format", "mp3") or "mp3").lstrip(".").lower()
-                raw_iter = synth_stream(text)
-            else:
-                audio_bytes, raw_ext = await tts.synthesize(text)
-                src_fmt = raw_ext.lstrip(".").lower() or "mp3"
-                raw_iter = _chunk_bytes(audio_bytes)
-
-            transcoded = transcode_audio_stream(
-                raw_iter,
-                src_fmt=src_fmt,
-                dst_fmt=output_fmt,
-                ffmpeg_bin=cfg.ffmpeg_bin,
-                ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
+            raw_fmt = body.get("output_format")
+            output_fmt = (
+                str(raw_fmt).strip().lower()
+                if raw_fmt is not None and str(raw_fmt).strip()
+                else cfg.default_output_format
             )
             try:
-                first_chunk = await anext(transcoded)
-            except BaseException:
-                with contextlib.suppress(Exception):
-                    await transcoded.aclose()
-                raise
-        except StopAsyncIteration:
-            raise HTTPException(
-                status_code=502,
-                detail="TTS provider returned empty audio",
-            ) from None
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
+                mime_type, sample_rate, channels = output_format_meta(output_fmt)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=safe_error_detail(exc, cfg)) from None
 
-        headers = {
-            "X-Audio-Format": output_fmt,
-            "X-Sample-Rate": str(sample_rate),
-            "X-Channels": str(channels),
-        }
-        if stream_flag:
-            return StreamingResponse(
-                _prepend_first(first_chunk, transcoded),
-                media_type=mime_type,
-                headers=headers,
-            )
+            stream_flag = body.get("stream", True)
+            if not isinstance(stream_flag, bool):
+                raise HTTPException(status_code=400, detail="stream must be a boolean")
 
-        buf = bytearray()
-        try:
-            if len(first_chunk) > cfg.max_tts_audio_bytes:
+            tts = bundle.tts
+            synth_stream = getattr(tts, "synthesize_stream", None)
+            has_synth = callable(getattr(tts, "synthesize", None))
+            try:
+                if (cfg.tts_streaming and callable(synth_stream)) or not has_synth:
+                    assert callable(synth_stream)
+                    src_fmt = (
+                        str(getattr(tts, "response_format", "mp3") or "mp3").lstrip(".").lower()
+                    )
+                    raw_iter = synth_stream(text)
+                else:
+                    audio_bytes, raw_ext = await tts.synthesize(text)
+                    src_fmt = raw_ext.lstrip(".").lower() or "mp3"
+                    raw_iter = _chunk_bytes(audio_bytes)
+
+                transcoded = transcode_audio_stream(
+                    raw_iter,
+                    src_fmt=src_fmt,
+                    dst_fmt=output_fmt,
+                    ffmpeg_bin=cfg.ffmpeg_bin,
+                    ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
+                )
+                try:
+                    first_chunk = await anext(transcoded)
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await transcoded.aclose()
+                    raise
+            except StopAsyncIteration:
                 raise HTTPException(
                     status_code=502,
-                    detail="TTS audio exceeds max_tts_audio_bytes",
+                    detail="TTS provider returned empty audio",
+                ) from None
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
+
+            headers = {
+                "X-Audio-Format": output_fmt,
+                "X-Sample-Rate": str(sample_rate),
+                "X-Channels": str(channels),
+            }
+            if stream_flag:
+                handed_off = True
+                return StreamingResponse(
+                    _prepend_first(first_chunk, transcoded, on_close=_release_once),
+                    media_type=mime_type,
+                    headers=headers,
+                    background=BackgroundTask(_release_once),
                 )
-            buf.extend(first_chunk)
-            async for chunk in transcoded:
-                if len(buf) + len(chunk) > cfg.max_tts_audio_bytes:
+
+            buf = bytearray()
+            try:
+                if len(first_chunk) > cfg.max_tts_audio_bytes:
                     raise HTTPException(
                         status_code=502,
                         detail="TTS audio exceeds max_tts_audio_bytes",
                     )
-                buf.extend(chunk)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
-        finally:
-            with contextlib.suppress(Exception):
-                await transcoded.aclose()
+                buf.extend(first_chunk)
+                async for chunk in transcoded:
+                    if len(buf) + len(chunk) > cfg.max_tts_audio_bytes:
+                        raise HTTPException(
+                            status_code=502,
+                            detail="TTS audio exceeds max_tts_audio_bytes",
+                        )
+                    buf.extend(chunk)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
+            finally:
+                with contextlib.suppress(Exception):
+                    await transcoded.aclose()
 
-        audio_bytes = bytes(buf)
-        duration_ms = await probe_audio_duration_ms(
-            audio_bytes,
-            output_fmt,
-            ffmpeg_bin=cfg.ffmpeg_bin,
-            ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
-        )
-        if duration_ms is not None and duration_ms > 0:
-            headers["X-Audio-Duration-Ms"] = str(duration_ms)
-        return Response(content=audio_bytes, media_type=mime_type, headers=headers)
+            audio_bytes = bytes(buf)
+            duration_ms = await probe_audio_duration_ms(
+                audio_bytes,
+                output_fmt,
+                ffmpeg_bin=cfg.ffmpeg_bin,
+                ffmpeg_semaphore=request.app.state.ffmpeg_semaphore,
+            )
+            if duration_ms is not None and duration_ms > 0:
+                headers["X-Audio-Duration-Ms"] = str(duration_ms)
+            return Response(content=audio_bytes, media_type=mime_type, headers=headers)
+        finally:
+            if not handed_off:
+                await _release_once()
 
     @app.websocket("/{full_path:path}")
     async def voice_ws(websocket: WebSocket, full_path: str = "") -> None:
@@ -632,6 +784,16 @@ def create_gateway_app(
         await websocket.accept()
         log.info("event=voice_gateway_connected adapter=%s client=%s", adapter_id, client_id)
 
+        @asynccontextmanager
+        async def _lease_ws_providers() -> AsyncIterator[
+            tuple[VoiceGatewayConfig, STTProvider, TTSProvider]
+        ]:
+            bundle: ProviderBundle = websocket.app.state.provider_bundle.acquire()
+            try:
+                yield bundle.config, bundle.stt, bundle.tts
+            finally:
+                await bundle.release()
+
         session = VoiceGatewaySession(
             cfg,
             stt_provider=websocket.app.state.stt,
@@ -643,6 +805,8 @@ def create_gateway_app(
             client_id=client_id,
             upstream_connect_factory=websocket.app.state.upstream_connect_factory,
             ffmpeg_semaphore=websocket.app.state.ffmpeg_semaphore,
+            provider_lease=_lease_ws_providers,
+            config_getter=lambda: websocket.app.state.config,
         )
         await session.start()
         try:

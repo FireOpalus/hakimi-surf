@@ -103,6 +103,7 @@ function renderIdentityPersonsList(){
     const saveBtn=el('button','保存档案','primary');saveBtn.type='submit';
     footerRow.append(saveBtn);
     form.append(footerRow);
+    if(typeof enhanceLabels==='function')enhanceLabels(form);
 
     form.addEventListener('submit',e=>{
       e.preventDefault();
@@ -344,6 +345,7 @@ function renderPluginBus(d){
     const saveBtn=el('button','保存配置','primary');saveBtn.type='submit';
     editFoot.append(enabledLabel,saveBtn);
     form.append(editFoot);
+    if(typeof enhanceLabels==='function')enhanceLabels(form);
 
     form.addEventListener('submit',e=>{
       e.preventDefault();

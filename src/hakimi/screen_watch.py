@@ -11,6 +11,7 @@ import math
 import re
 import time
 import uuid
+import weakref
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -31,6 +32,19 @@ _CONFIG_KEY = "screen_watch_config"
 _VAULT_CTX_CFG = "admin:screen_watch_config"
 _MAX_BASE64_FRAME_CHARS = 2_800_000
 _SILENT_TOKEN = "[SILENT]"
+_FRAME_DECODE_CONCURRENCY = 2
+_FRAME_DECODE_SEMAPHORES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _frame_decode_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _FRAME_DECODE_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(_FRAME_DECODE_CONCURRENCY)
+        _FRAME_DECODE_SEMAPHORES[loop] = sem
+    return sem
 
 
 class ScreenWatchConfig(BaseModel):
@@ -127,6 +141,26 @@ def decode_b64_frames(
             )
         )
     return out
+
+
+async def decode_b64_frames_async(
+    raw_frames: Any,
+    max_frames: int,
+    settings: Any,
+    *,
+    error_prefix: str = "screen",
+) -> list[ModelImage]:
+    """Decode base64 frames off the event loop behind a bounded concurrency semaphore."""
+    if not raw_frames:
+        return []
+    async with _frame_decode_semaphore():
+        return await asyncio.to_thread(
+            decode_b64_frames,
+            raw_frames,
+            max_frames,
+            settings,
+            error_prefix=error_prefix,
+        )
 
 
 @dataclass(frozen=True)
@@ -792,7 +826,7 @@ class ScreenWatch:
                     now = self.clock()
                     self._prune_frames(now)
                     try:
-                        decoded = decode_b64_frames(
+                        decoded = await decode_b64_frames_async(
                             frame.get("frames"), 2, self.s, error_prefix="screen"
                         )
                     except Rejected as exc:

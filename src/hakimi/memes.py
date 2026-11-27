@@ -343,14 +343,15 @@ class MemeLibrary:
                 "label": label,
                 "filename": key + normalized.extension,
                 "mime_type": normalized.mime_type,
-                "digest": hashlib.sha256(normalized.data).hexdigest(),
+                "digest": digest,
                 "byte_size": len(normalized.data),
                 "width": normalized.width,
                 "height": normalized.height,
                 "created": time.time(),
             }
+            source_digest = hashlib.sha256(raw).hexdigest()
             # File creation is complete before registration; unregistered files cannot be sent.
-            self._write(entry["filename"], normalized.data)
+            await asyncio.to_thread(self._write, entry["filename"], normalized.data)
             try:
                 async with self.store.transaction():
                     await self.store.db.execute(
@@ -361,18 +362,17 @@ class MemeLibrary:
                         ),
                         tuple(entry.values()),
                     )
+                    await self.store.db.execute(
+                        "INSERT OR REPLACE INTO meme_source_hashes VALUES (?,?)",
+                        (source_digest, label),
+                    )
             except BaseException:
-                self._unlink(entry["filename"])
+                await asyncio.to_thread(self._unlink, entry["filename"])
                 raise
             if variant:
                 self._variants[key] = entry
             else:
                 self._entries[label] = entry
-            source_digest = hashlib.sha256(raw).hexdigest()
-            async with self.store.transaction():
-                await self.store.db.execute(
-                    "INSERT OR REPLACE INTO meme_source_hashes VALUES (?,?)", (source_digest, label)
-                )
             self.source_hashes[source_digest] = label
             self._refresh_prompt()
             return {**self._public(entry), "first_frame_only": normalized.first_frame_only}
@@ -504,7 +504,7 @@ class MemeLibrary:
                         del self._variants[replacement["id"]]
                         self._entries[replacement["label"]] = replacement
             self._refresh_prompt()
-            self._unlink(entry["filename"])
+            await asyncio.to_thread(self._unlink, entry["filename"])
 
     async def choose(self, label, scope):
         await self.initialize()

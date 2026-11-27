@@ -541,8 +541,9 @@ function renderVoiceCompanion(d){
 }
 function _normSttProv(v){const s=String(v||'fish').toLowerCase();return s==='fish_audio'?'fish':['openai_compatible','groq'].includes(s)?'openai':s;}
 function _normTtsProv(v){const s=String(v||'breezeblue').toLowerCase();return s==='fish_audio'?'fish':['breeze_blue','breeze'].includes(s)?'breezeblue':s==='edge_tts'?'edge':s;}
-function renderVoiceGatewayConfig(d){
+function renderVoiceGatewayConfig(d,opts={}){
   const g=d?.gateway||null,saved=d?.saved_keys||{};
+  const preserveForm=Boolean(opts.preserveForm);
   const pills=[];
   if(!d?.configured){pills.push(pill('未配置 VOICE_GATEWAY_URL','muted'));}
   else if(d.reachable&&g){
@@ -556,30 +557,32 @@ function renderVoiceGatewayConfig(d){
   ['vc-gw-save','vc-gw-reset'].forEach(id=>{$(id).disabled=!usable;});
   $('vc-gw-test').disabled=!Boolean(d?.configured&&d?.reachable);
   if(g){
-    $('vc-gw-stt-provider').value=_normSttProv(g.stt_provider);
-    $('vc-gw-tts-provider').value=_normTtsProv(g.tts_provider);
-    $('vc-gw-tts-speed').value=String(g.tts_speed??1.05);
-    $('vc-gw-tts-buffer-mode').value=g.tts_buffer_mode||'turn';
-    $('vc-gw-tts-streaming').checked=Boolean(g.tts_streaming);
     const brz=g.breezeblue||{},fish=g.fish||{},sf=g.siliconflow||{},oai=g.openai_stt||{},edge=g.edge_tts||{};
-    $('vc-gw-brz-url').value=brz.base_url||'https://api.breeze.blue';
-    $('vc-gw-brz-voice').value=brz.voice_id||'';
-    $('vc-gw-brz-model').value=brz.model_id||'breeze-tts-2';
-    $('vc-gw-brz-lang').value=brz.language_code??'zh';
-    $('vc-gw-brz-guidance').value=brz.guidance_scale??'';
-    $('vc-gw-brz-instructions').value=brz.instructions||'';
-    $('vc-gw-fish-url').value=fish.base_url||'https://api.fish.audio';
-    $('vc-gw-fish-ref').value=fish.reference_id||'';
-    $('vc-gw-fish-model').value=fish.model||'';
-    $('vc-gw-fish-latency').value=fish.latency||'balanced';
-    $('vc-gw-fish-asr-lang').value=fish.asr_language??'zh';
-    $('vc-gw-sf-url').value=sf.base_url||'https://api.siliconflow.cn/v1';
-    $('vc-gw-sf-stt-model').value=sf.stt_model||'FunAudioLLM/SenseVoiceSmall';
-    $('vc-gw-sf-tts-model').value=sf.tts_model||'FunAudioLLM/CosyVoice2-0.5B';
-    $('vc-gw-sf-tts-voice').value=sf.tts_voice||'FunAudioLLM/CosyVoice2-0.5B:diana';
-    $('vc-gw-oai-url').value=oai.base_url||'https://api.groq.com/openai/v1';
-    $('vc-gw-oai-model').value=oai.model||'whisper-large-v3-turbo';
-    $('vc-gw-edge-voice').value=edge.voice||'zh-CN-XiaoyiNeural';
+    if(!preserveForm){
+      $('vc-gw-stt-provider').value=_normSttProv(g.stt_provider);
+      $('vc-gw-tts-provider').value=_normTtsProv(g.tts_provider);
+      $('vc-gw-tts-speed').value=String(g.tts_speed??1.05);
+      $('vc-gw-tts-buffer-mode').value=g.tts_buffer_mode||'turn';
+      $('vc-gw-tts-streaming').checked=Boolean(g.tts_streaming);
+      $('vc-gw-brz-url').value=brz.base_url||'https://api.breeze.blue';
+      $('vc-gw-brz-voice').value=brz.voice_id||'';
+      $('vc-gw-brz-model').value=brz.model_id||'breeze-tts-2';
+      $('vc-gw-brz-lang').value=brz.language_code??'zh';
+      $('vc-gw-brz-guidance').value=brz.guidance_scale??'';
+      $('vc-gw-brz-instructions').value=brz.instructions||'';
+      $('vc-gw-fish-url').value=fish.base_url||'https://api.fish.audio';
+      $('vc-gw-fish-ref').value=fish.reference_id||'';
+      $('vc-gw-fish-model').value=fish.model||'';
+      $('vc-gw-fish-latency').value=fish.latency||'balanced';
+      $('vc-gw-fish-asr-lang').value=fish.asr_language??'zh';
+      $('vc-gw-sf-url').value=sf.base_url||'https://api.siliconflow.cn/v1';
+      $('vc-gw-sf-stt-model').value=sf.stt_model||'FunAudioLLM/SenseVoiceSmall';
+      $('vc-gw-sf-tts-model').value=sf.tts_model||'FunAudioLLM/CosyVoice2-0.5B';
+      $('vc-gw-sf-tts-voice').value=sf.tts_voice||'FunAudioLLM/CosyVoice2-0.5B:diana';
+      $('vc-gw-oai-url').value=oai.base_url||'https://api.groq.com/openai/v1';
+      $('vc-gw-oai-model').value=oai.model||'whisper-large-v3-turbo';
+      $('vc-gw-edge-voice').value=edge.voice||'zh-CN-XiaoyiNeural';
+    }
     const brzOk=Boolean(brz.configured||saved.breezeblue);
     text('vc-gw-brz-key-state',brz.configured?(saved.breezeblue?'已存(SQLite)':'已配置(.env)'):saved.breezeblue?'已存(SQLite)':'未配置');
     text('vc-gw-fish-key-state',fish.configured?(saved.fish?'已存(SQLite)':'已配置(.env)'):saved.fish?'已存(SQLite)':'未配置');
@@ -593,12 +596,16 @@ function renderVoiceGatewayConfig(d){
     text('vc-gw-oai-key-state',saved.openai_stt?'已存(SQLite)':'未读取');
     $('vc-gw-brz-fetch-voices').disabled=true;
   }
-  syncVoiceGatewayFolds();
-  clearDirty('vc-gw-form');
+  if(!preserveForm){
+    syncVoiceGatewayFolds();
+    clearDirty('vc-gw-form');
+  }
 }
+let vcFetchGen=0,vcGwFetchGen=0;
 async function voiceGatewayConfig(){
+  const gwGen=++vcGwFetchGen;
   const d=await api('life/voice-companion/gateway');
-  if(!token)return;
+  if(!token||gwGen!==vcGwFetchGen)return;
   renderVoiceGatewayConfig(d);
 }
 $('vc-gw-refresh').addEventListener('click',e=>busy(e.target,async()=>{
@@ -665,7 +672,9 @@ $('vc-gw-form').addEventListener('submit',e=>{
       openai_stt_model:$('vc-gw-oai-model').value.trim(),
       edge_tts_voice:$('vc-gw-edge-voice').value.trim()||'zh-CN-XiaoyiNeural',
     };
+    vcGwFetchGen++;
     const next=await api('life/voice-companion/gateway','PUT',payload);
+    if(!token)return;
     ['vc-gw-brz-key','vc-gw-fish-key','vc-gw-sf-key','vc-gw-oai-key'].forEach(id=>{$(id).value='';});
     ['vc-gw-brz-clear','vc-gw-fish-clear','vc-gw-sf-clear','vc-gw-oai-clear'].forEach(id=>{$(id).checked=false;});
     renderVoiceGatewayConfig(next);
@@ -674,22 +683,33 @@ $('vc-gw-form').addEventListener('submit',e=>{
 });
 $('vc-gw-reset').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDialog('清除后台语音网关 API 覆盖，恢复网关 .env 默认配置？',{danger:true,confirmLabel:'恢复默认'})))return;
+  vcGwFetchGen++;
   const next=await api('life/voice-companion/gateway','DELETE');
+  if(!token)return;
   ['vc-gw-brz-key','vc-gw-fish-key','vc-gw-sf-key','vc-gw-oai-key'].forEach(id=>{$(id).value='';});
   ['vc-gw-brz-clear','vc-gw-fish-clear','vc-gw-sf-clear','vc-gw-oai-clear'].forEach(id=>{$(id).checked=false;});
   renderVoiceGatewayConfig(next);
   notice('已恢复网关 .env 默认配置');
 }));
 async function voiceCompanion(){
-  const [vcRes,gwRes]=await Promise.allSettled([
-    api('life/voice-companion'),
-    api('life/voice-companion/gateway')
-  ]);
-  if(vcRes.status==='rejected')throw vcRes.reason;
-  if(!token)return;
-  renderVoiceCompanion(vcRes.value);
-  if(gwRes.status==='fulfilled'){renderVoiceGatewayConfig(gwRes.value);}
-  else if(gwRes.reason?.name!=='AbortError'){renderVoiceGatewayConfig({configured:false,reachable:false,error:gwRes.reason?.message||'unavailable'});}
+  const vcGen=++vcFetchGen,gwGen=++vcGwFetchGen;
+  if($('vc-gw-pills')&&!$('vc-gw-pills').children.length){
+    $('vc-gw-pills').replaceChildren(pill('正在读取语音网关配置…','muted'));
+    text('vc-gw-state','正在异步读取语音网关状态…');
+  }
+  api('life/voice-companion/gateway').then(gw=>{
+    if(!token||gwGen!==vcGwFetchGen)return;
+    renderVoiceGatewayConfig(gw,{preserveForm:Boolean(dirtyRegistry.get($('vc-gw-form'))?.dirty)});
+  }).catch(err=>{
+    if(!token||gwGen!==vcGwFetchGen||err?.name==='AbortError')return;
+    renderVoiceGatewayConfig(
+      {configured:false,reachable:false,error:err?.message||'unavailable'},
+      {preserveForm:Boolean(dirtyRegistry.get($('vc-gw-form'))?.dirty)}
+    );
+  });
+  const vc=await api('life/voice-companion');
+  if(!token||vcGen!==vcFetchGen)return;
+  renderVoiceCompanion(vc);
 }
 $('refresh-vc').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('voice-companion','刷新语音伴随状态')))return;
@@ -804,6 +824,8 @@ trackDirty('vc-gw-form','语音网关 API 配置');
 trackDirty('sw-config-form','屏幕伴看策略');
 
 onLogout(()=>{
+  vcFetchGen++;
+  vcGwFetchGen++;
   clearTtsPreview();
   $('world-observation-card').hidden=true;
   for(const id of ['proactive-stats','proactive-queue','proactive-alerts','world-day-stats','world-agenda','world-daily-actions','world-plans','world-days','world-evenings','life-digests','life-stats','life-changes','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table','mc-overview','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table','vc-gw-pills','vc-gw-brz-voice-select','sw-pills','sw-commentary-table'])$(id).replaceChildren();

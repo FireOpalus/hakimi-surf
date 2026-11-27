@@ -593,8 +593,16 @@ class _ServiceDeliveryMixin:
     async def delivery(self):
         while True:
             try:
+                wakeup = getattr(self.store, "reply_wakeup", None)
+                if wakeup is not None:
+                    wakeup.clear()
                 sent = await self.deliver_once()
-                await self._sleep(2 if sent else 0.25)
+                if sent:
+                    await self._sleep(2)
+                elif hasattr(self.store, "wait_for_reply"):
+                    await self.store.wait_for_reply()
+                else:
+                    await self._sleep(0.25)
             except asyncio.CancelledError:
                 raise
             except Exception:

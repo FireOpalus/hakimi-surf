@@ -437,6 +437,32 @@ class TelegramBotApi:
         )
         return str(res["message_id"])
 
+    async def send_sticker(
+        self,
+        chat_id: str,
+        sticker_bytes: bytes,
+        *,
+        filename: str = "sticker.webp",
+        mime_type: str = "image/webp",
+        reply_to_message_id: int | None = None,
+    ) -> str:
+        data: dict[str, Any] = {"chat_id": str(chat_id)}
+        if reply_to_message_id is not None:
+            data["reply_parameters"] = json.dumps(
+                {
+                    "message_id": int(reply_to_message_id),
+                    "allow_sending_without_reply": True,
+                },
+                separators=(",", ":"),
+            )
+        res = await self._send_with_reply_fallback(
+            "sendSticker",
+            data=data,
+            files={"sticker": (filename, sticker_bytes, mime_type)},
+            timeout=30.0,
+        )
+        return str(res["message_id"])
+
     async def set_message_reaction(self, chat_id: str, message_id: int, emoji: str) -> bool:
         clean_emoji = str(emoji or "").strip()
         if not clean_emoji:

@@ -146,6 +146,8 @@ async def test_farm_minigame_sdk_post_read_consume_and_ttl(settings, store):
         assert replanted.status == "pending"
         expired_check = await farm.read_ledger_events(only_due=False, now=day2_1005 + 7201)
         assert expired_check == []
+        # read() is strictly read-only; explicit expire_due() transitions DB status to expired.
+        assert await svc.event_ledger.expire_due(day2_1005 + 7201) == 1
         row = await store.one("SELECT status FROM event_ledger WHERE id=?", (replanted.id,))
         assert row["status"] == "expired"
 

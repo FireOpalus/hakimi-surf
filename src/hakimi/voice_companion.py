@@ -21,7 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from .media import ModelImage
 from .models import Message
 from .modules.base import sanitize_sensor_text
-from .screen_watch import decode_b64_frames, decode_ws_json_frame, strip_markdown_noise
+from .screen_watch import (
+    decode_b64_frames_async,
+    decode_ws_json_frame,
+    strip_markdown_noise,
+)
 from .security import Rejected, clean_text, configured_secrets, safe_output
 from .work_usage import model_work
 
@@ -156,8 +160,8 @@ def decode_companion_frame(raw: str | bytes, limit: int) -> dict[str, Any]:
     return decode_ws_json_frame(raw, limit, error_prefix="companion")
 
 
-def _decode_frames(raw_frames: Any, max_frames: int, settings: Any) -> list[ModelImage]:
-    return decode_b64_frames(raw_frames, max_frames, settings, error_prefix="companion")
+async def _decode_frames(raw_frames: Any, max_frames: int, settings: Any) -> list[ModelImage]:
+    return await decode_b64_frames_async(raw_frames, max_frames, settings, error_prefix="companion")
 
 
 def _parse_optional_nonneg_int(raw: Any, *, max_value: int = 10_000_000) -> int | None:
@@ -1210,7 +1214,7 @@ class VoiceCompanion:
                     speaker_id = str(frame.get("speaker_id") or "speaker").strip()[:64]
                     speaker_name = str(frame.get("speaker_name") or "").strip()[:48]
                     try:
-                        frames = _decode_frames(frame.get("frames"), 2, self.s)
+                        frames = await _decode_frames(frame.get("frames"), 2, self.s)
                     except Rejected as exc:
                         await self._send_frame(
                             peer,

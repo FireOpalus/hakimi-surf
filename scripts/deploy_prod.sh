@@ -52,5 +52,5 @@ deploy() {
     fi
 }
 
-if [[ $mode != engine ]]; then deploy hakimi-admin admin 12143 admin pyproject.toml src/hakimi/__init__.py; fi
 if [[ $mode != admin ]]; then deploy hakimi-bot . 12141 src Dockerfile pyproject.toml uv.lock .dockerignore; fi
+if [[ $mode != engine ]]; then deploy hakimi-admin admin 12143 admin pyproject.toml src/hakimi/__init__.py; fi

@@ -335,15 +335,17 @@ async def delete_subscription(request: Request, kind: str, key: str):
 
 @router.get("/api/system-modules")
 async def system_modules(request: Request):
+    modules = list(service(request).modules.systems.values())
+    statuses = await asyncio.gather(*(module.status() for module in modules)) if modules else []
     return [
         {
             "id": module.module_id,
             "title": module.display_name,
             "description": module.description,
             "panel": module.admin_panel,
-            "status": await module.status(),
+            "status": status,
         }
-        for module in service(request).modules.systems.values()
+        for module, status in zip(modules, statuses, strict=True)
     ]
 
 

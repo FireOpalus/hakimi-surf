@@ -30,6 +30,22 @@ MAX_UPSTREAM_JSON_BYTES = 2_097_152
 MAX_TOKEN_JSON_BYTES = 16384
 MAX_POLL_ATTEMPTS = 10
 MAX_PAGES = 20
+_RETRY_BACKOFF_SECONDS: tuple[int, ...] = (60, 300, 900, 3600)
+
+
+class _GcpUnauthorized(Exception):
+    """Internal signal to evict a cached OAuth token and retry once on HTTP 401."""
+
+
+def _sa_fingerprint(raw: str | dict[str, Any]) -> str:
+    if isinstance(raw, str):
+        payload = raw.encode("utf-8", errors="surrogatepass")
+    else:
+        payload = json.dumps(raw, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8", errors="surrogatepass"
+        )
+    return hashlib.sha256(payload).hexdigest()
+
 
 BIGQUERY_TABLE_RE = re.compile(
     r"^[a-z][a-z0-9-]{4,29}(?::[a-z0-9.-]+)?\.[A-Za-z0-9_]{1,256}\.[A-Za-z0-9_]{1,256}$"
@@ -409,7 +425,13 @@ class GcpBillingManager:
         self._manual_set_microdollars: int | None = None
         self._bq_last_error: str | None = None
         self._mon_last_error: str | None = None
+        self._bq_failures: int = 0
+        self._bq_next_retry_at: float = 0.0
+        self._mon_failures: int = 0
+        self._mon_next_retry_at: float = 0.0
         self._tokens: dict[tuple[str, str], tuple[str, float]] = {}
+        self._validated_sa_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._prov_blob_cache: tuple[bytes, dict[str, Any]] | None = None
         self._cached_sa_project: str = ""
         self._token_lock = asyncio.Lock()
         self._bq_sync_lock = asyncio.Lock()
@@ -417,6 +439,39 @@ class GcpBillingManager:
         self._config_lock = asyncio.Lock()
         self._transport = transport
         self._clock = clock or time.time
+
+    @staticmethod
+    def _backoff_seconds(failures: int) -> int:
+        idx = min(max(0, failures - 1), len(_RETRY_BACKOFF_SECONDS) - 1)
+        return _RETRY_BACKOFF_SECONDS[idx]
+
+    def _reset_bq_backoff(self) -> None:
+        self._bq_failures = 0
+        self._bq_next_retry_at = 0.0
+
+    def _reset_mon_backoff(self) -> None:
+        self._mon_failures = 0
+        self._mon_next_retry_at = 0.0
+
+    def _reset_all_backoffs(self) -> None:
+        self._reset_bq_backoff()
+        self._reset_mon_backoff()
+
+    def _clear_sa_cache(self) -> None:
+        self._validated_sa_cache.clear()
+        self._prov_blob_cache = None
+
+    async def _validate_sa_cached(self, source: str, raw: str | dict[str, Any]) -> dict[str, Any]:
+        fp = _sa_fingerprint(raw)
+        key = (source, fp)
+        cached = self._validated_sa_cache.get(key)
+        if cached is not None:
+            return cached
+        validated = await asyncio.to_thread(validate_service_account_json, raw)
+        if len(self._validated_sa_cache) >= 8:
+            self._validated_sa_cache.clear()
+        self._validated_sa_cache[key] = validated
+        return validated
 
     @property
     def config(self) -> GcpBillingConfig:
@@ -440,6 +495,8 @@ class GcpBillingManager:
         self._bq_snapshot = None
         self._mon_snapshot = None
         self._manual_set_microdollars = None
+        self._clear_sa_cache()
+        self._reset_all_backoffs()
         if "gcp_billing" in loaded:
             merged = (
                 {**self.env.model_dump(mode="json"), **loaded["gcp_billing"]}
@@ -455,7 +512,7 @@ class GcpBillingManager:
                 else raw_cred
             )
             if sa_raw:
-                self._dedicated_sa = validate_service_account_json(sa_raw)
+                self._dedicated_sa = await self._validate_sa_cached("gcp_billing", sa_raw)
         if isinstance(loaded.get("gcp_billing_snapshot"), dict):
             self._bq_snapshot = loaded["gcp_billing_snapshot"]
         if isinstance(loaded.get("gcp_monitoring_snapshot"), dict):
@@ -481,7 +538,7 @@ class GcpBillingManager:
             info, _ = provider_routing.service_account_info()
             if isinstance(info, dict):
                 try:
-                    validated = validate_service_account_json(info)
+                    validated = await self._validate_sa_cached("provider_credentials", info)
                     self._cached_sa_project = str(validated.get("project_id") or "")
                     return validated, "provider_credentials"
                 except Rejected:
@@ -491,16 +548,26 @@ class GcpBillingManager:
                 "SELECT payload FROM admin_config WHERE key='provider_credentials'"
             )
         if row:
-            data = self.store.vault.open("admin:provider_credentials", row[0])
+            blob = row[0]
+            if self._prov_blob_cache is not None and self._prov_blob_cache[0] == blob:
+                validated = self._prov_blob_cache[1]
+                self._cached_sa_project = str(validated.get("project_id") or "")
+                return validated, "provider_credentials"
+            data = self.store.vault.open("admin:provider_credentials", blob)
             raw_sa = data.get("gcp_service_account_json") if isinstance(data, dict) else None
             if raw_sa:
                 try:
-                    validated = validate_service_account_json(raw_sa)
+                    validated = await self._validate_sa_cached("provider_credentials", raw_sa)
+                    self._prov_blob_cache = (blob, validated)
                     self._cached_sa_project = str(validated.get("project_id") or "")
                     return validated, "provider_credentials"
                 except Rejected:
+                    self._prov_blob_cache = None
                     self._cached_sa_project = ""
                     return None, "none"
+            self._prov_blob_cache = None
+        else:
+            self._prov_blob_cache = None
         self._cached_sa_project = ""
         return None, "none"
 
@@ -845,6 +912,7 @@ class GcpBillingManager:
             self.override = value
             self._bq_last_error = None
             self._mon_last_error = None
+            self._reset_all_backoffs()
         return await self.status()
 
     async def update_credentials(self, update: GcpBillingCredentialsUpdate) -> dict[str, Any]:
@@ -860,7 +928,9 @@ class GcpBillingManager:
                     )
                 self._dedicated_sa = None
             else:
-                info = validate_service_account_json(update.gcp_service_account_json)
+                info = await asyncio.to_thread(
+                    validate_service_account_json, update.gcp_service_account_json
+                )
                 payload = {"gcp_service_account_json": info}
                 async with self.store.transaction():
                     await self.store.db.execute(
@@ -869,7 +939,9 @@ class GcpBillingManager:
                         (self.store.vault.seal("admin:gcp_billing_credentials", payload),),
                     )
                 self._dedicated_sa = info
+            self._clear_sa_cache()
             self._tokens.clear()
+            self._reset_all_backoffs()
         return await self.status()
 
     async def _bounded_json(
@@ -880,9 +952,12 @@ class GcpBillingManager:
         *,
         max_bytes: int = MAX_UPSTREAM_JSON_BYTES,
         error_code: str = "gcp_request_failed",
+        raise_on_401: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         async with client.stream(method, url, follow_redirects=False, **kwargs) as response:
+            if raise_on_401 and response.status_code == 401:
+                raise _GcpUnauthorized()
             if response.status_code != 200:
                 raise Rejected(error_code)
             body = bytearray()
@@ -898,30 +973,74 @@ class GcpBillingManager:
             raise Rejected(error_code)
         return data
 
+    @staticmethod
+    def _token_cache_key(scope: str, sa_info: dict[str, Any]) -> tuple[str, str]:
+        fingerprint = hashlib.sha256(
+            (
+                str(sa_info.get("client_email", "")) + "|" + str(sa_info.get("private_key", ""))
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return (scope, fingerprint)
+
+    async def _evict_access_token(
+        self, scope: str, sa_info: dict[str, Any], stale_token: str
+    ) -> None:
+        cache_key = self._token_cache_key(scope, sa_info)
+        async with self._token_lock:
+            cached = self._tokens.get(cache_key)
+            if cached is not None and cached[0] == stale_token:
+                self._tokens.pop(cache_key, None)
+
+    async def _authorized_json(
+        self,
+        client: httpx.AsyncClient,
+        scope: str,
+        sa_info: dict[str, Any],
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        max_bytes: int = MAX_UPSTREAM_JSON_BYTES,
+        error_code: str = "gcp_request_failed",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        for attempt in range(2):
+            token = await self._access_token(scope, sa_info, client)
+            req_headers = {"Authorization": f"Bearer {token}", **(headers or {})}
+            try:
+                return await self._bounded_json(
+                    client,
+                    method,
+                    url,
+                    headers=req_headers,
+                    max_bytes=max_bytes,
+                    error_code=error_code,
+                    raise_on_401=(attempt == 0),
+                    **kwargs,
+                )
+            except _GcpUnauthorized:
+                await self._evict_access_token(scope, sa_info, token)
+        raise Rejected(error_code)
+
     async def _access_token(
         self,
         scope: str,
         sa_info: dict[str, Any],
         client: httpx.AsyncClient,
     ) -> str:
-        fingerprint = hashlib.sha256(
-            (
-                str(sa_info.get("client_email", "")) + "|" + str(sa_info.get("private_key", ""))
-            ).encode("utf-8")
-        ).hexdigest()[:16]
-        cache_key = (scope, fingerprint)
+        cache_key = self._token_cache_key(scope, sa_info)
         async with self._token_lock:
             cached = self._tokens.get(cache_key)
             if cached and cached[0] and time.monotonic() < cached[1]:
                 return cached[0]
-            try:
-                creds = await asyncio.to_thread(
-                    service_account.Credentials.from_service_account_info,
+            now = int(self._clock())
+
+            def _build_assertion() -> str:
+                creds = service_account.Credentials.from_service_account_info(
                     sa_info,
                     scopes=[scope],
                 )
-                now = int(self._clock())
-                assertion = jwt.encode(
+                return jwt.encode(
                     creds.signer,
                     {
                         "iss": creds.service_account_email,
@@ -931,6 +1050,9 @@ class GcpBillingManager:
                         "exp": now + 3600,
                     },
                 ).decode("ascii")
+
+            try:
+                assertion = await asyncio.to_thread(_build_assertion)
             except Exception:
                 raise Rejected("gcp_credentials_invalid") from None
             token = await self._bounded_json(
@@ -961,7 +1083,7 @@ class GcpBillingManager:
     async def _execute_bigquery_query(
         self,
         client: httpx.AsyncClient,
-        token: str,
+        sa_info: dict[str, Any],
         billing_project: str,
         sql: str,
         default_columns: tuple[str, ...],
@@ -970,7 +1092,6 @@ class GcpBillingManager:
     ) -> list[dict[str, Any]]:
         if not SAFE_PATH_PROJECT_RE.fullmatch(billing_project):
             raise Rejected("invalid_bigquery_table")
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         body: dict[str, Any] = {
             "query": sql,
             "useLegacySql": False,
@@ -979,11 +1100,13 @@ class GcpBillingManager:
         if self.config.bigquery_location:
             body["location"] = self.config.bigquery_location
         url = f"{BIGQUERY_API_BASE}/projects/{billing_project}/queries"
-        data = await self._bounded_json(
+        data = await self._authorized_json(
             client,
+            BIGQUERY_SCOPE,
+            sa_info,
             "POST",
             url,
-            headers=headers,
+            headers={"Content-Type": "application/json"},
             json=body,
             error_code="gcp_billing_request_failed",
         )
@@ -1004,11 +1127,12 @@ class GcpBillingManager:
             if job_loc and LOCATION_RE.fullmatch(job_loc):
                 params["location"] = job_loc
             await asyncio.sleep(0 if mocked else 0.3)
-            data = await self._bounded_json(
+            data = await self._authorized_json(
                 client,
+                BIGQUERY_SCOPE,
+                sa_info,
                 "GET",
                 f"{BIGQUERY_API_BASE}/projects/{job_proj}/queries/{job_id}",
-                headers={"Authorization": f"Bearer {token}"},
                 params=params,
                 error_code="gcp_billing_request_failed",
             )
@@ -1026,11 +1150,12 @@ class GcpBillingManager:
             params = {"pageToken": page_token}
             if job_loc and LOCATION_RE.fullmatch(job_loc):
                 params["location"] = job_loc
-            page = await self._bounded_json(
+            page = await self._authorized_json(
                 client,
+                BIGQUERY_SCOPE,
+                sa_info,
                 "GET",
                 f"{BIGQUERY_API_BASE}/projects/{job_proj}/queries/{job_id}",
-                headers={"Authorization": f"Bearer {token}"},
                 params=params,
                 error_code="gcp_billing_request_failed",
             )
@@ -1041,9 +1166,14 @@ class GcpBillingManager:
         return rows
 
     async def sync_bigquery(
-        self, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        _from_tick: bool = False,
     ) -> dict[str, Any]:
         async with self._bq_sync_lock:
+            if not _from_tick:
+                self._reset_bq_backoff()
             sa_info, _ = await self._resolve_credentials()
             if sa_info is None:
                 self._bq_last_error = "gcp_credentials_missing"
@@ -1072,10 +1202,9 @@ class GcpBillingManager:
                     follow_redirects=False,
                     transport=effective_transport,
                 ) as client:
-                    token = await self._access_token(BIGQUERY_SCOPE, sa_info, client)
                     credit_rows = await self._execute_bigquery_query(
                         client,
-                        token,
+                        sa_info,
                         billing_project,
                         credit_sql,
                         ("credit_name", "used_usd"),
@@ -1083,7 +1212,7 @@ class GcpBillingManager:
                     )
                     summary_rows = await self._execute_bigquery_query(
                         client,
-                        token,
+                        sa_info,
                         billing_project,
                         summary_sql,
                         ("gross_cost_usd", "net_cost_usd", "latest_usage_end_ts", "currency"),
@@ -1122,12 +1251,18 @@ class GcpBillingManager:
             self._bq_snapshot = snapshot
             self._unsettled_local_microdollars = unsettled_micro
             self._bq_last_error = None
+            self._reset_bq_backoff()
         return await self.status()
 
     async def sync_monitoring(
-        self, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        _from_tick: bool = False,
     ) -> dict[str, Any]:
         async with self._mon_sync_lock:
+            if not _from_tick:
+                self._reset_mon_backoff()
             sa_info, _ = await self._resolve_credentials()
             if sa_info is None:
                 self._mon_last_error = "gcp_credentials_missing"
@@ -1150,7 +1285,7 @@ class GcpBillingManager:
                 ("filter", f'metric.type="{MONITORING_METRIC_TYPE}"'),
                 ("interval.startTime", start_iso),
                 ("interval.endTime", end_iso),
-                ("aggregation.alignmentPeriod", "60s"),
+                ("aggregation.alignmentPeriod", "3600s"),
                 ("aggregation.perSeriesAligner", "ALIGN_SUM"),
                 ("aggregation.crossSeriesReducer", "REDUCE_SUM"),
                 ("aggregation.groupByFields", "metric.labels.type"),
@@ -1166,19 +1301,18 @@ class GcpBillingManager:
                     follow_redirects=False,
                     transport=effective_transport,
                 ) as client:
-                    token = await self._access_token(MONITORING_SCOPE, sa_info, client)
-                    headers = {"Authorization": f"Bearer {token}"}
                     url = f"{MONITORING_API_BASE}/projects/{monitoring_project}/timeSeries"
                     page_token = ""
                     for _ in range(MAX_PAGES):
                         params = list(base_params)
                         if page_token:
                             params.append(("pageToken", page_token))
-                        data = await self._bounded_json(
+                        data = await self._authorized_json(
                             client,
+                            MONITORING_SCOPE,
+                            sa_info,
                             "GET",
                             url,
-                            headers=headers,
                             params=params,
                             error_code="gcp_monitoring_request_failed",
                         )
@@ -1293,6 +1427,7 @@ class GcpBillingManager:
                 )
             self._mon_snapshot = snapshot
             self._mon_last_error = None
+            self._reset_mon_backoff()
         return await self.status()
 
     async def tick(self) -> None:
@@ -1304,23 +1439,35 @@ class GcpBillingManager:
                 if self._bq_snapshot is not None
                 else 0.0
             )
-            if not self._bq_snapshot or now - last_bq >= cfg.bigquery_sync_interval_seconds:
+            if now >= self._bq_next_retry_at and (
+                not self._bq_snapshot or now - last_bq >= cfg.bigquery_sync_interval_seconds
+            ):
                 try:
-                    await self.sync_bigquery()
+                    await self.sync_bigquery(_from_tick=True)
                 except Rejected as exc:
                     self._bq_last_error = str(exc)
+                    self._bq_failures += 1
+                    self._bq_next_retry_at = now + self._backoff_seconds(self._bq_failures)
                 except Exception:
                     self._bq_last_error = "gcp_billing_request_failed"
+                    self._bq_failures += 1
+                    self._bq_next_retry_at = now + self._backoff_seconds(self._bq_failures)
         if cfg.monitoring_enabled:
             last_mon = (
                 float(self._mon_snapshot.get("last_sync_at") or 0)
                 if self._mon_snapshot is not None
                 else 0.0
             )
-            if not self._mon_snapshot or now - last_mon >= cfg.monitoring_sync_interval_seconds:
+            if now >= self._mon_next_retry_at and (
+                not self._mon_snapshot or now - last_mon >= cfg.monitoring_sync_interval_seconds
+            ):
                 try:
-                    await self.sync_monitoring()
+                    await self.sync_monitoring(_from_tick=True)
                 except Rejected as exc:
                     self._mon_last_error = str(exc)
+                    self._mon_failures += 1
+                    self._mon_next_retry_at = now + self._backoff_seconds(self._mon_failures)
                 except Exception:
                     self._mon_last_error = "gcp_monitoring_request_failed"
+                    self._mon_failures += 1
+                    self._mon_next_retry_at = now + self._backoff_seconds(self._mon_failures)

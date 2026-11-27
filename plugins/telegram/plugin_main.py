@@ -123,6 +123,12 @@ def _sanitize_media_filename(raw_name: Any, *, default_stem: str, ext: str) -> s
     return f"{stem}.{ext}"
 
 
+def _sanitize_filename_stem(raw: Any, *, default: str) -> str:
+    cleaned = re.sub(r"[\r\n\x00-\x1f/\\\"<>:|?*]+", "_", str(raw or "")).strip(" ._")
+    cleaned = re.sub(r"\.{2,}", ".", cleaned).strip(" ._")[:100]
+    return cleaned or default
+
+
 def _map_tg_reaction_emoji(emoji: Any, emoji_id: Any) -> str | None:
     """Map inbound emoji / emoji_id onto Telegram's free reaction emoji allowlist."""
     raw_emoji = emoji.replace("\ufe0f", "").strip() if isinstance(emoji, str) else ""
@@ -318,6 +324,8 @@ class TelegramPlugin:
         self._tg_connected: bool = False
         self.poll_timeout = max(5, min(int(poll_timeout), 50))
         self.enable_polling = bool(enable_polling)
+        self._reconnect_min = max(0.01, float(reconnect_min))
+        self._reconnect_max = max(self._reconnect_min, float(reconnect_max))
         self.clock = clock if clock is not None else time.time
 
         self._owns_api = api is None
@@ -329,6 +337,8 @@ class TelegramPlugin:
         self._offset: int | None = None
         self._module_enabled: bool = True
         self._stopped: bool = False
+        self._bootstrap_task: asyncio.Task[None] | None = None
+        self._bootstrap_retry_after: float | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._media_registry: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._rx_count: int = 0
@@ -437,10 +447,11 @@ class TelegramPlugin:
 
     async def close(self) -> None:
         self._stopped = True
-        if self._poll_task is not None and not self._poll_task.done():
-            self._poll_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._poll_task
+        for task in (self._bootstrap_task, self._poll_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         await self.client.stop()
         if self._owns_api:
             await self.api.close()
@@ -448,23 +459,62 @@ class TelegramPlugin:
     async def _on_switch(self, enabled: bool) -> None:
         self._module_enabled = bool(enabled)
 
-    async def _on_connect(self, welcome: dict[str, Any]) -> None:
-        self._module_enabled = bool(welcome.get("enabled", True))
+    async def _push_or_cache_status(
+        self,
+        *,
+        connected: bool,
+        configuration_issue: str | None,
+    ) -> None:
+        snapshot = self._status_snapshot(connected=connected)
+        if self.client.connected:
+            with contextlib.suppress(Exception):
+                await self.client.push_status(
+                    snapshot,
+                    configuration_issue=configuration_issue,
+                )
+        else:
+            self.client.set_status_cache(
+                snapshot,
+                configuration_issue=configuration_issue,
+            )
+
+    async def _complete_bootstrap(self) -> Literal["ready", "auth_failed", "transient"]:
         try:
             me = await self.api.get_me()
             self.bot_id = str(me["id"])
             self.bot_username = str(me.get("username") or "").strip()
             self._last_error = ""
             self._tg_connected = True
+            self._bootstrap_retry_after = None
+        except asyncio.CancelledError:
+            raise
         except TelegramApiError as exc:
             self._last_error = exc.code
             self._tg_connected = False
-            log.warning("event=tg_get_me_failed code=%s", exc.code)
-            await self.client.push_status(
-                self._status_snapshot(connected=False),
-                configuration_issue="tg_bot_auth_failed",
+            if exc.code == "tg_unauthorized":
+                log.warning("event=tg_get_me_failed code=%s", exc.code)
+                await self._push_or_cache_status(
+                    connected=False,
+                    configuration_issue="tg_bot_auth_failed",
+                )
+                return "auth_failed"
+            self._bootstrap_retry_after = exc.retry_after
+            log.warning("event=tg_get_me_transient_failed code=%s", exc.code)
+            await self._push_or_cache_status(
+                connected=False,
+                configuration_issue=None,
             )
-            return
+            return "transient"
+        except Exception as exc:
+            self._last_error = type(exc).__name__
+            self._tg_connected = False
+            self._bootstrap_retry_after = None
+            log.warning("event=tg_get_me_transient_failed err=%s", type(exc).__name__)
+            await self._push_or_cache_status(
+                connected=False,
+                configuration_issue=None,
+            )
+            return "transient"
 
         try:
             saved_offset = await self.client.state_get("tg_update_offset")
@@ -478,8 +528,8 @@ class TelegramPlugin:
         except Exception:
             pass
 
-        await self.client.push_status(
-            self._status_snapshot(connected=True),
+        await self._push_or_cache_status(
+            connected=True,
             configuration_issue=None,
         )
         log.info(
@@ -491,6 +541,39 @@ class TelegramPlugin:
         )
         if self.enable_polling and (self._poll_task is None or self._poll_task.done()):
             self._poll_task = asyncio.create_task(self._poll_loop(), name="tg-poll-loop")
+        return "ready"
+
+    async def _bootstrap_loop(self) -> None:
+        backoff = self._reconnect_min
+        while not self._stopped:
+            sleep_for = (
+                self._bootstrap_retry_after if self._bootstrap_retry_after is not None else backoff
+            )
+            self._bootstrap_retry_after = None
+            await asyncio.sleep(sleep_for)
+            if self._stopped:
+                return
+            if not self.client.connected:
+                continue
+            outcome = await self._complete_bootstrap()
+            if outcome in {"ready", "auth_failed"}:
+                return
+            backoff = min(backoff * 2.0, self._reconnect_max)
+
+    async def _on_connect(self, welcome: dict[str, Any]) -> None:
+        self._module_enabled = bool(welcome.get("enabled", True))
+        self._bootstrap_retry_after = None
+        outcome = await self._complete_bootstrap()
+        if outcome in {"ready", "auth_failed"}:
+            if self._bootstrap_task is not None and not self._bootstrap_task.done():
+                self._bootstrap_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._bootstrap_task
+            return
+        if self._bootstrap_task is None or self._bootstrap_task.done():
+            self._bootstrap_task = asyncio.create_task(
+                self._bootstrap_loop(), name="tg-bootstrap-loop"
+            )
 
     async def _sensor_summary(self, _params: dict[str, Any] | None = None) -> str:
         state = "在线" if (self.bot_id and not self._last_error) else "异常"
@@ -610,7 +693,7 @@ class TelegramPlugin:
                     if not isinstance(p.get("file_size"), int)
                     or p["file_size"] <= _MAX_PHOTO_FILE_BYTES
                 ]
-                chosen = eligible[-1] if eligible else (candidates[-1] if candidates else None)
+                chosen = eligible[-1] if eligible else (candidates[0] if candidates else None)
                 if chosen is not None:
                     fid = chosen["file_id"].strip()
                     if fid and fid not in seen_images:
@@ -981,31 +1064,34 @@ class TelegramPlugin:
             "audios": audios,
         }
 
-    async def process_update(self, update: dict[str, Any]) -> bool:
-        """Parse one Telegram update and forward it over the plugin bus if admitted."""
-        parsed = self.parse_update(update)
-        if parsed is None:
-            return False
+    async def _emit_parsed_update(self, parsed: dict[str, Any]) -> bool:
         if not self._module_enabled or not self.client.connected:
             return False
         await self.client.emit_chat_inbound(**parsed)
         self._rx_count += 1
         return True
 
+    async def process_update(self, update: dict[str, Any]) -> bool:
+        """Parse one Telegram update and forward it over the plugin bus if admitted."""
+        parsed = self.parse_update(update)
+        if parsed is None:
+            return False
+        return await self._emit_parsed_update(parsed)
+
     async def _poll_loop(self) -> None:
-        backoff = 1.0
+        backoff = self._reconnect_min
         while not self._stopped:
             if not self.client.connected or not self._module_enabled or not self.bot_id:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(min(1.0, self._reconnect_min))
                 continue
             try:
                 updates = await self.api.get_updates(
                     offset=self._offset,
                     timeout=self.poll_timeout,
                 )
-                backoff = 1.0
-                if self._last_error:
+                if self._last_error or not self._tg_connected:
                     self._last_error = ""
+                    self._tg_connected = True
                     with contextlib.suppress(Exception):
                         await self.client.push_status(
                             self._status_snapshot(connected=True),
@@ -1017,37 +1103,70 @@ class TelegramPlugin:
                 self._last_error = exc.code
                 sleep_for = exc.retry_after if exc.retry_after is not None else backoff
                 log.warning("event=tg_poll_error code=%s sleep=%.1f", exc.code, sleep_for)
-                backoff = min(backoff * 2.0, 30.0)
+                backoff = min(backoff * 2.0, self._reconnect_max)
                 await asyncio.sleep(sleep_for)
                 continue
             except Exception as exc:
                 self._last_error = type(exc).__name__
                 log.warning("event=tg_poll_exception err=%s", type(exc).__name__)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2.0, 30.0)
+                backoff = min(backoff * 2.0, self._reconnect_max)
                 continue
 
             if not updates:
+                backoff = self._reconnect_min
                 continue
 
             max_offset: int | None = None
+            batch_failed = False
+            custom_process = (
+                "process_update" in self.__dict__
+                or type(self).process_update is not TelegramPlugin.process_update
+            )
             for upd in updates:
+                if not self.client.connected or not self._module_enabled:
+                    batch_failed = True
+                    break
+                try:
+                    parsed = self.parse_update(upd)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("event=tg_update_parse_failed err=%s", type(exc).__name__)
+                    parsed = None
+                if parsed is not None:
+                    try:
+                        emitted = (
+                            await self.process_update(upd)
+                            if custom_process
+                            else await self._emit_parsed_update(parsed)
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.warning("event=tg_update_process_failed err=%s", type(exc).__name__)
+                        batch_failed = True
+                        break
+                    if not emitted:
+                        batch_failed = True
+                        break
                 uid = upd.get("update_id")
                 if isinstance(uid, int) and not isinstance(uid, bool):
                     next_off = uid + 1
                     if max_offset is None or next_off > max_offset:
                         max_offset = next_off
-                try:
-                    await self.process_update(upd)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.warning("event=tg_update_process_failed err=%s", type(exc).__name__)
 
             if max_offset is not None and (self._offset is None or max_offset > self._offset):
                 self._offset = max_offset
-                with contextlib.suppress(Exception):
-                    await self.client.state_set("tg_update_offset", self._offset)
+                if self.client.connected:
+                    with contextlib.suppress(Exception):
+                        await self.client.state_set("tg_update_offset", self._offset)
+
+            if batch_failed:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, self._reconnect_max)
+            else:
+                backoff = self._reconnect_min
 
     async def _handle_chat_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
         _kind, chat_id = self._delivery_allowed(params)
@@ -1083,7 +1202,7 @@ class TelegramPlugin:
         mime_type = str(
             params.get("mime_type") or ("audio/ogg" if fmt == "ogg_opus" else f"audio/{fmt}")
         ).strip()
-        ext = "ogg" if fmt == "ogg_opus" else fmt
+        ext = re.sub(r"[^a-z0-9]", "", ("ogg" if fmt == "ogg_opus" else fmt).lower()) or "ogg"
         raw_dur_ms = params.get("duration_ms")
         duration_sec = (
             max(1, round(float(raw_dur_ms) / 1000.0))
@@ -1096,10 +1215,18 @@ class TelegramPlugin:
         title = str(params.get("title") or "").strip() or None
         kind_hint = str(params.get("kind_hint") or "").strip().lower()
         is_song = kind_hint == "song" or title is not None
+        blob_meta = params.get("blob_meta")
+        blob_meta_fname = blob_meta.get("filename") if isinstance(blob_meta, dict) else None
+        raw_blob_fname = blob_meta_fname or params.get("blob_filename")
 
         try:
             if is_song:
-                fname = str(params.get("blob_filename") or "").strip() or f"{title or 'song'}.{ext}"
+                safe_stem = _sanitize_filename_stem(title, default="song")
+                fname = (
+                    _sanitize_media_filename(raw_blob_fname, default_stem=safe_stem, ext=ext)
+                    if str(raw_blob_fname or "").strip()
+                    else f"{safe_stem}.{ext}"
+                )
                 msg_id = await self.api.send_audio(
                     chat_id,
                     raw_audio,
@@ -1111,7 +1238,11 @@ class TelegramPlugin:
                     reply_to_message_id=reply_to,
                 )
             else:
-                fname = str(params.get("blob_filename") or "").strip() or f"voice.{ext}"
+                fname = (
+                    _sanitize_media_filename(raw_blob_fname, default_stem="voice", ext=ext)
+                    if str(raw_blob_fname or "").strip()
+                    else f"voice.{ext}"
+                )
                 msg_id = await self.api.send_voice(
                     chat_id,
                     raw_audio,
@@ -1155,7 +1286,11 @@ class TelegramPlugin:
         default_stem = (
             "meme"
             if detected_ext == "gif"
-            else (raw_media_kind if raw_media_kind in {"sticker", "card", "image"} else "image")
+            else (
+                "sticker"
+                if detected_ext == "webp"
+                else (raw_media_kind if raw_media_kind in {"sticker", "card", "image"} else "image")
+            )
         )
         blob_meta = params.get("blob_meta")
         blob_meta_fname = blob_meta.get("filename") if isinstance(blob_meta, dict) else None
@@ -1167,6 +1302,14 @@ class TelegramPlugin:
         try:
             if detected_ext == "gif":
                 msg_id = await self.api.send_animation(
+                    chat_id,
+                    raw_media,
+                    filename=fname,
+                    mime_type=detected_mime,
+                    reply_to_message_id=reply_to,
+                )
+            elif detected_ext == "webp":
+                msg_id = await self.api.send_sticker(
                     chat_id,
                     raw_media,
                     filename=fname,

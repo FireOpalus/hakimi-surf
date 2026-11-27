@@ -787,6 +787,10 @@ _MICRO_GAME_VERBS = frozenset(
     }
 )
 _ADMIN_ONLY_VERBS = frozenset({"status", "pause", "resume"})
+_LONG_ACTION_VERBS = frozenset({"connect", "acquire", "smelt", "craft"})
+_ACTION_TIMEOUT_LONG_SECONDS = 50.0
+_ACTION_TIMEOUT_GOAL_SECONDS = 45.0
+_ACTION_TIMEOUT_ADMIN_SECONDS = 20.0
 _EFFORTFUL_VERBS = frozenset(
     {
         "explore",
@@ -906,6 +910,13 @@ class MinecraftPlugin:
         async def _run(params: dict[str, Any]) -> dict[str, Any]:
             return await self._handle_action(verb, params)
 
+        if admin_only:
+            timeout_seconds = _ACTION_TIMEOUT_ADMIN_SECONDS
+        elif verb in _LONG_ACTION_VERBS:
+            timeout_seconds = _ACTION_TIMEOUT_LONG_SECONDS
+        else:
+            timeout_seconds = _ACTION_TIMEOUT_GOAL_SECONDS
+
         return ActionSpec(
             name=f"mc.{verb}",
             description=description,
@@ -915,6 +926,7 @@ class MinecraftPlugin:
             interrupts_focus=False,
             window="any",
             aliases=[] if admin_only else [["minecraft", verb, False]],
+            timeout_seconds=timeout_seconds,
             handler=_run,
         )
 

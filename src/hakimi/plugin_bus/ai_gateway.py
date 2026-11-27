@@ -11,7 +11,7 @@ from ..config import Settings
 from ..generation_policy import Scenario
 from ..media import ModelImage
 from ..roaming_logger import redact_public_summary
-from ..screen_watch import decode_b64_frames
+from ..screen_watch import decode_b64_frames_async
 from ..security import Rejected, clean_text, safe_output
 from ..work_usage import model_work
 from .protocol import (
@@ -178,7 +178,7 @@ class PluginBusAIGatewayMixin:
         async def _run_screen() -> None:
             try:
                 images: list[ModelImage] = (
-                    decode_b64_frames(raw_images, 2, self.s, error_prefix="plugin")
+                    await decode_b64_frames_async(raw_images, 2, self.s, error_prefix="plugin")
                     if raw_images
                     else []
                 )
@@ -370,7 +370,7 @@ class PluginBusAIGatewayMixin:
         async def _run_generate() -> None:
             try:
                 images: list[ModelImage] = (
-                    decode_b64_frames(raw_images, 2, self.s, error_prefix="plugin")
+                    await decode_b64_frames_async(raw_images, 2, self.s, error_prefix="plugin")
                     if raw_images
                     else []
                 )

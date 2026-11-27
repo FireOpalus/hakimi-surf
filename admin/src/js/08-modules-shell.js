@@ -146,6 +146,7 @@ function moduleSchedulePanel(d){
   const path='life/modules/'+encodeURIComponent(d.id)+'/schedule';
   const buttons=el('div',undefined,'row'),save=el('button','保存模块调度','primary'),reset=el('button','恢复模块默认值','secondary');
   save.type='submit';reset.type='button';buttons.append(save,reset);form.append(grid,buttons);panel.append(form);
+  if(typeof enhanceLabels==='function')enhanceLabels(panel);
   const refresh=result=>panel.replaceWith(moduleSchedulePanel(result));
   form.addEventListener('submit',e=>{e.preventDefault();busy(save,async()=>{
     const values={};
@@ -690,6 +691,8 @@ function trackLoad(promise){
 }
 let lastVisit=0;
 let navPromptPending=false;
+let pollInFlight=false;
+onLogout(()=>{pollInFlight=false;});
 async function navigate(key,{focusContent=false,heading=null,fromHash=false,replaceHash=false}={}){
   if(!token||!sections.has(key))return;
   if(key!==tab&&isTabDirty(tab)){
@@ -707,22 +710,29 @@ async function navigate(key,{focusContent=false,heading=null,fromHash=false,repl
   const drawerOpen=$('sidebar').classList.contains('open');
   closeNavigation();
   const changed=key!==tab;
+  if(changed)abortTabRequests();
   selectTab(key);
   if(!fromHash&&(changed||replaceHash||location.hash!=='#'+key)){
     syncHash(key,replaceHash||!changed);
   }
   if(drawerOpen||focusContent)$('page-title').focus({preventScroll:true});
-  let loading=panelLoads.get(panel);
-  if(!loading){
+  const reqSignal=tabRequests.signal;
+  let entry=panelLoads.get(panel);
+  if(!entry||entry.signal.aborted){
     panel.inert=true;panel.setAttribute('aria-busy','true');
     if(loadedPanels.has(key))panel.dataset.refreshing='1';
-    loading=trackLoad(refreshTab(key).then(()=>{loadedPanels.add(key);})).finally(()=>{
-      panel.inert=false;panel.removeAttribute('aria-busy');delete panel.dataset.refreshing;panelLoads.delete(panel);
+    const promise=trackLoad(refreshTab(key).then(()=>{
+      if(!reqSignal.aborted)loadedPanels.add(key);
+    })).finally(()=>{
+      if(panelLoads.get(panel)?.promise===promise){
+        panel.inert=false;panel.removeAttribute('aria-busy');delete panel.dataset.refreshing;panelLoads.delete(panel);
+      }
     });
-    panelLoads.set(panel,loading);
+    entry={promise,signal:reqSignal};
+    panelLoads.set(panel,entry);
   }
-  try{await loading;}
-  catch(e){if(visit===lastVisit&&token&&e.name!=='AbortError')notice(e.message,true);return;}
+  try{await entry.promise;}
+  catch(e){if(visit===lastVisit&&token&&e?.name!=='AbortError')notice(e.message,true);return;}
   if(!heading||visit!==lastVisit||!token)return;
   revealSectionFor(heading);
   if(heading.closest('[hidden]'))return;
@@ -746,9 +756,11 @@ $('login-form').addEventListener('submit',e=>{
   busy(e.submitter,async()=>{
     $('login-error').hidden=true;$('token').removeAttribute('aria-invalid');
     token=$('token').value;$('token').value='';
+    const hashKey=location.hash.replace(/^#/,'');
+    const hasHashTarget=Boolean(hashKey&&hashKey!=='overview'&&sections.has(hashKey));
     try{
       const first=await fetchOverviewPayload();
-      await dashboard(first);
+      await dashboard(first,{lightweight:hasHashTarget});
     }catch(err){
       if(err.name==='AbortError')return;
       token='';text('login-error',err.message);$('login-error').hidden=false;
@@ -758,19 +770,27 @@ $('login-form').addEventListener('submit',e=>{
     $('login').hidden=true;$('app').hidden=false;hideNotice();
     for(const id of ['logout','open-finder','menu-toggle','workspace-switch'])$(id).hidden=false;
     document.body.classList.add('authenticated');
-    const hashKey=location.hash.replace(/^#/,'');
-    if(hashKey&&hashKey!=='overview'&&sections.has(hashKey)){
+    if(hasHashTarget){
       selectTab('overview');
       navigate(hashKey,{fromHash:true,focusContent:true});
     }else{
+      loadedPanels.add('overview');
       selectTab('overview');
       syncHash('overview',true);
       $('page-title').focus({preventScroll:true});
     }
+    if(timer){clearInterval(timer);timer=null;}
+    pollInFlight=false;
     timer=setInterval(()=>{
-      if(document.hidden||!token)return;
+      if(document.hidden||!token||pollInFlight)return;
       const read=tab==='overview'?()=>dashboard(undefined,{lightweight:true}):tab==='filter'?decisionAudit:tab==='logs'?logs:null;
-      if(read)read().catch(err=>{if(err.name!=='AbortError')notice(err.message,true);});
+      if(!read)return;
+      pollInFlight=true;
+      (async()=>{
+        try{await read();}
+        catch(err){if(err?.name!=='AbortError')notice(err.message,true);}
+        finally{pollInFlight=false;}
+      })();
     },15000);
   });
 });

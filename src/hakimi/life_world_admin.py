@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -202,27 +203,32 @@ async def _collect_modules_status(svc: Any, *, include_sensors: bool) -> list[di
     registry = getattr(svc, "modules", None)
     if registry is None:
         return []
-    items: list[dict[str, Any]] = []
-    for mod in registry.all():
+    mods = list(registry.all())
+
+    async def _read_sensor(mod: Any) -> str:
+        if not include_sensors or mod.inactive_reason:
+            return ""
         try:
-            summary = (
-                await mod.get_sensor_summary()
-                if include_sensors and not mod.inactive_reason
-                else ""
-            )
+            return await mod.get_sensor_summary()
         except Exception:
-            summary = ""
-        items.append(
-            {
-                "module_id": mod.module_id,
-                "enabled": mod.enabled,
-                "node_region": mod.node_region,
-                "attention_level": mod.attention_level,
-                "proactive_paused": bool(mod.proactive_paused),
-                "sensor_summary": summary,
-            }
-        )
-    return items
+            return ""
+
+    summaries = (
+        await asyncio.gather(*(_read_sensor(mod) for mod in mods))
+        if include_sensors and mods
+        else [""] * len(mods)
+    )
+    return [
+        {
+            "module_id": mod.module_id,
+            "enabled": mod.enabled,
+            "node_region": mod.node_region,
+            "attention_level": mod.attention_level,
+            "proactive_paused": bool(mod.proactive_paused),
+            "sensor_summary": summary,
+        }
+        for mod, summary in zip(mods, summaries, strict=True)
+    ]
 
 
 async def _read_intents(store: Any) -> list[dict[str, Any]]:
@@ -401,8 +407,12 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
     }
 
     cloud_memory = getattr(svc, "cloud_memory", None)
-    if cloud_memory is not None and hasattr(cloud_memory, "latest_activity_info"):
-        desktop_memory = await _maybe_await(cloud_memory.latest_activity_info())
+    latest_info_fn = getattr(cloud_memory, "latest_activity_info", None)
+    if callable(latest_info_fn):
+        if inspect.iscoroutinefunction(latest_info_fn):
+            desktop_memory = await latest_info_fn()
+        else:
+            desktop_memory = await _maybe_await(await asyncio.to_thread(latest_info_fn))
     else:
         desktop_memory = {"enabled": bool(svc.s.enable_antigravity_memory)}
 
@@ -525,7 +535,7 @@ async def life_save_config(request: Request):
             await _maybe_await(engine.set_config(value))
         except ValueError:
             raise HTTPException(400, "unsupported_action_mode") from None
-        return await _build_life_status(svc)
+        return await _build_life_status(svc, include_sensors=False)
 
 
 @router.put("/actions/{name}")
@@ -546,7 +556,7 @@ async def life_action_mode(request: Request, name: str):
             raise HTTPException(400, "unsupported_action_mode") from None
         if value.view == "module":
             return await module_detail(request, engine.catalog.owners[canonical])
-        return await _build_life_status(svc)
+        return await _build_life_status(svc, include_sensors=False)
 
 
 @router.delete("")
@@ -557,7 +567,7 @@ async def life_reset_config(request: Request):
         if engine is None:
             raise HTTPException(503, "life_engine_unavailable")
         await _maybe_await(engine.set_config(None))
-        return await _build_life_status(svc)
+        return await _build_life_status(svc, include_sensors=False)
 
 
 @router.put("/rhythm")
@@ -600,7 +610,7 @@ async def world_schedule(request: Request):
             raise invalid_input_http_error(exc, detail="invalid_world_settings") from None
         except ValueError:
             raise HTTPException(400, "invalid_world_settings") from None
-        return await _build_life_status(svc)
+        return await _build_life_status(svc, include_sensors=False)
 
 
 @router.put("/world")
@@ -626,7 +636,7 @@ async def life_update_world(request: Request):
             if str(exc) != "mc_task_required":
                 raise
             raise HTTPException(400, "mc_task_required") from None
-        return await _build_life_status(svc)
+        return await _build_life_status(svc, include_sensors=False)
 
 
 @router.post("/plan")
@@ -734,7 +744,7 @@ async def life_cancel_intent(request: Request, intent_id: str):
         changed = await ws.mark_intent(intent_id, "gated_skip", reason="admin_cancelled")
         if not changed:
             raise HTTPException(409, "intent_not_pending")
-        return await _build_life_status(svc)
+        return await _build_life_status(svc, include_sensors=False)
 
 
 @router.post("/mc/goal")

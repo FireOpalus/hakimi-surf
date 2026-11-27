@@ -26,6 +26,8 @@ from urllib.parse import quote, urlencode, urljoin, urlsplit
 import httpx
 
 MAX_BYTES = 80 * 1024 * 1024
+MUX_HEADROOM_BYTES = 2 * 1024 * 1024
+MAX_CDN_CHUNKS = 256
 MAX_JOB_BYTES = 192 * 1024 * 1024
 MAX_API_BYTES = 1 * 1024 * 1024
 MAX_REDIRECTS = 3
@@ -716,14 +718,30 @@ def _api_get_json(
     return payload
 
 
-def _parse_content_range_total(header_value: str | None) -> int | None:
+def _parse_content_range(header_value: str | None) -> tuple[int | None, int | None, int | None]:
     if not header_value:
-        return None
-    match = re.match(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", header_value.strip(), re.IGNORECASE)
-    if not match or match.group(3) == "*":
-        return None
-    total = int(match.group(3))
-    return total if total > 0 else None
+        return None, None, None
+    cleaned = header_value.strip()
+    unsat = re.match(r"^bytes\s+\*/(\d+)$", cleaned, re.IGNORECASE)
+    if unsat:
+        total = int(unsat.group(1))
+        return None, None, total if total >= 0 else None
+    match = re.match(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", cleaned, re.IGNORECASE)
+    if not match:
+        return None, None, None
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if end < start:
+        return None, None, None
+    total = None if match.group(3) == "*" else int(match.group(3))
+    if total is not None and total <= 0:
+        total = None
+    return start, end, total
+
+
+def _parse_content_range_total(header_value: str | None) -> int | None:
+    _, _, total = _parse_content_range(header_value)
+    return total if total is not None and total > 0 else None
 
 
 def _download_single_url(
@@ -740,7 +758,7 @@ def _download_single_url(
     current_url = allowed_url(url)
     written = 0
     total_expected: int | None = None
-    max_chunks = 64
+    max_chunks = MAX_CDN_CHUNKS
 
     with contextlib.suppress(OSError):
         dest.unlink()
@@ -772,6 +790,13 @@ def _download_single_url(
                             current_url = allowed_url(next_url)
                             redirects += 1
                             continue
+                        if status == 416 and written > 0 and total_expected is None:
+                            _, _, unsat_total = _parse_content_range(
+                                resp.headers.get("content-range")
+                            )
+                            if unsat_total is None or unsat_total == written:
+                                return True, written, status, None
+                            return False, written, status, "video_download_unavailable"
                         if status not in {200, 206}:
                             return False, written, status, None
 
@@ -782,15 +807,20 @@ def _download_single_url(
                             written = 0
 
                         raw_cl = resp.headers.get("content-length")
+                        declared_cl: int | None = None
                         if raw_cl and raw_cl.isdigit():
-                            cl = int(raw_cl)
-                            if written + cl > max_bytes:
+                            declared_cl = int(raw_cl)
+                            if written + declared_cl > max_bytes:
                                 raise WorkerError("video_download_size")
 
+                        cr_start: int | None = None
+                        cr_end: int | None = None
                         if status == 206:
-                            parsed_total = _parse_content_range_total(
+                            cr_start, cr_end, parsed_total = _parse_content_range(
                                 resp.headers.get("content-range")
                             )
+                            if cr_start is not None and cr_start != written:
+                                return False, written, status, "video_download_unavailable"
                             if parsed_total is not None:
                                 if parsed_total > max_bytes:
                                     raise WorkerError("video_download_size")
@@ -813,11 +843,23 @@ def _download_single_url(
                         out.flush()
                         check_disk()
 
+                        if declared_cl is not None and chunk_bytes < declared_cl:
+                            return False, written, status, "video_download_unavailable"
+                        if (
+                            status == 206
+                            and cr_start is not None
+                            and cr_end is not None
+                            and chunk_bytes < (cr_end - cr_start + 1)
+                        ):
+                            return False, written, status, "video_download_unavailable"
+
                         if status == 200:
                             return written > 0, written, status, None
-                        if total_expected is None or written >= total_expected:
+                        if total_expected is not None and written >= total_expected:
                             return written > 0, written, status, None
                         if chunk_bytes == 0:
+                            if total_expected is None and written > 0:
+                                return True, written, status, None
                             return False, written, status, "video_download_unavailable"
                         break
                 except WorkerError:
@@ -1000,14 +1042,16 @@ def execute(config, *, http_client: httpx.Client | None = None, sleep_fn=time.sl
         durl = play_data.get("durl")
         if isinstance(dash, dict):
             selected = select_dash_streams(dash, duration)
+            headroom = MUX_HEADROOM_BYTES if MAX_BYTES > MUX_HEADROOM_BYTES else 0
+            dash_budget = MAX_BYTES - headroom
             audio_written = download_cdn_stream(
                 client,
                 selected["audio"]["urls"],
                 audio_part,
-                max_bytes=MAX_BYTES,
+                max_bytes=dash_budget,
                 sleep_fn=sleep_fn,
             )
-            remaining = MAX_BYTES - audio_written
+            remaining = dash_budget - audio_written
             if remaining <= 0:
                 raise WorkerError("video_download_size")
             download_cdn_stream(
@@ -1041,6 +1085,8 @@ def execute(config, *, http_client: httpx.Client | None = None, sleep_fn=time.sl
         else:
             raise WorkerError("video_download_format")
 
+        if out_path.is_file() and out_path.stat().st_size > MAX_BYTES:
+            raise WorkerError("video_download_size")
         return {"status": "ok", "duration": inspect_media(out_path, max_seconds)}
     finally:
         with contextlib.suppress(OSError):
@@ -1056,7 +1102,8 @@ def main():
     result = {"status": "error", "error": "video_download_unavailable"}
     try:
         os.umask(0o077)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_BYTES, MAX_BYTES))
+        fsize_limit = MAX_BYTES + MUX_HEADROOM_BYTES
+        resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         config = json.loads(Path("request.json").read_text())

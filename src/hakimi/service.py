@@ -165,6 +165,7 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         )
         self._lurk_react_at: dict[str, float] = {}
         self._last_aff_recovery_at: float = 0.0
+        self._last_session_prune_at: float = 0.0
         self.modules = ModuleRegistry()
         settings._chat_registry = weakref.ref(self.modules)
         self.kernel = PluginKernel()
@@ -418,6 +419,7 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                         "WHERE j.scope=? AND o.status IN ('pending','sending')",
                         (self.store.session_scope(message),),
                     )
+                    cancelled_outbox = False
                     for row in rows:
                         data = self.store.vault.open(row["id"], row["payload"])
                         originals = data.get("participants") or [data["message"]]
@@ -426,6 +428,11 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                                 "UPDATE outbox SET status='cancelled',payload=NULL WHERE id=?",
                                 (row["id"],),
                             )
+                            cancelled_outbox = True
+                if cancelled_outbox:
+                    wakeup = getattr(self.store, "job_wakeup", None)
+                    if wakeup is not None:
+                        wakeup.set()
                 return "recalled"
             return await self.accept(message)
         return await self.accept(onebot_message(payload, self.s))
@@ -936,9 +943,14 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
     async def worker(self):
         while True:
             try:
+                wakeup = getattr(self.store, "job_wakeup", None)
+                if wakeup is not None:
+                    wakeup.clear()
                 job = await self.store.claim()
                 if job:
                     await self.process(job)
+                elif hasattr(self.store, "wait_for_job"):
+                    await self.store.wait_for_job()
                 else:
                     await asyncio.sleep(0.25)
             except asyncio.CancelledError:
@@ -1085,9 +1097,12 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         while True:
             await self.store.runtime.flush()
             await self.store.prune()
-            await self.sessions.prune()
+            now = time.time()
+            if now - self._last_session_prune_at >= 1800:
+                await self.sessions.prune()
+                self._last_session_prune_at = now
             await self.proactive.prune()
-            await self.world_state.experience.prune(time.time())
+            await self.world_state.experience.prune(now)
             if hasattr(self.ai, "cleanup_video_files"):
                 try:
                     await self.ai.cleanup_video_files()

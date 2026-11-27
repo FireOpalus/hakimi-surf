@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS world_news (
  source TEXT NOT NULL, ref TEXT NOT NULL, title TEXT NOT NULL, shared_at REAL, intent_id TEXT
 );
 CREATE INDEX IF NOT EXISTS world_news_available ON world_news(audience,shared_at,expires);
+CREATE INDEX IF NOT EXISTS world_news_expires ON world_news(expires);
 CREATE TRIGGER IF NOT EXISTS world_snapshot_fields
 AFTER UPDATE OF current_module,focus_level,mood,energy,boredom,last_proactive_at,updated_at
 ON world_state BEGIN

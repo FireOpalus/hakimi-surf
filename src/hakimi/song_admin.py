@@ -306,10 +306,24 @@ async def songs(request: Request):
     }
 
 
+def _wants_refresh(request: Request) -> bool:
+    for header in ("x-force-refresh", "x-refresh"):
+        val = request.headers.get(header, "").strip().lower()
+        if val in {"1", "true", "yes"}:
+            return True
+    return False
+
+
 @router.get("/storage")
 async def song_storage(request: Request):
     lib = library(request)
-    return await lib.drive_storage_status(probe=True)
+    return await lib.drive_storage_status(probe=True, force_refresh=_wants_refresh(request))
+
+
+@router.post("/storage/refresh")
+async def refresh_song_storage(request: Request):
+    lib = library(request)
+    return await lib.drive_storage_status(probe=True, force_refresh=True)
 
 
 @router.put("/storage")
@@ -334,7 +348,15 @@ async def reset_song_storage(request: Request):
 @router.get("/inbox")
 async def song_inbox(request: Request):
     try:
-        return await library(request).list_inbox()
+        return await library(request).list_inbox(force_refresh=_wants_refresh(request))
+    except Rejected as exc:
+        raise _map_song_rejected(exc) from None
+
+
+@router.post("/inbox/refresh")
+async def refresh_song_inbox(request: Request):
+    try:
+        return await library(request).list_inbox(force_refresh=True)
     except Rejected as exc:
         raise _map_song_rejected(exc) from None
 
@@ -368,7 +390,15 @@ async def upload_song_inbox(request: Request):
 @router.get("/voices")
 async def song_voices(request: Request):
     try:
-        return await library(request).list_voices()
+        return await library(request).list_voices(force_refresh=_wants_refresh(request))
+    except Rejected as exc:
+        raise _map_song_rejected(exc) from None
+
+
+@router.post("/voices/refresh")
+async def refresh_song_voices(request: Request):
+    try:
+        return await library(request).list_voices(force_refresh=True)
     except Rejected as exc:
         raise _map_song_rejected(exc) from None
 
