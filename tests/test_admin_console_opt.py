@@ -39,6 +39,7 @@ from hakimi import (
 from hakimi.app import create_app
 from hakimi.usage_accounting import TokenUsage
 from tests.fakes import FakeGateway
+from tests.js_runtime import find_js_engine, run_js_harness
 from tests.test_admin import TOKEN
 from tests.test_voice_gateway_admin import GW_TOKEN, _gw_cfg
 from voice_gateway.app import create_gateway_app
@@ -626,16 +627,8 @@ def test_unified_cloud_resource_view_dom_contract_and_csp():
 def test_unified_cloud_resource_view_js_runtime_and_degradation():
     """Execute assembled JS renderers in a mock DOM (jsc/node) to verify rendering & fallback."""
     import json
-    import shutil
 
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    runner: list[str] | None = None
-    if shutil.which("node"):
-        runner = ["node", "-e"]
-    elif jsc_path.is_file():
-        runner = [str(jsc_path), "-e"]
-    if runner is None:
-        pytest.skip("No local JS engine (node/jsc) available for DOM renderer execution test")
+    find_js_engine("No local JS engine (node/jsc) available for DOM renderer execution test")
 
     core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
     ledger_js = (ADMIN_DIR / "src" / "js" / "02-overview-ledger.js").read_text(encoding="utf-8")
@@ -1077,20 +1070,13 @@ def test_unified_cloud_resource_view_js_runtime_and_degradation():
     assert($('cloud-sync-bq').disabled === true, 'logout should disable cloud-sync-bq');
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"JS runtime test failed:\n{proc.stderr}\n{proc.stdout}"
 
 
 def test_colab_and_songs_ui_physical_decoupling():
     """Verify #colab-compute and #songs are physically decoupled in HTML, JS, and runtime."""
     import json
-    import shutil
 
     html = build_html()
     assert audit_html(html) == []
@@ -1175,14 +1161,7 @@ def test_colab_and_songs_ui_physical_decoupling():
     assert "colab_gpu_not_allowed" in script
     assert "learn_gpu_policy" in script
 
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    runner: list[str] | None = None
-    if shutil.which("node"):
-        runner = ["node", "-e"]
-    elif jsc_path.is_file():
-        runner = [str(jsc_path), "-e"]
-    if runner is None:
-        pytest.skip("No local JS engine (node/jsc) available for decoupled UI runtime test")
+    find_js_engine("No local JS engine (node/jsc) available for decoupled UI runtime test")
 
     core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
     media_js = (ADMIN_DIR / "src" / "js" / "07-media-bili.js").read_text(encoding="utf-8")
@@ -1544,29 +1523,15 @@ def test_colab_and_songs_ui_physical_decoupling():
     );
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Song decoupled JS test failed:\n{proc.stderr}\n{proc.stdout}"
 
 
 def test_colab_config_and_song_learn_form_submit_payloads():
     """Verify #colab-config-form and #song-learn-form submit payloads via actual JS listeners."""
     import json
-    import shutil
 
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    runner: list[str] | None = None
-    if shutil.which("node"):
-        runner = ["node", "-e"]
-    elif jsc_path.is_file():
-        runner = [str(jsc_path), "-e"]
-    if runner is None:
-        pytest.skip("No local JS engine (node/jsc) available for form submit payload test")
+    find_js_engine("No local JS engine (node/jsc) available for form submit payload test")
 
     html = build_html()
     collector = _IdCollector()
@@ -1868,13 +1833,7 @@ def test_colab_config_and_song_learn_form_submit_payloads():
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Form submit JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "FORM_AND_TAKES_OK" in proc.stdout, (
         f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"
@@ -1884,7 +1843,6 @@ def test_colab_config_and_song_learn_form_submit_payloads():
 def test_overview_ledger_non_blocking_colab_and_panel_fold():
     """Verify non-blocking Colab fetch, one-shot refresh retry, and .panel-fold structure."""
     import json
-    import shutil
 
     html = build_html()
     assert audit_html(html) == []
@@ -1951,14 +1909,7 @@ def test_overview_ledger_non_blocking_colab_and_panel_fold():
     assert not re.search(r"api\(\s*['\"][^'\"\n]*\?", script)
     assert "api('colab/refresh','POST')" in script
 
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    runner: list[str] | None = None
-    if shutil.which("node"):
-        runner = ["node", "-e"]
-    elif jsc_path.is_file():
-        runner = [str(jsc_path), "-e"]
-    if runner is None:
-        pytest.skip("No local JS engine (node/jsc) available for non-blocking Colab runtime test")
+    find_js_engine("No local JS engine (node/jsc) available for non-blocking Colab runtime test")
 
     core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
     ledger_js = (ADMIN_DIR / "src" / "js" / "02-overview-ledger.js").read_text(encoding="utf-8")
@@ -2278,13 +2229,7 @@ def test_overview_ledger_non_blocking_colab_and_panel_fold():
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Non-blocking Colab JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "NON_BLOCKING_COLAB_FOLD_OK" in proc.stdout, (
         f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"
@@ -2294,20 +2239,12 @@ def test_overview_ledger_non_blocking_colab_and_panel_fold():
 def test_song_finder_ui_rendering_and_fetch_prefill_runtime():
     """Verify renderSongFinderResults() builds valid DOM nodes and fetchOne() prefills cleanly."""
     import json
-    import shutil
 
     media_js = (ADMIN_DIR / "src" / "js" / "07-media-bili.js").read_text(encoding="utf-8")
     for stale_fn in ("refreshSongInbox", "guessTitleFromFilename", "setSongLearnInboxValue"):
         assert stale_fn not in media_js, f"Undefined helper {stale_fn!r} still in 07-media-bili.js"
 
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    runner: list[str] | None = None
-    if shutil.which("node"):
-        runner = ["node", "-e"]
-    elif jsc_path.is_file():
-        runner = [str(jsc_path), "-e"]
-    if runner is None:
-        pytest.skip("No local JS engine (node/jsc) available for Song Finder JS runtime test")
+    find_js_engine("No local JS engine (node/jsc) available for Song Finder JS runtime test")
 
     html = build_html()
     assert audit_html(html) == []
@@ -2549,13 +2486,7 @@ def test_song_finder_ui_rendering_and_fetch_prefill_runtime():
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Song Finder JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "SONG_FINDER_UI_OK" in proc.stdout, (
         f"Song Finder async JS test did not complete:\n{proc.stderr}\n{proc.stdout}"

@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import importlib.util
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 from pydantic import SecretStr
 
 from admin.build import _IdCollector, audit_html, build_html
@@ -18,20 +16,12 @@ from admin.csp import content_security_policy
 from hakimi.app import create_app
 from hakimi.social import OwnerBinding
 from tests.fakes import FakeGateway
+from tests.js_runtime import find_js_engine, run_js_harness
 from tests.test_admin import TOKEN
 from tests.test_wave12_admin_infra import _mock_dom_prelude
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ADMIN_DIR = REPO_ROOT / "admin"
-
-
-def _js_runner() -> list[str]:
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    if shutil.which("node"):
-        return ["node", "-e"]
-    if jsc_path.is_file():
-        return [str(jsc_path), "-e"]
-    pytest.skip("No local JS engine (node/jsc) available for Wave 4 JS runtime test")
 
 
 def _cross_platform_settings(settings: Any) -> Any:
@@ -177,7 +167,7 @@ async def test_cross_platform_moderation_admin_api_put_and_delete(settings: Any)
 
 def test_wave4_admin_js_runtime_table_empty_tg_users_moderation_and_dedup() -> None:
     """Execute assembled JS snippets in node/jsc for Wave 4 UI polish & bugfixes."""
-    runner = _js_runner()
+    find_js_engine("No local JS engine (node/jsc) available for Wave 4 JS runtime test")
     html = build_html()
     assert audit_html(html) == []
     policy = content_security_policy(html)
@@ -475,13 +465,7 @@ def test_wave4_admin_js_runtime_table_empty_tg_users_moderation_and_dedup() -> N
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Wave 4 JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "WAVE4_ADMIN_JS_OK" in proc.stdout
 

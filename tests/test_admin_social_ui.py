@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 from pydantic import SecretStr
 
 from admin.build import _extract_js_id_refs, _IdCollector, audit_html, build_html
@@ -20,6 +18,7 @@ from hakimi.app import create_app
 from hakimi.life_engine import LifeEngine
 from hakimi.social import OwnerBinding
 from tests.fakes import FakeGateway
+from tests.js_runtime import find_js_engine, run_js_harness
 from tests.test_admin import TOKEN
 from tests.test_plugin_telegram import (
     BOT_ID,
@@ -171,14 +170,7 @@ def test_admin_social_ui_build_and_markup(tmp_path: Path) -> None:
 
 
 def test_admin_social_ui_js_runtime() -> None:
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    runner: list[str] | None = None
-    if shutil.which("node"):
-        runner = ["node", "-e"]
-    elif jsc_path.is_file():
-        runner = [str(jsc_path), "-e"]
-    if runner is None:
-        pytest.skip("No local JS engine (node/jsc) available for admin JS runtime test")
+    find_js_engine("No local JS engine (node/jsc) available for admin JS runtime test")
 
     html = build_html()
     collector = _IdCollector()
@@ -578,13 +570,7 @@ def test_admin_social_ui_js_runtime() -> None:
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"JS runtime test failed:\n{proc.stderr}\n{proc.stdout}"
 
 
@@ -833,14 +819,7 @@ def test_admin_telegram_social_hot_config_ui_and_platform_badges() -> None:
     assert "group_memory_mirror" in gp_html
     assert "Antigravity_Memory" in gp_html
 
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    runner: list[str] | None = None
-    if shutil.which("node"):
-        runner = ["node", "-e"]
-    elif jsc_path.is_file():
-        runner = [str(jsc_path), "-e"]
-    if runner is None:
-        pytest.skip("No local JS engine (node/jsc) available for Telegram UI runtime test")
+    find_js_engine("No local JS engine (node/jsc) available for Telegram UI runtime test")
 
     core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
     adm_js = (ADMIN_DIR / "src" / "js" / "04-admission-memory.js").read_text(encoding="utf-8")
@@ -1140,13 +1119,7 @@ def test_admin_telegram_social_hot_config_ui_and_platform_badges() -> None:
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Telegram UI JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "TG_SOCIAL_UI_OK" in proc.stdout, (
         f"Async JS test did not reach completion sentinel:\n{proc.stderr}\n{proc.stdout}"

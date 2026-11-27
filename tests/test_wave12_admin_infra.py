@@ -5,34 +5,24 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import shutil
 import subprocess
 import threading
 import time
 from pathlib import Path
 
 import httpx
-import pytest
 from pydantic import SecretStr
 
 from admin.build import _IdCollector, audit_html, build_html
 from hakimi.app import create_app
 from hakimi.world_state import IntentTicketCreate
 from tests.fakes import FakeGateway
+from tests.js_runtime import find_js_engine, run_js_harness
 from tests.test_admin import TOKEN
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ADMIN_DIR = REPO_ROOT / "admin"
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy_prod.sh"
-
-
-def _js_runner() -> list[str]:
-    jsc_path = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc")
-    if shutil.which("node"):
-        return ["node", "-e"]
-    if jsc_path.is_file():
-        return [str(jsc_path), "-e"]
-    pytest.skip("No local JS engine (node/jsc) available for Admin JS runtime test")
 
 
 def test_deploy_prod_deploys_engine_before_admin_and_valid_bash():
@@ -430,7 +420,7 @@ def _mock_dom_prelude(all_ids: list[str]) -> str:
 
 def test_songs_and_voice_companion_non_blocking_js_runtime():
     """Verify #songs and #voice-companion render primary data without blocking on slow calls."""
-    runner = _js_runner()
+    find_js_engine("No local JS engine (node/jsc) available for Admin JS runtime test")
     html = build_html()
     assert audit_html(html) == []
     collector = _IdCollector()
@@ -696,20 +686,14 @@ def test_songs_and_voice_companion_non_blocking_js_runtime():
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Non-blocking JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "NON_BLOCKING_MEDIA_VC_OK" in proc.stdout
 
 
 def test_ledger_balance_reuse_per_tab_abort_polling_guard_and_hash_login_runtime():
     """Verify #ledger avoids redundant account-balance, per-tab abort, poll guard & hash login."""
-    runner = _js_runner()
+    find_js_engine("No local JS engine (node/jsc) available for Admin JS runtime test")
     html = build_html()
     assert audit_html(html) == []
     collector = _IdCollector()
@@ -940,20 +924,14 @@ def test_ledger_balance_reuse_per_tab_abort_polling_guard_and_hash_login_runtime
     }});
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"Shell hygiene JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "SHELL_HYGIENE_OK" in proc.stdout
 
 
 def test_mutation_observer_scoped_to_forms_not_body_js_runtime():
     """Verify 09-ux.js observes only #app forms (never document.body) and enhances labels."""
-    runner = _js_runner()
+    find_js_engine("No local JS engine (node/jsc) available for Admin JS runtime test")
     html = build_html()
     assert audit_html(html) == []
     collector = _IdCollector()
@@ -1047,12 +1025,6 @@ def test_mutation_observer_scoped_to_forms_not_body_js_runtime():
     else console.log('UX_OBSERVER_SCOPED_OK');
     """
 
-    proc = subprocess.run(
-        [*runner, harness],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
     assert proc.returncode == 0, f"UX observer JS test failed:\n{proc.stderr}\n{proc.stdout}"
     assert "UX_OBSERVER_SCOPED_OK" in proc.stdout
