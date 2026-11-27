@@ -2,9 +2,13 @@ name: checks
 on: [push, pull_request]
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   catalog:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       sha: ${{ steps.catalog.outputs.sha }}
       matrix: ${{ steps.platforms.outputs.matrix }}
@@ -31,6 +35,7 @@ jobs:
   platform:
     needs: catalog
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
       matrix: ${{ fromJSON(needs.catalog.outputs.matrix) }}
     name: Fetch ${{ matrix.name }}
@@ -54,6 +59,7 @@ jobs:
   offline-tests:
     needs: [catalog, platform]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -75,6 +81,8 @@ jobs:
         with:
           version: '0.13.8'
           python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -88,3 +96,61 @@ jobs:
             sudo apt-get install -y --no-install-recommends nginx
           fi
       - run: bash scripts/test_fast.sh -q
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate Compose configurations
+        run: |
+          set -euo pipefail
+          cleanup() {
+            rm -f .env secrets/voice-gateway.env secrets/plugins.env
+            rmdir secrets 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          cp .env.example .env
+          mkdir -p secrets
+          cp .env.voice-gateway.example secrets/voice-gateway.env
+          : > secrets/plugins.env
+          docker compose -f compose.yaml config -q
+          docker compose -f compose.yaml -f compose.plugins.yaml config -q
+          docker compose -f compose.yaml -f compose.voice-gateway.yaml config -q
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Lint Dockerfiles with BuildKit checks
+        run: |
+          set -euo pipefail
+          docker buildx build --check -f Dockerfile .
+          docker buildx build --check -f admin/Dockerfile ./admin
+          docker buildx build --check -f plugins/Dockerfile .
+          docker buildx build --check -f plugins/doc_render/Dockerfile .
+          docker buildx build --check -f plugins/song_finder/Dockerfile .
+          docker buildx build --check -f voice_gateway/Dockerfile .
+      - name: Build hakimi-admin image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./admin
+          file: admin/Dockerfile
+          load: true
+          tags: hakimi-admin:ci
+          cache-from: type=gha,scope=admin
+          cache-to: type=gha,mode=max,scope=admin,ignore-error=true
+      - name: Verify hakimi-admin Nginx config
+        run: >-
+          docker run --rm --network none --read-only
+          --tmpfs /tmp:size=32m,mode=1777 --cap-drop ALL
+          hakimi-admin:ci -t
+      - name: Build hakimi-voice-gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: voice_gateway/Dockerfile
+          push: false
+          cache-from: type=gha,scope=voice-gateway
+          cache-to: type=gha,mode=max,scope=voice-gateway,ignore-error=true

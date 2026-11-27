@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import shutil
 import subprocess
@@ -496,6 +497,127 @@ def test_ci_workflow_fast_tests_and_admin_gates() -> None:
     assert ci_text.index(build_step) < ci_text.index(verify_step) < ci_text.index(csp_step)
     assert "bash scripts/test_fast.sh -q" in ci_text
     assert "uv run pytest -q" not in ci_text
+
+
+def _parse_ci_sections(ci_text: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Structurally split top-level workflow sections and per-job blocks without PyYAML."""
+    assert "\t" not in ci_text, "YAML must not contain tab indentation"
+    top_blocks: dict[str, str] = {}
+    cur_top: str | None = None
+    for line in ci_text.splitlines():
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            assert ":" in line, f"Malformed top-level YAML line: {line!r}"
+            key = line.split(":", 1)[0].strip()
+            assert key not in top_blocks, f"Duplicate top-level YAML key: {key}"
+            cur_top = key
+            top_blocks[cur_top] = line + "\n"
+        elif cur_top is not None:
+            top_blocks[cur_top] += line + "\n"
+
+    assert "jobs" in top_blocks, "CI workflow missing top-level jobs section"
+    job_blocks: dict[str, str] = {}
+    cur_job: str | None = None
+    for line in top_blocks["jobs"].splitlines()[1:]:
+        if line.startswith("  ") and not line.startswith("   ") and line.rstrip().endswith(":"):
+            job_name = line.strip()[:-1]
+            assert job_name not in job_blocks, f"Duplicate CI job: {job_name}"
+            cur_job = job_name
+            job_blocks[cur_job] = ""
+        elif cur_job is not None:
+            job_blocks[cur_job] += line + "\n"
+    return top_blocks, job_blocks
+
+
+def test_ci_workflow_hardening_and_docker_checks() -> None:
+    ci_text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    if importlib.util.find_spec("yaml") is not None:
+        import yaml  # type: ignore[import-not-found]
+
+        parsed = yaml.safe_load(ci_text)
+        assert isinstance(parsed, dict)
+        assert isinstance(parsed.get("jobs"), dict)
+
+    top_blocks, job_blocks = _parse_ci_sections(ci_text)
+
+    # 1. Workflow-level concurrency cancellation & read-only default permissions
+    assert "concurrency" in top_blocks
+    concurrency_block = top_blocks["concurrency"]
+    assert "group: ${{ github.workflow }}-${{ github.ref }}" in concurrency_block
+    assert re.search(r"^\s*cancel-in-progress:\s*true\s*$", concurrency_block, re.M)
+    assert re.search(r"^\s*contents:\s*read\s*$", top_blocks["permissions"], re.M)
+    assert not re.search(r":\s*write\b", ci_text), "CI workflow must stay read-only"
+
+    # 2. Expected jobs and mandatory timeout-minutes on every job
+    expected_timeouts = {
+        "catalog": 5,
+        "platform": 5,
+        "offline-tests": 15,
+        "docker": 10,
+    }
+    assert set(job_blocks) == set(expected_timeouts)
+    for job_name, expected_timeout in expected_timeouts.items():
+        m = re.search(r"^    timeout-minutes:\s*(\d+)\s*$", job_blocks[job_name], re.M)
+        assert m is not None, f"CI job {job_name!r} missing timeout-minutes"
+        assert int(m.group(1)) == expected_timeout, (job_name, m.group(1))
+
+    # 3. setup-uv caching on offline-tests + preserved lint/admin/fast-test gates
+    offline = job_blocks["offline-tests"]
+    assert "uses: astral-sh/setup-uv@v6" in offline
+    assert re.search(r"^\s*enable-cache:\s*true\s*$", offline, re.M)
+    assert re.search(r"^\s*cache-dependency-glob:\s*['\"]?uv\.lock['\"]?\s*$", offline, re.M)
+    for required_cmd in (
+        "uv sync --frozen",
+        "uv run ruff check .",
+        "uv run ruff format --check .",
+        "uv run python admin/build.py",
+        "uv run python admin/build.py --check --verify-file",
+        "uv run python admin/csp.py",
+        "bash scripts/test_fast.sh -q",
+    ):
+        assert required_cmd in offline
+
+    # 4. Parallel secret-free Docker & Compose validation job
+    docker_job = job_blocks["docker"]
+    assert not re.search(r"^\s*needs:", docker_job, re.M), "docker job must run in parallel"
+    assert "secrets." not in docker_job, "docker job must not require private deploy keys"
+    assert re.search(r"^    permissions:\s*\n      contents:\s*read\s*$", docker_job, re.M)
+
+    # Clean-checkout env bootstrap + cleanup + all 3 Compose validations
+    for env_src in (".env.example", ".env.voice-gateway.example"):
+        assert (REPO_ROOT / env_src).is_file(), f"Missing tracked example env file: {env_src}"
+        assert env_src in docker_job
+    assert "secrets/voice-gateway.env" in docker_job
+    assert "trap cleanup EXIT" in docker_job
+    for compose_cmd in (
+        "docker compose -f compose.yaml config -q",
+        "docker compose -f compose.yaml -f compose.plugins.yaml config -q",
+        "docker compose -f compose.yaml -f compose.voice-gateway.yaml config -q",
+    ):
+        assert compose_cmd in docker_job
+
+    # BuildKit --check lint across all 6 Dockerfiles with exact build contexts
+    expected_checks = (
+        ("Dockerfile", "."),
+        ("admin/Dockerfile", "./admin"),
+        ("plugins/Dockerfile", "."),
+        ("plugins/doc_render/Dockerfile", "."),
+        ("plugins/song_finder/Dockerfile", "."),
+        ("voice_gateway/Dockerfile", "."),
+    )
+    for dockerfile, context in expected_checks:
+        assert (REPO_ROOT / dockerfile).is_file(), f"Missing Dockerfile: {dockerfile}"
+        assert f"docker buildx build --check -f {dockerfile} {context}" in docker_job
+
+    # Self-contained image builds: hakimi-admin (+ nginx -t) and hakimi-voice-gateway
+    assert "uses: docker/setup-buildx-action@v3" in docker_job
+    assert "uses: docker/build-push-action@v6" in docker_job
+    assert "context: ./admin" in docker_job
+    assert "file: admin/Dockerfile" in docker_job
+    assert "hakimi-admin:ci -t" in docker_job
+    assert "file: voice_gateway/Dockerfile" in docker_job
+    assert (REPO_ROOT / "voice_gateway" / "Dockerfile.dockerignore").is_file()
+    assert "type=gha" in docker_job
 
 
 def test_compose_plugins_shared_image_cpus_and_healthchecks() -> None:
