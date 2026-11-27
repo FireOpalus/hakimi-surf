@@ -132,6 +132,8 @@ def microdollars(value: Decimal) -> int:
 
 def _classify_usage_category(lane: str, work_kind: str, subject: str) -> str:
     kind = (work_kind or "").strip()
+    if kind.startswith("embedding."):
+        return "embedding"
     if lane == "chat":
         if kind.startswith("voice.companion"):
             return "voice_companion"

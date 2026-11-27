@@ -23,6 +23,7 @@ from hakimi_plugin_sdk.bili_common import extract_bvid as extract_bvid
 
 from .config import Settings
 from .context_budget import estimate_tokens
+from .embeddings import EmbeddingClient
 from .gateway import FilterManager
 from .gemini_generate import _GeminiGenerateMixin
 from .gemini_search_screen import _GeminiSearchScreenMixin
@@ -128,6 +129,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         files_client: Any = None,
         free_decision_client: Any = None,
         vertex_chat_client: Any = None,
+        embedding_client: EmbeddingClient | None = None,
     ):
         if tuple(int(p) for p in version("google-genai").split(".")[:3]) < (3, 2, 0):
             raise RuntimeError("google-genai >= 3.2.0 is required")
@@ -178,6 +180,10 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         self._routing_generation = -1
         self.free_decision_client: Any = free_decision_client
         self.vertex_chat_client: Any = vertex_chat_client
+        self._owned_embeddings = embedding_client is None
+        self.embeddings: EmbeddingClient = embedding_client or EmbeddingClient(
+            settings, store, routing=self.routing
+        )
         self.reload_provider_clients()
 
     @property
@@ -416,6 +422,8 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         )
         self.vertex_blocked_until = 0.0
         self._routing_generation = self.routing.generation
+        if getattr(self, "embeddings", None) is not None:
+            self.embeddings.reload_provider_clients()
         self._schedule_retired_cleanup()
 
     def _schedule_retired_cleanup(self) -> None:
@@ -539,6 +547,8 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         self._retired_provider_clients.clear()
         for entry in (*retired, *active_entries):
             await self._close_retired_entry(entry)
+        if self._owned_embeddings and getattr(self, "embeddings", None) is not None:
+            await self.embeddings.close()
 
     def _price(self, lane: str, *, at=None) -> tuple[Decimal, Decimal]:
         if lane == "decision":

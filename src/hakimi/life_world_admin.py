@@ -456,6 +456,42 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
     now_ledger = engine.clock() if engine is not None and hasattr(engine, "clock") else None
     ledger_events = await ledger.admin_list(now=now_ledger, limit=30) if ledger is not None else []
 
+    resonance_mgr = getattr(svc, "share_resonance", None)
+    if resonance_mgr is not None and hasattr(resonance_mgr, "admin_status"):
+        try:
+            resonance_status = await resonance_mgr.admin_status(now=now_ledger)
+        except Exception:
+            resonance_status = {
+                "enabled": bool(config.get("resonance_enabled", True)),
+                "ready": False,
+            }
+    else:
+        resonance_status = {
+            "enabled": bool(config.get("resonance_enabled", True)),
+            "ready": False,
+            "pending_count": 0,
+            "owner_pending_count": 0,
+            "group_pending_count": 0,
+            "delivered_count": 0,
+            "tracked_scopes": 0,
+            "positive_streak_scopes": 0,
+            "backoff_scopes": 0,
+        }
+
+    owner_mem = getattr(svc, "owner_memory", None)
+    if owner_mem is not None and hasattr(owner_mem, "stats"):
+        try:
+            raw_om = await owner_mem.stats()
+            owner_memory_status = dict(raw_om) if isinstance(raw_om, dict) else {"ready": False}
+            owner_memory_status.setdefault(
+                "ready",
+                bool(getattr(owner_mem, "ready", getattr(owner_mem, "_initialized", False))),
+            )
+        except Exception:
+            owner_memory_status = {"ready": False}
+    else:
+        owner_memory_status = {"ready": False}
+
     return {
         "config": config,
         "source": source,
@@ -468,6 +504,8 @@ async def _build_life_status(svc: Any, *, include_sensors: bool = True) -> dict[
         "world_state": world_state_data,
         "nodes": nodes,
         "desktop_memory": desktop_memory,
+        "resonance": resonance_status,
+        "owner_memory": owner_memory_status,
         "intents": intents,
         "rule_receipts": [dict(row) for row in receipts],
         "events": events,

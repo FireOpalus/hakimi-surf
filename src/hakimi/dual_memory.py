@@ -1,7 +1,7 @@
 """Session-local encrypted memories, immutable source slices and bounded local recall.
 
-Vectors are deterministic hashed word/character features (including extracted topic tags),
-not remote embeddings. No cross-session search, plaintext disk index or embedding API.
+Supports both legacy 192-dim hashed feature vectors and Vault-sealed E1 semantic
+embeddings seamlessly, with strict per-session physical SQLite isolation.
 """
 
 import base64
@@ -19,6 +19,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .outbound_actions import require_all_schema_fields
+from .owner_memory import (
+    cosine_similarity_blobs,
+    embed_one_safe,
+    embed_texts_safe,
+    is_semantic_blob,
+)
 from .security import Rejected
 from .social import bound_owner, chat_module
 from .social_chat_config import cached_remote_chat_config, load_remote_chat_config
@@ -176,9 +182,8 @@ def vector(text):
 
 
 def similarity(a, b):
-    return sum(
-        x * y for x, y in zip(struct.unpack("<192f", a), struct.unpack("<192f", b), strict=True)
-    )
+    score = cosine_similarity_blobs(a, b)
+    return float(score) if score is not None else 0.0
 
 
 class RecallIndex:
@@ -221,13 +226,39 @@ class RecallIndex:
 
 
 class DualMemory:
-    def __init__(self, sessions):
+    def __init__(self, sessions, *, embedder=None):
         self.sessions = sessions
         self.s, self.vault = sessions.s, sessions.vault
+        self._embedder = embedder
         self.index = RecallIndex()
         self._stats_cache: OrderedDict[str, tuple[int, int, int, int]] = OrderedDict()
         self.dirty_sessions: set[str] = set()
         self.deferred_until: dict[str, float] = {}
+
+    @property
+    def embedder(self):
+        if self._embedder is not None:
+            return self._embedder
+        svc = getattr(self.sessions, "service", None)
+        ai = getattr(svc, "ai", None) if svc is not None else None
+        store = getattr(self.sessions, "store", None)
+        for holder, attr in (
+            (self.sessions, "embedder"),
+            (self.sessions, "embeddings"),
+            (svc, "embedder"),
+            (svc, "embeddings"),
+            (ai, "embeddings"),
+            (ai, "embedder"),
+            (store, "embedder"),
+        ):
+            cand = getattr(holder, attr, None) if holder is not None else None
+            if cand is not None:
+                return cand
+        return None
+
+    @embedder.setter
+    def embedder(self, value) -> None:
+        self._embedder = value
 
     def mark_dirty(self, key: str) -> None:
         self.dirty_sessions.add(key)
@@ -926,7 +957,36 @@ class DualMemory:
                 )
         return result
 
-    async def commit(self, message, snapshot, extraction):
+    async def commit(self, message, snapshot, extraction, *, embeddings=None):
+        sem_embeddings: list[bytes | None] = []
+        if extraction.chronicles:
+            if embeddings is not None:
+                if isinstance(embeddings, dict):
+                    sem_embeddings = [
+                        bytes(embeddings[idx])
+                        if idx in embeddings and is_semantic_blob(embeddings[idx])
+                        else None
+                        for idx in range(len(extraction.chronicles))
+                    ]
+                elif isinstance(embeddings, Sequence) and not isinstance(embeddings, str | bytes):
+                    sem_embeddings = [
+                        bytes(embeddings[idx])
+                        if idx < len(embeddings) and is_semantic_blob(embeddings[idx])
+                        else None
+                        for idx in range(len(extraction.chronicles))
+                    ]
+            elif (embedder := self.embedder) is not None:
+                doc_texts = [
+                    f"{fact.text} {' '.join(fact.tags)}".strip() for fact in extraction.chronicles
+                ]
+                sem_embeddings = await embed_texts_safe(
+                    embedder,
+                    doc_texts,
+                    task_type="RETRIEVAL_DOCUMENT",
+                    budget_lane="memory",
+                    subject=self.sessions.key(message)[:16],
+                    purpose="dual_commit",
+                )
         async with self.sessions.database(message, preserve_history=True) as (db, key):
             async with db.execute("SELECT epoch,version FROM rolling_state") as cur:
                 if await cur.fetchone() != (snapshot["epoch"], snapshot["version"]):
@@ -1006,7 +1066,7 @@ class DualMemory:
             existing_ids = {r[0] for r in existing}
             locked_rows = [r for r in existing if r[2]]
             tombstone_cache: dict[str, tuple[set[int], bytes]] = {}
-            for fact in extraction.chronicles:
+            for fact_idx, fact in enumerate(extraction.chronicles):
                 if any(seq not in rows for seq in fact.evidence_seqs) or any(
                     len(t) > 40 for t in fact.tags
                 ):
@@ -1015,6 +1075,7 @@ class DualMemory:
                     "chronicle-topic", key, fact.category, fact.topic.strip().lower()
                 )[:24]
                 fact_vec: bytes | None = None
+                fact_sem_vec = sem_embeddings[fact_idx] if fact_idx < len(sem_embeddings) else None
                 fact_seqs = set(fact.evidence_seqs)
                 blocked = False
                 for old_id, blob, locked, deleted, old_vector in locked_rows:
@@ -1039,15 +1100,24 @@ class DualMemory:
                     if old_seqs & fact_seqs:
                         blocked = True
                         break
-                    if fact_vec is None:
-                        fact_vec = vector(fact.text)
-                    if similarity(old_vec, fact_vec) >= 0.78:
-                        blocked = True
-                        break
+                    if is_semantic_blob(old_vec):
+                        if fact_sem_vec is not None and similarity(old_vec, fact_sem_vec) >= 0.78:
+                            blocked = True
+                            break
+                    else:
+                        if fact_vec is None:
+                            fact_vec = vector(fact.text)
+                        if similarity(old_vec, fact_vec) >= 0.78:
+                            blocked = True
+                            break
                 if blocked or (len(existing) >= MAX_ENTRIES and ident not in existing_ids):
                     continue
                 data = fact.model_dump()
-                packed = vector(fact.text + " " + " ".join(fact.tags))
+                packed = (
+                    fact_sem_vec
+                    if fact_sem_vec is not None
+                    else vector(fact.text + " " + " ".join(fact.tags))
+                )
                 await db.execute(
                     "INSERT INTO chronicle_events VALUES (?,?,?,1,?,?,0,0,?) ON "
                     "CONFLICT(id) DO UPDATE SET "
@@ -1103,6 +1173,7 @@ class DualMemory:
         tags: Sequence[str] = (),
         source_id: str = "",
         created_at: float | None = None,
+        embedding: bytes | None = None,
     ) -> bool:
         """Record or update an encrypted chronicle entry directly without LLM extraction."""
         if not isinstance(topic, str) or not isinstance(text, str):
@@ -1141,6 +1212,17 @@ class DualMemory:
         ts = float(time.time() if created_at is None else created_at)
         clean_source = source_id[:80] if isinstance(source_id, str) else ""
 
+        sem_vec: bytes | None = bytes(embedding) if is_semantic_blob(embedding) else None
+        if sem_vec is None and embedding is None and (embedder := self.embedder) is not None:
+            sem_vec = await embed_one_safe(
+                embedder,
+                f"{clean_text} {' '.join(clean_tags)}".strip(),
+                task_type="RETRIEVAL_DOCUMENT",
+                budget_lane="memory",
+                subject=self.sessions.key(message)[:16],
+                purpose="dual_chronicle",
+            )
+
         async with self.sessions.database(message, preserve_history=True) as (db, key):
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 row = await cur.fetchone()
@@ -1155,18 +1237,17 @@ class DualMemory:
             existing_ids = {r[0] for r in existing}
             text_vec = vector(clean_text)
             for old_id, _blob, locked, deleted, old_vector in existing:
-                if locked and (
-                    old_id == ident
-                    or (
-                        deleted
-                        and similarity(
-                            base64.b64decode(self.vault.open(key + ":v:" + old_id, old_vector)),
-                            text_vec,
-                        )
-                        >= 0.78
-                    )
-                ):
+                if not locked:
+                    continue
+                if old_id == ident:
                     return False
+                if deleted:
+                    old_raw = base64.b64decode(self.vault.open(key + ":v:" + old_id, old_vector))
+                    if is_semantic_blob(old_raw):
+                        if sem_vec is not None and similarity(old_raw, sem_vec) >= 0.78:
+                            return False
+                    elif similarity(old_raw, text_vec) >= 0.78:
+                        return False
             if len(existing) >= MAX_ENTRIES and ident not in existing_ids:
                 return False
             data = {
@@ -1176,7 +1257,9 @@ class DualMemory:
                 "tags": clean_tags,
                 "evidence_seqs": [],
             }
-            packed = vector(clean_text + " " + " ".join(clean_tags))
+            packed = (
+                sem_vec if sem_vec is not None else vector(clean_text + " " + " ".join(clean_tags))
+            )
             await db.execute(
                 "INSERT INTO chronicle_events VALUES (?,?,?,1,?,?,0,0,?) ON "
                 "CONFLICT(id) DO UPDATE SET "
@@ -1204,6 +1287,30 @@ class DualMemory:
         )
 
     async def edit_many(self, message, edits, version):
+        sem_edit_vecs: dict[str, bytes] = {}
+        if (embedder := self.embedder) is not None:
+            chron_edits = [
+                (edit["id"], edit["text"])
+                for edit in edits
+                if isinstance(edit, dict)
+                and edit.get("action") == "edit"
+                and isinstance(edit.get("id"), str)
+                and edit["id"].startswith("e:")
+                and isinstance(edit.get("text"), str)
+                and 1 <= len(edit["text"]) <= 500
+            ]
+            if chron_edits:
+                blobs = await embed_texts_safe(
+                    embedder,
+                    [txt for _, txt in chron_edits],
+                    task_type="RETRIEVAL_DOCUMENT",
+                    budget_lane="memory",
+                    subject=self.sessions.key(message)[:16],
+                    purpose="dual_edit",
+                )
+                for (cid, _txt), blob in zip(chron_edits, blobs, strict=True):
+                    if is_semantic_blob(blob):
+                        sem_edit_vecs[cid] = bytes(blob)  # type: ignore[arg-type]
         async with self.sessions.database(message, preserve_history=True) as (db, key):
             async with db.execute("SELECT version FROM rolling_state") as cur:
                 if (await cur.fetchone())[0] != version:
@@ -1256,9 +1363,8 @@ class DualMemory:
                 else:
                     eid = ident[2:]
                     if action == "edit":
-                        vec = self.vault.seal(
-                            key + ":v:" + eid, base64.b64encode(vector(data["text"])).decode()
-                        )
+                        packed = sem_edit_vecs.get(ident) or vector(data["text"])
+                        vec = self.vault.seal(key + ":v:" + eid, base64.b64encode(packed).decode())
                     else:
                         async with db.execute(
                             "SELECT vector FROM chronicle_events WHERE id=?", (eid,)
@@ -1274,7 +1380,38 @@ class DualMemory:
         self._stats_cache.pop(key, None)
         return {"status": "saved", "version": version + 1}
 
-    async def prefetch(self, message, query, *, recall=False, related_user_ids=()):
+    async def _load_chronicle_cards(self, db, key: str, version: int) -> list:
+        cards = self.index.get(key, version)
+        if cards is not None:
+            return cards
+        async with db.execute(
+            "SELECT id,payload,vector,heat,updated FROM chronicle_events "
+            "WHERE deleted=0 ORDER BY updated DESC LIMIT ?",
+            (MAX_ENTRIES,),
+        ) as cur:
+            cards = []
+            for ident, blob, vec, heat, updated in await cur.fetchall():
+                data = self.vault.open(key + ":e:" + ident, blob)
+                tag_str = " ".join(data.get("tags", []))
+                card_terms = frozenset(terms(data["text"] + " " + tag_str))
+                cards.append(
+                    (
+                        ident,
+                        data["text"],
+                        tag_str,
+                        base64.b64decode(self.vault.open(key + ":v:" + ident, vec)),
+                        heat,
+                        updated,
+                        card_terms,
+                        str(data.get("topic") or ""),
+                    )
+                )
+        self.index.put(key, version, cards)
+        return cards
+
+    async def prefetch(
+        self, message, query, *, recall=False, related_user_ids=(), query_vector=None
+    ):
         # Caller has already checked admission, source gate and sandbox. Never accepts a
         # scope parameter.
         peers = []
@@ -1297,10 +1434,12 @@ class DualMemory:
                 else {}
             )
         mentioned_profiles = {}
+        session_key = ""
         async with self.sessions.database(message, preserve_history=True, readonly=True) as (
             db,
             key,
         ):
+            session_key = key
             async with db.execute("SELECT enabled FROM session_meta") as cur:
                 if not (await cur.fetchone())[0]:
                     return {}
@@ -1336,42 +1475,37 @@ class DualMemory:
                             break
             cards = []
             if recall:
-                cards = self.index.get(key, version)
-                if cards is None:
-                    async with db.execute(
-                        "SELECT id,payload,vector,heat,updated FROM chronicle_events "
-                        "WHERE deleted=0 ORDER BY updated DESC LIMIT ?",
-                        (MAX_ENTRIES,),
-                    ) as cur:
-                        cards = []
-                        for ident, blob, vec, heat, updated in await cur.fetchall():
-                            data = self.vault.open(key + ":e:" + ident, blob)
-                            tag_str = " ".join(data.get("tags", []))
-                            card_terms = frozenset(terms(data["text"] + " " + tag_str))
-                            cards.append(
-                                (
-                                    ident,
-                                    data["text"],
-                                    tag_str,
-                                    base64.b64decode(self.vault.open(key + ":v:" + ident, vec)),
-                                    heat,
-                                    updated,
-                                    card_terms,
-                                )
-                            )
-                    self.index.put(key, version, cards)
+                cards = await self._load_chronicle_cards(db, key, version)
         found = []
         if cards:
             now_ts = time.time()
-            words, query_vector = terms(query), vector(query)
-            scored = [
-                (
-                    c,
-                    len(words & (c[6] if len(c) > 6 else terms(c[1] + " " + c[2]))),
-                    similarity(query_vector, c[3]),
+            has_semantic = any(is_semantic_blob(c[3]) for c in cards)
+            has_legacy = any(not is_semantic_blob(c[3]) for c in cards)
+            words = terms(query)
+            legacy_qvec = vector(query) if has_legacy else None
+            sem_qvec = bytes(query_vector) if is_semantic_blob(query_vector) else None
+            if (
+                has_semantic
+                and sem_qvec is None
+                and str(query or "").strip()
+                and (embedder := self.embedder) is not None
+            ):
+                sem_qvec = await embed_one_safe(
+                    embedder,
+                    query,
+                    task_type="RETRIEVAL_QUERY",
+                    budget_lane="memory",
+                    subject=session_key[:16] or "dual",
+                    purpose="dual_prefetch",
                 )
-                for c in cards
-            ]
+            scored = []
+            for c in cards:
+                overlap = len(words & (c[6] if len(c) > 6 else terms(c[1] + " " + c[2])))
+                if is_semantic_blob(c[3]):
+                    sim = max(0.0, similarity(sem_qvec, c[3])) if sem_qvec is not None else 0.0
+                else:
+                    sim = similarity(legacy_qvec, c[3]) if legacy_qvec is not None else 0.0
+                scored.append((c, overlap, sim))
             keyword = sorted(scored, key=lambda item: item[1], reverse=True)
             nearest = sorted(scored, key=lambda item: item[2], reverse=True)
             ranks = {item[0][0]: 1 / (60 + n) for n, item in enumerate(keyword)}
@@ -1389,3 +1523,184 @@ class DualMemory:
         if mentioned_profiles:
             result["mentioned_profiles"] = mentioned_profiles
         return result
+
+    async def probe_resonance(
+        self,
+        message,
+        query_text: str,
+        query_vector: bytes | None = None,
+        *,
+        limit: int = 2,
+        now: float | None = None,
+    ) -> list[dict]:
+        """Strictly read-only reverse resonance probe scoped ONLY to message's own session DB."""
+        q_clean = str(query_text or "").strip()
+        sem_qvec = bytes(query_vector) if is_semantic_blob(query_vector) else None
+        if not q_clean and sem_qvec is None:
+            return []
+        path = self.sessions.path(message)
+        self.sessions._check_not_symlink(path)
+        if not path.exists():
+            return []
+        session_key = ""
+        cards = []
+        async with self.sessions.database(message, preserve_history=True, readonly=True) as (
+            db,
+            key,
+        ):
+            session_key = key
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                row = await cur.fetchone()
+                if not row or not row[0]:
+                    return []
+            async with db.execute("SELECT version FROM rolling_state") as cur:
+                version = (await cur.fetchone())[0]
+            cards = await self._load_chronicle_cards(db, key, version)
+        if not cards:
+            return []
+
+        now_ts = float(time.time() if now is None else now)
+        has_semantic = any(is_semantic_blob(c[3]) for c in cards)
+        has_legacy = any(not is_semantic_blob(c[3]) for c in cards)
+        if (
+            has_semantic
+            and sem_qvec is None
+            and q_clean
+            and (embedder := self.embedder) is not None
+        ):
+            sem_qvec = await embed_one_safe(
+                embedder,
+                q_clean,
+                task_type="RETRIEVAL_QUERY",
+                budget_lane="memory",
+                subject=session_key[:16] or "dual",
+                purpose="dual_resonance",
+            )
+        q_terms = terms(q_clean) if q_clean else set()
+        leg_qvec = vector(q_clean) if has_legacy and q_clean else None
+
+        hits: list[tuple[float, float, dict]] = []
+        for card in cards:
+            ident, text, tag_str, raw_vec, heat, updated = card[:6]
+            card_terms = card[6] if len(card) > 6 else frozenset(terms(text + " " + tag_str))
+            topic = str(card[7]) if len(card) > 7 else ""
+            overlap = len(q_terms & card_terms) if q_terms else 0
+            lex_norm = (
+                min(1.0, overlap / max(1, min(len(q_terms), 6))) if q_terms and overlap > 0 else 0.0
+            )
+            vec_sim = 0.0
+            used_sem = False
+            if is_semantic_blob(raw_vec) and sem_qvec is not None:
+                vec_sim = max(0.0, similarity(sem_qvec, raw_vec))
+                used_sem = True
+            elif not is_semantic_blob(raw_vec) and leg_qvec is not None:
+                vec_sim = max(0.0, similarity(leg_qvec, raw_vec))
+
+            if used_sem:
+                if vec_sim < 0.32 and overlap == 0:
+                    continue
+                base = max(vec_sim, 0.78 * vec_sim + 0.22 * lex_norm)
+            else:
+                if overlap == 0 and vec_sim < 0.35:
+                    continue
+                base = max(vec_sim, 0.55 * vec_sim + 0.45 * lex_norm)
+
+            recency = 0.05 * math.exp(-max(0.0, now_ts - float(updated)) / 2_592_000.0)
+            heat_bonus = min(int(heat), 10) * 0.004
+            final_score = min(1.0, base + recency + heat_bonus)
+            hits.append(
+                (
+                    final_score,
+                    float(updated),
+                    {
+                        "id": "e:" + ident,
+                        "source": "dual_memory",
+                        "topic": topic,
+                        "text": text[:350],
+                        "score": round(final_score, 4),
+                        "entities": tag_str.split() if tag_str else [],
+                    },
+                )
+            )
+        hits.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        bounded_limit = max(1, min(int(limit), 10))
+        return [item[2] for item in hits[:bounded_limit]]
+
+    async def backfill_embeddings(self, message, embedder, *, limit: int = 10) -> int:
+        """Backfill legacy hashed vectors in a session DB to Vault-sealed semantic embeddings."""
+        if embedder is None or limit <= 0:
+            return 0
+        path = self.sessions.path(message)
+        self.sessions._check_not_symlink(path)
+        if not path.exists():
+            return 0
+
+        targets: list[tuple[str, str, float]] = []
+        session_key = ""
+        async with self.sessions.database(message, preserve_history=True, readonly=True) as (
+            db,
+            key,
+        ):
+            session_key = key
+            async with db.execute("SELECT enabled FROM session_meta") as cur:
+                row = await cur.fetchone()
+                if not row or not row[0]:
+                    return 0
+            async with db.execute(
+                "SELECT id,payload,vector,updated FROM chronicle_events "
+                "WHERE deleted=0 ORDER BY updated DESC LIMIT ?",
+                (MAX_ENTRIES,),
+            ) as cur:
+                for ident, blob, vec_blob, updated in await cur.fetchall():
+                    try:
+                        raw_vec = base64.b64decode(self.vault.open(key + ":v:" + ident, vec_blob))
+                    except Exception:
+                        continue
+                    if is_semantic_blob(raw_vec):
+                        continue
+                    try:
+                        data = self.vault.open(key + ":e:" + ident, blob)
+                    except Exception:
+                        continue
+                    doc_text = f"{data.get('text', '')} {' '.join(data.get('tags', []))}".strip()
+                    if doc_text:
+                        targets.append((ident, doc_text, float(updated)))
+                        if len(targets) >= int(limit):
+                            break
+        if not targets:
+            return 0
+
+        blobs = await embed_texts_safe(
+            embedder,
+            [doc for _, doc, _ in targets],
+            task_type="RETRIEVAL_DOCUMENT",
+            budget_lane="memory",
+            subject=session_key[:16] or "dual",
+            purpose="dual_backfill",
+        )
+        updates = [
+            (ident, bytes(blob), old_updated)
+            for (ident, _doc, old_updated), blob in zip(targets, blobs, strict=True)
+            if is_semantic_blob(blob)
+        ]
+        if not updates:
+            return 0
+
+        updated_count = 0
+        async with self.sessions.database(message, preserve_history=True) as (db, key):
+            for ident, sem_vec, old_updated in updates:
+                cur = await db.execute(
+                    "UPDATE chronicle_events SET vector=? WHERE id=? AND deleted=0 AND updated=?",
+                    (
+                        self.vault.seal(key + ":v:" + ident, base64.b64encode(sem_vec).decode()),
+                        ident,
+                        old_updated,
+                    ),
+                )
+                updated_count += max(0, int(cur.rowcount or 0))
+            if updated_count > 0:
+                await db.execute("UPDATE rolling_state SET version=version+1")
+        if updated_count > 0:
+            self.index.discard(session_key)
+            self._stats_cache.pop(session_key, None)
+        return updated_count

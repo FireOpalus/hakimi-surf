@@ -627,6 +627,38 @@ class Settings(BaseSettings):
         max_length=128,
         validation_alias=AliasChoices("VERTEX_HYDROGEN_MODEL", "HAKIMI_VERTEX_HYDROGEN_MODEL"),
     )
+    embedding_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EMBEDDING_ENABLED", "HAKIMI_EMBEDDING_ENABLED"),
+    )
+    embedding_model: str = Field(
+        default="gemini-embedding-001",
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:/-]{1,128}$",
+        validation_alias=AliasChoices("EMBEDDING_MODEL", "HAKIMI_EMBEDDING_MODEL"),
+    )
+    embedding_dim: int = Field(
+        default=768,
+        ge=1,
+        le=3072,
+        validation_alias=AliasChoices("EMBEDDING_DIM", "HAKIMI_EMBEDDING_DIM"),
+    )
+    vertex_embedding_location: str = Field(
+        default="us-central1",
+        max_length=64,
+        pattern=r"^$|^[a-z0-9-]{1,64}$",
+        validation_alias=AliasChoices(
+            "VERTEX_EMBEDDING_LOCATION", "HAKIMI_VERTEX_EMBEDDING_LOCATION"
+        ),
+    )
+    embedding_input_usd_per_m: Decimal = Field(
+        default=Decimal("0.15"),
+        ge=0,
+        le=100,
+        validation_alias=AliasChoices(
+            "EMBEDDING_INPUT_USD_PER_M", "HAKIMI_EMBEDDING_INPUT_USD_PER_M"
+        ),
+    )
     gcp_billing_project: str = Field(
         default="",
         max_length=128,

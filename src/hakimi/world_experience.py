@@ -44,6 +44,8 @@ OWNER_CHAT_SOCIAL_COST = 0.0
 CHAT_ENERGY_COST = 0.2
 CHAT_BOREDOM_DELTA = -2
 OWNER_CHAT_BOREDOM_DELTA = -3
+ENGAGEMENT_SOCIAL_RECOVERY = 3.0
+MAX_ENGAGEMENT_SOCIAL_RECOVERY = 6.0
 AWAKE_SECONDS_PER_POINT = 600
 REST_SECONDS_PER_POINT = 120
 HOURLY_RATES = {
@@ -698,6 +700,69 @@ class WorldExperience:
             )
             if owner_any:
                 await self.touch_owner_tx(now)
+
+    async def boost_from_engagement_tx(
+        self,
+        receipt_key: str,
+        now: float,
+        *,
+        amount: float = ENGAGEMENT_SOCIAL_RECOVERY,
+        audience_label: str | None = None,
+    ) -> float:
+        """Recover a capped small amount of social battery on warm share engagement (idempotent)."""
+        key = str(receipt_key or "").strip()
+        if not key:
+            return 0.0
+        delta = min(MAX_ENGAGEMENT_SOCIAL_RECOVERY, max(0.0, float(amount)))
+        if delta <= 0.0:
+            return 0.0
+        receipt = key if key.startswith("engage:") else f"engage:{key}"
+        if await self.store.one("SELECT 1 FROM world_changes WHERE receipt=?", (receipt,)):
+            return 0.0
+        await self.advance_tx(now)
+        row = await self.store.one("SELECT charge FROM world_social_battery WHERE id=1")
+        if row is None:
+            return 0.0
+        before = float(row[0])
+        after = bounded(before + delta)
+        if not await self._change_tx(
+            receipt,
+            now,
+            "share_engagement",
+            0,
+            0,
+            social=(audience_label, before, after),
+        ):
+            return 0.0
+        if after != before:
+            await self.store.db.execute(
+                "UPDATE world_social_battery SET charge=? WHERE id=1",
+                (after,),
+            )
+        return round(after - before, 4)
+
+    async def boost_from_engagement(
+        self,
+        receipt_key: str,
+        now: float | None = None,
+        *,
+        amount: float = ENGAGEMENT_SOCIAL_RECOVERY,
+        audience_label: str | None = None,
+    ) -> float:
+        """Idempotent capped social battery recovery when a proactive share receives warm reply."""
+        if not self.ready:
+            return 0.0
+        ts = self.world.clock() if now is None else float(now)
+        async with self.store.transaction():
+            recovered = await self.boost_from_engagement_tx(
+                receipt_key,
+                ts,
+                amount=amount,
+                audience_label=audience_label,
+            )
+        if recovered > 0.0:
+            await self.world.refresh()
+        return recovered
 
     @staticmethod
     def _news_item_mentioned(item, texts, *, proactive: bool) -> bool:

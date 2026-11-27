@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any
 
@@ -15,7 +16,7 @@ from .modules.base import sanitize_sensor_text
 from .outgoing import deliver_proactive_jit
 from .routing import RouteDecision
 from .security import authorize
-from .social import RecipientResolver, owner_binding, owner_target
+from .social import RecipientResolver, owner_binding, owner_target, resolve_owner_scope
 
 JIT_TRIGGER_MESSAGE = (
     "[系统主动意图触发：这是你自己先前排定的主动发言时刻。请结合 "
@@ -130,6 +131,93 @@ def resolve_social_target(
     return None
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            p.name == name
+            and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for p in sig.parameters.values()
+    )
+
+
+def _sanitize_resonance_bundle(
+    bundle: dict[str, Any], settings: Any
+) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+    """Sanitize a target-scoped resonance bundle into material, experience, and 1-2 memories."""
+    raw_exp = bundle.get("experience")
+    exp = raw_exp if isinstance(raw_exp, dict) else {}
+    exp_source = sanitize_sensor_text(str(exp.get("source") or ""), settings, max_tokens=16)
+    exp_event_type = sanitize_sensor_text(str(exp.get("event_type") or ""), settings, max_tokens=20)
+    exp_title = sanitize_sensor_text(str(exp.get("title") or ""), settings, max_tokens=48)
+    exp_summary = sanitize_sensor_text(str(exp.get("summary") or ""), settings, max_tokens=140)
+    exp_ref = sanitize_sensor_text(str(exp.get("ref") or ""), settings, max_tokens=24)
+
+    experience_obj: dict[str, Any] = {}
+    if exp_source:
+        experience_obj["source"] = exp_source
+    if exp_event_type:
+        experience_obj["event_type"] = exp_event_type
+    if exp_title:
+        experience_obj["title"] = exp_title
+    if exp_summary:
+        experience_obj["summary"] = exp_summary
+    if exp_ref:
+        experience_obj["ref"] = exp_ref
+
+    exp_parts: list[str] = []
+    if exp_source:
+        exp_parts.append(f"见闻({exp_source})")
+    if exp_title:
+        exp_parts.append(exp_title)
+    if exp_summary and exp_summary != exp_title:
+        exp_parts.append(exp_summary)
+    if exp_ref:
+        exp_parts.append(exp_ref)
+    exp_material = " ".join(exp_parts)
+
+    sanitized_memories: list[dict[str, Any]] = []
+    raw_memories = bundle.get("memories")
+    if isinstance(raw_memories, (list, tuple)):
+        for mem in raw_memories[:2]:
+            if not isinstance(mem, dict):
+                continue
+            mem_source = sanitize_sensor_text(str(mem.get("source") or ""), settings, max_tokens=16)
+            mem_topic = sanitize_sensor_text(str(mem.get("topic") or ""), settings, max_tokens=28)
+            mem_text = sanitize_sensor_text(str(mem.get("text") or ""), settings, max_tokens=80)
+            if not (mem_topic or mem_text):
+                continue
+            entry: dict[str, Any] = {}
+            if mem_source:
+                entry["source"] = mem_source
+            if mem_topic:
+                entry["topic"] = mem_topic
+            if mem_text:
+                entry["text"] = mem_text
+            if mem.get("score") is not None:
+                try:
+                    entry["score"] = round(float(mem["score"]), 3)
+                except (TypeError, ValueError):
+                    pass
+            raw_entities = mem.get("entities")
+            if isinstance(raw_entities, (list, tuple)):
+                clean_entities = [
+                    ent
+                    for raw_ent in raw_entities[:4]
+                    if (ent := sanitize_sensor_text(str(raw_ent or ""), settings, max_tokens=16))
+                ]
+                if clean_entities:
+                    entry["entities"] = clean_entities
+            sanitized_memories.append(entry)
+
+    return exp_material, experience_obj, sanitized_memories
+
+
 async def speak_proactive(
     service: Any,
     target_msg: Message | None,
@@ -146,8 +234,47 @@ async def speak_proactive(
     if target_msg is None or not authorize(target_msg, service.s):
         return Outcome("gated_skip", "unauthorized_scope")
 
+    private_owner = target_msg.kind == "private" and is_persona_owner(target_msg, service.s)
+    gate_cond = (
+        ticket.get("gate_condition") if isinstance(ticket.get("gate_condition"), dict) else {}
+    )
+    resonance_share_id = str(gate_cond.get("resonance_share_id") or "").strip()
+    ticket_scope = str(ticket.get("target_scope") or "").strip()
+    resonance_engine = getattr(service, "share_resonance", None)
+    resonance_bundle: dict[str, Any] | None = None
+    resonance_exp_material = ""
+    resonance_experience: dict[str, Any] = {}
+    resonance_memories: list[dict[str, Any]] = []
+
+    if resonance_share_id:
+        if target_msg.kind == "group":
+            expected_scope = f"{target_msg.platform}:{target_msg.conversation_id}"
+            if ticket_scope and ticket_scope != expected_scope:
+                return Outcome("gated_skip", "resonance_scope_mismatch")
+        else:
+            if not private_owner:
+                return Outcome("gated_skip", "unauthorized_scope")
+            owner_match = resolve_owner_scope(ticket_scope, service.s) if ticket_scope else None
+            if owner_match is None or owner_match[0] != target_msg.platform:
+                return Outcome("gated_skip", "resonance_scope_mismatch")
+            expected_scope = ticket_scope
+        if resonance_engine is None or not hasattr(resonance_engine, "load_share_for_scope"):
+            return Outcome("gated_skip", "resonance_unavailable")
+        load_fn = resonance_engine.load_share_for_scope
+        if _accepts_kwarg(load_fn, "now"):
+            resonance_bundle = await load_fn(resonance_share_id, expected_scope, now=ts)
+        else:
+            resonance_bundle = await load_fn(resonance_share_id, expected_scope)
+        if not isinstance(resonance_bundle, dict):
+            return Outcome("gated_skip", "resonance_share_unavailable")
+        if target_msg.kind == "group" and resonance_bundle.get("is_owner"):
+            return Outcome("gated_skip", "resonance_scope_mismatch")
+        resonance_exp_material, resonance_experience, resonance_memories = (
+            _sanitize_resonance_bundle(resonance_bundle, service.s)
+        )
+
     selected_news = {}
-    if ticket.get("source_event_id") or ticket.get("gate_condition", {}).get("share_news"):
+    if ticket.get("source_event_id") or gate_cond.get("share_news"):
         selected_news = await ws.experience.reserve_news(target_msg, ticket, ts)
         if selected_news is None:
             return Outcome("gated_skip", "news_already_shared_or_expired")
@@ -163,10 +290,12 @@ async def speak_proactive(
             + " "
             + json.dumps(call.evidence["payload"], ensure_ascii=False, separators=(",", ":"))
         )
+    if resonance_exp_material:
+        parts.append(resonance_exp_material)
+    material_limit = 220 if resonance_bundle is not None else 90
     material_summary = sanitize_sensor_text(
-        " | ".join(filter(None, parts)), service.s, max_tokens=90
+        " | ".join(filter(None, parts)), service.s, max_tokens=material_limit
     )
-    private_owner = target_msg.kind == "private" and is_persona_owner(target_msg, service.s)
     session = await service.sessions.snapshot(target_msg)
     recent = list(session.get("recent_messages", []))[-10:]
     if not recent and target_msg.kind == "group" and getattr(service, "hot", None):
@@ -223,6 +352,10 @@ async def speak_proactive(
     }
     if material_summary:
         jit_intent["module_material"] = material_summary
+    if resonance_experience:
+        jit_intent["resonance_experience"] = resonance_experience
+    if resonance_memories:
+        jit_intent["resonance_memories"] = resonance_memories
     if desktop_context_hint:
         jit_intent["desktop_context_hint"] = desktop_context_hint
 
@@ -326,6 +459,25 @@ async def speak_proactive(
     )
     status = str(res.get("status", "not_dispatched"))
     if status == "sent":
+        if resonance_engine is not None:
+            delivered_at = max(ts, _life_clock())
+            try:
+                if resonance_share_id and hasattr(resonance_engine, "mark_delivered"):
+                    mark_fn = resonance_engine.mark_delivered
+                    if _accepts_kwarg(mark_fn, "now"):
+                        await mark_fn(resonance_share_id, now=delivered_at)
+                    else:
+                        await mark_fn(resonance_share_id)
+                elif ticket_scope and hasattr(resonance_engine, "record_shared"):
+                    rec_fn = resonance_engine.record_shared
+                    if _accepts_kwarg(rec_fn, "now"):
+                        await rec_fn(ticket_scope, now=delivered_at)
+                    else:
+                        await rec_fn(ticket_scope)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
         return Outcome("done", "proactive_sent", {"delivery": res})
     if status in ("not_dispatched", "uncertain"):
         return Outcome(status, status, {"delivery": res})

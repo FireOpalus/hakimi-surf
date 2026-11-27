@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from .bot_server import is_persona_owner, untrusted_input
 from .dual_memory import EXTRACTION_INSTRUCTION, FLEX_CAPACITY_DELAYS, parse_extraction
 from .generation_policy import Scenario
+from .owner_memory import embed_texts_safe
 from .security import Rejected, configured_secrets
 from .work_usage import model_work
 
@@ -52,9 +53,18 @@ def check_memory_text(text, settings):
 
 class MemoryCompressor:
     def __init__(
-        self, settings, sessions, gateway, store, *, clock=time.monotonic, wall_clock=time.time
+        self,
+        settings,
+        sessions,
+        gateway,
+        store,
+        *,
+        clock=time.monotonic,
+        wall_clock=time.time,
+        embedder=None,
     ):
         self.s, self.sessions, self.ai, self.store = settings, sessions, gateway, store
+        self._embedder = embedder
         self.tasks = {}
         self.locks = [asyncio.Lock() for _ in range(32)]
         self.slots = asyncio.Semaphore(1)
@@ -63,6 +73,20 @@ class MemoryCompressor:
         self.wall_clock = wall_clock
         self.slice_backoff: OrderedDict[str, tuple[int, float]] = OrderedDict()
         self._dirty_seeded: bool = False
+
+    def _get_embedder(self):
+        if self._embedder is not None:
+            return self._embedder
+        for holder in (
+            self.sessions,
+            getattr(self.sessions, "dual", None),
+            self.ai,
+            self.store,
+        ):
+            cand = getattr(holder, "embedder", None) if holder is not None else None
+            if cand is not None:
+                return cand
+        return None
 
     def schedule(self, message):
         if self.s.prefix_history_enabled:
@@ -330,7 +354,29 @@ class MemoryCompressor:
                             raise flex_exc from fallback_exc
                 check_memory_text(result, self.s)
                 extraction = parse_extraction(result)
-                committed = await self.sessions.dual.commit(message, snapshot, extraction)
+                embedder = self._get_embedder()
+                if (
+                    extraction.chronicles
+                    and embedder is not None
+                    and _supports_kwarg(self.sessions.dual.commit, "embeddings")
+                ):
+                    doc_texts = [
+                        f"{fact.text} {' '.join(fact.tags)}".strip()
+                        for fact in extraction.chronicles
+                    ]
+                    chronicle_embeddings = await embed_texts_safe(
+                        embedder,
+                        doc_texts,
+                        task_type="RETRIEVAL_DOCUMENT",
+                        budget_lane="memory",
+                        subject=subject,
+                        purpose="memory_extract",
+                    )
+                    committed = await self.sessions.dual.commit(
+                        message, snapshot, extraction, embeddings=chronicle_embeddings
+                    )
+                else:
+                    committed = await self.sessions.dual.commit(message, snapshot, extraction)
             except asyncio.CancelledError:
                 # A dispatched archive may have been billed. Keep its slices out of the retry queue.
                 if await self.sessions.dual.finish(
@@ -414,6 +460,56 @@ class MemoryCompressor:
                 "compressed_messages": len(snapshot["messages"]) if committed else 0,
                 "batch_id": snapshot["batch_id"],
             }
+
+    async def backfill_session_embeddings(self, message, *, limit: int = 10) -> int:
+        """Backfill legacy DualMemory chronicle vectors for one session when budget permits."""
+        embedder = self._get_embedder()
+        if embedder is None or limit <= 0 or not hasattr(self.sessions.dual, "backfill_embeddings"):
+            return 0
+        budget = await self.store.budget_status()
+        if budget["hard_stop"]:
+            return 0
+        return int(await self.sessions.dual.backfill_embeddings(message, embedder, limit=limit))
+
+    async def run_backfill_pass(
+        self,
+        *,
+        owner_memory=None,
+        session_limit: int = 10,
+        owner_limit: int = 20,
+    ) -> dict[str, int]:
+        """Run one bounded embedding backfill pass across sessions and optional Zone 2 store."""
+        embedder = self._get_embedder()
+        if embedder is None:
+            return {"sessions": 0, "owner_memory": 0}
+        budget = await self.store.budget_status()
+        if budget["hard_stop"]:
+            return {"sessions": 0, "owner_memory": 0}
+        sessions_updated = 0
+        if session_limit > 0 and hasattr(self.sessions.dual, "backfill_embeddings"):
+            remaining = int(session_limit)
+            for _, message in await self.store.runtime.sessions():
+                if remaining <= 0:
+                    break
+                updated = await self.sessions.dual.backfill_embeddings(
+                    message, embedder, limit=remaining
+                )
+                sessions_updated += int(updated)
+                remaining -= int(updated)
+                if updated > 0:
+                    budget = await self.store.budget_status()
+                    if budget["hard_stop"]:
+                        return {"sessions": sessions_updated, "owner_memory": 0}
+        owner_updated = 0
+        if (
+            owner_memory is not None
+            and owner_limit > 0
+            and hasattr(owner_memory, "backfill_embeddings")
+        ):
+            owner_updated = int(
+                await owner_memory.backfill_embeddings(embedder, limit=int(owner_limit))
+            )
+        return {"sessions": sessions_updated, "owner_memory": owner_updated}
 
     async def nightly(self, now=None):
         now = now or datetime.now(ZoneInfo(self.s.bot_timezone))

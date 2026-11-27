@@ -35,6 +35,7 @@ from .output_links import filter_reply_links
 from .routing import RouteDecision
 from .security import Rejected, authorize, owner
 from .session_manager import apply_audio_memory_tags, session_epoch
+from .social import owner_target_scope
 from .streaming import cancellable
 from .voice_reply import explicit_voice_request
 from .web_search import (
@@ -48,6 +49,13 @@ from .web_search import (
 
 class _ServiceTurnMixin:
     """Mixin implementing single-turn chat admission, context assembly, generation, and queuing."""
+
+    def _resonance_scope_for_message(self, message: Message) -> str:
+        if message.kind == "group":
+            return f"{message.platform}:{message.conversation_id}"
+        if message.kind == "private" and is_persona_owner(message, self.s):
+            return owner_target_scope(self.s, message.platform) or ""
+        return ""
 
     async def handle_message(self, job: dict):
         message = Message.model_validate(job["payload"])
@@ -314,6 +322,24 @@ class _ServiceTurnMixin:
         sandbox = getattr(intent, "sandbox_mode", False)
         if not sandbox and is_persona_owner(message, self.s) and hasattr(self, "world_state"):
             await self.world_state.experience.touch_owner(self.world_state.clock())
+        resonance = getattr(self, "share_resonance", None)
+        if (
+            not sandbox
+            and resonance is not None
+            and getattr(resonance, "ready", False)
+            and not self.bot_guard.known_bot(message)
+        ):
+            res_scope = self._resonance_scope_for_message(message)
+            if res_scope:
+                try:
+                    engage_now = (
+                        self.world_state.clock() if hasattr(self, "world_state") else time.time()
+                    )
+                    await resonance.check_inbound_engagement(res_scope, now=engage_now)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.record("share_resonance_engage_error", emit_audit=False)
         if self.diary and not sandbox:
             await self.diary.group(job["id"], message, members=members)
         if not sandbox:
@@ -632,6 +658,17 @@ class _ServiceTurnMixin:
                     ("news", self.world_state.experience.news(message, now_ts, limit=2))
                 )
                 ctx_tasks.append(("ws_summary", self.world_state.chat_sensor_payload(message)))
+            resonance = getattr(self, "share_resonance", None)
+            if not is_known_bot and resonance is not None and getattr(resonance, "ready", False):
+                res_scope = self._resonance_scope_for_message(message)
+                if res_scope:
+                    res_now = self.world_state.clock() if hasattr(self, "world_state") else now_ts
+                    ctx_tasks.append(
+                        (
+                            "pending_shares",
+                            resonance.pending_for_context(res_scope, limit=2, now=res_now),
+                        )
+                    )
 
             ctx_results = dict(
                 zip(
@@ -674,6 +711,21 @@ class _ServiceTurnMixin:
                 payload["unshared_world_news"] = ctx_results["news"]
             if ctx_results.get("ws_summary"):
                 payload["world_state_summary"] = ctx_results["ws_summary"]
+            pending_shares = ctx_results.get("pending_shares")
+            if pending_shares:
+                payload["pending_resonance_shares"] = [
+                    {
+                        "id": item["id"],
+                        "source": item["experience"].get("source", ""),
+                        "title": item["experience"].get("title", ""),
+                        "summary": item["experience"].get("summary", ""),
+                        "ref": item["experience"].get("ref", ""),
+                        "matched_topics": [
+                            m["topic"] for m in item.get("memories", [])[:2] if m.get("topic")
+                        ],
+                    }
+                    for item in pending_shares
+                ]
             if verified_owner_turn:
                 owner_chat_actions = self._collect_owner_chat_actions()
                 if owner_chat_actions:

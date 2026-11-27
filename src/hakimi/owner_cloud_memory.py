@@ -1,25 +1,55 @@
-"""Read-only owner memory loader & zero-LLM local recall for Antigravity_Memory."""
+"""Read-only owner memory loader & local recall for Antigravity_Memory.
+
+Antigravity_Memory is STRICTLY READ-ONLY. Any optional cached semantic embeddings
+live in a Vault-sealed local SQLite cache under ``settings.data_dir`` (never inside
+``antigravity_memory_dir``).
+"""
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .owner_memory import (
+    cosine_similarity_blobs,
+    embed_texts_safe,
+    is_semantic_blob,
+)
 from .reply_style import trim_complete_text
-from .security import CREDENTIAL_RE, ROLE_TAG_RE, clean_text, redact_secrets
+from .security import CREDENTIAL_RE, ROLE_TAG_RE, Rejected, Vault, clean_text, redact_secrets
 from .social import bound_owner
 
 MAX_FILE_BYTES = 262_144
 MAX_PINNED_CHARS = 1800
 MAX_RECALLED_CHARS = 1800
 MAX_RECENT_CORE_TURNS = 4
+MAX_CACHED_EMBEDDINGS = 4096
+
+_CLOUD_CACHE_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS cloud_chunk_embeddings (
+        chunk_sha256 TEXT PRIMARY KEY,
+        vector_blob BLOB NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cloud_chunk_embeddings_updated
+        ON cloud_chunk_embeddings(updated_at DESC)
+    """,
+)
 
 BROAD_RECALL_RE = re.compile(
     r"记得|忘|想起来|以前|之前|过去|从前|当初|相遇|约定|契约|小本本|回忆|记忆"
@@ -149,11 +179,39 @@ def _parse_markdown_sections(text: str, *, source: str, title_prefix: str) -> li
     return chunks
 
 
+def _chunk_sha256(chunk: dict[str, Any]) -> str:
+    material = (
+        f"{chunk.get('source', '')}|{chunk.get('date', '')}|"
+        f"{chunk.get('title', '')}|{chunk.get('text', '')}"
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 class OwnerCloudMemory:
     """Thread-safe, mtime-cached read-only memory & local search for private Owner chats."""
 
-    def __init__(self, settings):
+    def __init__(
+        self,
+        settings,
+        *,
+        vault: Vault | Any | None = None,
+        embedder: Any = None,
+        cache_path: Path | None = None,
+    ):
         self.s = settings
+        self._vault: Vault | None = (
+            vault
+            if isinstance(vault, Vault)
+            else getattr(vault, "vault", None)
+            if vault is not None
+            else None
+        )
+        self.embedder = embedder
+        self._cache_path = (
+            Path(cache_path)
+            if cache_path is not None
+            else (Path(settings.data_dir) / "owner_cloud_embed_cache.sqlite3")
+        )
         self._lock = threading.Lock()
         self._signature: tuple[tuple[str, int, int], ...] = ()
         self._pinned = ""
@@ -163,6 +221,182 @@ class OwnerCloudMemory:
         self._latest_ts: float = 0.0
         self._latest_iso: str = ""
         self._latest_tag: str = ""
+        self._chunk_vectors: dict[str, bytes] = {}
+        self._cache_fp: tuple[int, ...] | None = None
+
+    def _get_vault(self) -> Vault:
+        if self._vault is None:
+            self._vault = Vault(self.s.encryption_key.get_secret_value())
+        return self._vault
+
+    def _check_cache_path_safe(self) -> None:
+        for candidate in (self._cache_path, self._cache_path.parent, Path(self.s.data_dir)):
+            if candidate.is_symlink():
+                raise Rejected("invalid_cloud_cache_path")
+        cloud_dir = getattr(self.s, "antigravity_memory_dir", None)
+        if cloud_dir:
+            try:
+                cloud_resolved = Path(cloud_dir).resolve()
+                cache_resolved = self._cache_path.resolve()
+                if cache_resolved == cloud_resolved or cloud_resolved in cache_resolved.parents:
+                    raise Rejected("invalid_cloud_cache_path")
+            except OSError:
+                pass
+
+    def _cache_fingerprint(self) -> tuple[int, ...] | None:
+        try:
+            st = os.lstat(self._cache_path)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            raise Rejected("invalid_cloud_cache_path")
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        wal_size = -1
+        wal_mtime = -1
+        try:
+            wst = os.lstat(f"{self._cache_path}-wal")
+            wal_size = wst.st_size
+            wal_mtime = wst.st_mtime_ns
+        except OSError:
+            pass
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, wal_size, wal_mtime)
+
+    def _load_cached_vectors_locked(self) -> None:
+        try:
+            self._check_cache_path_safe()
+            fp = self._cache_fingerprint()
+        except Rejected:
+            self._chunk_vectors = {}
+            self._cache_fp = None
+            return
+        if fp is None:
+            self._chunk_vectors = {}
+            self._cache_fp = None
+            return
+        if fp == self._cache_fp and self._chunk_vectors:
+            return
+        wanted = {chunk["chunk_hash"] for chunk in self._chunks if chunk.get("chunk_hash")}
+        if not wanted:
+            self._chunk_vectors = {}
+            self._cache_fp = fp
+            return
+        vault = self._get_vault()
+        uri = f"{self._cache_path.absolute().as_uri()}?mode=ro"
+        loaded: dict[str, bytes] = {}
+        try:
+            conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=5.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                rows = conn.execute(
+                    "SELECT chunk_sha256, vector_blob FROM cloud_chunk_embeddings"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            self._chunk_vectors = {}
+            self._cache_fp = None
+            return
+        for chunk_hash, blob in rows:
+            if chunk_hash not in wanted:
+                continue
+            try:
+                raw_vec = base64.b64decode(vault.open(f"owner-cloud-embed:{chunk_hash}", blob))
+            except Exception:
+                continue
+            if is_semantic_blob(raw_vec):
+                loaded[str(chunk_hash)] = raw_vec
+        self._chunk_vectors = loaded
+        self._cache_fp = fp
+
+    def cache_embeddings(self, mapping: dict[str, bytes]) -> int:
+        """Persist Vault-sealed semantic vectors keyed by chunk SHA-256 into local cache DB."""
+        clean_items = [
+            (str(k).strip(), bytes(v))
+            for k, v in mapping.items()
+            if isinstance(k, str) and len(k.strip()) == 64 and is_semantic_blob(v)
+        ]
+        if not clean_items:
+            return 0
+        with self._lock:
+            self._check_cache_path_safe()
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                self._cache_path.parent.chmod(0o700)
+            except OSError:
+                pass
+            fd = os.open(self._cache_path, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            os.close(fd)
+            self._cache_path.chmod(0o600)
+            vault = self._get_vault()
+            now_ts = time.time()
+            conn = sqlite3.connect(self._cache_path, isolation_level=None, timeout=5.0)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("PRAGMA secure_delete=ON")
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("BEGIN IMMEDIATE")
+                for stmt in _CLOUD_CACHE_SCHEMA:
+                    conn.execute(stmt)
+                for chunk_hash, raw_vec in clean_items:
+                    sealed = vault.seal(
+                        f"owner-cloud-embed:{chunk_hash}",
+                        base64.b64encode(raw_vec).decode("ascii"),
+                    )
+                    conn.execute(
+                        "INSERT INTO cloud_chunk_embeddings(chunk_sha256, vector_blob, updated_at) "
+                        "VALUES (?,?,?) ON CONFLICT(chunk_sha256) DO UPDATE SET "
+                        "vector_blob=excluded.vector_blob, updated_at=excluded.updated_at",
+                        (chunk_hash, sealed, now_ts),
+                    )
+                conn.execute(
+                    "DELETE FROM cloud_chunk_embeddings WHERE chunk_sha256 NOT IN ("
+                    "SELECT chunk_sha256 FROM cloud_chunk_embeddings "
+                    "ORDER BY updated_at DESC LIMIT ?)",
+                    (MAX_CACHED_EMBEDDINGS,),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+            for chunk_hash, raw_vec in clean_items:
+                self._chunk_vectors[chunk_hash] = raw_vec
+            self._cache_fp = self._cache_fingerprint()
+        return len(clean_items)
+
+    async def sync_embeddings(self, embedder: Any = None, *, limit: int = 40) -> int:
+        """Compute and Vault-seal semantic embeddings for uncached read-only cloud chunks."""
+        active = embedder if embedder is not None else self.embedder
+        if active is None or not self.s.enable_antigravity_memory or limit <= 0:
+            return 0
+        with self._lock:
+            self._rebuild_if_needed()
+            missing = [
+                (chunk["chunk_hash"], f"{chunk['title']} {chunk['text']}".strip())
+                for chunk in self._chunks
+                if chunk.get("chunk_hash") and chunk["chunk_hash"] not in self._chunk_vectors
+            ][: max(1, min(int(limit), 100))]
+        if not missing:
+            return 0
+        blobs = await embed_texts_safe(
+            active,
+            [txt for _, txt in missing],
+            task_type="RETRIEVAL_DOCUMENT",
+            budget_lane="memory",
+            subject="owner_cloud_memory",
+            purpose="owner_cloud_embed",
+        )
+        mapping = {
+            chunk_hash: bytes(blob)
+            for (chunk_hash, _), blob in zip(missing, blobs, strict=True)
+            if is_semantic_blob(blob)
+        }
+        if not mapping:
+            return 0
+        return await asyncio.to_thread(self.cache_embeddings, mapping)
 
     def _collect_files(self) -> list[tuple[str, Path]]:
         root = Path(self.s.antigravity_memory_dir)
@@ -202,6 +436,7 @@ class OwnerCloudMemory:
         files = self._collect_files()
         sig = self._signature_for(files)
         if sig == self._signature and (sig or not files):
+            self._load_cached_vectors_locked()
             return
 
         pinned = ""
@@ -303,6 +538,9 @@ class OwnerCloudMemory:
                     _parse_markdown_sections(text, source="notes", title_prefix=Path(rel).stem)
                 )
 
+        for chunk in chunks:
+            chunk["chunk_hash"] = _chunk_sha256(chunk)
+
         self._signature = sig
         self._pinned = pinned
         self._recent_core = recent_core
@@ -311,19 +549,35 @@ class OwnerCloudMemory:
         self._latest_ts = latest_ts
         self._latest_iso = latest_iso
         self._latest_tag = latest_tag
+        self._cache_fp = None
+        self._load_cached_vectors_locked()
 
-    def _search_chunks(self, query_text: str, *, recall: bool) -> list[dict[str, str]]:
+    def _search_chunks(
+        self,
+        query_text: str,
+        *,
+        recall: bool,
+        query_vector: bytes | None = None,
+    ) -> list[dict[str, str]]:
         if not self._chunks:
             return []
         q_tokens, q_strong, q_phrases = _tokenize(query_text)
         broad = bool(BROAD_RECALL_RE.search(query_text))
-        if not q_tokens and not recall and not broad:
+        sem_qvec = bytes(query_vector) if is_semantic_blob(query_vector) else None
+        if not q_tokens and not recall and not broad and sem_qvec is None:
             return []
 
         scored: list[tuple[float, int, dict[str, Any]]] = []
         for idx, chunk in enumerate(self._chunks):
             overlap = q_tokens & chunk["tokens"]
-            if not overlap and not broad:
+            sem_sim = 0.0
+            if sem_qvec is not None:
+                chunk_vec = self._chunk_vectors.get(chunk.get("chunk_hash", ""))
+                if chunk_vec is not None:
+                    sim_val = cosine_similarity_blobs(sem_qvec, chunk_vec)
+                    if sim_val is not None:
+                        sem_sim = max(0.0, sim_val)
+            if not overlap and not broad and sem_sim < 0.40:
                 continue
             score = float(len(overlap))
             score += float(len(q_strong & chunk["strong_ascii"]))
@@ -335,6 +589,8 @@ class OwnerCloudMemory:
                     score += 2.5
             if overlap and chunk["source"] in {"notebook_index", "notes"}:
                 score += 0.5
+            if sem_sim >= 0.40:
+                score += sem_sim * 4.5
             if score >= 1.0:
                 scored.append((score, idx, chunk))
 
@@ -378,7 +634,14 @@ class OwnerCloudMemory:
 
         return selected
 
-    def for_message(self, message, query_text: str = "", *, recall: bool = False) -> dict[str, Any]:
+    def for_message(
+        self,
+        message,
+        query_text: str = "",
+        *,
+        recall: bool = False,
+        query_vector: bytes | None = None,
+    ) -> dict[str, Any]:
         if (
             not self.s.enable_antigravity_memory
             or message is None
@@ -396,10 +659,96 @@ class OwnerCloudMemory:
                 core["recent_computer_chats"] = list(self._recent_core)
             if core:
                 result["owner_core_memory"] = core
-            recalled = self._search_chunks(query_text, recall=recall)
+            recalled = self._search_chunks(query_text, recall=recall, query_vector=query_vector)
             if recalled:
                 result["owner_recalled_memories"] = recalled
             return result
+
+    def probe_resonance(
+        self,
+        query_text: str,
+        query_vector: bytes | None = None,
+        *,
+        limit: int = 2,
+        message: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Probe read-only Owner cloud chunks for semantic/lexical resonance (Owner-only)."""
+        if not self.s.enable_antigravity_memory:
+            return []
+        if message is not None:
+            if message.kind != "private" or not bound_owner(message, self.s, "notebook"):
+                return []
+        elif not (self.s.owner_qq_id or getattr(self.s, "social_owner_bindings", None)):
+            return []
+        q_clean = str(query_text or "").strip()
+        sem_qvec = bytes(query_vector) if is_semantic_blob(query_vector) else None
+        if not q_clean and sem_qvec is None:
+            return []
+
+        with self._lock:
+            self._rebuild_if_needed()
+            chunks = list(self._chunks)
+            chunk_vectors = dict(self._chunk_vectors)
+        if not chunks:
+            return []
+
+        q_tokens, q_strong, q_phrases = _tokenize(q_clean) if q_clean else (set(), set(), [])
+        q_lower = q_clean.lower()
+        scored: list[tuple[float, int, dict[str, Any]]] = []
+        for idx, chunk in enumerate(chunks):
+            overlap = q_tokens & chunk["tokens"] if q_tokens else set()
+            raw_lex = float(len(overlap)) + float(len(q_strong & chunk["strong_ascii"]))
+            if q_lower and any(tag in q_lower for tag in chunk["tags"]):
+                raw_lex += 1.5
+            lowered_body = chunk["text"].lower()
+            for phrase in q_phrases:
+                if phrase in chunk["text"] or phrase.lower() in lowered_body:
+                    raw_lex += 2.5
+            if overlap and chunk["source"] in {"notebook_index", "notes"}:
+                raw_lex += 0.5
+            lex_norm = min(1.0, raw_lex / 5.0) if raw_lex > 0 else 0.0
+
+            sem_sim: float | None = None
+            if sem_qvec is not None:
+                cvec = chunk_vectors.get(chunk.get("chunk_hash", ""))
+                if cvec is not None:
+                    val = cosine_similarity_blobs(sem_qvec, cvec)
+                    if val is not None:
+                        sem_sim = max(0.0, val)
+
+            if sem_sim is not None:
+                if sem_sim < 0.35 and raw_lex < 2.0:
+                    continue
+                score = max(sem_sim, 0.78 * sem_sim + 0.22 * lex_norm)
+            else:
+                if raw_lex < 2.0:
+                    continue
+                score = lex_norm
+            scored.append((min(1.0, score), idx, chunk))
+
+        scored.sort(key=lambda item: (-item[0], -item[1]))
+        bounded_limit = max(1, min(int(limit), 10))
+        out: list[dict[str, Any]] = []
+        seen_texts: set[str] = set()
+        for score, _idx, chunk in scored:
+            text = chunk["text"]
+            if text in seen_texts:
+                continue
+            seen_texts.add(text)
+            chash = chunk.get("chunk_hash") or _chunk_sha256(chunk)
+            out.append(
+                {
+                    "id": f"cloud:{chash[:16]}",
+                    "source": f"cloud:{chunk['source']}",
+                    "topic": chunk["title"],
+                    "text": trim_complete_text(text, 360),
+                    "score": round(score, 4),
+                    "entities": sorted(chunk["tags"]),
+                }
+            )
+            if len(out) >= bounded_limit:
+                break
+        return out
 
     def latest_activity_info(self) -> dict[str, Any]:
         enabled = bool(self.s.enable_antigravity_memory)
@@ -423,6 +772,7 @@ class OwnerCloudMemory:
                 "pinned_chars": len(self._pinned),
                 "recent_turns": len(self._recent_core),
                 "indexed_chunks": len(self._chunks),
+                "cached_embeddings": len(self._chunk_vectors),
             }
 
     def admin_preview(self) -> dict[str, Any]:

@@ -226,6 +226,12 @@ def create_app(
                         await service.memes.initialize()
                     await service.world_state.initialize()
                     await service.life_engine.initialize()
+                    if (om := getattr(service, "owner_memory", None)) is not None and not getattr(
+                        om, "ready", getattr(om, "_initialized", False)
+                    ):
+                        await om.initialize()
+                    if (sr := getattr(service, "share_resonance", None)) is not None:
+                        await sr.initialize()
                     for module in service.modules.all():
                         await resources.enter_async_context(module.lifespan())
                     if "proactive_delivery" in service.modules.systems:

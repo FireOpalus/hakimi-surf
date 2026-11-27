@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .bot_server import is_persona_owner, untrusted_input
 from .config import Settings
 from .models import Message
 from .modules.base import sanitize_sensor_text
+from .owner_memory import OwnerMemoryStore
 from .security import Rejected, clean_text, configured_secrets, safe_output
 from .social import owner_target
 
@@ -23,6 +25,86 @@ _PLATFORM_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 _DUAL_CATEGORIES = frozenset({"event", "slang", "consensus", "open_question"})
 _CHAT_CLOUD_KEYS = ("owner_core_memory", "owner_recalled_memories")
 _PLANNER_HISTORY_MAX_AGE_SECONDS = 129600.0
+_CAPABILITY_SEAL = object()
+_MAX_BG_WRITES = 64
+
+
+def _supports_kwarg(fn: Any, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            p.name == name
+            and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for p in sig.parameters.values()
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryCapability:
+    """Unforgeable per-turn memory access token minted strictly via capability_for()."""
+
+    is_owner: bool
+    is_private: bool
+    can_read_owner_private: bool
+    can_write_owner_private: bool
+    can_read_cloud_memory: bool
+    surface: Literal["private", "group", "public_task"]
+    platform: str
+    session_scope: str
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._seal is not _CAPABILITY_SEAL:
+            raise PermissionError("MemoryCapability must be constructed via capability_for()")
+
+
+def capability_for(
+    message: Message | None,
+    settings: Settings,
+    *,
+    sandbox: bool = False,
+) -> MemoryCapability:
+    """Mint a protocol-verified MemoryCapability using is_persona_owner() only."""
+    if sandbox or message is None:
+        return MemoryCapability(
+            is_owner=False,
+            is_private=False,
+            can_read_owner_private=False,
+            can_write_owner_private=False,
+            can_read_cloud_memory=False,
+            surface="public_task",
+            platform="",
+            session_scope="",
+            _seal=_CAPABILITY_SEAL,
+        )
+    verified_owner = bool(is_persona_owner(message, settings))
+    is_priv = bool(
+        message.kind == "private"
+        and isinstance(message.conversation_id, str)
+        and message.conversation_id == message.user_id
+    )
+    owner_priv = verified_owner and is_priv
+    can_cloud = owner_priv and bool(getattr(settings, "enable_antigravity_memory", False))
+    surface: Literal["private", "group", "public_task"] = (
+        "private" if message.kind == "private" else "group"
+    )
+    scope = f"{message.platform}:{message.kind}:{message.conversation_id}"
+    return MemoryCapability(
+        is_owner=verified_owner,
+        is_private=is_priv,
+        can_read_owner_private=owner_priv,
+        can_write_owner_private=owner_priv,
+        can_read_cloud_memory=can_cloud,
+        surface=surface,
+        platform=str(message.platform or ""),
+        session_scope=scope,
+        _seal=_CAPABILITY_SEAL,
+    )
 
 
 @dataclass(frozen=True)
@@ -32,6 +114,7 @@ class ExperienceWriteResult:
     recap_written: bool = False
     ledger_event_id: str | None = None
     chronicle_written: bool = False
+    owner_memory_id: str | None = None
 
 
 class MemoryHub:
@@ -42,14 +125,199 @@ class MemoryHub:
         settings: Settings,
         service: Any,
         *,
+        owner_memory: OwnerMemoryStore | None = None,
+        embedder: Any = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.s = settings
         self.settings = settings
         self.service = service
+        self._explicit_owner_memory = owner_memory
+        self._lazy_owner_memory: OwnerMemoryStore | None = None
+        self._embedder = embedder
         self.clock = clock
         self._writes: int = 0
         self._recalls: int = 0
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._closed: bool = False
+
+    def capability_for(
+        self,
+        message: Message | None,
+        *,
+        sandbox: bool = False,
+    ) -> MemoryCapability:
+        """Verify protocol-layer Owner identity and mint an unforgeable MemoryCapability."""
+        return capability_for(message, self.s, sandbox=sandbox)
+
+    def _embedder_client(self) -> Any:
+        if self._embedder is not None:
+            return self._embedder
+        ai = getattr(self.service, "ai", None)
+        sessions = self._sessions()
+        for holder, attr in (
+            (self.service, "embedder"),
+            (self.service, "embeddings"),
+            (ai, "embeddings"),
+            (ai, "embedder"),
+            (sessions, "embedder"),
+            (sessions, "embeddings"),
+        ):
+            cand = getattr(holder, attr, None) if holder is not None else None
+            if cand is not None:
+                return cand
+        return None
+
+    def _owner_memory(self) -> OwnerMemoryStore | None:
+        if self._explicit_owner_memory is not None:
+            return self._explicit_owner_memory
+        svc_om = getattr(self.service, "owner_memory", None)
+        if svc_om is not None:
+            return svc_om
+        if self._lazy_owner_memory is None:
+            store = getattr(self.service, "store", None)
+            vault = getattr(store, "vault", None) if store is not None else None
+            self._lazy_owner_memory = OwnerMemoryStore(
+                self.s,
+                vault=vault,
+                embedder=self._embedder_client(),
+                clock=lambda: self.clock(),
+            )
+        elif self._lazy_owner_memory.embedder is None:
+            emb = self._embedder_client()
+            if emb is not None:
+                self._lazy_owner_memory.embedder = emb
+        return self._lazy_owner_memory
+
+    @property
+    def owner_memory(self) -> OwnerMemoryStore | None:
+        """Public accessor for Zone 2 OwnerMemoryStore (used by ShareResonanceEngine)."""
+        return self._owner_memory()
+
+    def _schedule_owner_memory_write(
+        self,
+        owner_mem: Any,
+        *,
+        source: str,
+        topic: str,
+        text: str,
+        category: str,
+        tags: tuple[str, ...],
+        now: float,
+    ) -> bool:
+        """Offload Zone 2 SQLite write off the asyncio event loop; sync fallback if no loop."""
+        if self._closed or owner_mem is None:
+            return False
+        has_sync = hasattr(owner_mem, "record_sync")
+        has_async = hasattr(owner_mem, "record")
+        if not has_sync and not has_async:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            if len(self._bg_tasks) >= _MAX_BG_WRITES:
+                log.warning(
+                    "event=memory_hub_bg_write_dropped reason=queue_full category=%s",
+                    category,
+                )
+                return False
+
+            async def _run_write() -> None:
+                try:
+                    if has_sync:
+                        await asyncio.to_thread(
+                            owner_mem.record_sync,
+                            source,
+                            topic,
+                            text,
+                            category=category,
+                            tags=tags,
+                            now=now,
+                        )
+                    else:
+                        await owner_mem.record(
+                            source,
+                            topic,
+                            text,
+                            category=category,
+                            tags=tags,
+                            now=now,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_owner_bg_write_failed category=%s exc=%s",
+                        category,
+                        type(exc).__name__,
+                    )
+
+            task = loop.create_task(_run_write(), name=f"memory-hub-{category}")
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            return True
+
+        if not has_sync:
+            return False
+        try:
+            return bool(
+                owner_mem.record_sync(
+                    source,
+                    topic,
+                    text,
+                    category=category,
+                    tags=tags,
+                    now=now,
+                )
+            )
+        except Exception as exc:
+            log.debug(
+                "event=memory_hub_owner_sync_write_failed category=%s exc=%s",
+                category,
+                type(exc).__name__,
+            )
+            return False
+
+    async def drain_background_writes(
+        self,
+        *,
+        max_wait: float = 5.0,
+        cancel_on_timeout: bool = False,
+    ) -> int:
+        """Await tracked offloaded Zone 2 writes cleanly (bounded by max_wait seconds)."""
+        drained = 0
+        deadline = time.monotonic() + max(0.0, float(max_wait))
+        while self._bg_tasks:
+            pending = tuple(self._bg_tasks)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                if cancel_on_timeout:
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                break
+            done, still = await asyncio.wait(pending, timeout=remaining)
+            for task in done:
+                drained += 1
+                if not task.cancelled():
+                    _ = task.exception()
+            if still:
+                if cancel_on_timeout:
+                    for task in still:
+                        task.cancel()
+                    await asyncio.gather(*still, return_exceptions=True)
+                break
+        return drained
+
+    async def close(self, *, max_wait: float = 5.0) -> None:
+        """Drain background writes and release lazy Zone 2 resources cleanly."""
+        self._closed = True
+        await self.drain_background_writes(max_wait=max_wait, cancel_on_timeout=True)
+        if self._lazy_owner_memory is not None:
+            await self._lazy_owner_memory.close()
 
     def _sessions(self) -> Any:
         return getattr(self.service, "sessions", None)
@@ -122,22 +390,24 @@ class MemoryHub:
         return targets
 
     def _is_verified_private_owner(self, message: Message | None) -> bool:
-        return bool(
-            message is not None and message.kind == "private" and is_persona_owner(message, self.s)
-        )
+        return self.capability_for(message).can_read_owner_private
 
     def status_counts(self) -> dict[str, int]:
         return {"writes": self._writes, "recalls": self._recalls}
 
     def record_turn_recap(self, message: Message, reply_text: str) -> bool:
-        """Record a concise private-owner chat turn recap into the cross-surface ring."""
+        """Record a concise private-owner chat turn recap into the cross-surface ring and Zone 2."""
+        cap = self.capability_for(message)
         identity = self._identity()
+        owner_mem = self._owner_memory()
         if (
-            identity is None
-            or not hasattr(identity, "record_owner_recap")
-            or not self._is_verified_private_owner(message)
+            not cap.can_write_owner_private
             or not isinstance(message.platform, str)
             or not _PLATFORM_ID_RE.fullmatch(message.platform)
+            or (
+                (identity is None or not hasattr(identity, "record_owner_recap"))
+                and owner_mem is None
+            )
         ):
             return False
         user_raw = " ".join(str(message.text or "").split())
@@ -168,9 +438,23 @@ class MemoryHub:
             summary = reply_part or user_part
         if not summary:
             return False
-        identity.record_owner_recap(message.platform, summary, message=message)
-        self._writes += 1
-        return True
+        wrote = False
+        if identity is not None and hasattr(identity, "record_owner_recap"):
+            identity.record_owner_recap(message.platform, summary, message=message)
+            wrote = True
+        if owner_mem is not None and self._schedule_owner_memory_write(
+            owner_mem,
+            source=f"chat:{message.platform}",
+            topic=f"{message.platform}_turn",
+            text=summary,
+            category="turn_recap",
+            tags=(message.platform,),
+            now=float(self.clock()),
+        ):
+            wrote = True
+        if wrote:
+            self._writes += 1
+        return wrote
 
     def record_quick_recap(
         self,
@@ -181,14 +465,15 @@ class MemoryHub:
         now: float | None = None,
         private_owner: bool = False,
     ) -> bool:
-        """Scrub, sanitize, and record a short owner-private surface recap."""
+        """Scrub, sanitize, and record a short owner-private surface recap into ring and Zone 2."""
         identity = self._identity()
-        if identity is None or not hasattr(identity, "record_owner_recap"):
+        owner_mem = self._owner_memory()
+        if (identity is None or not hasattr(identity, "record_owner_recap")) and owner_mem is None:
             return False
         if not private_owner:
             return False
         if message is not None:
-            if not self._is_verified_private_owner(message):
+            if not self.capability_for(message).can_write_owner_private:
                 return False
         elif not self._has_configured_owner():
             return False
@@ -202,15 +487,29 @@ class MemoryHub:
         if not cleaned:
             return False
         ts = float(self.clock() if now is None else now)
-        identity.record_owner_recap(
-            platform,
-            cleaned,
+        wrote = False
+        if identity is not None and hasattr(identity, "record_owner_recap"):
+            identity.record_owner_recap(
+                platform,
+                cleaned,
+                now=ts,
+                message=message,
+                private_owner=True,
+            )
+            wrote = True
+        if owner_mem is not None and self._schedule_owner_memory_write(
+            owner_mem,
+            source=platform,
+            topic=f"{platform}_recap",
+            text=cleaned,
+            category="recap",
+            tags=(platform,),
             now=ts,
-            message=message,
-            private_owner=True,
-        )
-        self._writes += 1
-        return True
+        ):
+            wrote = True
+        if wrote:
+            self._writes += 1
+        return wrote
 
     def _clean_tags(
         self,
@@ -261,9 +560,15 @@ class MemoryHub:
             "event", "fact", "preference", "slang", "consensus", "open_question"
         ] = "event",
         owner_message: Message | None = None,
+        entities: Sequence[str] = (),
+        links: Sequence[Any] = (),
+        valid_from: float | None = None,
+        valid_until: float | None = None,
+        supersedes_topic: str | None = None,
+        write_owner_memory: bool = True,
         now: float | None = None,
     ) -> ExperienceWriteResult:
-        """Persist sanitized cross-module experience into ledger, recap ring, and DualMemory."""
+        """Persist sanitized experience into ledger, recap ring, DualMemory, and Zone 2."""
         if visibility not in {"public", "owner_private"}:
             return ExperienceWriteResult()
 
@@ -313,13 +618,15 @@ class MemoryHub:
 
         recap_written = False
         chronicle_written = False
+        owner_memory_id: str | None = None
 
-        # Hard privacy barrier: owner recaps and Owner DualMemory never accept public events
-        # or non-owner targets. Antigravity_Memory / owner_cloud_memory is strictly read-only.
+        # Hard privacy barrier: owner recaps, Owner DualMemory, and Zone 2 OwnerMemoryStore
+        # never accept public events or non-owner targets. Antigravity_Memory is strictly read-only.
+        owner_cap = self.capability_for(owner_message) if owner_message is not None else None
         allow_owner_private = (
             visibility == "owner_private"
             and self._has_configured_owner()
-            and (owner_message is None or self._is_verified_private_owner(owner_message))
+            and (owner_cap is None or owner_cap.can_write_owner_private)
         )
         if allow_owner_private:
             recap_target = (recap_platform or clean_source or "").strip()
@@ -339,6 +646,13 @@ class MemoryHub:
                 )
                 recap_written = True
 
+            clean_topic = ""
+            clean_chronicle_text = ""
+            clean_tags = self._clean_tags(
+                chronicle_tags,
+                fallback_source=clean_source,
+                secrets=secrets,
+            )
             if isinstance(chronicle_topic, str) and chronicle_topic.strip():
                 try:
                     scrubbed_topic = safe_output(clean_text(chronicle_topic), secrets, limit=80)
@@ -366,11 +680,6 @@ class MemoryHub:
                         scrubbed_summary, self.s, max_tokens=420
                     )[:500].strip()
 
-                clean_tags = self._clean_tags(
-                    chronicle_tags,
-                    fallback_source=clean_source,
-                    secrets=secrets,
-                )
                 sessions = self._sessions()
                 dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
                 if (
@@ -386,7 +695,10 @@ class MemoryHub:
                             if candidate is not None:
                                 target_msg = candidate
                                 break
-                    if target_msg is not None and self._is_verified_private_owner(target_msg):
+                    if (
+                        target_msg is not None
+                        and self.capability_for(target_msg).can_write_owner_private
+                    ):
                         effective_category = (
                             chronicle_category
                             if chronicle_category in _DUAL_CATEGORIES
@@ -415,13 +727,46 @@ class MemoryHub:
                             )
                             chronicle_written = False
 
-        if ledger_event_id is not None or recap_written or chronicle_written:
+            owner_mem = self._owner_memory()
+            if write_owner_memory and owner_mem is not None and hasattr(owner_mem, "record"):
+                om_topic = clean_topic or (event_type or clean_source)
+                om_text = clean_chronicle_text or clean_summary
+                om_dedupe = f"{clean_source}:{dedupe_key}" if dedupe_key else None
+                try:
+                    owner_memory_id = await owner_mem.record(
+                        clean_source,
+                        om_topic,
+                        om_text,
+                        category=chronicle_category,
+                        tags=clean_tags,
+                        entities=entities,
+                        links=links,
+                        valid_from=valid_from,
+                        valid_until=valid_until,
+                        supersedes_topic=supersedes_topic,
+                        dedupe_key=om_dedupe,
+                        now=ts,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "event=memory_hub_owner_memory_write_failed exc=%s",
+                        type(exc).__name__,
+                    )
+                    owner_memory_id = None
+
+        if (
+            ledger_event_id is not None
+            or recap_written
+            or chronicle_written
+            or owner_memory_id is not None
+        ):
             self._writes += 1
 
         return ExperienceWriteResult(
             recap_written=recap_written,
             ledger_event_id=ledger_event_id,
             chronicle_written=chronicle_written,
+            owner_memory_id=owner_memory_id,
         )
 
     async def _read_owner_recent_session(
@@ -499,12 +844,14 @@ class MemoryHub:
         sandbox: bool = False,
         related_user_ids: Sequence[str] = (),
         allow_dual_profile: bool = True,
+        query_vector: bytes | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
         """Recall audience-authorized context slices for chat, voice, screen, or planner."""
         if sandbox:
             return {}
         ts = float(self.clock() if now is None else now)
+        cap = self.capability_for(audience, sandbox=sandbox)
 
         if mode == "chat":
             if audience is None:
@@ -513,12 +860,13 @@ class MemoryHub:
             sessions = self._sessions()
             dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
             if dual_mem is not None and hasattr(dual_mem, "prefetch"):
-                dual_data = await dual_mem.prefetch(
-                    audience,
-                    query,
-                    recall=recall,
-                    related_user_ids=related_user_ids,
-                )
+                prefetch_kwargs: dict[str, Any] = {
+                    "recall": recall,
+                    "related_user_ids": related_user_ids,
+                }
+                if query_vector is not None and _supports_kwarg(dual_mem.prefetch, "query_vector"):
+                    prefetch_kwargs["query_vector"] = query_vector
+                dual_data = await dual_mem.prefetch(audience, query, **prefetch_kwargs)
                 if not allow_dual_profile and isinstance(dual_data, dict):
                     dual_data = {
                         k: v
@@ -527,7 +875,7 @@ class MemoryHub:
                     }
                 out["dual_memory_data"] = dual_data
 
-            if self._is_verified_private_owner(audience):
+            if cap.can_read_owner_private:
                 notebook = self._notebook()
                 if notebook is not None and hasattr(notebook, "for_message"):
                     snapshot = notebook.for_message(audience)
@@ -547,12 +895,21 @@ class MemoryHub:
                         out["近期群聊巡逻记忆（只读背景）"] = public_history
 
                 cloud_memory = self._cloud_memory()
-                if cloud_memory is not None and hasattr(cloud_memory, "for_message"):
+                if (
+                    cap.can_read_cloud_memory
+                    and cloud_memory is not None
+                    and hasattr(cloud_memory, "for_message")
+                ):
+                    cloud_kwargs: dict[str, Any] = {"recall": recall}
+                    if query_vector is not None and _supports_kwarg(
+                        cloud_memory.for_message, "query_vector"
+                    ):
+                        cloud_kwargs["query_vector"] = query_vector
                     cloud_mem = await asyncio.to_thread(
                         cloud_memory.for_message,
                         audience,
                         query,
-                        recall=recall,
+                        **cloud_kwargs,
                     )
                     if isinstance(cloud_mem, dict) and cloud_mem:
                         for key in _CHAT_CLOUD_KEYS:
@@ -569,11 +926,34 @@ class MemoryHub:
                     if other_recent:
                         out["owner_other_surface_recent"] = other_recent
 
+                owner_mem = self._owner_memory()
+                if (
+                    owner_mem is not None
+                    and hasattr(owner_mem, "recall")
+                    and (recall or bool(str(query or "").strip()) or query_vector is not None)
+                ):
+                    if self._bg_tasks:
+                        await self.drain_background_writes(max_wait=1.0)
+                    try:
+                        om_hits = await owner_mem.recall(
+                            query,
+                            query_vector=query_vector,
+                            limit=4,
+                            now=ts,
+                        )
+                        if om_hits:
+                            out["owner_memories"] = om_hits
+                    except Exception as exc:
+                        log.debug(
+                            "event=memory_hub_owner_memory_recall_failed mode=chat exc=%s",
+                            type(exc).__name__,
+                        )
+
             self._recalls += 1
             return out
 
         if mode == "voice":
-            if not self._is_verified_private_owner(audience):
+            if not cap.can_read_owner_private:
                 return {}
             assert audience is not None
             out = {}
@@ -590,13 +970,22 @@ class MemoryHub:
                     )
 
             cloud_memory = self._cloud_memory()
-            if cloud_memory is not None and hasattr(cloud_memory, "for_message"):
+            if (
+                cap.can_read_cloud_memory
+                and cloud_memory is not None
+                and hasattr(cloud_memory, "for_message")
+            ):
                 try:
+                    cloud_kwargs = {"recall": False}
+                    if query_vector is not None and _supports_kwarg(
+                        cloud_memory.for_message, "query_vector"
+                    ):
+                        cloud_kwargs["query_vector"] = query_vector
                     mem = await asyncio.to_thread(
                         cloud_memory.for_message,
                         audience,
                         query,
-                        recall=False,
+                        **cloud_kwargs,
                     )
                     if isinstance(mem, dict) and mem:
                         for key in _CHAT_CLOUD_KEYS:
@@ -661,11 +1050,30 @@ class MemoryHub:
                         type(exc).__name__,
                     )
 
+            owner_mem = self._owner_memory()
+            if owner_mem is not None and hasattr(owner_mem, "recall"):
+                if self._bg_tasks:
+                    await self.drain_background_writes(max_wait=1.0)
+                try:
+                    om_hits = await owner_mem.recall(
+                        query or "语音伴随",
+                        query_vector=query_vector,
+                        limit=3,
+                        now=ts,
+                    )
+                    if om_hits:
+                        out["owner_memories"] = om_hits
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_owner_memory_recall_failed mode=voice exc=%s",
+                        type(exc).__name__,
+                    )
+
             self._recalls += 1
             return out
 
         if mode == "screen":
-            if not self._is_verified_private_owner(audience):
+            if not cap.can_read_owner_private:
                 return {}
             assert audience is not None
             out = {}
@@ -695,12 +1103,31 @@ class MemoryHub:
                         type(exc).__name__,
                     )
 
+            owner_mem = self._owner_memory()
+            if owner_mem is not None and hasattr(owner_mem, "recall"):
+                if self._bg_tasks:
+                    await self.drain_background_writes(max_wait=1.0)
+                try:
+                    om_hits = await owner_mem.recall(
+                        query,
+                        query_vector=query_vector,
+                        limit=2,
+                        now=ts,
+                    )
+                    if om_hits:
+                        out["owner_memories"] = om_hits
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_owner_memory_recall_failed mode=screen exc=%s",
+                        type(exc).__name__,
+                    )
+
             self._recalls += 1
             return out
 
         if mode == "planner":
             if audience is not None:
-                if not self._is_verified_private_owner(audience):
+                if not cap.can_read_owner_private:
                     return {}
                 targets = [(audience.platform, audience, False)]
             else:
@@ -763,6 +1190,24 @@ class MemoryHub:
                     self.s,
                     max_tokens=120 if len(summaries) > 1 else 80,
                 )
+            owner_mem = self._owner_memory()
+            if owner_mem is not None and hasattr(owner_mem, "recall"):
+                if self._bg_tasks:
+                    await self.drain_background_writes(max_wait=1.0)
+                try:
+                    om_hits = await owner_mem.recall(
+                        query,
+                        query_vector=query_vector,
+                        limit=3,
+                        now=ts,
+                    )
+                    if om_hits:
+                        out["owner_memories"] = om_hits
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_owner_memory_recall_failed mode=planner exc=%s",
+                        type(exc).__name__,
+                    )
             self._recalls += 1
             return out
 

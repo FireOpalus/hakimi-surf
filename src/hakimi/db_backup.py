@@ -40,9 +40,15 @@ LOCAL_SESSIONS_SUFFIX = ".tar.gz.enc"
 DRIVE_SESSIONS_PREFIX = "hakimi-sessions-"
 DRIVE_SESSIONS_SUFFIX = ".tar.gz.enc"
 DRIVE_SESSIONS_PROP = "hakimi_sessions_backup"
+LOCAL_OWNER_MEMORY_PREFIX = "hakimi-owner-memory-"
+LOCAL_OWNER_MEMORY_SUFFIX = ".sqlite3.gz.enc"
+DRIVE_OWNER_MEMORY_PREFIX = "hakimi-owner-memory-"
+DRIVE_OWNER_MEMORY_SUFFIX = ".sqlite3.gz.enc"
+DRIVE_OWNER_MEMORY_PROP = "hakimi_owner_memory_backup"
 
 _LOCAL_BACKUP_RE = re.compile(r"^hakimi-backup-(\d{4}-\d{2}-\d{2})\.sqlite3\.gz\.enc$")
 _LOCAL_SESSIONS_RE = re.compile(r"^hakimi-sessions-(\d{4}-\d{2}-\d{2})\.tar\.gz\.enc$")
+_LOCAL_OWNER_MEMORY_RE = re.compile(r"^hakimi-owner-memory-(\d{4}-\d{2}-\d{2})\.sqlite3\.gz\.enc$")
 
 log = logging.getLogger("hakimi")
 
@@ -261,10 +267,7 @@ class SessionsBackupCollection:
     ) -> tuple[str, list[str]]:
         await self._drive.validate_folder()
         files = await self._list()
-        remote_name = (
-            f"{DRIVE_SESSIONS_PREFIX}{date.fromisoformat(day_str).isoformat()}"
-            f"{DRIVE_SESSIONS_SUFFIX}"
-        )
+        remote_name = self._remote_name(day_str)
         matches = [item for item in files if item.get("name") == remote_name]
         file_id = await self._drive.write_listed(
             remote_name,
@@ -288,6 +291,27 @@ class SessionsBackupCollection:
                 await self._delete(item_id, item_name, expected=item)
                 pruned_drive.append(item_name)
         return file_id, pruned_drive
+
+    @staticmethod
+    def _remote_name(day_str: str) -> str:
+        return (
+            f"{DRIVE_SESSIONS_PREFIX}{date.fromisoformat(day_str).isoformat()}"
+            f"{DRIVE_SESSIONS_SUFFIX}"
+        )
+
+
+class OwnerMemoryBackupCollection(SessionsBackupCollection):
+    """Date-keyed, encrypted Zone 2 owner_memory.sqlite3 backups in one scoped Drive folder."""
+
+    property_name = DRIVE_OWNER_MEMORY_PROP
+    names = _LOCAL_OWNER_MEMORY_RE
+
+    @staticmethod
+    def _remote_name(day_str: str) -> str:
+        return (
+            f"{DRIVE_OWNER_MEMORY_PREFIX}{date.fromisoformat(day_str).isoformat()}"
+            f"{DRIVE_OWNER_MEMORY_SUFFIX}"
+        )
 
 
 def _atomic_write_private(target: Path, data: bytes) -> None:
@@ -340,6 +364,13 @@ class DatabaseBackup:
             if drive
             else None
         )
+        self.owner_memory_drive = (
+            OwnerMemoryBackupCollection(
+                drive, store.vault.digest("owner-memory-backup", settings.namespace)
+            )
+            if drive
+            else None
+        )
         self.transfer = transfer
         self.interval_seconds = interval_seconds
         self.keep_days = max(1, int(keep_days))
@@ -357,6 +388,7 @@ class DatabaseBackup:
         self._lock = asyncio.Lock()
         self._main_drive_synced_day: str | None = None
         self._sessions_drive_synced_day: str | None = None
+        self._owner_memory_drive_synced_day: str | None = None
         self._drive_retry_day: str | None = None
         self._drive_retry_failures: int = 0
         self._next_drive_retry_at: float = 0.0
@@ -375,6 +407,16 @@ class DatabaseBackup:
 
     def _has_session_dbs(self) -> bool:
         return bool(self._collect_session_dbs())
+
+    def _owner_memory_db_path(self) -> Path | None:
+        candidate = Path(self.s.data_dir) / "owner_memory.sqlite3"
+        if not candidate.exists() or candidate.is_symlink():
+            return None
+        try:
+            st = candidate.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        return candidate if stat.S_ISREG(st.st_mode) else None
 
     def _record_drive_failure(self, day_str: str, ts: float) -> None:
         if self._drive_retry_day != day_str:
@@ -410,7 +452,12 @@ class DatabaseBackup:
                 and self._has_session_dbs()
                 and self._sessions_drive_synced_day != day_str
             )
-            if main_pending or sessions_pending:
+            owner_mem_pending = (
+                self.owner_memory_drive is not None
+                and self._owner_memory_db_path() is not None
+                and self._owner_memory_drive_synced_day != day_str
+            )
+            if main_pending or sessions_pending or owner_mem_pending:
                 if self._drive_retry_day == day_str and ts < self._next_drive_retry_at:
                     return False
                 return True
@@ -565,6 +612,48 @@ class DatabaseBackup:
         }
         return summary, enc_bytes
 
+    def _create_owner_memory_backup(
+        self, day_str: str, cutoff_date: date
+    ) -> tuple[dict[str, Any] | None, bytes | None]:
+        backups_dir = self.backup_dir
+        backups_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(backups_dir, 0o700)
+        pruned_local = self._prune_local_pattern(backups_dir, _LOCAL_OWNER_MEMORY_RE, cutoff_date)
+        db_path = self._owner_memory_db_path()
+        if db_path is None:
+            return None, None
+
+        tmp_snapshot = backups_dir / f".owner-mem-{day_str}-{uuid.uuid4().hex}.sqlite3"
+        try:
+            conn = sqlite3.connect(db_path, timeout=10.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=10000")
+                conn.execute("VACUUM INTO ?", (str(tmp_snapshot),))
+            finally:
+                conn.close()
+            verify_sqlite_integrity(tmp_snapshot)
+            raw_bytes = tmp_snapshot.read_bytes()
+        finally:
+            tmp_snapshot.unlink(missing_ok=True)
+
+        gz_bytes = gzip.compress(raw_bytes, mtime=0)
+        enc_bytes = encrypt_backup_bytes(gz_bytes, self.s.encryption_key.get_secret_value())
+        final_path = (
+            backups_dir / f"{LOCAL_OWNER_MEMORY_PREFIX}{day_str}{LOCAL_OWNER_MEMORY_SUFFIX}"
+        )
+        _atomic_write_private(final_path, enc_bytes)
+        summary: dict[str, Any] = {
+            "day": day_str,
+            "path": str(final_path),
+            "filename": final_path.name,
+            "raw_bytes": len(raw_bytes),
+            "gzip_bytes": len(gz_bytes),
+            "encrypted_bytes": len(enc_bytes),
+            "sha256": hashlib.sha256(enc_bytes).hexdigest(),
+            "pruned_local": pruned_local,
+        }
+        return summary, enc_bytes
+
     async def _sync_drive_backup(self, day_str, cutoff_date, enc_bytes):
         if len(enc_bytes) > MAX_BACKUP_UPLOAD_BYTES:
             raise Rejected("db_backup_too_large")
@@ -579,6 +668,13 @@ class DatabaseBackup:
             raise Rejected("drive_unavailable")
         return await self.sessions_drive.sync_day(day_str, cutoff_date, enc_bytes)
 
+    async def _sync_owner_memory_drive_backup(self, day_str, cutoff_date, enc_bytes):
+        if len(enc_bytes) > MAX_BACKUP_UPLOAD_BYTES:
+            raise Rejected("owner_memory_backup_too_large")
+        if self.owner_memory_drive is None:
+            raise Rejected("drive_unavailable")
+        return await self.owner_memory_drive.sync_day(day_str, cutoff_date, enc_bytes)
+
     @staticmethod
     def _error_label(exc: Exception) -> str:
         return str(exc) if isinstance(exc, Rejected) else type(exc).__name__
@@ -588,6 +684,14 @@ class DatabaseBackup:
             return True
         sessions_file = self.backup_dir / f"{LOCAL_SESSIONS_PREFIX}{day_str}{LOCAL_SESSIONS_SUFFIX}"
         return sessions_file.exists() and sessions_file.stat().st_size > 0
+
+    def _local_owner_memory_ready(self, day_str: str) -> bool:
+        if self._owner_memory_db_path() is None:
+            return True
+        om_file = (
+            self.backup_dir / f"{LOCAL_OWNER_MEMORY_PREFIX}{day_str}{LOCAL_OWNER_MEMORY_SUFFIX}"
+        )
+        return om_file.exists() and om_file.stat().st_size > 0
 
     async def _hydrate_drive_sync_state(self, now: float) -> None:
         if self._drive_state_hydrated or not self._drive_upload_enabled():
@@ -618,6 +722,9 @@ class DatabaseBackup:
         if self._sessions_drive_synced_day is None:
             if await asyncio.to_thread(self._local_sessions_ready, today_str):
                 self._sessions_drive_synced_day = synced_day
+        if self._owner_memory_drive_synced_day is None:
+            if await asyncio.to_thread(self._local_owner_memory_ready, today_str):
+                self._owner_memory_drive_synced_day = synced_day
 
     async def snapshot_once(self, now: float | None = None, upload_drive: bool = True) -> dict:
         """Create a verified encrypted SQLite snapshot and optionally sync it to Google Drive."""
@@ -649,6 +756,19 @@ class DatabaseBackup:
                 sessions_local_exc = exc
                 log.warning("event=sessions_backup_local_failed reason=%s", self._error_label(exc))
 
+            owner_mem_local_exc: Exception | None = None
+            owner_mem_summary: dict[str, Any] | None = None
+            owner_mem_enc: bytes | None = None
+            try:
+                owner_mem_summary, owner_mem_enc = await asyncio.to_thread(
+                    self._create_owner_memory_backup, day_str, cutoff_date
+                )
+            except Exception as exc:
+                owner_mem_local_exc = exc
+                log.warning(
+                    "event=owner_memory_backup_local_failed reason=%s", self._error_label(exc)
+                )
+
             drive_uploaded = False
             drive_file_id: str | None = None
             pruned_drive: list[str] = []
@@ -659,6 +779,12 @@ class DatabaseBackup:
             sess_pruned_drive: list[str] = []
             sess_skip_reason: str | None = None
             sessions_drive_exc: Exception | None = None
+
+            om_uploaded = False
+            om_file_id: str | None = None
+            om_pruned_drive: list[str] = []
+            om_skip_reason: str | None = None
+            owner_mem_drive_exc: Exception | None = None
 
             drive_enabled = upload_drive and self.s.roaming_enabled
             want_main_drive = bool(
@@ -676,9 +802,21 @@ class DatabaseBackup:
                         )
                     else:
                         want_sessions_drive = True
+            want_owner_mem_drive = False
+            if owner_mem_summary is not None and owner_mem_enc is not None:
+                if drive_enabled and self.owner_memory_drive is not None:
+                    if len(owner_mem_enc) > MAX_BACKUP_UPLOAD_BYTES:
+                        om_skip_reason = "owner_memory_backup_too_large"
+                        log.warning(
+                            "event=owner_memory_backup_too_large bytes=%d limit=%d",
+                            len(owner_mem_enc),
+                            MAX_BACKUP_UPLOAD_BYTES,
+                        )
+                    else:
+                        want_owner_mem_drive = True
 
             transfer_exc: Exception | None = None
-            if want_main_drive or want_sessions_drive:
+            if want_main_drive or want_sessions_drive or want_owner_mem_drive:
                 self._drive_state_hydrated = True
                 try:
                     async with self.transfer():
@@ -711,14 +849,34 @@ class DatabaseBackup:
                                     self._error_label(exc),
                                 )
 
+                        if want_owner_mem_drive and owner_mem_enc is not None:
+                            try:
+                                (
+                                    om_file_id,
+                                    om_pruned_drive,
+                                ) = await self._sync_owner_memory_drive_backup(
+                                    day_str, cutoff_date, owner_mem_enc
+                                )
+                                om_uploaded = True
+                            except Exception as exc:
+                                owner_mem_drive_exc = exc
+                                log.warning(
+                                    "event=owner_memory_backup_drive_failed reason=%s",
+                                    self._error_label(exc),
+                                )
+
                         if main_drive_exc is not None:
                             raise main_drive_exc
                         if sessions_drive_exc is not None:
                             raise sessions_drive_exc
+                        if owner_mem_drive_exc is not None:
+                            raise owner_mem_drive_exc
                         if main_local_exc is not None:
                             raise main_local_exc
                         if sessions_local_exc is not None:
                             raise sessions_local_exc
+                        if owner_mem_local_exc is not None:
+                            raise owner_mem_local_exc
                 except Exception as exc:
                     transfer_exc = exc
 
@@ -741,6 +899,17 @@ class DatabaseBackup:
                     else None
                 )
             summary["sessions_backup"] = sessions_summary
+            if owner_mem_summary is not None:
+                owner_mem_summary["drive_uploaded"] = om_uploaded
+                owner_mem_summary["drive_file_id"] = om_file_id
+                owner_mem_summary["pruned_drive"] = om_pruned_drive
+                owner_mem_summary["drive_skipped_reason"] = om_skip_reason
+                owner_mem_summary["drive_error"] = (
+                    self._error_label(owner_mem_drive_exc)
+                    if owner_mem_drive_exc is not None
+                    else None
+                )
+            summary["owner_memory_backup"] = owner_mem_summary
             self.last_summary = summary
 
             if drive_enabled and self.drive is not None:
@@ -755,12 +924,23 @@ class DatabaseBackup:
                     self._sessions_drive_synced_day = day_str
                 elif sessions_local_exc is not None and self._sessions_drive_synced_day == day_str:
                     self._sessions_drive_synced_day = None
+                if want_owner_mem_drive:
+                    self._owner_memory_drive_synced_day = day_str if om_uploaded else None
+                elif om_skip_reason == "owner_memory_backup_too_large":
+                    self._owner_memory_drive_synced_day = day_str
+                elif (
+                    owner_mem_local_exc is not None
+                    and self._owner_memory_drive_synced_day == day_str
+                ):
+                    self._owner_memory_drive_synced_day = None
                 if (
                     transfer_exc is not None
                     or main_drive_exc is not None
                     or sessions_drive_exc is not None
+                    or owner_mem_drive_exc is not None
                     or main_local_exc is not None
                     or sessions_local_exc is not None
+                    or owner_mem_local_exc is not None
                 ):
                     self._record_drive_failure(day_str, ts)
                 else:
@@ -772,6 +952,8 @@ class DatabaseBackup:
                 raise main_local_exc
             if sessions_local_exc is not None:
                 raise sessions_local_exc
+            if owner_mem_local_exc is not None:
+                raise owner_mem_local_exc
             return summary
 
     async def run(self) -> None:

@@ -8,6 +8,7 @@ import logging
 import math
 import random
 import time
+import uuid
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
@@ -54,6 +55,7 @@ from .world_state import (
     MilestoneEvent,
     PrivateEventScope,
     _check_no_prewritten_speech,
+    _sanitize_payload,
     private_event_for_owner,
 )
 
@@ -121,6 +123,9 @@ class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
     sleep_min_minutes: int = Field(default=360, ge=120, le=960)
     sleep_max_minutes: int = Field(default=480, ge=180, le=960)
     max_proactive_per_day: int = Field(default=6, ge=0, le=30)
+    max_owner_proactive_per_day: int | None = Field(default=None, ge=0, le=30)
+    max_group_proactive_per_day: int | None = Field(default=None, ge=0, le=30)
+    resonance_enabled: bool = True
 
     module_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
@@ -1068,11 +1073,17 @@ class GatekeeperWorker:
             )
             return int(cur.rowcount or 0)
 
-    def quota_for(self, spec, scope):
+    def _is_owner_scope(self, scope: str) -> bool:
+        if not scope:
+            return False
         selected = getattr(self.service, "proactive", None)
-        owner = is_verified_owner_scope(scope, self.s) or bool(
-            selected is not None and selected.external_scope(scope)
+        return bool(
+            is_verified_owner_scope(scope, self.s)
+            or (selected is not None and selected.external_scope(scope))
         )
+
+    def quota_for(self, spec, scope):
+        owner = self._is_owner_scope(scope)
         return next((rule for rule in spec.quota_rules() if not rule.owner_only or owner), None)
 
     def is_unlimited(self, spec, rule, cfg):
@@ -1086,8 +1097,8 @@ class GatekeeperWorker:
             usage, _ = await self._usage_tx(now, cfg)
             return usage
 
-    async def _usage_tx(self, now, cfg):
-        """Caller owns the SQLite lock. Settled usage and live reservations share a snapshot."""
+    async def _usage_breakdown_tx(self, now, cfg):
+        """Caller owns the SQLite lock. Returns (usage, total_held, audience_buckets)."""
         start, end = _day_bounds(now, self.s.bot_timezone)
         catalog = self.engine.catalog
         usage = {
@@ -1098,6 +1109,14 @@ class GatekeeperWorker:
         }
         usage.update(total=0, counted=0)
         reserved = 0
+        buckets = {
+            "owner_settled": 0,
+            "owner_held": 0,
+            "group_settled": 0,
+            "group_held": 0,
+            "other_settled": 0,
+            "other_held": 0,
+        }
         rows = await self.store.all(
             "SELECT action_name,target_module,action_type,target_scope,COUNT(*) AS n,"
             "SUM(status='executing') AS held FROM scheduled_intents "
@@ -1109,15 +1128,23 @@ class GatekeeperWorker:
         for row in rows:
             name = row["action_name"] or catalog.old_name(row)
             spec = catalog.get(name)
-            settled = row["n"] - row["held"]
+            held_n = int(row["held"] or 0)
+            settled = int(row["n"] or 0) - held_n
+            scope = str(row["target_scope"] or "")
             if not spec:
                 # Preserve historical deliveries from actions no longer registered.
-                if row["target_scope"]:
+                if scope:
                     usage["total"] += settled
                     usage["counted"] += settled
-                    reserved += row["held"]
+                    reserved += held_n
+                    if self._is_owner_scope(scope):
+                        buckets["owner_settled"] += settled
+                        buckets["owner_held"] += held_n
+                    else:
+                        buckets["group_settled"] += settled
+                        buckets["group_held"] += held_n
                 continue
-            rule = self.quota_for(spec, row["target_scope"])
+            rule = self.quota_for(spec, scope)
             if rule is None:
                 continue
             usage["total"] += settled
@@ -1125,8 +1152,97 @@ class GatekeeperWorker:
                 usage[rule.counter] += settled
             if not self.is_unlimited(spec, rule, cfg):
                 usage["counted"] += settled
-                reserved += row["held"]
+                reserved += held_n
+                if spec.social:
+                    if self._is_owner_scope(scope):
+                        buckets["owner_settled"] += settled
+                        buckets["owner_held"] += held_n
+                    else:
+                        buckets["group_settled"] += settled
+                        buckets["group_held"] += held_n
+                else:
+                    buckets["other_settled"] += settled
+                    buckets["other_held"] += held_n
+        return usage, reserved, buckets
+
+    async def _usage_tx(self, now, cfg):
+        """Caller owns the SQLite lock. Settled usage and live reservations share a snapshot."""
+        usage, reserved, _ = await self._usage_breakdown_tx(now, cfg)
         return usage, reserved
+
+    def _audience_quota_counts(
+        self,
+        spec,
+        scope: str,
+        cfg: LifeEngineConfig,
+        usage: dict[str, int],
+        reserved: int,
+        buckets: dict[str, int],
+    ) -> tuple[int, int, int]:
+        """Return (settled, held, limit) for (spec, scope) with decoupled Owner/Group budgets."""
+        owner_cap = cfg.max_owner_proactive_per_day
+        group_cap = cfg.max_group_proactive_per_day
+        if owner_cap is None and group_cap is None:
+            return usage["counted"], reserved, cfg.max_proactive_per_day
+        is_owner = bool(spec.social and self._is_owner_scope(scope))
+        is_group = bool(spec.social and not is_owner)
+        if is_owner:
+            if owner_cap is not None:
+                return buckets["owner_settled"], buckets["owner_held"], owner_cap
+            # Group has its own dedicated budget; Owner shares only non-group pool.
+            return (
+                buckets["owner_settled"] + buckets["other_settled"],
+                buckets["owner_held"] + buckets["other_held"],
+                cfg.max_proactive_per_day,
+            )
+        if is_group:
+            if group_cap is not None:
+                return buckets["group_settled"], buckets["group_held"], group_cap
+            # Owner has its own dedicated budget; Group shares only non-owner pool.
+            return (
+                buckets["group_settled"] + buckets["other_settled"],
+                buckets["group_held"] + buckets["other_held"],
+                cfg.max_proactive_per_day,
+            )
+        # Non-social metered actions share the general pool minus decoupled social buckets.
+        settled = buckets["other_settled"]
+        held = buckets["other_held"]
+        if owner_cap is None:
+            settled += buckets["owner_settled"]
+            held += buckets["owner_held"]
+        if group_cap is None:
+            settled += buckets["group_settled"]
+            held += buckets["group_held"]
+        return settled, held, cfg.max_proactive_per_day
+
+    async def audience_quota_status(
+        self,
+        scope: str,
+        now: float,
+        cfg: LifeEngineConfig | None = None,
+        *,
+        action: str = "social.speak",
+    ) -> dict[str, int | bool]:
+        """Inspect effective settled/held/limit quota status for a target social scope."""
+        active_cfg = self.config if cfg is None else cfg
+        spec = self.engine.catalog.get(action)
+        if spec is None:
+            return {"allowed": False, "unlimited": False, "used": 0, "held": 0, "limit": 0}
+        rule = self.quota_for(spec, scope)
+        if rule is None or self.is_unlimited(spec, rule, active_cfg):
+            return {"allowed": True, "unlimited": True, "used": 0, "held": 0, "limit": 0}
+        async with self.store.lock:
+            usage, reserved, buckets = await self._usage_breakdown_tx(now, active_cfg)
+        settled, held, limit = self._audience_quota_counts(
+            spec, scope, active_cfg, usage, reserved, buckets
+        )
+        return {
+            "allowed": (settled + held) < limit,
+            "unlimited": False,
+            "used": settled,
+            "held": held,
+            "limit": limit,
+        }
 
     async def daily_limit_allows(
         self, action: str, scope: str, now: float, cfg: LifeEngineConfig, *, settled_only=False
@@ -1138,8 +1254,11 @@ class GatekeeperWorker:
         if rule is None or self.is_unlimited(spec, rule, cfg):
             return True
         async with self.store.lock:
-            usage, held = await self._usage_tx(now, cfg)
-        return usage["counted"] + (0 if settled_only else held) < cfg.max_proactive_per_day
+            usage, reserved, buckets = await self._usage_breakdown_tx(now, cfg)
+        settled, held, limit = self._audience_quota_counts(
+            spec, scope, cfg, usage, reserved, buckets
+        )
+        return settled + (0 if settled_only else held) < limit
 
     async def quota_gate_tx(self, ticket, now):
         try:
@@ -1150,10 +1269,13 @@ class GatekeeperWorker:
         rule = self.quota_for(spec, ticket["target_scope"])
         if rule is None or self.is_unlimited(spec, rule, cfg):
             return GateDecision()
-        usage, held = await self._usage_tx(now, cfg)
-        if usage["counted"] >= cfg.max_proactive_per_day:
+        usage, reserved, buckets = await self._usage_breakdown_tx(now, cfg)
+        settled, held, limit = self._audience_quota_counts(
+            spec, ticket["target_scope"], cfg, usage, reserved, buckets
+        )
+        if settled >= limit:
             return GateDecision("daily_proactive_limit")
-        if usage["counted"] + held >= cfg.max_proactive_per_day:
+        if settled + held >= limit:
             # A running action may yet be proven unsent and release its reservation.
             return GateDecision("daily_capacity_reserved", delay=60)
         return GateDecision()
@@ -1181,6 +1303,8 @@ class GatekeeperWorker:
             return "deferred"
 
         await self.engine.compare_shadow(ticket)
+        if ticket.get("origin") == "resonance" and not cfg.resonance_enabled:
+            return await reject("resonance_disabled")
         try:
             spec, _ = self.engine.resolve(ticket)
         except ValueError as exc:
@@ -1308,6 +1432,10 @@ class JITExecutor:
                     local = datetime.fromtimestamp(current, _zone(self.s.bot_timezone))
                     return (
                         self.engine.config.enabled
+                        and (
+                            ticket.get("origin") != "resonance"
+                            or self.engine.config.resonance_enabled
+                        )
                         and not self.engine.catalog.inactive_reason(
                             self.engine.catalog.owners[spec.name]
                         )
@@ -1425,6 +1553,7 @@ class LifeEngine:
         self._gate_lock = asyncio.Lock()
         self._background: dict[str, asyncio.Task] = {}
         self._session_exit_attempts: dict[str, float] = {}
+        self._immediate_gate: bool = False
         self.wakeup = asyncio.Event()
         self.planner = LifeBlockPlanner(service, self, clock=self.clock, rng=self.rng)
         self.gatekeeper = GatekeeperWorker(service, self, clock=self.clock)
@@ -1600,9 +1729,12 @@ class LifeEngine:
         return result
 
     def resolve(self, ticket: dict, *, admin: bool = False):
-        if (ticket.get("origin") == "admin") != admin:
+        origin = ticket.get("origin")
+        if (origin == "admin") != admin:
             raise ValueError("action_origin_forbidden")
-        spec = self.catalog.resolve(ticket)
+        is_resonance = origin == "resonance"
+        catalog_ticket = {**ticket, "origin": "rule"} if is_resonance else ticket
+        spec = self.catalog.resolve(catalog_ticket)
         source = self.service.modules.get(ticket.get("source_module", ""))
         if source and source.inactive_reason:
             raise ValueError(source.inactive_reason)
@@ -1610,13 +1742,15 @@ class LifeEngine:
         if mode == "off":
             raise ValueError("action_disabled")
         if mode in {"legacy", "shadow"}:
-            spec = self.catalog.resolve(ticket, compatibility=True)
+            spec = self.catalog.resolve(catalog_ticket, compatibility=True)
         recipient = ticket.get("target_scope", "")
         selected = getattr(self.service, "proactive", None)
+        verified_owner = False
         if recipient.startswith(("owner:", "boundowner:")):
             matched = resolve_owner_scope(recipient, self.s)
             if matched is None:
                 raise ValueError("unauthorized_scope")
+            verified_owner = True
             plat, _ = matched
             owner_mod = self.catalog.owners.get(spec.name)
             mod_obj = self.service.modules.get(owner_mod) if owner_mod else None
@@ -1628,6 +1762,15 @@ class LifeEngine:
                     raise ValueError("unauthorized_scope")
         elif spec.owner_only:
             raise ValueError("unauthorized_scope")
+        if is_resonance:
+            if not spec.social:
+                raise ValueError("action_origin_forbidden")
+            if not verified_owner:
+                gate_cond = ticket.get("gate_condition")
+                if not (
+                    isinstance(gate_cond, dict) and gate_cond.get("untainted_public_share") is True
+                ):
+                    raise ValueError("action_origin_forbidden")
         if spec.social:
             scope = ticket["target_scope"]
             if self.service.modules.normalize_recipient(scope) != scope:
@@ -1636,15 +1779,113 @@ class LifeEngine:
                 raise ValueError("action_disabled")
         return spec, spec.arguments.model_validate(ticket.get("arguments", {}))
 
+    async def enqueue_resonance_intent(
+        self,
+        *,
+        action_name: str,
+        target_module: str,
+        target_scope: str,
+        action_type: str,
+        execute_after: float,
+        expire_at: float,
+        intent_note: str | dict[str, Any],
+        gate_condition: dict[str, Any],
+        dedupe_key: str,
+        mood: str = "",
+        source_module: str = "",
+        source_event_id: str = "",
+        arguments: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> str:
+        """Enqueue a verified untainted resonance social ticket (bypasses Planner taint wall)."""
+        if not self.config.enabled or not self.config.resonance_enabled:
+            raise ValueError("action_disabled")
+        ts = self.clock() if now is None else float(now)
+        # Validate fields strictly through IntentTicketCreate (anti-prewritten-speech & bounds).
+        validated = IntentTicketCreate(
+            action_name=action_name,
+            target_module=target_module,
+            target_scope=target_scope,
+            action_type=action_type,
+            arguments=arguments or {},
+            origin="rule",
+            source_module=source_module,
+            source_event_id=source_event_id,
+            dedupe_key=dedupe_key,
+            execute_after=execute_after,
+            expire_at=expire_at,
+            mood=mood,
+            gate_condition=gate_condition,
+            intent_note=intent_note,
+        )
+        # Enforce resonance origin rules (social-only; groups require untainted_public_share=True).
+        resonance_ticket = {**validated.model_dump(), "origin": "resonance"}
+        self.resolve(resonance_ticket)
+
+        async with self.store.transaction():
+            if validated.dedupe_key:
+                existing = await self.store.one(
+                    "SELECT id FROM scheduled_intents WHERE dedupe_key=?",
+                    (validated.dedupe_key,),
+                )
+                if existing:
+                    return str(existing[0])
+            intent_id = uuid.uuid4().hex
+            gate_json = json.dumps(
+                _sanitize_payload(validated.gate_condition, self.s),
+                ensure_ascii=False,
+            )
+            if isinstance(validated.intent_note, dict):
+                note_obj: dict[str, Any] = _sanitize_payload(validated.intent_note, self.s)
+            elif validated.intent_note:
+                note_obj = {"note": sanitize_sensor_text(validated.intent_note, self.s)}
+            else:
+                note_obj = {}
+            note_json = json.dumps(note_obj, ensure_ascii=False)
+            args_json = json.dumps(
+                _sanitize_payload(validated.arguments, self.s), ensure_ascii=False
+            )
+            await self.store.db.execute(
+                "INSERT INTO scheduled_intents(id,created_at,execute_after,expire_at,target_module,"
+                "target_scope,action_type,mood,gate_condition_json,intent_note_json,updated_at,"
+                "action_name,arguments_json,origin,source_module,source_event_id,dedupe_key)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    intent_id,
+                    ts,
+                    validated.execute_after,
+                    validated.expire_at,
+                    validated.target_module,
+                    validated.target_scope,
+                    validated.action_type,
+                    validated.mood,
+                    gate_json,
+                    note_json,
+                    ts,
+                    validated.action_name,
+                    args_json,
+                    "resonance",
+                    validated.source_module,
+                    validated.source_event_id,
+                    validated.dedupe_key,
+                ),
+            )
+        self._immediate_gate = True
+        self.wakeup.set()
+        return intent_id
+
     async def compare_shadow(self, ticket: dict):
         raw_name = ticket.get("action_name") or self.catalog.old_name(ticket)
         name = self.catalog.canonical_name(raw_name) or raw_name
         if self.config.action_modes.get(name) != "shadow":
             return
+        catalog_ticket = (
+            {**ticket, "origin": "rule"} if ticket.get("origin") == "resonance" else ticket
+        )
         results = []
         for compat in (True, False):
             try:
-                spec = self.catalog.resolve(ticket, compatibility=compat)
+                spec = self.catalog.resolve(catalog_ticket, compatibility=compat)
                 spec.arguments.model_validate(ticket.get("arguments", {}))
                 results.append(spec.name)
             except ValueError as exc:
@@ -2112,7 +2353,8 @@ class LifeEngine:
                         await self.initialize()
                     now = self.clock()
                     if self.config.enabled:
-                        if now >= next_gate:
+                        if now >= next_gate or self._immediate_gate:
+                            self._immediate_gate = False
                             next_gate = now + 60
                             await self.tick_gatekeeper_once(now=now, wait=False)
                         if now >= self.planner.next_plan_at and "plan-work" not in self._background:

@@ -87,12 +87,13 @@ from .service_owner_actions import (
 from .service_turn import _ServiceTurnMixin
 from .session_manager import SessionManager
 from .session_scheduler import SessionScheduler
+from .share_resonance import ShareResonanceEngine
 from .social import chat_module
 from .social_presence import SocialPresenceModule
 from .store import Store
 from .system_modules import SystemResources, install_system_modules
 from .work_usage import model_work
-from .world_experience import SOCIAL_LOW
+from .world_experience import NON_MILESTONE_MC_ACTIONS, SOCIAL_LOW
 from .world_state import WorldStateManager
 
 log = logging.getLogger("hakimi")
@@ -116,6 +117,16 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         node_transport: NodeTransport | None = None,
     ):
         self.s, self.store, self.ai, self.sender = settings, store, gateway, sender
+        if (
+            gateway is not None
+            and getattr(gateway, "_owned", True) is False
+            and getattr(gateway, "_owned_embeddings", False) is True
+        ):
+            self.embedder = None
+        else:
+            self.embedder = getattr(gateway, "embeddings", None) or getattr(
+                gateway, "embedder", None
+            )
         # Older composition roots supplied their shared HTTP client on the sender.
         self.http = http if http is not None else getattr(sender, "http", None)
         self.node_transport = (
@@ -128,6 +139,7 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
             if node_transport is not None or getattr(self.bili, "node_transport", None) is None:
                 self.bili.node_transport = self.node_transport
         self.sessions = SessionManager(settings, store)
+        self.sessions.embedder = self.embedder
         self.hot = HotRing()
         store.runtime.hot_ring = self.hot
         store.runtime.filters.hot_ring = self.hot
@@ -169,6 +181,9 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         self._last_moderation_prune_at: float = 0.0
         self._last_heavy_retention_at: float = 0.0
         self._heavy_retention_interval: float = 3 * 3600.0
+        self._last_resonance_due_at: float = 0.0
+        self._last_embed_backfill_at: float = 0.0
+        self._resonance_slots = asyncio.Semaphore(2)
         self.modules = ModuleRegistry()
         settings._chat_registry = weakref.ref(self.modules)
         self.kernel = PluginKernel()
@@ -212,7 +227,18 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         self.identity = self.modules.systems["identity"].identity
         self.affection = self.modules.systems["affection"].manager
         self.memory_hub = self.modules.systems["memory_hub"].hub
+        self.owner_memory = self.modules.systems["memory_hub"].owner_memory
         self.compressor = self.modules.systems["memory_compressor"].compressor
+        if self.embedder is not None:
+            if hasattr(self.cloud_memory, "embedder"):
+                self.cloud_memory.embedder = self.embedder
+            if hasattr(self.compressor, "_embedder") and self.compressor._embedder is None:
+                self.compressor._embedder = self.embedder
+            if (
+                hasattr(self.sessions, "dual")
+                and getattr(self.sessions.dual, "_embedder", None) is None
+            ):
+                self.sessions.dual._embedder = self.embedder
         self.memes = self.modules.systems["meme_library"].library
         self.plugin_bus = self.modules.systems["plugin_bus"].plugin_bus
         self.images.plugin_bus = self.plugin_bus
@@ -233,6 +259,14 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         self.kernel.provide_core("plugin_bus", self.plugin_bus)
         self.world_state = WorldStateManager(settings, store, self.modules)
         self.world_state.subscribe(self._broadcast_world_event)
+        self.share_resonance = ShareResonanceEngine(
+            self,
+            embedder=self.embedder,
+            owner_memory=self.owner_memory,
+            dual_memory=self.sessions.dual,
+            owner_cloud_memory=self.cloud_memory,
+        )
+        self.world_state.subscribe(self._on_public_world_event_resonance)
         install_modules(self)
         self.modules.register(SocialPresenceModule(self))
         if (
@@ -270,6 +304,109 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
             return
         if pb := getattr(self, "plugin_bus", None):
             await pb.broadcast_world_event(event)
+
+    def _on_public_world_event_resonance(self, event: Any) -> None:
+        """Non-blocking tracked background trigger from public world events into ShareResonance."""
+        resonance = getattr(self, "share_resonance", None)
+        engine = getattr(self, "life_engine", None)
+        if resonance is None or engine is None:
+            return
+        cfg = getattr(engine, "config", None)
+        if cfg is None or not cfg.enabled or not getattr(cfg, "resonance_enabled", True):
+            return
+        if isinstance(event, dict):
+            payload = event.get("payload")
+            source = str(event.get("source_module") or "")
+            event_type = str(event.get("event_type") or "")
+            importance = str(event.get("importance") or "normal")
+            created_at = event.get("created_at")
+            event_id = str(event.get("id") or "")
+        else:
+            payload = getattr(event, "payload", None)
+            source = str(getattr(event, "source_module", "") or "")
+            event_type = str(getattr(event, "event_type", "") or "")
+            importance = str(getattr(event, "importance", "normal") or "normal")
+            created_at = getattr(event, "created_at", None)
+            event_id = str(getattr(event, "id", "") or "")
+
+        # Strict privacy filter: private/scoped events NEVER enter public resonance probing.
+        if not isinstance(payload, dict):
+            return
+        if payload.get("private_first") or payload.get("owner_private") or payload.get("audience"):
+            return
+        if event_type in {"life_block", "heartbeat", "status_sync"}:
+            return
+        if (
+            source == "minecraft"
+            and event_type == "mc_goal_completed"
+            and str(payload.get("action_type") or "").strip().lower() in NON_MILESTONE_MC_ACTIONS
+        ):
+            return
+
+        is_known_experience = (
+            payload.get("activity_kind") == "video_learning"
+            or event_type
+            in {
+                "bili_video_watched",
+                "mc_goal_completed",
+                "mc_rare_find",
+                "song_learned",
+                "patrol_diary_entry",
+                "patrol_summary",
+            }
+            or event_type.endswith(("_learned", "_discovered", "_milestone"))
+            or importance == "high"
+        )
+        if not is_known_experience:
+            return
+
+        title = str(
+            payload.get("title")
+            or payload.get("song_title")
+            or payload.get("topic")
+            or payload.get("block")
+            or ""
+        ).strip()
+        summary = str(payload.get("summary") or payload.get("detail") or title).strip()
+        if not (title or summary):
+            return
+        ref = str(
+            payload.get("bvid") or payload.get("ref") or payload.get("song_id") or event_id or ""
+        ).strip()
+        novelty = 0.75 if (importance == "high" or event_type == "mc_rare_find") else 0.55
+        if event_type == "bili_video_watched" and importance != "high":
+            novelty = 0.62
+        try:
+            now_ts = float(created_at) if created_at is not None else self.world_state.clock()
+        except (TypeError, ValueError):
+            now_ts = self.world_state.clock()
+
+        if len(self.background_tasks) >= 32:
+            return
+
+        async def _run_resonance() -> None:
+            async with self._resonance_slots:
+                try:
+                    await resonance.on_public_experience(
+                        source=source or "world",
+                        event_type=event_type or "experience",
+                        title=title or summary[:48],
+                        summary=summary,
+                        ref=ref,
+                        novelty=novelty,
+                        now=now_ts,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.record("share_resonance_error", emit_audit=False)
+
+        try:
+            task = asyncio.create_task(_run_resonance(), name="share-resonance-probe")
+        except RuntimeError:
+            return
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
 
     async def _relay_node_event(self, frame: dict[str, Any]) -> str:
         if not isinstance(frame, dict):
@@ -646,6 +783,21 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         if songs := getattr(self, "songs", None):
             if (sd := getattr(songs, "drive", None)) is not None and hasattr(sd, "close"):
                 await sd.close()
+        if mh := getattr(self, "memory_hub", None):
+            if hasattr(mh, "close"):
+                close_mh = mh.close()
+                if inspect.isawaitable(close_mh):
+                    await close_mh
+        if om := getattr(self, "owner_memory", None):
+            if hasattr(om, "close"):
+                close_om = om.close()
+                if inspect.isawaitable(close_om):
+                    await close_om
+        if cm := getattr(self, "cloud_memory", None):
+            if hasattr(cm, "close"):
+                close_cm = cm.close()
+                if inspect.isawaitable(close_cm):
+                    await close_cm
 
     async def command(self, message: Message) -> str | None:
         return await self.commands.dispatch(self, message)
@@ -1135,6 +1287,97 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         summary["wal_checkpoint"] = await self.store.wal_checkpoint("TRUNCATE")
         return summary
 
+    async def run_semantic_maintenance(
+        self,
+        now: float | None = None,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Rate-limited maintenance: due resonance shares, pruning, and bounded embed backfill."""
+        ts = time.time() if now is None else float(now)
+        summary: dict[str, Any] = {
+            "promoted": 0,
+            "pruned": 0,
+            "backfill_sessions": 0,
+            "backfill_owner": 0,
+            "backfill_cloud": 0,
+        }
+        resonance = getattr(self, "share_resonance", None)
+        engine = getattr(self, "life_engine", None)
+        res_enabled = bool(
+            engine is not None
+            and getattr(engine.config, "enabled", True)
+            and getattr(engine.config, "resonance_enabled", True)
+        )
+        if (
+            resonance is not None
+            and getattr(resonance, "ready", False)
+            and (force or (ts - self._last_resonance_due_at) >= 300.0)
+        ):
+            self._last_resonance_due_at = ts
+            try:
+                if res_enabled and not self.store.runtime.is_resting(ts):
+                    promoted = await resonance.pop_due_shares(now=ts, limit=2)
+                    summary["promoted"] = len(promoted)
+                summary["pruned"] = int(await resonance.prune(now=ts))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.record("share_resonance_maintenance_error", emit_audit=False)
+
+        embedder = getattr(self, "embedder", None)
+        if (
+            embedder is not None
+            and getattr(self.s, "embedding_enabled", True)
+            and (force or (ts - self._last_embed_backfill_at) >= 900.0)
+        ):
+            self._last_embed_backfill_at = ts
+            owner_mem = getattr(self, "owner_memory", None)
+            owner_mem_ready = bool(
+                owner_mem is not None
+                and getattr(owner_mem, "ready", getattr(owner_mem, "_initialized", False))
+            )
+            if (comp := getattr(self, "compressor", None)) is not None and hasattr(
+                comp, "run_backfill_pass"
+            ):
+                try:
+                    bf = await comp.run_backfill_pass(
+                        owner_memory=owner_mem if owner_mem_ready else None,
+                        session_limit=6,
+                        owner_limit=8,
+                    )
+                    summary["backfill_sessions"] = int(bf.get("sessions", 0) or 0)
+                    summary["backfill_owner"] = int(bf.get("owner_memory", 0) or 0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.record("embedding_backfill_error", emit_audit=False)
+            elif owner_mem is not None and owner_mem_ready:
+                try:
+                    summary["backfill_owner"] = int(
+                        await owner_mem.backfill_embeddings(embedder, limit=8)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.record("embedding_backfill_error", emit_audit=False)
+
+            cloud_mem = getattr(self, "cloud_memory", None)
+            if (
+                cloud_mem is not None
+                and getattr(self.s, "enable_antigravity_memory", False)
+                and hasattr(cloud_mem, "sync_embeddings")
+            ):
+                try:
+                    summary["backfill_cloud"] = int(
+                        await cloud_mem.sync_embeddings(embedder, limit=12)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.record("cloud_embedding_backfill_error", emit_audit=False)
+        return summary
+
     async def janitor(self):
         while True:
             await self.store.runtime.flush()
@@ -1148,6 +1391,7 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                 self._last_session_prune_at = now
             await self.proactive.prune()
             await self.world_state.experience.prune(now)
+            await self.run_semantic_maintenance(now)
             if now - self._last_heavy_retention_at >= self._heavy_retention_interval:
                 self._last_heavy_retention_at = now
                 try:

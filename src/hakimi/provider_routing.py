@@ -22,6 +22,11 @@ VERTEX_LOCATION_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 VERTEX_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 MAX_SERVICE_ACCOUNT_BYTES = 65536
+_VERTEX_EMBEDDING_REGION_FALLBACKS = {
+    "global": "us-central1",
+    "us": "us-central1",
+    "eu": "europe-west4",
+}
 
 
 def validate_service_account_json(raw: str) -> dict[str, Any]:
@@ -343,7 +348,29 @@ class ProviderRoutingManager:
             return "high"
         return self.config.default_private_privacy
 
+    def effective_vertex_embedding_location(self) -> str:
+        """Resolve a regional Vertex location for embedding models.
+
+        Multi-regional Vertex endpoints (``us``, ``eu``) return 404 on ``gemini-embedding-001``,
+        so non-regional values map to concrete regions unless explicitly overridden via Settings.
+        """
+        explicit = (getattr(self.s, "vertex_embedding_location", "") or "").strip()
+        fields_set = getattr(self.s, "model_fields_set", set())
+        if explicit and "vertex_embedding_location" in fields_set:
+            return explicit
+        loc = (self.config.vertex_location or "").strip().lower()
+        if loc in _VERTEX_EMBEDDING_REGION_FALLBACKS:
+            return _VERTEX_EMBEDDING_REGION_FALLBACKS[loc]
+        if loc and "-" in loc:
+            return loc
+        return explicit or "us-central1"
+
     def hydrogen_provider_for(self, message: Message | None = None) -> Literal["gemini", "vertex"]:
+        if self.config.vertex_enabled and self.has_vertex_credentials():
+            return "vertex"
+        return "gemini"
+
+    def embedding_provider(self) -> Literal["vertex", "gemini"]:
         if self.config.vertex_enabled and self.has_vertex_credentials():
             return "vertex"
         return "gemini"

@@ -24,6 +24,7 @@ class TokenUsage:
         "memory_flex",
         "neon_flex",
         "carbon_flex",
+        "embedding",
     ] = "interaction"
     thinking_level: ThinkingLevelValue | None = None
 
@@ -40,7 +41,10 @@ class TokenUsage:
                 raise ValueError("Invalid observed token count")
         if self.cached_tokens is not None and self.cached_tokens > self.input_tokens:
             raise ValueError("Cached tokens cannot exceed input tokens")
-        if self.model_lane != "interaction" and self.model_lane not in MODEL_LANES:
+        if (
+            self.model_lane not in {"interaction", "embedding"}
+            and self.model_lane not in MODEL_LANES
+        ):
             raise ValueError("Invalid model lane")
         if self.thinking_level is not None and self.thinking_level not in VALID_THINKING_LEVELS:
             raise ValueError("Invalid thinking level")
