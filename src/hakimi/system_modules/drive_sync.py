@@ -29,10 +29,15 @@ ERROR_LABELS = frozenset(
         "drive_oauth_client_invalid",
         "drive_etag_conflict",
         "drive_etag_required",
+        "drive_invalid_response",
+        "drive_response_too_large",
+        "drive_unavailable",
         "memory_mirror_local_conflict",
         "memory_mirror_unbound",
         "memory_mirror_remote_missing",
         "db_backup_too_large",
+        "db_backup_integrity_failed",
+        "sessions_backup_too_large",
     }
 )
 

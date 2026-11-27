@@ -22,7 +22,25 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 API = "https://www.googleapis.com/drive/v3/files"
 UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 FILE_FIELDS = "id,name,parents,mimeType,trashed,appProperties"
+VERSIONED_FILE_FIELDS = FILE_FIELDS + ",md5Checksum,version,headRevisionId"
 MAX_DIARY_UPLOAD_BYTES = 4_500_000
+
+
+def _normalize_v3_meta(meta: dict[str, Any]) -> tuple[str, str, str]:
+    md5 = ("" if meta.get("md5Checksum") is None else str(meta.get("md5Checksum"))).strip().lower()
+    ver = ("" if meta.get("version") is None else str(meta.get("version"))).strip()
+    rev = ("" if meta.get("headRevisionId") is None else str(meta.get("headRevisionId"))).strip()
+    return md5, ver, rev
+
+
+def _synthesize_v3_etag(meta: dict[str, Any]) -> str:
+    md5, ver, rev = _normalize_v3_meta(meta)
+    md5_ok = bool(re.fullmatch(r"[a-f0-9]{32}", md5))
+    ver_ok = bool(re.fullmatch(r"[0-9]{1,20}", ver))
+    rev_ok = bool(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", rev))
+    if not md5_ok or (ver and not ver_ok) or (rev and not rev_ok) or not (ver_ok or rev_ok):
+        raise Rejected("drive_etag_required")
+    return f"v3:{ver}:{rev}:{md5}"
 
 
 class DriveAuth:
@@ -230,6 +248,7 @@ class FolderDrive(DriveAuth):
             )
             if self.validate_owned_file(current, filename, mime_type, prop, marker) != file_id:
                 raise Rejected("drive_file_outside_scope")
+            etag = etag.strip() if isinstance(etag, str) else ""
             result, _ = await self._json(
                 "PATCH",
                 UPLOAD + "/" + file_id,
@@ -334,21 +353,7 @@ class FolderDrive(DriveAuth):
         self._validate_memory_file(meta, scope)
         etag = etag.strip() if isinstance(etag, str) else ""
         if not etag:
-            md5 = (
-                ("" if meta.get("md5Checksum") is None else str(meta.get("md5Checksum")))
-                .strip()
-                .lower()
-            )
-            ver = ("" if meta.get("version") is None else str(meta.get("version"))).strip()
-            rev = (
-                "" if meta.get("headRevisionId") is None else str(meta.get("headRevisionId"))
-            ).strip()
-            md5_ok = bool(re.fullmatch(r"[a-f0-9]{32}", md5))
-            ver_ok = bool(re.fullmatch(r"[0-9]{1,20}", ver))
-            rev_ok = bool(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", rev))
-            if not md5_ok or (ver and not ver_ok) or (rev and not rev_ok) or not (ver_ok or rev_ok):
-                raise Rejected("drive_etag_required")
-            etag = f"v3:{ver}:{rev}:{md5}"
+            etag = _synthesize_v3_etag(meta)
         return {
             "id": ident,
             "etag": etag,
@@ -441,6 +446,62 @@ class FolderDrive(DriveAuth):
             )
         return self._validate_memory_file(result, scope)
 
+    async def delete_owned_file(
+        self,
+        file_id: str,
+        filename: str,
+        mime_type: str,
+        prop: str,
+        marker: str,
+        *,
+        expected: dict[str, Any] | None = None,
+    ) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id):
+            raise Rejected("drive_file_outside_scope")
+        current, etag = await self._json(
+            "GET",
+            f"{API}/{file_id}",
+            params={"fields": VERSIONED_FILE_FIELDS, "supportsAllDrives": "true"},
+        )
+        if self.validate_owned_file(current, filename, mime_type, prop, marker) != file_id:
+            raise Rejected("drive_file_outside_scope")
+        etag = etag.strip() if isinstance(etag, str) else ""
+        if not etag:
+            _synthesize_v3_etag(current)
+            if expected is not None:
+                exp_md5, exp_ver, exp_rev = _normalize_v3_meta(expected)
+                cur_md5, cur_ver, cur_rev = _normalize_v3_meta(current)
+                if (
+                    (exp_md5 and exp_md5 != cur_md5)
+                    or (exp_ver and exp_ver != cur_ver)
+                    or (exp_rev and exp_rev != cur_rev)
+                ):
+                    raise Rejected("drive_etag_conflict")
+        elif expected is not None:
+            exp_md5, exp_ver, exp_rev = _normalize_v3_meta(expected)
+            cur_md5, cur_ver, cur_rev = _normalize_v3_meta(current)
+            if (
+                (exp_md5 and cur_md5 and exp_md5 != cur_md5)
+                or (exp_ver and cur_ver and exp_ver != cur_ver)
+                or (exp_rev and cur_rev and exp_rev != cur_rev)
+            ):
+                raise Rejected("drive_etag_conflict")
+        token = await self._access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        if etag:
+            headers["If-Match"] = etag
+        async with self.http.stream(
+            "DELETE",
+            f"{API}/{file_id}",
+            headers=headers,
+            params={"supportsAllDrives": "true"},
+            follow_redirects=False,
+        ) as response:
+            if response.status_code == 412:
+                raise Rejected("drive_etag_conflict")
+            if response.status_code not in {200, 204, 404}:
+                raise Rejected("drive_request_failed")
+
 
 class BackupCollection:
     """Date-keyed, encrypted snapshots in one folder and namespace."""
@@ -453,31 +514,19 @@ class BackupCollection:
             raise Rejected("drive_backup_marker_invalid")
         self._drive, self.marker = drive, marker
 
-    async def _delete(self, file_id: str, filename: str) -> None:
-        if not self.names.fullmatch(filename) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id):
+    async def _delete(
+        self, file_id: str, filename: str, expected: dict[str, Any] | None = None
+    ) -> None:
+        if not self.names.fullmatch(filename):
             raise Rejected("drive_file_outside_scope")
-        current, etag = await self._drive._json(
-            "GET", f"{API}/{file_id}", params={"fields": FILE_FIELDS, "supportsAllDrives": "true"}
+        await self._drive.delete_owned_file(
+            file_id,
+            filename,
+            "application/octet-stream",
+            self.property_name,
+            self.marker,
+            expected=expected,
         )
-        if (
-            self._drive.validate_owned_file(
-                current, filename, "application/octet-stream", self.property_name, self.marker
-            )
-            != file_id
-        ):
-            raise Rejected("drive_file_outside_scope")
-        if not etag:
-            raise Rejected("drive_etag_required")
-        token = await self._drive._access_token()
-        async with self._drive.http.stream(
-            "DELETE",
-            f"{API}/{file_id}",
-            headers={"Authorization": f"Bearer {token}", "If-Match": etag},
-            params={"supportsAllDrives": "true"},
-            follow_redirects=False,
-        ) as response:
-            if response.status_code not in {200, 204, 404}:
-                raise Rejected("drive_request_failed")
 
     async def _list(self) -> list[dict[str, Any]]:
         query = (
@@ -489,7 +538,7 @@ class BackupCollection:
         for _ in range(20):
             params: dict[str, str] = {
                 "q": query,
-                "fields": f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
+                "fields": f"nextPageToken,incompleteSearch,files({VERSIONED_FILE_FIELDS})",
                 "pageSize": "100",
                 "supportsAllDrives": "true",
                 "includeItemsFromAllDrives": "true",
@@ -549,7 +598,7 @@ class BackupCollection:
             except ValueError:
                 continue
             if item_date < cutoff_date and item_id != file_id:
-                await self._delete(item_id, item_name)
+                await self._delete(item_id, item_name, expected=item)
                 pruned_drive.append(item_name)
 
         return file_id, pruned_drive

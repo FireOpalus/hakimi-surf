@@ -4,7 +4,14 @@ import httpx
 import pytest
 from google.auth import jwt
 
-from hakimi.drive_client import API, SCOPE, TOKEN_URI, UPLOAD, FolderDrive
+from hakimi.drive_client import (
+    API,
+    SCOPE,
+    TOKEN_URI,
+    UPLOAD,
+    BackupCollection,
+    FolderDrive,
+)
 from hakimi.security import Rejected
 from tests.conftest import cached_rsa_private_key_pem
 
@@ -291,3 +298,193 @@ async def test_sync_day_allows_large_diary_up_to_4_5mb_and_rejects_excess(settin
         assert await drive.sync_day(DAY, "x" * 400_000) == FILE
         with pytest.raises(Rejected, match="drive_invalid_diary"):
             await drive.sync_day(DAY, "x" * (MAX_DIARY_UPLOAD_BYTES + 1))
+
+
+@pytest.mark.parametrize(
+    "v3_meta",
+    [
+        {
+            "md5Checksum": "0123456789abcdef0123456789ABCDEF",
+            "version": "9",
+            "headRevisionId": "rev_9",
+        },
+        {
+            "md5Checksum": "0123456789abcdef0123456789abcdef",
+            "version": "12",
+        },
+        {
+            "md5Checksum": "0123456789abcdef0123456789abcdef",
+            "headRevisionId": "rev-only_1",
+        },
+    ],
+)
+async def test_backup_collection_delete_v3_without_http_etag(settings, v3_meta):
+    from datetime import date
+
+    marker = "backup-marker"
+    old_name = "db-backup-2026-11-01.sqlite3.gz.enc"
+    new_name = "db-backup-2026-11-17.sqlite3.gz.enc"
+    old_item = {
+        "id": "old-backup-1",
+        "name": old_name,
+        "parents": [FOLDER],
+        "mimeType": "application/octet-stream",
+        "appProperties": {"hakimi_db_backup": marker},
+        "trashed": False,
+        **v3_meta,
+    }
+    new_item = {
+        "id": "new-backup-1",
+        "name": new_name,
+        "parents": [FOLDER],
+        "mimeType": "application/octet-stream",
+        "appProperties": {"hakimi_db_backup": marker},
+        "trashed": False,
+    }
+    deleted: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/drive/v3/files/{FOLDER}":
+            return httpx.Response(200, json=folder_info())
+        if request.method == "GET" and request.url.path == "/drive/v3/files":
+            fields = request.url.params["fields"]
+            assert "md5Checksum" in fields and "version" in fields and "headRevisionId" in fields
+            return httpx.Response(200, json={"files": [old_item]})
+        if request.method == "POST" and str(request.url).startswith(UPLOAD):
+            return httpx.Response(200, json=new_item)
+        if request.method == "GET" and request.url.path == "/drive/v3/files/old-backup-1":
+            fields = request.url.params["fields"]
+            assert "md5Checksum" in fields and "version" in fields and "headRevisionId" in fields
+            return httpx.Response(200, json=old_item)
+        if request.method == "DELETE" and request.url.path == "/drive/v3/files/old-backup-1":
+            assert "If-Match" not in request.headers
+            deleted.append(request)
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    drive, client = await drive_for(settings, handler)
+    async with client:
+        col = BackupCollection(drive, marker)
+        fid, pruned = await col.sync_day("2026-11-17", date(2026, 11, 11), b"encrypted")
+    assert fid == "new-backup-1"
+    assert pruned == [old_name]
+    assert len(deleted) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_meta",
+    [
+        {},
+        {"md5Checksum": "0123456789abcdef0123456789abcdef"},
+        {"version": "5", "headRevisionId": "rev1"},
+        {"md5Checksum": "not-an-md5", "version": "5"},
+        {"md5Checksum": "0123456789abcdef0123456789abcdef", "version": "abc"},
+        {
+            "md5Checksum": "0123456789abcdef0123456789abcdef",
+            "version": "5",
+            "headRevisionId": "bad:rev",
+        },
+    ],
+)
+async def test_backup_collection_delete_requires_etag_or_valid_v3_metadata(settings, bad_meta):
+    marker = "backup-marker"
+    old_name = "db-backup-2026-11-01.sqlite3.gz.enc"
+    delete_called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal delete_called
+        if request.method == "GET" and request.url.path == "/drive/v3/files/old-1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "old-1",
+                    "name": old_name,
+                    "parents": [FOLDER],
+                    "mimeType": "application/octet-stream",
+                    "appProperties": {"hakimi_db_backup": marker},
+                    "trashed": False,
+                    **bad_meta,
+                },
+            )
+        if request.method == "DELETE":
+            delete_called = True
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    drive, client = await drive_for(settings, handler)
+    async with client:
+        col = BackupCollection(drive, marker)
+        with pytest.raises(Rejected, match="drive_etag_required"):
+            await col._delete("old-1", old_name)
+    assert delete_called is False
+
+
+async def test_backup_collection_delete_etag_present_mismatch_and_v3_conflict(settings):
+    marker = "backup-marker"
+    old_name = "db-backup-2026-11-01.sqlite3.gz.enc"
+    base_item = {
+        "id": "old-1",
+        "name": old_name,
+        "parents": [FOLDER],
+        "mimeType": "application/octet-stream",
+        "appProperties": {"hakimi_db_backup": marker},
+        "trashed": False,
+    }
+    mode = {"case": "etag_412"}
+    delete_headers: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/drive/v3/files/old-1":
+            if mode["case"] == "etag_412":
+                return httpx.Response(200, json=base_item, headers={"ETag": '"v1"'})
+            if mode["case"] == "v3_conflict":
+                return httpx.Response(
+                    200,
+                    json={
+                        **base_item,
+                        "md5Checksum": "0123456789abcdef0123456789abcdef",
+                        "version": "2",
+                    },
+                )
+            if mode["case"] == "trashed":
+                return httpx.Response(
+                    200,
+                    json={
+                        **base_item,
+                        "trashed": True,
+                        "md5Checksum": "0123456789abcdef0123456789abcdef",
+                        "version": "1",
+                    },
+                )
+        if request.method == "DELETE":
+            delete_headers.append(dict(request.headers))
+            return httpx.Response(412)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    drive, client = await drive_for(settings, handler)
+    async with client:
+        col = BackupCollection(drive, marker)
+        # HTTP ETag returned -> If-Match sent, 412 surfaces as drive_etag_conflict.
+        with pytest.raises(Rejected, match="drive_etag_conflict"):
+            await col._delete("old-1", old_name)
+        assert len(delete_headers) == 1 and delete_headers[0]["if-match"] == '"v1"'
+
+        # Drive v3 metadata changed since listing -> conflict raised before DELETE.
+        mode["case"] = "v3_conflict"
+        with pytest.raises(Rejected, match="drive_etag_conflict"):
+            await col._delete(
+                "old-1",
+                old_name,
+                expected={
+                    **base_item,
+                    "md5Checksum": "0123456789abcdef0123456789abcdef",
+                    "version": "1",
+                },
+            )
+        assert len(delete_headers) == 1
+
+        # Trashed file rejected before DELETE.
+        mode["case"] = "trashed"
+        with pytest.raises(Rejected, match="drive_file_outside_scope"):
+            await col._delete("old-1", old_name)
+        assert len(delete_headers) == 1

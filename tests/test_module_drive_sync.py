@@ -12,7 +12,7 @@ from hakimi.db_backup import decrypt_backup_bytes
 from hakimi.modules import BaseModule
 from hakimi.security import Rejected
 from hakimi.system_modules import SystemModule
-from hakimi.system_modules.drive_sync import MAX_BINARY_BYTES, MAX_TEXT_BYTES
+from hakimi.system_modules.drive_sync import ERROR_LABELS, MAX_BINARY_BYTES, MAX_TEXT_BYTES
 from tests.test_admin import admin_api as admin_api
 from tests.test_drive_client import FOLDER, drive_for, folder_info
 
@@ -314,3 +314,47 @@ async def test_group_revoking_consent_while_a_sync_waits_prevents_drive_access(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert drive.writes == 0
+
+
+async def test_drive_sync_error_labels_include_backup_errors_and_preserve_in_receipt(admin_api):
+    app, client, _ = admin_api
+    svc = app.state.service
+    expected_codes = {
+        "sessions_backup_too_large",
+        "db_backup_too_large",
+        "db_backup_integrity_failed",
+        "drive_etag_required",
+        "drive_etag_conflict",
+        "drive_invalid_response",
+        "drive_response_too_large",
+        "drive_unavailable",
+    }
+    assert expected_codes <= ERROR_LABELS
+
+    provider = svc.drive_sync
+    live = type(provider)(replace(provider.resources, drive=object()), svc.modules)
+    db_mod = svc.modules.systems["database_backup"]
+    svc.s.roaming_enabled = True
+
+    with pytest.raises(Rejected, match="sessions_backup_too_large"):
+        async with live.transfer(db_mod):
+            raise Rejected("sessions_backup_too_large")
+
+    row = next(
+        r
+        for r in (await client.get("/admin/api/drive-sync")).json()["consumers"]
+        if r["id"] == "database_backup"
+    )
+    assert row["last_error"] == "sessions_backup_too_large"
+    assert row["last_attempt"] is not None
+
+    with pytest.raises(Rejected, match="unexpected-secret-error"):
+        async with live.transfer(db_mod):
+            raise Rejected("unexpected-secret-error")
+
+    row2 = next(
+        r
+        for r in (await client.get("/admin/api/drive-sync")).json()["consumers"]
+        if r["id"] == "database_backup"
+    )
+    assert row2["last_error"] == "drive_sync_failed"

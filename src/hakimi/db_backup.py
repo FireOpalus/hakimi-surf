@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet, InvalidToken
 
 from .config import Settings
-from .drive_client import API, FILE_FIELDS, BackupCollection, FolderDrive
+from .drive_client import API, VERSIONED_FILE_FIELDS, BackupCollection, FolderDrive
 from .security import Rejected
 from .store import Store
 
@@ -201,31 +201,19 @@ class SessionsBackupCollection:
             raise Rejected("drive_backup_marker_invalid")
         self._drive, self.marker = drive, marker
 
-    async def _delete(self, file_id: str, filename: str) -> None:
-        if not self.names.fullmatch(filename) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id):
+    async def _delete(
+        self, file_id: str, filename: str, expected: dict[str, Any] | None = None
+    ) -> None:
+        if not self.names.fullmatch(filename):
             raise Rejected("drive_file_outside_scope")
-        current, etag = await self._drive._json(
-            "GET", f"{API}/{file_id}", params={"fields": FILE_FIELDS, "supportsAllDrives": "true"}
+        await self._drive.delete_owned_file(
+            file_id,
+            filename,
+            "application/octet-stream",
+            self.property_name,
+            self.marker,
+            expected=expected,
         )
-        if (
-            self._drive.validate_owned_file(
-                current, filename, "application/octet-stream", self.property_name, self.marker
-            )
-            != file_id
-        ):
-            raise Rejected("drive_file_outside_scope")
-        if not etag:
-            raise Rejected("drive_etag_required")
-        token = await self._drive._access_token()
-        async with self._drive.http.stream(
-            "DELETE",
-            f"{API}/{file_id}",
-            headers={"Authorization": f"Bearer {token}", "If-Match": etag},
-            params={"supportsAllDrives": "true"},
-            follow_redirects=False,
-        ) as response:
-            if response.status_code not in {200, 204, 404}:
-                raise Rejected("drive_request_failed")
 
     async def _list(self) -> list[dict[str, Any]]:
         query = (
@@ -237,7 +225,7 @@ class SessionsBackupCollection:
         for _ in range(20):
             params: dict[str, str] = {
                 "q": query,
-                "fields": f"nextPageToken,incompleteSearch,files({FILE_FIELDS})",
+                "fields": f"nextPageToken,incompleteSearch,files({VERSIONED_FILE_FIELDS})",
                 "pageSize": "100",
                 "supportsAllDrives": "true",
                 "includeItemsFromAllDrives": "true",
@@ -297,7 +285,7 @@ class SessionsBackupCollection:
             except ValueError:
                 continue
             if item_date < cutoff_date and item_id != file_id:
-                await self._delete(item_id, item_name)
+                await self._delete(item_id, item_name, expected=item)
                 pruned_drive.append(item_name)
         return file_id, pruned_drive
 
@@ -335,6 +323,8 @@ class DatabaseBackup:
         keep_days: int = 7,
         startup_delay_seconds: float = 60.0,
         check_interval_seconds: float = 3600.0,
+        retry_backoff_seconds: float | None = None,
+        max_retry_backoff_seconds: float = 14400.0,
     ):
         self.s = settings
         self.store = store
@@ -355,8 +345,23 @@ class DatabaseBackup:
         self.keep_days = max(1, int(keep_days))
         self.startup_delay_seconds = startup_delay_seconds
         self.check_interval_seconds = check_interval_seconds
+        self.retry_backoff_seconds = (
+            min(1800.0, max(0.0, float(check_interval_seconds)))
+            if retry_backoff_seconds is None
+            else max(0.0, float(retry_backoff_seconds))
+        )
+        self.max_retry_backoff_seconds = max(
+            self.retry_backoff_seconds, float(max_retry_backoff_seconds)
+        )
         self.zone = ZoneInfo(settings.bot_timezone)
         self._lock = asyncio.Lock()
+        self._main_drive_synced_day: str | None = None
+        self._sessions_drive_synced_day: str | None = None
+        self._drive_retry_day: str | None = None
+        self._drive_retry_failures: int = 0
+        self._next_drive_retry_at: float = 0.0
+        self._drive_state_hydrated: bool = False
+        self.last_summary: dict[str, Any] | None = None
 
     @property
     def backup_dir(self) -> Path:
@@ -364,6 +369,29 @@ class DatabaseBackup:
 
     def _local_date(self, ts: float) -> date:
         return datetime.fromtimestamp(ts, UTC).astimezone(self.zone).date()
+
+    def _drive_upload_enabled(self) -> bool:
+        return bool(self.drive is not None and self.s.roaming_enabled)
+
+    def _has_session_dbs(self) -> bool:
+        return bool(self._collect_session_dbs())
+
+    def _record_drive_failure(self, day_str: str, ts: float) -> None:
+        if self._drive_retry_day != day_str:
+            self._drive_retry_day = day_str
+            self._drive_retry_failures = 1
+        else:
+            self._drive_retry_failures += 1
+        delay = min(
+            self.retry_backoff_seconds * (2 ** (self._drive_retry_failures - 1)),
+            self.max_retry_backoff_seconds,
+        )
+        self._next_drive_retry_at = ts + delay
+
+    def _clear_drive_retry_backoff(self) -> None:
+        self._drive_retry_day = None
+        self._drive_retry_failures = 0
+        self._next_drive_retry_at = 0.0
 
     def _needs_backup(self, ts: float) -> bool:
         day_str = self._local_date(ts).isoformat()
@@ -373,8 +401,19 @@ class DatabaseBackup:
         stat_result = target.stat()
         if stat_result.st_size == 0:
             return True
-        if self.interval_seconds < 86400:
-            return (ts - stat_result.st_mtime) >= self.interval_seconds
+        if self.interval_seconds < 86400 and (ts - stat_result.st_mtime) >= self.interval_seconds:
+            return True
+        if self._drive_upload_enabled():
+            main_pending = self._main_drive_synced_day != day_str
+            sessions_pending = (
+                self.sessions_drive is not None
+                and self._has_session_dbs()
+                and self._sessions_drive_synced_day != day_str
+            )
+            if main_pending or sessions_pending:
+                if self._drive_retry_day == day_str and ts < self._next_drive_retry_at:
+                    return False
+                return True
         return False
 
     def _create_local_backup(self, day_str: str, cutoff_date: date) -> tuple[dict[str, Any], bytes]:
@@ -540,6 +579,46 @@ class DatabaseBackup:
             raise Rejected("drive_unavailable")
         return await self.sessions_drive.sync_day(day_str, cutoff_date, enc_bytes)
 
+    @staticmethod
+    def _error_label(exc: Exception) -> str:
+        return str(exc) if isinstance(exc, Rejected) else type(exc).__name__
+
+    def _local_sessions_ready(self, day_str: str) -> bool:
+        if not self._has_session_dbs():
+            return True
+        sessions_file = self.backup_dir / f"{LOCAL_SESSIONS_PREFIX}{day_str}{LOCAL_SESSIONS_SUFFIX}"
+        return sessions_file.exists() and sessions_file.stat().st_size > 0
+
+    async def _hydrate_drive_sync_state(self, now: float) -> None:
+        if self._drive_state_hydrated or not self._drive_upload_enabled():
+            return
+        self._drive_state_hydrated = True
+        try:
+            async with self.store.lock:
+                row = await self.store.one(
+                    "SELECT last_success, last_error FROM drive_module_sync"
+                    " WHERE module_id = 'database_backup'"
+                )
+        except Exception:
+            return
+        if not row:
+            return
+        last_success, last_error = row[0], row[1]
+        if last_success is None or last_error:
+            return
+        try:
+            synced_day = self._local_date(float(last_success)).isoformat()
+        except (TypeError, ValueError, OSError):
+            return
+        today_str = self._local_date(now).isoformat()
+        if synced_day != today_str:
+            return
+        if self._main_drive_synced_day is None:
+            self._main_drive_synced_day = synced_day
+        if self._sessions_drive_synced_day is None:
+            if await asyncio.to_thread(self._local_sessions_ready, today_str):
+                self._sessions_drive_synced_day = synced_day
+
     async def snapshot_once(self, now: float | None = None, upload_drive: bool = True) -> dict:
         """Create a verified encrypted SQLite snapshot and optionally sync it to Google Drive."""
         ts = time.time() if now is None else float(now)
@@ -548,32 +627,46 @@ class DatabaseBackup:
         cutoff_date = today - timedelta(days=self.keep_days - 1)
 
         async with self._lock:
-            summary, enc_bytes = await asyncio.to_thread(
-                self._create_local_backup, day_str, cutoff_date
-            )
+            main_local_exc: Exception | None = None
+            summary: dict[str, Any] | None = None
+            enc_bytes: bytes | None = None
+            try:
+                summary, enc_bytes = await asyncio.to_thread(
+                    self._create_local_backup, day_str, cutoff_date
+                )
+            except Exception as exc:
+                main_local_exc = exc
+                log.warning("event=db_backup_local_failed reason=%s", self._error_label(exc))
+
+            sessions_local_exc: Exception | None = None
+            sessions_summary: dict[str, Any] | None = None
+            sessions_enc: bytes | None = None
+            try:
+                sessions_summary, sessions_enc = await asyncio.to_thread(
+                    self._create_sessions_backup, day_str, cutoff_date
+                )
+            except Exception as exc:
+                sessions_local_exc = exc
+                log.warning("event=sessions_backup_local_failed reason=%s", self._error_label(exc))
+
             drive_uploaded = False
             drive_file_id: str | None = None
             pruned_drive: list[str] = []
-            if upload_drive and self.drive is not None and self.s.roaming_enabled:
-                async with self.transfer():
-                    drive_file_id, pruned_drive = await self._sync_drive_backup(
-                        day_str, cutoff_date, enc_bytes
-                    )
-                drive_uploaded = True
+            main_drive_exc: Exception | None = None
 
-            summary["drive_uploaded"] = drive_uploaded
-            summary["drive_file_id"] = drive_file_id
-            summary["pruned_drive"] = pruned_drive
+            sess_uploaded = False
+            sess_file_id: str | None = None
+            sess_pruned_drive: list[str] = []
+            sess_skip_reason: str | None = None
+            sessions_drive_exc: Exception | None = None
 
-            sessions_summary, sessions_enc = await asyncio.to_thread(
-                self._create_sessions_backup, day_str, cutoff_date
+            drive_enabled = upload_drive and self.s.roaming_enabled
+            want_main_drive = bool(
+                drive_enabled and self.drive is not None and enc_bytes is not None
             )
+            want_sessions_drive = False
             if sessions_summary is not None and sessions_enc is not None:
-                sess_uploaded = False
-                sess_file_id: str | None = None
-                sess_pruned_drive: list[str] = []
-                sess_skip_reason: str | None = None
-                if upload_drive and self.sessions_drive is not None and self.s.roaming_enabled:
+                if drive_enabled and self.sessions_drive is not None:
                     if len(sessions_enc) > MAX_SESSIONS_BACKUP_UPLOAD_BYTES:
                         sess_skip_reason = "sessions_backup_too_large"
                         log.warning(
@@ -582,19 +675,103 @@ class DatabaseBackup:
                             MAX_SESSIONS_BACKUP_UPLOAD_BYTES,
                         )
                     else:
-                        async with self.transfer():
-                            (
-                                sess_file_id,
-                                sess_pruned_drive,
-                            ) = await self._sync_sessions_drive_backup(
-                                day_str, cutoff_date, sessions_enc
-                            )
-                        sess_uploaded = True
+                        want_sessions_drive = True
+
+            transfer_exc: Exception | None = None
+            if want_main_drive or want_sessions_drive:
+                self._drive_state_hydrated = True
+                try:
+                    async with self.transfer():
+                        if want_main_drive and enc_bytes is not None:
+                            try:
+                                drive_file_id, pruned_drive = await self._sync_drive_backup(
+                                    day_str, cutoff_date, enc_bytes
+                                )
+                                drive_uploaded = True
+                            except Exception as exc:
+                                main_drive_exc = exc
+                                log.warning(
+                                    "event=db_backup_drive_failed reason=%s",
+                                    self._error_label(exc),
+                                )
+
+                        if want_sessions_drive and sessions_enc is not None:
+                            try:
+                                (
+                                    sess_file_id,
+                                    sess_pruned_drive,
+                                ) = await self._sync_sessions_drive_backup(
+                                    day_str, cutoff_date, sessions_enc
+                                )
+                                sess_uploaded = True
+                            except Exception as exc:
+                                sessions_drive_exc = exc
+                                log.warning(
+                                    "event=sessions_backup_drive_failed reason=%s",
+                                    self._error_label(exc),
+                                )
+
+                        if main_drive_exc is not None:
+                            raise main_drive_exc
+                        if sessions_drive_exc is not None:
+                            raise sessions_drive_exc
+                        if main_local_exc is not None:
+                            raise main_local_exc
+                        if sessions_local_exc is not None:
+                            raise sessions_local_exc
+                except Exception as exc:
+                    transfer_exc = exc
+
+            if summary is None:
+                summary = {"day": day_str}
+            summary["drive_uploaded"] = drive_uploaded
+            summary["drive_file_id"] = drive_file_id
+            summary["pruned_drive"] = pruned_drive
+            summary["drive_error"] = (
+                self._error_label(main_drive_exc) if main_drive_exc is not None else None
+            )
+            if sessions_summary is not None:
                 sessions_summary["drive_uploaded"] = sess_uploaded
                 sessions_summary["drive_file_id"] = sess_file_id
                 sessions_summary["pruned_drive"] = sess_pruned_drive
                 sessions_summary["drive_skipped_reason"] = sess_skip_reason
+                sessions_summary["drive_error"] = (
+                    self._error_label(sessions_drive_exc)
+                    if sessions_drive_exc is not None
+                    else None
+                )
             summary["sessions_backup"] = sessions_summary
+            self.last_summary = summary
+
+            if drive_enabled and self.drive is not None:
+                self._drive_state_hydrated = True
+                if want_main_drive:
+                    self._main_drive_synced_day = day_str if drive_uploaded else None
+                elif main_local_exc is not None and self._main_drive_synced_day == day_str:
+                    self._main_drive_synced_day = None
+                if want_sessions_drive:
+                    self._sessions_drive_synced_day = day_str if sess_uploaded else None
+                elif sess_skip_reason == "sessions_backup_too_large":
+                    self._sessions_drive_synced_day = day_str
+                elif sessions_local_exc is not None and self._sessions_drive_synced_day == day_str:
+                    self._sessions_drive_synced_day = None
+                if (
+                    transfer_exc is not None
+                    or main_drive_exc is not None
+                    or sessions_drive_exc is not None
+                    or main_local_exc is not None
+                    or sessions_local_exc is not None
+                ):
+                    self._record_drive_failure(day_str, ts)
+                else:
+                    self._clear_drive_retry_backoff()
+
+            if transfer_exc is not None:
+                raise transfer_exc
+            if main_local_exc is not None:
+                raise main_local_exc
+            if sessions_local_exc is not None:
+                raise sessions_local_exc
             return summary
 
     async def run(self) -> None:
@@ -603,6 +780,7 @@ class DatabaseBackup:
         while True:
             try:
                 now = time.time()
+                await self._hydrate_drive_sync_state(now)
                 if await asyncio.to_thread(self._needs_backup, now):
                     await self.snapshot_once(now=now)
             except asyncio.CancelledError:
