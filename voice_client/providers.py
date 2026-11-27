@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import mimetypes
 import re
 import tempfile
@@ -19,12 +20,19 @@ _STT_MARKUP_RE = re.compile(r"<\|[^|>]{1,32}\|>")
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
 _BRZ_TOKEN_RE = re.compile(r"brz_[A-Za-z0-9_-]{8,}")
+DEFAULT_MAX_TTS_AUDIO_BYTES = 16 * 1024 * 1024
+_MAX_ERROR_BODY_BYTES = 8192
 
 
-def _read_existing_file(path: Path) -> bytes | None:
+def _read_existing_file(path: Path, *, max_bytes: int | None = None) -> bytes | None:
     if not path.is_file():
         return None
-    return path.read_bytes()
+    if max_bytes is not None and path.stat().st_size > max_bytes:
+        raise ProviderError(f"音频文件超过大小上限 ({max_bytes} bytes)")
+    data = path.read_bytes()
+    if max_bytes is not None and len(data) > max_bytes:
+        raise ProviderError(f"音频文件超过大小上限 ({max_bytes} bytes)")
+    return data
 
 
 class ProviderError(RuntimeError):
@@ -90,8 +98,98 @@ class TTSProvider(Protocol):
 def _make_default_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         follow_redirects=False,
+        trust_env=False,
         timeout=httpx.Timeout(30.0, connect=10.0),
     )
+
+
+async def _post_bounded_audio(
+    http: httpx.AsyncClient,
+    url: str,
+    *,
+    provider_label: str,
+    api_key: str,
+    max_bytes: int = DEFAULT_MAX_TTS_AUDIO_BYTES,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    json: dict[str, Any] | None = None,
+) -> bytes:
+    """POST a TTS request and read response audio enforcing a hard byte cap."""
+    limit = max(1, int(max_bytes))
+    try:
+        if callable(getattr(http, "stream", None)):
+            async with http.stream(
+                "POST",
+                url,
+                headers=headers,
+                params=params,
+                json=json,
+            ) as resp:
+                if resp.status_code >= 400:
+                    err_buf = bytearray()
+                    if resp.is_stream_consumed:
+                        err_buf.extend(resp.content[:_MAX_ERROR_BODY_BYTES])
+                    else:
+                        async for chunk in resp.aiter_bytes(chunk_size=4096):
+                            if not chunk:
+                                continue
+                            remaining = _MAX_ERROR_BODY_BYTES - len(err_buf)
+                            if remaining <= 0:
+                                break
+                            err_buf.extend(chunk[:remaining])
+                    body = _sanitize_error_detail(
+                        err_buf.decode("utf-8", errors="replace"),
+                        secrets=(api_key,),
+                    )
+                    suffix = f": {body}" if body else ""
+                    raise ProviderError(
+                        f"{provider_label} 请求失败 (HTTP {resp.status_code}){suffix}"
+                    )
+
+                cl_raw = resp.headers.get("content-length", "").strip()
+                if cl_raw:
+                    with contextlib.suppress(ValueError):
+                        if int(cl_raw) > limit:
+                            raise ProviderError(
+                                f"{provider_label} 音频响应超过大小上限 ({limit} bytes)"
+                            )
+
+                if resp.is_stream_consumed:
+                    data = resp.content
+                    if len(data) > limit:
+                        raise ProviderError(
+                            f"{provider_label} 音频响应超过大小上限 ({limit} bytes)"
+                        )
+                    if not data:
+                        raise ProviderError(f"{provider_label} 返回了空音频数据")
+                    return data
+
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes(chunk_size=16384):
+                    if not chunk:
+                        continue
+                    if len(buf) + len(chunk) > limit:
+                        raise ProviderError(
+                            f"{provider_label} 音频响应超过大小上限 ({limit} bytes)"
+                        )
+                    buf.extend(chunk)
+                if not buf:
+                    raise ProviderError(f"{provider_label} 返回了空音频数据")
+                return bytes(buf)
+
+        resp = await http.post(url, headers=headers, params=params, json=json)
+    except ProviderError:
+        raise
+    except httpx.HTTPError as exc:
+        raise ProviderError(f"{provider_label} 网络请求失败 ({type(exc).__name__})") from None
+
+    _raise_for_bad_status(provider_label, resp, secrets=(api_key,))
+    data = resp.content
+    if len(data) > limit:
+        raise ProviderError(f"{provider_label} 音频响应超过大小上限 ({limit} bytes)")
+    if not data:
+        raise ProviderError(f"{provider_label} 返回了空音频数据")
+    return data
 
 
 async def _post_transcription(
@@ -255,6 +353,7 @@ class SiliconFlowTTS:
         response_format: Literal["mp3", "wav"] = "mp3",
         speed: float = 1.05,
         gain: float = 0.0,
+        max_audio_bytes: int = DEFAULT_MAX_TTS_AUDIO_BYTES,
         http: httpx.AsyncClient | None = None,
     ) -> None:
         self.api_key = api_key
@@ -264,6 +363,7 @@ class SiliconFlowTTS:
         self.response_format: Literal["mp3", "wav"] = response_format
         self.speed = speed
         self.gain = gain
+        self.max_audio_bytes = max(1, int(max_audio_bytes))
         self._owns_http = http is None
         self._http = http or _make_default_http_client()
 
@@ -272,26 +372,24 @@ class SiliconFlowTTS:
             raise ProviderError("SiliconFlow TTS 输入文本为空")
         fmt = self.response_format
         sample_rate = 44100 if fmt == "mp3" else 32000
-        try:
-            resp = await self._http.post(
-                f"{self.base_url}/audio/speech",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "input": text,
-                    "voice": self.voice,
-                    "response_format": fmt,
-                    "sample_rate": sample_rate,
-                    "speed": self.speed,
-                    "gain": self.gain,
-                },
-            )
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"SiliconFlow TTS 网络请求失败 ({type(exc).__name__})") from None
-        _raise_for_bad_status("SiliconFlow TTS", resp, secrets=(self.api_key,))
-        if not resp.content:
-            raise ProviderError("SiliconFlow TTS 返回了空音频数据")
-        return resp.content, fmt
+        data = await _post_bounded_audio(
+            self._http,
+            f"{self.base_url}/audio/speech",
+            provider_label="SiliconFlow TTS",
+            api_key=self.api_key,
+            max_bytes=self.max_audio_bytes,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "input": text,
+                "voice": self.voice,
+                "response_format": fmt,
+                "sample_rate": sample_rate,
+                "speed": self.speed,
+                "gain": self.gain,
+            },
+        )
+        return data, fmt
 
     async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
         if not text.strip():
@@ -384,6 +482,7 @@ class FishAudioTTS:
         latency: str = "balanced",
         speed: float = 1.0,
         volume: float = 0.0,
+        max_audio_bytes: int = DEFAULT_MAX_TTS_AUDIO_BYTES,
         http: httpx.AsyncClient | None = None,
     ) -> None:
         self.api_key = api_key
@@ -394,6 +493,7 @@ class FishAudioTTS:
         self.latency = latency if latency in {"balanced", "normal"} else "balanced"
         self.speed = max(0.5, min(2.0, float(speed)))
         self.volume = max(-20.0, min(20.0, float(volume)))
+        self.max_audio_bytes = max(1, int(max_audio_bytes))
         self._owns_http = http is None
         self._http = http or _make_default_http_client()
 
@@ -417,18 +517,16 @@ class FishAudioTTS:
             body["reference_id"] = self.reference_id
         if self.response_format == "mp3":
             body["mp3_bitrate"] = 128
-        try:
-            resp = await self._http.post(
-                f"{self.base_url}/v1/tts",
-                headers=headers,
-                json=body,
-            )
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"Fish Audio TTS 网络请求失败 ({type(exc).__name__})") from None
-        _raise_for_bad_status("Fish Audio TTS", resp, secrets=(self.api_key,))
-        if not resp.content:
-            raise ProviderError("Fish Audio TTS 返回了空音频数据")
-        return resp.content, self.response_format
+        data = await _post_bounded_audio(
+            self._http,
+            f"{self.base_url}/v1/tts",
+            provider_label="Fish Audio TTS",
+            api_key=self.api_key,
+            max_bytes=self.max_audio_bytes,
+            headers=headers,
+            json=body,
+        )
+        return data, self.response_format
 
     async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
         if not text.strip():
@@ -491,6 +589,7 @@ class BreezeBlueTTS:
         speed: float = 1.0,
         guidance_scale: float | None = None,
         use_speaker_boost: bool | None = None,
+        max_audio_bytes: int = DEFAULT_MAX_TTS_AUDIO_BYTES,
         http: httpx.AsyncClient | None = None,
     ) -> None:
         self.api_key = api_key
@@ -508,6 +607,7 @@ class BreezeBlueTTS:
             max(1.0, min(10.0, float(guidance_scale))) if guidance_scale is not None else None
         )
         self.use_speaker_boost = use_speaker_boost
+        self.max_audio_bytes = max(1, int(max_audio_bytes))
         self._owns_http = http is None
         self._http = http or _make_default_http_client()
 
@@ -542,19 +642,17 @@ class BreezeBlueTTS:
         if not self.voice_id:
             raise ProviderError("BreezeBlue TTS 未配置 voice_id")
         voice_seg = quote(self.voice_id, safe="")
-        try:
-            resp = await self._http.post(
-                f"{self.base_url}/v1/text-to-speech/{voice_seg}",
-                params={"output_format": self._output_format_param()},
-                headers=self._headers(),
-                json=self._body(text),
-            )
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"BreezeBlue TTS 网络请求失败 ({type(exc).__name__})") from None
-        _raise_for_bad_status("BreezeBlue TTS", resp, secrets=(self.api_key,))
-        if not resp.content:
-            raise ProviderError("BreezeBlue TTS 返回了空音频数据")
-        return resp.content, self.response_format
+        data = await _post_bounded_audio(
+            self._http,
+            f"{self.base_url}/v1/text-to-speech/{voice_seg}",
+            provider_label="BreezeBlue TTS",
+            api_key=self.api_key,
+            max_bytes=self.max_audio_bytes,
+            params={"output_format": self._output_format_param()},
+            headers=self._headers(),
+            json=self._body(text),
+        )
+        return data, self.response_format
 
     async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
         if not text.strip():
@@ -615,9 +713,13 @@ class EdgeFallbackTTS:
         *,
         voice: str = "zh-CN-XiaoyiNeural",
         edge_tts_bin: str = "edge-tts",
+        timeout_seconds: float = 30.0,
+        max_audio_bytes: int = DEFAULT_MAX_TTS_AUDIO_BYTES,
     ) -> None:
         self.voice = voice
         self.edge_tts_bin = edge_tts_bin
+        self.timeout_seconds = max(0.05, float(timeout_seconds))
+        self.max_audio_bytes = max(1, int(max_audio_bytes))
 
     async def synthesize(self, text: str) -> tuple[bytes, str]:
         if not text.strip():
@@ -627,12 +729,11 @@ class EdgeFallbackTTS:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     self.edge_tts_bin,
-                    "--voice",
-                    self.voice,
-                    "--text",
-                    text,
+                    f"--voice={self.voice}",
+                    f"--text={text}",
                     "--write-media",
                     str(out_path),
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -640,13 +741,31 @@ class EdgeFallbackTTS:
                 raise ProviderError(
                     f"未找到 {self.edge_tts_bin!r} 命令，如需使用 Edge TTS 请先安装 edge-tts。"
                 ) from None
-            _, stderr = await proc.communicate()
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    _, stderr = await proc.communicate()
+            except TimeoutError:
+                if proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    with contextlib.suppress(BaseException):
+                        await proc.wait()
+                raise ProviderError("edge-tts 执行超时") from None
+            except BaseException:
+                if proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    with contextlib.suppress(BaseException):
+                        await proc.wait()
+                raise
             if proc.returncode != 0:
                 err_text = _sanitize_error_detail(stderr.decode("utf-8", errors="replace"))
                 raise ProviderError(
                     f"edge-tts 执行失败 (exit={proc.returncode}): {err_text or 'unknown error'}"
                 )
-            audio_bytes = await asyncio.to_thread(_read_existing_file, out_path)
+            audio_bytes = await asyncio.to_thread(
+                _read_existing_file, out_path, max_bytes=self.max_audio_bytes
+            )
             if audio_bytes is None:
                 raise ProviderError("edge-tts 未生成音频文件")
             if not audio_bytes:

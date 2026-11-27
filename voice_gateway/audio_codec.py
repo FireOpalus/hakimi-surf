@@ -8,6 +8,7 @@ import io
 import math
 import os
 import tempfile
+import time
 import wave
 import weakref
 from collections.abc import AsyncIterable, AsyncIterator, Iterable
@@ -267,6 +268,8 @@ async def transcode_audio_stream(
     ffmpeg_bin: str = "ffmpeg",
     chunk_size: int = 16384,
     ffmpeg_semaphore: asyncio.Semaphore | None = None,
+    read_timeout: float = 30.0,  # noqa: ASYNC109
+    overall_timeout: float = 180.0,  # noqa: ASYNC109
 ) -> AsyncIterator[bytes]:
     """Stream-transcode audio chunks via ffmpeg, or pass through zero-copy when formats match."""
     src = src_fmt.strip().lower().lstrip(".")
@@ -337,23 +340,47 @@ async def transcode_audio_stream(
                 finally:
                     with contextlib.suppress(Exception):
                         proc.stdin.close()
-                        await proc.stdin.wait_closed()
+                        async with asyncio.timeout(0.5):
+                            await proc.stdin.wait_closed()
 
             assert proc.stdout is not None
             assert proc.stderr is not None
             feeder_task = asyncio.create_task(_feed_stdin())
             stderr_task = asyncio.create_task(proc.stderr.read())
+            deadline = (time.monotonic() + overall_timeout) if overall_timeout > 0 else None
+
+            def _next_timeout() -> float | None:
+                rem: float | None = None
+                if deadline is not None:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0.0:
+                        raise TimeoutError("ffmpeg transcode exceeded overall_timeout")
+                if read_timeout > 0:
+                    return min(read_timeout, rem) if rem is not None else read_timeout
+                return rem
 
             try:
                 while True:
-                    data = await proc.stdout.read(chunk_size)
+                    step_timeout = _next_timeout()
+                    if step_timeout is not None:
+                        async with asyncio.timeout(step_timeout):
+                            data = await proc.stdout.read(chunk_size)
+                    else:
+                        data = await proc.stdout.read(chunk_size)
                     if not data:
                         break
                     yield data
 
-                await feeder_task
-                stderr_bytes = await stderr_task
-                rc = await proc.wait()
+                finish_timeout = _next_timeout()
+                if finish_timeout is not None:
+                    async with asyncio.timeout(finish_timeout):
+                        await feeder_task
+                        stderr_bytes = await stderr_task
+                        rc = await proc.wait()
+                else:
+                    await feeder_task
+                    stderr_bytes = await stderr_task
+                    rc = await proc.wait()
 
                 if feeder_error is not None:
                     raise feeder_error
@@ -385,8 +412,14 @@ def _derive_ffprobe_bin(ffmpeg_bin: str) -> str:
     return str(path.with_name("ffprobe"))
 
 
-def _write_temp_audio(audio_bytes: bytes, suffix: str) -> str:
+def _write_temp_audio(
+    audio_bytes: bytes,
+    suffix: str,
+    created_paths: list[str] | None = None,
+) -> str:
     fd, temp_path = tempfile.mkstemp(prefix="vg-dur-", suffix=suffix)
+    if created_paths is not None:
+        created_paths.append(temp_path)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(audio_bytes)
@@ -430,11 +463,14 @@ async def probe_audio_duration_ms(
 
     ffprobe_bin = _derive_ffprobe_bin(ffmpeg_bin)
     suffix = ".ogg" if fmt_norm == "ogg_opus" else f".{fmt_norm}" if fmt_norm.isalnum() else ".bin"
+    created_paths: list[str] = []
     temp_path: str | None = None
     try:
         sem = _resolve_ffmpeg_semaphore(ffmpeg_semaphore)
         async with sem:
-            temp_path = await asyncio.to_thread(_write_temp_audio, audio_bytes, suffix)
+            temp_path = await asyncio.to_thread(
+                _write_temp_audio, audio_bytes, suffix, created_paths
+            )
             proc = await asyncio.create_subprocess_exec(
                 ffprobe_bin,
                 "-v",
@@ -469,6 +505,10 @@ async def probe_audio_duration_ms(
     except (FileNotFoundError, OSError, ValueError):
         return None
     finally:
+        # Synchronous unlink cannot be aborted by CancelledError during task unwind.
+        paths_to_clean = set(created_paths)
         if temp_path is not None:
+            paths_to_clean.add(temp_path)
+        for path in paths_to_clean:
             with contextlib.suppress(OSError):
-                await asyncio.to_thread(os.unlink, temp_path)
+                os.unlink(path)

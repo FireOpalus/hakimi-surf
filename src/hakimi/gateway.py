@@ -12,6 +12,8 @@ from .admission_policy import effective_bot_reply_threshold
 from .affection import level_for_score
 from .provider_diagnostics import LANES, PROVIDERS, append_attempts, safe_attempts
 from .security import Rejected, clean_text, configured_secrets
+from .social import chat_module
+from .social_chat_config import cached_remote_chat_config, load_remote_chat_config
 from .streaming import upstream_error_code, upstream_http_status
 
 PRESETS = {"quiet": 0.65, "natural": 0.42, "active": 0.28}
@@ -43,7 +45,10 @@ class FilterConfig(BaseModel):
     @classmethod
     def group_keys(cls, values):
         if len(values) > 1000 or any(
-            not re.fullmatch(r"(?:onebot:[1-9][0-9]{0,19}|qq:[A-Za-z0-9_-]{1,128})", key)
+            not re.fullmatch(
+                r"(?:onebot:[1-9][0-9]{0,19}|qq:[A-Za-z0-9_-]{1,128}|telegram:-?[0-9]{1,20})",
+                key,
+            )
             for key in values
         ):
             raise ValueError("Invalid group activity keys")
@@ -129,7 +134,10 @@ class FilterManager:
             if self.initialized:
                 return
             async with self.store.transaction():
-                await self.store.db.executescript(SCHEMA)
+                for stmt in SCHEMA.split(";"):
+                    sql = stmt.strip()
+                    if sql:
+                        await self.store.db.execute(sql)
                 row = await self.store.one("SELECT payload FROM admin_config WHERE key='filters'")
                 if row:
                     self.config = FilterConfig.model_validate(
@@ -153,8 +161,31 @@ class FilterManager:
 
     async def set_group_activity(self, platform, group_id, preset):
         await self.initialize()
-        groups = self.s.onebot_allowed_groups if platform == "onebot" else self.s.qq_allowed_groups
-        if platform not in {"onebot", "qq"} or group_id not in groups:
+        if platform == "onebot":
+            groups = set(self.s.onebot_allowed_groups)
+        elif platform == "qq":
+            groups = set(self.s.qq_allowed_groups)
+        elif platform == "telegram":
+            remote_cfg = cached_remote_chat_config(self.s, platform)
+            if remote_cfg is None:
+                try:
+                    remote_cfg = await load_remote_chat_config(
+                        self.store, platform, settings=self.s
+                    )
+                except Exception:
+                    remote_cfg = None
+            if remote_cfg is not None:
+                groups = set(remote_cfg.allowed_groups)
+            else:
+                mod = chat_module(self.s, platform)
+                groups = (
+                    set(mod.allowed_groups())
+                    if mod is not None and hasattr(mod, "allowed_groups")
+                    else set()
+                )
+        else:
+            groups = set()
+        if platform not in {"onebot", "qq", "telegram"} or group_id not in groups:
             raise Rejected("group_not_allowlisted")
         if preset is not None and preset not in PRESETS:
             raise Rejected("invalid_activity_preset")

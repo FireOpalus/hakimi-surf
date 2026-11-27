@@ -9,6 +9,7 @@ Drive folders), and supports bounded-memory Drive v3 Resumable Upload streaming.
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import hashlib
 import json
 import os
@@ -16,8 +17,10 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -49,6 +52,16 @@ DEREVERB_MODELS: tuple[str, ...] = (
     "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
     "UVR-DeEcho-DeReverb.pth",
 )
+SVC_WEIGHT_MODELS: tuple[str, ...] = (
+    "GiantAILab/YingMusic-SVC:YingMusic-SVC-full.pt",
+    "Plachtaa/Seed-VC:DiT_uvit_tat_xlsr_ema",
+)
+_RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_TRANSIENT_RETRIES = 3
+_RETRY_BASE_DELAY_SECONDS = 0.5
+_RETRY_MAX_DELAY_SECONDS = 8.0
+_VERIFY_CACHE_TTL_SECONDS = 30.0
+_VERIFY_CACHE_MAX_ENTRIES = 256
 
 FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
 FOLDER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}\Z")
@@ -108,9 +121,42 @@ class SongDriveFolderTree:
         return mapping[role]
 
 
+def _parse_retry_after(headers: dict[str, str] | None) -> float | None:
+    if not headers:
+        return None
+    raw = str(headers.get("retry-after") or headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+        if val >= 0.0:
+            return min(30.0, val)
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        delta = (dt - datetime.now(UTC)).total_seconds()
+        return max(0.0, min(30.0, delta))
+    except Exception:
+        return None
+
+
 def compute_weight_cache_key(mode: str = "cover") -> str:
-    """Deterministic version key for RVC + audio-separator weights matching colab_remote_rvc."""
-    norm_mode = "cover" if str(mode or "").strip().lower() == "cover" else "all"
+    """Deterministic key for SVC / RVC + separator weights matching colab_remote_rvc."""
+    raw_mode = str(mode or "").strip().lower()
+    if raw_mode == "svc":
+        spec = {
+            "schema": WEIGHT_CACHE_SCHEMA_VERSION,
+            "mode": "svc",
+            "primary_sep": list(PRIMARY_SEP_MODELS),
+            "karaoke_sep": list(KARAOKE_SEP_MODELS),
+            "svc_models": list(SVC_WEIGHT_MODELS),
+        }
+        digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()
+        return f"svc_weights_{digest[:12]}"
+    norm_mode = "cover" if raw_mode == "cover" else "all"
     spec = {
         "schema": WEIGHT_CACHE_SCHEMA_VERSION,
         "mode": norm_mode,
@@ -295,6 +341,7 @@ class SongDriveStore:
         *,
         http: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.time,
+        sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
         timeout: float = 30.0,
         chunk_bytes: int = RESUMABLE_CHUNK_BYTES,
     ) -> None:
@@ -311,6 +358,7 @@ class SongDriveStore:
         self._injected_http = http
         self._owned_http: httpx.AsyncClient | None = None
         self._clock = clock
+        self._sleep_fn = sleep_fn
         self._timeout = float(timeout)
         self._chunk_bytes = chunk_bytes
 
@@ -332,6 +380,9 @@ class SongDriveStore:
         self._cache_folder_id: str = ""
         self._cache_folder_root_id: str = ""
         self._last_error: str | None = None
+        self._verified_file_cache: OrderedDict[tuple[str, str], tuple[float, dict[str, Any]]] = (
+            OrderedDict()
+        )
 
     def _oauth_path(self) -> Path | None:
         for attr in ("song_drive_oauth_file", "gdrive_oauth_credentials_file"):
@@ -498,6 +549,7 @@ class SongDriveStore:
                 self._tree = None
                 self._cache_folder_id = ""
                 self._cache_folder_root_id = ""
+                self._verified_file_cache.clear()
             self._last_error = None
 
         return await self.status_overview(probe=self.configured())
@@ -664,8 +716,10 @@ class SongDriveStore:
         client = await self._http()
         eff_timeout = timeout_sec if timeout_sec is not None else self._timeout
 
-        for attempt in range(2):
-            token = await self._get_access_token(force_refresh=(attempt > 0))
+        refreshed_auth = False
+        transient_retries = 0
+        while True:
+            token = await self._get_access_token(force_refresh=refreshed_auth)
             req_headers = {"Authorization": f"Bearer {token}"}
             if headers:
                 req_headers.update(headers)
@@ -689,17 +743,47 @@ class SongDriveStore:
             except Rejected:
                 raise
             except httpx.TimeoutException:
+                if transient_retries < _MAX_TRANSIENT_RETRIES:
+                    delay = min(
+                        _RETRY_MAX_DELAY_SECONDS,
+                        _RETRY_BASE_DELAY_SECONDS * (2**transient_retries),
+                    )
+                    transient_retries += 1
+                    await self._sleep_fn(delay)
+                    continue
                 raise Rejected("song_drive_network_timeout") from None
             except (httpx.HTTPError, OSError):
+                if transient_retries < _MAX_TRANSIENT_RETRIES:
+                    delay = min(
+                        _RETRY_MAX_DELAY_SECONDS,
+                        _RETRY_BASE_DELAY_SECONDS * (2**transient_retries),
+                    )
+                    transient_retries += 1
+                    await self._sleep_fn(delay)
+                    continue
                 raise Rejected("song_drive_network_error") from None
 
-            if status == 401 and attempt == 0:
+            if status == 401 and not refreshed_auth:
                 async with self._token_lock:
                     self._access_token = ""
+                refreshed_auth = True
                 continue
+            if status in _RETRYABLE_HTTP_STATUSES and transient_retries < _MAX_TRANSIENT_RETRIES:
+                retry_after = _parse_retry_after(resp_headers)
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else min(
+                        _RETRY_MAX_DELAY_SECONDS,
+                        _RETRY_BASE_DELAY_SECONDS * (2**transient_retries),
+                    )
+                )
+                transient_retries += 1
+                await self._sleep_fn(delay)
+                continue
+            if status == 401:
+                raise Rejected("song_drive_token_failed")
             return status, resp_headers, raw
-
-        raise Rejected("song_drive_token_failed")
 
     async def _api_json(
         self,
@@ -835,6 +919,8 @@ class SongDriveStore:
                 role_name: DriveRole = sub  # type: ignore[assignment]
                 sub_ids[sub] = await self._find_or_create_folder(sub, root_id, role=role_name)
 
+            if force_refresh:
+                self._verified_file_cache.clear()
             self._tree = SongDriveFolderTree(
                 root=root_id,
                 models=sub_ids["models"],
@@ -865,10 +951,38 @@ class SongDriveStore:
         tree = await self.ensure_folder_tree()
         return tree.folder_for(role)
 
-    async def _verify_file_in_role(self, file_id: str, role: DriveSubRole) -> dict[str, Any]:
+    def _cache_verified_meta(self, fid: str, parent_id: str, meta: dict[str, Any]) -> None:
+        key = (fid, parent_id)
+        self._verified_file_cache[key] = (
+            self._clock() + _VERIFY_CACHE_TTL_SECONDS,
+            dict(meta),
+        )
+        self._verified_file_cache.move_to_end(key)
+        while len(self._verified_file_cache) > _VERIFY_CACHE_MAX_ENTRIES:
+            self._verified_file_cache.popitem(last=False)
+
+    def _get_cached_verified_meta(self, fid: str, parent_id: str) -> dict[str, Any] | None:
+        key = (fid, parent_id)
+        cached = self._verified_file_cache.get(key)
+        if cached is None:
+            return None
+        expires_at, meta = cached
+        if self._clock() >= expires_at:
+            self._verified_file_cache.pop(key, None)
+            return None
+        self._verified_file_cache.move_to_end(key)
+        return dict(meta)
+
+    async def _verify_file_in_role(
+        self, file_id: str, role: DriveSubRole, *, use_cache: bool = True
+    ) -> dict[str, Any]:
         """Verify file exists, is not trashed, is not a folder, and parents == [folder_id]."""
         fid = validate_drive_id(file_id)
         expected_parent = await self._folder_id_for_role(role)
+        if use_cache:
+            cached = self._get_cached_verified_meta(fid, expected_parent)
+            if cached is not None:
+                return cached
         meta = await self._api_json(
             "GET",
             f"{DRIVE_FILES_API}/{fid}",
@@ -884,6 +998,7 @@ class SongDriveStore:
             or meta.get("parents") != [expected_parent]
         ):
             raise Rejected("song_drive_file_outside_scope")
+        self._cache_verified_meta(fid, expected_parent, meta)
         return meta
 
     async def _resolve_named_file(self, role: DriveSubRole, filename: str) -> dict[str, Any] | None:
@@ -919,6 +1034,17 @@ class SongDriveStore:
             fid = validate_drive_id(str(item.get("id") or ""))
             raw_size = item.get("size")
             size_val = int(raw_size) if raw_size is not None and str(raw_size).isdigit() else 0
+            resolved_meta = {
+                "id": fid,
+                "name": str(item.get("name") or clean_name),
+                "parents": [parent_id],
+                "size": str(size_val),
+                "modifiedTime": str(item.get("modifiedTime") or ""),
+                "mimeType": str(item.get("mimeType") or "application/octet-stream"),
+                "trashed": False,
+                "appProperties": dict(item.get("appProperties") or {}),
+            }
+            self._cache_verified_meta(fid, parent_id, resolved_meta)
             return {
                 "id": fid,
                 "name": str(item.get("name") or clean_name),
@@ -1168,8 +1294,13 @@ class SongDriveStore:
         *,
         role: DriveSubRole,
         max_bytes: int,
+        verified_meta: dict[str, Any] | None = None,
     ) -> bytes:
-        meta = await self._verify_file_in_role(file_id, role)
+        meta = (
+            verified_meta
+            if verified_meta is not None
+            else await self._verify_file_in_role(file_id, role)
+        )
         raw_size = meta.get("size")
         if raw_size is not None and str(raw_size).isdigit() and int(raw_size) > max_bytes:
             raise Rejected("song_drive_file_too_large")
@@ -1212,6 +1343,7 @@ class SongDriveStore:
                 entry["id"],
                 role="cache",
                 max_bytes=MAX_CACHE_MANIFEST_BYTES,
+                verified_meta=entry,
             )
             manifest = json.loads(raw.decode("utf-8"))
         except (Rejected, ValueError, UnicodeDecodeError):
@@ -1395,44 +1527,73 @@ class SongDriveStore:
             "Content-Type": mime_type,
         }
         client = await self._http()
-        req = client.build_request(
-            "PUT",
-            upload_url,
-            headers=req_headers,
-            content=chunk,
-            timeout=httpx.Timeout(max(self._timeout, 120.0), connect=10.0),
-        )
-        resp: httpx.Response | None = None
-        try:
-            resp = await client.send(req, stream=True, follow_redirects=False)
-            status = resp.status_code
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            raw = await self._read_bounded_response(
-                resp,
-                max_bytes=MAX_JSON_RESPONSE_BYTES,
-                too_large_code="song_drive_response_too_large",
+        for attempt in range(_MAX_TRANSIENT_RETRIES + 1):
+            req = client.build_request(
+                "PUT",
+                upload_url,
+                headers=req_headers,
+                content=chunk,
+                timeout=httpx.Timeout(max(self._timeout, 120.0), connect=10.0),
             )
-        except Rejected:
-            raise
-        except httpx.TimeoutException:
-            raise Rejected("song_drive_network_timeout") from None
-        except (httpx.HTTPError, OSError):
-            raise Rejected("song_drive_network_error") from None
-        finally:
+            resp: httpx.Response | None = None
             try:
-                if resp is not None:
-                    await resp.aclose()
-            except Exception:
-                pass
+                resp = await client.send(req, stream=True, follow_redirects=False)
+                status = resp.status_code
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                raw = await self._read_bounded_response(
+                    resp,
+                    max_bytes=MAX_JSON_RESPONSE_BYTES,
+                    too_large_code="song_drive_response_too_large",
+                )
+            except Rejected:
+                raise
+            except httpx.TimeoutException:
+                if attempt < _MAX_TRANSIENT_RETRIES:
+                    delay = min(
+                        _RETRY_MAX_DELAY_SECONDS,
+                        _RETRY_BASE_DELAY_SECONDS * (2**attempt),
+                    )
+                    await self._sleep_fn(delay)
+                    continue
+                raise Rejected("song_drive_network_timeout") from None
+            except (httpx.HTTPError, OSError):
+                if attempt < _MAX_TRANSIENT_RETRIES:
+                    delay = min(
+                        _RETRY_MAX_DELAY_SECONDS,
+                        _RETRY_BASE_DELAY_SECONDS * (2**attempt),
+                    )
+                    await self._sleep_fn(delay)
+                    continue
+                raise Rejected("song_drive_network_error") from None
             finally:
-                if resp is not None:
-                    resp._request = None
-                # Explicitly detach the transmitted chunk from httpx.Request (_content and
-                # ByteStream) so cyclic Request/Response references never retain multi-MiB
-                # uploaded chunks until the next cyclic GC sweep.
-                req._content = b""
-                req.stream = httpx.ByteStream(b"")
-        return status, resp_headers, raw
+                try:
+                    if resp is not None:
+                        await resp.aclose()
+                except Exception:
+                    pass
+                finally:
+                    if resp is not None:
+                        resp._request = None
+                    # Explicitly detach the transmitted chunk from httpx.Request (_content and
+                    # ByteStream) so cyclic Request/Response references never retain multi-MiB
+                    # uploaded chunks until the next cyclic GC sweep.
+                    req._content = b""
+                    req.stream = httpx.ByteStream(b"")
+
+            if status in _RETRYABLE_HTTP_STATUSES and attempt < _MAX_TRANSIENT_RETRIES:
+                retry_after = _parse_retry_after(resp_headers)
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else min(
+                        _RETRY_MAX_DELAY_SECONDS,
+                        _RETRY_BASE_DELAY_SECONDS * (2**attempt),
+                    )
+                )
+                await self._sleep_fn(delay)
+                continue
+            return status, resp_headers, raw
+        raise Rejected("song_drive_upload_failed")
 
     async def _upload_role_stream(
         self,
@@ -1567,11 +1728,27 @@ class SongDriveStore:
                 raise Rejected("song_drive_invalid_response")
             fid = validate_drive_id(str(resp.get("id") or ""))
             completed = True
+            out_name = str(resp.get("name") or clean_name)
+            out_mime = str(resp.get("mimeType") or resolved_mime)
+            self._cache_verified_meta(
+                fid,
+                parent_id,
+                {
+                    "id": fid,
+                    "name": out_name,
+                    "parents": [parent_id],
+                    "size": str(total_seen),
+                    "modifiedTime": "",
+                    "mimeType": out_mime,
+                    "trashed": False,
+                    "appProperties": dict(props),
+                },
+            )
             return {
                 "file_id": fid,
-                "name": str(resp.get("name") or clean_name),
+                "name": out_name,
                 "size": total_seen,
-                "mime_type": str(resp.get("mimeType") or resolved_mime),
+                "mime_type": out_mime,
             }
         finally:
             buf.clear()
@@ -1645,10 +1822,10 @@ class SongDriveStore:
         if not self.configured():
             raise Rejected("song_drive_not_configured")
         clean_name = sanitize_drive_filename(filename)
-        if not isinstance(raw, (bytes, bytearray)) or not raw:
+        if not isinstance(raw, (bytes, bytearray, memoryview)) or not raw:
             raise Rejected("invalid_song_audio")
-        data = bytes(raw)
-        if len(data) > max_bytes:
+        total_len = len(raw)
+        if total_len > max_bytes:
             raise Rejected(
                 "song_inbox_upload_too_large" if role == "inbox" else "song_drive_file_too_large"
             )
@@ -1656,20 +1833,23 @@ class SongDriveStore:
         if not resolved_mime:
             resolved_mime = "application/octet-stream"
 
-        if len(data) > MULTIPART_THRESHOLD_BYTES and role == "inbox":
+        if total_len > MULTIPART_THRESHOLD_BYTES and role == "inbox":
 
             async def _slice_iter() -> AsyncIterator[bytes]:
+                view = memoryview(raw)
                 step = self._chunk_bytes
-                for idx in range(0, len(data), step):
-                    yield data[idx : idx + step]
+                for idx in range(0, total_len, step):
+                    yield bytes(view[idx : idx + step])
 
             return await self.upload_inbox_stream(
                 clean_name,
                 _slice_iter(),
                 mime_type=resolved_mime,
-                content_length=len(data),
+                content_length=total_len,
                 max_bytes=max_bytes,
             )
+
+        data = raw if isinstance(raw, bytes) else bytes(raw)
 
         parent_id = await self._folder_id_for_role(role)
         existing = await self._resolve_named_file(role, clean_name)
@@ -1724,11 +1904,27 @@ class SongDriveStore:
                     await self._abort_resumable_session(upload_url)
 
         fid = validate_drive_id(str(resp.get("id") or ""))
+        out_name = str(resp.get("name") or clean_name)
+        out_mime = str(resp.get("mimeType") or resolved_mime)
+        self._cache_verified_meta(
+            fid,
+            parent_id,
+            {
+                "id": fid,
+                "name": out_name,
+                "parents": [parent_id],
+                "size": str(len(data)),
+                "modifiedTime": "",
+                "mimeType": out_mime,
+                "trashed": False,
+                "appProperties": dict(props),
+            },
+        )
         return {
             "file_id": fid,
-            "name": str(resp.get("name") or clean_name),
+            "name": out_name,
             "size": len(data),
-            "mime_type": str(resp.get("mimeType") or resolved_mime),
+            "mime_type": out_mime,
         }
 
     async def upload_inbox_bytes(

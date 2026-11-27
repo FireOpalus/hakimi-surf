@@ -368,3 +368,77 @@ class PlannerJournal:
                 "THEN ? ELSE stage END WHERE day=? AND action=?",
                 [(r.started, r.started, r.confirmed, r.stage, r.day, name) for r in receipts],
             )
+
+    async def prune(self, now: float, *, retention_days: int = 30) -> dict[str, int]:
+        """Prune old completed planner runs, agenda links, and observed day/slot history."""
+        counts = {
+            "life_plan_runs": 0,
+            "life_agenda_items": 0,
+            "life_observed_days": 0,
+            "life_observed_slots": 0,
+        }
+        days = max(1, int(retention_days))
+        cutoff_ts = float(now) - days * 86400.0
+        cutoff_day = (
+            datetime.fromtimestamp(cutoff_ts, ZoneInfo(self.store.s.bot_timezone))
+            .date()
+            .isoformat()
+        )
+        async with self.store.lock:
+            tables = {
+                row[0]
+                for row in await self.store.all("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            has_work = False
+            if "life_plan_runs" in tables and await self.store.one(
+                "SELECT 1 FROM life_plan_runs "
+                "WHERE outcome NOT IN ('running','prepared') AND started<? LIMIT 1",
+                (cutoff_ts,),
+            ):
+                has_work = True
+            elif "life_agenda_items" in tables and await self.store.one(
+                "SELECT 1 FROM life_agenda_items WHERE day<? LIMIT 1",
+                (cutoff_day,),
+            ):
+                has_work = True
+            elif "life_observed_days" in tables and await self.store.one(
+                "SELECT 1 FROM life_observed_days WHERE day<? LIMIT 1",
+                (cutoff_day,),
+            ):
+                has_work = True
+            elif "life_observed_slots" in tables and await self.store.one(
+                "SELECT 1 FROM life_observed_slots WHERE day<? LIMIT 1",
+                (cutoff_day,),
+            ):
+                has_work = True
+
+        if not has_work:
+            return counts
+
+        async with self.store.transaction():
+            if "life_plan_runs" in tables:
+                cur = await self.store.db.execute(
+                    "DELETE FROM life_plan_runs "
+                    "WHERE outcome NOT IN ('running','prepared') AND started<?",
+                    (cutoff_ts,),
+                )
+                counts["life_plan_runs"] = max(0, int(cur.rowcount or 0))
+            if "life_agenda_items" in tables:
+                cur = await self.store.db.execute(
+                    "DELETE FROM life_agenda_items WHERE day<?",
+                    (cutoff_day,),
+                )
+                counts["life_agenda_items"] = max(0, int(cur.rowcount or 0))
+            if "life_observed_days" in tables:
+                cur = await self.store.db.execute(
+                    "DELETE FROM life_observed_days WHERE day<?",
+                    (cutoff_day,),
+                )
+                counts["life_observed_days"] = max(0, int(cur.rowcount or 0))
+            if "life_observed_slots" in tables:
+                cur = await self.store.db.execute(
+                    "DELETE FROM life_observed_slots WHERE day<?",
+                    (cutoff_day,),
+                )
+                counts["life_observed_slots"] = max(0, int(cur.rowcount or 0))
+        return counts

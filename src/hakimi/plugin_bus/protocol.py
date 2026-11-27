@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import heapq
 import hmac
 import json
 import math
@@ -229,6 +230,10 @@ _VAULT_CRED_PREFIX = "plugin-cred:"
 _VAULT_KV_PREFIX = "plugin-kv:"
 _LEGACY_KV_VALUE_BYTES = 16_384
 _MAX_KV_VALUE_BYTES = 65_536
+_MAX_KV_KEYS_PER_PLUGIN = 512
+_MAX_DOMAIN_QUEUE_SIZE = 64
+_MAX_STATE_QUEUE_SIZE = 64
+_DEFAULT_SEND_TIMEOUT_SECONDS = 5.0
 _MAX_NODE_BRIDGE_INFLIGHT = 16
 _MAX_AI_CALLS_INFLIGHT = 4
 _DEFAULT_MAX_FRAME_BYTES = 262_144
@@ -387,34 +392,31 @@ def _bound_ai_payload(
     cleaned = _scrub_json_secrets(payload, secrets_list)
     if not isinstance(cleaned, dict):
         raise Rejected("plugin_invalid_schema")
-    if len(untrusted_input(cleaned).encode("utf-8")) <= max_bytes:
+    cur_bytes = len(untrusted_input(cleaned).encode("utf-8"))
+    if cur_bytes <= max_bytes:
         return cleaned
 
     bounded = copy.deepcopy(cleaned)
 
-    def _find_longest_str(node: Any) -> tuple[int, Any, Any] | None:
-        best: tuple[int, Any, Any] | None = None
+    def _collect_long_strings(
+        node: Any, out: list[tuple[int, int, Any, Any]], counter: list[int]
+    ) -> None:
         if isinstance(node, dict):
             for k, v in node.items():
                 if isinstance(v, str):
-                    cand = (len(v), node, k)
-                    if best is None or cand[0] > best[0]:
-                        best = cand
+                    if len(v) > 32:
+                        counter[0] += 1
+                        out.append((-len(v), counter[0], node, k))
                 elif isinstance(v, dict | list):
-                    sub = _find_longest_str(v)
-                    if sub is not None and (best is None or sub[0] > best[0]):
-                        best = sub
+                    _collect_long_strings(v, out, counter)
         elif isinstance(node, list):
             for idx, item in enumerate(node):
                 if isinstance(item, str):
-                    cand = (len(item), node, idx)
-                    if best is None or cand[0] > best[0]:
-                        best = cand
+                    if len(item) > 32:
+                        counter[0] += 1
+                        out.append((-len(item), counter[0], node, idx))
                 elif isinstance(item, dict | list):
-                    sub = _find_longest_str(item)
-                    if sub is not None and (best is None or sub[0] > best[0]):
-                        best = sub
-        return best
+                    _collect_long_strings(item, out, counter)
 
     def _find_longest_list(node: Any) -> list[Any] | None:
         best: list[Any] | None = None
@@ -438,19 +440,49 @@ def _bound_ai_payload(
                         best = sub
         return best
 
-    while len(untrusted_input(bounded).encode("utf-8")) > max_bytes:
-        longest = _find_longest_str(bounded)
-        if longest is not None and longest[0] > 32:
-            length, container, key = longest
-            container[key] = container[key][: max(16, length // 2)]
-            if container is bounded and key == "subtitle_excerpt":
-                bounded["subtitle_complete"] = False
-                bounded["subtitle_status"] = "truncated"
-                bounded["material_scope"] = "partial_subtitle" if bounded[key] else "metadata_only"
+    heap: list[tuple[int, int, Any, Any]] = []
+    _collect_long_strings(bounded, heap, [0])
+    heapq.heapify(heap)
+
+    while cur_bytes > max_bytes:
+        if heap:
+            est_bytes = cur_bytes
+            while heap and est_bytes > max_bytes:
+                _, seq, container, key = heapq.heappop(heap)
+                old_val = container[key]
+                if not isinstance(old_val, str) or len(old_val) <= 32:
+                    continue
+                new_len = max(16, len(old_val) // 2)
+                new_val = old_val[:new_len]
+                container[key] = new_val
+                if container is bounded and key == "subtitle_excerpt":
+                    bounded["subtitle_complete"] = False
+                    bounded["subtitle_status"] = "truncated"
+                    bounded["material_scope"] = (
+                        "partial_subtitle" if bounded[key] else "metadata_only"
+                    )
+                saved = len(old_val.encode("utf-8")) - len(new_val.encode("utf-8"))
+                est_bytes -= max(1, saved)
+                if new_len > 32:
+                    heapq.heappush(heap, (-new_len, seq, container, key))
+            cur_bytes = len(untrusted_input(bounded).encode("utf-8"))
             continue
+
         longest_list = _find_longest_list(bounded)
         if longest_list is not None and len(longest_list) > 0:
-            longest_list.pop()
+            est_bytes = cur_bytes
+            while longest_list and est_bytes > max_bytes:
+                removed = longest_list.pop()
+                try:
+                    removed_bytes = len(
+                        json.dumps(removed, ensure_ascii=False, separators=(",", ":")).encode(
+                            "utf-8"
+                        )
+                    )
+                except (TypeError, ValueError):
+                    removed_bytes = 1
+                est_bytes -= max(1, removed_bytes + 1)
+            cur_bytes = len(untrusted_input(bounded).encode("utf-8"))
             continue
         raise Rejected("context_too_large")
     return bounded

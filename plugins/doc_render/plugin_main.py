@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import functools
 import logging
 import os
 import signal
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -46,6 +50,7 @@ from .renderer import (
 )
 
 log = logging.getLogger("hakimi_plugin_doc_render")
+_T = TypeVar("_T")
 
 PLUGIN_ID = "doc_render"
 ACTION_READ_FILE = "doc_render.read_file"
@@ -120,7 +125,7 @@ _RENDER_CARD_ACTION_SCHEMA: dict[str, Any] = {
         "text": {
             "type": "string",
             "min_length": 1,
-            "max_length": 4096,
+            "max_length": MAX_INPUT_CHARS,
             "description": "待渲染 Markdown 或纯文本内容",
         },
         "format": {
@@ -231,6 +236,58 @@ class DocRenderPlugin:
         await self.client.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
+    async def _run_bounded(
+        self,
+        fn: Callable[[], _T],
+        *,
+        timeout_seconds: float,
+    ) -> _T:
+        """Run `fn` in the bounded worker pool, holding `self._sem` until the thread exits."""
+        loop = asyncio.get_running_loop()
+        await self._sem.acquire()
+        released = False
+
+        def _release_once() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._sem.release()
+
+        try:
+            cfut: concurrent.futures.Future[_T] = self._executor.submit(fn)
+        except BaseException:
+            _release_once()
+            raise
+
+        def _on_cfut_done(_done: concurrent.futures.Future[_T]) -> None:
+            if not loop.is_closed():
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_release_once)
+
+        cfut.add_done_callback(_on_cfut_done)
+        afut = asyncio.wrap_future(cfut, loop=loop)
+
+        def _consume_detached_exception(done: asyncio.Future[_T]) -> None:
+            if not done.cancelled():
+                done.exception()
+
+        afut.add_done_callback(_consume_detached_exception)
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                result = await asyncio.shield(afut)
+            _release_once()
+            return result
+        except TimeoutError:
+            cfut.cancel()
+            raise
+        except asyncio.CancelledError:
+            cfut.cancel()
+            raise
+        except BaseException:
+            if cfut.done():
+                _release_once()
+            raise
+
     async def _handle_read_file(self, params: dict[str, Any]) -> dict[str, Any]:
         raw_args = params.get("arguments")
         if not isinstance(raw_args, dict):
@@ -247,26 +304,23 @@ class DocRenderPlugin:
         if len(raw_bytes) > MAX_DOCUMENT_BYTES:
             raise PluginRpcError("oversized", "document payload exceeds limit")
 
-        loop = asyncio.get_running_loop()
-        async with self._sem:
-            try:
-                async with asyncio.timeout(self.parse_timeout_seconds):
-                    parsed = await loop.run_in_executor(
-                        self._executor,
-                        functools.partial(
-                            parse_document_bytes,
-                            raw_bytes,
-                            args.filename,
-                            mime_type=args.mime_type,
-                            max_chars=args.max_chars,
-                            max_bytes=MAX_DOCUMENT_BYTES,
-                            timeout_seconds=self.parse_timeout_seconds,
-                        ),
-                    )
-            except TimeoutError:
-                raise PluginRpcError("parse_timeout", "document parsing timed out") from None
-            except DocumentParseError as exc:
-                raise PluginRpcError(exc.code, exc.message) from None
+        try:
+            parsed = await self._run_bounded(
+                functools.partial(
+                    parse_document_bytes,
+                    raw_bytes,
+                    args.filename,
+                    mime_type=args.mime_type,
+                    max_chars=args.max_chars,
+                    max_bytes=MAX_DOCUMENT_BYTES,
+                    timeout_seconds=self.parse_timeout_seconds,
+                ),
+                timeout_seconds=self.parse_timeout_seconds,
+            )
+        except TimeoutError:
+            raise PluginRpcError("parse_timeout", "document parsing timed out") from None
+        except DocumentParseError as exc:
+            raise PluginRpcError(exc.code, exc.message) from None
         return parsed.to_result_dict()
 
     async def _handle_render_card(self, params: dict[str, Any]) -> BlobResult:
@@ -283,26 +337,25 @@ class DocRenderPlugin:
         if args.width * args.max_height > MAX_RENDER_PIXELS:
             raise PluginRpcError("card_too_large", "card dimensions exceed pixel limit")
 
-        loop = asyncio.get_running_loop()
-        async with self._sem:
-            try:
-                async with asyncio.timeout(self.render_timeout_seconds):
-                    rendered = await loop.run_in_executor(
-                        self._executor,
-                        functools.partial(
-                            render_card_bytes,
-                            args.text,
-                            fmt=args.format,
-                            width=args.width,
-                            max_height=args.max_height,
-                            theme=args.theme,
-                            max_bytes=MAX_CARD_BYTES,
-                        ),
-                    )
-            except TimeoutError:
-                raise PluginRpcError("render_failed", "card rendering timed out") from None
-            except CardRenderError as exc:
-                raise PluginRpcError(exc.code, exc.message) from None
+        deadline = time.monotonic() + self.render_timeout_seconds
+        try:
+            rendered = await self._run_bounded(
+                functools.partial(
+                    render_card_bytes,
+                    args.text,
+                    fmt=args.format,
+                    width=args.width,
+                    max_height=args.max_height,
+                    theme=args.theme,
+                    max_bytes=MAX_CARD_BYTES,
+                    deadline=deadline,
+                ),
+                timeout_seconds=self.render_timeout_seconds,
+            )
+        except TimeoutError:
+            raise PluginRpcError("render_failed", "card rendering timed out") from None
+        except CardRenderError as exc:
+            raise PluginRpcError(exc.code, exc.message) from None
 
         return BlobResult(
             data=rendered.to_metadata(),

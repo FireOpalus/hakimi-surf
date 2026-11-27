@@ -241,10 +241,6 @@ class RemoteBiliWatcher:
             return proxy
         return None
 
-    def _inside_own_reader(self) -> bool:
-        task = asyncio.current_task()
-        return task is not None and task.get_name() == "plugin-reader:bilibili_surf"
-
     def _require_online_proxy(
         self,
         *,
@@ -605,7 +601,7 @@ class RemoteBiliWatcher:
         ):
             return None
         proxy = self._online_proxy()
-        if proxy is None or not proxy.enabled or self._inside_own_reader():
+        if proxy is None or not proxy.enabled:
             return None
         try:
             res = await proxy.call_raw_rpc("bili.cover_thumb", {"url": cover_url}, timeout=15.0)
@@ -787,7 +783,7 @@ class RemoteBiliWatcher:
             return None
         secrets = self._all_secrets()
         proxy = self._online_proxy()
-        if proxy is not None and not self._inside_own_reader():
+        if proxy is not None:
             try:
                 res = await proxy.call_raw_rpc(
                     "bili.lookup_watched",
@@ -967,7 +963,7 @@ class RemoteBiliWatcher:
         prio_map = await self._active_private_priority_map(current)
         secrets = self._all_secrets()
         proxy = self._online_proxy()
-        if proxy is not None and not self._inside_own_reader():
+        if proxy is not None:
             try:
                 res = await proxy.call_raw_rpc(
                     "bili.recent_surfed",
@@ -1224,7 +1220,7 @@ class RemoteBiliWatcher:
 
     async def status(self) -> dict[str, Any]:
         proxy = self._online_proxy()
-        if proxy is not None and not self._inside_own_reader():
+        if proxy is not None:
             try:
                 res = await proxy.call_raw_rpc("bili.account.status", {})
             except Rejected as exc:

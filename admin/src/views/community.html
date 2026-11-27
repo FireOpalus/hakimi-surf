@@ -84,12 +84,12 @@
     </details>
   </div>
   <div class="card"><div class="row between"><h2>讨厌鬼小黑屋</h2><button id="refresh-community" type="button" class="secondary">刷新</button></div>
-    <p class="muted">应用层屏蔽，群聊与私聊都直接忽略。Owner 与机器人自身受保护。只有明确勾选并确认，才会顺带从好友列表移除。</p>
-    <form id="mute-form"><div class="row"><input id="mute-qq" inputmode="numeric" pattern="[1-9][0-9]{0,19}" maxlength="20" placeholder="QQ 号" aria-label="屏蔽目标 QQ" required><label><input id="mute-delete" type="checkbox"> 同时移除 QQ 好友（若存在）</label><button type="submit" class="primary">加入小黑屋</button></div></form>
+    <p class="muted">应用层屏蔽，群聊与私聊都直接忽略。支持纯数字 QQ 号或跨平台标识（如 <code>telegram:123456</code>）。Owner 与机器人自身受保护。只有明确勾选并确认，才会顺带从 QQ 好友列表移除。</p>
+    <form id="mute-form"><div class="row"><input id="mute-qq" type="text" maxlength="180" placeholder="QQ 号或 平台:用户ID（如 telegram:123456）" aria-label="屏蔽目标账号" required><label><input id="mute-delete" type="checkbox"> 同时移除 QQ 好友（仅 QQ/OneBot 有效）</label><button type="submit" class="primary">加入小黑屋</button></div></form>
     <div id="mute-list" class="table"></div>
   </div>
   <div class="card"><h2>待审批告状</h2>
-    <p class="muted">同一群友 24 小时内多次触发安全检测后申请，未审批前不会自动屏蔽。昵称仅供辨认，身份以 QQ 号为准。</p>
+    <p class="muted">同一群友 24 小时内多次触发安全检测后申请，未审批前不会自动屏蔽。昵称仅供辨认，身份以平台与协议层账号为准。</p>
     <div id="mute-proposals" class="table"></div>
   </div>
 </section>

@@ -20,6 +20,8 @@ dependencies = [
   "aiohttp>=3.11,<4",
   "pillow>=12,<13",
   "google-auth>=2.40,<3",
+  # Retained in uv.lock for host scripts/colab_rvc.py CLI & smoke_container parity;
+  # hakimi-bot runtime does not invoke yt-dlp (song_finder installs its own copy).
   "yt-dlp==2026.10.26",
 ]
 

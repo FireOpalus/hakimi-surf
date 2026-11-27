@@ -263,17 +263,23 @@ class Module(SystemModule):
             raise Rejected("song_drive_not_configured")
         return drive
 
-    async def _resolve_weight_cache(self, drive: Any, mode: str) -> tuple[str, str, str]:
+    async def _resolve_weight_cache(
+        self, drive: Any, mode: str, *, fallback_mode: str = ""
+    ) -> tuple[str, str, str]:
         cache_folder_id = ""
         cache_weights_file_id = ""
         cache_weights_sha256 = ""
         try:
             cache_folder_id = await drive.ensure_cache_folder()
-            cache_key = compute_weight_cache_key(mode)
-            manifest = await drive.resolve_cache_manifest(cache_key, expected_kind="weights")
-            if isinstance(manifest, dict):
-                cache_weights_file_id = str(manifest.get("archive_file_id") or "")
-                cache_weights_sha256 = str(manifest.get("sha256") or "")
+            modes = (mode, fallback_mode) if fallback_mode and fallback_mode != mode else (mode,)
+            for m in modes:
+                cache_key = compute_weight_cache_key(m)
+                manifest = await drive.resolve_cache_manifest(cache_key, expected_kind="weights")
+                if isinstance(manifest, dict):
+                    cache_weights_file_id = str(manifest.get("archive_file_id") or "")
+                    cache_weights_sha256 = str(manifest.get("sha256") or "")
+                    if cache_weights_file_id:
+                        break
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -287,53 +293,57 @@ class Module(SystemModule):
         engine = normalize_cover_engine(payload.get("engine"))
 
         tree = await drive.ensure_folder_tree()
-        token_info = await drive.get_short_lived_token(min_ttl_seconds=1800)
-        access_token = str(token_info.get("access_token") or "").strip()
-        if not access_token:
-            raise Rejected("song_drive_token_failed")
-
         req_inbox_id = str(payload.get("inbox_file_id") or "").strip()
         req_inbox_name = str(payload.get("inbox_filename") or "").strip()
-        inbox_file_id = ""
-        inbox_name = ""
-        if req_inbox_id or req_inbox_name:
-            inbox_meta = await drive.resolve_inbox_file(
-                file_id=req_inbox_id,
-                filename=req_inbox_name,
-            )
-            inbox_file_id = str(inbox_meta.get("id") or "")
-            inbox_name = str(inbox_meta.get("name") or req_inbox_name)
-        else:
+        if not req_inbox_id and not req_inbox_name:
             raise Rejected("song_source_required")
 
-        pth_file_id = ""
-        index_file_id = ""
-        ref_audio_file_id = ""
-        ref_audio_name = ""
-        if engine == "rvc":
-            model_name = str(payload.get("model_name") or "hakimi").strip() or "hakimi"
-            remote_models = await drive.resolve_model_files(model_name)
-            if isinstance(remote_models, dict):
-                pth_meta = remote_models.get("pth")
-                idx_meta = remote_models.get("index")
-                if isinstance(pth_meta, dict) and isinstance(idx_meta, dict):
-                    pth_file_id = str(pth_meta.get("id") or "")
-                    index_file_id = str(idx_meta.get("id") or "")
-        else:
+        async def _resolve_voice_asset() -> tuple[str, str, str, str]:
+            if engine == "rvc":
+                model_name = str(payload.get("model_name") or "hakimi").strip() or "hakimi"
+                remote_models = await drive.resolve_model_files(model_name)
+                if isinstance(remote_models, dict):
+                    pth_meta = remote_models.get("pth")
+                    idx_meta = remote_models.get("index")
+                    if isinstance(pth_meta, dict) and isinstance(idx_meta, dict):
+                        return (
+                            str(pth_meta.get("id") or ""),
+                            str(idx_meta.get("id") or ""),
+                            "",
+                            "",
+                        )
+                return "", "", "", ""
             req_ref_id = str(payload.get("ref_audio_file_id") or "").strip()
             req_ref_name = str(payload.get("ref_voice") or "").strip()
             ref_meta = await drive.resolve_ref_voice(
                 file_id=req_ref_id,
                 filename=req_ref_name,
             )
-            ref_audio_file_id = str(ref_meta.get("id") or "")
-            ref_audio_name = str(ref_meta.get("name") or req_ref_name)
+            return (
+                "",
+                "",
+                str(ref_meta.get("id") or ""),
+                str(ref_meta.get("name") or req_ref_name),
+            )
 
-        (
-            cache_folder_id,
-            cache_weights_file_id,
-            cache_weights_sha256,
-        ) = await self._resolve_weight_cache(drive, "cover")
+        weight_cache_mode = "cover" if engine == "rvc" else "svc"
+        weight_cache_fallback = "" if engine == "rvc" else "cover"
+        token_info, inbox_meta, voice_tuple, cache_tuple = await asyncio.gather(
+            drive.get_short_lived_token(min_ttl_seconds=1800),
+            drive.resolve_inbox_file(file_id=req_inbox_id, filename=req_inbox_name),
+            _resolve_voice_asset(),
+            self._resolve_weight_cache(
+                drive, weight_cache_mode, fallback_mode=weight_cache_fallback
+            ),
+        )
+        access_token = str(token_info.get("access_token") or "").strip()
+        if not access_token:
+            raise Rejected("song_drive_token_failed")
+
+        inbox_file_id = str(inbox_meta.get("id") or "")
+        inbox_name = str(inbox_meta.get("name") or req_inbox_name)
+        pth_file_id, index_file_id, ref_audio_file_id, ref_audio_name = voice_tuple
+        cache_folder_id, cache_weights_file_id, cache_weights_sha256 = cache_tuple
 
         return {
             "drive": {

@@ -317,6 +317,7 @@ class WorkerJobRecord:
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     cancelled: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -360,7 +361,6 @@ class WorkerState:
         probe_session_fn: Callable[[str], dict[str, Any]] | None = None,
         cover_runner: Callable[..., dict[str, Any]] | None = None,
         train_runner: Callable[..., dict[str, Any]] | None = None,
-        clean_search_fn: Callable[..., Path] | None = None,
         dataset_builder: Callable[..., dict[str, Any]] | None = None,
         job_overrides: dict[str, Any] | None = None,
         handlers: Sequence[JobHandler] | None = None,
@@ -379,8 +379,6 @@ class WorkerState:
             overrides["cover_runner"] = cover_runner
         if train_runner is not None:
             overrides["train_runner"] = train_runner
-        if clean_search_fn is not None:
-            overrides["clean_search_fn"] = clean_search_fn
         if dataset_builder is not None:
             overrides["dataset_builder"] = dataset_builder
         self._job_overrides = overrides
@@ -389,12 +387,29 @@ class WorkerState:
         self.jobs: dict[str, WorkerJobRecord] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.running_job_id: str | None = None
+        self._inflight_lock = threading.Lock()
+        self._inflight_threads: set[str] = set()
         self.warm_pool = WarmSessionPool(max_sessions=config.warm_max_sessions)
         self._reaper_task: asyncio.Task[None] | None = None
         self._local_handlers: dict[str, JobHandler] = {}
 
         for handler in handlers or ():
             self.register_job_handler(handler)
+
+    def _is_thread_inflight(self, job_id: str | None = None) -> bool:
+        with self._inflight_lock:
+            if job_id is None:
+                return bool(self._inflight_threads)
+            return job_id in self._inflight_threads
+
+    @property
+    def worker_draining(self) -> bool:
+        with self._inflight_lock:
+            for jid in self._inflight_threads:
+                rec = self.jobs.get(jid)
+                if rec is None or rec.status != "running":
+                    return True
+            return False
 
     def register_job_handler(self, handler: JobHandler) -> None:
         """Register a per-worker `JobHandler` override/extension."""
@@ -547,7 +562,8 @@ class WorkerState:
             stop_session_fn=self._stop_session_fn,
             clock=self._clock,
             overrides=dict(self._job_overrides),
-            _is_cancelled_fn=lambda: record.cancelled,
+            cancel_event=record.cancel_event,
+            _is_cancelled_fn=lambda: record.cancelled or record.cancel_event.is_set(),
             _can_keep_warm_fn=lambda gpu: self._can_keep_warm(
                 job_type=record.job_type,
                 gpu=gpu,
@@ -620,12 +636,16 @@ class WorkerState:
         warm_sessions, warm_pool = self.warm_pool_summary()
         raw_err = usage.get("error")
         err = _scrub_secret(str(raw_err), self.cfg.token) if raw_err else None
+        usage_active = max(0, int(usage.get("active_sessions") or 0))
+        untracked_active = max(0, usage_active - len(warm_sessions))
         return {
             "reachable": bool(usage.get("reachable", True)),
             "compute_units": usage.get("compute_units"),
             "usage_rate": usage.get("usage_rate"),
-            "active_sessions": max(int(usage.get("active_sessions") or 0), len(warm_sessions)),
+            "active_sessions": max(usage_active, len(warm_sessions)),
+            "untracked_active_sessions": untracked_active,
             "running_job_id": self.running_job_id,
+            "worker_draining": self.worker_draining,
             "supported_job_types": list(self.supported_job_types()),
             "warm_sessions": warm_sessions,
             "warm_pool": warm_pool,
@@ -648,7 +668,11 @@ class WorkerState:
                 active = self.jobs.get(self.running_job_id)
                 if active is not None and active.status == "running":
                     raise HTTPException(409, "worker_busy")
+                if self._is_thread_inflight(self.running_job_id):
+                    raise HTTPException(409, "worker_draining")
                 self.running_job_id = None
+            if self._is_thread_inflight():
+                raise HTTPException(409, "worker_draining")
 
             session_name = f"hakimi-w-{req.job_id[:8]}"
             record = WorkerJobRecord(
@@ -700,6 +724,28 @@ class WorkerState:
             cu_before = None
 
         job_ctx: WorkerJobContext | None = None
+        loop = asyncio.get_running_loop()
+
+        def _clear_draining_on_loop(jid: str) -> None:
+            rec = self.jobs.get(jid)
+            if self.running_job_id == jid and (rec is None or rec.status != "running"):
+                self.running_job_id = None
+
+        def _run_sync_tracked(ctx: WorkerJobContext, parsed_arg: Any) -> tuple[dict[str, Any], str]:
+            try:
+                return handler.run_sync(ctx, parsed_arg)
+            finally:
+                with self._inflight_lock:
+                    self._inflight_threads.discard(record.job_id)
+                if record.cancelled or record.cancel_event.is_set():
+                    if self.warm_pool.remove_by_session_name(record.session_name):
+                        try:
+                            self._stop_session_fn(record.session_name)
+                        except Exception:
+                            pass
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_clear_draining_on_loop, record.job_id)
+
         try:
             job_ctx = self._build_job_context(
                 record,
@@ -707,9 +753,19 @@ class WorkerState:
                 allow_warm_keepalive=allow_warm_keepalive,
                 cu_balance_hint=cu_before,
             )
-            async with asyncio.timeout(timeout_seconds):
-                res, assigned_gpu = await asyncio.to_thread(handler.run_sync, job_ctx, parsed)
-            if record.cancelled:
+            if record.cancelled or record.cancel_event.is_set():
+                raise asyncio.CancelledError
+            with self._inflight_lock:
+                self._inflight_threads.add(record.job_id)
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    res, assigned_gpu = await asyncio.to_thread(_run_sync_tracked, job_ctx, parsed)
+            except (TimeoutError, asyncio.CancelledError):
+                # Thread may still be draining cooperatively; cancel_event wakes it up.
+                record.cancelled = True
+                record.cancel_event.set()
+                raise
+            if record.cancelled or record.cancel_event.is_set():
                 record.status = "cancelled"
                 record.error_code = record.error_code or "cancelled"
                 if self.warm_pool.remove_by_session_name(record.session_name):
@@ -719,6 +775,8 @@ class WorkerState:
                 record.result = res
                 record.assigned_gpu = assigned_gpu
         except TimeoutError:
+            record.cancelled = True
+            record.cancel_event.set()
             record.status = "failed"
             record.error_code = "job_timeout"
             record.error = "Job timed out"
@@ -726,9 +784,11 @@ class WorkerState:
             self.warm_pool.remove_by_session_name(record.session_name)
             await asyncio.to_thread(self._stop_session_fn, record.session_name)
         except asyncio.CancelledError:
+            record.cancelled = True
+            record.cancel_event.set()
             record.status = "cancelled"
-            record.error_code = "cancelled"
-            record.result = {"error_code": "cancelled"}
+            record.error_code = record.error_code or "cancelled"
+            record.result = {"error_code": record.error_code}
             self.warm_pool.remove_by_session_name(record.session_name)
             await asyncio.to_thread(self._stop_session_fn, record.session_name)
         except Exception as exc:
@@ -736,9 +796,9 @@ class WorkerState:
             err_code = getattr(exc, "code", None) or "colab_worker_error"
             if not isinstance(err_code, str) or err_code not in allowed_codes:
                 err_code = "colab_worker_error"
-            if record.cancelled:
+            if record.cancelled or record.cancel_event.is_set():
                 record.status = "cancelled"
-                record.error_code = "cancelled"
+                record.error_code = record.error_code or "cancelled"
             else:
                 record.status = "failed"
                 record.error_code = err_code
@@ -765,7 +825,9 @@ class WorkerState:
                 pass
             record.finished_at = self._clock()
             async with self.lock:
-                if self.running_job_id == record.job_id:
+                if self.running_job_id == record.job_id and not self._is_thread_inflight(
+                    record.job_id
+                ):
                     self.running_job_id = None
                 self.tasks.pop(record.job_id, None)
 
@@ -779,11 +841,12 @@ class WorkerState:
             if record.status != "running":
                 return record.to_dict()
             record.cancelled = True
+            record.cancel_event.set()
             record.status = "cancelled"
             record.error_code = "cancelled"
             record.finished_at = self._clock()
             task = self.tasks.get(job_id)
-            if self.running_job_id == job_id:
+            if self.running_job_id == job_id and not self._is_thread_inflight(job_id):
                 self.running_job_id = None
         if task is not None and not task.done():
             task.cancel()
@@ -798,6 +861,7 @@ class WorkerState:
             for job_id, record in self.jobs.items():
                 if record.status == "running":
                     record.cancelled = True
+                    record.cancel_event.set()
                     record.status = "cancelled"
                     record.error_code = "emergency_terminated"
                     record.finished_at = self._clock()
@@ -806,7 +870,8 @@ class WorkerState:
                     task = self.tasks.get(job_id)
                     if task is not None and not task.done():
                         task.cancel()
-            self.running_job_id = None
+            if not self._is_thread_inflight(self.running_job_id):
+                self.running_job_id = None
         warm_entries = self.warm_pool.pop_all()
         for entry in warm_entries:
             if entry.session_name not in extra_sessions:
@@ -829,7 +894,6 @@ def create_worker_app(
     probe_session_fn: Callable[[str], dict[str, Any]] | None = None,
     cover_runner: Callable[..., dict[str, Any]] | None = None,
     train_runner: Callable[..., dict[str, Any]] | None = None,
-    clean_search_fn: Callable[..., Path] | None = None,
     dataset_builder: Callable[..., dict[str, Any]] | None = None,
     job_overrides: dict[str, Any] | None = None,
     handlers: Sequence[JobHandler] | None = None,
@@ -844,7 +908,6 @@ def create_worker_app(
         probe_session_fn=probe_session_fn,
         cover_runner=cover_runner,
         train_runner=train_runner,
-        clean_search_fn=clean_search_fn,
         dataset_builder=dataset_builder,
         job_overrides=job_overrides,
         handlers=handlers,

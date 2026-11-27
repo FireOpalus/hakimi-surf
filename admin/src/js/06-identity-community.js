@@ -754,9 +754,38 @@ $('aff-user-form').addEventListener('submit',e=>{
   });
 });
 
-function communityQQ(value){const id=value.trim();if(!/^[1-9][0-9]{0,19}$/.test(id))throw Error('请输入纯数字 QQ 号');return id;}
+function parseCommunityMuteTarget(value){
+  const raw=String(value||'').trim();
+  if(!raw)throw Error('请输入纯数字 QQ 号或 平台:用户ID（如 telegram:123456）');
+  if(raw.includes(':')){
+    const idx=raw.indexOf(':');
+    const platform=raw.slice(0,idx).trim().toLowerCase();
+    const uid=raw.slice(idx+1).trim();
+    if(!/^[a-z][a-z0-9_]{0,47}$/.test(platform))throw Error('平台标识须以小写字母开头，仅含小写字母、数字和下划线');
+    if(platform==='onebot'){
+      if(!/^[1-9][0-9]{0,19}$/.test(uid))throw Error('OneBot QQ 号须为不含前导零的纯数字');
+      return {platform:'onebot',user_id:uid,target:uid};
+    }
+    if(platform==='qq'){
+      if(!/^[A-Za-z0-9_-]{1,128}$/.test(uid))throw Error('QQ 官方 ID 仅支持字母、数字、下划线或短横线');
+    }else if(!/^[A-Za-z0-9_.:@-]{1,128}$/.test(uid)){
+      throw Error('用户 ID 须为 1–128 位字母、数字或 _ . : @ -');
+    }
+    return {platform,user_id:uid,target:platform+':'+uid};
+  }
+  if(!/^[1-9][0-9]{0,19}$/.test(raw))throw Error('请输入纯数字 QQ 号，或使用 平台:用户ID（如 telegram:123456）');
+  return {platform:'onebot',user_id:raw,target:raw};
+}
+function communityPlatformBadge(platform){
+  const p=String(platform||'onebot').toLowerCase();
+  if(typeof formatPlatformBadge==='function')return formatPlatformBadge(p);
+  if(p==='onebot')return pill('QQ','paid');
+  if(p==='qq')return pill('QQ 官方','vertex');
+  if(p==='telegram')return pill('Telegram','tg');
+  return pill(p,'muted');
+}
 async function syncCommunityAndAffection(){await community();await affection().catch(()=>{});}
-const muteDeleteLabels={none:'仅屏蔽',deleted:'已删好友',not_friend:'非好友',failed:'删好友失败'};
+const muteDeleteLabels={none:'仅屏蔽',not_requested:'仅屏蔽',not_supported:'不适用（跨平台）',requested:'待删好友',attempted:'删好友中',done:'已删好友',deleted:'已删好友',not_friend:'非好友',uncertain:'结果不确定',unavailable:'暂不可用',failed:'删好友失败'};
 const proposalStatusLabels={pending:'待审批',approved:'已批准',rejected:'已驳回'};
 const cfgSourceLabels={admin:'SQLite 热配置',sqlite:'SQLite 热配置',env:'.env 默认值',none:'未配置'};
 const signStatusLabels={never:'尚未自动换签',ok:'更新成功',updated:'更新成功',skipped:'冷却跳过',disabled:'未启用',failed:'更新失败'};
@@ -771,33 +800,65 @@ async function longnick(){
 }
 async function community(){
   const m=await api('moderation');if(!token)return;
-  table('mute-list',['QQ 号','加入时间','好友操作','操作'],m.muted_users.map(x=>[
-    x.user_id,dateTime(x.created),muteDeleteLabels[x.delete_status]||x.delete_status,
-    button('解除屏蔽',async()=>{await api('moderation/users','PUT',{user_id:x.user_id,muted:false});await syncCommunityAndAffection();})
-  ]));
-  table('mute-proposals',['编号 / QQ / 昵称','原因','状态','操作'],m.proposals.map(x=>{
+  const mutedRows=[];
+  const seenMuted=new Set();
+  for(const item of [...(Array.isArray(m.muted_users)?m.muted_users:[]),...(Array.isArray(m.platform_muted_users)?m.platform_muted_users:[])]){
+    const plat=String(item.platform||'onebot').toLowerCase();
+    const uid=String(item.user_id||'');
+    if(!uid)continue;
+    const dedupeKey=plat+':'+uid;
+    if(seenMuted.has(dedupeKey))continue;
+    seenMuted.add(dedupeKey);
+    mutedRows.push({...item,platform:plat,user_id:uid,target:item.target||(plat==='onebot'?uid:(plat+':'+uid))});
+  }
+  mutedRows.sort((a,b)=>Number(b.created||0)-Number(a.created||0));
+  table('mute-list',['平台 / 账号','加入时间','好友操作','操作'],mutedRows.map(x=>{
+    const acctCell=el('div',undefined,'stack-xs');
+    const idRow=el('div',undefined,'platform-cell');
+    idRow.append(communityPlatformBadge(x.platform),el('code',x.user_id,'code-mono'));
+    acctCell.append(idRow);
+    if(x.nickname)acctCell.append(el('small',x.nickname,'muted'));
+    const unmuteTarget=x.platform==='onebot'?x.user_id:(x.platform+':'+x.user_id);
+    return[
+      acctCell,
+      dateTime(x.created),
+      muteDeleteLabels[x.delete_status]||x.delete_status||'—',
+      button('解除屏蔽',async()=>{
+        await api('moderation/mute/'+encodeURIComponent(unmuteTarget),'DELETE');
+        notice('已解除 '+x.platform+':'+x.user_id+' 的小黑屋屏蔽');
+        await syncCommunityAndAffection();
+      })
+    ];
+  }),'当前小黑屋为空，还没有被屏蔽的用户。');
+  table('mute-proposals',['编号 / 账号 / 昵称','原因','状态','操作'],(m.proposals||[]).map(x=>{
+    const plat=String(x.platform||'onebot').toLowerCase();
+    const whoCell=el('div',undefined,'platform-cell');
+    whoCell.append(communityPlatformBadge(plat),el('span',x.id+' / '+x.user_id+(x.nickname?' / '+x.nickname:'')));
     const actions=el('div',undefined,'row');
     if(x.status==='pending'){
       actions.append(
-        button('批准屏蔽',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:true});await syncCommunityAndAffection();}),
-        button('批准并移除好友',async()=>{
+        button('批准屏蔽',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:true});await syncCommunityAndAffection();})
+      );
+      if(plat==='onebot'){
+        actions.append(button('批准并移除好友',async()=>{
           if(!(await confirmDialog('将屏蔽 QQ '+x.user_id+'，并在其为好友时移除好友。确定执行？',{danger:true,confirmLabel:'屏蔽并删好友'})))return;
           await api('moderation/proposals/'+x.id,'POST',{approve:true,delete_friend:true});await syncCommunityAndAffection();
-        },'danger'),
-        button('驳回',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:false});await community();})
-      );
+        },'danger'));
+      }
+      actions.append(button('驳回',async()=>{await api('moderation/proposals/'+x.id,'POST',{approve:false});await community();}));
     }
-    return[x.id+' / '+x.user_id+' / '+x.nickname,x.reason,proposalStatusLabels[x.status]||x.status,actions];
+    return[whoCell,x.reason,proposalStatusLabels[x.status]||x.status,actions];
   }));
 }
 $('refresh-community').addEventListener('click',e=>busy(e.target,syncCommunityAndAffection));
 $('mute-form').addEventListener('submit',e=>{
   e.preventDefault();
   busy(e.submitter,async()=>{
-    const uid=communityQQ($('mute-qq').value),remove=$('mute-delete').checked;
-    if(remove&&!(await confirmDialog('确认屏蔽并移除 QQ '+uid+' 的好友关系（若存在）？',{danger:true,confirmLabel:'屏蔽并删好友'})))return;
-    const r=await api('moderation/users','PUT',{user_id:uid,muted:true,delete_friend:remove});
-    notice('屏蔽已生效 · 好友操作 '+r.delete_status);
+    const parsed=parseCommunityMuteTarget($('mute-qq').value),remove=$('mute-delete').checked;
+    if(remove&&parsed.platform!=='onebot')throw Error('仅 QQ（OneBot）账号支持同时移除好友，请取消勾选后再加入小黑屋');
+    if(remove&&!(await confirmDialog('确认屏蔽并移除 QQ '+parsed.user_id+' 的好友关系（若存在）？',{danger:true,confirmLabel:'屏蔽并删好友'})))return;
+    const r=await api('moderation/users','PUT',{user_id:parsed.target,muted:true,delete_friend:remove});
+    notice('屏蔽已生效（'+parsed.platform+':'+parsed.user_id+'） · 好友操作 '+(muteDeleteLabels[r.delete_status]||r.delete_status));
     $('mute-qq').value='';$('mute-delete').checked=false;
     await syncCommunityAndAffection();
   });

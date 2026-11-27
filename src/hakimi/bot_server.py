@@ -530,52 +530,76 @@ def assemble_chat_input(
         parts.append("</transient_turn_context>")
         return "".join(parts)
 
-    if metadata.get("module_context") and estimate_tokens(tail()) > settings.chat_tail_tokens:
+    limit = settings.chat_tail_tokens
+    rendered = tail()
+    tokens = estimate_tokens(rendered)
+    if tokens <= limit:
+        return "<conversation_history_log>\n" + b + "</conversation_history_log>\n" + rendered
+
+    def _recompute() -> tuple[str, int]:
+        r = tail()
+        return r, estimate_tokens(r)
+
+    if metadata.get("module_context") and tokens > limit:
         metadata.pop("module_context")
-    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        rendered, tokens = _recompute()
+    if tokens > limit and "待分享见闻（仅供当前会话，有关时再提）" in metadata:
         metadata.pop("待分享见闻（仅供当前会话，有关时再提）", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and dual:
+        rendered, tokens = _recompute()
+    if tokens > limit and dual:
         dual = {"speaker_profile": dual.get("speaker_profile", {})}
-    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        rendered, tokens = _recompute()
+    if tokens > limit and dual:
         dual = {}
+        rendered, tokens = _recompute()
     # Trim optional background first; never move a dynamic fragment ahead of B.
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and background:
+    if tokens > limit and background:
         for drop_key in (
             "近期群聊巡逻记忆（只读背景）",
             "owner_other_surface_recent",
             "owner_recalled_memories",
         ):
-            if drop_key in background and estimate_tokens(tail()) > settings.chat_tail_tokens:
+            if drop_key in background and tokens > limit:
                 background.pop(drop_key, None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens:
-        background = (
-            {"excerpt": truncate_tokens(json.dumps(background, ensure_ascii=False), 180)}
-            if background
-            else {}
-        )
-    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+                rendered, tokens = _recompute()
+    if tokens > limit and background:
+        background = {"excerpt": truncate_tokens(json.dumps(background, ensure_ascii=False), 180)}
+        rendered, tokens = _recompute()
+    if tokens > limit and (background or summary):
         background = {}
         summary = truncate_tokens(summary, 180)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("world_state_summary"):
+        rendered, tokens = _recompute()
+    if tokens > limit and metadata.get("world_state_summary"):
         metadata.pop("world_state_summary", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("recent_bili_surfed"):
+        rendered, tokens = _recompute()
+    if tokens > limit and metadata.get("recent_bili_surfed"):
         metadata.pop("recent_bili_surfed", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("nearby_group_context"):
+        rendered, tokens = _recompute()
+    if tokens > limit and metadata.get("nearby_group_context"):
         half = max(1, len(metadata["nearby_group_context"]) // 2)
         metadata["nearby_group_context"] = metadata["nearby_group_context"][-half:]
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("file_attachments"):
+        rendered, tokens = _recompute()
+    if tokens > limit and metadata.get("file_attachments"):
         metadata["file_attachments"] = [
             {**item, "content": truncate_tokens(str(item.get("content", "")), 900)}
             for item in metadata["file_attachments"][:1]
             if isinstance(item, dict)
         ]
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and metadata.get("file_attachments"):
+        rendered, tokens = _recompute()
+    if tokens > limit and metadata.get("file_attachments"):
         metadata["file_attachments"] = [
             {**item, "content": truncate_tokens(str(item.get("content", "")), 350)}
             for item in metadata["file_attachments"][:1]
             if isinstance(item, dict)
         ]
-    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        rendered, tokens = _recompute()
+    if tokens > limit and (
+        summary
+        or "file_attachments" in metadata
+        or "image_sources" in metadata
+        or "nearby_group_context" in metadata
+        or "allowed_at_qqs" in metadata
+    ):
         summary = ""
         metadata.pop("file_attachments", None)
         if "image_sources" in metadata:
@@ -584,20 +608,24 @@ def assemble_chat_input(
             metadata["nearby_group_context"] = []
         if "allowed_at_qqs" in metadata:
             metadata["allowed_at_qqs"] = metadata["allowed_at_qqs"][:20]
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and "jit_proactive_intent" in metadata:
+        rendered, tokens = _recompute()
+    if tokens > limit and "jit_proactive_intent" in metadata:
         metadata.pop("jit_proactive_intent", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and "voice_reply_hint" in metadata:
+        rendered, tokens = _recompute()
+    if tokens > limit and "voice_reply_hint" in metadata:
         metadata.pop("voice_reply_hint", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and "audio_gist_hint" in metadata:
+        rendered, tokens = _recompute()
+    if tokens > limit and "audio_gist_hint" in metadata:
         metadata.pop("audio_gist_hint", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and (
-        "sing_song_hint" in metadata or "song_catalog" in metadata
-    ):
+        rendered, tokens = _recompute()
+    if tokens > limit and ("sing_song_hint" in metadata or "song_catalog" in metadata):
         metadata.pop("sing_song_hint", None)
         metadata.pop("song_catalog", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens and "owner_chat_actions" in metadata:
+        rendered, tokens = _recompute()
+    if tokens > limit and "owner_chat_actions" in metadata:
         metadata.pop("owner_chat_actions", None)
         metadata.pop("owner_chat_action_hint", None)
-    if estimate_tokens(tail()) > settings.chat_tail_tokens:
+        rendered, tokens = _recompute()
+    if tokens > limit:
         raise Rejected("transient_context_too_large")
-    return "<conversation_history_log>\n" + b + "</conversation_history_log>\n" + tail()
+    return "<conversation_history_log>\n" + b + "</conversation_history_log>\n" + rendered

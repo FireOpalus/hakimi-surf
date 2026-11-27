@@ -35,6 +35,15 @@ from .protocol import (
 
 log = logging.getLogger("voice_gateway.session")
 
+DEFAULT_MAX_TTS_QUEUE_SIZE = 32
+_MAX_TURNS = 64
+_TARGET_TURNS = 48
+_MAX_TURN_AGE_SECONDS = 1800.0
+
+
+class _TtsAudioTooLargeError(RuntimeError):
+    """Raised when synthesized TTS audio exceeds configured max_tts_audio_bytes."""
+
 
 def _join_turn_chunks(parts: list[str]) -> str:
     """Join streamed text chunks while avoiding extra spaces between CJK characters."""
@@ -156,6 +165,7 @@ class VoiceGatewaySession:
         ]
         | None = None,
         config_getter: Callable[[], VoiceGatewayConfig] | None = None,
+        max_tts_queue_size: int = DEFAULT_MAX_TTS_QUEUE_SIZE,
     ) -> None:
         self._config = config
         self._stt = stt_provider
@@ -186,11 +196,13 @@ class VoiceGatewaySession:
         self._audio_turn_tasks: dict[str, asyncio.Task[None]] = {}
         self._bg_tasks: set[asyncio.Task[None]] = set()
 
+        self._max_tts_queue_size = max(1, int(max_tts_queue_size))
         self._tts_queue: deque[_TtsJob] = deque()
         self._tts_wake = asyncio.Event()
         self._tts_worker_task: asyncio.Task[None] | None = None
         self._active_tts_job: _TtsJob | None = None
         self._active_tts_task: asyncio.Task[None] | None = None
+        self._active_tts_settled: asyncio.Event | None = None
 
     @property
     def session_active(self) -> bool:
@@ -581,7 +593,7 @@ class VoiceGatewaySession:
             await self._send_error("invalid_output_format", str(exc), req_id=req_id)
             return
 
-        self._enqueue_tts_job(
+        if not self._enqueue_tts_job(
             _TtsJob(
                 turn_id="",
                 seq=1,
@@ -589,7 +601,12 @@ class VoiceGatewaySession:
                 output_format=fmt,
                 req_id=req_id,
             )
-        )
+        ):
+            await self._send_error(
+                "tts_queue_full",
+                "TTS queue is full",
+                req_id=req_id,
+            )
 
     async def _handle_audio_turn(self, frame: dict[str, Any]) -> None:
         raw_tid = frame.get("turn_id")
@@ -934,17 +951,33 @@ class VoiceGatewaySession:
                     await self._upstream.cancel_turn(target_id)
 
     def _register_turn(self, turn_id: str, *, stt_ms: float | None = None) -> _TurnState:
+        now = time.perf_counter()
         state = self._turns.get(turn_id)
         if state is None:
-            state = _TurnState(turn_id=turn_id, sent_at=time.perf_counter(), stt_ms=stt_ms)
+            state = _TurnState(turn_id=turn_id, sent_at=now, stt_ms=stt_ms)
             self._turns[turn_id] = state
         elif stt_ms is not None:
             state.stt_ms = stt_ms
-        if len(self._turns) > 64:
+
+        active_tid = self._active_tts_job.turn_id if self._active_tts_job is not None else ""
+        protected = {turn_id, active_tid} - {""}
+        for old_tid in list(self._turns):
+            if old_tid in protected:
+                continue
+            if now - self._turns[old_tid].sent_at > _MAX_TURN_AGE_SECONDS:
+                self._turns.pop(old_tid, None)
+
+        if len(self._turns) > _MAX_TURNS:
             for old_tid in list(self._turns):
-                if old_tid != turn_id and self._turns[old_tid].ended:
+                if old_tid not in protected and self._turns[old_tid].ended:
                     self._turns.pop(old_tid, None)
-                if len(self._turns) <= 48:
+                if len(self._turns) <= _TARGET_TURNS:
+                    break
+        if len(self._turns) > _MAX_TURNS:
+            for old_tid in list(self._turns):
+                if old_tid not in protected:
+                    self._turns.pop(old_tid, None)
+                if len(self._turns) <= _TARGET_TURNS:
                     break
         return state
 
@@ -1113,11 +1146,30 @@ class VoiceGatewaySession:
         await self._cancel_local_tts()
         await self._send_error("upstream_disconnected", "Upstream companion WebSocket closed")
 
-    def _enqueue_tts_job(self, job: _TtsJob) -> None:
+    def _enqueue_tts_job(self, job: _TtsJob) -> bool:
         if self._closing:
-            return
+            return False
+        if len(self._tts_queue) >= self._max_tts_queue_size:
+            if job.final_turn_payload is not None:
+                # Preserve turn completion barriers while enforcing the hard queue bound.
+                evicted = False
+                for idx, existing in enumerate(self._tts_queue):
+                    if existing.final_turn_payload is None:
+                        del self._tts_queue[idx]
+                        evicted = True
+                        break
+                if not evicted and self._tts_queue:
+                    self._tts_queue.popleft()
+            else:
+                log.warning(
+                    "event=voice_gateway_tts_queue_full size=%d max=%d",
+                    len(self._tts_queue),
+                    self._max_tts_queue_size,
+                )
+                return False
         self._tts_queue.append(job)
         self._tts_wake.set()
+        return True
 
     async def _cancel_local_tts(
         self,
@@ -1157,6 +1209,8 @@ class VoiceGatewaySession:
                 kept.append(job)
         self._tts_queue = kept
 
+        task_to_wait: asyncio.Task[None] | None = None
+        settled_to_wait: asyncio.Event | None = None
         active = self._active_tts_job
         if active is not None:
             active_matches = (
@@ -1168,6 +1222,22 @@ class VoiceGatewaySession:
                 active.cancelled = True
                 if self._active_tts_task is not None and not self._active_tts_task.done():
                     self._active_tts_task.cancel()
+                task_to_wait = self._active_tts_task
+                settled_to_wait = self._active_tts_settled
+
+        current = asyncio.current_task()
+        if task_to_wait is not None and task_to_wait is not current:
+            with contextlib.suppress(BaseException):
+                await task_to_wait
+        if (
+            settled_to_wait is not None
+            and self._tts_worker_task is not None
+            and self._tts_worker_task is not current
+            and not self._tts_worker_task.done()
+        ):
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(2.0):
+                    await settled_to_wait.wait()
 
         for cancelled_tid in deferred_cancellations:
             tstate = self._turns.get(cancelled_tid)
@@ -1222,7 +1292,9 @@ class VoiceGatewaySession:
                 continue
 
             exec_state = _TtsExecutionState()
+            settled = asyncio.Event()
             self._active_tts_job = job
+            self._active_tts_settled = settled
             task = asyncio.create_task(self._execute_tts_job(job, exec_state))
             self._active_tts_task = task
             try:
@@ -1249,6 +1321,38 @@ class VoiceGatewaySession:
                         job.turn_id,
                         status="cancelled",
                         reason="barge_in",
+                        metrics=self._build_turn_metrics(
+                            tstate,
+                            llm_ms=job.final_turn_payload.get("llm_ms"),
+                            tts_ttfb_ms=exec_state.ttfb_ms or None,
+                        ),
+                    )
+            except _TtsAudioTooLargeError as exc:
+                if exec_state.started_wire:
+                    await self._send_json(
+                        {
+                            "type": "tts.end",
+                            "req_id": job.req_id,
+                            "turn_id": job.turn_id,
+                            "seq": job.seq,
+                            "bytes": exec_state.total_bytes,
+                            "status": "error",
+                            "reason": "tts_audio_too_large",
+                            "tts_ttfb_ms": round(exec_state.ttfb_ms, 2),
+                        }
+                    )
+                await self._send_error(
+                    "tts_audio_too_large",
+                    str(exc),
+                    req_id=job.req_id,
+                    turn_id=job.turn_id,
+                )
+                if job.final_turn_payload is not None and job.turn_id:
+                    tstate = self._turns.get(job.turn_id)
+                    await self._emit_turn_end(
+                        job.turn_id,
+                        status="error",
+                        reason="tts_audio_too_large",
                         metrics=self._build_turn_metrics(
                             tstate,
                             llm_ms=job.final_turn_payload.get("llm_ms"),
@@ -1292,6 +1396,9 @@ class VoiceGatewaySession:
                     self._active_tts_job = None
                 if self._active_tts_task is task:
                     self._active_tts_task = None
+                if self._active_tts_settled is settled:
+                    self._active_tts_settled = None
+                settled.set()
 
     async def _execute_tts_job(self, job: _TtsJob, state: _TtsExecutionState) -> None:
         t0 = time.perf_counter()
@@ -1345,6 +1452,10 @@ class VoiceGatewaySession:
                 ):
                     raise asyncio.CancelledError
 
+                max_audio_bytes = cfg.max_tts_audio_bytes
+                if len(first_chunk) > max_audio_bytes:
+                    raise _TtsAudioTooLargeError("TTS audio exceeds max_tts_audio_bytes")
+
                 state.ttfb_ms = (time.perf_counter() - t0) * 1000.0
                 if job.turn_id:
                     tstate = self._turns.get(job.turn_id)
@@ -1376,6 +1487,8 @@ class VoiceGatewaySession:
                         or (job.turn_id and job.turn_id in self._cancelled_turns)
                     ):
                         raise asyncio.CancelledError
+                    if state.total_bytes + len(chunk) > max_audio_bytes:
+                        raise _TtsAudioTooLargeError("TTS audio exceeds max_tts_audio_bytes")
                     await self._send_raw_bytes(chunk)
                     state.total_bytes += len(chunk)
 

@@ -256,7 +256,11 @@ class GroupPipeline:
             wakeup.set()
 
     async def initialize(self):
-        await self.store.db.executescript(SCHEMA)
+        async with self.store.transaction():
+            for stmt in SCHEMA.split(";"):
+                sql = stmt.strip()
+                if sql:
+                    await self.store.db.execute(sql)
 
     def message_size(self, message):
         return (

@@ -829,18 +829,43 @@ class WorldExperience:
             "circadian_tag": self.circadian_tag(now, energy=row["energy"]),
         }
 
-    async def prune(self, now):
+    async def prune(self, now, *, confirmed_retention_days: int = 60):
         if not self.ready:
             return
+        timer_cutoff = now - 14 * 86400
+        confirmed_cutoff = now - max(1, int(confirmed_retention_days)) * 86400
+        social_cutoff = now - 30 * 86400
+        news_cutoff = now - 86400
+        async with self.store.lock:
+            has_work = bool(
+                await self.store.one(
+                    "SELECT 1 FROM world_changes WHERE "
+                    "(reason IN ('rest','sleep','day_rest','idle','mc_work','mc_play') AND at<?) "
+                    "OR (receipt!='initial' AND at<?) LIMIT 1",
+                    (timer_cutoff, confirmed_cutoff),
+                )
+                or await self.store.one(
+                    "SELECT 1 FROM world_social WHERE at<? LIMIT 1", (social_cutoff,)
+                )
+                or await self.store.one(
+                    "SELECT 1 FROM world_news WHERE expires<? LIMIT 1", (news_cutoff,)
+                )
+            )
+        if not has_work:
+            return
         async with self.store.transaction():
-            # Keep confirmed activity once by its durable source ID. Time samples are disposable.
+            # Keep confirmed activity within retention; disposable timer samples expire sooner.
             await self.store.db.execute(
                 "DELETE FROM world_changes WHERE reason IN "
                 "('rest','sleep','day_rest','idle','mc_work','mc_play') AND at<?",
-                (now - 14 * 86400,),
+                (timer_cutoff,),
             )
-            await self.store.db.execute("DELETE FROM world_social WHERE at<?", (now - 30 * 86400,))
-            await self.store.db.execute("DELETE FROM world_news WHERE expires<?", (now - 86400,))
+            await self.store.db.execute(
+                "DELETE FROM world_changes WHERE receipt!='initial' AND at<?",
+                (confirmed_cutoff,),
+            )
+            await self.store.db.execute("DELETE FROM world_social WHERE at<?", (social_cutoff,))
+            await self.store.db.execute("DELETE FROM world_news WHERE expires<?", (news_cutoff,))
 
     async def view(self, now):
         async with self.store.lock:

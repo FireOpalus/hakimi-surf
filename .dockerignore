@@ -5,7 +5,9 @@
 **/.git
 data
 tests
-__pycache__
+**/__pycache__
+*.pyc
+*.pyo
 .pytest_cache
 .ruff_cache
 *.sqlite*
@@ -14,5 +16,13 @@ secrets
 *oauth*.json
 dist
 admin/
+docs/
+cn/
+deploy/
+voice_client/
+voice_gateway/
+architecture.html
+README.md
+开发手册.md
 node_modules
 **/node_modules

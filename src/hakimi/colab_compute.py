@@ -276,6 +276,7 @@ class ColabComputeHub:
         self._clock = clock
         self._init_lock = asyncio.Lock()
         self._op_lock = asyncio.Lock()
+        self._sched_lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self.initialized = False
         self._closed = False
@@ -283,6 +284,9 @@ class ColabComputeHub:
         self.config = self._default_config()
         self._job_types: dict[str, _RegisteredJobSpec] = {}
         self._hooks: dict[str, list[Callable[[dict[str, Any]], Awaitable[None]]]] = {}
+        self._in_flight_dispatch_ids: set[str] = set()
+        self._dispatch_backoff_until: dict[str, float] = {}
+        self._dispatch_backoff_attempts: dict[str, int] = {}
 
         # Non-blocking cached operational summary for SystemModule.status()
         self._active_jobs = 0
@@ -554,7 +558,7 @@ class ColabComputeHub:
         self._invalidate_analytics_cache()
         async with self.store.lock:
             row_active = await self.store.one(
-                "SELECT COUNT(*) FROM colab_jobs WHERE status='running'"
+                "SELECT COUNT(*) FROM colab_jobs WHERE status IN ('running', 'dispatching')"
             )
             row_queued = await self.store.one(
                 "SELECT COUNT(*) FROM colab_jobs WHERE status='queued'"
@@ -719,6 +723,7 @@ class ColabComputeHub:
             "reachable": False,
             "compute_units": None,
             "active_sessions": 0,
+            "untracked_active_sessions": 0,
             "running_job_id": None,
             "warm_sessions": [],
             "supported_job_types": [],
@@ -751,6 +756,7 @@ class ColabComputeHub:
             "reachable": False,
             "compute_units": self._last_cu_balance,
             "active_sessions": 0,
+            "untracked_active_sessions": 0,
             "running_job_id": None,
             "warm_sessions": [],
             "supported_job_types": [],
@@ -784,6 +790,7 @@ class ColabComputeHub:
             "reachable": None,
             "compute_units": self._last_cu_balance,
             "active_sessions": len(warm),
+            "untracked_active_sessions": 0,
             "running_job_id": None,
             "warm_sessions": [dict(item) for item in warm],
             "supported_job_types": list(self.registered_job_types()),
@@ -855,10 +862,19 @@ class ColabComputeHub:
                     cleaned = str(item or "").strip()
                     if _JOB_TYPE_RE.fullmatch(cleaned) and cleaned not in supported_types:
                         supported_types.append(cleaned)
+            active_sessions = max(0, _safe_int(data.get("active_sessions"), 0))
+            if (
+                "untracked_active_sessions" in data
+                and data.get("untracked_active_sessions") is not None
+            ):
+                untracked_active = max(0, _safe_int(data.get("untracked_active_sessions"), 0))
+            else:
+                untracked_active = max(0, active_sessions - len(warm_sessions))
             result = {
                 "reachable": reachable,
                 "compute_units": float(cu) if has_cu else None,
-                "active_sessions": max(0, _safe_int(data.get("active_sessions"), 0)),
+                "active_sessions": active_sessions,
+                "untracked_active_sessions": untracked_active,
                 "running_job_id": data.get("running_job_id"),
                 "warm_sessions": [dict(item) for item in warm_sessions],
                 "supported_job_types": supported_types,
@@ -939,7 +955,8 @@ class ColabComputeHub:
                     "AS failed_jobs, "
                     "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) "
                     "AS cancelled_jobs, "
-                    "COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) "
+                    "COALESCE(SUM(CASE WHEN status IN ('running', 'dispatching') "
+                    "THEN 1 ELSE 0 END), 0) "
                     "AS running_jobs, "
                     "COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) "
                     "AS queued_jobs, "
@@ -976,7 +993,7 @@ class ColabComputeHub:
                 )
                 acc_rows = await self.store.all(
                     "SELECT id, result FROM colab_jobs "
-                    "WHERE status NOT IN ('queued', 'running') "
+                    "WHERE status NOT IN ('queued', 'dispatching', 'running') "
                     "ORDER BY COALESCE(finished_at, updated_at, created_at) DESC, created_at DESC "
                     "LIMIT ?",
                     (_ACCELERATION_SAMPLE_LIMIT,),
@@ -1278,7 +1295,8 @@ class ColabComputeHub:
         async with self._op_lock:
             async with self.store.lock:
                 row_pending = await self.store.one(
-                    "SELECT COUNT(*) FROM colab_jobs WHERE status IN ('queued', 'running')"
+                    "SELECT COUNT(*) FROM colab_jobs "
+                    "WHERE status IN ('queued', 'dispatching', 'running')"
                 )
             pending_count = int(row_pending[0]) if row_pending and row_pending[0] is not None else 0
 
@@ -1346,6 +1364,17 @@ class ColabComputeHub:
             )
         return [self._row_to_job(r) for r in rows]
 
+    def _schedule_dispatch_backoff(self, job_id: str, now: float) -> float:
+        attempts = self._dispatch_backoff_attempts.get(job_id, 0) + 1
+        delay = min(120.0, 5.0 * (2 ** min(attempts - 1, 5)))
+        self._dispatch_backoff_attempts[job_id] = attempts
+        self._dispatch_backoff_until[job_id] = now + delay
+        return delay
+
+    def _clear_dispatch_backoff(self, job_id: str) -> None:
+        self._dispatch_backoff_attempts.pop(job_id, None)
+        self._dispatch_backoff_until.pop(job_id, None)
+
     async def cancel_job(self, job_id: str) -> dict[str, Any]:
         await self.initialize()
         if not isinstance(job_id, str) or not _JOB_ID_RE.fullmatch(job_id):
@@ -1358,12 +1387,7 @@ class ColabComputeHub:
             job = self._row_to_job(row)
             if job["status"] in {"succeeded", "failed", "cancelled"}:
                 raise Rejected("colab_job_not_cancellable")
-            was_running = job["status"] == "running"
-            if was_running and self.configured():
-                try:
-                    await self._request("POST", f"/v1/jobs/{job_id}/cancel", timeout_sec=8.0)
-                except Rejected:
-                    pass
+            was_active = job["status"] in {"running", "dispatching"}
             now = self._clock()
             async with self.store.transaction():
                 await self.store.db.execute(
@@ -1372,7 +1396,13 @@ class ColabComputeHub:
                     (now, now, job_id),
                 )
                 row = await self.store.one("SELECT * FROM colab_jobs WHERE id=?", (job_id,))
+            self._clear_dispatch_backoff(job_id)
             await self._refresh_cached_counts()
+        if was_active and self.configured():
+            try:
+                await self._request("POST", f"/v1/jobs/{job_id}/cancel", timeout_sec=8.0)
+            except Rejected:
+                pass
         assert row is not None
         return self._row_to_job(row)
 
@@ -1393,7 +1423,7 @@ class ColabComputeHub:
         async with self._op_lock:
             async with self.store.lock:
                 running_rows = await self.store.all(
-                    "SELECT id FROM colab_jobs WHERE status='running'"
+                    "SELECT id FROM colab_jobs WHERE status IN ('running', 'dispatching')"
                 )
             if running_rows:
                 async with self.store.transaction():
@@ -1404,6 +1434,7 @@ class ColabComputeHub:
                             "WHERE id=?",
                             (now, now, r["id"]),
                         )
+                        self._clear_dispatch_backoff(str(r["id"]))
                         cancelled_jobs += 1
             await self._refresh_cached_counts()
 
@@ -1416,6 +1447,7 @@ class ColabComputeHub:
             self._last_worker_status = {
                 **self._last_worker_status,
                 "active_sessions": 0,
+                "untracked_active_sessions": 0,
                 "running_job_id": None,
                 "warm_sessions": [],
             }
@@ -1487,6 +1519,93 @@ class ColabComputeHub:
         await self._refresh_cached_counts()
         return self._row_to_job(row) if row is not None else None
 
+    async def _revert_dispatching_to_queued(self, job_id: str) -> None:
+        now = self._clock()
+        async with self._op_lock:
+            async with self.store.transaction():
+                await self.store.db.execute(
+                    "UPDATE colab_jobs SET status='queued', updated_at=? "
+                    "WHERE id=? AND status='dispatching'",
+                    (now, job_id),
+                )
+            await self._refresh_cached_counts()
+
+    async def _promote_dispatching_to_running(self, job_id: str, started_at: float) -> bool:
+        """Transition `'dispatching' -> 'running'`; return False if concurrently cancelled."""
+        async with self._op_lock:
+            async with self.store.transaction():
+                cur = await self.store.db.execute(
+                    "UPDATE colab_jobs SET status='running', started_at=?, updated_at=? "
+                    "WHERE id=? AND status='dispatching'",
+                    (started_at, started_at, job_id),
+                )
+                promoted = cur.rowcount == 1
+            if promoted:
+                self._clear_dispatch_backoff(job_id)
+            await self._refresh_cached_counts()
+        return promoted
+
+    async def _reconcile_dispatching_job(
+        self,
+        job_id: str,
+        *,
+        started_at: float,
+        finished_to_notify: list[dict[str, Any]],
+        revert_on_404: bool = True,
+    ) -> bool:
+        """Probe `GET /v1/jobs/{job_id}` to avoid duplicate dispatch after HTTP timeout."""
+        try:
+            probe = await self._request("GET", f"/v1/jobs/{job_id}", timeout_sec=5.0)
+        except Rejected:
+            self._schedule_dispatch_backoff(job_id, self._clock())
+            return False
+
+        if probe.status_code == 200:
+            try:
+                w_job = probe.json()
+            except ValueError:
+                w_job = {}
+            w_status = str(w_job.get("status") or "") if isinstance(w_job, dict) else ""
+            if w_status in {"succeeded", "failed", "cancelled"}:
+                async with self._op_lock:
+                    done = await self._finalize_job(
+                        job_id,
+                        status=w_status,  # type: ignore[arg-type]
+                        result=w_job.get("result"),
+                        error_code=w_job.get("error_code"),
+                        error=w_job.get("error"),
+                        assigned_gpu=w_job.get("assigned_gpu"),
+                        cu_used=float(w_job.get("cu_used") or 0.0),
+                    )
+                    self._clear_dispatch_backoff(job_id)
+                if done is not None and w_status in {"succeeded", "failed"}:
+                    finished_to_notify.append(done)
+                return True
+            promoted = await self._promote_dispatching_to_running(job_id, started_at)
+            if not promoted:
+                try:
+                    await self._request("POST", f"/v1/jobs/{job_id}/cancel", timeout_sec=8.0)
+                except Rejected:
+                    pass
+            return True
+
+        if probe.status_code == 404 and revert_on_404:
+            self._schedule_dispatch_backoff(job_id, self._clock())
+            await self._revert_dispatching_to_queued(job_id)
+            return True
+
+        self._schedule_dispatch_backoff(job_id, self._clock())
+        return False
+
+    @staticmethod
+    def _untracked_sessions(worker: dict[str, Any]) -> int:
+        raw_untracked = worker.get("untracked_active_sessions")
+        if raw_untracked is not None and not isinstance(raw_untracked, bool):
+            return max(0, _safe_int(raw_untracked, 0))
+        active = max(0, _safe_int(worker.get("active_sessions"), 0))
+        warm_count = len(worker.get("warm_sessions") or ())
+        return max(0, active - warm_count)
+
     async def scheduler_step(self) -> None:
         """Perform one serial scheduling, timeout, orphan-check, and completion-hook pass."""
         await self.initialize()
@@ -1494,18 +1613,46 @@ class ColabComputeHub:
             return
 
         finished_to_notify: list[dict[str, Any]] = []
-        async with self._op_lock:
+        async with self._sched_lock:
             now = self._clock()
-            async with self.store.lock:
-                running_rows = await self.store.all(
-                    "SELECT * FROM colab_jobs WHERE status='running' ORDER BY created_at ASC"
-                )
+            async with self._op_lock:
+                async with self.store.lock:
+                    active_rows = await self.store.all(
+                        "SELECT * FROM colab_jobs "
+                        "WHERE status IN ('running', 'dispatching') "
+                        "ORDER BY created_at ASC"
+                    )
+                active_jobs = [self._row_to_job(r) for r in active_rows]
 
-            if running_rows:
+            if active_jobs:
                 self._orphan_seen_since = None
-                for row in running_rows:
-                    job = self._row_to_job(row)
+                for job in active_jobs:
                     job_id = job["id"]
+                    if job["status"] == "dispatching":
+                        if job_id in self._in_flight_dispatch_ids:
+                            continue
+                        effective_timeout = self._effective_timeout(job["job_type"])
+                        if now - (job["updated_at"] or job["created_at"]) > effective_timeout:
+                            async with self._op_lock:
+                                done = await self._finalize_job(
+                                    job_id,
+                                    status="failed",
+                                    error_code="job_timeout",
+                                    error=f"Exceeded {effective_timeout}s dispatch timeout",
+                                )
+                                self._clear_dispatch_backoff(job_id)
+                            if done is not None:
+                                finished_to_notify.append(done)
+                            continue
+                        if now < self._dispatch_backoff_until.get(job_id, 0.0):
+                            continue
+                        await self._reconcile_dispatching_job(
+                            job_id,
+                            started_at=job["updated_at"] or now,
+                            finished_to_notify=finished_to_notify,
+                        )
+                        continue
+
                     started = job["started_at"] or job["created_at"]
                     effective_timeout = self._effective_timeout(job["job_type"])
                     if now - started > effective_timeout:
@@ -1515,12 +1662,14 @@ class ColabComputeHub:
                             )
                         except Rejected:
                             pass
-                        done = await self._finalize_job(
-                            job_id,
-                            status="failed",
-                            error_code="job_timeout",
-                            error=f"Exceeded {effective_timeout}s timeout",
-                        )
+                        async with self._op_lock:
+                            done = await self._finalize_job(
+                                job_id,
+                                status="failed",
+                                error_code="job_timeout",
+                                error=f"Exceeded {effective_timeout}s timeout",
+                            )
+                            self._clear_dispatch_backoff(job_id)
                         if done is not None:
                             finished_to_notify.append(done)
                         continue
@@ -1531,12 +1680,14 @@ class ColabComputeHub:
                         continue
 
                     if resp.status_code == 404:
-                        done = await self._finalize_job(
-                            job_id,
-                            status="failed",
-                            error_code="worker_job_lost",
-                            error="Worker restarted or lost job state",
-                        )
+                        async with self._op_lock:
+                            done = await self._finalize_job(
+                                job_id,
+                                status="failed",
+                                error_code="worker_job_lost",
+                                error="Worker restarted or lost job state",
+                            )
+                            self._clear_dispatch_backoff(job_id)
                         if done is not None:
                             finished_to_notify.append(done)
                         continue
@@ -1546,28 +1697,31 @@ class ColabComputeHub:
                     w_job = resp.json()
                     w_status = str(w_job.get("status") or "")
                     if w_status in {"succeeded", "failed", "cancelled"}:
-                        done = await self._finalize_job(
-                            job_id,
-                            status=w_status,  # type: ignore[arg-type]
-                            result=w_job.get("result"),
-                            error_code=w_job.get("error_code"),
-                            error=w_job.get("error"),
-                            assigned_gpu=w_job.get("assigned_gpu"),
-                            cu_used=float(w_job.get("cu_used") or 0.0),
-                        )
+                        async with self._op_lock:
+                            done = await self._finalize_job(
+                                job_id,
+                                status=w_status,  # type: ignore[arg-type]
+                                result=w_job.get("result"),
+                                error_code=w_job.get("error_code"),
+                                error=w_job.get("error"),
+                                assigned_gpu=w_job.get("assigned_gpu"),
+                                cu_used=float(w_job.get("cu_used") or 0.0),
+                            )
+                            self._clear_dispatch_backoff(job_id)
                         if done is not None and w_status in {"succeeded", "failed"}:
                             finished_to_notify.append(done)
             else:
-                # Orphan Colab session watchdog when no job is running.
+                # Orphan Colab session watchdog when no job is running (runs outside _op_lock).
                 if self._orphan_seen_since is not None or now - self._last_status_poll_at >= 60.0:
                     in_flight = self._status_refresh_task
                     if in_flight is not None and not in_flight.done():
                         worker = await asyncio.shield(in_flight)
                     else:
                         worker = await self._poll_worker_status()
+                    untracked_active = self._untracked_sessions(worker)
                     if (
                         worker.get("reachable")
-                        and int(worker.get("active_sessions") or 0) > 0
+                        and untracked_active > 0
                         and not worker.get("running_job_id")
                     ):
                         if self._orphan_seen_since is None:
@@ -1586,6 +1740,7 @@ class ColabComputeHub:
                                     self._last_worker_status = {
                                         **self._last_worker_status,
                                         "active_sessions": 0,
+                                        "untracked_active_sessions": 0,
                                         "running_job_id": None,
                                         "warm_sessions": [],
                                     }
@@ -1595,130 +1750,203 @@ class ColabComputeHub:
                     else:
                         self._orphan_seen_since = None
 
-                # Serial dispatch of next queued job if enabled.
+                # Serial dispatch of next queued job: claim 'queued' -> 'dispatching' under
+                # _op_lock, then run slow Drive pre_dispatch and worker HTTP calls outside _op_lock.
+                claimed_job: dict[str, Any] | None = None
+                claimed_spec: _RegisteredJobSpec | None = None
                 if self.config.enabled:
-                    async with self.store.lock:
-                        next_row = await self.store.one(
-                            "SELECT * FROM colab_jobs WHERE status='queued' "
-                            "ORDER BY created_at ASC LIMIT 1"
-                        )
-                    if next_row is not None:
-                        next_job = self._row_to_job(next_row)
-                        spec = self._job_types.get(next_job["job_type"])
-                        if spec is None:
-                            done = await self._finalize_job(
-                                next_job["id"],
-                                status="failed",
-                                error_code="colab_invalid_job",
-                                error="Unregistered job type",
+                    async with self._op_lock:
+                        async with self.store.lock:
+                            still_active = await self.store.one(
+                                "SELECT 1 FROM colab_jobs "
+                                "WHERE status IN ('running', 'dispatching') LIMIT 1"
                             )
-                            if done is not None:
-                                finished_to_notify.append(done)
-                        elif next_job["preferred_gpu"] not in spec.allowed_gpus:
-                            done = await self._finalize_job(
-                                next_job["id"],
-                                status="failed",
-                                error_code="colab_gpu_not_allowed",
-                                error="Preferred GPU not allowed for job type",
+                            next_row = (
+                                None
+                                if still_active is not None
+                                else await self.store.one(
+                                    "SELECT * FROM colab_jobs WHERE status='queued' "
+                                    "ORDER BY created_at ASC LIMIT 1"
+                                )
                             )
-                            if done is not None:
-                                finished_to_notify.append(done)
-                        else:
-                            dispatch_ctx: dict[str, Any] | None = None
-                            pre_failed = False
-                            if spec.pre_dispatch is not None:
-                                try:
-                                    dispatch_ctx = await spec.pre_dispatch(dict(next_job))
-                                except Rejected as exc:
-                                    err_code = str(exc) or "colab_pre_dispatch_failed"
+                        if next_row is not None:
+                            next_job = self._row_to_job(next_row)
+                            jid = next_job["id"]
+                            if now >= self._dispatch_backoff_until.get(jid, 0.0):
+                                spec = self._job_types.get(next_job["job_type"])
+                                if spec is None:
                                     done = await self._finalize_job(
-                                        next_job["id"],
+                                        jid,
+                                        status="failed",
+                                        error_code="colab_invalid_job",
+                                        error="Unregistered job type",
+                                    )
+                                    self._clear_dispatch_backoff(jid)
+                                    if done is not None:
+                                        finished_to_notify.append(done)
+                                elif next_job["preferred_gpu"] not in spec.allowed_gpus:
+                                    done = await self._finalize_job(
+                                        jid,
+                                        status="failed",
+                                        error_code="colab_gpu_not_allowed",
+                                        error="Preferred GPU not allowed for job type",
+                                    )
+                                    self._clear_dispatch_backoff(jid)
+                                    if done is not None:
+                                        finished_to_notify.append(done)
+                                else:
+                                    async with self.store.transaction():
+                                        cur = await self.store.db.execute(
+                                            "UPDATE colab_jobs SET status='dispatching', "
+                                            "updated_at=? WHERE id=? AND status='queued'",
+                                            (now, jid),
+                                        )
+                                        transitioned = cur.rowcount == 1
+                                    if transitioned:
+                                        await self._refresh_cached_counts()
+                                        self._in_flight_dispatch_ids.add(jid)
+                                        claimed_job = next_job
+                                        claimed_spec = spec
+
+                if claimed_job is not None and claimed_spec is not None:
+                    job_id = claimed_job["id"]
+                    dispatch_ctx: dict[str, Any] | None = None
+                    body: dict[str, Any] = {}
+                    try:
+                        pre_failed = False
+                        if claimed_spec.pre_dispatch is not None:
+                            try:
+                                dispatch_ctx = await claimed_spec.pre_dispatch(dict(claimed_job))
+                            except Rejected as exc:
+                                err_code = str(exc) or "colab_pre_dispatch_failed"
+                                async with self._op_lock:
+                                    done = await self._finalize_job(
+                                        job_id,
                                         status="failed",
                                         error_code=err_code,
                                         error=err_code,
                                     )
-                                    if done is not None:
-                                        finished_to_notify.append(done)
-                                    pre_failed = True
-                                except asyncio.CancelledError:
-                                    raise
-                                except Exception as exc:
+                                    self._clear_dispatch_backoff(job_id)
+                                if done is not None:
+                                    finished_to_notify.append(done)
+                                pre_failed = True
+                            except asyncio.CancelledError:
+                                await self._revert_dispatching_to_queued(job_id)
+                                raise
+                            except Exception as exc:
+                                async with self._op_lock:
                                     done = await self._finalize_job(
-                                        next_job["id"],
+                                        job_id,
                                         status="failed",
                                         error_code="colab_pre_dispatch_failed",
                                         error=self._scrub(type(exc).__name__),
                                     )
-                                    if done is not None:
-                                        finished_to_notify.append(done)
-                                    pre_failed = True
-                            if not pre_failed and dispatch_ctx is not None:
-                                if not isinstance(dispatch_ctx, dict):
+                                    self._clear_dispatch_backoff(job_id)
+                                if done is not None:
+                                    finished_to_notify.append(done)
+                                pre_failed = True
+
+                        if not pre_failed and dispatch_ctx is not None:
+                            if not isinstance(dispatch_ctx, dict):
+                                async with self._op_lock:
                                     done = await self._finalize_job(
-                                        next_job["id"],
+                                        job_id,
                                         status="failed",
                                         error_code="colab_pre_dispatch_failed",
                                         error="Invalid dispatch context",
                                     )
-                                    if done is not None:
-                                        finished_to_notify.append(done)
-                                    pre_failed = True
-                            if not pre_failed:
-                                gpu_candidates: list[str] = [next_job["preferred_gpu"]]
-                                for fb in next_job.get("fallback_gpus") or ():
-                                    if fb in spec.allowed_gpus and fb not in gpu_candidates:
-                                        gpu_candidates.append(fb)
-                                effective_timeout = self._effective_timeout(next_job["job_type"])
-                                body: dict[str, Any] = {
-                                    "job_id": next_job["id"],
-                                    "job_type": next_job["job_type"],
-                                    "gpu_candidates": gpu_candidates,
-                                    "timeout_seconds": effective_timeout,
-                                    "allow_warm_keepalive": bool(self.config.enabled),
-                                    "payload": next_job["payload"],
-                                }
-                                if dispatch_ctx:
-                                    body["dispatch_context"] = dispatch_ctx
-                                try:
-                                    disp = await self._request(
-                                        "POST", "/v1/jobs", json_body=body, timeout_sec=8.0
+                                    self._clear_dispatch_backoff(job_id)
+                                if done is not None:
+                                    finished_to_notify.append(done)
+                                pre_failed = True
+
+                        if not pre_failed:
+                            # Confirm job was not cancelled while pre_dispatch ran outside _op_lock.
+                            async with self._op_lock:
+                                async with self.store.lock:
+                                    st_row = await self.store.one(
+                                        "SELECT status FROM colab_jobs WHERE id=?", (job_id,)
                                     )
-                                    if disp.status_code in {200, 202}:
-                                        async with self.store.transaction():
-                                            await self.store.db.execute(
-                                                "UPDATE colab_jobs SET status='running', "
-                                                "started_at=?, updated_at=? WHERE id=?",
-                                                (now, now, next_job["id"]),
-                                            )
-                                        await self._refresh_cached_counts()
-                                    elif disp.status_code == 400:
-                                        worker_code = "colab_invalid_job"
+                            if st_row is None or str(st_row["status"]) != "dispatching":
+                                pre_failed = True
+
+                        if not pre_failed:
+                            gpu_candidates: list[str] = [claimed_job["preferred_gpu"]]
+                            for fb in claimed_job.get("fallback_gpus") or ():
+                                if fb in claimed_spec.allowed_gpus and fb not in gpu_candidates:
+                                    gpu_candidates.append(fb)
+                            effective_timeout = self._effective_timeout(claimed_job["job_type"])
+                            body = {
+                                "job_id": job_id,
+                                "job_type": claimed_job["job_type"],
+                                "gpu_candidates": gpu_candidates,
+                                "timeout_seconds": effective_timeout,
+                                "allow_warm_keepalive": bool(self.config.enabled),
+                                "payload": claimed_job["payload"],
+                            }
+                            if dispatch_ctx:
+                                body["dispatch_context"] = dispatch_ctx
+                            try:
+                                disp = await self._request(
+                                    "POST", "/v1/jobs", json_body=body, timeout_sec=8.0
+                                )
+                            except Rejected:
+                                # On HTTP timeout/network ambiguity, probe worker GET /v1/jobs/{id}
+                                # before ever re-dispatching.
+                                await self._reconcile_dispatching_job(
+                                    job_id,
+                                    started_at=self._clock(),
+                                    finished_to_notify=finished_to_notify,
+                                )
+                            else:
+                                if disp.status_code in {200, 202}:
+                                    promoted = await self._promote_dispatching_to_running(
+                                        job_id, self._clock()
+                                    )
+                                    if not promoted:
                                         try:
-                                            err_data = disp.json()
-                                            if isinstance(err_data, dict):
-                                                detail = str(err_data.get("detail") or "").strip()
-                                                if detail in {
-                                                    "colab_invalid_job",
-                                                    "drive_context_required",
-                                                    "colab_drive_not_configured",
-                                                    "song_source_required",
-                                                }:
-                                                    worker_code = detail
-                                        except ValueError:
+                                            await self._request(
+                                                "POST",
+                                                f"/v1/jobs/{job_id}/cancel",
+                                                timeout_sec=8.0,
+                                            )
+                                        except Rejected:
                                             pass
+                                elif disp.status_code == 400:
+                                    worker_code = "colab_invalid_job"
+                                    try:
+                                        err_data = disp.json()
+                                        if isinstance(err_data, dict):
+                                            detail = str(err_data.get("detail") or "").strip()
+                                            if detail in {
+                                                "colab_invalid_job",
+                                                "drive_context_required",
+                                                "colab_drive_not_configured",
+                                                "song_source_required",
+                                            }:
+                                                worker_code = detail
+                                    except ValueError:
+                                        pass
+                                    async with self._op_lock:
                                         done = await self._finalize_job(
-                                            next_job["id"],
+                                            job_id,
                                             status="failed",
                                             error_code=worker_code,
                                             error="Worker rejected job payload",
                                         )
-                                        if done is not None:
-                                            finished_to_notify.append(done)
-                                except Rejected:
-                                    pass
-                                finally:
-                                    dispatch_ctx = None
-                                    body.pop("dispatch_context", None)
+                                        self._clear_dispatch_backoff(job_id)
+                                    if done is not None:
+                                        finished_to_notify.append(done)
+                                elif disp.status_code == 409 or disp.status_code >= 500:
+                                    self._schedule_dispatch_backoff(job_id, self._clock())
+                                    await self._revert_dispatching_to_queued(job_id)
+                                else:
+                                    self._schedule_dispatch_backoff(job_id, self._clock())
+                                    await self._revert_dispatching_to_queued(job_id)
+                    finally:
+                        dispatch_ctx = None
+                        body.pop("dispatch_context", None)
+                        self._in_flight_dispatch_ids.discard(job_id)
 
         for done_job in finished_to_notify:
             await self._fire_hooks(done_job)

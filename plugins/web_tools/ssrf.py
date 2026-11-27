@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import ipaddress
 import re
 import socket
+import ssl
 import typing
 import zlib
 from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -280,6 +282,25 @@ def build_pinned_request(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def get_default_ssl_context() -> ssl.SSLContext:
+    """Return a process-wide cached default SSLContext so CA bundles aren't reloaded per request."""
+    return ssl.create_default_context()
+
+
+class _NonClosingTransport(httpx.AsyncBaseTransport):
+    """Wrap a caller-owned transport so AsyncClient exit does not close shared pools."""
+
+    def __init__(self, wrapped: httpx.AsyncBaseTransport) -> None:
+        self._wrapped = wrapped
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self._wrapped.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        return None
+
+
 class PinnedPublicTransport(httpx.AsyncBaseTransport):
     """httpx transport pinning every TCP socket to validated public IPs with full TLS SNI."""
 
@@ -290,13 +311,16 @@ class PinnedPublicTransport(httpx.AsyncBaseTransport):
         dns_resolver: DnsResolver | None = None,
         allowed_ports: frozenset[int] = DEFAULT_ALLOWED_PORTS,
         max_connections: int = 8,
+        ssl_context: ssl.SSLContext | None = None,
+        dns_timeout: float | None = None,
     ) -> None:
         self._owns_inner = inner is None
+        self._ssl_context = ssl_context if ssl_context is not None else get_default_ssl_context()
         self._inner = (
             inner
             if inner is not None
             else httpx.AsyncHTTPTransport(
-                verify=True,
+                verify=self._ssl_context,
                 trust_env=False,
                 http1=True,
                 http2=False,
@@ -310,6 +334,9 @@ class PinnedPublicTransport(httpx.AsyncBaseTransport):
         )
         self._dns_resolver = dns_resolver
         self._allowed_ports = allowed_ports
+        self._dns_timeout = (
+            float(dns_timeout) if dns_timeout is not None and dns_timeout > 0 else None
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         scheme = request.url.scheme.lower()
@@ -324,7 +351,24 @@ class PinnedPublicTransport(httpx.AsyncBaseTransport):
         if not original_host:
             raise SsrfBlockedError("ssrf_blocked")
 
-        ips = await resolve_public_ips(original_host, port, resolver=self._dns_resolver)
+        connect_timeout: float | None = None
+        timeout_ext = request.extensions.get("timeout")
+        if isinstance(timeout_ext, dict):
+            raw_ct = timeout_ext.get("connect")
+            if isinstance(raw_ct, (int, float)) and not isinstance(raw_ct, bool) and raw_ct > 0:
+                connect_timeout = float(raw_ct)
+        if connect_timeout is None:
+            connect_timeout = self._dns_timeout
+
+        try:
+            if connect_timeout is not None:
+                async with asyncio.timeout(connect_timeout):
+                    ips = await resolve_public_ips(original_host, port, resolver=self._dns_resolver)
+            else:
+                ips = await resolve_public_ips(original_host, port, resolver=self._dns_resolver)
+        except TimeoutError:
+            raise httpx.ConnectTimeout("DNS resolution timed out", request=request) from None
+
         replayable = isinstance(request.stream, httpx.ByteStream)
         candidates = ips if replayable else ips[:1]
         last_exc: Exception | None = None
@@ -355,15 +399,17 @@ def build_pinned_client(
     dns_resolver: DnsResolver | None = None,
     allowed_ports: frozenset[int] = DEFAULT_ALLOWED_PORTS,
     max_connections: int = 8,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> httpx.AsyncClient:
     """Create a hardened httpx AsyncClient with trust_env=False and redirects disabled."""
     effective_transport = (
-        transport
+        _NonClosingTransport(transport)
         if transport is not None
         else PinnedPublicTransport(
             dns_resolver=dns_resolver,
             allowed_ports=allowed_ports,
             max_connections=max_connections,
+            ssl_context=ssl_context,
         )
     )
     return httpx.AsyncClient(

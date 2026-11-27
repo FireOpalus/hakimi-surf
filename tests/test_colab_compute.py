@@ -799,7 +799,6 @@ def _make_drive_dispatch_context(
 def _build_test_worker(
     tmp_path: Path,
     *,
-    clean_search_fn=None,
     cover_runner=None,
     train_runner=None,
     stop_all_fn=None,
@@ -865,7 +864,6 @@ def _build_test_worker(
         stop_all_fn=stop_all_fn or default_stop_all,
         cover_runner=cover_runner or default_cover,
         train_runner=train_runner,
-        clean_search_fn=clean_search_fn,
     )
     return app, cfg, drive_client, tree, usage_state, backend
 

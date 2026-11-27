@@ -903,20 +903,27 @@ class WebSearch:
         return self._attempt_providers.get(attempt_id, "google")
 
     async def initialize(self):
-        await self.store.db.executescript(SCHEMA)
-        cols = {row[1] for row in await self.store.all("PRAGMA table_info(web_search_attempts)")}
-        if "provider" not in cols:
-            await self.store.db.execute(
-                "ALTER TABLE web_search_attempts ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'"
+        async with self.store.transaction():
+            for stmt in SCHEMA.split(";"):
+                sql = stmt.strip()
+                if sql:
+                    await self.store.db.execute(sql)
+            cols = {
+                row[1] for row in await self.store.all("PRAGMA table_info(web_search_attempts)")
+            }
+            if "provider" not in cols:
+                await self.store.db.execute(
+                    "ALTER TABLE web_search_attempts "
+                    "ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'"
+                )
+            row = await self.store.one("SELECT payload FROM admin_config WHERE key='web_search'")
+            ds_row = await self.store.one(
+                "SELECT payload FROM admin_config WHERE key='deepseek_credentials'"
             )
-        row = await self.store.one("SELECT payload FROM admin_config WHERE key='web_search'")
         self.override = (
             WebSearchConfig.model_validate(self.store.vault.open("admin:web_search", row[0]))
             if row
             else None
-        )
-        ds_row = await self.store.one(
-            "SELECT payload FROM admin_config WHERE key='deepseek_credentials'"
         )
         if ds_row:
             self.deepseek_override = self.store.vault.open("admin:deepseek_credentials", ds_row[0])

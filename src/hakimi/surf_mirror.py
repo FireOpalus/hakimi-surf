@@ -12,14 +12,15 @@ import sqlite3
 import stat
 import tempfile
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from .drive_client import FolderDrive
-from .security import Rejected, clean_text, configured_secrets
+from .models import Message
+from .security import CREDENTIAL_RE, ROLE_TAG_RE, Rejected, clean_text, redact_secrets
 from .social import chat_module, owner_binding, owner_target
 
 log = logging.getLogger("hakimi")
@@ -29,30 +30,19 @@ MAX_RECENT_TURNS = 12
 MAX_CHRONICLE_ITEMS = 20
 MAX_GLOBAL_EVENTS = 12
 MAX_ROAMING_EVENTS = 30
+DEFAULT_KEEP_DAYS = 30
 DRIVE_LATEST_NAME = "surf-mirror-latest.md"
-CREDENTIAL_RE = re.compile(
-    r"(?i)(?:(?:api[_ -]?key|password|passwd|token|secret|sessdata|bili_jct|密钥|密码)"
-    r"\s*[:=：]\s*\S{6,}|bearer\s+\S+|\bsk-[A-Za-z0-9_-]{16,}|\bAIza[0-9A-Za-z_-]{20,}"
-    r"|-----BEGIN [^-]+PRIVATE KEY-----)"
-)
-ROLE_TAG_RE = re.compile(r"\[role=", re.IGNORECASE)
+_DAILY_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.md$")
+_DAY_KEY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})$")
+_DRIVE_DAILY_KEY_RE = re.compile(r"^surf-mirror-(\d{4}-\d{2}-\d{2})\.md$")
+
+__all__ = ["CREDENTIAL_RE", "ROLE_TAG_RE", "MAX_MIRROR_BYTES", "SurfMirror"]
 
 
 def sanitize_mirror_text(text: Any, settings: Any, *, limit: int = 2000) -> str:
     """Normalize text, scrub secrets/credentials, and neutralize role/protocol tags."""
     cleaned = clean_text(str(text or ""))
-    candidates = {
-        val
-        for secret in configured_secrets(settings)
-        if secret and len(secret) >= 6
-        for val in (secret, clean_text(secret))
-        if len(val) >= 6
-    }
-    for secret in sorted(candidates, key=len, reverse=True):
-        if secret in cleaned:
-            cleaned = cleaned.replace(secret, "[凭证已隐去]")
-    cleaned = CREDENTIAL_RE.sub("[凭证已隐去]", cleaned)
-    cleaned = ROLE_TAG_RE.sub("[untrusted_role=", cleaned)
+    cleaned = redact_secrets(cleaned, settings, neutralize_role_tags=True)
     cleaned = (
         cleaned.replace("[CQ:", "［CQ:")
         .replace("@everyone", "＠everyone")
@@ -68,19 +58,7 @@ def sanitize_mirror_text(text: Any, settings: Any, *, limit: int = 2000) -> str:
 
 def sanitize_mirror_text_post(markdown: str, settings: Any) -> str:
     """Final full-document secret and role-tag scrub without altering valid Markdown headings."""
-    cleaned = markdown
-    candidates = {
-        val
-        for secret in configured_secrets(settings)
-        if secret and len(secret) >= 6
-        for val in (secret, clean_text(secret))
-        if len(val) >= 6
-    }
-    for secret in sorted(candidates, key=len, reverse=True):
-        if secret in cleaned:
-            cleaned = cleaned.replace(secret, "[凭证已隐去]")
-    cleaned = CREDENTIAL_RE.sub("[凭证已隐去]", cleaned)
-    return ROLE_TAG_RE.sub("[untrusted_role=", cleaned)
+    return redact_secrets(markdown, settings, neutralize_role_tags=True)
 
 
 def _cap_markdown_bytes(markdown: str, max_bytes: int = MAX_MIRROR_BYTES) -> str:
@@ -150,6 +128,50 @@ def _read_state_sync(state_path: Path) -> dict[str, Any]:
     }
 
 
+def _prune_mirror_retention_sync(
+    daily_dir: Path, state: dict[str, Any], day: str, keep_days: int = DEFAULT_KEEP_DAYS
+) -> tuple[list[str], bool]:
+    """Delete daily mirror files older than keep_days and prune expired state keys."""
+    cutoff = date.fromisoformat(day) - timedelta(days=max(1, int(keep_days)) - 1)
+    pruned_daily: list[str] = []
+    if daily_dir.is_dir() and not daily_dir.is_symlink():
+        for entry in sorted(daily_dir.iterdir()):
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            match = _DAILY_FILE_RE.fullmatch(entry.name)
+            if not match:
+                continue
+            try:
+                entry_day = date.fromisoformat(match.group(1))
+            except ValueError:
+                continue
+            if entry_day < cutoff:
+                entry.unlink(missing_ok=True)
+                pruned_daily.append(entry.name)
+
+    state_changed = False
+    for bucket_name, pattern in (
+        ("local_digests", _DAY_KEY_RE),
+        ("drive_digests", _DAY_KEY_RE),
+        ("drive_file_ids", _DRIVE_DAILY_KEY_RE),
+    ):
+        bucket = state.get(bucket_name)
+        if not isinstance(bucket, dict):
+            continue
+        for key in list(bucket):
+            match = pattern.fullmatch(str(key))
+            if not match:
+                continue
+            try:
+                key_day = date.fromisoformat(match.group(1))
+            except ValueError:
+                continue
+            if key_day < cutoff:
+                bucket.pop(key, None)
+                state_changed = True
+    return pruned_daily, state_changed
+
+
 def _write_mirror_outputs_sync(
     mirror_dir: Path,
     day: str,
@@ -157,6 +179,8 @@ def _write_mirror_outputs_sync(
     daily_md: str,
     latest_digest: str,
     daily_digest: str,
+    *,
+    keep_days: int = DEFAULT_KEEP_DAYS,
 ) -> dict[str, Any]:
     _ensure_dir_no_symlink(mirror_dir)
     daily_dir = mirror_dir / "daily"
@@ -177,14 +201,18 @@ def _write_mirror_outputs_sync(
         _atomic_write_text(daily_path, daily_md)
         local_digests[day] = daily_digest
 
-    if latest_changed or daily_changed or not state_path.is_file():
-        state["local_digests"] = local_digests
+    state["local_digests"] = local_digests
+    pruned_daily, state_pruned = _prune_mirror_retention_sync(
+        daily_dir, state, day, keep_days=keep_days
+    )
+    if latest_changed or daily_changed or state_pruned or not state_path.is_file():
         _atomic_write_text(state_path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
 
     return {
         "latest_path": str(latest_path),
         "daily_path": str(daily_path),
         "local_changed": bool(latest_changed or daily_changed),
+        "pruned_daily": pruned_daily,
         "state": state,
     }
 
@@ -243,7 +271,11 @@ def _read_owner_session_sync(
                 if exp == 0 or exp > now:
                     try:
                         rolling_summary = str(vault.open(key, row["summary"]) or "")
-                    except Exception:
+                    except Exception as exc:
+                        log.warning(
+                            "event=surf_mirror_decrypt_failed section=rolling_summary exc=%s",
+                            type(exc).__name__,
+                        )
                         rolling_summary = ""
 
         recent_messages: list[dict[str, Any]] = []
@@ -258,7 +290,11 @@ def _read_owner_session_sync(
                     item = vault.open(key, row["payload"])
                     if isinstance(item, dict):
                         recent_messages.append(item)
-                except Exception:
+                except Exception as exc:
+                    log.warning(
+                        "event=surf_mirror_decrypt_failed section=recent_message exc=%s",
+                        type(exc).__name__,
+                    )
                     continue
 
         turns: list[list[dict[str, Any]]] = []
@@ -290,7 +326,11 @@ def _read_owner_session_sync(
                                 "updated": row["updated"],
                             }
                         )
-                except Exception:
+                except Exception as exc:
+                    log.warning(
+                        "event=surf_mirror_decrypt_failed section=member_profile exc=%s",
+                        type(exc).__name__,
+                    )
                     continue
 
         chronicles: list[dict[str, Any]] = []
@@ -313,7 +353,11 @@ def _read_owner_session_sync(
                                 "heat": row["heat"],
                             }
                         )
-                except Exception:
+                except Exception as exc:
+                    log.warning(
+                        "event=surf_mirror_decrypt_failed section=chronicle_event exc=%s",
+                        type(exc).__name__,
+                    )
                     continue
 
         return {
@@ -347,6 +391,7 @@ class SurfMirror:
         drive: FolderDrive | None = None,
         *,
         interval_seconds: int = 1800,
+        keep_days: int = DEFAULT_KEEP_DAYS,
         write_file=None,
     ):
         self.svc = service
@@ -356,6 +401,7 @@ class SurfMirror:
         self.drive = drive
         self.write_file = write_file or partial(self.write_drive_text, drive)
         self.interval_seconds = interval_seconds
+        self.keep_days = max(1, int(keep_days))
         self.zone = ZoneInfo(self.s.bot_timezone)
         self._lock = asyncio.Lock()
 
@@ -369,11 +415,40 @@ class SurfMirror:
 
     async def _read_owner_sessions(self, now: float) -> list[tuple[str, dict]]:
         result = []
+        if not self.sessions:
+            return result
         for platform in ("onebot", *self.s.social_owner_bindings):
-            binding = owner_binding(self.s, platform)
-            if binding and binding.mirror and self.sessions and chat_module(self.s, platform):
-                target = owner_target(self.s, platform, now, "surf-mirror-ro")
-                result.append((platform, await self._read_owner_session(target, now)))
+            if platform == "onebot":
+                binding = owner_binding(self.s, platform)
+                if binding and binding.mirror and chat_module(self.s, platform):
+                    target = owner_target(self.s, platform, now, "surf-mirror-ro")
+                    if target is not None:
+                        result.append((platform, await self._read_owner_session(target, now)))
+                continue
+            if chat_module(self.s, platform):
+                binding = owner_binding(self.s, platform)
+                if binding and binding.mirror:
+                    target = owner_target(self.s, platform, now, "surf-mirror-ro")
+                    if target is not None:
+                        result.append((platform, await self._read_owner_session(target, now)))
+                continue
+            # Remote social plugin momentarily disconnected: still render existing local session DB.
+            binding = self.s.social_owner_bindings.get(platform)
+            if binding and binding.mirror:
+                target = Message(
+                    platform=platform,
+                    bot_id=binding.bot_id,
+                    user_id=binding.user_id,
+                    conversation_id=binding.user_id,
+                    kind="private",
+                    text="",
+                    addressed=True,
+                    event_id="surf-mirror-ro",
+                    created_at=now,
+                )
+                db_path = self.sessions.path(target)
+                if not db_path.is_symlink() and db_path.is_file():
+                    result.append((platform, await self._read_owner_session(target, now)))
         return result
 
     async def _read_owner_session(self, owner_msg, now):
@@ -445,7 +520,11 @@ class SurfMirror:
                     item = dict(row)
                     try:
                         text = self.store.vault.open(item["id"], item["payload"])
-                    except Exception:
+                    except Exception as exc:
+                        log.warning(
+                            "event=surf_mirror_decrypt_failed section=roaming_event exc=%s",
+                            type(exc).__name__,
+                        )
                         continue
                     roaming_events.append(
                         {
@@ -674,6 +753,7 @@ class SurfMirror:
                 daily_md,
                 latest_digest,
                 daily_digest,
+                keep_days=self.keep_days,
             )
             state = write_res["state"]
             drive_digests = state["drive_digests"]
@@ -708,6 +788,7 @@ class SurfMirror:
                 "latest_digest": latest_digest,
                 "daily_digest": daily_digest,
                 "local_changed": write_res["local_changed"],
+                "pruned_daily": write_res["pruned_daily"],
                 "uploaded": uploaded,
                 "skipped_drive": skipped_drive,
             }

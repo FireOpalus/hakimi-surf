@@ -15,6 +15,7 @@ from .ssrf import (
     REDIRECT_STATUSES,
     BodyTooLargeError,
     DnsResolver,
+    PinnedPublicTransport,
     SsrfBlockedError,
     build_pinned_client,
     read_bounded_body,
@@ -196,6 +197,27 @@ async def _fetch_single_preview(
         return None, None
 
 
+async def _fetch_single_preview_bounded(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    budget: float,
+    pre_check_dns: bool,
+    dns_resolver: DnsResolver | None,
+) -> tuple[dict[str, str] | None, str | None]:
+    try:
+        async with asyncio.timeout(budget):
+            return await _fetch_single_preview(
+                client,
+                url,
+                pre_check_dns=pre_check_dns,
+                dns_resolver=dns_resolver,
+            )
+    except TimeoutError:
+        log.debug("event=web_tools_preview_timeout")
+        return None, None
+
+
 async def preview_urls(
     urls: list[str],
     *,
@@ -209,36 +231,42 @@ async def preview_urls(
         return PreviewOutcome(previews=[], ssrf_blocked_count=0, total_urls=0, oversized_count=0)
 
     budget = min(max(float(budget_seconds), PREVIEW_MIN_BUDGET_SECONDS), PREVIEW_MAX_BUDGET_SECONDS)
-    pre_check_dns = transport is not None and dns_resolver is not None
+    pre_check_dns = (
+        transport is not None
+        and not isinstance(transport, PinnedPublicTransport)
+        and dns_resolver is not None
+    )
 
-    try:
-        async with asyncio.timeout(budget):
-            async with build_pinned_client(
-                timeout=budget,
-                transport=transport,
-                dns_resolver=dns_resolver,
-                max_connections=4,
-            ) as client:
-                results = await asyncio.gather(
-                    *(
-                        _fetch_single_preview(
-                            client,
-                            u,
-                            pre_check_dns=pre_check_dns,
-                            dns_resolver=dns_resolver,
-                        )
-                        for u in bounded_urls
-                    )
+    async with build_pinned_client(
+        timeout=budget,
+        transport=transport,
+        dns_resolver=dns_resolver,
+        max_connections=4,
+    ) as client:
+        raw_results = await asyncio.gather(
+            *(
+                _fetch_single_preview_bounded(
+                    client,
+                    u,
+                    budget=budget,
+                    pre_check_dns=pre_check_dns,
+                    dns_resolver=dns_resolver,
                 )
-    except TimeoutError:
-        return PreviewOutcome(
-            previews=[], ssrf_blocked_count=0, total_urls=len(bounded_urls), oversized_count=0
+                for u in bounded_urls
+            ),
+            return_exceptions=True,
         )
 
     previews: list[dict[str, str]] = []
     ssrf_count = 0
     oversized_count = 0
-    for item, failure in results:
+    for entry in raw_results:
+        if isinstance(entry, asyncio.CancelledError):
+            raise entry
+        if isinstance(entry, BaseException):
+            log.debug("event=web_tools_preview_error type=%s", type(entry).__name__)
+            continue
+        item, failure = entry
         if item is not None:
             previews.append(item)
         elif failure == "ssrf":

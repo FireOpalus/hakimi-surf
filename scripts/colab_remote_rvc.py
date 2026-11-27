@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import email.utils
 import hashlib
 import json
 import math
@@ -26,6 +27,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -106,7 +108,16 @@ DEREVERB_MODELS = (
     "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
     "UVR-DeEcho-DeReverb.pth",
 )
+SVC_WEIGHT_MODELS = (
+    "GiantAILab/YingMusic-SVC:YingMusic-SVC-full.pt",
+    "Plachtaa/Seed-VC:DiT_uvit_tat_xlsr_ema",
+)
 DEREVERB_MODEL = DEREVERB_MODELS[0]
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_DRIVE_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_DRIVE_MAX_RETRIES = 3
+_DRIVE_RETRY_BASE_SEC = 0.5
+_DRIVE_RETRY_MAX_SEC = 8.0
 SUPPORTED_AUDIO_EXTS = frozenset({".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"})
 MAX_CHORUS_BYTES = 1_750_000
 DEFAULT_BACKING_GAIN_DB = -14.0
@@ -726,8 +737,19 @@ def _sanitize_cache_token(value: str, fallback: str = "unknown") -> str:
 
 
 def compute_weight_cache_key(mode: str = "cover") -> str:
-    """Deterministic version key for high-frequency RVC + audio-separator weights."""
-    norm_mode = "cover" if str(mode or "").strip().lower() == "cover" else "all"
+    """Deterministic version key for high-frequency SVC / RVC + audio-separator weights."""
+    raw_mode = str(mode or "").strip().lower()
+    if raw_mode == "svc":
+        spec = {
+            "schema": WEIGHT_CACHE_SCHEMA_VERSION,
+            "mode": "svc",
+            "primary_sep": list(PRIMARY_SEP_MODELS),
+            "karaoke_sep": list(KARAOKE_SEP_MODELS),
+            "svc_models": list(SVC_WEIGHT_MODELS),
+        }
+        digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()
+        return f"svc_weights_{digest[:12]}"
+    norm_mode = "cover" if raw_mode == "cover" else "all"
     spec = {
         "schema": WEIGHT_CACHE_SCHEMA_VERSION,
         "mode": norm_mode,
@@ -852,6 +874,164 @@ def _has_applio_pretrained_weights(applio_dir: Path, mode: str = "cover") -> boo
     return True
 
 
+def _has_svc_cached_weights(
+    sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
+    svc_hf_cache: Path = DEFAULT_SVC_HF_CACHE,
+) -> bool:
+    """Return True when separation weights or SVC HuggingFace weights exist to cache."""
+    if sep_models_dir.is_dir():
+        for p in sep_models_dir.rglob("*"):
+            if (
+                p.is_file()
+                and not p.is_symlink()
+                and not p.name.startswith(".")
+                and p.suffix.lower() in _WEIGHT_CACHE_EXTS
+                and p.stat().st_size > 0
+            ):
+                return True
+    if svc_hf_cache.is_dir():
+        for p in svc_hf_cache.rglob("*"):
+            if (
+                p.is_file()
+                and not p.is_symlink()
+                and ".locks" not in p.parts
+                and not p.name.endswith((".lock", ".tmp", ".incomplete"))
+                and p.stat().st_size > 0
+            ):
+                return True
+    return False
+
+
+def _is_safe_rel_symlink(parts: tuple[str, ...], linkname: str, stage_root: Path) -> bool:
+    """Validate that an archive symlink under `svc_hf_cache` is relative and stays inside root."""
+    if not linkname or "\x00" in linkname or "\\" in linkname or os.path.isabs(linkname):
+        return False
+    top_root = (stage_root / parts[0]).resolve()
+    link_parent = stage_root.joinpath(*parts[:-1])
+    resolved = Path(os.path.normpath(str(link_parent / linkname)))
+    return resolved.is_relative_to(top_root)
+
+
+def _compress_tar_to_zst(raw_tar: Path, output_path: Path) -> str:
+    """Compress raw tar into `.tar.zst` via `zstd` CLI (or gzip fallback if zstd absent)."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out = output_path.with_suffix(output_path.suffix + ".tmp")
+    zstd_bin = shutil.which("zstd")
+    try:
+        if zstd_bin:
+            proc = subprocess.run(
+                [zstd_bin, "-T0", "-3", "-q", "-f", str(raw_tar), "-o", str(tmp_out)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0 and tmp_out.is_file() and tmp_out.stat().st_size > 0:
+                tmp_out.replace(output_path)
+                return "zstd"
+            tmp_out.unlink(missing_ok=True)
+        # Fallback to gzip compression when zstd CLI is unavailable on host/test env.
+        import gzip
+
+        with raw_tar.open("rb") as src, gzip.open(tmp_out, "wb", compresslevel=3) as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+        tmp_out.replace(output_path)
+        return "gzip"
+    finally:
+        tmp_out.unlink(missing_ok=True)
+
+
+def _decompress_zst_if_needed(archive_path: Path, work_dir: Path) -> tuple[Path, bool]:
+    """If `archive_path` starts with zstd magic bytes, decompress to a temp tar file."""
+    with archive_path.open("rb") as handle:
+        magic = handle.read(4)
+    if magic != _ZSTD_MAGIC:
+        return archive_path, False
+    zstd_bin = shutil.which("zstd")
+    if not zstd_bin:
+        raise RuntimeError("zstd binary required to extract .tar.zst weight cache")
+    out_tar = work_dir / f"decompressed_{uuid.uuid4().hex[:8]}.tar"
+    proc = subprocess.run(
+        [zstd_bin, "-d", "-q", "-f", str(archive_path), "-o", str(out_tar)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not out_tar.is_file():
+        out_tar.unlink(missing_ok=True)
+        raise ValueError("weight_cache_zstd_decompress_failed")
+    return out_tar, True
+
+
+def pack_svc_weight_cache(
+    output_archive: Path,
+    *,
+    sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
+    svc_hf_cache: Path = DEFAULT_SVC_HF_CACHE,
+) -> dict[str, Any]:
+    """Pack BS-RoFormer `sep_models` + `/content/svc-hf-cache` weights into `.tar.zst`."""
+    entries: list[tuple[Path, str]] = []
+    sep_count = 0
+    svc_count = 0
+
+    if sep_models_dir.is_dir():
+        for p in sorted(sep_models_dir.rglob("*")):
+            if (
+                p.is_file()
+                and not p.is_symlink()
+                and not p.name.startswith(".")
+                and p.suffix.lower() in _WEIGHT_CACHE_EXTS
+            ):
+                rel = p.relative_to(sep_models_dir).as_posix()
+                entries.append((p, f"sep_models/{rel}"))
+                sep_count += 1
+
+    if svc_hf_cache.is_dir():
+        hf_root = svc_hf_cache.resolve()
+        for p in sorted(svc_hf_cache.rglob("*")):
+            rel_parts = p.relative_to(svc_hf_cache).parts
+            if not rel_parts or ".locks" in rel_parts:
+                continue
+            if p.name.endswith((".lock", ".tmp", ".incomplete")):
+                continue
+            if p.is_symlink():
+                raw_target = os.readlink(p)
+                if os.path.isabs(raw_target):
+                    continue
+                resolved = Path(os.path.normpath(str(p.parent / raw_target)))
+                if not resolved.is_relative_to(hf_root):
+                    continue
+                rel = p.relative_to(svc_hf_cache).as_posix()
+                entries.append((p, f"svc_hf_cache/{rel}"))
+                svc_count += 1
+            elif p.is_file():
+                rel = p.relative_to(svc_hf_cache).as_posix()
+                entries.append((p, f"svc_hf_cache/{rel}"))
+                svc_count += 1
+
+    if not entries:
+        raise FileNotFoundError("No SVC or separator weight files found to pack into cache archive")
+
+    output_archive.parent.mkdir(parents=True, exist_ok=True)
+    tmp_raw = output_archive.parent / f".tmp_svc_pack_{uuid.uuid4().hex[:8]}.tar"
+    try:
+        with tarfile.open(tmp_raw, "w") as tf:
+            for src_path, arcname in entries:
+                tf.add(src_path, arcname=arcname, recursive=False)
+        compression = _compress_tar_to_zst(tmp_raw, output_archive)
+    finally:
+        tmp_raw.unlink(missing_ok=True)
+
+    return {
+        "path": output_archive,
+        "sha256": sha256_file(output_archive),
+        "size": output_archive.stat().st_size,
+        "file_count": len(entries),
+        "sep_model_files": sep_count,
+        "svc_model_files": svc_count,
+        "compression": compression,
+    }
+
+
 def pack_weight_cache(
     output_tar: Path,
     *,
@@ -930,9 +1110,10 @@ def restore_weight_cache(
     expected_sha256: str = "",
     applio_dir: Path = DEFAULT_APPLIO_DIR,
     sep_models_dir: Path = DEFAULT_SEP_MODELS_DIR,
+    svc_hf_cache: Path = DEFAULT_SVC_HF_CACHE,
     only_prefixes: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """Verify SHA-256 and safely restore cached separation + Applio weights."""
+    """Verify SHA-256 and safely restore cached separation + Applio/SVC weights."""
     if not tar_path.is_file():
         raise FileNotFoundError(f"Weight cache archive missing: {tar_path}")
     actual_sha = sha256_file(tar_path)
@@ -946,6 +1127,7 @@ def restore_weight_cache(
         "sep_models": sep_models_dir,
         "applio_rvc_models": applio_dir / "rvc" / "models",
         "applio_assets": applio_dir / "assets",
+        "svc_hf_cache": svc_hf_cache,
     }
     target_prefixes = (
         frozenset(only_prefixes) if only_prefixes is not None else frozenset(allowed_roots)
@@ -953,28 +1135,55 @@ def restore_weight_cache(
     restored = 0
     sep_restored = 0
     applio_restored = 0
+    svc_restored = 0
 
     with tempfile.TemporaryDirectory(prefix="hakimi_wcache_", dir=tar_path.parent) as stage_str:
         stage_root = Path(stage_str).resolve()
-        with tarfile.open(tar_path, "r:*") as tf:
-            members = tf.getmembers()
-            for member in members:
-                if member.issym() or member.islnk() or member.isdev() or member.isfifo():
-                    raise ValueError(f"Unsafe member in weight cache archive: {member.name}")
-                clean_parts = Path(member.name).parts
-                if (
-                    not clean_parts
-                    or clean_parts[0] not in allowed_roots
-                    or any(part in {"..", "/"} for part in clean_parts)
-                ):
-                    raise ValueError(f"Disallowed path in weight cache archive: {member.name}")
-                target = (stage_root / member.name).resolve()
-                if not target.is_relative_to(stage_root):
-                    raise ValueError(f"Path traversal in weight cache archive: {member.name}")
-            if hasattr(tarfile, "data_filter"):
-                tf.extractall(stage_root, filter="data")
-            else:
-                tf.extractall(stage_root)
+        open_tar_path, created_temp_tar = _decompress_zst_if_needed(tar_path, stage_root)
+        try:
+            with tarfile.open(open_tar_path, "r:*") as tf:
+                members = tf.getmembers()
+                for member in members:
+                    if member.islnk() or member.isdev() or member.isfifo():
+                        raise ValueError(f"Unsafe member in weight cache archive: {member.name}")
+                    clean_parts = Path(member.name).parts
+                    if (
+                        not clean_parts
+                        or clean_parts[0] not in allowed_roots
+                        or any(part in {"..", "/"} for part in clean_parts)
+                    ):
+                        raise ValueError(f"Disallowed path in weight cache archive: {member.name}")
+                    if member.issym():
+                        if clean_parts[0] != "svc_hf_cache" or not _is_safe_rel_symlink(
+                            clean_parts, member.linkname, stage_root
+                        ):
+                            raise ValueError(
+                                f"Unsafe member in weight cache archive: {member.name}"
+                            )
+                    target = Path(os.path.normpath(str(stage_root / member.name)))
+                    if not target.is_relative_to(stage_root):
+                        raise ValueError(f"Path traversal in weight cache archive: {member.name}")
+                for member in members:
+                    clean_parts = Path(member.name).parts
+                    if clean_parts[0] not in target_prefixes:
+                        continue
+                    dst_stage = stage_root.joinpath(*clean_parts)
+                    if member.isdir():
+                        dst_stage.mkdir(parents=True, exist_ok=True)
+                    elif member.issym():
+                        dst_stage.parent.mkdir(parents=True, exist_ok=True)
+                        if dst_stage.exists() or dst_stage.is_symlink():
+                            dst_stage.unlink()
+                        os.symlink(member.linkname, dst_stage)
+                    elif member.isfile():
+                        dst_stage.parent.mkdir(parents=True, exist_ok=True)
+                        src_f = tf.extractfile(member)
+                        if src_f is not None:
+                            with src_f, dst_stage.open("wb") as out_f:
+                                shutil.copyfileobj(src_f, out_f, length=1024 * 1024)
+        finally:
+            if created_temp_tar:
+                open_tar_path.unlink(missing_ok=True)
 
         for prefix, dest_base in allowed_roots.items():
             if prefix not in target_prefixes:
@@ -983,15 +1192,25 @@ def restore_weight_cache(
             if not src_sub.is_dir():
                 continue
             for item in sorted(src_sub.rglob("*")):
-                if not item.is_file():
+                if item.is_dir() and not item.is_symlink():
                     continue
                 rel = item.relative_to(src_sub)
                 dst = dest_base / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(item), str(dst))
+                if item.is_symlink():
+                    link_target = os.readlink(item)
+                    if dst.exists() or dst.is_symlink():
+                        dst.unlink()
+                    os.symlink(link_target, dst)
+                elif item.is_file():
+                    shutil.move(str(item), str(dst))
+                else:
+                    continue
                 restored += 1
                 if prefix == "sep_models":
                     sep_restored += 1
+                elif prefix == "svc_hf_cache":
+                    svc_restored += 1
                 else:
                     applio_restored += 1
 
@@ -1001,6 +1220,7 @@ def restore_weight_cache(
         "file_count": restored,
         "sep_model_files": sep_restored,
         "applio_model_files": applio_restored,
+        "svc_model_files": svc_restored,
         "sha256": actual_sha,
     }
 
@@ -1188,6 +1408,7 @@ def _try_restore_weight_cache_from_drive(
     applio_dir: Path,
     sep_models_dir: Path,
     work_dir: Path,
+    svc_hf_cache: Path = DEFAULT_SVC_HF_CACHE,
     explicit_file_id: str = "",
     explicit_sha256: str = "",
     only_prefixes: tuple[str, ...] | None = None,
@@ -1217,7 +1438,8 @@ def _try_restore_weight_cache_from_drive(
 
         cache_tmp = work_dir / "_cache_dl"
         cache_tmp.mkdir(parents=True, exist_ok=True)
-        tar_path = cache_tmp / f"{weight_cache_key}.tar"
+        suffix = ".tar.zst" if weight_cache_key.startswith("svc_weights_") else ".tar"
+        tar_path = cache_tmp / f"{weight_cache_key}{suffix}"
         try:
             _drive_download_to_path(drive_token, archive_id, tar_path)
             info = restore_weight_cache(
@@ -1225,11 +1447,13 @@ def _try_restore_weight_cache_from_drive(
                 expected_sha256=expected_sha,
                 applio_dir=applio_dir,
                 sep_models_dir=sep_models_dir,
+                svc_hf_cache=svc_hf_cache,
                 only_prefixes=only_prefixes,
             )
             log(
                 f"Weight cache HIT ({weight_cache_key}): restored {info['file_count']} file(s) "
-                f"(sep={info['sep_model_files']}, applio={info['applio_model_files']})."
+                f"(sep={info['sep_model_files']}, applio={info['applio_model_files']}, "
+                f"svc={info.get('svc_model_files', 0)})."
             )
             return True, None, info
         finally:
@@ -1310,6 +1534,77 @@ def _try_restore_venv_cache_from_drive(
         reason = scrub_secrets(f"{type(exc).__name__}:{exc}")[:120]
         log(f"Venv cache fallback ({venv_cache_key}): {reason}")
         return False, reason
+
+
+def _writeback_svc_weight_cache_to_drive(
+    *,
+    drive_token: str,
+    cache_folder_id: str,
+    weight_cache_key: str,
+    sep_models_dir: Path,
+    svc_hf_cache: Path,
+    work_dir: Path,
+) -> bool:
+    """Atomically write `.tar.zst` SVC + BS-RoFormer weights first, then commit manifest JSON."""
+    if not drive_token or not cache_folder_id:
+        return False
+    cache_tmp = work_dir / "_cache_wb"
+    cache_tmp.mkdir(parents=True, exist_ok=True)
+    archive_name = f"{weight_cache_key}.tar.zst"
+    archive_path = cache_tmp / archive_name
+    try:
+        packed = pack_svc_weight_cache(
+            archive_path,
+            sep_models_dir=sep_models_dir,
+            svc_hf_cache=svc_hf_cache,
+        )
+        mime_type = "application/zstd" if packed["compression"] == "zstd" else "application/gzip"
+        up = _drive_upload_from_path(
+            drive_token,
+            cache_folder_id,
+            archive_path,
+            archive_name,
+            mime_type,
+            replace_existing=True,
+            app_properties={
+                "hakimi_songs_role": "cache",
+                "cache_kind": "weights",
+                "cache_key": weight_cache_key[:100],
+            },
+        )
+        manifest = {
+            "schema": WEIGHT_CACHE_SCHEMA_VERSION,
+            "kind": "weights",
+            "version_key": weight_cache_key,
+            "archive_file_id": up["file_id"],
+            "archive_name": up["name"],
+            "sha256": packed["sha256"],
+            "size": packed["size"],
+            "file_count": packed["file_count"],
+            "sep_model_files": packed["sep_model_files"],
+            "svc_model_files": packed["svc_model_files"],
+            "compression": packed["compression"],
+            "created_at": int(time.time()),
+        }
+        _drive_upload_json(
+            drive_token,
+            cache_folder_id,
+            f"{weight_cache_key}.manifest.json",
+            manifest,
+            replace_existing=True,
+            app_properties={"hakimi_songs_role": "cache", "cache_key": weight_cache_key[:100]},
+        )
+        log(
+            f"SVC weight cache atomic writeback committed: {weight_cache_key} "
+            f"({packed['size']} B, sep={packed['sep_model_files']}, "
+            f"svc={packed['svc_model_files']}, codec={packed['compression']})"
+        )
+        return True
+    except Exception as exc:
+        log(f"Warning: SVC weight cache writeback skipped ({type(exc).__name__}: {exc})")
+        return False
+    finally:
+        archive_path.unlink(missing_ok=True)
 
 
 def _writeback_weight_cache_to_drive(
@@ -1575,7 +1870,7 @@ def action_setup(
     """Provision GPU check, ffmpeg, uv, sep-venv, and requested SVC or Applio/RVC runtime."""
     norm_mode = str(mode or "all").strip().lower() or "all"
     is_svc_only = norm_mode == "svc"
-    cache_key_mode = "cover" if norm_mode in {"cover", "svc", "rvc"} else "all"
+    cache_key_mode = "svc" if is_svc_only else ("cover" if norm_mode in {"cover", "rvc"} else "all")
     weight_cache_key = compute_weight_cache_key(cache_key_mode)
     sep_marker = _effective_marker(SEP_SETUP_MARKER, Path("/content/.hakimi_sep_setup_done"))
     svc_marker = _effective_marker(SVC_SETUP_MARKER, Path("/content/.hakimi_svc_setup_done"))
@@ -1587,6 +1882,7 @@ def action_setup(
         "weight_cache_hit": None,
         "weight_cache_written": False,
         "weight_cache_has_sep_models": False,
+        "weight_cache_has_svc_models": False,
         "weight_fallback_reason": None,
         "venv_cache_hit": None,
         "venv_cache_written": False,
@@ -1631,14 +1927,16 @@ def action_setup(
                 weight_cache_key=weight_cache_key,
                 applio_dir=applio_dir,
                 sep_models_dir=sep_models_dir,
+                svc_hf_cache=svc_hf_cache,
                 work_dir=DEFAULT_WORK_DIR,
                 explicit_file_id=cache_weights_file_id,
                 explicit_sha256=cache_weights_sha256,
-                only_prefixes=("sep_models",),
+                only_prefixes=("sep_models", "svc_hf_cache"),
             )
             cache_status["weight_cache_hit"] = weight_hit
             cache_status["weight_fallback_reason"] = weight_reason
             cache_status["weight_cache_has_sep_models"] = bool(weight_info.get("sep_model_files"))
+            cache_status["weight_cache_has_svc_models"] = bool(weight_info.get("svc_model_files"))
 
         if force or not (sep_marker.is_file() and (sep_venv / "bin" / "python").is_file()):
             _setup_sep_venv(uv_bin, sep_venv)
@@ -2610,12 +2908,14 @@ def _mix_and_slice_candidate(
     work_cover: Path,
     out_dir: Path,
     chunks_dir: Path,
+    orig_db: float | None = None,
+    skip_chunk_split: bool = False,
 ) -> tuple[Path, Path, float, dict[str, Any]]:
-    orig_db = _detect_mean_volume_db(lead_vocals_wav)
+    resolved_orig_db = _detect_mean_volume_db(lead_vocals_wav) if orig_db is None else orig_db
     conv_db = _detect_mean_volume_db(converted_wav)
-    gain_db = max(-12.0, min(12.0, orig_db - conv_db))
+    gain_db = max(-12.0, min(12.0, resolved_orig_db - conv_db))
     log(
-        f"[{engine_key}] Loudness match: orig={orig_db:.1f} dB, "
+        f"[{engine_key}] Loudness match: orig={resolved_orig_db:.1f} dB, "
         f"conv={conv_db:.1f} dB -> gain={gain_db:+.2f} dB"
     )
 
@@ -2718,8 +3018,9 @@ def _mix_and_slice_candidate(
     metrics = compute_acoustic_metrics(
         converted_wav, full_mp3, chorus_mp3, work_cover / f"metrics_{engine_key}"
     )
-    split_file(full_mp3, chunks_dir / f"cover_{engine_key}_full", chunk_mb=chunk_mb)
-    split_file(chorus_mp3, chunks_dir / f"cover_{engine_key}_chorus", chunk_mb=chunk_mb)
+    if not skip_chunk_split:
+        split_file(full_mp3, chunks_dir / f"cover_{engine_key}_full", chunk_mb=chunk_mb)
+        split_file(chorus_mp3, chunks_dir / f"cover_{engine_key}_chorus", chunk_mb=chunk_mb)
     return full_mp3, chorus_mp3, gain_db, metrics
 
 
@@ -2744,6 +3045,7 @@ def action_cover(
     chorus_anchor: str = "",
     fallback_start_sec: float = 60.0,
     chunk_mb: int = 6,
+    skip_chunk_split: bool = False,
     applio_dir: Path = DEFAULT_APPLIO_DIR,
     rvc_venv: Path = DEFAULT_RVC_VENV,
     sep_venv: Path = DEFAULT_SEP_VENV,
@@ -2857,6 +3159,7 @@ def action_cover(
     candidates: list[dict[str, Any]] = []
     candidate_paths: dict[str, tuple[Path, Path]] = {}
     first_exc: Exception | None = None
+    lead_orig_db = _detect_mean_volume_db(lead_vocals_wav)
 
     for eng in target_engines:
         started_t = time.monotonic()
@@ -2917,6 +3220,8 @@ def action_cover(
                 work_cover=work_cover,
                 out_dir=out_dir,
                 chunks_dir=chunks_dir,
+                orig_db=lead_orig_db,
+                skip_chunk_split=skip_chunk_split,
             )
             try:
                 chorus_dur_ms = int(round(_probe_duration_sec(chorus_mp3) * 1000.0))
@@ -3019,8 +3324,9 @@ def action_cover(
         json.dumps(meta, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    split_file(cover_full_mp3, chunks_dir / "cover_full", chunk_mb=chunk_mb)
-    split_file(cover_chorus_mp3, chunks_dir / "cover_chorus", chunk_mb=chunk_mb)
+    if not skip_chunk_split:
+        split_file(cover_full_mp3, chunks_dir / "cover_full", chunk_mb=chunk_mb)
+        split_file(cover_chorus_mp3, chunks_dir / "cover_chorus", chunk_mb=chunk_mb)
     log(
         f"Cover ready: engine={resolved_engine} used={primary_eng} "
         f"ok={len(succeeded)}/{len(candidates)} start={chosen_start}s "
@@ -3059,11 +3365,62 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _DRIVE_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
-def _drive_urlopen(req: urllib.request.Request, *, timeout: float = 120.0):
+def _parse_retry_after_header(headers: Any) -> float | None:
+    if not headers:
+        return None
+    raw = str(headers.get("Retry-After") or headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+        if val >= 0.0:
+            return min(30.0, val)
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        delta = (dt - datetime.now(UTC)).total_seconds()
+        return max(0.0, min(30.0, delta))
+    except Exception:
+        return None
+
+
+def _drive_urlopen(
+    req: urllib.request.Request,
+    *,
+    timeout: float = 120.0,
+    sleep_fn=time.sleep,
+):
     parsed = urllib.parse.urlsplit(req.full_url)
     if parsed.scheme != "https" or parsed.netloc != "www.googleapis.com":
         raise ValueError("Disallowed Drive API endpoint")
-    return _DRIVE_OPENER.open(req, timeout=timeout)
+    for attempt in range(_DRIVE_MAX_RETRIES + 1):
+        try:
+            return _DRIVE_OPENER.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code in _DRIVE_RETRYABLE_STATUSES and attempt < _DRIVE_MAX_RETRIES:
+                retry_after = _parse_retry_after_header(exc.headers)
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else min(_DRIVE_RETRY_MAX_SEC, _DRIVE_RETRY_BASE_SEC * (2**attempt))
+                )
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+                sleep_fn(delay)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < _DRIVE_MAX_RETRIES:
+                delay = min(_DRIVE_RETRY_MAX_SEC, _DRIVE_RETRY_BASE_SEC * (2**attempt))
+                sleep_fn(delay)
+                continue
+            raise
+    raise RuntimeError("Drive API request retries exhausted")
 
 
 def _escape_drive_q(value: str) -> str:
@@ -3137,16 +3494,25 @@ def _drive_download_to_path(access_token: str, file_id: str, dest_path: Path) ->
     if not clean_id or clean_id != file_id.strip():
         raise ValueError("Invalid Drive file ID")
     url = f"https://www.googleapis.com/drive/v3/files/{clean_id}?alt=media&supportsAllDrives=true"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
-    try:
-        with _drive_urlopen(req, timeout=180.0) as resp, tmp_path.open("wb") as handle:
-            while chunk := resp.read(1024 * 1024):
-                handle.write(chunk)
-        tmp_path.replace(dest_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    for attempt in range(_DRIVE_MAX_RETRIES + 1):
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+        try:
+            with _drive_urlopen(req, timeout=180.0) as resp, tmp_path.open("wb") as handle:
+                while chunk := resp.read(1024 * 1024):
+                    handle.write(chunk)
+            tmp_path.replace(dest_path)
+            break
+        except (urllib.error.URLError, TimeoutError, OSError):
+            tmp_path.unlink(missing_ok=True)
+            if attempt < _DRIVE_MAX_RETRIES:
+                time.sleep(min(_DRIVE_RETRY_MAX_SEC, _DRIVE_RETRY_BASE_SEC * (2**attempt)))
+                continue
+            raise
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
     log(f"Direct Drive download complete -> {dest_path} ({dest_path.stat().st_size} B)")
     return dest_path
 
@@ -3338,12 +3704,43 @@ def _download_drive_model_if_needed(
     return True
 
 
+def _consume_remote_secrets_file() -> str:
+    """Read and immediately unlink single-use `HAKIMI_SECRETS_FILE` from disk."""
+    sec_path_raw = os.environ.pop("HAKIMI_SECRETS_FILE", "").strip()
+    if not sec_path_raw:
+        return ""
+    sec_path = Path(sec_path_raw)
+    token = ""
+    try:
+        raw = sec_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            token = str(data.get("HAKIMI_DRIVE_ACCESS_TOKEN") or "").strip()
+            for k, v in data.items():
+                if k == "HAKIMI_DRIVE_ACCESS_TOKEN":
+                    continue
+                if isinstance(k, str) and k and v is not None:
+                    val = str(v)
+                    if len(val) >= 6:
+                        _ACTIVE_SECRETS.add(val)
+                    os.environ[k] = val
+    except Exception:
+        pass
+    finally:
+        try:
+            sec_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return token
+
+
 def _dispatch_env(action: str, drive_token: str | None = None) -> None:
-    token = (
-        os.environ.pop("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
-        if drive_token is None
-        else drive_token
-    )
+    if drive_token is None:
+        file_token = _consume_remote_secrets_file()
+        env_token = os.environ.pop("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
+        token = file_token or env_token
+    else:
+        token = drive_token
     registered = bool(token and token not in _ACTIVE_SECRETS)
     if registered:
         _ACTIVE_SECRETS.add(token)
@@ -3486,6 +3883,9 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
                     raise RuntimeError(
                         f"drive_direct_input_failed:{target_name}:{type(exc).__name__}"
                     ) from None
+        songs_folder = os.environ.get("HAKIMI_DRIVE_SONGS_FOLDER_ID", "").strip()
+        use_direct_outputs = bool(drive_token and songs_folder)
+        chunk_mb = _env_int("HAKIMI_CHUNK_MB", 6)
         meta = action_cover(
             source_audio=source_path,
             pth_path=pth_path if (raw_engine == "rvc" or not raw_engine) else None,
@@ -3507,10 +3907,10 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
             duration_sec=_env_float("HAKIMI_DURATION_SEC", 50.0),
             chorus_anchor=os.environ.get("HAKIMI_CHORUS_ANCHOR", ""),
             fallback_start_sec=_env_float("HAKIMI_FALLBACK_START_SEC", 60.0),
-            chunk_mb=_env_int("HAKIMI_CHUNK_MB", 6),
+            chunk_mb=chunk_mb,
+            skip_chunk_split=use_direct_outputs,
         )
-        songs_folder = os.environ.get("HAKIMI_DRIVE_SONGS_FOLDER_ID", "").strip()
-        if drive_token and songs_folder:
+        if use_direct_outputs:
             try:
                 raw_prefix = os.environ.get("HAKIMI_COVER_PREFIX", "cover").strip()
                 prefix = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", raw_prefix).strip("_") or "cover"
@@ -3551,11 +3951,19 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
                         c_sha = str(cand.get("digest") or sha256_file(c_chorus_path))
                         c_size = c_chorus_path.stat().st_size
                         c_full_size = c_full_path.stat().st_size
-                        try:
-                            c_dur_ms = int(round(_probe_duration_sec(c_chorus_path) * 1000.0))
-                        except Exception:
-                            fallback_dur = float(meta.get("chorus_duration_sec", 50.0))
-                            c_dur_ms = int(cand.get("duration_ms") or round(fallback_dur * 1000.0))
+                        raw_cand_dur = cand.get("duration_ms")
+                        if (
+                            isinstance(raw_cand_dur, (int, float))
+                            and not isinstance(raw_cand_dur, bool)
+                            and int(raw_cand_dur) > 0
+                        ):
+                            c_dur_ms = int(raw_cand_dur)
+                        else:
+                            try:
+                                c_dur_ms = int(round(_probe_duration_sec(c_chorus_path) * 1000.0))
+                            except Exception:
+                                fallback_dur = float(meta.get("chorus_duration_sec", 50.0))
+                                c_dur_ms = int(round(fallback_dur * 1000.0))
                         if single_legacy_rvc:
                             c_chorus_name = f"{prefix}_{c_sha[:8]}_chorus.mp3"
                             c_full_name = f"{prefix}_{c_sha[:8]}_full.mp3"
@@ -3662,37 +4070,89 @@ def _dispatch_env_inner(action: str, drive_token: str) -> None:
             except Exception as exc:
                 log(
                     "Warning: direct Drive cover upload failed "
-                    f"({type(exc).__name__}: {exc}); host will fall back to chunk download."
+                    f"({type(exc).__name__}: {exc}); generating WS fallback chunks."
                 )
+                # Lazily generate WS chunks only on Drive Direct upload failure.
+                cover_full_mp3 = DEFAULT_OUT_DIR / "cover_full.mp3"
+                cover_chorus_mp3 = DEFAULT_OUT_DIR / "cover_chorus.mp3"
+                if cover_full_mp3.is_file():
+                    split_file(cover_full_mp3, DEFAULT_CHUNKS_DIR / "cover_full", chunk_mb=chunk_mb)
+                if cover_chorus_mp3.is_file():
+                    split_file(
+                        cover_chorus_mp3, DEFAULT_CHUNKS_DIR / "cover_chorus", chunk_mb=chunk_mb
+                    )
+                for cand in meta.get("candidates") or ():
+                    if not isinstance(cand, dict) or cand.get("status") != "succeeded":
+                        continue
+                    eng = str(cand.get("engine") or "").strip()
+                    if not eng:
+                        continue
+                    c_full = DEFAULT_OUT_DIR / str(
+                        cand.get("local_full_file") or f"cover_{eng}_full.mp3"
+                    )
+                    c_chorus = DEFAULT_OUT_DIR / str(
+                        cand.get("local_chorus_file") or f"cover_{eng}_chorus.mp3"
+                    )
+                    if c_full.is_file():
+                        split_file(
+                            c_full, DEFAULT_CHUNKS_DIR / f"cover_{eng}_full", chunk_mb=chunk_mb
+                        )
+                    if c_chorus.is_file():
+                        split_file(
+                            c_chorus, DEFAULT_CHUNKS_DIR / f"cover_{eng}_chorus", chunk_mb=chunk_mb
+                        )
 
         cache_folder = os.environ.get("HAKIMI_CACHE_FOLDER_ID", "").strip()
+        eff_req_engine = str(meta.get("engine_requested") or raw_engine or "dual").strip().lower()
         if (
             drive_token
             and cache_folder
             and _env_bool("HAKIMI_CACHE_WRITEBACK", False)
             and _env_bool("HAKIMI_CACHE_WEIGHTS_WRITEBACK_AFTER_COVER", False)
-            and _has_applio_pretrained_weights(DEFAULT_APPLIO_DIR, mode="cover")
         ):
-            w_key = compute_weight_cache_key("cover")
-            written = _writeback_weight_cache_to_drive(
-                drive_token=drive_token,
-                cache_folder_id=cache_folder,
-                weight_cache_key=w_key,
-                applio_dir=DEFAULT_APPLIO_DIR,
-                sep_models_dir=DEFAULT_SEP_MODELS_DIR,
-                work_dir=DEFAULT_WORK_DIR,
-            )
-            print(
-                CACHE_STATUS_PREFIX
-                + json.dumps(
-                    {
-                        "weight_cache_key": w_key,
-                        "weight_cache_written": written,
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
+            if eff_req_engine == "rvc":
+                if _has_applio_pretrained_weights(DEFAULT_APPLIO_DIR, mode="cover"):
+                    w_key = compute_weight_cache_key("cover")
+                    written = _writeback_weight_cache_to_drive(
+                        drive_token=drive_token,
+                        cache_folder_id=cache_folder,
+                        weight_cache_key=w_key,
+                        applio_dir=DEFAULT_APPLIO_DIR,
+                        sep_models_dir=DEFAULT_SEP_MODELS_DIR,
+                        work_dir=DEFAULT_WORK_DIR,
+                    )
+                    print(
+                        CACHE_STATUS_PREFIX
+                        + json.dumps(
+                            {
+                                "weight_cache_key": w_key,
+                                "weight_cache_written": written,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+            elif _has_svc_cached_weights(DEFAULT_SEP_MODELS_DIR, DEFAULT_SVC_HF_CACHE):
+                w_key = compute_weight_cache_key("svc")
+                written = _writeback_svc_weight_cache_to_drive(
+                    drive_token=drive_token,
+                    cache_folder_id=cache_folder,
+                    weight_cache_key=w_key,
+                    sep_models_dir=DEFAULT_SEP_MODELS_DIR,
+                    svc_hf_cache=DEFAULT_SVC_HF_CACHE,
+                    work_dir=DEFAULT_WORK_DIR,
+                )
+                print(
+                    CACHE_STATUS_PREFIX
+                    + json.dumps(
+                        {
+                            "weight_cache_key": w_key,
+                            "weight_cache_written": written,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
     else:
         raise ValueError(f"Unsupported HAKIMI_COLAB_ACTION: {action!r}")
 
@@ -3752,7 +4212,9 @@ def main(argv: list[str] | None = None) -> int:
     actions = {"reassemble", "split", "setup", "train", "cover"}
     env_action = os.environ.get("HAKIMI_COLAB_ACTION", "").strip()
     effective_argv = sys.argv[1:] if argv is None else argv
-    drive_token = os.environ.pop("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
+    file_token = _consume_remote_secrets_file()
+    env_token = os.environ.pop("HAKIMI_DRIVE_ACCESS_TOKEN", "").strip()
+    drive_token = file_token or env_token
     if drive_token:
         _ACTIVE_SECRETS.add(drive_token)
 

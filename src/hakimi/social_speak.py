@@ -254,8 +254,6 @@ async def speak_proactive(
     payload.update(await service.modules.context_data(limit=3, now=ts, message=target_msg))
 
     if private_owner:
-        if not call.evidence and service.proactive.matches(target_msg):
-            payload["companion_context"] = await service.proactive.companion_context(ts)
         cloud_mem = getattr(service, "cloud_memory", None)
         if cloud_mem is not None:
             mem_data = await asyncio.to_thread(cloud_mem.for_message, target_msg, "", recall=False)

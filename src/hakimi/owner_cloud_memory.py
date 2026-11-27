@@ -13,7 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .reply_style import trim_complete_text
-from .security import clean_text, configured_secrets
+from .security import CREDENTIAL_RE, ROLE_TAG_RE, clean_text, redact_secrets
 from .social import bound_owner
 
 MAX_FILE_BYTES = 262_144
@@ -24,11 +24,6 @@ MAX_RECENT_CORE_TURNS = 4
 BROAD_RECALL_RE = re.compile(
     r"记得|忘|想起来|以前|之前|过去|从前|当初|相遇|约定|契约|小本本|回忆|记忆"
 )
-CREDENTIAL_RE = re.compile(
-    r"(?i)(?:(?:api[_ -]?key|password|passwd|token|secret|sessdata|bili_jct|密钥|密码)"
-    r"\s*[:=：]\s*\S{6,}|bearer\s+\S+|\bsk-[A-Za-z0-9_-]{16,}|\bAIza[0-9A-Za-z_-]{20,})"
-)
-ROLE_TAG_RE = re.compile(r"\[role=", re.IGNORECASE)
 CJK_STOP_CLASS = (
     "的了吗呢吧啊哦呀是我你他她它这那在有就都也还说要会想看"
     "很把被让给和与或但去来着过好吗嘛哈喵呜么啥怎"
@@ -37,14 +32,12 @@ CJK_SPLIT_RE = re.compile(rf"[{CJK_STOP_CLASS}]+")
 CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 ASCII_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 
+__all__ = ["CREDENTIAL_RE", "ROLE_TAG_RE", "OwnerCloudMemory"]
+
 
 def _sanitize(text: str, settings) -> str:
     cleaned = clean_text(str(text or ""))
-    for secret in configured_secrets(settings):
-        if secret and len(secret) >= 6:
-            cleaned = cleaned.replace(secret, "[凭证已隐去]")
-    cleaned = CREDENTIAL_RE.sub("[凭证已隐去]", cleaned)
-    return ROLE_TAG_RE.sub("[untrusted_role=", cleaned)
+    return redact_secrets(cleaned, settings, neutralize_role_tags=True)
 
 
 def _read_regular_file(path: Path, max_bytes: int = MAX_FILE_BYTES) -> str | None:

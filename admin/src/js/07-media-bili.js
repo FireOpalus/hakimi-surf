@@ -81,15 +81,8 @@ function clearMemePreviews(revokeAll=false){
   $('meme-list').replaceChildren();
   text('meme-state','');
 }
-async function memeRequest(path,method='GET',body){
-  const signal=activeRequestSignal(method);
-  const r=await fetch('/admin/api/memes'+path,{method,signal,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':body.type||'application/octet-stream'}:{})},body,cache:'no-store',credentials:'omit',redirect:'error'});
-  if(!r.ok){
-    let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}
-    if(!signal.aborted&&(r.status===401||r.status===403))logout();
-    throw Error(detail);
-  }
-  return r;
+function memeRequest(path,method='GET',body){
+  return apiRaw('/admin/api/memes'+path,method,body);
 }
 function pumpMemeQueue(){
   while(memeActiveFetches<MEME_CONCURRENCY&&memeFetchQueue.length&&token){
@@ -541,70 +534,28 @@ function clearSongPreviews(revokeAll=false){
   text('song-learn-colab-hint','');
   text('song-state','');
 }
-async function songRequest(path,method='GET',body,extraHeaders={}){
-  const signal=activeRequestSignal(method);
-  const r=await fetch('/admin/api/songs'+path,{method,signal,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':body.type||'application/octet-stream'}:{}),...extraHeaders},body,cache:'no-store',credentials:'omit',redirect:'error'});
-  if(!r.ok){
-    let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}
-    if(!signal.aborted&&(r.status===401||r.status===403))logout();
-    throw Error(songErrorLabels[detail]||detail);
-  }
-  return r;
+function songRequest(path,method='GET',body,extraHeaders={}){
+  return apiRaw('/admin/api/songs'+path,method,body,{
+    extraHeaders,
+    mapError:detail=>songErrorLabels[detail]||detail
+  });
 }
-async function uploadInboxAudio(file){
-  const signal=sessionRequests.signal;
+async function uploadSongDriveAudio(url,file){
   const contentType=(file.type&&/^audio\/(?:mpeg|mp3|wav|x-wav|wave|ogg|opus|mp4|x-m4a|flac)$/i.test(file.type))?file.type:'application/octet-stream';
-  const r=await fetch('/admin/api/songs/inbox',{
-    method:'POST',
-    signal,
-    headers:{
-      Authorization:'Bearer '+token,
-      'Content-Type':contentType,
-      'X-Drive-Filename':encodeURIComponent(file.name)
-    },
-    body:file,
-    cache:'no-store',
-    credentials:'omit',
-    redirect:'error'
+  const r=await apiRaw(url,'POST',file,{
+    signal:sessionRequests.signal,
+    contentType,
+    extraHeaders:{'X-Drive-Filename':encodeURIComponent(file.name)},
+    mapError:detail=>mapSongError({message:detail})
   });
   let data=null;
   try{data=await r.json();}catch{}
-  if(signal.aborted)throw new DOMException('请求已取消','AbortError');
-  if(!r.ok){
-    if(r.status===401||r.status===403)logout();
-    const detail=data?.detail||('HTTP '+r.status);
-    throw Error(mapSongError({message:detail}));
-  }
+  if(sessionRequests.signal.aborted)throw new DOMException('请求已取消','AbortError');
   if(!data)throw Error('服务器未返回有效 JSON');
   return data;
 }
-async function uploadRefVoiceAudio(file){
-  const signal=sessionRequests.signal;
-  const contentType=(file.type&&/^audio\/(?:mpeg|mp3|wav|x-wav|wave|ogg|opus|mp4|x-m4a|flac)$/i.test(file.type))?file.type:'application/octet-stream';
-  const r=await fetch('/admin/api/songs/ref-voices',{
-    method:'POST',
-    signal,
-    headers:{
-      Authorization:'Bearer '+token,
-      'Content-Type':contentType,
-      'X-Drive-Filename':encodeURIComponent(file.name)
-    },
-    body:file,
-    cache:'no-store',
-    credentials:'omit',
-    redirect:'error'
-  });
-  let data=null;
-  try{data=await r.json();}catch{}
-  if(signal.aborted)throw new DOMException('请求已取消','AbortError');
-  if(!r.ok){
-    if(r.status===401||r.status===403)logout();
-    const detail=data?.detail||('HTTP '+r.status);
-    throw Error(mapSongError({message:detail}));
-  }
-  if(!data)throw Error('服务器未返回有效 JSON');
-  return data;
-}
+function uploadInboxAudio(file){return uploadSongDriveAudio('/admin/api/songs/inbox',file);}
+function uploadRefVoiceAudio(file){return uploadSongDriveAudio('/admin/api/songs/ref-voices',file);}
 function setSelectedSongFile(file){
   if(!file){selectedSongFile=null;text('song-file-name','未选择音频文件');return;}
   if(!/\.(?:mp3|wav|ogg|opus|m4a|flac)$/i.test(file.name)||file.size>100*1024*1024){

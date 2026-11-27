@@ -27,9 +27,22 @@ from .screen_watch import (
     strip_markdown_noise,
 )
 from .security import Rejected, clean_text, configured_secrets, safe_output
+from .social import owner_target
 from .work_usage import model_work
 
 log = logging.getLogger("hakimi")
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        log.debug("event=voice_companion_bg_task_error exc=%s", type(exc).__name__)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS voice_companion_sessions (
@@ -239,34 +252,68 @@ class VoiceCompanion:
         self.config = VoiceCompanionConfig()
         self.overridden = False
         self.initialized = False
+        self._init_lock = asyncio.Lock()
         self.peer_lock = asyncio.Lock()
         self._peer: _CompanionPeer | None = None
         self._retired: set[asyncio.Task[Any]] = set()
         self.source_ip: str | None = None
         self.connected_at: float | None = None
 
+    def _resolve_owner_identity(self) -> tuple[str, str, str] | None:
+        preferred = getattr(self.s, "owner_delivery_platform", "onebot") or "onebot"
+        bindings = getattr(self.s, "social_owner_bindings", None) or {}
+        ordered: list[str] = [preferred]
+        if "onebot" not in ordered:
+            ordered.append("onebot")
+        for plat in bindings:
+            if plat not in ordered and plat != "qq":
+                ordered.append(plat)
+        now = self.clock()
+        for plat in ordered:
+            msg = owner_target(self.s, plat, now, "vc-owner")
+            if msg is not None:
+                return msg.platform, msg.bot_id, msg.user_id
+        for plat in ordered:
+            if plat == "onebot":
+                if getattr(self.s, "owner_qq_id", ""):
+                    return "onebot", getattr(self.s, "onebot_self_id", ""), self.s.owner_qq_id
+            elif plat != "qq":
+                binding = bindings.get(plat)
+                if binding is not None:
+                    return plat, binding.bot_id, binding.user_id
+        if getattr(self.s, "owner_qq_id", ""):
+            return "onebot", getattr(self.s, "onebot_self_id", ""), self.s.owner_qq_id
+        return None
+
     async def initialize(self) -> None:
         if self.initialized:
             return
-        async with self.store.lock:
-            await self.store.db.executescript(SCHEMA)
-            row = await self.store.one(
-                "SELECT payload FROM admin_config WHERE key=?", (_CONFIG_KEY,)
-            )
-            if row and row[0]:
-                try:
-                    data = self.store.vault.open(_VAULT_CTX_CFG, row[0])
-                    filtered = (
-                        {k: v for k, v in data.items() if k in VoiceCompanionConfig.model_fields}
-                        if isinstance(data, dict)
-                        else data
-                    )
-                    self.config = VoiceCompanionConfig.model_validate(filtered)
-                    self.overridden = True
-                except Exception:
-                    self.config = VoiceCompanionConfig()
-                    self.overridden = False
-        self.initialized = True
+        async with self._init_lock:
+            if self.initialized:
+                return
+            async with self.store.lock:
+                await self.store.db.executescript(SCHEMA)
+                row = await self.store.one(
+                    "SELECT payload FROM admin_config WHERE key=?", (_CONFIG_KEY,)
+                )
+                if row and row[0]:
+                    try:
+                        data = self.store.vault.open(_VAULT_CTX_CFG, row[0])
+                        filtered = (
+                            {
+                                k: v
+                                for k, v in data.items()
+                                if k in VoiceCompanionConfig.model_fields
+                            }
+                            if isinstance(data, dict)
+                            else data
+                        )
+                        self.config = VoiceCompanionConfig.model_validate(filtered)
+                        self.overridden = True
+                    except Exception:
+                        self.config = VoiceCompanionConfig()
+                        self.overridden = False
+            self.initialized = True
 
     def has_active_owner_session(self) -> bool:
         """Whether an authenticated owner_private voice session is ready and allows screen_watch."""
@@ -277,7 +324,7 @@ class VoiceCompanion:
             and not peer.closed
             and self.config.enabled
             and self.config.use_screen_watch
-            and bool(self.s.owner_qq_id)
+            and self._resolve_owner_identity() is not None
             and peer.session is not None
             and not peer.session.finalized
             and peer.session.mode == "owner_private"
@@ -293,13 +340,14 @@ class VoiceCompanion:
         """Trigger a proactive spoken commentary turn using frames supplied by screen_watch."""
         async with self.peer_lock:
             peer = self._peer
+        owner_ident = self._resolve_owner_identity()
         if (
             peer is None
             or not peer.ready.is_set()
             or peer.closed
             or not self.config.enabled
             or not self.config.use_screen_watch
-            or not self.s.owner_qq_id
+            or owner_ident is None
             or peer.session is None
             or peer.session.finalized
             or peer.session.mode != "owner_private"
@@ -330,13 +378,14 @@ class VoiceCompanion:
                     turn_id=tid,
                     event_kind="screen_pulse",
                     speech_text="",
-                    speaker_id=self.s.owner_qq_id,
+                    speaker_id=owner_ident[2],
                     speaker_name="BOISER",
                     frames=list(frames[:2]),
                     cancel_event=cancel_event,
                     game_title_override=game_title,
                 )
             )
+            task.add_done_callback(_consume_task_exception)
             peer.active_turn_task = task
             peer.active_turn_cancel = cancel_event
             peer.active_turn_id = tid
@@ -588,8 +637,9 @@ class VoiceCompanion:
         if session.spoken_turns < 1:
             return
         if session.mode == "owner_private":
+            owner_ident = self._resolve_owner_identity()
             want_ledger = bool(self.config.save_recap_to_ledger)
-            want_dual = bool(self.config.save_recap_to_dual_memory and self.s.owner_qq_id)
+            want_dual = bool(self.config.save_recap_to_dual_memory and owner_ident is not None)
             if want_ledger or want_dual:
                 hub = getattr(self.service, "memory_hub", None)
                 if hub is not None and hasattr(hub, "record_experience"):
@@ -597,11 +647,11 @@ class VoiceCompanion:
                     recap_text = ""
                     tags: list[str] = []
                     owner_msg: Message | None = None
-                    if want_dual:
+                    if want_dual and owner_ident is not None:
                         try:
                             topic, recap_text, tags = self._build_dual_memory_recap(session, now)
                             owner_msg = self._make_turn_message(
-                                session, self.s.owner_qq_id, "BOISER", "", now
+                                session, owner_ident[2], "BOISER", "", now
                             )
                         except Exception:
                             want_dual = False
@@ -643,7 +693,7 @@ class VoiceCompanion:
                             )
                         except Exception:
                             pass
-                    if want_dual:
+                    if want_dual and owner_ident is not None:
                         sessions = getattr(self.service, "sessions", None)
                         dual_mem = getattr(sessions, "dual", None) if sessions is not None else None
                         if dual_mem is not None and hasattr(dual_mem, "record_chronicle"):
@@ -652,7 +702,7 @@ class VoiceCompanion:
                                     session, now
                                 )
                                 owner_msg = self._make_turn_message(
-                                    session, self.s.owner_qq_id, "BOISER", "", now
+                                    session, owner_ident[2], "BOISER", "", now
                                 )
                                 await dual_mem.record_chronicle(
                                     owner_msg,
@@ -700,19 +750,22 @@ class VoiceCompanion:
         text: str,
         now: float,
     ) -> Message:
-        if session.mode == "owner_private" and self.s.owner_qq_id:
-            return Message(
-                platform="onebot",
-                bot_id=self.s.onebot_self_id,
-                event_id="vc-" + uuid.uuid4().hex[:12],
-                user_id=self.s.owner_qq_id,
-                kind="private",
-                conversation_id=self.s.owner_qq_id,
-                text=text or "[看屏观察]",
-                addressed=True,
-                created_at=now,
-                sender_nickname="BOISER",
-            )
+        if session.mode == "owner_private":
+            owner_ident = self._resolve_owner_identity()
+            if owner_ident is not None:
+                platform, bot_id, user_id = owner_ident
+                return Message(
+                    platform=platform,
+                    bot_id=bot_id,
+                    event_id="vc-" + uuid.uuid4().hex[:12],
+                    user_id=user_id,
+                    kind="private",
+                    conversation_id=user_id,
+                    text=text or "[看屏观察]",
+                    addressed=True,
+                    created_at=now,
+                    sender_nickname="BOISER",
+                )
         safe_speaker = re.sub(r"[^A-Za-z0-9_.-]", "_", speaker_id)[:64] or "member"
         return Message(
             platform="companion",
@@ -799,7 +852,8 @@ class VoiceCompanion:
             else configured_secrets(self.s)
         )
         allow_silent = event_kind == "screen_pulse"
-        is_owner = session.mode == "owner_private" and bool(self.s.owner_qq_id)
+        owner_ident = self._resolve_owner_identity() if session.mode == "owner_private" else None
+        is_owner = owner_ident is not None
         now = self.clock()
         session.turns += 1
         session.frames_analyzed += len(frames)
@@ -868,11 +922,14 @@ class VoiceCompanion:
                 await emit_chunk(chunk)
 
         await self._send_frame(peer, {"type": "turn.start", "turn_id": turn_id, "kind": event_kind})
-        subject = (
-            f"voice:owner:{self.s.owner_qq_id}"
-            if is_owner
-            else f"voice:{session.adapter_id}:{session.id}"
-        )
+        if is_owner and owner_ident is not None:
+            subject = (
+                f"voice:owner:{owner_ident[2]}"
+                if owner_ident[0] == "onebot"
+                else f"voice:owner:{owner_ident[0]}:{owner_ident[2]}"
+            )
+        else:
+            subject = f"voice:{session.adapter_id}:{session.id}"
         budget_lane = "proactive" if allow_silent else "chat"
         try:
             with model_work("voice.companion", f"{session.id[:8]}:{turn_id}", independent=True):
@@ -1043,6 +1100,7 @@ class VoiceCompanion:
                     game_title_override=game_title_override,
                 )
             )
+            task.add_done_callback(_consume_task_exception)
             peer.active_turn_task = task
             peer.active_turn_cancel = cancel_event
             peer.active_turn_id = turn_id
@@ -1075,7 +1133,12 @@ class VoiceCompanion:
             if old is not None:
                 retire = asyncio.create_task(self._retire_peer(old, reason="superseded"))
                 self._retired.add(retire)
-                retire.add_done_callback(self._retired.discard)
+
+                def _on_retire_done(t: asyncio.Task[Any]) -> None:
+                    self._retired.discard(t)
+                    _consume_task_exception(t)
+
+                retire.add_done_callback(_on_retire_done)
             peer.ready.set()
         if hasattr(self.service, "record"):
             self.service.record("companion_connected")
@@ -1096,7 +1159,8 @@ class VoiceCompanion:
                     req_mode = str(frame.get("mode") or "owner_private").strip()
                     mode: Literal["owner_private", "room_public"] = (
                         "owner_private"
-                        if req_mode == "owner_private" and bool(self.s.owner_qq_id)
+                        if req_mode == "owner_private"
+                        and self._resolve_owner_identity() is not None
                         else "room_public"
                     )
                     game_title = sanitize_sensor_text(
@@ -1144,7 +1208,14 @@ class VoiceCompanion:
                         bg = getattr(self.service, "background_tasks", None)
                         if isinstance(bg, set):
                             bg.add(sync_task)
-                            sync_task.add_done_callback(bg.discard)
+
+                            def _on_sync_done(t: asyncio.Task[Any], tasks: set[Any] = bg) -> None:
+                                tasks.discard(t)
+                                _consume_task_exception(t)
+
+                            sync_task.add_done_callback(_on_sync_done)
+                        else:
+                            sync_task.add_done_callback(_consume_task_exception)
                 elif typ == "turn.cancel":
                     target_id = str(frame.get("turn_id") or "").strip()
                     played_seq = _parse_optional_nonneg_int(frame.get("played_seq"))

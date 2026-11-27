@@ -402,7 +402,7 @@ class Moderation:
             aff = getattr(self.store.runtime, "affection", None)
             if aff is not None:
                 await aff.on_unmute(uid)
-        return {"user_id": uid, "muted": muted, "delete_status": deletion}
+        return {"platform": "onebot", "user_id": uid, "muted": muted, "delete_status": deletion}
 
     async def set_platform_muted(
         self,
@@ -638,6 +638,10 @@ class Moderation:
         else:
             await self.initialize()
         now_wall = self.clock()
+        ident = self._identity()
+        identity_scope = getattr(ident, "scope", None) or self.store.vault.digest(
+            "identity", self.s.namespace
+        )
         async with self.store.lock:
             muted = await self.store.all(
                 "SELECT * FROM muted_users WHERE scope=? ORDER BY created DESC LIMIT 1000",
@@ -648,19 +652,119 @@ class Moderation:
                 "ORDER BY created DESC LIMIT 100",
                 (self.scope,),
             )
-        return {
-            "muted_users": [
+            has_identity_tables = bool(
+                await self.store.one(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity_persons'"
+                )
+                and await self.store.one(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity_links'"
+                )
+            )
+            muted_persons = (
+                await self.store.all(
+                    "SELECT person_id, payload, updated FROM identity_persons "
+                    "WHERE scope=? AND muted=1 AND person_id!='owner' "
+                    "ORDER BY updated DESC LIMIT 1000",
+                    (identity_scope,),
+                )
+                if has_identity_tables
+                else []
+            )
+            muted_links = (
+                await self.store.all(
+                    "SELECT l.account_key, l.person_id, l.platform, l.payload, l.updated "
+                    "FROM identity_links l "
+                    "JOIN identity_persons p ON p.person_id=l.person_id AND p.scope=l.scope "
+                    "WHERE l.scope=? AND p.muted=1 AND p.person_id!='owner' "
+                    "AND l.platform!='onebot' "
+                    "ORDER BY p.updated DESC, l.updated DESC LIMIT 1000",
+                    (identity_scope,),
+                )
+                if has_identity_tables and muted_persons
+                else []
+            )
+
+        person_meta: dict[str, tuple[dict, float]] = {}
+        for prow in muted_persons:
+            pid = str(prow["person_id"])
+            ctx = (
+                ident._person_seal_ctx(pid)
+                if ident is not None and hasattr(ident, "_person_seal_ctx")
+                else f"identity-person:{identity_scope}:{pid}"
+            )
+            try:
+                opened_p = self.store.vault.open(ctx, prow["payload"])
+            except Exception:
+                continue
+            pdata = opened_p if isinstance(opened_p, dict) else {}
+            person_meta[pid] = (pdata, float(prow["updated"] or 0.0))
+
+        platform_muted_users: list[dict] = []
+        seen_platform_targets: set[tuple[str, str]] = set()
+        for lrow in muted_links:
+            pid = str(lrow["person_id"])
+            if pid not in person_meta:
+                continue
+            acc_key = str(lrow["account_key"])
+            ctx = (
+                ident._link_seal_ctx(acc_key)
+                if ident is not None and hasattr(ident, "_link_seal_ctx")
+                else f"identity-link:{identity_scope}:{acc_key}"
+            )
+            try:
+                opened_l = self.store.vault.open(ctx, lrow["payload"])
+            except Exception:
+                continue
+            if not isinstance(opened_l, dict):
+                continue
+            plat = str(opened_l.get("platform") or lrow["platform"] or "").strip()
+            uid = str(opened_l.get("user_id") or "").strip()
+            if not plat or plat == "onebot" or not uid:
+                continue
+            if (plat, uid) in seen_platform_targets:
+                continue
+            if self._is_protected_platform_account(plat, uid):
+                continue
+            seen_platform_targets.add((plat, uid))
+            pdata, p_updated = person_meta[pid]
+            created = float(
+                p_updated or pdata.get("updated_at") or opened_l.get("linked_at") or 0.0
+            )
+            platform_muted_users.append(
                 {
-                    **self.store.vault.open(r["user_key"], r["identity"]),
+                    "platform": plat,
+                    "user_id": uid,
+                    "target": f"{plat}:{uid}",
+                    "nickname": str(opened_l.get("nickname") or pdata.get("display_name") or ""),
+                    "person_id": pid,
+                    "created": created,
+                    "source": str(pdata.get("mute_source") or "manual"),
+                    "delete_status": "not_supported",
+                }
+            )
+
+        muted_users: list[dict] = []
+        for r in muted:
+            opened = self.store.vault.open(r["user_key"], r["identity"])
+            uid = str(opened.get("user_id") or "")
+            muted_users.append(
+                {
+                    "platform": "onebot",
+                    **opened,
+                    "target": f"onebot:{uid}",
                     "created": r["created"],
                     "source": r["source"],
                     "delete_status": r["delete_status"],
                 }
-                for r in muted
-            ],
-            "proposals": [
+            )
+
+        proposal_items: list[dict] = []
+        for r in proposals:
+            opened = self.store.vault.open(r["id"], r["identity"])
+            proposal_items.append(
                 {
-                    **self.store.vault.open(r["id"], r["identity"]),
+                    "platform": "onebot",
+                    **opened,
                     "id": r["id"],
                     "reason": REASONS[r["reason"]],
                     "created": r["created"],
@@ -669,8 +773,12 @@ class Moderation:
                     if (r["status"] == "pending" and r["expires"] <= now_wall)
                     else r["status"],
                 }
-                for r in proposals
-            ],
+            )
+
+        return {
+            "muted_users": muted_users,
+            "platform_muted_users": platform_muted_users,
+            "proposals": proposal_items,
         }
 
     async def prune(self):

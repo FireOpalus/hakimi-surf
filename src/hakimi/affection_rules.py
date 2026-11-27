@@ -76,7 +76,8 @@ def _sanitize_reason(value: Any, settings: Settings, default: str = "chat") -> s
     return text
 
 
-def _validate_platform_user(platform: str, user_id: str) -> str:
+def validate_platform_user(platform: str, user_id: str) -> str:
+    """Validate platform and user_id using strict per-platform patterns."""
     if not isinstance(platform, str) or not PLATFORM_ID_RE.fullmatch(platform):
         raise Rejected("invalid_platform")
     if isinstance(user_id, bool) or not isinstance(user_id, str):
@@ -91,6 +92,9 @@ def _validate_platform_user(platform: str, user_id: str) -> str:
     if not pattern.fullmatch(uid):
         raise Rejected("invalid_user_id")
     return uid
+
+
+_validate_platform_user = validate_platform_user
 
 
 class AffectionConfig(BaseModel):

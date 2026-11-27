@@ -6,6 +6,7 @@ All providers are self-contained and strictly anonymous (zero account cookies or
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import html
 import json
@@ -15,6 +16,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -40,6 +42,8 @@ DEFAULT_COOLDOWN_SECONDS = 600.0
 MAX_COOLDOWN_SECONDS = 3600.0
 DEFAULT_MIN_INTERVAL_SECONDS = 1.0
 MAX_HTTP_JSON_BYTES = 512 * 1024
+DEFAULT_DOWNLOAD_TIMEOUT_SEC = 120.0
+_DOWNLOAD_WRITE_BUFFER_BYTES = 262_144
 
 VALID_PROVIDERS: tuple[str, ...] = ("youtube", "bilibili_public")
 DEFAULT_PROVIDER_ORDER: tuple[str, ...] = ("bilibili_public", "youtube")
@@ -747,11 +751,13 @@ async def _run_exec(
         async with asyncio.timeout(timeout_sec):
             stdout, stderr = await proc.communicate()
     except asyncio.CancelledError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
         await proc.wait()
         raise
     except TimeoutError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
         await proc.wait()
         raise SongFinderError(error_code, "subprocess timed out") from None
 
@@ -856,6 +862,10 @@ async def transcode_clean_audio(
     rc_ff, _, _ = await _run_exec(cmd, timeout_sec=90.0, error_code="transcode_failed")
     if rc_ff != 0:
         raise SongFinderError("transcode_failed", "ffmpeg failed")
+
+    # Release raw input from tmpfs immediately before buffering transcoded output into RAM.
+    if input_path != out_path:
+        await asyncio.to_thread(input_path.unlink, missing_ok=True)
 
     data = await asyncio.to_thread(
         _read_file_if_bounded,
@@ -1039,6 +1049,61 @@ class YouTubeProvider:
         return chosen
 
 
+class _AsyncBufferedFileWriter:
+    """Thread-safe buffered file writer offloading disk I/O off the asyncio event loop."""
+
+    def __init__(self, path: Path, *, flush_bytes: int = _DOWNLOAD_WRITE_BUFFER_BYTES) -> None:
+        self._path = path
+        self._flush_bytes = max(4096, int(flush_bytes))
+        self._lock = threading.Lock()
+        self._fh: Any = None
+        self._buf = bytearray()
+        self._closed = False
+
+    def _flush_locked(self, data: bytes) -> None:
+        with self._lock:
+            if self._closed or not data:
+                return
+            if self._fh is None:
+                self._fh = self._path.open("wb")
+            self._fh.write(data)
+
+    def _close_locked(self, *, unlink: bool) -> None:
+        with self._lock:
+            self._closed = True
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                finally:
+                    self._fh = None
+            if unlink:
+                self._path.unlink(missing_ok=True)
+
+    async def write(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._buf.extend(chunk)
+        if len(self._buf) >= self._flush_bytes:
+            payload = bytes(self._buf)
+            self._buf.clear()
+            await asyncio.to_thread(self._flush_locked, payload)
+
+    async def finish(self) -> None:
+        if self._buf:
+            payload = bytes(self._buf)
+            self._buf.clear()
+            await asyncio.to_thread(self._flush_locked, payload)
+        await asyncio.to_thread(self._close_locked, unlink=False)
+
+    async def abort(self) -> None:
+        self._buf.clear()
+        await asyncio.to_thread(self._close_locked, unlink=True)
+
+    def abort_sync(self) -> None:
+        self._buf.clear()
+        self._close_locked(unlink=True)
+
+
 class BilibiliPublicProvider:
     """Strictly anonymous, zero-cookie public audio search & DASH stream fetcher.
 
@@ -1062,6 +1127,7 @@ class BilibiliPublicProvider:
         max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
         min_duration_sec: float = float(MIN_SOURCE_DURATION_SEC),
         max_duration_sec: float = float(MAX_SOURCE_DURATION_SEC),
+        download_timeout_sec: float = DEFAULT_DOWNLOAD_TIMEOUT_SEC,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._owns_http = http is None
@@ -1078,6 +1144,7 @@ class BilibiliPublicProvider:
         self.max_download_bytes = max(MIN_OUTPUT_BYTES_LIMIT, int(max_download_bytes))
         self.min_duration_sec = float(min_duration_sec)
         self.max_duration_sec = float(max_duration_sec)
+        self.download_timeout_sec = max(0.05, float(download_timeout_sec))
         self._clock = clock
         self._wbi_key: str = ""
         self._wbi_expires_at: float = 0.0
@@ -1157,6 +1224,7 @@ class BilibiliPublicProvider:
             ) as resp:
                 if resp.status_code in (403, 412, 429):
                     if resp.status_code == 412:
+                        self._buvid_cookie = ""
                         self._buvid_expires_at = 0.0
                     raise ProviderRiskControlError(self.provider_id, f"http_{resp.status_code}")
                 if 300 <= resp.status_code < 400:
@@ -1404,11 +1472,17 @@ class BilibiliPublicProvider:
         max_download_bytes: int | None = None,
         min_duration_sec: float | None = None,
         max_duration_sec: float | None = None,
+        download_timeout_sec: float | None = None,
     ) -> Path:
         cap = (
             min(self.max_download_bytes, int(max_download_bytes))
             if max_download_bytes is not None and int(max_download_bytes) > 0
             else self.max_download_bytes
+        )
+        timeout_sec = (
+            self.download_timeout_sec
+            if download_timeout_sec is None
+            else max(0.05, float(download_timeout_sec))
         )
         bvid = candidate.source_id
         urls = await self._resolve_audio_urls(
@@ -1421,58 +1495,73 @@ class BilibiliPublicProvider:
         risk_hits = 0
         redirect_hits = 0
 
-        for cdn_url in urls:
-            out_path.unlink(missing_ok=True)
-            if hasattr(self.http, "cookies"):
-                self.http.cookies.clear()
-            headers = {
-                "User-Agent": _PUBLIC_USER_AGENT,
-                "Referer": referer,
-                "Origin": "https://www.bilibili.com",
-                "Range": "bytes=0-",
-            }
-            try:
-                async with self.http.stream(
-                    "GET", cdn_url, headers=headers, follow_redirects=False
-                ) as resp:
-                    if resp.status_code in (403, 412, 429):
-                        risk_hits += 1
+        try:
+            async with asyncio.timeout(timeout_sec):
+                for cdn_url in urls:
+                    await asyncio.to_thread(out_path.unlink, missing_ok=True)
+                    if hasattr(self.http, "cookies"):
+                        self.http.cookies.clear()
+                    headers = {
+                        "User-Agent": _PUBLIC_USER_AGENT,
+                        "Referer": referer,
+                        "Origin": "https://www.bilibili.com",
+                        "Range": "bytes=0-",
+                    }
+                    writer = _AsyncBufferedFileWriter(out_path)
+                    try:
+                        async with self.http.stream(
+                            "GET", cdn_url, headers=headers, follow_redirects=False
+                        ) as resp:
+                            if resp.status_code in (403, 412, 429):
+                                risk_hits += 1
+                                continue
+                            if 300 <= resp.status_code < 400:
+                                redirect_hits += 1
+                                continue
+                            if resp.status_code not in (200, 206):
+                                continue
+                            cl_raw = resp.headers.get("content-length")
+                            if cl_raw:
+                                try:
+                                    if int(cl_raw) > cap:
+                                        raise SongFinderError(
+                                            "download_too_large", provider=self.provider_id
+                                        )
+                                except ValueError:
+                                    pass
+                            total = 0
+                            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                total += len(chunk)
+                                if total > cap:
+                                    raise SongFinderError(
+                                        "download_too_large", provider=self.provider_id
+                                    )
+                                await writer.write(chunk)
+                            await writer.finish()
+                            if total >= MIN_DOWNLOAD_BYTES:
+                                return out_path
+                            await asyncio.to_thread(out_path.unlink, missing_ok=True)
+                    except SongFinderError as exc:
+                        await writer.abort()
+                        if exc.code == "download_too_large":
+                            raise
                         continue
-                    if 300 <= resp.status_code < 400:
-                        redirect_hits += 1
+                    except httpx.HTTPError:
+                        await writer.abort()
                         continue
-                    if resp.status_code not in (200, 206):
-                        continue
-                    cl_raw = resp.headers.get("content-length")
-                    if cl_raw:
-                        try:
-                            if int(cl_raw) > cap:
-                                raise SongFinderError(
-                                    "download_too_large", provider=self.provider_id
-                                )
-                        except ValueError:
-                            pass
-                    total = 0
-                    with out_path.open("wb") as fh:
-                        async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            total += len(chunk)
-                            if total > cap:
-                                raise SongFinderError(
-                                    "download_too_large", provider=self.provider_id
-                                )
-                            fh.write(chunk)
-                    if total >= MIN_DOWNLOAD_BYTES:
-                        return out_path
-            except SongFinderError as exc:
-                out_path.unlink(missing_ok=True)
-                if exc.code == "download_too_large":
-                    raise
-                continue
-            except httpx.HTTPError:
-                out_path.unlink(missing_ok=True)
-                continue
+                    except asyncio.CancelledError:
+                        writer.abort_sync()
+                        raise
+                    except BaseException:
+                        writer.abort_sync()
+                        raise
+        except TimeoutError:
+            await asyncio.to_thread(out_path.unlink, missing_ok=True)
+            raise SongFinderError(
+                "source_not_found", "download timed out", provider=self.provider_id
+            ) from None
 
-        out_path.unlink(missing_ok=True)
+        await asyncio.to_thread(out_path.unlink, missing_ok=True)
         if risk_hits == len(urls) and risk_hits > 0:
             raise ProviderRiskControlError(self.provider_id, "cdn_risk_control")
         if redirect_hits == len(urls) and redirect_hits > 0:

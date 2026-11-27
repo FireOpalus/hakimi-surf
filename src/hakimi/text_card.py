@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -197,18 +198,90 @@ def _draw_mixed(draw, xy: tuple[float, float], text: str, font_ascii, font_cjk, 
         x += font.getlength(part)
 
 
+def _fit_prefix_end(
+    text: str,
+    start: int,
+    max_width: float,
+    measure: Callable[[str], float],
+    *,
+    hint: int = 0,
+) -> int:
+    """Return maximal end index in [start + 1, len(text)] whose width <= max_width."""
+    n = len(text)
+    if start + 1 >= n:
+        return n
+
+    lo = start + 1
+    if hint > 1:
+        probe = min(n, start + hint)
+        if measure(text[start:probe]) <= max_width:
+            lo = probe
+            if lo >= n:
+                return n
+            step = 1
+            hi = n
+            while lo < n:
+                nxt = min(n, lo + step)
+                if measure(text[start:nxt]) <= max_width:
+                    lo = nxt
+                    step *= 2
+                else:
+                    hi = nxt
+                    break
+            else:
+                return n
+        else:
+            hi = probe
+            step = 1
+            while hi > start + 1:
+                prev = max(start + 1, hi - step)
+                if measure(text[start:prev]) <= max_width:
+                    lo = prev
+                    break
+                hi = prev
+                step *= 2
+            else:
+                return start + 1
+    else:
+        step = 1
+        hi = n
+        while lo < n:
+            nxt = min(n, lo + step)
+            if measure(text[start:nxt]) <= max_width:
+                lo = nxt
+                step *= 2
+            else:
+                hi = nxt
+                break
+        else:
+            return n
+
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if measure(text[start:mid]) <= max_width:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 def _wrap_line(text: str, max_width: float, font_ascii, font_cjk) -> list[str]:
     if not text:
         return [""]
+    measure: Callable[[str], float] = (
+        font_cjk.getlength
+        if font_ascii is font_cjk
+        else (lambda s: _mixed_width(s, font_ascii, font_cjk))
+    )
     lines: list[str] = []
-    cur = ""
-    for ch in text:
-        if cur and _mixed_width(cur + ch, font_ascii, font_cjk) > max_width:
-            lines.append(cur)
-            cur = ch
-        else:
-            cur += ch
-    lines.append(cur)
+    pos = 0
+    n = len(text)
+    hint = 0
+    while pos < n:
+        end = _fit_prefix_end(text, pos, max_width, measure, hint=hint)
+        lines.append(text[pos:end])
+        hint = end - pos
+        pos = end
     return lines
 
 
@@ -276,22 +349,28 @@ def _wrap_rich_lines(
                     lines[-1].append(("code", wrapped, w))
                     cur_width = w
                 continue
-            buf = ""
             font = font_bold if kind == "bold" else font_text
-            for ch in content:
-                cw = font.getlength(ch)
-                if cur_width + font.getlength(buf) + cw > max_width and (buf or lines[-1]):
-                    if buf:
-                        lines[-1].append((kind, buf, font.getlength(buf)))
+            measure = font.getlength
+            pos = 0
+            n = len(content)
+            hint = 0
+            while pos < n:
+                avail = max_width - cur_width
+                if lines[-1] and measure(content[pos : pos + 1]) > avail:
                     lines.append([])
                     cur_width = 0.0
-                    buf = ch
+                    avail = max_width
+                end = _fit_prefix_end(content, pos, avail, measure, hint=hint)
+                seg = content[pos:end]
+                seg_w = measure(seg)
+                lines[-1].append((kind, seg, seg_w))
+                if end < n:
+                    hint = end - pos
+                    lines.append([])
+                    cur_width = 0.0
                 else:
-                    buf += ch
-            if buf:
-                bw = font.getlength(buf)
-                lines[-1].append((kind, buf, bw))
-                cur_width += bw
+                    cur_width += seg_w
+                pos = end
     return lines
 
 

@@ -4,7 +4,8 @@ COPY --from=uv /uv /usr/local/bin/uv
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy PATH="/app/.venv/bin:$PATH" TZ=Asia/Shanghai
 WORKDIR /app
-# Latest stable yt-dlp is pinned in uv.lock; ffmpeg/ffprobe validate and merge bounded media.
+# ffmpeg/ffprobe validate and merge bounded media; yt-dlp==2026.10.26 remains pinned in uv.lock
+# for host scripts/colab_rvc.py CLI tooling (song_finder ships its own isolated yt-dlp image).
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates fonts-wqy-zenhei && \
     rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./

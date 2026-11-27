@@ -1170,13 +1170,11 @@ async def deliver_proactive_jit(
                 filtered = filter_reply_links(item, public=is_group).strip()
                 if not filtered:
                     continue
-                bubbles.append(
-                    safe_output(safe_output(filtered, secrets, limit=218), secrets, limit=220)
-                )
+                bubbles.append(safe_output(filtered, secrets, limit=218))
     else:
         filtered = filter_reply_links(raw, public=is_group).strip()
         if filtered:
-            bubbles = [safe_output(safe_output(filtered, secrets, limit=218), secrets, limit=220)]
+            bubbles = [safe_output(filtered, secrets, limit=218)]
 
     reaction_target_id = (
         str(message.event_id) if re.fullmatch(r"-?[0-9]{1,30}", str(message.event_id)) else None

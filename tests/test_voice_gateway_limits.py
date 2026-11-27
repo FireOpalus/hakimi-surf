@@ -602,17 +602,21 @@ def test_http_tts_non_streaming_audio_cap_and_streaming_passthrough(tmp_path, mo
         assert tts_multi.yielded_count == 3  # stopped on 3rd chunk (30 > 25), never read 4th
         assert tts_multi.stream_closed is True
 
-        # Streaming mode continues streaming cleanly past max_tts_audio_bytes
+        # Streaming mode enforces max_tts_audio_bytes and stops reading upstream cleanly
+        tts_multi.yielded_count = 0
+        tts_multi.stream_closed = False
         with client.stream(
             "POST",
             "/v1/tts",
             headers=auth,
-            json={"text": "流式不截断", "output_format": "mp3", "stream": True},
+            json={"text": "流式字节上限", "output_format": "mp3", "stream": True},
         ) as r_stream:
             assert r_stream.status_code == 200
             streamed = b"".join(r_stream.iter_bytes())
-        assert len(streamed) == 40
-        assert streamed == b"A" * 10 + b"B" * 10 + b"C" * 10 + b"D" * 10
+        assert len(streamed) == 20 <= cfg.max_tts_audio_bytes
+        assert streamed == b"A" * 10 + b"B" * 10
+        assert tts_multi.yielded_count == 3  # stopped on 3rd chunk (30 > 25), never read 4th
+        assert tts_multi.stream_closed is True
 
     # 2. First chunk alone exceeding max_tts_audio_bytes rejects 502 and releases ffmpeg semaphore
     tts_first = _FakeTTS(chunks=[b"X" * 64, b"Y" * 64], response_format="mp3")

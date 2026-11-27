@@ -211,7 +211,10 @@ class VideoWatch:
             if self.initialized:
                 return
             async with self.store.transaction():
-                await self.store.db.executescript(SCHEMA)
+                for stmt in SCHEMA.split(";"):
+                    sql = stmt.strip()
+                    if sql:
+                        await self.store.db.execute(sql)
                 row = await self.store.one(
                     "SELECT payload FROM admin_config WHERE key='video_watch'"
                 )

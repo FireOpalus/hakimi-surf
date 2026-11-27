@@ -78,10 +78,13 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - run: uv run python admin/build.py
+      - run: uv run python admin/build.py --check --verify-file
+      - run: uv run python admin/csp.py
       - name: Provide Nginx for the admin release integration test
         run: |
           if ! command -v nginx >/dev/null; then
             sudo apt-get update -qq
             sudo apt-get install -y --no-install-recommends nginx
           fi
-      - run: uv run pytest -q
+      - run: bash scripts/test_fast.sh -q

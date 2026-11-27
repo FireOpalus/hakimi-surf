@@ -1,5 +1,6 @@
 services:
   hakimi-plugin-weather:
+    image: hakimi-plugin-common:latest
     build:
       context: .
       dockerfile: plugins/Dockerfile
@@ -20,8 +21,15 @@ services:
     security_opt:
       - no-new-privileges:true
     init: true
+    cpus: 0.5
     mem_limit: 128m
     pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,pathlib,sys\nme=str(os.getpid());t=b'plugins.weather.plugin_main'\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit() and p.name!=me:\n  try:\n   if t in (p/'cmdline').read_bytes():sys.exit(0)\n  except OSError:pass\nsys.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     logging:
       driver: json-file
@@ -30,6 +38,7 @@ services:
         max-file: "2"
 
   hakimi-plugin-minecraft:
+    image: hakimi-plugin-common:latest
     build:
       context: .
       dockerfile: plugins/Dockerfile
@@ -51,8 +60,15 @@ services:
     security_opt:
       - no-new-privileges:true
     init: true
+    cpus: 0.5
     mem_limit: 128m
     pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,pathlib,sys\nme=str(os.getpid());t=b'plugins.minecraft.plugin_main'\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit() and p.name!=me:\n  try:\n   if t in (p/'cmdline').read_bytes():sys.exit(0)\n  except OSError:pass\nsys.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     logging:
       driver: json-file
@@ -61,6 +77,7 @@ services:
         max-file: "2"
 
   hakimi-plugin-bilibili:
+    image: hakimi-plugin-common:latest
     build:
       context: .
       dockerfile: plugins/Dockerfile
@@ -81,8 +98,15 @@ services:
     security_opt:
       - no-new-privileges:true
     init: true
+    cpus: 0.5
     mem_limit: 128m
     pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,pathlib,sys\nme=str(os.getpid());t=b'plugins.bilibili.plugin_main'\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit() and p.name!=me:\n  try:\n   if t in (p/'cmdline').read_bytes():sys.exit(0)\n  except OSError:pass\nsys.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     logging:
       driver: json-file
@@ -91,6 +115,7 @@ services:
         max-file: "2"
 
   hakimi-plugin-web-tools:
+    image: hakimi-plugin-common:latest
     build:
       context: .
       dockerfile: plugins/Dockerfile
@@ -111,8 +136,15 @@ services:
     security_opt:
       - no-new-privileges:true
     init: true
+    cpus: 0.5
     mem_limit: 128m
     pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,pathlib,sys\nme=str(os.getpid());t=b'plugins.web_tools.plugin_main'\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit() and p.name!=me:\n  try:\n   if t in (p/'cmdline').read_bytes():sys.exit(0)\n  except OSError:pass\nsys.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     logging:
       driver: json-file
@@ -121,6 +153,7 @@ services:
         max-file: "2"
 
   hakimi-plugin-doc-render:
+    image: hakimi-plugin-doc-render:latest
     build:
       context: .
       dockerfile: plugins/doc_render/Dockerfile
@@ -141,8 +174,15 @@ services:
     security_opt:
       - no-new-privileges:true
     init: true
+    cpus: 1.0
     mem_limit: 384m
     pids_limit: 48
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,pathlib,sys\nme=str(os.getpid());t=b'plugins.doc_render.plugin_main'\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit() and p.name!=me:\n  try:\n   if t in (p/'cmdline').read_bytes():sys.exit(0)\n  except OSError:pass\nsys.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     logging:
       driver: json-file
@@ -151,6 +191,7 @@ services:
         max-file: "2"
 
   hakimi-plugin-song-finder:
+    image: hakimi-plugin-song-finder:latest
     build:
       context: .
       dockerfile: plugins/song_finder/Dockerfile
@@ -171,8 +212,15 @@ services:
     security_opt:
       - no-new-privileges:true
     init: true
+    cpus: 1.0
     mem_limit: 384m
     pids_limit: 64
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,pathlib,sys\nme=str(os.getpid());t=b'plugins.song_finder.plugin_main'\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit() and p.name!=me:\n  try:\n   if t in (p/'cmdline').read_bytes():sys.exit(0)\n  except OSError:pass\nsys.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     logging:
       driver: json-file
@@ -181,6 +229,7 @@ services:
         max-file: "2"
 
   hakimi-plugin-telegram:
+    image: hakimi-plugin-common:latest
     build:
       context: .
       dockerfile: plugins/Dockerfile
@@ -201,8 +250,15 @@ services:
     security_opt:
       - no-new-privileges:true
     init: true
+    cpus: 0.5
     mem_limit: 192m
     pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,pathlib,sys\nme=str(os.getpid());t=b'plugins.telegram.plugin_main'\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit() and p.name!=me:\n  try:\n   if t in (p/'cmdline').read_bytes():sys.exit(0)\n  except OSError:pass\nsys.exit(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     logging:
       driver: json-file

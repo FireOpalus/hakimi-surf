@@ -168,6 +168,14 @@ def verify_qq(body: bytes, timestamp: str, signature: str, secret: str, max_age:
         raise Rejected("invalid_signature") from exc
 
 
+CREDENTIAL_RE = re.compile(
+    r"(?i)(?:(?:api[_ -]?key|password|passwd|token|secret|sessdata|bili_jct|密钥|密码)"
+    r"\s*[:=：]\s*\S{6,}|bearer\s+\S+|\bsk-[A-Za-z0-9_-]{16,}|\bAIza[0-9A-Za-z_-]{20,}"
+    r"|-----BEGIN [^-]+PRIVATE KEY-----)"
+)
+ROLE_TAG_RE = re.compile(r"\[role=", re.IGNORECASE)
+
+
 def clean_text(text: str) -> str:
     # Normalize only text, never signed bytes or identity fields.
     return "".join(
@@ -175,6 +183,33 @@ def clean_text(text: str) -> str:
         for c in unicodedata.normalize("NFKC", text)
         if c in "\n\t" or not unicodedata.category(c).startswith("C")
     ).strip()
+
+
+def redact_secrets(
+    text: Any,
+    settings: Settings | None = None,
+    *,
+    replacement: str = "[凭证已隐去]",
+    min_secret_len: int = 6,
+    neutralize_role_tags: bool = False,
+) -> str:
+    """Scrub configured secrets and common credential patterns from arbitrary text."""
+    cleaned = str(text or "")
+    if settings is not None:
+        candidates = {
+            val
+            for secret in configured_secrets(settings)
+            if secret and len(secret) >= min_secret_len
+            for val in (secret, clean_text(secret))
+            if len(val) >= min_secret_len
+        }
+        for secret in sorted(candidates, key=len, reverse=True):
+            if secret in cleaned:
+                cleaned = cleaned.replace(secret, replacement)
+    cleaned = CREDENTIAL_RE.sub(replacement, cleaned)
+    if neutralize_role_tags:
+        cleaned = ROLE_TAG_RE.sub("[untrusted_role=", cleaned)
+    return cleaned
 
 
 def owner(message: Message, settings: Settings) -> bool:

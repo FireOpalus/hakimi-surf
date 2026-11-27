@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from datetime import time as day_time
+from functools import lru_cache
 from typing import Any, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -40,7 +42,7 @@ from .modules.actions import (
 )
 from .modules.base import sanitize_sensor_text
 from .planning_journal import PlannerJournal
-from .proactive_policy import hours_bounds, within_hours
+from .proactive_policy import hours_bounds, minute_of_day, within_hours
 from .reply_style import trim_complete_text
 from .social import RecipientResolver, is_verified_owner_scope, resolve_owner_scope
 from .thinking_policy import preferences as model_preferences
@@ -161,6 +163,7 @@ class LifeEngineConfig(LegacyScheduleAccess, BaseModel):
         return within_hours(local.hour * 60 + local.minute, hours_bounds(self.quiet_hours))
 
 
+@lru_cache(maxsize=16)
 def _zone(tz_name: str) -> ZoneInfo:
     try:
         return ZoneInfo(tz_name)
@@ -385,11 +388,18 @@ class LifeBlockPlanner:
         modules_reg = self.service.modules
         module_data = await modules_reg.context_data(limit=4, now=ts)
         sensors = await modules_reg.collect_sensor_summaries()
-        known_modules = {"idle", *(m.module_id for m in modules_reg.active())}
+        active_modules = list(modules_reg.active())
+        known_modules = {"idle", *(m.module_id for m in active_modules)}
         planning_context = {}
         module_fingerprints: dict[str, str] = {}
-        for module in modules_reg.active():
-            ctx_chunk = await module.planning_context(self.service, cfg, ts)
+        ctx_chunks = (
+            await asyncio.gather(
+                *(module.planning_context(self.service, cfg, ts) for module in active_modules)
+            )
+            if active_modules
+            else []
+        )
+        for module, ctx_chunk in zip(active_modules, ctx_chunks, strict=True):
             for k, v in ctx_chunk.items():
                 if k == "available_groups" and isinstance(v, list):
                     existing = list(planning_context.get(k) or [])
@@ -426,7 +436,10 @@ class LifeBlockPlanner:
         ]
         offered = {action["name"] for action in available_actions}
         active_session = self.engine.active_session_exit()
-        near_horizon = await self._near_horizon_summary(calendar, ts)
+        agenda_day_iso = calendar.day.isoformat()
+        async with self.store.lock:
+            agenda_rows = await agenda_items(self.store, agenda_day_iso)
+        near_horizon = await self._near_horizon_summary(calendar, ts, rows=agenda_rows)
         zone = _zone(self.s.bot_timezone)
         current_world_state: dict[str, Any] = {
             "current_module": current.current_module,
@@ -497,6 +510,10 @@ class LifeBlockPlanner:
             run_id, scheduled_at, next_at = row["id"], row["started"], row["next_at"]
             morning = row["trigger"] == "morning"
             calendar = self.calendar(date.fromisoformat(row["day"]))
+            if calendar.day.isoformat() != agenda_day_iso:
+                agenda_day_iso = calendar.day.isoformat()
+                async with self.store.lock:
+                    agenda_rows = await agenda_items(self.store, agenda_day_iso)
             plan = WireLifePlan.model_validate(body)
             plan_source = row["source"]
             reasons = json.loads(row["reasons"])
@@ -602,7 +619,9 @@ class LifeBlockPlanner:
                 subject = self.store.vault.digest("life-planner", self.s.namespace)
                 try:
                     planner_payload.update(
-                        await self.agenda_context(calendar, ts, morning, near_horizon=near_horizon)
+                        await self.agenda_context(
+                            calendar, ts, morning, near_horizon=near_horizon, rows=agenda_rows
+                        )
                     )
                     with model_work("world.plan", run_id):
                         raw_plan = await self.service.ai.generate(
@@ -758,11 +777,9 @@ class LifeBlockPlanner:
             tickets.append(ticket)
 
         changes = []
-        agenda_snapshot: list[dict] | None = None
+        agenda_snapshot: list[dict] = agenda_rows
         if plan.agenda_changes and not morning and plan_source == "llm":
-            async with self.store.lock:
-                items = await agenda_items(self.store, calendar.day.isoformat())
-            agenda_snapshot = items
+            items = agenda_snapshot
             pending = {
                 i["id"]: i
                 for i in items
@@ -815,9 +832,6 @@ class LifeBlockPlanner:
                 self.engine.day_rest_limit(decision_at), scheduled_at + plan.rest_minutes * 60
             )
             day_rest = (decision_at, end)
-        if agenda_snapshot is None:
-            async with self.store.lock:
-                agenda_snapshot = await agenda_items(self.store, calendar.day.isoformat())
         horizon_end = ts + NEAR_HORIZON_SECONDS
         change_map = dict(changes)
         post_near_has_pending = any(
@@ -951,9 +965,11 @@ class LifeBlockPlanner:
         morning,
         *,
         near_horizon: dict[str, Any] | None = None,
+        rows: list[dict] | None = None,
     ):
-        async with self.store.lock:
-            rows = await agenda_items(self.store, calendar.day.isoformat())
+        if rows is None:
+            async with self.store.lock:
+                rows = await agenda_items(self.store, calendar.day.isoformat())
         remaining = [r for r in rows if r["status"] in ("pending", "executing")]
         history = [r for r in rows if r["status"] not in ("pending", "executing")]
         reserved = []
@@ -1859,12 +1875,61 @@ class LifeEngine:
         if not self.config.enabled or not runtime.rest_hours.day_rest_enabled:
             return now
         end = now + MAX_DAY_REST_MINUTES * 60
-        point = now
-        while point < end:
-            if runtime.is_resting(point) or self.closing_due(point):
-                return point
-            point = (int(point // 60) + 1) * 60
-        return end
+        zone = _zone(self.s.bot_timezone)
+        rest_cfg = runtime.rest_hours
+        local_now = datetime.fromtimestamp(now, zone)
+        start_day = local_now.date()
+        today_closing = self.closing_window(start_day)
+        if rest_cfg.active(local_now) or (
+            today_closing is not None and today_closing[0] <= now < today_closing[1]
+        ):
+            return now
+        first_minute = (int(now // 60) + 1) * 60
+        if first_minute >= end:
+            return end
+        best = end
+        start_min = end_min = 0
+        if rest_cfg.enabled:
+            if rest_cfg.active(datetime.fromtimestamp(first_minute, zone)):
+                return first_minute
+            start_min, end_min = map(minute_of_day, rest_cfg.rest_hours.split("-"))
+        end_day = datetime.fromtimestamp(end, zone).date()
+        day = start_day
+        while day <= end_day:
+            if rest_cfg.enabled:
+                candidates: list[float] = [
+                    datetime(
+                        day.year,
+                        day.month,
+                        day.day,
+                        start_min // 60,
+                        start_min % 60,
+                        tzinfo=zone,
+                        fold=fold,
+                    ).timestamp()
+                    for fold in (0, 1)
+                ]
+                if start_min > end_min:
+                    candidates.extend(
+                        datetime(
+                            day.year, day.month, day.day, 0, 0, tzinfo=zone, fold=fold
+                        ).timestamp()
+                        for fold in (0, 1)
+                    )
+                for raw_ts in candidates:
+                    cand = math.ceil(raw_ts / 60.0) * 60
+                    if first_minute <= cand < best and rest_cfg.active(
+                        datetime.fromtimestamp(cand, zone)
+                    ):
+                        best = cand
+            win = today_closing if day == start_day else self.closing_window(day)
+            if win is not None:
+                w_start, w_end = win
+                lo = max(first_minute, ((w_start + 59) // 60) * 60)
+                if lo < w_end and lo < best:
+                    best = lo
+            day += timedelta(days=1)
+        return best
 
     async def trim_day_rest(self, now):
         start, end = self.store.runtime.day_rest

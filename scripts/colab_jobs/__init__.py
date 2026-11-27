@@ -8,10 +8,12 @@ metadata verification, and secret scrubbing.
 
 from __future__ import annotations
 
+import email.utils
 import json
 import os
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -20,6 +22,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,6 +36,33 @@ _MULTIPART_THRESHOLD_BYTES = 4 * 1024 * 1024
 _RESUMABLE_CHUNK_BYTES = 4 * 1024 * 1024
 _MAX_EPHEMERAL_DOWNLOAD_BYTES = 250 * 1024 * 1024
 _MAX_EPHEMERAL_UPLOAD_BYTES = 250 * 1024 * 1024
+_RETRYABLE_DRIVE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_DRIVE_RETRIES = 3
+_RETRY_BASE_DELAY_SECONDS = 0.5
+_RETRY_MAX_DELAY_SECONDS = 8.0
+
+
+def _parse_retry_after(headers: dict[str, str] | None) -> float | None:
+    if not headers:
+        return None
+    raw = str(headers.get("retry-after") or headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+        if val >= 0.0:
+            return min(30.0, val)
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        delta = (dt - datetime.now(UTC)).total_seconds()
+        return max(0.0, min(30.0, delta))
+    except Exception:
+        return None
+
 
 VALID_DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 VALID_JOB_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
@@ -171,6 +201,7 @@ class EphemeralDriveClient:
         *,
         transport: TransportFn | None = None,
         timeout: float = 30.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         cleaned_tok = str(access_token or "").strip()
         if (
@@ -193,6 +224,8 @@ class EphemeralDriveClient:
         self._folders = clean_folders
         self._transport: TransportFn = transport or _default_drive_transport
         self._timeout = float(timeout)
+        self._sleep_fn = sleep_fn
+        self._verified_meta: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
 
     def folder_for(self, role: str) -> str:
         fid = self._folders.get(role, "")
@@ -222,13 +255,49 @@ class EphemeralDriveClient:
             req_headers["Authorization"] = f"Bearer {self._access_token}"
         if headers:
             req_headers.update(headers)
-        return self._transport(
-            method,
-            full_url,
-            req_headers,
-            body,
-            timeout if timeout is not None else self._timeout,
-        )
+        eff_timeout = timeout if timeout is not None else self._timeout
+        for attempt in range(_MAX_DRIVE_RETRIES + 1):
+            try:
+                status, resp_headers, raw = self._transport(
+                    method,
+                    full_url,
+                    req_headers,
+                    body,
+                    eff_timeout,
+                )
+            except EphemeralDriveError as exc:
+                if (
+                    exc.code in {"drive_network_error", "drive_network_timeout"}
+                    and attempt < _MAX_DRIVE_RETRIES
+                ):
+                    delay = min(_RETRY_MAX_DELAY_SECONDS, _RETRY_BASE_DELAY_SECONDS * (2**attempt))
+                    self._sleep_fn(delay)
+                    continue
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < _MAX_DRIVE_RETRIES:
+                    delay = min(_RETRY_MAX_DELAY_SECONDS, _RETRY_BASE_DELAY_SECONDS * (2**attempt))
+                    self._sleep_fn(delay)
+                    continue
+                if isinstance(exc, TimeoutError):
+                    raise EphemeralDriveError(
+                        "drive_network_timeout", "Drive API request timed out"
+                    ) from None
+                raise EphemeralDriveError(
+                    "drive_network_error", f"Drive network error: {type(exc).__name__}"
+                ) from None
+
+            if status in _RETRYABLE_DRIVE_STATUSES and attempt < _MAX_DRIVE_RETRIES:
+                retry_after = _parse_retry_after(resp_headers)
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else min(_RETRY_MAX_DELAY_SECONDS, _RETRY_BASE_DELAY_SECONDS * (2**attempt))
+                )
+                self._sleep_fn(delay)
+                continue
+            return status, resp_headers, raw
+        raise EphemeralDriveError("drive_request_failed", "Drive API request retries exhausted")
 
     def _api_json(
         self,
@@ -277,6 +346,10 @@ class EphemeralDriveClient:
         except ValueError as exc:
             raise EphemeralDriveError("drive_file_outside_scope", str(exc)) from None
         allowed_parents = {self.folder_for(role) for role in allowed_roles}
+        cache_key = (fid, tuple(sorted(allowed_parents)))
+        cached = self._verified_meta.get(cache_key)
+        if cached is not None:
+            return dict(cached)
         meta = self._api_json(
             "GET",
             f"{DRIVE_FILES_API}/{fid}",
@@ -299,6 +372,7 @@ class EphemeralDriveClient:
                 "drive_file_outside_scope",
                 "Requested Drive file is outside authorized folder scope",
             )
+        self._verified_meta[cache_key] = dict(meta)
         return meta
 
     def download_bytes(
@@ -740,6 +814,7 @@ class WorkerJobContext:
     stop_session_fn: Callable[[str], None] | None = None
     clock: Callable[[], float] = time.time
     overrides: dict[str, Any] = field(default_factory=dict)
+    cancel_event: threading.Event | None = field(default=None, repr=False)
     _is_cancelled_fn: Callable[[], bool] | None = field(default=None, repr=False)
     _can_keep_warm_fn: Callable[[str], bool] | None = field(default=None, repr=False)
     _claim_warm_fn: Callable[[], WarmSessionClaim] | None = field(default=None, repr=False)
@@ -747,6 +822,8 @@ class WorkerJobContext:
     _drain_warm_fn: Callable[[], None] | None = field(default=None, repr=False)
 
     def is_cancelled(self) -> bool:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            return True
         return bool(self._is_cancelled_fn()) if self._is_cancelled_fn is not None else False
 
     def can_keep_warm(self, gpu: str) -> bool:

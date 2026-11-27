@@ -36,7 +36,12 @@ from .search import (
     SearchProviderConfig,
     execute_search,
 )
-from .ssrf import DnsResolver
+from .ssrf import (
+    DEFAULT_ALLOWED_PORTS,
+    DnsResolver,
+    PinnedPublicTransport,
+    get_default_ssl_context,
+)
 
 log = logging.getLogger("hakimi_plugin_web_tools")
 
@@ -177,7 +182,26 @@ class WebToolsPlugin:
         self.search_config = (
             search_config if search_config is not None else SearchProviderConfig.from_env()
         )
-        self._transport = transport
+        self._owns_transports = transport is None
+        if transport is not None:
+            self._transport: httpx.AsyncBaseTransport = transport
+            self._search_transport: httpx.AsyncBaseTransport = transport
+            self._preview_transport: httpx.AsyncBaseTransport = transport
+        else:
+            ssl_ctx = get_default_ssl_context()
+            self._search_transport = PinnedPublicTransport(
+                dns_resolver=dns_resolver,
+                allowed_ports=frozenset({443}),
+                max_connections=8,
+                ssl_context=ssl_ctx,
+            )
+            self._preview_transport = PinnedPublicTransport(
+                dns_resolver=dns_resolver,
+                allowed_ports=DEFAULT_ALLOWED_PORTS,
+                max_connections=8,
+                ssl_context=ssl_ctx,
+            )
+            self._transport = self._preview_transport
         self._dns_resolver = dns_resolver
 
         config = PluginRuntimeConfig(
@@ -229,6 +253,9 @@ class WebToolsPlugin:
 
     async def close(self) -> None:
         await self.client.stop()
+        if self._owns_transports:
+            await self._search_transport.aclose()
+            await self._preview_transport.aclose()
 
     async def _handle_search_action(self, params: dict[str, Any]) -> dict[str, Any]:
         raw_args = params.get("arguments")
@@ -246,7 +273,7 @@ class WebToolsPlugin:
                 provider=args.provider,
                 max_results=args.max_results,
                 timeout_seconds=args.timeout_seconds,
-                transport=self._transport,
+                transport=self._search_transport,
                 dns_resolver=self._dns_resolver,
             )
         except SearchError as exc:
@@ -278,7 +305,7 @@ class WebToolsPlugin:
             outcome = await preview_urls(
                 target_urls,
                 budget_seconds=args.budget_seconds,
-                transport=self._transport,
+                transport=self._preview_transport,
                 dns_resolver=self._dns_resolver,
             )
         except Exception as exc:

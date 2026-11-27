@@ -243,6 +243,8 @@ async def test_gcp_billing_module_worker_migration_and_compat_wrapper(settings, 
         st = await gcp_mod.status()
         assert st["state"] in {"ready", "unconfigured"}
 
+        assert not hasattr(svc, "gcp_billing_worker")
+
         tick_calls = 0
 
         async def fake_tick() -> None:
@@ -253,9 +255,9 @@ async def test_gcp_billing_module_worker_migration_and_compat_wrapper(settings, 
             raise asyncio.CancelledError
 
         monkeypatch.setattr(svc.store.runtime.gcp_billing, "tick", fake_tick)
-        monkeypatch.setattr("hakimi.service.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("hakimi.system_modules.gcp_billing.asyncio.sleep", fake_sleep)
         with pytest.raises(asyncio.CancelledError):
-            await svc.gcp_billing_worker()
+            await gcp_mod.run_sync()
         assert tick_calls == 1
 
     # Isolated runtime without pre-attached gcp_billing still mounts it cleanly.

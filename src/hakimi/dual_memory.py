@@ -20,7 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .outbound_actions import require_all_schema_fields
 from .security import Rejected
-from .social import bound_owner
+from .social import bound_owner, chat_module
+from .social_chat_config import cached_remote_chat_config, load_remote_chat_config
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS member_profiles (
@@ -189,7 +190,9 @@ class RecallIndex:
     @staticmethod
     def size(value):
         return sys.getsizeof(value) + (
-            sum(RecallIndex.size(x) for x in value) if isinstance(value, (tuple, list)) else 0
+            sum(RecallIndex.size(x) for x in value)
+            if isinstance(value, (tuple, list, frozenset, set))
+            else 0
         )
 
     def discard(self, key):
@@ -545,10 +548,145 @@ class DualMemory:
             )
             return changed.rowcount > 0
 
-    async def stats_in_db(self, db, key: str, epoch: int, version: int) -> dict:
+    async def has_prunable_in_db(
+        self,
+        db,
+        now: float,
+        *,
+        cold_slice_days: int = 60,
+        soft_delete_days: int = 30,
+        locked_tombstone_days: int = 90,
+    ) -> bool:
+        """Read-only check for completed old slices, expired state profiles, or stale tombstones."""
+        slice_cutoff = now - max(1, int(cold_slice_days)) * 86400.0
+        soft_cutoff = now - max(1, int(soft_delete_days)) * 86400.0
+        locked_cutoff = now - max(int(soft_delete_days), int(locked_tombstone_days)) * 86400.0
         async with db.execute(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM member_profiles WHERE deleted=0 LIMIT ?)",
-            (MAX_ENTRIES,),
+            "SELECT 1 FROM cold_history_slices c JOIN memory_slice_jobs j ON j.id=c.id "
+            "WHERE j.status='done' AND c.created<=? "
+            "AND c.id NOT IN (SELECT 'legacy-'||id FROM history_folds) LIMIT 1",
+            (slice_cutoff,),
+        ) as cur:
+            if await cur.fetchone():
+                return True
+        async with db.execute(
+            "SELECT 1 FROM member_profiles "
+            "WHERE (slot='state' AND locked=0 AND expires>0 AND expires<=?) "
+            "OR (deleted=1 AND ((locked=0 AND updated<=?) OR (locked=1 AND updated<=?))) LIMIT 1",
+            (now, soft_cutoff, locked_cutoff),
+        ) as cur:
+            if await cur.fetchone():
+                return True
+        async with db.execute(
+            "SELECT 1 FROM chronicle_events "
+            "WHERE deleted=1 AND ((locked=0 AND updated<=?) OR (locked=1 AND updated<=?)) LIMIT 1",
+            (soft_cutoff, locked_cutoff),
+        ) as cur:
+            return bool(await cur.fetchone())
+
+    async def _purge_reclaimable_entries_tx(
+        self,
+        db,
+        now: float,
+        *,
+        soft_delete_days: int = 30,
+        locked_tombstone_days: int = 90,
+    ) -> tuple[int, int]:
+        """Purge expired unlocked state profiles and aged soft-deleted rows inside a write tx."""
+        soft_cutoff = now - max(1, int(soft_delete_days)) * 86400.0
+        locked_cutoff = now - max(int(soft_delete_days), int(locked_tombstone_days)) * 86400.0
+        prof_cur = await db.execute(
+            "DELETE FROM member_profiles "
+            "WHERE (slot='state' AND locked=0 AND expires>0 AND expires<=?) "
+            "OR (deleted=1 AND ((locked=0 AND updated<=?) OR (locked=1 AND updated<=?)))",
+            (now, soft_cutoff, locked_cutoff),
+        )
+        chron_cur = await db.execute(
+            "DELETE FROM chronicle_events "
+            "WHERE deleted=1 AND ((locked=0 AND updated<=?) OR (locked=1 AND updated<=?))",
+            (soft_cutoff, locked_cutoff),
+        )
+        return max(0, int(prof_cur.rowcount or 0)), max(0, int(chron_cur.rowcount or 0))
+
+    async def prune_in_db(
+        self,
+        db,
+        key: str,
+        now: float | None = None,
+        *,
+        cold_slice_days: int = 60,
+        soft_delete_days: int = 30,
+        locked_tombstone_days: int = 90,
+    ) -> dict[str, int]:
+        """Purge old done cold slices, expired unlocked state profiles, and old soft deletes."""
+        ts = time.time() if now is None else float(now)
+        slice_cutoff = ts - max(1, int(cold_slice_days)) * 86400.0
+        async with db.execute(
+            "SELECT c.id FROM cold_history_slices c JOIN memory_slice_jobs j ON j.id=c.id "
+            "WHERE j.status='done' AND c.created<=? "
+            "AND c.id NOT IN (SELECT 'legacy-'||id FROM history_folds)",
+            (slice_cutoff,),
+        ) as cur:
+            old_slice_ids = [row[0] for row in await cur.fetchall()]
+        slices_deleted = 0
+        if old_slice_ids:
+            await db.executemany(
+                "DELETE FROM memory_slice_jobs WHERE id=?",
+                [(ident,) for ident in old_slice_ids],
+            )
+            slice_cur = await db.executemany(
+                "DELETE FROM cold_history_slices WHERE id=?",
+                [(ident,) for ident in old_slice_ids],
+            )
+            slices_deleted = max(0, int(slice_cur.rowcount or len(old_slice_ids)))
+        profiles_deleted, chronicles_deleted = await self._purge_reclaimable_entries_tx(
+            db,
+            ts,
+            soft_delete_days=soft_delete_days,
+            locked_tombstone_days=locked_tombstone_days,
+        )
+        if profiles_deleted or chronicles_deleted:
+            self.index.discard(key)
+            self._stats_cache.pop(key, None)
+        return {
+            "cold_history_slices": slices_deleted,
+            "member_profiles": profiles_deleted,
+            "chronicle_events": chronicles_deleted,
+        }
+
+    async def _default_mirror_enabled(self, message) -> bool:
+        if message.kind != "group":
+            return False
+        if f"{message.platform}:{message.conversation_id}" in self.s.roaming_group_ids:
+            return True
+        if message.platform in {"onebot", "qq"}:
+            return False
+        mod = chat_module(self.s, message.platform)
+        if mod is not None and hasattr(mod, "permits_memory_mirror"):
+            try:
+                if mod.permits_memory_mirror(message, self.s):
+                    return True
+            except Exception:
+                pass
+        cfg = None
+        try:
+            cfg = await load_remote_chat_config(
+                self.sessions.store, message.platform, settings=self.s
+            )
+        except Exception:
+            cfg = None
+        if cfg is None:
+            cfg = cached_remote_chat_config(self.s, message.platform)
+        if cfg is not None and cfg.memory_mirror_enabled:
+            return not cfg.allowed_groups or message.conversation_id in set(cfg.allowed_groups)
+        return False
+
+    async def stats_in_db(self, db, key: str, epoch: int, version: int) -> dict:
+        now = time.time()
+        async with db.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM member_profiles "
+            "WHERE deleted=0 AND (expires=0 OR expires>?) LIMIT ?)",
+            (now, MAX_ENTRIES),
         ) as cur:
             prof_count = (await cur.fetchone())[0]
         async with db.execute(
@@ -569,8 +707,8 @@ class DualMemory:
                 if prof_count:
                     async with db.execute(
                         "SELECT member_id,slot,payload FROM member_profiles "
-                        "WHERE deleted=0 LIMIT ?",
-                        (MAX_ENTRIES,),
+                        "WHERE deleted=0 AND (expires=0 OR expires>?) LIMIT ?",
+                        (now, MAX_ENTRIES),
                     ) as cur:
                         for uid, slot, blob in await cur.fetchall():
                             data = self.vault.open(key + f":p:{uid}:{slot}", blob)
@@ -632,8 +770,7 @@ class DualMemory:
                 "entries": [],
                 "jobs": {},
                 "flex_retry": None,
-                "mirror_enabled": f"{message.platform}:{message.conversation_id}"
-                in self.s.roaming_group_ids,
+                "mirror_enabled": await self._default_mirror_enabled(message),
                 "mirror": {"last_success": None, "last_error": None, "digest": None},
             }
         async with self.sessions.database(message, preserve_history=True, readonly=True) as (
@@ -655,24 +792,21 @@ class DualMemory:
                 jobs = dict(await cur.fetchall())
             retry = await self._capacity_retry(db, epoch)
             state = self.vault.open(key + ":mirror", mirror) if mirror else {}
-            return {
-                "epoch": epoch,
-                "version": version,
-                "ready": bool(ready),
-                "entries": [
-                    e
-                    for e in entries
-                    if not query or query.lower() in (e["id"] + e["text"]).lower()
-                ],
-                "jobs": jobs,
-                "flex_retry": {k: v for k, v in retry.items() if k != "batch_id"}
-                if retry
-                else None,
-                "mirror_enabled": enabled
-                if enabled is not None
-                else f"{message.platform}:{message.conversation_id}" in self.s.roaming_group_ids,
-                "mirror": {k: state.get(k) for k in ("last_success", "last_error", "digest")},
-            }
+        mirror_enabled = (
+            enabled if enabled is not None else await self._default_mirror_enabled(message)
+        )
+        return {
+            "epoch": epoch,
+            "version": version,
+            "ready": bool(ready),
+            "entries": [
+                e for e in entries if not query or query.lower() in (e["id"] + e["text"]).lower()
+            ],
+            "jobs": jobs,
+            "flex_retry": {k: v for k, v in retry.items() if k != "batch_id"} if retry else None,
+            "mirror_enabled": mirror_enabled,
+            "mirror": {k: state.get(k) for k in ("last_success", "last_error", "digest")},
+        }
 
     async def _entries(self, db, key):
         result = []
@@ -725,6 +859,7 @@ class DualMemory:
                 jobs = await cur.fetchall()
             if len(jobs) != len(ids) or any(row[0] != "attempted" for row in jobs):
                 return False
+            await self._purge_reclaimable_entries_tx(db, time.time())
             rows = {r["seq"]: r for r in snapshot["messages"]}
             for fact in sorted(
                 extraction.profiles, key=lambda f: (f.evidence_seq, f.basis == "self_correction")
@@ -930,6 +1065,7 @@ class DualMemory:
                 row = await cur.fetchone()
                 if not row or not row[0]:
                     return False
+            await self._purge_reclaimable_entries_tx(db, ts)
             ident = self.vault.digest("chronicle-topic", key, category, clean_topic.lower())[:24]
             async with db.execute(
                 "SELECT id,payload,locked,deleted,vector FROM chronicle_events"
@@ -1129,39 +1265,45 @@ class DualMemory:
                         cards = []
                         for ident, blob, vec, heat, updated in await cur.fetchall():
                             data = self.vault.open(key + ":e:" + ident, blob)
+                            tag_str = " ".join(data.get("tags", []))
+                            card_terms = frozenset(terms(data["text"] + " " + tag_str))
                             cards.append(
                                 (
                                     ident,
                                     data["text"],
-                                    " ".join(data.get("tags", [])),
+                                    tag_str,
                                     base64.b64decode(self.vault.open(key + ":v:" + ident, vec)),
                                     heat,
                                     updated,
+                                    card_terms,
                                 )
                             )
                     self.index.put(key, version, cards)
         found = []
         if cards:
+            now_ts = time.time()
             words, query_vector = terms(query), vector(query)
-            keyword = sorted(
-                cards, key=lambda c: len(words & terms(c[1] + " " + c[2])), reverse=True
-            )
-            nearest = sorted(cards, key=lambda c: similarity(query_vector, c[3]), reverse=True)
-            ranks = {c[0]: 1 / (60 + n) for n, c in enumerate(keyword)}
-            for n, card in enumerate(nearest):
-                ranks[card[0]] += 1 / (60 + n)
-            for card in cards:
+            scored = [
+                (
+                    c,
+                    len(words & (c[6] if len(c) > 6 else terms(c[1] + " " + c[2]))),
+                    similarity(query_vector, c[3]),
+                )
+                for c in cards
+            ]
+            keyword = sorted(scored, key=lambda item: item[1], reverse=True)
+            nearest = sorted(scored, key=lambda item: item[2], reverse=True)
+            ranks = {item[0][0]: 1 / (60 + n) for n, item in enumerate(keyword)}
+            for n, item in enumerate(nearest):
+                ranks[item[0][0]] += 1 / (60 + n)
+            for card, _overlap, _sim in scored:
                 ranks[card[0]] *= (
                     1
                     + min(card[4], 10) * 0.015
-                    + 0.15 * math.exp(-max(0, time.time() - card[5]) / 2592000)
+                    + 0.15 * math.exp(-max(0, now_ts - card[5]) / 2592000)
                 )
-            selected = sorted(cards, key=lambda c: ranks[c[0]], reverse=True)
-            found = [
-                c[1][:350]
-                for c in selected
-                if words & terms(c[1] + " " + c[2]) or similarity(query_vector, c[3]) > 0.35
-            ][:3]
+            selected = sorted(scored, key=lambda item: ranks[item[0][0]], reverse=True)
+            found = [item[0][1][:350] for item in selected if item[1] > 0 or item[2] > 0.35][:3]
         result = {"speaker_profile": profile, "chronicle_recall": found}
         if mentioned_profiles:
             result["mentioned_profiles"] = mentioned_profiles

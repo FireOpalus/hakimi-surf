@@ -311,7 +311,10 @@ class FileReader:
         async with self.init_lock:
             if not self.initialized:
                 async with self.store.transaction():
-                    await self.store.db.executescript(SCHEMA)
+                    for stmt in SCHEMA.split(";"):
+                        sql = stmt.strip()
+                        if sql:
+                            await self.store.db.execute(sql)
                 self.initialized = True
 
     def _max_bytes(self) -> int:

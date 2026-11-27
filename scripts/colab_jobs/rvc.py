@@ -588,7 +588,10 @@ class RvcCoverHandler(JobHandler):
                 "reused_svc_ready": warm_claim.svc_ready if warm_reused else None,
                 "reused_rvc_ready": warm_claim.rvc_ready if warm_reused else None,
                 "keep_session_on_success": want_keep_warm,
+                "cancel_event": ctx.cancel_event,
             }
+            if ctx.is_cancelled():
+                raise RuntimeError("cancelled")
             try:
                 pipe_res = cover_runner(**_filter_runner_kwargs(cover_runner, runner_kwargs))
             except RuntimeError as exc:
@@ -895,6 +898,8 @@ class RvcTrainHandler(JobHandler):
 
         # Drain any warm cover sessions before allocating a heavy training GPU.
         ctx.drain_warm_sessions()
+        if ctx.is_cancelled():
+            raise RuntimeError("cancelled")
 
         tar_path = ctx.config.dataset_dir / "dataset.tar.gz"
         if payload.force_dataset or not tar_path.is_file():
@@ -949,7 +954,10 @@ class RvcTrainHandler(JobHandler):
             "cache_weights_sha256": cache_weights_sha256,
             "cache_venv_enabled": ctx.config.cache_venv_enabled,
             "cache_writeback": ctx.config.cache_writeback,
+            "cancel_event": ctx.cancel_event,
         }
+        if ctx.is_cancelled():
+            raise RuntimeError("cancelled")
         pipe_res = train_runner(**_filter_runner_kwargs(train_runner, train_kwargs))
         drive_outputs = pipe_res.get("drive_outputs")
         pth_out = drive_outputs.get("pth") if isinstance(drive_outputs, dict) else None

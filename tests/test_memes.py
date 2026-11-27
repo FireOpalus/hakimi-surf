@@ -129,10 +129,11 @@ async def test_library_stable_static_prefix_restart_hot_revoke_and_base64(store)
     first = await library.upload("无语盯.png", picture())
     await library.upload("A.webp", picture("WEBP"))
     assert library.labels == ("A", "无语盯")
-    assert '表情标签白名单：["A","无语盯"]' in library.static_prompt
+    assert "meme_labels" in library.protocol_prompt
     restart = MemeLibrary(store)
     await restart.initialize()
-    assert restart.static_prompt == library.static_prompt
+    assert restart.labels == library.labels
+    assert restart.protocol_prompt == library.protocol_prompt
     assert await restart.list() == await library.list()
     raw, mime = await library.preview(first["id"])
     assert mime == "image/jpeg"
@@ -143,7 +144,7 @@ async def test_library_stable_static_prefix_restart_hot_revoke_and_base64(store)
     assert await library.get_base64("manual") is None
     await library.delete(first["id"])
     assert await library.get_base64("无语盯") is None
-    assert "无语盯" not in library.static_prompt
+    assert "无语盯" not in library.labels
     assert not (library.root / (first["id"] + ".jpg")).exists()
     await restart.delete((await restart.list())[0]["id"])
 

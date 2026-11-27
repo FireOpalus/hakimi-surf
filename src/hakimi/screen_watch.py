@@ -24,9 +24,22 @@ from .media import ModelImage, normalize_image
 from .models import Message
 from .modules.base import sanitize_sensor_text
 from .security import Rejected, clean_text, configured_secrets, safe_output
+from .social import owner_target
 from .work_usage import model_work
 
 log = logging.getLogger("hakimi")
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        log.debug("event=screen_watch_bg_task_error exc=%s", type(exc).__name__)
+
 
 _CONFIG_KEY = "screen_watch_config"
 _VAULT_CTX_CFG = "admin:screen_watch_config"
@@ -207,6 +220,7 @@ class ScreenWatch:
         self.config = ScreenWatchConfig()
         self.overridden = False
         self.initialized = False
+        self._init_lock = asyncio.Lock()
         self.peer_lock = asyncio.Lock()
         self._peer: _ScreenPeer | None = None
         self._retired: set[asyncio.Task[Any]] = set()
@@ -222,22 +236,51 @@ class ScreenWatch:
         self.routed_voice_count: int = 0
         self.standalone_commentary_count: int = 0
 
+    def _resolve_owner_identity(self) -> tuple[str, str, str] | None:
+        preferred = getattr(self.s, "owner_delivery_platform", "onebot") or "onebot"
+        bindings = getattr(self.s, "social_owner_bindings", None) or {}
+        ordered: list[str] = [preferred]
+        if "onebot" not in ordered:
+            ordered.append("onebot")
+        for plat in bindings:
+            if plat not in ordered and plat != "qq":
+                ordered.append(plat)
+        now = self.clock()
+        for plat in ordered:
+            msg = owner_target(self.s, plat, now, "sw-owner")
+            if msg is not None:
+                return msg.platform, msg.bot_id, msg.user_id
+        for plat in ordered:
+            if plat == "onebot":
+                if getattr(self.s, "owner_qq_id", ""):
+                    return "onebot", getattr(self.s, "onebot_self_id", ""), self.s.owner_qq_id
+            elif plat != "qq":
+                binding = bindings.get(plat)
+                if binding is not None:
+                    return plat, binding.bot_id, binding.user_id
+        if getattr(self.s, "owner_qq_id", ""):
+            return "onebot", getattr(self.s, "onebot_self_id", ""), self.s.owner_qq_id
+        return None
+
     async def initialize(self) -> None:
         if self.initialized:
             return
-        async with self.store.lock:
-            row = await self.store.one(
-                "SELECT payload FROM admin_config WHERE key=?", (_CONFIG_KEY,)
-            )
-            if row and row[0]:
-                try:
-                    data = self.store.vault.open(_VAULT_CTX_CFG, row[0])
-                    self.config = ScreenWatchConfig.model_validate(data)
-                    self.overridden = True
-                except Exception:
-                    self.config = ScreenWatchConfig()
-                    self.overridden = False
-        self.initialized = True
+        async with self._init_lock:
+            if self.initialized:
+                return
+            async with self.store.lock:
+                row = await self.store.one(
+                    "SELECT payload FROM admin_config WHERE key=?", (_CONFIG_KEY,)
+                )
+                if row and row[0]:
+                    try:
+                        data = self.store.vault.open(_VAULT_CTX_CFG, row[0])
+                        self.config = ScreenWatchConfig.model_validate(data)
+                        self.overridden = True
+                    except Exception:
+                        self.config = ScreenWatchConfig()
+                        self.overridden = False
+            self.initialized = True
 
     def _prune_frames(self, now: float) -> None:
         ttl = float(self.config.frame_ttl_seconds)
@@ -264,7 +307,12 @@ class ScreenWatch:
         now: float | None = None,
     ) -> tuple[list[ModelImage], str]:
         """Return fresh RAM-buffered Owner screen frames (never exposed outside Owner scope)."""
-        if not owner_only or not self.config.enabled or self._paused or not self.s.owner_qq_id:
+        if (
+            not owner_only
+            or not self.config.enabled
+            or self._paused
+            or self._resolve_owner_identity() is None
+        ):
             return [], ""
         ts = self.clock() if now is None else float(now)
         self._prune_frames(ts)
@@ -407,13 +455,22 @@ class ScreenWatch:
             peer.runner.cancel()
 
     def _make_owner_message(self, now: float) -> Message:
+        owner_ident = self._resolve_owner_identity()
+        if owner_ident is not None:
+            platform, bot_id, user_id = owner_ident
+        else:
+            platform, bot_id, user_id = (
+                "onebot",
+                getattr(self.s, "onebot_self_id", ""),
+                getattr(self.s, "owner_qq_id", ""),
+            )
         return Message(
-            platform="onebot",
-            bot_id=self.s.onebot_self_id,
+            platform=platform,
+            bot_id=bot_id,
             event_id="sw-" + uuid.uuid4().hex[:12],
-            user_id=self.s.owner_qq_id,
+            user_id=user_id,
             kind="private",
-            conversation_id=self.s.owner_qq_id,
+            conversation_id=user_id,
             text="[独立看屏脉冲]",
             addressed=True,
             created_at=now,
@@ -466,11 +523,16 @@ class ScreenWatch:
         }
         payload.update(await self._gather_owner_context(owner_msg, now))
 
+        subject = (
+            f"screen:owner:{owner_msg.user_id}"
+            if owner_msg.platform == "onebot"
+            else f"screen:owner:{owner_msg.platform}:{owner_msg.user_id}"
+        )
         try:
             with model_work("screen.watch", tid, independent=True):
                 raw = await self.service.ai.generate(
                     payload,
-                    f"screen:owner:{self.s.owner_qq_id}",
+                    subject,
                     scenario="screen.watch",
                     budget_lane="proactive",
                     images=frames or None,
@@ -574,7 +636,7 @@ class ScreenWatch:
         change_score: float,
         now: float,
     ) -> None:
-        if not self.s.owner_qq_id:
+        if self._resolve_owner_identity() is None:
             await self._send_frame(
                 peer,
                 {
@@ -682,6 +744,7 @@ class ScreenWatch:
                     cancel_event=cancel_event,
                 )
             )
+            task.add_done_callback(_consume_task_exception)
             peer.active_commentary_task = task
             peer.active_commentary_cancel = cancel_event
 
@@ -717,7 +780,12 @@ class ScreenWatch:
             if old is not None:
                 retire = asyncio.create_task(self._retire_peer(old, reason="superseded"))
                 self._retired.add(retire)
-                retire.add_done_callback(self._retired.discard)
+
+                def _on_retire_done(t: asyncio.Task[Any]) -> None:
+                    self._retired.discard(t)
+                    _consume_task_exception(t)
+
+                retire.add_done_callback(_on_retire_done)
             peer.ready.set()
         if hasattr(self.service, "record"):
             self.service.record("screen_watch_connected")

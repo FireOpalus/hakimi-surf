@@ -32,6 +32,7 @@ from .protocol import (
     _CODE_RE,
     _EVENT_TYPE_RE,
     _LEGACY_KV_VALUE_BYTES,
+    _MAX_KV_KEYS_PER_PLUGIN,
     _MAX_KV_VALUE_BYTES,
     _MAX_NODE_BRIDGE_INFLIGHT,
     _NODE_BRIDGE_PLUGIN_ACTIONS,
@@ -1261,14 +1262,38 @@ class PluginBusDomainBridgeMixin:
         aad = f"{_VAULT_KV_PREFIX}{session.plugin_id}:{state_key}"
         blob = self.store.vault.seal(aad, value)
         now = self.clock()
+        key_limit_exceeded = False
         async with self.store.transaction():
-            await self.store.db.execute(
-                "INSERT INTO plugin_kv_state(plugin_id, state_key, payload, updated) "
-                "VALUES (?,?,?,?) "
-                "ON CONFLICT(plugin_id, state_key) DO UPDATE SET "
-                "payload=excluded.payload, updated=excluded.updated",
-                (session.plugin_id, state_key, blob, now),
+            existing = await self.store.one(
+                "SELECT 1 FROM plugin_kv_state WHERE plugin_id=? AND state_key=?",
+                (session.plugin_id, state_key),
             )
+            if existing is None:
+                cnt_row = await self.store.one(
+                    "SELECT COUNT(*) FROM plugin_kv_state WHERE plugin_id=?",
+                    (session.plugin_id,),
+                )
+                if cnt_row is not None and int(cnt_row[0]) >= _MAX_KV_KEYS_PER_PLUGIN:
+                    key_limit_exceeded = True
+            if not key_limit_exceeded:
+                await self.store.db.execute(
+                    "INSERT INTO plugin_kv_state(plugin_id, state_key, payload, updated) "
+                    "VALUES (?,?,?,?) "
+                    "ON CONFLICT(plugin_id, state_key) DO UPDATE SET "
+                    "payload=excluded.payload, updated=excluded.updated",
+                    (session.plugin_id, state_key, blob, now),
+                )
+        if key_limit_exceeded:
+            await self._send_frame(
+                session,
+                {
+                    "type": "kernel.result",
+                    "id": req_id,
+                    "ok": False,
+                    "error": "state_key_limit_exceeded",
+                },
+            )
+            return
         if (
             session.plugin_id == "bilibili_surf"
             and state_key == "credentials"
@@ -1512,15 +1537,29 @@ class PluginBusDomainBridgeMixin:
             return
         sanitized_frame = _sanitize_payload(frame, self.s)
         payload = {"type": "node.event", "frame": sanitized_frame}
-        for session in list(self._sessions.values()):
-            if session.ready and not session.closed and "node_bridge" in session.scopes:
-                await self._send_frame(session, payload)
+        targets = [
+            session
+            for session in list(self._sessions.values())
+            if session.ready and not session.closed and "node_bridge" in session.scopes
+        ]
+        if targets:
+            await asyncio.gather(
+                *(self._send_frame(session, payload) for session in targets),
+                return_exceptions=True,
+            )
 
     async def relay_node_state(self, connected: bool) -> None:
         payload = {"type": "node.state", "connected": bool(connected)}
-        for session in list(self._sessions.values()):
-            if session.ready and not session.closed and "node_bridge" in session.scopes:
-                await self._send_frame(session, payload)
+        targets = [
+            session
+            for session in list(self._sessions.values())
+            if session.ready and not session.closed and "node_bridge" in session.scopes
+        ]
+        if targets:
+            await asyncio.gather(
+                *(self._send_frame(session, payload) for session in targets),
+                return_exceptions=True,
+            )
 
     async def broadcast_world_event(self, event: Any) -> None:
         if isinstance(event, dict):
@@ -1560,9 +1599,16 @@ class PluginBusDomainBridgeMixin:
             "payload": _sanitize_payload(payload, self.s),
         }
         frame = {"type": "world.event.broadcast", "event": sanitized_dict}
-        for session in list(self._sessions.values()):
-            if session.ready and not session.closed and event_type in session.event_subscriptions:
-                await self._send_frame(session, frame)
+        targets = [
+            session
+            for session in list(self._sessions.values())
+            if session.ready and not session.closed and event_type in session.event_subscriptions
+        ]
+        if targets:
+            await asyncio.gather(
+                *(self._send_frame(session, frame) for session in targets),
+                return_exceptions=True,
+            )
 
     async def _handle_plugin_status(self, session: _PluginSession, frame: dict[str, Any]) -> None:
         proxy = session.proxy
@@ -1572,7 +1618,7 @@ class PluginBusDomainBridgeMixin:
             raw_status = frame["status"]
             if not isinstance(raw_status, dict):
                 raise Rejected("plugin_invalid_schema")
-            proxy._remote_status = _sanitize_payload(raw_status, self.s)
+            proxy.apply_remote_status(raw_status)
         if "configuration_issue" in frame:
             raw_issue = frame["configuration_issue"]
             if raw_issue is None or raw_issue == "":

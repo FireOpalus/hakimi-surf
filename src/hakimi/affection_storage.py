@@ -12,9 +12,21 @@ from .affection_rules import (
 )
 
 
+async def _db_one(db: Any, sql: str, params: tuple[Any, ...] = ()) -> Any:
+    async with db.execute(sql, params) as cur:
+        return await cur.fetchone()
+
+
+async def _db_all(db: Any, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+    async with db.execute(sql, params) as cur:
+        return list(await cur.fetchall())
+
+
 class _AffectionStorageMixin:
-    async def _migrate_to_identity_unlocked(self, identity: Any) -> None:
-        if identity is None or not getattr(identity, "initialized", False):
+    async def _migrate_to_identity_unlocked(
+        self, identity: Any, *, identity_ready: bool = False
+    ) -> None:
+        if identity is None or (not identity_ready and not getattr(identity, "initialized", False)):
             return
         if self._migrated_to_person:
             return
@@ -39,7 +51,7 @@ class _AffectionStorageMixin:
                 )
             )
         if already:
-            await self._reload_caches_unlocked(identity)
+            await self._reload_caches_unlocked(identity, identity_ready=identity_ready)
             self._migrated_to_person = True
             return
 
@@ -240,15 +252,17 @@ class _AffectionStorageMixin:
             if pid != "owner":
                 await identity.set_person_muted(pid, True, source="ai_affection_zero")
 
-        await self._reload_caches_unlocked(identity)
+        await self._reload_caches_unlocked(identity, identity_ready=identity_ready)
         self._migrated_to_person = True
 
-    async def migrate_to_identity(self) -> None:
+    async def migrate_to_identity(self, *, _identity_ready: bool = False) -> None:
         identity = self._get_identity()
-        if identity is None or not getattr(identity, "initialized", False):
+        if identity is None or (
+            not _identity_ready and not getattr(identity, "initialized", False)
+        ):
             return
         async with self.init_lock:
-            await self._migrate_to_identity_unlocked(identity)
+            await self._migrate_to_identity_unlocked(identity, identity_ready=_identity_ready)
 
     async def _ensure_identity_ready(self) -> Any:
         identity = self._get_identity()
@@ -532,6 +546,243 @@ class _AffectionStorageMixin:
             out["person_id"] = pid
         return out
 
+    async def _person_score_in_tx(self, db: Any, person_id: str) -> int | None:
+        pk = self._person_key(person_id)
+        row = await _db_one(
+            db,
+            "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+            (pk, self.scope),
+        )
+        if not row:
+            return None
+        opened = self.store.vault.open("affection:" + pk, row["payload"])
+        if not isinstance(opened, dict) or "score" not in opened:
+            return None
+        return clamp_score(int(opened["score"]), is_owner=(person_id == "owner"))
+
+    async def merge_person_scores_in_tx(
+        self,
+        db: Any,
+        source_person_id: str,
+        target_person_id: str,
+        *,
+        force_zero: bool = False,
+        now: float | None = None,
+        linked_accounts: list[tuple[str, str]] | None = None,
+        _cache_out: dict[str, Any] | None = None,
+    ) -> int:
+        """Atomically merge source_person_id affection rows into target_person_id in active tx."""
+        identity = self._get_identity()
+        is_owner = target_person_id == "owner"
+        src_key = self._person_key(source_person_id)
+        dst_key = self._person_key(target_person_id)
+        ts = float(self.clock() if now is None else now)
+        today = self._today_str(ts)
+        merged_score: int | None = None
+        rep_plat = ""
+        rep_uid = ""
+
+        src_row = await _db_one(
+            db,
+            "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+            (src_key, self.scope),
+        )
+        dst_row = await _db_one(
+            db,
+            "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
+            (dst_key, self.scope),
+        )
+        src_data = (
+            self.store.vault.open("affection:" + src_key, src_row["payload"]) if src_row else None
+        )
+        dst_data = (
+            self.store.vault.open("affection:" + dst_key, dst_row["payload"]) if dst_row else None
+        )
+        existing = [d for d in (dst_data, src_data) if isinstance(d, dict) and "score" in d]
+
+        prev_for_merge = (
+            clamp_score(int(dst_data["score"]), is_owner=is_owner)
+            if isinstance(dst_data, dict) and "score" in dst_data
+            else (
+                clamp_score(int(src_data["score"]), is_owner=is_owner)
+                if isinstance(src_data, dict) and "score" in src_data
+                else (120 if is_owner else self.config.initial_score)
+            )
+        )
+
+        if is_owner:
+            raw_scores = [clamp_score(int(d["score"]), is_owner=True) for d in existing]
+            merged_score = clamp_score(max(raw_scores) if raw_scores else 120, is_owner=True)
+        elif force_zero:
+            merged_score = 0
+        elif existing:
+            raw_scores = [clamp_score(int(d["score"]), is_owner=False) for d in existing]
+            merged_score = clamp_score(min(raw_scores), is_owner=False)
+
+        if src_key != dst_key:
+            hist_rows = await _db_all(
+                db,
+                "SELECT id, payload FROM affection_history WHERE scope=? AND user_key=?",
+                (self.scope, src_key),
+            )
+            for hrow in hist_rows:
+                opened = self.store.vault.open("affection-hist:" + src_key, hrow["payload"])
+                if isinstance(opened, dict):
+                    updated_payload = {**opened, "person_id": target_person_id}
+                    re_sealed = self.store.vault.seal("affection-hist:" + dst_key, updated_payload)
+                    await db.execute(
+                        "UPDATE affection_history SET user_key=?, payload=? WHERE id=?",
+                        (dst_key, re_sealed, int(hrow["id"])),
+                    )
+                else:
+                    await db.execute(
+                        "DELETE FROM affection_history WHERE id=?",
+                        (int(hrow["id"]),),
+                    )
+
+        if merged_score is not None:
+            base = (
+                dst_data
+                if isinstance(dst_data, dict)
+                else (src_data if isinstance(src_data, dict) else {})
+            )
+            rep_plat = str(base.get("platform", ""))
+            rep_uid = str(base.get("user_id", ""))
+            if (not rep_plat or not rep_uid) and linked_accounts:
+                rep_plat, rep_uid = linked_accounts[0]
+            if (not rep_plat or not rep_uid) and identity is not None:
+                linked = identity.linked_accounts_cached(target_person_id)
+                if linked:
+                    rep_plat, rep_uid = linked[0]
+            if not rep_plat:
+                rep_plat = "onebot"
+            if not rep_uid:
+                rep_uid = "0"
+            last_negative = max(
+                (float(d.get("last_negative_at", 0.0) or 0.0) for d in existing),
+                default=0.0,
+            )
+            last_recovery_day = max(
+                (str(d.get("last_recovery_day", "") or "") for d in existing),
+                default="",
+            )
+            safety_strikes_total = sum(
+                max(0, int(d.get("safety_strikes_total", 0) or 0)) for d in existing
+            )
+            last_violation_at = max(
+                (float(d.get("last_violation_at", 0.0) or 0.0) for d in existing),
+                default=0.0,
+            )
+            merge_reason = (
+                "merged_blacklist" if force_zero else str(base.get("last_reason", "merged"))
+            )
+            record = self._normalize_record(
+                {
+                    **base,
+                    "score": merged_score,
+                    "last_negative_at": last_negative,
+                    "last_recovery_day": last_recovery_day,
+                    "safety_strikes_total": safety_strikes_total,
+                    "last_violation_at": last_violation_at,
+                    "last_reason": merge_reason,
+                    "updated_at": ts,
+                },
+                rep_plat,
+                rep_uid,
+                "",
+                today,
+                is_owner=is_owner,
+                person_id=target_person_id,
+            )
+            saved_record = {**record, "person_id": target_person_id}
+            subject = self._subject(rep_plat, rep_uid)
+            sealed = self.store.vault.seal("affection:" + dst_key, saved_record)
+            await db.execute(
+                "INSERT INTO user_affection(user_key,scope,subject,payload,updated) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(user_key) DO UPDATE SET scope=excluded.scope,subject=excluded.subject,"
+                "payload=excluded.payload,updated=excluded.updated",
+                (dst_key, self.scope, subject, sealed, float(saved_record["updated_at"])),
+            )
+            if merged_score != prev_for_merge:
+                delta = int(merged_score) - int(prev_for_merge)
+                await db.execute(
+                    "DELETE FROM affection_history WHERE created<?",
+                    (ts - 90 * 86400,),
+                )
+                hist_payload = {
+                    "user_id": str(rep_uid),
+                    "platform": str(rep_plat),
+                    "person_id": str(target_person_id),
+                    "nickname": _sanitize_nickname(record["nickname"], self.s),
+                    "prev_score": int(prev_for_merge),
+                    "new_score": int(merged_score),
+                    "delta": delta,
+                    "kind": "merge",
+                    "reason": _sanitize_reason(
+                        "merged_blacklist" if force_zero else "merged",
+                        self.s,
+                        default="merge",
+                    ),
+                }
+                await db.execute(
+                    "INSERT INTO affection_history(scope,user_key,delta,payload,created) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        self.scope,
+                        dst_key,
+                        delta,
+                        self.store.vault.seal("affection-hist:" + dst_key, hist_payload),
+                        float(ts),
+                    ),
+                )
+
+        if src_row:
+            await db.execute(
+                "DELETE FROM user_affection WHERE user_key=? AND scope=?",
+                (src_key, self.scope),
+            )
+        await db.execute(
+            "UPDATE affection_events SET user_key=? WHERE scope=? AND user_key=?",
+            (dst_key, self.scope, src_key),
+        )
+
+        if _cache_out is not None:
+            _cache_out["merged_score"] = merged_score
+            _cache_out["rep_plat"] = rep_plat
+            _cache_out["rep_uid"] = rep_uid
+            _cache_out["is_owner"] = is_owner
+
+        return (
+            merged_score
+            if merged_score is not None
+            else (120 if is_owner else self.config.initial_score)
+        )
+
+    def _finalize_merged_person_caches(
+        self,
+        source_person_id: str,
+        target_person_id: str,
+        cache_meta: dict[str, Any],
+        *,
+        identity: Any = None,
+    ) -> None:
+        ident = identity if identity is not None else self._get_identity()
+        src_key = self._person_key(source_person_id)
+        self._user_scores.pop(src_key, None)
+        self._person_scores.pop(source_person_id, None)
+        self._annoyance_at.pop(src_key, None)
+        merged_score = cache_meta.get("merged_score")
+        if merged_score is not None:
+            self._update_caches(
+                str(cache_meta.get("rep_plat") or "onebot"),
+                str(cache_meta.get("rep_uid") or "0"),
+                int(merged_score),
+                is_owner=bool(cache_meta.get("is_owner", target_person_id == "owner")),
+                person_id=target_person_id,
+                identity=ident,
+            )
+
     async def merge_person_scores(
         self,
         source_person_id: str,
@@ -541,154 +792,20 @@ class _AffectionStorageMixin:
     ) -> int:
         await self.initialize()
         identity = self._get_identity()
-        is_owner = target_person_id == "owner"
-        src_key = self._person_key(source_person_id)
-        dst_key = self._person_key(target_person_id)
-        now = float(self.clock())
-        today = self._today_str(now)
-        merged_score: int | None = None
-
+        cache_meta: dict[str, Any] = {}
         async with self._lock:
             async with self.store.transaction():
-                src_row = await self.store.one(
-                    "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
-                    (src_key, self.scope),
+                result = await self.merge_person_scores_in_tx(
+                    self.store.db,
+                    source_person_id,
+                    target_person_id,
+                    force_zero=force_zero,
+                    _cache_out=cache_meta,
                 )
-                dst_row = await self.store.one(
-                    "SELECT payload FROM user_affection WHERE user_key=? AND scope=?",
-                    (dst_key, self.scope),
-                )
-                src_data = (
-                    self.store.vault.open("affection:" + src_key, src_row["payload"])
-                    if src_row
-                    else None
-                )
-                dst_data = (
-                    self.store.vault.open("affection:" + dst_key, dst_row["payload"])
-                    if dst_row
-                    else None
-                )
-                existing = [d for d in (dst_data, src_data) if isinstance(d, dict) and "score" in d]
-
-                prev_for_merge = (
-                    clamp_score(int(dst_data["score"]), is_owner=is_owner)
-                    if isinstance(dst_data, dict) and "score" in dst_data
-                    else (
-                        clamp_score(int(src_data["score"]), is_owner=is_owner)
-                        if isinstance(src_data, dict) and "score" in src_data
-                        else (120 if is_owner else self.config.initial_score)
-                    )
-                )
-
-                if is_owner:
-                    raw_scores = [clamp_score(int(d["score"]), is_owner=True) for d in existing]
-                    merged_score = clamp_score(
-                        max(raw_scores) if raw_scores else 120, is_owner=True
-                    )
-                elif force_zero:
-                    merged_score = 0
-                elif existing:
-                    raw_scores = [clamp_score(int(d["score"]), is_owner=False) for d in existing]
-                    merged_score = clamp_score(min(raw_scores), is_owner=False)
-
-                await self._migrate_history_key_in_tx(src_key, dst_key, person_id=target_person_id)
-
-                if merged_score is not None:
-                    base = (
-                        dst_data
-                        if isinstance(dst_data, dict)
-                        else (src_data if isinstance(src_data, dict) else {})
-                    )
-                    rep_plat = str(base.get("platform", ""))
-                    rep_uid = str(base.get("user_id", ""))
-                    if (not rep_plat or not rep_uid) and identity is not None:
-                        linked = identity.linked_accounts_cached(target_person_id)
-                        if linked:
-                            rep_plat, rep_uid = linked[0]
-                    if not rep_plat:
-                        rep_plat = "onebot"
-                    if not rep_uid:
-                        rep_uid = "0"
-                    last_negative = max(
-                        (float(d.get("last_negative_at", 0.0) or 0.0) for d in existing),
-                        default=0.0,
-                    )
-                    last_recovery_day = max(
-                        (str(d.get("last_recovery_day", "") or "") for d in existing),
-                        default="",
-                    )
-                    safety_strikes_total = sum(
-                        max(0, int(d.get("safety_strikes_total", 0) or 0)) for d in existing
-                    )
-                    last_violation_at = max(
-                        (float(d.get("last_violation_at", 0.0) or 0.0) for d in existing),
-                        default=0.0,
-                    )
-                    merge_reason = (
-                        "merged_blacklist" if force_zero else str(base.get("last_reason", "merged"))
-                    )
-                    record = self._normalize_record(
-                        {
-                            **base,
-                            "score": merged_score,
-                            "last_negative_at": last_negative,
-                            "last_recovery_day": last_recovery_day,
-                            "safety_strikes_total": safety_strikes_total,
-                            "last_violation_at": last_violation_at,
-                            "last_reason": merge_reason,
-                            "updated_at": now,
-                        },
-                        rep_plat,
-                        rep_uid,
-                        "",
-                        today,
-                        is_owner=is_owner,
-                        person_id=target_person_id,
-                    )
-                    await self._save_user_in_tx(
-                        rep_plat, rep_uid, record, person_id=target_person_id
-                    )
-                    if merged_score != prev_for_merge:
-                        await self._append_history_in_tx(
-                            user_key=dst_key,
-                            platform=rep_plat,
-                            user_id=rep_uid,
-                            person_id=target_person_id,
-                            nickname=record["nickname"],
-                            prev_score=prev_for_merge,
-                            new_score=merged_score,
-                            kind="merge",
-                            reason="merged_blacklist" if force_zero else "merged",
-                            now=now,
-                        )
-                    self._update_caches(
-                        rep_plat,
-                        rep_uid,
-                        merged_score,
-                        is_owner=is_owner,
-                        person_id=target_person_id,
-                        identity=identity,
-                    )
-
-                if src_row:
-                    await self.store.db.execute(
-                        "DELETE FROM user_affection WHERE user_key=? AND scope=?",
-                        (src_key, self.scope),
-                    )
-                await self.store.db.execute(
-                    "UPDATE affection_events SET user_key=? WHERE scope=? AND user_key=?",
-                    (dst_key, self.scope, src_key),
-                )
-
-            self._user_scores.pop(src_key, None)
-            self._person_scores.pop(source_person_id, None)
-            self._annoyance_at.pop(src_key, None)
-
-        return (
-            merged_score
-            if merged_score is not None
-            else (120 if is_owner else self.config.initial_score)
-        )
+            self._finalize_merged_person_caches(
+                source_person_id, target_person_id, cache_meta, identity=identity
+            )
+        return result
 
     @staticmethod
     def _clamp_history_limit(limit: int, *, default: int) -> int:

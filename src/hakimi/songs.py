@@ -16,6 +16,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,6 +44,16 @@ DEFAULT_SONG_CACHE_MAX_BYTES = 30 * 1024 * 1024
 CACHE_EVICT_INTERVAL_SECONDS = 1800.0
 LAST_USED_PERSIST_INTERVAL_SECONDS = 300.0
 DRIVE_PROBE_CACHE_TTL_SECONDS = 45.0
+_INBOX_STREAM_THRESHOLD_BYTES = 4 * 1024 * 1024
+_INBOX_STREAM_CHUNK_BYTES = 2 * 1024 * 1024
+_TAKE_PREVIEW_CACHE_MAX_ITEMS = 8
+_TAKE_PREVIEW_CACHE_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _sha256_hex(data: bytes | bytearray | memoryview) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 MIN_SONG_PITCH = -24
 MAX_SONG_PITCH = 24
 CoverEngine = Literal["dual", "yingmusic_svc", "seed_vc", "rvc"]
@@ -912,6 +923,8 @@ class SongLibrary:
         self.initialized = False
         self._entries: dict[str, dict[str, Any]] = {}
         self._download_locks: dict[str, asyncio.Lock] = {}
+        self._take_preview_cache: OrderedDict[tuple[str, str, str], bytes] = OrderedDict()
+        self._take_preview_cache_bytes: int = 0
         self.titles: tuple[str, ...] = ()
         self._probe_cache: dict[str, tuple[float, tuple[Any, ...], Any]] = {}
         self._probe_cache_gen: dict[str, int] = {"storage": 0, "inbox": 0, "voices": 0}
@@ -977,16 +990,58 @@ class SongLibrary:
             getattr(self.compute, "download_drive_song", None)
         )
 
+    def _evict_take_preview_for_song(self, song_id: str) -> None:
+        for key in [k for k in self._take_preview_cache if k[0] == song_id]:
+            removed = self._take_preview_cache.pop(key, None)
+            if removed is not None:
+                self._take_preview_cache_bytes = max(
+                    0, self._take_preview_cache_bytes - len(removed)
+                )
+
+    def _put_take_preview_cache(self, song_id: str, take_key: str, digest: str, raw: bytes) -> None:
+        if not raw or len(raw) > _TAKE_PREVIEW_CACHE_MAX_BYTES:
+            return
+        cache_key = (song_id, take_key, digest)
+        prev = self._take_preview_cache.pop(cache_key, None)
+        if prev is not None:
+            self._take_preview_cache_bytes = max(0, self._take_preview_cache_bytes - len(prev))
+        self._take_preview_cache[cache_key] = raw
+        self._take_preview_cache_bytes += len(raw)
+        while (
+            len(self._take_preview_cache) > _TAKE_PREVIEW_CACHE_MAX_ITEMS
+            or self._take_preview_cache_bytes > _TAKE_PREVIEW_CACHE_MAX_BYTES
+        ):
+            _, evicted = self._take_preview_cache.popitem(last=False)
+            self._take_preview_cache_bytes = max(0, self._take_preview_cache_bytes - len(evicted))
+
     async def _upload_inbox_bytes(
-        self, filename: str, raw: bytes, *, mime_type: str
+        self, filename: str, raw: bytes | bytearray | memoryview, *, mime_type: str
     ) -> dict[str, Any]:
         if self._use_direct_drive("upload_drive_inbox"):
-            res = await self.drive.upload_inbox_bytes(filename, raw, mime_type=mime_type)
+            total_len = len(raw)
+            stream_fn = getattr(self.drive, "upload_inbox_stream", None)
+            if total_len > _INBOX_STREAM_THRESHOLD_BYTES and callable(stream_fn):
+
+                async def _chunk_stream() -> AsyncIterator[bytes]:
+                    view = memoryview(raw)
+                    for offset in range(0, total_len, _INBOX_STREAM_CHUNK_BYTES):
+                        yield bytes(view[offset : offset + _INBOX_STREAM_CHUNK_BYTES])
+
+                res = await stream_fn(
+                    filename,
+                    _chunk_stream(),
+                    mime_type=mime_type,
+                    content_length=total_len,
+                )
+            else:
+                payload = raw if isinstance(raw, bytes) else bytes(raw)
+                res = await self.drive.upload_inbox_bytes(filename, payload, mime_type=mime_type)
             self.invalidate_drive_probe_cache("inbox", "storage")
             return res
         legacy_fn = getattr(self.compute, "upload_drive_inbox", None)
         if callable(legacy_fn):
-            res = await legacy_fn(filename, raw, mime_type=mime_type)
+            payload = raw if isinstance(raw, bytes) else bytes(raw)
+            res = await legacy_fn(filename, payload, mime_type=mime_type)
             self.invalidate_drive_probe_cache("inbox", "storage")
             return res
         raise Rejected("song_drive_not_configured")
@@ -1387,15 +1442,15 @@ class SongLibrary:
         raw_blob = getattr(tool_res, "blob", None)
         meta = getattr(tool_res, "data", None)
         meta_dict = meta if isinstance(meta, dict) else {}
-        if not isinstance(raw_blob, (bytes, bytearray)) or not raw_blob:
+        if not isinstance(raw_blob, (bytes, bytearray, memoryview)) or not raw_blob:
             raise Rejected("source_not_found")
 
-        raw_bytes = bytes(raw_blob)
+        raw_bytes = raw_blob if isinstance(raw_blob, bytes) else bytes(raw_blob)
         if len(raw_bytes) > SONG_FINDER_MAX_AUDIO_BYTES or len(raw_bytes) > MAX_LEARN_UPLOAD_BYTES:
             raise Rejected("download_too_large")
 
         expected_sha = str(meta_dict.get("sha256") or "").strip().lower()
-        if expected_sha and hashlib.sha256(raw_bytes).hexdigest() != expected_sha:
+        if expected_sha and (await asyncio.to_thread(_sha256_hex, raw_bytes)) != expected_sha:
             raise Rejected("song_finder_remote_unavailable")
 
         fallback_stem = clean_title or effective_query or "source_track"
@@ -2140,6 +2195,7 @@ class SongLibrary:
             if existing is not None:
                 self._entries.pop(existing["id"], None)
                 self._download_locks.pop(existing["id"], None)
+                self._evict_take_preview_for_song(existing["id"])
                 await asyncio.to_thread(self._unlink, existing["filename"])
 
             self._entries[song_id] = entry
@@ -2302,15 +2358,14 @@ class SongLibrary:
         payload.update(optional_floats)
         payload.update(optional_bools)
 
-        prepared_upload: tuple[bytes, str, str] | None = None
+        prepared_upload: tuple[bytes | bytearray | memoryview, str, str] | None = None
         if audio_bytes is not None:
-            if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
+            if not isinstance(audio_bytes, (bytes, bytearray, memoryview)) or not audio_bytes:
                 raise Rejected("invalid_song_audio")
-            raw = bytes(audio_bytes)
-            if len(raw) > MAX_LEARN_UPLOAD_BYTES:
+            if len(audio_bytes) > MAX_LEARN_UPLOAD_BYTES:
                 raise Rejected("song_upload_too_large")
             safe_name, mime_type = _safe_learn_upload_name(audio_filename, clean_title)
-            prepared_upload = (raw, safe_name, mime_type)
+            prepared_upload = (audio_bytes, safe_name, mime_type)
             clean_inbox_name = ""
             clean_inbox_id = ""
         else:
@@ -2464,13 +2519,13 @@ class SongLibrary:
 
             if not isinstance(downloaded, (bytes, bytearray)):
                 raise Rejected("song_unavailable")
-            raw = bytes(downloaded)
+            raw = downloaded if isinstance(downloaded, bytes) else bytes(downloaded)
             if (
                 not raw
                 or len(raw) > MAX_STORED_SONG_BYTES
                 or len(raw) != expected_size
                 or not _is_valid_mp3_bytes(raw)
-                or hashlib.sha256(raw).hexdigest() != expected_digest
+                or (await asyncio.to_thread(_sha256_hex, raw)) != expected_digest
             ):
                 raise Rejected("song_unavailable")
 
@@ -2519,6 +2574,12 @@ class SongLibrary:
             except Rejected:
                 raise Rejected("song_take_unavailable") from None
 
+        cache_key = (song_id, take_snapshot["key"], str(take_snapshot["digest"]))
+        cached_raw = self._take_preview_cache.get(cache_key)
+        if cached_raw is not None:
+            self._take_preview_cache.move_to_end(cache_key)
+            return cached_raw, "audio/mpeg"
+
         try:
             downloaded = await self._download_drive_song(take_snapshot["drive_chorus_id"])
         except asyncio.CancelledError:
@@ -2528,15 +2589,18 @@ class SongLibrary:
 
         if not isinstance(downloaded, (bytes, bytearray)):
             raise Rejected("song_take_unavailable")
-        raw = bytes(downloaded)
+        raw = downloaded if isinstance(downloaded, bytes) else bytes(downloaded)
         if (
             not raw
             or len(raw) > MAX_STORED_SONG_BYTES
             or len(raw) != int(take_snapshot["byte_size"])
             or not _is_valid_mp3_bytes(raw)
-            or hashlib.sha256(raw).hexdigest() != take_snapshot["digest"]
+            or (await asyncio.to_thread(_sha256_hex, raw)) != take_snapshot["digest"]
         ):
             raise Rejected("song_take_unavailable")
+        self._put_take_preview_cache(
+            song_id, take_snapshot["key"], str(take_snapshot["digest"]), raw
+        )
         return raw, "audio/mpeg"
 
     async def switch_take(
@@ -2672,6 +2736,7 @@ class SongLibrary:
                 await self.store.db.execute("DELETE FROM song_library WHERE id=?", (song_id,))
             del self._entries[song_id]
             self._download_locks.pop(song_id, None)
+            self._evict_take_preview_for_song(song_id)
             self._refresh_titles()
             await asyncio.to_thread(self._unlink, entry["filename"])
             self.invalidate_drive_probe_cache("storage")

@@ -85,6 +85,7 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
         self._call_times: deque[float] = deque()
 
         self._task: asyncio.Task[None] | None = None
+        self._waypoint_save_tasks: set[asyncio.Task[None]] = set()
         self._wake_event = asyncio.Event()
         self._wake_seq: int = 0
         self._stop_requested: bool = False
@@ -264,9 +265,11 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             return
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._save_waypoints_safe())
+            task = loop.create_task(self._save_waypoints_safe(), name="mc-save-waypoints")
         except RuntimeError:
-            pass
+            return
+        self._waypoint_save_tasks.add(task)
+        task.add_done_callback(self._waypoint_save_tasks.discard)
 
     def _telemetry_waypoints(self) -> list[dict[str, Any]]:
         ordered = sorted(
@@ -331,7 +334,7 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
         self._task = asyncio.create_task(self._run_loop(), name="mc-play-brain")
 
     async def stop(self) -> None:
-        """Stop and cancel the background play loop cleanly."""
+        """Stop and cancel the background play loop cleanly and flush pending waypoint saves."""
         self._stop_requested = True
         self._wake()
         task = self._task
@@ -340,6 +343,18 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        pending_saves = list(self._waypoint_save_tasks)
+        if pending_saves:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(3.0):
+                    await asyncio.gather(*pending_saves, return_exceptions=True)
+            for save_task in pending_saves:
+                if not save_task.done():
+                    save_task.cancel()
+            still_pending = [t for t in pending_saves if not t.done()]
+            if still_pending:
+                await asyncio.gather(*still_pending, return_exceptions=True)
+            self._waypoint_save_tasks.clear()
 
     def on_disconnect(self) -> None:
         """Clear session-scoped turns and pending triggers on disconnect."""

@@ -14,7 +14,6 @@ from .persona import (
     SYSTEM_INSTRUCTION,
     identity_anchor,
 )
-from .thinking_policy import PRIMARY_MODELS
 
 OWNER_BACKGROUND_RULE = (
     "\n【单向公开背景规则】近期群聊巡逻记忆只来自已参与过的公开互动，"
@@ -93,7 +92,6 @@ class PrefixRuntime:
         self.clock = clock
         self.cache = OrderedDict()
         self.carbon = OrderedDict()
-        self.chains = OrderedDict()
 
     def put(self, mapping, key, value):
         mapping[key] = value
@@ -101,59 +99,9 @@ class PrefixRuntime:
         while len(mapping) > self.limit:
             mapping.popitem(last=False)
 
-    def get_chain(self, scope, lane, *, epoch, trim_version, system_digest, now=None):
-        entry = self.chains.get((scope, lane))
-        if not entry:
-            return None
-        current = time.time() if now is None else now
-        if entry.get("expires", 0) <= current or (
-            entry.get("epoch") != epoch
-            or entry.get("trim_version") != trim_version
-            or entry.get("system_digest") != system_digest
-        ):
-            self.chains.pop((scope, lane), None)
-            return None
-        return entry
-
-    def put_chain(
-        self,
-        scope,
-        lane,
-        *,
-        interaction_id,
-        epoch,
-        trim_version,
-        system_digest,
-        covered_seq,
-        expires,
-        turns=1,
-        context_digests=None,
-        seen_nearby=None,
-    ):
-        if not interaction_id:
-            return
-        self.put(
-            self.chains,
-            (scope, lane),
-            {
-                "interaction_id": interaction_id,
-                "epoch": epoch,
-                "trim_version": trim_version,
-                "system_digest": system_digest,
-                "covered_seq": int(covered_seq),
-                "expires": expires,
-                "turns": int(turns),
-                "context_digests": dict(context_digests or {}),
-                "seen_nearby": list(seen_nearby or [])[:16],
-            },
-        )
-
     def invalidate_chain(self, scope, lane=None):
-        if lane is None:
-            for item_lane in PRIMARY_MODELS:
-                self.chains.pop((scope, item_lane), None)
-        else:
-            self.chains.pop((scope, lane), None)
+        """No-op compatibility stub (interaction chains live in SessionManager)."""
+        del scope, lane
 
     @staticmethod
     def marker(payload):

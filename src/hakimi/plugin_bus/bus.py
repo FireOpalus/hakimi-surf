@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import inspect
 import json
@@ -13,6 +14,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import Any, Literal
 
 import anyio
@@ -49,9 +51,12 @@ from .protocol import (
     _DEFAULT_IDLE_TIMEOUT_SECONDS,
     _DEFAULT_MAX_FRAME_BYTES,
     _DEFAULT_RPC_TIMEOUT_SECONDS,
+    _DEFAULT_SEND_TIMEOUT_SECONDS,
     _FIELD_NAME_RE,
     _HOTPLUG_ADMIN_PANELS,
+    _MAX_DOMAIN_QUEUE_SIZE,
     _MAX_PENDING_RPCS,
+    _MAX_STATE_QUEUE_SIZE,
     _NOTIFY_MAX_PER_WINDOW,
     _NOTIFY_WINDOW_SECONDS,
     _RESERVED_ACTION_PREFIXES,
@@ -82,6 +87,7 @@ from .protocol import (
 from .proxy import RemoteModuleProxy, _PendingRpc, _PluginSession
 
 log = logging.getLogger("hakimi")
+_IN_DOMAIN_DISPATCH: ContextVar[str | None] = ContextVar("hakimi_plugin_bus_domain", default=None)
 
 __all__ = ["PluginBus", "log"]
 
@@ -198,7 +204,10 @@ class PluginBus(
             if self.initialized:
                 return
             async with self.store.transaction():
-                await self.store.db.executescript(_SCHEMA)
+                for stmt in _SCHEMA.split(";"):
+                    sql = stmt.strip()
+                    if sql:
+                        await self.store.db.execute(sql)
             self.initialized = True
 
     def _open_cred_row(self, row: Any) -> dict[str, Any]:
@@ -220,16 +229,20 @@ class PluginBus(
         }
 
     async def _load_cred(self, plugin_id: str) -> dict[str, Any] | None:
+        loaded = await self._load_cred_with_hash(plugin_id)
+        return loaded[0] if loaded is not None else None
+
+    async def _load_cred_with_hash(self, plugin_id: str) -> tuple[dict[str, Any], str] | None:
         await self.initialize()
         async with self.store.lock:
             row = await self.store.one(
-                "SELECT plugin_id, enabled, payload, updated "
+                "SELECT plugin_id, token_hash, enabled, payload, updated "
                 "FROM plugin_credentials WHERE plugin_id=?",
                 (plugin_id,),
             )
         if row is None:
             return None
-        return self._open_cred_row(row)
+        return self._open_cred_row(row), str(row["token_hash"])
 
     async def create_plugin(
         self,
@@ -322,19 +335,20 @@ class PluginBus(
                 (int(new_enabled), blob, now, pid),
             )
 
-        session = self._sessions.get(pid)
-        if session is not None:
-            scopes_narrowed = clean_scopes is not None and not session.scopes.issubset(
-                set(new_scopes)
-            )
-            if not new_enabled or scopes_narrowed:
-                await self._dispose_session(pid, close_code=1008)
-            elif session.proxy is not None:
-                if clean_name is not None:
-                    session.proxy.display_name = new_name
-                if region is not None:
-                    session.proxy.node_region = new_region
-                    session.node_region = new_region
+        async with self._connect_lock(pid):
+            session = self._sessions.get(pid)
+            if session is not None:
+                scopes_narrowed = clean_scopes is not None and not session.scopes.issubset(
+                    set(new_scopes)
+                )
+                if not new_enabled or scopes_narrowed:
+                    await self._dispose_session(pid, close_code=1008)
+                elif session.proxy is not None:
+                    if clean_name is not None:
+                        session.proxy.display_name = new_name
+                    if region is not None:
+                        session.proxy.node_region = new_region
+                        session.node_region = new_region
         return await self.overview()
 
     async def rotate_token(self, plugin_id: str) -> tuple[str, dict[str, Any]]:
@@ -352,19 +366,26 @@ class PluginBus(
             )
             if cur.rowcount == 0:
                 raise Rejected("plugin_not_found")
-        await self._dispose_session(pid, close_code=1008)
+        async with self._connect_lock(pid):
+            await self._dispose_session(pid, close_code=1008)
         return token, await self.overview()
 
     async def delete_plugin(self, plugin_id: str) -> dict[str, Any]:
         await self.initialize()
         pid = _validate_plugin_id(plugin_id)
-        await self._dispose_session(pid, close_code=1008)
         async with self.store.transaction():
             cur = await self.store.db.execute(
                 "DELETE FROM plugin_credentials WHERE plugin_id=?", (pid,)
             )
             if cur.rowcount == 0:
                 raise Rejected("plugin_not_found")
+            await self.store.db.execute("DELETE FROM plugin_kv_state WHERE plugin_id=?", (pid,))
+        lock = self._connect_lock(pid)
+        async with lock:
+            await self._dispose_session(pid, close_code=1008)
+            self._notify_history.pop(pid, None)
+            if self._connect_locks.get(pid) is lock and not getattr(lock, "_waiters", None):
+                self._connect_locks.pop(pid, None)
         return await self.overview()
 
     async def disconnect_plugin(self, plugin_id: str) -> dict[str, Any]:
@@ -372,7 +393,8 @@ class PluginBus(
         pid = _validate_plugin_id(plugin_id)
         if await self._load_cred(pid) is None:
             raise Rejected("plugin_not_found")
-        await self._dispose_session(pid, close_code=1012)
+        async with self._connect_lock(pid):
+            await self._dispose_session(pid, close_code=1012)
         return await self.overview()
 
     async def authenticate(self, plugin_id: str, token: str) -> dict[str, Any] | None:
@@ -538,10 +560,13 @@ class PluginBus(
         send: Callable[[str], Awaitable[None]],
         send_lock: asyncio.Lock,
         payload: dict[str, Any],
+        *,
+        timeout: float = _DEFAULT_SEND_TIMEOUT_SECONDS,  # noqa: ASYNC109
     ) -> None:
         wire = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-        async with send_lock:
-            await send(wire)
+        async with asyncio.timeout(timeout):
+            async with send_lock:
+                await send(wire)
 
     async def _send_frame(self, session: _PluginSession, payload: dict[str, Any]) -> None:
         if session.closed:
@@ -583,7 +608,8 @@ class PluginBus(
             raise Rejected("plugin_frame_too_large")
 
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        session.pending[req_id] = _PendingRpc(future=future, method=method, delivery_id=delivery_id)
+        pending = _PendingRpc(future=future, method=method, delivery_id=delivery_id)
+        session.pending[req_id] = pending
         dispatched = False
         try:
             async with asyncio.timeout(effective_timeout):
@@ -592,7 +618,7 @@ class PluginBus(
                         raise Rejected("plugin_disconnected")
                     dispatched = True
                     await session.send(frame)
-                return await future
+                result = await future
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -609,6 +635,14 @@ class PluginBus(
                 future.cancel()
             elif not future.cancelled():
                 future.exception()
+        if (
+            pending.barrier_seq > session.domain_completed_seq
+            and _IN_DOMAIN_DISPATCH.get() != session.plugin_id
+        ):
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(min(5.0, effective_timeout)):
+                    await session.wait_domain_seq(pending.barrier_seq)
+        return result
 
     def is_plugin_online(self, plugin_id: str, *, require_enabled: bool = True) -> bool:
         """Return True when `plugin_id` has an active ready session (and is enabled if required)."""
@@ -1181,14 +1215,15 @@ class PluginBus(
                 pass
             return
 
-        cred = await self._load_cred(pid)
-        if cred is None or not cred["enabled"]:
+        initial_loaded = await self._load_cred_with_hash(pid)
+        if initial_loaded is None or not initial_loaded[0]["enabled"]:
             log.warning("event=plugin_scope_rejected plugin=%s reason=unauthorized", pid)
             try:
                 await close(1008)
             except Exception:
                 pass
             return
+        cred, initial_token_hash = initial_loaded
 
         max_frame_bytes = self._max_frame_bytes()
         hs_lock = asyncio.Lock()
@@ -1238,12 +1273,26 @@ class PluginBus(
         session: _PluginSession | None = None
         ctx: PluginContext | None = None
         async with self._connect_lock(pid):
-            cred = await self._load_cred(pid)
-            if cred is None or not cred["enabled"]:
+            loaded = await self._load_cred_with_hash(pid)
+            if loaded is None or not loaded[0]["enabled"]:
                 log.warning("event=plugin_scope_rejected plugin=%s reason=disabled", pid)
                 try:
                     await self._send_raw(
                         send, hs_lock, {"type": "error", "reason": "plugin_disabled"}
+                    )
+                except Exception:
+                    pass
+                try:
+                    await close(1008)
+                except Exception:
+                    pass
+                return
+            cred, current_token_hash = loaded
+            if not hmac.compare_digest(current_token_hash, initial_token_hash):
+                log.warning("event=plugin_scope_rejected plugin=%s reason=token_rotated", pid)
+                try:
+                    await self._send_raw(
+                        send, hs_lock, {"type": "error", "reason": "plugin_token_rotated"}
                     )
                 except Exception:
                     pass
@@ -1342,9 +1391,9 @@ class PluginBus(
 
             def _cancel_pending_rpcs(sess: _PluginSession = session) -> None:
                 sess.ready = False
+                sess.close_domain_waiters()
                 for pending in list(sess.pending.values()):
                     if pending.delivery_id is not None:
-                        sess.uncertain_deliveries.add(pending.delivery_id)
                         self.uncertain_deliveries.append(pending.delivery_id)
                     if not pending.future.done():
                         err = (
@@ -1436,6 +1485,13 @@ class PluginBus(
                     )
                     for plat in chat_platforms:
                         register_platform_hooks(plat, hooks)
+                latest_loaded = await self._load_cred_with_hash(pid)
+                if latest_loaded is None or not latest_loaded[0]["enabled"]:
+                    raise Rejected("plugin_disabled")
+                if not hmac.compare_digest(latest_loaded[1], initial_token_hash):
+                    raise Rejected("plugin_token_rotated")
+                if not scope_set.issubset(set(latest_loaded[0]["allowed_scopes"])):
+                    raise Rejected("plugin_scope_rejected")
                 self._sessions[pid] = session
                 session.ready = True
                 became_ready = True
@@ -1491,6 +1547,49 @@ class PluginBus(
             )
 
         # Phase 3: Active message loop, 20s heartbeat, and 60s idle timeout on tracked fiber tasks.
+        # _reader() stays strictly non-blocking: control frames (ping/pong/rpc.result) resolve
+        # inline, ai.*/node.call spawn bounded subtasks, and stateful/domain frames execute in
+        # FIFO order on dedicated per-session bounded queues so reverse RPCs never deadlock.
+        domain_handlers: dict[str, Callable[[_PluginSession, dict[str, Any]], Awaitable[None]]] = {
+            "world.event": self._handle_world_event,
+            "chat.inbound": self._handle_chat_inbound,
+            "owner.notify": self._handle_owner_notify,
+            "plugin.status": self._handle_plugin_status,
+            "world.activity": self._handle_world_activity,
+            "world.reaction": self._handle_world_reaction,
+            "bili.memory_preferences": self._handle_bili_memory_preferences,
+            "bili.private_topic_commit": self._handle_bili_private_topic_commit,
+        }
+        state_handlers: dict[str, Callable[[_PluginSession, dict[str, Any]], Awaitable[None]]] = {
+            "state.get": self._handle_state_get,
+            "state.set": self._handle_state_set,
+            "state.delete": self._handle_state_delete,
+        }
+        domain_queue: asyncio.Queue[
+            tuple[Callable[[_PluginSession, dict[str, Any]], Awaitable[None]], dict[str, Any], int]
+        ] = asyncio.Queue(maxsize=_MAX_DOMAIN_QUEUE_SIZE)
+        state_queue: asyncio.Queue[
+            tuple[Callable[[_PluginSession, dict[str, Any]], Awaitable[None]], dict[str, Any]]
+        ] = asyncio.Queue(maxsize=_MAX_STATE_QUEUE_SIZE)
+
+        async def _drain_domain_queue() -> None:
+            token = _IN_DOMAIN_DISPATCH.set(pid)
+            try:
+                while True:
+                    handler, queued_frame, seq = await domain_queue.get()
+                    try:
+                        await handler(session, queued_frame)
+                    finally:
+                        session.mark_domain_completed(seq)
+            finally:
+                _IN_DOMAIN_DISPATCH.reset(token)
+                session.close_domain_waiters()
+
+        async def _drain_state_queue() -> None:
+            while True:
+                handler, queued_frame = await state_queue.get()
+                await handler(session, queued_frame)
+
         async def _reader() -> None:
             nonlocal last_rx
             while True:
@@ -1518,13 +1617,8 @@ class PluginBus(
                     req_id = frame.get("id")
                     pending = session.pending.get(req_id) if isinstance(req_id, str) else None
                     if pending is not None and not pending.future.done():
+                        pending.barrier_seq = session.domain_enqueued_seq
                         pending.future.set_result(frame)
-                elif ftype == "world.event":
-                    await self._handle_world_event(session, frame)
-                elif ftype == "chat.inbound":
-                    await self._handle_chat_inbound(session, frame)
-                elif ftype == "owner.notify":
-                    await self._handle_owner_notify(session, frame)
                 elif ftype == "ai.budget_check":
                     await self._handle_ai_budget_check(session, frame)
                 elif ftype == "ai.screen":
@@ -1533,24 +1627,45 @@ class PluginBus(
                     await self._handle_ai_generate(session, frame)
                 elif ftype == "ai.video_analyze":
                     await self._handle_ai_video_analyze(session, frame)
-                elif ftype == "state.get":
-                    await self._handle_state_get(session, frame)
-                elif ftype == "state.set":
-                    await self._handle_state_set(session, frame)
-                elif ftype == "state.delete":
-                    await self._handle_state_delete(session, frame)
                 elif ftype == "node.call":
                     await self._handle_node_call(session, frame)
-                elif ftype == "plugin.status":
-                    await self._handle_plugin_status(session, frame)
-                elif ftype == "world.activity":
-                    await self._handle_world_activity(session, frame)
-                elif ftype == "world.reaction":
-                    await self._handle_world_reaction(session, frame)
-                elif ftype == "bili.memory_preferences":
-                    await self._handle_bili_memory_preferences(session, frame)
-                elif ftype == "bili.private_topic_commit":
-                    await self._handle_bili_private_topic_commit(session, frame)
+                elif isinstance(ftype, str) and ftype in state_handlers:
+                    try:
+                        state_queue.put_nowait((state_handlers[ftype], frame))
+                    except asyncio.QueueFull:
+                        req_id = frame.get("id")
+                        if isinstance(req_id, str) and req_id.strip():
+                            await self._send_frame(
+                                session,
+                                {
+                                    "type": "kernel.result",
+                                    "id": req_id,
+                                    "ok": False,
+                                    "error": "plugin_backpressure",
+                                },
+                            )
+                        else:
+                            raise Rejected("plugin_backpressure") from None
+                elif isinstance(ftype, str) and ftype in domain_handlers:
+                    next_seq = session.domain_enqueued_seq + 1
+                    try:
+                        domain_queue.put_nowait((domain_handlers[ftype], frame, next_seq))
+                    except asyncio.QueueFull:
+                        req_id = frame.get("id")
+                        if ftype.startswith("bili.") and isinstance(req_id, str) and req_id.strip():
+                            await self._send_frame(
+                                session,
+                                {
+                                    "type": "kernel.result",
+                                    "id": req_id,
+                                    "ok": False,
+                                    "error": "plugin_backpressure",
+                                },
+                            )
+                        else:
+                            raise Rejected("plugin_backpressure") from None
+                    else:
+                        session.domain_enqueued_seq = next_seq
                 else:
                     raise Rejected("plugin_unknown_frame")
 
@@ -1560,6 +1675,8 @@ class PluginBus(
                 await self._send_frame(session, {"type": "ping", "ts": self.clock()})
 
         reader_task = ctx.spawn(_reader(), name=f"plugin-reader:{pid}")
+        domain_task = ctx.spawn(_drain_domain_queue(), name=f"plugin-domain:{pid}")
+        state_task = ctx.spawn(_drain_state_queue(), name=f"plugin-state:{pid}")
         heartbeat_task = ctx.spawn(_heartbeat(), name=f"plugin-heartbeat:{pid}")
         if persisted_chat_configs:
             ctx.spawn(
@@ -1568,7 +1685,8 @@ class PluginBus(
             )
         try:
             done, _ = await asyncio.wait(
-                [reader_task, heartbeat_task], return_when=asyncio.FIRST_COMPLETED
+                [reader_task, domain_task, state_task, heartbeat_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
             for t in done:
                 if not t.cancelled():

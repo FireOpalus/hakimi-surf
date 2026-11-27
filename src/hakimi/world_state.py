@@ -872,6 +872,97 @@ class WorldStateManager:
             payload=json.loads(row["payload_json"]),
         )
 
+    async def prune(
+        self,
+        now: float | None = None,
+        *,
+        retention_days: int = 30,
+        milestone_days: int = 90,
+    ) -> dict[str, int]:
+        """Prune old global events, event order entries, terminal intents, and rule receipts."""
+        counts = {
+            "global_events": 0,
+            "life_event_order": 0,
+            "scheduled_intents": 0,
+            "life_rule_receipts": 0,
+        }
+        ts = self.clock() if now is None else float(now)
+        days = max(1, int(retention_days))
+        ms_days = max(days, int(milestone_days))
+        cutoff = ts - days * 86400.0
+        milestone_cutoff = ts - ms_days * 86400.0
+
+        async with self.store.lock:
+            tables = {
+                row[0]
+                for row in await self.store.all("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            has_work = False
+            if "global_events" in tables and await self.store.one(
+                "SELECT 1 FROM global_events "
+                "WHERE (consumed=1 AND importance!='high' AND created_at<?) OR created_at<? "
+                "LIMIT 1",
+                (cutoff, milestone_cutoff),
+            ):
+                has_work = True
+            elif (
+                "life_event_order" in tables
+                and "global_events" in tables
+                and await self.store.one(
+                    "SELECT 1 FROM life_event_order "
+                    "WHERE event_id NOT IN (SELECT id FROM global_events) "
+                    "AND seq < COALESCE((SELECT MAX(seq) FROM life_event_order), 0) LIMIT 1"
+                )
+            ):
+                has_work = True
+            elif "scheduled_intents" in tables and await self.store.one(
+                "SELECT 1 FROM scheduled_intents "
+                "WHERE status IN ('done','expired','gated_skip','uncertain') "
+                "AND COALESCE(NULLIF(updated_at, 0), created_at)<? LIMIT 1",
+                (cutoff,),
+            ):
+                has_work = True
+            elif "life_rule_receipts" in tables and await self.store.one(
+                "SELECT 1 FROM life_rule_receipts WHERE created_at<? LIMIT 1",
+                (cutoff,),
+            ):
+                has_work = True
+
+        if not has_work:
+            return counts
+
+        async with self.store.transaction():
+            if "global_events" in tables:
+                cur = await self.store.db.execute(
+                    "DELETE FROM global_events "
+                    "WHERE (consumed=1 AND importance!='high' AND created_at<?) OR created_at<?",
+                    (cutoff, milestone_cutoff),
+                )
+                counts["global_events"] = max(0, int(cur.rowcount or 0))
+            if "life_event_order" in tables and "global_events" in tables:
+                # Preserve the latest sequence anchor so new rule cursors never see MAX(seq)=NULL.
+                cur = await self.store.db.execute(
+                    "DELETE FROM life_event_order "
+                    "WHERE event_id NOT IN (SELECT id FROM global_events) "
+                    "AND seq < COALESCE((SELECT MAX(seq) FROM life_event_order), 0)"
+                )
+                counts["life_event_order"] = max(0, int(cur.rowcount or 0))
+            if "scheduled_intents" in tables:
+                cur = await self.store.db.execute(
+                    "DELETE FROM scheduled_intents "
+                    "WHERE status IN ('done','expired','gated_skip','uncertain') "
+                    "AND COALESCE(NULLIF(updated_at, 0), created_at)<?",
+                    (cutoff,),
+                )
+                counts["scheduled_intents"] = max(0, int(cur.rowcount or 0))
+            if "life_rule_receipts" in tables:
+                cur = await self.store.db.execute(
+                    "DELETE FROM life_rule_receipts WHERE created_at<?",
+                    (cutoff,),
+                )
+                counts["life_rule_receipts"] = max(0, int(cur.rowcount or 0))
+        return counts
+
     async def mark_event_consumed(self, event_id: str) -> bool:
         """Mark a global event row as consumed."""
         async with self.store.transaction():

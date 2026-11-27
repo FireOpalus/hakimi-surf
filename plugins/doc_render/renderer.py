@@ -11,6 +11,8 @@ from __future__ import annotations
 import functools
 import io
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -230,18 +232,104 @@ def _draw_mixed(
         x += font.getlength(part)
 
 
-def _wrap_line(text: str, max_width: float, font_ascii: Any, font_cjk: Any) -> list[str]:
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("card rendering timed out")
+
+
+def _fit_prefix_end(
+    text: str,
+    start: int,
+    max_width: float,
+    measure: Callable[[str], float],
+    *,
+    hint: int = 0,
+) -> int:
+    """Return maximal end index in [start + 1, len(text)] whose width <= max_width."""
+    n = len(text)
+    if start + 1 >= n:
+        return n
+
+    lo = start + 1
+    if hint > 1:
+        probe = min(n, start + hint)
+        if measure(text[start:probe]) <= max_width:
+            lo = probe
+            if lo >= n:
+                return n
+            step = 1
+            hi = n
+            while lo < n:
+                nxt = min(n, lo + step)
+                if measure(text[start:nxt]) <= max_width:
+                    lo = nxt
+                    step *= 2
+                else:
+                    hi = nxt
+                    break
+            else:
+                return n
+        else:
+            hi = probe
+            step = 1
+            while hi > start + 1:
+                prev = max(start + 1, hi - step)
+                if measure(text[start:prev]) <= max_width:
+                    lo = prev
+                    break
+                hi = prev
+                step *= 2
+            else:
+                return start + 1
+    else:
+        step = 1
+        hi = n
+        while lo < n:
+            nxt = min(n, lo + step)
+            if measure(text[start:nxt]) <= max_width:
+                lo = nxt
+                step *= 2
+            else:
+                hi = nxt
+                break
+        else:
+            return n
+
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if measure(text[start:mid]) <= max_width:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _wrap_line(
+    text: str,
+    max_width: float,
+    font_ascii: Any,
+    font_cjk: Any,
+    *,
+    deadline: float | None = None,
+) -> list[str]:
     if not text:
         return [""]
+    measure: Callable[[str], float] = (
+        font_cjk.getlength
+        if font_ascii is font_cjk
+        else (lambda s: _mixed_width(s, font_ascii, font_cjk))
+    )
     lines: list[str] = []
-    cur = ""
-    for ch in text:
-        if cur and _mixed_width(cur + ch, font_ascii, font_cjk) > max_width:
-            lines.append(cur)
-            cur = ch
-        else:
-            cur += ch
-    lines.append(cur)
+    pos = 0
+    n = len(text)
+    hint = 0
+    while pos < n:
+        if deadline is not None and (len(lines) & 7) == 0:
+            _check_deadline(deadline)
+        end = _fit_prefix_end(text, pos, max_width, measure, hint=hint)
+        lines.append(text[pos:end])
+        hint = end - pos
+        pos = end
     return lines
 
 
@@ -279,6 +367,8 @@ def _wrap_rich_lines(
     font_bold: Any,
     font_code_ascii: Any,
     font_code_cjk: Any,
+    *,
+    deadline: float | None = None,
 ) -> list[list[tuple[str, str, float]]]:
     lines: list[list[tuple[str, str, float]]] = [[]]
     cur_width = 0.0
@@ -290,6 +380,7 @@ def _wrap_rich_lines(
         return font.getlength(chunk)
 
     for para_idx, para in enumerate(text.splitlines() or [""]):
+        _check_deadline(deadline)
         if para_idx > 0:
             lines.append([])
             cur_width = 0.0
@@ -304,7 +395,11 @@ def _wrap_rich_lines(
                     cur_width += total_w
                     continue
                 for wrapped in _wrap_line(
-                    content, max(80.0, max_width - 14), font_code_ascii, font_code_cjk
+                    content,
+                    max(80.0, max_width - 14),
+                    font_code_ascii,
+                    font_code_cjk,
+                    deadline=deadline,
                 ):
                     w = seg_width("code", wrapped)
                     if lines[-1]:
@@ -312,22 +407,30 @@ def _wrap_rich_lines(
                     lines[-1].append(("code", wrapped, w))
                     cur_width = w
                 continue
-            buf = ""
             font = font_bold if kind == "bold" else font_text
-            for ch in content:
-                cw = font.getlength(ch)
-                if cur_width + font.getlength(buf) + cw > max_width and (buf or lines[-1]):
-                    if buf:
-                        lines[-1].append((kind, buf, font.getlength(buf)))
+            measure = font.getlength
+            pos = 0
+            n = len(content)
+            hint = 0
+            while pos < n:
+                if deadline is not None and (len(lines) & 7) == 0:
+                    _check_deadline(deadline)
+                avail = max_width - cur_width
+                if lines[-1] and measure(content[pos : pos + 1]) > avail:
                     lines.append([])
                     cur_width = 0.0
-                    buf = ch
+                    avail = max_width
+                end = _fit_prefix_end(content, pos, avail, measure, hint=hint)
+                seg = content[pos:end]
+                seg_w = measure(seg)
+                lines[-1].append((kind, seg, seg_w))
+                if end < n:
+                    hint = end - pos
+                    lines.append([])
+                    cur_width = 0.0
                 else:
-                    buf += ch
-            if buf:
-                bw = font.getlength(buf)
-                lines[-1].append((kind, buf, bw))
-                cur_width += bw
+                    cur_width += seg_w
+                pos = end
     return lines
 
 
@@ -453,8 +556,10 @@ def render_card_bytes(
     max_height: int = MAX_CARD_HEIGHT,
     theme: str = "lavender",
     max_bytes: int = MAX_CARD_BYTES,
+    deadline: float | None = None,
 ) -> RenderedCard:
     """Render plain text or Markdown card to bounded PNG or JPEG bytes."""
+    _check_deadline(deadline)
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_INPUT_CHARS:
         raise CardRenderError("card_text_invalid")
     norm_fmt = str(fmt or "png").strip().lower()
@@ -503,12 +608,19 @@ def render_card_bytes(
             return True
 
         for block in _parse_blocks(text):
+            _check_deadline(deadline)
             kind = block[0]
             if kind == "heading":
                 _, level, heading_text = block
                 h_font = font_h1 if level == 1 else font_h2 if level == 2 else font_h3
                 line_h = 38 if level == 1 else 34
-                wrapped = _wrap_line(heading_text, max(80.0, content_w - 18), h_font, h_font)
+                wrapped = _wrap_line(
+                    heading_text,
+                    max(80.0, content_w - 18),
+                    h_font,
+                    h_font,
+                    deadline=deadline,
+                )
                 total_h = len(wrapped) * line_h + 14
 
                 def draw_heading(
@@ -540,8 +652,15 @@ def render_card_bytes(
                 inner_w = max(80.0, content_w - 36)
                 wrapped_code: list[str] = []
                 for raw_line in raw_lines:
+                    _check_deadline(deadline)
                     wrapped_code.extend(
-                        _wrap_line(raw_line, inner_w, font_code_ascii, font_code_cjk)
+                        _wrap_line(
+                            raw_line,
+                            inner_w,
+                            font_code_ascii,
+                            font_code_cjk,
+                            deadline=deadline,
+                        )
                     )
                 wrapped_code = wrapped_code[:120]
                 line_h = 28
@@ -610,8 +729,15 @@ def render_card_bytes(
                 row_layouts = []
                 cell_line_h = 24
                 for r in rows:
+                    _check_deadline(deadline)
                     cell_wrapped = [
-                        _wrap_line(cell, max(36.0, col_widths[ci] - 18), font_small, font_small)
+                        _wrap_line(
+                            cell,
+                            max(36.0, col_widths[ci] - 18),
+                            font_small,
+                            font_small,
+                            deadline=deadline,
+                        )
                         for ci, cell in enumerate(r)
                     ]
                     rh = max(len(cw) for cw in cell_wrapped) * cell_line_h + 16
@@ -669,6 +795,7 @@ def render_card_bytes(
                     font_body,
                     font_inline_ascii,
                     font_inline_cjk,
+                    deadline=deadline,
                 )
                 line_h = 31
                 box_h = len(wrapped_q) * line_h + 22
@@ -716,6 +843,7 @@ def render_card_bytes(
                     font_body,
                     font_inline_ascii,
                     font_inline_cjk,
+                    deadline=deadline,
                 )
                 line_h = 32
                 total_h = len(wrapped_l) * line_h + 6
@@ -755,6 +883,7 @@ def render_card_bytes(
                     font_body,
                     font_inline_ascii,
                     font_inline_cjk,
+                    deadline=deadline,
                 )
                 line_h = 32
                 total_h = len(wrapped_p) * line_h + 12
@@ -784,6 +913,7 @@ def render_card_bytes(
         if width * canvas_h > MAX_RENDER_PIXELS:
             raise CardRenderError("card_too_large")
 
+        _check_deadline(deadline)
         image = Image.new("RGB", (width, canvas_h), palette.outer_bg)
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle(
@@ -796,6 +926,7 @@ def render_card_bytes(
         draw.text((content_x, 44), "吉米奈喵 · 排版卡片", font=font_small, fill=palette.accent)
         draw.line((content_x, 76, width - content_x, 76), fill=palette.divider, width=1)
         for top, fn in ops:
+            _check_deadline(deadline)
             fn(draw, top)
         if truncated:
             draw.text(
@@ -805,8 +936,8 @@ def render_card_bytes(
                 fill=palette.muted,
             )
 
-        raw = _encode_bounded_image(image, norm_fmt, byte_cap)
-    except CardRenderError:
+        raw = _encode_bounded_image(image, norm_fmt, byte_cap, deadline=deadline)
+    except (CardRenderError, TimeoutError):
         raise
     except Exception:
         raise CardRenderError("render_failed") from None
@@ -826,14 +957,22 @@ def render_card_bytes(
     )
 
 
-def _encode_bounded_image(image: Image.Image, fmt: str, byte_cap: int) -> bytes:
+def _encode_bounded_image(
+    image: Image.Image,
+    fmt: str,
+    byte_cap: int,
+    *,
+    deadline: float | None = None,
+) -> bytes:
     if fmt == "png":
         for compress_level in (6, 9):
+            _check_deadline(deadline)
             target = io.BytesIO()
             image.save(target, format="PNG", optimize=True, compress_level=compress_level)
             raw = target.getvalue()
             if len(raw) <= byte_cap:
                 return raw
+        _check_deadline(deadline)
         quantized = image.quantize(colors=256)
         target = io.BytesIO()
         quantized.save(target, format="PNG", optimize=True, compress_level=9)
@@ -843,6 +982,7 @@ def _encode_bounded_image(image: Image.Image, fmt: str, byte_cap: int) -> bytes:
         raise CardRenderError("card_too_large")
 
     for quality in (88, 80, 72):
+        _check_deadline(deadline)
         target = io.BytesIO()
         image.save(target, format="JPEG", quality=quality, optimize=True)
         raw = target.getvalue()

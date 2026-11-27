@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 from html.parser import HTMLParser
 from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -18,6 +19,7 @@ from .ssrf import (
     REDIRECT_STATUSES,
     BodyTooLargeError,
     DnsResolver,
+    PinnedPublicTransport,
     SsrfBlockedError,
     build_pinned_client,
     read_bounded_body,
@@ -46,6 +48,36 @@ SEARCH_MIN_TIMEOUT_SECONDS = 1.0
 SEARCH_MAX_TIMEOUT_SECONDS = 30.0
 SEARCH_DEFAULT_TIMEOUT_SECONDS = 20.0
 SEARCH_MAX_TEXT_CHARS = 2400
+DEEPSEEK_TOOLS_UNSUPPORTED_TTL_SECONDS = 3600.0
+_DEEPSEEK_TOOLS_UNSUPPORTED_MAX_ENTRIES = 64
+_DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL: dict[str, float] = {}
+
+
+def clear_deepseek_tools_search_cache() -> None:
+    """Clear cached DeepSeek `/v1/tools/search` unsupported base URLs."""
+    _DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL.clear()
+
+
+def _is_deepseek_tools_search_unsupported(clean_base: str, now: float) -> bool:
+    expires_at = _DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL.get(clean_base)
+    if expires_at is None:
+        return False
+    if now < expires_at:
+        return True
+    _DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL.pop(clean_base, None)
+    return False
+
+
+def _mark_deepseek_tools_search_unsupported(clean_base: str, now: float) -> None:
+    if len(_DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL) >= _DEEPSEEK_TOOLS_UNSUPPORTED_MAX_ENTRIES:
+        expired = [k for k, v in _DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL.items() if v <= now]
+        for k in expired:
+            _DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL.pop(k, None)
+        while len(_DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL) >= _DEEPSEEK_TOOLS_UNSUPPORTED_MAX_ENTRIES:
+            oldest = next(iter(_DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL))
+            _DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL.pop(oldest, None)
+    _DEEPSEEK_TOOLS_UNSUPPORTED_UNTIL[clean_base] = now + DEEPSEEK_TOOLS_UNSUPPORTED_TTL_SECONDS
+
 
 _TAG_RE = re.compile(r"\[(?:AT|MEME|CQ):[^\]\n]*\]?", re.I)
 _TAG_PREFIX_RE = re.compile(r"\[(?:AT|MEME|CQ):", re.I)
@@ -336,51 +368,55 @@ async def _search_deepseek(
     if not cfg.deepseek_api_key.strip():
         raise SearchError("search_provider_unconfigured")
     clean_base = _validate_endpoint_base(cfg.deepseek_base_url)
-    search_url = clean_base + "/v1/tools/search"
-    await _ensure_dns_if_needed(search_url, pre_check_dns=pre_check_dns, dns_resolver=dns_resolver)
-
     headers = {
         "Authorization": f"Bearer {cfg.deepseek_api_key.strip()}",
         "Content-Type": "application/json",
         "Accept-Encoding": "gzip, deflate, identity",
     }
-    short_query = (query.strip() or "search")[:128]
-    async with client.stream(
-        "POST",
-        search_url,
-        headers=headers,
-        json={
-            "query": short_query,
-            "count": min(max(max_results + 1, 6), 10),
-            "ori_question": short_query,
-            "need_content": False,
-        },
-    ) as response:
-        _check_redirect_ssrf(response)
-        if response.status_code == 200:
-            data = await _read_bounded_json_response(response)
-            raw_results = data.get("results")
-            if not isinstance(raw_results, list):
-                raise SearchError("web_search_failed")
-            ranked = sorted(
-                (r for r in raw_results if isinstance(r, dict)),
-                key=lambda item: float(item.get("rerank_score") or 0),
-                reverse=True,
-            )
-            entries = [
-                (
-                    str(item.get("title") or ""),
-                    str(item.get("summary") or item.get("snippet") or ""),
-                    str(item.get("url") or ""),
+    now = time.monotonic()
+    if not _is_deepseek_tools_search_unsupported(clean_base, now):
+        search_url = clean_base + "/v1/tools/search"
+        await _ensure_dns_if_needed(
+            search_url, pre_check_dns=pre_check_dns, dns_resolver=dns_resolver
+        )
+        short_query = (query.strip() or "search")[:128]
+        async with client.stream(
+            "POST",
+            search_url,
+            headers=headers,
+            json={
+                "query": short_query,
+                "count": min(max(max_results + 1, 6), 10),
+                "ori_question": short_query,
+                "need_content": False,
+            },
+        ) as response:
+            _check_redirect_ssrf(response)
+            if response.status_code == 200:
+                data = await _read_bounded_json_response(response)
+                raw_results = data.get("results")
+                if not isinstance(raw_results, list):
+                    raise SearchError("web_search_failed")
+                ranked = sorted(
+                    (r for r in raw_results if isinstance(r, dict)),
+                    key=lambda item: float(item.get("rerank_score") or 0),
+                    reverse=True,
                 )
-                for item in ranked
-            ]
-            text, sources = _format_entries(entries, max_results=max_results)
-            if not text:
-                raise SearchError("search_no_grounding")
-            return text, sources
-        if response.status_code not in {400, 404, 405}:
-            raise SearchError("web_search_failed")
+                entries = [
+                    (
+                        str(item.get("title") or ""),
+                        str(item.get("summary") or item.get("snippet") or ""),
+                        str(item.get("url") or ""),
+                    )
+                    for item in ranked
+                ]
+                text, sources = _format_entries(entries, max_results=max_results)
+                if not text:
+                    raise SearchError("search_no_grounding")
+                return text, sources
+            if response.status_code not in {400, 404, 405}:
+                raise SearchError("web_search_failed")
+            _mark_deepseek_tools_search_unsupported(clean_base, time.monotonic())
 
     chat_url = clean_base + "/chat/completions"
     await _ensure_dns_if_needed(chat_url, pre_check_dns=pre_check_dns, dns_resolver=dns_resolver)
@@ -758,8 +794,14 @@ async def execute_search(
     )
     candidates = _select_candidates(cfg, provider)
     secrets = cfg.configured_secrets()
-    pre_check_dns = transport is not None and dns_resolver is not None
+    pre_check_dns = (
+        transport is not None
+        and not isinstance(transport, PinnedPublicTransport)
+        and dns_resolver is not None
+    )
     last_error: SearchError | None = None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + bounded_timeout
 
     try:
         async with asyncio.timeout(bounded_timeout):
@@ -771,16 +813,24 @@ async def execute_search(
                 max_connections=4,
             ) as client:
                 for idx, candidate in enumerate(candidates):
+                    remaining = deadline - loop.time()
+                    if remaining <= 0.0:
+                        break
+                    has_fallback = idx + 1 < len(candidates)
+                    attempt_timeout = (
+                        max(0.05, min(10.0, remaining * 0.6)) if has_fallback else remaining
+                    )
                     handler = _PROVIDER_HANDLERS[candidate]
                     try:
-                        text, sources = await handler(
-                            client,
-                            clean_query,
-                            cfg,
-                            max_results=bounded_results,
-                            pre_check_dns=pre_check_dns,
-                            dns_resolver=dns_resolver,
-                        )
+                        async with asyncio.timeout(attempt_timeout):
+                            text, sources = await handler(
+                                client,
+                                clean_query,
+                                cfg,
+                                max_results=bounded_results,
+                                pre_check_dns=pre_check_dns,
+                                dns_resolver=dns_resolver,
+                            )
                         return _finalize_output(text, sources, provider=candidate, secrets=secrets)
                     except SsrfBlockedError:
                         log.warning("event=web_tools_search_ssrf_blocked provider=%s", candidate)
@@ -792,7 +842,7 @@ async def execute_search(
                             )
                             raise
                         last_error = exc
-                        if idx + 1 < len(candidates):
+                        if has_fallback:
                             log.info(
                                 "event=web_tools_search_fallback provider=%s reason=%s",
                                 candidate,
@@ -800,6 +850,16 @@ async def execute_search(
                             )
                             continue
                         raise
+                    except TimeoutError:
+                        log.warning(
+                            "event=web_tools_search_timeout provider=%s timeout=%.2f",
+                            candidate,
+                            attempt_timeout,
+                        )
+                        last_error = SearchError("web_search_failed")
+                        if has_fallback:
+                            continue
+                        raise last_error from None
                     except httpx.HTTPError as exc:
                         log.warning(
                             "event=web_tools_search_http_error provider=%s type=%s",
@@ -807,7 +867,7 @@ async def execute_search(
                             type(exc).__name__,
                         )
                         last_error = SearchError("web_search_failed")
-                        if idx + 1 < len(candidates):
+                        if has_fallback:
                             continue
                         raise last_error from None
     except TimeoutError:

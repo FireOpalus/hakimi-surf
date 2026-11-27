@@ -76,7 +76,7 @@ class BilibiliPlugin:
                 timeout=15.0,
                 trust_env=False,
                 follow_redirects=False,
-                limits=httpx.Limits(max_connections=2),
+                limits=httpx.Limits(max_connections=6),
             )
         )
         self.client = HakimiPluginClient(

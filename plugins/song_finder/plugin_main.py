@@ -194,7 +194,7 @@ class SongFinderPlugin:
                 ffprobe_bin=ffprobe_bin,
             )
 
-        self._fetch_slots = asyncio.Semaphore(2)
+        self._fetch_slots = asyncio.Semaphore(1)
 
         config = PluginRuntimeConfig(
             ws_url=ws_url,

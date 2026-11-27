@@ -333,11 +333,25 @@ async def _prepend_first(
     first_chunk: bytes,
     rest: AsyncIterator[bytes],
     *,
+    max_bytes: int | None = None,
     on_close: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
+    total = 0
     try:
+        if max_bytes is not None and len(first_chunk) > max_bytes:
+            return
+        total += len(first_chunk)
         yield first_chunk
         async for chunk in rest:
+            if not chunk:
+                continue
+            if max_bytes is not None and total + len(chunk) > max_bytes:
+                log.warning(
+                    "event=voice_gateway_http_tts_stream_cap_reached max_bytes=%d",
+                    max_bytes,
+                )
+                break
+            total += len(chunk)
             yield chunk
     finally:
         try:
@@ -707,6 +721,14 @@ def create_gateway_app(
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=safe_error_detail(exc, cfg)) from None
 
+            if len(first_chunk) > cfg.max_tts_audio_bytes:
+                with contextlib.suppress(Exception):
+                    await transcoded.aclose()
+                raise HTTPException(
+                    status_code=502,
+                    detail="TTS audio exceeds max_tts_audio_bytes",
+                )
+
             headers = {
                 "X-Audio-Format": output_fmt,
                 "X-Sample-Rate": str(sample_rate),
@@ -715,7 +737,12 @@ def create_gateway_app(
             if stream_flag:
                 handed_off = True
                 return StreamingResponse(
-                    _prepend_first(first_chunk, transcoded, on_close=_release_once),
+                    _prepend_first(
+                        first_chunk,
+                        transcoded,
+                        max_bytes=cfg.max_tts_audio_bytes,
+                        on_close=_release_once,
+                    ),
                     media_type=mime_type,
                     headers=headers,
                     background=BackgroundTask(_release_once),
@@ -723,11 +750,6 @@ def create_gateway_app(
 
             buf = bytearray()
             try:
-                if len(first_chunk) > cfg.max_tts_audio_bytes:
-                    raise HTTPException(
-                        status_code=502,
-                        detail="TTS audio exceeds max_tts_audio_bytes",
-                    )
                 buf.extend(first_chunk)
                 async for chunk in transcoded:
                     if len(buf) + len(chunk) > cfg.max_tts_audio_bytes:
@@ -840,33 +862,14 @@ def create_gateway_app(
     return app
 
 
-async def _parse_stt_multipart(
-    request: Request,
+def _parse_stt_multipart_sync(
+    mime_buf: bytearray,
     *,
     max_audio_bytes: int,
 ) -> tuple[bytes, str, int, int]:
-    """Parse POST /v1/stt multipart/form-data using stdlib BytesParser (no python-multipart)."""
-    content_type = request.headers.get("content-type", "").strip()
-    if (
-        "\r" in content_type
-        or "\n" in content_type
-        or "multipart/form-data" not in content_type.lower()
-        or "boundary=" not in content_type.lower()
-    ):
-        raise HTTPException(status_code=400, detail="multipart/form-data with boundary required")
-
-    max_body = max_audio_bytes + 65536
-    body_buf = bytearray()
-    async for chunk in request.stream():
-        body_buf.extend(chunk)
-        if len(body_buf) > max_body:
-            raise HTTPException(status_code=413, detail="Audio exceeds max_audio_bytes")
-
-    raw_mime = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode(
-        "latin-1", errors="replace"
-    )
+    """Parse buffered multipart/form-data off the event loop without extra body copies."""
     try:
-        msg = BytesParser(policy=email.policy.default).parsebytes(raw_mime + bytes(body_buf))
+        msg = BytesParser(policy=email.policy.default).parsebytes(mime_buf)
     except Exception:
         raise HTTPException(status_code=400, detail="Malformed multipart/form-data body") from None
 
@@ -914,3 +917,36 @@ async def _parse_stt_multipart(
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Empty audio upload")
     return file_bytes, fmt, sample_rate, channels
+
+
+async def _parse_stt_multipart(
+    request: Request,
+    *,
+    max_audio_bytes: int,
+) -> tuple[bytes, str, int, int]:
+    """Parse POST /v1/stt multipart/form-data using stdlib BytesParser (no python-multipart)."""
+    content_type = request.headers.get("content-type", "").strip()
+    if (
+        "\r" in content_type
+        or "\n" in content_type
+        or "multipart/form-data" not in content_type.lower()
+        or "boundary=" not in content_type.lower()
+    ):
+        raise HTTPException(status_code=400, detail="multipart/form-data with boundary required")
+
+    raw_mime = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode(
+        "latin-1", errors="replace"
+    )
+    header_len = len(raw_mime)
+    max_body = max_audio_bytes + 65536
+    body_buf = bytearray(raw_mime)
+    async for chunk in request.stream():
+        body_buf.extend(chunk)
+        if len(body_buf) - header_len > max_body:
+            raise HTTPException(status_code=413, detail="Audio exceeds max_audio_bytes")
+
+    return await asyncio.to_thread(
+        _parse_stt_multipart_sync,
+        body_buf,
+        max_audio_bytes=max_audio_bytes,
+    )

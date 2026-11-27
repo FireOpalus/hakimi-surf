@@ -81,6 +81,10 @@ MAX_ACTIONS_LOG = 100
 
 _MARKDOWN_SAFE = str.maketrans({"<": "＜", ">": "＞", "[": "［", "]": "］", "`": "｀", "!": "！"})
 _PUBLIC_DEGRADE_ERRORS = PUBLIC_DEGRADE_ERRORS
+# HTTP 403/567 edge/CDN errors are intentionally excluded from 12h risk cooldown
+# (see test_cdn_errors_decoupled_from_12h_cooldown); HTTP 401 on authenticated API
+# calls maps to `bili_cookie_expired` alongside JSON code -101.
+_RISK_HTTP_STATUSES: frozenset[int] = frozenset({412, 429})
 
 
 def wbi_sign(
@@ -900,8 +904,11 @@ class BiliPatrolEngine:
                 raise BiliClientError("bili_account_unavailable") from None
             if code == "bili_http_status" or code.startswith("bili_http_status"):
                 combined = f"{code}:{detail}"
-                if not subtitle and re.search(r"(?<!\d)(412|429)(?!\d)", combined):
-                    await self._risk("bili_account_risk")
+                if not subtitle:
+                    if re.search(r"(?<!\d)(412|429)(?!\d)", combined):
+                        await self._risk("bili_account_risk")
+                    elif cookies.get("sessdata") and re.search(r"(?<!\d)401(?!\d)", combined):
+                        await self._risk("bili_cookie_expired")
                 raise BiliClientError("bili_account_unavailable") from None
             raise BiliClientError("bili_account_unavailable") from None
         except Exception:
@@ -946,7 +953,7 @@ class BiliPatrolEngine:
                     timeout=5,
                 )
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in {412, 429}:
+            if exc.response.status_code in _RISK_HTTP_STATUSES:
                 await self._risk("bili_account_risk")
             obj = None
         except BiliClientError as exc:
@@ -1060,8 +1067,11 @@ class BiliPatrolEngine:
                         max_bytes=524288,
                     )
             except httpx.HTTPStatusError as exc:
-                if not subtitle and exc.response.status_code in {412, 429}:
-                    await self._risk("bili_account_risk")
+                if not subtitle:
+                    if exc.response.status_code in _RISK_HTTP_STATUSES:
+                        await self._risk("bili_account_risk")
+                    elif not public and exc.response.status_code == 401:
+                        await self._risk("bili_cookie_expired")
                 raise BiliClientError("bili_account_unavailable") from None
             except BiliClientError:
                 raise

@@ -126,6 +126,8 @@ class SessionManager:
         self._file_count: int | None = None
         # key -> (next_expiry, last_sweep_wall, db_fingerprint)
         self._expiry_cache: dict[str, tuple[float | None, float, tuple[int, ...]]] = {}
+        # key -> (next_maintenance_due, db_fingerprint)
+        self._maintenance_cache: dict[str, tuple[float | None, tuple[int, ...]]] = {}
 
     def key(self, message: Message) -> str:
         if message.kind == "private" and message.conversation_id != message.user_id:
@@ -176,6 +178,7 @@ class SessionManager:
         self._file_count = None
         if key is not None:
             self._expiry_cache.pop(key, None)
+            self._maintenance_cache.pop(key, None)
 
     def _is_initialized_file(self, path: Path, key: str) -> tuple[int, ...] | None:
         if path not in self._initialized_paths:
@@ -202,6 +205,38 @@ class SessionManager:
             row = await cur.fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
+    @staticmethod
+    async def _min_maintenance_due(db) -> float | None:
+        async with db.execute(
+            "SELECT MIN(due) FROM ("
+            "SELECT MIN(expires) AS due FROM outgoing_receipts "
+            "UNION ALL "
+            "SELECT MIN(expires) AS due FROM received_messages "
+            "UNION ALL "
+            "SELECT MIN(c.created) + 5184000.0 AS due "
+            "FROM cold_history_slices c JOIN memory_slice_jobs j ON j.id=c.id "
+            "WHERE j.status='done' "
+            "AND c.id NOT IN (SELECT 'legacy-'||id FROM history_folds) "
+            "UNION ALL "
+            "SELECT MIN(expires) AS due FROM member_profiles "
+            "WHERE slot='state' AND locked=0 AND expires>0 "
+            "UNION ALL "
+            "SELECT MIN(updated) + 2592000.0 AS due FROM member_profiles "
+            "WHERE deleted=1 AND locked=0 "
+            "UNION ALL "
+            "SELECT MIN(updated) + 7776000.0 AS due FROM member_profiles "
+            "WHERE deleted=1 AND locked=1 "
+            "UNION ALL "
+            "SELECT MIN(updated) + 2592000.0 AS due FROM chronicle_events "
+            "WHERE deleted=1 AND locked=0 "
+            "UNION ALL "
+            "SELECT MIN(updated) + 7776000.0 AS due FROM chronicle_events "
+            "WHERE deleted=1 AND locked=1"
+            ") WHERE due IS NOT NULL"
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     def _needs_expiry_sweep(self, key: str, current_fp: tuple[int, ...] | None, now: float) -> bool:
         if current_fp is None:
             return True
@@ -213,10 +248,17 @@ class SessionManager:
             and (cached_expiry[0] is None or now < cached_expiry[0])
         )
 
-    def _needs_fold(self, texts: list[dict]) -> bool:
+    def _needs_fold(self, texts: list[dict], message: Message | None = None) -> bool:
         if not self.s.prefix_history_enabled or len(texts) < 2:
             return False
-        rendered = history_lines(texts, self.s.onebot_self_id)
+        self_id = (message.bot_id if message is not None else "") or self.s.onebot_self_id
+        platform = message.platform if message is not None else "onebot"
+        rendered = history_lines(
+            texts,
+            self_id,
+            timezone_name=self.s.bot_timezone,
+            platform=platform,
+        )
         high_tokens = (
             self.store.runtime.compression.history_high_tokens
             if self.store.runtime.compression_overridden
@@ -228,7 +270,14 @@ class SessionManager:
         )
 
     @asynccontextmanager
-    async def database(self, message: Message, *, preserve_history=False, readonly=False):
+    async def database(
+        self,
+        message: Message,
+        *,
+        preserve_history=False,
+        readonly=False,
+        checkpoint=False,
+    ):
         key, path = self.key(message), self.path(message)
         if readonly:
             async with self.locks[int(key[:8], 16) % len(self.locks)]:
@@ -286,9 +335,12 @@ class SessionManager:
             committed = False
             caller_wrote = False
             need_sweep = False
+            need_maint_refresh = False
             next_expiry: float | None = None
+            next_maint_due: float | None = None
             sweep_wall: float | None = None
             cached_expiry = self._expiry_cache.get(key) if fast_path else None
+            cached_maint = self._maintenance_cache.get(key) if fast_path else None
             async with aiosqlite.connect(path, isolation_level=None) as db:
                 if not fast_path:
                     await db.execute("PRAGMA journal_mode=WAL")
@@ -423,11 +475,20 @@ class SessionManager:
                         not fast_path and not caller_wrote
                     ):
                         next_expiry = await self._min_expiry(db)
+                    need_maint_refresh = (
+                        not preserve_history
+                        and (need_sweep or caller_wrote or cached_maint is None or checkpoint)
+                    ) or (not fast_path and not caller_wrote)
+                    if need_maint_refresh:
+                        next_maint_due = await self._min_maintenance_due(db)
                     await db.commit()
                     committed = True
+                    if checkpoint:
+                        await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except BaseException:
                     await db.rollback()
                     self._expiry_cache.pop(key, None)
+                    self._maintenance_cache.pop(key, None)
                     raise
             if committed:
                 post_fp = self._db_fingerprint(path)
@@ -437,27 +498,39 @@ class SessionManager:
                     if preserve_history:
                         if caller_wrote:
                             self._expiry_cache.pop(key, None)
+                            self._maintenance_cache.pop(key, None)
                         elif not fast_path:
                             self._expiry_cache[key] = (next_expiry, time.time(), post_fp)
+                            self._maintenance_cache[key] = (next_maint_due, post_fp)
+                        else:
+                            if cached_expiry is not None:
+                                self._expiry_cache[key] = (
+                                    cached_expiry[0],
+                                    cached_expiry[1],
+                                    post_fp,
+                                )
+                            if cached_maint is not None:
+                                self._maintenance_cache[key] = (cached_maint[0], post_fp)
+                    else:
+                        if need_sweep or caller_wrote:
+                            last_wall = (
+                                sweep_wall
+                                if sweep_wall is not None
+                                else (
+                                    cached_expiry[1] if cached_expiry is not None else time.time()
+                                )
+                            )
+                            self._expiry_cache[key] = (next_expiry, last_wall, post_fp)
                         elif cached_expiry is not None:
                             self._expiry_cache[key] = (
                                 cached_expiry[0],
                                 cached_expiry[1],
                                 post_fp,
                             )
-                    elif need_sweep or caller_wrote:
-                        last_wall = (
-                            sweep_wall
-                            if sweep_wall is not None
-                            else (cached_expiry[1] if cached_expiry is not None else time.time())
-                        )
-                        self._expiry_cache[key] = (next_expiry, last_wall, post_fp)
-                    elif cached_expiry is not None:
-                        self._expiry_cache[key] = (
-                            cached_expiry[0],
-                            cached_expiry[1],
-                            post_fp,
-                        )
+                        if need_maint_refresh:
+                            self._maintenance_cache[key] = (next_maint_due, post_fp)
+                        elif cached_maint is not None:
+                            self._maintenance_cache[key] = (cached_maint[0], post_fp)
 
     async def _migrate_private(self, db, message: Message, key: str):
         # Legacy group memory was per-user. Never merge it into a shared group session.
@@ -556,7 +629,7 @@ class SessionManager:
                 async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id") as cur:
                     rows = await cur.fetchall()
                 decoded = [{**self.vault.open(key, row[1]), "seq": row[0]} for row in rows]
-                if not self._needs_fold(decoded):
+                if not self._needs_fold(decoded, message):
                     async with db.execute(
                         "SELECT summary,epoch,version,retry_after,trim_version FROM rolling_state"
                     ) as cur:
@@ -998,6 +1071,7 @@ class SessionManager:
                     + digest[:MAX_IMAGE_DIGEST_CHARS]
                     + "]",
                 )
+            await db.execute("DELETE FROM outgoing_receipts WHERE expires<?", (time.time(),))
             await self._fold_history(db, key, message)
             return True
 
@@ -1133,7 +1207,13 @@ class SessionManager:
         async with db.execute("SELECT id,payload FROM recent_messages ORDER BY id") as cur:
             rows = await cur.fetchall()
         texts = [{**self.vault.open(key, r[1]), "seq": r[0]} for r in rows]
-        rendered = history_lines(texts, self.s.onebot_self_id)
+        self_id = message.bot_id or self.s.onebot_self_id
+        rendered = history_lines(
+            texts,
+            self_id,
+            timezone_name=self.s.bot_timezone,
+            platform=message.platform,
+        )
         high_tokens = (
             self.store.runtime.compression.history_high_tokens
             if self.store.runtime.compression_overridden
@@ -1148,7 +1228,14 @@ class SessionManager:
         # encrypted before removal, so a restart cannot lose the compression hand-off.
         target, running, half = estimate_tokens(rendered) / 2, 0, 0
         for entry in texts[:-1]:
-            running += estimate_tokens(history_lines([entry], self.s.onebot_self_id))
+            running += estimate_tokens(
+                history_lines(
+                    [entry],
+                    self_id,
+                    timezone_name=self.s.bot_timezone,
+                    platform=message.platform,
+                )
+            )
             half += 1
             if running >= target:
                 break
@@ -1411,15 +1498,25 @@ class SessionManager:
                     continue
                 fp = self._is_initialized_file(path, key)
                 cached = self._expiry_cache.get(key) if fp is not None else None
-                if (
+                maint_cached = self._maintenance_cache.get(key) if fp is not None else None
+                cache_clean = (
                     fp is not None
                     and cached is not None
                     and cached[2] == fp
                     and (cached[0] is None or now < cached[0])
-                ):
+                )
+                maint_clean = (
+                    fp is not None
+                    and maint_cached is not None
+                    and maint_cached[1] == fp
+                    and (maint_cached[0] is None or now < maint_cached[0])
+                )
+                if cache_clean and maint_clean:
                     continue
-                async with self.database(message):
-                    pass
+                async with self.database(message, checkpoint=True) as (db, sess_key):
+                    await db.execute("DELETE FROM outgoing_receipts WHERE expires<=?", (now,))
+                    await db.execute("DELETE FROM received_messages WHERE expires<=?", (now,))
+                    await self.dual.prune_in_db(db, sess_key, now)
             return
         # Expiry erasure also applies to sessions that receive no further messages.
         for path in self.root.glob("*/*.sqlite3"):
@@ -1428,44 +1525,63 @@ class SessionManager:
             key = path.stem
             fp = self._is_initialized_file(path, key)
             cached = self._expiry_cache.get(key) if fp is not None else None
-            if (
+            maint_cached = self._maintenance_cache.get(key) if fp is not None else None
+            cache_clean = (
                 fp is not None
                 and cached is not None
                 and cached[2] == fp
                 and (cached[0] is None or now < cached[0])
-            ):
+            )
+            maint_clean = (
+                fp is not None
+                and maint_cached is not None
+                and maint_cached[1] == fp
+                and (maint_cached[0] is None or now < maint_cached[0])
+            )
+            if cache_clean and maint_clean:
                 continue
             async with self.locks[int(key[:8], 16) % len(self.locks)]:
                 async with aiosqlite.connect(path) as db:
                     await db.execute("PRAGMA secure_delete=ON")
-                    await db.execute("DELETE FROM turns WHERE expires<=?", (now,))
                     async with db.execute(
-                        "SELECT name FROM sqlite_master WHERE name='rolling_state'"
+                        "SELECT name FROM sqlite_master WHERE type='table'"
                     ) as cur:
-                        if await cur.fetchone():
-                            deleted = await db.execute(
-                                "DELETE FROM recent_messages WHERE expires<=?", (now,)
-                            )
+                        tables = {row[0] for row in await cur.fetchall()}
+                    if "turns" in tables:
+                        await db.execute("DELETE FROM turns WHERE expires<=?", (now,))
+                    if "outgoing_receipts" in tables:
+                        await db.execute("DELETE FROM outgoing_receipts WHERE expires<=?", (now,))
+                    if "received_messages" in tables:
+                        await db.execute("DELETE FROM received_messages WHERE expires<=?", (now,))
+                    if "rolling_state" in tables:
+                        deleted = await db.execute(
+                            "DELETE FROM recent_messages WHERE expires<=?", (now,)
+                        )
+                        if deleted.rowcount:
+                            await db.execute("UPDATE rolling_state SET trim_version=trim_version+1")
+                        await db.execute(
+                            "UPDATE rolling_state SET "
+                            "summary=NULL,version=version+1 "
+                            "WHERE summary IS NOT NULL AND expires<=?",
+                            (now,),
+                        )
+                        if "interaction_chains" in tables:
                             if deleted.rowcount:
+                                await db.execute("DELETE FROM interaction_chains")
+                            else:
                                 await db.execute(
-                                    "UPDATE rolling_state SET trim_version=trim_version+1"
+                                    "DELETE FROM interaction_chains WHERE expires<=?",
+                                    (now,),
                                 )
-                            await db.execute(
-                                "UPDATE rolling_state SET "
-                                "summary=NULL,version=version+1 "
-                                "WHERE summary IS NOT NULL AND expires<=?",
-                                (now,),
-                            )
-                            async with db.execute(
-                                "SELECT name FROM sqlite_master WHERE name='interaction_chains'"
-                            ) as chain_cur:
-                                if await chain_cur.fetchone():
-                                    if deleted.rowcount:
-                                        await db.execute("DELETE FROM interaction_chains")
-                                    else:
-                                        await db.execute(
-                                            "DELETE FROM interaction_chains WHERE expires<=?",
-                                            (now,),
-                                        )
+                    if {
+                        "cold_history_slices",
+                        "memory_slice_jobs",
+                        "member_profiles",
+                        "chronicle_events",
+                        "history_folds",
+                    }.issubset(tables):
+                        await self.dual.prune_in_db(db, key, now)
                     await db.commit()
+                    await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 self._expiry_cache.pop(key, None)
+                self._maintenance_cache.pop(key, None)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -23,8 +24,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import wave
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -601,6 +604,42 @@ class ColabConnectionLostError(RuntimeError):
     """Raised when `colab` reports a dropped Jupyter WebSocket connection."""
 
 
+class JobCancelledError(RuntimeError):
+    """Raised when cooperative cancellation is requested via `cancel_event`."""
+
+
+def _check_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise JobCancelledError("cancelled")
+
+
+def _sleep_cancellable(seconds: float, cancel_event: threading.Event | None) -> None:
+    if seconds <= 0:
+        _check_cancelled(cancel_event)
+        return
+    if cancel_event is None:
+        time.sleep(seconds)
+        return
+    if cancel_event.wait(seconds):
+        raise JobCancelledError("cancelled")
+
+
+def _accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return name in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
+def _cancel_kwargs(fn: Callable[..., Any], cancel_event: threading.Event | None) -> dict[str, Any]:
+    if cancel_event is not None and _accepts_kwarg(fn, "cancel_event"):
+        return {"cancel_event": cancel_event}
+    return {}
+
+
 def _ensure_colab_installed() -> None:
     if not COLAB_BIN.is_file() or not COLAB_PYTHON.is_file():
         raise RuntimeError(
@@ -639,7 +678,9 @@ def _stream_process_with_watchdog(
     conn_lost_grace: float = 3.0,
     stream: bool = True,
     redact_secrets: tuple[str, ...] = (),
+    cancel_event: threading.Event | None = None,
 ) -> tuple[int, str]:
+    _check_cancelled(cancel_event)
     proc = subprocess.Popen(
         cmd,
         env=env,
@@ -675,31 +716,63 @@ def _stream_process_with_watchdog(
     lines: list[str] = []
     conn_lost = False
     conn_lost_deadline: float | None = None
+    last_activity = time.monotonic()
+
+    def _close_stdout() -> None:
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
     while True:
-        wait_sec = idle_timeout
+        if cancel_event is not None and cancel_event.is_set():
+            _terminate_proc(proc)
+            _close_stdout()
+            raise JobCancelledError("cancelled")
+        now = time.monotonic()
+        wait_sec: float | None = None
+        if idle_timeout is not None:
+            idle_remaining = (last_activity + idle_timeout) - now
+            if idle_remaining <= 0:
+                if conn_lost:
+                    break
+                _terminate_proc(proc)
+                _close_stdout()
+                raise TimeoutError(
+                    f"Command stalled for {idle_timeout}s: {_redact_cmd(cmd, *redact_secrets)}"
+                ) from None
+            wait_sec = idle_remaining
         if conn_lost_deadline is not None:
-            remaining = conn_lost_deadline - time.monotonic()
+            remaining = conn_lost_deadline - now
             if remaining <= 0:
                 break
             wait_sec = min(remaining, wait_sec) if wait_sec is not None else remaining
+        if cancel_event is not None:
+            wait_sec = min(wait_sec, 0.25) if wait_sec is not None else 0.25
         try:
             item = q.get(timeout=wait_sec)
         except queue.Empty:
-            if conn_lost:
+            if cancel_event is not None and cancel_event.is_set():
+                _terminate_proc(proc)
+                _close_stdout()
+                raise JobCancelledError("cancelled") from None
+            now_after = time.monotonic()
+            if conn_lost_deadline is not None and now_after >= conn_lost_deadline:
                 break
-            _terminate_proc(proc)
-            if proc.stdout is not None:
-                try:
-                    proc.stdout.close()
-                except Exception:
-                    pass
-            raise TimeoutError(
-                f"Command stalled for {idle_timeout}s: {_redact_cmd(cmd, *redact_secrets)}"
-            ) from None
+            if idle_timeout is not None and now_after - last_activity >= idle_timeout:
+                if conn_lost:
+                    break
+                _terminate_proc(proc)
+                _close_stdout()
+                raise TimeoutError(
+                    f"Command stalled for {idle_timeout}s: {_redact_cmd(cmd, *redact_secrets)}"
+                ) from None
+            continue
 
         if item is None:
             break
+        last_activity = time.monotonic()
         safe_item = _redact_text(item, *redact_secrets)
         if stream:
             sys.stdout.write(safe_item)
@@ -711,11 +784,7 @@ def _stream_process_with_watchdog(
 
     if conn_lost:
         _terminate_proc(proc)
-        if proc.stdout is not None:
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
+        _close_stdout()
         raise ColabConnectionLostError("Colab WebSocket connection was lost.")
 
     try:
@@ -723,11 +792,7 @@ def _stream_process_with_watchdog(
     except subprocess.TimeoutExpired:
         _terminate_proc(proc)
         rc = proc.wait()
-    if proc.stdout is not None:
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
+    _close_stdout()
     return rc, "".join(lines)
 
 
@@ -740,7 +805,9 @@ def _run_colab(
     stdin_text: str | None = None,
     idle_timeout: float | None = 600.0,
     redact_secrets: tuple[str, ...] = (),
+    cancel_event: threading.Event | None = None,
 ) -> tuple[int, str]:
+    _check_cancelled(cancel_event)
     _ensure_colab_installed()
     if require_adc and not COLAB_ADC_PATH.is_file():
         raise RuntimeError(
@@ -756,6 +823,7 @@ def _run_colab(
         idle_timeout=idle_timeout,
         stream=stream,
         redact_secrets=redact_secrets,
+        cancel_event=cancel_event,
     )
     if check and rc != 0:
         raise RuntimeError(f"colab {_redact_cmd(args, *redact_secrets)} failed (exit {rc})")
@@ -894,25 +962,65 @@ def _parse_prefixed_json(output: str, prefix: str) -> dict[str, Any] | None:
     return None
 
 
+def _push_remote_secrets_file(
+    session: str,
+    secret_env: dict[str, str],
+    *,
+    redact_secrets: tuple[str, ...] = (),
+    cancel_event: threading.Event | None = None,
+) -> str:
+    """Push sensitive env vars via a 0600 file so tokens stay out of /proc/<pid>/cmdline."""
+    remote_path = f"/tmp/.hakimi_sec_{uuid.uuid4().hex}.json"
+    with tempfile.TemporaryDirectory(prefix="hakimi_sec_") as tmp:
+        local_path = Path(tmp) / "secrets.json"
+        _write_secret_json(local_path, secret_env)
+        _run_colab(
+            ["upload", "-s", session, str(local_path), remote_path],
+            check=True,
+            stream=False,
+            idle_timeout=60.0,
+            redact_secrets=redact_secrets,
+            **_cancel_kwargs(_run_colab, cancel_event),
+        )
+    return remote_path
+
+
 def exec_remote_worker(
     session: str,
     action: str,
     env_vars: dict[str, str] | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Execute scripts/colab_remote_rvc.py on the Colab session and verify sentinel."""
-    args = ["exec", "-s", session, "--timeout", "0", "--env", f"HAKIMI_COLAB_ACTION={action}"]
+    _check_cancelled(cancel_event)
+    base_args = ["exec", "-s", session, "--timeout", "0", "--env", f"HAKIMI_COLAB_ACTION={action}"]
+    secret_env: dict[str, str] = {}
     secrets_list: list[str] = []
     for k, v in (env_vars or {}).items():
         val = str(v)
-        args.extend(["--env", f"{k}={val}"])
-        if _SECRET_ENV_KEY_RE.search(k) and len(val) >= 6:
-            secrets_list.append(val)
+        if _SECRET_ENV_KEY_RE.search(k):
+            secret_env[k] = val
+            if len(val) >= 6:
+                secrets_list.append(val)
+        else:
+            base_args.extend(["--env", f"{k}={val}"])
     redact_secrets = tuple(secrets_list)
-    args.extend(["-f", str(REMOTE_WORKER_PATH)])
 
     max_attempts = 3 if action in {"setup", "reassemble", "split"} else 1
     output = ""
     for attempt in range(1, max_attempts + 1):
+        _check_cancelled(cancel_event)
+        args = list(base_args)
+        if secret_env:
+            remote_sec_path = _push_remote_secrets_file(
+                session,
+                secret_env,
+                redact_secrets=redact_secrets,
+                cancel_event=cancel_event,
+            )
+            args.extend(["--env", f"HAKIMI_SECRETS_FILE={remote_sec_path}"])
+        args.extend(["-f", str(REMOTE_WORKER_PATH)])
         try:
             _, output = _run_colab(
                 args,
@@ -920,6 +1028,7 @@ def exec_remote_worker(
                 stream=True,
                 idle_timeout=600.0,
                 redact_secrets=redact_secrets,
+                **_cancel_kwargs(_run_colab, cancel_event),
             )
             break
         except (ColabConnectionLostError, TimeoutError) as exc:
@@ -930,7 +1039,7 @@ def exec_remote_worker(
                 f"(attempt {attempt}/{max_attempts}: {_redact_text(exc, *redact_secrets)}); "
                 "retrying in 5s..."
             )
-            time.sleep(5.0)
+            _sleep_cancellable(5.0, cancel_event)
 
     for line in reversed(output.splitlines()):
         if line.startswith(STATUS_ERR_PREFIX):
@@ -1002,24 +1111,33 @@ def probe_warm_session(session: str) -> dict[str, Any]:
     }
 
 
-def _ensure_remote_dirs(session: str, remote_dirs: list[str]) -> None:
+def _ensure_remote_dirs(
+    session: str,
+    remote_dirs: list[str],
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     literal = json.dumps(remote_dirs)
     code = f"import os\nfor d in {literal}: os.makedirs(d, exist_ok=True)\n"
     last_err: Exception | None = None
     for attempt in range(1, 4):
+        _check_cancelled(cancel_event)
         try:
             _run_colab(
                 ["exec", "-s", session, "--timeout", "60"],
                 stdin_text=code,
                 stream=False,
                 idle_timeout=60.0,
+                **_cancel_kwargs(_run_colab, cancel_event),
             )
             return
+        except JobCancelledError:
+            raise
         except Exception as exc:
             last_err = exc
             if attempt < 3:
                 log(f"Creating remote dirs failed (attempt {attempt}/3: {exc}); retrying in 4s...")
-                time.sleep(4.0)
+                _sleep_cancellable(4.0, cancel_event)
     raise RuntimeError(f"Failed creating remote dirs: {last_err}")
 
 
@@ -1030,8 +1148,10 @@ def upload_file_chunked(
     *,
     chunk_mb: int = DEFAULT_CHUNK_MB,
     tag: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Upload a file to Colab, chunking with SHA-256 verification when larger than chunk_mb."""
+    _check_cancelled(cancel_event)
     if not local_path.is_file():
         raise FileNotFoundError(f"Local file to upload not found: {local_path}")
     remote_parent = str(Path(remote_path).parent)
@@ -1039,14 +1159,18 @@ def upload_file_chunked(
     size = local_path.stat().st_size
 
     if size <= chunk_bytes:
-        _ensure_remote_dirs(session, [remote_parent])
+        _ensure_remote_dirs(session, [remote_parent], cancel_event=cancel_event)
         log(f"Uploading {local_path.name} ({size} B) -> {remote_path}...")
-        _run_colab(["upload", "-s", session, str(local_path), remote_path], idle_timeout=90.0)
+        _run_colab(
+            ["upload", "-s", session, str(local_path), remote_path],
+            idle_timeout=90.0,
+            **_cancel_kwargs(_run_colab, cancel_event),
+        )
         return
 
     safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", tag or local_path.stem)
     remote_chunk_dir = f"/content/in_chunks/{safe_tag}"
-    _ensure_remote_dirs(session, [remote_parent, remote_chunk_dir])
+    _ensure_remote_dirs(session, [remote_parent, remote_chunk_dir], cancel_event=cancel_event)
     expected_sha = _sha256_file(local_path)
 
     with tempfile.TemporaryDirectory(prefix="hakimi_up_") as tmp:
@@ -1062,10 +1186,12 @@ def upload_file_chunked(
 
         log(f"Uploading {local_path.name} ({size} B) in {len(parts)} chunk(s)...")
         for i, part in enumerate(parts, start=1):
+            _check_cancelled(cancel_event)
             log(f"  chunk {i}/{len(parts)}: {part.name} ({part.stat().st_size} B)")
             _run_colab(
                 ["upload", "-s", session, str(part), f"{remote_chunk_dir}/{part.name}"],
                 idle_timeout=90.0,
+                **_cancel_kwargs(_run_colab, cancel_event),
             )
 
     exec_remote_worker(
@@ -1076,6 +1202,7 @@ def upload_file_chunked(
             "HAKIMI_OUTPUT_PATH": remote_path,
             "HAKIMI_EXPECTED_SHA256": expected_sha,
         },
+        **_cancel_kwargs(exec_remote_worker, cancel_event),
     )
 
 
@@ -1083,8 +1210,11 @@ def download_chunked_dir(
     session: str,
     remote_chunk_dir: str,
     local_output_path: Path,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     """Download a remote chunked directory, reassemble, and verify SHA-256."""
+    _check_cancelled(cancel_event)
     local_output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="hakimi_dl_") as tmp:
         tmp_dir = Path(tmp)
@@ -1092,6 +1222,7 @@ def download_chunked_dir(
         _run_colab(
             ["download", "-s", session, f"{remote_chunk_dir}/manifest.json", str(manifest_local)],
             idle_timeout=90.0,
+            **_cancel_kwargs(_run_colab, cancel_event),
         )
         manifest = json.loads(manifest_local.read_text(encoding="utf-8"))
         chunks: list[str] = list(manifest["chunks"])
@@ -1101,11 +1232,13 @@ def download_chunked_dir(
         digest = hashlib.sha256()
         with tmp_out.open("wb") as dst:
             for idx, part_name in enumerate(chunks, start=1):
+                _check_cancelled(cancel_event)
                 part_local = tmp_dir / part_name
                 log(f"Downloading {manifest['filename']} chunk {idx}/{len(chunks)}...")
                 _run_colab(
                     ["download", "-s", session, f"{remote_chunk_dir}/{part_name}", str(part_local)],
                     idle_timeout=90.0,
+                    **_cancel_kwargs(_run_colab, cancel_event),
                 )
                 data = part_local.read_bytes()
                 digest.update(data)
@@ -1122,27 +1255,36 @@ def download_chunked_dir(
     return local_output_path
 
 
-def _wait_kernel_ready(session: str, *, retries: int = 3) -> None:
+def _wait_kernel_ready(
+    session: str,
+    *,
+    retries: int = 3,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Wait briefly for a newly-booted Colab runtime's Jupyter kernel WebSocket."""
-    time.sleep(4.0)
+    _sleep_cancellable(4.0, cancel_event)
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
+        _check_cancelled(cancel_event)
         try:
             _, out = _run_colab(
                 ["exec", "-s", session, "--timeout", "60"],
                 stdin_text='print("__READY__", flush=True)\n',
                 stream=False,
                 idle_timeout=60.0,
+                **_cancel_kwargs(_run_colab, cancel_event),
             )
             if "__READY__" in out:
                 log(f"Colab kernel warmup confirmed for '{session}'.")
                 return
             last_err = RuntimeError(f"Kernel warmup output missing __READY__: {out[:200]}")
+        except JobCancelledError:
+            raise
         except Exception as exc:
             last_err = exc
         if attempt < retries:
             log(f"Kernel warmup attempt {attempt}/{retries} failed ({last_err}); retrying in 5s...")
-            time.sleep(5.0)
+            _sleep_cancellable(5.0, cancel_event)
     raise RuntimeError(f"Colab kernel failed warmup after {retries} attempts: {last_err}")
 
 
@@ -1152,8 +1294,10 @@ def provision_gpu(
     gpu: str = "L4",
     strict_gpu: bool = False,
     high_mem: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Provision a Colab GPU runtime, supporting comma-separated fallbacks (e.g. H100,A100)."""
+    _check_cancelled(cancel_event)
     if "," in gpu:
         candidates = [part.strip() for part in gpu.split(",") if part.strip()]
         if not candidates:
@@ -1162,16 +1306,21 @@ def provision_gpu(
         candidates = [gpu] if (strict_gpu or gpu.upper() == "T4") else [gpu, "T4"]
     last_err: Exception | None = None
     for accel in candidates:
+        _check_cancelled(cancel_event)
         cmd = ["new", "-s", session, "--gpu", accel]
         if high_mem and accel.upper() != "L4":
             cmd.append("--high-mem")
         created = False
         try:
             log(f"Provisioning Colab session '{session}' with GPU={accel}...")
-            _run_colab(cmd, idle_timeout=120.0)
+            _run_colab(cmd, idle_timeout=120.0, **_cancel_kwargs(_run_colab, cancel_event))
             created = True
-            _wait_kernel_ready(session, retries=3)
+            _wait_kernel_ready(session, retries=3, cancel_event=cancel_event)
             return accel
+        except JobCancelledError:
+            if created:
+                stop_session(session)
+            raise
         except Exception as exc:
             last_err = exc
             log(f"Failed provisioning GPU={accel}: {exc}")
@@ -1372,8 +1521,13 @@ def parse_colab_usage() -> dict[str, Any]:
             "error": "colab_adc_missing",
         }
     try:
-        rc_u, out_u = _run_colab(["usage"], check=False, stream=False, idle_timeout=30.0)
-        rc_s, out_s = _run_colab(["sessions"], check=False, stream=False, idle_timeout=30.0)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_u = pool.submit(_run_colab, ["usage"], check=False, stream=False, idle_timeout=30.0)
+            fut_s = pool.submit(
+                _run_colab, ["sessions"], check=False, stream=False, idle_timeout=30.0
+            )
+            rc_u, out_u = fut_u.result()
+            rc_s, out_s = fut_s.result()
     except Exception as exc:
         return {
             "reachable": False,
@@ -1524,8 +1678,10 @@ def run_cover_pipeline(
     reused_svc_ready: bool | None = None,
     reused_rvc_ready: bool | None = None,
     keep_session_on_success: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run Colab SVC/RVC cover with Drive direct transfer, warm session reuse, and weight cache."""
+    _check_cancelled(cancel_event)
     _validate_bool_flag("skip_backing", skip_backing)
     _validate_bool_flag("skip_dereverb", skip_dereverb)
     clamped_backing_gain_db = _validate_backing_gain_db(backing_gain_db)
@@ -1550,8 +1706,13 @@ def run_cover_pipeline(
         effective_engine = _validate_cover_engine(engine)
     is_rvc = effective_engine == "rvc"
 
+    _check_cancelled(cancel_event)
     warm_reused = bool(reuse_session and reused_gpu)
-    assigned_gpu = reused_gpu if warm_reused else provision_gpu(session, gpu=gpu_spec)
+    assigned_gpu = (
+        reused_gpu
+        if warm_reused
+        else provision_gpu(session, gpu=gpu_spec, **_cancel_kwargs(provision_gpu, cancel_event))
+    )
     can_keep_session = bool(keep_session_on_success and assigned_gpu in {"L4", "T4"})
     succeeded = False
     drive_direct_used = False
@@ -1559,6 +1720,7 @@ def run_cover_pipeline(
     weight_cache_hit: bool | None = None
     weight_cache_written = False
     weight_cache_has_sep = False
+    weight_cache_has_svc = False
     venv_cache_hit: bool | None = None
     venv_cache_written = False
 
@@ -1604,6 +1766,7 @@ def run_cover_pipeline(
         profile_setup_ready = bool(eff_sep and eff_svc)
 
     try:
+        _check_cancelled(cancel_event)
         if not (warm_reused and profile_setup_ready):
             setup_mode = "cover" if is_rvc else "svc"
             setup_env: dict[str, str] = {"HAKIMI_SETUP_MODE": setup_mode}
@@ -1623,18 +1786,22 @@ def run_cover_pipeline(
                     setup_env["HAKIMI_CACHE_VENV_SHA256"] = cache_venv_sha256
                 if is_rvc and cache_venv_fingerprint:
                     setup_env["HAKIMI_CACHE_VENV_FINGERPRINT"] = cache_venv_fingerprint
-                if is_rvc and cache_writeback:
+                if cache_writeback:
                     setup_env["HAKIMI_CACHE_WRITEBACK"] = "1"
-            setup_out = exec_remote_worker(session, "setup", setup_env)
+            setup_out = exec_remote_worker(
+                session, "setup", setup_env, **_cancel_kwargs(exec_remote_worker, cancel_event)
+            )
             c_stat = _parse_prefixed_json(setup_out, CACHE_STATUS_PREFIX) or {}
             if c_stat.get("weight_cache_hit") is not None:
                 weight_cache_hit = bool(c_stat.get("weight_cache_hit"))
             weight_cache_written = bool(c_stat.get("weight_cache_written"))
             weight_cache_has_sep = bool(c_stat.get("weight_cache_has_sep_models"))
+            weight_cache_has_svc = bool(c_stat.get("weight_cache_has_svc_models"))
             if c_stat.get("venv_cache_hit") is not None:
                 venv_cache_hit = bool(c_stat.get("venv_cache_hit"))
             venv_cache_written = bool(c_stat.get("venv_cache_written"))
 
+        _check_cancelled(cancel_event)
         remote_pth = f"/content/out/{model_name}.pth"
         remote_idx = f"/content/out/{model_name}.index"
         ref_ext = drive_ref_audio_ext if drive_ref_audio_ext.startswith(".") else ".wav"
@@ -1649,14 +1816,32 @@ def run_cover_pipeline(
 
         if is_rvc and not use_direct_model:
             loc_pth, loc_idx = _resolve_local_model()
-            upload_file_chunked(session, loc_pth, remote_pth, tag=f"{model_name}_pth")
-            upload_file_chunked(session, loc_idx, remote_idx, tag=f"{model_name}_idx")
+            upload_file_chunked(
+                session,
+                loc_pth,
+                remote_pth,
+                tag=f"{model_name}_pth",
+                **_cancel_kwargs(upload_file_chunked, cancel_event),
+            )
+            upload_file_chunked(
+                session,
+                loc_idx,
+                remote_idx,
+                tag=f"{model_name}_idx",
+                **_cancel_kwargs(upload_file_chunked, cancel_event),
+            )
 
         if not is_rvc and not use_direct_ref:
             loc_ref = _resolve_local_ref()
             ref_ext = loc_ref.suffix or ".wav"
             remote_ref = f"/content/out/hakimi_ref{ref_ext}"
-            upload_file_chunked(session, loc_ref, remote_ref, tag="svc_ref_audio")
+            upload_file_chunked(
+                session,
+                loc_ref,
+                remote_ref,
+                tag="svc_ref_audio",
+                **_cancel_kwargs(upload_file_chunked, cancel_event),
+            )
 
         if use_direct_source:
             ext = drive_source_ext if drive_source_ext.startswith(".") else ".m4a"
@@ -1665,7 +1850,13 @@ def run_cover_pipeline(
             loc_src = _resolve_local_source()
             ext = loc_src.suffix or ".m4a"
             remote_source = f"/content/work/source_song{ext}"
-            upload_file_chunked(session, loc_src, remote_source, tag="source_song")
+            upload_file_chunked(
+                session,
+                loc_src,
+                remote_source,
+                tag="source_song",
+                **_cancel_kwargs(upload_file_chunked, cancel_event),
+            )
 
         cover_env: dict[str, str] = {
             "HAKIMI_COVER_ENGINE": effective_engine,
@@ -1707,22 +1898,31 @@ def run_cover_pipeline(
             cover_env["HAKIMI_COVER_PREFIX"] = cover_prefix or "cover"
             if song_title:
                 cover_env["HAKIMI_SONG_TITLE"] = song_title[:80]
+        needs_weight_writeback = (
+            not (weight_cache_hit and weight_cache_has_sep)
+            if is_rvc
+            else not (weight_cache_hit and weight_cache_has_sep and weight_cache_has_svc)
+        )
         if (
-            is_rvc
-            and cache_writeback
+            cache_writeback
             and drive_access_token
             and cache_folder_id
             and not warm_reused
-            and not (weight_cache_hit and weight_cache_has_sep)
+            and needs_weight_writeback
         ):
             cover_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
             cover_env["HAKIMI_CACHE_FOLDER_ID"] = cache_folder_id
             cover_env["HAKIMI_CACHE_WRITEBACK"] = "1"
             cover_env["HAKIMI_CACHE_WEIGHTS_WRITEBACK_AFTER_COVER"] = "1"
 
+        _check_cancelled(cancel_event)
         try:
-            cover_out = exec_remote_worker(session, "cover", cover_env)
+            cover_out = exec_remote_worker(
+                session, "cover", cover_env, **_cancel_kwargs(exec_remote_worker, cancel_event)
+            )
         except RuntimeError as exc:
+            if isinstance(exc, JobCancelledError):
+                raise
             if (
                 use_direct_source or use_direct_model or use_direct_ref
             ) and "drive_direct_input_failed:" in str(exc):
@@ -1730,28 +1930,54 @@ def run_cover_pipeline(
                 drive_direct_fallback = True
                 if use_direct_model:
                     loc_pth, loc_idx = _resolve_local_model()
-                    upload_file_chunked(session, loc_pth, remote_pth, tag=f"{model_name}_pth")
-                    upload_file_chunked(session, loc_idx, remote_idx, tag=f"{model_name}_idx")
+                    upload_file_chunked(
+                        session,
+                        loc_pth,
+                        remote_pth,
+                        tag=f"{model_name}_pth",
+                        **_cancel_kwargs(upload_file_chunked, cancel_event),
+                    )
+                    upload_file_chunked(
+                        session,
+                        loc_idx,
+                        remote_idx,
+                        tag=f"{model_name}_idx",
+                        **_cancel_kwargs(upload_file_chunked, cancel_event),
+                    )
                     cover_env.pop("HAKIMI_DRIVE_PTH_FILE_ID", None)
                     cover_env.pop("HAKIMI_DRIVE_INDEX_FILE_ID", None)
                 if use_direct_ref:
                     loc_ref = _resolve_local_ref()
                     ref_ext = loc_ref.suffix or ".wav"
                     remote_ref = f"/content/out/hakimi_ref{ref_ext}"
-                    upload_file_chunked(session, loc_ref, remote_ref, tag="svc_ref_audio")
+                    upload_file_chunked(
+                        session,
+                        loc_ref,
+                        remote_ref,
+                        tag="svc_ref_audio",
+                        **_cancel_kwargs(upload_file_chunked, cancel_event),
+                    )
                     cover_env["HAKIMI_REF_AUDIO"] = remote_ref
                     cover_env.pop("HAKIMI_DRIVE_REF_VOICE_FILE_ID", None)
                 if use_direct_source:
                     loc_src = _resolve_local_source()
                     ext = loc_src.suffix or ".m4a"
                     remote_source = f"/content/work/source_song{ext}"
-                    upload_file_chunked(session, loc_src, remote_source, tag="source_song")
+                    upload_file_chunked(
+                        session,
+                        loc_src,
+                        remote_source,
+                        tag="source_song",
+                        **_cancel_kwargs(upload_file_chunked, cancel_event),
+                    )
                     cover_env["HAKIMI_SOURCE_AUDIO"] = remote_source
                     cover_env.pop("HAKIMI_DRIVE_SOURCE_FILE_ID", None)
                 use_direct_source = False
                 use_direct_model = False
                 use_direct_ref = False
-                cover_out = exec_remote_worker(session, "cover", cover_env)
+                cover_out = exec_remote_worker(
+                    session, "cover", cover_env, **_cancel_kwargs(exec_remote_worker, cancel_event)
+                )
             else:
                 raise
 
@@ -1810,11 +2036,22 @@ def run_cover_pipeline(
         full_mp3 = cover_dir / "cover_full.mp3"
         chorus_mp3 = cover_dir / "cover_chorus.mp3"
         meta_json = cover_dir / "cover_meta.json"
-        download_chunked_dir(session, "/content/out_chunks/cover_full", full_mp3)
-        download_chunked_dir(session, "/content/out_chunks/cover_chorus", chorus_mp3)
+        download_chunked_dir(
+            session,
+            "/content/out_chunks/cover_full",
+            full_mp3,
+            **_cancel_kwargs(download_chunked_dir, cancel_event),
+        )
+        download_chunked_dir(
+            session,
+            "/content/out_chunks/cover_chorus",
+            chorus_mp3,
+            **_cancel_kwargs(download_chunked_dir, cancel_event),
+        )
         _run_colab(
             ["download", "-s", session, "/content/out/cover_meta.json", str(meta_json)],
             idle_timeout=90.0,
+            **_cancel_kwargs(_run_colab, cancel_event),
         )
         meta = json.loads(meta_json.read_text(encoding="utf-8"))
         candidate_files: dict[str, dict[str, Path]] = {}
@@ -1831,8 +2068,18 @@ def run_cover_pipeline(
                 if c_chorus_dir and c_full_dir:
                     c_chorus_local = cover_dir / f"cover_{eng}_chorus.mp3"
                     c_full_local = cover_dir / f"cover_{eng}_full.mp3"
-                    download_chunked_dir(session, c_full_dir, c_full_local)
-                    download_chunked_dir(session, c_chorus_dir, c_chorus_local)
+                    download_chunked_dir(
+                        session,
+                        c_full_dir,
+                        c_full_local,
+                        **_cancel_kwargs(download_chunked_dir, cancel_event),
+                    )
+                    download_chunked_dir(
+                        session,
+                        c_chorus_dir,
+                        c_chorus_local,
+                        **_cancel_kwargs(download_chunked_dir, cancel_event),
+                    )
                     candidate_files[eng] = {
                         "full_mp3": c_full_local,
                         "chorus_mp3": c_chorus_local,
@@ -1879,9 +2126,13 @@ def run_train_pipeline(
     cache_weights_sha256: str = "",
     cache_venv_enabled: bool = False,
     cache_writeback: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Provision Colab GPU, run setup + RVC training, fetch/upload weights, and always stop."""
-    assigned_gpu = provision_gpu(session, gpu=gpu_spec)
+    _check_cancelled(cancel_event)
+    assigned_gpu = provision_gpu(
+        session, gpu=gpu_spec, **_cancel_kwargs(provision_gpu, cancel_event)
+    )
     weight_cache_hit: bool | None = None
     weight_cache_written = False
     venv_cache_hit: bool | None = None
@@ -1889,6 +2140,7 @@ def run_train_pipeline(
     drive_direct_used = False
     drive_direct_fallback = False
     try:
+        _check_cancelled(cancel_event)
         setup_env: dict[str, str] = {"HAKIMI_SETUP_MODE": "all"}
         if drive_access_token and (cache_folder_id or cache_weights_file_id):
             setup_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
@@ -1902,7 +2154,9 @@ def run_train_pipeline(
                 setup_env["HAKIMI_CACHE_VENV_ENABLED"] = "1"
             if cache_writeback:
                 setup_env["HAKIMI_CACHE_WRITEBACK"] = "1"
-        setup_out = exec_remote_worker(session, "setup", setup_env)
+        setup_out = exec_remote_worker(
+            session, "setup", setup_env, **_cancel_kwargs(exec_remote_worker, cancel_event)
+        )
         c_stat = _parse_prefixed_json(setup_out, CACHE_STATUS_PREFIX) or {}
         if c_stat.get("weight_cache_hit") is not None:
             weight_cache_hit = bool(c_stat.get("weight_cache_hit"))
@@ -1911,7 +2165,14 @@ def run_train_pipeline(
             venv_cache_hit = bool(c_stat.get("venv_cache_hit"))
         venv_cache_written = bool(c_stat.get("venv_cache_written"))
 
-        upload_file_chunked(session, dataset_tar, "/content/work/dataset.tar.gz", tag="dataset")
+        _check_cancelled(cancel_event)
+        upload_file_chunked(
+            session,
+            dataset_tar,
+            "/content/work/dataset.tar.gz",
+            tag="dataset",
+            **_cancel_kwargs(upload_file_chunked, cancel_event),
+        )
         train_env: dict[str, str] = {
             "HAKIMI_MODEL_NAME": model_name,
             "HAKIMI_DATASET_TAR": "/content/work/dataset.tar.gz",
@@ -1924,7 +2185,10 @@ def run_train_pipeline(
         if use_direct_out:
             train_env["HAKIMI_DRIVE_ACCESS_TOKEN"] = drive_access_token
             train_env["HAKIMI_DRIVE_MODELS_FOLDER_ID"] = drive_models_folder_id
-        train_out = exec_remote_worker(session, "train", train_env)
+        _check_cancelled(cancel_event)
+        train_out = exec_remote_worker(
+            session, "train", train_env, **_cancel_kwargs(exec_remote_worker, cancel_event)
+        )
         drive_outputs = _parse_prefixed_json(train_out, DRIVE_OUTPUTS_PREFIX)
         pth_up = (drive_outputs or {}).get("pth") if isinstance(drive_outputs, dict) else None
         idx_up = (drive_outputs or {}).get("index") if isinstance(drive_outputs, dict) else None
@@ -1957,8 +2221,18 @@ def run_train_pipeline(
         model_dir.mkdir(parents=True, exist_ok=True)
         pth_out = model_dir / f"{model_name}.pth"
         idx_out = model_dir / f"{model_name}.index"
-        download_chunked_dir(session, f"/content/out_chunks/{model_name}_pth", pth_out)
-        download_chunked_dir(session, f"/content/out_chunks/{model_name}_index", idx_out)
+        download_chunked_dir(
+            session,
+            f"/content/out_chunks/{model_name}_pth",
+            pth_out,
+            **_cancel_kwargs(download_chunked_dir, cancel_event),
+        )
+        download_chunked_dir(
+            session,
+            f"/content/out_chunks/{model_name}_index",
+            idx_out,
+            **_cancel_kwargs(download_chunked_dir, cancel_event),
+        )
         return {
             "assigned_gpu": assigned_gpu,
             "pth_path": pth_out,

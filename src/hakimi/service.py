@@ -166,6 +166,9 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
         self._lurk_react_at: dict[str, float] = {}
         self._last_aff_recovery_at: float = 0.0
         self._last_session_prune_at: float = 0.0
+        self._last_moderation_prune_at: float = 0.0
+        self._last_heavy_retention_at: float = 0.0
+        self._heavy_retention_interval: float = 3 * 3600.0
         self.modules = ModuleRegistry()
         settings._chat_registry = weakref.ref(self.modules)
         self.kernel = PluginKernel()
@@ -342,10 +345,21 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                     return True
         return False
 
+    def _on_background_done(self, task: asyncio.Task) -> None:
+        self.background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            log.debug("event=background_task_error exc=%s", type(exc).__name__)
+
     def background(self, awaitable):
         task = asyncio.create_task(awaitable)
         self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
+        task.add_done_callback(self._on_background_done)
         return task
 
     async def enrich(self, message):
@@ -527,15 +541,6 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                 self.hot.observe(message)
                 self.counters["admission_resting"] += 1
                 return "resting"
-            if (message.images or message.audios or "http" in message.text) and len(
-                self.background_tasks
-            ) < 32:
-                if len(self.enrichments) >= 256:
-                    oldest = next(iter(self.enrichments))
-                    self.enrichments.pop(oldest).cancel()
-                self.enrichments[self.store.event_key(message)] = self.background(
-                    self.enrich(message)
-                )
             if not authorize(message, self.s) or (
                 message.kind == "group"
                 and not message.addressed
@@ -549,6 +554,17 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                 result = await self.store.admit(message, continuation_only=True)
             else:
                 result = await self.store.admit(message)
+            if (
+                result == "accepted"
+                and (message.images or message.audios or "http" in message.text)
+                and len(self.background_tasks) < 32
+            ):
+                if len(self.enrichments) >= 256:
+                    oldest = next(iter(self.enrichments))
+                    self.enrichments.pop(oldest).cancel()
+                self.enrichments[self.store.event_key(message)] = self.background(
+                    self.enrich(message)
+                )
             if message.kind == "group" and result in {"accepted", "ignored"}:
                 await self.store.groups.observe(message)
                 if result == "accepted" or (
@@ -1072,16 +1088,6 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
             except Rejected:
                 pass
 
-    async def gcp_billing_worker(self):
-        while True:
-            try:
-                await self.store.runtime.gcp_billing.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            await asyncio.sleep(30)
-
     async def patrol(self):
         while True:
             try:
@@ -1093,16 +1099,56 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                 self.record("patrol_worker_error")
             await asyncio.sleep(30)
 
+    async def run_retention_maintenance(
+        self,
+        now: float | None = None,
+        *,
+        retention_days: int = 30,
+        milestone_days: int = 90,
+        aux_retention_days: int = 60,
+    ) -> dict[str, Any]:
+        """Run periodic main-DB retention sweeps and TRUNCATE WAL checkpoint."""
+        ts = time.time() if now is None else float(now)
+        summary: dict[str, Any] = {}
+        summary["auxiliary"] = await self.store.prune_auxiliary(
+            now=ts,
+            video_retention_days=retention_days,
+            aux_retention_days=aux_retention_days,
+        )
+        if hasattr(self, "world_state") and hasattr(self.world_state, "prune"):
+            summary["world_state"] = await self.world_state.prune(
+                now=ts, retention_days=retention_days, milestone_days=milestone_days
+            )
+        planner = getattr(getattr(self, "life_engine", None), "planner", None)
+        journal = getattr(planner, "journal", None)
+        if journal is not None and hasattr(journal, "prune"):
+            summary["planning_journal"] = await journal.prune(now=ts, retention_days=retention_days)
+        if hasattr(self, "world_state") and hasattr(self.world_state, "experience"):
+            await self.world_state.experience.prune(ts, confirmed_retention_days=aux_retention_days)
+        summary["wal_checkpoint"] = await self.store.wal_checkpoint("TRUNCATE")
+        return summary
+
     async def janitor(self):
         while True:
             await self.store.runtime.flush()
             await self.store.prune()
             now = time.time()
+            if now - self._last_moderation_prune_at >= 300:
+                await self.moderation.prune()
+                self._last_moderation_prune_at = now
             if now - self._last_session_prune_at >= 1800:
                 await self.sessions.prune()
                 self._last_session_prune_at = now
             await self.proactive.prune()
             await self.world_state.experience.prune(now)
+            if now - self._last_heavy_retention_at >= self._heavy_retention_interval:
+                self._last_heavy_retention_at = now
+                try:
+                    await self.run_retention_maintenance(now)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.record("retention_maintenance_error", emit_audit=False)
             if hasattr(self.ai, "cleanup_video_files"):
                 try:
                     await self.ai.cleanup_video_files()

@@ -30,7 +30,13 @@ class PublicMemory:
             "session_epoch": expected_epoch,
             "group_name": getattr(message, "group_name", "") or "群 " + message.conversation_id,
             "speakers": [
-                {"nickname": m.sender_nickname, "qq": m.user_id, "excerpt": m.text[:240]}
+                {
+                    "nickname": m.sender_nickname,
+                    "platform": m.platform,
+                    "user_id": m.user_id,
+                    **({"qq": m.user_id} if m.platform in {"onebot", "qq"} else {}),
+                    "excerpt": m.text[:240],
+                }
                 for m in members[:8]
             ],
             "bot_reply": text[:400],

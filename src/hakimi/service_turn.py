@@ -328,6 +328,21 @@ class _ServiceTurnMixin:
                 )
                 return
             self.compressor.schedule(message)
+        if intent == "ignore":
+            await self._maybe_enqueue_lurk_emoji(
+                job=job,
+                message=message,
+                members=members,
+                session=session,
+                watermark=watermark,
+                audit_id=audit_id,
+                intent=intent,
+                sandbox=sandbox,
+                aff_active=aff_active,
+                caps=caps,
+            )
+            return
+        if not sandbox:
             fresh = await self.sessions.snapshot(message)
             current_events = {m.event_id for m in members}
             history = [
@@ -343,6 +358,7 @@ class _ServiceTurnMixin:
                 interaction_chains=fresh.get("interaction_chains", {}),
             )
         else:
+            history = []
             payload.update(
                 recent_messages=[],
                 rolling_summary="",
@@ -353,20 +369,6 @@ class _ServiceTurnMixin:
             payload.pop("owner_core_memory", None)
             payload.pop("owner_recalled_memories", None)
             payload.pop("近期群聊巡逻记忆（只读背景）", None)
-        if intent == "ignore":
-            await self._maybe_enqueue_lurk_emoji(
-                job=job,
-                message=message,
-                members=members,
-                session=session,
-                watermark=watermark,
-                audit_id=audit_id,
-                intent=intent,
-                sandbox=sandbox,
-                aff_active=aff_active,
-                caps=caps,
-            )
-            return
         # Ambient group traffic only becomes a conversation once the gate opts in.
         if not direct_chat:
             await turn.enter_async_context(self.world_state.experience.chatting())
@@ -392,8 +394,10 @@ class _ServiceTurnMixin:
         }
         current_events = {m.event_id for m in members}
         if message.kind == "group" and not sandbox:
-            nearby = await self.store.groups.previous_messages(message, members, limit=6)
-            consumed_events = await self.store.groups.consumed_image_events(message)
+            nearby, consumed_events = await asyncio.gather(
+                self.store.groups.previous_messages(message, members, limit=6),
+                self.store.groups.consumed_image_events(message),
+            )
             history_events = {item.get("event_id") for item in history if item.get("event_id")}
             filtered_nearby = [
                 m
@@ -569,24 +573,76 @@ class _ServiceTurnMixin:
         if not sandbox:
             related_user_ids = [
                 *(m.user_id for m in members),
-                *(uid for m in members for uid in m.mentioned_ids if uid != self.s.onebot_self_id),
+                *(uid for m in members for uid in m.mentioned_ids if uid != m.bot_id),
                 *(m.user_id for m in filtered_nearby),
                 *(str(item.get("user_id", "")) for item in history[-8:]),
             ]
-            recalled_ctx = await self.memory_hub.recall_context(
-                message,
-                message.text,
-                mode="chat",
-                recall=getattr(intent, "need_memory_recall", False),
-                sandbox=sandbox,
-                related_user_ids=related_user_ids,
-                allow_dual_profile=(not aff_active or caps.allow_dual_profile),
-            )
-            payload.update(recalled_ctx)
-            if aff_active:
-                sender_prof = await aff.profile(
-                    message.platform, message.user_id, message.sender_nickname
+            is_known_bot = self.bot_guard.known_bot(message)
+            now_ts = time.time()
+            ctx_tasks: list[tuple[str, Any]] = [
+                (
+                    "recall",
+                    self.memory_hub.recall_context(
+                        message,
+                        message.text,
+                        mode="chat",
+                        recall=getattr(intent, "need_memory_recall", False),
+                        sandbox=sandbox,
+                        related_user_ids=related_user_ids,
+                        allow_dual_profile=(not aff_active or caps.allow_dual_profile),
+                    ),
                 )
+            ]
+            aff_member_order: list[str] = []
+            if aff_active:
+                ctx_tasks.append(
+                    (
+                        "sender_aff",
+                        aff.profile(message.platform, message.user_id, message.sender_nickname),
+                    )
+                )
+                seen_aff_uids: set[str] = set()
+                for m in members:
+                    if m.user_id in seen_aff_uids or self.bot_guard.known_bot(m):
+                        continue
+                    seen_aff_uids.add(m.user_id)
+                    aff_member_order.append(m.user_id)
+                    if not (m.user_id == message.user_id and m.platform == message.platform):
+                        ctx_tasks.append(
+                            (
+                                f"member_aff:{m.user_id}",
+                                aff.profile(m.platform, m.user_id, m.sender_nickname),
+                            )
+                        )
+            identity = getattr(self, "identity", None)
+            if (
+                identity is not None
+                and not is_known_bot
+                and not identity.is_muted(message.platform, message.user_id)
+            ):
+                ctx_tasks.append(
+                    ("l2_tags", identity.get_l2_tags(message.platform, message.user_id))
+                )
+            if not is_known_bot:
+                ctx_tasks.append(
+                    ("modules", self.modules.context_data(limit=4, now=now_ts, message=message))
+                )
+            if not is_known_bot and hasattr(self, "world_state"):
+                ctx_tasks.append(
+                    ("news", self.world_state.experience.news(message, now_ts, limit=2))
+                )
+                ctx_tasks.append(("ws_summary", self.world_state.chat_sensor_payload(message)))
+
+            ctx_results = dict(
+                zip(
+                    (key for key, _ in ctx_tasks),
+                    await asyncio.gather(*(coro for _, coro in ctx_tasks)),
+                    strict=True,
+                )
+            )
+            payload.update(ctx_results["recall"])
+            if aff_active:
+                sender_prof = ctx_results["sender_aff"]
                 sender_aff_payload = {
                     "score": sender_prof["score"],
                     "lv": sender_prof["lv"],
@@ -597,15 +653,9 @@ class _ServiceTurnMixin:
                     sender_aff_payload["unique_owner"] = True
                 payload["sender_affection"] = sender_aff_payload
                 batch_aff: dict[str, dict] = {}
-                for m in members:
-                    if m.user_id in batch_aff or self.bot_guard.known_bot(m):
-                        continue
-                    m_prof = (
-                        sender_prof
-                        if (m.user_id == message.user_id and m.platform == message.platform)
-                        else await aff.profile(m.platform, m.user_id, m.sender_nickname)
-                    )
-                    batch_aff[m.user_id] = {
+                for uid in aff_member_order:
+                    m_prof = ctx_results.get(f"member_aff:{uid}", sender_prof)
+                    batch_aff[uid] = {
                         "score": m_prof["score"],
                         "lv": m_prof["lv"],
                         "tier": m_prof["tier"],
@@ -613,29 +663,17 @@ class _ServiceTurnMixin:
                     }
                 if batch_aff:
                     payload["batch_affection"] = batch_aff
-            identity = getattr(self, "identity", None)
-            if (
-                identity is not None
-                and not self.bot_guard.known_bot(message)
-                and not identity.is_muted(message.platform, message.user_id)
-            ):
-                l2_tags = await identity.get_l2_tags(message.platform, message.user_id)
-                if l2_tags:
-                    sender_aff = dict(payload.get("sender_affection") or {})
-                    sender_aff["known_preferences"] = l2_tags
-                    payload["sender_affection"] = sender_aff
-            if not self.bot_guard.known_bot(message):
-                material = await self.modules.context_data(
-                    limit=4, now=time.time(), message=message
-                )
-                payload.update({k: v for k, v in material.items() if v})
-            if not self.bot_guard.known_bot(message) and hasattr(self, "world_state"):
-                news = await self.world_state.experience.news(message, time.time(), limit=2)
-                if news:
-                    payload["unshared_world_news"] = news
-                ws_summary = await self.world_state.chat_sensor_payload(message)
-                if ws_summary:
-                    payload["world_state_summary"] = ws_summary
+            l2_tags = ctx_results.get("l2_tags")
+            if l2_tags:
+                sender_aff = dict(payload.get("sender_affection") or {})
+                sender_aff["known_preferences"] = l2_tags
+                payload["sender_affection"] = sender_aff
+            if "modules" in ctx_results:
+                payload.update({k: v for k, v in ctx_results["modules"].items() if v})
+            if ctx_results.get("news"):
+                payload["unshared_world_news"] = ctx_results["news"]
+            if ctx_results.get("ws_summary"):
+                payload["world_state_summary"] = ctx_results["ws_summary"]
             if verified_owner_turn:
                 owner_chat_actions = self._collect_owner_chat_actions()
                 if owner_chat_actions:

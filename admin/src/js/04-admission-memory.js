@@ -30,6 +30,7 @@ async function groups(){
 let tgSocialState=null;
 let tgSocialDraft=null;
 const TG_ID_RE=/^-?[0-9]{1,24}$/;
+const TG_USER_ID_RE=/^[1-9][0-9]{0,23}$/;
 const TG_CAP_LABELS={
   voice:'语音',
   voice_blob:'语音直传',
@@ -47,7 +48,7 @@ function normalizeTgDraft(raw){
   const groups=[...new Set((Array.isArray(src.allowed_groups)?src.allowed_groups:[]).map(v=>String(v).trim()).filter(v=>TG_ID_RE.test(v)))];
   const groupSet=new Set(groups);
   const proactive=[...new Set((Array.isArray(src.proactive_groups)?src.proactive_groups:[]).map(v=>String(v).trim()).filter(v=>groupSet.has(v)))];
-  const users=[...new Set((Array.isArray(src.allowed_users)?src.allowed_users:[]).map(v=>String(v).trim()).filter(v=>TG_ID_RE.test(v)))];
+  const users=[...new Set((Array.isArray(src.allowed_users)?src.allowed_users:[]).map(v=>String(v).trim()).filter(v=>TG_USER_ID_RE.test(v)))];
   const mode=src.private_mode==='owner_and_allowlist'?'owner_and_allowlist':'owner_only';
   return{
     allowed_groups:groups,
@@ -188,7 +189,7 @@ function addTgGroupFromInput(){
 function addTgUserFromInput(){
   if(!tgSocialDraft)tgSocialDraft=normalizeTgDraft(null);
   const uid=$('tg-user-input').value.trim();
-  if(!TG_ID_RE.test(uid))throw Error('Telegram 用户 ID 须为 1–24 位数字');
+  if(!TG_USER_ID_RE.test(uid))throw Error('Telegram 用户 ID 须为正整数（1–24 位数字，不可为负数）');
   if(tgSocialDraft.allowed_users.includes(uid))throw Error('该 Telegram 用户 ID 已在列表中');
   if(tgSocialDraft.allowed_users.length>=100)throw Error('白名单私聊用户最多配置 100 项');
   tgSocialDraft.allowed_users=[...tgSocialDraft.allowed_users,uid];

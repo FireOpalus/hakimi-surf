@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mode=${1:-auto}
 case "$mode" in auto|all|admin|engine) ;; *) echo "Usage: $0 [auto|admin|engine|all]" >&2; exit 2 ;; esac
-compose=(docker compose -f docker-compose.yml -f compose.roaming-oauth.yaml)
+compose=(docker compose -f compose.yaml -f compose.roaming-oauth.yaml)
 revision=$(git rev-parse HEAD)
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
 
@@ -19,7 +19,7 @@ deploy() {
     fi
     if [[ $mode == auto && -n "$running" ]] && git cat-file -e "$running^{commit}" 2>/dev/null && git diff --quiet "$running" "$revision" -- "$@"; then
         if [[ $(docker inspect --format '{{.State.Running}}' "$id") == true ]] &&
-            git diff --quiet "$running" "$revision" -- docker-compose.yml compose.roaming-oauth.yaml; then
+            git diff --quiet "$running" "$revision" -- compose.yaml compose.roaming-oauth.yaml; then
             echo "$service already current"
             return
         fi

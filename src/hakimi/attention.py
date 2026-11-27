@@ -57,7 +57,11 @@ class AttentionRouter:
         self.store = store
 
     async def initialize(self):
-        await self.store.db.executescript(SCHEMA)
+        async with self.store.transaction():
+            for stmt in SCHEMA.split(";"):
+                sql = stmt.strip()
+                if sql:
+                    await self.store.db.execute(sql)
 
     def key(self, message, message_id):
         return self.store.vault.digest(

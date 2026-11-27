@@ -148,10 +148,17 @@ async def accumulate(
         await accumulate_thinking(store, day, lane, thinking_level, amount, estimated, usage)
 
 
+async def _ensure_schema_in_tx(store) -> None:
+    for stmt in SCHEMA.split(";"):
+        sql = stmt.strip()
+        if sql:
+            await store.db.execute(sql)
+
+
 async def initialize(store):
-    await store.db.executescript(SCHEMA)
-    # Store.open holds the process flock. Marker and reconstruction commit atomically.
+    # Store.open holds the process flock. Schema, marker, and reconstruction commit atomically.
     async with store.transaction():
+        await _ensure_schema_in_tx(store)
         if await store.one("SELECT value FROM meta WHERE key='model_usage_v090'"):
             return
         rows = await store.all(
@@ -173,9 +180,9 @@ async def initialize(store):
 
 
 async def initialize_thinking(store):
-    await store.db.executescript(SCHEMA)
-    # Store.open holds the process flock. Backfill and meta marker commit atomically.
+    # Store.open holds the process flock. Schema, backfill, and meta marker commit atomically.
     async with store.transaction():
+        await _ensure_schema_in_tx(store)
         if await store.one("SELECT value FROM meta WHERE key='thinking_usage_v1'"):
             return
         rows = await store.all(

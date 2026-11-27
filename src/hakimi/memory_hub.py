@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -15,6 +16,8 @@ from .models import Message
 from .modules.base import sanitize_sensor_text
 from .security import Rejected, clean_text, configured_secrets, safe_output
 from .social import owner_target
+
+log = logging.getLogger("hakimi")
 
 _PLATFORM_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 _DUAL_CATEGORIES = frozenset({"event", "slang", "consensus", "open_question"})
@@ -80,6 +83,43 @@ class MemoryHub:
 
     def _has_configured_owner(self) -> bool:
         return bool(self.s.owner_qq_id or getattr(self.s, "social_owner_bindings", None))
+
+    def _configured_owner_platforms(self) -> list[str]:
+        preferred = getattr(self.s, "owner_delivery_platform", "onebot") or "onebot"
+        ordered: list[str] = [preferred]
+        if "onebot" not in ordered:
+            ordered.append("onebot")
+        bindings = getattr(self.s, "social_owner_bindings", None) or {}
+        for plat in bindings:
+            if plat not in ordered and plat != "qq":
+                ordered.append(plat)
+        return ordered
+
+    def _resolve_owner_targets(self, ts: float, event_id: str) -> list[tuple[str, Message, bool]]:
+        """Return `(platform, message, is_verified_binding)` for all configured owner platforms."""
+        targets: list[tuple[str, Message, bool]] = []
+        bindings = getattr(self.s, "social_owner_bindings", None) or {}
+        for plat in self._configured_owner_platforms():
+            msg = owner_target(self.s, plat, ts, event_id)
+            if msg is not None:
+                targets.append((plat, msg, True))
+                continue
+            if plat != "onebot" and plat != "qq":
+                binding = bindings.get(plat)
+                if binding is not None:
+                    fallback = Message(
+                        platform=plat,
+                        bot_id=binding.bot_id,
+                        user_id=binding.user_id,
+                        conversation_id=binding.user_id,
+                        kind="private",
+                        text="",
+                        addressed=True,
+                        event_id=event_id,
+                        created_at=ts,
+                    )
+                    targets.append((plat, fallback, True))
+        return targets
 
     def _is_verified_private_owner(self, message: Message | None) -> bool:
         return bool(
@@ -267,7 +307,8 @@ class MemoryHub:
                         ledger_event_id = ev_id
                     elif isinstance(ev, str) and ev:
                         ledger_event_id = ev
-                except Exception:
+                except Exception as exc:
+                    log.warning("event=memory_hub_ledger_post_failed exc=%s", type(exc).__name__)
                     ledger_event_id = None
 
         recap_written = False
@@ -338,12 +379,13 @@ class MemoryHub:
                     and dual_mem is not None
                     and hasattr(dual_mem, "record_chronicle")
                 ):
-                    target_msg = owner_message or owner_target(
-                        self.s,
-                        getattr(self.s, "owner_delivery_platform", "onebot") or "onebot",
-                        ts,
-                        f"hub:{clean_source}",
-                    )
+                    target_msg = owner_message
+                    if target_msg is None:
+                        for plat in self._configured_owner_platforms():
+                            candidate = owner_target(self.s, plat, ts, f"hub:{clean_source}")
+                            if candidate is not None:
+                                target_msg = candidate
+                                break
                     if target_msg is not None and self._is_verified_private_owner(target_msg):
                         effective_category = (
                             chronicle_category
@@ -366,7 +408,11 @@ class MemoryHub:
                                     created_at=ts,
                                 )
                             )
-                        except Exception:
+                        except Exception as exc:
+                            log.warning(
+                                "event=memory_hub_chronicle_write_failed exc=%s",
+                                type(exc).__name__,
+                            )
                             chronicle_written = False
 
         if ledger_event_id is not None or recap_written or chronicle_written:
@@ -385,9 +431,12 @@ class MemoryHub:
         limit: int = 8,
         require_enabled: bool = True,
         include_summary: bool = False,
+        verified_binding: bool = False,
     ) -> dict[str, Any]:
         """Read recent owner session state without creating missing SQLite files."""
-        if not self._is_verified_private_owner(owner_msg):
+        if not verified_binding and not self._is_verified_private_owner(owner_msg):
+            return {}
+        if owner_msg is None or owner_msg.kind != "private":
             return {}
         sessions = self._sessions()
         if sessions is None:
@@ -435,7 +484,8 @@ class MemoryHub:
                     "rolling_summary": str(snap.get("rolling_summary") or ""),
                     "recent_messages": list(snap.get("recent_messages") or [])[-int(limit) :],
                 }
-        except Exception:
+        except Exception as exc:
+            log.debug("event=memory_hub_session_read_failed exc=%s", type(exc).__name__)
             return {}
         return {}
 
@@ -533,8 +583,11 @@ class MemoryHub:
                     snap = notebook.for_message(audience)
                     if snap:
                         out["owner_notebook_snapshot"] = str(snap)[:800]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_notebook_read_failed mode=voice exc=%s",
+                        type(exc).__name__,
+                    )
 
             cloud_memory = self._cloud_memory()
             if cloud_memory is not None and hasattr(cloud_memory, "for_message"):
@@ -549,8 +602,11 @@ class MemoryHub:
                         for key in _CHAT_CLOUD_KEYS:
                             if val := mem.get(key):
                                 out[key] = val
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_cloud_read_failed mode=voice exc=%s",
+                        type(exc).__name__,
+                    )
 
             sess = await self._read_owner_recent_session(
                 audience,
@@ -585,8 +641,11 @@ class MemoryHub:
                             dual.get("speaker_profile") or dual.get("chronicle_recall")
                         ):
                             out["owner_dual_memory"] = dual
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.debug(
+                            "event=memory_hub_dual_prefetch_failed mode=voice exc=%s",
+                            type(exc).__name__,
+                        )
 
             ledger = self._event_ledger()
             if ledger is not None and hasattr(ledger, "read"):
@@ -596,8 +655,11 @@ class MemoryHub:
                         out["pending_ledger_events"] = [
                             {"key": it.dedupe_key, "summary": it.summary} for it in items[:6]
                         ]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_ledger_read_failed mode=voice exc=%s",
+                        type(exc).__name__,
+                    )
 
             self._recalls += 1
             return out
@@ -613,8 +675,11 @@ class MemoryHub:
                     snap = notebook.for_message(audience)
                     if snap:
                         out["owner_notebook_snapshot"] = str(snap)[:600]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_notebook_read_failed mode=screen exc=%s",
+                        type(exc).__name__,
+                    )
 
             ledger = self._event_ledger()
             if ledger is not None and hasattr(ledger, "read"):
@@ -624,58 +689,80 @@ class MemoryHub:
                         out["pending_ledger_events"] = [
                             {"key": it.dedupe_key, "summary": it.summary} for it in items[:4]
                         ]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "event=memory_hub_ledger_read_failed mode=screen exc=%s",
+                        type(exc).__name__,
+                    )
 
             self._recalls += 1
             return out
 
         if mode == "planner":
-            owner_msg = audience or owner_target(
-                self.s,
-                getattr(self.s, "owner_delivery_platform", "onebot") or "onebot",
-                ts,
-                "planner-owner-ctx",
-            )
-            if not self._is_verified_private_owner(owner_msg):
+            if audience is not None:
+                if not self._is_verified_private_owner(audience):
+                    return {}
+                targets = [(audience.platform, audience, False)]
+            else:
+                targets = self._resolve_owner_targets(ts, "planner-owner-ctx")
+                if not targets:
+                    return {}
+
+            turn_records: list[tuple[float, int, int, str]] = []
+            summaries: list[str] = []
+            any_enabled = False
+            for plat_idx, (_plat, target_msg, verified_binding) in enumerate(targets):
+                snap = await self._read_owner_recent_session(
+                    target_msg,
+                    limit=8,
+                    require_enabled=True,
+                    include_summary=True,
+                    verified_binding=verified_binding,
+                )
+                if not snap or not snap.get("enabled"):
+                    continue
+                any_enabled = True
+                for msg_idx, item in enumerate(snap.get("recent_messages", [])[-8:]):
+                    if not isinstance(item, dict):
+                        continue
+                    created = item.get("created_at")
+                    created_ts = (
+                        float(created)
+                        if isinstance(created, int | float)
+                        and not isinstance(created, bool)
+                        and created > 0
+                        else 0.0
+                    )
+                    if created_ts > 0 and created_ts < ts - _PLANNER_HISTORY_MAX_AGE_SECONDS:
+                        continue
+                    raw_text = str(item.get("text") or "").strip()
+                    if not raw_text or raw_text.startswith(("[协议事件", "/")):
+                        continue
+                    prefix = "BOISER: " if item.get("role") == "user" else "我: "
+                    cleaned = sanitize_sensor_text(raw_text, self.s, max_tokens=45)
+                    if cleaned:
+                        turn_records.append((created_ts, plat_idx, msg_idx, prefix + cleaned))
+                summary_clean = sanitize_sensor_text(
+                    str(snap.get("rolling_summary") or ""),
+                    self.s,
+                    max_tokens=80,
+                )
+                if summary_clean and summary_clean not in summaries:
+                    summaries.append(summary_clean)
+
+            if not any_enabled:
                 return {}
-            snap = await self._read_owner_recent_session(
-                owner_msg,
-                limit=8,
-                require_enabled=True,
-                include_summary=True,
-            )
-            if not snap or not snap.get("enabled"):
-                return {}
-            turns = []
-            for item in snap.get("recent_messages", [])[-8:]:
-                if not isinstance(item, dict):
-                    continue
-                created = item.get("created_at")
-                if (
-                    isinstance(created, int | float)
-                    and not isinstance(created, bool)
-                    and created > 0
-                    and created < ts - _PLANNER_HISTORY_MAX_AGE_SECONDS
-                ):
-                    continue
-                raw_text = str(item.get("text") or "").strip()
-                if not raw_text or raw_text.startswith(("[协议事件", "/")):
-                    continue
-                prefix = "BOISER: " if item.get("role") == "user" else "我: "
-                cleaned = sanitize_sensor_text(raw_text, self.s, max_tokens=45)
-                if cleaned:
-                    turns.append(prefix + cleaned)
             out = {}
-            if turns:
-                out["recent_turns"] = turns[-5:]
-            summary_clean = sanitize_sensor_text(
-                str(snap.get("rolling_summary") or ""),
-                self.s,
-                max_tokens=80,
-            )
-            if summary_clean:
-                out["rolling_summary"] = summary_clean
+            if turn_records:
+                turn_records.sort(key=lambda rec: (rec[0], rec[1], rec[2]))
+                out["recent_turns"] = [rec[3] for rec in turn_records[-5:]]
+            if summaries:
+                combined_summary = " | ".join(summaries)
+                out["rolling_summary"] = sanitize_sensor_text(
+                    combined_summary,
+                    self.s,
+                    max_tokens=120 if len(summaries) > 1 else 80,
+                )
             self._recalls += 1
             return out
 

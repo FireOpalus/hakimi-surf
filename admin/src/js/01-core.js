@@ -346,6 +346,8 @@ async function api(path,method='GET',data){
       login_rate_limited:'登录尝试过于频繁，请稍后再试。',
       admin_disabled:'管理入口已关闭。',
       protected_identity:'受保护的身份或唯一 Owner 账号不允许此操作。',
+      delete_friend_onebot_only:'仅 QQ（OneBot）账号支持同时移除好友。',
+      invalid_target:'目标账号格式无效，请输入纯数字 QQ 号或 平台:用户ID。',
       person_not_found:'未找到对应的统一身份档案。',
       account_not_found:'未找到对应的平台账号。',
       identity_unavailable:'统一身份服务暂未就绪。'
@@ -357,11 +359,25 @@ async function api(path,method='GET',data){
   return value;
 }
 
+async function apiRaw(path,method='GET',body,opts={}){
+  const signal=opts.signal||activeRequestSignal(method);
+  const url=path.startsWith('/admin/api/')?path:('/admin/api/'+path);
+  const contentType=opts.contentType||(body?(body.type||'application/octet-stream'):'');
+  const headers={Authorization:'Bearer '+token,...(contentType?{'Content-Type':contentType}:{}),...(opts.extraHeaders||{})};
+  const r=await fetch(url,{method,signal,headers,body,cache:'no-store',credentials:'omit',redirect:'error'});
+  if(signal.aborted)throw new DOMException('请求已取消','AbortError');
+  if(!r.ok){
+    let detail='HTTP '+r.status;try{detail=(await r.json()).detail||detail;}catch{}
+    if(!signal.aborted&&(r.status===401||r.status===403))logout();
+    throw Error(opts.mapError?opts.mapError(detail):detail);
+  }
+  return r;
+}
+
 async function busy(btn,fn){
-  if(!btn)return fn();
-  btn.disabled=true;btn.setAttribute('aria-busy','true');
+  if(btn){btn.disabled=true;btn.setAttribute('aria-busy','true');}
   try{await fn();}catch(e){if(e.name!=='AbortError')notice(e.message,true);}
-  finally{btn.disabled=false;btn.removeAttribute('aria-busy');}
+  finally{if(btn){btn.disabled=false;btn.removeAttribute('aria-busy');}}
 }
 
 function button(label,fn,cls='secondary'){
@@ -371,7 +387,7 @@ function button(label,fn,cls='secondary'){
   return b;
 }
 
-function table(id,headers,rows){
+function table(id,headers,rows,emptyText){
   const target=typeof id==='string'?$(id):id;
   const t=el('table'),thead=el('thead'),head=el('tr'),body=el('tbody');
   headers.forEach(v=>{const th=el('th',v);th.scope='col';head.append(th);});
@@ -387,7 +403,7 @@ function table(id,headers,rows){
     body.append(row);
   });
   target.replaceChildren(t);
-  if(!rows.length)target.append(el('p','还没有记录，新的动态会出现在这里。','empty-state'));
+  if(!rows.length)target.append(el('p',emptyText||'还没有记录，新的动态会出现在这里。','empty-state'));
 }
 
 function kpiCard(label,value,note,variant=''){

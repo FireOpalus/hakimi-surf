@@ -1888,13 +1888,14 @@ class Store:
             return [self.vault.open(subject, row[0]) for row in rows]
 
     async def prune(self) -> None:
+        now = time.time()
         async with self.transaction():
-            await self.db.execute("DELETE FROM message_recalls WHERE at<?", (time.time() - 86400,))
+            await self.db.execute("DELETE FROM message_recalls WHERE at<?", (now - 86400,))
             await self.db.execute(
-                "DELETE FROM outbox_bubble_receipts WHERE applied=1 AND created<?",
-                (time.time() - 9 * 86400,),
+                "DELETE FROM outbox_bubble_receipts WHERE (applied=1 AND created<?) OR created<?",
+                (now - 9 * 86400, now - 14 * 86400),
             )
-            await self.db.execute("DELETE FROM local_quick_acks WHERE at<?", (time.time() - 86400,))
+            await self.db.execute("DELETE FROM local_quick_acks WHERE at<?", (now - 86400,))
         now = time.time()
         async with self.transaction():
             await self.groups.prune_in_transaction(now)
@@ -1941,3 +1942,87 @@ class Store:
                 await self.db.execute(
                     "DELETE FROM ledger_provider WHERE id NOT IN (SELECT id FROM ledger)"
                 )
+
+    async def prune_auxiliary(
+        self,
+        now: float | None = None,
+        *,
+        video_retention_days: int = 30,
+        aux_retention_days: int = 60,
+    ) -> dict[str, int]:
+        """Prune old rows from optional subsystem tables when present in this SQLite file."""
+        ts = time.time() if now is None else float(now)
+        video_cutoff = ts - max(1, int(video_retention_days)) * 86400.0
+        aux_cutoff = ts - max(1, int(aux_retention_days)) * 86400.0
+        counts = {
+            "colab_jobs": 0,
+            "voice_companion_sessions": 0,
+            "video_watch_attempts": 0,
+            "bili_patrol_runs": 0,
+            "bili_actions": 0,
+        }
+        queries: tuple[tuple[str, str, str, tuple[float, ...]], ...] = (
+            (
+                "colab_jobs",
+                "SELECT 1 FROM colab_jobs "
+                "WHERE status IN ('succeeded','failed','cancelled','timed_out','orphaned') "
+                "AND COALESCE(finished_at, updated_at, created_at)<? LIMIT 1",
+                "DELETE FROM colab_jobs "
+                "WHERE status IN ('succeeded','failed','cancelled','timed_out','orphaned') "
+                "AND COALESCE(finished_at, updated_at, created_at)<?",
+                (aux_cutoff,),
+            ),
+            (
+                "voice_companion_sessions",
+                "SELECT 1 FROM voice_companion_sessions "
+                "WHERE COALESCE(NULLIF(ended_at, 0), started_at)<? LIMIT 1",
+                "DELETE FROM voice_companion_sessions "
+                "WHERE COALESCE(NULLIF(ended_at, 0), started_at)<?",
+                (aux_cutoff,),
+            ),
+            (
+                "video_watch_attempts",
+                "SELECT 1 FROM video_watch_attempts WHERE created<? LIMIT 1",
+                "DELETE FROM video_watch_attempts WHERE created<?",
+                (video_cutoff,),
+            ),
+            (
+                "bili_patrol_runs",
+                "SELECT 1 FROM bili_patrol_runs WHERE created<? LIMIT 1",
+                "DELETE FROM bili_patrol_runs WHERE created<?",
+                (aux_cutoff,),
+            ),
+            (
+                "bili_actions",
+                "SELECT 1 FROM bili_actions WHERE created<? LIMIT 1",
+                "DELETE FROM bili_actions WHERE created<?",
+                (aux_cutoff,),
+            ),
+        )
+        async with self.lock:
+            tables = {
+                row[0]
+                for row in await self.all("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            active_queries = []
+            for table, check_sql, delete_sql, params in queries:
+                if table in tables and await self.one(check_sql, params):
+                    active_queries.append((table, delete_sql, params))
+        if not active_queries:
+            return counts
+        async with self.transaction():
+            for table, delete_sql, params in active_queries:
+                cur = await self.db.execute(delete_sql, params)
+                counts[table] = max(0, int(cur.rowcount or 0))
+        return counts
+
+    async def wal_checkpoint(self, mode: str = "TRUNCATE") -> tuple[int, int, int] | None:
+        """Run PRAGMA wal_checkpoint(mode) outside an explicit transaction."""
+        normalized = str(mode or "TRUNCATE").upper()
+        if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            raise ValueError("invalid_wal_checkpoint_mode")
+        async with self.lock:
+            row = await self.one(f"PRAGMA wal_checkpoint({normalized})")
+        if row is None:
+            return None
+        return (int(row[0]), int(row[1]), int(row[2]))

@@ -12,6 +12,7 @@ import random
 import re
 import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -48,7 +49,72 @@ _ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}\.[a-z][a-z0-9_]{0,30}\Z")
 _CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 _VALID_WINDOWS = frozenset({"any", "active", "closing"})
 _DEFAULT_MAX_FRAME_BYTES = 262_144
+_MAX_NOTIF_QUEUE_SIZE = 256
+_CONTROL_NOTIF_KINDS = frozenset({"on_connect", "switch", "node_state"})
 _UNSET: Any = object()
+
+
+class _BoundedNotifQueue:
+    """Bounded FIFO notification buffer that never drops control frames."""
+
+    def __init__(self, *, max_size: int = _MAX_NOTIF_QUEUE_SIZE, plugin_id: str = "") -> None:
+        self._max_size = max(1, int(max_size))
+        self._plugin_id = plugin_id
+        self._items: deque[tuple[str, Any]] = deque()
+        self._ready = asyncio.Event()
+        self.dropped_events: int = 0
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def put_nowait(self, item: tuple[str, Any]) -> None:
+        kind, _ = item
+        if len(self._items) >= self._max_size:
+            if kind not in _CONTROL_NOTIF_KINDS:
+                # Evict oldest non-control event if present; otherwise drop this event.
+                evicted = False
+                for existing in self._items:
+                    if existing[0] not in _CONTROL_NOTIF_KINDS:
+                        self._items.remove(existing)
+                        evicted = True
+                        break
+                self.dropped_events += 1
+                if self.dropped_events == 1 or self.dropped_events % 64 == 0:
+                    log.warning(
+                        "event=plugin_notif_queue_dropped plugin=%s kind=%s dropped=%d",
+                        self._plugin_id,
+                        kind,
+                        self.dropped_events,
+                    )
+                if not evicted:
+                    return
+            else:
+                # Never drop control frames: evict oldest non-control event first,
+                # or supersede an older state-bearing control frame of the same kind.
+                evicted = False
+                for existing in self._items:
+                    if existing[0] not in _CONTROL_NOTIF_KINDS:
+                        self._items.remove(existing)
+                        self.dropped_events += 1
+                        evicted = True
+                        break
+                if not evicted and kind in {"switch", "node_state"}:
+                    for existing in self._items:
+                        if existing[0] == kind:
+                            self._items.remove(existing)
+                            break
+        self._items.append(item)
+        self._ready.set()
+
+    async def get(self) -> tuple[str, Any]:
+        while not self._items:
+            self._ready.clear()
+            await self._ready.wait()
+        item = self._items.popleft()
+        if not self._items:
+            self._ready.clear()
+        return item
+
 
 ThinkingLevel = Literal["low", "medium", "high", "xhigh"]
 OutputCapKey = Literal[
@@ -742,8 +808,8 @@ class HakimiPluginClient:
         future: asyncio.Future[Any] = loop.create_future()
         self._pending_kernel_rpcs[req_id] = future
         try:
-            await self._send_live_frame(outbound)
             async with asyncio.timeout(effective_timeout):
+                await self._send_live_frame(outbound)
                 return await future
         except TimeoutError:
             raise PluginRpcError(
@@ -751,6 +817,10 @@ class HakimiPluginClient:
             ) from None
         finally:
             self._pending_kernel_rpcs.pop(req_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def state_get(self, key: str) -> Any:
         """Read plugin-scoped KV state from the kernel."""
@@ -1588,7 +1658,9 @@ class HakimiPluginClient:
         self._connected_event.set()
         last_rx = loop.time()
 
-        notif_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        notif_queue: Any = _BoundedNotifQueue(
+            max_size=_MAX_NOTIF_QUEUE_SIZE, plugin_id=self.config.plugin_id
+        )
         notif_queue.put_nowait(("on_connect", welcome_frame))
 
         async def _reader() -> None:
@@ -1677,6 +1749,7 @@ class HakimiPluginClient:
                     return
                 except TimeoutError:
                     pass
+                self._evict_expired_blobs()
                 await self._ws_send(ws, {"type": "ping", "ts": time.time()})
 
         notif_task = asyncio.create_task(self._run_notifications(notif_queue))

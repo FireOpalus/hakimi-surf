@@ -12,7 +12,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
-from hakimi_plugin_sdk.protocol import BLOB_FIELD, sanitize_blob_meta_str
+from hakimi_plugin_sdk.protocol import (
+    BLOB_FIELD,
+    compute_inline_max_bytes,
+    sanitize_blob_meta_str,
+)
 
 from ..config import Settings
 from ..models import Message
@@ -63,6 +67,14 @@ def _is_valid_image_magic(raw: bytes) -> bool:
     return len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
 
 
+def _inline_precheck_max_bytes(max_frame_bytes: int, *, hard_cap: int) -> int:
+    """Upper bound on raw bytes eligible for inline base64 encoding within one WS frame."""
+    inline_cap = compute_inline_max_bytes(max_frame_bytes)
+    if inline_cap <= 0:
+        inline_cap = (max(0, int(max_frame_bytes) - 256) // 4) * 3
+    return min(hard_cap, inline_cap)
+
+
 async def _call_before_send(before_send: Callable[..., Any], delivery_id: str) -> bool:
     sig = inspect.signature(before_send)
     positional = [
@@ -85,6 +97,7 @@ class _PendingRpc:
     future: asyncio.Future[dict[str, Any]]
     method: str
     delivery_id: str | None = None
+    barrier_seq: int = 0
 
 
 @dataclass
@@ -104,13 +117,48 @@ class _PluginSession:
     event_subscriptions: frozenset[str] = frozenset()
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending: dict[str, _PendingRpc] = field(default_factory=dict)
-    uncertain_deliveries: set[str] = field(default_factory=set)
     _bili_private_handles: dict[str, dict[str, Any]] = field(default_factory=dict)
     inflight_node_calls: int = 0
     inflight_ai_calls: int = 0
     ready: bool = False
     closed: bool = False
     close_code: int = 1012
+    domain_enqueued_seq: int = 0
+    domain_completed_seq: int = 0
+    domain_closed: bool = False
+    _domain_waiters: list[tuple[int, asyncio.Future[None]]] = field(default_factory=list)
+
+    def mark_domain_completed(self, seq: int) -> None:
+        if seq > self.domain_completed_seq:
+            self.domain_completed_seq = seq
+        if not self._domain_waiters:
+            return
+        remaining: list[tuple[int, asyncio.Future[None]]] = []
+        for target_seq, fut in self._domain_waiters:
+            if target_seq <= self.domain_completed_seq:
+                if not fut.done():
+                    fut.set_result(None)
+            elif not fut.done():
+                remaining.append((target_seq, fut))
+        self._domain_waiters = remaining
+
+    def close_domain_waiters(self) -> None:
+        self.domain_closed = True
+        for _, fut in self._domain_waiters:
+            if not fut.done():
+                fut.set_result(None)
+        self._domain_waiters.clear()
+
+    async def wait_domain_seq(self, target_seq: int) -> None:
+        if target_seq <= self.domain_completed_seq or self.domain_closed or self.closed:
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._domain_waiters.append((target_seq, fut))
+        try:
+            await fut
+        finally:
+            if not fut.done():
+                fut.cancel()
 
 
 class RemoteModuleProxy(BaseModule):
@@ -185,6 +233,7 @@ class RemoteModuleProxy(BaseModule):
         self._remote_status: dict[str, Any] = (
             _sanitize_payload(initial_status, settings) if isinstance(initial_status, dict) else {}
         )
+        self._status_seq: int = 0
         self._remote_configs: dict[str, RemoteChatConfig] = {}
         self._last_sensor_summary: str = ""
         self._action_unavailable: dict[str, str] = {}
@@ -198,6 +247,11 @@ class RemoteModuleProxy(BaseModule):
 
     def status_dict(self) -> dict[str, Any]:
         return _sanitize_payload(self._remote_status, self.settings)
+
+    def apply_remote_status(self, status: dict[str, Any]) -> None:
+        """Apply a pushed `plugin.status` snapshot and advance the status sequence."""
+        self._remote_status = _sanitize_payload(status, self.settings)
+        self._status_seq += 1
 
     def actions(self) -> tuple[Action, ...]:
         return self._actions
@@ -337,6 +391,7 @@ class RemoteModuleProxy(BaseModule):
 
         if not self._session.ready or self._session.closed:
             return False
+        seq_before = self._status_seq
         try:
             resp = await self._bus._rpc(
                 self._session,
@@ -352,7 +407,34 @@ class RemoteModuleProxy(BaseModule):
             return False
         raw_res = resp.get("result") if "result" in resp else resp.get("data")
         if isinstance(raw_res, dict) and isinstance(raw_res.get("status"), dict):
-            self._remote_status = _sanitize_payload(raw_res["status"], self.settings)
+            incoming = _sanitize_payload(raw_res["status"], self.settings)
+            if self._status_seq != seq_before:
+                # A fresher plugin.status frame arrived while config.update was in flight.
+                # Preserve the fresher runtime status (e.g. connected=True) and only overlay
+                # config metadata.
+                for cfg_key in (
+                    "allowed_groups",
+                    "proactive_groups",
+                    "allowed_users",
+                    "private_mode",
+                    "memory_mirror_enabled",
+                    "allowed_groups_count",
+                    "config_source",
+                ):
+                    if cfg_key in incoming:
+                        self._remote_status[cfg_key] = incoming[cfg_key]
+                if plat and plat in self._remote_configs:
+                    self.apply_remote_config(self._remote_configs[plat], platform=plat)
+            else:
+                if (
+                    self._remote_status.get("connected") is True
+                    and incoming.get("connected") is False
+                ):
+                    incoming["connected"] = True
+                    for keep_key in ("bot_id", "bot_username"):
+                        if self._remote_status.get(keep_key) and not incoming.get(keep_key):
+                            incoming[keep_key] = self._remote_status[keep_key]
+                self._remote_status = incoming
         return True
 
     def channel_prompt(self, self_id: str, platform: str) -> str:
@@ -582,11 +664,9 @@ class RemoteModuleProxy(BaseModule):
                 delivery_id=delivery_id,
             )
         except asyncio.CancelledError:
-            self._session.uncertain_deliveries.add(delivery_id)
             self._bus.uncertain_deliveries.append(delivery_id)
             raise
         except Rejected as exc:
-            self._session.uncertain_deliveries.add(delivery_id)
             self._bus.uncertain_deliveries.append(delivery_id)
             if str(exc) in {
                 "plugin_disconnected",
@@ -596,7 +676,6 @@ class RemoteModuleProxy(BaseModule):
                 raise Rejected("plugin_delivery_uncertain") from None
             raise
         if not resp.get("ok", False):
-            self._session.uncertain_deliveries.add(delivery_id)
             self._bus.uncertain_deliveries.append(delivery_id)
             raw_err = str(resp.get("error") or "")
             code = raw_err if _CODE_RE.fullmatch(raw_err) else "plugin_delivery_failed"
@@ -689,7 +768,10 @@ class RemoteModuleProxy(BaseModule):
         if clean_title is not None:
             base_payload["title"] = clean_title
 
-        if len(raw_audio) <= _MAX_VOICE_AUDIO_BYTES:
+        voice_inline_cap = _inline_precheck_max_bytes(
+            self._bus._max_frame_bytes(), hard_cap=_MAX_VOICE_AUDIO_BYTES
+        )
+        if len(raw_audio) <= voice_inline_cap:
             inline_payload = {
                 **base_payload,
                 "audio_b64": base64.b64encode(raw_audio).decode("ascii"),
@@ -803,27 +885,31 @@ class RemoteModuleProxy(BaseModule):
             "reply_to": effective_reply_to,
         }
 
-        inline_payload = {
-            **base_payload,
-            "media_b64": base64.b64encode(raw_media).decode("ascii"),
-        }
-        probe = json.dumps(
-            {
-                "type": "rpc.request",
-                "id": "0" * 32,
-                "method": "delivery.send_media",
-                "params": {"delivery_id": "0" * 32, **inline_payload},
-            },
-            ensure_ascii=False,
-            allow_nan=False,
+        media_inline_cap = _inline_precheck_max_bytes(
+            self._bus._max_frame_bytes(), hard_cap=_MAX_MEDIA_IMAGE_BYTES
         )
-        if len(probe.encode("utf-8")) <= self._bus._max_frame_bytes():
-            return await self._deliver_rpc(
-                "delivery.send_media",
-                inline_payload,
-                before_send=before_send,
-                timeout=max(self._bus.rpc_timeout, 30.0),
+        if len(raw_media) <= media_inline_cap:
+            inline_payload = {
+                **base_payload,
+                "media_b64": base64.b64encode(raw_media).decode("ascii"),
+            }
+            probe = json.dumps(
+                {
+                    "type": "rpc.request",
+                    "id": "0" * 32,
+                    "method": "delivery.send_media",
+                    "params": {"delivery_id": "0" * 32, **inline_payload},
+                },
+                ensure_ascii=False,
+                allow_nan=False,
             )
+            if len(probe.encode("utf-8")) <= self._bus._max_frame_bytes():
+                return await self._deliver_rpc(
+                    "delivery.send_media",
+                    inline_payload,
+                    before_send=before_send,
+                    timeout=max(self._bus.rpc_timeout, 30.0),
+                )
 
         if not self.supports_media_blob:
             raise Rejected("media_payload_too_large")
