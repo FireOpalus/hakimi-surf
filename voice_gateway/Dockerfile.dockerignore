@@ -1,0 +1,9 @@
+*
+!voice_client
+!voice_client/**
+!voice_gateway
+!voice_gateway/**
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
