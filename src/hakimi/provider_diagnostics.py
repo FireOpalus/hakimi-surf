@@ -162,6 +162,7 @@ def safe_attempts(attempts):
         for key, choices in (
             ("upstream_code", CODES | NUMERIC_CODES),
             ("exception_type", EXCEPTION_TYPES),
+            ("service_tier", {"standard", "priority"}),
             ("stream_phase", {"waiting", "started", "partial_output"}),
             (
                 "fallback",

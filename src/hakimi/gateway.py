@@ -425,6 +425,8 @@ class FilterManager:
                 "not_dispatched",
             }:
                 incident["fallback"] = fallback
+            if provider_incident.get("fallback_target") in {"vertex_priority", "gemini_paid"}:
+                incident["fallback_target"] = provider_incident["fallback_target"]
             if provider_incident.get("fallback_code"):
                 incident["fallback_code"] = upstream_error_code(provider_incident["fallback_code"])
             if detail := _safe_detail(provider_incident.get("fallback_detail", "")):

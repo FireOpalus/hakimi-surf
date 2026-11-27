@@ -28,6 +28,9 @@ from .gemini_wire import (
     OWNER_COMPANION_INSTRUCTION,
     OWNER_DIGEST_INSTRUCTION,
     SCREEN_WATCH_INSTRUCTION,
+    VERTEX_PRIORITY_PAYGO_HEADERS,
+    VERTEX_PRIORITY_PRICE_MULTIPLIER,
+    VERTEX_STANDARD_PAYGO_HEADERS,
     VOICE_COMPANION_INSTRUCTION,
     GenerationTimeout,
     _validate_audios,
@@ -494,12 +497,16 @@ class _GeminiGenerateMixin:
             )
 
         attempts: list[dict] = []
+        vertex_interactions_404 = False
 
         async def _dispatch_once(
             active_plan: GenerationPlan,
             progress: StreamProgress | None,
             *,
-            developer_fallback=False,
+            developer_fallback: bool = False,
+            vertex_tier: Literal["standard", "priority"] = "standard",
+            force_no_chain: bool = False,
+            dispatch_state: dict[str, bool] | None = None,
         ):
             nonlocal \
                 used_lane, \
@@ -507,7 +514,8 @@ class _GeminiGenerateMixin:
                 used_turns, \
                 used_wire_state, \
                 used_system_digest, \
-                used_provider
+                used_provider, \
+                vertex_interactions_404
             rows = payload.get("recent_messages", [])
             if chat and active_plan.model_lane == "carbon":
                 rows = self.prefix_runtime.carbon_history(scope, payload)
@@ -521,7 +529,10 @@ class _GeminiGenerateMixin:
                 and self._should_use_vertex()
             )
             vertex_client = self.vertex_chat_client if use_vertex else None
-            if use_vertex and (
+            if vertex_tier == "priority":
+                if not use_vertex or vertex_client is None:
+                    raise Rejected("vertex_unavailable")
+            elif use_vertex and (
                 vertex_client is None
                 or (
                     self.routing.config.vertex_fallback_to_gemini
@@ -540,14 +551,26 @@ class _GeminiGenerateMixin:
                 )
                 provider_name = "vertex_paid"
                 proto = self.routing.config.vertex_protocol
-                try_interactions = proto != "generate_content"
+                try_interactions = proto != "generate_content" and not (
+                    proto == "auto" and vertex_interactions_404
+                )
                 allow_404_gc_fallback = proto == "auto"
+                vertex_headers = (
+                    dict(VERTEX_PRIORITY_PAYGO_HEADERS)
+                    if vertex_tier == "priority"
+                    else dict(VERTEX_STANDARD_PAYGO_HEADERS)
+                )
+                active_price_multiplier = (
+                    VERTEX_PRIORITY_PRICE_MULTIPLIER if vertex_tier == "priority" else Decimal(1)
+                )
             else:
                 model = "gemini-4-" + selected_model
                 active_system_digest = self.store.vault.digest("static-prefix", system)
                 provider_name = "gemini_paid"
                 try_interactions = True
                 allow_404_gc_fallback = False
+                vertex_headers = None
+                active_price_multiplier = Decimal(1)
 
             used_system_digest = active_system_digest
             used_provider = provider_name
@@ -557,7 +580,13 @@ class _GeminiGenerateMixin:
             prev_created_at = None
             chain = None
             max_chain_turns = self._max_chain_turns()
-            if stateful_chat and allow_chain and not developer_fallback and try_interactions:
+            if (
+                stateful_chat
+                and allow_chain
+                and not developer_fallback
+                and not force_no_chain
+                and try_interactions
+            ):
                 chain = (payload.get("interaction_chains") or {}).get(active_plan.model_lane)
                 if (
                     isinstance(chain, dict)
@@ -646,6 +675,10 @@ class _GeminiGenerateMixin:
                     thinking_level=active_plan.thinking_level,
                     sandbox_mode=getattr(route, "sandbox_mode", False),
                 )
+                if use_vertex:
+                    generation_trace["vertex_service_tier"] = vertex_tier
+                else:
+                    generation_trace.pop("vertex_service_tier", None)
 
             active_response_schema = (
                 CHAT_RESPONSE_FORMAT
@@ -660,7 +693,8 @@ class _GeminiGenerateMixin:
                 if with_longnick
                 else normalized_plugin_schema
             )
-            call_state = {"dispatched": False}
+            call_state = dispatch_state if dispatch_state is not None else {"dispatched": False}
+            call_state["dispatched"] = False
             cached_prefix = (
                 max(0, estimate_tokens(reserve_data) - estimate_tokens(wire_data)) if prev_id else 0
             )
@@ -687,6 +721,7 @@ class _GeminiGenerateMixin:
                     "http_options": types.HttpOptions(
                         timeout=int(deadline_seconds * 1000),
                         retry_options=types.HttpRetryOptions(attempts=1),
+                        headers=vertex_headers,
                     ),
                 }
                 if active_response_schema is not None:
@@ -730,6 +765,7 @@ class _GeminiGenerateMixin:
                 return self._normalize_generate_content([resp])
 
             async def operation():
+                nonlocal vertex_interactions_404
                 if chat and active_plan.model_lane == "carbon":
                     self.prefix_runtime.carbon_dispatched(scope, payload, rows)
                 call_state["dispatched"] = True
@@ -748,6 +784,7 @@ class _GeminiGenerateMixin:
                             **({"previous_interaction_id": prev_id} if prev_id else {}),
                             background=False,
                             stream=use_stream,
+                            extra_headers=vertex_headers,
                             **(
                                 {
                                     "response_format": {
@@ -779,6 +816,7 @@ class _GeminiGenerateMixin:
                             and self._http_status(exc) == 404
                             and not (progress and progress.started)
                         ):
+                            vertex_interactions_404 = True
                             return await _call_vertex_generate_content()
                         raise
                 client = self._flex_chat_client() if memory_archive else self.chat_client
@@ -859,7 +897,9 @@ class _GeminiGenerateMixin:
                 stream_progress=progress,
                 call_state=call_state,
                 thinking_level=active_plan.thinking_level,
+                price_multiplier=active_price_multiplier,
                 provider=provider_name,
+                service_tier=vertex_tier if use_vertex else None,
                 vertex_fallback_eligible=use_vertex
                 and self.routing.config.vertex_fallback_to_gemini,
             )
@@ -888,63 +928,201 @@ class _GeminiGenerateMixin:
         live_delta = on_text if (is_voice_companion and context.private_owner) else None
 
         async def dispatch(active_plan):
-            primary = StreamProgress(on_text=live_delta) if use_stream else None
-            try:
-                return await _dispatch_once(active_plan, primary)
-            except (Rejected, GenerationTimeout) as exc:
-                code = primary.error_code if primary else None
+            def _failure_info(
+                exc: BaseException,
+                progress: StreamProgress | None,
+                prev_attempt_count: int,
+            ):
+                last = attempts[-1] if len(attempts) > prev_attempt_count else None
+                code = progress.error_code if progress else None
+                if not code and last is not None:
+                    if last.get("http_status") is not None:
+                        code = str(last["http_status"])
+                    elif last.get("upstream_code"):
+                        code = str(last["upstream_code"])
                 unavailable_before_stream = str(exc) == "gemini_unavailable" and not (
-                    primary and primary.started
+                    progress and progress.started
+                )
+                rate_limited = (
+                    upstream_http_status(code) == 429
+                    or (last is not None and last.get("http_status") == 429)
+                    or (isinstance(exc, Rejected) and exc.detail == "rate_limited")
+                )
+                return last, code, unavailable_before_stream, rate_limited
+
+            primary = StreamProgress(on_text=live_delta) if use_stream else None
+            before_primary = len(attempts)
+            primary_exc: Rejected | GenerationTimeout | None = None
+            try:
+                return await _dispatch_once(active_plan, primary, vertex_tier="standard")
+            except (Rejected, GenerationTimeout) as exc:
+                primary_exc = exc
+                primary_detail, code, unavailable_before_stream, rate_limited = _failure_info(
+                    exc, primary, before_primary
                 )
                 if not code and not (used_provider == "vertex_paid" and unavailable_before_stream):
                     raise
-                incident = {"provider": used_provider, "code": code or "unknown"}
+                incident: dict[str, Any] = {"provider": used_provider, "code": code or "unknown"}
                 if generation_trace is not None:
                     generation_trace["provider_incident"] = incident
                 if used_provider != "vertex_paid":
                     raise
-                rate_limited = upstream_http_status(code) == 429
-                if rate_limited and self.routing.config.vertex_fallback_to_gemini:
-                    self.vertex_blocked_until = max(
-                        self.vertex_blocked_until, time.monotonic() + 60
-                    )
-                skip = None
-                if not self.routing.config.vertex_fallback_to_gemini:
-                    skip = "disabled"
-                elif primary and primary.output_text:
-                    skip = "partial_output"
-                elif not (
-                    unavailable_before_stream
-                    or (
-                        rate_limited and str(exc) in {"stream_provider_error", "gemini_unavailable"}
-                    )
-                ):
-                    skip = "ineligible"
-                if skip:
-                    incident["fallback"] = skip
-                    if attempts:
-                        attempts[-1]["fallback"] = skip
+                if primary and primary.output_text:
+                    incident["fallback"] = "partial_output"
+                    if primary_detail is not None:
+                        primary_detail["fallback"] = "partial_output"
+                    raise
+                primary_429_eligible = rate_limited and str(exc) in {
+                    "stream_provider_error",
+                    "gemini_unavailable",
+                }
+                if not primary_429_eligible and not unavailable_before_stream:
+                    incident["fallback"] = "ineligible"
+                    if primary_detail is not None:
+                        primary_detail["fallback"] = "ineligible"
                     raise
 
-            primary_detail = attempts[-1] if attempts else None
+            fallback_parent_detail = primary_detail
+            if primary_429_eligible:
+                # Stage 2: Vertex Standard PayGo 429 -> retry on Vertex Priority PayGo first.
+                priority_progress = StreamProgress(on_text=live_delta) if use_stream else None
+                priority_state = {"dispatched": False}
+                before_priority = len(attempts)
+                incident["fallback"] = "failed"
+                incident["fallback_target"] = "vertex_priority"
+                try:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise asyncio.CancelledError
+                    priority_result = await _dispatch_once(
+                        active_plan,
+                        priority_progress,
+                        vertex_tier="priority",
+                        force_no_chain=bool(primary and primary.started),
+                        dispatch_state=priority_state,
+                    )
+                except asyncio.CancelledError:
+                    incident["fallback"] = "cancelled"
+                    if primary_detail is not None:
+                        primary_detail["fallback"] = "cancelled"
+                    raise
+                except (Rejected, GenerationTimeout) as priority_exc:
+                    (
+                        priority_detail,
+                        priority_code,
+                        priority_unavail_before_stream,
+                        priority_rate_limited,
+                    ) = _failure_info(priority_exc, priority_progress, before_priority)
+                    priority_dispatched = priority_state["dispatched"] or bool(
+                        priority_progress and priority_progress.dispatched
+                    )
+                    if not priority_dispatched:
+                        if (
+                            str(priority_exc) == "vertex_unavailable"
+                            and self.routing.config.vertex_fallback_to_gemini
+                        ):
+                            if primary_detail is not None:
+                                primary_detail["fallback"] = "failed"
+                        else:
+                            incident["fallback"] = "not_dispatched"
+                            incident["fallback_detail"] = (
+                                priority_exc.audit_detail
+                                if isinstance(priority_exc, Rejected)
+                                else "timeout"
+                            )
+                            if primary_detail is not None:
+                                primary_detail["fallback"] = "not_dispatched"
+                            raise
+                    elif priority_progress and priority_progress.output_text:
+                        incident["fallback"] = "partial_output"
+                        if primary_detail is not None:
+                            primary_detail["fallback"] = "failed"
+                        if priority_detail is not None:
+                            priority_detail["fallback"] = "partial_output"
+                        raise
+                    else:
+                        if priority_rate_limited and self.routing.config.vertex_fallback_to_gemini:
+                            self.vertex_blocked_until = max(
+                                self.vertex_blocked_until, time.monotonic() + 60
+                            )
+                        priority_429_eligible = priority_rate_limited and str(priority_exc) in {
+                            "stream_provider_error",
+                            "gemini_unavailable",
+                        }
+                        if not (priority_429_eligible or priority_unavail_before_stream):
+                            incident["fallback"] = "ineligible"
+                            if priority_code:
+                                incident["fallback_code"] = priority_code
+                            incident["fallback_detail"] = (
+                                priority_exc.audit_detail
+                                if isinstance(priority_exc, Rejected)
+                                else "timeout"
+                            )
+                            if primary_detail is not None:
+                                primary_detail["fallback"] = "failed"
+                            if priority_detail is not None:
+                                priority_detail["fallback"] = "ineligible"
+                            raise
+                        if not self.routing.config.vertex_fallback_to_gemini:
+                            incident["fallback"] = "disabled"
+                            incident.pop("fallback_target", None)
+                            if primary_detail is not None:
+                                primary_detail["fallback"] = "failed"
+                            if priority_detail is not None:
+                                priority_detail["fallback"] = "disabled"
+                            raise
+                        if primary_detail is not None:
+                            primary_detail["fallback"] = "failed"
+                        fallback_parent_detail = priority_detail or primary_detail
+                else:
+                    if getattr(priority_result, "status", None) == "completed":
+                        incident["fallback"] = "succeeded"
+                        if primary_detail is not None:
+                            primary_detail["fallback"] = "succeeded"
+                    else:
+                        incident["fallback_detail"] = "generation_incomplete"
+                        if primary_detail is not None:
+                            primary_detail["fallback"] = "failed"
+                    return priority_result
+            elif not self.routing.config.vertex_fallback_to_gemini:
+                incident["fallback"] = "disabled"
+                if primary_detail is not None:
+                    primary_detail["fallback"] = "disabled"
+                assert primary_exc is not None
+                raise primary_exc
+
+            # Stage 3: Fall back to Gemini Developer API.
             backup = StreamProgress(on_text=live_delta) if use_stream else None
+            backup_state = {"dispatched": False}
             incident["fallback"] = "failed"
+            incident["fallback_target"] = "gemini_paid"
             try:
                 if cancel_event is not None and cancel_event.is_set():
                     raise asyncio.CancelledError
-                result = await _dispatch_once(active_plan, backup, developer_fallback=True)
+                result = await _dispatch_once(
+                    active_plan,
+                    backup,
+                    developer_fallback=True,
+                    dispatch_state=backup_state,
+                )
             except asyncio.CancelledError:
                 incident["fallback"] = "cancelled"
                 raise
-            except (Rejected, GenerationTimeout) as exc:
-                if backup and not backup.dispatched:
+            except (Rejected, GenerationTimeout) as backup_exc:
+                backup_dispatched = backup_state["dispatched"] or bool(backup and backup.dispatched)
+                if not backup_dispatched:
                     incident["fallback"] = "not_dispatched"
                 if backup and backup.error_code:
                     incident["fallback_code"] = backup.error_code
+                elif attempts and attempts[-1].get("provider") == "gemini_paid":
+                    last_backup = attempts[-1]
+                    if last_backup.get("http_status") is not None:
+                        incident["fallback_code"] = str(last_backup["http_status"])
+                    elif last_backup.get("upstream_code"):
+                        incident["fallback_code"] = str(last_backup["upstream_code"])
                 incident["fallback_detail"] = (
-                    exc.audit_detail if isinstance(exc, Rejected) else "timeout"
+                    backup_exc.audit_detail if isinstance(backup_exc, Rejected) else "timeout"
                 )
-                if rate_limited and isinstance(exc, GenerationTimeout):
+                if rate_limited and isinstance(backup_exc, GenerationTimeout):
                     raise Rejected("generation_incomplete") from None
                 raise
             else:
@@ -955,8 +1133,8 @@ class _GeminiGenerateMixin:
                 else:
                     incident["fallback"] = "succeeded"
             finally:
-                if primary_detail is not None:
-                    primary_detail["fallback"] = incident["fallback"]
+                if fallback_parent_detail is not None:
+                    fallback_parent_detail["fallback"] = incident["fallback"]
             return result
 
         def mark_chain_invalid():

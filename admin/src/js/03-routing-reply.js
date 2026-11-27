@@ -316,6 +316,7 @@ const modelFailureLabels={
   stage:{decision_message:'来信安全检查',decision_source:'来源安全检查',decision_output:'回复发送前检查',generation:'主模型生成',search:'联网搜索'},
   cause:{deadline:'达到本地调用时限',connect_timeout:'建立连接超时',read_timeout:'读取上游响应超时',write_timeout:'发送请求超时',pool_timeout:'等待连接池超时',sdk_timeout:'SDK 超时',timeout:'请求超时',http:'上游返回 HTTP 错误',dns:'域名解析失败',tls:'TLS 连接失败',connection:'连接失败',transport:'网络传输异常',stream_error:'上游流返回错误',circuit_open:'本地熔断冷却',unknown:'未识别的上游异常'},
   provider:{gemini_free:'Gemini Developer API（免费）',gemini_paid:'Gemini Developer API（付费）',vertex_paid:'Vertex AI'},
+  serviceTier:{standard:'Standard PayGo',priority:'Priority PayGo'},
   lane:{decision:'gemini-decision-1',hydrogen:'Hydrogen',neon:'Neon',carbon:'Carbon',memory_flex:'Hydrogen Flex',neon_flex:'Neon Flex',carbon_flex:'Carbon Flex'},
   stream:{waiting:'等待上游首个流事件',started:'已收流事件，尚无正文',partial_output:'已收到部分正文'},
   fallback:{succeeded:'回退成功',failed:'回退失败',cancelled:'回退已取消',not_dispatched:'备用请求未发出',disabled:'回退已关闭',ineligible:'此类错误跳过回退',partial_output:'已有部分正文，跳过回退'}
@@ -340,7 +341,7 @@ function diagnosticCell(row){
   box.append(el('summary',summaryText));
   const seconds=ms=>(ms/1000).toLocaleString('zh-CN',{maximumFractionDigits:3})+' 秒';
   for(const a of attempts){
-    const parts=[tags.stage[a.stage],tags.provider[a.provider],tags.lane[a.model_lane],tags.cause[a.cause]];
+    const parts=[tags.stage[a.stage],tags.provider[a.provider],a.service_tier&&tags.serviceTier[a.service_tier],tags.lane[a.model_lane],tags.cause[a.cause]];
     if(a.http_status)parts.push('HTTP '+a.http_status);
     if(a.upstream_code)parts.push(a.upstream_code);
     if(a.exception_type)parts.push(a.exception_type);
@@ -379,8 +380,9 @@ function auditOutcome(r){
     const code=incident.code==='unknown'?'上游未提供可识别错误码':incident.code;
     const status=incident.http_status&&String(incident.http_status)!==code?incident.http_status+' / ':'';
     details.push(provider+' · '+status+code);
+    const target=incident.fallback_target==='vertex_priority'?'Vertex Priority PayGo':'Gemini Developer API';
     const fallbackLabels={
-      succeeded:'Gemini Developer API 回退成功',failed:'Gemini Developer API 回退失败',
+      succeeded:target+' 回退成功',failed:target+' 回退失败',
       cancelled:'回退已取消',not_dispatched:'备用请求未发出',partial_output:'已产生部分正文，跳过回退',
       disabled:'回退开关已关闭',ineligible:'此错误不触发跨服务回退'
     };

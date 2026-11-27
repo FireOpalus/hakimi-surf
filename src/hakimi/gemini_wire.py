@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -12,6 +13,15 @@ from .audio_media import MAX_INLINE_AUDIO_BYTES, ModelAudio
 from .outbound_actions import require_all_schema_fields
 from .security import Rejected
 from .world_experience import MAX_DAY_REST_MINUTES
+
+VERTEX_STANDARD_PAYGO_HEADERS: dict[str, str] = {
+    "X-Vertex-AI-LLM-Request-Type": "shared",
+}
+VERTEX_PRIORITY_PAYGO_HEADERS: dict[str, str] = {
+    "X-Vertex-AI-LLM-Request-Type": "shared",
+    "X-Vertex-AI-LLM-Shared-Request-Type": "priority",
+}
+VERTEX_PRIORITY_PRICE_MULTIPLIER = Decimal("1.8")
 
 DIARY_INSTRUCTION = """你正在写吉米奈喵（哈基米）自己的每日冲浪观察手账，不是实时聊天回复。
 结合给定的公开巡逻摘要（public_summaries）、白名单聊天摘录（chat_excerpts）与活动计数，

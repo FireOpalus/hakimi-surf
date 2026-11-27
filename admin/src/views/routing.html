@@ -54,7 +54,7 @@
         <legend>Vertex AI 主模型通道</legend>
         <div class="row">
           <label><input id="prov-vertex-enabled" type="checkbox"> 通过 Vertex AI 调用全局主模型</label>
-          <label><input id="prov-vertex-fallback" type="checkbox"> Vertex 异常或凭据未就绪时自动回退至 Gemini Developer API</label>
+          <label><input id="prov-vertex-fallback" type="checkbox"> Vertex 429 优先升级 Priority PayGo，仍 429 或异常/凭据未就绪时自动回退至 Gemini Developer API</label>
         </div>
         <div class="grid">
           <label for="prov-vertex-auth-mode">Vertex 认证方式（vertex_auth_mode）

@@ -36,6 +36,9 @@ from .gemini_wire import (
     OWNER_COMPANION_INSTRUCTION,
     OWNER_DIGEST_INSTRUCTION,
     SCREEN_WATCH_INSTRUCTION,
+    VERTEX_PRIORITY_PAYGO_HEADERS,
+    VERTEX_PRIORITY_PRICE_MULTIPLIER,
+    VERTEX_STANDARD_PAYGO_HEADERS,
     VOICE_COMPANION_INSTRUCTION,
     GenerationTimeout,
     WireAgendaChange,
@@ -78,6 +81,9 @@ __all__ = [
     "OWNER_COMPANION_INSTRUCTION",
     "OWNER_DIGEST_INSTRUCTION",
     "SCREEN_WATCH_INSTRUCTION",
+    "VERTEX_PRIORITY_PAYGO_HEADERS",
+    "VERTEX_PRIORITY_PRICE_MULTIPLIER",
+    "VERTEX_STANDARD_PAYGO_HEADERS",
     "VOICE_COMPANION_INSTRUCTION",
     "WireAgendaChange",
     "WireBiliPick",
@@ -616,15 +622,42 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
             cached_rate = self.s.chat_cached_input_usd_per_m
         return cached_rate
 
-    def _discounted(self, actual, usage, rates, *, priced_at=None):
+    @staticmethod
+    def _vertex_downgraded_to_standard(result: Any) -> bool:
+        """Return True when Vertex explicitly reports a Priority request ran as Standard."""
+        um = getattr(result, "usage_metadata", None)
+        if um is not None:
+            tt = getattr(um, "traffic_type", None)
+            raw_tt = getattr(tt, "name", None) or getattr(tt, "value", None) or str(tt or "")
+            norm_tt = str(raw_tt).upper().split(".")[-1]
+            if norm_tt == "ON_DEMAND":
+                return True
+            if norm_tt == "ON_DEMAND_PRIORITY":
+                return False
+        tier = getattr(result, "service_tier", None)
+        raw_tier = getattr(tier, "value", None) or str(tier or "")
+        return raw_tier.lower() == "standard"
+
+    def _discounted(
+        self,
+        actual,
+        usage,
+        rates,
+        *,
+        priced_at=None,
+        price_multiplier: Decimal = Decimal(1),
+    ):
         if actual is None:
             return None
         if usage is None or usage.model_lane == "decision" or not usage.cached_tokens:
             return actual
         cached_rate = self._cached_input_rate(usage.model_lane, priced_at=priced_at)
-        if cached_rate is None or not Decimal(0) <= cached_rate <= rates[0]:
+        if cached_rate is None:
             return actual
-        return actual - usage.cached_tokens * (rates[0] - cached_rate) / 1_000_000
+        effective_cached_rate = cached_rate * price_multiplier
+        if not Decimal(0) <= effective_cached_rate <= rates[0]:
+            return actual
+        return actual - usage.cached_tokens * (rates[0] - effective_cached_rate) / 1_000_000
 
     @staticmethod
     def _http_status(exc: BaseException) -> int | None:
@@ -702,7 +735,9 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         call_state: dict[str, bool] | None = None,
         thinking_level: str | None = None,
         price_override: tuple[Decimal, Decimal] | None = None,
+        price_multiplier: Decimal = Decimal(1),
         provider: str = "gemini_paid",
+        service_tier: str | None = None,
         audit_stage: str = "generation",
         attempts: list[dict] | None = None,
         free_fallback_eligible: bool = False,
@@ -719,6 +754,8 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 "elapsed_ms": round(elapsed * 1000),
                 **facts,
             }
+            if service_tier in {"standard", "priority"}:
+                entry["service_tier"] = service_tier
             if stream_progress is not None:
                 entry["stream_phase"] = (
                     "partial_output"
@@ -756,10 +793,15 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         async with model_slot, self.memory_slots if model_lane in FLEX_MODELS else self.slots:
             await run_guard(before_call)
             priced_at = datetime.now(UTC)
-            rates = (
+            base_rates = (
                 price_override
                 if price_override is not None
                 else self._price(model_lane, at=priced_at)
+            )
+            effective_multiplier = price_multiplier if price_multiplier > 0 else Decimal(1)
+            rates = (
+                base_rates[0] * effective_multiplier,
+                base_rates[1] * effective_multiplier,
             )
             reserve_usd = (
                 (byte_count + 2048 + image_tokens) * rates[0] + output_cap * rates[1]
@@ -771,27 +813,53 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 result: Any = None,
                 usage: TokenUsage | None = None,
                 token_actual: Decimal | None = None,
+                settle_rates: tuple[Decimal, Decimal] | None = None,
+                settle_multiplier: Decimal | None = None,
             ) -> Decimal:
+                active_rates = settle_rates or rates
+                active_mult = (
+                    settle_multiplier if settle_multiplier is not None else effective_multiplier
+                )
                 extra = additional_reserve if fallback_additional is None else fallback_additional
                 if result is not None and token_actual is not None:
-                    disc = self._discounted(token_actual, usage, rates, priced_at=priced_at)
+                    disc = self._discounted(
+                        token_actual,
+                        usage,
+                        active_rates,
+                        priced_at=priced_at,
+                        price_multiplier=active_mult,
+                    )
                     est = (disc if disc is not None else token_actual) + extra
                 elif result is not None and usage is not None:
                     est_out = usage.output_tokens + min(output_cap, 256)
-                    gross = (usage.input_tokens * rates[0] + est_out * rates[1]) / 1_000_000
-                    disc = self._discounted(gross, usage, rates, priced_at=priced_at)
+                    gross = (
+                        usage.input_tokens * active_rates[0] + est_out * active_rates[1]
+                    ) / 1_000_000
+                    disc = self._discounted(
+                        gross,
+                        usage,
+                        active_rates,
+                        priced_at=priced_at,
+                        price_multiplier=active_mult,
+                    )
                     est = (disc if disc is not None else gross) + extra
                 else:
                     media = image_tokens if fallback_media_tokens is None else fallback_media_tokens
                     in_tokens = estimate_tokens(serialized) + 256 + media
                     cached_rate = self._cached_input_rate(model_lane, priced_at=priced_at)
+                    effective_cached_rate = (
+                        cached_rate * active_mult if cached_rate is not None else None
+                    )
                     cached_in = (
                         min(in_tokens, max(0, cached_prefix_tokens))
-                        if (cached_rate is not None and Decimal(0) <= cached_rate <= rates[0])
+                        if (
+                            effective_cached_rate is not None
+                            and Decimal(0) <= effective_cached_rate <= active_rates[0]
+                        )
                         else 0
                     )
-                    in_cost = (in_tokens - cached_in) * rates[0] + cached_in * (
-                        cached_rate or Decimal(0)
+                    in_cost = (in_tokens - cached_in) * active_rates[0] + cached_in * (
+                        effective_cached_rate or Decimal(0)
                     )
                     if output_cap <= 0:
                         out_tokens = 0
@@ -803,7 +871,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                         )
                     else:
                         out_tokens = min(output_cap, min(768, max(128, math.ceil(elapsed * 90))))
-                    est = (in_cost + out_tokens * rates[1]) / 1_000_000 + extra
+                    est = (in_cost + out_tokens * active_rates[1]) / 1_000_000 + extra
                 floor = Decimal("0.000001") if reserve_usd > 0 else Decimal(0)
                 return min(reserve_usd, max(floor, est))
 
@@ -1003,7 +1071,11 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 if non_billable and model_lane in FLEX_MODELS and status == 503:
                     raise rejected("gemini_unavailable", "flex_capacity_busy") from None
                 if non_billable and status == 429:
-                    if provider == "vertex_paid" and vertex_fallback_eligible:
+                    if (
+                        provider == "vertex_paid"
+                        and vertex_fallback_eligible
+                        and service_tier == "priority"
+                    ):
                         self.vertex_blocked_until = max(
                             self.vertex_blocked_until, time.monotonic() + 60
                         )
@@ -1020,7 +1092,17 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                     else "gemini_chat",
                     False,
                 )
-            token_actual = self._actual(result, rates)
+            settle_multiplier = effective_multiplier
+            settle_rates = rates
+            if (
+                provider == "vertex_paid"
+                and service_tier == "priority"
+                and effective_multiplier != Decimal(1)
+                and self._vertex_downgraded_to_standard(result)
+            ):
+                settle_multiplier = Decimal(1)
+                settle_rates = base_rates
+            token_actual = self._actual(result, settle_rates)
             usage = self._usage(result, model_lane, thinking_level=thinking_level)
             actual = token_actual
             if additional_actual is not None:
@@ -1028,9 +1110,22 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 actual = (
                     token_actual + extra if token_actual is not None and extra is not None else None
                 )
-            discounted = self._discounted(actual, usage, rates, priced_at=priced_at)
+            discounted = self._discounted(
+                actual,
+                usage,
+                settle_rates,
+                priced_at=priced_at,
+                price_multiplier=settle_multiplier,
+            )
             fallback = (
-                fallback_cost(elapsed, result=result, usage=usage, token_actual=token_actual)
+                fallback_cost(
+                    elapsed,
+                    result=result,
+                    usage=usage,
+                    token_actual=token_actual,
+                    settle_rates=settle_rates,
+                    settle_multiplier=settle_multiplier,
+                )
                 if actual is None
                 else None
             )
