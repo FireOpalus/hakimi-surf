@@ -931,6 +931,13 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                         "invalid_action_output",
                     }:
                         notice = "唔，我这边刚刚卡了一下，等会儿再喊我试试~"
+                    elif str(exc) == "upstream_media_rejected":
+                        notice = (
+                            "唔，这条消息里的图片/媒体被上游安全策略拒收了，"
+                            "我这边没法查看，换一张或直接发文字吧~"
+                        )
+                    elif str(exc) == "upstream_safety_rejected":
+                        notice = "唔，这条消息触发了上游安全策略被拒收了，换个说法再试试吧~"
                     elif str(exc) in {
                         "budget_exhausted",
                         "budget_hard_stop",

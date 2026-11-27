@@ -977,6 +977,46 @@ def test_provider_diagnostics_use_only_known_types_and_codes():
     ) == [safe]
     assert safe_attempts([dict(safe, stage="private text")]) == []
 
+    # Modern Interactions/Decisions API lowercase `error.code`, ErrorInfo `details[].reason`,
+    # and bounded HTTP 400 message classification map ONLY to allowlisted enum codes.
+    class _BodyErr(Exception):
+        def __init__(self, body):
+            super().__init__("raw secret exception")
+            self.body = body
+
+    assert error_facts(
+        _BodyErr({"error": {"code": "invalid_request", "message": "opaque detail"}}),
+        expired=False,
+        http_status=400,
+        stream_code=None,
+    ) == {"cause": "http", "http_status": 400, "upstream_code": "INVALID_REQUEST"}
+    assert error_facts(
+        _BodyErr(
+            {
+                "error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
+                    "details": [{"reason": "PROHIBITED_CONTENT"}],
+                }
+            }
+        ),
+        expired=False,
+        http_status=400,
+        stream_code=None,
+    ) == {"cause": "http", "http_status": 400, "upstream_code": "PROHIBITED_CONTENT"}
+    assert error_facts(
+        _BodyErr({"error": {"code": 400, "message": "Unable to process input image (secret)"}}),
+        expired=False,
+        http_status=400,
+        stream_code=None,
+    ) == {"cause": "http", "http_status": 400, "upstream_code": "INVALID_IMAGE"}
+    assert error_facts(
+        _BodyErr({"error": {"code": "custom_arbitrary_secret", "message": "secret text"}}),
+        expired=False,
+        http_status=400,
+        stream_code=None,
+    ) == {"cause": "http", "http_status": 400}
+
 
 async def test_existing_audit_table_gains_nullable_diagnostics_once(settings):
     import sqlite3

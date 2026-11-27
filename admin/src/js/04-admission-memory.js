@@ -611,7 +611,9 @@ const archiveLogLabels={
   memory_archive_unconfirmed:'归档中断，结果未确认，已暂停自动重试',
   memory_flex_retry_scheduled:'Flex 容量繁忙，等待重试',
   memory_flex_retry_succeeded:'Flex 重试成功，已归档',
-  memory_flex_retry_exhausted:'Flex 归档最终失败，已用完重试'
+  memory_flex_retry_exhausted:'Flex 归档最终失败，已用完重试',
+  upstream_media_rejected:'上游拒收图片/媒体（HTTP 400）',
+  upstream_safety_rejected:'上游安全策略拒收（HTTP 400）'
 };
 async function logs(){
   table('log-list',['时间','来源','事件','调用详情'],(await api('logs')).map(v=>{

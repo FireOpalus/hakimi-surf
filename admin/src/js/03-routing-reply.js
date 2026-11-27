@@ -311,7 +311,7 @@ for(const [id,path] of [['reset-debounce','debounce'],['reset-rate-limits','rate
 }
 
 function auditScore(value,direct=false){const box=el('div');if(value?.skipped){box.append(el('span',direct?'直接回应，跳过相关性':'未执行相关性判定'));return box;}if(!value||value.noul===null||value.noul===undefined){box.append(el('span','未知'));return box;}const bar=el('progress');bar.max=1;bar.value=value.noul;bar.setAttribute('aria-label','判定概率 '+value.noul);box.append(bar,el('small','p='+Number(value.noul).toFixed(3)+' · c='+(value.confidence===null||value.confidence===undefined?'未知':Number(value.confidence).toFixed(3))));return box;}
-const rejectDetails={budget_exhausted_user_daily:'budget_exhausted · 单用户日上限',budget_exhausted_daily:'budget_exhausted · 全局日上限',budget_exhausted_monthly:'budget_exhausted · 全局月上限',budget_exhausted_patrol_daily:'budget_exhausted · 巡逻日上限',budget_exhausted_memory_daily:'budget_exhausted · 记忆日上限',budget_exhausted_proactive_daily:'budget_exhausted · 主动生成日上限',budget_exhausted_admin_daily:'budget_exhausted · 沙盒日上限',budget_exhausted_search_daily:'budget_exhausted · 联网日上限',budget_exhausted_total:'budget_exhausted · 累计总上限',budget_exhausted_gcp_credit_exhausted:'gcp_credit_exhausted · GCP 赠金已耗尽'};
+const rejectDetails={budget_exhausted_user_daily:'budget_exhausted · 单用户日上限',budget_exhausted_daily:'budget_exhausted · 全局日上限',budget_exhausted_monthly:'budget_exhausted · 全局月上限',budget_exhausted_patrol_daily:'budget_exhausted · 巡逻日上限',budget_exhausted_memory_daily:'budget_exhausted · 记忆日上限',budget_exhausted_proactive_daily:'budget_exhausted · 主动生成日上限',budget_exhausted_admin_daily:'budget_exhausted · 沙盒日上限',budget_exhausted_search_daily:'budget_exhausted · 联网日上限',budget_exhausted_total:'budget_exhausted · 累计总上限',budget_exhausted_gcp_credit_exhausted:'gcp_credit_exhausted · GCP 赠金已耗尽',upstream_media_rejected:'上游拒收图片/媒体（HTTP 400）',upstream_media_rejected_safety:'上游安全策略拒收图片/媒体（HTTP 400）',upstream_safety_rejected:'上游安全策略拒收（HTTP 400）'};
 const modelFailureLabels={
   stage:{decision_message:'来信安全检查',decision_source:'来源安全检查',decision_output:'回复发送前检查',generation:'主模型生成',search:'联网搜索'},
   cause:{deadline:'达到本地调用时限',connect_timeout:'建立连接超时',read_timeout:'读取上游响应超时',write_timeout:'发送请求超时',pool_timeout:'等待连接池超时',sdk_timeout:'SDK 超时',timeout:'请求超时',http:'上游返回 HTTP 错误',dns:'域名解析失败',tls:'TLS 连接失败',connection:'连接失败',transport:'网络传输异常',stream_error:'上游流返回错误',circuit_open:'本地熔断冷却',unknown:'未识别的上游异常'},
@@ -397,7 +397,7 @@ function auditOutcome(r){
   if(s==='rejected'&&raw==='stream_provider_error'){
     details.push(incident?'模型流中断':'模型流中断（历史记录未保存上游错误码）');
   }else if(s){
-    const outcome=s==='rejected'?(raw.startsWith('budget_')?'预算限制':raw==='content_blocked'?'内容安全拦截':'处理未完成'):(outcomes[s]||s);
+    const outcome=s==='rejected'?(raw.startsWith('budget_')?'预算限制':raw==='content_blocked'?'内容安全拦截':/^upstream_(?:media|safety)_rejected/.test(raw)?'上游拒收':'处理未完成'):(outcomes[s]||s);
     details.push(outcome+(reason?'（'+reason+'）':''));
   }
   return details.length?' · '+details.join(' · '):'';
@@ -409,6 +409,7 @@ async function decisionAudit(){
     if(r.privacy_level)routeBox.append(privacyBadge(r.privacy_level));
     if(r.decision_tier)routeBox.append(decisionTierBadge(r.decision_tier));
     if(!r.privacy_level&&!r.decision_tier)routeBox.append(el('span','—','muted'));
+    const statusLabel=r.result==='blocked'&&/^gemini_(?:unavailable|circuit_open)/.test(r.reason)?'检查未完成':r.result==='blocked'&&/^upstream_(?:media|safety)_rejected$/.test(r.reason)?'上游拒收':r.result;
     return[
       dateTime(r.at)+' · '+r.source+' · '+r.surface+(r.group_id?' · 群 '+r.group_id:'')+(r.user_id_mask?' · '+r.user_id_mask:''),
       routeBox,
@@ -416,7 +417,7 @@ async function decisionAudit(){
       auditScore(r.scores?.is_prompt_injection),
       auditScore(r.scores?.is_unsafe_or_spam),
       auditScore(r.scores?.should_reply,r.reply_bypassed),
-      (r.result==='blocked'&&/^gemini_(?:unavailable|circuit_open)/.test(r.reason)?'检查未完成':r.result)+' · '+r.reason+(r.reply_bypassed?' · 明确请求，跳过插话门槛':'')+(r.attention_reason?' · '+r.attention_reason:'')+(r.thinking_level?' · 思考 '+(r.model_lane==='carbon'?'Carbon/':'')+r.thinking_level:'')+auditOutcome(r),diagnosticCell(r)
+      statusLabel+' · '+(rejectDetails[r.reason]||r.reason)+(r.reply_bypassed?' · 明确请求，跳过插话门槛':'')+(r.attention_reason?' · '+r.attention_reason:'')+(r.thinking_level?' · 思考 '+(r.model_lane==='carbon'?'Carbon/':'')+r.thinking_level:'')+auditOutcome(r),diagnosticCell(r)
     ];
   }));
 }

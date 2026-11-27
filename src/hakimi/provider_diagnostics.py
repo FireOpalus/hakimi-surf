@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import socket
 import ssl
 
@@ -32,31 +34,82 @@ CAUSES = {
 }
 # SDK error messages, HTTP bodies and even arbitrary provider-supplied identifiers can
 # contain request data. Only known protocol codes may leave the call boundary.
+SAFETY_UPSTREAM_CODES = frozenset(
+    {
+        "PROHIBITED_CONTENT",
+        "SAFETY",
+        "IMAGE_SAFETY",
+        "SAFETY_BLOCKED",
+        "CONTENT_BLOCKED",
+        "CONTENT_FILTERED",
+        "CONTENT_POLICY_VIOLATION",
+        "POLICY_VIOLATION",
+        "BLOCKLIST",
+        "SPII",
+        "RECITATION",
+    }
+)
 CODES = {
     "ABORTED",
     "ALREADY_EXISTS",
+    "API_KEY_INVALID",
+    "BAD_REQUEST",
     "CANCELLED",
     "DATA_LOSS",
     "DEADLINE_EXCEEDED",
     "FAILED_PRECONDITION",
     "INTERNAL",
     "INVALID_ARGUMENT",
+    "INVALID_IMAGE",
+    "INVALID_REQUEST",
     "NOT_FOUND",
     "OUT_OF_RANGE",
+    "PAYLOAD_TOO_LARGE",
     "PERMISSION_DENIED",
+    "REQUEST_TOO_LARGE",
     "RESOURCE_EXHAUSTED",
     "UNAUTHENTICATED",
     "UNAVAILABLE",
     "UNIMPLEMENTED",
     "UNKNOWN",
+    "UNSUPPORTED_MEDIA_TYPE",
     "GATEWAY_TIMEOUT",
     "TOO_MANY_REQUESTS",
     "RATE_LIMIT_EXCEEDED",
     "QUOTA_EXCEEDED",
     "RATE_LIMITED",
     "SERVER_ERROR",
+    *SAFETY_UPSTREAM_CODES,
 }
 NUMERIC_CODES = {str(code) for code in range(400, 600)}
+_MAX_BODY_PARSE_CHARS = 16384
+_MAX_MSG_CLASSIFY_CHARS = 4096
+_MSG_IMAGE_SAFETY_RE = re.compile(r"\bimage[_\s-]?safety\b", re.I)
+_MSG_PROHIBITED_RE = re.compile(r"\bprohibited[_\s-]?content\b", re.I)
+_MSG_SAFETY_BLOCKED_RE = re.compile(
+    r"\b(?:"
+    r"safety[_\s-]?block(?:ed)?|"
+    r"content[_\s-]?policy[_\s-]?violation|"
+    r"policy[_\s-]?violation|"
+    r"safety\s+(?:filter|policy|check|settings?|violation)|"
+    r"blocked\s+(?:by|for|due\s+to)\s+(?:our\s+)?(?:safety|content|policy)|"
+    r"violat(?:es|ing)\s+(?:our\s+)?(?:usage\s+|content\s+|safety\s+)?polic|"
+    r"sexually\s+explicit|"
+    r"nsfw|"
+    r"csam|"
+    r"child\s+safety"
+    r")\b",
+    re.I,
+)
+_MSG_INVALID_IMAGE_RE = re.compile(
+    r"\b(?:"
+    r"unable\s+to\s+process\s+input\s+image|"
+    r"invalid\s+image|"
+    r"corrupt(?:ed)?\s+image|"
+    r"unsupported\s+(?:image|mime|media)"
+    r")\b",
+    re.I,
+)
 EXCEPTION_TYPES = {
     "TimeoutError",
     "APITimeoutError",
@@ -87,18 +140,77 @@ EXCEPTION_TYPES = {
 MAX_ATTEMPTS = 6
 
 
+def _normalize_protocol_code(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip().replace("-", "_").upper()
+    if normalized in CODES:
+        return normalized
+    return None
+
+
+def _extract_body_code(body: object, *, http_status: int | None) -> str | None:
+    """Extract only allowlisted protocol/safety codes from an API error body."""
+    if isinstance(body, str):
+        stripped = body.strip()
+        if not stripped or len(stripped) > _MAX_BODY_PARSE_CHARS or stripped[0] not in "{[":
+            return None
+        try:
+            body = json.loads(stripped)
+        except ValueError:
+            return None
+    if isinstance(body, list):
+        body = body[0] if len(body) == 1 and isinstance(body[0], dict) else None
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error") if isinstance(body.get("error"), dict) else body
+    candidates: list[str] = []
+    for details_container in (err.get("details"), body.get("details")):
+        if isinstance(details_container, list):
+            for item in details_container[:8]:
+                if not isinstance(item, dict):
+                    continue
+                for field in ("reason", "code", "status"):
+                    if norm := _normalize_protocol_code(item.get(field)):
+                        candidates.append(norm)
+    for container in (err, body):
+        for field in ("reason", "status", "code"):
+            if norm := _normalize_protocol_code(container.get(field)):
+                candidates.append(norm)
+    for cand in candidates:
+        if cand in SAFETY_UPSTREAM_CODES:
+            return cand
+    if http_status == 400:
+        msg = err.get("message")
+        if isinstance(msg, str) and msg and len(msg) <= _MAX_MSG_CLASSIFY_CHARS:
+            if _MSG_IMAGE_SAFETY_RE.search(msg):
+                return "IMAGE_SAFETY"
+            if _MSG_PROHIBITED_RE.search(msg):
+                return "PROHIBITED_CONTENT"
+            if _MSG_SAFETY_BLOCKED_RE.search(msg):
+                return "SAFETY_BLOCKED"
+            if _MSG_INVALID_IMAGE_RE.search(msg):
+                return "INVALID_IMAGE"
+    return candidates[0] if candidates else None
+
+
 def error_facts(exc, *, expired, http_status, stream_code):
     """Classify the causal chain by type only. Never stringify an exception."""
     code = stream_code or getattr(exc, "status", None) or getattr(exc, "code", None)
     name = type(exc).__name__
     result = {"exception_type": name} if name in EXCEPTION_TYPES else {}
     body = getattr(exc, "body", None)
-    if isinstance(body, dict) and isinstance(body.get("error"), dict):
-        status = body["error"].get("status")
-        if isinstance(status, str) and status.upper() in CODES:
-            code = status
-    if isinstance(code, str) and (code.upper() in CODES or code in NUMERIC_CODES):
-        result["upstream_code"] = code.upper()
+    if body is None and exc is not None:
+        cause = getattr(exc, "__cause__", None)
+        if cause is not None:
+            body = getattr(cause, "body", None)
+    body_code = _extract_body_code(body, http_status=http_status)
+    if body_code is not None:
+        code = body_code
+    if isinstance(code, str):
+        normalized = code.strip().replace("-", "_").upper()
+        if normalized in CODES or normalized in NUMERIC_CODES:
+            result["upstream_code"] = normalized
     if isinstance(http_status, int) and 400 <= http_status <= 599:
         result["http_status"] = int(http_status)
     if expired:

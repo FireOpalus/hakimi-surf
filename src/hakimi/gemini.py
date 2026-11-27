@@ -222,6 +222,17 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
             self._channel_failures.pop(channel, None)
             self._channel_blocked_until.pop(channel, None)
 
+    @staticmethod
+    def _is_client_no_trip_status(status: int | None) -> bool:
+        return status is not None and (
+            status in _CLIENT_NO_TRIP_HTTP_STATUSES
+            or (
+                400 <= status < 500
+                and status not in _AUTH_GLOBAL_TRIP_HTTP_STATUSES
+                and status not in {408, 429}
+            )
+        )
+
     def _record_paid_failure(
         self,
         model_lane: str,
@@ -231,14 +242,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
     ) -> None:
         if model_lane in FLEX_MODELS or budget_lane == "search":
             return
-        if status is not None and (
-            status in _CLIENT_NO_TRIP_HTTP_STATUSES
-            or (
-                400 <= status < 500
-                and status not in _AUTH_GLOBAL_TRIP_HTTP_STATUSES
-                and status not in {408, 429}
-            )
-        ):
+        if self._is_client_no_trip_status(status):
             return
         now = time.monotonic()
         cooldown = max(0.0, float(self._circuit_cooldown_seconds))
@@ -1073,14 +1077,15 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                         )
                     )
                 if provider == "gemini_paid":
-                    await self.store.runtime.provider_result(
-                        "gemini_memory"
-                        if model_lane in FLEX_MODELS
-                        else "gemini_decision"
-                        if model_lane == "decision"
-                        else "gemini_chat",
-                        True,
-                    )
+                    if not self._is_client_no_trip_status(status):
+                        await self.store.runtime.provider_result(
+                            "gemini_memory"
+                            if model_lane in FLEX_MODELS
+                            else "gemini_decision"
+                            if model_lane == "decision"
+                            else "gemini_chat",
+                            True,
+                        )
                     self._record_paid_failure(model_lane, budget_lane, status=status)
                 elif provider == "gemini_free":
                     if (

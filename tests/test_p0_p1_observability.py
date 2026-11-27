@@ -238,7 +238,7 @@ async def test_inbound_decision_http_400_emits_content_free_warning(
     )
 
     with caplog.at_level(logging.WARNING, logger="hakimi"):
-        with pytest.raises(Rejected, match="^gemini_unavailable$"):
+        with pytest.raises(Rejected, match="^upstream_media_rejected$") as exc_info:
             await gate.screen(
                 {"current_message": f"{secret_text} {api_key}"},
                 "subject-key",
@@ -247,6 +247,10 @@ async def test_inbound_decision_http_400_emits_content_free_warning(
                 images=[img],
                 audios=[aud],
             )
+    assert exc_info.value.detail == ""
+    assert (
+        await store.one("SELECT failures FROM operational_health WHERE provider='gemini_decision'")
+    ) is None
 
     bad_req_logs = [
         rec for rec in caplog.records if "event=decision_bad_request" in rec.getMessage()
@@ -264,6 +268,7 @@ async def test_inbound_decision_http_400_emits_content_free_warning(
     assert m_bytes is not None and int(m_bytes.group(1)) > 0
     assert "error_type=BadRequestError" in msg
     assert "status=400" in msg
+    assert "upstream_code=INVALID_ARGUMENT" in msg
 
     for forbidden in (
         secret_text,
@@ -305,7 +310,15 @@ async def test_decision_bad_request_skips_non_inbound_and_non_400_and_sanitizes_
                 purpose="message",
                 message=message,
             )
-    assert not any("event=decision_bad_request" in rec.getMessage() for rec in caplog.records)
+        # Text-only generic HTTP 400 remains gemini_unavailable (not media/safety rejected).
+        with pytest.raises(Rejected, match="^gemini_unavailable$"):
+            await gate_400.screen(
+                {"current_message": "hello"},
+                "subject-key",
+                purpose="message",
+                message=message,
+            )
+    assert sum(1 for rec in caplog.records if "event=decision_bad_request" in rec.getMessage()) == 1
 
     # Malformed mime string on an image must be sanitized to "invalid", never logged raw.
     caplog.clear()
@@ -314,7 +327,7 @@ async def test_decision_bad_request_skips_non_inbound_and_non_400_and_sanitizes_
         mime_type="image/jpeg; secret=SHOULD_NOT_LEAK",
     )
     with caplog.at_level(logging.WARNING, logger="hakimi"):
-        with pytest.raises(Rejected, match="^gemini_unavailable$"):
+        with pytest.raises(Rejected, match="^upstream_media_rejected$"):
             await gate_400.screen(
                 {"current_message": "hi"},
                 "subject-key",
@@ -330,6 +343,81 @@ async def test_decision_bad_request_skips_non_inbound_and_non_400_and_sanitizes_
     assert len(bad_req_logs) == 1
     assert "mimes=invalid" in bad_req_logs[0]
     assert "SHOULD_NOT_LEAK" not in bad_req_logs[0]
+
+
+async def test_inbound_decision_400_extracts_gaos_code_and_classifies_safety(
+    settings, store, sdk_pair, message, caplog
+):
+    raw_secret = "RAW_BODY_CANARY_NEVER_LOGGED"
+
+    def handler_media_safety(request):
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "prohibited_content",
+                    "message": f"blocked image {raw_secret}",
+                }
+            },
+        )
+
+    def handler_text_safety(request):
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "invalid_request",
+                    "message": f"Request blocked by safety filter ({raw_secret})",
+                }
+            },
+        )
+
+    img = ModelImage(data=base64.b64encode(b"fake-jpeg").decode(), mime_type="image/jpeg")
+    gate_media = GeminiGateway(settings, store, *sdk_pair(handler_media_safety))
+    gate_text = GeminiGateway(settings, store, *sdk_pair(handler_text_safety))
+
+    with caplog.at_level(logging.WARNING, logger="hakimi"):
+        with pytest.raises(Rejected, match="^upstream_media_rejected$") as exc_media:
+            await gate_media.screen(
+                {"current_message": "look"},
+                "subject-key",
+                purpose="message",
+                message=message,
+                images=[img],
+            )
+        with pytest.raises(Rejected, match="^upstream_safety_rejected$") as exc_text:
+            await gate_text.screen(
+                {"current_message": "text only"},
+                "subject-key",
+                purpose="message",
+                message=message,
+            )
+
+    assert exc_media.value.audit_detail == "upstream_media_rejected_safety"
+    assert exc_media.value.provider_diagnostics[-1]["upstream_code"] == "PROHIBITED_CONTENT"
+    assert exc_text.value.audit_detail == "upstream_safety_rejected"
+    assert exc_text.value.provider_diagnostics[-1]["upstream_code"] == "SAFETY_BLOCKED"
+
+    logs = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "event=decision_bad_request" in rec.getMessage()
+    ]
+    assert len(logs) == 2
+    assert "upstream_code=PROHIBITED_CONTENT" in logs[0]
+    assert "upstream_code=SAFETY_BLOCKED" in logs[1]
+    assert all(raw_secret not in line for line in logs)
+
+    # Audit events and decision_audit record the distinct rejection codes (not gemini_unavailable).
+    codes = [
+        row["code"] for row in await store.all("SELECT code FROM audit_events ORDER BY id ASC")
+    ]
+    assert codes == ["upstream_media_rejected", "upstream_safety_rejected"]
+    audits = await gate_media.filters.recent_audit()
+    assert {item["reason"] for item in audits[:2]} == {
+        "upstream_media_rejected",
+        "upstream_safety_rejected",
+    }
 
 
 # ---------------------------------------------------------------------------

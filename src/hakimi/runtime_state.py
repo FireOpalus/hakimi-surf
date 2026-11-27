@@ -62,6 +62,8 @@ CODES = frozenset(
     {
         "prompt_injection",
         "content_blocked",
+        "upstream_media_rejected",
+        "upstream_safety_rejected",
         "noise_ignored",
         "invalid_decision",
         "onebot_connection_ended",

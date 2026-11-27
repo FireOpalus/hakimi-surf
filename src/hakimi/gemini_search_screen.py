@@ -20,7 +20,16 @@ from .gateway import redact_excerpt
 from .gemini_wire import _FreeTierFallback, _validate_audios, probability, questions
 from .media import ModelImage
 from .models import Message
-from .provider_diagnostics import EXCEPTION_TYPES
+from .provider_diagnostics import (
+    CODES as PROVIDER_CODES,
+)
+from .provider_diagnostics import (
+    EXCEPTION_TYPES,
+    SAFETY_UPSTREAM_CODES,
+)
+from .provider_diagnostics import (
+    NUMERIC_CODES as PROVIDER_NUMERIC_CODES,
+)
 from .routing import RouteDecision, select_tier
 from .security import Rejected
 from .store import DigestReviewCredit
@@ -792,9 +801,17 @@ class _GeminiSearchScreenMixin:
                             if type(raw_status) is int and 400 <= raw_status <= 599
                             else "unknown"
                         )
+                        raw_code = bad_attempt.get("upstream_code")
+                        upstream_code_label = (
+                            raw_code
+                            if isinstance(raw_code, str)
+                            and (raw_code in PROVIDER_CODES or raw_code in PROVIDER_NUMERIC_CODES)
+                            else "unknown"
+                        )
                         log.warning(
                             "event=decision_bad_request platform=%s surface=%s image_count=%d "
-                            "audio_count=%d mimes=%s text_bytes=%d error_type=%s status=%s",
+                            "audio_count=%d mimes=%s text_bytes=%d error_type=%s status=%s "
+                            "upstream_code=%s",
                             platform_label,
                             surface_label,
                             len(images),
@@ -803,11 +820,32 @@ class _GeminiSearchScreenMixin:
                             len(data.encode("utf-8")),
                             error_type,
                             status_label,
+                            upstream_code_label,
                         )
+                        if str(exc) == "gemini_unavailable":
+                            has_media = bool(images or audio_items or video is not None)
+                            is_safety_code = upstream_code_label in SAFETY_UPSTREAM_CODES
+                            if has_media:
+                                rewritten = Rejected(
+                                    "upstream_media_rejected",
+                                    "safety" if is_safety_code else "",
+                                    audited=exc.audited,
+                                )
+                                rewritten.provider_diagnostics = list(attempts)
+                                report.update(result="blocked", reason="upstream_media_rejected")
+                                exc = rewritten
+                            elif is_safety_code:
+                                rewritten = Rejected(
+                                    "upstream_safety_rejected",
+                                    audited=exc.audited,
+                                )
+                                rewritten.provider_diagnostics = list(attempts)
+                                report.update(result="blocked", reason="upstream_safety_rejected")
+                                exc = rewritten
             if not exc.audited:
                 await self.store.runtime.event(str(exc), audit_source, diagnostics=attempts)
                 exc.audited = True
-            raise
+            raise exc from None
         except (KeyError, AttributeError, TypeError, ValueError):
             report.update(result="blocked", reason="invalid_decision")
             await self.store.runtime.event("invalid_decision", audit_source)

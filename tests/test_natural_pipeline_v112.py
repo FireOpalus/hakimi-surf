@@ -204,6 +204,14 @@ async def test_search_provider_failure_does_not_open_chat_circuit(settings, stor
         ("gemini_circuit_open", "唔，我这边刚刚卡了一下，等会儿再喊我试试~"),
         ("generation_incomplete", "唔，我这边刚刚卡了一下，等会儿再喊我试试~"),
         ("invalid_action_output", "唔，我这边刚刚卡了一下，等会儿再喊我试试~"),
+        (
+            "upstream_media_rejected",
+            "唔，这条消息里的图片/媒体被上游安全策略拒收了，我这边没法查看，换一张或直接发文字吧~",
+        ),
+        (
+            "upstream_safety_rejected",
+            "唔，这条消息触发了上游安全策略被拒收了，换个说法再试试吧~",
+        ),
         ("budget_hard_stop", "唔，今天的额度刚好用完啦，明天再接着聊吧~"),
         ("budget_exhausted", "唔，今天的额度刚好用完啦，明天再接着聊吧~"),
         ("budget_circuit_open", "唔，今天的额度刚好用完啦，明天再接着聊吧~"),
