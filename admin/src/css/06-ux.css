@@ -284,3 +284,6 @@ form .grid, fieldset .grid {
 
 /* 模块卡片：没有独立页面的模块也保持一致的底部结构 */
 .module-open-none { flex: none; color: var(--muted); font-size: var(--fs-xs); font-weight: 600; }
+
+/* 折叠面板内的表单分组标题收紧顶部间距 */
+.panel-fold-body .grid > div > h3:first-child { margin-top: 4px; }

@@ -2,7 +2,16 @@
 const prefersReducedMotion=()=>Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
 
 /* ---------- 页内分区导航（长页面锚点条；带 data-section-group 的页面切换为二级分组） ---------- */
-const SECTION_GROUP_LABELS={cloud:'云资源总览',calls:'调用明细',billing:'余额与对账',budget:'预算策略'};
+const SECTION_GROUP_LABELS={
+  cloud:'云资源总览',
+  calls:'调用明细',
+  billing:'余额与对账',
+  budget:'预算策略',
+  song_list:'歌单与试听',
+  song_inbox:'找歌与收件箱',
+  song_learn:'Colab 学歌',
+  song_upload:'本地上传与目录'
+};
 const sectionNavs=new Map();
 
 function sectionTitle(card){
@@ -91,6 +100,23 @@ function revealSectionFor(heading){
 }
 
 /* ---------- 吸底保存条：当前页有未保存表单时浮出，就近保存或放弃 ---------- */
+var discardHandlers;
+function registerDiscardHandler(formOrId,fn){
+  const form=typeof formOrId==='string'?$(formOrId):formOrId;
+  if(!form||typeof fn!=='function')return;
+  if(!discardHandlers)discardHandlers=new WeakMap();
+  discardHandlers.set(form,fn);
+}
+function runDiscardHandlers(formsOrTabId){
+  if(!discardHandlers)return;
+  const forms=typeof formsOrTabId==='string'
+    ?[...dirtyRegistry.values()].filter(entry=>entry.tabId===formsOrTabId).map(entry=>entry.form)
+    :(Array.isArray(formsOrTabId)?formsOrTabId:[formsOrTabId]);
+  for(const form of forms){
+    const fn=discardHandlers.get(form);
+    if(fn){try{fn(form);}catch{}}
+  }
+}
 let saveBarSignature='';
 function renderSaveBar(){
   const bar=$('save-bar');
@@ -107,10 +133,17 @@ function renderSaveBar(){
   const discard=el('button','放弃修改','secondary');
   discard.type='button';
   discard.addEventListener('click',async()=>{
+    if(discard.disabled)return;
+    discard.disabled=true;
+    const activeTab=tab;
     const forms=entries.map(entry=>entry.form);
-    if(!(await confirmDiscardTabChanges(tab,'重新载入本页')))return;
+    let ok=false;
+    try{ok=await confirmDiscardTabChanges(activeTab,'重新载入本页');}
+    finally{if(!ok)discard.disabled=false;}
+    if(!ok)return;
     for(const form of forms)if(typeof form.reset==='function')form.reset();
-    busy(discard,()=>refreshTab());
+    runDiscardHandlers(forms);
+    await busy(null,()=>refreshTab(activeTab));
   });
   const saves=entries.map(entry=>{
     const submit=entry.form.querySelector('button[type=submit]');
@@ -217,14 +250,17 @@ function enhanceLabels(root){
 
 /* ---------- 说明折叠：长段说明只保留首句，其余收进「展开说明」 ---------- */
 function foldLongHelp(root){
-  for(const p of root.querySelectorAll('section.tab p.muted:not([id])')){
-    if(p.children.length||p.closest('.help-fold, .table, td, .tg-privacy-box'))continue;
+  if(!root||root.nodeType!==1)return;
+  const sel=root.matches?.('section.tab')?'p.muted:not([id])':'section.tab p.muted:not([id])';
+  for(const p of root.querySelectorAll(sel)){
+    if(p.dataset.helpFolded==='1'||p.children.length||p.closest('.help-fold, .table, td, .tg-privacy-box'))continue;
     const raw=p.textContent.trim();
     if(raw.length<110)continue;
     const boundary=[...raw.matchAll(/[。；]/g)].map(m=>m.index).find(index=>index>=24);
     if(boundary===undefined)continue;
     const rest=raw.slice(boundary+1).trim();
     if(rest.length<30)continue;
+    p.dataset.helpFolded='1';
     p.textContent=raw.slice(0,boundary+1);
     const fold=el('details',undefined,'help-fold');
     fold.append(el('summary','展开说明'),el('p',rest,'muted'));

@@ -157,7 +157,7 @@
     <p class="muted">提高注入／违规阈值会减少拦截，降低回应阈值会增加自由插话。外部来源与模型输出继续独立执行严格筛查；这些设置不改变白名单、身份或工具权限。</p>
     <p id="filter-source" class="muted"></p>
     <form id="filter-policy">
-      <details class="help-fold"><summary>阈值如何作用于私聊、点名与外部 Bot</summary><p class="muted">私聊与明确点名、回复机器人通过安全检查后可直接回应（群聊仅在明确 @ 机器人时解析视频）；外部 Bot 即使主动 @ 或引用回复也不会跳过门槛（默认 0.85，设为 1.00 为 0 Token 完全屏蔽；仅 Owner 发起 /bot-interact 时临时豁免 2 轮）。群内自由插话仍看 should_reply，每个群可在 QQ 的「群聊互动策略」中选择安静、自然或活跃预设；Owner 普通群聊的插话门槛最高为 0.28。</p></details>
+      <details class="help-fold"><summary>阈值如何作用于私聊、点名与外部 Bot</summary><p class="muted">私聊与明确点名、回复机器人通过安全检查后可直接回应（群聊仅在明确 @ 机器人时解析视频）；外部 Bot 即使主动 @ 或引用回复也不会跳过门槛（默认 0.85，设为 1.00 为 0 Token 完全屏蔽；仅 Owner 发起 /bot-interact 时临时豁免 2 轮）。群内自由插话仍看 should_reply，每个群可在各自平台模块页（QQ / Telegram）中调整触发策略与活跃度预设；Owner 普通群聊的插话门槛最高为 0.28。</p></details>
       <div class="grid">
         <label for="filter-injection">来信注入拦截阈值 <input id="filter-injection" type="number" min="0.01" max="0.99" step="0.01" required></label>
         <label for="filter-unsafe">来信违规拦截阈值 <input id="filter-unsafe" type="number" min="0.01" max="0.99" step="0.01" required></label>
@@ -178,7 +178,7 @@
 <section id="sandbox" class="tab" role="tabpanel" aria-labelledby="nav-sandbox" hidden>
   <div class="card"><h2>沙盒模拟测试台</h2>
     <p class="callout callout-warn"><strong>会产生费用：</strong>每次测试都调用真实模型并计入管理预算。</p>
-    <p class="muted">不会发送 QQ、读取真实记忆或写入生产 Session。Bot 处于 1.00 完全屏蔽、私聊或群策略不放行时不调用模型；阈值低于 1.00 时按 Bot 回复门槛实测。</p>
+    <p class="muted">不会向真实聊天发送消息、读取真实记忆或写入生产 Session；当前沙盒按 QQ 规则模拟。Bot 处于 1.00 完全屏蔽、私聊或群策略不放行时不调用模型；阈值低于 1.00 时按 Bot 回复门槛实测。</p>
     <div class="row">
       <select id="sim-identity" aria-label="身份"><option value="OWNER">OWNER</option><option value="MEMBER">普通群友</option><option value="BOT">已知 Bot</option></select>
       <select id="sim-scene" aria-label="场景"><option value="group_at">群聊 @</option><option value="group_plain">群聊普通发言</option><option value="private">私聊</option></select>
@@ -195,7 +195,7 @@
 </section>
 
 <section id="admission" class="tab" role="tabpanel" aria-labelledby="nav-admission" hidden>
-  <div class="card"><div class="row between"><h2>准入与防互刷名单管理</h2><div class="row"><button type="button" class="secondary" data-open-tab="group-policy">Telegram 渠道热配置与群策略 →</button><button id="refresh-admission" type="button" class="secondary">刷新名单</button></div></div>
+  <div class="card"><div class="row between"><h2>准入与防互刷名单管理</h2><div class="row"><button type="button" class="secondary" data-open-tab="group-policy">QQ 群聊互动策略 →</button><button id="refresh-admission" type="button" class="secondary">刷新名单</button></div></div>
     <p id="admission-source" class="muted"></p>
     <p id="admission-owner" class="muted"></p>
     <p class="muted">变更立即生效，无需重启；SQLite 保存的名单与阈值优先于启动时的 .env。非准入消息和设为 1.00 的 Bot 在模型调用前直接忽略。</p>

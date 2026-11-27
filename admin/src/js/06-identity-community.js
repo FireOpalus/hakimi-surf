@@ -65,7 +65,7 @@ function renderIdentityPersonsList(){
     const accList=p.accounts||[];
     table(accWrap,['平台','账号 ID','昵称','来源','绑定时间','操作'],accList.map(acc=>{
       const plat=acc.platform||'—';
-      const platPill=pill(plat,plat==='qq'?'vertex':plat==='onebot'?'paid':'muted');
+      const platPill=acc.platform?communityPlatformBadge(acc.platform):pill('—','muted');
       const srcPill=pill(idAccSourceLabels[acc.source]||acc.source||'—',acc.source==='owner_config'?'paid':'muted');
       const op=isSoleOwnerAccount(p,acc)?pill('唯一 Owner 账号','paid'):button('解绑',async()=>{
         if(!(await confirmDialog('确认解绑 '+plat+':'+acc.user_id+'？解绑后该账号将拆分为独立 Person 档案。',{danger:true,confirmLabel:'解绑账号'})))return;
@@ -364,7 +364,9 @@ function renderPluginBus(d){
         notice('已保存插件配置：'+p.plugin_id);
       });
     });
-    card.append(form);
+    const fold=el('details',undefined,'card-edit-fold');
+    fold.append(el('summary','编辑插件配置 / Scope'),form);
+    card.append(fold);
     return card;
   }));
 }
@@ -500,7 +502,7 @@ function renderAffectionUsers(){
     const plat=u.platform||'onebot';
     const userBox=el('div',undefined,'stack-xs');
     const idLine=el('div',undefined,'row');
-    idLine.append(el('span',u.user_id,'code-mono'),pill(plat,plat==='qq'?'vertex':'muted'));
+    idLine.append(el('span',u.user_id,'code-mono'),communityPlatformBadge(plat));
     userBox.append(idLine);
     const isOwnerImmune=u.safety_status==='owner_immune'||Boolean(u.is_owner);
     const isRisk=!isOwnerImmune&&u.safety_status==='risk';
@@ -577,7 +579,7 @@ function renderAffectionHistory(data){
     const plat=item.platform||'onebot';
     const userBox=el('div',undefined,'stack-xs');
     const idLine=el('div',undefined,'row');
-    idLine.append(el('span',item.user_id||'—','code-mono'),pill(plat,plat==='qq'?'vertex':'muted'));
+    idLine.append(el('span',item.user_id||'—','code-mono'),communityPlatformBadge(plat));
     if(item.person_id==='owner')idLine.append(pill('✦ 唯一专属','paid'));
     userBox.append(idLine);
     const sub=[item.nickname,item.person_id&&item.person_id!=='owner'?item.person_id:''].filter(Boolean).join(' · ');

@@ -520,6 +520,36 @@ body:not(.authenticated) main {
 .song-take-spec { font-size: var(--fs-xs); color: var(--muted); margin: 0; }
 .song-take-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .song-take-actions button { min-height: 28px; padding: 4px 10px; font-size: var(--fs-sm); }
+#songs .card > .sub-card { margin-top: 12px; }
+.song-finder-list {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  overflow: hidden;
+}
+.song-finder-list:empty { display: none; }
+.song-finder-list > p.muted { margin: 0; padding: 14px 16px; font-size: var(--fs-sm); }
+.song-finder-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  padding: 12px 14px;
+  transition: background .14s ease;
+}
+.song-finder-item + .song-finder-item { border-top: 1px solid var(--line); }
+.song-finder-item:hover { background: var(--hover-tint); }
+.song-finder-item > :first-child { flex: 1 1 260px; min-width: 0; }
+.song-finder-item > :first-child > strong {
+  display: block;
+  font-size: var(--fs-md);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.song-finder-item .pill-row { margin: 6px 0 0; gap: 6px; }
+.song-finder-item > .row { flex: none; gap: 8px; }
 
 /* 模型与思考场景配置 */
 .scene-heading { margin-top: 24px; }
@@ -712,6 +742,31 @@ body:not(.authenticated) main {
   color: var(--ink);
   cursor: pointer;
 }
+.tg-item-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+}
+.tg-item-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tg-item-controls .table-select {
+  min-height: 31px;
+  min-width: 112px;
+  width: auto;
+  padding: 4px 9px;
+  font-size: var(--fs-sm);
+}
+.tg-item-controls > .muted { font-size: var(--fs-xs); }
 .tg-privacy-box {
   margin: 12px 0 14px;
   padding: 12px 14px;
@@ -741,4 +796,22 @@ body:not(.authenticated) main {
   background: color-mix(in srgb, var(--vertex-bg) 78%, var(--free-bg));
   color: var(--vertex-ink);
   border-color: var(--vertex-line);
+}
+
+/* Minecraft 会话连接控制条 */
+.mc-control-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--soft-2) 60%, transparent);
+}
+.mc-control-bar button {
+  min-height: 33px;
+  padding: 6px 12px;
+  font-size: var(--fs-sm);
 }

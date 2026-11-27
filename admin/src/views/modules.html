@@ -66,16 +66,26 @@
 </section>
 
 <section id="group-policy" class="tab" role="tabpanel" aria-labelledby="nav-group-policy" hidden>
-  <div class="card"><h2>群聊互动策略</h2>
-    <p class="muted">统一管理 QQ / Telegram 等各平台已授权白名单群；保存后立即生效，重启保留。at_only 接收真实 @、对机器人的已验证回复和顶层昵称点名（群内看视频需真实 @）；muted 始终静默。活跃度只调整 smart_reply 的自由插话门槛。</p>
+  <div class="card">
+    <div class="row between">
+      <h2>QQ 群聊互动策略</h2>
+      <div class="row">
+        <button type="button" class="secondary" data-open-tab="admission">准入与外部 Bot 管理 →</button>
+        <button id="refresh-group-policy" type="button" class="secondary">刷新策略</button>
+      </div>
+    </div>
+    <p class="muted">管理 QQ / OneBot 白名单群的触发策略与自由插话活跃度；保存后立即生效，重启保留。at_only 接收真实 @、对机器人的已验证回复和顶层昵称点名（群内看视频需真实 @）；muted 始终静默。活跃度只调整 smart_reply 的自由插话门槛。</p>
     <div id="groups" class="table"></div>
   </div>
+</section>
+
+<section id="telegram" class="tab" role="tabpanel" aria-labelledby="nav-telegram" hidden>
   <div id="tg-social-card" class="card">
     <div class="row between">
       <h2>Telegram 社交接入与热配置</h2>
       <button id="tg-refresh" type="button" class="secondary">刷新状态</button>
     </div>
-    <p class="muted">在线管理 Telegram 远程社交插件的授权群号、主动冒泡白名单、私聊模式与群记忆镜像开关；保存后加密写入后台 SQLite 并在插件在线时实时热推送，新加入的群号自动同步到上方「群聊互动策略」列表。</p>
+    <p class="muted">在线管理 Telegram 远程社交插件的授权群号、主动冒泡白名单、私聊模式与群记忆镜像开关；保存后加密写入后台 SQLite 并在插件在线时实时热推送，已保存的授权群可直接在下方同行调整触发策略、自由插话活跃度与主动冒泡，无需跳转其他页面。</p>
     <div id="tg-status-pills" class="pill-row"></div>
     <p id="tg-status-meta" class="muted" aria-live="polite"></p>
     <div id="tg-capabilities-row" class="pill-row"></div>
@@ -83,7 +93,7 @@
       <div class="tg-config-grid">
         <fieldset class="panel-group">
           <legend>授权群号与主动冒泡（allowed_groups / proactive_groups）</legend>
-          <p class="muted">支持负数超级群 ID（如 -1001234567890）；每个授权群可单独勾选是否允许主动冒泡。</p>
+          <p class="muted">支持负数超级群 ID（如 -1001234567890）；已保存的授权群可直接在下方同行调整触发策略、自由插话活跃度与主动冒泡。</p>
           <div class="row">
             <input id="tg-group-input" type="text" inputmode="text" maxlength="25" placeholder="-1001234567890" aria-label="添加 Telegram 群号">
             <button id="tg-add-group" type="button" class="secondary">添加群号</button>
@@ -122,11 +132,14 @@
       </div>
     </form>
   </div>
-  <div class="card"><h2>Bot 回复阈值与冷却</h2>
-    <p class="muted">此处与「准入与防互刷」共用外部 Bot 名单与回复阈值（0.01–1.00，1.00=完全屏蔽）。显式 /bot-interact 窗口内允许 2 轮对话及点名，不改变日常阈值。</p>
-    <form id="bot-default-threshold-form" class="row"><label for="bot-default-threshold">全局默认 Bot 阈值 <input id="bot-default-threshold" class="bot-th-input" type="number" min="0.01" max="1" step="0.01" required></label><button type="submit" class="primary">保存默认阈值</button></form>
-    <div class="quick-bar"><label for="bot-id">其他机器人 QQ 号<input id="bot-id" inputmode="numeric" placeholder="纯数字 QQ 号"></label><label for="bot-custom-threshold">专属阈值（可留空）<input id="bot-custom-threshold" type="number" min="0.01" max="1" step="0.01" placeholder="跟随全局默认"></label><button id="add-bot" type="button" class="primary">加入管理</button></div>
-    <div id="bots" class="table"></div>
+  <div class="card">
+    <h2>会话隐私</h2>
+    <p id="tg-privacy-note" class="muted"></p>
+    <div id="tg-privacy-table" class="table"></div>
+  </div>
+  <div class="card">
+    <h2>模块动作</h2>
+    <div id="telegram-actions" class="module-tools"></div>
   </div>
 </section>
 
@@ -184,17 +197,19 @@
   <div class="card"><h2>Minecraft 控制</h2>
     <dl id="mc-overview" class="node-details"></dl>
     <p id="life-mc-status" class="muted"></p>
+    <div class="mc-control-bar row">
+      <button id="life-mc-connect" type="button" class="secondary" disabled>上线进服 (connect)</button>
+      <button id="life-mc-disconnect" type="button" class="secondary" disabled>下线待机 (disconnect)</button>
+      <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
+      <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
+      <button id="life-mc-idle" type="button" class="secondary" disabled>MC 待命 (idle)</button>
+      <button id="life-mc-status-btn" type="button" class="secondary" disabled>刷新 MC 状态</button>
+    </div>
     <form id="life-mc-form" class="quick-bar">
       <label for="life-mc-topic">Mineflayer 建造 / 活动目标
         <input id="life-mc-topic" type="text" maxlength="80" placeholder="例如：红石自动门、探索雪原">
       </label>
       <button id="life-mc-build" type="submit" class="primary" disabled>筹备建造 (build_plan)</button>
-      <button id="life-mc-connect" type="button" class="secondary" disabled>上线进服 (connect)</button>
-      <button id="life-mc-disconnect" type="button" class="secondary" disabled>下线待机 (disconnect)</button>
-      <button id="life-mc-status-btn" type="button" class="secondary" disabled>刷新 MC 状态</button>
-      <button id="life-mc-idle" type="button" class="secondary" disabled>MC 待命 (idle)</button>
-      <button id="life-mc-pause" type="button" class="secondary" disabled>暂停 MC</button>
-      <button id="life-mc-resume" type="button" class="secondary" disabled>恢复 MC</button>
     </form>
     <form id="life-mc-chat-form" class="quick-bar">
       <label for="life-mc-chat-msg">MC 公屏喊话 (chat)
@@ -206,7 +221,7 @@
   <div class="card"><h2>路标与近期动作流水</h2>
     <p id="mc-plan-summary" class="muted">暂无连贯计划或路标记录。</p>
     <div id="mc-waypoints-list" class="pill-row"></div>
-    <div id="mc-action-log" class="table-wrap"></div>
+    <div id="mc-action-log" class="table"></div>
   </div>
   <div class="card"><h2>模块动作</h2>
     <div id="minecraft-actions" class="module-tools"></div>

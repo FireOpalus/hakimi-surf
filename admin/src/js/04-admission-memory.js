@@ -6,26 +6,54 @@ function formatPlatformBadge(platform){
   if(p==='discord')return pill('Discord','vertex');
   return pill(p,'muted');
 }
+let lastGroupsItems=[];
+let lastFilterData=null;
 async function groups(){
   const [items,filterData]=await Promise.all([api('groups'),api('filter')]);
   if(!token)return;
-  table('groups',['平台 / 群号','触发策略','自由插话活跃度'],items.map(g=>{
+  lastGroupsItems=Array.isArray(items)?items:[];
+  lastFilterData=filterData||null;
+  const qqItems=lastGroupsItems.filter(g=>['onebot','qq'].includes(String(g.platform||'onebot').toLowerCase()));
+  table('groups',['平台 / 群号','触发策略','自由插话活跃度'],qqItems.map(g=>{
     const cell=el('div',undefined,'platform-cell');
     cell.append(formatPlatformBadge(g.platform),el('code',g.group_id,'code-mono'));
     const select=el('select',undefined,'table-select');
+    select.setAttribute('aria-label',g.group_id+' 触发策略');
     for(const [value,label] of Object.entries({at_only:'点名 / 回复 / 视频',smart_reply:'智能插话',muted:'静默'})){const o=el('option',label);o.value=value;select.append(o);}
     select.value=g.mode;
-    select.addEventListener('change',()=>busy(select,async()=>{await api('groups','PUT',{platform:g.platform,group_id:g.group_id,mode:select.value});notice('群策略已保存');}));
+    select.addEventListener('change',()=>busy(select,async()=>{
+      const prev=g.mode;
+      try{
+        await api('groups','PUT',{platform:g.platform,group_id:g.group_id,mode:select.value});
+        g.mode=select.value;
+        notice('群策略已保存');
+      }catch(error){select.value=prev;throw error;}
+    }));
     const activity=el('select',undefined,'table-select');
+    activity.setAttribute('aria-label',g.group_id+' 自由插话活跃度');
     for(const [value,label] of Object.entries({'':'跟随全局 '+filterData.config.reply_threshold,quiet:'安静 '+filterData.presets.quiet,natural:'自然 '+filterData.presets.natural,active:'活跃 '+filterData.presets.active})){const o=el('option',label);o.value=value;activity.append(o);}
-    activity.value=filterData.config.group_activity[g.platform+':'+g.group_id]||'';
-    activity.addEventListener('change',()=>busy(activity,async()=>{await api('filter/group-activity','POST',{platform:g.platform,group_id:g.group_id,preset:activity.value||null});notice('群活跃度已保存并立即生效');}));
+    const actKey=g.platform+':'+g.group_id;
+    activity.value=filterData.config.group_activity[actKey]||'';
+    activity.addEventListener('change',()=>busy(activity,async()=>{
+      const prev=filterData.config.group_activity[actKey]||'';
+      try{
+        await api('filter/group-activity','POST',{platform:g.platform,group_id:g.group_id,preset:activity.value||null});
+        if(activity.value)filterData.config.group_activity[actKey]=activity.value;
+        else delete filterData.config.group_activity[actKey];
+        notice('群活跃度已保存并立即生效');
+      }catch(error){activity.value=prev;throw error;}
+    }));
     return[cell,select,activity];
-  }));
+  }),'暂无 QQ 白名单群，请先前往「准入与防互刷」添加 QQ 白名单群。');
   $('sim-group').replaceChildren(el('option','默认群策略'));
   $('sim-group').firstChild.value='';
-  items.filter(g=>g.platform==='onebot').forEach(g=>{const o=el('option',g.group_id+' · '+g.mode);o.value=g.group_id;$('sim-group').append(o);});
+  lastGroupsItems.filter(g=>g.platform==='onebot').forEach(g=>{const o=el('option',g.group_id+' · '+g.mode);o.value=g.group_id;$('sim-group').append(o);});
+  if(tgSocialDraft)renderTelegramSocialLists();
 }
+$('refresh-group-policy').addEventListener('click',e=>busy(e.target,async()=>{
+  await groups();
+  notice('已刷新 QQ 群聊互动策略');
+}));
 
 let tgSocialState=null;
 let tgSocialDraft=null;
@@ -41,7 +69,8 @@ const TG_CAP_LABELS={
   rich_card:'代码卡片',
   typing:'输入状态',
   quick_ack:'快捷确认',
-  poke:'戳一戳'
+  poke:'戳一戳',
+  proactive_speak:'主动冒泡'
 };
 function normalizeTgDraft(raw){
   const src=raw&&typeof raw==='object'?raw:{};
@@ -71,10 +100,17 @@ function renderTelegramSocialLists(){
     groupsBox.replaceChildren(el('p','暂未授权 Telegram 群号，可在上方输入群 ID（如 -1001234567890）添加。','empty-state'));
   }else{
     const proactiveSet=new Set(draft.proactive_groups);
+    const savedGroups=new Set(Array.isArray(tgSocialState?.config?.allowed_groups)?tgSocialState.config.allowed_groups.map(v=>String(v)):[]);
+    const tgGroupMap=new Map(
+      lastGroupsItems
+        .filter(g=>String(g.platform||'').toLowerCase()==='telegram')
+        .map(g=>[String(g.group_id),g])
+    );
     groupsBox.replaceChildren(...draft.allowed_groups.map(gid=>{
       const row=el('div',undefined,'tg-item-row');
       const main=el('div',undefined,'tg-item-main');
       main.append(pill('Telegram','tg'),el('code',gid,'code-mono'));
+      const controls=el('div',undefined,'tg-item-controls');
       const proLabel=el('label');
       const proCb=el('input');
       proCb.type='checkbox';
@@ -86,7 +122,69 @@ function renderTelegramSocialLists(){
         markDirty('tg-config-form');
       });
       proLabel.append(proCb,'允许主动冒泡');
-      main.append(proLabel);
+      controls.append(proLabel);
+      let savedItem=tgGroupMap.get(gid);
+      if(savedGroups.has(gid)||savedItem){
+        let currentMode=savedItem?.mode||'at_only';
+        const modeSel=el('select',undefined,'table-select');
+        modeSel.dataset.tgPolicy='mode';
+        modeSel.setAttribute('aria-label','Telegram 群 '+gid+' 触发策略');
+        for(const [value,label] of Object.entries({at_only:'点名 / 回复 / 视频',smart_reply:'智能插话',muted:'静默'})){
+          const o=el('option',label);o.value=value;modeSel.append(o);
+        }
+        modeSel.value=currentMode;
+        modeSel.addEventListener('input',e=>e.stopPropagation?.());
+        modeSel.addEventListener('change',e=>{
+          e.stopPropagation?.();
+          const prev=currentMode;
+          busy(modeSel,async()=>{
+            try{
+              await api('groups','PUT',{platform:'telegram',group_id:gid,mode:modeSel.value});
+              currentMode=modeSel.value;
+              if(savedItem)savedItem.mode=currentMode;
+              else{savedItem={platform:'telegram',group_id:gid,mode:currentMode};lastGroupsItems.push(savedItem);}
+              notice('Telegram 群 '+gid+' 触发策略已保存');
+            }catch(error){modeSel.value=prev;throw error;}
+          });
+        });
+
+        const actKey='telegram:'+gid;
+        const replyTh=lastFilterData?.config?.reply_threshold;
+        const presets=lastFilterData?.presets||{};
+        let currentAct=(lastFilterData?.config?.group_activity||{})[actKey]||'';
+        const actSel=el('select',undefined,'table-select');
+        actSel.dataset.tgPolicy='activity';
+        actSel.setAttribute('aria-label','Telegram 群 '+gid+' 自由插话活跃度');
+        for(const [value,label] of Object.entries({
+          '':'跟随全局'+(replyTh!=null?' '+replyTh:''),
+          quiet:'安静'+(presets.quiet!=null?' '+presets.quiet:''),
+          natural:'自然'+(presets.natural!=null?' '+presets.natural:''),
+          active:'活跃'+(presets.active!=null?' '+presets.active:'')
+        })){
+          const o=el('option',label);o.value=value;actSel.append(o);
+        }
+        actSel.value=currentAct;
+        actSel.addEventListener('input',e=>e.stopPropagation?.());
+        actSel.addEventListener('change',e=>{
+          e.stopPropagation?.();
+          const prev=currentAct;
+          busy(actSel,async()=>{
+            try{
+              await api('filter/group-activity','POST',{platform:'telegram',group_id:gid,preset:actSel.value||null});
+              currentAct=actSel.value;
+              if(lastFilterData?.config?.group_activity){
+                if(currentAct)lastFilterData.config.group_activity[actKey]=currentAct;
+                else delete lastFilterData.config.group_activity[actKey];
+              }
+              notice('Telegram 群 '+gid+' 活跃度已保存并立即生效');
+            }catch(error){actSel.value=prev;throw error;}
+          });
+        });
+        controls.append(modeSel,actSel);
+      }else{
+        controls.append(el('small','保存后可调触发策略与活跃度','muted'));
+      }
+      main.append(controls);
       const rmBtn=el('button','删除','danger');
       rmBtn.type='button';
       rmBtn.addEventListener('click',()=>{
@@ -120,6 +218,14 @@ function renderTelegramSocialLists(){
     }));
   }
   updateTgPrivateModeHint();
+}
+function resetTgDraft(){
+  tgSocialDraft=normalizeTgDraft(tgSocialState?.config);
+  $('tg-group-input').value='';
+  $('tg-user-input').value='';
+  $('tg-private-mode').value=tgSocialDraft.private_mode;
+  $('tg-memory-mirror').checked=tgSocialDraft.memory_mirror_enabled;
+  renderTelegramSocialLists();
 }
 function renderTelegramSocialConfig(d){
   if(!d||typeof d!=='object')return;
@@ -215,8 +321,10 @@ $('tg-memory-mirror').addEventListener('change',()=>{
   tgSocialDraft.memory_mirror_enabled=$('tg-memory-mirror').checked;
 });
 $('tg-refresh').addEventListener('click',e=>busy(e.target,async()=>{
-  if(!(await confirmDiscardTabChanges('group-policy','刷新 Telegram 配置')))return;
-  await Promise.all([telegramSocialConfig(),groups()]);
+  if(!(await confirmDiscardTabChanges('telegram','刷新 Telegram 配置')))return;
+  resetTgDraft();
+  if(typeof telegramTab==='function')await telegramTab();
+  else await Promise.all([telegramSocialConfig(),groups()]);
   notice('已刷新 Telegram 渠道状态与群策略');
 }));
 $('tg-config-form').addEventListener('submit',e=>{
@@ -258,37 +366,21 @@ function botThresholdControl(uid,custom,effective,after){
   else if(Number(effective)<1)wrap.append(button('设为 1.00',async()=>{await api('bots','PUT',{user_id:uid,action:'threshold',threshold:1});await after();notice('Bot '+uid+' 已设为 1.00 完全屏蔽');}));
   return wrap;
 }
+function formatBotCooldown(groups){
+  if(!Array.isArray(groups)||!groups.length)return '无冷却';
+  return groups.map(g=>g.group_id+': '+(g.used??0)+' / '+(g.max_turns??2)+'轮'+(g.is_target?' · 当前目标':' · 本群共用额度')+(g.cooldown_seconds?' · 冷却 '+g.cooldown_seconds+'s':' · 窗口剩余 '+g.window_seconds+'s')).join('；');
+}
 async function syncActiveAdmissionOrBots(){
-  if(tab==='admission')await admission();
-  else if(tab==='group-policy')await bots();
-  else await admission();
+  await admission();
 }
-async function bots(){
-  const [items,th]=await Promise.all([api('bots'),api('bots/thresholds')]);
-  if(!token)return;
-  $('bot-default-threshold').value=th.bot_reply_threshold??0.85;
-  clearDirty('bot-default-threshold-form');
-  table('bots',['机器人 QQ','生效阈值','专属阈值调整','群冷却','操作'],items.map(b=>[
-    b.user_id,
-    botThresholdLabel(b.custom_threshold,b.effective_threshold),
-    botThresholdControl(b.user_id,b.custom_threshold,b.effective_threshold,syncActiveAdmissionOrBots),
-    b.groups.map(g=>g.group_id+': '+(g.used??0)+' / '+(g.max_turns??2)+'轮'+(g.is_target?' · 当前目标':' · 本群共用额度')+(g.cooldown_seconds?' · 冷却 '+g.cooldown_seconds+'s':' · 窗口剩余 '+g.window_seconds+'s')).join('；')||'无冷却',
-    button('移出管理',async()=>{
-      if(!(await confirmDialog('移出后将按普通成员策略处理，确定移出外部 Bot '+b.user_id+'？',{danger:true,confirmLabel:'移出管理'})))return;
-      await api('bots','PUT',{user_id:b.user_id,action:'remove'});
-      await syncActiveAdmissionOrBots();
-      notice('已移出外部 Bot '+b.user_id);
-    },'danger')
-  ]));
-}
-$('bot-default-threshold-form').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{const v=parseBotThreshold($('bot-default-threshold').value);await api('bots/thresholds','PUT',{bot_reply_threshold:v});await syncActiveAdmissionOrBots();notice('默认 Bot 回复阈值已更新为 '+v.toFixed(2));});});
-$('add-bot').addEventListener('click',e=>busy(e.target,async()=>{const th=parseBotThreshold($('bot-custom-threshold').value,true);await api('bots','PUT',{user_id:$('bot-id').value.trim(),action:'add',threshold:th});$('bot-id').value='';$('bot-custom-threshold').value='';await syncActiveAdmissionOrBots();notice('外部 Bot 已加入管理');}));
 
 let admissionState=null;
 const admissionLists=[['allowed_groups','admission-groups','QQ群号'],['allowed_users','admission-users','好友 QQ']];
 async function admission(){
-  const d=await api('admission');if(!token)return;
+  const [d,botRows]=await Promise.all([api('admission'),api('bots').catch(err=>{if(err?.name==='AbortError')throw err;return[];})]);
+  if(!token)return;
   admissionState=d;const c=d.config;
+  const botGroupsById=new Map((Array.isArray(botRows)?botRows:[]).map(b=>[String(b.user_id),Array.isArray(b.groups)?b.groups:[]]));
   $('admission-private-mode').value=c.private_mode;
   $('admission-bot-threshold').value=c.bot_reply_threshold??0.85;
   clearDirty('admission-bot-threshold-form');
@@ -304,9 +396,9 @@ async function admission(){
       notice('名单已更新，立即生效');
     },'danger')]));
   }
-  table('admission-bots',['外部 Bot QQ','当前生效阈值','专属阈值调整','操作'],c.ignored_bot_ids.map(uid=>{
+  table('admission-bots',['外部 Bot QQ','当前生效阈值','专属阈值调整','群冷却','操作'],c.ignored_bot_ids.map(uid=>{
     const custom=c.bot_reply_thresholds?.[uid],effective=custom??c.bot_reply_threshold??0.85;
-    return[uid,botThresholdLabel(custom,effective),botThresholdControl(uid,custom,effective,syncActiveAdmissionOrBots),button('移除',async()=>{
+    return[uid,botThresholdLabel(custom,effective),botThresholdControl(uid,custom,effective,syncActiveAdmissionOrBots),formatBotCooldown(botGroupsById.get(String(uid))),button('移除',async()=>{
       if(!(await confirmDialog('确认移出外部 Bot '+uid+'？移出后将按普通成员策略处理。',{danger:true,confirmLabel:'移除'})))return;
       await api('admission/change','POST',{list:'ignored_bot_ids',action:'remove',id:uid});
       await admission();
@@ -359,7 +451,7 @@ function flexRetryText(retry){
 }
 async function sessions(){
   table('sessions',['会话','热窗口 / 长期记忆','归档状态','操作'],(await api('sessions')).map(s=>[
-    s.platform+' '+s.kind+':'+s.conversation_id,formatSessionMemorySummary(s),
+    el('div',[formatPlatformBadge(s.platform),el('code',s.kind+':'+s.conversation_id,'code-mono')],'platform-cell'),formatSessionMemorySummary(s),
     [flexRetryText(s.flex_retry),s.archive_unconfirmed_slices?'归档结果未确认，已暂停自动重试 · '+s.archive_unconfirmed_slices+' 段':'',
       s.archive_failed_slices?'最终失败 '+s.archive_failed_slices+' 段':''].filter(Boolean).join(' / ')||'—',
     button('查看与管理',()=>openSession(s))
@@ -367,7 +459,7 @@ async function sessions(){
 }
 async function openSession(s){
   session=s;const d=await api('sessions/'+s.id);session.version=d.version;
-  text('session-title',s.kind+':'+s.conversation_id);
+  text('session-title',(s.platform?s.platform+' · ':'')+s.kind+':'+s.conversation_id);
   text('session-info','热窗口 '+d.recent_count+' 条 · 记忆'+(d.enabled?'开启':'关闭')+(d.dual_ready?' · 双轨已接管（有效 '+(d.dual_entries_count??0)+' 条 / '+(d.dual_chars??0)+' 字）':''));
   $('summary-text').value=d.rolling_summary;
   $('summary-text').placeholder=d.dual_ready?'当前会话已升级为下方「双轨记忆治理」，旧版单体滚动摘要已停用（此处为空属正常状态）':'暂无旧版滚动摘要';
@@ -529,16 +621,16 @@ async function logs(){
 }
 $('refresh-logs').addEventListener('click',e=>busy(e.target,logs));
 
-trackDirty('bot-default-threshold-form','全局默认 Bot 阈值');
 trackDirty('tg-config-form','Telegram 社交热配置');
+if(typeof registerDiscardHandler==='function')registerDiscardHandler('tg-config-form',resetTgDraft);
 trackDirty('admission-bot-threshold-form','默认 Bot 回复阈值');
 trackDirty('compression-form','滚动压缩参数');
 trackDirty('patrol-limits-form','订阅配额与轮询间隔');
 
 onLogout(()=>{
-  admissionState=null;memoryView=null;tgSocialState=null;tgSocialDraft=null;
-  for(const id of ['bot-id','bot-custom-threshold','sub-uid','tg-group-input','tg-user-input'])$(id).value='';
-  for(const id of ['groups','bots','admission-groups','admission-users','admission-bots','sessions','memory-entries','subs','drive-consumers','diaries','log-list','tg-status-pills','tg-capabilities-row','tg-groups-list','tg-users-list'])$(id).replaceChildren();
+  admissionState=null;memoryView=null;tgSocialState=null;tgSocialDraft=null;lastGroupsItems=[];lastFilterData=null;
+  for(const id of ['sub-uid','tg-group-input','tg-user-input'])$(id).value='';
+  for(const id of ['groups','admission-groups','admission-users','admission-bots','sessions','memory-entries','subs','drive-consumers','diaries','log-list','tg-status-pills','tg-capabilities-row','tg-groups-list','tg-users-list'])$(id).replaceChildren();
   for(const id of ['admission-source','admission-owner','admission-group-scope','admission-environment','compression-source','compression-summary','patrol-limits-source','drive-connection','journal-drive-status','notebook-state','notebook-action-note','memory-state','memory-mirror-state','tg-status-meta','tg-private-mode-hint'])text(id,'');
   text('tg-env-defaults','等待读取配置…');
   text('diary-preview','选择日期即可阅读日记。');

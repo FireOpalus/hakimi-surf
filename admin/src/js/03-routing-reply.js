@@ -192,12 +192,22 @@ function renderSceneGroups(){
     box.append(legend,fields);return box;
   }));
 }
+function resetThinkingDraft(){
+  sceneEdits.clear();
+  thinkingDirty=false;
+  text('thinking-edit-state','');
+  if(scenePolicy){
+    $('primary-model').value=scenePolicy.primary_model;
+    renderSceneGroups();
+  }
+}
 async function thinking(){displayModelSettings(await api('models'));}
 $('primary-model').addEventListener('change',()=>{renderSceneGroups();thinkingChanged();});
 $('thinking-fields').addEventListener('change',e=>{sceneEdits.set(e.target.dataset.scene,e.target.value);thinkingChanged();});
 $('refresh-thinking').addEventListener('click',e=>busy(e.target,async()=>{
-  if(thinkingDirty&&!(await confirmDialog('重新加载会覆盖待保存的修改，确定继续？',{danger:true,confirmLabel:'重新加载'})))return;
-  await thinking();
+  if(!(await confirmDiscardTabChanges('thinking','刷新模型与思考设置')))return;
+  resetThinkingDraft();
+  await Promise.all([thinking(),generationCaps()]);
 }));
 $('apply-thinking-all').addEventListener('click',()=>{
   const level=$('thinking-all').value;
@@ -231,7 +241,8 @@ async function generationCaps(){
 }
 $('refresh-gen-caps').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('thinking','刷新输出上限')))return;
-  await generationCaps();
+  resetThinkingDraft();
+  await Promise.all([thinking(),generationCaps()]);
 }));
 $('gen-caps-form').addEventListener('submit',e=>{e.preventDefault();busy($('save-gen-caps'),async()=>{const payload={};for(const key of Object.keys(genCapFields))payload[key]=Number($('gen-cap-'+key).value);await api('generation-caps','PUT',payload);notice('输出上限已保存并立即生效');await generationCaps();});});
 $('reset-gen-caps').addEventListener('click',e=>busy(e.target,async()=>{
@@ -447,6 +458,7 @@ trackDirty('prov-cred-form','API 凭据');
 trackDirty('prov-policy-form','全局模型通道');
 trackDirty('qq-privacy-defaults','QQ 默认隐私等级');
 trackDirty('thinking-policy','模型与思考设置');
+if(typeof registerDiscardHandler==='function')registerDiscardHandler('thinking-policy',resetThinkingDraft);
 trackDirty('gen-caps-form','输出 Token 上限');
 trackDirty('debounce-form','回复防抖时间');
 trackDirty('rate-limits-form','请求限流与延迟');

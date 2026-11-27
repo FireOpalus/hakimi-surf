@@ -2491,3 +2491,496 @@ def test_song_finder_ui_rendering_and_fetch_prefill_runtime():
     assert "SONG_FINDER_UI_OK" in proc.stdout, (
         f"Song Finder async JS test did not complete:\n{proc.stderr}\n{proc.stdout}"
     )
+
+
+def test_views_polish_markup_and_css_contracts():
+    """Verify #songs grouping, folds, #bili-policy button order, multi-platform copy & CSS."""
+    html = build_html()
+    assert audit_html(html) == []
+    policy = content_security_policy(html)
+    assert "script-src 'sha256-" in policy and "style-src 'sha256-" in policy
+
+    panels = dict(re.findall(r'<section id="([^"]+)" class="tab"[^>]*>(.*?)</section>', html, re.S))
+
+    # 1. #songs 4 top-level section groups, Drive config fold, and .song-finder-list container
+    songs_html = panels["songs"]
+    groups = re.findall(r'<div class="card" data-section-group="([^"]+)">', songs_html)
+    assert groups == ["song_list", "song_inbox", "song_learn", "song_upload"]
+    assert 'id="song-fold-drive-config" class="panel-fold"' in songs_html
+    fold_body = songs_html.split('id="song-fold-drive-config"')[1].split("</details>")[0]
+    for elem_id in ("song-storage-source", "song-drive-details", "song-storage-form"):
+        assert f'id="{elem_id}"' in fold_body
+    assert '<div id="song-finder-results" class="song-finder-list"></div>' in songs_html
+    assert "QQ / Telegram 私聊发送音频" in songs_html
+    assert "兼容 QQ / Telegram 语音条与各平台" in songs_html
+    assert "Telegram 自动匹配贴纸 / 动图 / 图片通道发送" in panels["memes"]
+
+    # 2. #bili-policy button order: primary save -> secondary run -> secondary reset (far right)
+    bili_html = panels["bili-account"]
+    bili_policy_block = bili_html.split('id="bili-policy"')[1].split("</form>")[0]
+    btn_row = bili_policy_block.rsplit('<div class="row">', 1)[1].split("</div>")[0]
+    assert btn_row.index("保存并立即生效") < btn_row.index('id="bili-run"')
+    assert btn_row.index('id="bili-run"') < btn_row.index('id="bili-reset"')
+    assert 'id="bili-run" class="secondary"' in btn_row
+    assert btn_row.count('class="primary"') == 1
+
+    # 3. #memory legacy compression parameters folded + neutral account isolation copy
+    memory_html = panels["memory"]
+    assert 'id="memory-fold-legacy" class="panel-fold"' in memory_html
+    legacy_block = memory_html.split('id="memory-fold-legacy"')[1].split("</details>")[0]
+    for elem_id in (
+        "group-messages",
+        "group-chars",
+        "group-keep",
+        "group-min_chars",
+        "group-max_messages",
+        "private-messages",
+        "private-chars",
+        "private-keep",
+    ):
+        assert f'id="{elem_id}"' in legacy_block
+    assert "画像按平台账号隔离" in memory_html
+    assert "画像按数字账号隔离" not in memory_html
+
+    # 4. #life / #voice-companion / #screen-watch / #community multi-platform copy
+    assert 'id="social-schedule-card"' in panels["life"]
+    assert "社交语音条（QQ / Telegram）与实时连麦" in panels["voice-companion"]
+    assert 'id="sw-qq-fallback"' in panels["screen-watch"]
+    assert "私聊至 Owner 主通道" in panels["screen-watch"]
+    assert "用户 ID（QQ / Telegram / OpenID）" in panels["community"]
+
+    # 5. CSS rules for song finder list, TG inline controls, and MC control bar
+    styles = re.findall(r"<style>(.*?)</style>", html, re.S)
+    assert len(styles) == 1
+    css = styles[0]
+    for selector in (
+        ".song-finder-list",
+        ".song-finder-item",
+        ".tg-item-controls",
+        ".mc-control-bar",
+    ):
+        assert selector in css, f"Missing CSS selector: {selector}"
+
+
+def test_views_polish_js_runtime_behaviors():
+    """Verify proactive TG fallback, logout cleanup, plugin-bus fold, badges, & song/bili UX."""
+    import json
+
+    find_js_engine("No local JS engine (node/jsc) available for views-polish JS runtime test")
+
+    html = build_html()
+    assert audit_html(html) == []
+    collector = _IdCollector()
+    collector.feed(html)
+    all_ids_json = json.dumps(sorted(set(collector.ids)))
+
+    core_js = (ADMIN_DIR / "src" / "js" / "01-core.js").read_text(encoding="utf-8")
+    life_js = (ADMIN_DIR / "src" / "js" / "05-life-companion.js").read_text(encoding="utf-8")
+    comm_js = (ADMIN_DIR / "src" / "js" / "06-identity-community.js").read_text(encoding="utf-8")
+    media_js = (ADMIN_DIR / "src" / "js" / "07-media-bili.js").read_text(encoding="utf-8")
+
+    harness = f"""
+    const ALL_IDS = {all_ids_json};
+    class MockNode {{
+      constructor(tag) {{
+        this.tagName = String(tag || 'div').toUpperCase();
+        this.children = [];
+        this.parentElement = null;
+        this.attrs = {{}};
+        this.dataset = {{}};
+        this.listeners = {{}};
+        this._text = '';
+        this.hidden = false;
+        this.disabled = false;
+        this.checked = false;
+        this.open = false;
+        this.value = '';
+        this.className = '';
+        this.tabIndex = 0;
+        this.options = [];
+        this.selectedOptions = [];
+        this.files = [];
+        this.classList = {{ add(){{}}, remove(){{}}, toggle(){{}}, contains(){{ return false; }} }};
+      }}
+      get textContent() {{
+        return this.children.length
+          ? this._text + this.children.map(c => c.textContent).join('')
+          : this._text;
+      }}
+      set textContent(v) {{ this._text = String(v ?? ''); this.children = []; }}
+      setAttribute(k, v) {{
+        if (k === 'class') this.className = String(v);
+        this.attrs[k] = String(v);
+      }}
+      getAttribute(k) {{ return this.attrs[k] ?? null; }}
+      removeAttribute(k) {{ delete this.attrs[k]; }}
+      append(...nodes) {{
+        for (const n of nodes) {{
+          if (n instanceof MockNode) {{
+            n.parentElement = this;
+            this.children.push(n);
+            if (n.tagName === 'OPTION') this.options.push(n);
+          }} else {{
+            const t = new MockNode('#text'); t._text = String(n); this.children.push(t);
+          }}
+        }}
+      }}
+      replaceChildren(...nodes) {{
+        this.children = []; this.options = []; this._text = ''; this.append(...nodes);
+      }}
+      add(opt) {{ this.append(opt); }}
+      addEventListener(evt, fn) {{ (this.listeners[evt] ||= []).push(fn); }}
+      dispatch(evt, extra={{}}) {{
+        const ev = {{ target: this, preventDefault(){{}}, ...extra }};
+        for (const fn of (this.listeners[evt] || [])) fn(ev);
+      }}
+      showModal() {{ this.open = true; }}
+      close() {{ this.open = false; }}
+      focus() {{ this._focused = true; }}
+      select() {{}}
+      scrollIntoView() {{ this._scrolled = true; }}
+      reset() {{}}
+      querySelector(sel) {{
+        if (sel === '.dirty-badge[data-dirty-indicator]') {{
+          return this.children.find(
+            c => c.className === 'dirty-badge' && c.dataset.dirtyIndicator === '1'
+          ) || null;
+        }}
+        return null;
+      }}
+      querySelectorAll(sel) {{
+        if (sel === '.row') return this.children.filter(c => c.className === 'row');
+        return [];
+      }}
+      closest(sel) {{
+        if (sel === 'section.tab') return {{ id: this._tabId || 'bili-account' }};
+        return null;
+      }}
+    }}
+    class Option extends MockNode {{
+      constructor(label, value) {{
+        super('option');
+        this._text = String(label ?? '');
+        this.value = value !== undefined ? String(value) : this._text;
+      }}
+    }}
+    const Node = MockNode;
+    const byId = new Map();
+    for (const id of ALL_IDS) {{
+      const n = new MockNode('div');
+      n.id = id;
+      byId.set(id, n);
+    }}
+    const document = {{
+      body: new MockNode('body'),
+      documentElement: new MockNode('html'),
+      hidden: false,
+      activeElement: null,
+      title: '',
+      getElementById(id) {{ return byId.get(id) || null; }},
+      createElement(tag) {{ return new MockNode(tag); }},
+      createTextNode(t) {{ const n = new MockNode('#text'); n._text = String(t); return n; }},
+      addEventListener() {{}},
+      querySelectorAll() {{ return []; }}
+    }};
+    class AbortController {{
+      constructor() {{ this.signal = {{ aborted: false }}; }}
+      abort() {{ this.signal.aborted = true; }}
+    }}
+    const window = {{}};
+    function setTimeout(){{ return 0; }}
+    function clearTimeout(){{}}
+    function clearInterval(){{}}
+    const location = {{ hash: '', pathname: '/admin' }};
+    const history = {{ replaceState(){{}}, pushState(){{}} }};
+    function renderRestHours(){{}}
+    function regionName(r){{ return r === 'CN' ? '境内' : '境外'; }}
+    const revealedTargets = [];
+    function revealSectionFor(target) {{ revealedTargets.push(target?.id || null); }}
+
+    {core_js}
+    token = 'polish-token';
+    confirmDialog = async () => true;
+    const pendingTasks = [];
+    const origBusy = busy;
+    busy = (btn, fn) => {{
+      const p = origBusy(btn, fn);
+      pendingTasks.push(p);
+      return p;
+    }};
+
+    const apiCalls = [];
+    let modulesResp = [{{ id: 'telegram', owner_delivery: true }}];
+    let tgDeliveryResp = {{
+      platform: 'telegram',
+      connected: true,
+      configured: true,
+      delivery_enabled: true,
+      day: '2026-11-27',
+      timezone: 'Asia/Shanghai',
+      next_digest_at: 1795780800,
+      proactive_daily_limit_usd: 1.5,
+      budget: {{ total: 250000, total_limit: 5000000, hard_stop: false }},
+      queue: [{{ kind: 'digest', status: 'queued', n: 1 }}],
+      alerts: []
+    }};
+    let inboxItems = [];
+    api = async (path, method='GET', data) => {{
+      apiCalls.push({{ path, method, data }});
+      if (path === 'proactive' && method === 'GET') return {{ assigned: false }};
+      if (path === 'life/modules' && method === 'GET') return modulesResp;
+      if (path === 'life/modules/telegram/owner-delivery' && method === 'GET') {{
+        return tgDeliveryResp;
+      }}
+      if (path.startsWith('life/modules/telegram/owner-delivery/') && method === 'POST') {{
+        return {{ status: 'sent', delivery: 'sent' }};
+      }}
+      if (path === 'songs/fetch-to-inbox' && method === 'POST') {{
+        const saved = {{
+          id: 'df_1', file_id: 'df_1', name: '晴天 - 周杰伦.mp3', size: 2048000
+        }};
+        inboxItems = [{{ id: 'df_1', name: saved.name, size: saved.size }}];
+        return saved;
+      }}
+      if (path === 'songs/inbox' && method === 'GET') return {{ items: inboxItems }};
+      if (path === 'bili-account' && method === 'GET') {{
+        return {{
+          config: {{
+            enabled: false, allow_like: false, allow_favorite: false,
+            favorite_folder_id: '', daily_action_limit: 1
+          }},
+          watch_history_counts: {{
+            done: 0, processing: 0, retryable: 0, exhausted: 0, uncertain: 0
+          }},
+          credentials: {{ sessdata: false }},
+          recent_runs: [],
+          source: 'env',
+          credential_source: 'env',
+          timezone: 'Asia/Shanghai',
+          actions_today: 0
+        }};
+      }}
+      if (path === 'bili-account/video-watch' && method === 'GET') {{
+        return {{
+          config: {{ enabled: false, max_seconds: 180, daily_limit: 3 }},
+          source: 'env', attempts_today: 0, remaining_today: 3, recent_attempts: []
+        }};
+      }}
+      return {{ ok: true }};
+    }};
+
+    {life_js}
+    {comm_js}
+    {media_js}
+
+    function walk(node, acc=[]) {{
+      acc.push(node);
+      for (const c of (node.children || [])) walk(c, acc);
+      return acc;
+    }}
+    function assert(cond, msg) {{ if (!cond) throw new Error('ASSERT FAILED: ' + msg); }}
+
+    (async () => {{
+      // 1. proactive() falls back to telegram owner-delivery when proactive returns assigned=false
+      await proactive();
+      assert(activeProactiveBase === 'life/modules/telegram/owner-delivery', 'base mismatch');
+      assert($('dm-test').disabled === false && $('dm-now').disabled === false, 'buttons enabled');
+      assert($('proactive-stats').textContent.includes('Telegram (telegram)'), 'TG label missing');
+      assert(!$('proactive-stats').textContent.includes('NapCat'), 'NapCat leaked');
+      assert($('proactive-state').textContent.includes('允许投递'), 'delivery state missing');
+      assert($('proactive-queue').textContent.includes('每日汇报'), 'queue row missing');
+
+      apiCalls.length = 0;
+      $('dm-test').dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        apiCalls.some(
+          c => c.method === 'POST' && c.path === 'life/modules/telegram/owner-delivery/test'
+        ),
+        'dm-test must POST to telegram owner-delivery/test: ' + JSON.stringify(apiCalls)
+      );
+
+      apiCalls.length = 0;
+      $('dm-now').dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        apiCalls.some(
+          c => c.method === 'POST' && c.path === 'life/modules/telegram/owner-delivery/digest'
+        ),
+        'dm-now must POST to telegram owner-delivery/digest: ' + JSON.stringify(apiCalls)
+      );
+
+      // Graceful unassigned fallback when life/modules returns non-array
+      modulesResp = {{}};
+      await proactive();
+      assert(activeProactiveBase === 'proactive', 'unassigned must reset base');
+      assert($('dm-test').disabled === true, 'dm-test must disable when unassigned');
+      assert(
+        $('proactive-state').textContent.includes('Owner 投递已分配给其他社交模块'),
+        'fallback message missing'
+      );
+
+      // 2. renderScreenWatch neutral channel label + onLogout cleans MC fields & proactive base
+      renderScreenWatch({{
+        timezone: 'Asia/Shanghai',
+        config: {{ enabled: true }},
+        buffered_frames: 0,
+        frames_received: 0,
+        routed_voice_count: 0,
+        standalone_commentary_count: 0,
+        recent_commentaries: [{{ at: 1795780800, channel: 'qq_dm', game_title: 'MC', text: 'hi' }}]
+      }});
+      assert(
+        $('sw-commentary-table').textContent.includes('Owner 私聊 + 气泡')
+          && !$('sw-commentary-table').textContent.includes('Owner QQ'),
+        'screen-watch qq_dm label must be platform-neutral'
+      );
+
+      renderMinecraft({{
+        active_plan: '去挖铁矿',
+        waypoints: [{{ name: 'home', pos: [1, 64, 2] }}],
+        action_log: [{{ ts: 1795780800, trigger: 'plan', action: 'mine', outcome: 'ok' }}]
+      }});
+      activeProactiveBase = 'life/modules/telegram/owner-delivery';
+      for (const fn of logoutHooks) fn();
+      assert(activeProactiveBase === 'proactive', 'logout must reset activeProactiveBase');
+      assert($('mc-waypoints-list').children.length === 0, 'logout must clear mc-waypoints-list');
+      assert($('mc-action-log').children.length === 0, 'logout must clear mc-action-log');
+      assert(
+        $('mc-plan-summary').textContent === '暂无连贯计划或路标记录。',
+        'logout must reset mc-plan-summary'
+      );
+      token = 'polish-token';
+
+      // 3. #plugin-bus card edit form folded + unified Telegram platform badge across tables
+      renderPluginBus({{
+        ws_enabled: true,
+        ws_path: '/ws/plugin',
+        allowed_scopes_catalog: ['actions', 'chat'],
+        plugins: [{{
+          plugin_id: 'telegram', display_name: 'Telegram', online: true,
+          enabled: true, node_region: 'KR', scopes: ['chat'], actions_count: 1
+        }}]
+      }});
+      const pbFolds = walk($('pb-plugins-list')).filter(
+        n => n.tagName === 'DETAILS' && n.className === 'card-edit-fold'
+      );
+      assert(pbFolds.length === 1 && pbFolds[0].open === false, 'plugin card fold missing');
+      assert(
+        pbFolds[0].textContent.includes('编辑插件配置 / Scope')
+          && walk(pbFolds[0]).some(n => n.tagName === 'FORM'),
+        'plugin fold must wrap inline edit form'
+      );
+
+      renderIdentityCenter({{
+        persons: [{{
+          person_id: 'p_tg1', display_name: 'TG 友', is_owner: false, muted: false,
+          accounts: [{{ platform: 'telegram', user_id: '777', nickname: 'tgu', source: 'auto' }}]
+        }}]
+      }});
+      assert(
+        walk($('identity-persons-list')).some(
+          n => n.className.includes('pill-tg') && n.textContent === 'Telegram'
+        ),
+        'identity table must use unified Telegram pill-tg badge'
+      );
+
+      renderAffection({{
+        source: 'env',
+        config: {{ enabled: true }},
+        users: [{{
+          user_id: '777', platform: 'telegram', nickname: 'tgu',
+          score: 65, level: 4, tier: 'familiar'
+        }}]
+      }});
+      assert(
+        walk($('aff-users-table')).some(
+          n => n.className.includes('pill-tg') && n.textContent === 'Telegram'
+        ),
+        'aff-users-table must use unified Telegram pill-tg badge'
+      );
+
+      renderAffectionHistory([{{
+        user_id: '777', platform: 'telegram', prev_score: 60, new_score: 65, delta: 5, kind: 'chat'
+      }}]);
+      assert(
+        walk($('aff-history-table')).some(
+          n => n.className.includes('pill-tg') && n.textContent === 'Telegram'
+        ),
+        'aff-history-table must use unified Telegram pill-tg badge'
+      );
+
+      // 4. Song Finder item class + revealSectionFor on both prefill paths
+      renderSongInboxTable([{{ id: 'df_1', name: '晴天.mp3', size: 1024 }}], '');
+      revealedTargets.length = 0;
+      const inboxFillBtn = walk($('song-inbox-table')).find(
+        n => n.tagName === 'BUTTON' && n.textContent === '填入学歌'
+      );
+      inboxFillBtn.dispatch('click');
+      assert(
+        revealedTargets.includes('song-learn-heading'),
+        'inbox prefill must call revealSectionFor(song-learn-heading)'
+      );
+
+      renderSongFinderResults({{
+        provider_used: 'bilibili_public',
+        candidates: [{{
+          candidate_id: 'bili:BV1', provider: 'bilibili_public',
+          title: '晴天', uploader: '周杰伦', duration_sec: 260, score: 9.5
+        }}]
+      }}, '晴天', '周杰伦');
+      const finderItems = $('song-finder-results').children.filter(
+        n => n.className === 'song-finder-item'
+      );
+      assert(finderItems.length === 1, 'finder row must use class song-finder-item');
+      revealedTargets.length = 0;
+      const finderFillBtn = walk(finderItems[0]).find(
+        n => n.tagName === 'BUTTON' && n.textContent === '下载并填入学歌'
+      );
+      finderFillBtn.dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        revealedTargets.includes('song-learn-heading'),
+        'finder download+fill must call revealSectionFor(song-learn-heading)'
+      );
+
+      // 5. #bili-credentials dirty tracking marks dirty and clears on save & clear
+      const biliCredForm = $('bili-credentials');
+      assert(dirtyRegistry.has(biliCredForm), 'bili-credentials must be tracked by trackDirty');
+      biliCredForm.dispatch('input', {{ target: $('bili-sessdata') }});
+      assert(
+        dirtyRegistry.get(biliCredForm).dirty === true,
+        'input must mark bili-credentials dirty'
+      );
+      biliCredForm.dispatch('submit', {{ submitter: null }});
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        dirtyRegistry.get(biliCredForm).dirty === false,
+        'save must clear bili-credentials dirty'
+      );
+
+      biliCredForm.dispatch('input', {{ target: $('bili-jct') }});
+      assert(dirtyRegistry.get(biliCredForm).dirty === true, 're-edit must mark dirty');
+      $('bili-clear').dispatch('click');
+      await Promise.all(pendingTasks.splice(0));
+      assert(
+        dirtyRegistry.get(biliCredForm).dirty === false,
+        'clear must clear bili-credentials dirty'
+      );
+
+      if (typeof print === 'function') print('VIEWS_POLISH_JS_OK');
+      else console.log('VIEWS_POLISH_JS_OK');
+    }})().catch(err => {{
+      const detail = String(err) + '\\n' + (err && err.stack ? err.stack : '');
+      if (typeof print === 'function') print('ERR: ' + detail);
+      else console.error(detail);
+      if (typeof process !== 'undefined' && process.exit) process.exit(1);
+      throw err;
+    }});
+    """
+
+    proc = run_js_harness(harness, cwd=REPO_ROOT)
+    assert proc.returncode == 0, f"Views polish JS test failed:\n{proc.stderr}\n{proc.stdout}"
+    assert "VIEWS_POLISH_JS_OK" in proc.stdout, (
+        f"Views polish async JS test did not complete:\n{proc.stderr}\n{proc.stdout}"
+    )

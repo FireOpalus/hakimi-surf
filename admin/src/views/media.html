@@ -7,7 +7,7 @@
       <div class="row"><input id="meme-batch-label" class="grow-input" maxlength="24" placeholder="统一标签（可选，同情绪多图轮换）" aria-label="统一标签"><button id="meme-apply-batch" type="button" class="secondary">应用到全部待传项</button><button id="meme-clear-queue" type="button" class="secondary">清空待传</button><button type="submit" class="primary">批量上传并立即生效</button></div>
       <div id="meme-pending" class="meme-queue"></div>
     </form>
-    <p class="muted">最多 100 张、合计 50 MiB。上传自动清除元数据：GIF / 动态 WebP 保留重编码动图（≤60 帧、512px），透明底 PNG / WebP 保留透明 PNG，普通静图转 JPEG（≤1024px）。以 OneBot 动画表情子类型（sub_type=1）跨容器 base64 发送；公开会话每 4 次回复最多附一张（Owner 私聊不限频），同名多图优先轮换不重复。</p>
+    <p class="muted">最多 100 张、合计 50 MiB。上传自动清除元数据：GIF / 动态 WebP 保留重编码动图（≤60 帧、512px），透明底 PNG / WebP 保留透明 PNG，普通静图转 JPEG（≤1024px）。QQ 以 OneBot 动画表情子类型（sub_type=1）发送，Telegram 自动匹配贴纸 / 动图 / 图片通道发送；公开会话每 4 次回复最多附一张（Owner 私聊不限频），同名多图优先轮换不重复。</p>
     <p id="meme-prompt-count" class="badge">当前已加载到 Prompt 的有效表情数量：0</p>
     <p id="meme-state" role="status"></p>
     <div id="meme-list" class="meme-grid"></div>
@@ -15,7 +15,7 @@
 </section>
 
 <section id="songs" class="tab" role="tabpanel" aria-labelledby="nav-songs" hidden>
-  <div class="card">
+  <div class="card" data-section-group="song_list">
     <div class="row between">
       <h2>猫猫专属翻唱歌单</h2>
       <div class="row">
@@ -33,7 +33,7 @@
     </div>
     <div id="song-list" class="song-grid"></div>
   </div>
-  <div class="card">
+  <div class="card" data-section-group="song_inbox">
     <div class="row between">
       <h2 data-nav-label="Drive 云盘与收件箱">Drive <code>Hakimi_Songs/</code> 云盘目录与待学原曲收件箱</h2>
       <div class="row">
@@ -41,26 +41,6 @@
       </div>
     </div>
     <p class="muted">歌单工坊独立直连 Google Drive <code>Hakimi_Songs/</code> 管理翻唱主存、音色模型与待学原曲收件箱（不依赖 Colab Worker 在线）。上传原曲至 <code>inbox/</code> 后，可在此一键填入学歌表单或直接发起学歌任务。</p>
-    <p id="song-storage-source" class="muted" aria-live="polite"></p>
-    <dl id="song-drive-details" class="node-details"></dl>
-    <form id="song-storage-form">
-      <div class="grid">
-        <label for="song-drive-folder-id">Drive 歌曲根目录 ID（drive_songs_folder_id）
-          <input id="song-drive-folder-id" type="text" maxlength="128" placeholder="Hakimi_Songs 根目录 Folder ID（留空回退默认配置）">
-        </label>
-      </div>
-      <div class="row">
-        <button id="song-storage-save" type="submit" class="primary" disabled>保存目录配置</button>
-        <button id="song-storage-reset" type="button" class="secondary" disabled>恢复默认配置</button>
-      </div>
-    </form>
-    <div class="sub-card">
-      <div class="row">
-        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 100 MiB，流式直传）</label>
-        <input id="song-inbox-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac">
-        <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
-      </div>
-    </div>
     <div class="sub-card">
       <div class="row between">
         <strong>独立音源检索（先搜候选再挑一首下进 <code>inbox/</code>，不占用 Colab GPU）</strong>
@@ -85,12 +65,37 @@
         </div>
       </form>
       <p id="song-finder-meta" class="muted" aria-live="polite"></p>
-      <div id="song-finder-results" class="table"></div>
+      <div id="song-finder-results" class="song-finder-list"></div>
+    </div>
+    <div class="sub-card">
+      <div class="row">
+        <label for="song-inbox-file">上传本地原曲到 Drive 收件箱（mp3/wav/ogg/opus/m4a/flac，≤ 100 MiB，流式直传）</label>
+        <input id="song-inbox-file" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac">
+        <button id="song-inbox-upload" type="button" class="secondary">上传到收件箱</button>
+      </div>
     </div>
     <h3>待学原曲收件箱（<code>inbox/</code>）</h3>
     <div id="song-inbox-table" class="table"></div>
+    <details id="song-fold-drive-config" class="panel-fold">
+      <summary>Drive 目录配置与子目录 ID<span class="fold-hint">Hakimi_Songs/ · 仅切换目录时展开</span></summary>
+      <div class="panel-fold-body">
+        <p id="song-storage-source" class="muted" aria-live="polite"></p>
+        <dl id="song-drive-details" class="node-details"></dl>
+        <form id="song-storage-form">
+          <div class="grid">
+            <label for="song-drive-folder-id">Drive 歌曲根目录 ID（drive_songs_folder_id）
+              <input id="song-drive-folder-id" type="text" maxlength="128" placeholder="Hakimi_Songs 根目录 Folder ID（留空回退默认配置）">
+            </label>
+          </div>
+          <div class="row">
+            <button id="song-storage-save" type="submit" class="primary" disabled>保存目录配置</button>
+            <button id="song-storage-reset" type="button" class="secondary" disabled>恢复默认配置</button>
+          </div>
+        </form>
+      </div>
+    </details>
   </div>
-  <div class="card">
+  <div class="card" data-section-group="song_learn">
     <div class="row between">
       <h2 id="song-learn-heading">Colab 学一首新歌</h2>
       <div class="row">
@@ -98,7 +103,7 @@
         <button type="button" class="secondary" data-open-tab="colab-compute">查看作业队列 →</button>
       </div>
     </div>
-    <p class="muted">歌单播放、Drive 主存、本地热缓存与原曲收件箱均由歌单工坊独立管理（不依赖 Colab Worker 在线）；提交异步学歌任务时默认经 Colab GPU 共享分轨双出片（<code>YingMusic-SVC</code> + <code>Seed-VC</code>），再由猫猫主模型原声亲听自选并保留双版本可随时切换，也保留经典 <code>RVC</code> 可选。也可在 QQ 私聊发送音频附带 <code>/学歌</code>。</p>
+    <p class="muted">歌单播放、Drive 主存、本地热缓存与原曲收件箱均由歌单工坊独立管理（不依赖 Colab Worker 在线）；提交异步学歌任务时默认经 Colab GPU 共享分轨双出片（<code>YingMusic-SVC</code> + <code>Seed-VC</code>），再由猫猫主模型原声亲听自选并保留双版本可随时切换，也保留经典 <code>RVC</code> 可选。也可在 QQ / Telegram 私聊发送音频附带 <code>/学歌</code>。</p>
     <p id="song-learn-colab-hint" class="muted"></p>
     <form id="song-learn-form">
       <div class="song-meta">
@@ -201,9 +206,9 @@
     </form>
     <div id="song-learn-result" class="sub-card" hidden></div>
   </div>
-  <div class="card">
+  <div class="card" data-section-group="song_upload">
     <h2>手动上传本地翻唱成品</h2>
-    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 100 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ 语音条与各平台。</p>
+    <p class="muted">上传由 Colab RVC 或其他工具制作好的猫猫翻唱成品（支持 mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 100 MiB）。入库时自动按起始秒数和时长裁剪为 ≤ 58 秒、去除元数据的 128 kbps MP3，兼容 QQ / Telegram 语音条与各平台。</p>
     <form id="song-upload">
       <label for="song-file" class="visually-hidden">选择音频文件</label><input id="song-file" class="visually-hidden" type="file" accept=".mp3,.wav,.ogg,.opus,.m4a,.flac" tabindex="-1">
       <div id="song-dropzone" class="meme-drop" role="button" tabindex="0"><strong>点击选择或把翻唱音频拖到这里</strong><small>mp3 / wav / ogg / opus / m4a / flac，单文件 ≤ 100 MiB；文件名自动识别为歌名</small></div>
@@ -243,7 +248,7 @@
       <label><input id="bili-enabled" type="checkbox"> 启用小号自主巡逻</label>
       <div class="row"><label><input id="bili-like" type="checkbox"> 允许低频点赞</label><label><input id="bili-favorite" type="checkbox"> 允许低频收藏</label><label>指定本账号收藏夹 ID <input id="bili-folder" pattern="[1-9][0-9]{0,19}|" maxlength="20" inputmode="numeric"></label><label>每日点赞与收藏合计上限 <select id="bili-limit"><option value="1">1 次</option><option value="2">2 次</option></select></label></div>
       <p class="muted">所有互动默认关闭。收藏前验证收藏夹归属；超时结果不确定时不自动重试。每轮巡逻都会检查预算和账号冷却状态。</p>
-      <div class="row"><button type="submit" class="primary">保存并立即生效</button><button type="button" id="bili-reset" class="secondary">恢复 .env 设置</button><button type="button" id="bili-run" class="primary">立即执行一轮巡逻</button></div>
+      <div class="row"><button type="submit" class="primary">保存并立即生效</button><button type="button" id="bili-run" class="secondary">立即执行一轮巡逻</button><button type="button" id="bili-reset" class="secondary">恢复 .env 设置</button></div>
     </form>
   </div>
   <div class="card"><h2>双轨看片：字幕优先 / 原片兜底</h2>

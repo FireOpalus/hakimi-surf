@@ -92,7 +92,7 @@ function renderModuleActions(target,actions){
   if(!actions.length){target.replaceChildren(el('p','当前模块没有注册动作。','muted'));return;}
   const modes={active:'按动作名',shadow:'对照旧路由',legacy:'仅旧路由',off:'停用'};
   table(target,['动作','发送范围','当前状态','路由方式'],actions.map(a=>{
-    const control=el('select');
+    const control=el('select',undefined,'table-select');
     control.setAttribute('aria-label',a.name+' 路由方式');
     for(const mode of (a.compatibility?Object.keys(modes):['active','off'])){
       const option=el('option',modes[mode]);option.value=mode;control.append(option);
@@ -107,6 +107,18 @@ function renderModuleActions(target,actions){
     }));
     return [a.name+' · '+a.description,({owner:'仅 Owner',social:'获准群 / Owner',internal:'模块内部'})[a.audience],a.available?'可用':a.reason,control];
   }));
+}
+function cleanupScheduleDirty(root){
+  if(!root)return;
+  let removed=false;
+  for(const oldForm of root.querySelectorAll('section.module-schedule form')){
+    if(dirtyRegistry.delete(oldForm))removed=true;
+  }
+  if(removed)updatePageDirtyBadge();
+}
+function trackSchedulePanel(panel,d){
+  const form=panel?.querySelector('form');
+  if(form)trackDirty(form,moduleTitle(d)+' 调度设置');
 }
 function moduleSchedulePanel(d){
   const panel=el('section',undefined,'module-schedule'),spec=d.scheduling;
@@ -147,7 +159,13 @@ function moduleSchedulePanel(d){
   const buttons=el('div',undefined,'row'),save=el('button','保存模块调度','primary'),reset=el('button','恢复模块默认值','secondary');
   save.type='submit';reset.type='button';buttons.append(save,reset);form.append(grid,buttons);panel.append(form);
   if(typeof enhanceLabels==='function')enhanceLabels(panel);
-  const refresh=result=>panel.replaceWith(moduleSchedulePanel(result));
+  const refresh=result=>{
+    dirtyRegistry.delete(form);
+    updatePageDirtyBadge();
+    const nextPanel=moduleSchedulePanel(result);
+    panel.replaceWith(nextPanel);
+    trackSchedulePanel(nextPanel,result);
+  };
   form.addEventListener('submit',e=>{e.preventDefault();busy(save,async()=>{
     const values={};
     for(const [key,field,input] of controls){
@@ -157,7 +175,7 @@ function moduleSchedulePanel(d){
       else if(input.type==='number')value=input.valueAsNumber;
       if(value!==spec.values[key])values[key]=value;
     }
-    if(!Object.keys(values).length){notice('当前设置已保存');return;}
+    if(!Object.keys(values).length){clearDirty(form);notice('当前设置已保存');return;}
     refresh(await api(path,'PUT',values));notice('模块调度设置已保存');
   });});
   reset.addEventListener('click',()=>busy(reset,async()=>{
@@ -210,6 +228,7 @@ function moduleSwitch(d){
   return label;
 }
 function renderModuleTools(container,d){
+  cleanupScheduleDirty(container);
   container.dataset.moduleTools=d.id;
   const actions=el('div',undefined,'table'),summary=el('p',undefined,'muted');
   const weather=d.id==='weather';
@@ -222,11 +241,14 @@ function renderModuleTools(container,d){
   }));
   read.disabled=!d.enabled||!!d.configuration_issue||(weather&&!d.actions.some(a=>a.name==='weather.read'&&a.available));
   const state=el('p',regionName(d.region)+' · '+(!d.enabled?'模块已关闭':moduleIssue(d)||(weather?'按需查询':d.proactive_paused?'主动动作已暂停':'允许调度主动动作')),'muted');
-  container.replaceChildren(state,moduleSchedulePanel(d),actions,read,summary);
+  const schedulePanel=moduleSchedulePanel(d);
+  container.replaceChildren(state,schedulePanel,actions,read,summary);
+  trackSchedulePanel(schedulePanel,d);
   renderModuleActions(actions,d.actions);
 }
 async function loadModule(id){
   const tools=$(modulePage.get(id)+'-actions');
+  cleanupScheduleDirty(tools);
   tools.replaceChildren();
   if(id==='qq_social'){
     text('connection-label','等待连接状态');$('connection-dot').className='status-dot';
@@ -295,6 +317,26 @@ function moduleCard(m){
   card.dataset.moduleId=m.id;
   return card;
 }
+const pluginShortcuts={
+  song_finder:{
+    title:'关联业务入口',
+    desc:'在「猫猫歌单」页可直接使用独立找歌、待学原曲收件箱与 Colab 学歌。',
+    label:'前往猫猫歌单 →',
+    tab:'songs'
+  },
+  web_tools:{
+    title:'关联业务入口',
+    desc:'在「回复与联网」页可配置模型联网搜索开关、每日/每月额度与 DeepSeek 备用检索。',
+    label:'前往回复与联网 →',
+    tab:'reply-settings'
+  },
+  doc_render:{
+    title:'关联业务入口',
+    desc:'在「回复与联网」页可配置纯文本 / 报错日志文件阅读与群聊代码表格卡片模式。',
+    label:'前往回复与联网 →',
+    tab:'reply-settings'
+  }
+};
 function registerPluginPage(m){
   if(modulePage.has(m.id))return;
   const key='plugin-'+m.id, group=el('div'), panel=el('section',undefined,'tab');
@@ -313,12 +355,13 @@ function registerPluginPage(m){
   if(protocols.length){
     const card=el('section',undefined,'card');card.append(el('h2','会话隐私'),privacy);panel.append(card);
   }
-  if(m.id==='telegram'||protocols.includes('telegram')){
-    const tgCard=el('section',undefined,'card');
-    const tgBtn=el('button','前往 Telegram 授权群与私聊热配置 →','secondary');
-    tgBtn.type='button';tgBtn.dataset.openTab='group-policy';
-    tgCard.append(el('h2','群聊与私聊热配置'),el('p','可在「群聊互动策略」页直接增删授权群、勾选主动冒泡、切换私聊白名单与群聊记忆镜像。','muted'),tgBtn);
-    panel.append(tgCard);
+  const shortcut=pluginShortcuts[m.id];
+  if(shortcut){
+    const linkCard=el('section',undefined,'card');
+    const linkBtn=el('button',shortcut.label,'secondary');
+    linkBtn.type='button';linkBtn.dataset.openTab=shortcut.tab;
+    linkCard.append(el('h2',shortcut.title),el('p',shortcut.desc,'muted'),el('div',linkBtn,'row'));
+    panel.append(linkCard);
   }
   $('modules').after(panel);
   const section={button:navBtn,workspace:'modules',module:m.id,title:m.title||m.id,group:'平台模块'};
@@ -328,7 +371,7 @@ function registerPluginPage(m){
   function draw(rows){
     if(!token)return;
     table(privacy,['会话','账号','群组或用户','隐私等级'],rows.map(row=>{
-      const select=el('select');select.setAttribute('aria-label',row.target_id+' 隐私等级');
+      const select=el('select',undefined,'table-select');select.setAttribute('aria-label',row.target_id+' 隐私等级');
       for(const [value,label] of [['default','默认（高隐私）'],['high','高隐私'],['low','低隐私']]){
         const option=el('option',label);option.value=value;select.append(option);
       }
@@ -362,13 +405,83 @@ function registerPluginPage(m){
     }
     card.append(el('h2','Owner 投递'),state,row);panel.append(card);
   }
+  if(typeof enhanceLabels==='function')enhanceLabels(panel);
+  if(typeof foldLongHelp==='function')foldLongHelp(panel);
   tabLoaders[key]=()=>Promise.all(readers.map(read=>read()));
   pluginPages.set(m.id,()=>{
+    cleanupScheduleDirty(panel);
     delete tabLoaders[key];sections.delete(key);modulePage.delete(m.id);
-    tabButtons.splice(tabButtons.indexOf(navBtn),1);
+    const btnIndex=tabButtons.indexOf(navBtn);if(btnIndex>=0)tabButtons.splice(btnIndex,1);
     const index=finderEntries.findIndex(entry=>entry.key===key);if(index>=0)finderEntries.splice(index,1);
     group.remove();panel.remove();pluginPages.delete(m.id);
   });
+}
+function isModuleOfflineError(err){
+  const msg=String(err?.message||'');
+  return msg.includes('模块当前未注册')||msg.includes('module_not_registered')||msg.includes('chat_module_not_found')||msg==='HTTP 404';
+}
+function renderTelegramOfflineHint(container,message){
+  const box=el('div',undefined,'stack-xs');
+  const btn=el('button','前往远程插件总线 →','secondary');
+  btn.type='button';
+  btn.dataset.openTab='plugin-bus';
+  box.append(el('p',message,'muted'),el('div',btn,'row'));
+  container.replaceChildren(box);
+}
+function renderTelegramPrivacy(rows){
+  if(!token)return;
+  const list=Array.isArray(rows)?rows:[];
+  text('tg-privacy-note',list.length
+    ?'高隐私使用付费安全审核，低隐私可使用已配置的免费审核；所有会话的主模型通道跟随全局。'
+    :'Telegram 插件在线，暂无已记录的 Telegram 会话（产生对话后可在此调整单会话隐私等级）。');
+  const path='life/modules/telegram/privacy';
+  table('tg-privacy-table',['会话','账号','群组或用户','隐私等级'],list.map(row=>{
+    const select=el('select',undefined,'table-select');
+    select.setAttribute('aria-label',row.target_id+' 隐私等级');
+    for(const [value,label] of [['default','默认（高隐私）'],['high','高隐私'],['low','低隐私']]){
+      const option=el('option',label);option.value=value;select.append(option);
+    }
+    select.value=row.override_privacy;
+    select.addEventListener('change',()=>busy(select,async()=>{
+      try{
+        renderTelegramPrivacy(await api(path,'PUT',{key:row.key,privacy:select.value}));
+        notice('Telegram 会话隐私等级已保存');
+      }catch(error){select.value=row.override_privacy;throw error;}
+    }));
+    return [row.kind==='group'?'群聊':'私聊',row.platform+' / '+row.bot_id,row.target_id,select];
+  }),'暂无已记录的 Telegram 会话。');
+}
+async function loadTelegramModule(){
+  try{
+    await loadModule('telegram');
+  }catch(err){
+    if(err?.name==='AbortError'||!token)throw err;
+    if(isModuleOfflineError(err)){
+      const slot=$('module-heading-switch');
+      if(tab==='telegram'){slot.replaceChildren();slot.hidden=true;}
+      renderTelegramOfflineHint($('telegram-actions'),'Telegram 远程插件当前未在线，暂无法读取模块动作；上方热配置仍可编辑并保存，插件重连后自动下发。');
+      return;
+    }
+    throw err;
+  }
+}
+async function loadTelegramPrivacy(){
+  try{
+    const rows=await api('life/modules/telegram/privacy');
+    if(!token)return;
+    renderTelegramPrivacy(rows);
+  }catch(err){
+    if(err?.name==='AbortError'||!token)throw err;
+    if(isModuleOfflineError(err)){
+      text('tg-privacy-note','Telegram 远程插件当前未在线，连线后可在此管理各会话隐私等级。');
+      renderTelegramOfflineHint($('tg-privacy-table'),'插件离线期间无法读取会话隐私列表，可前往远程插件总线检查连接状态。');
+      return;
+    }
+    throw err;
+  }
+}
+async function telegramTab(){
+  await Promise.all([telegramSocialConfig(),groups(),loadTelegramModule(),loadTelegramPrivacy()]);
 }
 function systemCard(m){
   const status=m.status||{};
@@ -387,18 +500,32 @@ async function systemDirectory(){
     catalog.replaceChildren(el('p','系统状态暂时无法读取，请刷新目录。','empty-state'));
   }
 }
-async function moduleDirectory(){
+async function fetchModuleDirectoryList(background,signal){
+  if(background&&typeof apiRaw==='function'){
+    const r=await apiRaw('life/modules','GET',undefined,{signal});
+    const value=await r.json();
+    if(signal.aborted)throw new DOMException('请求已取消','AbortError');
+    return value;
+  }
+  return api('life/modules');
+}
+async function moduleDirectory({background=false}={}){
   const container=$('module-catalog');
+  const reqSignal=background?sessionRequests.signal:tabRequests.signal;
   try{
-    const list=await api('life/modules');
+    const list=await fetchModuleDirectoryList(background,reqSignal);
+    if(!token||reqSignal.aborted)return;
     const registered=new Set(list.map(m=>m.id));
     for(const [id,remove] of pluginPages)if(!registered.has(id))remove();
     list.forEach(registerPluginPage);
-    for(const group of $('modules-nav').querySelectorAll('[data-module]'))group.hidden=!registered.has(group.dataset.module);
+    for(const group of $('modules-nav').querySelectorAll('[data-module]')){
+      group.hidden=group.dataset.module!=='telegram'&&!registered.has(group.dataset.module);
+    }
     container.replaceChildren(...list.map(moduleCard));
     if(!list.length)container.append(el('p','当前没有已安装的模块。','empty-state'));
   }catch(error){
     if(error.name==='AbortError')throw error;
+    if(!token||reqSignal.aborted||(background&&tab!=='modules'))return;
     container.replaceChildren(el('p','模块目录暂时无法读取，请点击刷新目录重试。','empty-state'));
   }
 }
@@ -598,8 +725,8 @@ const tabLoaders={
   overview:dashboard,ledger,'api-routing':providers,'reply-settings':replySettings,
   thinking:()=>Promise.all([thinking(),generationCaps()]),filter:filters,admission,
   modules:()=>Promise.all([moduleDirectory(),systemDirectory()]),journal:diaries,'drive-sync':driveSync,'event-ledger':eventLedger,'voice-companion':voiceCompanion,'screen-watch':screenWatch,'colab-compute':colabCompute,'identity-center':identityCenter,'plugin-bus':pluginBus,
-  qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy(),longnick()]),bili:()=>loadModule('bilibili_surf'),
-  weather:()=>loadModule('weather'),minecraft:()=>loadModule('minecraft'),'group-policy':()=>Promise.all([groups(),bots(),telegramSocialConfig()]),
+  qq:()=>Promise.all([loadModule('qq_social'),qqPrivacy(),longnick()]),telegram:telegramTab,bili:()=>loadModule('bilibili_surf'),
+  weather:()=>loadModule('weather'),minecraft:()=>loadModule('minecraft'),'group-policy':groups,
   memory:()=>Promise.all([sessions(),compression()]),
   'bili-account':biliAccount,community:async()=>{
     const [moderation,profiles]=await Promise.allSettled([community(),affection()]);
@@ -698,13 +825,15 @@ async function navigate(key,{focusContent=false,heading=null,fromHash=false,repl
   if(key!==tab&&isTabDirty(tab)){
     if(navPromptPending)return;
     navPromptPending=true;
+    const prevTab=tab;
     let ok=false;
-    try{ok=await confirmDiscardTabChanges(tab,'切换页面');}
+    try{ok=await confirmDiscardTabChanges(prevTab,'切换页面');}
     finally{navPromptPending=false;}
     if(!ok){
       if(fromHash)syncHash(tab,true);
       return;
     }
+    if(typeof runDiscardHandlers==='function')runDiscardHandlers(prevTab);
   }
   const panel=$(key),visit=++lastVisit;
   const drawerOpen=$('sidebar').classList.contains('open');
@@ -757,9 +886,11 @@ $('login-form').addEventListener('submit',e=>{
     $('login-error').hidden=true;$('token').removeAttribute('aria-invalid');
     token=$('token').value;$('token').value='';
     const hashKey=location.hash.replace(/^#/,'');
-    const hasHashTarget=Boolean(hashKey&&hashKey!=='overview'&&sections.has(hashKey));
+    const isPluginDeepLink=Boolean(hashKey&&!sections.has(hashKey)&&hashKey.startsWith('plugin-'));
+    const hasHashTarget=Boolean(hashKey&&hashKey!=='overview'&&(sections.has(hashKey)||isPluginDeepLink));
+    let first=null;
     try{
-      const first=await fetchOverviewPayload();
+      first=await fetchOverviewPayload();
       await dashboard(first,{lightweight:hasHashTarget});
     }catch(err){
       if(err.name==='AbortError')return;
@@ -770,14 +901,28 @@ $('login-form').addEventListener('submit',e=>{
     $('login').hidden=true;$('app').hidden=false;hideNotice();
     for(const id of ['logout','open-finder','menu-toggle','workspace-switch'])$(id).hidden=false;
     document.body.classList.add('authenticated');
-    if(hasHashTarget){
+    if(isPluginDeepLink&&typeof moduleDirectory==='function'){
+      try{await moduleDirectory({background:true});}catch{}
+      if(!token)return;
+    }
+    const resolvedHashTarget=Boolean(hashKey&&hashKey!=='overview'&&sections.has(hashKey));
+    if(resolvedHashTarget){
       selectTab('overview');
       navigate(hashKey,{fromHash:true,focusContent:true});
+      if(!isPluginDeepLink&&hashKey!=='modules'&&typeof moduleDirectory==='function'){
+        moduleDirectory({background:true}).catch(()=>{});
+      }
     }else{
       loadedPanels.add('overview');
       selectTab('overview');
       syncHash('overview',true);
       $('page-title').focus({preventScroll:true});
+      if(hasHashTarget){
+        dashboard(first).catch(err=>{if(err?.name!=='AbortError'&&token)notice(err.message,true);});
+      }
+      if(!isPluginDeepLink&&typeof moduleDirectory==='function'){
+        moduleDirectory({background:true}).catch(()=>{});
+      }
     }
     if(timer){clearInterval(timer);timer=null;}
     pollInFlight=false;
@@ -946,6 +1091,7 @@ $('app').addEventListener('click',e=>{
 $('reload-modules').addEventListener('click',()=>navigate('modules'));
 $('refresh-module').addEventListener('click',async()=>{
   if(!(await confirmDiscardTabChanges(tab,'刷新模块状态')))return;
+  if(typeof runDiscardHandlers==='function')runDiscardHandlers(tab);
   await navigate(tab);
 });
 document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>busy(b,async()=>{notice('正在执行，请稍候…');const v=await api('actions/'+b.dataset.action,'POST');notice(v.note||v.status||'快照已刷新');await refreshTab();})));
@@ -961,7 +1107,9 @@ onLogout(()=>{
   text('connection-label','等待连接状态');
   $('connection-dot').className='status-dot';
   text('ws-heartbeat','—');text('ws-source','—');
-  for(const id of ['module-catalog','system-catalog','qq-actions','bili-actions','minecraft-actions','weather-actions','module-heading-switch','colab-pills','colab-kpi-strip','colab-job-policies-table','colab-jobs-table'])$(id).replaceChildren();
+  for(const id of ['qq-actions','telegram-actions','bili-actions','minecraft-actions','weather-actions'])cleanupScheduleDirty($(id));
+  for(const id of ['module-catalog','system-catalog','qq-actions','telegram-actions','tg-privacy-table','bili-actions','minecraft-actions','weather-actions','module-heading-switch','colab-pills','colab-kpi-strip','colab-job-policies-table','colab-jobs-table'])$(id).replaceChildren();
+  text('tg-privacy-note','');
   $('module-heading-switch').hidden=true;
   resetWeatherEditor();
   $('weather-editor').disabled=true;

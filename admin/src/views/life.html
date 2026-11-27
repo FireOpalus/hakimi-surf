@@ -193,7 +193,7 @@
         <button id="vc-gw-test" type="button" class="secondary" disabled>实测合成一条 TTS</button>
       </div>
     </div>
-    <p class="muted">统一管理 KR 语音网关的 STT 识别与 TTS 合成引擎（同时作用于 QQ 语音条与实时连麦）。修改后加密保存在主脑 SQLite 并在不重启容器的情况下实时热切换；留空 API Key 表示保留已存密钥。</p>
+    <p class="muted">统一管理 KR 语音网关的 STT 识别与 TTS 合成引擎（同时作用于社交语音条（QQ / Telegram）与实时连麦）。修改后加密保存在主脑 SQLite 并在不重启容器的情况下实时热切换；留空 API Key 表示保留已存密钥。</p>
     <div id="vc-gw-pills" class="pill-row"></div>
     <p id="vc-gw-state" class="muted" aria-live="polite"></p>
     <div id="vc-gw-tts-preview" class="tts-preview" hidden></div>
@@ -332,7 +332,7 @@
       <div class="row">
         <label><input id="sw-enabled" type="checkbox"> 启用屏幕伴看接收（关闭立即销毁缓存并拒收新帧）</label>
         <label><input id="sw-proactive" type="checkbox"> 允许低频主动看屏吐槽（优先走在线语音伴随口播）</label>
-        <label><input id="sw-qq-fallback" type="checkbox"> 未开语音连麦时将主动吐槽同步私聊至 Owner QQ</label>
+        <label><input id="sw-qq-fallback" type="checkbox"> 未开语音连麦时将主动吐槽同步私聊至 Owner 主通道</label>
       </div>
       <div class="grid">
         <label for="sw-pulse-interval">主动吐槽最小间隔（秒，10–300）<input id="sw-pulse-interval" type="number" min="10" max="300" step="1" required></label>

@@ -2,9 +2,31 @@ const dmStatus={pending:'等待投递',sent:'已发送并处理记忆',delivered
 const deliveryStages={generating:'生成中',generated:'已生成',queued:'已入队',awaiting_qq:'等待 QQ 上线',awaiting_channel:'等待投递通道上线',submitting:'等待平台回执',confirmed:'平台已确认',expired:'已过期',generation_uncertain:'生成结果待核实',uncertain:'回执待核实',failed:'生成失败',cancelled:'已取消'};
 const dmKindLabels={companion:'日常陪伴',digest:'每日汇报',alert:'异常告警',test:'通路验证'};
 
+let activeProactiveBase='proactive';
 async function proactive(){
-  const d=await api('proactive');
-  const assigned=d.assigned!==false;
+  let d=await api('proactive');
+  if(!token)return;
+  let base='proactive';
+  if(d&&d.assigned===false){
+    try{
+      const mods=await api('life/modules');
+      if(!token)return;
+      const ownerMod=Array.isArray(mods)?mods.find(m=>m&&m.owner_delivery===true):null;
+      if(ownerMod&&ownerMod.id){
+        const modBase='life/modules/'+encodeURIComponent(ownerMod.id)+'/owner-delivery';
+        const alt=await api(modBase);
+        if(!token)return;
+        if(alt&&alt.assigned!==false&&(alt.platform||alt.budget)){
+          d=alt;
+          base=modBase;
+        }
+      }
+    }catch(err){
+      if(err?.name==='AbortError')throw err;
+    }
+  }
+  const assigned=Boolean(d&&d.assigned!==false);
+  activeProactiveBase=assigned?base:'proactive';
   for(const id of ['dm-test','dm-now'])$(id).disabled=!assigned;
   if(!assigned){
     text('proactive-state','Owner 投递已分配给其他社交模块。');
@@ -12,19 +34,20 @@ async function proactive(){
     return;
   }
   const fmt=t=>t?lifeFmt(t,d.timezone):'—';
-  const chanLabel=d.platform==='onebot'?'NapCat (QQ)':(d.platform||'投递通道');
+  const chanLabel=d.platform==='onebot'?'NapCat (QQ)':d.platform==='telegram'?'Telegram (telegram)':(d.platform||'投递通道');
   const stats=[[chanLabel,d.connected?'在线':'等待连接'],['下次日报',fmt(d.next_digest_at)]];
   $('proactive-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
   text('proactive-state',d.day+' · '+zoneLabel(d.timezone)+' · '+(!d.configured?'尚未配置 Owner 投递目标':d.delivery_enabled?'允许投递':'已停用投递'));
-  text('proactive-budget','主动生成日预算 '+usd(d.proactive_daily_limit_usd,2)+' · 本地累计 '+usd(d.budget.total/1e6,4)+' / '+(d.budget.total_limit>0?usd(d.budget.total_limit/1e6,2):'未设累计上限')+(d.budget.hard_stop?' · 付费生成已熔断':'')+'（含预留，不代表 Google 赠金余额）');
-  table('proactive-queue',['类型','状态','数量'],d.queue.map(v=>[dmKindLabels[v.kind]||v.kind,dmStatus[v.status]||v.status,v.n]));
-  table('proactive-alerts',['告警','入队时间','状态','冷却截止'],d.alerts.map(v=>[v.alert_key,fmt(v.queued_at),dmStatus[v.status]||v.status,fmt(v.cooldown_until)]));
+  const budget=d.budget||{total:0,total_limit:0,hard_stop:false};
+  text('proactive-budget','主动生成日预算 '+usd(d.proactive_daily_limit_usd,2)+' · 本地累计 '+usd(budget.total/1e6,4)+' / '+(budget.total_limit>0?usd(budget.total_limit/1e6,2):'未设累计上限')+(budget.hard_stop?' · 付费生成已熔断':'')+'（含预留，不代表 Google 赠金余额）');
+  table('proactive-queue',['类型','状态','数量'],(d.queue||[]).map(v=>[dmKindLabels[v.kind]||v.kind,dmStatus[v.status]||v.status,v.n]));
+  table('proactive-alerts',['告警','入队时间','状态','冷却截止'],(d.alerts||[]).map(v=>[v.alert_key,fmt(v.queued_at),dmStatus[v.status]||v.status,fmt(v.cooldown_until)]));
 }
 $('refresh-proactive').addEventListener('click',e=>busy(e.target,proactive));
 for(const [id,action] of [['dm-test','test'],['dm-now','digest']]){
   $(id).addEventListener('click',e=>busy(e.target,async()=>{
     notice(action==='test'?'正在验证私信通路…':'正在准备今日汇报…');
-    const result=await api('proactive/'+action,'POST');
+    const result=await api(activeProactiveBase+'/'+action,'POST');
     const state=result.delivery&&result.delivery!=='not_queued'?result.delivery:result.status;
     const label=deliveryStages[result.receipt?.stage]||dmStatus[state]||state;
     notice(label+(result.reason?' · '+result.reason:''));
@@ -763,7 +786,7 @@ function renderScreenWatch(d){
   $('sw-frame-ttl').value=c.frame_ttl_seconds??15;
   for(const id of ['sw-save','sw-reset'])$(id).disabled=false;
   clearDirty('sw-config-form');
-  const chLabels={voice_companion:'语音伴随口播',qq_dm:'Owner QQ 私聊 + 气泡',overlay:'桌面悬浮气泡'};
+  const chLabels={voice_companion:'语音伴随口播',qq_dm:'Owner 私聊 + 气泡',overlay:'桌面悬浮气泡'};
   table('sw-commentary-table',['时间','投递渠道','画面主题','内容摘要'],(d.recent_commentaries||[]).map(item=>[
     lifeFmt(item.at,tz),
     chLabels[item.channel]||item.channel,
@@ -824,13 +847,15 @@ trackDirty('vc-gw-form','语音网关 API 配置');
 trackDirty('sw-config-form','屏幕伴看策略');
 
 onLogout(()=>{
+  activeProactiveBase='proactive';
   vcFetchGen++;
   vcGwFetchGen++;
   clearTtsPreview();
   $('world-observation-card').hidden=true;
-  for(const id of ['proactive-stats','proactive-queue','proactive-alerts','world-day-stats','world-agenda','world-daily-actions','world-plans','world-days','world-evenings','life-digests','life-stats','life-changes','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table','mc-overview','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table','vc-gw-pills','vc-gw-brz-voice-select','sw-pills','sw-commentary-table'])$(id).replaceChildren();
+  for(const id of ['proactive-stats','proactive-queue','proactive-alerts','world-day-stats','world-agenda','world-daily-actions','world-plans','world-days','world-evenings','life-digests','life-stats','life-changes','life-news','life-node-pills','life-module-options','life-intents-table','life-events-table','life-rules-table','mc-overview','mc-waypoints-list','mc-action-log','life-ledger-table','ledger-module-options','vc-pills','vc-sessions-table','vc-gw-pills','vc-gw-brz-voice-select','sw-pills','sw-commentary-table'])$(id).replaceChildren();
   $('vc-gw-brz-voice-select').hidden=true;
   for(const id of ['proactive-state','proactive-budget','world-morning','world-next','world-quiet','world-day-coverage','world-evening-coverage','rest-hours-status','wake-window','life-battery-status','life-world-status','life-node-status','life-desktop-status','life-source','social-schedule-status','life-mc-status','event-ledger-state','vc-state','vc-gw-state','sw-state'])text(id,'');
+  text('mc-plan-summary','暂无连贯计划或路标记录。');
   ['vc-gw-brz-key-state','vc-gw-fish-key-state','vc-gw-sf-key-state','vc-gw-oai-key-state'].forEach(id=>text(id,'未读取'));
   for(const id of ['life-world-save','life-save-config','life-reset-config','life-plan-now','life-gatekeeper-now','social-schedule-save','social-schedule-reset','life-mc-build','life-mc-connect','life-mc-disconnect','life-mc-chat-btn','life-mc-status-btn','life-mc-idle','life-mc-pause','life-mc-resume','vc-disconnect','vc-save','vc-reset','vc-gw-save','vc-gw-reset','vc-gw-test','vc-gw-brz-fetch-voices','sw-clear','sw-disconnect','sw-save','sw-reset'])$(id).disabled=true;
 });

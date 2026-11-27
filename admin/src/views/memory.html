@@ -4,16 +4,21 @@
     <p id="compression-source" class="muted"></p>
     <form id="compression-form">
       <div class="row"><label><input id="compression-enabled" type="checkbox"> 启用自动压缩</label><label for="compression-high-tokens">热历史折半阈值（估算 Token，1000–40000） <input id="compression-high-tokens" type="number" min="1000" max="40000" step="100" required></label></div>
-      <div class="grid">
-        <div><h3>群聊 group:*</h3><label for="group-messages">条数触发线</label><input id="group-messages" type="number" min="2" max="500" step="1" required><label for="group-chars">字符触发线（达到即触发）</label><input id="group-chars" type="number" min="1" max="64000" step="1" required><label for="group-keep">压缩后保留条数</label><input id="group-keep" type="number" min="1" max="499" step="1" required><label for="group-min_chars">按条数触发所需最少字符</label><input id="group-min_chars" type="number" min="0" max="64000" step="1" required><label for="group-max_messages">短消息最多暂缓到多少条</label><input id="group-max_messages" type="number" min="2" max="500" step="1" required></div>
-        <div><h3>Owner 私聊 private:*</h3><label for="private-messages">条数触发线</label><input id="private-messages" type="number" min="2" max="500" step="1" required><label for="private-chars">字符触发线（达到即触发）</label><input id="private-chars" type="number" min="1" max="64000" step="1" required><label for="private-keep">压缩后保留条数</label><input id="private-keep" type="number" min="1" max="499" step="1" required><p class="muted">私聊参数也适用于获准的其他私聊，仅调整窗口，不改变 Owner 身份与隐私权限。</p></div>
-      </div>
+      <details id="memory-fold-legacy" class="panel-fold">
+        <summary>兼容模式条数参数（仅非折半策略生效）<span class="fold-hint">8 项旧窗口参数 · 默认无需调整</span></summary>
+        <div class="panel-fold-body">
+          <div class="grid">
+            <div><h3>群聊 group:*</h3><label for="group-messages">条数触发线</label><input id="group-messages" type="number" min="2" max="500" step="1" required><label for="group-chars">字符触发线（达到即触发）</label><input id="group-chars" type="number" min="1" max="64000" step="1" required><label for="group-keep">压缩后保留条数</label><input id="group-keep" type="number" min="1" max="499" step="1" required><label for="group-min_chars">按条数触发所需最少字符</label><input id="group-min_chars" type="number" min="0" max="64000" step="1" required><label for="group-max_messages">短消息最多暂缓到多少条</label><input id="group-max_messages" type="number" min="2" max="500" step="1" required></div>
+            <div><h3>Owner 私聊 private:*</h3><label for="private-messages">条数触发线</label><input id="private-messages" type="number" min="2" max="500" step="1" required><label for="private-chars">字符触发线（达到即触发）</label><input id="private-chars" type="number" min="1" max="64000" step="1" required><label for="private-keep">压缩后保留条数</label><input id="private-keep" type="number" min="1" max="499" step="1" required><p class="muted">私聊参数也适用于获准的其他私聊，仅调整窗口，不改变 Owner 身份与隐私权限。</p></div>
+          </div>
+        </div>
+      </details>
       <p id="compression-summary" class="muted"></p>
       <div class="row"><button type="submit" id="save-compression" class="primary">保存并立即生效</button><button type="button" id="reset-compression" class="secondary">恢复 .env 配置</button></div>
     </form>
   </div>
   <div class="card"><div class="row between"><h2>隔离会话与双轨记忆</h2><button id="refresh-sessions" type="button" class="secondary">刷新列表</button></div>
-    <p class="muted">旧摘要在首次双轨提炼前保留。画像按数字账号隔离，编年史按需召回；重置清空本会话全部记忆并关闭云端镜像。</p>
+    <p class="muted">旧摘要在首次双轨提炼前保留。画像按平台账号隔离，编年史按需召回；重置清空本会话全部记忆并关闭云端镜像。</p>
     <div id="sessions" class="table"></div>
   </div>
 </section>

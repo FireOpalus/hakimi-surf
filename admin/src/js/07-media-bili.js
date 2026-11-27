@@ -46,11 +46,11 @@ $('bili-refresh').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDiscardTabChanges('bili-account','刷新 B 站账号状态')))return;
   await biliAccount();
 }));
-$('bili-credentials').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('bili-account/credentials','POST',{sessdata:$('bili-sessdata').value.trim(),bili_jct:$('bili-jct').value.trim(),buvid3:$('bili-buvid3').value.trim(),buvid4:$('bili-buvid4').value.trim()});for(const id of ['bili-sessdata','bili-jct','bili-buvid3','bili-buvid4'])$(id).value='';notice('凭证已加密保存；原有风控冷却继续有效');await biliAccount();});});
+$('bili-credentials').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('bili-account/credentials','POST',{sessdata:$('bili-sessdata').value.trim(),bili_jct:$('bili-jct').value.trim(),buvid3:$('bili-buvid3').value.trim(),buvid4:$('bili-buvid4').value.trim()});for(const id of ['bili-sessdata','bili-jct','bili-buvid3','bili-buvid4'])$(id).value='';clearDirty('bili-credentials');notice('凭证已加密保存；原有风控冷却继续有效');await biliAccount();});});
 $('bili-policy').addEventListener('submit',e=>{e.preventDefault();busy(e.submitter,async()=>{await api('bili-account','PUT',{enabled:$('bili-enabled').checked,allow_like:$('bili-like').checked,allow_favorite:$('bili-favorite').checked,favorite_folder_id:$('bili-folder').value.trim(),daily_action_limit:Number($('bili-limit').value)});notice('小号巡逻设置已保存');await biliAccount();});});
 $('bili-clear').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDialog('清除保存的 B 站凭证，停止账号巡逻？',{danger:true,confirmLabel:'清除凭证'})))return;
-  await api('bili-account/credentials','POST',{clear:true});notice('已清除保存的 B 站凭证');await biliAccount();
+  await api('bili-account/credentials','POST',{clear:true});for(const id of ['bili-sessdata','bili-jct','bili-buvid3','bili-buvid4'])$(id).value='';clearDirty('bili-credentials');notice('已清除保存的 B 站凭证');await biliAccount();
 }));
 $('bili-reset').addEventListener('click',e=>busy(e.target,async()=>{
   if(!(await confirmDialog('恢复 B 站小号巡逻的 .env 初始设置？',{danger:true,confirmLabel:'恢复 .env 设置'})))return;
@@ -650,6 +650,7 @@ function renderSongInboxTable(items,errMsg=''){
         prefillSongLearn(item);
         pendingSongLearn=null;
         const heading=$('song-learn-heading');
+        if(typeof revealSectionFor==='function')revealSectionFor(heading);
         if(heading){
           heading.tabIndex=-1;
           heading.focus({preventScroll:true});
@@ -838,7 +839,9 @@ function renderSongFinderResults(data,queryTitle,queryArtist){
         if(chosenTitle)$('song-learn-title').value=chosenTitle;
         if(cleanArtist)$('song-learn-artist').value=cleanArtist;
         $('song-learn-auto-search').checked=false;
-        $('song-learn-heading')?.scrollIntoView({behavior:'smooth',block:'start'});
+        const heading=$('song-learn-heading');
+        if(typeof revealSectionFor==='function')revealSectionFor(heading);
+        heading?.scrollIntoView({behavior:'smooth',block:'start'});
         notice('已下载原曲「'+savedName+'」到收件箱并填入学歌表单（尚未消费 Colab 算力）');
       }else{
         notice('已下载原曲「'+savedName+'」（'+formatByteSize(res?.size||0)+'）到 Drive inbox/');
@@ -852,7 +855,7 @@ function renderSongFinderResults(data,queryTitle,queryArtist){
       try{await fetchOne(true);}
       catch(err){if(err?.name==='AbortError')throw err;throw Error(mapSongError(err));}
     },'primary');
-    const row=el('div',undefined,'row between');
+    const row=el('div',undefined,'song-finder-item');
     const info=el('div');
     const metaRow=pillRow(
       pill(provLabel,item.provider==='bilibili_public'?'ok':'free'),
@@ -1342,6 +1345,7 @@ $('song-finder-form')?.addEventListener('submit',e=>{
 
 syncSongLearnEngineFields();
 
+trackDirty('bili-credentials','B 站小号凭证');
 trackDirty('bili-policy','小号巡逻设置');
 trackDirty('video-watch-policy','原片分析设置');
 trackDirty('song-storage-form','歌单云盘目录');
