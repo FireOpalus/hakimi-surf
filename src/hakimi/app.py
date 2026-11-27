@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import re
+import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
@@ -32,10 +33,82 @@ from .modules.onebot_transport import HTTPTransport, WebSocketTransport, websock
 from .node_transport import NodeTransport
 from .plugin_admin import router as plugin_router
 from .provider_admin import router as provider_router
-from .security import Rejected, check_fresh, qq_signing_key, verify_onebot, verify_qq
+from .security import (
+    Rejected,
+    check_fresh,
+    qq_signing_key,
+    redact_secrets,
+    verify_onebot,
+    verify_qq,
+)
 from .service import Service
 from .song_admin import router as song_router
 from .store import Store
+
+_STDERR_HANDLER_ATTR = "_hakimi_stderr_handler"
+_WS_PATH_SETTINGS_ATTRS = (
+    "onebot_ws_path",
+    "node_ws_path",
+    "companion_ws_path",
+    "screen_ws_path",
+    "plugin_bus_ws_path",
+)
+_WS_SECRET_PATH_RE = re.compile(r"(/ws/(?:onebot|node|companion|screen|plugin))/[^\s\"'?,;)}\]]+")
+_COOKIE_HEADER_RE = re.compile(
+    r"(?i)\b(set-cookie|cookie)\s*([:=])\s*"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+(?:\s*;\s*[^\s,;]+)*)"
+)
+_COOKIE_KV_RE = re.compile(
+    r"(?i)\b(sessdata|bili_jct|buvid3|buvid4|dedeuserid|ac_time_value)\s*([:=])\s*[^\s;,&\"']+"
+)
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|x-api-key|x-goog-api-key)\s*([:=])\s*"
+    r"(?:(?:bearer|basic|token)\s+)?[^\s,;\"']+"
+)
+_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:key|api_key|apikey|token|access_token|secret|auth)=)[^\s&\"'#]+"
+)
+
+
+def _scrub_log_text(text: str, settings: Settings | None = None) -> str:
+    cleaned = str(text or "")
+    if settings is not None:
+        for attr in _WS_PATH_SETTINGS_ATTRS:
+            raw_path = getattr(settings, attr, "")
+            if isinstance(raw_path, str) and raw_path.startswith("/ws/"):
+                parts = raw_path.split("/")
+                if len(parts) >= 4 and parts[3]:
+                    cleaned = cleaned.replace(raw_path, f"/{parts[1]}/{parts[2]}/[REDACTED]")
+                    suffix = "/".join(parts[3:])
+                    if len(suffix) >= 8:
+                        cleaned = cleaned.replace(suffix, "[REDACTED]")
+    cleaned = _WS_SECRET_PATH_RE.sub(r"\1/[REDACTED]", cleaned)
+    cleaned = _COOKIE_HEADER_RE.sub(r"\1\2[REDACTED]", cleaned)
+    cleaned = _COOKIE_KV_RE.sub(r"\1\2[REDACTED]", cleaned)
+    cleaned = _AUTH_HEADER_RE.sub(r"\1\2[REDACTED]", cleaned)
+    cleaned = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", cleaned)
+    return redact_secrets(cleaned, settings, replacement="[REDACTED]")
+
+
+class _ScrubbingFormatter(logging.Formatter):
+    def __init__(self, settings: Settings | None = None) -> None:
+        super().__init__("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        self._settings = settings
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _scrub_log_text(super().format(record), self._settings)
+
+
+def _attach_stderr_handler(
+    logger: logging.Logger, settings: Settings | None = None
+) -> logging.Handler | None:
+    if any(getattr(handler, _STDERR_HANDLER_ATTR, False) for handler in logger.handlers):
+        return None
+    handler = logging.StreamHandler(sys.stderr)
+    setattr(handler, _STDERR_HANDLER_ATTR, True)
+    handler.setFormatter(_ScrubbingFormatter(settings))
+    logger.addHandler(handler)
+    return handler
 
 
 async def read_body(request: Request, settings: Settings) -> bytes:
@@ -177,9 +250,11 @@ def create_app(
                     app.state.admin_action_lock = asyncio.Lock()
                     app.state.admin_config_lock = asyncio.Lock()
                     app.state.sandbox_lock = asyncio.Lock()
-                    logging.getLogger("hakimi").addHandler(store.runtime.sink)
-                    old_log_level = logging.getLogger("hakimi").level
-                    logging.getLogger("hakimi").setLevel(logging.INFO)
+                    hakimi_logger = logging.getLogger("hakimi")
+                    hakimi_logger.addHandler(store.runtime.sink)
+                    stderr_handler = _attach_stderr_handler(hakimi_logger, s)
+                    old_log_level = hakimi_logger.level
+                    hakimi_logger.setLevel(logging.INFO)
 
                     async def ws_event(payload):
                         try:
@@ -188,20 +263,22 @@ def create_app(
                             return "ignored"
 
                     app.state.ws_event = ws_event
-                    if start_workers:
-                        service.start()
-                        if (
-                            s.onebot_enabled
-                            and isinstance(onebot, WebSocketTransport)
-                            and s.onebot_mode == "ws_forward"
-                        ):
-                            onebot.start_forward(ws_event)
                     try:
+                        if start_workers:
+                            service.start()
+                            if (
+                                s.onebot_enabled
+                                and isinstance(onebot, WebSocketTransport)
+                                and s.onebot_mode == "ws_forward"
+                            ):
+                                onebot.start_forward(ws_event)
                         yield
                     finally:
                         await service.stop()
-                        logging.getLogger("hakimi").removeHandler(store.runtime.sink)
-                        logging.getLogger("hakimi").setLevel(old_log_level)
+                        hakimi_logger.removeHandler(store.runtime.sink)
+                        if stderr_handler is not None:
+                            hakimi_logger.removeHandler(stderr_handler)
+                        hakimi_logger.setLevel(old_log_level)
                         await store.runtime.flush()
         finally:
             await store.close()

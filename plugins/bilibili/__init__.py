@@ -1,5 +1,9 @@
 """Standalone hot-plug Bilibili surf & patrol remote plugin."""
 
+from __future__ import annotations
+
+from typing import Any
+
 from .client import BV_RE, BVID, URL_RE, BiliClientError, BiliPublicClient, extract_bvid
 from .patrol import (
     BiliPatrolEngine,
@@ -14,12 +18,6 @@ from .patrol import (
     video_duration,
     wbi_keys,
     wbi_sign,
-)
-from .plugin_main import (
-    BilibiliPlugin,
-    bilibili_config_from_env,
-    build_bilibili_plugin,
-    build_bilibili_plugin_from_env,
 )
 
 __all__ = [
@@ -46,3 +44,20 @@ __all__ = [
     "wbi_keys",
     "wbi_sign",
 ]
+
+_PLUGIN_MAIN_EXPORTS = frozenset(
+    {
+        "BilibiliPlugin",
+        "bilibili_config_from_env",
+        "build_bilibili_plugin",
+        "build_bilibili_plugin_from_env",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _PLUGIN_MAIN_EXPORTS:
+        from . import plugin_main
+
+        return getattr(plugin_main, name)
+    raise AttributeError(name)

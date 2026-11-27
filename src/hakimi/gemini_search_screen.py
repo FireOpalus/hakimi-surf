@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -18,6 +20,7 @@ from .gateway import redact_excerpt
 from .gemini_wire import _FreeTierFallback, _validate_audios, probability, questions
 from .media import ModelImage
 from .models import Message
+from .provider_diagnostics import EXCEPTION_TYPES
 from .routing import RouteDecision, select_tier
 from .security import Rejected
 from .store import DigestReviewCredit
@@ -30,6 +33,33 @@ from .web_search import (
     natural_search_cue,
     parse_result,
 )
+
+log = logging.getLogger("hakimi")
+_SAFE_PLATFORM_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+_SAFE_MIME_RE = re.compile(r"^[a-z0-9.+-]{1,32}/[a-z0-9.+-]{1,64}$")
+_SAFE_SURFACES = frozenset({"private", "group", "public_task"})
+
+
+def _safe_decision_bad_request_mimes(
+    images: list[ModelImage],
+    audios: list[ModelAudio],
+    video: ModelVideo | None,
+) -> str:
+    raw_mimes: list[str] = [
+        *(getattr(item, "mime_type", "") for item in images),
+        *(getattr(item, "mime_type", "") for item in audios),
+    ]
+    if video is not None:
+        raw_mimes.append(getattr(video, "mime_type", ""))
+    cleaned: list[str] = []
+    for raw in raw_mimes:
+        norm = str(raw or "").strip().lower()
+        if not norm:
+            continue
+        cleaned.append(norm if _SAFE_MIME_RE.fullmatch(norm) else "invalid")
+    if not cleaned:
+        return "none"
+    return ",".join(dict.fromkeys(cleaned))
 
 
 class _GeminiSearchScreenMixin:
@@ -726,6 +756,54 @@ class _GeminiSearchScreenMixin:
                     dispatched = len(attempts) > 1 and attempts[-1]["cause"] != "circuit_open"
                     attempts[0]["fallback"] = "failed" if dispatched else "not_dispatched"
                 exc.provider_diagnostics = list(attempts)
+                if inbound:
+                    bad_attempt = next(
+                        (
+                            item
+                            for item in reversed(attempts)
+                            if isinstance(item, dict)
+                            and (
+                                item.get("http_status") == 400
+                                or item.get("exception_type") == "BadRequestError"
+                            )
+                        ),
+                        None,
+                    )
+                    if bad_attempt is not None:
+                        raw_platform = message.platform if message is not None else ""
+                        platform_label = (
+                            raw_platform
+                            if isinstance(raw_platform, str)
+                            and _SAFE_PLATFORM_RE.fullmatch(raw_platform)
+                            else "unknown"
+                        )
+                        surface_label = (
+                            context.surface if context.surface in _SAFE_SURFACES else "unknown"
+                        )
+                        raw_error_type = bad_attempt.get("exception_type")
+                        error_type = (
+                            raw_error_type
+                            if isinstance(raw_error_type, str) and raw_error_type in EXCEPTION_TYPES
+                            else "unknown"
+                        )
+                        raw_status = bad_attempt.get("http_status")
+                        status_label = (
+                            str(raw_status)
+                            if type(raw_status) is int and 400 <= raw_status <= 599
+                            else "unknown"
+                        )
+                        log.warning(
+                            "event=decision_bad_request platform=%s surface=%s image_count=%d "
+                            "audio_count=%d mimes=%s text_bytes=%d error_type=%s status=%s",
+                            platform_label,
+                            surface_label,
+                            len(images),
+                            len(audio_items),
+                            _safe_decision_bad_request_mimes(images, audio_items, video),
+                            len(data.encode("utf-8")),
+                            error_type,
+                            status_label,
+                        )
             if not exc.audited:
                 await self.store.runtime.event(str(exc), audit_source, diagnostics=attempts)
                 exc.audited = True

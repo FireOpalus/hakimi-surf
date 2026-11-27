@@ -52,5 +52,92 @@ deploy() {
     fi
 }
 
+prune_old_images() {
+    python3 - <<'PY' || true
+from collections import defaultdict
+from datetime import datetime, timezone
+import re
+import subprocess
+
+KEEP_REV_TAGS = 3
+
+
+def run_docker(*args: str) -> list[str]:
+    proc = subprocess.run(["docker", *args], capture_output=True, text=True, check=False)
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def parse_created(raw: str) -> float:
+    text = raw.strip()
+    if not text:
+        return 0.0
+    iso = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    if iso.endswith("Z"):
+        iso = iso[:-1] + "+00:00"
+    elif re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}(?: \S+)?$", iso):
+        parts = iso.split()
+        iso = f"{parts[0]}T{parts[1]}{parts[2][:3]}:{parts[2][3:]}"
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return 0.0
+
+
+in_use_ids: set[str] = set()
+container_ids = run_docker("ps", "-aq")
+if container_ids:
+    in_use_ids.update(run_docker("inspect", "--format", "{{.Image}}", *container_ids))
+
+rev_entries: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+unique_image_ids: set[str] = set()
+for line in run_docker("image", "ls", "--no-trunc", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedAt}}"):
+    parts = line.split("\t")
+    if len(parts) < 3:
+        continue
+    repo, tag, img_id = parts[0], parts[1], parts[2]
+    created_fallback = parts[3] if len(parts) >= 4 else ""
+    if not repo.startswith("hakimi-surf-"):
+        continue
+    if tag in {"latest", "rollback"} or not tag.startswith("rev-"):
+        continue
+    rev_entries[repo].append((tag, img_id, created_fallback))
+    unique_image_ids.add(img_id)
+
+created_by_id: dict[str, float] = {}
+if unique_image_ids:
+    for line in run_docker(
+        "image", "inspect", "--format", "{{.Id}}\t{{.Created}}", *sorted(unique_image_ids)
+    ):
+        if "\t" not in line:
+            continue
+        img_id, created_raw = line.split("\t", 1)
+        created_by_id[img_id.strip()] = parse_created(created_raw)
+
+for repo, entries in rev_entries.items():
+    entries.sort(
+        key=lambda item: (
+            created_by_id.get(item[1], parse_created(item[2])),
+            item[0],
+        ),
+        reverse=True,
+    )
+    for tag, img_id, _ in entries[KEEP_REV_TAGS:]:
+        if img_id in in_use_ids:
+            continue
+        subprocess.run(
+            ["docker", "image", "rm", f"{repo}:{tag}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+PY
+    docker image prune -f >/dev/null 2>&1 || true
+    docker builder prune -f --keep-storage=2GB >/dev/null 2>&1 || true
+}
+
 if [[ $mode != admin ]]; then deploy hakimi-bot . 12141 src Dockerfile pyproject.toml uv.lock .dockerignore; fi
 if [[ $mode != engine ]]; then deploy hakimi-admin admin 12143 admin pyproject.toml src/hakimi/__init__.py; fi
+prune_old_images || true

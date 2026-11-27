@@ -350,7 +350,10 @@ async function api(path,method='GET',data){
       invalid_target:'目标账号格式无效，请输入纯数字 QQ 号或 平台:用户ID。',
       person_not_found:'未找到对应的统一身份档案。',
       account_not_found:'未找到对应的平台账号。',
-      identity_unavailable:'统一身份服务暂未就绪。'
+      identity_unavailable:'统一身份服务暂未就绪。',
+      drive_etag_required:'Google Drive 未返回文件 ETag 校验头，本次远端变更已安全中止，请稍后重试。',
+      db_backup_too_large:'主数据库加密备份体积超过云端上传上限（32 MiB），已保留本地备份，请检查数据清理与压缩策略。',
+      sessions_backup_too_large:'会话数据库压缩备份体积超过云端上传上限（32 MiB），已保留本地备份并跳过云端上传。'
     };
     const invField=value?.invalid_field||value?.field||r.headers.get('X-Invalid-Field')||'';
     const baseMsg=hints[value?.detail]||value?.detail||('HTTP '+r.status);
