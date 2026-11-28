@@ -449,7 +449,7 @@ async def test_continuation_turn_deduplicates_unchanged_transient_context_and_ca
 ):
     from hakimi.prefix_runtime import MAX_CHAIN_TURNS
 
-    assert MAX_CHAIN_TURNS == 12 and settings.interaction_chain_ttl_seconds == 300
+    assert MAX_CHAIN_TURNS == 12 and settings.interaction_chain_ttl_seconds == 1800
     monkeypatch.setattr("hakimi.gemini.MAX_CHAIN_TURNS", 2)
     recorded = []
 
@@ -523,3 +523,456 @@ async def test_continuation_turn_deduplicates_unchanged_transient_context_and_ca
     w3 = wire(2)
     assert "固定群聊摘要" in w3 and '"meme_labels":["测试表情"]' in w3
     await svc.stop()
+
+
+async def test_interaction_chain_ttl_default_override_and_memory_clamp(
+    tmp_path, settings, store, message, monkeypatch
+):
+    from hakimi.config import Settings
+
+    assert settings.interaction_chain_ttl_seconds == 1800
+
+    monkeypatch.setenv("HAKIMI_INTERACTION_CHAIN_TTL_SECONDS", "900")
+    s_override = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "override",
+        gemini_api_key="paid-env-secret-abcdef",
+        encryption_key="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+    )
+    assert s_override.interaction_chain_ttl_seconds == 900
+
+    sessions = SessionManager(settings, store)
+    msg = group(message, event_id="ttl_1", text="你好")
+    await sessions.receive(msg)
+    snap = await sessions.snapshot(msg)
+    now = 1_750_000_000.0
+    monkeypatch.setattr("hakimi.session_manager.time.time", lambda: now)
+
+    # Normal default TTL = 1800s (memory_ttl_seconds is 86400s).
+    assert await sessions.commit_chain(
+        msg,
+        lane="hydrogen",
+        interaction_id="inter_ttl_1800",
+        expected_epoch=snap["epoch"],
+        trim_version=snap["history_revision"],
+        system_digest="dig-1",
+        covered_seq=0,
+    )
+    chain_1800 = (await sessions.snapshot(msg))["interaction_chains"]["hydrogen"]
+    assert chain_1800["expires"] == now + 1800
+
+    # Clamped by memory_ttl_seconds when memory_ttl_seconds < interaction_chain_ttl_seconds.
+    settings.memory_ttl_seconds = 600
+    assert await sessions.commit_chain(
+        msg,
+        lane="hydrogen",
+        interaction_id="inter_ttl_clamped",
+        expected_epoch=snap["epoch"],
+        trim_version=snap["history_revision"],
+        system_digest="dig-1",
+        covered_seq=0,
+    )
+    chain_clamped = (await sessions.snapshot(msg))["interaction_chains"]["hydrogen"]
+    assert chain_clamped["expires"] == now + 600
+
+
+async def test_intervening_proactive_and_social_speak_rows_appear_in_next_continuation(
+    settings, store, message, sdk_pair
+):
+    recorded = []
+
+    def handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        body = json.loads(request.content)
+        recorded.append(body)
+        resp = interaction_response()
+        resp["id"] = f"inter_gap_{len(recorded)}"
+        resp["steps"][0]["content"][0]["text"] = action(bubbles=[f"回复{len(recorded)}"])
+        return httpx.Response(200, json=resp)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(handler))
+    sender = ActionSender()
+    svc = Service(settings, store, gate, FakeBili(), sender)
+    try:
+        # Turn 1 on owner private session establishes chain.
+        m1 = message.model_copy(update={"event_id": "priv_1", "text": "第一句私聊"})
+        assert await svc.accept(m1) == "accepted"
+        await svc.process(await store.claim())
+        assert await svc.deliver_once()
+        snap1 = await svc.sessions.snapshot(m1)
+        epoch = snap1["epoch"]
+        assert snap1["interaction_chains"]["hydrogen"]["interaction_id"] == "inter_gap_1"
+
+        # Intervening proactive DM (remember_assistant) and JIT social_speak (reply_batch).
+        assert await svc.sessions.remember_assistant(
+            m1, "主动发来的早安提醒", "proactive-rcpt-1", expected_epoch=epoch
+        )
+        assert await svc.sessions.reply_batch(
+            m1,
+            "social-speak-1",
+            [{"message_id": "m-social-1", "text": "主动搭话冒泡一句"}],
+            expected_epoch=epoch,
+        )
+
+        # Turn 2 continues the chain and MUST include both intervening rows in delta history!
+        m2 = message.model_copy(update={"event_id": "priv_2", "text": "刚看到你的消息"})
+        assert await svc.accept(m2) == "accepted"
+        await svc.process(await store.claim())
+        assert recorded[1]["previous_interaction_id"] == "inter_gap_1"
+        wire2 = _wire_text(recorded[1])
+        log_block = wire2.split("<conversation_history_log>\n")[1].split(
+            "</conversation_history_log>"
+        )[0]
+        assert "第一句私聊" not in log_block
+        assert "回复1" not in log_block
+        assert "主动发来的早安提醒" in log_block
+        assert "主动搭话冒泡一句" in log_block
+    finally:
+        await svc.stop()
+
+
+async def test_vertex_location_change_isolates_vertex_chain_system_digest(settings, store, message):
+    from hakimi.provider_routing import ProviderRoutingConfig
+    from tests.test_provider_routing_and_vertex import _client_pair, _close_clients
+
+    vertex_calls = []
+
+    def dev_handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(200, json=interaction_response())
+
+    def vertex_handler(request):
+        body = json.loads(request.content)
+        vertex_calls.append(body)
+        resp = interaction_response()
+        resp["id"] = f"vtx_loc_{len(vertex_calls)}"
+        return httpx.Response(200, json=resp)
+
+    clients, transports = _client_pair(dev_handler)
+    v_client, v_clients, v_transports = _client_pair(vertex_handler, vertex=True)
+    gate = GeminiGateway(settings, store, *clients, vertex_chat_client=v_client)
+    try:
+        # Turn 1 on vertex_location="us"
+        await gate.routing.set_config(
+            ProviderRoutingConfig(vertex_enabled=True, vertex_location="us")
+        )
+        history = [{"seq": 1, "role": "user", "user_id": message.user_id, "text": "前文内容"}]
+        trace1 = {}
+        await gate.generate(
+            {"current_message": "hi", "recent_messages": history},
+            "subject",
+            message=message,
+            generation_trace=trace1,
+        )
+        us_chain = {**trace1["chain_commit"], "expires": time.time() + 1800}
+        assert us_chain["interaction_id"] == "vtx_loc_1"
+
+        # Turn 2 on same location ("us") reuses chain
+        trace2 = {}
+        await gate.generate(
+            {
+                "current_message": "same-region",
+                "recent_messages": history,
+                "interaction_chains": {"hydrogen": us_chain},
+            },
+            "subject",
+            message=message,
+            generation_trace=trace2,
+        )
+        assert vertex_calls[1]["previous_interaction_id"] == "vtx_loc_1"
+
+        # Switch vertex_location to "global" -> system_digest differs -> drops old "us" chain!
+        await gate.routing.set_config(
+            ProviderRoutingConfig(vertex_enabled=True, vertex_location="global")
+        )
+        trace3 = {}
+        await gate.generate(
+            {
+                "current_message": "global-region",
+                "recent_messages": history,
+                "interaction_chains": {"hydrogen": us_chain},
+            },
+            "subject",
+            message=message,
+            generation_trace=trace3,
+        )
+        assert "previous_interaction_id" not in vertex_calls[2]
+        assert "前文内容" in _wire_text(vertex_calls[2])
+        assert trace3["chain_commit"]["system_digest"] != us_chain["system_digest"]
+    finally:
+        await gate.close()
+        await _close_clients([*clients, *v_clients], transports + v_transports)
+
+
+async def test_stale_previous_interaction_id_400_404_retries_once_stateless(
+    settings, store, message, sdk_pair
+):
+    import pytest
+
+    from hakimi.provider_routing import ProviderRoutingConfig
+    from hakimi.security import Rejected
+    from tests.test_provider_routing_and_vertex import _client_pair, _close_clients
+
+    # 1. gemini_paid: 404 and 400 INVALID_ARGUMENT retry stateless with full history;
+    #    400 SAFETY_BLOCKED does NOT waste a retry.
+    dev_calls = []
+    dev_responses = []
+
+    def dev_handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        dev_calls.append(json.loads(request.content))
+        return dev_responses.pop(0)
+
+    gate = GeminiGateway(settings, store, *sdk_pair(dev_handler))
+    try:
+        history = [{"seq": 1, "role": "user", "user_id": message.user_id, "text": "必须保留的历史"}]
+        first_ok = interaction_response()
+        first_ok["id"] = "gem_orig_1"
+        dev_responses.append(httpx.Response(200, json=first_ok))
+        t0 = {}
+        await gate.generate(
+            {"current_message": "首轮", "recent_messages": history},
+            "subject",
+            message=message,
+            generation_trace=t0,
+        )
+        stale_chain = {**t0["chain_commit"], "expires": time.time() + 1800}
+
+        # Pre-stream 404 on prev_id -> $0 settled, 1 stateless retry with full history -> 200 OK
+        fresh_ok = interaction_response()
+        fresh_ok["id"] = "gem_fresh_2"
+        dev_responses.extend(
+            [
+                httpx.Response(404, json={"error": {"code": 404, "status": "NOT_FOUND"}}),
+                httpx.Response(200, json=fresh_ok),
+            ]
+        )
+        t404 = {}
+        out404 = await gate.generate(
+            {
+                "current_message": "续链404",
+                "recent_messages": history,
+                "interaction_chains": {"hydrogen": stale_chain},
+            },
+            "subject",
+            message=message,
+            generation_trace=t404,
+        )
+        assert json.loads(out404)["bubbles"]
+        assert dev_calls[1]["previous_interaction_id"] == "gem_orig_1"
+        assert "previous_interaction_id" not in dev_calls[2]
+        assert "必须保留的历史" in _wire_text(dev_calls[2])
+        assert t404["chain_commit"]["interaction_id"] == "gem_fresh_2"
+        assert t404["chain_commit"]["turns"] == 1
+        assert t404["provider_diagnostics"][0]["http_status"] == 404
+        assert t404["provider_diagnostics"][0]["fallback"] == "succeeded"
+
+        # Pre-stream 400 INVALID_ARGUMENT on prev_id -> stateless retry -> 200 OK
+        fresh_ok_3 = interaction_response()
+        fresh_ok_3["id"] = "gem_fresh_3"
+        dev_responses.extend(
+            [
+                httpx.Response(400, json={"error": {"code": 400, "status": "INVALID_ARGUMENT"}}),
+                httpx.Response(200, json=fresh_ok_3),
+            ]
+        )
+        out400 = await gate.generate(
+            {
+                "current_message": "续链400",
+                "recent_messages": history,
+                "interaction_chains": {"hydrogen": stale_chain},
+            },
+            "subject",
+            message=message,
+        )
+        assert json.loads(out400)["bubbles"]
+        assert dev_calls[3]["previous_interaction_id"] == "gem_orig_1"
+        assert "previous_interaction_id" not in dev_calls[4]
+        assert "必须保留的历史" in _wire_text(dev_calls[4])
+
+        # Pre-stream 400 SAFETY_BLOCKED does NOT retry stateless.
+        before_safety = len(dev_calls)
+        dev_responses.append(
+            httpx.Response(400, json={"error": {"code": 400, "status": "SAFETY_BLOCKED"}})
+        )
+        with pytest.raises(Rejected, match="gemini_unavailable"):
+            await gate.generate(
+                {
+                    "current_message": "安全400",
+                    "recent_messages": history,
+                    "interaction_chains": {"hydrogen": stale_chain},
+                },
+                "subject",
+                message=message,
+            )
+        assert len(dev_calls) == before_safety + 1
+    finally:
+        await gate.close()
+
+    # 2. Vertex proto="auto": 404 on stale prev_id retries stateless interactions.create FIRST;
+    #    if stateless interactions.create ALSO 404s, falls back cleanly to streamGenerateContent!
+    v_paths = []
+    v_bodies = []
+    v_resps = []
+
+    def v_handler(request):
+        v_paths.append(request.url.path)
+        v_bodies.append(json.loads(request.content))
+        return v_resps.pop(0)
+
+    def d_handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        return httpx.Response(200, json=interaction_response())
+
+    clients, transports = _client_pair(d_handler)
+    v_client, v_clients, v_transports = _client_pair(v_handler, vertex=True)
+    v_gate = GeminiGateway(settings, store, *clients, vertex_chat_client=v_client)
+    try:
+        await v_gate.routing.set_config(
+            ProviderRoutingConfig(vertex_enabled=True, vertex_protocol="auto")
+        )
+        history = [{"seq": 1, "role": "user", "user_id": message.user_id, "text": "Vertex旧记忆"}]
+        v1 = interaction_response()
+        v1["id"] = "vtx_stale_1"
+        v_resps.append(httpx.Response(200, json=v1))
+        vt1 = {}
+        await v_gate.generate(
+            {"current_message": "v1", "recent_messages": history},
+            "subject",
+            message=message,
+            generation_trace=vt1,
+        )
+        v_chain = {**vt1["chain_commit"], "expires": time.time() + 1800}
+
+        # (a) Stale prev_id 404 -> retries stateless interactions.create -> 200 OK on interactions!
+        v2 = interaction_response()
+        v2["id"] = "vtx_fresh_2"
+        v_resps.extend(
+            [
+                httpx.Response(404, json={"error": {"code": 404, "message": "stale id"}}),
+                httpx.Response(200, json=v2),
+            ]
+        )
+        vt2 = {}
+        await v_gate.generate(
+            {
+                "current_message": "v2",
+                "recent_messages": history,
+                "interaction_chains": {"hydrogen": v_chain},
+            },
+            "subject",
+            message=message,
+            generation_trace=vt2,
+        )
+        assert v_paths[1].endswith("/interactions")
+        assert v_bodies[1]["previous_interaction_id"] == "vtx_stale_1"
+        assert v_paths[2].endswith("/interactions")
+        assert "previous_interaction_id" not in v_bodies[2]
+        assert "Vertex旧记忆" in _wire_text(v_bodies[2])
+        assert vt2["chain_commit"]["interaction_id"] == "vtx_fresh_2"
+
+        # (b) Both prev_id AND stateless interactions.create return 404 -> falls back to GC stream!
+        gc_chunk = {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": action(bubbles=["GC回退成功"])}],
+                    },
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+        v_resps.extend(
+            [
+                httpx.Response(404, json={"error": {"code": 404, "message": "no endpoint 1"}}),
+                httpx.Response(404, json={"error": {"code": 404, "message": "no endpoint 2"}}),
+                httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content=f"data: {json.dumps(gc_chunk)}\n\n",
+                ),
+            ]
+        )
+        out_gc = await v_gate.generate(
+            {
+                "current_message": "v3",
+                "recent_messages": history,
+                "interaction_chains": {"hydrogen": v_chain},
+            },
+            "subject",
+            message=message,
+        )
+        assert json.loads(out_gc)["bubbles"] == ["GC回退成功"]
+        assert v_paths[3].endswith("/interactions") and v_paths[4].endswith("/interactions")
+        assert "streamGenerateContent" in v_paths[5]
+        assert "Vertex旧记忆" in json.dumps(v_bodies[5], ensure_ascii=False)
+    finally:
+        await v_gate.close()
+        await _close_clients([*clients, *v_clients], transports + v_transports)
+
+
+def test_continuation_resets_world_state_summary_on_return_to_calm_idle(settings, message):
+    base_payload = {
+        "current_message": "现在在干嘛",
+        "recent_messages": [
+            {"seq": 1, "role": "user", "user_id": "20000", "speaker": "BOISER", "text": "嗨"}
+        ],
+    }
+    active_world = {
+        "current_module": "minecraft",
+        "focus_level": "HIGH",
+        "mood": "focused",
+    }
+
+    def _meta(raw: str) -> dict:
+        return json.loads(
+            raw.split("<untrusted_user_input>")[1].split("</untrusted_user_input>")[0]
+        )
+
+    # Turn 1: active world state emitted & hashed
+    st1: dict = {}
+    out1 = assemble_chat_input(
+        {**base_payload, "world_state_summary": active_world},
+        message,
+        settings,
+        continuation=False,
+        out_state=st1,
+    )
+    assert _meta(out1)["world_state_summary"] == active_world
+    assert st1["context_digests"].get("world")
+
+    # Turn 2: calm idle (world_state_summary=None) on continuation -> emits explicit idle reset
+    # and clears world digest so stale activity/mood does not linger over a 30m chain.
+    st2: dict = {}
+    out2 = assemble_chat_input(
+        dict(base_payload),
+        message,
+        settings,
+        continuation=True,
+        prev_digests=st1["context_digests"],
+        out_state=st2,
+    )
+    assert _meta(out2)["world_state_summary"] == {
+        "current_module": "idle",
+        "focus_level": "LOW",
+        "mood": "calm",
+    }
+    assert "world" not in st2["context_digests"]
+
+    # Turn 3: still calm idle -> does not repeatedly emit the idle reset.
+    st3: dict = {}
+    out3 = assemble_chat_input(
+        dict(base_payload),
+        message,
+        settings,
+        continuation=True,
+        prev_digests=st2["context_digests"],
+        out_state=st3,
+    )
+    assert "world_state_summary" not in _meta(out3)
+    assert "world" not in st3["context_digests"]

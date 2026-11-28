@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     )
     prefix_history_enabled: bool = True
     interaction_store_enabled: bool = True
-    interaction_chain_ttl_seconds: int = Field(default=300, ge=60, le=604800)
+    interaction_chain_ttl_seconds: int = Field(default=1800, ge=60, le=604800)
     history_high_tokens: int = Field(default=14000, ge=1000, le=40000)
     history_max_bytes: int = Field(default=144000, ge=4000, le=144000)
     chat_tail_tokens: int = Field(default=4200, ge=400, le=4200)
@@ -626,6 +626,26 @@ class Settings(BaseSettings):
         max_length=128,
         validation_alias=AliasChoices("VERTEX_HYDROGEN_MODEL", "HAKIMI_VERTEX_HYDROGEN_MODEL"),
     )
+    vertex_circuit_base_cooldown_seconds: float = Field(
+        default=120.0,
+        ge=1.0,
+        le=3600.0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices(
+            "VERTEX_CIRCUIT_BASE_COOLDOWN_SECONDS",
+            "HAKIMI_VERTEX_CIRCUIT_BASE_COOLDOWN_SECONDS",
+        ),
+    )
+    vertex_circuit_max_cooldown_seconds: float = Field(
+        default=300.0,
+        ge=1.0,
+        le=3600.0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices(
+            "VERTEX_CIRCUIT_MAX_COOLDOWN_SECONDS",
+            "HAKIMI_VERTEX_CIRCUIT_MAX_COOLDOWN_SECONDS",
+        ),
+    )
     embedding_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("EMBEDDING_ENABLED", "HAKIMI_EMBEDDING_ENABLED"),
@@ -806,6 +826,11 @@ class Settings(BaseSettings):
             raise ValueError("cached input price must not exceed standard input price")
         if self.send_delay_max < self.send_delay_min:
             raise ValueError("send_delay_max must be >= send_delay_min")
+        if self.vertex_circuit_max_cooldown_seconds < self.vertex_circuit_base_cooldown_seconds:
+            raise ValueError(
+                "vertex_circuit_max_cooldown_seconds must be >= "
+                "vertex_circuit_base_cooldown_seconds"
+            )
         if self.onebot_enabled and self.onebot_mode != "http":
             if (
                 not valid_token(self.onebot_ws_token)

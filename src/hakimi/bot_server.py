@@ -304,6 +304,13 @@ def assemble_chat_input(
             next_world_dig = world_dig
             if "world" not in prev or prev.get("world") != world_dig:
                 metadata["world_state_summary"] = world_obj
+        elif not sandbox_mode and prev.get("world"):
+            metadata["world_state_summary"] = {
+                "current_module": "idle",
+                "focus_level": "LOW",
+                "mood": "calm",
+            }
+            next_world_dig = ""
         if not sandbox_mode:
             for key in (
                 "file_attachments",
@@ -571,6 +578,13 @@ def assemble_chat_input(
         rendered, tokens = _recompute()
     if tokens > limit and metadata.get("world_state_summary"):
         metadata.pop("world_state_summary", None)
+        if (
+            out_state is not None
+            and continuation
+            and prev.get("world")
+            and not payload.get("world_state_summary")
+        ):
+            out_state["context_digests"]["world"] = prev["world"]
         rendered, tokens = _recompute()
     if tokens > limit and metadata.get("recent_bili_surfed"):
         metadata.pop("recent_bili_surfed", None)

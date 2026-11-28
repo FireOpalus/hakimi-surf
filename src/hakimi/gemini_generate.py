@@ -46,6 +46,7 @@ from .outbound_actions import (
     require_all_schema_fields,
 )
 from .persona import SYSTEM_INSTRUCTION, identity_anchor
+from .provider_diagnostics import MAX_ATTEMPTS, SAFETY_UPSTREAM_CODES
 from .routing import RouteDecision
 from .security import Rejected, clean_text
 from .social import chat_module
@@ -53,6 +54,8 @@ from .store import DigestReviewCredit
 from .streaming import StreamProgress, cancellable, consume_stream, upstream_http_status
 from .thinking_policy import preferences, supported_level
 from .video_files import ModelVideo, run_guard
+
+_NON_CHAIN_400_CODES = SAFETY_UPSTREAM_CODES | {"INVALID_IMAGE"}
 
 
 class _GeminiGenerateMixin:
@@ -522,17 +525,29 @@ class _GeminiGenerateMixin:
 
         attempts: list[dict] = []
         vertex_interactions_404 = False
+        long_audio = sum(a.duration_sec for a in audio_items) > 60
+        deadline_seconds = (
+            self.s.memory_flex_timeout
+            if use_flex_archive
+            else max(self.s.generation_timeout, 120)
+            if video
+            else max(self.s.generation_timeout, 90)
+            if long_audio
+            else self.s.generation_timeout
+        )
 
         async def _dispatch_once(
             active_plan: GenerationPlan,
             progress: StreamProgress | None,
             *,
             developer_fallback: bool = False,
+            skip_vertex: bool = False,
             vertex_tier: Literal["standard", "priority"] = "standard",
             force_no_chain: bool = False,
             dispatch_state: dict[str, bool] | None = None,
         ):
             nonlocal \
+                allow_chain, \
                 used_lane, \
                 used_rows, \
                 used_turns, \
@@ -548,6 +563,7 @@ class _GeminiGenerateMixin:
 
             use_vertex = (
                 not developer_fallback
+                and not skip_vertex
                 and not use_flex_archive
                 and video is None
                 and self._should_use_vertex()
@@ -556,22 +572,17 @@ class _GeminiGenerateMixin:
             if vertex_tier == "priority":
                 if not use_vertex or vertex_client is None:
                     raise Rejected("vertex_unavailable")
-            elif use_vertex and (
-                vertex_client is None
-                or (
-                    self.routing.config.vertex_fallback_to_gemini
-                    and time.monotonic() < self.vertex_blocked_until
-                )
-            ):
-                if self.routing.config.vertex_fallback_to_gemini:
+            elif use_vertex and vertex_client is None:
+                if self._vertex_fallback_available():
                     use_vertex = False
                 else:
                     raise Rejected("vertex_unavailable")
 
             if use_vertex:
                 model = "gemini-4-" + selected_model
+                vertex_loc = (self.routing.config.vertex_location or "global").strip() or "global"
                 active_system_digest = self.store.vault.digest(
-                    "static-prefix", system, "vertex:" + model
+                    "static-prefix", system, f"vertex:{vertex_loc}:{model}"
                 )
                 provider_name = "vertex_paid"
                 proto = self.routing.config.vertex_protocol
@@ -722,16 +733,6 @@ class _GeminiGenerateMixin:
             cached_prefix = (
                 max(0, estimate_tokens(reserve_data) - estimate_tokens(wire_data)) if prev_id else 0
             )
-            long_audio = sum(a.duration_sec for a in audio_items) > 60
-            deadline_seconds = (
-                self.s.memory_flex_timeout
-                if use_flex_archive
-                else max(self.s.generation_timeout, 120)
-                if video
-                else max(self.s.generation_timeout, 90)
-                if long_audio
-                else self.s.generation_timeout
-            )
 
             async def _call_vertex_generate_content():
                 gc_thinking = (
@@ -837,6 +838,7 @@ class _GeminiGenerateMixin:
                     except Exception as exc:
                         if (
                             allow_404_gc_fallback
+                            and not prev_id
                             and self._http_status(exc) == 404
                             and not (progress and progress.started)
                         ):
@@ -889,44 +891,91 @@ class _GeminiGenerateMixin:
                     await cancellable(operation, cancel_event) if use_stream else await operation()
                 )
 
-            result = await self._call(
-                subject,
-                budget_lane,
-                active_plan.model_lane,
-                {"input": reserve_data, "system_instruction": system},
-                active_plan.output_tokens,
-                deadline_seconds,
-                controlled_operation,
-                attempts=attempts,
-                work_kind="world.plan" if life_plan else str(scenario),
-                **({"digest_review": review} if review is not None else {}),
-                stream_retryable=use_stream,
-                image_tokens=len(images) * self.s.image_token_reserve
-                + audio_token_reserve
-                + (video.tokens if video else 0),
-                before_call=before_call,
-                context_limit=(
-                    self.s.history_max_bytes + 48000
-                    if chat
-                    else self.s.history_max_bytes + 12000
-                    if scenario == Scenario.MEMORY_COMPRESSION and self.s.prefix_history_enabled
-                    else None
-                ),
-                fallback_media_tokens=(
-                    sum(1120 if i.resolution == "high" else 560 for i in images)
+            before_call_attempts = len(attempts)
+            try:
+                result = await self._call(
+                    subject,
+                    budget_lane,
+                    active_plan.model_lane,
+                    {"input": reserve_data, "system_instruction": system},
+                    active_plan.output_tokens,
+                    deadline_seconds,
+                    controlled_operation,
+                    attempts=attempts,
+                    work_kind="world.plan" if life_plan else str(scenario),
+                    **({"digest_review": review} if review is not None else {}),
+                    stream_retryable=use_stream,
+                    image_tokens=len(images) * self.s.image_token_reserve
                     + audio_token_reserve
-                    + (video.tokens if video else 0)
-                ),
-                cached_prefix_tokens=cached_prefix,
-                stream_progress=progress,
-                call_state=call_state,
-                thinking_level=active_plan.thinking_level,
-                price_multiplier=active_price_multiplier,
-                provider=provider_name,
-                service_tier=vertex_tier if use_vertex else None,
-                vertex_fallback_eligible=use_vertex
-                and self.routing.config.vertex_fallback_to_gemini,
-            )
+                    + (video.tokens if video else 0),
+                    before_call=before_call,
+                    context_limit=(
+                        self.s.history_max_bytes + 48000
+                        if chat
+                        else self.s.history_max_bytes + 12000
+                        if scenario == Scenario.MEMORY_COMPRESSION and self.s.prefix_history_enabled
+                        else None
+                    ),
+                    fallback_media_tokens=(
+                        sum(1120 if i.resolution == "high" else 560 for i in images)
+                        + audio_token_reserve
+                        + (video.tokens if video else 0)
+                    ),
+                    cached_prefix_tokens=cached_prefix,
+                    stream_progress=progress,
+                    call_state=call_state,
+                    thinking_level=active_plan.thinking_level,
+                    price_multiplier=active_price_multiplier,
+                    provider=provider_name,
+                    service_tier=vertex_tier if use_vertex else None,
+                    vertex_fallback_eligible=use_vertex and self._vertex_fallback_available(),
+                )
+            except Rejected as exc:
+                last_attempt = attempts[-1] if len(attempts) > before_call_attempts else None
+                stale_status = last_attempt.get("http_status") if last_attempt is not None else None
+                stale_code = last_attempt.get("upstream_code") if last_attempt is not None else None
+                if (
+                    prev_id
+                    and not force_no_chain
+                    and str(exc) == "gemini_unavailable"
+                    and stale_status in {400, 404}
+                    and stale_code not in _NON_CHAIN_400_CODES
+                    and not (progress and progress.started)
+                ):
+                    allow_chain = False
+                    if cancel_event is not None and cancel_event.is_set():
+                        if last_attempt is not None:
+                            last_attempt["fallback"] = "cancelled"
+                        raise asyncio.CancelledError from None
+                    if progress is not None:
+                        progress.dispatched = False
+                        progress.error_code = None
+                    try:
+                        retry_result = await _dispatch_once(
+                            active_plan,
+                            progress,
+                            developer_fallback=developer_fallback,
+                            skip_vertex=skip_vertex,
+                            vertex_tier=vertex_tier,
+                            force_no_chain=True,
+                            dispatch_state=dispatch_state,
+                        )
+                    except asyncio.CancelledError:
+                        if last_attempt is not None:
+                            last_attempt["fallback"] = "cancelled"
+                        raise
+                    except BaseException:
+                        if last_attempt is not None:
+                            last_attempt["fallback"] = "failed"
+                        raise
+                    if last_attempt is not None:
+                        last_attempt["fallback"] = (
+                            "succeeded"
+                            if getattr(retry_result, "status", None) == "completed"
+                            else "failed"
+                        )
+                    return retry_result
+                raise
 
             usage = self._usage(
                 result, active_plan.model_lane, thinking_level=active_plan.thinking_level
@@ -970,20 +1019,78 @@ class _GeminiGenerateMixin:
                 rate_limited = (
                     upstream_http_status(code) == 429
                     or (last is not None and last.get("http_status") == 429)
+                    or (last is not None and upstream_http_status(last.get("upstream_code")) == 429)
                     or (isinstance(exc, Rejected) and exc.detail == "rate_limited")
                 )
                 return last, code, unavailable_before_stream, rate_limited
 
             primary = StreamProgress(on_text=live_delta) if use_stream else None
+            would_use_vertex = (
+                not use_flex_archive
+                and video is None
+                and self._should_use_vertex()
+                and self.vertex_chat_client is not None
+            )
+            route_key = active_plan.model_lane
+            circuit_mode: Literal["closed", "open", "half_open"] = "closed"
+            cooldown_remaining = 0.0
+            circuit_epoch = self._vertex_circuit_epoch
+            probe_token: int | None = None
+            if would_use_vertex and self._vertex_fallback_available():
+                circuit_mode, cooldown_remaining, circuit_epoch, probe_token = (
+                    self._acquire_vertex_circuit(route_key)
+                )
+
+            if circuit_mode == "open":
+                skip_entry: dict[str, Any] = {
+                    "stage": "generation",
+                    "provider": "vertex_paid",
+                    "model_lane": active_plan.model_lane,
+                    "cause": "circuit_open",
+                    "cooldown_ms": (
+                        max(1, round(cooldown_remaining * 1000)) if cooldown_remaining > 0 else 0
+                    ),
+                    "timeout_ms": round(deadline_seconds * 1000),
+                    "elapsed_ms": 0,
+                }
+                attempts.append(skip_entry)
+                del attempts[:-MAX_ATTEMPTS]
+                skip_state = {"dispatched": False}
+                try:
+                    result = await _dispatch_once(
+                        active_plan,
+                        primary,
+                        skip_vertex=True,
+                        dispatch_state=skip_state,
+                    )
+                except asyncio.CancelledError:
+                    skip_entry["fallback"] = "cancelled"
+                    raise
+                except BaseException:
+                    dispatched = skip_state["dispatched"] or bool(primary and primary.dispatched)
+                    skip_entry["fallback"] = "failed" if dispatched else "not_dispatched"
+                    raise
+                skip_entry["fallback"] = (
+                    "succeeded" if getattr(result, "status", None) == "completed" else "failed"
+                )
+                return result
+
+            is_half_open_probe = circuit_mode == "half_open"
             before_primary = len(attempts)
             primary_exc: Rejected | GenerationTimeout | None = None
             try:
-                return await _dispatch_once(active_plan, primary, vertex_tier="standard")
+                primary_result = await _dispatch_once(active_plan, primary, vertex_tier="standard")
             except (Rejected, GenerationTimeout) as exc:
                 primary_exc = exc
                 primary_detail, code, unavailable_before_stream, rate_limited = _failure_info(
                     exc, primary, before_primary
                 )
+                if is_half_open_probe and used_provider == "vertex_paid" and rate_limited:
+                    self._trip_vertex_circuit(
+                        route_key,
+                        expected_epoch=circuit_epoch,
+                        probe_token=probe_token,
+                    )
                 if not code and not (used_provider == "vertex_paid" and unavailable_before_stream):
                     raise
                 incident: dict[str, Any] = {"provider": used_provider, "code": code or "unknown"}
@@ -1005,9 +1112,24 @@ class _GeminiGenerateMixin:
                     if primary_detail is not None:
                         primary_detail["fallback"] = "ineligible"
                     raise
+            else:
+                if used_provider == "vertex_paid":
+                    self._record_vertex_success(
+                        route_key,
+                        expected_epoch=circuit_epoch,
+                        probe_token=probe_token,
+                    )
+                return primary_result
+            finally:
+                if is_half_open_probe:
+                    self._release_vertex_probe(
+                        route_key,
+                        expected_epoch=circuit_epoch,
+                        probe_token=probe_token,
+                    )
 
             fallback_parent_detail = primary_detail
-            if primary_429_eligible:
+            if primary_429_eligible and not is_half_open_probe:
                 # Stage 2: Vertex Standard PayGo 429 -> retry on Vertex Priority PayGo first.
                 priority_progress = StreamProgress(on_text=live_delta) if use_stream else None
                 priority_state = {"dispatched": False}
@@ -1042,7 +1164,7 @@ class _GeminiGenerateMixin:
                     if not priority_dispatched:
                         if (
                             str(priority_exc) in {"vertex_unavailable", "budget_exhausted"}
-                            and self.routing.config.vertex_fallback_to_gemini
+                            and self._vertex_fallback_available()
                         ):
                             if primary_detail is not None:
                                 primary_detail["fallback"] = "failed"
@@ -1064,9 +1186,10 @@ class _GeminiGenerateMixin:
                             priority_detail["fallback"] = "partial_output"
                         raise
                     else:
-                        if priority_rate_limited and self.routing.config.vertex_fallback_to_gemini:
-                            self.vertex_blocked_until = max(
-                                self.vertex_blocked_until, time.monotonic() + 60
+                        if priority_rate_limited and self._vertex_fallback_available():
+                            self._trip_vertex_circuit(
+                                route_key,
+                                expected_epoch=circuit_epoch,
                             )
                         priority_429_eligible = priority_rate_limited and str(priority_exc) in {
                             "stream_provider_error",
@@ -1086,7 +1209,7 @@ class _GeminiGenerateMixin:
                             if priority_detail is not None:
                                 priority_detail["fallback"] = "ineligible"
                             raise
-                        if not self.routing.config.vertex_fallback_to_gemini:
+                        if not self._vertex_fallback_available():
                             incident["fallback"] = "disabled"
                             incident.pop("fallback_target", None)
                             if primary_detail is not None:
@@ -1107,7 +1230,7 @@ class _GeminiGenerateMixin:
                         if primary_detail is not None:
                             primary_detail["fallback"] = "failed"
                     return priority_result
-            elif not self.routing.config.vertex_fallback_to_gemini:
+            elif not self._vertex_fallback_available():
                 incident["fallback"] = "disabled"
                 if primary_detail is not None:
                     primary_detail["fallback"] = "disabled"

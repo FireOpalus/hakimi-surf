@@ -1088,3 +1088,535 @@ async def test_memory_archive_allow_flex_false_uses_standard_routing_and_extract
         ("memory", "memory_flex", 263, "gemini_paid"),
         ("memory", "hydrogen", 525, "vertex_paid" if vertex_enabled else "gemini_paid"),
     ]
+
+
+async def test_vertex_breaker_exponential_backoff_half_open_probe_and_recovery(
+    routes, message, settings, monkeypatch
+):
+    now = [1000.0]
+    monkeypatch.setattr("hakimi.gemini.time.monotonic", lambda: now[0])
+    gate, calls, replies = routes
+    assert settings.vertex_circuit_base_cooldown_seconds == 120.0
+    assert settings.vertex_circuit_max_cooldown_seconds == 300.0
+
+    # Trip 1 (closed -> open): Standard 429 + Priority 429 -> 120s cooldown.
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}),
+            httpx.Response(429, json={"error": {"code": 429, "status": "TOO_MANY_REQUESTS"}}),
+        ]
+    )
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    out1 = await gate.generate({"current_message": "trip1"}, "subject", message=message)
+    assert json.loads(out1)["bubbles"]
+    assert len(calls["vertex"]) == 2 and len(calls["developer"]) == 1
+    assert gate.vertex_blocked_until == pytest.approx(1120.0)
+
+    # During cooldown: skips Vertex completely, records circuit_open diagnostic.
+    now[0] = 1050.0
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    trace_skip = {}
+    out_skip = await gate.generate(
+        {"current_message": "skip"}, "subject", message=message, generation_trace=trace_skip
+    )
+    assert json.loads(out_skip)["bubbles"]
+    assert len(calls["vertex"]) == 2 and len(calls["developer"]) == 2
+    assert trace_skip["provider"] == "gemini_paid"
+    assert "vertex_service_tier" not in trace_skip
+    assert "provider_incident" not in trace_skip
+    [skip_diag] = trace_skip["provider_diagnostics"]
+    assert skip_diag["stage"] == "generation"
+    assert skip_diag["provider"] == "vertex_paid"
+    assert skip_diag["model_lane"] == "hydrogen"
+    assert skip_diag["cause"] == "circuit_open"
+    assert skip_diag["cooldown_ms"] == 70_000
+    assert skip_diag["elapsed_ms"] == 0
+    assert skip_diag["fallback"] == "succeeded"
+
+    # Trip 2 (half-open probe fails with 429): probes Standard ONLY (no Priority retry!),
+    # falls back straight to Developer API, escalates cooldown to 240s.
+    now[0] = 1120.0
+    replies["vertex"].append(sse(stream_error("RESOURCE_EXHAUSTED")))
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    trace_p1 = {}
+    out_p1 = await gate.generate(
+        {"current_message": "probe1"}, "subject", message=message, generation_trace=trace_p1
+    )
+    assert json.loads(out_p1)["bubbles"]
+    assert len(calls["vertex"]) == 3 and len(calls["developer"]) == 3
+    assert calls["vertex_headers"][-1] == {"x-vertex-ai-llm-request-type": "shared"}
+    assert gate.vertex_blocked_until == pytest.approx(1360.0)
+    assert trace_p1["provider_incident"] == {
+        "provider": "vertex_paid",
+        "code": "RESOURCE_EXHAUSTED",
+        "fallback": "succeeded",
+        "fallback_target": "gemini_paid",
+    }
+
+    # Trip 3 (half-open probe fails again): capped at max_cooldown = 300s (not 480s).
+    now[0] = 1360.0
+    replies["vertex"].append(
+        httpx.Response(429, json={"error": {"code": 429, "status": "TOO_MANY_REQUESTS"}})
+    )
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    out_p2 = await gate.generate({"current_message": "probe2"}, "subject", message=message)
+    assert json.loads(out_p2)["bubbles"]
+    assert len(calls["vertex"]) == 4 and len(calls["developer"]) == 4
+    assert gate.vertex_blocked_until == pytest.approx(1660.0)
+
+    # Half-open probe SUCCEEDS -> closes breaker and resets backoff to 0!
+    now[0] = 1660.0
+    replies["vertex"].append(httpx.Response(200, json=interaction_response()))
+    trace_rec = {}
+    out_rec = await gate.generate(
+        {"current_message": "recovered"}, "subject", message=message, generation_trace=trace_rec
+    )
+    assert json.loads(out_rec)["bubbles"]
+    assert len(calls["vertex"]) == 5 and len(calls["developer"]) == 4
+    assert trace_rec["provider"] == "vertex_paid"
+    assert gate.vertex_blocked_until == 0.0
+
+    # Verify backoff was reset: next 429 pair opens at base 120s (not 300s).
+    now[0] = 1700.0
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "message": "std 429"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "prio 429"}}),
+        ]
+    )
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    await gate.generate({"current_message": "fresh-trip"}, "subject", message=message)
+    assert gate.vertex_blocked_until == pytest.approx(1820.0)
+
+
+async def test_vertex_breaker_keeps_gemini_paid_chain_continuity_during_cooldown(
+    routes, message, monkeypatch
+):
+    now = [2000.0]
+    monkeypatch.setattr("hakimi.gemini.time.monotonic", lambda: now[0])
+    gate, calls, replies = routes
+
+    # Turn 1: Vertex Standard & Priority 429 -> falls back to gemini_paid, opens cooldown.
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "message": "std 429"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "prio 429"}}),
+        ]
+    )
+    dev1 = interaction_response()
+    dev1["id"] = "gem-chain-1"
+    dev2 = interaction_response()
+    dev2["id"] = "gem-chain-2"
+    dev3 = interaction_response()
+    dev3["id"] = "gem-chain-3"
+    replies["developer"].extend(
+        [
+            httpx.Response(200, json=dev1),
+            httpx.Response(200, json=dev2),
+            httpx.Response(200, json=dev3),
+        ]
+    )
+
+    history1 = [{"seq": 1, "role": "user", "user_id": message.user_id, "text": "旧消息一"}]
+    trace1 = {}
+    await gate.generate(
+        {"current_message": "第一轮", "recent_messages": history1},
+        "subject",
+        message=message,
+        generation_trace=trace1,
+    )
+    assert trace1["provider"] == "gemini_paid"
+    chain1 = {**trace1["chain_commit"], "expires": time.time() + 600}
+    assert chain1["interaction_id"] == "gem-chain-1"
+
+    # Turn 2 during cooldown: skips Vertex and reuses gemini_paid's previous_interaction_id!
+    now[0] = 2030.0
+    history2 = [
+        *history1,
+        {"seq": 2, "role": "user", "user_id": message.user_id, "text": "新增第二句"},
+    ]
+    trace2 = {}
+    await gate.generate(
+        {
+            "current_message": "第二轮",
+            "recent_messages": history2,
+            "interaction_chains": {"hydrogen": chain1},
+        },
+        "subject",
+        message=message,
+        generation_trace=trace2,
+    )
+    assert len(calls["vertex"]) == 2 and len(calls["developer"]) == 2
+    assert calls["developer"][1]["previous_interaction_id"] == "gem-chain-1"
+    assert "旧消息一" not in wire_input_text(calls["developer"][1])
+    assert "新增第二句" in wire_input_text(calls["developer"][1])
+    assert trace2["provider_diagnostics"][0]["cause"] == "circuit_open"
+    assert trace2["provider_diagnostics"][0]["provider"] == "vertex_paid"
+    chain2 = {**trace2["chain_commit"], "expires": time.time() + 600}
+    assert chain2["interaction_id"] == "gem-chain-2"
+    assert chain2["system_digest"] == chain1["system_digest"]
+
+    # Turn 3 still during cooldown: chains cleanly off gem-chain-2.
+    now[0] = 2060.0
+    trace3 = {}
+    await gate.generate(
+        {
+            "current_message": "第三轮",
+            "recent_messages": history2,
+            "interaction_chains": {"hydrogen": chain2},
+        },
+        "subject",
+        message=message,
+        generation_trace=trace3,
+    )
+    assert len(calls["vertex"]) == 2 and len(calls["developer"]) == 3
+    assert calls["developer"][2]["previous_interaction_id"] == "gem-chain-2"
+
+
+async def test_vertex_half_open_single_probe_concurrency_and_lock_release_on_failure(
+    settings, store, message, monkeypatch
+):
+    now = [3000.0]
+    monkeypatch.setattr("hakimi.gemini.time.monotonic", lambda: now[0])
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+    vertex_calls = []
+    developer_calls = []
+    vertex_mode = ["429_burst"]
+
+    async def vertex_handler(request):
+        vertex_calls.append(json.loads(request.content))
+        mode = vertex_mode[0]
+        if mode == "429_burst":
+            return httpx.Response(429, json={"error": {"code": 429, "message": "busy"}})
+        if mode == "slow_ok":
+            probe_started.set()
+            await release_probe.wait()
+            return httpx.Response(200, json=interaction_response())
+        if mode == "slow_cancel":
+            probe_started.set()
+            await release_probe.wait()
+            return httpx.Response(200, json=interaction_response())
+        if mode == "503":
+            return httpx.Response(503, json={"error": {"code": 503, "message": "err"}})
+        return httpx.Response(200, json=interaction_response())
+
+    def dev_handler(request):
+        if request.url.path.endswith("decisions"):
+            return httpx.Response(200, json=decision_response())
+        developer_calls.append(json.loads(request.content))
+        return httpx.Response(200, json=interaction_response())
+
+    clients, transports = _client_pair(dev_handler)
+    vertex, v_clients, v_transports = _client_pair(vertex_handler, vertex=True)
+    gate = GeminiGateway(settings, store, *clients, vertex_chat_client=vertex)
+    await gate.routing.set_config(ProviderRoutingConfig(vertex_enabled=True))
+    try:
+        # 1. Open the breaker (Standard 429 + Priority 429).
+        await gate.generate({"current_message": "trip"}, "subject", message=message)
+        assert len(vertex_calls) == 2 and len(developer_calls) == 1
+        assert gate.vertex_blocked_until == pytest.approx(3120.0)
+
+        # 2. Cooldown expires -> Task A acquires single half-open probe; concurrent Task B
+        #    must NOT hit Vertex (zero thundering herd) and goes straight to gemini_paid.
+        now[0] = 3120.0
+        vertex_mode[0] = "slow_ok"
+        trace_a, trace_b = {}, {}
+        task_a = asyncio.create_task(
+            gate.generate(
+                {"current_message": "probe-a"}, "subject", message=message, generation_trace=trace_a
+            )
+        )
+        await asyncio.wait_for(probe_started.wait(), timeout=2.0)
+        out_b = await gate.generate(
+            {"current_message": "peer-b"}, "subject", message=message, generation_trace=trace_b
+        )
+        assert json.loads(out_b)["bubbles"]
+        assert len(vertex_calls) == 3  # Only Task A hit Vertex!
+        assert len(developer_calls) == 2  # Task B skipped straight to Developer API!
+        assert trace_b["provider_diagnostics"][0]["cause"] == "circuit_open"
+        assert trace_b["provider_diagnostics"][0]["cooldown_ms"] == 0
+        assert trace_b["provider_diagnostics"][0]["fallback"] == "succeeded"
+
+        release_probe.set()
+        out_a = await task_a
+        assert json.loads(out_a)["bubbles"]
+        assert trace_a["provider"] == "vertex_paid"
+        assert gate.vertex_blocked_until == 0.0
+
+        # 3. Re-trip breaker, then verify cancelled probe & 503 probe NEVER leave probing stuck!
+        now[0] = 3200.0
+        vertex_mode[0] = "429_burst"
+        await gate.generate({"current_message": "trip2"}, "subject", message=message)
+        assert gate.vertex_blocked_until == pytest.approx(3320.0)
+
+        now[0] = 3320.0
+        probe_started.clear()
+        release_probe.clear()
+        vertex_mode[0] = "slow_cancel"
+        cancel_ev = asyncio.Event()
+        cancel_task = asyncio.create_task(
+            gate.generate(
+                {"current_message": "cancel-probe"},
+                "subject",
+                message=message,
+                cancel_event=cancel_ev,
+            )
+        )
+        await asyncio.wait_for(probe_started.wait(), timeout=2.0)
+        cancel_ev.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancel_task
+        assert not gate._vertex_circuits["hydrogen"].probing
+        assert gate._vertex_circuits["hydrogen"].consecutive_trips == 1
+
+        # 503 during half-open probe falls back to Developer API and releases probing lock.
+        vertex_mode[0] = "503"
+        out_503 = await gate.generate({"current_message": "probe-503"}, "subject", message=message)
+        assert json.loads(out_503)["bubbles"]
+        assert not gate._vertex_circuits["hydrogen"].probing
+        assert gate._vertex_circuits["hydrogen"].consecutive_trips == 1
+
+        # Next call can immediately probe again and recover Vertex!
+        vertex_mode[0] = "ok"
+        trace_ok = {}
+        await gate.generate(
+            {"current_message": "probe-ok"}, "subject", message=message, generation_trace=trace_ok
+        )
+        assert trace_ok["provider"] == "vertex_paid"
+        assert gate.vertex_blocked_until == 0.0
+    finally:
+        release_probe.set()
+        await gate.close()
+        await _close_clients([*clients, *v_clients], transports + v_transports)
+
+
+async def test_vertex_breaker_no_block_without_fallback_and_isolates_embeddings(
+    routes, message, settings, store, monkeypatch
+):
+    from hakimi.embeddings import EmbeddingClient
+
+    now = [4000.0]
+    monkeypatch.setattr("hakimi.gemini.time.monotonic", lambda: now[0])
+    gate, calls, replies = routes
+
+    # 1. With vertex_fallback_to_gemini=False, even after repeated 429s Vertex is never skipped.
+    await gate.routing.set_config(
+        ProviderRoutingConfig(vertex_enabled=True, vertex_fallback_to_gemini=False)
+    )
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "message": "std 429"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "prio 429"}}),
+            httpx.Response(200, json=interaction_response()),
+        ]
+    )
+    with pytest.raises(Rejected, match="gemini_unavailable"):
+        await gate.generate({"current_message": "no-fb-1"}, "subject", message=message)
+    assert gate.vertex_blocked_until == 0.0
+    out_sole = await gate.generate({"current_message": "no-fb-2"}, "subject", message=message)
+    assert json.loads(out_sole)["bubbles"]
+    assert len(calls["vertex"]) == 3 and len(calls["developer"]) == 0
+
+    # 2. Re-enable fallback, trip hydrogen breaker, verify:
+    #    (a) chat_client=None disables skipping even while cooldown timestamp is active
+    #    (b) neon route is NOT blocked by hydrogen's breaker
+    #    (c) EmbeddingClient on Vertex is completely unaffected!
+    await gate.routing.set_config(
+        ProviderRoutingConfig(vertex_enabled=True, vertex_fallback_to_gemini=True)
+    )
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "message": "std 429"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "prio 429"}}),
+        ]
+    )
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    await gate.generate({"current_message": "trip-h"}, "subject", message=message)
+    assert gate.vertex_blocked_until == pytest.approx(4120.0)
+
+    # (a) If fallback client disappears, Vertex is NOT blocked.
+    orig_chat_client = gate.chat_client
+    gate.chat_client = None
+    replies["vertex"].append(httpx.Response(200, json=interaction_response()))
+    try:
+        out_no_client = await gate.generate(
+            {"current_message": "sole-client"}, "subject", message=message
+        )
+        assert json.loads(out_no_client)["bubbles"]
+        assert len(calls["vertex"]) == 6
+    finally:
+        gate.chat_client = orig_chat_client
+
+    # Re-trip hydrogen for isolation checks.
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "message": "std 429"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "prio 429"}}),
+        ]
+    )
+    replies["developer"].append(httpx.Response(200, json=interaction_response()))
+    await gate.generate({"current_message": "trip-h2"}, "subject", message=message)
+    assert gate.vertex_blocked_until == pytest.approx(4120.0)
+
+    # (b) Neon generation route stays closed while hydrogen is open.
+    settings.primary_model = "neon"
+    replies["vertex"].append(httpx.Response(200, json=interaction_response()))
+    trace_neon = {}
+    await gate.generate(
+        {"current_message": "neon-ok"}, "subject", message=message, generation_trace=trace_neon
+    )
+    assert trace_neon["provider"] == "vertex_paid"
+    assert trace_neon["model_lane"] == "neon"
+    settings.primary_model = "hydrogen"
+
+    # (c) EmbeddingClient is completely unaffected by Vertex generation breaker.
+    embed_calls = []
+
+    async def fake_embed_content(**kwargs):
+        embed_calls.append(kwargs)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            embeddings=[SimpleNamespace(values=[0.5, 0.5, 0.5, 0.5])],
+            usage_metadata=SimpleNamespace(prompt_token_count=4),
+        )
+
+    from types import SimpleNamespace
+
+    fake_vertex_embed = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=fake_embed_content))
+    )
+    embed_client = EmbeddingClient(
+        settings, store, routing=gate.routing, vertex_client=fake_vertex_embed
+    )
+    try:
+        vecs = await embed_client.embed_texts(["测试向量"])
+        assert len(vecs) == 1 and vecs[0] is not None
+        assert len(embed_calls) == 1
+        assert embed_client._vertex_blocked_until == 0.0
+    finally:
+        await embed_client.close()
+
+
+async def test_vertex_breaker_reload_resets_backoff_and_ignores_stale_epoch_429(
+    routes, message, monkeypatch
+):
+    now = [5000.0]
+    monkeypatch.setattr("hakimi.gemini.time.monotonic", lambda: now[0])
+    gate, calls, replies = routes
+
+    # Trip twice so consecutive_trips == 2 (240s backoff).
+    replies["vertex"].extend(
+        [
+            httpx.Response(429, json={"error": {"code": 429, "message": "std 429"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "prio 429"}}),
+            httpx.Response(429, json={"error": {"code": 429, "message": "probe 429"}}),
+        ]
+    )
+    replies["developer"].extend(
+        [
+            httpx.Response(200, json=interaction_response()),
+            httpx.Response(200, json=interaction_response()),
+        ]
+    )
+    await gate.generate({"current_message": "t1"}, "subject", message=message)
+    now[0] = 5120.0
+    await gate.generate({"current_message": "t2"}, "subject", message=message)
+    assert gate.vertex_blocked_until == pytest.approx(5360.0)
+    stale_epoch = gate._vertex_circuit_epoch
+
+    # reload_provider_clients resets cooldown, consecutive_trips, and increments epoch.
+    gate.reload_provider_clients()
+    assert gate.vertex_blocked_until == 0.0
+    assert gate._vertex_circuits == {}
+    assert gate._vertex_circuit_epoch > stale_epoch
+
+    # A stale pre-reload 429 cannot trip the freshly reloaded breaker!
+    assert gate._trip_vertex_circuit("hydrogen", expected_epoch=stale_epoch) == 0.0
+    assert gate.vertex_blocked_until == 0.0
+
+    # Immediate Vertex call succeeds right after reload.
+    replies["vertex"].append(httpx.Response(200, json=interaction_response()))
+    trace = {}
+    await gate.generate(
+        {"current_message": "after-reload"}, "subject", message=message, generation_trace=trace
+    )
+    assert trace["provider"] == "vertex_paid"
+    assert len(calls["vertex"]) == 4
+
+
+def test_vertex_circuit_settings_aliases_and_validation(tmp_path, monkeypatch):
+    from hakimi.config import Settings
+
+    monkeypatch.setenv("VERTEX_CIRCUIT_BASE_COOLDOWN_SECONDS", "90")
+    monkeypatch.setenv("VERTEX_CIRCUIT_MAX_COOLDOWN_SECONDS", "240")
+    s = Settings(
+        _env_file=None,
+        data_dir=tmp_path / "data",
+        gemini_api_key="paid-env-secret-abcdef",
+        encryption_key="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+    )
+    assert s.vertex_circuit_base_cooldown_seconds == 90.0
+    assert s.vertex_circuit_max_cooldown_seconds == 240.0
+
+    monkeypatch.setenv("VERTEX_CIRCUIT_BASE_COOLDOWN_SECONDS", "300")
+    monkeypatch.setenv("VERTEX_CIRCUIT_MAX_COOLDOWN_SECONDS", "120")
+    with pytest.raises(ValueError, match="vertex_circuit_max_cooldown_seconds"):
+        Settings(
+            _env_file=None,
+            data_dir=tmp_path / "data",
+            gemini_api_key="paid-env-secret-abcdef",
+            encryption_key="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        )
+
+
+def test_admin_js_renders_vertex_circuit_open_diagnostic_row():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    js_src = (root / "admin" / "src" / "js" / "03-routing-reply.js").read_text(encoding="utf-8")
+    start = js_src.index("const rejectDetails=")
+    end = js_src.index("async function decisionAudit()")
+    snippet = js_src[start:end]
+    skip_row = json.dumps(
+        {
+            "provider_diagnostics": [
+                {
+                    "stage": "generation",
+                    "provider": "vertex_paid",
+                    "model_lane": "hydrogen",
+                    "cause": "circuit_open",
+                    "cooldown_ms": 95200,
+                    "timeout_ms": 45000,
+                    "elapsed_ms": 0,
+                    "fallback": "succeeded",
+                }
+            ]
+        }
+    )
+    harness = f"""
+function el(tag, text, cls) {{
+  return {{
+    tag, text: text == null ? '' : String(text), cls: cls || '', children: [],
+    append(...items) {{ this.children.push(...items); }},
+    toText() {{
+      const kids = this.children.map(c => typeof c === 'string' ? c : c.toText());
+      return [this.text, ...kids].filter(Boolean).join(' | ');
+    }}
+  }};
+}}
+function dateTime(v) {{ return String(v); }}
+{snippet}
+const diag = diagnosticCell({skip_row}).toText();
+const out = JSON.stringify({{ diag }});
+if (typeof print === 'function') print(out); else console.log(out);
+"""
+    proc = run_js_harness(harness, cwd=root)
+    assert proc.returncode == 0, proc.stderr
+    rendered = json.loads(proc.stdout.strip())["diag"]
+    assert "Vertex AI" in rendered
+    assert "本地熔断冷却" in rendered
+    assert "本次未发出请求" in rendered
+    assert "95.2 秒" in rendered
+    assert "回退成功" in rendered

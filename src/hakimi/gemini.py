@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import version
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from google import genai
@@ -118,6 +118,14 @@ class _RetiredProviderClient:
     scheduled: bool = False
 
 
+@dataclass
+class _VertexCircuitState:
+    blocked_until: float = 0.0
+    consecutive_trips: int = 0
+    probing: bool = False
+    probe_token: int = 0
+
+
 class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
     def __init__(
         self,
@@ -152,7 +160,10 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         self._circuit_failure_window_seconds: float = max(
             120.0, float(settings.generation_timeout) * 3.0
         )
-        self.vertex_blocked_until = 0.0
+        self._vertex_global_blocked_until: float = 0.0
+        self._vertex_circuits: dict[str, _VertexCircuitState] = {}
+        self._vertex_circuit_epoch: int = 0
+        self._vertex_probe_seq: int = 0
         self.files_client = files_client
         self._owned_files = files_client is None
         self.flex_client = chat_client
@@ -197,6 +208,125 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         self._global_blocked_until = ts
         if ts <= time.monotonic():
             self._channel_blocked_until.clear()
+
+    @property
+    def vertex_blocked_until(self) -> float:
+        """Highest active Vertex generation cooldown timestamp (monotonic seconds)."""
+        candidates = [self._vertex_global_blocked_until]
+        candidates.extend(state.blocked_until for state in self._vertex_circuits.values())
+        return max(candidates, default=0.0)
+
+    @vertex_blocked_until.setter
+    def vertex_blocked_until(self, value: float) -> None:
+        ts = float(value)
+        if ts <= time.monotonic():
+            self._reset_vertex_circuits()
+        else:
+            self._vertex_global_blocked_until = ts
+
+    def _reset_vertex_circuits(self) -> None:
+        self._vertex_global_blocked_until = 0.0
+        self._vertex_circuits.clear()
+        self._vertex_circuit_epoch += 1
+
+    def _vertex_fallback_available(self) -> bool:
+        return bool(self.routing.config.vertex_fallback_to_gemini and self.chat_client is not None)
+
+    @staticmethod
+    def _vertex_circuit_route(model_lane: str) -> str:
+        return model_lane or "hydrogen"
+
+    def _vertex_cooldown_for_trip(self, consecutive_trips: int) -> float:
+        base = max(1.0, float(self.s.vertex_circuit_base_cooldown_seconds))
+        cap = max(base, float(self.s.vertex_circuit_max_cooldown_seconds))
+        shift = min(max(0, consecutive_trips - 1), 16)
+        return min(cap, base * float(1 << shift))
+
+    def _acquire_vertex_circuit(
+        self, model_lane: str
+    ) -> tuple[Literal["closed", "open", "half_open"], float, int, int | None]:
+        """Decide whether a Vertex generation call should run, skip, or half-open probe.
+
+        Synchronous (no await) so single-probe acquisition is atomic across asyncio tasks.
+        """
+        epoch = self._vertex_circuit_epoch
+        if not self._vertex_fallback_available():
+            return ("closed", 0.0, epoch, None)
+        now = time.monotonic()
+        if self._vertex_global_blocked_until > now:
+            return ("open", self._vertex_global_blocked_until - now, epoch, None)
+        if self._vertex_global_blocked_until > 0.0:
+            self._vertex_global_blocked_until = 0.0
+        route = self._vertex_circuit_route(model_lane)
+        state = self._vertex_circuits.get(route)
+        if state is None or (state.blocked_until <= 0.0 and not state.probing):
+            return ("closed", 0.0, epoch, None)
+        if now < state.blocked_until:
+            return ("open", state.blocked_until - now, epoch, None)
+        if state.probing:
+            return ("open", 0.0, epoch, None)
+        self._vertex_probe_seq += 1
+        state.probing = True
+        state.probe_token = self._vertex_probe_seq
+        return ("half_open", 0.0, epoch, state.probe_token)
+
+    def _trip_vertex_circuit(
+        self,
+        model_lane: str,
+        *,
+        expected_epoch: int,
+        probe_token: int | None = None,
+    ) -> float:
+        """Open or escalate the Vertex generation breaker for ``model_lane`` after 429."""
+        if expected_epoch != self._vertex_circuit_epoch or not self._vertex_fallback_available():
+            return 0.0
+        route = self._vertex_circuit_route(model_lane)
+        state = self._vertex_circuits.get(route)
+        if state is None:
+            state = _VertexCircuitState()
+            self._vertex_circuits[route] = state
+        if probe_token is not None and state.probe_token != probe_token:
+            return max(0.0, state.blocked_until - time.monotonic())
+        now = time.monotonic()
+        # Concurrent closed-state 429s from the same outage burst must not double-escalate.
+        if probe_token is None and state.blocked_until > now:
+            return state.blocked_until - now
+        state.consecutive_trips += 1
+        cooldown = self._vertex_cooldown_for_trip(state.consecutive_trips)
+        state.blocked_until = max(state.blocked_until, now + cooldown)
+        state.probing = False
+        return cooldown
+
+    def _record_vertex_success(
+        self,
+        model_lane: str,
+        *,
+        expected_epoch: int,
+        probe_token: int | None = None,
+    ) -> None:
+        if expected_epoch != self._vertex_circuit_epoch:
+            return
+        route = self._vertex_circuit_route(model_lane)
+        state = self._vertex_circuits.get(route)
+        if state is None:
+            return
+        if probe_token is not None and state.probe_token != probe_token:
+            return
+        self._vertex_circuits.pop(route, None)
+
+    def _release_vertex_probe(
+        self,
+        model_lane: str,
+        *,
+        expected_epoch: int,
+        probe_token: int | None,
+    ) -> None:
+        if probe_token is None or expected_epoch != self._vertex_circuit_epoch:
+            return
+        route = self._vertex_circuit_route(model_lane)
+        state = self._vertex_circuits.get(route)
+        if state is not None and state.probing and state.probe_token == probe_token:
+            state.probing = False
 
     @staticmethod
     def _circuit_channel(model_lane: str) -> str | None:
@@ -420,7 +550,7 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
         self.vertex_chat_client = (
             self._injected_vertex_chat_client or self._owned_vertex_chat_client
         )
-        self.vertex_blocked_until = 0.0
+        self._reset_vertex_circuits()
         self._routing_generation = self.routing.generation
         if getattr(self, "embeddings", None) is not None:
             self.embeddings.reload_provider_clients()
@@ -1107,14 +1237,6 @@ class GeminiGateway(_GeminiSearchScreenMixin, _GeminiGenerateMixin):
                 if non_billable and model_lane in FLEX_MODELS and status == 503:
                     raise rejected("gemini_unavailable", "flex_capacity_busy") from None
                 if non_billable and status == 429:
-                    if (
-                        provider == "vertex_paid"
-                        and vertex_fallback_eligible
-                        and service_tier == "priority"
-                    ):
-                        self.vertex_blocked_until = max(
-                            self.vertex_blocked_until, time.monotonic() + 60
-                        )
                     raise rejected("gemini_unavailable", "rate_limited") from None
                 raise rejected("gemini_unavailable") from None
             elapsed = max(0.0, time.monotonic() - started_at)
