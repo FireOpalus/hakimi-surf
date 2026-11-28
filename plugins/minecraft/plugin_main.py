@@ -116,6 +116,9 @@ _SNAPSHOT_FIELD_KEYS = frozenset(
         "free_slots",
         "safe_food_count",
         "in_water",
+        "in_shelter",
+        "sky_exposed",
+        "sky_light",
         "combat_mode",
         "guard_target",
         "time_of_day",
@@ -328,6 +331,9 @@ class MinecraftSnapshot(BaseModel):
     free_slots: int | None = Field(default=None, ge=0, le=36)
     safe_food_count: int | None = Field(default=None, ge=0, le=2304)
     in_water: bool = False
+    in_shelter: bool = False
+    sky_exposed: bool | None = None
+    sky_light: int | None = Field(default=None, ge=0, le=15)
     combat_mode: Literal["evade", "guard"] = "evade"
     guard_target: str = Field(default="", max_length=16)
     time_of_day: Literal["", "day", "sunset", "night", "sunrise"] = ""
@@ -362,7 +368,7 @@ class MinecraftSnapshot(BaseModel):
                 raise ValueError("invalid_inventory_entry")
         return value
 
-    @field_validator("free_slots", "safe_food_count", mode="before")
+    @field_validator("free_slots", "safe_food_count", "sky_light", mode="before")
     @classmethod
     def _reject_bool_free_slots(cls, value: Any) -> Any:
         if isinstance(value, bool):
@@ -1052,6 +1058,18 @@ class MinecraftPlugin:
             else None
         )
         in_water = bool(data.get("in_water")) if connected else False
+        in_shelter = bool(data.get("in_shelter")) if connected else False
+        raw_sky_exposed = data.get("sky_exposed")
+        sky_exposed = raw_sky_exposed if connected and isinstance(raw_sky_exposed, bool) else None
+        raw_sky_light = data.get("sky_light")
+        sky_light = (
+            raw_sky_light
+            if connected
+            and isinstance(raw_sky_light, int)
+            and not isinstance(raw_sky_light, bool)
+            and 0 <= raw_sky_light <= 15
+            else None
+        )
         raw_mode = data.get("combat_mode")
         combat_mode: Literal["evade", "guard"] = "guard" if raw_mode == "guard" else "evade"
         raw_guard_target = data.get("guard_target")
@@ -1085,6 +1103,9 @@ class MinecraftPlugin:
             free_slots=free_slots,
             safe_food_count=safe_food_count,
             in_water=in_water,
+            in_shelter=in_shelter,
+            sky_exposed=sky_exposed,
+            sky_light=sky_light,
             combat_mode=combat_mode,
             guard_target=guard_target,
             time_of_day=time_of_day,
@@ -1100,6 +1121,7 @@ class MinecraftPlugin:
         self.snapshot = sanitized
         self._has_snapshot = True
         self._snapshot_seq += 1
+        self.brain.observe_snapshot(sanitized)
         return sanitized
 
     def apply_status(self, raw: dict[str, Any]) -> MinecraftSnapshot:
@@ -1113,6 +1135,7 @@ class MinecraftPlugin:
             self.snapshot = sanitized
             self._has_snapshot = True
             self._snapshot_seq += 1
+            self.brain.observe_snapshot(sanitized)
             return sanitized
         stripped = {k: v for k, v in raw.items() if k not in _NON_SNAPSHOT_KEYS}
         snapshot_fields = {k: v for k, v in stripped.items() if k in _SNAPSHOT_FIELD_KEYS}
@@ -1123,6 +1146,7 @@ class MinecraftPlugin:
             self._snapshot_seq += 1
             if sanitized.connected:
                 self._has_snapshot = True
+            self.brain.observe_snapshot(sanitized)
         return self.snapshot
 
     def _macro_importance(
@@ -1269,6 +1293,9 @@ class MinecraftPlugin:
             "free_slots": snap.free_slots,
             "safe_food_count": snap.safe_food_count,
             "in_water": bool(snap.in_water),
+            "in_shelter": bool(snap.in_shelter),
+            "sky_exposed": snap.sky_exposed,
+            "sky_light": snap.sky_light,
             "combat_mode": snap.combat_mode,
             "guard_target": snap.guard_target,
             "time_of_day": snap.time_of_day,
@@ -1652,6 +1679,8 @@ class MinecraftPlugin:
             artifacts["best_tool"] = clean_best_tool
         if clean_mob := _normalize_item_id(data.get("target_mob")):
             artifacts["target_mob"] = clean_mob
+        if clean_threat_mob := _normalize_item_id(data.get("threat_mob")):
+            artifacts["threat_mob"] = clean_threat_mob
         if clean_blocker := _normalize_item_id(data.get("blocker_item")):
             artifacts["blocker_item"] = clean_blocker
         if data.get("mode") in ("deposit", "withdraw", "inspect", "auto", "enter", "exit"):
@@ -1682,10 +1711,12 @@ class MinecraftPlugin:
             "placed_bed",
             "placed_chest",
             "sheltered",
+            "in_shelter",
             "shallow",
             "already_evading",
             "already_owned",
             "threats_nearby",
+            "interrupted",
         ):
             if isinstance(data.get(bool_key), bool):
                 artifacts[bool_key] = data[bool_key]

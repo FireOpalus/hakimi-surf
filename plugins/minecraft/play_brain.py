@@ -24,6 +24,7 @@ from .play_brain_cruise import _PlayBrainCruiseMixin
 from .play_brain_models import (
     _ACTION_LOG_LIMIT,
     _COLLAPSE_WS_RE,
+    _GOTO_RELAY_PLAN_PREFIX,
     _HANDLED_MILESTONE_EVENTS,
     _MAX_WAYPOINTS,
     _PINNED_WAYPOINTS,
@@ -78,6 +79,14 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
         self._active_plan: str = ""
         self._chain_next_step: bool = False
         self._recovery_retry_pending: bool = False
+        self._threat_interrupt_pending: bool = False
+        self._last_threat_mob: str = ""
+        self._goto_relay: dict[str, Any] | None = None
+        self._last_surface_pos: tuple[float, float, float] | None = None
+        self._last_surface_dim: str = ""
+        self._underground_active: bool = False
+        self._active_cave_entry: list[int] | None = None
+        self._active_cave_dim: str = ""
         self._consecutive_failures: int = 0
         self._first_cruise_pending: bool = True
         self._last_turn_snapshot: dict[str, Any] | None = None
@@ -191,6 +200,8 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
         pos: Any,
         *,
         dimension: str = "",
+        entry_pos: Any = None,
+        via: str = "",
     ) -> bool:
         """Record or update a named spatial landmark in bounded memory."""
         clean_name = re.sub(r"[^a-z0-9_]", "_", str(name or "").strip().lower()).strip("_")[:32]
@@ -206,12 +217,21 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             )
             or "overworld"
         )
-        self._waypoints[clean_name] = {
+        entry: dict[str, Any] = {
             "name": clean_name,
             "dimension": dim,
             "pos": coords,
             "updated_at": round(float(self.plugin.clock()), 1),
         }
+        coerced_entry = self._coerce_waypoint_pos(entry_pos) if entry_pos is not None else None
+        if coerced_entry is not None:
+            entry["entry_pos"] = coerced_entry
+        clean_via = re.sub(r"[^a-z0-9_]", "_", str(via or "").strip().lower()).strip("_")[:32]
+        if clean_via and _WAYPOINT_NAME_RE.fullmatch(clean_via):
+            entry["via"] = clean_via
+        elif coerced_entry is not None:
+            entry["via"] = "cave_entry"
+        self._waypoints[clean_name] = entry
         if len(self._waypoints) > _MAX_WAYPOINTS:
             removable = [
                 (k, float(v.get("updated_at") or 0.0))
@@ -247,6 +267,8 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
                 str(entry.get("name") or ""),
                 entry.get("pos"),
                 dimension=str(entry.get("dimension") or ""),
+                entry_pos=entry.get("entry_pos"),
+                via=str(entry.get("via") or ""),
             )
 
     async def _save_waypoints_safe(self) -> None:
@@ -279,15 +301,20 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
                 -float(w.get("updated_at") or 0.0),
             ),
         )
-        return [
-            {
+        out: list[dict[str, Any]] = []
+        for w in ordered[:12]:
+            item: dict[str, Any] = {
                 "name": str(w["name"]),
                 "dimension": str(w.get("dimension") or "overworld"),
                 "pos": list(w["pos"]),
                 "updated_at": float(w.get("updated_at") or 0.0),
             }
-            for w in ordered[:12]
-        ]
+            if isinstance(w.get("entry_pos"), list) and len(w["entry_pos"]) == 3:
+                item["entry_pos"] = list(w["entry_pos"])
+            if w.get("via"):
+                item["via"] = str(w["via"])
+            out.append(item)
+        return out
 
     def _nearby_waypoints_for_state(self, snap: Any) -> list[dict[str, Any]]:
         if not self._waypoints:
@@ -306,6 +333,10 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
                 continue
             wpos = wp["pos"]
             item: dict[str, Any] = {"name": wp["name"], "pos": list(wpos)}
+            if isinstance(wp.get("entry_pos"), list) and len(wp["entry_pos"]) == 3:
+                item["entry_pos"] = list(wp["entry_pos"])
+            if wp.get("via"):
+                item["via"] = str(wp["via"])
             dist = 999999.0
             if has_pos:
                 dist = math.dist(
@@ -317,6 +348,131 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             ranked.append((priority, dist, item))
         ranked.sort(key=lambda entry: (entry[0], entry[1]))
         return [entry[2] for entry in ranked[:8]]
+
+    def observe_snapshot(self, snap: Any) -> bool:
+        """Track open-surface -> underground cave descent and record `cave_entry` landmark."""
+        if not bool(getattr(snap, "connected", False)):
+            return False
+        cur_dim = str(getattr(snap, "dimension", "") or "").strip().lower() or "overworld"
+        if self._goto_relay and self._goto_relay.get("dimension") != cur_dim:
+            self._goto_relay = None
+        if self._last_surface_dim and self._last_surface_dim != cur_dim:
+            self._last_surface_pos = None
+            self._last_surface_dim = ""
+            self._underground_active = False
+            self._active_cave_entry = None
+            self._active_cave_dim = ""
+        if cur_dim != "overworld":
+            return False
+
+        pos = getattr(snap, "pos", None)
+        if not (
+            isinstance(pos, (list, tuple))
+            and len(pos) == 3
+            and all(isinstance(v, (int, float)) and math.isfinite(float(v)) for v in pos)
+        ):
+            return False
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+
+        # Never treat digging a cramped night shelter pit as a cave entrance descent.
+        if self._is_sheltered(snap):
+            return False
+
+        in_water = bool(getattr(snap, "in_water", False))
+        sky_exposed = getattr(snap, "sky_exposed", None)
+        sky_light = getattr(snap, "sky_light", None)
+        has_sky_exposed = isinstance(sky_exposed, bool)
+        has_sky_light = isinstance(sky_light, int) and not isinstance(sky_light, bool)
+
+        if has_sky_exposed:
+            is_open_surface = sky_exposed and y >= 54.0
+        elif has_sky_light:
+            is_open_surface = sky_light >= 12 and y >= 54.0
+        else:
+            is_open_surface = y >= 60.0
+
+        if is_open_surface and not in_water:
+            self._last_surface_pos = (x, y, z)
+            self._last_surface_dim = cur_dim
+            self._underground_active = False
+            self._active_cave_entry = None
+            self._active_cave_dim = ""
+            return False
+
+        if self._last_surface_pos is None or self._last_surface_dim != cur_dim:
+            return False
+
+        sx, sy, sz = self._last_surface_pos
+        drop_y = sy - y
+        horiz = math.hypot(x - sx, z - sz)
+        if has_sky_exposed:
+            is_underground = (not sky_exposed) and (drop_y >= 6.0 or (y <= 52.0 and drop_y >= 4.0))
+        elif has_sky_light:
+            is_underground = sky_light <= 4 and (drop_y >= 6.0 or (y <= 52.0 and drop_y >= 4.0))
+        else:
+            is_underground = y <= 52.0 and drop_y >= 8.0
+
+        if is_underground and horiz <= 96.0:
+            if not self._underground_active:
+                self._underground_active = True
+                entry_coords = [int(round(sx)), int(round(sy)), int(round(sz))]
+                self._active_cave_entry = entry_coords
+                self._active_cave_dim = cur_dim
+                if self.record_waypoint("cave_entry", entry_coords, dimension=cur_dim):
+                    self._schedule_waypoints_save()
+                    return True
+        return False
+
+    def _resolve_underground_cave_entry(
+        self, pos_raw: Any, dimension: str = ""
+    ) -> list[int] | None:
+        """Return matching surface `cave_entry` coords if `pos_raw` is an underground landmark."""
+        coords = self._coerce_waypoint_pos(pos_raw)
+        if coords is None:
+            return None
+        dim = (
+            str(dimension or getattr(self.plugin.snapshot, "dimension", "") or "overworld")
+            .strip()
+            .lower()
+            or "overworld"
+        )
+        if dim != "overworld":
+            return None
+        px, py, pz = coords
+        snap = self.plugin.snapshot
+        sky_exposed = getattr(snap, "sky_exposed", None)
+        is_underground_target = (
+            py <= 52
+            or self._underground_active
+            or (isinstance(sky_exposed, bool) and (not sky_exposed) and py <= 56)
+        )
+        if not is_underground_target:
+            return None
+        if self._active_cave_entry and self._active_cave_dim == dim:
+            return list(self._active_cave_entry)
+        if (
+            self._last_surface_pos is not None
+            and self._last_surface_dim == dim
+            and (self._last_surface_pos[1] - py) >= 6.0
+            and math.hypot(px - self._last_surface_pos[0], pz - self._last_surface_pos[2]) <= 128.0
+        ):
+            entry_coords = [int(round(v)) for v in self._last_surface_pos]
+            self.record_waypoint("cave_entry", entry_coords, dimension=dim)
+            self._active_cave_entry = entry_coords
+            self._active_cave_dim = dim
+            self._underground_active = True
+            return list(entry_coords)
+        existing = self._waypoints.get("cave_entry")
+        if (
+            isinstance(existing, dict)
+            and str(existing.get("dimension") or "overworld").strip().lower() == dim
+            and isinstance(existing.get("pos"), list)
+            and len(existing["pos"]) == 3
+        ):
+            ex, _ey, ez = existing["pos"]
+            if math.hypot(px - float(ex), pz - float(ez)) <= 256.0:
+                return list(existing["pos"])
+        return None
 
     def start(self) -> None:
         """Start the background play loop idempotently when `enable_brain` is enabled."""
@@ -364,6 +520,14 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
         self._active_plan = ""
         self._chain_next_step = False
         self._recovery_retry_pending = False
+        self._threat_interrupt_pending = False
+        self._last_threat_mob = ""
+        self._goto_relay = None
+        self._last_surface_pos = None
+        self._last_surface_dim = ""
+        self._underground_active = False
+        self._active_cave_entry = None
+        self._active_cave_dim = ""
         self._consecutive_failures = 0
         self._consecutive_cruise_skips = 0
         self._evade_backoff_active = False
@@ -582,6 +746,7 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             self.on_disconnect()
             return
         self._prev_connected = connected
+        self.observe_snapshot(snap)
         if getattr(snap, "combat_mode", "evade") == "guard":
             self._evade_backoff_active = False
         now_ready = self.is_ready()
@@ -620,19 +785,33 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             return
 
         if etype in _HANDLED_MILESTONE_EVENTS:
-            if etype == "mc_death" and data.get("pos") is not None:
-                if self.record_waypoint(
-                    "last_death",
-                    data.get("pos"),
-                    dimension=str(data.get("dimension") or ""),
-                ):
-                    self._schedule_waypoints_save()
+            if etype == "mc_death":
+                self._goto_relay = None
+                if self._active_plan.startswith(_GOTO_RELAY_PLAN_PREFIX):
+                    self._active_plan = ""
+                if data.get("pos") is not None:
+                    cave_entry_pos = self._resolve_underground_cave_entry(
+                        data.get("pos"), str(data.get("dimension") or "")
+                    )
+                    if self.record_waypoint(
+                        "last_death",
+                        data.get("pos"),
+                        dimension=str(data.get("dimension") or ""),
+                        entry_pos=cave_entry_pos,
+                        via="cave_entry" if cave_entry_pos else "",
+                    ):
+                        self._schedule_waypoints_save()
             elif etype == "mc_rare_find" and data.get("pos") is not None and data.get("block"):
                 clean_blk = re.sub(r"[^a-z0-9_]", "_", str(data.get("block") or "").lower())[:24]
+                cave_entry_pos = self._resolve_underground_cave_entry(
+                    data.get("pos"), str(data.get("dimension") or "")
+                )
                 if clean_blk and self.record_waypoint(
                     f"rare_{clean_blk}",
                     data.get("pos"),
                     dimension=str(data.get("dimension") or ""),
+                    entry_pos=cave_entry_pos,
+                    via="cave_entry" if cave_entry_pos else "",
                 ):
                     self._schedule_waypoints_save()
             sanitized: dict[str, Any] = {"event_type": etype}
@@ -785,6 +964,10 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             self._last_decision_at = now
             self._first_cruise_pending = False
             self._recovery_retry_pending = False
+            threat_recheck = self._threat_interrupt_pending
+            threat_mob = self._last_threat_mob
+            self._threat_interrupt_pending = False
+            self._last_threat_mob = ""
 
             unavailable_reason = await self._check_budget_and_rate(now)
             if unavailable_reason is not None:
@@ -826,7 +1009,10 @@ class McPlayBrain(_PlayBrainCruiseMixin, _PlayBrainActionsMixin):
             routing_hint: dict[str, Any] | None = None
             if trigger == "cruise":
                 cruise_outcome, routing_hint = await self._route_cruise_decision(
-                    screen_parsed, snap=snap
+                    screen_parsed,
+                    snap=snap,
+                    threat_recheck=threat_recheck,
+                    threat_mob=threat_mob,
                 )
                 if cruise_outcome in ("skip", "handled"):
                     return

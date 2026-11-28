@@ -29,6 +29,28 @@ log = logging.getLogger("hakimi_plugin_minecraft")
 class _PlayBrainCruiseMixin:
     """Mixin providing Layer 1 gate screening, cruise scheduling, and state snapshots."""
 
+    @staticmethod
+    def _is_sheltered(snap: Any) -> bool:
+        if bool(getattr(snap, "in_shelter", False)):
+            return True
+        reflex = getattr(snap, "reflex_modes", ()) or ()
+        if "sheltered" in reflex:
+            return True
+        return str(getattr(snap, "activity", "") or "").strip() == "掩体避险"
+
+    @staticmethod
+    def _is_night_time(snap: Any) -> bool:
+        tod = str(getattr(snap, "time_of_day", "") or "").strip().lower()
+        return tod in ("night", "sunset", "dusk", "")
+
+    def _has_active_goto_relay(self, snap: Any) -> bool:
+        relay = self._goto_relay
+        if not isinstance(relay, dict):
+            return False
+        cur_dim = str(getattr(snap, "dimension", "") or "").strip().lower() or "overworld"
+        rdim = str(relay.get("dimension") or "overworld").strip().lower() or "overworld"
+        return cur_dim == rdim and isinstance(relay.get("target"), tuple)
+
     def _compute_cruise_interval(self, snap: Any, now: float) -> float:
         has_players = bool(snap.nearby_players)
         base_interval = (
@@ -44,15 +66,16 @@ class _PlayBrainCruiseMixin:
             )
         reflex = set(getattr(snap, "reflex_modes", ()) or ())
         activity = str(getattr(snap, "activity", "") or "").strip()
-        tod = str(getattr(snap, "time_of_day", "") or "").strip().lower()
-        is_sheltered_hold = ("sheltered" in reflex or activity == "掩体避险") and tod in (
-            "night",
-            "sunset",
-            "dusk",
-            "",
-        )
+        is_sheltered_hold = self._is_sheltered(snap) and self._is_night_time(snap)
         if is_sheltered_hold:
             return base_interval * max(1.0, float(self.config.sheltered_cruise_multiplier))
+        if self._threat_interrupt_pending and len(self._call_times) < max(
+            1, self.config.max_calls_per_10m - 1
+        ):
+            return min(
+                base_interval,
+                max(0.01, float(self.config.threat_interrupt_interval_seconds)),
+            )
         is_evade_hold = (
             self._evade_backoff_active
             or "evade_active" in reflex
@@ -211,8 +234,51 @@ class _PlayBrainCruiseMixin:
             payload["safe_food_count"] = raw_safe_food
         if getattr(snap, "in_water", False):
             payload["in_water"] = True
+            cur_dim = str(getattr(snap, "dimension", "") or "").strip().lower() or "overworld"
+            cur_pos = getattr(snap, "pos", None)
+            if (
+                self._last_surface_pos is not None
+                and self._last_surface_dim == cur_dim
+                and isinstance(cur_pos, (list, tuple))
+                and len(cur_pos) == 3
+                and all(isinstance(v, (int, float)) and math.isfinite(float(v)) for v in cur_pos)
+                and math.dist(
+                    self._last_surface_pos,
+                    (float(cur_pos[0]), float(cur_pos[1]), float(cur_pos[2])),
+                )
+                <= self.config.max_goto_distance
+            ):
+                payload["last_dry_pos"] = [int(round(v)) for v in self._last_surface_pos]
+        if self._is_sheltered(snap):
+            payload["in_shelter"] = True
+        sky_exposed = getattr(snap, "sky_exposed", None)
+        if isinstance(sky_exposed, bool):
+            payload["sky_exposed"] = sky_exposed
+        sky_light = getattr(snap, "sky_light", None)
+        if isinstance(sky_light, int) and not isinstance(sky_light, bool):
+            payload["sky_light"] = sky_light
         if reflex_modes:
             payload["reflex_modes"] = reflex_modes
+        if self._has_active_goto_relay(snap) and isinstance(self._goto_relay, dict):
+            relay_target = self._goto_relay["target"]
+            relay_info: dict[str, Any] = {
+                "target": [int(round(v)) for v in relay_target],
+                "segments": int(self._goto_relay.get("segments") or 0),
+            }
+            cur_pos = getattr(snap, "pos", None)
+            if (
+                isinstance(cur_pos, (list, tuple))
+                and len(cur_pos) == 3
+                and all(isinstance(v, (int, float)) and math.isfinite(float(v)) for v in cur_pos)
+            ):
+                relay_info["remaining_dist"] = round(
+                    math.dist(
+                        (float(cur_pos[0]), float(cur_pos[1]), float(cur_pos[2])),
+                        relay_target,
+                    ),
+                    1,
+                )
+            payload["goto_relay"] = relay_info
         since_last = self._compute_since_last_turn(snap)
         if since_last:
             payload["since_last_turn"] = since_last
@@ -320,13 +386,7 @@ class _PlayBrainCruiseMixin:
         # sheltering at night or actively evading threats.
         if "mc_low_food" in etypes and self._has_actionable_food_option(snap):
             reflex_now = set(getattr(snap, "reflex_modes", ()) or ())
-            tod_now = str(getattr(snap, "time_of_day", "") or "").strip().lower()
-            in_shelter_night = "sheltered" in reflex_now and tod_now in (
-                "night",
-                "sunset",
-                "dusk",
-                "",
-            )
+            in_shelter_night = self._is_sheltered(snap) and self._is_night_time(snap)
             if not (in_shelter_night or "evade_active" in reflex_now or self._evade_backoff_active):
                 return False
 
@@ -336,9 +396,8 @@ class _PlayBrainCruiseMixin:
             self._chain_next_step = False
             self._recovery_retry_pending = False
             self._recent_death_times.append(now)
-            reflex = set(getattr(snap, "reflex_modes", ()) or ())
             if (
-                "sheltered" not in reflex
+                not self._is_sheltered(snap)
                 and self._recent_death_count(now, window_seconds=180.0) >= 2
                 and (now - self._last_death_escalate_at) >= 90.0
             ):
@@ -465,15 +524,18 @@ class _PlayBrainCruiseMixin:
     def _receipt_ok(res: dict[str, Any] | None) -> bool:
         return isinstance(res, dict) and res.get("ok") is True and res.get("accepted", True) is True
 
-    def _needs_model_judgment_on_idle(self, snap: Any) -> str:
+    def _needs_model_judgment_on_idle(self, snap: Any, *, threat_recheck: bool = False) -> str:
         """Return a non-empty escalation reason when Layer 1 should not silently skip Layer 2."""
         if str(getattr(snap, "active_task", "") or "").strip():
             return ""
-        reflex = set(getattr(snap, "reflex_modes", ()) or ())
-        if "sheltered" in reflex:
+        if self._is_sheltered(snap):
             return ""
+        if threat_recheck or self._threat_interrupt_pending:
+            return "threat_interrupted_reevaluate"
         if getattr(snap, "in_water", False):
             return "in_water_needs_land"
+        if self._has_active_goto_relay(snap):
+            return "goto_relay_pending"
         hp = getattr(snap, "health", None)
         food = getattr(snap, "food", None)
         raw_safe = getattr(snap, "safe_food_count", None)
@@ -515,6 +577,8 @@ class _PlayBrainCruiseMixin:
         parsed: ScreenDecisionResult | None,
         *,
         snap: Any,
+        threat_recheck: bool = False,
+        threat_mob: str = "",
     ) -> tuple[Literal["skip", "handled", "escalate"], dict[str, Any] | None]:
         if parsed is None or not parsed.decisions:
             return "escalate", None
@@ -526,6 +590,9 @@ class _PlayBrainCruiseMixin:
         stance_conf = parsed.confidence_of("stance")
         cur_mode = getattr(snap, "combat_mode", "evade")
         cur_guard = getattr(snap, "guard_target", "")
+        is_sheltered_night = self._is_sheltered(snap) and self._is_night_time(snap)
+        last_outcome = str(self.recent_turns[-1].get("outcome") or "") if self.recent_turns else ""
+        was_still_in_water = last_outcome == "explore:still_in_water"
 
         # 1. High-confidence emergency defensive retreat takes precedence over no-replan skip.
         if stance == "retreat_eat" and stance_conf >= direct_conf:
@@ -536,19 +603,19 @@ class _PlayBrainCruiseMixin:
             if cur_mode == "evade" and (
                 in_water or (not has_ready_food and (not has_hostile or is_night))
             ):
-                return (
-                    "escalate",
-                    {
-                        "template": _MC_CRUISE_GATE_TEMPLATE,
-                        "stance": "retreat_eat",
-                        "already_evading": True,
-                        "hint": (
-                            "in_water_needs_land"
-                            if in_water
-                            else "already_in_evade_choose_shelter_or_gather"
-                        ),
-                    },
-                )
+                hint_payload: dict[str, Any] = {
+                    "template": _MC_CRUISE_GATE_TEMPLATE,
+                    "stance": "retreat_eat",
+                    "already_evading": True,
+                    "hint": (
+                        "in_water_needs_land"
+                        if in_water
+                        else "already_in_evade_choose_shelter_or_gather"
+                    ),
+                }
+                if in_water and was_still_in_water:
+                    hint_payload["still_in_water"] = True
+                return "escalate", hint_payload
             if cur_mode != "evade" or has_hostile:
                 res = await self._dispatch_goal_result({"action_type": "evade"})
                 if not self._receipt_ok(res):
@@ -573,16 +640,18 @@ class _PlayBrainCruiseMixin:
 
         # 2. Confident keep_current or should_replan=False -> skip Layer 2 unless stuck/stalled.
         if stance == "keep_current" or replan is False:
-            escalate_hint = self._needs_model_judgment_on_idle(snap)
+            escalate_hint = self._needs_model_judgment_on_idle(snap, threat_recheck=threat_recheck)
             if escalate_hint:
-                return (
-                    "escalate",
-                    {
-                        "template": _MC_CRUISE_GATE_TEMPLATE,
-                        "stance": stance or "no_replan",
-                        "hint": escalate_hint,
-                    },
-                )
+                hint_payload = {
+                    "template": _MC_CRUISE_GATE_TEMPLATE,
+                    "stance": stance or "no_replan",
+                    "hint": escalate_hint,
+                }
+                if escalate_hint == "in_water_needs_land" and was_still_in_water:
+                    hint_payload["still_in_water"] = True
+                if escalate_hint == "threat_interrupted_reevaluate" and threat_mob:
+                    hint_payload["threat_mob"] = threat_mob
+                return "escalate", hint_payload
             self._chain_next_step = False
             self._recovery_retry_pending = False
             self._consecutive_cruise_skips += 1
@@ -590,6 +659,19 @@ class _PlayBrainCruiseMixin:
             self._last_reason = (
                 "cruise_gate:keep_current" if stance == "keep_current" else "cruise_gate:no_replan"
             )
+            await self._push_status_safe()
+            return "skip", None
+
+        # 2b. Inside a sealed night shelter pit, do NOT wake Layer 2 for gather/craft_gear loops
+        # (e.g., repeated `acquire bed` / tree chopping / 3x3 crafting table placement).
+        if is_sheltered_night and (
+            stance in ("craft_gear", "gather") or (stance is None and replan is True)
+        ):
+            self._chain_next_step = False
+            self._recovery_retry_pending = False
+            self._consecutive_cruise_skips += 1
+            self.cruise_skipped_count += 1
+            self._last_reason = "cruise_gate:sheltered_night_hold"
             await self._push_status_safe()
             return "skip", None
 
@@ -643,26 +725,33 @@ class _PlayBrainCruiseMixin:
 
         # 4. Parameterized actions (gather/craft_gear) or mid-confidence stances -> Layer 2.
         if stance is not None:
-            return (
-                "escalate",
-                {
-                    "template": _MC_CRUISE_GATE_TEMPLATE,
-                    "stance": stance,
-                    "confidence": round(stance_conf, 3),
-                },
-            )
+            hint_payload = {
+                "template": _MC_CRUISE_GATE_TEMPLATE,
+                "stance": stance,
+                "confidence": round(stance_conf, 3),
+            }
+            if threat_recheck:
+                hint_payload["hint"] = "threat_interrupted_reevaluate"
+                if threat_mob:
+                    hint_payload["threat_mob"] = threat_mob
+            elif getattr(snap, "in_water", False) and was_still_in_water:
+                hint_payload["hint"] = "in_water_needs_land"
+                hint_payload["still_in_water"] = True
+            return "escalate", hint_payload
 
         # 5. Low-confidence stance degradation: escalate if should_replan is confident True,
         # otherwise fall back to conservative mode without spending Layer 2 tokens.
         if replan is True:
-            return (
-                "escalate",
-                {
-                    "template": _MC_CRUISE_GATE_TEMPLATE,
-                    "stance": "uncertain",
-                    "confidence": round(stance_conf, 3),
-                },
-            )
+            hint_payload = {
+                "template": _MC_CRUISE_GATE_TEMPLATE,
+                "stance": "uncertain",
+                "confidence": round(stance_conf, 3),
+            }
+            if threat_recheck:
+                hint_payload["hint"] = "threat_interrupted_reevaluate"
+                if threat_mob:
+                    hint_payload["threat_mob"] = threat_mob
+            return "escalate", hint_payload
 
         hp = getattr(snap, "health", None)
         if (
@@ -677,17 +766,19 @@ class _PlayBrainCruiseMixin:
             self._last_reason = "cruise_gate:low_confidence_conservative"
             await self._push_status_safe()
             return "skip", None
-        escalate_hint = self._needs_model_judgment_on_idle(snap)
+        escalate_hint = self._needs_model_judgment_on_idle(snap, threat_recheck=threat_recheck)
         if escalate_hint:
-            return (
-                "escalate",
-                {
-                    "template": _MC_CRUISE_GATE_TEMPLATE,
-                    "stance": "uncertain",
-                    "confidence": round(stance_conf, 3),
-                    "hint": escalate_hint,
-                },
-            )
+            hint_payload = {
+                "template": _MC_CRUISE_GATE_TEMPLATE,
+                "stance": "uncertain",
+                "confidence": round(stance_conf, 3),
+                "hint": escalate_hint,
+            }
+            if escalate_hint == "in_water_needs_land" and was_still_in_water:
+                hint_payload["still_in_water"] = True
+            if escalate_hint == "threat_interrupted_reevaluate" and threat_mob:
+                hint_payload["threat_mob"] = threat_mob
+            return "escalate", hint_payload
         self._consecutive_cruise_skips += 1
         self.cruise_skipped_count += 1
         self._last_reason = "cruise_gate:low_confidence_conservative"

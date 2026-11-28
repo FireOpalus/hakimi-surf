@@ -615,7 +615,7 @@ async def test_mc_play_brain_safety_clamps_goto_slash_follow_and_invalid_json() 
     plugin.brain.start()
 
     try:
-        # 1. goto > 128 rejected & "/" in say blocked
+        # 1. goto > max_goto_distance (512m sanity ceiling) rejected & "/" in say blocked
         replies.append(
             json.dumps(
                 {
@@ -623,7 +623,7 @@ async def test_mc_play_brain_safety_clamps_goto_slash_follow_and_invalid_json() 
                     "action": "goto",
                     "target_player": "",
                     "block_type": "",
-                    "x": 200.0,
+                    "x": 2000.0,
                     "y": 64.0,
                     "z": 0.0,
                     "reason": "尝试超远传送",
@@ -634,7 +634,7 @@ async def test_mc_play_brain_safety_clamps_goto_slash_follow_and_invalid_json() 
         await _wait_until(lambda: len(plugin.brain.recent_turns) == 1)
         assert dispatched == []
 
-        # 2. goto <= 128 allowed + follow fallback to speaking_player
+        # 2. goto <= segment cap allowed + follow fallback to speaking_player
         replies.append(
             json.dumps(
                 {
@@ -3721,3 +3721,780 @@ async def test_mc_play_recent_chats_compact_state_and_recap_no_immediate_wake(
     assert planner.next_plan_at == future_wake
     items = await svc.event_ledger.read(source_module="minecraft", now=NOW)
     assert any(it.event_type == "mc_session_recap" for it in items)
+
+
+@pytest.mark.asyncio
+async def test_mc_goto_segmented_relay_xz_first_y_converge_chaining_and_stall_guard() -> None:
+    """Verify >128m segmented goto relay, XZ-first->Y convergence, chaining, and stall bounds."""
+    from plugins.minecraft.play_brain import McBrainDecision
+
+    now = [6_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+        brain_config=McBrainConfig(
+            max_goto_distance=512.0,
+            goto_segment_distance=56.0,
+            goto_y_converge_horiz=16.0,
+            max_goto_relay_segments=12,
+            max_goto_relay_stalls=2,
+            chained_step_interval_seconds=15.0,
+            solo_chained_step_interval_seconds=40.0,
+        ),
+    )
+    dispatched: list[dict[str, Any]] = []
+    bridge_mode = "advance"
+
+    async def fake_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert action == "mc.dispatch_goal"
+        dispatched.append(dict(params))
+        if bridge_mode == "advance":
+            wx, wy, wz = float(params["x"]), float(params["y"]), float(params["z"])
+            cur = plugin.snapshot.pos
+            moved = (
+                int(round(abs(wx - cur[0]) + abs(wy - cur[1]) + abs(wz - cur[2])))
+                if isinstance(cur, tuple)
+                else 56
+            )
+            plugin.apply_snapshot(_connected_snapshot(pos=(wx, wy, wz), nearby_players=[]))
+            return {
+                "ok": True,
+                "accepted": True,
+                "moved_blocks": moved,
+                "snapshot": {"pos": [wx, wy, wz]},
+            }
+        if bridge_mode == "stuck":
+            return {"ok": False, "accepted": True, "reason": "path_stuck", "moved_blocks": 0}
+        if bridge_mode == "zero_progress_ok":
+            cur = plugin.snapshot.pos
+            pos_list = list(cur) if isinstance(cur, tuple) else [0.0, 64.0, 0.0]
+            return {
+                "ok": True,
+                "accepted": True,
+                "moved_blocks": 0,
+                "snapshot": {"pos": pos_list},
+            }
+        return {"ok": True, "accepted": True}
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. 164m distant surface furnace landmark: 3 hops (56 -> 112 -> 164), no false failure
+        plugin.apply_snapshot(_connected_snapshot(pos=(0.0, 64.0, 0.0), nearby_players=[]))
+        plugin.brain._first_cruise_pending = False
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=164, y=64, z=0, reason="回远处熔炉"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "goto", "x": 56.0, "y": 64.0, "z": 0.0}
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:partial(56m,rem=108m)"
+        assert plugin.brain._consecutive_failures == 0
+        assert plugin.brain._chain_next_step is True
+        assert plugin.brain._active_plan == "继续分段前往(164,64,0)"
+        assert plugin.brain._goto_relay is not None
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(40.0)
+
+        # State exposes goto_relay and Layer 1 keep_current escalates with goto_relay_pending
+        st = plugin.brain._state_payload(plugin.snapshot)
+        assert st["goto_relay"]["target"] == [164, 64, 0]
+        assert st["goto_relay"]["segments"] == 1
+        assert st["goto_relay"]["remaining_dist"] == pytest.approx(108.0)
+        assert plugin.brain._needs_model_judgment_on_idle(plugin.snapshot) == "goto_relay_pending"
+
+        # Hop 2 -> (112, 64, 0), Hop 3 -> direct final (164, 64, 0)
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=164, y=64, z=0, reason="继续中继"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "goto", "x": 112.0, "y": 64.0, "z": 0.0}
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:partial(56m,rem=52m)"
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=164, y=64, z=0, reason="最后一段到达"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "goto", "x": 164.0, "y": 64.0, "z": 0.0}
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:(164,64,0)"
+        assert plugin.brain._goto_relay is None
+        assert plugin.brain._active_plan == ""
+
+        # 2. XZ-first -> Y-convergence for distant deep target (164, -20, 0) from (0, 64, 0)
+        dispatched.clear()
+        plugin.apply_snapshot(_connected_snapshot(pos=(0.0, 64.0, 0.0), nearby_players=[]))
+        expected_hops = [
+            (56.0, 64.0, 0.0),  # XZ hop 1 (Y stays safe at 64)
+            (112.0, 64.0, 0.0),  # XZ hop 2 (Y stays safe at 64)
+            (164.0, 64.0, 0.0),  # Finish XZ before converging Y
+            (164.0, 8.0, 0.0),  # Converge Y in bounded 56m vertical step
+            (164.0, -20.0, 0.0),  # Final arrival
+        ]
+        for idx, exp in enumerate(expected_hops):
+            await plugin.brain._apply_decision(
+                McBrainDecision(action="goto", x=164, y=-20, z=0, reason=f"hop_{idx}"),
+                snap=plugin.snapshot,
+                speaking_player="",
+                trigger="cruise",
+                input_summary="cruise",
+            )
+            assert (dispatched[-1]["x"], dispatched[-1]["y"], dispatched[-1]["z"]) == exp
+        assert plugin.brain._goto_relay is None
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:(164,-20,0)"
+
+        # 2b. Short-XZ + deep-Y leg (horiz=18, dy=-94): horizontal progress must NOT false-stall
+        dispatched.clear()
+        plugin.apply_snapshot(_connected_snapshot(pos=(0.0, 64.0, 0.0), nearby_players=[]))
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=18, y=-30, z=0, reason="short_xz_deep_y"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched[-1] == {"action_type": "goto", "x": 18.0, "y": 64.0, "z": 0.0}
+        assert plugin.brain._goto_relay is not None
+        assert plugin.brain._goto_relay["stalls"] == 0
+
+        # 3. Sanity ceiling still rejects absurd coords (e.g. 2000m)
+        dispatched.clear()
+        plugin.apply_snapshot(_connected_snapshot(pos=(0.0, 64.0, 0.0), nearby_players=[]))
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=2000, y=64, z=0, reason="absurd_coord"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert dispatched == []
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:distance_exceeded(2000m)"
+
+        # 4. Stall guard terminates permanently blocked relay cleanly (both path_stuck & 0m ok)
+        bridge_mode = "stuck"
+        plugin.apply_snapshot(_connected_snapshot(pos=(0.0, 64.0, 0.0), nearby_players=[]))
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=180, y=64, z=0, reason="blocked_1"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:path_stuck"
+        assert plugin.brain._goto_relay is not None
+        assert plugin.brain._goto_relay["stalls"] == 1
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=180, y=64, z=0, reason="blocked_2"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:relay_stalled"
+        assert plugin.brain._goto_relay is None
+        assert plugin.brain._recovery_retry_pending is False
+        assert plugin.brain._chain_next_step is False
+
+        # Zero-progress ok responses also trip stall guard on 2nd stalled hop
+        bridge_mode = "zero_progress_ok"
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=180, y=64, z=0, reason="zero_1"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain._goto_relay is not None
+        assert plugin.brain._goto_relay["stalls"] == 1
+
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=180, y=64, z=0, reason="zero_2"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:relay_stalled"
+        assert plugin.brain._goto_relay is None
+        assert plugin.brain._recovery_retry_pending is False
+
+        # 5. Segment cap terminates cleanly
+        bridge_mode = "advance"
+        plugin.brain.config.max_goto_relay_segments = 2
+        plugin.apply_snapshot(_connected_snapshot(pos=(0.0, 64.0, 0.0), nearby_players=[]))
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=300, y=64, z=0, reason="cap_1"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain._goto_relay is not None
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=300, y=64, z=0, reason="cap_2"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:relay_limit_reached"
+        assert plugin.brain._goto_relay is None
+        assert plugin.brain._recovery_retry_pending is False
+    finally:
+        await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_mc_cave_entry_descent_tracking_rare_association_and_respawn_navigation() -> None:
+    """Verify surface->cave descent detection, cave_entry pinning, rare_* linking, and fallback."""
+    now = [7_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+    )
+    kv_store: dict[str, Any] = {}
+
+    async def fake_state_set(key: str, value: Any) -> None:
+        kv_store[key] = value
+
+    async def fake_state_get(key: str) -> Any:
+        return kv_store.get(key)
+
+    plugin.client._ws = object()
+    plugin.client._connected = True
+    plugin.client.state_set = fake_state_set  # type: ignore[method-assign]
+    plugin.client.state_get = fake_state_get  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Snapshot sanitization for in_shelter / sky_exposed / sky_light
+        with pytest.raises(ValidationError):
+            MinecraftSnapshot(connected=True, sky_light=True)  # type: ignore[arg-type]
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(10.0, 64.0, 20.0),
+                in_shelter=False,
+                sky_exposed=True,
+                sky_light=15,
+            )
+        )
+        assert plugin.snapshot.in_shelter is False
+        assert plugin.snapshot.sky_exposed is True
+        assert plugin.snapshot.sky_light == 15
+        st = plugin.status_dict()
+        assert st["in_shelter"] is False
+        assert st["sky_exposed"] is True
+        assert st["sky_light"] == 15
+
+        # 2. Tree canopy (drop_y=1) & night shelter pit (in_shelter=True) must NOT record cave_entry
+        plugin.apply_snapshot(
+            _connected_snapshot(pos=(11.0, 63.0, 21.0), sky_exposed=False, sky_light=11)
+        )
+        assert "cave_entry" not in plugin.brain._waypoints
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(10.0, 58.0, 20.0),
+                in_shelter=True,
+                reflex_modes=["sheltered"],
+                sky_exposed=False,
+                sky_light=0,
+            )
+        )
+        assert "cave_entry" not in plugin.brain._waypoints
+
+        # 3. Genuine descent into cave records surface cave_entry at [10, 64, 20]
+        plugin.apply_snapshot(
+            _connected_snapshot(pos=(15.0, 48.0, 26.0), sky_exposed=False, sky_light=0)
+        )
+        assert "cave_entry" in plugin.brain._waypoints
+        assert plugin.brain._waypoints["cave_entry"]["pos"] == [10, 64, 20]
+
+        # Deep underground exploration does NOT overwrite cave_entry
+        plugin.apply_snapshot(
+            _connected_snapshot(pos=(22.0, -12.0, 34.0), sky_exposed=False, sky_light=0)
+        )
+        assert plugin.brain._waypoints["cave_entry"]["pos"] == [10, 64, 20]
+
+        # 4. Underground rare_diamond_ore & last_death associate cave_entry context
+        plugin.brain.on_milestone(
+            "mc_rare_find",
+            {"block": "diamond_ore", "pos": [22.0, -12.0, 34.0], "dimension": "overworld"},
+        )
+        rare_wp = plugin.brain._waypoints["rare_diamond_ore"]
+        assert rare_wp["pos"] == [22, -12, 34]
+        assert rare_wp["via"] == "cave_entry"
+        assert rare_wp["entry_pos"] == [10, 64, 20]
+
+        plugin.brain.on_milestone(
+            "mc_death",
+            {"pos": [24.0, -12.0, 36.0], "dimension": "overworld"},
+        )
+        death_wp = plugin.brain._waypoints["last_death"]
+        assert death_wp["via"] == "cave_entry"
+        assert death_wp["entry_pos"] == [10, 64, 20]
+        await asyncio.sleep(0.02)
+        assert "mc_waypoints" in kv_store
+
+        # 5. Respawn on distant surface (170m away) preserves cave_entry and surfaces it in state
+        plugin.apply_snapshot(
+            _connected_snapshot(pos=(-160.0, 64.0, 20.0), sky_exposed=True, sky_light=15)
+        )
+        assert plugin.brain._waypoints["cave_entry"]["pos"] == [10, 64, 20]
+        state = plugin.brain._state_payload(plugin.snapshot)
+        wps = {w["name"]: w for w in state["waypoints"]}
+        assert "cave_entry" in wps
+        assert wps["cave_entry"]["pos"] == [10, 64, 20]
+        assert wps["cave_entry"]["dist"] == pytest.approx(170.0)
+        assert wps["rare_diamond_ore"]["via"] == "cave_entry"
+        assert wps["rare_diamond_ore"]["entry_pos"] == [10, 64, 20]
+        assert wps["last_death"]["via"] == "cave_entry"
+        assert wps["last_death"]["entry_pos"] == [10, 64, 20]
+
+        # KV reload restores cave_entry and rare_* entry_pos/via metadata
+        plugin2 = MinecraftPlugin(
+            ws_url="ws://127.0.0.1:1/ws",
+            token="t" * 40,
+            enable_brain=True,
+            clock=lambda: now[0],
+        )
+        plugin2.client._ws = object()
+        plugin2.client._connected = True
+        plugin2.client.state_get = fake_state_get  # type: ignore[method-assign]
+        try:
+            await plugin2.brain.load_waypoints()
+            assert plugin2.brain._waypoints["cave_entry"]["pos"] == [10, 64, 20]
+            assert plugin2.brain._waypoints["rare_diamond_ore"]["entry_pos"] == [10, 64, 20]
+            assert plugin2.brain._waypoints["rare_diamond_ore"]["via"] == "cave_entry"
+
+            # 6. Safe Y-only fallback works even when JS does not send sky_exposed/sky_light
+            plugin2.apply_snapshot(_connected_snapshot(pos=(50.0, 66.0, -10.0)))
+            plugin2.apply_snapshot(_connected_snapshot(pos=(56.0, 44.0, -6.0)))
+            assert plugin2.brain._waypoints["cave_entry"]["pos"] == [50, 66, -10]
+
+            # Disconnect resets sky/shelter fields cleanly
+            plugin2.apply_snapshot(
+                {"connected": False, "in_shelter": True, "sky_exposed": True, "sky_light": 15}
+            )
+            assert plugin2.snapshot.in_shelter is False
+            assert plugin2.snapshot.sky_exposed is None
+            assert plugin2.snapshot.sky_light is None
+        finally:
+            await plugin2.close()
+    finally:
+        await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_mc_shelter_acquire_bed_guard_and_daytime_resume() -> None:
+    """Block acquire bed/3x3 loops while enclosed in night shelter; resume normally in daytime."""
+    from plugins.minecraft.play_brain import McBrainDecision
+
+    now = [8_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+        brain_config=McBrainConfig(
+            solo_cruise_interval_seconds=60.0,
+            sheltered_cruise_multiplier=3.0,
+        ),
+    )
+    dispatched: list[dict[str, Any]] = []
+    generate_calls = 0
+    bridge_reply: dict[str, Any] = {"ok": True, "accepted": True, "acquired_count": 4}
+
+    async def fake_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+        dispatched.append({"action": action, **params})
+        return dict(bridge_reply)
+
+    async def fake_budget(_lane: str) -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "decisions": {
+                "should_replan": {
+                    "type": "noul",
+                    "value": True,
+                    "noul": 0.9,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "craft_gear",
+                    "confidence": 0.9,
+                    "probabilities": {"craft_gear": 0.9},
+                    "confident": True,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, _payload: dict[str, Any], **_kw: Any) -> str:
+        nonlocal generate_calls
+        generate_calls += 1
+        return json.dumps(
+            {
+                "say": "",
+                "action": "shelter",
+                "target_player": "",
+                "target_mob": "",
+                "mode": "exit",
+                "block_type": "",
+                "item_name": "",
+                "count": 0,
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": "天亮了挖开掩体出门",
+                "next_goal": "",
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Night shelter pit (in_shelter=True): Layer 1 craft_gear skips Layer 2 (0 tokens)
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                nearby_players=[],
+                in_shelter=True,
+                reflex_modes=["sheltered"],
+                time_of_day="night",
+                activity="掩体避险",
+                inventory_summary=["white_wool:3", "oak_planks:2"],
+            )
+        )
+        plugin.brain._first_cruise_pending = False
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(
+            180.0
+        )
+        assert plugin.brain._state_payload(plugin.snapshot)["in_shelter"] is True
+
+        await plugin.brain._execute_cycle("cruise")
+        assert generate_calls == 0
+        assert plugin.brain._last_reason == "cruise_gate:sheltered_night_hold"
+        assert dispatched == []
+
+        # 2. Direct Layer 2 decisions for acquire bed/3x3 & craft bed are blocked pre-dispatch
+        for act, item in (
+            ("acquire", "white_bed"),
+            ("acquire", "bed"),
+            ("acquire", "stone_pickaxe"),
+            ("acquire", "crafting_table"),
+            ("craft", "white_bed"),
+        ):
+            await plugin.brain._apply_decision(
+                McBrainDecision(action=act, item_name=item, count=1, reason="掩体内尝试合成"),
+                snap=plugin.snapshot,
+                speaking_player="",
+                trigger="cruise",
+                input_summary="cruise",
+            )
+            assert dispatched == []
+            assert plugin.brain.recent_turns[-1]["outcome"] == f"{act}:blocked_in_shelter:{item}"
+            assert plugin.brain._recovery_retry_pending is False
+            assert plugin.brain._chain_next_step is False
+
+        # 3. Safe in-pit 2x2 craft with owned materials (torch) is still permitted
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                nearby_players=[],
+                in_shelter=True,
+                reflex_modes=["sheltered"],
+                time_of_day="night",
+                inventory_summary=["coal:2", "stick:4"],
+            )
+        )
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="acquire", item_name="torch", count=4, reason="插火把照明"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert len(dispatched) == 1
+        assert dispatched[-1]["item_name"] == "torch"
+
+        # 4. CN sheltered_no_space receipt formats cleanly without 30s recovery retry loop
+        dispatched.clear()
+        bridge_reply = {
+            "ok": False,
+            "accepted": True,
+            "reason": "sheltered_no_space",
+            "item_name": "white_bed",
+            "blocker_item": "crafting_table",
+            "wood_shortfall_logs": 2,
+        }
+        plugin.apply_snapshot(
+            _connected_snapshot(nearby_players=[], in_shelter=False, time_of_day="night")
+        )
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="acquire", item_name="white_bed", count=1, reason="做床"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert (
+            plugin.brain.recent_turns[-1]["outcome"]
+            == "acquire:sheltered_no_space:crafting_table,need_logs:2"
+        )
+        assert plugin.brain._recovery_retry_pending is False
+
+        # 5. Daytime in shelter escalates cleanly so bot can exit shelter
+        dispatched.clear()
+        bridge_reply = {"ok": True, "accepted": True, "mode": "exit", "sheltered": False}
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                nearby_players=[],
+                in_shelter=True,
+                reflex_modes=["sheltered"],
+                time_of_day="day",
+                activity="掩体避险",
+            )
+        )
+        await plugin.brain._execute_cycle("cruise")
+        assert generate_calls == 1
+        assert dispatched[-1]["action_type"] == "shelter"
+        assert dispatched[-1]["mode"] == "exit"
+    finally:
+        await plugin.close()
+
+
+@pytest.mark.asyncio
+async def test_mc_threat_interrupt_and_still_in_water_alignment() -> None:
+    """Verify interrupted_by_threat/damage avoids 150s penalty backoff and still_in_water flow."""
+    from plugins.minecraft.play_brain import McBrainDecision
+
+    now = [9_000.0]
+    plugin = MinecraftPlugin(
+        ws_url="ws://127.0.0.1:1/ws",
+        token="t" * 40,
+        enable_brain=True,
+        clock=lambda: now[0],
+        brain_config=McBrainConfig(
+            solo_cruise_interval_seconds=105.0,
+            evade_cruise_multiplier=2.5,
+            threat_interrupt_interval_seconds=12.0,
+        ),
+    )
+    dispatched: list[dict[str, Any]] = []
+    seen_payloads: list[dict[str, Any]] = []
+    bridge_queue: list[dict[str, Any]] = []
+
+    async def fake_bridge(action: str, params: dict[str, Any]) -> dict[str, Any]:
+        dispatched.append({"action": action, **params})
+        if bridge_queue:
+            return bridge_queue.pop(0)
+        return {"ok": True, "accepted": True}
+
+    async def fake_budget(_lane: str) -> dict[str, Any]:
+        return {"available": True, "hard_stop": False}
+
+    async def fake_screen(_payload: dict[str, Any], **_kw: Any) -> dict[str, Any]:
+        return {
+            "passed": True,
+            "decisions": {
+                "should_replan": {
+                    "type": "noul",
+                    "value": False,
+                    "noul": 0.1,
+                    "confidence": 0.9,
+                    "confident": True,
+                },
+                "stance": {
+                    "type": "choice",
+                    "choice": "keep_current",
+                    "confidence": 0.9,
+                    "probabilities": {"keep_current": 0.9},
+                    "confident": True,
+                },
+            },
+        }
+
+    async def fake_generate(_scene: str, payload: dict[str, Any], **_kw: Any) -> str:
+        seen_payloads.append(payload)
+        return json.dumps(
+            {
+                "say": "",
+                "action": "evade",
+                "target_player": "",
+                "target_mob": "",
+                "mode": "",
+                "block_type": "",
+                "item_name": "",
+                "count": 0,
+                "x": 0,
+                "y": 0,
+                "z": 0,
+                "reason": "遇敌后重新评估先拉开距离",
+                "next_goal": "",
+            },
+            ensure_ascii=False,
+        )
+
+    plugin._call_bridge = fake_bridge  # type: ignore[method-assign]
+    plugin.client.ai_budget_check = fake_budget  # type: ignore[method-assign]
+    plugin.client.ai_screen = fake_screen  # type: ignore[method-assign]
+    plugin.client.ai_generate = fake_generate  # type: ignore[method-assign]
+    plugin.bridge_ready = True
+
+    try:
+        # 1. Segmented goto interrupted by threat: keeps relay with 0 failures/stalls
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(0.0, 64.0, 0.0),
+                nearby_players=[],
+                sky_exposed=True,
+                sky_light=15,
+            )
+        )
+        plugin.brain._first_cruise_pending = False
+        bridge_queue.append(
+            {
+                "ok": False,
+                "accepted": True,
+                "reason": "interrupted_by_threat",
+                "threat_mob": "drowned",
+                "interrupted": True,
+            }
+        )
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="goto", x=164, y=64, z=0, reason="去远处熔炉"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "goto:interrupted_by_threat(drowned)"
+        assert plugin.brain._consecutive_failures == 0
+        assert plugin.brain._evade_backoff_active is False
+        assert plugin.brain._threat_interrupt_pending is True
+        assert plugin.brain._goto_relay is not None
+        assert plugin.brain._goto_relay["stalls"] == 0
+        assert plugin.brain._compute_cruise_interval(plugin.snapshot, now[0]) == pytest.approx(12.0)
+
+        # Next cruise escalates even on Layer 1 keep_current with threat_mob context
+        bridge_queue.append({"ok": True, "accepted": True, "combat_mode": "evade"})
+        await plugin.brain._execute_cycle("cruise")
+        assert len(seen_payloads) == 1
+        assert seen_payloads[-1]["routing_hint"]["hint"] == "threat_interrupted_reevaluate"
+        assert seen_payloads[-1]["routing_hint"]["threat_mob"] == "drowned"
+
+        # 2. interrupted_by_damage while in guard mode + creeper/low HP triggers immediate evade
+        dispatched.clear()
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(5.0, 64.0, 5.0),
+                health=6.0,
+                combat_mode="guard",
+                nearby_entities=["creeper"],
+                nearby_players=[],
+            )
+        )
+        bridge_queue.extend(
+            [
+                {
+                    "ok": False,
+                    "accepted": True,
+                    "reason": "interrupted_by_damage",
+                    "threat_mob": "creeper",
+                },
+                {"ok": True, "accepted": True, "combat_mode": "evade"},
+            ]
+        )
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="gather", block_type="oak_log", count=2, reason="砍树"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain._consecutive_failures == 0
+        assert plugin.brain.recent_turns[-1]["outcome"] == "gather:interrupted_by_damage(creeper)"
+        assert dispatched[-1]["action_type"] == "evade"
+
+        # 3. dispatch_goal exposes threat_mob & interrupted artifacts
+        bridge_queue.append(
+            {
+                "ok": False,
+                "accepted": True,
+                "reason": "interrupted_by_threat",
+                "threat_mob": "drowned",
+                "interrupted": True,
+            }
+        )
+        goal_res = await plugin.dispatch_goal({"action_type": "explore"})
+        assert goal_res["ok"] is False
+        assert goal_res["reason"] == "interrupted_by_threat"
+        assert goal_res["artifacts"]["threat_mob"] == "drowned"
+        assert goal_res["artifacts"]["interrupted"] is True
+
+        # 4. explore still_in_water records clean outcome, exposes last_dry_pos & routing hint
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(10.0, 64.0, 10.0),
+                in_water=False,
+                sky_exposed=True,
+                sky_light=15,
+                nearby_players=[],
+            )
+        )
+        plugin.apply_snapshot(
+            _connected_snapshot(
+                pos=(14.0, 62.0, 14.0),
+                in_water=True,
+                sky_exposed=True,
+                sky_light=15,
+                nearby_players=[],
+            )
+        )
+        bridge_queue.append(
+            {
+                "ok": False,
+                "accepted": True,
+                "reason": "still_in_water",
+                "moved_blocks": 6,
+            }
+        )
+        await plugin.brain._apply_decision(
+            McBrainDecision(action="explore", reason="游上岸", next_goal="砍树"),
+            snap=plugin.snapshot,
+            speaking_player="",
+            trigger="cruise",
+            input_summary="cruise",
+        )
+        assert plugin.brain.recent_turns[-1]["outcome"] == "explore:still_in_water"
+        assert plugin.brain._chain_next_step is False
+        assert plugin.brain._recovery_retry_pending is True
+        water_state = plugin.brain._state_payload(plugin.snapshot)
+        assert water_state["in_water"] is True
+        assert water_state["last_dry_pos"] == [10, 64, 10]
+
+        bridge_queue.append({"ok": True, "accepted": True})
+        await plugin.brain._execute_cycle("cruise")
+        assert seen_payloads[-1]["routing_hint"]["hint"] == "in_water_needs_land"
+        assert seen_payloads[-1]["routing_hint"]["still_in_water"] is True
+    finally:
+        await plugin.close()
