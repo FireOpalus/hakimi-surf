@@ -173,7 +173,6 @@ async def test_old_ledger_migration_keeps_unknown_history_explicit(settings):
 
 async def test_monthly_limit_reservations_are_atomic(store):
     store.s.user_daily_usd = Decimal("100")
-    store.s.total_usd = Decimal(0)
     await store.set_budget_config(BudgetConfig(daily_usd="100", monthly_usd="1"))
     results = await asyncio.gather(
         *(store.reserve(f"s-{i}", "chat", Decimal(".2")) for i in range(20)), return_exceptions=True

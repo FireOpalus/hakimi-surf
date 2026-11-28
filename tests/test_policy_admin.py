@@ -273,7 +273,8 @@ async def test_budget_survives_real_store_restart_and_env_does_not_override(sett
             "admin_daily_usd": "0.20",
         }
         assert state["source"] == "admin"
-        assert settings.total_usd == Decimal("40")
+        assert not hasattr(settings, "total_usd")
+        assert "total_limit" not in await restarted.state.service.store.budget_status()
     assert not gateway.calls
 
 

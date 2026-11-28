@@ -2068,7 +2068,7 @@ def test_overview_ledger_non_blocking_colab_and_panel_fold():
       }},
       budget_status: {{
         daily: 120000, daily_limit: 5000000, monthly: 120000, monthly_limit: 50000000,
-        total: 120000, total_limit: 0, sub_budgets: {{}}
+        total: 120000, sub_budgets: {{}}
       }},
       rest_hours: null,
       notebook: {{ enabled: false }}
@@ -2170,6 +2170,8 @@ def test_overview_ledger_non_blocking_colab_and_panel_fold():
         'ledger colab should be in-flight');
       assert($('token-ledger').textContent.includes('1000'),
         'ledger must render main tables before colab resolves');
+      assert(!$('budget-periods').textContent.includes('累计总上限'),
+        'budget-periods must not render removed cumulative total cap row');
       assert($('cloud-colab-pills').textContent.includes('正在同步'),
         'cloud colab card should show non-blocking syncing pill');
 
@@ -2720,7 +2722,7 @@ def test_views_polish_js_runtime_behaviors():
       timezone: 'Asia/Shanghai',
       next_digest_at: 1795780800,
       proactive_daily_limit_usd: 1.5,
-      budget: {{ total: 250000, total_limit: 5000000, hard_stop: false }},
+      budget: {{ total: 250000, hard_stop: false }},
       queue: [{{ kind: 'digest', status: 'queued', n: 1 }}],
       alerts: []
     }};
@@ -2788,6 +2790,11 @@ def test_views_polish_js_runtime_behaviors():
       assert($('proactive-stats').textContent.includes('Telegram (telegram)'), 'TG label missing');
       assert(!$('proactive-stats').textContent.includes('NapCat'), 'NapCat leaked');
       assert($('proactive-state').textContent.includes('允许投递'), 'delivery state missing');
+      assert(
+        $('proactive-budget').textContent.includes('本地累计 $0.2500')
+        && !$('proactive-budget').textContent.includes('未设累计上限'),
+        'proactive budget must omit removed cumulative total cap'
+      );
       assert($('proactive-queue').textContent.includes('每日汇报'), 'queue row missing');
 
       apiCalls.length = 0;

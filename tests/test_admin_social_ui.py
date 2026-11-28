@@ -375,7 +375,7 @@ def test_admin_social_ui_js_runtime() -> None:
         day: '2026-11-26',
         timezone: 'Asia/Shanghai',
         next_digest_at: 1795694400,
-        budget: {{ total: 0, total_limit: 0, hard_stop: false }},
+        budget: {{ total: 0, hard_stop: false }},
         proactive_daily_limit_usd: 1.0,
         queue: [],
         alerts: []

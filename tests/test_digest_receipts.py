@@ -48,7 +48,7 @@ async def process(settings, clock, gateway, wire):
 
 async def test_generated_digest_survives_crash_cutoff_and_two_real_restarts(settings, monkeypatch):
     settings.onebot_mode = "ws_reverse"
-    settings.total_usd = Decimal("0.01")
+    settings.daily_usd = Decimal("0.01")
     at = [stamp("2026-11-14T22:15:00")]
     gateway, wire = FakeGateway(), Wire()
     wire.ready.clear()

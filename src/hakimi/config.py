@@ -526,7 +526,6 @@ class Settings(BaseSettings):
     daily_digest_enabled: bool = Field(default=True, validation_alias="DAILY_DIGEST_ENABLED")
     quiet_hours: str = Field(default="23:30-08:30", validation_alias="QUIET_HOURS")
     proactive_daily_usd: Decimal = Field(default=Decimal("0.10"), ge=0, le=100)
-    total_usd: Decimal = Field(default=Decimal("40"), ge=0, le=10000)
     proactive_alert_cooldown_seconds: int = Field(default=21600, ge=3600, le=86400)
     proactive_ws_alert_after_seconds: int = Field(default=300, ge=60, le=86400)
     images_enabled: bool = True

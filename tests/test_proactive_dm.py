@@ -389,25 +389,28 @@ async def test_owner_reply_waits_for_confirmed_proactive_memory(dm):
 
 
 async def test_cumulative_budget_settlement_and_pruning_preserves_total(settings):
-    settings.total_usd = Decimal(".10")
+    settings.daily_usd = Decimal("100")
+    settings.monthly_usd = Decimal("100")
+    settings.user_daily_usd = Decimal("100")
     store = Store(settings)
     await store.open()
     try:
-        reservation = await store.reserve("x", "chat", Decimal(".08"))
-        await store.settle(reservation, Decimal(".04"))
+        reservation = await store.reserve("x", "chat", Decimal("50"))
+        await store.settle(reservation, Decimal("45"))
         await store.db.execute("UPDATE ledger SET day='2000-01-01'")
         await store.prune()
-        assert (await store.budget_status())["total"] == 40000
-        with pytest.raises(Rejected, match="budget_exhausted"):
-            await store.reserve("x", "chat", Decimal(".07"))
-        await store.reserve("x", "chat", Decimal(".06"))
-        assert (await store.budget_status())["hard_stop"] is True
+        status = await store.budget_status()
+        assert status["total"] == 45_000_000
+        assert "total_limit" not in status
+        assert status["hard_stop"] is False
+        await store.reserve("x", "chat", Decimal("1"))
+        assert (await store.budget_status())["hard_stop"] is False
     finally:
         await store.close()
     store = Store(settings)
     await store.open()
     try:
-        assert (await store.budget_status())["total"] == 100000
+        assert (await store.budget_status())["total"] == 46_000_000
     finally:
         await store.close()
 
@@ -444,9 +447,9 @@ async def test_real_bilibili_patrol_412_streak_excludes_backoff_and_resets(dm):
         )[0] == 0
 
 
-async def test_budget_total_85_and_100_alerts_do_not_use_models(dm):
-    dm.s.total_usd = Decimal("1")
-    dm.s.daily_usd = dm.s.user_daily_usd = Decimal("10")
+async def test_budget_daily_85_and_100_alerts_do_not_use_models(dm):
+    dm.s.daily_usd = Decimal("1")
+    dm.s.monthly_usd = dm.s.user_daily_usd = Decimal("10")
     await dm.store.reserve("test", "chat", Decimal(".85"))
     await dm.check_alerts()
     await dm.store.reserve("test", "chat", Decimal(".15"))
@@ -455,8 +458,9 @@ async def test_budget_total_85_and_100_alerts_do_not_use_models(dm):
     keys = [r[0] for r in await dm.store.all("SELECT alert_key FROM alert_cooldown")]
     assert (
         len(keys) == 2
-        and any("budget_total_85" in k for k in keys)
-        and any("budget_total_100" in k for k in keys)
+        and any("budget_daily_85" in k for k in keys)
+        and any("budget_daily_100" in k for k in keys)
+        and not any("budget_total_" in k for k in keys)
     )
     assert not dm.service.ai.calls
 

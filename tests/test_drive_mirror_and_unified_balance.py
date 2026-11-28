@@ -376,7 +376,6 @@ async def test_unified_balance_four_modes_no_double_deduction_and_hard_stop_resc
     try:
         store.s.daily_usd = Decimal("1000")
         store.s.monthly_usd = Decimal("1000")
-        store.s.total_usd = Decimal("1000")
         store.s.user_daily_usd = Decimal("1000")
 
         # 1. Mode "none"
@@ -527,7 +526,6 @@ async def test_unified_balance_four_modes_no_double_deduction_and_hard_stop_resc
 async def test_affection_budget_multiplier_hook_in_store_budget_refusal(store):
     store.s.daily_usd = Decimal("100")
     store.s.monthly_usd = Decimal("100")
-    store.s.total_usd = Decimal("100")
     store.s.user_daily_usd = Decimal("1.00")
 
     multipliers = {

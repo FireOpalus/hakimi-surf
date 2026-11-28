@@ -455,7 +455,6 @@ class OwnerProactive:
         for kind, label in (
             ("daily", f"{self.s.bot_timezone} 日预算"),
             ("monthly", f"{self.s.bot_timezone} 自然月预算"),
-            ("total", "本地累计预算"),
         ):
             amount, limit = budget[kind], budget[kind + "_limit"]
             if limit <= 0:

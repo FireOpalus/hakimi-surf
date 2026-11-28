@@ -275,7 +275,6 @@ async def test_bigquery_sync_polling_grants_unsettled_delta_and_hard_stop(store)
     # Raise daily/user caps so local test spend isn't blocked before GCP credit exhaustion.
     store.s.daily_usd = Decimal("1000")
     store.s.monthly_usd = Decimal("1000")
-    store.s.total_usd = Decimal("1000")
     store.s.user_daily_usd = Decimal("1000")
 
     # Seed pre-watermark settled call (must NOT count in unsettled), in-flight reserved call
@@ -915,7 +914,6 @@ async def test_gcp_admin_reconciliation_states_and_read_only_safety(settings):
     settings.admin_token = SecretStr(TOKEN)
     settings.daily_usd = Decimal("1000")
     settings.monthly_usd = Decimal("1000")
-    settings.total_usd = Decimal("1000")
     settings.user_daily_usd = Decimal("1000")
     sa = make_sa_info(project_id="rec-proj-1")
     headers = {"Authorization": "Bearer " + TOKEN}

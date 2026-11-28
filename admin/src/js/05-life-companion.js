@@ -38,8 +38,8 @@ async function proactive(){
   const stats=[[chanLabel,d.connected?'在线':'等待连接'],['下次日报',fmt(d.next_digest_at)]];
   $('proactive-stats').replaceChildren(...stats.map(([k,v])=>{const n=el('div',undefined,'stat');n.append(el('small',k),el('strong',v));return n;}));
   text('proactive-state',d.day+' · '+zoneLabel(d.timezone)+' · '+(!d.configured?'尚未配置 Owner 投递目标':d.delivery_enabled?'允许投递':'已停用投递'));
-  const budget=d.budget||{total:0,total_limit:0,hard_stop:false};
-  text('proactive-budget','主动生成日预算 '+usd(d.proactive_daily_limit_usd,2)+' · 本地累计 '+usd(budget.total/1e6,4)+' / '+(budget.total_limit>0?usd(budget.total_limit/1e6,2):'未设累计上限')+(budget.hard_stop?' · 付费生成已熔断':'')+'（含预留，不代表 Google 赠金余额）');
+  const budget=d.budget||{total:0,hard_stop:false};
+  text('proactive-budget','主动生成日预算 '+usd(d.proactive_daily_limit_usd,2)+' · 本地累计 '+usd(budget.total/1e6,4)+(budget.hard_stop?' · 付费生成已熔断':'')+'（含预留，不代表 Google 赠金余额）');
   table('proactive-queue',['类型','状态','数量'],(d.queue||[]).map(v=>[dmKindLabels[v.kind]||v.kind,dmStatus[v.status]||v.status,v.n]));
   table('proactive-alerts',['告警','入队时间','状态','冷却截止'],(d.alerts||[]).map(v=>[v.alert_key,fmt(v.queued_at),dmStatus[v.status]||v.status,fmt(v.cooldown_until)]));
 }

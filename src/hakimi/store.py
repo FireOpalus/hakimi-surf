@@ -988,7 +988,6 @@ class Store:
                 gcp.set_manual_balance_microdollars(manual_set_micro)
             if self._gcp_hard_stop_exhausted(gcp, manual_set_micro):
                 return "gcp_credit_exhausted"
-        total = (await self.one("SELECT amount FROM budget_totals WHERE singleton=1"))[0]
         month = await self.one(
             "SELECT charged_amount FROM usage_aggregates WHERE period=?", ("month:" + day[:7],)
         )
@@ -1025,8 +1024,6 @@ class Store:
             return "daily"
         if monthly_limit <= 0 or monthly_total + amount > monthly_limit:
             return "monthly"
-        if self.s.total_usd > 0 and total + amount > microdollars(self.s.total_usd):
-            return "total"
         aff = getattr(self.runtime, "affection", None)
         if aff is not None and hasattr(aff, "budget_multiplier_for_subject"):
             raw_mult = aff.budget_multiplier_for_subject(subject)
@@ -1599,10 +1596,7 @@ class Store:
                 (day,),
             )
             lane_used = {row["lane"]: row["total"] for row in lane_rows}
-            daily_limit, total_limit = (
-                microdollars(self.s.daily_usd),
-                microdollars(self.s.total_usd),
-            )
+            daily_limit = microdollars(self.s.daily_usd)
             monthly_limit = microdollars(getattr(self.s, "monthly_usd", Decimal("40")))
             account_balance = await self._account_balance_unlocked()
             gcp = getattr(self.runtime, "gcp_billing", None)
@@ -1631,7 +1625,6 @@ class Store:
             "monthly_calendar_carry": monthly_carry,
             "monthly_limit": monthly_limit,
             "total": total,
-            "total_limit": total_limit,
             "account_balance": account_balance,
             "gcp_billing": gcp_summary,
             "user_top_daily": user_top_row[0] if user_top_row else 0,
@@ -1657,7 +1650,6 @@ class Store:
             "hard_stop": circuit
             or daily >= daily_limit
             or monthly >= monthly_limit
-            or (total_limit > 0 and total >= total_limit)
             or gcp_exhausted,
             "circuit": circuit,
         }

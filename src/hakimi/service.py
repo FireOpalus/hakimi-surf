@@ -1097,7 +1097,6 @@ class Service(_ServiceOwnerActionsMixin, _ServiceDeliveryMixin, _ServiceTurnMixi
                         "budget_reservation_exceeded",
                         "daily_budget",
                         "monthly_budget",
-                        "total_budget",
                         "user_budget",
                         "lane_budget",
                     }:

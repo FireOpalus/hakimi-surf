@@ -773,7 +773,7 @@ def test_ledger_balance_reuse_per_tab_abort_polling_guard_and_hash_login_runtime
       }},
       budget_status: {{
         daily: 50000, daily_limit: 5000000, monthly: 50000, monthly_limit: 50000000,
-        total: 50000, total_limit: 0, sub_budgets: {{}},
+        total: 50000, sub_budgets: {{}},
         account_balance: {{
           mode: 'manual', configured: true, manual_configured: true,
           set_usd: '25.00', remaining_usd: '24.9500', manual_remaining_usd: '24.9500',

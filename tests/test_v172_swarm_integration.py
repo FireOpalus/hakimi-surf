@@ -69,7 +69,6 @@ async def test_mounted_affection_admin_csp_and_merged_balance(admin_frontend, se
     settings.admin_token = SecretStr(TOKEN)
     settings.daily_usd = Decimal("100")
     settings.monthly_usd = Decimal("100")
-    settings.total_usd = Decimal("100")
     settings.user_daily_usd = Decimal("100")
     sa = make_sa_info(project_id="v172-proj-1")
     watermark_ts = 1_760_000_000.0
